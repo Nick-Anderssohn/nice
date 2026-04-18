@@ -1,10 +1,10 @@
 # Nice
 
-A native macOS GUI that sits in front of the [`claude`](https://github.com/anthropics/claude-code) CLI. Each sidebar tab is a long-lived Claude Code session running in a pseudo-terminal; the companion pane on the right is a `zsh` rooted in the same working directory. An in-process MCP server lets a running Claude spawn sibling tabs, switch tabs, list tabs, and run shell commands in its own companion terminal — so voice control "just works" via OS dictation into the active Claude.
+A native macOS GUI that sits in front of the [`claude`](https://github.com/anthropics/claude-code) CLI. Each sidebar tab is a long-lived Claude Code session running in a pseudo-terminal; the companion pane on the right is a `zsh` rooted in the same working directory. You open a new tab the same way you'd start Claude anywhere else — by typing `claude …` at the Main Terminal prompt — and an in-process MCP server lets a running Claude switch tabs, list tabs, and run shell commands in its own companion terminal, so voice control "just works" via OS dictation into the active Claude.
 
 ## Status
 
-Early but functional. All six scaffold phases are landed, the app runs end-to-end, native controls respect the user's accent, SwiftTerm panes theme to match `niceBg3`, "Launch at login" is wired to `SMAppService`, and an automated MCP smoke test (`scripts/mcp-e2e.sh`) covers the Claude-in-a-tab → `nice.tab.new` loop.
+Early but functional. The app runs end-to-end, native controls respect the user's accent, SwiftTerm panes theme to match `niceBg3`, "Launch at login" is wired to `SMAppService`, typing `claude …` in the Main Terminal opens a new tab with the args passed through, and an automated MCP smoke test (`scripts/mcp-e2e.sh`) covers the three `nice.*` tools.
 
 ## Requirements
 
@@ -49,10 +49,11 @@ Nice.app                                    (single process)
 
 | Name | Arguments | Effect |
 |---|---|---|
-| `nice.tab.new` | `title?`, `cwd?`, `project?` | Creates a tab, returns `tabId` |
 | `nice.tab.switch` | `tabId?` or `titleQuery?` (fuzzy) | Focuses a tab |
 | `nice.tab.list` | — | Returns all tabs across all projects |
 | `nice.run` | `tabId?`, `command` | Writes `command + "\n"` into that tab's `zsh` |
+
+Tab creation is deliberately not an MCP tool — see **Opening tabs** below.
 
 Every spawned `claude` gets a temp `.mcp.json` threaded in via `--mcp-config`:
 
@@ -77,14 +78,28 @@ Settings (`⌘,`):
 
 The look was mocked up in HTML/React at [claude.ai/design](https://claude.ai/design) and ported to SwiftUI 1:1. The terracotta-accent, 3-column Xcode-flavored aesthetic is a direct translation of that design; all dimensions, paddings, and animation curves were lifted from the CSS source.
 
+## Opening tabs
+
+The Main Terminal ships with a `claude` zsh function that intercepts interactive invocations and asks the app to open a new tab in its place:
+
+```sh
+claude                        # → new tab, claude starts fresh
+claude "fix foo.swift"        # → new tab, claude gets that prompt as argv
+cd ~/Projects/nice && claude  # → new tab rooted at the nice repo
+```
+
+Non-interactive runs stay on the Main Terminal — the function passes through to the real binary when you use `-p` / `--print`, info flags (`--version`, `--help`), subcommands (`claude mcp …`, `claude config …`, `claude update`), or piped stdin. The channel is a Unix-domain socket in `$TMPDIR`, set into the shell as `$NICE_SOCKET`; if the socket isn't reachable the function still falls back to running claude directly.
+
+Regular tabs' right-side `zsh` is untouched — it's a plain interactive shell with no shadow.
+
 ## Non-goals
 
-- **Voice button.** Out of scope — OS dictation into the active Claude reaches the same MCP tools (`nice.tab.switch`, `nice.tab.new`, etc.) without needing a microphone UI or hotkey-managed speech pipeline in Nice itself.
+- **Voice button.** Out of scope — OS dictation into the active Claude reaches the same MCP tools (`nice.tab.switch`, etc.) without needing a microphone UI or hotkey-managed speech pipeline in Nice itself.
 - **Mac App Store distribution.** Blocked by the sandbox requirement — the App Sandbox forbids spawning child processes via pty.
 
 ## Testing the MCP surface
 
-`scripts/mcp-e2e.sh` is a smoke test that simulates what a Claude running inside a tab does: it performs the MCP `initialize` handshake, asserts the four `nice.*` tools are advertised, calls `nice.tab.new`, and confirms the new tab shows up in `nice.tab.list`.
+`scripts/mcp-e2e.sh` is a smoke test that simulates what a Claude running inside a tab does: it performs the MCP `initialize` handshake, asserts the three `nice.*` tools are advertised, and confirms `nice.tab.list` returns a coherent JSON array. Tab creation itself is out of scope for this script — it happens off the MCP surface, via the shadowed `claude()` function in the Main Terminal.
 
 ```sh
 open ~/Library/Developer/Xcode/DerivedData/Nice-*/Build/Products/Debug/Nice.app

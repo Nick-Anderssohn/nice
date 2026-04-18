@@ -89,13 +89,6 @@ struct SidebarView: View {
 
     private var footer: some View {
         HStack(spacing: 4) {
-            FooterBtn(
-                systemImage: "plus",
-                label: "New tab",
-                shortcut: "⌘T"
-            ) {
-                appState.newTab()
-            }
             Spacer(minLength: 0)
             SidebarIconButton(systemImage: "gearshape", help: "Settings") {
                 SettingsWindow.open()
@@ -291,40 +284,6 @@ private struct TabRow: View {
 }
 
 // MARK: - Footer controls
-
-private struct FooterBtn: View {
-    @Environment(\.colorScheme) private var scheme
-
-    let systemImage: String
-    let label: String
-    let shortcut: String
-    let action: () -> Void
-
-    @State private var hover = false
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: systemImage)
-                .font(.system(size: 14, weight: .regular))
-            Text(label)
-                .font(.system(size: 12, weight: .medium))
-            Text(shortcut)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(Color.niceInk3(scheme))
-                .padding(.leading, 2)
-        }
-        .foregroundStyle(Color.niceInk2(scheme))
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(hover ? Color.niceInk(scheme).opacity(0.08) : Color.clear)
-        )
-        .contentShape(Rectangle())
-        .onHover { hover = $0 }
-        .onTapGesture { action() }
-    }
-}
 
 private struct SidebarIconButton: View {
     @Environment(\.colorScheme) private var scheme

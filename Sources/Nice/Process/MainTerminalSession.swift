@@ -16,9 +16,15 @@ final class MainTerminalSession: ObservableObject {
     let view: LocalProcessTerminalView
     private let delegateBridge = TerminalDelegateBridge()
     private(set) var cwd: String
+    /// Extra env vars (merged on top of SwiftTerm's defaults) passed
+    /// into zsh every time we spawn. Used to carry `ZDOTDIR` and
+    /// `NICE_SOCKET` so the shadowed `claude()` function loads and
+    /// knows where to talk to.
+    private let extraEnv: [String: String]
 
-    init(cwd: String) {
+    init(cwd: String, extraEnv: [String: String] = [:]) {
         self.cwd = cwd
+        self.extraEnv = extraEnv
         let font = NSFont(name: "JetBrainsMono-Regular", size: 12)
             ?? NSFont.userFixedPitchFont(ofSize: 12)
             ?? NSFont.systemFont(ofSize: 12)
@@ -30,7 +36,7 @@ final class MainTerminalSession: ObservableObject {
         self.view.startProcess(
             executable: "/bin/zsh",
             args: ["-il"],
-            environment: nil,
+            environment: Self.buildEnv(extraEnv: extraEnv),
             execName: nil,
             currentDirectory: Self.expandTilde(cwd)
         )
@@ -46,17 +52,32 @@ final class MainTerminalSession: ObservableObject {
     }
 
     /// Terminate the current zsh (if any) and re-spawn in `cwd`. Called
-    /// from the sidebar's "Change directory…" action.
+    /// from the sidebar's "Change directory…" action. Preserves the
+    /// same `extraEnv` as the initial spawn so ZDOTDIR/NICE_SOCKET
+    /// stick across restarts.
     func restart(cwd: String) {
         self.cwd = cwd
         view.process.terminate()
         view.startProcess(
             executable: "/bin/zsh",
             args: ["-il"],
-            environment: nil,
+            environment: Self.buildEnv(extraEnv: extraEnv),
             execName: nil,
             currentDirectory: Self.expandTilde(cwd)
         )
+    }
+
+    /// Merge `extraEnv` on top of `Terminal.getEnvironmentVariables()`
+    /// (TERM, COLORTERM, LANG, LOGNAME, USER, HOME — PATH is
+    /// intentionally omitted; zsh -il sources .zprofile/.zshrc to
+    /// populate it). Returns the `KEY=VALUE` list `startProcess`
+    /// expects.
+    private static func buildEnv(extraEnv: [String: String]) -> [String] {
+        var env = Terminal.getEnvironmentVariables()
+        for (k, v) in extraEnv {
+            env.append("\(k)=\(v)")
+        }
+        return env
     }
 
     private static func expandTilde(_ path: String) -> String {

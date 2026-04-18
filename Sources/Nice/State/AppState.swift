@@ -10,6 +10,7 @@
 //  persist across tab switches.
 //
 
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -43,6 +44,14 @@ final class AppState: ObservableObject {
     /// the user's PATH. `TabPtySession` falls back to zsh when nil.
     private var resolvedClaudePath: String?
 
+    // MARK: - Phase 7 control socket
+
+    /// Unix-domain-socket listener the Main Terminal's shadowed
+    /// `claude()` zsh function posts newtab requests to. Exposed here
+    /// so the socket path can be injected into the Main Terminal's env
+    /// as `NICE_SOCKET`.
+    private var controlSocket: NiceControlSocket?
+
     init() {
         self.projects = Project.seed
         // Main terminal is the default selection — `AppShellView` renders
@@ -56,13 +65,65 @@ final class AppState: ObservableObject {
         // has customised it, the stored value wins.
         let storedMainCwd = UserDefaults.standard.string(forKey: "mainTerminalCwd")
             ?? NSHomeDirectory()
-        self.mainTerminal = MainTerminalSession(cwd: storedMainCwd)
+
+        // Allocate the control socket + write the ZDOTDIR inject
+        // *before* spawning the Main Terminal's zsh — the shell needs
+        // NICE_SOCKET + ZDOTDIR in its environment at startup or the
+        // `claude()` shadow never loads. The socket path is
+        // pid-derived, so we can build `extraEnv` from it without the
+        // listener being bound yet; we call `start(handler:)` only
+        // after every stored property is initialized so `self`-capture
+        // in the handler is legal.
+        let socket = NiceControlSocket()
+        self.controlSocket = socket
+
+        var extraEnv: [String: String] = [:]
+        extraEnv["NICE_SOCKET"] = socket.path
+        do {
+            let zdotdir = try MainTerminalShellInject.make(socketPath: socket.path)
+            extraEnv["ZDOTDIR"] = zdotdir.path
+        } catch {
+            NSLog("AppState: ZDOTDIR inject failed: \(error)")
+        }
+
+        self.mainTerminal = MainTerminalSession(
+            cwd: storedMainCwd,
+            extraEnv: extraEnv
+        )
 
         // Resolve `claude` synchronously on launch (takes <10ms) so the
         // first tab the user clicks actually runs claude, not the zsh
         // fallback. If it's not on PATH, resolvedClaudePath stays nil
         // and all tabs fall back to zsh.
         self.resolvedClaudePath = Self.runWhich(binary: "claude")
+
+        // Stored properties are all initialized — now safe to capture
+        // `self` and bind the listener. The handler fires on
+        // `NiceControlSocket`'s background queue, so hop to MainActor
+        // before touching app state. Bind failure is non-fatal:
+        // claude() in the Main Terminal will detect the unreachable
+        // socket and fall back to running claude in-place.
+        do {
+            try socket.start { [weak self] cwd, args in
+                Task { @MainActor [weak self] in
+                    self?.createTabFromMainTerminal(cwd: cwd, args: args)
+                }
+            }
+        } catch {
+            NSLog("AppState: control socket failed to bind: \(error)")
+        }
+
+        // Tear down the socket on app quit. Missing this is tolerable
+        // — `unlink` before bind on next launch clears stale files —
+        // but it keeps $TMPDIR tidy during normal usage.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.controlSocket?.stop()
+            }
+        }
     }
 
     // MARK: - Selection
@@ -77,23 +138,40 @@ final class AppState: ObservableObject {
 
     // MARK: - Tab creation
 
-    /// Prepend a freshly created tab to the first project, spawn its
-    /// pty pair, and select it.
-    func newTab() {
-        guard !projects.isEmpty else { return }
+    /// Open a new tab rooted at `cwd`, running `claude` in the chat
+    /// pane with any `args` forwarded through. Called from the
+    /// `NiceControlSocket` handler when the Main Terminal's shadowed
+    /// `claude()` function posts a newtab message.
+    ///
+    /// `cwd` comes straight from the Main Terminal's `$PWD` at the
+    /// moment of invocation; `args` is the raw argv the user typed.
+    func createTabFromMainTerminal(cwd: String, args: [String]) {
         let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
-        let first = projects[0]
+        let title: String = {
+            guard !args.isEmpty else { return "New tab" }
+            let joined = args.joined(separator: " ")
+            let trimmed = String(joined.prefix(40))
+                .trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? "New tab" : trimmed
+        }()
         let tab = Tab(
             id: newId,
-            title: "New tab",
+            title: title,
             status: .idle,
-            cwd: first.path,
+            cwd: cwd,
             branch: nil
         )
-        projects[0].tabs.insert(tab, at: 0)
+        if !projects.isEmpty {
+            projects[0].tabs.insert(tab, at: 0)
+        } else {
+            // Defensive: seed is non-empty today, but keep the app
+            // functional if that ever changes.
+            projects.append(
+                Project(id: "default", name: "default", path: cwd, tabs: [tab])
+            )
+        }
         activeTabId = newId
-        // Warm the pty so switching lands on a live view.
-        _ = session(for: newId, cwd: tab.cwd)
+        _ = session(for: newId, cwd: cwd, extraClaudeArgs: args)
     }
 
     // MARK: - Bootstrap
@@ -124,32 +202,6 @@ final class AppState: ObservableObject {
     }
 
     // MARK: - MCP tool handlers
-
-    /// Create a tab programmatically. Mirrors `newTab()` but lets the
-    /// MCP caller override cwd and title. Returns the new tab's id.
-    func mcpCreateTab(cwd: String?, title: String?) -> String {
-        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
-        let resolvedCwd = cwd ?? projects.first?.path ?? "~"
-        let tab = Tab(
-            id: newId,
-            title: title ?? "New tab",
-            status: .idle,
-            cwd: resolvedCwd,
-            branch: nil
-        )
-        if !projects.isEmpty {
-            projects[0].tabs.insert(tab, at: 0)
-        } else {
-            // Defensive: if somehow projects is empty, create a
-            // synthetic one so the tab can land somewhere.
-            projects.append(
-                Project(id: "default", name: "default", path: resolvedCwd, tabs: [tab])
-            )
-        }
-        activeTabId = newId
-        _ = session(for: newId, cwd: resolvedCwd)
-        return newId
-    }
 
     /// Switch to a tab by id or fuzzy title match. Returns the resolved
     /// id, or nil if nothing matches.
@@ -219,7 +271,17 @@ final class AppState: ObservableObject {
     /// inside that tab can call back into the Nice MCP server. A
     /// failure to write the config is non-fatal — we fall back to
     /// spawning claude without it.
-    func session(for tabId: String, cwd: String? = nil) -> TabPtySession {
+    ///
+    /// `extraClaudeArgs` is forwarded to `TabPtySession` and appended
+    /// after `--mcp-config` on the claude command line. Populated only
+    /// on the Main-Terminal-driven creation path
+    /// (`createTabFromMainTerminal`); other callers (MCP tools that
+    /// need to warm a session, tab-row taps) pass an empty array.
+    func session(
+        for tabId: String,
+        cwd: String? = nil,
+        extraClaudeArgs: [String] = []
+    ) -> TabPtySession {
         if let existing = ptySessions[tabId] {
             return existing
         }
@@ -236,7 +298,8 @@ final class AppState: ObservableObject {
             tabId: tabId,
             cwd: resolvedCwd,
             claudeBinary: resolvedClaudePath,
-            mcpConfigPath: cfgPath
+            mcpConfigPath: cfgPath,
+            extraClaudeArgs: extraClaudeArgs
         )
         session.applyTheme(currentScheme)
         ptySessions[tabId] = session

@@ -25,7 +25,8 @@ final class TabPtySession: ObservableObject {
         tabId: String,
         cwd: String,
         claudeBinary: String?,
-        mcpConfigPath: URL? = nil
+        mcpConfigPath: URL? = nil,
+        extraClaudeArgs: [String] = []
     ) {
         self.tabId = tabId
         self.cwd = cwd
@@ -59,6 +60,12 @@ final class TabPtySession: ObservableObject {
             if let cfg = mcpConfigPath?.path {
                 parts.append("--mcp-config")
                 parts.append(Self.shellQuote(cfg))
+            }
+            // Pass-through args from the Main Terminal's `claude …`
+            // invocation. Already-quoted on the way in via shellQuote,
+            // so paths with spaces / embedded quotes survive intact.
+            for a in extraClaudeArgs {
+                parts.append(Self.shellQuote(a))
             }
             chatView.startProcess(
                 executable: "/bin/zsh",

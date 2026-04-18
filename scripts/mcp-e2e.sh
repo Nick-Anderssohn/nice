@@ -2,7 +2,12 @@
 #
 # End-to-end smoke test for Nice's MCP server. Simulates what a Claude
 # process running inside a Nice tab does: handshake → list tools →
-# create a sibling tab → confirm the new tab appears.
+# list tabs → verify the response shape.
+#
+# Tab creation is not covered here — it happens off the MCP surface,
+# via the Main Terminal's shadowed `claude()` function talking to
+# Nice's control socket. This script only asserts the three MCP tools
+# still present are wired up correctly.
 #
 # Requires: Nice.app running (to have the server bound on 127.0.0.1:7420).
 # Dependencies: curl, jq.
@@ -10,12 +15,11 @@
 # Exit codes:
 #   0  all checks passed
 #   1  prereq missing (jq, not running, etc.)
-#   2  a check failed (response shape / tab not created)
+#   2  a check failed (response shape mismatch)
 
 set -euo pipefail
 
 URL="http://127.0.0.1:7420/mcp"
-TAB_TITLE="e2e-test-$$"
 
 log()  { printf '[e2e] %s\n' "$*"; }
 fail() { printf '[e2e] FAIL: %s\n' "$*" >&2; exit 2; }
@@ -88,38 +92,20 @@ call() {
         | sed 's/^data: //'
 }
 
-# ── 2. tools/list advertises the four nice.* tools ────────────────────
+# ── 2. tools/list advertises the three nice.* tools ──────────────────
 TOOLS_JSON=$(call tools/list '{"id":2}')
 TOOLS=$(jq -r '.result.tools[].name' <<<"$TOOLS_JSON" | sort | tr '\n' ',' | sed 's/,$//')
-EXPECTED="nice.run,nice.tab.list,nice.tab.new,nice.tab.switch"
+EXPECTED="nice.run,nice.tab.list,nice.tab.switch"
 [[ "$TOOLS" == "$EXPECTED" ]] || fail "tools/list mismatch: got [$TOOLS], want [$EXPECTED]"
 log "tools/list ok: $TOOLS"
 
-# ── 3. baseline tab count ─────────────────────────────────────────────
-LIST1=$(call tools/call "$(jq -nc '{id:3, name:"nice.tab.list", arguments:{}}')")
-# Each CallToolResult wraps the payload in .result.content[0].text as a
-# JSON-encoded string — unwrap it once to get the list.
-COUNT_BEFORE=$(jq -r '.result.content[0].text | fromjson | length' <<<"$LIST1")
-log "baseline tab count: $COUNT_BEFORE"
-
-# ── 4. create a new tab ───────────────────────────────────────────────
-NEW_ARGS=$(jq -nc --arg t "$TAB_TITLE" '{id:4, name:"nice.tab.new", arguments:{title:$t}}')
-NEW_RESP=$(call tools/call "$NEW_ARGS")
-NEW_TAB_ID=$(jq -r '.result.content[0].text | fromjson | .tabId' <<<"$NEW_RESP")
-[[ -n "$NEW_TAB_ID" && "$NEW_TAB_ID" != "null" ]] \
-    || fail "nice.tab.new returned no tabId — raw: $NEW_RESP"
-log "nice.tab.new ok — tabId=$NEW_TAB_ID title=$TAB_TITLE"
-
-# ── 5. confirm the new tab is now visible via nice.tab.list ───────────
-LIST2=$(call tools/call "$(jq -nc '{id:5, name:"nice.tab.list", arguments:{}}')")
-TABS=$(jq -r '.result.content[0].text | fromjson' <<<"$LIST2")
-COUNT_AFTER=$(jq 'length' <<<"$TABS")
-FOUND=$(jq --arg id "$NEW_TAB_ID" 'map(select(.id == $id)) | length' <<<"$TABS")
-
-(( COUNT_AFTER == COUNT_BEFORE + 1 )) \
-    || fail "tab count did not advance: before=$COUNT_BEFORE after=$COUNT_AFTER"
-(( FOUND == 1 )) \
-    || fail "new tabId $NEW_TAB_ID not present in nice.tab.list"
-
-log "nice.tab.list ok — count=$COUNT_AFTER, new tab present"
+# ── 3. nice.tab.list returns a coherent JSON array ────────────────────
+LIST_RESP=$(call tools/call "$(jq -nc '{id:3, name:"nice.tab.list", arguments:{}}')")
+TABS=$(jq -r '.result.content[0].text | fromjson' <<<"$LIST_RESP")
+# Must parse as an array (length is an Int). An error from jq here means
+# the server didn't wrap the response correctly.
+COUNT=$(jq 'length' <<<"$TABS")
+[[ "$COUNT" =~ ^[0-9]+$ ]] \
+    || fail "nice.tab.list did not return a JSON array — raw: $LIST_RESP"
+log "nice.tab.list ok — count=$COUNT"
 log "all checks passed ✓"
