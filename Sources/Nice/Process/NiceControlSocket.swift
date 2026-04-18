@@ -25,8 +25,21 @@
 import Darwin
 import Foundation
 
+/// Discriminated payload carried on the control socket. Produced by the
+/// parser in `readClient`, consumed by `AppState.init`'s handler, which
+/// dispatches each case to the appropriate MainActor method.
+enum SocketMessage: Sendable {
+    /// Main-Terminal `claude` shadow asking for a brand-new tab rooted
+    /// at `cwd` with the given argv.
+    case newtab(cwd: String, args: [String])
+    /// Companion-shell `claude` shadow asking to promote the tab it's
+    /// running inside back to Claude-tab state. `tabId` is read from
+    /// `$NICE_TAB_ID` in the companion's env.
+    case promoteTab(tabId: String, args: [String])
+}
+
 final class NiceControlSocket: @unchecked Sendable {
-    typealias Handler = @Sendable (_ cwd: String, _ args: [String]) -> Void
+    typealias Handler = @Sendable (SocketMessage) -> Void
 
     /// Path of the bound socket file. Exported via `NICE_SOCKET` into
     /// the Main Terminal so the shadowed `claude()` zsh function can
@@ -37,7 +50,7 @@ final class NiceControlSocket: @unchecked Sendable {
     private var acceptSource: DispatchSourceRead?
     // Set once from `start(handler:)` before the source resumes, so
     // readClient's read of it from a bg queue is safe without a lock.
-    private var handler: Handler = { _, _ in }
+    private var handler: Handler = { _ in }
 
     /// Allocates only — the socket path is derived from the process
     /// pid so it's known immediately and can be injected into the Main
@@ -149,12 +162,23 @@ final class NiceControlSocket: @unchecked Sendable {
 
         guard
             let obj = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any],
-            (obj["action"] as? String) == "newtab",
-            let cwd = obj["cwd"] as? String
+            let action = obj["action"] as? String
         else {
             return
         }
         let args = (obj["args"] as? [String]) ?? []
-        handler(cwd, args)
+        switch action {
+        case "newtab":
+            guard let cwd = obj["cwd"] as? String else { return }
+            handler(.newtab(cwd: cwd, args: args))
+        case "promoteTab":
+            guard let tabId = obj["tabId"] as? String, !tabId.isEmpty else { return }
+            handler(.promoteTab(tabId: tabId, args: args))
+        default:
+            // Unknown action — log and drop, matching the silent-drop
+            // behavior used elsewhere for malformed payloads.
+            NSLog("NiceControlSocket: unknown action '\(action)' — ignoring")
+            return
+        }
     }
 }

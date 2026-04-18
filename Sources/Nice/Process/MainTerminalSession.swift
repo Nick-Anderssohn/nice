@@ -2,9 +2,14 @@
 //  MainTerminalSession.swift
 //  Nice
 //
-//  Phase 4: singleton zsh pty that backs the "Main terminal" sidebar row.
+//  Singleton zsh pty that backs the "Main terminal" sidebar row.
 //  Owned by `AppState`; the view identity is stable, so `TerminalHost`
 //  can relay it as-is without re-creating on every redraw.
+//
+//  Termination is handled via a `ProcessTerminationDelegate` in the
+//  `.main` role — when the shell exits (Ctrl+D, `exit`, crash),
+//  AppState decides whether to show a quit prompt or terminate the app
+//  outright.
 //
 
 import AppKit
@@ -14,7 +19,12 @@ import SwiftUI
 @MainActor
 final class MainTerminalSession: ObservableObject {
     let view: LocalProcessTerminalView
-    private let delegateBridge = TerminalDelegateBridge()
+    /// Retained so SwiftTerm's weak `processDelegate` reference stays
+    /// alive for the lifetime of the session.
+    private var delegate: ProcessTerminationDelegate
+    /// Closure AppState passes in; re-used by `restart(cwd:)` when we
+    /// reinstall the delegate on a fresh view.
+    private let onExit: @MainActor (Int32?) -> Void
     private(set) var cwd: String
     /// Extra env vars (merged on top of SwiftTerm's defaults) passed
     /// into zsh every time we spawn. Used to carry `ZDOTDIR` and
@@ -22,9 +32,14 @@ final class MainTerminalSession: ObservableObject {
     /// knows where to talk to.
     private let extraEnv: [String: String]
 
-    init(cwd: String, extraEnv: [String: String] = [:]) {
+    init(
+        cwd: String,
+        extraEnv: [String: String] = [:],
+        onExit: @escaping @MainActor (Int32?) -> Void
+    ) {
         self.cwd = cwd
         self.extraEnv = extraEnv
+        self.onExit = onExit
         let font = NSFont(name: "JetBrainsMono-Regular", size: 12)
             ?? NSFont.userFixedPitchFont(ofSize: 12)
             ?? NSFont.systemFont(ofSize: 12)
@@ -32,7 +47,11 @@ final class MainTerminalSession: ObservableObject {
         // the font is set via the inherited `TerminalView.font` property.
         self.view = LocalProcessTerminalView(frame: .zero)
         self.view.font = font
-        self.view.processDelegate = delegateBridge
+        self.delegate = ProcessTerminationDelegate(
+            role: .main,
+            onExit: { [onExit] _, code in onExit(code) }
+        )
+        self.view.processDelegate = self.delegate
         self.view.startProcess(
             executable: "/bin/zsh",
             args: ["-il"],
@@ -52,12 +71,22 @@ final class MainTerminalSession: ObservableObject {
     }
 
     /// Terminate the current zsh (if any) and re-spawn in `cwd`. Called
-    /// from the sidebar's "Change directory…" action. Preserves the
-    /// same `extraEnv` as the initial spawn so ZDOTDIR/NICE_SOCKET
-    /// stick across restarts.
+    /// from the sidebar's "Change directory…" action and from
+    /// `AppState.cancelQuitPrompt` when the user backs out of the
+    /// Main-Terminal-exit quit confirmation. Preserves the same
+    /// `extraEnv` as the initial spawn so ZDOTDIR/NICE_SOCKET stick
+    /// across restarts, and reinstalls the termination delegate so the
+    /// fresh shell's exit still routes back to AppState.
     func restart(cwd: String) {
         self.cwd = cwd
         view.process.terminate()
+        let onExit = self.onExit
+        let fresh = ProcessTerminationDelegate(
+            role: .main,
+            onExit: { [onExit] _, code in onExit(code) }
+        )
+        self.delegate = fresh
+        view.processDelegate = fresh
         view.startProcess(
             executable: "/bin/zsh",
             args: ["-il"],

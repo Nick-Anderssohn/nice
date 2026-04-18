@@ -2,12 +2,11 @@
 //  AppState.swift
 //  Nice
 //
-//  Phase 4: real process plumbing. In addition to the sidebar state from
-//  phase 2, `AppState` now owns the long-lived pty sessions — one
-//  `MainTerminalSession` (the "Main terminal" sidebar row) and a cache
-//  of `TabPtySession` values keyed by tab id (middle + right panes per
-//  tab). Sessions outlive SwiftUI redraws, so processes and scrollback
-//  persist across tab switches.
+//  Phase 4 + terminal lifecycle cleanup. `AppState` owns the long-lived
+//  pty sessions (one `MainTerminalSession` for the "Main terminal"
+//  sidebar row, and a cache of `TabPtySession` keyed by tab id) and
+//  fans process-exit events back into the data model so the sidebar
+//  and split view can react to ctrl+D, `exit`, and crashes.
 //
 
 import AppKit
@@ -25,6 +24,17 @@ final class AppState: ObservableObject {
 
     @Published private(set) var ptySessions: [String: TabPtySession] = [:]
     @Published private(set) var mainTerminal: MainTerminalSession
+
+    /// Surfaces a "Quit NICE?" alert when the Main Terminal exits while
+    /// open tabs still exist. `AppShellView` binds its `.alert` to this
+    /// flag and calls `cancelQuitPrompt()` / `NSApp.terminate(nil)`
+    /// from the two buttons.
+    @Published var showQuitPrompt: Bool = false
+
+    /// Cached cwd for the Main Terminal so `cancelQuitPrompt` can
+    /// respawn the shell at the same place the user started from.
+    /// Kept in sync with `mainTerminal.cwd` via `restartMainTerminal`.
+    private var storedMainCwd: String
 
     /// Tracks the SwiftUI `ColorScheme` currently showing. `AppShellView`
     /// keeps this in sync via `updateScheme(_:)` so new sessions can be
@@ -52,6 +62,13 @@ final class AppState: ObservableObject {
     /// as `NICE_SOCKET`.
     private var controlSocket: NiceControlSocket?
 
+    /// Filesystem path of the ZDOTDIR directory produced by
+    /// `MainTerminalShellInject.make`. Captured at init so every new
+    /// `TabPtySession` can hand it to its companion spawns, making the
+    /// shadowed `claude()` zsh function available inside companion
+    /// terminals as well.
+    private var zdotdirPath: String?
+
     init() {
         self.projects = Project.seed
         // Main terminal is the default selection — `AppShellView` renders
@@ -65,6 +82,7 @@ final class AppState: ObservableObject {
         // has customised it, the stored value wins.
         let storedMainCwd = UserDefaults.standard.string(forKey: "mainTerminalCwd")
             ?? NSHomeDirectory()
+        self.storedMainCwd = storedMainCwd
 
         // Allocate the control socket + write the ZDOTDIR inject
         // *before* spawning the Main Terminal's zsh — the shell needs
@@ -82,13 +100,29 @@ final class AppState: ObservableObject {
         do {
             let zdotdir = try MainTerminalShellInject.make(socketPath: socket.path)
             extraEnv["ZDOTDIR"] = zdotdir.path
+            self.zdotdirPath = zdotdir.path
         } catch {
             NSLog("AppState: ZDOTDIR inject failed: \(error)")
+            self.zdotdirPath = nil
         }
 
+        // Route Main Terminal exits through `mainTerminalExited`. Capture
+        // weakly so the session's retained delegate doesn't keep the
+        // AppState alive past app teardown.
+        //
+        // NB: we need a reference to pass into the MainTerminalSession
+        // initializer, and we can't reference `self` until stored props
+        // are set. So we stash a placeholder here and patch the closure
+        // target through a local `weak self` box after init. In
+        // practice: define the closure inline with `[weak self]` and
+        // wait for full init before anything can fire.
+        let mainExitBox = WeakSelfBox()
         self.mainTerminal = MainTerminalSession(
             cwd: storedMainCwd,
-            extraEnv: extraEnv
+            extraEnv: extraEnv,
+            onExit: { code in
+                mainExitBox.value?.mainTerminalExited(exitCode: code)
+            }
         )
 
         // Resolve `claude` synchronously on launch (takes <10ms) so the
@@ -97,16 +131,21 @@ final class AppState: ObservableObject {
         // and all tabs fall back to zsh.
         self.resolvedClaudePath = Self.runWhich(binary: "claude")
 
-        // Stored properties are all initialized — now safe to capture
-        // `self` and bind the listener. The handler fires on
-        // `NiceControlSocket`'s background queue, so hop to MainActor
-        // before touching app state. Bind failure is non-fatal:
-        // claude() in the Main Terminal will detect the unreachable
-        // socket and fall back to running claude in-place.
+        // Stored properties are all initialized — now safe to wire the
+        // weak-box, start the socket listener, and register the
+        // teardown observer.
+        mainExitBox.value = self
+
         do {
-            try socket.start { [weak self] cwd, args in
+            try socket.start { [weak self] message in
                 Task { @MainActor [weak self] in
-                    self?.createTabFromMainTerminal(cwd: cwd, args: args)
+                    guard let self else { return }
+                    switch message {
+                    case let .newtab(cwd, args):
+                        self.createTabFromMainTerminal(cwd: cwd, args: args)
+                    case let .promoteTab(tabId, args):
+                        self.promoteTabToClaude(tabId: tabId, args: args)
+                    }
                 }
             }
         } catch {
@@ -154,12 +193,16 @@ final class AppState: ObservableObject {
                 .trimmingCharacters(in: .whitespaces)
             return trimmed.isEmpty ? "New tab" : trimmed
         }()
+        let companionId = "\(newId)-c1"
         let tab = Tab(
             id: newId,
             title: title,
             status: .idle,
             cwd: cwd,
-            branch: nil
+            branch: nil,
+            hasClaudePane: true,
+            companions: [CompanionTerminal(id: companionId, title: "Terminal 1")],
+            activeCompanionId: companionId
         )
         if !projects.isEmpty {
             projects[0].tabs.insert(tab, at: 0)
@@ -199,6 +242,181 @@ final class AppState: ObservableObject {
             session.applyTheme(scheme)
         }
         mainTerminal.applyTheme(scheme)
+    }
+
+    // MARK: - Lifecycle handlers
+
+    /// The Claude process in `tabId` exited. The tab stays in its
+    /// project group (so its companions keep running) but its icon
+    /// flips and the chat pane goes away.
+    func claudePaneExited(tabId: String, exitCode: Int32?) {
+        guard let (pi, ti) = tabIndex(for: tabId) else { return }
+        projects[pi].tabs[ti].hasClaudePane = false
+        ptySessions[tabId]?.closeClaude()
+    }
+
+    /// A companion in `tabId` exited. Drop it from the tab's companion
+    /// list and the session's `terminals` dict. If it was the active
+    /// pill, focus an adjacent one. If that was the last companion AND
+    /// Claude is already gone, remove the tab entirely.
+    func companionExited(tabId: String, companionId: String, exitCode: Int32?) {
+        guard let (pi, ti) = tabIndex(for: tabId) else { return }
+        var tab = projects[pi].tabs[ti]
+        guard let compIdx = tab.companions.firstIndex(where: { $0.id == companionId }) else {
+            return
+        }
+        tab.companions.remove(at: compIdx)
+
+        // Pick a neighbor if the removed companion was active. Prefer
+        // the one that took its slot (index `compIdx`), else the
+        // previous, else nil (covered below).
+        if tab.activeCompanionId == companionId {
+            if compIdx < tab.companions.count {
+                tab.activeCompanionId = tab.companions[compIdx].id
+            } else if compIdx > 0 {
+                tab.activeCompanionId = tab.companions[compIdx - 1].id
+            } else {
+                tab.activeCompanionId = nil
+            }
+        }
+
+        // Drop the session's view/delegate regardless of what's left.
+        ptySessions[tabId]?.removeCompanion(id: companionId)
+
+        // If the tab has nothing left to host, dissolve it entirely.
+        if tab.companions.isEmpty && tab.hasClaudePane == false {
+            projects[pi].tabs.remove(at: ti)
+            ptySessions.removeValue(forKey: tabId)
+            if activeTabId == tabId {
+                activeTabId = nil
+            }
+        } else {
+            projects[pi].tabs[ti] = tab
+        }
+    }
+
+    /// The Main Terminal's zsh exited. Terminate the app if nothing
+    /// else is running; otherwise surface a "Quit NICE?" confirmation
+    /// that lets the user back out by respawning the shell.
+    func mainTerminalExited(exitCode: Int32?) {
+        if projects.flatMap({ $0.tabs }).isEmpty {
+            NSApp.terminate(nil)
+        } else {
+            showQuitPrompt = true
+        }
+    }
+
+    /// Cancel the post-exit quit prompt: hide the alert and bring the
+    /// Main Terminal's zsh back up in the same cwd.
+    func cancelQuitPrompt() {
+        showQuitPrompt = false
+        mainTerminal.restart(cwd: storedMainCwd)
+    }
+
+    /// Promote a terminal-only tab back to Claude-tab state. Called
+    /// from the control socket's `promoteTab` handler when a companion
+    /// shell's shadowed `claude()` fires (it's already about to
+    /// `exec claude` in the same pty — this just flips the data model
+    /// so the layout shows it as the chat pane).
+    ///
+    /// Assumption: the shadow that fired this message ran in the
+    /// companion the user currently has focused, so `activeCompanionId`
+    /// is the promote source. This is true by construction because the
+    /// shell only executes inside whichever pty the user is typing in.
+    /// The wire payload deliberately doesn't carry a companion id — we
+    /// infer it here.
+    func promoteTabToClaude(tabId: String, args: [String]) {
+        guard let (pi, ti) = tabIndex(for: tabId) else {
+            NSLog("AppState: promoteTabToClaude for unknown tab \(tabId) — ignoring")
+            return
+        }
+        // Tab is already a Claude tab → the shadow will still
+        // `exec claude` inline, giving the user a second claude in
+        // that companion. Nothing for the layout to do.
+        if projects[pi].tabs[ti].hasClaudePane {
+            return
+        }
+        guard let activeCompanionId = projects[pi].tabs[ti].activeCompanionId else {
+            NSLog("AppState: promoteTabToClaude with no active companion on \(tabId)")
+            return
+        }
+
+        // Move the companion's delegate/role into the chat slot. The
+        // Phase 1 implementation of `promoteCompanionToChat` flips
+        // `isClaudeAlive` and rewires the delegate without physically
+        // moving the view (deferred to Phase 3 when chatView becomes
+        // optional). That's sufficient here.
+        if let session = ptySessions[tabId] {
+            _ = session.promoteCompanionToChat(id: activeCompanionId)
+        }
+
+        // Strip the promoted companion from the tab's companion list —
+        // it is now the chat pane, not a companion.
+        projects[pi].tabs[ti].companions.removeAll { $0.id == activeCompanionId }
+        projects[pi].tabs[ti].hasClaudePane = true
+
+        // If nothing remains on the companion side, spawn a fresh one
+        // so the layout has a terminal to render next to the chat.
+        if projects[pi].tabs[ti].companions.isEmpty {
+            let tabCwd = projects[pi].tabs[ti].cwd
+            _ = addCompanion(tabId: tabId, cwd: tabCwd)
+            // addCompanion already updates activeCompanionId to the
+            // newly spawned id.
+        } else {
+            // At least one companion still exists — focus the first.
+            projects[pi].tabs[ti].activeCompanionId =
+                projects[pi].tabs[ti].companions.first?.id
+        }
+    }
+
+    // MARK: - Companion management
+
+    /// Append a new companion to `tabId`, spawn its pty, and focus it.
+    /// Returns the new companion id, or nil if the tab doesn't exist.
+    @discardableResult
+    func addCompanion(
+        tabId: String,
+        cwd: String? = nil,
+        title: String? = nil
+    ) -> String? {
+        guard let (pi, ti) = tabIndex(for: tabId) else { return nil }
+        let newId = "\(tabId)-c\(Int(Date().timeIntervalSince1970 * 1000))"
+        let resolvedTitle = title ?? "Terminal \(projects[pi].tabs[ti].companions.count + 1)"
+        projects[pi].tabs[ti].companions.append(
+            CompanionTerminal(id: newId, title: resolvedTitle)
+        )
+        projects[pi].tabs[ti].activeCompanionId = newId
+
+        // Ensure a session exists for this tab before asking it to host
+        // a new companion. Use the tab's cwd if no override is given.
+        let tabCwd = projects[pi].tabs[ti].cwd
+        let session: TabPtySession
+        if let existing = ptySessions[tabId] {
+            session = existing
+        } else {
+            session = self.session(for: tabId, cwd: tabCwd)
+        }
+        _ = session.addCompanion(id: newId, cwd: cwd ?? tabCwd)
+        return newId
+    }
+
+    /// Focus a specific companion in `tabId`. No-op if the id isn't
+    /// actually one of the tab's companions.
+    func setActiveCompanion(tabId: String, companionId: String) {
+        guard let (pi, ti) = tabIndex(for: tabId) else { return }
+        guard projects[pi].tabs[ti].companions.contains(where: { $0.id == companionId }) else {
+            return
+        }
+        projects[pi].tabs[ti].activeCompanionId = companionId
+    }
+
+    /// Ask a companion to quit by writing `"exit\n"` into its pty. The
+    /// process-exit delegate (`companionExited`) handles cleanup once
+    /// the shell actually dies, so this is a "soft" close — if zsh is
+    /// blocked on a running child (e.g. vim), nothing happens.
+    func requestCloseCompanion(tabId: String, companionId: String) {
+        guard let session = ptySessions[tabId] else { return }
+        session.sendToTerminal("exit", companionId: companionId)
     }
 
     // MARK: - MCP tool handlers
@@ -242,21 +460,34 @@ final class AppState: ObservableObject {
         return rows
     }
 
-    /// Write `command + "\n"` into the target tab's right-side zsh.
+    /// Spawn a new companion terminal in a tab. Defaults to the active
+    /// tab when `tabId` is nil; uses the tab's cwd when `cwd` is nil;
+    /// uses "Terminal N" when `title` is nil. Returns the new companion
+    /// id, or nil if no valid target tab could be resolved.
+    func mcpOpenTerminal(tabId: String?, cwd: String?, title: String?) -> String? {
+        let targetId = tabId ?? activeTabId
+        guard let targetId else { return nil }
+        guard tab(for: targetId) != nil else { return nil }
+        return addCompanion(tabId: targetId, cwd: cwd, title: title)
+    }
+
+    /// Write `command + "\n"` into the target tab's active companion.
     /// Defaults to the active tab when `tabId` is nil. Returns false if
-    /// no suitable session is found.
+    /// no suitable session/companion is found.
     func mcpRun(tabId: String?, command: String) -> Bool {
         let targetId = tabId ?? activeTabId
         guard let targetId else { return false }
+        guard let tab = tab(for: targetId) else { return false }
+        guard let companionId = tab.activeCompanionId ?? tab.companions.first?.id else {
+            return false
+        }
         let session: TabPtySession
         if let existing = ptySessions[targetId] {
             session = existing
-        } else if let tab = tab(for: targetId) {
-            session = self.session(for: targetId, cwd: tab.cwd)
         } else {
-            return false
+            session = self.session(for: targetId, cwd: tab.cwd)
         }
-        session.sendToTerminal(command)
+        session.sendToTerminal(command, companionId: companionId)
         return true
     }
 
@@ -277,6 +508,14 @@ final class AppState: ObservableObject {
     /// on the Main-Terminal-driven creation path
     /// (`createTabFromMainTerminal`); other callers (MCP tools that
     /// need to warm a session, tab-row taps) pass an empty array.
+    ///
+    /// Invariant: every tab that has a session also has ≥1
+    /// `CompanionTerminal` whose id matches a key in
+    /// `session.terminals`. If the tab doesn't already have a
+    /// companion on file (e.g. an MCP `nice.run` warm-up arrives
+    /// before `createTabFromMainTerminal` seeded one), we synthesize
+    /// one here and insert it into the `Tab` before constructing the
+    /// session so caller assumptions hold.
     func session(
         for tabId: String,
         cwd: String? = nil,
@@ -294,12 +533,51 @@ final class AppState: ObservableObject {
                 return nil
             }
         }()
+
+        // Resolve the initial companion id. Prefer an id already on the
+        // tab (set up by `createTabFromMainTerminal` or the seed data).
+        // Otherwise mint a fresh one and patch it into the tab so the
+        // model + session agree.
+        let initialCompanionId: String
+        if let (pi, ti) = tabIndex(for: tabId),
+           let first = projects[pi].tabs[ti].companions.first?.id {
+            initialCompanionId = first
+            if projects[pi].tabs[ti].activeCompanionId == nil {
+                projects[pi].tabs[ti].activeCompanionId = first
+            }
+        } else if let (pi, ti) = tabIndex(for: tabId) {
+            let synth = "\(tabId)-c1"
+            projects[pi].tabs[ti].companions.append(
+                CompanionTerminal(id: synth, title: "Terminal 1")
+            )
+            projects[pi].tabs[ti].activeCompanionId = synth
+            initialCompanionId = synth
+        } else {
+            // No matching tab in the model — rare; still need an id so
+            // the session is well-formed. Caller is responsible for
+            // either adding a tab or accepting the orphan session.
+            initialCompanionId = "\(tabId)-c1"
+        }
+
         let session = TabPtySession(
             tabId: tabId,
             cwd: resolvedCwd,
             claudeBinary: resolvedClaudePath,
             mcpConfigPath: cfgPath,
-            extraClaudeArgs: extraClaudeArgs
+            extraClaudeArgs: extraClaudeArgs,
+            initialCompanionId: initialCompanionId,
+            socketPath: controlSocket?.path,
+            zdotdirPath: zdotdirPath,
+            onChatExit: { [weak self] code in
+                self?.claudePaneExited(tabId: tabId, exitCode: code)
+            },
+            onCompanionExit: { [weak self] companionId, code in
+                self?.companionExited(
+                    tabId: tabId,
+                    companionId: companionId,
+                    exitCode: code
+                )
+            }
         )
         session.applyTheme(currentScheme)
         ptySessions[tabId] = session
@@ -309,6 +587,7 @@ final class AppState: ObservableObject {
     /// Called from the sidebar when the user picks a new directory for
     /// the main terminal. Re-spawns zsh rooted at `cwd`.
     func restartMainTerminal(cwd: String) {
+        storedMainCwd = cwd
         mainTerminal.restart(cwd: cwd)
     }
 
@@ -357,8 +636,8 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Look up a tab by id across all projects.
-    private func tab(for id: String) -> Tab? {
+    /// Look up a tab by id across all projects. Returns a copy.
+    func tab(for id: String) -> Tab? {
         for project in projects {
             if let hit = project.tabs.first(where: { $0.id == id }) {
                 return hit
@@ -366,4 +645,29 @@ final class AppState: ObservableObject {
         }
         return nil
     }
+
+    /// Look up `(projectIndex, tabIndex)` for the tab with id `id`, so
+    /// callers can mutate the tab in place without the cost of
+    /// re-searching. `Tab` is a struct, so mutating the copy returned
+    /// by `tab(for:)` wouldn't write back to `projects`.
+    private func tabIndex(for id: String) -> (Int, Int)? {
+        for (pi, project) in projects.enumerated() {
+            if let ti = project.tabs.firstIndex(where: { $0.id == id }) {
+                return (pi, ti)
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Init-time weak self routing
+
+/// Tiny weak-reference box used during `AppState.init` to wire the Main
+/// Terminal's exit handler. `MainTerminalSession` needs the closure at
+/// construction time, but `self` isn't available until every stored
+/// property has been initialised. We hand the session a closure that
+/// captures this box; after init completes, `box.value = self` is set
+/// and the closure starts routing correctly.
+private final class WeakSelfBox: @unchecked Sendable {
+    weak var value: AppState?
 }

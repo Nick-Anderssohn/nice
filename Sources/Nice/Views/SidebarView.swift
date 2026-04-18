@@ -162,6 +162,8 @@ private struct MainTerminalRow: View {
                 pickDirectory()
             }
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("sidebar.mainTerminal")
     }
 
     private func pickDirectory() {
@@ -259,7 +261,22 @@ private struct TabRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            StatusDot(status: tab.status)
+            if tab.hasClaudePane {
+                StatusDot(status: tab.status)
+                    .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")
+            } else {
+                // Terminal-only tab: no Claude process here, so the
+                // status-dot semantics (thinking/waiting/idle) don't
+                // apply. A small terminal glyph in dimmed ink reads as
+                // "this is a shell-only tab" at a glance. We size it
+                // to match the 12pt StatusDot frame so the row height
+                // and left alignment stay pixel-identical.
+                Image(systemName: "terminal")
+                    .font(.system(size: 10, weight: .regular))
+                    .foregroundStyle(Color.niceInk3(scheme))
+                    .frame(width: 12, height: 12)
+                    .accessibilityIdentifier("sidebar.tab.\(tab.id).terminalIcon")
+            }
             Text(tab.title)
                 .font(.system(size: 12, weight: isActive ? .semibold : .regular))
                 .foregroundStyle(isActive ? Color.niceInk(scheme) : Color.niceInk2(scheme))
@@ -280,6 +297,8 @@ private struct TabRow: View {
         .onTapGesture {
             appState.selectTab(tab.id)
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sidebar.tab.\(tab.id)")
     }
 }
 

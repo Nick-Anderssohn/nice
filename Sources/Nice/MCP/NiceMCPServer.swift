@@ -158,6 +158,27 @@ final class NiceMCPServer: ObservableObject {
                     ]),
                 ])
             ),
+            Tool(
+                name: "nice.terminal.open",
+                description: "Open a new companion terminal in a tab. Use this to reopen a terminal the user accidentally closed, or to add a second shell alongside Claude.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "tabId": .object([
+                            "type": .string("string"),
+                            "description": .string("Target tab id. Defaults to the active tab."),
+                        ]),
+                        "cwd": .object([
+                            "type": .string("string"),
+                            "description": .string("Working directory for the new shell. Defaults to the tab's cwd."),
+                        ]),
+                        "title": .object([
+                            "type": .string("string"),
+                            "description": .string("Display title for the companion pill. Defaults to \"Terminal N\"."),
+                        ]),
+                    ]),
+                ])
+            ),
         ]
     }
 
@@ -204,6 +225,30 @@ final class NiceMCPServer: ObservableObject {
                 content: [.text(text: json, annotations: nil, _meta: nil)],
                 isError: ok ? nil : true
             )
+
+        case "nice.terminal.open":
+            let tabId = args["tabId"]?.stringValue
+            let cwd = args["cwd"]?.stringValue
+            let title = args["title"]?.stringValue
+            let newId = await MainActor.run { [weak appState] in
+                appState?.mcpOpenTerminal(tabId: tabId, cwd: cwd, title: title)
+            }
+            if let newId {
+                let json = Self.jsonString(["companionId": newId])
+                return CallTool.Result(
+                    content: [.text(text: json, annotations: nil, _meta: nil)]
+                )
+            } else {
+                return CallTool.Result(
+                    content: [
+                        .text(
+                            text: "no valid target tab for nice.terminal.open",
+                            annotations: nil, _meta: nil
+                        )
+                    ],
+                    isError: true
+                )
+            }
 
         default:
             return CallTool.Result(

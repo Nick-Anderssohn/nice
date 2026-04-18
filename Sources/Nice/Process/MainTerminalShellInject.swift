@@ -126,6 +126,36 @@ enum MainTerminalShellInject {
             first=0
         done
         args_json+="]"
+
+        # Resolve the real claude binary up front so we can exec it
+        # regardless of which branch posts to the socket. `command -v`
+        # follows `$PATH` without consulting aliases/functions, so it
+        # doesn't recurse into this shadow.
+        local real_claude
+        real_claude=$(command -v claude 2>/dev/null)
+
+        if [[ -n "$NICE_TAB_ID" ]]; then
+            # Inside an existing Nice tab's companion terminal. Ask Nice
+            # to promote this tab back to Claude-tab state, then exec
+            # the real claude in-place so the promoted view shows a
+            # live claude running in the same pty. We exec regardless
+            # of socket success — if the socket is down, running claude
+            # inline is still the right UX for the user.
+            local tab_json
+            tab_json=$(_nice_json_escape "$NICE_TAB_ID")
+            local payload="{\"action\":\"promoteTab\",\"tabId\":${tab_json},\"args\":${args_json}}"
+            printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 1 2>/dev/null
+            if [[ -n "$real_claude" ]]; then
+                exec "$real_claude" "$@"
+            else
+                command claude "$@"
+            fi
+            return
+        fi
+
+        # Main Terminal path: ask Nice to open a new tab rooted at PWD.
+        # On socket failure, fall back to running claude inline so the
+        # user's command still works.
         local cwd_json
         cwd_json=$(_nice_json_escape "$PWD")
         local payload="{\"action\":\"newtab\",\"cwd\":${cwd_json},\"args\":${args_json}}"

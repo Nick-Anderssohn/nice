@@ -69,3 +69,41 @@ targets:
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: "-"
         SWIFT_STRICT_CONCURRENCY: complete
+
+  NiceUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Nice
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nickanderssohn.nice.uitests
+        PRODUCT_NAME: NiceUITests
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        TEST_TARGET_NAME: Nice
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_HARDENED_RUNTIME: NO
+
+schemes:
+  Nice:
+    build:
+      targets:
+        Nice: all
+        NiceUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - NiceUITests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
