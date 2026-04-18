@@ -77,14 +77,16 @@ struct AppShellView: View {
                 if let chat = session.chatView {
                     TerminalHost(view: chat, focus: true)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(.top, 12)
                         .background(Color.nicePanel(scheme))
-
-                    Rectangle()
-                        .fill(Color.niceLine(scheme))
-                        .frame(width: 1)
 
                     CompanionPaneView(tabId: activeId)
                         .frame(width: 400)
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(Color.niceLine(scheme))
+                                .frame(width: 1)
+                        }
                 } else {
                     // Claude pane advertised but view not yet built —
                     // fall back to the companion pane filling the
@@ -100,6 +102,7 @@ struct AppShellView: View {
         } else {
             TerminalHost(view: appState.mainTerminal.view, focus: true)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.top, 12)
                 .background(Color.nicePanel(scheme))
         }
     }

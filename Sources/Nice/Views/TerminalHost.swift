@@ -16,7 +16,10 @@ struct TerminalHost: NSViewRepresentable {
     let view: LocalProcessTerminalView
     var focus: Bool = false
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView { view }
+    func makeNSView(context: Context) -> LocalProcessTerminalView {
+        view.scrollerStyle = .overlay
+        return view
+    }
 
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
         if focus {
