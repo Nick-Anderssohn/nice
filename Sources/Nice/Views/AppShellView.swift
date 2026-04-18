@@ -28,6 +28,15 @@ struct AppShellView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            // Xcode-style floating sidebar card. The native traffic
+            // lights are positioned in absolute window coordinates by
+            // macOS and render on top of whatever's here; the 52pt
+            // clear spacer inside the VStack keeps the sidebar's own
+            // content clear of them visually. The card itself is
+            // inset 6pt on top/leading/bottom (no trailing padding —
+            // the gap between sidebar and main content is just the
+            // card's own edge). Tweak pixel values here if it starts
+            // to look off relative to Xcode in dark mode.
             SidebarBackground(palette: palette, scheme: scheme) {
                 VStack(spacing: 0) {
                     // Reserve the traffic-light safe zone at the top of
@@ -40,12 +49,18 @@ struct AppShellView: View {
             }
             .frame(width: appState.sidebarCollapsed ? 52 : 240)
             .animation(.easeInOut(duration: 0.22), value: appState.sidebarCollapsed)
-            .overlay(alignment: .trailing) {
-                Rectangle()
-                    .fill(Color.niceLine(scheme, palette))
-                    .frame(width: 0.5)
-                    .opacity(0.8)
-            }
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(
+                        Color.niceLine(scheme, palette).opacity(0.5),
+                        lineWidth: 0.5
+                    )
+            )
+            .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+            .padding(.leading, 6)
+            .padding(.top, 6)
+            .padding(.bottom, 6)
 
             VStack(spacing: 0) {
                 WindowToolbarView()
@@ -108,35 +123,6 @@ struct AppShellView: View {
             Color.nicePanel(scheme, palette)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-    }
-}
-
-// MARK: - Sidebar background
-
-/// Paints the sidebar column background appropriate to the active palette.
-/// Nice palette: flat `niceBg2`. macOS palette: wallpaper-tinted
-/// NSVisualEffectView (`.sidebar` material, `.behindWindow` blending).
-private struct SidebarBackground<Content: View>: View {
-    let palette: Palette
-    let scheme: ColorScheme
-    @ViewBuilder let content: Content
-
-    var body: some View {
-        content
-            .background(
-                Group {
-                    switch palette {
-                    case .nice:
-                        Color.niceBg2(scheme, palette)
-                    case .macOS:
-                        VisualEffectView(
-                            material: .sidebar,
-                            blendingMode: .behindWindow,
-                            state: .active
-                        )
-                    }
-                }
-            )
     }
 }
 

@@ -64,27 +64,39 @@ struct SettingsView: View {
     // MARK: Left rail
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            ForEach(SettingsSection.allCases) { section in
-                SettingsSectionRow(
-                    section: section,
-                    active: active == section,
-                    accent: tweaks.accent.color
-                ) {
-                    active = section
+        // Floating-card treatment matching AppShellView's sidebar:
+        // palette-aware background (VisualEffectView for macOS, flat
+        // niceBg2 for nice), rounded corners, subtle stroked border,
+        // soft shadow. No traffic-light spacer needed — the Settings
+        // window uses standard chrome.
+        SidebarBackground(palette: palette, scheme: scheme) {
+            VStack(alignment: .leading, spacing: 1) {
+                ForEach(SettingsSection.allCases) { section in
+                    SettingsSectionRow(
+                        section: section,
+                        active: active == section,
+                        accent: tweaks.accent.color
+                    ) {
+                        active = section
+                    }
                 }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 10)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 10)
         .frame(width: 160)
-        .background(Color.niceBg2(scheme, palette))
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(Color.niceLine(scheme, palette))
-                .frame(width: 1)
-        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(
+                    Color.niceLine(scheme, palette).opacity(0.5),
+                    lineWidth: 0.5
+                )
+        )
+        .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+        .padding(.leading, 6)
+        .padding(.vertical, 6)
     }
 
     // MARK: Right panel

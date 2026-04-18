@@ -211,12 +211,27 @@ final class Tweaks: ObservableObject {
 
     // MARK: - Theme transitions
 
-    /// Called when the user taps a theme button in settings. Respects the
-    /// current `syncWithOS` setting — if sync is on, we pick the chosen
-    /// *family* but let the OS dictate the scheme axis.
+    /// Called when the user taps a theme button in settings.
+    ///
+    /// When `syncWithOS` is on and the clicked choice matches the OS
+    /// scheme, we stay synced and just update the family — the scheme
+    /// axis is still driven by the OS.
+    ///
+    /// When `syncWithOS` is on and the clicked choice's scheme does
+    /// *not* match the OS, we treat the click as an explicit override:
+    /// sync is turned off and the theme is pinned to exactly what the
+    /// user picked. This is less surprising than silently flipping to
+    /// the counterpart (which can produce a "click did nothing" feel
+    /// when the counterpart is already the current theme).
+    ///
+    /// Ordering matters: set `syncWithOS = false` before `theme` so
+    /// that the `syncWithOS` didSet observer — which only reconciles
+    /// when sync flips ON — doesn't fire, and the subsequent theme
+    /// assignment writes through cleanly.
     func userPicked(_ choice: ThemeChoice) {
         if syncWithOS, choice.scheme != osSchemeProvider() {
-            theme = choice.counterpart
+            syncWithOS = false
+            theme = choice
         } else {
             theme = choice
         }
@@ -260,11 +275,14 @@ final class Tweaks: ObservableObject {
     /// `"system" | "light" | "dark"` values written by earlier versions of
     /// the app. Legacy mapping:
     ///
-    ///   system → niceLight + syncWithOS = true  (bound to OS)
-    ///   light  → niceLight + syncWithOS = false (pinned)
-    ///   dark   → niceDark  + syncWithOS = false (pinned)
+    ///   system → macLight/macDark (per OS) + syncWithOS = true
+    ///   light  → niceLight + syncWithOS = false (pinned, user's explicit choice)
+    ///   dark   → niceDark  + syncWithOS = false (pinned, user's explicit choice)
     ///
-    /// Fresh install: niceLight + syncWithOS = true.
+    /// Fresh install: macLight or macDark (per OS) + syncWithOS = true.
+    /// The macOS palette is the default because it integrates with the
+    /// system's Desktop Tinting and matches Xcode/Finder/Mail out of the
+    /// box; users who want the nice palette can pick it explicitly.
     static func loadOrMigrate(
         defaults: UserDefaults,
         osScheme: ColorScheme
@@ -279,14 +297,16 @@ final class Tweaks: ObservableObject {
 
         switch raw {
         case "system":
-            return (.niceLight, true)
+            // Legacy "follow system" maps to macOS palette + sync on,
+            // starting from whichever scheme the OS currently is.
+            return (osScheme == .dark ? .macDark : .macLight, true)
         case "light":
             return (.niceLight, false)
         case "dark":
             return (.niceDark, false)
         default:
-            // Fresh install — follow OS from a sensible starting family.
-            return (osScheme == .dark ? .niceDark : .niceLight, true)
+            // Fresh install — macOS palette, synced with current OS.
+            return (osScheme == .dark ? .macDark : .macLight, true)
         }
     }
 }

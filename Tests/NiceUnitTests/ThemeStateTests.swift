@@ -137,27 +137,36 @@ final class ThemeStateTests: XCTestCase {
         XCTAssertEqual(tweaks.theme, .niceLight)
     }
 
-    func test_userPicked_syncOn_OSMismatch_flipsToCounterpart() {
+    func test_userPicked_syncOn_OSMismatch_disablesSyncAndPinsExactly() {
         let (tweaks, stub) = makeTweaks(os: .dark)
         stub.stubbedOSScheme = .dark
         tweaks.syncWithOS = true
 
-        // User picks a light theme but OS is dark: we keep the palette
-        // family but flip to the dark counterpart.
+        // User picks a light theme while OS is dark and sync is on.
+        // New behavior: treat the click as an explicit override — turn
+        // sync off and pin the theme to exactly what was picked.
         tweaks.userPicked(.niceLight)
+        XCTAssertEqual(tweaks.theme, .niceLight)
+        XCTAssertFalse(tweaks.syncWithOS)
+
+        // Turn sync back on to test the macOS family path in isolation.
+        tweaks.syncWithOS = true
+        // syncToggleOn reconciles; OS is dark so theme becomes niceDark.
         XCTAssertEqual(tweaks.theme, .niceDark)
-        XCTAssertEqual(tweaks.theme.palette, .nice)
+        XCTAssertTrue(tweaks.syncWithOS)
 
         tweaks.userPicked(.macLight)
-        XCTAssertEqual(tweaks.theme, .macDark)
-        XCTAssertEqual(tweaks.theme.palette, .macOS)
+        XCTAssertEqual(tweaks.theme, .macLight)
+        XCTAssertFalse(tweaks.syncWithOS)
 
-        // Flip OS to light; user picks a dark theme — flips to light
-        // counterpart.
+        // And the dark-picked-while-OS-light variant disables sync too.
         stub.stubbedOSScheme = .light
-        tweaks.reconcileWithOS() // realign theme with new OS
+        tweaks.syncWithOS = true
+        // Reconcile on toggle-on aligns theme to light — macLight stays.
+        XCTAssertEqual(tweaks.theme, .macLight)
         tweaks.userPicked(.niceDark)
-        XCTAssertEqual(tweaks.theme, .niceLight)
+        XCTAssertEqual(tweaks.theme, .niceDark)
+        XCTAssertFalse(tweaks.syncWithOS)
     }
 
     // MARK: - Tweaks.reconcileWithOS
@@ -252,11 +261,20 @@ final class ThemeStateTests: XCTestCase {
 
     // MARK: - UserDefaults migration (Tweaks.loadOrMigrate)
 
-    func test_migration_legacySystem_mapsToNiceLightWithSync() {
+    func test_migration_legacySystem_mapsToMacOSPaletteWithSync() {
+        // Legacy "system" now prefers the macOS palette, scheme
+        // resolved against the OS.
         defaults.set("system", forKey: Tweaks.themeKey)
-        let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
-        XCTAssertEqual(theme, .niceLight)
-        XCTAssertTrue(sync)
+
+        let (themeLight, syncLight) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertEqual(themeLight, .macLight)
+        XCTAssertEqual(themeLight.palette, .macOS)
+        XCTAssertTrue(syncLight)
+
+        let (themeDark, syncDark) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
+        XCTAssertEqual(themeDark, .macDark)
+        XCTAssertEqual(themeDark.palette, .macOS)
+        XCTAssertTrue(syncDark)
     }
 
     func test_migration_legacyLight_mapsToNiceLightPinned() {
@@ -273,18 +291,21 @@ final class ThemeStateTests: XCTestCase {
         XCTAssertFalse(sync)
     }
 
-    func test_migration_freshInstall_osLight_mapsToNiceLightWithSync() {
-        // No theme key present at all.
+    func test_migration_freshInstall_osLight_mapsToMacLightWithSync() {
+        // No theme key present at all — fresh installs now default to
+        // the macOS palette, synced with the OS scheme.
         XCTAssertNil(defaults.object(forKey: Tweaks.themeKey))
         let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
-        XCTAssertEqual(theme, .niceLight)
+        XCTAssertEqual(theme, .macLight)
+        XCTAssertEqual(theme.palette, .macOS)
         XCTAssertTrue(sync)
     }
 
-    func test_migration_freshInstall_osDark_mapsToNiceDarkWithSync() {
+    func test_migration_freshInstall_osDark_mapsToMacDarkWithSync() {
         XCTAssertNil(defaults.object(forKey: Tweaks.themeKey))
         let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
-        XCTAssertEqual(theme, .niceDark)
+        XCTAssertEqual(theme, .macDark)
+        XCTAssertEqual(theme.palette, .macOS)
         XCTAssertTrue(sync)
     }
 
