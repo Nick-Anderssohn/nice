@@ -263,6 +263,7 @@ private struct TabRow: View {
         HStack(spacing: 8) {
             if tab.hasClaudePane {
                 StatusDot(status: tab.status)
+                    .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")
             } else {
                 // Terminal-only tab: no Claude process here, so the
@@ -275,6 +276,7 @@ private struct TabRow: View {
                     .font(.system(size: 10, weight: .regular))
                     .foregroundStyle(Color.niceInk3(scheme))
                     .frame(width: 12, height: 12)
+                    .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).terminalIcon")
             }
             Text(tab.title)

@@ -56,7 +56,8 @@ final class NiceControlSocket: @unchecked Sendable {
     /// pid so it's known immediately and can be injected into the Main
     /// Terminal's env before `start(handler:)` is called.
     init() {
-        self.path = NSTemporaryDirectory() + "nice-\(getpid()).sock"
+        self.path = ProcessInfo.processInfo.environment["NICE_SOCKET_PATH"]
+            ?? NSTemporaryDirectory() + "nice-\(getpid()).sock"
     }
 
     /// Bind, listen, and start accepting connections on a background

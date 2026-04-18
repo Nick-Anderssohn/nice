@@ -28,6 +28,78 @@ final class NiceUITests: XCTestCase {
         return app
     }
 
+    /// Launch the Nice app fresh for a test with additional env vars
+    /// applied via `launchEnvironment`. Used by the claude-exit /
+    /// socket-promote tests to swap the real `claude` binary for a
+    /// scripted stub.
+    @discardableResult
+    private func launchApp(extraEnv: [String: String]) -> XCUIApplication {
+        let app = XCUIApplication()
+        for (k, v) in extraEnv {
+            app.launchEnvironment[k] = v
+        }
+        app.launch()
+        return app
+    }
+
+    /// Returns the path to a system binary that reads stdin until EOF
+    /// and exits on Ctrl+D. Used as the `NICE_CLAUDE_OVERRIDE` value
+    /// so the chat pane runs a predictable, controllable process.
+    /// `/bin/cat` is globally accessible (no sandbox issues) and exits
+    /// cleanly on EOF. `TabPtySession` skips `--mcp-config` args when
+    /// the override env var is set, so cat receives no file arguments.
+    private func fakeClaude() -> String {
+        "/bin/cat"
+    }
+
+    /// Socket path shared between the test runner and the Nice app via
+    /// `NICE_SOCKET_PATH`. Placed inside the test runner's own container
+    /// directory: the sandboxed runner can connect here, and the
+    /// unsandboxed Nice app can bind here.
+    private static let testSocketPath: String = {
+        let dir = FileManager.default.temporaryDirectory.path
+        return (dir as NSString).appendingPathComponent("nice-xctest.sock")
+    }()
+
+    /// Send a single newline-delimited JSON message over a Unix-domain
+    /// socket using POSIX APIs directly. Avoids spawning `nc` which
+    /// inherits the test runner's sandbox and may not be able to
+    /// connect to paths outside the container.
+    private func sendSocketLine(_ json: String, to socketPath: String) throws {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw NSError(domain: "NiceUITests", code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "socket() failed: errno=\(errno)"])
+        }
+        defer { Darwin.close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        socketPath.withCString { cstr in
+            withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+                let dst = buf.baseAddress!.assumingMemoryBound(to: CChar.self)
+                strncpy(dst, cstr, buf.count)
+            }
+        }
+
+        let connectResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else {
+            throw NSError(domain: "NiceUITests", code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "connect(\(socketPath)) failed: errno=\(errno)"])
+        }
+
+        let payload = Array((json + "\n").utf8)
+        let written = Darwin.write(fd, payload, payload.count)
+        guard written == payload.count else {
+            throw NSError(domain: "NiceUITests", code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: "write() failed: wrote \(written)/\(payload.count)"])
+        }
+    }
+
     /// Find the first element whose identifier starts with `prefix` but
     /// doesn't continue with `excludedInfixes` (used to skip nested
     /// children like `sidebar.tab.<id>.claudeIcon` when searching for
@@ -277,6 +349,119 @@ final class NiceUITests: XCTestCase {
         XCTAssertEqual(
             XCTWaiter.wait(for: [dismissed], timeout: 5), .completed,
             "Cancel should dismiss the Quit NICE? sheet"
+        )
+    }
+
+    /// Look up an icon element by identifier using a `BEGINSWITH`
+    /// predicate. Plain subscript access via
+    /// `app.descendants(matching: .any)["<id>"]` is flaky when the
+    /// parent row uses `.accessibilityElement(children: .contain)` —
+    /// the predicate-based query matches the same way existing tests
+    /// look up sidebar rows and succeeds consistently.
+    private func iconElement(in app: XCUIApplication, identifier: String) -> XCUIElement {
+        let query = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier == %@", identifier)
+        )
+        return query.element(boundBy: 0)
+    }
+
+    /// 7. Ctrl+D in a Claude tab's chat pane trips the fake-claude's
+    /// `cat > /dev/null`, which exits on EOF. The pty read loop sees
+    /// the close and fires `onChatExit` → `claudePaneExited`, which
+    /// flips `hasClaudePane` to false. The sidebar swaps the status
+    /// dot for the terminal glyph.
+    func testClaudeExitFlipsTabToTerminalIcon() throws {
+        let fakePath = fakeClaude()
+        print("DEBUG fakePath=\(fakePath)")
+        let app = launchApp(extraEnv: ["NICE_CLAUDE_OVERRIDE": fakePath])
+
+        // Wait for the sidebar to materialise, then tap t1.
+        let tabRow = iconElement(in: app, identifier: "sidebar.tab.t1")
+        XCTAssertTrue(
+            tabRow.waitForExistence(timeout: 5),
+            "sidebar.tab.t1 should exist (seed)"
+        )
+        tabRow.click()
+
+        // Claude-icon visible → tab is in Claude-mode.
+        let claudeIcon = iconElement(in: app, identifier: "sidebar.tab.t1.claudeIcon")
+        XCTAssertTrue(
+            claudeIcon.waitForExistence(timeout: 5),
+            "sidebar.tab.t1.claudeIcon should appear while fake-claude is running"
+        )
+
+        // Focus the chat pane (left-of-center within the main split).
+        // Mirror the existing Main-Terminal test's focus pattern; the
+        // chat pane is the leftmost of the two panes in a Claude tab,
+        // so dx=0.4 stays inside it.
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5))
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.5)).click()
+
+        // Send Ctrl+D (EOF). `cat > /dev/null` exits, fake-claude
+        // returns, the pty closes, onChatExit fires.
+        app.typeKey("d", modifierFlags: .control)
+
+        let terminalIcon = iconElement(in: app, identifier: "sidebar.tab.t1.terminalIcon")
+        XCTAssertTrue(
+            terminalIcon.waitForExistence(timeout: 10),
+            "sidebar.tab.t1.terminalIcon should appear after fake-claude exits"
+        )
+        XCTAssertFalse(
+            claudeIcon.exists,
+            "sidebar.tab.t1.claudeIcon should be gone once hasClaudePane flips false"
+        )
+    }
+
+    /// 8. After Claude exits, a `promoteTab` message over the control
+    /// socket should flip the tab back to Claude-mode without the user
+    /// lifting a finger. Proves the full wire: bash shadow → nc →
+    /// `NiceControlSocket.readClient` → `AppState.promoteTabToClaude`
+    /// → `TabPtySession.promoteCompanionToChat` → `hasClaudePane = true`.
+    func testSocketPromoteFlow() throws {
+        let fakePath = fakeClaude()
+        let socketPath = Self.testSocketPath
+        // Remove stale socket from a prior run so NiceControlSocket
+        // can bind cleanly (it unlinks before bind, but belt+suspenders).
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakePath,
+            "NICE_SOCKET_PATH": socketPath
+        ])
+
+        let tabRow = iconElement(in: app, identifier: "sidebar.tab.t1")
+        XCTAssertTrue(tabRow.waitForExistence(timeout: 5))
+        tabRow.click()
+
+        let claudeIcon = iconElement(in: app, identifier: "sidebar.tab.t1.claudeIcon")
+        XCTAssertTrue(
+            claudeIcon.waitForExistence(timeout: 5),
+            "precondition: claudeIcon visible before exit"
+        )
+
+        // Drive the exit exactly as in test 7.
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5))
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.5)).click()
+        app.typeKey("d", modifierFlags: .control)
+
+        let terminalIcon = iconElement(in: app, identifier: "sidebar.tab.t1.terminalIcon")
+        XCTAssertTrue(
+            terminalIcon.waitForExistence(timeout: 10),
+            "precondition: terminalIcon visible after fake-claude exits"
+        )
+
+        // Send promoteTab for t1 over the well-known test socket.
+        // The handler infers the companion from `activeCompanionId`.
+        let json = #"{"action":"promoteTab","tabId":"t1","args":[]}"#
+        try sendSocketLine(json, to: socketPath)
+
+        // Icon should flip back to the claude dot purely as a
+        // consequence of the socket message (no keystrokes, no clicks
+        // after sending).
+        XCTAssertTrue(
+            claudeIcon.waitForExistence(timeout: 10),
+            "sidebar.tab.t1.claudeIcon should reappear after promoteTab over socket"
         )
     }
 }

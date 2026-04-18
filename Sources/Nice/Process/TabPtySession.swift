@@ -113,18 +113,17 @@ final class TabPtySession: ObservableObject {
         // `.zprofile` (login-only). Running `zsh -ilc` sources both,
         // then `exec` swaps the shell for claude so the process tree
         // looks clean.
+        let isOverride = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] != nil
         if let claude = claudeBinary {
             var parts = ["exec", Self.shellQuote(claude)]
-            if let cfg = mcpConfigPath?.path {
-                parts.append("--mcp-config")
-                parts.append(Self.shellQuote(cfg))
-            }
-            // Pass-through args from the Main Terminal's `claude …`
-            // invocation. Already-quoted on the way in via
-            // shellQuote, so paths with spaces / embedded quotes
-            // survive intact.
-            for a in extraClaudeArgs {
-                parts.append(Self.shellQuote(a))
+            if !isOverride {
+                if let cfg = mcpConfigPath?.path {
+                    parts.append("--mcp-config")
+                    parts.append(Self.shellQuote(cfg))
+                }
+                for a in extraClaudeArgs {
+                    parts.append(Self.shellQuote(a))
+                }
             }
             chat.startProcess(
                 executable: "/bin/zsh",

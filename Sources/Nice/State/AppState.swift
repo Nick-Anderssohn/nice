@@ -129,7 +129,8 @@ final class AppState: ObservableObject {
         // first tab the user clicks actually runs claude, not the zsh
         // fallback. If it's not on PATH, resolvedClaudePath stays nil
         // and all tabs fall back to zsh.
-        self.resolvedClaudePath = Self.runWhich(binary: "claude")
+        self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
+            ?? Self.runWhich(binary: "claude")
 
         // Stored properties are all initialized — now safe to wire the
         // weak-box, start the socket listener, and register the
