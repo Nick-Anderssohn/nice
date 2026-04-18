@@ -18,6 +18,10 @@ struct TerminalHost: NSViewRepresentable {
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
         view.scrollerStyle = .overlay
+        if let scroller = findScroller(in: view) {
+            scroller.isHidden = true
+            context.coordinator.startObserving(scroller)
+        }
         return view
     }
 
@@ -26,6 +30,32 @@ struct TerminalHost: NSViewRepresentable {
             DispatchQueue.main.async {
                 nsView.window?.makeFirstResponder(nsView)
             }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    private func findScroller(in view: NSView) -> NSScroller? {
+        for subview in view.subviews {
+            if let scroller = subview as? NSScroller {
+                return scroller
+            }
+        }
+        return nil
+    }
+
+    final class Coordinator {
+        private var timer: Timer?
+
+        func startObserving(_ scroller: NSScroller) {
+            timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak scroller] _ in
+                guard let scroller else { return }
+                scroller.isHidden = !scroller.isEnabled
+            }
+        }
+
+        deinit {
+            timer?.invalidate()
         }
     }
 }
