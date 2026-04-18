@@ -32,11 +32,15 @@ struct AppShellView: View {
             // lights are positioned in absolute window coordinates by
             // macOS and render on top of whatever's here; the 52pt
             // clear spacer inside the VStack keeps the sidebar's own
-            // content clear of them visually. The card itself is
-            // inset 6pt on top/leading/bottom (no trailing padding —
-            // the gap between sidebar and main content is just the
-            // card's own edge). Tweak pixel values here if it starts
-            // to look off relative to Xcode in dark mode.
+            // content clear of them visually. The card is inset so
+            // that the traffic lights (~x:20, y:15, 14pt diameter)
+            // have at least ~8pt of clearance on both sides: the
+            // leading edge sits at ~12pt and the top edge at ~40pt.
+            // Bottom mirrors the top so the card looks visually
+            // symmetric around the vertical axis. No trailing
+            // padding — the gap between sidebar and main content is
+            // just the card's own edge. Tweak pixel values here if
+            // it starts to look off relative to Xcode in dark mode.
             SidebarBackground(palette: palette, scheme: scheme) {
                 VStack(spacing: 0) {
                     // Reserve the traffic-light safe zone at the top of
@@ -58,9 +62,9 @@ struct AppShellView: View {
                     )
             )
             .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-            .padding(.leading, 6)
-            .padding(.top, 6)
-            .padding(.bottom, 6)
+            .padding(.leading, 12)
+            .padding(.top, 40)
+            .padding(.bottom, 40)
 
             VStack(spacing: 0) {
                 WindowToolbarView()
@@ -107,6 +111,10 @@ struct AppShellView: View {
 
     @ViewBuilder
     private var mainContent: some View {
+        // Leading padding here mirrors WindowToolbarView's `.padding(.trailing, 20)`
+        // so the terminal text has the same breathing room from the sidebar
+        // card that the tab strip gets from the window's right edge.
+        // Worth a visual refinement pass if it looks off against Xcode.
         if let tabId = appState.activeTabId,
            let tab = appState.tab(for: tabId),
            let paneId = tab.activePaneId,
@@ -116,12 +124,14 @@ struct AppShellView: View {
                 .id(paneId)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.top, 12)
+                .padding(.leading, 20)
                 .background(Color.nicePanel(scheme, palette))
         } else {
             // Transient: no pane currently hosted (e.g. Terminals tab
             // with its last pane just exited, awaiting the quit alert).
             Color.nicePanel(scheme, palette)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.leading, 20)
         }
     }
 }
