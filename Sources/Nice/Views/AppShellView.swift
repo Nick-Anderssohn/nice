@@ -27,7 +27,6 @@ struct AppShellView: View {
             WindowToolbarView()
 
             HStack(spacing: 0) {
-                // Left: floating inset "sidebar card"
                 SidebarView()
                     .frame(width: 240)
                     .background(
@@ -48,7 +47,7 @@ struct AppShellView: View {
             }
         }
         .ignoresSafeArea(edges: .top)
-        .background(Color.niceBg2(scheme).ignoresSafeArea())
+        .background(Color.niceBg3(scheme).ignoresSafeArea())
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
             Button("Quit", role: .destructive) { NSApp.terminate(nil) }
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
