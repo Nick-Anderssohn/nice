@@ -19,6 +19,12 @@ final class AppState: ObservableObject {
     /// `nil` = the "Main terminal" row is selected.
     @Published var activeTabId: String?
     @Published var sidebarQuery: String = ""
+    @Published var sidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "sidebarCollapsed")
+
+    func toggleSidebar() {
+        sidebarCollapsed.toggle()
+        UserDefaults.standard.set(sidebarCollapsed, forKey: "sidebarCollapsed")
+    }
 
     // MARK: - Phase 4 process plumbing
 

@@ -28,7 +28,8 @@ struct AppShellView: View {
 
             HStack(spacing: 0) {
                 SidebarView()
-                    .frame(width: 240)
+                    .frame(width: appState.sidebarCollapsed ? 52 : 240)
+                    .animation(.easeInOut(duration: 0.22), value: appState.sidebarCollapsed)
                     .background(
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
                             .fill(.ultraThinMaterial)

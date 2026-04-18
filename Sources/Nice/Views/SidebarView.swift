@@ -2,17 +2,8 @@
 //  SidebarView.swift
 //  Nice
 //
-//  Phase 2 sidebar. Ported from
-//  /tmp/nice-design/nice/project/nice/sidebar.jsx. Structure:
-//
-//      VStack(spacing: 0) {
-//          Search bar
-//          MainTerminalRow
-//          ScrollView { ProjectGroup*  }
-//          Footer (New tab, Settings)
-//      }
-//
-//  Mock data only — real processes / keyboard shortcuts come later.
+//  Supports expanded (240pt) and collapsed (~52pt) rail modes.
+//  The collapsed state is driven by `appState.sidebarCollapsed`.
 //
 
 import AppKit
@@ -24,6 +15,78 @@ struct SidebarView: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        if appState.sidebarCollapsed {
+            collapsedRail
+        } else {
+            expandedSidebar
+        }
+    }
+
+    // MARK: - Collapsed rail
+
+    private var collapsedRail: some View {
+        VStack(spacing: 0) {
+            RailButton(
+                systemImage: "sidebar.left",
+                help: "Expand sidebar",
+                action: { appState.toggleSidebar() }
+            )
+
+            Spacer().frame(height: 6)
+            railDivider
+            Spacer().frame(height: 6)
+
+            RailButton(
+                systemImage: "magnifyingglass",
+                help: "Search tabs · ⌘K",
+                action: { appState.toggleSidebar() }
+            )
+
+            RailButton(
+                systemImage: "terminal",
+                help: "Main terminal",
+                isActive: appState.activeTabId == nil,
+                action: { appState.selectMainTerminal() }
+            )
+
+            Spacer().frame(height: 6)
+            railDivider
+            Spacer().frame(height: 6)
+
+            ScrollView {
+                VStack(spacing: 0) {
+                    let allTabs = appState.projects.flatMap(\.tabs)
+                    ForEach(allTabs) { tab in
+                        RailTabDot(tab: tab)
+                    }
+                }
+            }
+            .frame(maxHeight: .infinity)
+
+            railDivider
+            Spacer().frame(height: 6)
+
+            RailButton(
+                systemImage: "gearshape",
+                help: "Settings",
+                action: { SettingsWindow.open() }
+            )
+        }
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+        .background(Color.niceBg2(scheme))
+    }
+
+    private var railDivider: some View {
+        Rectangle()
+            .fill(Color.niceLine(scheme))
+            .frame(height: 1)
+            .padding(.horizontal, 10)
+    }
+
+    // MARK: - Expanded sidebar
+
+    private var expandedSidebar: some View {
         VStack(spacing: 0) {
             searchBar
             MainTerminalRow()
@@ -37,25 +100,31 @@ struct SidebarView: View {
 
     private var searchBar: some View {
         HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .regular))
-                .foregroundStyle(Color.niceInk3(scheme))
-            TextField("Search tabs", text: $appState.sidebarQuery)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundStyle(Color.niceInk(scheme))
-            KbdPill(text: "⌘K")
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(Color.niceInk3(scheme))
+                TextField("Search tabs", text: $appState.sidebarQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.niceInk(scheme))
+                KbdPill(text: "⌘K")
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 26)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.niceBg3(scheme))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
+            )
+
+            SidebarIconButton(systemImage: "sidebar.left", help: "Collapse sidebar") {
+                appState.toggleSidebar()
+            }
         }
-        .padding(.horizontal, 8)
-        .frame(height: 26)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.niceBg3(scheme))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
-        )
         .padding(.top, 14)
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
@@ -101,6 +170,106 @@ struct SidebarView: View {
                 .fill(Color.niceLine(scheme))
                 .frame(height: 1)
         }
+    }
+}
+
+// MARK: - Rail button (collapsed mode)
+
+private struct RailButton: View {
+    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(\.colorScheme) private var scheme
+
+    let systemImage: String
+    let help: String
+    var isActive: Bool = false
+    let action: () -> Void
+
+    @State private var hover = false
+
+    private var background: Color {
+        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
+        if hover { return Color.niceInk(scheme).opacity(0.07) }
+        return .clear
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            if isActive {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(tweaks.accent.color)
+                    .frame(width: 2)
+                    .padding(.vertical, 6)
+                    .offset(x: -6)
+            }
+
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(isActive ? tweaks.accent.color : Color.niceInk2(scheme))
+                .frame(width: 36, height: 30)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(background)
+                )
+        }
+        .frame(width: 36, height: 30)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { action() }
+        .help(help)
+    }
+}
+
+// MARK: - Rail tab dot (collapsed mode)
+
+private struct RailTabDot: View {
+    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(\.colorScheme) private var scheme
+
+    let tab: Tab
+    @State private var hover = false
+
+    private var isActive: Bool { tab.id == appState.activeTabId }
+
+    private var background: Color {
+        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
+        if hover { return Color.niceInk(scheme).opacity(0.06) }
+        return .clear
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            if isActive {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(tweaks.accent.color)
+                    .frame(width: 2)
+                    .padding(.vertical, 5)
+                    .offset(x: -6)
+            }
+
+            Group {
+                if tab.hasClaudePane {
+                    StatusDot(status: tab.status, size: 10)
+                } else {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 10, weight: .regular))
+                        .foregroundStyle(Color.niceInk3(scheme))
+                        .frame(width: 14, height: 14)
+                }
+            }
+            .frame(width: 36, height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(background)
+            )
+        }
+        .frame(width: 36, height: 28)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { appState.selectTab(tab.id) }
+        .help(tab.title)
     }
 }
 
@@ -174,7 +343,6 @@ private struct MainTerminalRow: View {
         panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url {
             mainTerminalCwd = url.path
-            // Phase 4: re-root the main terminal's zsh at the new path.
             appState.restartMainTerminal(cwd: url.path)
         }
     }
@@ -217,7 +385,7 @@ private struct ProjectGroup: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
-        .padding(.horizontal, 6) // wraps the inner horizontal 10, mirrors `margin: '0 6px'`
+        .padding(.horizontal, 6)
         .contentShape(Rectangle())
         .onTapGesture {
             isOpen.toggle()
@@ -266,12 +434,6 @@ private struct TabRow: View {
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")
             } else {
-                // Terminal-only tab: no Claude process here, so the
-                // status-dot semantics (thinking/waiting/idle) don't
-                // apply. A small terminal glyph in dimmed ink reads as
-                // "this is a shell-only tab" at a glance. We size it
-                // to match the 12pt StatusDot frame so the row height
-                // and left alignment stay pixel-identical.
                 Image(systemName: "terminal")
                     .font(.system(size: 10, weight: .regular))
                     .foregroundStyle(Color.niceInk3(scheme))

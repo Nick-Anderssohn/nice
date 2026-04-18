@@ -16,6 +16,7 @@ struct StatusDot: View {
     @Environment(\.colorScheme) private var scheme
 
     let status: TabStatus
+    var size: CGFloat = 8
     /// Disables the `thinking` pulse in previews/snapshots.
     var pulsePaused: Bool = false
 
@@ -51,7 +52,7 @@ struct StatusDot: View {
             if shouldPulse {
                 Circle()
                     .fill(baseColor)
-                    .frame(width: 12, height: 12)
+                    .frame(width: size + 4, height: size + 4)
                     .scaleEffect(pulsing ? (status == .waiting ? 2.0 : 1.6) : 1.0)
                     .opacity(pulsing ? 0.0 : (status == .waiting ? 0.7 : 0.6))
                     .animation(
@@ -66,7 +67,7 @@ struct StatusDot: View {
             // Inner solid dot.
             Circle()
                 .fill(baseColor)
-                .frame(width: 8, height: 8)
+                .frame(width: size, height: size)
                 .opacity(
                     shouldPulse
                         ? (pulsing ? 1.0 : (status == .waiting ? 0.4 : 0.5))
@@ -80,7 +81,7 @@ struct StatusDot: View {
                     value: pulsing
                 )
         }
-        .frame(width: 12, height: 12)
+        .frame(width: size + 4, height: size + 4)
         .onAppear {
             if !pulsePaused {
                 pulsing = true
