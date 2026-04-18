@@ -381,12 +381,12 @@ private struct ThemeButtonGrid: View {
     var body: some View {
         VStack(spacing: 8) {
             HStack(spacing: 8) {
-                cell(.niceLight)
-                cell(.niceDark)
-            }
-            HStack(spacing: 8) {
                 cell(.macLight)
                 cell(.macDark)
+            }
+            HStack(spacing: 8) {
+                cell(.niceLight)
+                cell(.niceDark)
             }
         }
         .frame(width: 260)
