@@ -44,11 +44,10 @@ struct AppShellView: View {
                     .padding(.bottom, 10)
 
                 mainContent
-                    .padding(.top, 12)
             }
         }
         .ignoresSafeArea(edges: .top)
-        .background(Color.niceBg3(scheme).ignoresSafeArea())
+        .background(Color.nicePanel(scheme).ignoresSafeArea())
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
             Button("Quit", role: .destructive) { NSApp.terminate(nil) }
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
@@ -101,7 +100,7 @@ struct AppShellView: View {
         } else {
             TerminalHost(view: appState.mainTerminal.view, focus: true)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.niceBg3(scheme))
+                .background(Color.nicePanel(scheme))
         }
     }
 }

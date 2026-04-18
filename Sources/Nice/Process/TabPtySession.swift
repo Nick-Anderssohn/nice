@@ -212,7 +212,7 @@ final class TabPtySession: ObservableObject {
 
         // Paint with the currently-cached scheme so the pane doesn't
         // flash default colors before the next `applyTheme` call.
-        applyTheme(currentScheme, to: view)
+        applyTheme(currentScheme, to: view, background: SwiftUI.Color.niceBg3NS(currentScheme))
         return view
     }
 
@@ -259,6 +259,7 @@ final class TabPtySession: ObservableObject {
         delegates["chat"] = delegate
         self.chatView = view
         isClaudeAlive = true
+        applyTheme(currentScheme, to: view, background: SwiftUI.Color.nicePanelNS(currentScheme))
         return view
     }
 
@@ -297,20 +298,21 @@ final class TabPtySession: ObservableObject {
     func applyTheme(_ scheme: ColorScheme) {
         currentScheme = scheme
         if let chat = chatView {
-            applyTheme(scheme, to: chat)
+            applyTheme(scheme, to: chat, background: SwiftUI.Color.nicePanelNS(scheme))
         }
         for view in terminals.values {
-            applyTheme(scheme, to: view)
+            applyTheme(scheme, to: view, background: SwiftUI.Color.niceBg3NS(scheme))
         }
     }
 
-    private func applyTheme(_ scheme: ColorScheme, to view: LocalProcessTerminalView) {
-        // `Color` is ambiguous in this file — SwiftTerm also exports one.
-        // Qualify with `SwiftUI.` to pick up the palette extensions.
-        let bg = SwiftUI.Color.niceBg3NS(scheme)
+    private func applyTheme(
+        _ scheme: ColorScheme,
+        to view: LocalProcessTerminalView,
+        background: NSColor
+    ) {
         let fg = SwiftUI.Color.niceInkNS(scheme)
         let palette = NiceANSIPalette.colors(for: scheme)
-        view.nativeBackgroundColor = bg
+        view.nativeBackgroundColor = background
         view.nativeForegroundColor = fg
         view.installColors(palette)
     }

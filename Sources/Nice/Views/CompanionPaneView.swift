@@ -15,6 +15,8 @@ import SwiftUI
 struct CompanionPaneView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
+    @State private var hoveredPillId: String?
+    @State private var addHovered = false
 
     let tabId: String
 
@@ -32,9 +34,9 @@ struct CompanionPaneView: View {
     // MARK: - Tab bar
 
     private var tabBar: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 2) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
+                HStack(spacing: 2) {
                     if let tab = appState.tab(for: tabId) {
                         ForEach(tab.companions) { companion in
                             pill(
@@ -50,64 +52,76 @@ struct CompanionPaneView: View {
             Button(action: { appState.addCompanion(tabId: tabId) }) {
                 Image(systemName: "plus")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Color.niceInk(scheme))
-                    .frame(width: 22, height: 20)
+                    .foregroundStyle(Color.niceInk2(scheme))
+                    .frame(width: 22, height: 22)
                     .background(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .fill(Color.niceBg2(scheme))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(addHovered
+                                  ? Color.niceInk(scheme).opacity(0.07)
+                                  : Color.clear)
                     )
             }
             .buttonStyle(.plain)
+            .onHover { addHovered = $0 }
             .padding(.trailing, 6)
             .accessibilityIdentifier("companion.add")
         }
-        .frame(height: 28)
-        .background(Color.niceBg3(scheme))
+        .frame(height: 32)
+        .background(Color.niceBg2(scheme))
     }
 
     private func pill(for companion: CompanionTerminal, isActive: Bool) -> some View {
-        let bg = isActive ? Color.niceBg3(scheme) : Color.niceBg2(scheme)
+        let isHovered = hoveredPillId == companion.id
         let font: Font = {
-            if NSFont(name: "JetBrainsMono-Regular", size: 11) != nil {
-                return .custom("JetBrainsMono-Regular", size: 11)
+            if NSFont(name: "JetBrainsMono-Regular", size: 11.5) != nil {
+                return .custom("JetBrainsMono-Regular", size: 11.5)
             }
-            return .system(size: 11)
+            return .system(size: 11.5)
         }()
-        return HStack(spacing: 4) {
+        let bg: Color = isActive
+            ? Color.nicePanel(scheme)
+            : isHovered
+                ? Color.niceInk(scheme).opacity(0.05)
+                : Color.clear
+        return HStack(spacing: 6) {
+            Circle()
+                .fill(isActive ? Color.niceAccentDynamic : Color.niceInk3(scheme).opacity(0.6))
+                .frame(width: 6, height: 6)
             Text(companion.title)
                 .font(font)
-                .foregroundStyle(Color.niceInk(scheme))
+                .fontWeight(isActive ? .semibold : .medium)
+                .foregroundStyle(isActive ? Color.niceInk(scheme) : Color.niceInk2(scheme))
                 .lineLimit(1)
-                .onTapGesture {
-                    appState.setActiveCompanion(tabId: tabId, companionId: companion.id)
+            if isActive || isHovered {
+                Button(action: {
+                    appState.requestCloseCompanion(tabId: tabId, companionId: companion.id)
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Color.niceInk3(scheme))
+                        .frame(width: 14, height: 14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(Color.clear)
+                        )
                 }
-            Button(action: {
-                appState.requestCloseCompanion(tabId: tabId, companionId: companion.id)
-            }) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Color.niceInk(scheme))
-                    .frame(width: 14, height: 14)
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("companion.close.\(companion.id)")
             }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("companion.close.\(companion.id)")
         }
-        .padding(.leading, 8)
-        .padding(.trailing, 4)
-        .padding(.vertical, 3)
+        .padding(.leading, 10)
+        .padding(.trailing, 8)
+        .frame(height: 22)
         .background(
-            RoundedRectangle(cornerRadius: 4, style: .continuous)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(bg)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(isActive ? Color.niceLine(scheme) : Color.clear, lineWidth: 1)
         )
         .contentShape(Rectangle())
+        .onHover { hoveredPillId = $0 ? companion.id : nil }
         .onTapGesture {
             appState.setActiveCompanion(tabId: tabId, companionId: companion.id)
         }

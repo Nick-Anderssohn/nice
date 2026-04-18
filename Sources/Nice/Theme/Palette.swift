@@ -150,6 +150,13 @@ public extension SwiftUI.Color {
             : NSColor(srgbRed: 0.934, green: 0.919, blue: 0.907, alpha: 1.0)
     }
 
+    /// `nicePanel` expressed as `NSColor` for the Claude pane terminal.
+    static func nicePanelNS(_ scheme: ColorScheme) -> NSColor {
+        scheme == .dark
+            ? NSColor(srgbRed: 0.097, green: 0.083, blue: 0.072, alpha: 1.0)
+            : NSColor(srgbRed: 1.000, green: 0.992, blue: 0.986, alpha: 1.0)
+    }
+
     /// `niceInk` expressed as `NSColor` for feeding SwiftTerm's
     /// `nativeForegroundColor`.
     static func niceInkNS(_ scheme: ColorScheme) -> NSColor {
