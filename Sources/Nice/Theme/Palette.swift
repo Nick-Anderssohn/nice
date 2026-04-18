@@ -22,8 +22,22 @@ public extension Color {
 
     // MARK: - Accent
 
-    /// Default terracotta accent (`#c96442`).
+    /// Default terracotta accent (`#c96442`). Kept as a static fallback
+    /// for previews and contexts without a `Tweaks` environment object.
+    /// Runtime code should prefer `tweaks.accent.color` (or
+    /// `Color.niceAccentDynamic`) so the whole tree repaints when the
+    /// user picks a different swatch.
     static let niceAccent = Color(.sRGB, red: 0.788, green: 0.392, blue: 0.259, opacity: 1.0)
+
+    /// Resolves the user's currently-selected accent preset from
+    /// `UserDefaults`. Falls back to terracotta if the key is missing or
+    /// unrecognised. Used by helpers (e.g. `niceSelDynamic`) that don't
+    /// already hold a `Tweaks` reference.
+    @MainActor static var niceAccentDynamic: Color {
+        let raw = UserDefaults.standard.string(forKey: Tweaks.accentKey)
+            ?? AccentPreset.terracotta.rawValue
+        return AccentPreset(rawValue: raw)?.color ?? AccentPreset.terracotta.color
+    }
 
     // MARK: - Backgrounds
 
@@ -90,9 +104,21 @@ public extension Color {
     /// CSS: `color-mix(in oklch, var(--accent) 14%, transparent)` (light),
     /// `22%` in dark. Approximated here by applying the accent with the
     /// same alpha against a transparent base.
+    ///
+    /// Preview-safe fallback — bakes in the static terracotta accent.
+    /// Runtime code should prefer `niceSel(_:accent:)` below so the
+    /// selection tint follows the user's chosen swatch.
     static func niceSel(_ scheme: ColorScheme) -> Color {
         let alpha: Double = scheme == .dark ? 0.22 : 0.14
         return Color(.sRGB, red: 0.788, green: 0.392, blue: 0.259, opacity: alpha)
+    }
+
+    /// Accent-driven selection tint for runtime use. Mirrors the CSS
+    /// mix ratios (14% light / 22% dark) but applies them to whichever
+    /// accent swatch the user has chosen.
+    static func niceSel(_ scheme: ColorScheme, accent: Color) -> Color {
+        let alpha: Double = scheme == .dark ? 0.22 : 0.14
+        return accent.opacity(alpha)
     }
 
     static func niceUserBubble(_ scheme: ColorScheme) -> Color {

@@ -19,18 +19,25 @@
 import SwiftUI
 
 struct Logo: View {
+    /// Optional override — when nil we read the user's current accent
+    /// from the environment so the logo repaints live when the swatch
+    /// changes. A static color can still be passed for previews.
+    var fill: Color? = nil
     var size: CGFloat = 22
+
+    @EnvironmentObject private var tweaks: Tweaks
 
     var body: some View {
         // Source viewBox is 22×22; scale factor lets us render at any size
         // while preserving stroke metrics proportionally.
         let scale = size / 22
+        let accent = fill ?? tweaks.accent.color
 
         ZStack {
             // Rounded square fill — rect is 20×20 inset 1pt from each edge
             // (so 0…22 viewBox with rx=6 becomes a 20pt square with r=6).
             RoundedRectangle(cornerRadius: 6 * scale, style: .continuous)
-                .fill(Color.niceAccent)
+                .fill(accent)
                 .frame(width: 20 * scale, height: 20 * scale)
 
             // Inline chevron + trailing underline.
@@ -63,9 +70,9 @@ struct Logo: View {
 
 #Preview("Logo") {
     HStack(spacing: 16) {
-        Logo()
-        Logo(size: 32)
-        Logo(size: 48)
+        Logo(fill: .niceAccent)
+        Logo(fill: .niceAccent, size: 32)
+        Logo(fill: .niceAccent, size: 48)
     }
     .padding(40)
 }

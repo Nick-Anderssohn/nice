@@ -126,20 +126,24 @@ struct WindowToolbarView: View {
 
 // MARK: - MCP chip
 
-/// Small terracotta "MCP" pill that sits next to the brand mark. Mirrors
-/// the inline span in app.jsx (lines ~173–178) with its `--accent-soft`
-/// background (accent at 18% alpha).
+/// Small accent-coloured "MCP" pill that sits next to the brand mark.
+/// Mirrors the inline span in app.jsx (lines ~173–178) with its
+/// `--accent-soft` background (accent at 18% alpha). Reads the accent
+/// from `Tweaks` so it repaints when the user picks a new swatch.
 private struct MCPChip: View {
+    @EnvironmentObject private var tweaks: Tweaks
+
     var body: some View {
+        let accent = tweaks.accent.color
         Text("MCP")
             .font(.system(size: 9.5, weight: .bold))
             .tracking(0.3)
-            .foregroundStyle(Color.niceAccent)
+            .foregroundStyle(accent)
             .padding(.horizontal, 5)
             .padding(.vertical, 2)
             .background(
                 RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(Color.niceAccent.opacity(0.18))
+                    .fill(accent.opacity(0.18))
             )
     }
 }
@@ -149,6 +153,7 @@ private struct MCPChip: View {
 #Preview("Toolbar — tab selected (light)") {
     WindowToolbarView()
         .environmentObject(AppState())
+        .environmentObject(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.light)
 }
@@ -158,6 +163,7 @@ private struct MCPChip: View {
     state.selectMainTerminal()
     return WindowToolbarView()
         .environmentObject(state)
+        .environmentObject(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.dark)
 }

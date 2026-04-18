@@ -20,6 +20,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -97,8 +98,7 @@ struct SidebarView: View {
             }
             Spacer(minLength: 0)
             SidebarIconButton(systemImage: "gearshape", help: "Settings") {
-                // Phase 2 non-goal: Settings action is a no-op for now.
-                print("Settings tapped")
+                SettingsWindow.open()
             }
         }
         .padding(.horizontal, 8)
@@ -115,6 +115,7 @@ struct SidebarView: View {
 
 private struct MainTerminalRow: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
     @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
 
@@ -148,7 +149,9 @@ private struct MainTerminalRow: View {
         .foregroundStyle(isActive ? Color.niceInk(scheme) : Color.niceInk2(scheme))
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isActive ? Color.niceSel(scheme) : Color.clear)
+                .fill(isActive
+                      ? Color.niceSel(scheme, accent: tweaks.accent.color)
+                      : Color.clear)
         )
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
@@ -241,6 +244,7 @@ private struct CountPill: View {
 
 private struct TabRow: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
 
     let tab: Tab
@@ -249,7 +253,7 @@ private struct TabRow: View {
     private var isActive: Bool { tab.id == appState.activeTabId }
 
     private var backgroundColor: Color {
-        if isActive { return Color.niceSel(scheme) }
+        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
         if hover    { return Color.niceInk(scheme).opacity(0.06) }
         return .clear
     }
@@ -363,5 +367,6 @@ private struct KbdPill: View {
 #Preview("Sidebar") {
     SidebarView()
         .environmentObject(AppState())
+        .environmentObject(Tweaks())
         .frame(width: 240, height: 680)
 }
