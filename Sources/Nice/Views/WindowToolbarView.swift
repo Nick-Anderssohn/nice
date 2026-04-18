@@ -53,7 +53,7 @@ struct WindowToolbarView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.leading, 14)
-        .padding(.trailing, 10)
+        .padding(.trailing, 20)
         .frame(height: 52)
         .frame(maxWidth: .infinity)
         .background(Color.niceChrome(scheme))
