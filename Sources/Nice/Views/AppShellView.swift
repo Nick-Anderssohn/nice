@@ -72,6 +72,15 @@ struct AppShellView: View {
             }
         }
         .ignoresSafeArea(edges: .top)
+        .background(
+            // Host-window reach-through: once the shell is mounted, nudge
+            // the native traffic lights deeper into the sidebar card so
+            // they don't sit flush against the rounded corner. Xcode's
+            // buttons sit ~8pt further in on both axes; we do the same.
+            WindowAccessor { window in
+                TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
+            }
+        )
         .background(windowBackground.ignoresSafeArea())
         .environment(\.palette, palette)
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
