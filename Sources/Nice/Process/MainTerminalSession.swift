@@ -65,7 +65,7 @@ final class MainTerminalSession: ObservableObject {
     /// Called from `AppShellView` on appear and on scheme changes.
     func applyTheme(_ scheme: ColorScheme) {
         // Qualify with `SwiftUI.` to disambiguate from `SwiftTerm.Color`.
-        view.nativeBackgroundColor = SwiftUI.Color.niceBg3NS(scheme)
+        view.nativeBackgroundColor = SwiftUI.Color.nicePanelNS(scheme)
         view.nativeForegroundColor = SwiftUI.Color.niceInkNS(scheme)
         view.installColors(NiceANSIPalette.colors(for: scheme))
     }
