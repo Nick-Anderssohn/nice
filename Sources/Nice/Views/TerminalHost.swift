@@ -14,7 +14,15 @@ import SwiftUI
 
 struct TerminalHost: NSViewRepresentable {
     let view: LocalProcessTerminalView
+    var focus: Bool = false
 
     func makeNSView(context: Context) -> LocalProcessTerminalView { view }
-    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {}
+
+    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
+        if focus {
+            DispatchQueue.main.async {
+                nsView.window?.makeFirstResponder(nsView)
+            }
+        }
+    }
 }

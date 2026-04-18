@@ -76,7 +76,7 @@ struct AppShellView: View {
             let session = appState.session(for: activeId)
             if tab.hasClaudePane {
                 if let chat = session.chatView {
-                    TerminalHost(view: chat)
+                    TerminalHost(view: chat, focus: true)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color.nicePanel(scheme))
 
@@ -99,7 +99,7 @@ struct AppShellView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else {
-            TerminalHost(view: appState.mainTerminal.view)
+            TerminalHost(view: appState.mainTerminal.view, focus: true)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.niceBg3(scheme))
         }
