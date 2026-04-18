@@ -30,15 +30,13 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources/Nice
+      - path: Resources/Assets.xcassets
+        buildPhase: resources
     dependencies:
       - package: SwiftTerm
         product: SwiftTerm
       - package: MCP
         product: MCP
-    resources:
-      - path: Resources
-        excludes:
-          - Nice.entitlements
     entitlements:
       path: Resources/Nice.entitlements
       properties:
@@ -53,6 +51,7 @@ targets:
         CFBundleIdentifier: dev.nickanderssohn.nice
         CFBundlePackageType: APPL
         CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleIconName: AppIcon
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: "Copyright (c) 2026 Nick Anderssohn. All rights reserved."
         NSHighResolutionCapable: true
