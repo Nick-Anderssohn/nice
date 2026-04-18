@@ -65,6 +65,10 @@ struct AppShellView: View {
             .padding(.leading, 6)
             .padding(.top, 6)
             .padding(.bottom, 6)
+            // Lift the card above the main content in Z so its shadow
+            // isn't clipped by the opaque nicePanel / niceChrome
+            // backgrounds of the toolbar and terminal host next to it.
+            .zIndex(1)
 
             VStack(spacing: 0) {
                 WindowToolbarView()
