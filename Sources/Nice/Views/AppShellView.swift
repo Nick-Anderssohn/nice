@@ -44,6 +44,7 @@ struct AppShellView: View {
                     .padding(.bottom, 10)
 
                 mainContent
+                    .padding(.top, 12)
             }
         }
         .ignoresSafeArea(edges: .top)
