@@ -170,6 +170,8 @@ private struct MainTerminalRow: View {
         panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url {
             mainTerminalCwd = url.path
+            // Phase 4: re-root the main terminal's zsh at the new path.
+            appState.restartMainTerminal(cwd: url.path)
         }
     }
 }

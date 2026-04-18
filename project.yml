@@ -15,6 +15,11 @@ settings:
     DEAD_CODE_STRIPPING: YES
     CLANG_ENABLE_MODULES: YES
 
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    branch: main
+
 targets:
   Nice:
     type: application
@@ -22,6 +27,9 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources/Nice
+    dependencies:
+      - package: SwiftTerm
+        product: SwiftTerm
     resources:
       - path: Resources
         excludes:
