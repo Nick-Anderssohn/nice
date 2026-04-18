@@ -28,7 +28,7 @@ struct AppShellView: View {
 
             HStack(spacing: 0) {
                 SidebarView()
-                    .frame(width: appState.sidebarCollapsed ? 52 : 240)
+                    .frame(width: appState.sidebarCollapsed ? AppState.sidebarCollapsedWidth : appState.sidebarWidth)
                     .animation(.easeInOut(duration: 0.22), value: appState.sidebarCollapsed)
                     .background(
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -38,6 +38,9 @@ struct AppShellView: View {
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
                             .strokeBorder(Color.niceLine(scheme).opacity(0.5), lineWidth: 0.5)
                     )
+                    .overlay(alignment: .trailing) {
+                        SidebarResizeHandle()
+                    }
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
                     .padding(.horizontal, 10)
@@ -106,6 +109,49 @@ struct AppShellView: View {
                 .padding(.top, 12)
                 .background(Color.nicePanel(scheme))
         }
+    }
+}
+
+// MARK: - Sidebar resize handle
+
+private struct SidebarResizeHandle: View {
+    @EnvironmentObject private var appState: AppState
+
+    @State private var hover = false
+    @State private var dragging = false
+    @State private var initialWidth: CGFloat = 0
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: 6)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                hover = hovering
+                if hovering || dragging {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        if !dragging {
+                            dragging = true
+                            initialWidth = appState.sidebarCollapsed
+                                ? AppState.sidebarCollapsedWidth
+                                : appState.sidebarWidth
+                        }
+                        let newWidth = initialWidth + value.translation.width
+                        appState.resizeSidebar(to: newWidth)
+                    }
+                    .onEnded { _ in
+                        dragging = false
+                        if !hover { NSCursor.pop() }
+                    }
+            )
     }
 }
 

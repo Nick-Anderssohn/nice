@@ -20,10 +20,37 @@ final class AppState: ObservableObject {
     @Published var activeTabId: String?
     @Published var sidebarQuery: String = ""
     @Published var sidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "sidebarCollapsed")
+    @Published var sidebarWidth: CGFloat = {
+        let stored = UserDefaults.standard.double(forKey: "sidebarWidth")
+        let w = stored > 0 ? CGFloat(stored) : 240
+        return min(400, max(140, w))
+    }()
+
+    static let sidebarMinWidth: CGFloat = 140
+    static let sidebarMaxWidth: CGFloat = 400
+    static let sidebarCollapsedWidth: CGFloat = 52
+    static let sidebarDefaultWidth: CGFloat = 240
 
     func toggleSidebar() {
         sidebarCollapsed.toggle()
         UserDefaults.standard.set(sidebarCollapsed, forKey: "sidebarCollapsed")
+    }
+
+    func resizeSidebar(to width: CGFloat) {
+        if width < 80 {
+            if !sidebarCollapsed {
+                sidebarCollapsed = true
+                UserDefaults.standard.set(true, forKey: "sidebarCollapsed")
+            }
+        } else {
+            let clamped = min(Self.sidebarMaxWidth, max(Self.sidebarMinWidth, width))
+            sidebarWidth = clamped
+            UserDefaults.standard.set(Double(clamped), forKey: "sidebarWidth")
+            if sidebarCollapsed {
+                sidebarCollapsed = false
+                UserDefaults.standard.set(false, forKey: "sidebarCollapsed")
+            }
+        }
     }
 
     // MARK: - Phase 4 process plumbing
