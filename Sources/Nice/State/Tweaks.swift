@@ -181,8 +181,8 @@ final class Tweaks: ObservableObject {
     ) {
         self.osSchemeProvider = osSchemeProvider
 
-        let accentRaw = defaults.string(forKey: Self.accentKey) ?? AccentPreset.terracotta.rawValue
-        let accent = AccentPreset(rawValue: accentRaw) ?? .terracotta
+        let accentRaw = defaults.string(forKey: Self.accentKey) ?? AccentPreset.ocean.rawValue
+        let accent = AccentPreset(rawValue: accentRaw) ?? .ocean
 
         let (theme, sync) = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
