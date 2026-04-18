@@ -214,7 +214,7 @@ private struct GeneralPane: View {
         panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url {
             mainTerminalCwd = url.path
-            appState.restartMainTerminal(cwd: url.path)
+            appState.restartTerminalsFirstPane(cwd: url.path)
         }
     }
 }

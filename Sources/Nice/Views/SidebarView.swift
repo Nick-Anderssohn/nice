@@ -44,9 +44,9 @@ struct SidebarView: View {
 
             RailButton(
                 systemImage: "terminal",
-                help: "Main terminal",
-                isActive: appState.activeTabId == nil,
-                action: { appState.selectMainTerminal() }
+                help: "Terminals",
+                isActive: appState.activeTabId == AppState.terminalsTabId,
+                action: { appState.selectTab(AppState.terminalsTabId) }
             )
 
             Spacer().frame(height: 6)
@@ -89,7 +89,7 @@ struct SidebarView: View {
     private var expandedSidebar: some View {
         VStack(spacing: 0) {
             searchBar
-            MainTerminalRow()
+            TerminalsRow()
             tabList
             footer
         }
@@ -249,7 +249,7 @@ private struct RailTabDot: View {
             }
 
             Group {
-                if tab.hasClaudePane {
+                if tab.hasClaude {
                     StatusDot(status: tab.status, size: 10)
                 } else {
                     Image(systemName: "terminal")
@@ -273,18 +273,18 @@ private struct RailTabDot: View {
     }
 }
 
-// MARK: - Main terminal row
+// MARK: - Terminals row (built-in)
 
-private struct MainTerminalRow: View {
+private struct TerminalsRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
     @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
     @State private var hover = false
 
-    private var isActive: Bool { appState.activeTabId == nil }
+    private var isActive: Bool { appState.activeTabId == AppState.terminalsTabId }
 
-    /// Collapse `$HOME` to `~` per the JSX's right-side label shape.
+    /// Collapse `$HOME` to `~` for the right-side cwd label.
     private var cwdDisplayName: String {
         let home = NSHomeDirectory()
         if mainTerminalCwd == home { return "~" }
@@ -304,7 +304,7 @@ private struct MainTerminalRow: View {
         HStack(spacing: 8) {
             Image(systemName: "terminal")
                 .font(.system(size: 13, weight: .regular))
-            Text("Main terminal")
+            Text("Terminals")
                 .font(.system(size: 12, weight: isActive ? .semibold : .medium))
             Spacer(minLength: 6)
             Text(cwdDisplayName)
@@ -324,7 +324,7 @@ private struct MainTerminalRow: View {
         .contentShape(Rectangle())
         .onHover { hover = $0 }
         .onTapGesture {
-            appState.selectMainTerminal()
+            appState.selectTab(AppState.terminalsTabId)
         }
         .contextMenu {
             Button("Change directory…") {
@@ -332,7 +332,7 @@ private struct MainTerminalRow: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("sidebar.mainTerminal")
+        .accessibilityIdentifier("sidebar.terminals")
     }
 
     private func pickDirectory() {
@@ -343,7 +343,7 @@ private struct MainTerminalRow: View {
         panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url {
             mainTerminalCwd = url.path
-            appState.restartMainTerminal(cwd: url.path)
+            appState.restartTerminalsFirstPane(cwd: url.path)
         }
     }
 }
@@ -429,7 +429,7 @@ private struct TabRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            if tab.hasClaudePane {
+            if tab.hasClaude {
                 StatusDot(status: tab.status)
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")

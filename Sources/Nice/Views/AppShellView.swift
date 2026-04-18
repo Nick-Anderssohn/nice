@@ -2,17 +2,12 @@
 //  AppShellView.swift
 //  Nice
 //
-//  Three render modes once a tab is selected:
-//    1. Claude tab with live chatView  — chat on the left, CompanionPaneView
-//       on the right (fixed 400pt), a 1pt `niceLine` divider between them.
-//    2. Claude tab with chatView still building (rare edge case while a
-//       session warms up) — CompanionPaneView fills the whole column.
-//    3. Terminal-only tab (hasClaudePane == false) — CompanionPaneView
-//       fills the whole column.
-//  With no tab selected, the shared `MainTerminalSession` view takes
-//  over the whole column (Main Terminal mode).
+//  Single-pane main content. The upper toolbar hosts the tab pills
+//  (claude + terminal panes for the active session), and the main area
+//  shows exactly one pane — the active pane of the active tab. Built-in
+//  tabs (Terminals) and user sessions follow the same shape.
 //
-//  The Main Terminal quit alert hangs off `appState.showQuitPrompt`.
+//  The "Quit NICE?" alert still hangs off `appState.showQuitPrompt`.
 //
 
 import AppKit
@@ -53,12 +48,9 @@ struct AppShellView: View {
             Button("Quit", role: .destructive) { NSApp.terminate(nil) }
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
         } message: {
-            Text("Your Main Terminal just exited. You still have open tabs.")
+            Text("Your last terminal just exited. You still have open sessions.")
         }
         .task {
-            // Phase 6: boot the in-process MCP server exactly once.
-            // `bootstrap()` is idempotent via `NiceMCPServer.isRunning`
-            // so a re-render firing `.task` again is harmless.
             await appState.bootstrap()
         }
         .onAppear { appState.updateScheme(scheme) }
@@ -67,44 +59,25 @@ struct AppShellView: View {
         }
     }
 
-    // MARK: - Middle + right column dispatch
+    // MARK: - Main content
 
     @ViewBuilder
     private var mainContent: some View {
-        if let activeId = appState.activeTabId,
-           let tab = appState.tab(for: activeId) {
-            let session = appState.session(for: activeId)
-            if tab.hasClaudePane {
-                if let chat = session.chatView {
-                    TerminalHost(view: chat, focus: true)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(.top, 12)
-                        .background(Color.nicePanel(scheme))
-
-                    CompanionPaneView(tabId: activeId)
-                        .frame(width: 400)
-                        .overlay(alignment: .leading) {
-                            Rectangle()
-                                .fill(Color.niceLine(scheme))
-                                .frame(width: 1)
-                        }
-                } else {
-                    // Claude pane advertised but view not yet built —
-                    // fall back to the companion pane filling the
-                    // column so the tab still shows something live.
-                    CompanionPaneView(tabId: activeId)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            } else {
-                // Terminal-only tab: companions take the full column.
-                CompanionPaneView(tabId: activeId)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        } else {
-            TerminalHost(view: appState.mainTerminal.view, focus: true)
+        if let tabId = appState.activeTabId,
+           let tab = appState.tab(for: tabId),
+           let paneId = tab.activePaneId,
+           let session = appState.ptySessions[tabId],
+           let view = session.panes[paneId] {
+            TerminalHost(view: view, focus: true)
+                .id(paneId)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.top, 12)
                 .background(Color.nicePanel(scheme))
+        } else {
+            // Transient: no pane currently hosted (e.g. Terminals tab
+            // with its last pane just exited, awaiting the quit alert).
+            Color.nicePanel(scheme)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }

@@ -2,18 +2,21 @@
 //  TabPtySession.swift
 //  Nice
 //
-//  Each sidebar tab owns:
-//    - a `chatView` running the `claude` CLI (or a zsh fallback when the
-//      claude binary isn't on PATH). `chatView` is optional: it goes nil
-//      when Claude exits (`closeClaude()`), at which point `AppShellView`
-//      stops rendering the middle column for that tab.
-//    - one or more `companion` terminals — `zsh -il` shells — keyed by
-//      `CompanionTerminal.id` in the `terminals` dict.
+//  Each sidebar tab (session) owns a set of `Pane`s — claude or terminal.
+//  Each pane backs a `LocalProcessTerminalView` stored in `panes[paneId]`.
+//  Panes are spawned at session init (one claude pane for user-created
+//  sessions + one terminal pane) and on demand via `addTerminalPane`.
 //
-//  Every spawned view installs its own `ProcessTerminationDelegate` so
-//  the owning `AppState` can react to exits on a per-view basis.
-//  Sessions are retained by `AppState`, so the underlying processes
-//  persist across tab switches and SwiftUI redraws.
+//  Every pane installs its own `ProcessTerminationDelegate` with a
+//  `.pane(tabId:, paneId:)` role so `AppState` can fan exit and title
+//  callbacks to the right pane. Sessions are retained by `AppState`, so
+//  the underlying processes persist across tab switches and SwiftUI
+//  redraws.
+//
+//  `promotePaneToClaude` handles the `claude` zsh-shadow flow — the
+//  user's terminal pane is about to exec claude in place, so the session
+//  just re-themes the pane to the claude background. The `Pane.kind`
+//  flip lives in `AppState` alongside the model update.
 //
 
 import AppKit
@@ -24,43 +27,37 @@ import SwiftUI
 final class TabPtySession: ObservableObject {
     let tabId: String
     let cwd: String
-    /// The middle-column view hosting `claude` (or zsh fallback). Nil
-    /// once the underlying process has exited (see `closeClaude()`), or
-    /// after promotion swaps a companion into this slot and leaves the
-    /// previous one detached. `AppShellView` checks both `hasClaudePane`
-    /// (on the `Tab`) and the optionality of this view to decide the
-    /// three render modes (claude-alive, claude-dead, terminal-only).
-    var chatView: LocalProcessTerminalView?
-    /// False once the claude/zsh in `chatView` has exited. `AppState`
-    /// also stores the same signal on `Tab.hasClaudePane` so the UI
-    /// layer (in a later phase) can flip icon + layout without peeking
-    /// into the session.
-    private(set) var isClaudeAlive: Bool
-    /// Companion terminals keyed by `CompanionTerminal.id`.
-    var terminals: [String: LocalProcessTerminalView] = [:]
+
+    /// All live panes (claude + terminal) keyed by pane id.
+    var panes: [String: LocalProcessTerminalView] = [:]
     /// Retains the per-view termination delegates so SwiftTerm's weak
-    /// `processDelegate` reference stays live. Keyed by `"chat"` for
-    /// the Claude pane and by `CompanionTerminal.id` for companions.
+    /// `processDelegate` reference stays live.
     private var delegates: [String: ProcessTerminationDelegate] = [:]
-    /// Stored so later `addCompanion(...)` calls (from UI "+" or MCP)
-    /// can wire the same handler the initial companion used.
-    private let onChatExit: @MainActor (Int32?) -> Void
-    private let onChatTitleChange: @MainActor (String) -> Void
-    private let onCompanionExit: @MainActor (String, Int32?) -> Void
-    /// Cached SwiftUI `ColorScheme` so companions spawned after the
-    /// session already exists (via `addCompanion`) can be themed at
-    /// creation without round-tripping through `AppState`.
+
+    private let onPaneExit: @MainActor (String, Int32?) -> Void
+    private let onPaneTitleChange: @MainActor (String, String) -> Void
+
+    /// Cached SwiftUI `ColorScheme` so panes added after init can be
+    /// themed at creation without round-tripping through `AppState`.
     private var currentScheme: ColorScheme = .dark
-    /// Unix-domain-socket path to inject into companion shells as
-    /// `NICE_SOCKET`. Captured at init so every subsequent
-    /// `addCompanion(...)` can thread it in without re-plumbing from
-    /// the call site.
+
+    /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
-    /// ZDOTDIR directory (same one the Main Terminal uses) to inject
-    /// into companion shells. Enables the shadowed `claude()` zsh
-    /// function inside companion ptys, which in turn drives the
-    /// promote-tab flow via the control socket.
+    /// ZDOTDIR directory injected into terminal panes so the shadowed
+    /// `claude()` function is available inside them.
     private let zdotdirPath: String?
+
+    /// Captured for the optional initial claude pane spawn.
+    private let claudeBinary: String?
+    private let mcpConfigPath: URL?
+    private let extraClaudeArgs: [String]
+
+    /// When true, terminal panes on this session get `NICE_TAB_ID` in
+    /// their env so the shadowed `claude()` zsh function fires the
+    /// `promoteTab` flow. For the built-in Terminals session this is
+    /// false — typing `claude` there should open a new sidebar session
+    /// (the `newtab` flow), just like the old Main Terminal did.
+    private let injectTabIdEnv: Bool
 
     init(
         tabId: String,
@@ -68,55 +65,51 @@ final class TabPtySession: ObservableObject {
         claudeBinary: String?,
         mcpConfigPath: URL? = nil,
         extraClaudeArgs: [String] = [],
-        initialCompanionId: String,
+        initialClaudePaneId: String? = nil,
+        initialTerminalPaneId: String? = nil,
         socketPath: String? = nil,
         zdotdirPath: String? = nil,
-        onChatExit: @escaping @MainActor (Int32?) -> Void,
-        onChatTitleChange: @escaping @MainActor (String) -> Void = { _ in },
-        onCompanionExit: @escaping @MainActor (String, Int32?) -> Void
+        injectTabIdEnv: Bool = true,
+        onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
+        onPaneTitleChange: @escaping @MainActor (String, String) -> Void
     ) {
         self.tabId = tabId
         self.cwd = cwd
-        self.onChatExit = onChatExit
-        self.onChatTitleChange = onChatTitleChange
-        self.onCompanionExit = onCompanionExit
-        self.isClaudeAlive = (claudeBinary != nil)
+        self.onPaneExit = onPaneExit
+        self.onPaneTitleChange = onPaneTitleChange
         self.socketPath = socketPath
         self.zdotdirPath = zdotdirPath
+        self.claudeBinary = claudeBinary
+        self.mcpConfigPath = mcpConfigPath
+        self.extraClaudeArgs = extraClaudeArgs
+        self.injectTabIdEnv = injectTabIdEnv
 
-        let font = Self.terminalFont()
+        if let claudeId = initialClaudePaneId {
+            _ = spawnClaudePane(id: claudeId, cwd: cwd)
+        }
+        if let termId = initialTerminalPaneId {
+            _ = addTerminalPane(id: termId, cwd: cwd)
+        }
+    }
+
+    // MARK: - Pane spawn
+
+    /// Spawn a claude-kind pane. Runs claude inside a login+interactive
+    /// zsh via `zsh -ilc "exec claude ..."` so zshrc/zprofile (PATH,
+    /// nvm, etc.) are sourced before the exec. When `claudeBinary` is
+    /// nil, falls back to a plain zsh — the pane still renders as a
+    /// claude pane at the model layer, but what's actually running
+    /// inside is just a shell.
+    @discardableResult
+    private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
+        let view = LocalProcessTerminalView(frame: .zero)
+        view.font = Self.terminalFont()
+        let delegate = makePaneDelegate(paneId: id)
+        view.processDelegate = delegate
+        panes[id] = view
+        delegates[id] = delegate
+
         let resolvedCwd = Self.expandTilde(cwd)
-
-        // `LocalProcessTerminalView` only exposes `init(frame:)` on
-        // macOS; the font is set via the inherited `TerminalView.font`
-        // property.
-        let chat = LocalProcessTerminalView(frame: .zero)
-        chat.font = font
-        self.chatView = chat
-
-        let chatDelegate = ProcessTerminationDelegate(
-            role: .claude(tabId: tabId),
-            onExit: { [onChatExit] _, code in onChatExit(code) },
-            onTitleChange: { [onChatTitleChange] _, title in onChatTitleChange(title) }
-        )
-        chat.processDelegate = chatDelegate
-        self.delegates["chat"] = chatDelegate
-        // Note: even when `claudeBinary == nil`, we still spawn zsh in
-        // the chat slot as a live fallback (behavior from Phase 0).
-        // The type is now optional, but the initial value is non-nil.
-
-        // Spawn claude if available; otherwise spawn zsh as a fallback
-        // so the middle column shows a live prompt. claude shells out
-        // to `/bin/sh -c "node …"` for sub-tools, so it needs the
-        // user's full PATH. Three reasons the default env is
-        // insufficient: (1) apps opened from Finder inherit only
-        // launchd's minimal PATH (no `/opt/homebrew/bin` etc.);
-        // (2) SwiftTerm's `getEnvironmentVariables` deliberately omits
-        // PATH from the forwarded keys; and (3) node managers like
-        // nvm only activate in `.zshrc` (interactive), not
-        // `.zprofile` (login-only). Running `zsh -ilc` sources both,
-        // then `exec` swaps the shell for claude so the process tree
-        // looks clean.
         let isOverride = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] != nil
         if let claude = claudeBinary {
             var parts = ["exec", Self.shellQuote(claude)]
@@ -129,7 +122,7 @@ final class TabPtySession: ObservableObject {
                     parts.append(Self.shellQuote(a))
                 }
             }
-            chat.startProcess(
+            view.startProcess(
                 executable: "/bin/zsh",
                 args: ["-ilc", parts.joined(separator: " ")],
                 environment: nil,
@@ -137,7 +130,7 @@ final class TabPtySession: ObservableObject {
                 currentDirectory: resolvedCwd
             )
         } else {
-            chat.startProcess(
+            view.startProcess(
                 executable: "/bin/zsh",
                 args: ["-il"],
                 environment: nil,
@@ -146,26 +139,18 @@ final class TabPtySession: ObservableObject {
             )
         }
 
-        // Always bring up the initial companion — every live tab keeps
-        // at least one zsh pane so the layout has something to render
-        // on the terminal side.
-        _ = addCompanion(id: initialCompanionId, cwd: cwd)
+        applyTheme(
+            currentScheme, to: view,
+            background: SwiftUI.Color.nicePanelNS(currentScheme)
+        )
+        return view
     }
 
-    // MARK: - Companion lifecycle
-
-    /// Allocate a fresh `LocalProcessTerminalView`, install a
-    /// per-companion `ProcessTerminationDelegate`, start `zsh -il` in
-    /// `cwd` (defaulting to the session's cwd), and insert into
-    /// `terminals` + `delegates`. Returns the new view so the caller
-    /// (SwiftUI layer) can host it.
-    ///
-    /// `socketPath` / `zdotdirPath` override the session-level
-    /// defaults captured at init, if a caller needs to point a single
-    /// companion elsewhere. Both default to the stored values so the
-    /// common case is the old two-argument call.
+    /// Spawn a terminal-kind pane — a plain `zsh -il` with injected
+    /// `ZDOTDIR` + `NICE_SOCKET` + `NICE_TAB_ID` so the shadowed
+    /// `claude()` function is available inside.
     @discardableResult
-    func addCompanion(
+    func addTerminalPane(
         id: String,
         cwd: String? = nil,
         socketPath: String? = nil,
@@ -173,25 +158,11 @@ final class TabPtySession: ObservableObject {
     ) -> LocalProcessTerminalView {
         let view = LocalProcessTerminalView(frame: .zero)
         view.font = Self.terminalFont()
-        let onCompanionExit = self.onCompanionExit
-        let delegate = ProcessTerminationDelegate(
-            role: .companion(tabId: tabId, companionId: id),
-            onExit: { [onCompanionExit] role, code in
-                if case let .companion(_, companionId) = role {
-                    onCompanionExit(companionId, code)
-                }
-            }
-        )
+        let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
-        terminals[id] = view
+        panes[id] = view
         delegates[id] = delegate
 
-        // Build extra env for the companion: socket path + ZDOTDIR so
-        // the shadowed `claude()` function loads, plus NICE_TAB_ID so
-        // the shadow knows which tab to promote. Same merge pattern as
-        // MainTerminalSession.buildEnv. If no socket/zdotdir were
-        // supplied, fall back to a plain env — running `claude` inside
-        // the companion will just exec the real binary.
         var extraEnv: [String: String] = [:]
         if let sp = socketPath ?? self.socketPath {
             extraEnv["NICE_SOCKET"] = sp
@@ -199,7 +170,9 @@ final class TabPtySession: ObservableObject {
         if let zp = zdotdirPath ?? self.zdotdirPath {
             extraEnv["ZDOTDIR"] = zp
         }
-        extraEnv["NICE_TAB_ID"] = tabId
+        if injectTabIdEnv {
+            extraEnv["NICE_TAB_ID"] = tabId
+        }
 
         let resolvedCwd = Self.expandTilde(cwd ?? self.cwd)
         view.startProcess(
@@ -210,66 +183,54 @@ final class TabPtySession: ObservableObject {
             currentDirectory: resolvedCwd
         )
 
-        // Paint with the currently-cached scheme so the pane doesn't
-        // flash default colors before the next `applyTheme` call.
-        applyTheme(currentScheme, to: view, background: SwiftUI.Color.niceBg3NS(currentScheme))
-        return view
-    }
-
-    /// Merge `extraEnv` on top of SwiftTerm's default forwarded env
-    /// (TERM, COLORTERM, LANG, LOGNAME, USER, HOME). Mirrors the
-    /// helper in `MainTerminalSession`.
-    private static func buildEnv(extraEnv: [String: String]) -> [String] {
-        var env = SwiftTerm.Terminal.getEnvironmentVariables()
-        for (k, v) in extraEnv {
-            env.append("\(k)=\(v)")
-        }
-        return env
-    }
-
-    /// Drop the companion's view + delegate from the dicts. Does NOT
-    /// terminate the underlying process — callers invoke this from the
-    /// delegate's exit hook, by which time the process is already gone.
-    func removeCompanion(id: String) {
-        terminals.removeValue(forKey: id)
-        delegates.removeValue(forKey: id)
-    }
-
-    /// Move a companion's view into the chat slot. Removes the
-    /// companion from `terminals` / `delegates`, installs a fresh
-    /// claude-role `ProcessTerminationDelegate` on the view (so a
-    /// subsequent exit routes through `onChatExit`), and assigns the
-    /// view to `self.chatView`. Returns the view so callers can act on
-    /// it (e.g. to focus it in the layout). Nil if `id` isn't a known
-    /// companion.
-    @discardableResult
-    func promoteCompanionToChat(id: String) -> LocalProcessTerminalView? {
-        guard let view = terminals[id] else { return nil }
-        terminals.removeValue(forKey: id)
-        delegates.removeValue(forKey: id)
-
-        let onChatExit = self.onChatExit
-        let onChatTitleChange = self.onChatTitleChange
-        let delegate = ProcessTerminationDelegate(
-            role: .claude(tabId: tabId),
-            onExit: { [onChatExit] _, code in onChatExit(code) },
-            onTitleChange: { [onChatTitleChange] _, title in onChatTitleChange(title) }
+        applyTheme(
+            currentScheme, to: view,
+            background: SwiftUI.Color.nicePanelNS(currentScheme)
         )
-        view.processDelegate = delegate
-        delegates["chat"] = delegate
-        self.chatView = view
-        isClaudeAlive = true
-        applyTheme(currentScheme, to: view, background: SwiftUI.Color.nicePanelNS(currentScheme))
         return view
     }
 
-    /// Mark the chat view's process as gone and drop the view so the
-    /// UI layer stops rendering the middle column for this tab. The
-    /// matching `Tab.hasClaudePane` flag is maintained by `AppState`.
-    func closeClaude() {
-        isClaudeAlive = false
-        delegates.removeValue(forKey: "chat")
-        chatView = nil
+    /// Build a `.pane` role delegate that routes exit + title change
+    /// back to `AppState`.
+    private func makePaneDelegate(paneId: String) -> ProcessTerminationDelegate {
+        let onExit = self.onPaneExit
+        let onTitleChange = self.onPaneTitleChange
+        return ProcessTerminationDelegate(
+            role: .pane(tabId: tabId, paneId: paneId),
+            onExit: { [onExit] role, code in
+                if case let .pane(_, paneId) = role {
+                    onExit(paneId, code)
+                }
+            },
+            onTitleChange: { [onTitleChange] role, title in
+                if case let .pane(_, paneId) = role {
+                    onTitleChange(paneId, title)
+                }
+            }
+        )
+    }
+
+    /// Drop a pane's view + delegate from the dicts. Does NOT terminate
+    /// the underlying process — callers invoke this from the pane's
+    /// exit hook, by which time the process is already gone.
+    func removePane(id: String) {
+        panes.removeValue(forKey: id)
+        delegates.removeValue(forKey: id)
+    }
+
+    /// Flip a terminal pane's visual role to claude. The pty already
+    /// `exec`s claude inline (the zsh-shadow flow is the only caller),
+    /// so there's no process swap — we just repaint with the claude
+    /// background. Returns the affected view, or nil if `id` isn't
+    /// currently hosted.
+    @discardableResult
+    func promotePaneToClaude(id: String) -> LocalProcessTerminalView? {
+        guard let view = panes[id] else { return nil }
+        applyTheme(
+            currentScheme, to: view,
+            background: SwiftUI.Color.nicePanelNS(currentScheme)
+        )
+        return view
     }
 
     // MARK: - IO
@@ -281,10 +242,10 @@ final class TabPtySession: ObservableObject {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// Send `text` plus a newline into the specified companion's pty.
-    /// No-op if `companionId` isn't currently hosted in this session.
-    func sendToTerminal(_ text: String, companionId: String) {
-        guard let view = terminals[companionId] else { return }
+    /// Send `text` plus a newline into the specified pane's pty.
+    /// No-op if `paneId` isn't currently hosted in this session.
+    func sendToPane(_ text: String, paneId: String) {
+        guard let view = panes[paneId] else { return }
         let data = Array((text + "\n").utf8)
         view.send(data: ArraySlice(data))
     }
@@ -292,16 +253,16 @@ final class TabPtySession: ObservableObject {
     // MARK: - Theming
 
     /// Paint every live pane with the Nice palette for the given color
-    /// scheme. Called from `AppShellView` on appear and whenever the
-    /// effective `ColorScheme` flips. Subsequently spawned companions
-    /// pick up the cached scheme inside `addCompanion`.
+    /// scheme. Called from `AppState` on scheme changes. All panes use
+    /// the `nicePanel` background so the single-pane main area looks
+    /// consistent across kinds.
     func applyTheme(_ scheme: ColorScheme) {
         currentScheme = scheme
-        if let chat = chatView {
-            applyTheme(scheme, to: chat, background: SwiftUI.Color.nicePanelNS(scheme))
-        }
-        for view in terminals.values {
-            applyTheme(scheme, to: view, background: SwiftUI.Color.niceBg3NS(scheme))
+        for view in panes.values {
+            applyTheme(
+                scheme, to: view,
+                background: SwiftUI.Color.nicePanelNS(scheme)
+            )
         }
     }
 
@@ -315,6 +276,26 @@ final class TabPtySession: ObservableObject {
         view.nativeBackgroundColor = background
         view.nativeForegroundColor = fg
         view.installColors(palette)
+    }
+
+    /// Terminate every live pane's process. Used when a tab is being
+    /// closed while its panes are still running (e.g. the user closed
+    /// the last tab; model-driven teardown). Pane-exit callbacks still
+    /// fire and drive cleanup through the normal path.
+    func terminateAll() {
+        for view in panes.values {
+            view.process.terminate()
+        }
+    }
+
+    /// Merge `extraEnv` on top of SwiftTerm's default forwarded env
+    /// (TERM, COLORTERM, LANG, LOGNAME, USER, HOME).
+    private static func buildEnv(extraEnv: [String: String]) -> [String] {
+        var env = SwiftTerm.Terminal.getEnvironmentVariables()
+        for (k, v) in extraEnv {
+            env.append("\(k)=\(v)")
+        }
+        return env
     }
 
     // MARK: - Helpers

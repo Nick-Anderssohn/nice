@@ -2,16 +2,17 @@
 //  NiceMCPServer.swift
 //  Nice
 //
-//  Phase 6: owns the in-process MCP server lifecycle. Registers three
+//  Phase 6: owns the in-process MCP server lifecycle. Registers the
 //  tools the `claude` CLI inside each tab can call back into:
 //
-//    nice.tab.switch — focus a tab by id or fuzzy title match
-//    nice.tab.list   — enumerate all tabs as JSON
-//    nice.run        — run a shell command in a tab's companion zsh
+//    nice.tab.switch    — focus a tab by id or fuzzy title match
+//    nice.tab.list      — enumerate all tabs as JSON
+//    nice.run           — run a shell command in a tab's terminal pane
+//    nice.terminal.open — add a new terminal pane to a tab
 //
 //  Tab creation is deliberately not an MCP tool — it lives on the
 //  control socket (see `NiceControlSocket`) driven by a shadowed
-//  `claude()` zsh function in the Main Terminal, so the natural
+//  `claude()` zsh function in the Terminals tab, so the natural
 //  `claude <args>` invocation opens a tab.
 //
 //  The server itself uses the Swift SDK's `StatefulHTTPServerTransport`
@@ -142,7 +143,7 @@ final class NiceMCPServer: ObservableObject {
             ),
             Tool(
                 name: "nice.run",
-                description: "Run a shell command in a tab's companion terminal. If tabId is omitted, runs in the currently active tab.",
+                description: "Run a shell command in a tab's terminal pane. If tabId is omitted, runs in the currently active tab.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "required": .array([.string("command")]),
@@ -160,7 +161,7 @@ final class NiceMCPServer: ObservableObject {
             ),
             Tool(
                 name: "nice.terminal.open",
-                description: "Open a new companion terminal in a tab. Use this to reopen a terminal the user accidentally closed, or to add a second shell alongside Claude.",
+                description: "Open a new terminal pane in a tab. Use this to reopen a terminal the user accidentally closed, or to add a second shell alongside Claude.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
@@ -174,7 +175,7 @@ final class NiceMCPServer: ObservableObject {
                         ]),
                         "title": .object([
                             "type": .string("string"),
-                            "description": .string("Display title for the companion pill. Defaults to \"Terminal N\"."),
+                            "description": .string("Display title for the new pane's pill. Defaults to \"Terminal N\"."),
                         ]),
                     ]),
                 ])
@@ -234,7 +235,7 @@ final class NiceMCPServer: ObservableObject {
                 appState?.mcpOpenTerminal(tabId: tabId, cwd: cwd, title: title)
             }
             if let newId {
-                let json = Self.jsonString(["companionId": newId])
+                let json = Self.jsonString(["paneId": newId])
                 return CallTool.Result(
                     content: [.text(text: json, annotations: nil, _meta: nil)]
                 )

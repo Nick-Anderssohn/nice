@@ -2,12 +2,18 @@
 //  Models.swift
 //  Nice
 //
-//  Value types mirroring the React mock in
-//  /tmp/nice-design/nice/project/nice/data.jsx. Phase 2 — sidebar only.
-//  Keep field names aligned with the JSX so the seed data stays legible.
+//  Value types for the tab/pane data model. A sidebar row is a `Tab`
+//  (a session); each tab owns an ordered list of `Pane`s which show up
+//  as pills in the upper toolbar. Claude and terminal panes share the
+//  same storage — only the `kind` field distinguishes them.
 //
 
 import Foundation
+
+enum PaneKind: String, Hashable, Sendable {
+    case claude
+    case terminal
+}
 
 enum TabStatus: String, CaseIterable, Hashable, Sendable {
     case thinking
@@ -15,28 +21,49 @@ enum TabStatus: String, CaseIterable, Hashable, Sendable {
     case idle
 }
 
-struct CompanionTerminal: Identifiable, Hashable, Sendable {
+struct Pane: Identifiable, Hashable, Sendable {
     let id: String
     var title: String
+    var kind: PaneKind
+    /// False once the pty for this pane has exited. `AppState` flips this
+    /// before removing the pane so interim UI states render cleanly.
+    var isAlive: Bool = true
+    /// Per-pane status (thinking/waiting/idle). Meaningful for `.claude`
+    /// panes; `.terminal` panes stay `.idle`.
+    var status: TabStatus = .idle
 }
 
 struct Tab: Identifiable, Hashable, Sendable {
     let id: String
     var title: String
+    /// Aggregate status surfaced in the sidebar. Mirrors the status of
+    /// the active pane when it's a claude pane; `.idle` otherwise.
     var status: TabStatus
     var cwd: String
     var branch: String?
-    /// Flips false after the Claude process in this tab exits. The tab
-    /// stays in the sidebar; the UI swaps its icon and hides the chat
-    /// pane. Defaults to true because new tabs spawn with Claude alive.
-    var hasClaudePane: Bool = true
-    /// One or more companion zsh terminals hosted next to the Claude
-    /// pane. At least one entry is expected while the tab is alive;
-    /// the invariant is maintained by `AppState`.
-    var companions: [CompanionTerminal] = []
-    /// The companion currently focused in the tab bar. `nil` only when
-    /// `companions` is empty (transient, during teardown).
-    var activeCompanionId: String? = nil
+    /// Built-in tabs (the "Terminals" session) cannot be deleted by the
+    /// user and always exist. Non-built-in tabs dissolve when their
+    /// last pane closes.
+    var isBuiltIn: Bool = false
+    /// Ordered panes shown as pills in the toolbar. Expected non-empty
+    /// while the tab is alive; the invariant is maintained by `AppState`.
+    var panes: [Pane] = []
+    /// The pane currently focused in the toolbar. `nil` only when
+    /// `panes` is empty (transient, during teardown).
+    var activePaneId: String? = nil
+}
+
+extension Tab {
+    /// True if any alive pane on this tab is a Claude pane.
+    var hasClaude: Bool {
+        panes.contains { $0.kind == .claude && $0.isAlive }
+    }
+
+    /// The pane currently focused, if any.
+    var activePane: Pane? {
+        guard let id = activePaneId else { return nil }
+        return panes.first { $0.id == id }
+    }
 }
 
 struct Project: Identifiable, Hashable, Sendable {

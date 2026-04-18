@@ -17,12 +17,10 @@ import SwiftTerm
 
 final class ProcessTerminationDelegate: NSObject, LocalProcessTerminalViewDelegate {
     /// Identifies which logical slot this delegate instance is attached
-    /// to. `AppState` fans the exit callback out to the right handler
-    /// based on this tag.
+    /// to. Every pane (Claude or terminal) carries a `.pane` role; the
+    /// owning tab + pane id let `AppState` route exit/title callbacks.
     enum Role {
-        case main
-        case claude(tabId: String)
-        case companion(tabId: String, companionId: String)
+        case pane(tabId: String, paneId: String)
     }
 
     private let role: Role
