@@ -45,6 +45,7 @@ final class TabPtySession: ObservableObject {
     /// Stored so later `addCompanion(...)` calls (from UI "+" or MCP)
     /// can wire the same handler the initial companion used.
     private let onChatExit: @MainActor (Int32?) -> Void
+    private let onChatTitleChange: @MainActor (String) -> Void
     private let onCompanionExit: @MainActor (String, Int32?) -> Void
     /// Cached SwiftUI `ColorScheme` so companions spawned after the
     /// session already exists (via `addCompanion`) can be themed at
@@ -71,11 +72,13 @@ final class TabPtySession: ObservableObject {
         socketPath: String? = nil,
         zdotdirPath: String? = nil,
         onChatExit: @escaping @MainActor (Int32?) -> Void,
+        onChatTitleChange: @escaping @MainActor (String) -> Void = { _ in },
         onCompanionExit: @escaping @MainActor (String, Int32?) -> Void
     ) {
         self.tabId = tabId
         self.cwd = cwd
         self.onChatExit = onChatExit
+        self.onChatTitleChange = onChatTitleChange
         self.onCompanionExit = onCompanionExit
         self.isClaudeAlive = (claudeBinary != nil)
         self.socketPath = socketPath
@@ -93,7 +96,8 @@ final class TabPtySession: ObservableObject {
 
         let chatDelegate = ProcessTerminationDelegate(
             role: .claude(tabId: tabId),
-            onExit: { [onChatExit] _, code in onChatExit(code) }
+            onExit: { [onChatExit] _, code in onChatExit(code) },
+            onTitleChange: { [onChatTitleChange] _, title in onChatTitleChange(title) }
         )
         chat.processDelegate = chatDelegate
         self.delegates["chat"] = chatDelegate
@@ -245,9 +249,11 @@ final class TabPtySession: ObservableObject {
         delegates.removeValue(forKey: id)
 
         let onChatExit = self.onChatExit
+        let onChatTitleChange = self.onChatTitleChange
         let delegate = ProcessTerminationDelegate(
             role: .claude(tabId: tabId),
-            onExit: { [onChatExit] _, code in onChatExit(code) }
+            onExit: { [onChatExit] _, code in onChatExit(code) },
+            onTitleChange: { [onChatTitleChange] _, title in onChatTitleChange(title) }
         )
         view.processDelegate = delegate
         delegates["chat"] = delegate

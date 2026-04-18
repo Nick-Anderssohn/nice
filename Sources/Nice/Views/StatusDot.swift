@@ -41,19 +41,24 @@ struct StatusDot: View {
         }
     }
 
+    private var shouldPulse: Bool {
+        status == .thinking || status == .waiting
+    }
+
     var body: some View {
         ZStack {
-            // Expanding ring — only rendered when thinking.
-            if status == .thinking {
+            // Expanding ring — thinking and waiting.
+            if shouldPulse {
                 Circle()
                     .fill(baseColor)
-                    .frame(width: 12, height: 12) // 8 + inset(-2) each side
-                    .scaleEffect(pulsing ? 1.6 : 1.0)
-                    .opacity(pulsing ? 0.0 : 0.6)
+                    .frame(width: 12, height: 12)
+                    .scaleEffect(pulsing ? (status == .waiting ? 2.0 : 1.6) : 1.0)
+                    .opacity(pulsing ? 0.0 : (status == .waiting ? 0.7 : 0.6))
                     .animation(
                         pulsePaused
                             ? nil
-                            : .easeOut(duration: 1.6).repeatForever(autoreverses: false),
+                            : .easeOut(duration: status == .waiting ? 1.2 : 1.6)
+                                .repeatForever(autoreverses: false),
                         value: pulsing
                     )
             }
@@ -63,19 +68,18 @@ struct StatusDot: View {
                 .fill(baseColor)
                 .frame(width: 8, height: 8)
                 .opacity(
-                    status == .thinking
-                        ? (pulsing ? 1.0 : 0.5)
+                    shouldPulse
+                        ? (pulsing ? 1.0 : (status == .waiting ? 0.4 : 0.5))
                         : 1.0
                 )
                 .animation(
-                    (status == .thinking && !pulsePaused)
-                        ? .easeInOut(duration: 0.7).repeatForever(autoreverses: true)
+                    (shouldPulse && !pulsePaused)
+                        ? .easeInOut(duration: status == .waiting ? 0.9 : 0.7)
+                            .repeatForever(autoreverses: true)
                         : nil,
                     value: pulsing
                 )
         }
-        // Frame matches the outer ring size so layout doesn't jitter between
-        // statuses. Callers should still treat the logical size as 8pt.
         .frame(width: 12, height: 12)
         .onAppear {
             if !pulsePaused {

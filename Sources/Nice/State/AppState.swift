@@ -257,7 +257,24 @@ final class AppState: ObservableObject {
     func claudePaneExited(tabId: String, exitCode: Int32?) {
         guard let (pi, ti) = tabIndex(for: tabId) else { return }
         projects[pi].tabs[ti].hasClaudePane = false
+        projects[pi].tabs[ti].status = .idle
         ptySessions[tabId]?.closeClaude()
+    }
+
+    func updateTabStatusFromTitle(_ tabId: String, title: String) {
+        guard let first = title.unicodeScalars.first else { return }
+        let newStatus: TabStatus
+        if first.value >= 0x2800 && first.value <= 0x28FF {
+            newStatus = .thinking
+        } else if first == "\u{2733}" {
+            newStatus = .waiting
+        } else {
+            return
+        }
+        guard let (pi, ti) = tabIndex(for: tabId) else { return }
+        if projects[pi].tabs[ti].status != newStatus {
+            projects[pi].tabs[ti].status = newStatus
+        }
     }
 
     /// A companion in `tabId` exited. Drop it from the tab's companion
@@ -575,6 +592,9 @@ final class AppState: ObservableObject {
             zdotdirPath: zdotdirPath,
             onChatExit: { [weak self] code in
                 self?.claudePaneExited(tabId: tabId, exitCode: code)
+            },
+            onChatTitleChange: { [weak self] title in
+                self?.updateTabStatusFromTitle(tabId, title: title)
             },
             onCompanionExit: { [weak self] companionId, code in
                 self?.companionExited(

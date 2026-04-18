@@ -27,14 +27,27 @@ final class ProcessTerminationDelegate: NSObject, LocalProcessTerminalViewDelega
 
     private let role: Role
     private let onExit: @MainActor (Role, Int32?) -> Void
+    private let onTitleChange: (@MainActor (Role, String) -> Void)?
 
-    init(role: Role, onExit: @escaping @MainActor (Role, Int32?) -> Void) {
+    init(
+        role: Role,
+        onExit: @escaping @MainActor (Role, Int32?) -> Void,
+        onTitleChange: (@MainActor (Role, String) -> Void)? = nil
+    ) {
         self.role = role
         self.onExit = onExit
+        self.onTitleChange = onTitleChange
     }
 
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+
+    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
+        guard let onTitleChange else { return }
+        let role = self.role
+        Task { @MainActor in
+            onTitleChange(role, title)
+        }
+    }
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
 
     func processTerminated(source: TerminalView, exitCode: Int32?) {
