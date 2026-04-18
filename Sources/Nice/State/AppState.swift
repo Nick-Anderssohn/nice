@@ -205,14 +205,18 @@ final class AppState: ObservableObject {
             companions: [CompanionTerminal(id: companionId, title: "Terminal 1")],
             activeCompanionId: companionId
         )
-        if !projects.isEmpty {
-            projects[0].tabs.insert(tab, at: 0)
+        let normalizedCwd = cwd.replacingOccurrences(of: "~", with: NSHomeDirectory())
+        if let idx = projects.enumerated()
+            .filter({ normalizedCwd.hasPrefix($0.element.path.replacingOccurrences(of: "~", with: NSHomeDirectory())) })
+            .max(by: { $0.element.path.count < $1.element.path.count })?
+            .offset
+        {
+            projects[idx].tabs.insert(tab, at: 0)
         } else {
-            // Defensive: seed is non-empty today, but keep the app
-            // functional if that ever changes.
-            projects.append(
-                Project(id: "default", name: "default", path: cwd, tabs: [tab])
-            )
+            let dirName = (normalizedCwd as NSString).lastPathComponent.uppercased()
+            let projectId = "p-\(dirName.lowercased())-\(Int(Date().timeIntervalSince1970))"
+            let newProject = Project(id: projectId, name: dirName, path: normalizedCwd, tabs: [tab])
+            projects.append(newProject)
         }
         activeTabId = newId
         _ = session(for: newId, cwd: cwd, extraClaudeArgs: args)

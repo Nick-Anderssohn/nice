@@ -47,6 +47,7 @@ struct AppShellView: View {
                 mainContent
             }
         }
+        .ignoresSafeArea(edges: .top)
         .background(Color.niceBg2(scheme).ignoresSafeArea())
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
             Button("Quit", role: .destructive) { NSApp.terminate(nil) }
