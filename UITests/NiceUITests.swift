@@ -863,4 +863,204 @@ final class NiceUITests: XCTestCase {
             "No companion.* after closing a pane"
         )
     }
+
+    // MARK: - Typing `claude` in a pane (regression tests)
+    //
+    // These exercise the full zsh-shadow → control-socket → AppState path
+    // that broke after the refactor. A pre-fix run crashed the app when
+    // the Terminals tab's pane injected `NICE_TAB_ID` and the shadow
+    // chose the `promoteTab` branch; the guarded no-op + claude's
+    // inline exec caused a runaway socket-event storm that tripped a
+    // Swift 6 concurrency assertion. These tests would have caught it.
+
+    /// Focus the main terminal area of the app window. XCUITest sends
+    /// keystrokes to whichever view has focus, so every typing test
+    /// needs this first. 0.6 / 0.5 lands well right of the 240pt
+    /// sidebar regardless of window size.
+    private func focusMainTerminal(in app: XCUIApplication) {
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5))
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5))
+            .click()
+    }
+
+    /// Regression: typing `claude` in the built-in Terminals tab must
+    /// fire the `newtab` control-socket path (creating a new sidebar
+    /// session), not `promoteTab`. The shadow uses `$NICE_TAB_ID` to
+    /// pick branches, so the Terminals session deliberately omits that
+    /// env var. If it's re-introduced, this test catches it: a
+    /// `sidebar.tab.*` row must appear after typing, and the app must
+    /// still be running.
+    func testTypeClaudeInTerminalsFiresNewtab() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        // Give zsh a moment to finish loading .zshrc and defining the
+        // `claude()` shadow function.
+        Thread.sleep(forTimeInterval: 1.0)
+
+        focusMainTerminal(in: app)
+        app.typeText("claude\n")
+
+        // The shadow should post a newtab message over the socket,
+        // which the app processes on MainActor, creating a new sidebar
+        // row. Filter out the sub-element icon identifiers.
+        let tabQuery = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                "sidebar.tab.",
+                ".claudeIcon",
+                ".terminalIcon"
+            )
+        )
+        let appeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in tabQuery.count >= 1 }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [appeared], timeout: 10), .completed,
+            "Typing `claude` in Terminals should create a new sidebar session via newtab"
+        )
+
+        // Sanity: app is still alive (pre-fix bug caused a crash here).
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"].exists,
+            "App should still be running with sidebar visible"
+        )
+    }
+
+    /// Regression: typing `claude` in a user session's terminal pane
+    /// must fire `promoteTab` (which promotes the active pane to a
+    /// claude pane and appends a fresh terminal), without crashing the
+    /// app. Pre-fix this would have also been stable — the crash was
+    /// Terminals-specific — but this guards against regressions in the
+    /// companion-pane path.
+    func testTypeClaudeInUserSessionTerminalPromotes() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        let rowId = try createTabViaSocket(in: app, socketPath: socketPath)
+        let row = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier == %@", rowId)
+        ).element(boundBy: 0)
+        row.click()
+
+        // Wait for both pills to render (claude + terminal).
+        let twoPills = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") >= 2
+            }),
+            object: nil
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [twoPills], timeout: 5), .completed)
+
+        // Activate the second pill (the terminal kind) so typing targets
+        // its pty, not the Claude chat. SwiftUI can expose each pill as
+        // multiple accessibility elements with the same identifier, so
+        // we dedupe to find the genuinely-different second pane id.
+        let uniquePillIds = Array(NSOrderedSet(array: panePillIds(in: app))) as! [String]
+        XCTAssertGreaterThanOrEqual(uniquePillIds.count, 2,
+            "Expected at least 2 distinct pane ids before promote")
+        let terminalPaneId = uniquePillIds[1]
+        let terminalPill = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "tab.pill.\(terminalPaneId)"))
+            .element(boundBy: 0)
+        terminalPill.click()
+
+        // Give the terminal pane's zsh a moment to finish startup and
+        // SwiftUI a moment to swap the main content.
+        Thread.sleep(forTimeInterval: 1.5)
+
+        let uniqueBefore = Set(panePillIds(in: app)).count
+        focusMainTerminal(in: app)
+        app.typeText("claude\n")
+
+        // Promote flow appends a fresh terminal pane, so the count of
+        // distinct pane ids should grow by at least one.
+        let pillsGrew = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                Set(self.panePillIds(in: app)).count > uniqueBefore
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [pillsGrew], timeout: 10), .completed,
+            "Typing `claude` in a user-session terminal pane should grow the pill count via promoteTab"
+        )
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"].exists,
+            "App should still be running after promote flow"
+        )
+    }
+
+    /// Regression: typing `claude` repeatedly in the Terminals tab must
+    /// not destabilise the control socket. Each invocation opens a new
+    /// sidebar session; the final count must match, and the app must
+    /// remain responsive. This is the closest structural test for the
+    /// socket-event storm crash short of driving claude's real subshell
+    /// behaviour.
+    func testTypeClaudeMultipleTimesInTerminalsIsStable() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+        Thread.sleep(forTimeInterval: 1.0)
+
+        let tabQuery = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                "sidebar.tab.",
+                ".claudeIcon",
+                ".terminalIcon"
+            )
+        )
+
+        let rounds = 3
+        for i in 1...rounds {
+            // Each round needs to drop back into the Terminals tab so
+            // the next `claude` invocation lands in its zsh pane.
+            app.descendants(matching: .any)["sidebar.terminals"].click()
+            Thread.sleep(forTimeInterval: 0.3)
+            focusMainTerminal(in: app)
+            app.typeText("claude\n")
+
+            let expected = i
+            let reached = XCTNSPredicateExpectation(
+                predicate: NSPredicate(block: { _, _ in tabQuery.count >= expected }),
+                object: nil
+            )
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [reached], timeout: 10), .completed,
+                "Round \(i): expected >= \(expected) sidebar session rows after typing claude"
+            )
+        }
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"].exists,
+            "App must survive repeated `claude` invocations"
+        )
+    }
 }
