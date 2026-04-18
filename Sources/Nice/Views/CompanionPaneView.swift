@@ -123,7 +123,8 @@ struct CompanionPaneView: View {
            let active = tab.activeCompanionId,
            let session = appState.ptySessions[tabId],
            let view = session.terminals[active] {
-            TerminalHost(view: view)
+            TerminalHost(view: view, focus: !tab.hasClaudePane)
+                .id(active)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             // No companion to host (transient during teardown). Fill
