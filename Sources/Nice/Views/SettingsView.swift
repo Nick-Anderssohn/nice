@@ -18,6 +18,7 @@
 //
 
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 // MARK: - Section enum
@@ -145,11 +146,40 @@ private struct GeneralPane: View {
         return mainTerminalCwd
     }
 
+    /// Custom binding so flipping the Toggle calls SMAppService.register/
+    /// unregister instead of just writing @AppStorage. If the call
+    /// throws, we snap the UI back to whatever SMAppService reports —
+    /// common in dev builds where the app isn't in /Applications.
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { launchAtLogin },
+            set: { newValue in
+                do {
+                    if newValue {
+                        try SMAppService.mainApp.register()
+                    } else {
+                        try SMAppService.mainApp.unregister()
+                    }
+                    launchAtLogin = newValue
+                } catch {
+                    NSLog("SMAppService \(newValue ? "register" : "unregister") failed: \(error)")
+                    launchAtLogin = SMAppService.mainApp.status == .enabled
+                }
+            }
+        )
+    }
+
     var body: some View {
         SettingTitle("General")
+            .onAppear {
+                // Sync the stored flag with reality — the user may have
+                // toggled the Login Items entry via System Settings, or
+                // a previous register() call may have silently failed.
+                launchAtLogin = SMAppService.mainApp.status == .enabled
+            }
 
         SettingRow(label: "Launch at login") {
-            Toggle("", isOn: $launchAtLogin)
+            Toggle("", isOn: launchAtLoginBinding)
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
@@ -229,7 +259,7 @@ private struct MCPPane: View {
         SettingTitle("MCP Server")
 
         SettingRow(label: "Status") {
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Circle()
                     .fill(appState.mcp.isRunning ? runningGreen : stoppedRed)
                     .frame(width: 8, height: 8)
@@ -240,6 +270,13 @@ private struct MCPPane: View {
                 )
                     .font(.system(size: 12))
                     .foregroundStyle(Color.niceInk(scheme))
+                if !appState.mcp.isRunning {
+                    Button("Start") {
+                        let state = appState
+                        Task { await state.mcp.start(appState: state) }
+                    }
+                    .controlSize(.small)
+                }
             }
         }
 

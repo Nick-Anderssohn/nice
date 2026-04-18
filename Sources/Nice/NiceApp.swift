@@ -24,6 +24,7 @@ struct NiceApp: App {
                 .environmentObject(tweaks)
                 .frame(minWidth: 1180, minHeight: 680)
                 .preferredColorScheme(tweaks.theme.scheme)
+                .tint(tweaks.accent.color)
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
@@ -37,6 +38,7 @@ struct NiceApp: App {
                 .environmentObject(tweaks)
                 .frame(width: 640, height: 440)
                 .preferredColorScheme(tweaks.theme.scheme)
+                .tint(tweaks.accent.color)
         }
     }
 }

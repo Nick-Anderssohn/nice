@@ -9,6 +9,7 @@
 
 import AppKit
 import SwiftTerm
+import SwiftUI
 
 @MainActor
 final class MainTerminalSession: ObservableObject {
@@ -28,11 +29,20 @@ final class MainTerminalSession: ObservableObject {
         self.view.processDelegate = delegateBridge
         self.view.startProcess(
             executable: "/bin/zsh",
-            args: ["-l"],
+            args: ["-il"],
             environment: nil,
             execName: nil,
             currentDirectory: Self.expandTilde(cwd)
         )
+    }
+
+    /// Paint the pane with the Nice palette for the current color scheme.
+    /// Called from `AppShellView` on appear and on scheme changes.
+    func applyTheme(_ scheme: ColorScheme) {
+        // Qualify with `SwiftUI.` to disambiguate from `SwiftTerm.Color`.
+        view.nativeBackgroundColor = SwiftUI.Color.niceBg3NS(scheme)
+        view.nativeForegroundColor = SwiftUI.Color.niceInkNS(scheme)
+        view.installColors(NiceANSIPalette.colors(for: scheme))
     }
 
     /// Terminate the current zsh (if any) and re-spawn in `cwd`. Called
@@ -42,7 +52,7 @@ final class MainTerminalSession: ObservableObject {
         view.process.terminate()
         view.startProcess(
             executable: "/bin/zsh",
-            args: ["-l"],
+            args: ["-il"],
             environment: nil,
             execName: nil,
             currentDirectory: Self.expandTilde(cwd)

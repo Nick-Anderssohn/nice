@@ -71,6 +71,10 @@ struct AppShellView: View {
             // so a re-render firing `.task` again is harmless.
             await appState.bootstrap()
         }
+        .onAppear { appState.updateScheme(scheme) }
+        .onChange(of: scheme) { _, newScheme in
+            appState.updateScheme(newScheme)
+        }
     }
 }
 

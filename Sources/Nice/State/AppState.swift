@@ -25,6 +25,12 @@ final class AppState: ObservableObject {
     @Published private(set) var ptySessions: [String: TabPtySession] = [:]
     @Published private(set) var mainTerminal: MainTerminalSession
 
+    /// Tracks the SwiftUI `ColorScheme` currently showing. `AppShellView`
+    /// keeps this in sync via `updateScheme(_:)` so new sessions can be
+    /// themed at creation without the view layer plumbing the scheme in
+    /// manually.
+    private var currentScheme: ColorScheme = .dark
+
     // MARK: - Phase 6 MCP server
 
     /// In-process HTTP MCP server. Started from `bootstrap()` after the
@@ -39,7 +45,11 @@ final class AppState: ObservableObject {
 
     init() {
         self.projects = Project.seed
-        self.activeTabId = "t1"
+        // Main terminal is the default selection — `AppShellView` renders
+        // just the terminal (no chat pane) in that state, which is the
+        // right blank-slate for a fresh launch. Users opt into a tab by
+        // clicking one or creating a new one.
+        self.activeTabId = nil
 
         // Initial cwd for the main terminal mirrors the sidebar's
         // `@AppStorage("mainTerminalCwd")` default ($HOME). If the user
@@ -49,16 +59,10 @@ final class AppState: ObservableObject {
         self.mainTerminal = MainTerminalSession(cwd: storedMainCwd)
 
         // Resolve `claude` synchronously on launch (takes <10ms) so the
-        // very first tab spawned in init below actually runs claude, not
-        // the zsh fallback. If it's not on PATH, resolvedClaudePath stays
-        // nil and all tabs fall back to zsh.
+        // first tab the user clicks actually runs claude, not the zsh
+        // fallback. If it's not on PATH, resolvedClaudePath stays nil
+        // and all tabs fall back to zsh.
         self.resolvedClaudePath = Self.runWhich(binary: "claude")
-
-        // Warm the pty for the initial selection so the first render
-        // shows a live terminal, not a white frame.
-        if let id = activeTabId, let tab = tab(for: id) {
-            _ = session(for: id, cwd: tab.cwd)
-        }
     }
 
     // MARK: - Selection
@@ -95,10 +99,28 @@ final class AppState: ObservableObject {
     // MARK: - Bootstrap
 
     /// Called from `AppShellView.task` on first render. Starts the MCP
-    /// server exactly once. Guarded by `mcp.isRunning` so SwiftUI
-    /// refiring `.task` is harmless.
+    /// server exactly once, unless the user has unchecked
+    /// `@AppStorage("mcpAutoStart")` in Settings → MCP. Guarded by
+    /// `mcp.isRunning` so SwiftUI refiring `.task` is harmless.
     func bootstrap() async {
+        let defaults = UserDefaults.standard
+        let shouldAutoStart = (defaults.object(forKey: "mcpAutoStart") as? Bool) ?? true
+        guard shouldAutoStart else { return }
         await mcp.start(appState: self)
+    }
+
+    // MARK: - Theme
+
+    /// Called from `AppShellView` whenever the effective color scheme
+    /// changes (and once on first appear). Stores the value so new
+    /// sessions spawn pre-themed, and re-applies to every existing
+    /// session so pre-existing tabs repaint live.
+    func updateScheme(_ scheme: ColorScheme) {
+        currentScheme = scheme
+        for session in ptySessions.values {
+            session.applyTheme(scheme)
+        }
+        mainTerminal.applyTheme(scheme)
     }
 
     // MARK: - MCP tool handlers
@@ -216,6 +238,7 @@ final class AppState: ObservableObject {
             claudeBinary: resolvedClaudePath,
             mcpConfigPath: cfgPath
         )
+        session.applyTheme(currentScheme)
         ptySessions[tabId] = session
         return session
     }

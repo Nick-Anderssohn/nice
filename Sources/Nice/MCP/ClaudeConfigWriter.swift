@@ -6,11 +6,12 @@
 //  server to `claude` processes spawned by `TabPtySession`. The file's
 //  path is passed as `--mcp-config <path>` to the claude binary so each
 //  tab's Claude can call back into Nice via the HTTP MCP endpoint on
-//  127.0.0.1:<port>.
+//  127.0.0.1:<port>/mcp.
 //
-//  Per Claude Code's config format, HTTP servers are identified purely
-//  by a `url` key — no `type` field and no path suffix. Claude Code
-//  infers HTTP transport from the URL scheme.
+//  Claude Code's current MCP config schema requires an explicit `type`
+//  field ("http" | "sse" | "stdio"); the URL-only form produces
+//  "Invalid MCP configuration: … Does not adhere to MCP server
+//  configuration schema". We emit `type: "http"` alongside the URL.
 //
 
 import Foundation
@@ -28,7 +29,10 @@ enum ClaudeConfigWriter {
         let file = dir.appendingPathComponent("\(UUID().uuidString).json")
         let payload: [String: Any] = [
             "mcpServers": [
-                "nice": ["url": "http://127.0.0.1:\(port)"]
+                "nice": [
+                    "type": "http",
+                    "url": "http://127.0.0.1:\(port)/mcp",
+                ]
             ]
         ]
         let data = try JSONSerialization.data(

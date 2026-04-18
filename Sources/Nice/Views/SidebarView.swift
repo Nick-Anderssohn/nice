@@ -118,6 +118,7 @@ private struct MainTerminalRow: View {
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
     @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
+    @State private var hover = false
 
     private var isActive: Bool { appState.activeTabId == nil }
 
@@ -129,6 +130,12 @@ private struct MainTerminalRow: View {
             return "~" + mainTerminalCwd.dropFirst(home.count)
         }
         return mainTerminalCwd
+    }
+
+    private var backgroundColor: Color {
+        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
+        if hover    { return Color.niceInk(scheme).opacity(0.06) }
+        return .clear
     }
 
     var body: some View {
@@ -149,12 +156,11 @@ private struct MainTerminalRow: View {
         .foregroundStyle(isActive ? Color.niceInk(scheme) : Color.niceInk2(scheme))
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isActive
-                      ? Color.niceSel(scheme, accent: tweaks.accent.color)
-                      : Color.clear)
+                .fill(backgroundColor)
         )
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
+        .onHover { hover = $0 }
         .onTapGesture {
             appState.selectMainTerminal()
         }

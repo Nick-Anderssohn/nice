@@ -11,6 +11,7 @@
 
 import AppKit
 import SwiftTerm
+import SwiftUI
 
 @MainActor
 final class TabPtySession: ObservableObject {
@@ -42,15 +43,26 @@ final class TabPtySession: ObservableObject {
 
         // Spawn claude if available; otherwise spawn zsh as a fallback so
         // the user always sees a live prompt in the middle pane.
+        //
+        // claude shells out to `/bin/sh -c "node …"` for sub-tools, so
+        // it needs the user's full PATH. Three reasons the default env
+        // is insufficient: (1) apps opened from Finder inherit only
+        // launchd's minimal PATH (no `/opt/homebrew/bin` etc.);
+        // (2) SwiftTerm's `getEnvironmentVariables` deliberately omits
+        // PATH from the forwarded keys; and (3) node managers like nvm
+        // only activate in `.zshrc` (interactive), not `.zprofile`
+        // (login-only). Running `zsh -ilc` sources both, then `exec`
+        // swaps the shell for claude so the process tree looks clean.
         let resolvedCwd = Self.expandTilde(cwd)
         if let claude = claudeBinary {
-            var args: [String] = []
+            var parts = ["exec", Self.shellQuote(claude)]
             if let cfg = mcpConfigPath?.path {
-                args.append(contentsOf: ["--mcp-config", cfg])
+                parts.append("--mcp-config")
+                parts.append(Self.shellQuote(cfg))
             }
             chatView.startProcess(
-                executable: claude,
-                args: args,
+                executable: "/bin/zsh",
+                args: ["-ilc", parts.joined(separator: " ")],
                 environment: nil,
                 execName: nil,
                 currentDirectory: resolvedCwd
@@ -58,7 +70,7 @@ final class TabPtySession: ObservableObject {
         } else {
             chatView.startProcess(
                 executable: "/bin/zsh",
-                args: ["-l"],
+                args: ["-il"],
                 environment: nil,
                 execName: nil,
                 currentDirectory: resolvedCwd
@@ -66,17 +78,40 @@ final class TabPtySession: ObservableObject {
         }
         terminalView.startProcess(
             executable: "/bin/zsh",
-            args: ["-l"],
+            args: ["-il"],
             environment: nil,
             execName: nil,
             currentDirectory: resolvedCwd
         )
     }
 
+    /// Single-quote a string for safe inclusion in a zsh `-c` command.
+    /// Embedded single quotes are escaped with the standard `'\''`
+    /// close-open-escape-reopen sequence.
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Send `text` plus a newline into the tab's right-side terminal.
     func sendToTerminal(_ text: String) {
         let data = Array((text + "\n").utf8)
         terminalView.send(data: ArraySlice(data))
+    }
+
+    /// Paint both panes with the Nice palette for the current color
+    /// scheme. Called from `AppShellView` on appear and whenever the
+    /// effective `ColorScheme` flips.
+    func applyTheme(_ scheme: ColorScheme) {
+        // `Color` is ambiguous in this file — SwiftTerm also exports one.
+        // Qualify with `SwiftUI.` to pick up the palette extensions.
+        let bg = SwiftUI.Color.niceBg3NS(scheme)
+        let fg = SwiftUI.Color.niceInkNS(scheme)
+        let palette = NiceANSIPalette.colors(for: scheme)
+        for view in [chatView, terminalView] {
+            view.nativeBackgroundColor = bg
+            view.nativeForegroundColor = fg
+            view.installColors(palette)
+        }
     }
 
     /// Expand a leading `~` to `$HOME` so `startProcess`'s working

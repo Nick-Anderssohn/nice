@@ -4,7 +4,7 @@ A native macOS GUI that sits in front of the [`claude`](https://github.com/anthr
 
 ## Status
 
-Early. All six scaffold phases are landed and the app runs end-to-end, but the polish list is non-empty. See [Known gaps](#known-gaps) below.
+Early but functional. All six scaffold phases are landed, the app runs end-to-end, native controls respect the user's accent, SwiftTerm panes theme to match `niceBg3`, "Launch at login" is wired to `SMAppService`, and an automated MCP smoke test (`scripts/mcp-e2e.sh`) covers the Claude-in-a-tab → `nice.tab.new` loop.
 
 ## Requirements
 
@@ -82,12 +82,16 @@ The look was mocked up in HTML/React at [claude.ai/design](https://claude.ai/des
 - **Voice button.** Out of scope — OS dictation into the active Claude reaches the same MCP tools (`nice.tab.switch`, `nice.tab.new`, etc.) without needing a microphone UI or hotkey-managed speech pipeline in Nice itself.
 - **Mac App Store distribution.** Blocked by the sandbox requirement — the App Sandbox forbids spawning child processes via pty.
 
-## Known gaps
+## Testing the MCP surface
 
-- Toggle/button tint uses the system accent (blue) rather than the user-selected Nice accent — needs `.tint(...)` on root scenes
-- SwiftTerm panes default to a black background; theming the ANSI palette to match `niceBg3` would complete the visual integration
-- "Launch at login" / "Auto-start at login" toggles are `@AppStorage` stubs — no real `SMAppService` registration yet
-- No automated end-to-end test yet covering "Claude-in-tab calls `nice.tab.new`" (verified manually via `curl`)
+`scripts/mcp-e2e.sh` is a smoke test that simulates what a Claude running inside a tab does: it performs the MCP `initialize` handshake, asserts the four `nice.*` tools are advertised, calls `nice.tab.new`, and confirms the new tab shows up in `nice.tab.list`.
+
+```sh
+open ~/Library/Developer/Xcode/DerivedData/Nice-*/Build/Products/Debug/Nice.app
+./scripts/mcp-e2e.sh
+```
+
+Requires `curl` and `jq`. Non-zero exit means a check failed.
 
 ## Credits
 
