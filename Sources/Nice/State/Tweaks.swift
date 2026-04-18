@@ -11,6 +11,7 @@
 //  /tmp/nice-design/nice/project/nice/tweaks.jsx (five swatches).
 //
 
+import AppKit
 import SwiftUI
 
 // MARK: - Theme choice
@@ -31,6 +32,16 @@ enum ThemeChoice: String, CaseIterable, Identifiable {
         case .system: nil
         case .light:  .light
         case .dark:   .dark
+        }
+    }
+
+    /// `NSAppearance` equivalent, or `nil` for `.system` to inherit the OS
+    /// appearance.
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: nil
+        case .light:  NSAppearance(named: .aqua)
+        case .dark:   NSAppearance(named: .darkAqua)
         }
     }
 }
@@ -89,7 +100,10 @@ final class Tweaks: ObservableObject {
     static let accentKey = "accent"
 
     @Published var theme: ThemeChoice {
-        didSet { UserDefaults.standard.set(theme.rawValue, forKey: Self.themeKey) }
+        didSet {
+            UserDefaults.standard.set(theme.rawValue, forKey: Self.themeKey)
+            NSApp?.appearance = theme.nsAppearance
+        }
     }
 
     @Published var accent: AccentPreset {
@@ -100,7 +114,9 @@ final class Tweaks: ObservableObject {
         let defaults = UserDefaults.standard
         let rawTheme = defaults.string(forKey: Self.themeKey) ?? ThemeChoice.system.rawValue
         let rawAccent = defaults.string(forKey: Self.accentKey) ?? AccentPreset.terracotta.rawValue
-        self.theme = ThemeChoice(rawValue: rawTheme) ?? .system
+        let theme = ThemeChoice(rawValue: rawTheme) ?? .system
+        self.theme = theme
         self.accent = AccentPreset(rawValue: rawAccent) ?? .terracotta
+        NSApp?.appearance = theme.nsAppearance
     }
 }

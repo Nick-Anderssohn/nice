@@ -9,6 +9,11 @@
 //  Settings window, and the Settings window is explicitly sized to
 //  640×440 per the design mock.
 //
+//  Theme is driven via `NSApp.appearance` from `Tweaks` rather than
+//  `.preferredColorScheme`, because the latter can't clear a previously
+//  applied non-nil scheme — switching back to "Match system" would leave
+//  windows pinned to the last explicit choice.
+//
 
 import SwiftUI
 
@@ -23,7 +28,6 @@ struct NiceApp: App {
                 .environmentObject(appState)
                 .environmentObject(tweaks)
                 .frame(minWidth: 1180, minHeight: 680)
-                .preferredColorScheme(tweaks.theme.scheme)
                 .tint(tweaks.accent.color)
         }
         .windowStyle(.hiddenTitleBar)
@@ -37,7 +41,6 @@ struct NiceApp: App {
                 .environmentObject(appState)
                 .environmentObject(tweaks)
                 .frame(width: 640, height: 440)
-                .preferredColorScheme(tweaks.theme.scheme)
                 .tint(tweaks.accent.color)
         }
     }
