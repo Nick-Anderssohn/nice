@@ -50,6 +50,7 @@ struct SettingsView: View {
         }
         .frame(width: 640, height: 440)
         .background(Color.nicePanel(scheme))
+        .accessibilityIdentifier("settings.root")
     }
 
     // MARK: Left rail
@@ -510,28 +511,6 @@ private struct ReadOnlyValuePill: View {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .strokeBorder(Color.niceLineStrong(scheme), lineWidth: 1)
             )
-    }
-}
-
-// MARK: - Helpers
-
-/// Opens the Settings window from anywhere (e.g. the sidebar gear).
-/// macOS 13+ uses `showSettingsWindow:`; earlier releases use the older
-/// `showPreferencesWindow:` selector. We try both so this keeps working
-/// across OS versions.
-@MainActor
-enum SettingsWindow {
-    static func open() {
-        NSApp.activate(ignoringOtherApps: true)
-        let settingsSel = Selector(("showSettingsWindow:"))
-        if NSApp.responds(to: settingsSel) {
-            NSApp.sendAction(settingsSel, to: nil, from: nil)
-            return
-        }
-        let prefsSel = Selector(("showPreferencesWindow:"))
-        if NSApp.responds(to: prefsSel) {
-            NSApp.sendAction(prefsSel, to: nil, from: nil)
-        }
     }
 }
 

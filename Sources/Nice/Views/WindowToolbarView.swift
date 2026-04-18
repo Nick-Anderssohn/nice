@@ -40,8 +40,6 @@ struct WindowToolbarView: View {
                 .foregroundStyle(Color.niceInk(scheme))
                 .layoutPriority(1)
 
-            MCPChip()
-
             // Vertical separator — width:1, height:20, margin: 0 6px.
             Rectangle()
                 .fill(Color.niceLine(scheme))
@@ -311,30 +309,6 @@ private struct NewTabBtn: View {
         .help("New tab")
         .accessibilityIdentifier("tab.add")
         .accessibilityLabel("New tab")
-    }
-}
-
-// MARK: - MCP chip
-
-/// Small accent-coloured "MCP" pill that sits next to the brand mark.
-/// Mirrors the inline span in app.jsx with its `--accent-soft` background
-/// (accent at 18% alpha). Reads the accent from `Tweaks` so it repaints
-/// when the user picks a new swatch.
-private struct MCPChip: View {
-    @EnvironmentObject private var tweaks: Tweaks
-
-    var body: some View {
-        let accent = tweaks.accent.color
-        Text("MCP")
-            .font(.system(size: 9.5, weight: .bold))
-            .tracking(0.3)
-            .foregroundStyle(accent)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(accent.opacity(0.18))
-            )
     }
 }
 

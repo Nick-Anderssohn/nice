@@ -864,6 +864,33 @@ final class NiceUITests: XCTestCase {
         )
     }
 
+    // MARK: - Settings window
+
+    /// Regression: clicking the sidebar settings gear must open the
+    /// Settings window. Pre-fix the gear called a stale `showSettingsWindow:`
+    /// selector path that silently failed; this guards the
+    /// `@Environment(\.openSettings)` wiring.
+    func testSettingsGearOpensSettingsWindow() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        let gear = app.descendants(matching: .any)["sidebar.settings"]
+        XCTAssertTrue(
+            gear.waitForExistence(timeout: 5),
+            "Sidebar settings gear should exist"
+        )
+        gear.click()
+
+        let settingsRoot = app.descendants(matching: .any)["settings.root"]
+        XCTAssertTrue(
+            settingsRoot.waitForExistence(timeout: 5),
+            "Clicking the sidebar settings gear must open the Settings window"
+        )
+    }
+
     // MARK: - Typing `claude` in a pane (regression tests)
     //
     // These exercise the full zsh-shadow → control-socket → AppState path

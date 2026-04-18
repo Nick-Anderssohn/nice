@@ -13,6 +13,7 @@ struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         if appState.sidebarCollapsed {
@@ -69,7 +70,8 @@ struct SidebarView: View {
             RailButton(
                 systemImage: "gearshape",
                 help: "Settings",
-                action: { SettingsWindow.open() }
+                accessibilityId: "sidebar.settings",
+                action: { openSettings() }
             )
         }
         .padding(.top, 10)
@@ -159,8 +161,12 @@ struct SidebarView: View {
     private var footer: some View {
         HStack(spacing: 4) {
             Spacer(minLength: 0)
-            SidebarIconButton(systemImage: "gearshape", help: "Settings") {
-                SettingsWindow.open()
+            SidebarIconButton(
+                systemImage: "gearshape",
+                help: "Settings",
+                accessibilityId: "sidebar.settings"
+            ) {
+                openSettings()
             }
         }
         .padding(.horizontal, 8)
@@ -182,6 +188,7 @@ private struct RailButton: View {
     let systemImage: String
     let help: String
     var isActive: Bool = false
+    var accessibilityId: String? = nil
     let action: () -> Void
 
     @State private var hover = false
@@ -217,6 +224,7 @@ private struct RailButton: View {
         .onHover { hover = $0 }
         .onTapGesture { action() }
         .help(help)
+        .accessibilityIdentifier(accessibilityId ?? "")
     }
 }
 
@@ -473,6 +481,7 @@ private struct SidebarIconButton: View {
 
     let systemImage: String
     let help: String
+    var accessibilityId: String? = nil
     let action: () -> Void
 
     @State private var hover = false
@@ -490,6 +499,7 @@ private struct SidebarIconButton: View {
             .onHover { hover = $0 }
             .onTapGesture { action() }
             .help(help)
+            .accessibilityIdentifier(accessibilityId ?? "")
     }
 }
 
