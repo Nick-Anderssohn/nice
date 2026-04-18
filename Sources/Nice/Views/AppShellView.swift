@@ -61,7 +61,7 @@ struct AppShellView: View {
                         lineWidth: 0.5
                     )
             )
-            .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+            .shadow(color: Color.black.opacity(0.25), radius: 10, x: 0, y: 4)
             .padding(.leading, 6)
             .padding(.top, 6)
             .padding(.bottom, 6)
