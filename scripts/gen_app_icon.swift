@@ -63,10 +63,13 @@ func renderIcon(size: Int) -> Data {
     ctx.setShouldAntialias(true)
     ctx.interpolationQuality = .high
 
-    // Rounded-square fill — 20×20 inset 1pt from each edge of the 22×22
-    // viewBox with corner radius 6.
-    let rect = CGRect(x: 1 * scale, y: 1 * scale, width: 20 * scale, height: 20 * scale)
-    let radius = 6 * scale
+    // Rounded-square fill that spans the entire canvas — unlike the
+    // in-app Logo (which insets 1pt from a 22×22 viewBox), the app icon
+    // needs to be edge-to-edge so macOS's dock tile doesn't leave a
+    // visible gutter of transparent/white around the blue.
+    // Corner radius 6.6 preserves the in-app logo's 30% rounding ratio.
+    let rect = CGRect(x: 0, y: 0, width: w, height: w)
+    let radius = 6.6 * scale
     let fillPath = CGPath(
         roundedRect: rect,
         cornerWidth: radius,
