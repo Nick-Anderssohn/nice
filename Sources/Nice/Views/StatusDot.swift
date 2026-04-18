@@ -1,0 +1,96 @@
+//
+//  StatusDot.swift
+//  Nice
+//
+//  Port of the `StatusDot` component from
+//  /tmp/nice-design/nice/project/nice/sidebar.jsx. An 8pt circle whose
+//  colour maps to TabStatus. When `thinking`, the dot breathes (0.5↔1.0
+//  opacity at 1.4s) and an outer ring scales 1.0→1.6 while fading out
+//  (1.6s). Keyframes come from the `@keyframes pulse-ring` and
+//  `@keyframes status-pulse` rules in Nice.html.
+//
+
+import SwiftUI
+
+struct StatusDot: View {
+    @Environment(\.colorScheme) private var scheme
+
+    let status: TabStatus
+    /// Disables the `thinking` pulse in previews/snapshots.
+    var pulsePaused: Bool = false
+
+    @State private var pulsing: Bool = false
+
+    private var baseColor: Color {
+        switch status {
+        case .thinking:
+            return .niceAccent
+        case .waiting:
+            // oklch(0.65 0.14 250) -> sRGB approximation per the JSX.
+            return Color(.sRGB, red: 0.48, green: 0.58, blue: 0.86, opacity: 1)
+        case .idle:
+            return .niceInk3(scheme)
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch status {
+        case .thinking: return "Thinking"
+        case .waiting:  return "Waiting for input"
+        case .idle:     return "Idle"
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            // Expanding ring — only rendered when thinking.
+            if status == .thinking {
+                Circle()
+                    .fill(baseColor)
+                    .frame(width: 12, height: 12) // 8 + inset(-2) each side
+                    .scaleEffect(pulsing ? 1.6 : 1.0)
+                    .opacity(pulsing ? 0.0 : 0.6)
+                    .animation(
+                        pulsePaused
+                            ? nil
+                            : .easeOut(duration: 1.6).repeatForever(autoreverses: false),
+                        value: pulsing
+                    )
+            }
+
+            // Inner solid dot.
+            Circle()
+                .fill(baseColor)
+                .frame(width: 8, height: 8)
+                .opacity(
+                    status == .thinking
+                        ? (pulsing ? 1.0 : 0.5)
+                        : 1.0
+                )
+                .animation(
+                    (status == .thinking && !pulsePaused)
+                        ? .easeInOut(duration: 0.7).repeatForever(autoreverses: true)
+                        : nil,
+                    value: pulsing
+                )
+        }
+        // Frame matches the outer ring size so layout doesn't jitter between
+        // statuses. Callers should still treat the logical size as 8pt.
+        .frame(width: 12, height: 12)
+        .onAppear {
+            if !pulsePaused {
+                pulsing = true
+            }
+        }
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+#Preview("States") {
+    HStack(spacing: 24) {
+        StatusDot(status: .thinking)
+        StatusDot(status: .waiting)
+        StatusDot(status: .idle)
+    }
+    .padding(40)
+}
