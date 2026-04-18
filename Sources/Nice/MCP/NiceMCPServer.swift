@@ -1,0 +1,265 @@
+//
+//  NiceMCPServer.swift
+//  Nice
+//
+//  Phase 6: owns the in-process MCP server lifecycle. Registers four
+//  tools the `claude` CLI inside each tab can call back into:
+//
+//    nice.tab.new    — spawn a new sibling tab
+//    nice.tab.switch — focus a tab by id or fuzzy title match
+//    nice.tab.list   — enumerate all tabs as JSON
+//    nice.run        — run a shell command in a tab's companion zsh
+//
+//  The server itself uses the Swift SDK's `StatefulHTTPServerTransport`
+//  (framework-agnostic — just parses/emits `HTTPRequest`/`HTTPResponse`)
+//  paired with our local `NiceHTTPBridge` (an `NWListener` on
+//  127.0.0.1:7420 that speaks HTTP/1.1 + chunked SSE).
+//
+//  Tool handlers are `@Sendable async throws` and hop to `@MainActor`
+//  before touching `AppState`.
+//
+
+import Foundation
+import MCP
+
+@MainActor
+final class NiceMCPServer: ObservableObject {
+    @Published private(set) var isRunning = false
+    @Published private(set) var port: Int = 7420
+
+    private weak var appState: AppState?
+    private var server: Server?
+    private var transport: StatefulHTTPServerTransport?
+    private var bridge: NiceHTTPBridge?
+    private var serverTask: Task<Void, Never>?
+
+    /// Start the server. Idempotent — if `isRunning` is already true,
+    /// this is a no-op. Called from `AppState.bootstrap()`.
+    func start(appState: AppState) async {
+        guard !isRunning else { return }
+        self.appState = appState
+
+        let server = Server(
+            name: "Nice",
+            version: "0.1.0",
+            capabilities: .init(tools: .init(listChanged: false))
+        )
+        let transport = StatefulHTTPServerTransport()
+
+        // Register tool handlers. These run on the server actor; they
+        // hop to MainActor before touching AppState.
+        await server.withMethodHandler(ListTools.self) { _ in
+            ListTools.Result(tools: NiceMCPServer.tools)
+        }
+        await server.withMethodHandler(CallTool.self) { [weak self] params in
+            guard let self else {
+                return CallTool.Result(
+                    content: [.text(text: "server gone", annotations: nil, _meta: nil)],
+                    isError: true
+                )
+            }
+            return try await self.handleCall(params: params)
+        }
+
+        let bridge = NiceHTTPBridge(
+            port: UInt16(self.port), transport: transport
+        )
+        do {
+            try await bridge.start()
+        } catch {
+            NSLog("NiceMCPServer: failed to bind HTTP bridge on port \(self.port): \(error)")
+            return
+        }
+
+        self.server = server
+        self.transport = transport
+        self.bridge = bridge
+
+        // Start the server's receive loop. `Server.start` connects the
+        // transport and runs the message loop until the transport is
+        // disconnected.
+        serverTask = Task { [server, transport] in
+            do {
+                try await server.start(transport: transport)
+                await server.waitUntilCompleted()
+            } catch {
+                NSLog("NiceMCPServer: server loop ended with error: \(error)")
+            }
+        }
+
+        isRunning = true
+        NSLog("NiceMCPServer: running on 127.0.0.1:\(port)")
+    }
+
+    func stop() async {
+        serverTask?.cancel()
+        serverTask = nil
+        await server?.stop()
+        await bridge?.stop()
+        server = nil
+        transport = nil
+        bridge = nil
+        isRunning = false
+    }
+
+    // MARK: - Tool registry
+
+    /// The four static tool definitions advertised via `tools/list`.
+    /// Schemas are encoded as the SDK's `Value` JSON form.
+    ///
+    /// `nonisolated` so the Sendable `ListTools` handler closure can
+    /// read it without hopping to the main actor.
+    nonisolated static var tools: [Tool] {
+        [
+            Tool(
+                name: "nice.tab.new",
+                description: "Open a new tab in Nice, optionally with a title, working directory, and project id.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "title": .object([
+                            "type": .string("string"),
+                            "description": .string("Display title for the new tab."),
+                        ]),
+                        "cwd": .object([
+                            "type": .string("string"),
+                            "description": .string("Working directory for the new tab. Supports ~."),
+                        ]),
+                        "project": .object([
+                            "type": .string("string"),
+                            "description": .string("Project id to attach the tab to (defaults to the first project)."),
+                        ]),
+                    ]),
+                ])
+            ),
+            Tool(
+                name: "nice.tab.switch",
+                description: "Focus an existing tab, either by exact id or by fuzzy-matching its title.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "tabId": .object([
+                            "type": .string("string"),
+                            "description": .string("Exact tab id."),
+                        ]),
+                        "titleQuery": .object([
+                            "type": .string("string"),
+                            "description": .string("Case-insensitive substring to match against tab titles."),
+                        ]),
+                    ]),
+                ])
+            ),
+            Tool(
+                name: "nice.tab.list",
+                description: "List every tab across all projects.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                ])
+            ),
+            Tool(
+                name: "nice.run",
+                description: "Run a shell command in a tab's companion terminal. If tabId is omitted, runs in the currently active tab.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "required": .array([.string("command")]),
+                    "properties": .object([
+                        "tabId": .object([
+                            "type": .string("string"),
+                            "description": .string("Target tab id. Defaults to the active tab."),
+                        ]),
+                        "command": .object([
+                            "type": .string("string"),
+                            "description": .string("Shell command to run (appended with a newline)."),
+                        ]),
+                    ]),
+                ])
+            ),
+        ]
+    }
+
+    // MARK: - CallTool dispatch
+
+    private func handleCall(params: CallTool.Parameters) async throws -> CallTool.Result {
+        let args = params.arguments ?? [:]
+        switch params.name {
+        case "nice.tab.new":
+            let title = args["title"]?.stringValue
+            let cwd = args["cwd"]?.stringValue
+            let id = await MainActor.run { [weak appState] in
+                appState?.mcpCreateTab(cwd: cwd, title: title) ?? ""
+            }
+            let json = Self.jsonString(["tabId": id])
+            return CallTool.Result(
+                content: [.text(text: json, annotations: nil, _meta: nil)]
+            )
+
+        case "nice.tab.switch":
+            let tabId = args["tabId"]?.stringValue
+            let query = args["titleQuery"]?.stringValue
+            let resolved = await MainActor.run { [weak appState] in
+                appState?.mcpSwitchTab(tabId: tabId, titleQuery: query)
+            }
+            if let resolved {
+                let json = Self.jsonString(["tabId": resolved])
+                return CallTool.Result(
+                    content: [.text(text: json, annotations: nil, _meta: nil)]
+                )
+            } else {
+                return CallTool.Result(
+                    content: [.text(text: "no match", annotations: nil, _meta: nil)],
+                    isError: true
+                )
+            }
+
+        case "nice.tab.list":
+            let rows = await MainActor.run { [weak appState] in
+                appState?.mcpListTabs() ?? []
+            }
+            let json = Self.jsonArrayString(rows)
+            return CallTool.Result(
+                content: [.text(text: json, annotations: nil, _meta: nil)]
+            )
+
+        case "nice.run":
+            let tabId = args["tabId"]?.stringValue
+            let cmd = args["command"]?.stringValue ?? ""
+            let ok = await MainActor.run { [weak appState] in
+                appState?.mcpRun(tabId: tabId, command: cmd) ?? false
+            }
+            let json = Self.jsonString(["ok": ok ? "true" : "false"])
+            return CallTool.Result(
+                content: [.text(text: json, annotations: nil, _meta: nil)],
+                isError: ok ? nil : true
+            )
+
+        default:
+            return CallTool.Result(
+                content: [
+                    .text(text: "unknown tool: \(params.name)", annotations: nil, _meta: nil)
+                ],
+                isError: true
+            )
+        }
+    }
+
+    // MARK: - JSON helpers
+
+    private static func jsonString(_ dict: [String: String]) -> String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: dict, options: [.sortedKeys]
+        ), let s = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return s
+    }
+
+    private static func jsonArrayString(_ rows: [[String: String]]) -> String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: rows, options: [.sortedKeys]
+        ), let s = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return s
+    }
+}

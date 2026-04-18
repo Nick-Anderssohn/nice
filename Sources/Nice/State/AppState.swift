@@ -25,6 +25,13 @@ final class AppState: ObservableObject {
     @Published private(set) var ptySessions: [String: TabPtySession] = [:]
     @Published private(set) var mainTerminal: MainTerminalSession
 
+    // MARK: - Phase 6 MCP server
+
+    /// In-process HTTP MCP server. Started from `bootstrap()` after the
+    /// app launches; injects its port into every spawned claude via
+    /// `--mcp-config`.
+    @Published private(set) var mcp = NiceMCPServer()
+
     /// Absolute path to the `claude` binary if we've resolved it; nil
     /// means either we haven't finished resolving yet, or it isn't on
     /// the user's PATH. `TabPtySession` falls back to zsh when nil.
@@ -85,20 +92,129 @@ final class AppState: ObservableObject {
         _ = session(for: newId, cwd: tab.cwd)
     }
 
+    // MARK: - Bootstrap
+
+    /// Called from `AppShellView.task` on first render. Starts the MCP
+    /// server exactly once. Guarded by `mcp.isRunning` so SwiftUI
+    /// refiring `.task` is harmless.
+    func bootstrap() async {
+        await mcp.start(appState: self)
+    }
+
+    // MARK: - MCP tool handlers
+
+    /// Create a tab programmatically. Mirrors `newTab()` but lets the
+    /// MCP caller override cwd and title. Returns the new tab's id.
+    func mcpCreateTab(cwd: String?, title: String?) -> String {
+        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
+        let resolvedCwd = cwd ?? projects.first?.path ?? "~"
+        let tab = Tab(
+            id: newId,
+            title: title ?? "New tab",
+            status: .idle,
+            cwd: resolvedCwd,
+            branch: nil
+        )
+        if !projects.isEmpty {
+            projects[0].tabs.insert(tab, at: 0)
+        } else {
+            // Defensive: if somehow projects is empty, create a
+            // synthetic one so the tab can land somewhere.
+            projects.append(
+                Project(id: "default", name: "default", path: resolvedCwd, tabs: [tab])
+            )
+        }
+        activeTabId = newId
+        _ = session(for: newId, cwd: resolvedCwd)
+        return newId
+    }
+
+    /// Switch to a tab by id or fuzzy title match. Returns the resolved
+    /// id, or nil if nothing matches.
+    func mcpSwitchTab(tabId: String?, titleQuery: String?) -> String? {
+        if let tabId, tab(for: tabId) != nil {
+            activeTabId = tabId
+            return tabId
+        }
+        if let q = titleQuery?.lowercased(), !q.isEmpty {
+            for project in projects {
+                if let hit = project.tabs.first(where: {
+                    $0.title.lowercased().contains(q)
+                }) {
+                    activeTabId = hit.id
+                    return hit.id
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Flatten every tab across every project into dicts suitable for
+    /// JSON encoding over the MCP wire.
+    func mcpListTabs() -> [[String: String]] {
+        var rows: [[String: String]] = []
+        for project in projects {
+            for tab in project.tabs {
+                rows.append([
+                    "id": tab.id,
+                    "title": tab.title,
+                    "cwd": tab.cwd,
+                    "branch": tab.branch ?? "",
+                    "status": tab.status.rawValue,
+                    "project": project.id,
+                ])
+            }
+        }
+        return rows
+    }
+
+    /// Write `command + "\n"` into the target tab's right-side zsh.
+    /// Defaults to the active tab when `tabId` is nil. Returns false if
+    /// no suitable session is found.
+    func mcpRun(tabId: String?, command: String) -> Bool {
+        let targetId = tabId ?? activeTabId
+        guard let targetId else { return false }
+        let session: TabPtySession
+        if let existing = ptySessions[targetId] {
+            session = existing
+        } else if let tab = tab(for: targetId) {
+            session = self.session(for: targetId, cwd: tab.cwd)
+        } else {
+            return false
+        }
+        session.sendToTerminal(command)
+        return true
+    }
+
     // MARK: - Pty sessions
 
     /// Return the pty session for `tabId`, creating and caching one if
     /// it doesn't exist yet. The `cwd` argument is used only on first
     /// creation; subsequent lookups return the existing session as-is.
+    ///
+    /// On first creation, we also synthesize a temp `.mcp.json` and
+    /// thread its path into claude via `--mcp-config`, so the claude
+    /// inside that tab can call back into the Nice MCP server. A
+    /// failure to write the config is non-fatal — we fall back to
+    /// spawning claude without it.
     func session(for tabId: String, cwd: String? = nil) -> TabPtySession {
         if let existing = ptySessions[tabId] {
             return existing
         }
         let resolvedCwd = cwd ?? tab(for: tabId)?.cwd ?? NSHomeDirectory()
+        let cfgPath: URL? = {
+            do {
+                return try ClaudeConfigWriter.writeConfig(port: mcp.port)
+            } catch {
+                NSLog("AppState: ClaudeConfigWriter failed: \(error)")
+                return nil
+            }
+        }()
         let session = TabPtySession(
             tabId: tabId,
             cwd: resolvedCwd,
-            claudeBinary: resolvedClaudePath
+            claudeBinary: resolvedClaudePath,
+            mcpConfigPath: cfgPath
         )
         ptySessions[tabId] = session
         return session

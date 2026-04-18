@@ -212,8 +212,18 @@ private struct ShortcutsPane: View {
 // MARK: - MCP pane
 
 private struct MCPPane: View {
+    @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
     @AppStorage("mcpAutoStart") private var autoStart: Bool = true
+
+    /// oklch(0.65 0.18 145) — the settings.jsx "running" dot.
+    private let runningGreen = Color(
+        .sRGB, red: 0.31, green: 0.74, blue: 0.43, opacity: 1.0
+    )
+    /// Muted red for the "stopped" state.
+    private let stoppedRed = Color(
+        .sRGB, red: 0.76, green: 0.32, blue: 0.32, opacity: 1.0
+    )
 
     var body: some View {
         SettingTitle("MCP Server")
@@ -221,10 +231,13 @@ private struct MCPPane: View {
         SettingRow(label: "Status") {
             HStack(spacing: 6) {
                 Circle()
-                    // oklch(0.65 0.18 145) — the settings.jsx "running" dot.
-                    .fill(Color(.sRGB, red: 0.31, green: 0.74, blue: 0.43, opacity: 1.0))
+                    .fill(appState.mcp.isRunning ? runningGreen : stoppedRed)
                     .frame(width: 8, height: 8)
-                Text("Running on :7420")
+                Text(
+                    appState.mcp.isRunning
+                        ? "Running on :\(appState.mcp.port)"
+                        : "Stopped"
+                )
                     .font(.system(size: 12))
                     .foregroundStyle(Color.niceInk(scheme))
             }

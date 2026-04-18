@@ -20,7 +20,12 @@ final class TabPtySession: ObservableObject {
     let terminalView: LocalProcessTerminalView
     private let delegateBridge = TerminalDelegateBridge()
 
-    init(tabId: String, cwd: String, claudeBinary: String?) {
+    init(
+        tabId: String,
+        cwd: String,
+        claudeBinary: String?,
+        mcpConfigPath: URL? = nil
+    ) {
         self.tabId = tabId
         self.cwd = cwd
         let font = NSFont(name: "JetBrainsMono-Regular", size: 12)
@@ -39,9 +44,13 @@ final class TabPtySession: ObservableObject {
         // the user always sees a live prompt in the middle pane.
         let resolvedCwd = Self.expandTilde(cwd)
         if let claude = claudeBinary {
+            var args: [String] = []
+            if let cfg = mcpConfigPath?.path {
+                args.append(contentsOf: ["--mcp-config", cfg])
+            }
             chatView.startProcess(
                 executable: claude,
-                args: [],
+                args: args,
                 environment: nil,
                 execName: nil,
                 currentDirectory: resolvedCwd

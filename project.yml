@@ -19,6 +19,9 @@ packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
     branch: main
+  MCP:
+    url: https://github.com/modelcontextprotocol/swift-sdk.git
+    from: 0.12.0
 
 targets:
   Nice:
@@ -30,6 +33,8 @@ targets:
     dependencies:
       - package: SwiftTerm
         product: SwiftTerm
+      - package: MCP
+        product: MCP
     resources:
       - path: Resources
         excludes:

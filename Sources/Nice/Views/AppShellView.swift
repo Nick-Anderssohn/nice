@@ -65,6 +65,12 @@ struct AppShellView: View {
             }
         }
         .background(Color.niceBg2(scheme).ignoresSafeArea())
+        .task {
+            // Phase 6: boot the in-process MCP server exactly once.
+            // `bootstrap()` is idempotent via `NiceMCPServer.isRunning`
+            // so a re-render firing `.task` again is harmless.
+            await appState.bootstrap()
+        }
     }
 }
 
