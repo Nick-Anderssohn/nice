@@ -1,0 +1,28 @@
+# Swift / SPM
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# Xcode
+DerivedData/
+build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Generated from xcodegen / Info.plist
+# (regenerate via `xcodegen generate`)
+Nice.xcodeproj/
+Resources/Info.generated.plist
+
+# macOS
+.DS_Store
