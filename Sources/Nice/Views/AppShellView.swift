@@ -62,9 +62,9 @@ struct AppShellView: View {
                     )
             )
             .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-            .padding(.leading, 12)
-            .padding(.top, 40)
-            .padding(.bottom, 40)
+            .padding(.leading, 6)
+            .padding(.top, 6)
+            .padding(.bottom, 6)
 
             VStack(spacing: 0) {
                 WindowToolbarView()
