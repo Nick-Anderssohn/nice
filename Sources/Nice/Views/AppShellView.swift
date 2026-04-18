@@ -2,9 +2,14 @@
 //  AppShellView.swift
 //  Nice
 //
-//  Phase 2 shell: the left column now hosts the real `SidebarView`, wired
-//  to the shared `AppState`. Chat + terminal placeholders still come
-//  in Phase 3/4.
+//  Phase 3: root restructured as a vertical stack — the new
+//  `WindowToolbarView` sits above the existing 3-column layout so the
+//  sidebar, chat, and terminal all hang under a unified top bar. The
+//  sidebar's top inset is trimmed so its card aligns flush with the
+//  toolbar's bottom divider.
+//
+//  Chat + terminal placeholders are unchanged; real panes land in later
+//  phases.
 //
 
 import SwiftUI
@@ -13,29 +18,35 @@ struct AppShellView: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Left: floating inset "sidebar card"
-            SidebarView()
-                .frame(width: 240)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.niceBg2(scheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .shadow(color: Color.black.opacity(0.25), radius: 20, x: 0, y: 10)
-                .padding(10)
+        VStack(spacing: 0) {
+            WindowToolbarView()
 
-            // Middle: chat pane (flex) — Phase 3 placeholder.
-            chatPlaceholder
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack(spacing: 0) {
+                // Left: floating inset "sidebar card"
+                SidebarView()
+                    .frame(width: 240)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.niceBg2(scheme))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .shadow(color: Color.black.opacity(0.25), radius: 20, x: 0, y: 10)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 10)
+                    .padding(.bottom, 10)
 
-            // Right: terminal pane — Phase 4 placeholder.
-            terminalPlaceholder
-                .frame(width: 400)
+                // Middle: chat pane (flex) — Phase 3 placeholder.
+                chatPlaceholder
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                // Right: terminal pane — Phase 4 placeholder.
+                terminalPlaceholder
+                    .frame(width: 400)
+            }
         }
         .background(Color.niceBg2(scheme).ignoresSafeArea())
     }
