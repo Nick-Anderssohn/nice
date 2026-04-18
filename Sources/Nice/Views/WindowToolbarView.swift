@@ -13,8 +13,10 @@
 //    • no "+" dropdown menu ("New Claude session")
 //    • no keyboard shortcuts / drag-to-reorder
 //
-//  The window uses `.hiddenTitleBar`, so the native traffic lights float
-//  over the leading 72pt Spacer reserved in the main HStack.
+//  The window uses `.hiddenTitleBar` and the sidebar now runs floor-to-
+//  ceiling, so the native traffic lights float on top of the sidebar —
+//  this toolbar sits to the right of the sidebar and no longer needs to
+//  reserve leading space for them.
 //
 
 import AppKit
@@ -23,26 +25,22 @@ import SwiftUI
 struct WindowToolbarView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     var body: some View {
         HStack(spacing: 10) {
-            // Reserve space for the native traffic lights (top-left of
-            // the hidden-title-bar window). 72pt matches the close/min/
-            // zoom triad + its own leading inset.
-            Spacer().frame(width: 72)
-
             // Brand block.
             Logo()
 
             Text("Nice")
                 .font(.system(size: 13, weight: .bold))
                 .tracking(-0.2)
-                .foregroundStyle(Color.niceInk(scheme))
+                .foregroundStyle(Color.niceInk(scheme, palette))
                 .layoutPriority(1)
 
             // Vertical separator — width:1, height:20, margin: 0 6px.
             Rectangle()
-                .fill(Color.niceLine(scheme))
+                .fill(Color.niceLine(scheme, palette))
                 .frame(width: 1, height: 20)
                 .padding(.horizontal, 6)
 
@@ -54,10 +52,10 @@ struct WindowToolbarView: View {
         .padding(.trailing, 20)
         .frame(height: 52)
         .frame(maxWidth: .infinity)
-        .background(Color.niceChrome(scheme))
+        .background(Color.niceChrome(scheme, palette))
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(Color.niceLine(scheme))
+                .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
     }

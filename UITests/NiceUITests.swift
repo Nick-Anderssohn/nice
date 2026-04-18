@@ -1090,4 +1090,108 @@ final class NiceUITests: XCTestCase {
             "App must survive repeated `claude` invocations"
         )
     }
+
+    // MARK: - Settings appearance pane
+
+    /// Opens the Settings window and navigates to the Appearance pane.
+    /// Returns the app; the caller can query theme cells or the sync
+    /// toggle against it.
+    private func openAppearancePane(_ app: XCUIApplication) {
+        let gear = app.descendants(matching: .any)["sidebar.settings"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.click()
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["settings.root"]
+                .waitForExistence(timeout: 5),
+            "Settings window must open before navigating panes"
+        )
+
+        // The left rail lists sections as plain tappable Text rows —
+        // "Appearance" is the label in the `SettingsSectionRow`.
+        let row = app.staticTexts["Appearance"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        row.click()
+    }
+
+    /// The Appearance pane must offer all four theme cells + a sync
+    /// toggle. Guards against accidental renames or one-of-four drops
+    /// in `ThemeButtonGrid`.
+    func testSettingsAppearance_showsFourThemeCellsAndSyncToggle() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        openAppearancePane(app)
+
+        for id in [
+            "settings.theme.cell.niceLight",
+            "settings.theme.cell.niceDark",
+            "settings.theme.cell.macLight",
+            "settings.theme.cell.macDark",
+        ] {
+            XCTAssertTrue(
+                app.descendants(matching: .any)[id].waitForExistence(timeout: 3),
+                "Missing theme cell \(id)"
+            )
+        }
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["settings.theme.sync"]
+                .waitForExistence(timeout: 3),
+            "Sync with OS toggle must be present in the Appearance pane"
+        )
+    }
+
+    /// Tapping a theme cell must move the selected state to it.
+    /// This guards the `tweaks.userPicked` wiring — if the action
+    /// doesn't fire, no cell ever reports selected after the click.
+    /// Launch arguments pre-seed UserDefaults so the app starts with
+    /// `syncWithOS=false` + `theme=niceLight`, giving a deterministic
+    /// starting state regardless of the host OS appearance.
+    func testSettingsAppearance_tappingCellSelectsIt() throws {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-theme", "niceLight",
+            "-syncWithOS", "NO",
+        ]
+        app.launch()
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        openAppearancePane(app)
+
+        // Each cell exposes its selected/unselected bit as the
+        // element's accessibility value (see ThemeCell).
+        let niceLight = app.descendants(matching: .any)["settings.theme.cell.niceLight"]
+        XCTAssertTrue(niceLight.waitForExistence(timeout: 3))
+        XCTAssertEqual(
+            niceLight.value as? String, "selected",
+            "Launch-arg seeded theme=niceLight should render as the selected cell"
+        )
+
+        let macDark = app.descendants(matching: .any)["settings.theme.cell.macDark"]
+        XCTAssertTrue(macDark.waitForExistence(timeout: 3))
+        macDark.click()
+
+        let becameSelected = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "selected"),
+            object: macDark
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [becameSelected], timeout: 3), .completed,
+            "macDark cell value should become 'selected' after being tapped"
+        )
+
+        // And the previously-selected niceLight must clear its selected value.
+        XCTAssertEqual(
+            niceLight.value as? String, "unselected",
+            "Previously-selected cell must clear its selected value once another cell is picked"
+        )
+    }
 }

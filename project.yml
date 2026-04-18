@@ -89,17 +89,38 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         ENABLE_HARDENED_RUNTIME: NO
 
+  NiceUnitTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Tests/NiceUnitTests
+    dependencies:
+      - target: Nice
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.nickanderssohn.nice.unittests
+        PRODUCT_NAME: NiceUnitTests
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_HARDENED_RUNTIME: NO
+        SWIFT_STRICT_CONCURRENCY: complete
+
 schemes:
   Nice:
     build:
       targets:
         Nice: all
+        NiceUnitTests: [test]
         NiceUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
+        - NiceUnitTests
         - NiceUITests
     profile:
       config: Release

@@ -5,6 +5,11 @@
 //  Supports expanded (240pt) and collapsed (~52pt) rail modes.
 //  The collapsed state is driven by `appState.sidebarCollapsed`.
 //
+//  The column background is owned upstream by `AppShellView` via
+//  `SidebarBackground` (flat panel for `.nice`, wallpaper-tinted
+//  `NSVisualEffectView` for `.macOS`); this view paints no background
+//  of its own so vibrancy shows through.
+//
 
 import AppKit
 import SwiftUI
@@ -13,6 +18,7 @@ struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -74,14 +80,13 @@ struct SidebarView: View {
                 action: { openSettings() }
             )
         }
-        .padding(.top, 10)
+        .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(Color.niceBg2(scheme))
     }
 
     private var railDivider: some View {
         Rectangle()
-            .fill(Color.niceLine(scheme))
+            .fill(Color.niceLine(scheme, palette))
             .frame(height: 1)
             .padding(.horizontal, 10)
     }
@@ -95,7 +100,6 @@ struct SidebarView: View {
             tabList
             footer
         }
-        .background(Color.niceBg2(scheme))
     }
 
     // MARK: - Search
@@ -105,29 +109,29 @@ struct SidebarView: View {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(Color.niceInk3(scheme))
+                    .foregroundStyle(Color.niceInk3(scheme, palette))
                 TextField("Search tabs", text: $appState.sidebarQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
-                    .foregroundStyle(Color.niceInk(scheme))
+                    .foregroundStyle(Color.niceInk(scheme, palette))
                 KbdPill(text: "⌘K")
             }
             .padding(.horizontal, 8)
             .frame(height: 26)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.niceBg3(scheme))
+                    .fill(Color.niceBg3(scheme, palette))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(Color.niceLine(scheme), lineWidth: 1)
+                    .strokeBorder(Color.niceLine(scheme, palette), lineWidth: 1)
             )
 
             SidebarIconButton(systemImage: "sidebar.left", help: "Collapse sidebar") {
                 appState.toggleSidebar()
             }
         }
-        .padding(.top, 14)
+        .padding(.top, 8)
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
     }
@@ -141,7 +145,7 @@ struct SidebarView: View {
                 if projects.isEmpty {
                     Text("No matching tabs")
                         .font(.system(size: 12))
-                        .foregroundStyle(Color.niceInk3(scheme))
+                        .foregroundStyle(Color.niceInk3(scheme, palette))
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 20)
@@ -173,7 +177,7 @@ struct SidebarView: View {
         .padding(.vertical, 6)
         .overlay(alignment: .top) {
             Rectangle()
-                .fill(Color.niceLine(scheme))
+                .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
     }
@@ -184,6 +188,7 @@ struct SidebarView: View {
 private struct RailButton: View {
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let systemImage: String
     let help: String
@@ -195,7 +200,7 @@ private struct RailButton: View {
 
     private var background: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover { return Color.niceInk(scheme).opacity(0.07) }
+        if hover { return Color.niceInk(scheme, palette).opacity(0.07) }
         return .clear
     }
 
@@ -211,7 +216,7 @@ private struct RailButton: View {
 
             Image(systemName: systemImage)
                 .font(.system(size: 14, weight: .regular))
-                .foregroundStyle(isActive ? tweaks.accent.color : Color.niceInk2(scheme))
+                .foregroundStyle(isActive ? tweaks.accent.color : Color.niceInk2(scheme, palette))
                 .frame(width: 36, height: 30)
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -234,6 +239,7 @@ private struct RailTabDot: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let tab: Tab
     @State private var hover = false
@@ -242,7 +248,7 @@ private struct RailTabDot: View {
 
     private var background: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover { return Color.niceInk(scheme).opacity(0.06) }
+        if hover { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
     }
 
@@ -262,7 +268,7 @@ private struct RailTabDot: View {
                 } else {
                     Image(systemName: "terminal")
                         .font(.system(size: 10, weight: .regular))
-                        .foregroundStyle(Color.niceInk3(scheme))
+                        .foregroundStyle(Color.niceInk3(scheme, palette))
                         .frame(width: 14, height: 14)
                 }
             }
@@ -287,6 +293,7 @@ private struct TerminalsRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
     @State private var hover = false
 
@@ -304,7 +311,7 @@ private struct TerminalsRow: View {
 
     private var backgroundColor: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover    { return Color.niceInk(scheme).opacity(0.06) }
+        if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
     }
 
@@ -317,13 +324,13 @@ private struct TerminalsRow: View {
             Spacer(minLength: 6)
             Text(cwdDisplayName)
                 .font(.system(size: 10))
-                .foregroundStyle(Color.niceInk3(scheme))
+                .foregroundStyle(Color.niceInk3(scheme, palette))
                 .lineLimit(1)
                 .truncationMode(.head)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
-        .foregroundStyle(isActive ? Color.niceInk(scheme) : Color.niceInk2(scheme))
+        .foregroundStyle(isActive ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(backgroundColor)
@@ -361,6 +368,7 @@ private struct TerminalsRow: View {
 private struct ProjectGroup: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let project: Project
     @State private var isOpen: Bool = true
@@ -387,7 +395,7 @@ private struct ProjectGroup: View {
             Text(project.name.uppercased())
                 .font(.system(size: 11, weight: .semibold))
                 .tracking(0.2)
-                .foregroundStyle(Color.niceInk2(scheme))
+                .foregroundStyle(Color.niceInk2(scheme, palette))
             Spacer(minLength: 4)
             CountPill(count: project.tabs.count)
         }
@@ -403,16 +411,17 @@ private struct ProjectGroup: View {
 
 private struct CountPill: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     let count: Int
 
     var body: some View {
         Text("\(count)")
             .font(.system(size: 10, weight: .medium))
-            .foregroundStyle(Color.niceInk3(scheme))
+            .foregroundStyle(Color.niceInk3(scheme, palette))
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
             .background(
-                Capsule().fill(Color.niceInk(scheme).opacity(0.07))
+                Capsule().fill(Color.niceInk(scheme, palette).opacity(0.07))
             )
     }
 }
@@ -423,6 +432,7 @@ private struct TabRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let tab: Tab
     @State private var hover = false
@@ -431,7 +441,7 @@ private struct TabRow: View {
 
     private var backgroundColor: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover    { return Color.niceInk(scheme).opacity(0.06) }
+        if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
     }
 
@@ -444,14 +454,14 @@ private struct TabRow: View {
             } else {
                 Image(systemName: "terminal")
                     .font(.system(size: 10, weight: .regular))
-                    .foregroundStyle(Color.niceInk3(scheme))
+                    .foregroundStyle(Color.niceInk3(scheme, palette))
                     .frame(width: 12, height: 12)
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).terminalIcon")
             }
             Text(tab.title)
                 .font(.system(size: 12, weight: isActive ? .semibold : .regular))
-                .foregroundStyle(isActive ? Color.niceInk(scheme) : Color.niceInk2(scheme))
+                .foregroundStyle(isActive ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -478,6 +488,7 @@ private struct TabRow: View {
 
 private struct SidebarIconButton: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let systemImage: String
     let help: String
@@ -489,11 +500,11 @@ private struct SidebarIconButton: View {
     var body: some View {
         Image(systemName: systemImage)
             .font(.system(size: 14, weight: .regular))
-            .foregroundStyle(Color.niceInk2(scheme))
+            .foregroundStyle(Color.niceInk2(scheme, palette))
             .frame(width: 24, height: 24)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(hover ? Color.niceInk(scheme).opacity(0.08) : Color.clear)
+                    .fill(hover ? Color.niceInk(scheme, palette).opacity(0.08) : Color.clear)
             )
             .contentShape(Rectangle())
             .onHover { hover = $0 }
@@ -507,17 +518,18 @@ private struct SidebarIconButton: View {
 
 private struct KbdPill: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     let text: String
 
     var body: some View {
         Text(text)
             .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(Color.niceInk3(scheme))
+            .foregroundStyle(Color.niceInk3(scheme, palette))
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
             .background(
                 RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .fill(Color.niceInk(scheme).opacity(0.06))
+                    .fill(Color.niceInk(scheme, palette).opacity(0.06))
             )
     }
 }

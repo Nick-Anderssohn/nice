@@ -27,6 +27,7 @@ struct NiceApp: App {
             AppShellView()
                 .environmentObject(appState)
                 .environmentObject(tweaks)
+                .environment(\.palette, tweaks.theme.palette)
                 .frame(minWidth: 1180, minHeight: 680)
                 .tint(tweaks.accent.color)
         }
@@ -40,6 +41,7 @@ struct NiceApp: App {
             SettingsView()
                 .environmentObject(appState)
                 .environmentObject(tweaks)
+                .environment(\.palette, tweaks.theme.palette)
                 .frame(width: 640, height: 440)
                 .tint(tweaks.accent.color)
         }

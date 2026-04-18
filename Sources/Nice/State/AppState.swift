@@ -53,6 +53,10 @@ final class AppState: ObservableObject {
     /// are themed at creation using this.
     private var currentScheme: ColorScheme = .dark
 
+    /// Tracks the active chrome `Palette` (nice | macOS). New sessions
+    /// are themed at creation using this alongside `currentScheme`.
+    private var currentPalette: Palette = .nice
+
     // MARK: - MCP server
 
     @Published private(set) var mcp = NiceMCPServer()
@@ -223,10 +227,11 @@ final class AppState: ObservableObject {
 
     // MARK: - Theme
 
-    func updateScheme(_ scheme: ColorScheme) {
+    func updateScheme(_ scheme: ColorScheme, palette: Palette) {
         currentScheme = scheme
+        currentPalette = palette
         for session in ptySessions.values {
-            session.applyTheme(scheme)
+            session.applyTheme(scheme, palette: palette)
         }
     }
 
@@ -585,7 +590,7 @@ final class AppState: ObservableObject {
                 self?.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
             }
         )
-        session.applyTheme(currentScheme)
+        session.applyTheme(currentScheme, palette: currentPalette)
         ptySessions[tabId] = session
         return session
     }

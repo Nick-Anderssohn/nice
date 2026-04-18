@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  Nice
 //
-//  Phase 5: preferences window content, bound to ⌘, via the app's
+//  Preferences window content, bound to ⌘, via the app's
 //  `Settings { … }` scene. Port of the React mock in
 //  /tmp/nice-design/nice/project/nice/settings.jsx with the Voice
 //  section intentionally dropped (not a product surface here).
@@ -15,6 +15,11 @@
 //  The accent swatches live in the Appearance tab and write through the
 //  `Tweaks` environment object so the rest of the app (Logo, MCP chip,
 //  selection tints…) repaints live the moment a new swatch is picked.
+//
+//  The Appearance pane owns the theme picker (four choices: Nice
+//  light/dark + macOS light/dark) and a `Sync with OS theme` toggle that
+//  flips between the scheme counterparts within the selected palette
+//  family whenever the system appearance changes.
 //
 
 import AppKit
@@ -41,6 +46,8 @@ struct SettingsView: View {
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
 
+    private var palette: Palette { tweaks.theme.palette }
+
     @State private var active: SettingsSection = .general
 
     var body: some View {
@@ -49,7 +56,8 @@ struct SettingsView: View {
             content
         }
         .frame(width: 640, height: 440)
-        .background(Color.nicePanel(scheme))
+        .background(Color.nicePanel(scheme, palette))
+        .environment(\.palette, palette)
         .accessibilityIdentifier("settings.root")
     }
 
@@ -71,10 +79,10 @@ struct SettingsView: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 10)
         .frame(width: 160)
-        .background(Color.niceBg2(scheme))
+        .background(Color.niceBg2(scheme, palette))
         .overlay(alignment: .trailing) {
             Rectangle()
-                .fill(Color.niceLine(scheme))
+                .fill(Color.niceLine(scheme, palette))
                 .frame(width: 1)
         }
     }
@@ -97,7 +105,7 @@ struct SettingsView: View {
             .padding(.vertical, 18)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.nicePanel(scheme))
+        .background(Color.nicePanel(scheme, palette))
     }
 }
 
@@ -105,6 +113,7 @@ struct SettingsView: View {
 
 private struct SettingsSectionRow: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let section: SettingsSection
     let active: Bool
@@ -114,7 +123,7 @@ private struct SettingsSectionRow: View {
     var body: some View {
         Text(section.label)
             .font(.system(size: 12.5, weight: active ? .semibold : .medium))
-            .foregroundStyle(active ? Color.niceInk(scheme) : Color.niceInk2(scheme))
+            .foregroundStyle(active ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -134,6 +143,7 @@ private struct SettingsSectionRow: View {
 private struct GeneralPane: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     @AppStorage("launchAtLogin") private var launchAtLogin: Bool = false
     @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
@@ -193,7 +203,7 @@ private struct GeneralPane: View {
             HStack(spacing: 8) {
                 Text(cwdDisplayName)
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Color.niceInk2(scheme))
+                    .foregroundStyle(Color.niceInk2(scheme, palette))
                     .lineLimit(1)
                     .truncationMode(.head)
                     .frame(maxWidth: 200, alignment: .trailing)
@@ -245,6 +255,7 @@ private struct ShortcutsPane: View {
 private struct MCPPane: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     @AppStorage("mcpAutoStart") private var autoStart: Bool = true
 
     /// oklch(0.65 0.18 145) — the settings.jsx "running" dot.
@@ -270,7 +281,7 @@ private struct MCPPane: View {
                         : "Stopped"
                 )
                     .font(.system(size: 12))
-                    .foregroundStyle(Color.niceInk(scheme))
+                    .foregroundStyle(Color.niceInk(scheme, palette))
                 if !appState.mcp.isRunning {
                     Button("Start") {
                         let state = appState
@@ -287,7 +298,7 @@ private struct MCPPane: View {
         ) {
             Text("nice.tab.new, nice.tab.switch, nice.tab.list, nice.run")
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(Color.niceInk2(scheme))
+                .foregroundStyle(Color.niceInk2(scheme, palette))
                 .multilineTextAlignment(.trailing)
                 .frame(maxWidth: 260, alignment: .trailing)
         }
@@ -306,22 +317,27 @@ private struct MCPPane: View {
 private struct AppearancePane: View {
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     var body: some View {
         SettingTitle("Appearance")
 
         SettingRow(
-            label: "Theme",
-            hint: "Match the OS, or pin light / dark."
+            label: "Sync with OS theme",
+            hint: "Flip between light and dark as the system does, within the chosen palette."
         ) {
-            Picker("", selection: $tweaks.theme) {
-                ForEach(ThemeChoice.allCases) { t in
-                    Text(t.label).tag(t)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 240)
+            Toggle("", isOn: $tweaks.syncWithOS)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.theme.sync")
+        }
+
+        SettingRow(
+            label: "Theme",
+            hint: "Pick a palette and scheme. Sync with OS overrides the scheme."
+        ) {
+            ThemeButtonGrid()
         }
 
         SettingRow(
@@ -342,8 +358,102 @@ private struct AppearancePane: View {
     }
 }
 
+/// 2×2 grid of theme choices. Top row is the nice palette (Light / Dark);
+/// bottom row is the macOS palette. The cell matching `tweaks.theme` is
+/// highlighted with the accent. Tapping a cell calls `tweaks.userPicked`
+/// which respects the sync-with-OS flag (if sync is on and the tapped
+/// cell's scheme doesn't match the OS, we fall back to its counterpart).
+private struct ThemeButtonGrid: View {
+    @EnvironmentObject private var tweaks: Tweaks
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                cell(.niceLight)
+                cell(.niceDark)
+            }
+            HStack(spacing: 8) {
+                cell(.macLight)
+                cell(.macDark)
+            }
+        }
+        .frame(width: 260)
+    }
+
+    private func cell(_ choice: ThemeChoice) -> some View {
+        ThemeCell(
+            choice: choice,
+            selected: tweaks.theme == choice,
+            accent: tweaks.accent.color
+        ) {
+            tweaks.userPicked(choice)
+        }
+    }
+}
+
+private struct ThemeCell: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+
+    let choice: ThemeChoice
+    let selected: Bool
+    let accent: Color
+    let action: () -> Void
+
+    @State private var hover = false
+
+    private var background: Color {
+        if selected { return Color.niceSel(scheme, accent: accent) }
+        if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
+        return Color.niceBg3(scheme, palette)
+    }
+
+    private var border: Color {
+        selected ? accent : Color.niceLine(scheme, palette)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(selected ? accent : Color.niceInk3(scheme, palette))
+
+            Text(choice.label)
+                .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                .foregroundStyle(Color.niceInk(scheme, palette))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(background)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(border, lineWidth: selected ? 1.5 : 1)
+        )
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { action() }
+        .help(choice.label)
+        // Combine the inner Image + Text into a single a11y element so
+        // XCUITest queries for the cell resolve to one node, not two.
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("settings.theme.cell.\(choice.rawValue)")
+        .accessibilityLabel(choice.label)
+        // `.isSelected` trait doesn't reliably surface to XCUIElement.isSelected
+        // on macOS; expose the bit as the element's value instead so
+        // UI tests can read it via `.value`.
+        .accessibilityValue(selected ? "selected" : "unselected")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
 private struct AccentSwatch: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     let preset: AccentPreset
     let selected: Bool
     let action: () -> Void
@@ -357,7 +467,7 @@ private struct AccentSwatch: View {
                 // doesn't jump when the selection moves.
                 Circle()
                     .strokeBorder(
-                        selected ? Color.niceInk(scheme) : Color.clear,
+                        selected ? Color.niceInk(scheme, palette) : Color.clear,
                         lineWidth: 2
                     )
             )
@@ -378,16 +488,17 @@ private struct AccentSwatch: View {
 
 private struct AboutPane: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     var body: some View {
         SettingTitle("About")
         VStack(alignment: .leading, spacing: 6) {
             Text("Nice v0.1.0")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.niceInk(scheme))
+                .foregroundStyle(Color.niceInk(scheme, palette))
             Text("A companion app for the Claude CLI.")
                 .font(.system(size: 12))
-                .foregroundStyle(Color.niceInk2(scheme))
+                .foregroundStyle(Color.niceInk2(scheme, palette))
         }
         .padding(.top, 2)
     }
@@ -399,6 +510,7 @@ private struct AboutPane: View {
 /// pane with a 14pt bottom margin.
 struct SettingTitle: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     let text: String
     init(_ text: String) { self.text = text }
 
@@ -406,7 +518,7 @@ struct SettingTitle: View {
         Text(text)
             .font(.system(size: 16, weight: .bold))
             .tracking(-0.2)
-            .foregroundStyle(Color.niceInk(scheme))
+            .foregroundStyle(Color.niceInk(scheme, palette))
             .padding(.bottom, 14)
     }
 }
@@ -416,6 +528,7 @@ struct SettingTitle: View {
 /// padding and a 1pt `niceLine` bottom border.
 struct SettingRow<Content: View>: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
 
     let label: String
     let hint: String?
@@ -436,11 +549,11 @@ struct SettingRow<Content: View>: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(label)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color.niceInk(scheme))
+                    .foregroundStyle(Color.niceInk(scheme, palette))
                 if let hint {
                     Text(hint)
                         .font(.system(size: 11.5))
-                        .foregroundStyle(Color.niceInk3(scheme))
+                        .foregroundStyle(Color.niceInk3(scheme, palette))
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -451,7 +564,7 @@ struct SettingRow<Content: View>: View {
         .padding(.vertical, 10)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(Color.niceLine(scheme))
+                .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
     }
@@ -460,6 +573,7 @@ struct SettingRow<Content: View>: View {
 /// Matches `KeyPills` in settings.jsx — mono beveled kbd boxes.
 struct KeyPills: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     let keys: [String]
 
     var body: some View {
@@ -467,22 +581,22 @@ struct KeyPills: View {
             ForEach(Array(keys.enumerated()), id: \.offset) { _, key in
                 Text(key)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color.niceInk(scheme))
+                    .foregroundStyle(Color.niceInk(scheme, palette))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .frame(minWidth: 14)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(Color.niceBg3(scheme))
+                            .fill(Color.niceBg3(scheme, palette))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .strokeBorder(Color.niceLineStrong(scheme), lineWidth: 1)
+                            .strokeBorder(Color.niceLineStrong(scheme, palette), lineWidth: 1)
                     )
                     // Extra-light bevel echoing the JSX box-shadow.
                     .overlay(alignment: .bottom) {
                         Rectangle()
-                            .fill(Color.niceLineStrong(scheme))
+                            .fill(Color.niceLineStrong(scheme, palette))
                             .frame(height: 1)
                             .padding(.horizontal, 1)
                     }
@@ -495,21 +609,22 @@ struct KeyPills: View {
 /// dropdown is overkill (e.g. "zsh" with no alternatives).
 private struct ReadOnlyValuePill: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
     let value: String
 
     var body: some View {
         Text(value)
             .font(.system(size: 12))
-            .foregroundStyle(Color.niceInk(scheme))
+            .foregroundStyle(Color.niceInk(scheme, palette))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.niceBg3(scheme))
+                    .fill(Color.niceBg3(scheme, palette))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(Color.niceLineStrong(scheme), lineWidth: 1)
+                    .strokeBorder(Color.niceLineStrong(scheme, palette), lineWidth: 1)
             )
     }
 }

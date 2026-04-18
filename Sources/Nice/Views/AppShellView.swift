@@ -2,10 +2,16 @@
 //  AppShellView.swift
 //  Nice
 //
-//  Single-pane main content. The upper toolbar hosts the tab pills
-//  (claude + terminal panes for the active session), and the main area
-//  shows exactly one pane — the active pane of the active tab. Built-in
-//  tabs (Terminals) and user sessions follow the same shape.
+//  Floor-to-ceiling sidebar on the left (matches Xcode / Finder / Mail);
+//  the native traffic lights float on top of its upper 52pt. On the
+//  right, a thin toolbar hosts the brand + tab pills, and the main area
+//  shows exactly one pane — the active pane of the active tab.
+//
+//  The sidebar's background depends on the active palette:
+//    • `.nice`  — flat `niceBg2` panel
+//    • `.macOS` — `NSVisualEffectView` with `.sidebar` material and
+//                 `.behindWindow` blending, so the OS's Desktop Tinting
+//                 mixes wallpaper color into the chrome.
 //
 //  The "Quit NICE?" alert still hangs off `appState.showQuitPrompt`.
 //
@@ -15,35 +21,40 @@ import SwiftUI
 
 struct AppShellView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
 
+    private var palette: Palette { tweaks.theme.palette }
+
     var body: some View {
-        VStack(spacing: 0) {
-            WindowToolbarView()
+        HStack(spacing: 0) {
+            SidebarBackground(palette: palette, scheme: scheme) {
+                VStack(spacing: 0) {
+                    // Reserve the traffic-light safe zone at the top of
+                    // the sidebar. 52pt matches the classic hidden-title-
+                    // bar chrome height and aligns with the toolbar row
+                    // on the right.
+                    Color.clear.frame(height: 52)
+                    SidebarView()
+                }
+            }
+            .frame(width: appState.sidebarCollapsed ? 52 : 240)
+            .animation(.easeInOut(duration: 0.22), value: appState.sidebarCollapsed)
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(Color.niceLine(scheme, palette))
+                    .frame(width: 0.5)
+                    .opacity(0.8)
+            }
 
-            HStack(spacing: 0) {
-                SidebarView()
-                    .frame(width: appState.sidebarCollapsed ? 52 : 240)
-                    .animation(.easeInOut(duration: 0.22), value: appState.sidebarCollapsed)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(.ultraThinMaterial)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(Color.niceLine(scheme).opacity(0.5), lineWidth: 0.5)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-                    .padding(.horizontal, 10)
-                    .padding(.top, 10)
-                    .padding(.bottom, 10)
-
+            VStack(spacing: 0) {
+                WindowToolbarView()
                 mainContent
             }
         }
         .ignoresSafeArea(edges: .top)
-        .background(Color.nicePanel(scheme).ignoresSafeArea())
+        .background(windowBackground.ignoresSafeArea())
+        .environment(\.palette, palette)
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
             Button("Quit", role: .destructive) { NSApp.terminate(nil) }
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
@@ -53,9 +64,27 @@ struct AppShellView: View {
         .task {
             await appState.bootstrap()
         }
-        .onAppear { appState.updateScheme(scheme) }
+        .onAppear { appState.updateScheme(scheme, palette: palette) }
         .onChange(of: scheme) { _, newScheme in
-            appState.updateScheme(newScheme)
+            appState.updateScheme(newScheme, palette: palette)
+        }
+        .onChange(of: palette) { _, newPalette in
+            appState.updateScheme(scheme, palette: newPalette)
+        }
+    }
+
+    // MARK: - Window background
+
+    /// In the macOS palette the window background is transparent so the
+    /// NSVisualEffectView sidebar can pull wallpaper pixels through the
+    /// window without a solid color blocking the effect at the seam
+    /// between sidebar and main content. The main content area paints
+    /// its own `nicePanel` underlay.
+    @ViewBuilder
+    private var windowBackground: some View {
+        switch palette {
+        case .nice:  Color.nicePanel(scheme, palette)
+        case .macOS: Color(nsColor: .windowBackgroundColor)
         }
     }
 
@@ -72,13 +101,42 @@ struct AppShellView: View {
                 .id(paneId)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.top, 12)
-                .background(Color.nicePanel(scheme))
+                .background(Color.nicePanel(scheme, palette))
         } else {
             // Transient: no pane currently hosted (e.g. Terminals tab
             // with its last pane just exited, awaiting the quit alert).
-            Color.nicePanel(scheme)
+            Color.nicePanel(scheme, palette)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+}
+
+// MARK: - Sidebar background
+
+/// Paints the sidebar column background appropriate to the active palette.
+/// Nice palette: flat `niceBg2`. macOS palette: wallpaper-tinted
+/// NSVisualEffectView (`.sidebar` material, `.behindWindow` blending).
+private struct SidebarBackground<Content: View>: View {
+    let palette: Palette
+    let scheme: ColorScheme
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .background(
+                Group {
+                    switch palette {
+                    case .nice:
+                        Color.niceBg2(scheme, palette)
+                    case .macOS:
+                        VisualEffectView(
+                            material: .sidebar,
+                            blendingMode: .behindWindow,
+                            state: .active
+                        )
+                    }
+                }
+            )
     }
 }
 

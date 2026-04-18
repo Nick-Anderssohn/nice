@@ -2,23 +2,50 @@
 //  Palette.swift
 //  Nice
 //
-//  Source of truth: the `<style>` block in
+//  Source of truth for the *nice* palette: the `<style>` block in
 //  /tmp/nice-design/nice/project/Nice.html — the CSS variables defined
 //  under `.theme-light` and `.theme-dark` scopes (plus `--accent`).
 //
 //  The design mock uses `oklch(L C H)` values. Swift's `Color(.sRGB, ...)`
-//  initializer doesn't accept oklch directly, so each value below was
-//  converted to sRGB via Björn Ottosson's standard oklch -> oklab ->
-//  linear sRGB -> gamma-encoded sRGB pipeline, rounded to 3 decimals.
-//  (Verified against https://oklch.com for spot-checks; drift is < 0.5%.)
+//  initializer doesn't accept oklch directly, so each nice-palette value
+//  below was converted to sRGB via Björn Ottosson's standard oklch ->
+//  oklab -> linear sRGB -> gamma-encoded sRGB pipeline, rounded to 3
+//  decimals. (Verified against https://oklch.com for spot-checks; drift
+//  is < 0.5%.)
 //
 //  When the design CSS changes, re-run the conversion and update the
 //  corresponding literals below. Keep this file and the CSS in sync.
+//
+//  The *macOS* palette is not a literal table — it delegates to system
+//  semantic colors (`NSColor.windowBackgroundColor`, `.labelColor`, …)
+//  so chrome matches Finder / Mail / Xcode pixel-for-pixel. Those NSColor
+//  values resolve dynamically against the current `NSApp.appearance`,
+//  which Tweaks pins to `.aqua` / `.darkAqua` based on `theme.scheme`.
 //
 
 import AppKit
 import SwiftTerm
 import SwiftUI
+
+// MARK: - Palette environment key
+
+private struct PaletteKey: EnvironmentKey {
+    static let defaultValue: Palette = .nice
+}
+
+public extension EnvironmentValues {
+    /// The active chrome palette for the current view subtree. Set at the
+    /// app root from `Tweaks.theme.palette`; consumed by the `Color.niceX`
+    /// helpers that need to branch between the nice literals and the
+    /// system semantic colors. Defaults to `.nice` so preview/test views
+    /// that don't install the environment key still render correctly.
+    var palette: Palette {
+        get { self[PaletteKey.self] }
+        set { self[PaletteKey.self] = newValue }
+    }
+}
+
+// MARK: - Color helpers
 
 public extension SwiftUI.Color {
 
@@ -46,62 +73,98 @@ public extension SwiftUI.Color {
 
     // MARK: - Backgrounds
 
-    static func niceBg(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.080, green: 0.066, blue: 0.055, opacity: 1.0)
-            : Self(.sRGB, red: 0.989, green: 0.978, blue: 0.970, opacity: 1.0)
+    static func niceBg(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .windowBackgroundColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.080, green: 0.066, blue: 0.055, opacity: 1.0)
+                : Self(.sRGB, red: 0.989, green: 0.978, blue: 0.970, opacity: 1.0)
+        }
     }
 
-    static func niceBg2(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.058, green: 0.045, blue: 0.035, opacity: 1.0)
-            : Self(.sRGB, red: 0.965, green: 0.952, blue: 0.942, opacity: 1.0)
+    static func niceBg2(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .underPageBackgroundColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.058, green: 0.045, blue: 0.035, opacity: 1.0)
+                : Self(.sRGB, red: 0.965, green: 0.952, blue: 0.942, opacity: 1.0)
+        }
     }
 
-    static func niceBg3(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.037, green: 0.026, blue: 0.019, opacity: 1.0)
-            : Self(.sRGB, red: 0.934, green: 0.919, blue: 0.907, opacity: 1.0)
+    static func niceBg3(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .textBackgroundColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.037, green: 0.026, blue: 0.019, opacity: 1.0)
+                : Self(.sRGB, red: 0.934, green: 0.919, blue: 0.907, opacity: 1.0)
+        }
     }
 
-    static func nicePanel(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.097, green: 0.083, blue: 0.072, opacity: 1.0)
-            : Self(.sRGB, red: 1.000, green: 0.992, blue: 0.986, opacity: 1.0)
+    static func nicePanel(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .windowBackgroundColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.097, green: 0.083, blue: 0.072, opacity: 1.0)
+                : Self(.sRGB, red: 1.000, green: 0.992, blue: 0.986, opacity: 1.0)
+        }
     }
 
     // MARK: - Ink (foreground text)
 
-    static func niceInk(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.956, green: 0.946, blue: 0.938, opacity: 1.0)
-            : Self(.sRGB, red: 0.091, green: 0.074, blue: 0.060, opacity: 1.0)
+    static func niceInk(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .labelColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.956, green: 0.946, blue: 0.938, opacity: 1.0)
+                : Self(.sRGB, red: 0.091, green: 0.074, blue: 0.060, opacity: 1.0)
+        }
     }
 
-    static func niceInk2(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.693, green: 0.679, blue: 0.667, opacity: 1.0)
-            : Self(.sRGB, red: 0.273, green: 0.257, blue: 0.244, opacity: 1.0)
+    static func niceInk2(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .secondaryLabelColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.693, green: 0.679, blue: 0.667, opacity: 1.0)
+                : Self(.sRGB, red: 0.273, green: 0.257, blue: 0.244, opacity: 1.0)
+        }
     }
 
-    static func niceInk3(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.460, green: 0.441, blue: 0.427, opacity: 1.0)
-            : Self(.sRGB, red: 0.494, green: 0.475, blue: 0.461, opacity: 1.0)
+    static func niceInk3(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .tertiaryLabelColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.460, green: 0.441, blue: 0.427, opacity: 1.0)
+                : Self(.sRGB, red: 0.494, green: 0.475, blue: 0.461, opacity: 1.0)
+        }
     }
 
     // MARK: - Lines / dividers
 
-    static func niceLine(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.172, green: 0.157, blue: 0.145, opacity: 1.0)
-            : Self(.sRGB, red: 0.857, green: 0.841, blue: 0.829, opacity: 1.0)
+    static func niceLine(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .separatorColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.172, green: 0.157, blue: 0.145, opacity: 1.0)
+                : Self(.sRGB, red: 0.857, green: 0.841, blue: 0.829, opacity: 1.0)
+        }
     }
 
-    static func niceLineStrong(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.252, green: 0.236, blue: 0.223, opacity: 1.0)
-            : Self(.sRGB, red: 0.735, green: 0.715, blue: 0.699, opacity: 1.0)
+    static func niceLineStrong(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .gridColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.252, green: 0.236, blue: 0.223, opacity: 1.0)
+                : Self(.sRGB, red: 0.735, green: 0.715, blue: 0.699, opacity: 1.0)
+        }
     }
 
     // MARK: - Selection / bubble / chrome
@@ -120,49 +183,72 @@ public extension SwiftUI.Color {
 
     /// Accent-driven selection tint for runtime use. Mirrors the CSS
     /// mix ratios (14% light / 22% dark) but applies them to whichever
-    /// accent swatch the user has chosen.
+    /// accent swatch the user has chosen. Palette-agnostic — selection
+    /// always tints with the user's accent regardless of chrome palette.
     static func niceSel(_ scheme: ColorScheme, accent: Self) -> Self {
         let alpha: Double = scheme == .dark ? 0.22 : 0.14
         return accent.opacity(alpha)
     }
 
-    static func niceUserBubble(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.134, green: 0.119, blue: 0.108, opacity: 1.0)
-            : Self(.sRGB, red: 0.939, green: 0.918, blue: 0.902, opacity: 1.0)
+    static func niceUserBubble(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .controlBackgroundColor)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.134, green: 0.119, blue: 0.108, opacity: 1.0)
+                : Self(.sRGB, red: 0.939, green: 0.918, blue: 0.902, opacity: 1.0)
+        }
     }
 
     /// CSS: `color-mix(in oklch, var(--bg) 70%, transparent)`. We mirror
     /// that by taking `--bg` and dropping alpha to 0.7.
-    static func niceChrome(_ scheme: ColorScheme) -> Self {
-        scheme == .dark
-            ? Self(.sRGB, red: 0.080, green: 0.066, blue: 0.055, opacity: 0.70)
-            : Self(.sRGB, red: 0.989, green: 0.978, blue: 0.970, opacity: 0.70)
+    static func niceChrome(_ scheme: ColorScheme, _ palette: Palette = .nice) -> Self {
+        switch palette {
+        case .macOS: Self(nsColor: .windowBackgroundColor).opacity(0.70)
+        case .nice:
+            scheme == .dark
+                ? Self(.sRGB, red: 0.080, green: 0.066, blue: 0.055, opacity: 0.70)
+                : Self(.sRGB, red: 0.989, green: 0.978, blue: 0.970, opacity: 0.70)
+        }
     }
 
     // MARK: - NSColor helpers for SwiftTerm
 
     /// `niceBg3` expressed as `NSColor` for feeding SwiftTerm's
-    /// `nativeBackgroundColor`. Literals mirror the SwiftUI values above.
-    static func niceBg3NS(_ scheme: ColorScheme) -> NSColor {
-        scheme == .dark
-            ? NSColor(srgbRed: 0.037, green: 0.026, blue: 0.019, alpha: 1.0)
-            : NSColor(srgbRed: 0.934, green: 0.919, blue: 0.907, alpha: 1.0)
+    /// `nativeBackgroundColor`. For the macOS palette we return a
+    /// dynamic semantic color that resolves against the pinned
+    /// `NSApp.appearance` at draw time.
+    static func niceBg3NS(_ scheme: ColorScheme, _ palette: Palette = .nice) -> NSColor {
+        switch palette {
+        case .macOS: .textBackgroundColor
+        case .nice:
+            scheme == .dark
+                ? NSColor(srgbRed: 0.037, green: 0.026, blue: 0.019, alpha: 1.0)
+                : NSColor(srgbRed: 0.934, green: 0.919, blue: 0.907, alpha: 1.0)
+        }
     }
 
     /// `nicePanel` expressed as `NSColor` for the Claude pane terminal.
-    static func nicePanelNS(_ scheme: ColorScheme) -> NSColor {
-        scheme == .dark
-            ? NSColor(srgbRed: 0.097, green: 0.083, blue: 0.072, alpha: 1.0)
-            : NSColor(srgbRed: 1.000, green: 0.992, blue: 0.986, alpha: 1.0)
+    static func nicePanelNS(_ scheme: ColorScheme, _ palette: Palette = .nice) -> NSColor {
+        switch palette {
+        case .macOS: .windowBackgroundColor
+        case .nice:
+            scheme == .dark
+                ? NSColor(srgbRed: 0.097, green: 0.083, blue: 0.072, alpha: 1.0)
+                : NSColor(srgbRed: 1.000, green: 0.992, blue: 0.986, alpha: 1.0)
+        }
     }
 
     /// `niceInk` expressed as `NSColor` for feeding SwiftTerm's
     /// `nativeForegroundColor`.
-    static func niceInkNS(_ scheme: ColorScheme) -> NSColor {
-        scheme == .dark
-            ? NSColor(srgbRed: 0.956, green: 0.946, blue: 0.938, alpha: 1.0)
-            : NSColor(srgbRed: 0.091, green: 0.074, blue: 0.060, alpha: 1.0)
+    static func niceInkNS(_ scheme: ColorScheme, _ palette: Palette = .nice) -> NSColor {
+        switch palette {
+        case .macOS: .labelColor
+        case .nice:
+            scheme == .dark
+                ? NSColor(srgbRed: 0.956, green: 0.946, blue: 0.938, alpha: 1.0)
+                : NSColor(srgbRed: 0.091, green: 0.074, blue: 0.060, alpha: 1.0)
+        }
     }
 }
 
@@ -173,6 +259,11 @@ public extension SwiftUI.Color {
 /// near-white — defaults like bright-white become invisible. The palettes
 /// below replace the 16-entry ANSI table with values harmonized to the
 /// respective `niceBg3` per theme.
+///
+/// ANSI colors are palette-agnostic — we only vary on scheme (light/dark)
+/// because the contrast problem is the same whether the terminal sits on
+/// `.niceBg3` or `NSColor.textBackgroundColor` (both are near-black in
+/// dark mode, near-white in light).
 ///
 /// Values are 8-bit per channel; SwiftTerm's `Color(red:green:blue:)`
 /// takes 16-bit, so the helper scales by 257 (the standard 8 → 16-bit
