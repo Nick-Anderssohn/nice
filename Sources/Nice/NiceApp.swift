@@ -21,6 +21,11 @@ import SwiftUI
 @main
 struct NiceApp: App {
     @StateObject private var services = NiceServices()
+    // Owns `applicationShouldTerminate` so ⌘Q / Quit-menu goes through
+    // the "you have live panes" confirmation before willTerminate fires.
+    // The adaptor instantiates the delegate before SwiftUI builds the
+    // body, so we late-bind the registry pointer in `onAppear`.
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         WindowGroup {
@@ -31,7 +36,12 @@ struct NiceApp: App {
                 .environmentObject(services.fontSettings)
                 .environment(\.palette, services.tweaks.theme.palette)
                 .tint(services.tweaks.accent.color)
-                .onAppear { services.bootstrap() }
+                .onAppear {
+                    AppDelegate.registryProvider = { [weak services] in
+                        services?.registry
+                    }
+                    services.bootstrap()
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)

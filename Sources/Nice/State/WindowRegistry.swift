@@ -15,6 +15,11 @@
 //  calls arriving while the app is backgrounded still have a sensible
 //  target.
 //
+//  Registration also installs a `CloseConfirmationDelegate` on the
+//  window so red-button / ⌘W closes with live panes surface a
+//  confirmation alert before teardown. The wrapper forwards every other
+//  `NSWindowDelegate` callback to the delegate SwiftUI had installed.
+//
 
 import AppKit
 import Foundation
@@ -30,6 +35,10 @@ final class WindowRegistry: ObservableObject {
         weak var window: NSWindow?
         let closeObserver: NSObjectProtocol
         let becomeKeyObserver: NSObjectProtocol
+        /// `NSWindow.delegate` is a weak property, so we retain the
+        /// confirmation proxy here to keep it alive for the window's
+        /// lifetime. Released when `handleClose` drops the entry.
+        let closeConfirmer: CloseConfirmationDelegate
     }
 
     private var entries: [ObjectIdentifier: Entry] = [:]
@@ -61,11 +70,21 @@ final class WindowRegistry: ObservableObject {
             }
         }
 
+        // Install a confirmation proxy as the window's delegate,
+        // wrapping whatever SwiftUI had previously set. See
+        // `CloseConfirmationDelegate` for the forwarding behavior.
+        let closeConfirmer = CloseConfirmationDelegate(
+            appState: appState,
+            originalDelegate: window.delegate
+        )
+        window.delegate = closeConfirmer
+
         entries[id] = Entry(
             appState: appState,
             window: window,
             closeObserver: closeObserver,
-            becomeKeyObserver: becomeKeyObserver
+            becomeKeyObserver: becomeKeyObserver,
+            closeConfirmer: closeConfirmer
         )
 
         // Seed the fallback so the first window is reachable from MCP

@@ -108,7 +108,13 @@ private struct AppShellHost: View {
         .environment(\.palette, palette)
         .environmentObject(appState)
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
-            Button("Quit", role: .destructive) { NSApp.terminate(nil) }
+            Button("Quit", role: .destructive) {
+                // The user already confirmed here; skip the redundant
+                // `applicationShouldTerminate` confirmation on the way
+                // out so ⌘Q isn't presented twice.
+                AppDelegate.skipNextTerminateConfirmation = true
+                NSApp.terminate(nil)
+            }
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
         } message: {
             Text("Your last terminal just exited. You still have open sessions.")

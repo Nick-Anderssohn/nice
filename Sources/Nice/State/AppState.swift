@@ -202,6 +202,25 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Snapshot of this window's live panes grouped by kind. Used by
+    /// the quit / window-close confirmation alerts to word the prompt
+    /// ("N Claude sessions and M terminals") without exposing the model
+    /// to callers outside AppState.
+    var livePaneCounts: (claude: Int, terminal: Int) {
+        var claude = 0
+        var terminal = 0
+        let allTabs = [terminalsTab] + projects.flatMap { $0.tabs }
+        for tab in allTabs {
+            for pane in tab.panes where pane.isAlive {
+                switch pane.kind {
+                case .claude: claude += 1
+                case .terminal: terminal += 1
+                }
+            }
+        }
+        return (claude, terminal)
+    }
+
     /// Stop every resource this window owns. Called by
     /// `WindowRegistry` when its `NSWindow` closes, and by
     /// `NiceServices` for every live AppState on app terminate.
