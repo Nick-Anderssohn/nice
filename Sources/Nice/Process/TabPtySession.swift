@@ -117,6 +117,12 @@ final class TabPtySession: ObservableObject {
 
         let resolvedCwd = Self.expandTilde(cwd)
         let isOverride = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] != nil
+        // Claude Code gates OSC title emission on TERM_PROGRAM ∈
+        // {"iTerm.app","ghostty","WezTerm","Apple_Terminal"}. Advertise
+        // as ghostty so the in-app session label updates automatically
+        // — SwiftTerm handles the resulting OSC 0/1/2 sequences natively
+        // and the choice doesn't trigger iTerm-specific OSC extensions.
+        let claudeEnv = Self.buildEnv(extraEnv: ["TERM_PROGRAM": "ghostty"])
         if let claude = claudeBinary {
             var parts = ["exec", Self.shellQuote(claude)]
             if !isOverride {
@@ -131,7 +137,7 @@ final class TabPtySession: ObservableObject {
             view.startProcess(
                 executable: "/bin/zsh",
                 args: ["-ilc", parts.joined(separator: " ")],
-                environment: nil,
+                environment: claudeEnv,
                 execName: nil,
                 currentDirectory: resolvedCwd
             )
