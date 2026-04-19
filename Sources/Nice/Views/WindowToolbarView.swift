@@ -52,7 +52,16 @@ struct WindowToolbarView: View {
         .padding(.trailing, 20)
         .frame(height: 52)
         .frame(maxWidth: .infinity)
-        .background(Color.niceChrome(scheme, palette))
+        .background {
+            ZStack {
+                Color.niceChrome(scheme, palette)
+                // Sits on top of the chrome fill but behind the toolbar's
+                // interactive children — pills/buttons still receive
+                // their own clicks while empty chrome behaves like a
+                // title bar (drag to move, double-click to zoom).
+                WindowDragRegion()
+            }
+        }
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(Color.niceLine(scheme, palette))

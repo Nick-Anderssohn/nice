@@ -45,6 +45,7 @@ struct AppShellView: View {
             // buttons sit ~8pt further in on both axes; we do the same.
             WindowAccessor { window in
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
+                TitleBarZoomMonitor.install()
             }
         )
         .background(windowBackground.ignoresSafeArea())
@@ -100,8 +101,11 @@ struct AppShellView: View {
                     // Reserve the traffic-light safe zone at the top of
                     // the sidebar. 52pt matches the classic hidden-title-
                     // bar chrome height and aligns with the toolbar row
-                    // on the right.
-                    Color.clear.frame(height: 52)
+                    // on the right. WindowDragRegion makes this strip
+                    // behave like a title bar (drag + double-click zoom);
+                    // the traffic lights themselves are standard
+                    // NSButtons layered above and keep their own clicks.
+                    WindowDragRegion().frame(height: 52)
                     SidebarView()
                 }
             }
@@ -156,11 +160,15 @@ struct AppShellView: View {
     private var collapsedCap: some View {
         SidebarBackground(palette: palette, scheme: scheme) {
             HStack(spacing: 0) {
-                Color.clear.frame(width: 82)
+                // Leading 82pt hosts the traffic lights; the drag region
+                // underneath makes that strip (and any empty space past
+                // the restore button) behave like a title bar for
+                // drag + double-click zoom.
+                WindowDragRegion().frame(width: 82)
                 CollapsedSidebarRestoreButton {
                     appState.toggleSidebar()
                 }
-                Spacer(minLength: 0)
+                WindowDragRegion()
             }
         }
         .frame(width: 124, height: 40)
