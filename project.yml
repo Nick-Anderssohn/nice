@@ -18,7 +18,9 @@ settings:
 packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
-    branch: main
+    # Pinned to the upstream Metal-renderer revision (PR #484, March 2026).
+    # Bump deliberately — `main` lands fixes weekly that can change behaviour.
+    revision: f37922e49067c26f0b0cbabc7131b3f02862a7b5
   MCP:
     url: https://github.com/modelcontextprotocol/swift-sdk.git
     from: 0.12.0

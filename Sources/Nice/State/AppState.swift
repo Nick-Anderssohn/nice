@@ -93,6 +93,12 @@ final class AppState: ObservableObject {
     /// live `TabPtySession`.
     private var currentTerminalFontSize: CGFloat = FontSettings.defaultSize
 
+    /// Tracks the GPU rendering preference (`Tweaks.gpuRendering`). New
+    /// sessions seed from this; `updateGpuRendering` fans changes out
+    /// to every live `TabPtySession` so the Metal renderer toggles in
+    /// place. Defaults to `true` to match `Tweaks.gpuRendering`.
+    private var currentGpuRendering: Bool = true
+
     // MARK: - MCP server
 
     @Published private(set) var mcp = NiceMCPServer()
@@ -326,6 +332,16 @@ final class AppState: ObservableObject {
         currentTerminalFontSize = size
         for session in ptySessions.values {
             session.applyTerminalFont(size: size)
+        }
+    }
+
+    /// Pushed by `AppShellView` whenever `Tweaks.gpuRendering` changes
+    /// (and once on launch). Updates the cached value used to seed
+    /// future sessions and broadcasts to every live one.
+    func updateGpuRendering(_ enabled: Bool) {
+        currentGpuRendering = enabled
+        for session in ptySessions.values {
+            session.applyGpuRendering(enabled: enabled)
         }
     }
 
@@ -818,6 +834,7 @@ final class AppState: ObservableObject {
         )
         session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
         session.applyTerminalFont(size: currentTerminalFontSize)
+        session.applyGpuRendering(enabled: currentGpuRendering)
         ptySessions[tabId] = session
         return session
     }

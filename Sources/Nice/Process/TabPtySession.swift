@@ -29,7 +29,10 @@ final class TabPtySession: ObservableObject {
     let cwd: String
 
     /// All live panes (claude + terminal) keyed by pane id.
-    var panes: [String: LocalProcessTerminalView] = [:]
+    /// Typed as `NiceTerminalView` (subclass of `LocalProcessTerminalView`)
+    /// so `applyGpuRendering` can call subclass-only helpers; the values
+    /// still pass anywhere the supertype is expected (e.g. `TerminalHost`).
+    var panes: [String: NiceTerminalView] = [:]
     /// Retains the per-view termination delegates so SwiftTerm's weak
     /// `processDelegate` reference stays live.
     private var delegates: [String: ProcessTerminationDelegate] = [:]
@@ -56,6 +59,12 @@ final class TabPtySession: ObservableObject {
     /// `applyTerminalFont` pick it up at construction. Seeded with the
     /// pre-feature 12pt default.
     private var currentTerminalFontSize: CGFloat = FontSettings.defaultSize
+
+    /// Cached "GPU rendering" preference. Read by every pane's
+    /// `gpuPreferenceProvider` closure so a Settings toggle propagates
+    /// without restarting the session. Defaults to `true` to match
+    /// `Tweaks.gpuRendering`'s default.
+    private var currentGpuRendering: Bool = true
 
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
@@ -118,8 +127,9 @@ final class TabPtySession: ObservableObject {
     /// inside is just a shell.
     @discardableResult
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
-        let view = LocalProcessTerminalView(frame: .zero)
+        let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(size: currentTerminalFontSize)
+        view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -178,8 +188,9 @@ final class TabPtySession: ObservableObject {
         socketPath: String? = nil,
         zdotdirPath: String? = nil
     ) -> LocalProcessTerminalView {
-        let view = LocalProcessTerminalView(frame: .zero)
+        let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(size: currentTerminalFontSize)
+        view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -344,6 +355,18 @@ final class TabPtySession: ObservableObject {
         let font = Self.terminalFont(size: size)
         for view in panes.values {
             view.font = font
+        }
+    }
+
+    /// Re-apply the GPU rendering preference to every live pane.
+    /// Called by `AppState.updateGpuRendering` when the user flips the
+    /// Settings toggle. Each pane's `gpuPreferenceProvider` reads back
+    /// through `currentGpuRendering`, so updating the cached value plus
+    /// calling `applyGpuPreference` is enough to flip every live pane.
+    func applyGpuRendering(enabled: Bool) {
+        currentGpuRendering = enabled
+        for view in panes.values {
+            view.applyGpuPreference()
         }
     }
 

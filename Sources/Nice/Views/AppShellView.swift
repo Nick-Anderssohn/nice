@@ -119,6 +119,7 @@ private struct AppShellHost: View {
         .onAppear {
             appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalFontSize(fontSettings.terminalFontSize)
+            appState.updateGpuRendering(tweaks.gpuRendering)
         }
         .onChange(of: scheme) { _, newScheme in
             appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
@@ -131,6 +132,9 @@ private struct AppShellHost: View {
         }
         .onChange(of: fontSettings.terminalFontSize) { _, newSize in
             appState.updateTerminalFontSize(newSize)
+        }
+        .onChange(of: tweaks.gpuRendering) { _, newValue in
+            appState.updateGpuRendering(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar and Main-Terminal cwd across relaunch.

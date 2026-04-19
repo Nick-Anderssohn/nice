@@ -384,6 +384,17 @@ private struct AppearancePane: View {
                 }
             }
         }
+
+        SettingRow(
+            label: "GPU rendering",
+            hint: "Use Metal for terminal drawing. Faster on most Macs; falls back to CPU automatically if Metal is unavailable."
+        ) {
+            Toggle("", isOn: $tweaks.gpuRendering)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.appearance.gpuRendering")
+        }
     }
 }
 

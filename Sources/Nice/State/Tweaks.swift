@@ -160,9 +160,10 @@ extension Color {
 /// `syncWithOS` flips to true, and from the OS-scheme notification handler.
 @MainActor
 final class Tweaks: ObservableObject {
-    static let themeKey  = "theme"
-    static let syncKey   = "syncWithOS"
-    static let accentKey = "accent"
+    static let themeKey         = "theme"
+    static let syncKey          = "syncWithOS"
+    static let accentKey        = "accent"
+    static let gpuRenderingKey  = "gpuRendering"
 
     @Published var theme: ThemeChoice {
         didSet {
@@ -182,6 +183,14 @@ final class Tweaks: ObservableObject {
         didSet { UserDefaults.standard.set(accent.rawValue, forKey: Self.accentKey) }
     }
 
+    /// Toggles the SwiftTerm Metal renderer for every live terminal pane.
+    /// Default `true`: the upstream Metal path landed in SwiftTerm
+    /// PR #484 and falls back to CoreGraphics automatically when Metal
+    /// isn't available (`MetalError.deviceUnavailable` — VMs, some CI).
+    @Published var gpuRendering: Bool {
+        didSet { UserDefaults.standard.set(gpuRendering, forKey: Self.gpuRenderingKey) }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
@@ -199,11 +208,20 @@ final class Tweaks: ObservableObject {
         let accentRaw = defaults.string(forKey: Self.accentKey) ?? AccentPreset.ocean.rawValue
         let accent = AccentPreset(rawValue: accentRaw) ?? .ocean
 
+        // Default GPU rendering on; explicit `false` from a previous
+        // launch sticks. `bool(forKey:)` returns `false` for an absent
+        // key, so check `object(forKey:)` to distinguish unset from
+        // explicit-off.
+        let gpu: Bool = defaults.object(forKey: Self.gpuRenderingKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.gpuRenderingKey)
+
         let (theme, sync) = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
         self.theme = theme
         self.syncWithOS = sync
         self.accent = accent
+        self.gpuRendering = gpu
 
         NSApp?.appearance = theme.nsAppearance
 
