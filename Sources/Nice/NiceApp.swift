@@ -30,11 +30,10 @@ struct NiceApp: App {
                 .environmentObject(tweaks)
                 .environmentObject(shortcuts)
                 .environment(\.palette, tweaks.theme.palette)
-                .frame(minWidth: 1180, minHeight: 680)
                 .tint(tweaks.accent.color)
         }
         .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentMinSize)
+        .windowResizability(.contentSize)
 
         // ⌘, binds to this scene automatically on macOS. SettingsView
         // sets its own 640×440 frame, but we repeat it here so the
