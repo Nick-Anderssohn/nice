@@ -52,8 +52,24 @@ struct WindowAccessor: NSViewRepresentable {
 /// zoom) by a fixed offset. Also installs observers so the offset
 /// sticks across focus + resize events (AppKit otherwise resets the
 /// buttons to their default positions).
+@MainActor
 enum TrafficLightNudger {
-    private static let sentinelKey = "dev.nickanderssohn.nice.trafficLightsNudged"
+    /// Windows we've already installed observers on — keyed by identity
+    /// so a second `nudge(window:)` call for the same window is a no-op.
+    private static var observed: Set<ObjectIdentifier> = []
+
+    /// Per-button canonical (pre-nudge) origin, captured on first touch
+    /// and reused on every subsequent `applyOffset` so the offset is
+    /// idempotent instead of compounding on each focus / resize event.
+    ///
+    /// Keyed by `ObjectIdentifier(button)` rather than an
+    /// `objc_setAssociatedObject` key — Swift `String` literals don't
+    /// produce stable pointers for the associated-object API, which
+    /// caused the lookup to miss and re-capture the already-nudged
+    /// origin (bug: traffic lights drifted inward + down on every
+    /// Settings-window close, which fires `didBecomeKey` on the main
+    /// window).
+    private static var canonicalOrigins: [ObjectIdentifier: CGPoint] = [:]
 
     static func nudge(window: NSWindow, dx: CGFloat, dy: CGFloat) {
         // Skip windows without a full-size content view — those have
@@ -63,8 +79,8 @@ enum TrafficLightNudger {
 
         // Guard against double-install (WindowAccessor can fire its
         // callback more than once if the view moves windows).
-        if objc_getAssociatedObject(window, sentinelKey) as? Bool == true { return }
-        objc_setAssociatedObject(window, sentinelKey, true, .OBJC_ASSOCIATION_RETAIN)
+        let windowKey = ObjectIdentifier(window)
+        guard observed.insert(windowKey).inserted else { return }
 
         applyOffset(to: window, dx: dx, dy: dy)
 
@@ -77,7 +93,9 @@ enum TrafficLightNudger {
             queue: .main
         ) { [weak window] _ in
             guard let window else { return }
-            applyOffset(to: window, dx: dx, dy: dy)
+            MainActor.assumeIsolated {
+                applyOffset(to: window, dx: dx, dy: dy)
+            }
         }
         center.addObserver(
             forName: NSWindow.didResizeNotification,
@@ -85,14 +103,11 @@ enum TrafficLightNudger {
             queue: .main
         ) { [weak window] _ in
             guard let window else { return }
-            applyOffset(to: window, dx: dx, dy: dy)
+            MainActor.assumeIsolated {
+                applyOffset(to: window, dx: dx, dy: dy)
+            }
         }
     }
-
-    /// Offset stored per-button so repeated applications are idempotent
-    /// — we record each button's "canonical" origin on first touch and
-    /// always apply the nudge to that, rather than stacking offsets.
-    private static let canonicalKey = "dev.nickanderssohn.nice.buttonCanonicalOrigin"
 
     private static func applyOffset(to window: NSWindow, dx: CGFloat, dy: CGFloat) {
         for kind in [NSWindow.ButtonType.closeButton,
@@ -102,18 +117,12 @@ enum TrafficLightNudger {
 
             // Record the canonical origin on first touch; reuse it on
             // every subsequent call so the offset doesn't compound.
-            let canonical: CGPoint
-            if let stored = objc_getAssociatedObject(button, canonicalKey) as? NSValue {
-                canonical = stored.pointValue
-            } else {
-                canonical = button.frame.origin
-                objc_setAssociatedObject(
-                    button,
-                    canonicalKey,
-                    NSValue(point: canonical),
-                    .OBJC_ASSOCIATION_RETAIN
-                )
-            }
+            let buttonKey = ObjectIdentifier(button)
+            let canonical = canonicalOrigins[buttonKey] ?? {
+                let origin = button.frame.origin
+                canonicalOrigins[buttonKey] = origin
+                return origin
+            }()
 
             button.setFrameOrigin(CGPoint(x: canonical.x + dx, y: canonical.y + dy))
         }
