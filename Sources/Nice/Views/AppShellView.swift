@@ -65,6 +65,11 @@ private struct AppShellHost: View {
     @Binding var sidebarCollapsedBinding: Bool
     @Binding var mainCwdBinding: String
 
+    /// True while the cursor is over the floating peek sidebar. Keeps
+    /// the overlay rendered after the keyboard modifiers are released
+    /// so the user can click a tab without holding any keys.
+    @State private var peekMousePinned: Bool = false
+
     init(
         services: NiceServices,
         initialSidebarCollapsed: Bool,
@@ -129,8 +134,15 @@ private struct AppShellHost: View {
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar and Main-Terminal cwd across relaunch.
+        // Also clear any in-flight peek state when the sidebar is
+        // explicitly expanded (via ⌘B or the chevron) so we don't carry
+        // a stale peek flag into the expanded shell.
         .onChange(of: appState.sidebarCollapsed) { _, new in
             sidebarCollapsedBinding = new
+            if !new {
+                appState.sidebarPeeking = false
+                peekMousePinned = false
+            }
         }
         .onChange(of: appState.terminalsTab.cwd) { _, new in
             mainCwdBinding = new
@@ -152,68 +164,7 @@ private struct AppShellHost: View {
     /// content stacked to its right.
     private var expandedShell: some View {
         HStack(spacing: 0) {
-            // Xcode-style floating sidebar card. The native traffic
-            // lights are positioned in absolute window coordinates by
-            // macOS and render on top of whatever's here; the 52pt
-            // clear spacer inside the VStack keeps the sidebar's own
-            // content clear of them visually. The card is inset so
-            // that the traffic lights (~x:20, y:15, 14pt diameter)
-            // have at least ~8pt of clearance on both sides: the
-            // leading edge sits at ~12pt and the top edge at ~40pt.
-            // Bottom mirrors the top so the card looks visually
-            // symmetric around the vertical axis. No trailing
-            // padding — the gap between sidebar and main content is
-            // just the card's own edge. Tweak pixel values here if
-            // it starts to look off relative to Xcode in dark mode.
-            SidebarBackground(palette: palette, scheme: scheme) {
-                VStack(spacing: 0) {
-                    // Reserve the traffic-light safe zone at the top of
-                    // the sidebar. 52pt matches the classic hidden-title-
-                    // bar chrome height and aligns with the toolbar row
-                    // on the right. WindowDragRegion makes this strip
-                    // behave like a title bar (drag + double-click zoom);
-                    // the traffic lights themselves are standard
-                    // NSButtons layered above and keep their own clicks.
-                    // The collapse toggle lives at the trailing edge so
-                    // its vertical band matches the collapsed cap's
-                    // restore button.
-                    WindowDragRegion()
-                        .frame(height: 52)
-                        .overlay(alignment: .topTrailing) {
-                            // Button top at strip-y=8 places the 24pt
-                            // button's center at strip-y=20, i.e. 26pt
-                            // from the window top — matching the collapsed
-                            // cap's button (40pt card, 6pt top padding,
-                            // HStack-centered button → same window-y=26).
-                            SidebarToggleButton(
-                                help: "Collapse sidebar",
-                                accessibilityId: "sidebar.collapse"
-                            ) {
-                                appState.toggleSidebar()
-                            }
-                            .padding(.top, 8)
-                            .padding(.trailing, 10)
-                        }
-                    SidebarView()
-                }
-            }
-            .frame(width: 240)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(
-                        Color.niceLine(scheme, palette).opacity(0.5),
-                        lineWidth: 0.5
-                    )
-            )
-            .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-            .padding(.leading, 6)
-            .padding(.top, 6)
-            .padding(.bottom, 6)
-            // Lift the card above the main content in Z so its shadow
-            // isn't clipped by the opaque nicePanel / niceChrome
-            // backgrounds of the toolbar and terminal host next to it.
-            .zIndex(1)
+            floatingSidebarCard
 
             VStack(spacing: 0) {
                 WindowToolbarView()
@@ -222,12 +173,83 @@ private struct AppShellHost: View {
         }
     }
 
+    /// The 240pt floating sidebar card. Used both as the leading column
+    /// of `expandedShell` and as a transient overlay above the
+    /// terminal in `collapsedShell` when a sidebar-tab shortcut is
+    /// peeking. The native traffic lights are positioned in absolute
+    /// window coordinates by macOS and render on top of whatever's
+    /// here; the 52pt clear spacer inside the VStack keeps the
+    /// sidebar's own content clear of them visually. The card is
+    /// inset so that the traffic lights (~x:20, y:15, 14pt diameter)
+    /// have at least ~8pt of clearance on both sides: the leading edge
+    /// sits at ~12pt and the top edge at ~40pt. Bottom mirrors the top
+    /// so the card looks visually symmetric around the vertical axis.
+    /// No trailing padding — the gap between sidebar and main content
+    /// is just the card's own edge. Tweak pixel values here if it
+    /// starts to look off relative to Xcode in dark mode.
+    private var floatingSidebarCard: some View {
+        SidebarBackground(palette: palette, scheme: scheme) {
+            VStack(spacing: 0) {
+                // Reserve the traffic-light safe zone at the top of
+                // the sidebar. 52pt matches the classic hidden-title-
+                // bar chrome height and aligns with the toolbar row
+                // on the right. WindowDragRegion makes this strip
+                // behave like a title bar (drag + double-click zoom);
+                // the traffic lights themselves are standard
+                // NSButtons layered above and keep their own clicks.
+                // The collapse toggle lives at the trailing edge so
+                // its vertical band matches the collapsed cap's
+                // restore button.
+                WindowDragRegion()
+                    .frame(height: 52)
+                    .overlay(alignment: .topTrailing) {
+                        // Button top at strip-y=8 places the 24pt
+                        // button's center at strip-y=20, i.e. 26pt
+                        // from the window top — matching the collapsed
+                        // cap's button (40pt card, 6pt top padding,
+                        // HStack-centered button → same window-y=26).
+                        SidebarToggleButton(
+                            help: "Collapse sidebar",
+                            accessibilityId: "sidebar.collapse"
+                        ) {
+                            appState.toggleSidebar()
+                        }
+                        .padding(.top, 8)
+                        .padding(.trailing, 10)
+                    }
+                SidebarView()
+            }
+        }
+        .frame(width: 240)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(
+                    Color.niceLine(scheme, palette).opacity(0.5),
+                    lineWidth: 0.5
+                )
+        )
+        .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+        .padding(.leading, 6)
+        .padding(.top, 6)
+        .padding(.bottom, 6)
+        // Lift the card above the main content in Z so its shadow
+        // isn't clipped by the opaque nicePanel / niceChrome
+        // backgrounds of the toolbar and terminal host next to it.
+        .zIndex(1)
+    }
+
     /// Collapsed: no sidebar column. A small floating card sits in the
     /// upper-left behind the three traffic lights and hosts a restore
     /// icon to re-expand the sidebar. The card is constrained within the
     /// top bar's 52pt vertical band — same styling as the expanded
     /// sidebar card (rounded corners, border, shadow, sidebar material),
     /// just sized down. The main content fills the full width below.
+    ///
+    /// When a sidebar-tab shortcut is held (`appState.sidebarPeeking`)
+    /// or the cursor is pinning a peek (`peekMousePinned`), the full
+    /// 240pt sidebar card overlays the terminal at top-leading without
+    /// reflowing the layout below.
     private var collapsedShell: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -236,6 +258,22 @@ private struct AppShellHost: View {
             }
             mainContent
         }
+        .overlay(alignment: .topLeading) {
+            if appState.sidebarPeeking || peekMousePinned {
+                floatingSidebarCard
+                    .onHover { hovering in
+                        peekMousePinned = hovering
+                    }
+                    .transition(
+                        .move(edge: .leading).combined(with: .opacity)
+                    )
+                    // Sit above the collapsedCap (zIndex 1) so the
+                    // peek visually replaces it, not slides under.
+                    .zIndex(2)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: appState.sidebarPeeking)
+        .animation(.easeOut(duration: 0.15), value: peekMousePinned)
     }
 
     /// Floating card that lives in the top bar's upper-left corner when

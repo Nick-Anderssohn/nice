@@ -65,6 +65,21 @@ enum KeyboardShortcutMonitor {
             }
             return consumed ? nil : event
         }
+
+        // Observer-only monitor for modifier-release: ends the
+        // sidebar-peek overlay once the user lets go of all the
+        // modifiers from the sidebar-tab shortcuts.
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) {
+            [weak registry, weak shortcuts] event in
+            MainActor.assumeIsolated {
+                endPeekIfModifiersReleased(
+                    event: event,
+                    registry: registry,
+                    shortcuts: shortcuts
+                )
+            }
+            return event
+        }
     }
 
     /// Returns `true` if the event matched a binding and was dispatched
@@ -107,7 +122,54 @@ enum KeyboardShortcutMonitor {
             return false
         }
         dispatch(action, on: appState)
+
+        // Sidebar-tab shortcuts triggered while the sidebar is collapsed
+        // float the sidebar over the terminal so the user can see which
+        // tab they're cycling toward. The peek dismisses on modifier
+        // release (see flagsChanged monitor in `install`).
+        if (action == .nextSidebarTab || action == .prevSidebarTab),
+           appState.sidebarCollapsed {
+            appState.sidebarPeeking = true
+        }
+
         return true
+    }
+
+    /// Observer for `.flagsChanged`. If the focused window is currently
+    /// peeking, end the peek once none of the sidebar-tab shortcuts'
+    /// modifiers are held anymore. Reads bindings live so a rebound
+    /// shortcut takes effect without restarting.
+    private static func endPeekIfModifiersReleased(
+        event: NSEvent,
+        registry: WindowRegistry?,
+        shortcuts: KeyboardShortcuts?
+    ) {
+        guard let registry, let shortcuts else { return }
+        guard let appState = registry.activeAppState(preferKey: true) else { return }
+        guard appState.sidebarPeeking else { return }
+
+        var relevant: NSEvent.ModifierFlags = []
+        if let combo = shortcuts.binding(for: .nextSidebarTab) {
+            relevant.formUnion(NSEvent.ModifierFlags(rawValue: combo.modifierFlagsRaw))
+        }
+        if let combo = shortcuts.binding(for: .prevSidebarTab) {
+            relevant.formUnion(NSEvent.ModifierFlags(rawValue: combo.modifierFlagsRaw))
+        }
+        relevant.formIntersection(KeyCombo.relevantModifierMask)
+        guard !relevant.isEmpty else {
+            // Both sidebar-tab shortcuts are unbound; nothing can hold
+            // the peek open, so close it.
+            appState.endSidebarPeek()
+            return
+        }
+
+        let stillHeld = !event.modifierFlags
+            .intersection(KeyCombo.relevantModifierMask)
+            .intersection(relevant)
+            .isEmpty
+        if !stillHeld {
+            appState.endSidebarPeek()
+        }
     }
 
     /// Handle font-zoom actions. Returns `true` if `action` was a font

@@ -42,8 +42,23 @@ final class AppState: ObservableObject {
     /// its own state; the view writes back on changes.
     @Published var sidebarCollapsed: Bool = false
 
+    /// Transient: sidebar is floating over the terminal as a peek
+    /// triggered by the tab-cycling shortcut while collapsed. Set by
+    /// `KeyboardShortcutMonitor` after a sidebar-tab dispatch, cleared
+    /// when the user releases the shortcut's modifiers. Never set while
+    /// `sidebarCollapsed == false`. The view layer ORs this with its own
+    /// mouse-hover pin so a hovered peek stays open after the keys lift.
+    @Published var sidebarPeeking: Bool = false
+
     func toggleSidebar() {
         sidebarCollapsed.toggle()
+    }
+
+    /// Called by the keyboard monitor when all relevant shortcut
+    /// modifiers have been released. The view's separate mouse-hover
+    /// pin keeps the overlay rendered if the cursor is over it.
+    func endSidebarPeek() {
+        sidebarPeeking = false
     }
 
     // MARK: - Process plumbing
