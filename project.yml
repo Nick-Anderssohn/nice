@@ -18,15 +18,21 @@ settings:
 packages:
   SwiftTerm:
     # Nick-Anderssohn/SwiftTerm fast-render branch: upstream's PR #484
-    # Metal-renderer revision (f37922e, March 2026) plus a one-file
-    # patch that drops the legacy 1/60s render throttle on the Metal
-    # path. MTKView's own vsync coalescing handles frame pacing from
-    # there — removing the timer cuts ~16–33ms off typing latency and
-    # fixes held-key jitter (visibly smoother held backspace).
+    # Metal-renderer revision (f37922e, March 2026) plus local patches:
+    #   - drop the legacy 1/60s render throttle on the Metal path
+    #   - paint via MTKView.draw() instead of setNeedsDisplay so rapid
+    #     PTY bursts can't be dropped by AppKit's display scheduling
+    # Together these cut ~16-33ms off typing latency (visibly smoother
+    # held backspace) without the missing-output regression the
+    # throttle was masking.
     # To pick up an upstream bump, rebase `fast-render` onto the new
     # revision and update the pin here.
+    #
+    # While iterating on SwiftTerm itself, swap to a local path:
+    #   path: ../SwiftTerm
+    # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: ccc89077f5dc6331138a07adc9975c4af13e33fd
+    revision: 85b0395391ab82ab813c2e84a4027ca40b746e0a
   MCP:
     url: https://github.com/modelcontextprotocol/swift-sdk.git
     from: 0.12.0
