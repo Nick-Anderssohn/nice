@@ -26,7 +26,16 @@ final class AppState: ObservableObject {
     /// Built-in "Terminals" session. Always present, never removable.
     @Published var terminalsTab: Tab
     /// Currently-selected tab. Defaults to the Terminals tab on launch.
-    @Published var activeTabId: String?
+    @Published var activeTabId: String? {
+        didSet {
+            // Viewing a tab dismisses the attention pulse on its active
+            // pane's waiting state — centralised here so every call site
+            // that flips `activeTabId` gets the same acknowledgment.
+            if let id = activeTabId, id != oldValue {
+                acknowledgeWaitingOnActivePane(tabId: id)
+            }
+        }
+    }
     @Published var sidebarQuery: String = ""
     @Published var sidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "sidebarCollapsed")
 
@@ -160,9 +169,27 @@ final class AppState: ObservableObject {
     /// Pick which pane is focused in `tabId`. No-op if `paneId` isn't a
     /// pane on the tab.
     func setActivePane(tabId: String, paneId: String) {
+        let viewing = activeTabId == tabId
         mutateTab(id: tabId) { tab in
-            guard tab.panes.contains(where: { $0.id == paneId }) else { return }
+            guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
+                return
+            }
             tab.activePaneId = paneId
+            if viewing {
+                tab.panes[pi].markAcknowledgedIfWaiting()
+            }
+        }
+    }
+
+    /// Clear the waiting-attention pulse on whichever pane is currently
+    /// focused in `tabId`. Called from the `activeTabId` `didSet` when
+    /// the user navigates to a different tab.
+    private func acknowledgeWaitingOnActivePane(tabId: String) {
+        mutateTab(id: tabId) { tab in
+            guard let paneId = tab.activePaneId,
+                  let pi = tab.panes.firstIndex(where: { $0.id == paneId })
+            else { return }
+            tab.panes[pi].markAcknowledgedIfWaiting()
         }
     }
 
@@ -345,14 +372,17 @@ final class AppState: ObservableObject {
         }
 
         if let newStatus {
+            let viewing = (activeTabId == tabId)
             mutateTab(id: tabId) { tab in
                 guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                     return
                 }
-                if tab.panes[pi].status != newStatus {
-                    tab.panes[pi].status = newStatus
-                }
-                if tab.activePaneId == paneId && tab.status != newStatus {
+                let isActivePane = (tab.activePaneId == paneId)
+                tab.panes[pi].applyStatusTransition(
+                    to: newStatus,
+                    isCurrentlyBeingViewed: viewing && isActivePane
+                )
+                if isActivePane && tab.status != newStatus {
                     tab.status = newStatus
                 }
             }

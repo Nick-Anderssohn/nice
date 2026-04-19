@@ -279,7 +279,10 @@ private struct TabRow: View {
     var body: some View {
         HStack(spacing: 8) {
             if tab.hasClaude {
-                StatusDot(status: tab.status, suppressWaitingPulse: isActive)
+                StatusDot(
+                    status: tab.status,
+                    suppressWaitingPulse: tab.waitingAcknowledged
+                )
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")
             } else {

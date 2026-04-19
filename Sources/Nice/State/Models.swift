@@ -31,6 +31,42 @@ struct Pane: Identifiable, Hashable, Sendable {
     /// Per-pane status (thinking/waiting/idle). Meaningful for `.claude`
     /// panes; `.terminal` panes stay `.idle`.
     var status: TabStatus = .idle
+    /// For `.waiting`: whether the user has already seen this pane enter
+    /// the waiting state. The sidebar/toolbar dot pulses for waiting only
+    /// while this is `false` — once the user looks at the pane, we stop
+    /// competing for their attention. Recomputed on every entry into
+    /// `.waiting` (so a fresh waiting event can pulse again) and cleared
+    /// on any transition out of `.waiting`.
+    var waitingAcknowledged: Bool = false
+}
+
+extension Pane {
+    /// Apply a status transition and recompute `waitingAcknowledged` as a
+    /// side-effect: entering `.waiting` marks it acknowledged iff the
+    /// user is already looking at this pane; any other status resets it.
+    /// No-op when `newStatus` matches the current status so re-reporting
+    /// the same state doesn't clobber a prior acknowledgment.
+    mutating func applyStatusTransition(
+        to newStatus: TabStatus,
+        isCurrentlyBeingViewed: Bool
+    ) {
+        guard status != newStatus else { return }
+        status = newStatus
+        switch newStatus {
+        case .waiting:
+            waitingAcknowledged = isCurrentlyBeingViewed
+        case .thinking, .idle:
+            waitingAcknowledged = false
+        }
+    }
+
+    /// The user just looked at this pane — if it is waiting, dismiss the
+    /// attention signal. No-op otherwise.
+    mutating func markAcknowledgedIfWaiting() {
+        if status == .waiting {
+            waitingAcknowledged = true
+        }
+    }
 }
 
 struct Tab: Identifiable, Hashable, Sendable {
@@ -68,6 +104,12 @@ extension Tab {
     var activePane: Pane? {
         guard let id = activePaneId else { return nil }
         return panes.first { $0.id == id }
+    }
+
+    /// Sidebar-dot acknowledgment: mirrors the active pane's flag, since
+    /// `tab.status` already mirrors the active pane's status.
+    var waitingAcknowledged: Bool {
+        activePane?.waitingAcknowledged ?? false
     }
 }
 

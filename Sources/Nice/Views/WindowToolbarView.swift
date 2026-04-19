@@ -228,7 +228,10 @@ private struct InlineTabPill: View {
     private var leadingIcon: some View {
         switch pane.kind {
         case .claude:
-            StatusDot(status: pane.status, suppressWaitingPulse: isActive)
+            StatusDot(
+                status: pane.status,
+                suppressWaitingPulse: pane.waitingAcknowledged
+            )
         case .terminal:
             Image(systemName: "terminal")
                 .font(.system(size: 12))
