@@ -111,6 +111,21 @@ enum AccentPreset: String, CaseIterable, Identifiable {
     }
 
     var color: Color { Color(hex: hex) }
+
+    /// NSColor counterpart of `color`. Used where AppKit APIs (like
+    /// SwiftTerm's `caretColor`) need the accent natively. Built from
+    /// the same `hex` source so the two paths stay in sync.
+    var nsColor: NSColor {
+        let scrubbed = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+        var n: UInt64 = 0
+        Scanner(string: scrubbed).scanHexInt64(&n)
+        return NSColor(
+            srgbRed: CGFloat((n >> 16) & 0xff) / 255,
+            green:   CGFloat((n >> 8)  & 0xff) / 255,
+            blue:    CGFloat(n         & 0xff) / 255,
+            alpha:   1.0
+        )
+    }
 }
 
 // MARK: - Color hex init

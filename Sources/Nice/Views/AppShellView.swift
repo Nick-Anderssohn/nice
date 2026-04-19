@@ -61,12 +61,15 @@ struct AppShellView: View {
         .task {
             await appState.bootstrap()
         }
-        .onAppear { appState.updateScheme(scheme, palette: palette) }
+        .onAppear { appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor) }
         .onChange(of: scheme) { _, newScheme in
-            appState.updateScheme(newScheme, palette: palette)
+            appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
         }
         .onChange(of: palette) { _, newPalette in
-            appState.updateScheme(scheme, palette: newPalette)
+            appState.updateScheme(scheme, palette: newPalette, accent: tweaks.accent.nsColor)
+        }
+        .onChange(of: tweaks.accent) { _, newAccent in
+            appState.updateScheme(scheme, palette: palette, accent: newAccent.nsColor)
         }
     }
 

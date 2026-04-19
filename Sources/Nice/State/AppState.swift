@@ -66,6 +66,11 @@ final class AppState: ObservableObject {
     /// are themed at creation using this alongside `currentScheme`.
     private var currentPalette: Palette = .nice
 
+    /// Tracks the user's active accent as an `NSColor`, used to paint
+    /// the terminal caret so the blinking cursor matches the app tint.
+    /// Seeded with terracotta; `updateScheme` overwrites on every call.
+    private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
+
     // MARK: - MCP server
 
     @Published private(set) var mcp = NiceMCPServer()
@@ -258,11 +263,12 @@ final class AppState: ObservableObject {
 
     // MARK: - Theme
 
-    func updateScheme(_ scheme: ColorScheme, palette: Palette) {
+    func updateScheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
         currentScheme = scheme
         currentPalette = palette
+        currentAccent = accent
         for session in ptySessions.values {
-            session.applyTheme(scheme, palette: palette)
+            session.applyTheme(scheme, palette: palette, accent: accent)
         }
     }
 
@@ -753,7 +759,7 @@ final class AppState: ObservableObject {
                 self?.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
             }
         )
-        session.applyTheme(currentScheme, palette: currentPalette)
+        session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
         ptySessions[tabId] = session
         return session
     }

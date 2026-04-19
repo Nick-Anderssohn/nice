@@ -47,6 +47,11 @@ final class TabPtySession: ObservableObject {
     /// `NSColor` semantic colors that haven't been appearance-resolved.
     private var currentPalette: Palette = .nice
 
+    /// Cached active accent as an `NSColor`, used to paint the caret so
+    /// the blinking cursor matches the app's tint. Seeded with the
+    /// terracotta fallback; `applyTheme` overwrites it on every call.
+    private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
+
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
     /// ZDOTDIR directory injected into terminal panes so the shadowed
@@ -152,7 +157,7 @@ final class TabPtySession: ObservableObject {
         }
 
         applyTheme(
-            currentScheme, palette: currentPalette, to: view,
+            currentScheme, palette: currentPalette, accent: currentAccent, to: view,
             background: SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
         )
         return view
@@ -196,7 +201,7 @@ final class TabPtySession: ObservableObject {
         )
 
         applyTheme(
-            currentScheme, palette: currentPalette, to: view,
+            currentScheme, palette: currentPalette, accent: currentAccent, to: view,
             background: SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
         )
         return view
@@ -239,7 +244,7 @@ final class TabPtySession: ObservableObject {
     func promotePaneToClaude(id: String) -> LocalProcessTerminalView? {
         guard let view = panes[id] else { return nil }
         applyTheme(
-            currentScheme, palette: currentPalette, to: view,
+            currentScheme, palette: currentPalette, accent: currentAccent, to: view,
             background: SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
         )
         return view
@@ -265,15 +270,16 @@ final class TabPtySession: ObservableObject {
     // MARK: - Theming
 
     /// Paint every live pane with the active chrome palette for the
-    /// given color scheme. Called from `AppState` on scheme or palette
-    /// changes. All panes use the `nicePanel` background so the single-
-    /// pane main area looks consistent across kinds.
-    func applyTheme(_ scheme: ColorScheme, palette: Palette) {
+    /// given color scheme. Called from `AppState` on scheme, palette,
+    /// or accent changes. All panes use the `nicePanel` background so
+    /// the single-pane main area looks consistent across kinds.
+    func applyTheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
         currentScheme = scheme
         currentPalette = palette
+        currentAccent = accent
         for view in panes.values {
             applyTheme(
-                scheme, palette: palette, to: view,
+                scheme, palette: palette, accent: accent, to: view,
                 background: SwiftUI.Color.nicePanelNS(scheme, palette)
             )
         }
@@ -282,6 +288,7 @@ final class TabPtySession: ObservableObject {
     private func applyTheme(
         _ scheme: ColorScheme,
         palette: Palette,
+        accent: NSColor,
         to view: LocalProcessTerminalView,
         background: NSColor
     ) {
@@ -290,6 +297,7 @@ final class TabPtySession: ObservableObject {
         view.nativeBackgroundColor = background
         view.nativeForegroundColor = fg
         view.installColors(ansi)
+        view.caretColor = accent
     }
 
     /// Terminate every live pane's process. Used when a tab is being
