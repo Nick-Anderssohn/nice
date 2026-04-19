@@ -22,11 +22,28 @@ struct TerminalHost: NSViewRepresentable {
             scroller.isHidden = true
             context.coordinator.startObserving(scroller)
         }
+        // Arm the focus latch before AppKit attaches the view so the
+        // ensuing `viewDidMove…` callbacks grab first responder atomically.
+        // Without this, the window's first responder is briefly nil between
+        // the outgoing pane's teardown and the async hop below — any key
+        // pressed in that window (common after ctrl+D ctrl+D exits Claude)
+        // falls off the responder chain and beeps.
+        if focus, let nice = view as? NiceTerminalView {
+            nice.wantsFocusOnAttach = true
+        }
         return view
     }
 
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
         if focus {
+            // Belt-and-suspenders: when SwiftUI keeps the same NSView
+            // attached across a rebuild (no viewDidMove… fires), fall back
+            // to the original async makeFirstResponder. A latch re-arm also
+            // covers the case where the view leaves and rejoins the window
+            // without this host being recreated.
+            if let nice = nsView as? NiceTerminalView {
+                nice.wantsFocusOnAttach = true
+            }
             DispatchQueue.main.async {
                 nsView.window?.makeFirstResponder(nsView)
             }

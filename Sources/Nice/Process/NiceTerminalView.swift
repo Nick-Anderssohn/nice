@@ -33,6 +33,15 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// `Tweaks.gpuRendering` default.
     var gpuPreferenceProvider: (() -> Bool)?
 
+    /// Latch set by `TerminalHost.makeNSView` when this pane is the one
+    /// SwiftUI is about to mount as the active pane. Consumed on the
+    /// next `viewDidMoveToWindow` / `viewDidMoveToSuperview` so focus
+    /// transfers atomically during AppKit's reattach — closing the race
+    /// where a key pressed between the old pane's exit and
+    /// `updateNSView`'s async `makeFirstResponder` drops off the end of
+    /// the responder chain and beeps.
+    var wantsFocusOnAttach: Bool = false
+
     private static let acceptedDragTypes: [NSPasteboard.PasteboardType] = [
         .fileURL,
         .png,
@@ -82,6 +91,23 @@ final class NiceTerminalView: LocalProcessTerminalView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyGpuPreference()
+        claimFocusIfRequested()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        claimFocusIfRequested()
+    }
+
+    /// If a host marked us as the incoming focus target, grab first
+    /// responder now that AppKit has us live in a window. One-shot: the
+    /// latch clears on first success so later reattaches (tab switches
+    /// while we're already focused, etc.) don't fight the user.
+    private func claimFocusIfRequested() {
+        guard wantsFocusOnAttach, let window, window.firstResponder !== self else { return }
+        if window.makeFirstResponder(self) {
+            wantsFocusOnAttach = false
+        }
     }
 
     // MARK: - Image drag-and-drop
