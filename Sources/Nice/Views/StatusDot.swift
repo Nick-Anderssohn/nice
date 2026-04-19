@@ -19,8 +19,10 @@ struct StatusDot: View {
     var size: CGFloat = 8
     /// Disables the `thinking` pulse in previews/snapshots.
     var pulsePaused: Bool = false
-
-    @State private var pulsing: Bool = false
+    /// Suppresses the `waiting` pulse when the user is already looking at
+    /// the owning tab — the pulse exists to attract attention, so it's
+    /// only needed when the waiting state is out of sight.
+    var suppressWaitingPulse: Bool = false
 
     private var baseColor: Color {
         switch status {
@@ -43,51 +45,79 @@ struct StatusDot: View {
     }
 
     private var shouldPulse: Bool {
-        status == .thinking || status == .waiting
+        switch status {
+        case .thinking: return true
+        case .waiting:  return !suppressWaitingPulse
+        case .idle:     return false
+        }
     }
 
     var body: some View {
         ZStack {
-            // Expanding ring — thinking and waiting.
             if shouldPulse {
+                PulsingLayer(
+                    status: status,
+                    baseColor: baseColor,
+                    size: size,
+                    pulsePaused: pulsePaused
+                )
+            } else {
                 Circle()
                     .fill(baseColor)
-                    .frame(width: size + 4, height: size + 4)
-                    .scaleEffect(pulsing ? (status == .waiting ? 2.0 : 1.6) : 1.0)
-                    .opacity(pulsing ? 0.0 : (status == .waiting ? 0.7 : 0.6))
-                    .animation(
-                        pulsePaused
-                            ? nil
-                            : .easeOut(duration: status == .waiting ? 1.2 : 1.6)
-                                .repeatForever(autoreverses: false),
-                        value: pulsing
-                    )
+                    .frame(width: size, height: size)
             }
+        }
+        .frame(width: size + 4, height: size + 4)
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
 
-            // Inner solid dot.
+/// The animated ring + breathing dot. Isolated so that each time
+/// `shouldPulse` transitions false → true a fresh instance is inserted
+/// with `pulsing` starting at `false`; `onAppear` then flips it to `true`,
+/// giving SwiftUI the value change it needs to trigger the repeat-forever
+/// animation. Without this isolation, a single persistent `@State` for
+/// `pulsing` stays `true` forever and the animation never retriggers.
+private struct PulsingLayer: View {
+    let status: TabStatus
+    let baseColor: Color
+    let size: CGFloat
+    let pulsePaused: Bool
+
+    @State private var pulsing: Bool = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(baseColor)
+                .frame(width: size + 4, height: size + 4)
+                .scaleEffect(pulsing ? (status == .waiting ? 2.0 : 1.6) : 1.0)
+                .opacity(pulsing ? 0.0 : (status == .waiting ? 0.7 : 0.6))
+                .animation(
+                    pulsePaused
+                        ? nil
+                        : .easeOut(duration: status == .waiting ? 1.2 : 1.6)
+                            .repeatForever(autoreverses: false),
+                    value: pulsing
+                )
+
             Circle()
                 .fill(baseColor)
                 .frame(width: size, height: size)
-                .opacity(
-                    shouldPulse
-                        ? (pulsing ? 1.0 : (status == .waiting ? 0.4 : 0.5))
-                        : 1.0
-                )
+                .opacity(pulsing ? 1.0 : (status == .waiting ? 0.4 : 0.5))
                 .animation(
-                    (shouldPulse && !pulsePaused)
-                        ? .easeInOut(duration: status == .waiting ? 0.9 : 0.7)
-                            .repeatForever(autoreverses: true)
-                        : nil,
+                    pulsePaused
+                        ? nil
+                        : .easeInOut(duration: status == .waiting ? 0.9 : 0.7)
+                            .repeatForever(autoreverses: true),
                     value: pulsing
                 )
         }
-        .frame(width: size + 4, height: size + 4)
         .onAppear {
             if !pulsePaused {
                 pulsing = true
             }
         }
-        .accessibilityLabel(accessibilityLabel)
     }
 }
 
