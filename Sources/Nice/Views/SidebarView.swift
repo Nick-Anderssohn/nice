@@ -2,8 +2,9 @@
 //  SidebarView.swift
 //  Nice
 //
-//  Supports expanded (240pt) and collapsed (~52pt) rail modes.
-//  The collapsed state is driven by `appState.sidebarCollapsed`.
+//  The expanded 240pt sidebar column. The collapsed state is handled
+//  upstream in `AppShellView` as a small top-bar cap, so this view
+//  is only instantiated when `appState.sidebarCollapsed == false`.
 //
 //  The column background is owned upstream by `AppShellView` via
 //  `SidebarBackground` (flat panel for `.nice`, wallpaper-tinted
@@ -22,73 +23,7 @@ struct SidebarView: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        if appState.sidebarCollapsed {
-            collapsedRail
-        } else {
-            expandedSidebar
-        }
-    }
-
-    // MARK: - Collapsed rail
-
-    private var collapsedRail: some View {
-        VStack(spacing: 0) {
-            RailButton(
-                systemImage: "sidebar.left",
-                help: "Expand sidebar",
-                action: { appState.toggleSidebar() }
-            )
-
-            Spacer().frame(height: 6)
-            railDivider
-            Spacer().frame(height: 6)
-
-            RailButton(
-                systemImage: "magnifyingglass",
-                help: "Search tabs · ⌘K",
-                action: { appState.toggleSidebar() }
-            )
-
-            RailButton(
-                systemImage: "terminal",
-                help: "Terminals",
-                isActive: appState.activeTabId == AppState.terminalsTabId,
-                action: { appState.selectTab(AppState.terminalsTabId) }
-            )
-
-            Spacer().frame(height: 6)
-            railDivider
-            Spacer().frame(height: 6)
-
-            ScrollView {
-                VStack(spacing: 0) {
-                    let allTabs = appState.projects.flatMap(\.tabs)
-                    ForEach(allTabs) { tab in
-                        RailTabDot(tab: tab)
-                    }
-                }
-            }
-            .frame(maxHeight: .infinity)
-
-            railDivider
-            Spacer().frame(height: 6)
-
-            RailButton(
-                systemImage: "gearshape",
-                help: "Settings",
-                accessibilityId: "sidebar.settings",
-                action: { openSettings() }
-            )
-        }
-        .padding(.top, 6)
-        .padding(.bottom, 8)
-    }
-
-    private var railDivider: some View {
-        Rectangle()
-            .fill(Color.niceLine(scheme, palette))
-            .frame(height: 1)
-            .padding(.horizontal, 10)
+        expandedSidebar
     }
 
     // MARK: - Expanded sidebar
@@ -180,110 +115,6 @@ struct SidebarView: View {
                 .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
-    }
-}
-
-// MARK: - Rail button (collapsed mode)
-
-private struct RailButton: View {
-    @EnvironmentObject private var tweaks: Tweaks
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-
-    let systemImage: String
-    let help: String
-    var isActive: Bool = false
-    var accessibilityId: String? = nil
-    let action: () -> Void
-
-    @State private var hover = false
-
-    private var background: Color {
-        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover { return Color.niceInk(scheme, palette).opacity(0.07) }
-        return .clear
-    }
-
-    var body: some View {
-        ZStack(alignment: .leading) {
-            if isActive {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(tweaks.accent.color)
-                    .frame(width: 2)
-                    .padding(.vertical, 6)
-                    .offset(x: -6)
-            }
-
-            Image(systemName: systemImage)
-                .font(.system(size: 14, weight: .regular))
-                .foregroundStyle(isActive ? tweaks.accent.color : Color.niceInk2(scheme, palette))
-                .frame(width: 36, height: 30)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(background)
-                )
-        }
-        .frame(width: 36, height: 30)
-        .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
-        .onHover { hover = $0 }
-        .onTapGesture { action() }
-        .help(help)
-        .accessibilityIdentifier(accessibilityId ?? "")
-    }
-}
-
-// MARK: - Rail tab dot (collapsed mode)
-
-private struct RailTabDot: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var tweaks: Tweaks
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-
-    let tab: Tab
-    @State private var hover = false
-
-    private var isActive: Bool { tab.id == appState.activeTabId }
-
-    private var background: Color {
-        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover { return Color.niceInk(scheme, palette).opacity(0.06) }
-        return .clear
-    }
-
-    var body: some View {
-        ZStack(alignment: .leading) {
-            if isActive {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(tweaks.accent.color)
-                    .frame(width: 2)
-                    .padding(.vertical, 5)
-                    .offset(x: -6)
-            }
-
-            Group {
-                if tab.hasClaude {
-                    StatusDot(status: tab.status, size: 10)
-                } else {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 10, weight: .regular))
-                        .foregroundStyle(Color.niceInk3(scheme, palette))
-                        .frame(width: 14, height: 14)
-                }
-            }
-            .frame(width: 36, height: 28)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(background)
-            )
-        }
-        .frame(width: 36, height: 28)
-        .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
-        .onHover { hover = $0 }
-        .onTapGesture { appState.selectTab(tab.id) }
-        .help(tab.title)
     }
 }
 

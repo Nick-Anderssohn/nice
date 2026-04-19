@@ -2,12 +2,21 @@
 //  AppShellView.swift
 //  Nice
 //
-//  Floor-to-ceiling sidebar on the left (matches Xcode / Finder / Mail);
-//  the native traffic lights float on top of its upper 52pt. On the
-//  right, a thin toolbar hosts the brand + tab pills, and the main area
-//  shows exactly one pane — the active pane of the active tab.
+//  Two layout modes, toggled by `appState.sidebarCollapsed`:
 //
-//  The sidebar's background depends on the active palette:
+//  • Expanded — floor-to-ceiling floating sidebar card on the left
+//    (Xcode / Finder / Mail style), with the toolbar + main content
+//    stacked to its right. Native traffic lights float on top of the
+//    card's upper 52pt.
+//
+//  • Collapsed — no sidebar column at all. A small chrome rectangle
+//    sits in the upper-left as a seamless continuation of the top
+//    bar, just wide enough to host the three native traffic lights
+//    plus a restore icon that re-expands the sidebar. The main
+//    terminal area extends all the way to the window's left edge
+//    beneath it.
+//
+//  The sidebar's expanded background depends on the active palette:
 //    • `.nice`  — flat `niceBg2` panel
 //    • `.macOS` — `NSVisualEffectView` with `.sidebar` material and
 //                 `.behindWindow` blending, so the OS's Desktop Tinting
@@ -27,54 +36,7 @@ struct AppShellView: View {
     private var palette: Palette { tweaks.theme.palette }
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Xcode-style floating sidebar card. The native traffic
-            // lights are positioned in absolute window coordinates by
-            // macOS and render on top of whatever's here; the 52pt
-            // clear spacer inside the VStack keeps the sidebar's own
-            // content clear of them visually. The card is inset so
-            // that the traffic lights (~x:20, y:15, 14pt diameter)
-            // have at least ~8pt of clearance on both sides: the
-            // leading edge sits at ~12pt and the top edge at ~40pt.
-            // Bottom mirrors the top so the card looks visually
-            // symmetric around the vertical axis. No trailing
-            // padding — the gap between sidebar and main content is
-            // just the card's own edge. Tweak pixel values here if
-            // it starts to look off relative to Xcode in dark mode.
-            SidebarBackground(palette: palette, scheme: scheme) {
-                VStack(spacing: 0) {
-                    // Reserve the traffic-light safe zone at the top of
-                    // the sidebar. 52pt matches the classic hidden-title-
-                    // bar chrome height and aligns with the toolbar row
-                    // on the right.
-                    Color.clear.frame(height: 52)
-                    SidebarView()
-                }
-            }
-            .frame(width: appState.sidebarCollapsed ? 52 : 240)
-            .animation(.easeInOut(duration: 0.22), value: appState.sidebarCollapsed)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(
-                        Color.niceLine(scheme, palette).opacity(0.5),
-                        lineWidth: 0.5
-                    )
-            )
-            .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
-            .padding(.leading, 6)
-            .padding(.top, 6)
-            .padding(.bottom, 6)
-            // Lift the card above the main content in Z so its shadow
-            // isn't clipped by the opaque nicePanel / niceChrome
-            // backgrounds of the toolbar and terminal host next to it.
-            .zIndex(1)
-
-            VStack(spacing: 0) {
-                WindowToolbarView()
-                mainContent
-            }
-        }
+        shell
         .ignoresSafeArea(edges: .top)
         .background(
             // Host-window reach-through: once the shell is mounted, nudge
@@ -103,6 +65,119 @@ struct AppShellView: View {
         .onChange(of: palette) { _, newPalette in
             appState.updateScheme(scheme, palette: newPalette)
         }
+    }
+
+    // MARK: - Layout modes
+
+    @ViewBuilder
+    private var shell: some View {
+        if appState.sidebarCollapsed {
+            collapsedShell
+        } else {
+            expandedShell
+        }
+    }
+
+    /// Floor-to-ceiling floating sidebar card on the left, toolbar + main
+    /// content stacked to its right.
+    private var expandedShell: some View {
+        HStack(spacing: 0) {
+            // Xcode-style floating sidebar card. The native traffic
+            // lights are positioned in absolute window coordinates by
+            // macOS and render on top of whatever's here; the 52pt
+            // clear spacer inside the VStack keeps the sidebar's own
+            // content clear of them visually. The card is inset so
+            // that the traffic lights (~x:20, y:15, 14pt diameter)
+            // have at least ~8pt of clearance on both sides: the
+            // leading edge sits at ~12pt and the top edge at ~40pt.
+            // Bottom mirrors the top so the card looks visually
+            // symmetric around the vertical axis. No trailing
+            // padding — the gap between sidebar and main content is
+            // just the card's own edge. Tweak pixel values here if
+            // it starts to look off relative to Xcode in dark mode.
+            SidebarBackground(palette: palette, scheme: scheme) {
+                VStack(spacing: 0) {
+                    // Reserve the traffic-light safe zone at the top of
+                    // the sidebar. 52pt matches the classic hidden-title-
+                    // bar chrome height and aligns with the toolbar row
+                    // on the right.
+                    Color.clear.frame(height: 52)
+                    SidebarView()
+                }
+            }
+            .frame(width: 240)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(
+                        Color.niceLine(scheme, palette).opacity(0.5),
+                        lineWidth: 0.5
+                    )
+            )
+            .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+            .padding(.leading, 6)
+            .padding(.top, 6)
+            .padding(.bottom, 6)
+            // Lift the card above the main content in Z so its shadow
+            // isn't clipped by the opaque nicePanel / niceChrome
+            // backgrounds of the toolbar and terminal host next to it.
+            .zIndex(1)
+
+            VStack(spacing: 0) {
+                WindowToolbarView()
+                mainContent
+            }
+        }
+    }
+
+    /// Collapsed: no sidebar column. A small floating card sits in the
+    /// upper-left behind the three traffic lights and hosts a restore
+    /// icon to re-expand the sidebar. The card is constrained within the
+    /// top bar's 52pt vertical band — same styling as the expanded
+    /// sidebar card (rounded corners, border, shadow, sidebar material),
+    /// just sized down. The main content fills the full width below.
+    private var collapsedShell: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                collapsedCap
+                WindowToolbarView()
+            }
+            mainContent
+        }
+    }
+
+    /// Floating card that lives in the top bar's upper-left corner when
+    /// the sidebar is collapsed. The leading 82pt reserves space for the
+    /// three native traffic lights (nudged to x≈28 with 14pt diameter
+    /// and 6pt spacing, last edge ≈82); the restore button sits just
+    /// past them. Vertical padding centers it within the 52pt top bar
+    /// row so it reads as a distinct card rather than blending into
+    /// either the chrome above or the content below.
+    private var collapsedCap: some View {
+        SidebarBackground(palette: palette, scheme: scheme) {
+            HStack(spacing: 0) {
+                Color.clear.frame(width: 82)
+                CollapsedSidebarRestoreButton {
+                    appState.toggleSidebar()
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(width: 124, height: 40)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(
+                    Color.niceLine(scheme, palette).opacity(0.5),
+                    lineWidth: 0.5
+                )
+        )
+        .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
+        .padding(.leading, 6)
+        .padding(.vertical, 6)
+        // Lift above the adjacent toolbar's opaque chrome so the shadow
+        // isn't clipped at the card's trailing edge.
+        .zIndex(1)
     }
 
     // MARK: - Window background
@@ -146,6 +221,37 @@ struct AppShellView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.leading, 20)
         }
+    }
+}
+
+// MARK: - Collapsed sidebar restore button
+
+/// The "unhide" chevron that lives in the top bar's cap when the sidebar
+/// is collapsed. Single responsibility: toggle `sidebarCollapsed` back to
+/// `false`. Styling mirrors `SidebarIconButton` so the hover feedback
+/// feels consistent with the sidebar's own controls.
+private struct CollapsedSidebarRestoreButton: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+
+    let action: () -> Void
+
+    @State private var hover = false
+
+    var body: some View {
+        Image(systemName: "sidebar.left")
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(Color.niceInk2(scheme, palette))
+            .frame(width: 24, height: 24)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(hover ? Color.niceInk(scheme, palette).opacity(0.08) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .onHover { hover = $0 }
+            .onTapGesture { action() }
+            .help("Expand sidebar")
+            .accessibilityIdentifier("sidebar.expand")
     }
 }
 
