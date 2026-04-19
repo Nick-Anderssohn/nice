@@ -186,7 +186,7 @@ final class AppState: ObservableObject {
             branch: nil,
             isBuiltIn: false,
             panes: [
-                Pane(id: claudePaneId, title: title, kind: .claude),
+                Pane(id: claudePaneId, title: "Claude", kind: .claude),
                 Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
             ],
             activePaneId: claudePaneId
@@ -292,22 +292,47 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// A pane emitted a window-title update via OSC 0/1/2. Claude encodes
-    /// thinking/waiting as a leading braille-spinner or asterisk; any
-    /// other non-empty title is the session label Claude sets once it's
-    /// picked a name (e.g. "fix-top-bar-height"). Terminal panes emit
-    /// prompt-driven titles (e.g. cwd) that we ignore for the sidebar.
+    /// A pane emitted a window-title update via OSC 0/1/2. Claude panes
+    /// encode thinking/waiting as a leading braille-spinner or asterisk;
+    /// the trailing text is the session label (e.g. "fix-top-bar-height")
+    /// which becomes the sidebar tab title. The claude-pane pill itself
+    /// stays pinned to "Claude". Terminal panes take the emitted title
+    /// verbatim as their toolbar pill label.
     func paneTitleChanged(tabId: String, paneId: String, title: String) {
+        guard let tab = tab(for: tabId),
+              let pane = tab.panes.first(where: { $0.id == paneId })
+        else { return }
+
+        if pane.kind == .terminal {
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let clipped: String = {
+                guard trimmed.count > 40 else { return trimmed }
+                let idx = trimmed.index(trimmed.startIndex, offsetBy: 40)
+                return String(trimmed[..<idx]).trimmingCharacters(in: .whitespaces)
+            }()
+            mutateTab(id: tabId) { tab in
+                guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
+                    return
+                }
+                if tab.panes[pi].title != clipped {
+                    tab.panes[pi].title = clipped
+                }
+            }
+            return
+        }
+
+        // Claude pane: split off the status prefix, update pane/tab
+        // status, and feed the trailing label into the tab title.
         guard let first = title.unicodeScalars.first else { return }
         let newStatus: TabStatus?
-        let labelStart: String.Index?
+        let labelStart: String.Index
         if first.value >= 0x2800 && first.value <= 0x28FF {
-            // Braille-spinner prefix: Claude is thinking. The string is
-            // "<spinner> <session label>" (e.g. "⠐ Plan next steps…").
+            // Braille-spinner prefix: Claude is thinking.
             newStatus = .thinking
             labelStart = title.index(after: title.startIndex)
         } else if first == "\u{2733}" {
-            // Sparkle: Claude is waiting for input. Same format.
+            // Sparkle: Claude is waiting for input.
             newStatus = .waiting
             labelStart = title.index(after: title.startIndex)
         } else {
@@ -320,7 +345,6 @@ final class AppState: ObservableObject {
                 guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                     return
                 }
-                guard tab.panes[pi].kind == .claude else { return }
                 if tab.panes[pi].status != newStatus {
                     tab.panes[pi].status = newStatus
                 }
@@ -330,18 +354,11 @@ final class AppState: ObservableObject {
             }
         }
 
-        // Extract and apply the session label (everything after the
-        // optional status prefix). Only for claude panes.
-        guard let labelStart else { return }
         let rawLabel = title[labelStart...]
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawLabel.isEmpty else { return }
-        // Ignore Claude's initial generic title before a session is named.
+        // Ignore Claude's generic placeholder before a session is named.
         if rawLabel == "Claude Code" { return }
-        guard let tab = tab(for: tabId),
-              let pane = tab.panes.first(where: { $0.id == paneId }),
-              pane.kind == .claude
-        else { return }
         applyAutoTitle(tabId: tabId, rawTitle: rawLabel)
     }
 
@@ -429,6 +446,7 @@ final class AppState: ObservableObject {
             if let i = tab.panes.firstIndex(where: { $0.id == promotedId }) {
                 tab.panes[i].kind = .claude
                 tab.panes[i].isAlive = true
+                tab.panes[i].title = "Claude"
             }
         }
         ptySessions[tabId]?.promotePaneToClaude(id: promotedId)
