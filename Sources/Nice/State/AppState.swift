@@ -705,10 +705,15 @@ final class AppState: ObservableObject {
 
     // MARK: - Claude binary resolution
 
+    /// Resolve `binary` via a login+interactive zsh so `.zprofile` /
+    /// `.zshrc` PATH customizations (Homebrew, nvm, `~/.local/bin`) are
+    /// applied. Nice launched from Finder/Spotlight inherits only the
+    /// macOS default PATH, so `/usr/bin/which` misses anything the user
+    /// put on PATH from their shell rc — the common case for `claude`.
     private nonisolated static func runWhich(binary: String) -> String? {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        proc.arguments = [binary]
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        proc.arguments = ["-ilc", "command -v -- \(binary)"]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = Pipe()
@@ -718,8 +723,12 @@ final class AppState: ObservableObject {
             guard proc.terminationStatus == 0 else { return nil }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             guard let raw = String(data: data, encoding: .utf8) else { return nil }
+            // `command -v` on a shell function or alias prints the name
+            // or a definition rather than an absolute path — only accept
+            // an absolute path.
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            guard trimmed.hasPrefix("/") else { return nil }
+            return trimmed
         } catch {
             return nil
         }
