@@ -118,7 +118,7 @@ Regular tabs' right-side `zsh` is untouched — it's a plain interactive shell w
 `scripts/mcp-e2e.sh` is a smoke test that simulates what a Claude running inside a tab does: it performs the MCP `initialize` handshake, asserts the three `nice.*` tools are advertised, and confirms `nice.tab.list` returns a coherent JSON array. Tab creation itself is out of scope for this script — it happens off the MCP surface, via the shadowed `claude()` function in the Main Terminal.
 
 ```sh
-open ~/Library/Developer/Xcode/DerivedData/Nice-*/Build/Products/Debug/Nice.app
+open -a Nice          # or any other launch path
 ./scripts/mcp-e2e.sh
 ```
 
