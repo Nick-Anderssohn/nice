@@ -6,9 +6,14 @@
 //
 //  Every test creates its own isolated `UserDefaults(suiteName:)` so state
 //  doesn't leak between tests. Tests never install the real distributed
-//  notification observer — we always pass `installOSObserver: false` — and
-//  never assert on `NSApp.appearance` (the `didSet` writes to it, but we
-//  don't care for unit testing).
+//  notification observer — we always pass `installOSObserver: false`.
+//
+//  `Tweaks`'s `didSet` observers on `theme` / `syncWithOS` / `accent`
+//  hardcode `UserDefaults.standard` rather than the injected `defaults`,
+//  and the `theme` didSet + init also mutate `NSApp?.appearance`. So the
+//  suite isolation above doesn't cover everything — setUp snapshots those
+//  four values and tearDown restores them, leaving the test host's
+//  user-visible theme settings untouched after the suite runs.
 //
 
 import AppKit
@@ -24,17 +29,43 @@ final class ThemeStateTests: XCTestCase {
     private var suiteName: String!
     private var defaults: UserDefaults!
 
+    // Snapshot of the global state that `Tweaks` mutates outside the
+    // injected `defaults` suite, captured before each test runs.
+    private var savedStandardTheme: String?
+    private var savedStandardSync: Bool?
+    private var savedStandardAccent: String?
+    private var savedAppAppearance: NSAppearance?
+
     override func setUp() {
         super.setUp()
         suiteName = "test-\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
+
+        savedStandardTheme = UserDefaults.standard.string(forKey: Tweaks.themeKey)
+        savedStandardSync = UserDefaults.standard.object(forKey: Tweaks.syncKey) as? Bool
+        savedStandardAccent = UserDefaults.standard.string(forKey: Tweaks.accentKey)
+        savedAppAppearance = NSApp?.appearance
     }
 
     override func tearDown() {
         defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
         suiteName = nil
+
+        restoreStandardDefault(Tweaks.themeKey, savedStandardTheme)
+        restoreStandardDefault(Tweaks.syncKey, savedStandardSync)
+        restoreStandardDefault(Tweaks.accentKey, savedStandardAccent)
+        NSApp?.appearance = savedAppAppearance
+
         super.tearDown()
+    }
+
+    private func restoreStandardDefault(_ key: String, _ value: Any?) {
+        if let value {
+            UserDefaults.standard.set(value, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
     }
 
     // MARK: - Helpers
