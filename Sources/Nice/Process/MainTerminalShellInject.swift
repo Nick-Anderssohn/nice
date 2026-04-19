@@ -19,8 +19,8 @@ import Foundation
 enum MainTerminalShellInject {
     /// Write the ZDOTDIR contents for this launch and return its path.
     /// The `$NICE_SOCKET` env var the `claude()` function reads is
-    /// injected separately — this file just references it.
-    static func make(socketPath: String) throws -> URL {
+    /// injected separately — the script just references it.
+    static func make() throws -> URL {
         let dir = URL(
             fileURLWithPath: NSTemporaryDirectory(),
             isDirectory: true

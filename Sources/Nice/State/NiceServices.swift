@@ -31,6 +31,15 @@ final class NiceServices: ObservableObject {
     /// opening a second window doesn't re-run the login-shell probe.
     let resolvedClaudePath: String?
 
+    /// Process-wide ZDOTDIR directory whose stub `.zshrc` chains back to
+    /// the user's real `$HOME/.zshrc` and shadows `claude` to talk to
+    /// our control socket. Owned here (not per-AppState) so multi-window
+    /// scenarios share one dir and a closing window can't yank it out
+    /// from under another window's still-spawning shells. Created at
+    /// init *after* `cleanupStaleTempFiles` so the cleanup never wipes
+    /// the dir we just wrote. Deleted by the `willTerminate` observer.
+    let zdotdirPath: String?
+
     private var terminateObserver: NSObjectProtocol?
 
     init() {
@@ -38,19 +47,28 @@ final class NiceServices: ObservableObject {
         self.shortcuts = KeyboardShortcuts()
         self.fontSettings = FontSettings()
         self.registry = WindowRegistry()
+        // Sweep `$TMPDIR` debris from prior crashed runs *before*
+        // writing this run's zdotdir — otherwise the cleanup would
+        // race the freshly-written dir and delete it, causing every
+        // companion shell spawned after onAppear to source nothing.
+        Self.cleanupStaleTempFiles()
+        do {
+            self.zdotdirPath = try MainTerminalShellInject.make().path
+        } catch {
+            NSLog("NiceServices: ZDOTDIR inject failed: \(error)")
+            self.zdotdirPath = nil
+        }
         self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
             ?? Self.runWhich(binary: "claude")
     }
 
     /// Idempotent process-wide wiring. Installs the single keyboard
-    /// monitor, cleans up `$TMPDIR` debris from prior crashed runs, and
-    /// registers the terminate observer that tears every window down.
+    /// monitor and registers the terminate observer that tears every
+    /// window down and removes the shared ZDOTDIR.
     private var booted = false
     func bootstrap() {
         guard !booted else { return }
         booted = true
-
-        Self.cleanupStaleTempFiles()
 
         KeyboardShortcutMonitor.install(
             registry: registry,
@@ -67,6 +85,9 @@ final class NiceServices: ObservableObject {
             MainActor.assumeIsolated {
                 for state in self.registry.allAppStates {
                     state.tearDown()
+                }
+                if let zdotdirPath = self.zdotdirPath {
+                    try? FileManager.default.removeItem(atPath: zdotdirPath)
                 }
             }
         }
@@ -103,13 +124,16 @@ final class NiceServices: ObservableObject {
     // MARK: - Temp cleanup
 
     /// Remove `nice-*.sock` and `nice-zdotdir-*` leftovers from prior
-    /// runs that crashed without running `tearDown`. Socket files from
-    /// *this* process's pid are left alone — they may belong to live
-    /// windows registered earlier this launch.
+    /// runs that crashed without running `tearDown`. Files belonging to
+    /// *this* process's pid are left alone: live windows may still own
+    /// the socket, and the next step of init writes the zdotdir we
+    /// must not delete here.
     private nonisolated static func cleanupStaleTempFiles() {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
         let fm = FileManager.default
-        let pidPrefix = "nice-\(getpid())-"
+        let pid = getpid()
+        let pidSocketPrefix = "nice-\(pid)-"
+        let pidZdotdirName = "nice-zdotdir-\(pid)"
         guard let contents = try? fm.contentsOfDirectory(
             at: tmp, includingPropertiesForKeys: nil
         ) else { return }
@@ -118,7 +142,8 @@ final class NiceServices: ObservableObject {
             let isSocket = name.hasPrefix("nice-") && name.hasSuffix(".sock")
             let isZdotdir = name.hasPrefix("nice-zdotdir-")
             guard isSocket || isZdotdir else { continue }
-            if isSocket, name.hasPrefix(pidPrefix) { continue }
+            if isSocket, name.hasPrefix(pidSocketPrefix) { continue }
+            if isZdotdir, name == pidZdotdirName { continue }
             try? fm.removeItem(at: url)
         }
     }

@@ -104,6 +104,11 @@ final class AppState: ObservableObject {
     // MARK: - Control socket
 
     private var controlSocket: NiceControlSocket?
+    /// Process-wide ZDOTDIR path owned by `NiceServices`. Stored here
+    /// so terminal-pane spawns can inject it as an env var without
+    /// reaching back through the services reference. Never deleted by
+    /// this AppState — the owning `NiceServices` cleans it up at app
+    /// terminate.
     private var zdotdirPath: String?
     private var controlSocketExtraEnv: [String: String] = [:]
 
@@ -126,24 +131,21 @@ final class AppState: ObservableObject {
         let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
         self.storedMainCwd = resolvedMainCwd
 
-        // Allocate the control socket + write the ZDOTDIR inject
-        // *before* spawning any ptys — the shells need NICE_SOCKET +
-        // ZDOTDIR in their environment at startup or the `claude()`
-        // shadow never loads. Each window owns its own socket so a
-        // `claude` invocation in one window's Main Terminal only opens
-        // a tab in that window.
+        // Allocate the control socket *before* spawning any ptys — the
+        // shells need NICE_SOCKET in their environment at startup or
+        // the `claude()` shadow can't reach us. Each window owns its
+        // own socket so a `claude` invocation in one window's Main
+        // Terminal only opens a tab in that window. The ZDOTDIR is
+        // process-wide and written by `NiceServices` before the first
+        // AppState is constructed; we just read its path here.
         let socket = NiceControlSocket()
         self.controlSocket = socket
+        self.zdotdirPath = services?.zdotdirPath
 
         var extraEnv: [String: String] = [:]
         extraEnv["NICE_SOCKET"] = socket.path
-        do {
-            let zdotdir = try MainTerminalShellInject.make(socketPath: socket.path)
-            extraEnv["ZDOTDIR"] = zdotdir.path
-            self.zdotdirPath = zdotdir.path
-        } catch {
-            NSLog("AppState: ZDOTDIR inject failed: \(error)")
-            self.zdotdirPath = nil
+        if let zdotdirPath {
+            extraEnv["ZDOTDIR"] = zdotdirPath
         }
         self.controlSocketExtraEnv = extraEnv
 
@@ -197,7 +199,8 @@ final class AppState: ObservableObject {
     /// Stop every resource this window owns. Called by
     /// `WindowRegistry` when its `NSWindow` closes, and by
     /// `NiceServices` for every live AppState on app terminate.
-    /// Safe to call more than once.
+    /// Safe to call more than once. The shared ZDOTDIR is owned by
+    /// `NiceServices` and removed at app terminate, not here.
     func tearDown() {
         for session in ptySessions.values {
             session.terminateAll()
@@ -207,10 +210,6 @@ final class AppState: ObservableObject {
         controlSocket = nil
         let mcpRef = mcp
         Task { await mcpRef.stop() }
-        if let zdotdirPath {
-            try? FileManager.default.removeItem(atPath: zdotdirPath)
-            self.zdotdirPath = nil
-        }
     }
 
     // MARK: - Selection
