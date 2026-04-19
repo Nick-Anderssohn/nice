@@ -71,18 +71,8 @@ struct SidebarView: View {
     private var tabList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                let projects = appState.filteredProjects
-                if projects.isEmpty {
-                    Text("No matching tabs")
-                        .font(.system(size: fontSettings.sidebarSize(12)))
-                        .foregroundStyle(Color.niceInk3(scheme, palette))
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 20)
-                } else {
-                    ForEach(projects) { project in
-                        ProjectGroup(project: project)
-                    }
+                ForEach(appState.filteredProjects) { project in
+                    ProjectGroup(project: project)
                 }
             }
             .padding(.vertical, 10)
