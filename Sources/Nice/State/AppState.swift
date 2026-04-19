@@ -37,11 +37,13 @@ final class AppState: ObservableObject {
         }
     }
     @Published var sidebarQuery: String = ""
-    @Published var sidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "sidebarCollapsed")
+    /// Whether the sidebar is collapsed. Seeded from the per-window
+    /// `@SceneStorage` value by the owning view so each window keeps
+    /// its own state; the view writes back on changes.
+    @Published var sidebarCollapsed: Bool = false
 
     func toggleSidebar() {
         sidebarCollapsed.toggle()
-        UserDefaults.standard.set(sidebarCollapsed, forKey: "sidebarCollapsed")
     }
 
     // MARK: - Process plumbing
@@ -85,17 +87,31 @@ final class AppState: ObservableObject {
     private var zdotdirPath: String?
     private var controlSocketExtraEnv: [String: String] = [:]
 
-    init() {
-        self.projects = Project.seed
+    /// Convenience init for `#Preview` blocks and unit tests. Each
+    /// AppState is otherwise expected to be constructed by
+    /// `AppShellView` passing its window's `NiceServices` and the
+    /// per-window `@SceneStorage` values.
+    convenience init() {
+        self.init(services: nil, initialSidebarCollapsed: false, initialMainCwd: nil)
+    }
 
-        let storedMainCwd = UserDefaults.standard.string(forKey: "mainTerminalCwd")
-            ?? NSHomeDirectory()
-        self.storedMainCwd = storedMainCwd
+    init(
+        services: NiceServices?,
+        initialSidebarCollapsed: Bool,
+        initialMainCwd: String?
+    ) {
+        self.projects = Project.seed
+        self.sidebarCollapsed = initialSidebarCollapsed
+
+        let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
+        self.storedMainCwd = resolvedMainCwd
 
         // Allocate the control socket + write the ZDOTDIR inject
         // *before* spawning any ptys — the shells need NICE_SOCKET +
         // ZDOTDIR in their environment at startup or the `claude()`
-        // shadow never loads.
+        // shadow never loads. Each window owns its own socket so a
+        // `claude` invocation in one window's Main Terminal only opens
+        // a tab in that window.
         let socket = NiceControlSocket()
         self.controlSocket = socket
 
@@ -111,10 +127,16 @@ final class AppState: ObservableObject {
         }
         self.controlSocketExtraEnv = extraEnv
 
-        // Resolve `claude` synchronously on launch (cheap). If missing,
-        // claude panes fall back to zsh.
-        self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
-            ?? Self.runWhich(binary: "claude")
+        // Prefer the process-wide cached `claude` path from services;
+        // fall back to probing if services isn't available (previews /
+        // unit tests). Probing a login shell costs 200–500ms so the
+        // cache materially improves second-window open latency.
+        if let cached = services?.resolvedClaudePath {
+            self.resolvedClaudePath = cached
+        } else {
+            self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
+                ?? Self.runWhich(binary: "claude")
+        }
 
         // Seed the built-in Terminals tab with one terminal pane.
         let initialPaneId = "\(Self.terminalsTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
@@ -123,7 +145,7 @@ final class AppState: ObservableObject {
             id: Self.terminalsTabId,
             title: "Terminals",
             status: .idle,
-            cwd: storedMainCwd,
+            cwd: resolvedMainCwd,
             branch: nil,
             isBuiltIn: true,
             panes: [initialPane],
@@ -133,7 +155,7 @@ final class AppState: ObservableObject {
 
         // All stored properties set — now bring up the session for the
         // Terminals tab and start the control socket.
-        _ = self.makeSession(for: Self.terminalsTabId, cwd: storedMainCwd)
+        _ = self.makeSession(for: Self.terminalsTabId, cwd: resolvedMainCwd)
 
         do {
             try socket.start { [weak self] message in
@@ -150,18 +172,24 @@ final class AppState: ObservableObject {
         } catch {
             NSLog("AppState: control socket failed to bind: \(error)")
         }
+    }
 
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                for session in self.ptySessions.values {
-                    session.terminateAll()
-                }
-                self.controlSocket?.stop()
-            }
+    /// Stop every resource this window owns. Called by
+    /// `WindowRegistry` when its `NSWindow` closes, and by
+    /// `NiceServices` for every live AppState on app terminate.
+    /// Safe to call more than once.
+    func tearDown() {
+        for session in ptySessions.values {
+            session.terminateAll()
+        }
+        ptySessions.removeAll()
+        controlSocket?.stop()
+        controlSocket = nil
+        let mcpRef = mcp
+        Task { await mcpRef.stop() }
+        if let zdotdirPath {
+            try? FileManager.default.removeItem(atPath: zdotdirPath)
+            self.zdotdirPath = nil
         }
     }
 

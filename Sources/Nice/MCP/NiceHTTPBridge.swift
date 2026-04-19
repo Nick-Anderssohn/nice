@@ -24,19 +24,23 @@ import MCP
 import Network
 
 /// Listens on 127.0.0.1:<port> and shuttles HTTP/1.1 requests to an
-/// underlying `StatefulHTTPServerTransport`.
+/// underlying `StatefulHTTPServerTransport`. Passing `port: 0` binds
+/// an OS-assigned ephemeral port; the bound port is returned from
+/// `start()` so callers can advertise it.
 actor NiceHTTPBridge {
-    private let port: NWEndpoint.Port
+    private let requestedPort: NWEndpoint.Port
     private let transport: StatefulHTTPServerTransport
     private var listener: NWListener?
 
     init(port: UInt16, transport: StatefulHTTPServerTransport) {
-        self.port = NWEndpoint.Port(rawValue: port)!
+        self.requestedPort = NWEndpoint.Port(rawValue: port) ?? .any
         self.transport = transport
     }
 
-    /// Begin accepting connections. Throws if the listener cannot bind.
-    func start() throws {
+    /// Begin accepting connections. Returns the OS-assigned port (which
+    /// equals the requested port when non-zero). Throws if the listener
+    /// cannot bind or fails before becoming ready.
+    func start() async throws -> UInt16 {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         // Confining to loopback-only is enforced by the transport's
@@ -44,7 +48,7 @@ actor NiceHTTPBridge {
         // dev tool). Passing `requiredLocalEndpoint` here conflicts
         // with `NWListener(using:on:)`'s own port argument.
 
-        let listener = try NWListener(using: params, on: port)
+        let listener = try NWListener(using: params, on: requestedPort)
         self.listener = listener
 
         listener.newConnectionHandler = { [weak self] conn in
@@ -55,7 +59,31 @@ actor NiceHTTPBridge {
             Task { await self.accept(conn) }
         }
 
-        listener.start(queue: .global(qos: .userInitiated))
+        // Wait for `.ready` so `listener.port` reflects the OS-assigned
+        // port when `requestedPort` was `.any`. `stateUpdateHandler`
+        // fires on a background queue, so we guard the continuation
+        // with a locked box to avoid double-resume if multiple state
+        // transitions race.
+        let gate = StartupGate()
+        let boundPort: UInt16 = try await withCheckedThrowingContinuation { cont in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    gate.resumeOnce {
+                        cont.resume(returning: listener.port?.rawValue ?? 0)
+                    }
+                case .failed(let err):
+                    gate.resumeOnce { cont.resume(throwing: err) }
+                case .cancelled:
+                    gate.resumeOnce { cont.resume(throwing: CancellationError()) }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: .global(qos: .userInitiated))
+        }
+
+        return boundPort
     }
 
     func stop() {
@@ -78,6 +106,23 @@ actor NiceHTTPBridge {
             }
         }
         conn.start(queue: .global(qos: .userInitiated))
+    }
+}
+
+/// Single-shot guard around the startup continuation. `NWListener`'s
+/// `stateUpdateHandler` fires on a concurrent queue, so the locked
+/// flag keeps `.ready` / `.failed` / `.cancelled` from each trying to
+/// resume the same continuation.
+private final class StartupGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+
+    func resumeOnce(_ action: () -> Void) {
+        lock.lock()
+        let first = !fired
+        fired = true
+        lock.unlock()
+        if first { action() }
     }
 }
 

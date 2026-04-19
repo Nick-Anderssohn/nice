@@ -3,10 +3,10 @@
 //  Nice
 //
 //  A single process-wide local `NSEvent` monitor that translates keyDown
-//  events into `AppState` actions according to the bindings owned by
-//  `KeyboardShortcuts`. Mirrors `TitleBarZoomMonitor`'s install-once
-//  pattern: the first call wires up the monitor and stashes weak refs to
-//  the two stores; subsequent calls are no-ops.
+//  events into `AppState` actions. Multi-window routing: the monitor
+//  asks the `WindowRegistry` which AppState is currently focused and
+//  dispatches there, so hitting ⌘T in window B adds a pane to window B
+//  (not whichever window happened to register first).
 //
 //  Local monitors run on the app's main thread/run loop, so we can
 //  reach `@MainActor` state via `MainActor.assumeIsolated` instead of
@@ -19,13 +19,13 @@
 //  Two gates keep the monitor from firing when it shouldn't:
 //
 //  • `isRecording` — flipped on by `KeyRecorderField` while it's
-//    capturing a new combo. The recorder installs its own higher-priority
-//    monitor and we stand down so the user's keystrokes reach it instead
-//    of triggering an action.
-//  • `event.window` must be the main window (or nil for app-targeted
-//    events). Without this, pressing ⌘B inside Settings would collapse
-//    the sidebar of the main window — surprising — and could swallow
-//    keys destined for text fields in Settings.
+//    capturing a new combo. The recorder installs its own higher-
+//    priority monitor and we stand down so the user's keystrokes reach
+//    it instead of triggering an action.
+//  • Settings window — the registry tracks which windows host
+//    `AppShellView`. Events from a window that isn't registered (i.e.
+//    Settings, or any accessory panel) are passed through so shortcuts
+//    don't leak into those surfaces.
 //
 
 import AppKit
@@ -40,22 +40,17 @@ enum KeyboardShortcutMonitor {
 
     private static var installed = false
 
-    /// Install the monitor. Safe to call repeatedly — only the first call
-    /// installs the underlying `NSEvent` handler. Captures `appState` /
-    /// `shortcuts` weakly so the monitor doesn't keep them alive past
-    /// app teardown (in practice both are `@StateObject`s on `NiceApp`
-    /// and live for the process, so this is belt-and-braces).
-    static func install(appState: AppState, shortcuts: KeyboardShortcuts) {
+    /// Install the monitor. Safe to call repeatedly — only the first
+    /// call installs the underlying `NSEvent` handler. Captures the
+    /// registry and shortcuts weakly so teardown isn't blocked by the
+    /// monitor's retain; in practice both live for the whole process.
+    static func install(registry: WindowRegistry, shortcuts: KeyboardShortcuts) {
         guard !installed else { return }
         installed = true
 
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak appState, weak shortcuts] event in
-            // The closure runs on the main run loop, but it isn't
-            // statically MainActor-isolated. We hop via `assumeIsolated`
-            // and return a `Bool` (Sendable) rather than `NSEvent?`
-            // (non-Sendable) — then reconstruct the event return outside.
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak registry, weak shortcuts] event in
             let consumed: Bool = MainActor.assumeIsolated {
-                consume(event: event, appState: appState, shortcuts: shortcuts)
+                consume(event: event, registry: registry, shortcuts: shortcuts)
             }
             return consumed ? nil : event
         }
@@ -63,20 +58,25 @@ enum KeyboardShortcutMonitor {
 
     /// Returns `true` if the event matched a binding and was dispatched
     /// (caller should swallow), `false` if it should pass through to
-    /// downstream handlers (terminal, Claude pane, SwiftUI focus).
+    /// downstream handlers (terminal, Claude pane, SwiftUI focus, or
+    /// the Settings window's controls).
     private static func consume(
         event: NSEvent,
-        appState: AppState?,
+        registry: WindowRegistry?,
         shortcuts: KeyboardShortcuts?
     ) -> Bool {
         guard !isRecording else { return false }
-        guard let appState, let shortcuts else { return false }
+        guard let registry, let shortcuts else { return false }
 
-        // Only fire when the user is interacting with the main window.
-        // `event.window` is nil for app-level events (menubar, etc.) — we
-        // accept those too. Anything else (Settings window, accessory
-        // panels) passes through.
-        if let window = event.window, window !== NSApp.mainWindow {
+        // Events from unregistered windows (Settings, accessory panels)
+        // pass through so text fields and the key recorder work normally.
+        // App-level events (`event.window == nil`, e.g. from the menubar)
+        // route to the key window via the registry below.
+        if let window = event.window, registry.isSettingsWindow(window) {
+            return false
+        }
+
+        guard let appState = registry.activeAppState(preferKey: true) else {
             return false
         }
 

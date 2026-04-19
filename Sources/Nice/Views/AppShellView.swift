@@ -2,6 +2,12 @@
 //  AppShellView.swift
 //  Nice
 //
+//  Per-window root: owns this window's `AppState` as a `@StateObject`
+//  (so every `WindowGroup` instance gets its own), bridges SwiftUI's
+//  per-scene `@SceneStorage` to AppState for things like the collapsed
+//  sidebar state, and registers the window with the app-wide
+//  `WindowRegistry` once AppKit hands us a real `NSWindow`.
+//
 //  Two layout modes, toggled by `appState.sidebarCollapsed`:
 //
 //  • Expanded — floor-to-ceiling floating sidebar card on the left
@@ -29,10 +35,51 @@ import AppKit
 import SwiftUI
 
 struct AppShellView: View {
-    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var services: NiceServices
+    @SceneStorage("sidebarCollapsed") private var storedSidebarCollapsed: Bool = false
+    @SceneStorage("mainTerminalCwd") private var storedMainCwd: String = ""
+
+    var body: some View {
+        AppShellHost(
+            services: services,
+            initialSidebarCollapsed: storedSidebarCollapsed,
+            initialMainCwd: storedMainCwd.isEmpty ? nil : storedMainCwd,
+            sidebarCollapsedBinding: $storedSidebarCollapsed,
+            mainCwdBinding: $storedMainCwd
+        )
+    }
+}
+
+/// The stateful inner view. Splitting it out lets us read
+/// `@EnvironmentObject services` and `@SceneStorage` values from
+/// `AppShellView` before constructing the per-window `AppState`
+/// (`@StateObject` can't reach environment in its own `init`).
+private struct AppShellHost: View {
     @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var shortcuts: KeyboardShortcuts
     @Environment(\.colorScheme) private var scheme
+
+    @StateObject private var appState: AppState
+    let services: NiceServices
+    @Binding var sidebarCollapsedBinding: Bool
+    @Binding var mainCwdBinding: String
+
+    init(
+        services: NiceServices,
+        initialSidebarCollapsed: Bool,
+        initialMainCwd: String?,
+        sidebarCollapsedBinding: Binding<Bool>,
+        mainCwdBinding: Binding<String>
+    ) {
+        self.services = services
+        _appState = StateObject(wrappedValue: AppState(
+            services: services,
+            initialSidebarCollapsed: initialSidebarCollapsed,
+            initialMainCwd: initialMainCwd
+        ))
+        _sidebarCollapsedBinding = sidebarCollapsedBinding
+        _mainCwdBinding = mainCwdBinding
+    }
 
     private var palette: Palette { tweaks.theme.palette }
 
@@ -40,18 +87,20 @@ struct AppShellView: View {
         shell
         .ignoresSafeArea(edges: .top)
         .background(
-            // Host-window reach-through: once the shell is mounted, nudge
-            // the native traffic lights deeper into the sidebar card so
-            // they don't sit flush against the rounded corner. Xcode's
-            // buttons sit ~8pt further in on both axes; we do the same.
+            // Host-window reach-through: once the shell is mounted,
+            // register the window so shortcuts and termination route to
+            // this AppState, and nudge the native traffic lights deeper
+            // into the sidebar card so they don't sit flush against the
+            // rounded corner.
             WindowAccessor { window in
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
                 TitleBarZoomMonitor.install()
-                KeyboardShortcutMonitor.install(appState: appState, shortcuts: shortcuts)
+                services.registry.register(appState: appState, window: window)
             }
         )
         .background(windowBackground.ignoresSafeArea())
         .environment(\.palette, palette)
+        .environmentObject(appState)
         .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
             Button("Quit", role: .destructive) { NSApp.terminate(nil) }
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
@@ -70,6 +119,14 @@ struct AppShellView: View {
         }
         .onChange(of: tweaks.accent) { _, newAccent in
             appState.updateScheme(scheme, palette: palette, accent: newAccent.nsColor)
+        }
+        // Per-window SceneStorage bridges: persist this window's
+        // collapsed-sidebar and Main-Terminal cwd across relaunch.
+        .onChange(of: appState.sidebarCollapsed) { _, new in
+            sidebarCollapsedBinding = new
+        }
+        .onChange(of: appState.terminalsTab.cwd) { _, new in
+            mainCwdBinding = new
         }
     }
 
@@ -270,16 +327,18 @@ private struct CollapsedSidebarRestoreButton: View {
 
 #Preview("Light") {
     AppShellView()
-        .environmentObject(AppState())
+        .environmentObject(NiceServices())
         .environmentObject(Tweaks())
+        .environmentObject(KeyboardShortcuts())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.light)
 }
 
 #Preview("Dark") {
     AppShellView()
-        .environmentObject(AppState())
+        .environmentObject(NiceServices())
         .environmentObject(Tweaks())
+        .environmentObject(KeyboardShortcuts())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.dark)
 }

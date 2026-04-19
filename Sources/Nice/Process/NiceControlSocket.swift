@@ -53,11 +53,18 @@ final class NiceControlSocket: @unchecked Sendable {
     private var handler: Handler = { _ in }
 
     /// Allocates only — the socket path is derived from the process
-    /// pid so it's known immediately and can be injected into the Main
-    /// Terminal's env before `start(handler:)` is called.
+    /// pid plus a UUID so multiple sockets (one per window) can coexist
+    /// within the same process, and so the path is known immediately and
+    /// can be injected into the Main Terminal's env before
+    /// `start(handler:)` is called. `NICE_SOCKET_PATH` still overrides
+    /// for UI tests.
     init() {
-        self.path = ProcessInfo.processInfo.environment["NICE_SOCKET_PATH"]
-            ?? NSTemporaryDirectory() + "nice-\(getpid()).sock"
+        if let override = ProcessInfo.processInfo.environment["NICE_SOCKET_PATH"] {
+            self.path = override
+        } else {
+            let suffix = UUID().uuidString.prefix(8)
+            self.path = NSTemporaryDirectory() + "nice-\(getpid())-\(suffix).sock"
+        }
     }
 
     /// Bind, listen, and start accepting connections on a background

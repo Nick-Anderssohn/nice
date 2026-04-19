@@ -2,35 +2,35 @@
 //  NiceApp.swift
 //  Nice
 //
-//  Phase 5: the shell now owns a second observable store (`Tweaks`) that
-//  drives user-selected theme + accent, and registers a standard
-//  `Settings { … }` scene so ⌘, opens the preferences window on macOS.
-//  Both environment objects are injected into the main window *and* the
-//  Settings window, and the Settings window is explicitly sized to
-//  640×440 per the design mock.
+//  App entry point. App-wide services (`Tweaks`, `KeyboardShortcuts`,
+//  the shared `WindowRegistry`, and the cached `claude` path) live on
+//  one `NiceServices` instance owned here. Per-window state
+//  (`AppState`, `NiceMCPServer`, `NiceControlSocket`) lives inside
+//  each `AppShellView` — every `WindowGroup` instance gets its own,
+//  so opening a second window via ⌘N yields a fully isolated window
+//  with its own tabs, panes, pty sessions, and MCP endpoint.
 //
 //  Theme is driven via `NSApp.appearance` from `Tweaks` rather than
-//  `.preferredColorScheme`, because the latter can't clear a previously
-//  applied non-nil scheme — switching back to "Match system" would leave
-//  windows pinned to the last explicit choice.
+//  `.preferredColorScheme`, because the latter can't clear a
+//  previously applied non-nil scheme — switching back to "Match
+//  system" would leave windows pinned to the last explicit choice.
 //
 
 import SwiftUI
 
 @main
 struct NiceApp: App {
-    @StateObject private var appState = AppState()
-    @StateObject private var tweaks = Tweaks()
-    @StateObject private var shortcuts = KeyboardShortcuts()
+    @StateObject private var services = NiceServices()
 
     var body: some Scene {
         WindowGroup {
             AppShellView()
-                .environmentObject(appState)
-                .environmentObject(tweaks)
-                .environmentObject(shortcuts)
-                .environment(\.palette, tweaks.theme.palette)
-                .tint(tweaks.accent.color)
+                .environmentObject(services)
+                .environmentObject(services.tweaks)
+                .environmentObject(services.shortcuts)
+                .environment(\.palette, services.tweaks.theme.palette)
+                .tint(services.tweaks.accent.color)
+                .onAppear { services.bootstrap() }
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
@@ -40,12 +40,12 @@ struct NiceApp: App {
         // window resizes correctly even before the child view lays out.
         Settings {
             SettingsView()
-                .environmentObject(appState)
-                .environmentObject(tweaks)
-                .environmentObject(shortcuts)
-                .environment(\.palette, tweaks.theme.palette)
+                .environmentObject(services)
+                .environmentObject(services.tweaks)
+                .environmentObject(services.shortcuts)
+                .environment(\.palette, services.tweaks.theme.palette)
                 .frame(width: 640, height: 440)
-                .tint(tweaks.accent.color)
+                .tint(services.tweaks.accent.color)
         }
     }
 }

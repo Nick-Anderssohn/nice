@@ -30,7 +30,11 @@ import MCP
 @MainActor
 final class NiceMCPServer: ObservableObject {
     @Published private(set) var isRunning = false
-    @Published private(set) var port: Int = 7420
+    /// OS-assigned port, published after `start` binds successfully.
+    /// Zero while the server is stopped. Multi-window: each window runs
+    /// its own server on a distinct ephemeral port so a Claude process
+    /// spawned in that window connects only to that window's MCP.
+    @Published private(set) var port: Int = 0
 
     private weak var appState: AppState?
     private var server: Server?
@@ -66,19 +70,21 @@ final class NiceMCPServer: ObservableObject {
             return try await self.handleCall(params: params)
         }
 
-        let bridge = NiceHTTPBridge(
-            port: UInt16(self.port), transport: transport
-        )
+        // Bind an OS-assigned ephemeral port so multiple windows can
+        // each run a server in the same process without colliding.
+        let bridge = NiceHTTPBridge(port: 0, transport: transport)
+        let boundPort: UInt16
         do {
-            try await bridge.start()
+            boundPort = try await bridge.start()
         } catch {
-            NSLog("NiceMCPServer: failed to bind HTTP bridge on port \(self.port): \(error)")
+            NSLog("NiceMCPServer: failed to bind HTTP bridge: \(error)")
             return
         }
 
         self.server = server
         self.transport = transport
         self.bridge = bridge
+        self.port = Int(boundPort)
 
         // Start the server's receive loop. `Server.start` connects the
         // transport and runs the message loop until the transport is
@@ -103,6 +109,7 @@ final class NiceMCPServer: ObservableObject {
         await bridge?.stop()
         server = nil
         transport = nil
+        port = 0
         bridge = nil
         isRunning = false
     }

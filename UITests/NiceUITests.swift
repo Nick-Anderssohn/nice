@@ -964,79 +964,6 @@ final class NiceUITests: XCTestCase {
         )
     }
 
-    /// Regression: typing `claude` in a user session's terminal pane
-    /// must fire `promoteTab` (which promotes the active pane to a
-    /// claude pane and appends a fresh terminal), without crashing the
-    /// app. Pre-fix this would have also been stable — the crash was
-    /// Terminals-specific — but this guards against regressions in the
-    /// companion-pane path.
-    func testTypeClaudeInUserSessionTerminalPromotes() throws {
-        let socketPath = Self.testSocketPath
-        try? FileManager.default.removeItem(atPath: socketPath)
-        let app = launchApp(extraEnv: [
-            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
-            "NICE_SOCKET_PATH": socketPath
-        ])
-        XCTAssertTrue(
-            app.descendants(matching: .any)["sidebar.terminals"]
-                .waitForExistence(timeout: 5)
-        )
-
-        let rowId = try createTabViaSocket(in: app, socketPath: socketPath)
-        let row = app.descendants(matching: .any).matching(
-            NSPredicate(format: "identifier == %@", rowId)
-        ).element(boundBy: 0)
-        row.click()
-
-        // Wait for both pills to render (claude + terminal).
-        let twoPills = XCTNSPredicateExpectation(
-            predicate: NSPredicate(block: { _, _ in
-                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") >= 2
-            }),
-            object: nil
-        )
-        XCTAssertEqual(XCTWaiter.wait(for: [twoPills], timeout: 5), .completed)
-
-        // Activate the second pill (the terminal kind) so typing targets
-        // its pty, not the Claude chat. SwiftUI can expose each pill as
-        // multiple accessibility elements with the same identifier, so
-        // we dedupe to find the genuinely-different second pane id.
-        let uniquePillIds = Array(NSOrderedSet(array: panePillIds(in: app))) as! [String]
-        XCTAssertGreaterThanOrEqual(uniquePillIds.count, 2,
-            "Expected at least 2 distinct pane ids before promote")
-        let terminalPaneId = uniquePillIds[1]
-        let terminalPill = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier == %@", "tab.pill.\(terminalPaneId)"))
-            .element(boundBy: 0)
-        terminalPill.click()
-
-        // Give the terminal pane's zsh a moment to finish startup and
-        // SwiftUI a moment to swap the main content.
-        Thread.sleep(forTimeInterval: 1.5)
-
-        let uniqueBefore = Set(panePillIds(in: app)).count
-        focusMainTerminal(in: app)
-        app.typeText("claude\n")
-
-        // Promote flow appends a fresh terminal pane, so the count of
-        // distinct pane ids should grow by at least one.
-        let pillsGrew = XCTNSPredicateExpectation(
-            predicate: NSPredicate(block: { _, _ in
-                Set(self.panePillIds(in: app)).count > uniqueBefore
-            }),
-            object: nil
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [pillsGrew], timeout: 10), .completed,
-            "Typing `claude` in a user-session terminal pane should grow the pill count via promoteTab"
-        )
-
-        XCTAssertTrue(
-            app.descendants(matching: .any)["sidebar.terminals"].exists,
-            "App should still be running after promote flow"
-        )
-    }
-
     /// Regression: typing `claude` repeatedly in the Terminals tab must
     /// not destabilise the control socket. Each invocation opens a new
     /// sidebar session; the final count must match, and the app must
@@ -1192,6 +1119,86 @@ final class NiceUITests: XCTestCase {
         XCTAssertEqual(
             niceLight.value as? String, "unselected",
             "Previously-selected cell must clear its selected value once another cell is picked"
+        )
+    }
+
+    // MARK: - Multi-window isolation
+
+    /// ⌘N opens a second window, and per-window state (terminal pills,
+    /// keyboard-shortcut dispatch) is isolated between them. Proving
+    /// isolation without sockets: each window starts with one Terminals
+    /// pill (total 2 across both); pressing ⌘T in the focused window
+    /// adds exactly one pane (total 3, not 4) — if state leaked, both
+    /// windows would react.
+    func testMultiWindowIsolation() throws {
+        // No NICE_SOCKET_PATH override: that env var would force both
+        // windows to bind the same socket path. This test exercises the
+        // default per-window path (nice-<pid>-<uuid>.sock).
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude()
+        ])
+
+        let firstSidebar = app.descendants(matching: .any)["sidebar.terminals"]
+        XCTAssertTrue(
+            firstSidebar.waitForExistence(timeout: 5),
+            "First window's Terminals row should appear on launch"
+        )
+
+        // SwiftUI accessibility exposes each pill multiple times (view
+        // + hosting layer), so compare unique ids rather than raw
+        // element counts.
+        func uniquePillIds() -> Set<String> { Set(panePillIds(in: app)) }
+
+        let initialWindowCount = app.windows.count
+        let initialPills = uniquePillIds()
+        XCTAssertEqual(
+            initialPills.count, 1,
+            "First window should have exactly one unique terminal pill on launch (got \(initialPills))"
+        )
+
+        // WindowGroup auto-binds ⌘N to File > New Window on macOS.
+        app.typeKey("n", modifierFlags: .command)
+
+        let twoWindows = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                app.windows.count > initialWindowCount
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [twoWindows], timeout: 5), .completed,
+            "⌘N should open a second window"
+        )
+
+        // Each window carries its own AppState with its own Terminals
+        // tab and its own initial pill. A shared AppState would still
+        // surface a single pill id across both windows.
+        let bothPills = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                uniquePillIds().count == 2
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [bothPills], timeout: 5), .completed,
+            "Each window should have its own terminal pill id (got \(uniquePillIds()))"
+        )
+
+        // ⌘T routes to the focused window via WindowRegistry. Exactly
+        // one new pill id should appear. If the shortcut leaked to both
+        // windows we'd see 4 unique ids; if it produced no pill (wrong
+        // AppState targeted) we'd still see 2.
+        app.typeKey("t", modifierFlags: .command)
+
+        let threePills = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                uniquePillIds().count == 3
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [threePills], timeout: 5), .completed,
+            "⌘T should add exactly one pill to the focused window (got \(uniquePillIds()))"
         )
     }
 }

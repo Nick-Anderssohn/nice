@@ -125,10 +125,14 @@ private struct TerminalsRow: View {
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
-    @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
     @State private var hover = false
 
     private var isActive: Bool { appState.activeTabId == AppState.terminalsTabId }
+
+    /// The Main Terminal cwd is per-window state now, read directly
+    /// from the built-in tab so two windows with different cwds don't
+    /// share a label.
+    private var mainTerminalCwd: String { appState.terminalsTab.cwd }
 
     /// Collapse `$HOME` to `~` for the right-side cwd label.
     private var cwdDisplayName: String {
@@ -188,7 +192,8 @@ private struct TerminalsRow: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url {
-            mainTerminalCwd = url.path
+            // `restartTerminalsFirstPane` updates `terminalsTab.cwd`
+            // which the AppShellView bridges back to `@SceneStorage`.
             appState.restartTerminalsFirstPane(cwd: url.path)
         }
     }

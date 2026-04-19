@@ -42,7 +42,6 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 // MARK: - Root
 
 struct SettingsView: View {
-    @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
 
@@ -153,20 +152,31 @@ private struct SettingsSectionRow: View {
 // MARK: - General pane
 
 private struct GeneralPane: View {
-    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var services: NiceServices
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
     @AppStorage("launchAtLogin") private var launchAtLogin: Bool = false
-    @AppStorage("mainTerminalCwd") private var mainTerminalCwd: String = NSHomeDirectory()
+
+    /// The "Main terminal directory" row targets the focused window's
+    /// Main Terminal. Each window keeps its own cwd; this is the one
+    /// the user currently sees.
+    private var focusedAppState: AppState? {
+        services.registry.activeAppState(preferKey: false)
+    }
+
+    private var focusedMainCwd: String {
+        focusedAppState?.terminalsTab.cwd ?? NSHomeDirectory()
+    }
 
     private var cwdDisplayName: String {
+        let cwd = focusedMainCwd
         let home = NSHomeDirectory()
-        if mainTerminalCwd == home { return "~" }
-        if mainTerminalCwd.hasPrefix(home + "/") {
-            return "~" + mainTerminalCwd.dropFirst(home.count)
+        if cwd == home { return "~" }
+        if cwd.hasPrefix(home + "/") {
+            return "~" + cwd.dropFirst(home.count)
         }
-        return mainTerminalCwd
+        return cwd
     }
 
     /// Custom binding so flipping the Toggle calls SMAppService.register/
@@ -236,8 +246,7 @@ private struct GeneralPane: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url {
-            mainTerminalCwd = url.path
-            appState.restartTerminalsFirstPane(cwd: url.path)
+            focusedAppState?.restartTerminalsFirstPane(cwd: url.path)
         }
     }
 }
@@ -260,7 +269,7 @@ private struct ShortcutsPane: View {
 // MARK: - MCP pane
 
 private struct MCPPane: View {
-    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var services: NiceServices
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @AppStorage("mcpAutoStart") private var autoStart: Bool = true
@@ -274,24 +283,29 @@ private struct MCPPane: View {
         .sRGB, red: 0.76, green: 0.32, blue: 0.32, opacity: 1.0
     )
 
+    /// AppState for the window the user last interacted with. Each
+    /// window runs its own MCP server on a distinct ephemeral port, so
+    /// this row surfaces whichever one is currently in focus. `nil`
+    /// only when no windows are open (Settings alone).
+    private var focusedAppState: AppState? {
+        services.registry.activeAppState(preferKey: false)
+    }
+
     var body: some View {
         SettingTitle("MCP Server")
 
         SettingRow(label: "Status") {
             HStack(spacing: 8) {
+                let mcp = focusedAppState?.mcp
+                let isRunning = mcp?.isRunning ?? false
                 Circle()
-                    .fill(appState.mcp.isRunning ? runningGreen : stoppedRed)
+                    .fill(isRunning ? runningGreen : stoppedRed)
                     .frame(width: 8, height: 8)
-                Text(
-                    appState.mcp.isRunning
-                        ? "Running on :\(appState.mcp.port)"
-                        : "Stopped"
-                )
+                Text(statusText(running: isRunning, port: mcp?.port ?? 0))
                     .font(.system(size: 12))
                     .foregroundStyle(Color.niceInk(scheme, palette))
-                if !appState.mcp.isRunning {
+                if !isRunning, let state = focusedAppState {
                     Button("Start") {
-                        let state = appState
                         Task { await state.mcp.start(appState: state) }
                     }
                     .controlSize(.small)
@@ -316,6 +330,12 @@ private struct MCPPane: View {
                 .toggleStyle(.switch)
                 .controlSize(.small)
         }
+    }
+
+    private func statusText(running: Bool, port: Int) -> String {
+        if !running { return "Stopped" }
+        if port == 0 { return "Starting…" }
+        return "Running on :\(port)"
     }
 }
 
@@ -640,6 +660,7 @@ private struct ReadOnlyValuePill: View {
 
 #Preview("Settings") {
     SettingsView()
-        .environmentObject(AppState())
+        .environmentObject(NiceServices())
         .environmentObject(Tweaks())
+        .environmentObject(KeyboardShortcuts())
 }
