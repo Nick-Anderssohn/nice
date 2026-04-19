@@ -23,6 +23,7 @@ import Foundation
 final class NiceServices: ObservableObject {
     let tweaks: Tweaks
     let shortcuts: KeyboardShortcuts
+    let fontSettings: FontSettings
     let registry: WindowRegistry
 
     /// Absolute path to the `claude` binary if resolvable; nil falls
@@ -35,6 +36,7 @@ final class NiceServices: ObservableObject {
     init() {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
+        self.fontSettings = FontSettings()
         self.registry = WindowRegistry()
         self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
             ?? Self.runWhich(binary: "claude")
@@ -50,7 +52,11 @@ final class NiceServices: ObservableObject {
 
         Self.cleanupStaleTempFiles()
 
-        KeyboardShortcutMonitor.install(registry: registry, shortcuts: shortcuts)
+        KeyboardShortcutMonitor.install(
+            registry: registry,
+            shortcuts: shortcuts,
+            fontSettings: fontSettings
+        )
 
         terminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,

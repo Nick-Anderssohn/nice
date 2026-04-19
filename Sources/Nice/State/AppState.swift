@@ -73,6 +73,11 @@ final class AppState: ObservableObject {
     /// Seeded with terracotta; `updateScheme` overwrites on every call.
     private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
 
+    /// Tracks the user's terminal font size. New sessions pick this up
+    /// at creation; `updateTerminalFontSize` fans changes out to every
+    /// live `TabPtySession`.
+    private var currentTerminalFontSize: CGFloat = FontSettings.defaultSize
+
     // MARK: - MCP server
 
     @Published private(set) var mcp = NiceMCPServer()
@@ -297,6 +302,16 @@ final class AppState: ObservableObject {
         currentAccent = accent
         for session in ptySessions.values {
             session.applyTheme(scheme, palette: palette, accent: accent)
+        }
+    }
+
+    /// Fan a new terminal font size out to every live session. Called
+    /// by `AppShellHost` on launch and whenever `FontSettings.terminalFontSize`
+    /// changes (slider drag or Cmd+/-).
+    func updateTerminalFontSize(_ size: CGFloat) {
+        currentTerminalFontSize = size
+        for session in ptySessions.values {
+            session.applyTerminalFont(size: size)
         }
     }
 
@@ -788,6 +803,7 @@ final class AppState: ObservableObject {
             }
         )
         session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
+        session.applyTerminalFont(size: currentTerminalFontSize)
         ptySessions[tabId] = session
         return session
     }

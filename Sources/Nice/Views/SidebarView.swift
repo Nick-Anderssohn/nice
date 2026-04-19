@@ -18,6 +18,7 @@ import SwiftUI
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
@@ -42,11 +43,11 @@ struct SidebarView: View {
     private var searchBar: some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .regular))
+                .font(.system(size: fontSettings.sidebarSize(12), weight: .regular))
                 .foregroundStyle(Color.niceInk3(scheme, palette))
             TextField("Search tabs", text: $appState.sidebarQuery)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(.system(size: fontSettings.sidebarSize(12)))
                 .foregroundStyle(Color.niceInk(scheme, palette))
             KbdPill(text: "⌘K")
         }
@@ -73,7 +74,7 @@ struct SidebarView: View {
                 let projects = appState.filteredProjects
                 if projects.isEmpty {
                     Text("No matching tabs")
-                        .font(.system(size: 12))
+                        .font(.system(size: fontSettings.sidebarSize(12)))
                         .foregroundStyle(Color.niceInk3(scheme, palette))
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, 16)
@@ -117,6 +118,7 @@ struct SidebarView: View {
 private struct TerminalsRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @State private var hover = false
@@ -147,12 +149,12 @@ private struct TerminalsRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "terminal")
-                .font(.system(size: 13, weight: .regular))
+                .font(.system(size: fontSettings.sidebarSize(13), weight: .regular))
             Text("Terminals")
-                .font(.system(size: 12, weight: isActive ? .semibold : .medium))
+                .font(.system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .medium))
             Spacer(minLength: 6)
             Text(cwdDisplayName)
-                .font(.system(size: 10))
+                .font(.system(size: fontSettings.sidebarSize(10)))
                 .foregroundStyle(Color.niceInk3(scheme, palette))
                 .lineLimit(1)
                 .truncationMode(.head)
@@ -197,6 +199,7 @@ private struct TerminalsRow: View {
 
 private struct ProjectGroup: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -218,12 +221,12 @@ private struct ProjectGroup: View {
     private var header: some View {
         HStack(spacing: 6) {
             Image(systemName: "chevron.right")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: fontSettings.sidebarSize(10), weight: .semibold))
                 .rotationEffect(.degrees(isOpen ? 90 : 0))
                 .opacity(0.7)
                 .animation(.easeInOut(duration: 0.12), value: isOpen)
             Text(project.name.uppercased())
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: fontSettings.sidebarSize(11), weight: .semibold))
                 .tracking(0.2)
                 .foregroundStyle(Color.niceInk2(scheme, palette))
             Spacer(minLength: 4)
@@ -240,13 +243,14 @@ private struct ProjectGroup: View {
 }
 
 private struct CountPill: View {
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     let count: Int
 
     var body: some View {
         Text("\(count)")
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: fontSettings.sidebarSize(10), weight: .medium))
             .foregroundStyle(Color.niceInk3(scheme, palette))
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
@@ -261,6 +265,7 @@ private struct CountPill: View {
 private struct TabRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -286,14 +291,14 @@ private struct TabRow: View {
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")
             } else {
                 Image(systemName: "terminal")
-                    .font(.system(size: 10, weight: .regular))
+                    .font(.system(size: fontSettings.sidebarSize(10), weight: .regular))
                     .foregroundStyle(Color.niceInk3(scheme, palette))
                     .frame(width: 12, height: 12)
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).terminalIcon")
             }
             Text(tab.title)
-                .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                .font(.system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .regular))
                 .foregroundStyle(isActive ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -320,6 +325,7 @@ private struct TabRow: View {
 // MARK: - Footer controls
 
 private struct SidebarIconButton: View {
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -332,7 +338,7 @@ private struct SidebarIconButton: View {
 
     var body: some View {
         Image(systemName: systemImage)
-            .font(.system(size: 14, weight: .regular))
+            .font(.system(size: fontSettings.sidebarSize(14), weight: .regular))
             .foregroundStyle(Color.niceInk2(scheme, palette))
             .frame(width: 24, height: 24)
             .background(
@@ -350,13 +356,14 @@ private struct SidebarIconButton: View {
 // MARK: - Small shared pill
 
 private struct KbdPill: View {
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     let text: String
 
     var body: some View {
         Text(text)
-            .font(.system(size: 10, design: .monospaced))
+            .font(.system(size: fontSettings.sidebarSize(10), design: .monospaced))
             .foregroundStyle(Color.niceInk3(scheme, palette))
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
@@ -371,5 +378,6 @@ private struct KbdPill: View {
     SidebarView()
         .environmentObject(AppState())
         .environmentObject(Tweaks())
+        .environmentObject(FontSettings())
         .frame(width: 240, height: 680)
 }

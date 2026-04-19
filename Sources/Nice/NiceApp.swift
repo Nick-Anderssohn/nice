@@ -28,6 +28,7 @@ struct NiceApp: App {
                 .environmentObject(services)
                 .environmentObject(services.tweaks)
                 .environmentObject(services.shortcuts)
+                .environmentObject(services.fontSettings)
                 .environment(\.palette, services.tweaks.theme.palette)
                 .tint(services.tweaks.accent.color)
                 .onAppear { services.bootstrap() }
@@ -43,6 +44,7 @@ struct NiceApp: App {
                 .environmentObject(services)
                 .environmentObject(services.tweaks)
                 .environmentObject(services.shortcuts)
+                .environmentObject(services.fontSettings)
                 .environment(\.palette, services.tweaks.theme.palette)
                 .frame(width: 640, height: 440)
                 .tint(services.tweaks.accent.color)

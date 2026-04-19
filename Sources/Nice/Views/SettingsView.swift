@@ -33,6 +33,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case shortcuts   = "Shortcuts"
     case mcp         = "MCP"
     case appearance  = "Appearance"
+    case font        = "Font"
     case about       = "About"
 
     var id: String { rawValue }
@@ -108,6 +109,7 @@ struct SettingsView: View {
                 case .shortcuts:  ShortcutsPane()
                 case .mcp:        MCPPane()
                 case .appearance: AppearancePane()
+                case .font:       FontPane()
                 case .about:      AboutPane()
                 }
             }
@@ -663,4 +665,5 @@ private struct ReadOnlyValuePill: View {
         .environmentObject(NiceServices())
         .environmentObject(Tweaks())
         .environmentObject(KeyboardShortcuts())
+        .environmentObject(FontSettings())
 }

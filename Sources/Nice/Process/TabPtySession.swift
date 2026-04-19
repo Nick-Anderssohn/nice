@@ -52,6 +52,11 @@ final class TabPtySession: ObservableObject {
     /// terracotta fallback; `applyTheme` overwrites it on every call.
     private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
 
+    /// Cached terminal font size so panes spawned after the first
+    /// `applyTerminalFont` pick it up at construction. Seeded with the
+    /// pre-feature 12pt default.
+    private var currentTerminalFontSize: CGFloat = FontSettings.defaultSize
+
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
     /// ZDOTDIR directory injected into terminal panes so the shadowed
@@ -114,7 +119,7 @@ final class TabPtySession: ObservableObject {
     @discardableResult
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
         let view = LocalProcessTerminalView(frame: .zero)
-        view.font = Self.terminalFont()
+        view.font = Self.terminalFont(size: currentTerminalFontSize)
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -174,7 +179,7 @@ final class TabPtySession: ObservableObject {
         zdotdirPath: String? = nil
     ) -> LocalProcessTerminalView {
         let view = LocalProcessTerminalView(frame: .zero)
-        view.font = Self.terminalFont()
+        view.font = Self.terminalFont(size: currentTerminalFontSize)
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -322,10 +327,24 @@ final class TabPtySession: ObservableObject {
 
     // MARK: - Helpers
 
-    private static func terminalFont() -> NSFont {
-        NSFont(name: "JetBrainsMono-Regular", size: 12)
-            ?? NSFont.userFixedPitchFont(ofSize: 12)
-            ?? NSFont.systemFont(ofSize: 12)
+    private static func terminalFont(size: CGFloat) -> NSFont {
+        NSFont(name: "JetBrainsMono-Regular", size: size)
+            ?? NSFont.userFixedPitchFont(ofSize: size)
+            ?? NSFont.systemFont(ofSize: size)
+    }
+
+    /// Re-apply the terminal font to every live pane on this session.
+    /// Called by `AppState.updateTerminalFontSize` when the user drags
+    /// the Font-pane slider or presses Cmd+/-.
+    /// SwiftTerm's `LocalProcessTerminalView.font` setter rebuilds its
+    /// internal `FontSet`, recomputes cell dimensions, and resizes the
+    /// pty — the terminal reflows automatically.
+    func applyTerminalFont(size: CGFloat) {
+        currentTerminalFontSize = size
+        let font = Self.terminalFont(size: size)
+        for view in panes.values {
+            view.font = font
+        }
     }
 
     /// Expand a leading `~` to `$HOME` so `startProcess`'s working

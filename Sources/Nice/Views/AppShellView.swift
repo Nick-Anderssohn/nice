@@ -57,6 +57,7 @@ struct AppShellView: View {
 private struct AppShellHost: View {
     @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var shortcuts: KeyboardShortcuts
+    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
 
     @StateObject private var appState: AppState
@@ -110,7 +111,10 @@ private struct AppShellHost: View {
         .task {
             await appState.bootstrap()
         }
-        .onAppear { appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor) }
+        .onAppear {
+            appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
+            appState.updateTerminalFontSize(fontSettings.terminalFontSize)
+        }
         .onChange(of: scheme) { _, newScheme in
             appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
         }
@@ -119,6 +123,9 @@ private struct AppShellHost: View {
         }
         .onChange(of: tweaks.accent) { _, newAccent in
             appState.updateScheme(scheme, palette: palette, accent: newAccent.nsColor)
+        }
+        .onChange(of: fontSettings.terminalFontSize) { _, newSize in
+            appState.updateTerminalFontSize(newSize)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar and Main-Terminal cwd across relaunch.
@@ -354,6 +361,7 @@ private struct SidebarToggleButton: View {
         .environmentObject(NiceServices())
         .environmentObject(Tweaks())
         .environmentObject(KeyboardShortcuts())
+        .environmentObject(FontSettings())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.light)
 }
@@ -363,6 +371,7 @@ private struct SidebarToggleButton: View {
         .environmentObject(NiceServices())
         .environmentObject(Tweaks())
         .environmentObject(KeyboardShortcuts())
+        .environmentObject(FontSettings())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.dark)
 }

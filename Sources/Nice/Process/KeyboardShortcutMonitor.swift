@@ -42,15 +42,26 @@ enum KeyboardShortcutMonitor {
 
     /// Install the monitor. Safe to call repeatedly — only the first
     /// call installs the underlying `NSEvent` handler. Captures the
-    /// registry and shortcuts weakly so teardown isn't blocked by the
-    /// monitor's retain; in practice both live for the whole process.
-    static func install(registry: WindowRegistry, shortcuts: KeyboardShortcuts) {
+    /// registry, shortcuts, and font settings weakly so teardown isn't
+    /// blocked by the monitor's retain; in practice all live for the
+    /// whole process.
+    static func install(
+        registry: WindowRegistry,
+        shortcuts: KeyboardShortcuts,
+        fontSettings: FontSettings
+    ) {
         guard !installed else { return }
         installed = true
 
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak registry, weak shortcuts] event in
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak registry, weak shortcuts, weak fontSettings] event in
             let consumed: Bool = MainActor.assumeIsolated {
-                consume(event: event, registry: registry, shortcuts: shortcuts)
+                consume(
+                    event: event,
+                    registry: registry,
+                    shortcuts: shortcuts,
+                    fontSettings: fontSettings
+                )
             }
             return consumed ? nil : event
         }
@@ -63,7 +74,8 @@ enum KeyboardShortcutMonitor {
     private static func consume(
         event: NSEvent,
         registry: WindowRegistry?,
-        shortcuts: KeyboardShortcuts?
+        shortcuts: KeyboardShortcuts?,
+        fontSettings: FontSettings?
     ) -> Bool {
         guard !isRecording else { return false }
         guard let registry, let shortcuts else { return false }
@@ -76,10 +88,6 @@ enum KeyboardShortcutMonitor {
             return false
         }
 
-        guard let appState = registry.activeAppState(preferKey: true) else {
-            return false
-        }
-
         guard let action = shortcuts.actionMatching(
             keyCode: event.keyCode,
             modifiers: event.modifierFlags
@@ -87,8 +95,34 @@ enum KeyboardShortcutMonitor {
             return false
         }
 
+        // Font actions dispatch to the process-wide FontSettings — they
+        // don't need a focused window. Handle them before the AppState
+        // lookup so Cmd+=/-/0 still zoom even with no windows open
+        // (e.g. only Settings visible).
+        if let fontSettings, dispatchFontAction(action, fontSettings: fontSettings) {
+            return true
+        }
+
+        guard let appState = registry.activeAppState(preferKey: true) else {
+            return false
+        }
         dispatch(action, on: appState)
         return true
+    }
+
+    /// Handle font-zoom actions. Returns `true` if `action` was a font
+    /// action (and was dispatched); `false` if it's unrelated and the
+    /// caller should continue the normal window-scoped dispatch.
+    private static func dispatchFontAction(
+        _ action: ShortcutAction,
+        fontSettings: FontSettings
+    ) -> Bool {
+        switch action {
+        case .increaseFontSize: fontSettings.zoom(by: +1); return true
+        case .decreaseFontSize: fontSettings.zoom(by: -1); return true
+        case .resetFontSizes:   fontSettings.resetToDefaults(); return true
+        default: return false
+        }
     }
 
     private static func dispatch(_ action: ShortcutAction, on appState: AppState) {
@@ -99,6 +133,9 @@ enum KeyboardShortcutMonitor {
         case .prevPane:        appState.selectPrevPane()
         case .newTerminalPane: appState.addTerminalToActiveTab()
         case .toggleSidebar:   appState.toggleSidebar()
+        case .increaseFontSize, .decreaseFontSize, .resetFontSizes:
+            // Handled by dispatchFontAction before we reach here.
+            break
         }
     }
 }

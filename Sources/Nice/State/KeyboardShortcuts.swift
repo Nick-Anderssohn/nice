@@ -41,16 +41,22 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable {
     case prevPane
     case newTerminalPane
     case toggleSidebar
+    case increaseFontSize
+    case decreaseFontSize
+    case resetFontSizes
 
     /// Human-readable label for the recorder row.
     var label: String {
         switch self {
-        case .nextSidebarTab:  "Next sidebar tab"
-        case .prevSidebarTab:  "Previous sidebar tab"
-        case .nextPane:        "Next pane"
-        case .prevPane:        "Previous pane"
-        case .newTerminalPane: "New terminal pane"
-        case .toggleSidebar:   "Toggle sidebar"
+        case .nextSidebarTab:   "Next sidebar tab"
+        case .prevSidebarTab:   "Previous sidebar tab"
+        case .nextPane:         "Next pane"
+        case .prevPane:         "Previous pane"
+        case .newTerminalPane:  "New terminal pane"
+        case .toggleSidebar:    "Toggle sidebar"
+        case .increaseFontSize: "Increase font size"
+        case .decreaseFontSize: "Decrease font size"
+        case .resetFontSizes:   "Reset font size"
         }
     }
 }
@@ -169,12 +175,15 @@ final class KeyboardShortcuts: ObservableObject {
     /// the user picked: directional arrows for both axes, ⌘T for new
     /// pane, ⌘B for sidebar toggle.
     static let defaults: [ShortcutAction: KeyCombo] = [
-        .nextSidebarTab:  KeyCombo(keyCode: UInt16(kVK_DownArrow),  modifierFlags: [.command, .option]),
-        .prevSidebarTab:  KeyCombo(keyCode: UInt16(kVK_UpArrow),    modifierFlags: [.command, .option]),
-        .nextPane:        KeyCombo(keyCode: UInt16(kVK_RightArrow), modifierFlags: [.command, .option]),
-        .prevPane:        KeyCombo(keyCode: UInt16(kVK_LeftArrow),  modifierFlags: [.command, .option]),
-        .newTerminalPane: KeyCombo(keyCode: UInt16(kVK_ANSI_T),     modifierFlags: [.command]),
-        .toggleSidebar:   KeyCombo(keyCode: UInt16(kVK_ANSI_B),     modifierFlags: [.command]),
+        .nextSidebarTab:   KeyCombo(keyCode: UInt16(kVK_DownArrow),  modifierFlags: [.command, .option]),
+        .prevSidebarTab:   KeyCombo(keyCode: UInt16(kVK_UpArrow),    modifierFlags: [.command, .option]),
+        .nextPane:         KeyCombo(keyCode: UInt16(kVK_RightArrow), modifierFlags: [.command, .option]),
+        .prevPane:         KeyCombo(keyCode: UInt16(kVK_LeftArrow),  modifierFlags: [.command, .option]),
+        .newTerminalPane:  KeyCombo(keyCode: UInt16(kVK_ANSI_T),     modifierFlags: [.command]),
+        .toggleSidebar:    KeyCombo(keyCode: UInt16(kVK_ANSI_B),     modifierFlags: [.command]),
+        .increaseFontSize: KeyCombo(keyCode: UInt16(kVK_ANSI_Equal), modifierFlags: [.command]),
+        .decreaseFontSize: KeyCombo(keyCode: UInt16(kVK_ANSI_Minus), modifierFlags: [.command]),
+        .resetFontSizes:   KeyCombo(keyCode: UInt16(kVK_ANSI_0),     modifierFlags: [.command]),
     ]
 
     /// Current map. `nil` value = action is unbound. Always reflects what

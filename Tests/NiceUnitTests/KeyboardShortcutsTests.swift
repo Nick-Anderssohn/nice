@@ -59,6 +59,20 @@ final class KeyboardShortcutsTests: XCTestCase {
         XCTAssertTrue(combo?.modifierFlags.contains(.option) ?? false)
     }
 
+    func test_defaults_fontShortcuts_bindCmdPlusMinusZero() {
+        let inc = KeyboardShortcuts.defaults[.increaseFontSize]
+        XCTAssertEqual(inc?.keyCode, UInt16(kVK_ANSI_Equal))
+        XCTAssertEqual(inc?.modifierFlags, [.command])
+
+        let dec = KeyboardShortcuts.defaults[.decreaseFontSize]
+        XCTAssertEqual(dec?.keyCode, UInt16(kVK_ANSI_Minus))
+        XCTAssertEqual(dec?.modifierFlags, [.command])
+
+        let reset = KeyboardShortcuts.defaults[.resetFontSizes]
+        XCTAssertEqual(reset?.keyCode, UInt16(kVK_ANSI_0))
+        XCTAssertEqual(reset?.modifierFlags, [.command])
+    }
+
     // MARK: - Persistence
 
     func test_setBinding_persistsToDefaults() {
