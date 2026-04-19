@@ -41,31 +41,25 @@ struct SidebarView: View {
 
     private var searchBar: some View {
         HStack(spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(Color.niceInk3(scheme, palette))
-                TextField("Search tabs", text: $appState.sidebarQuery)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.niceInk(scheme, palette))
-                KbdPill(text: "⌘K")
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 26)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.niceBg3(scheme, palette))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(Color.niceLine(scheme, palette), lineWidth: 1)
-            )
-
-            SidebarIconButton(systemImage: "sidebar.left", help: "Collapse sidebar") {
-                appState.toggleSidebar()
-            }
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(Color.niceInk3(scheme, palette))
+            TextField("Search tabs", text: $appState.sidebarQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(Color.niceInk(scheme, palette))
+            KbdPill(text: "⌘K")
         }
+        .padding(.horizontal, 8)
+        .frame(height: 26)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.niceBg3(scheme, palette))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.niceLine(scheme, palette), lineWidth: 1)
+        )
         .padding(.top, 8)
         .padding(.horizontal, 10)
         .padding(.bottom, 8)

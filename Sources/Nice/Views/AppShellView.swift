@@ -167,7 +167,26 @@ private struct AppShellHost: View {
                     // behave like a title bar (drag + double-click zoom);
                     // the traffic lights themselves are standard
                     // NSButtons layered above and keep their own clicks.
-                    WindowDragRegion().frame(height: 52)
+                    // The collapse toggle lives at the trailing edge so
+                    // its vertical band matches the collapsed cap's
+                    // restore button.
+                    WindowDragRegion()
+                        .frame(height: 52)
+                        .overlay(alignment: .topTrailing) {
+                            // Button top at strip-y=8 places the 24pt
+                            // button's center at strip-y=20, i.e. 26pt
+                            // from the window top — matching the collapsed
+                            // cap's button (40pt card, 6pt top padding,
+                            // HStack-centered button → same window-y=26).
+                            SidebarToggleButton(
+                                help: "Collapse sidebar",
+                                accessibilityId: "sidebar.collapse"
+                            ) {
+                                appState.toggleSidebar()
+                            }
+                            .padding(.top, 8)
+                            .padding(.trailing, 10)
+                        }
                     SidebarView()
                 }
             }
@@ -227,7 +246,10 @@ private struct AppShellHost: View {
                 // the restore button) behave like a title bar for
                 // drag + double-click zoom.
                 WindowDragRegion().frame(width: 82)
-                CollapsedSidebarRestoreButton {
+                SidebarToggleButton(
+                    help: "Expand sidebar",
+                    accessibilityId: "sidebar.expand"
+                ) {
                     appState.toggleSidebar()
                 }
                 WindowDragRegion()
@@ -294,16 +316,18 @@ private struct AppShellHost: View {
     }
 }
 
-// MARK: - Collapsed sidebar restore button
+// MARK: - Sidebar toggle button
 
-/// The "unhide" chevron that lives in the top bar's cap when the sidebar
-/// is collapsed. Single responsibility: toggle `sidebarCollapsed` back to
-/// `false`. Styling mirrors `SidebarIconButton` so the hover feedback
-/// feels consistent with the sidebar's own controls.
-private struct CollapsedSidebarRestoreButton: View {
+/// The chevron that toggles `sidebarCollapsed`. Used both in the collapsed
+/// top-bar cap (to expand) and in the expanded sidebar's 52pt top strip
+/// (to collapse). Styling mirrors `SidebarIconButton` so the hover
+/// feedback feels consistent with the sidebar's own controls.
+private struct SidebarToggleButton: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
+    let help: String
+    let accessibilityId: String
     let action: () -> Void
 
     @State private var hover = false
@@ -320,8 +344,8 @@ private struct CollapsedSidebarRestoreButton: View {
             .contentShape(Rectangle())
             .onHover { hover = $0 }
             .onTapGesture { action() }
-            .help("Expand sidebar")
-            .accessibilityIdentifier("sidebar.expand")
+            .help(help)
+            .accessibilityIdentifier(accessibilityId)
     }
 }
 
