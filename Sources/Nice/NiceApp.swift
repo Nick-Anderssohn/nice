@@ -21,12 +21,14 @@ import SwiftUI
 struct NiceApp: App {
     @StateObject private var appState = AppState()
     @StateObject private var tweaks = Tweaks()
+    @StateObject private var shortcuts = KeyboardShortcuts()
 
     var body: some Scene {
         WindowGroup {
             AppShellView()
                 .environmentObject(appState)
                 .environmentObject(tweaks)
+                .environmentObject(shortcuts)
                 .environment(\.palette, tweaks.theme.palette)
                 .frame(minWidth: 1180, minHeight: 680)
                 .tint(tweaks.accent.color)
@@ -41,6 +43,7 @@ struct NiceApp: App {
             SettingsView()
                 .environmentObject(appState)
                 .environmentObject(tweaks)
+                .environmentObject(shortcuts)
                 .environment(\.palette, tweaks.theme.palette)
                 .frame(width: 640, height: 440)
                 .tint(tweaks.accent.color)

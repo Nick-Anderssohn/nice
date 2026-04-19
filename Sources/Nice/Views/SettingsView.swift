@@ -245,19 +245,14 @@ private struct GeneralPane: View {
 // MARK: - Shortcuts pane
 
 private struct ShortcutsPane: View {
+    @EnvironmentObject private var shortcuts: KeyboardShortcuts
+
     var body: some View {
         SettingTitle("Shortcuts")
-        SettingRow(label: "New tab") {
-            KeyPills(keys: ["⌘", "T"])
-        }
-        SettingRow(label: "Command palette") {
-            KeyPills(keys: ["⌘", "K"])
-        }
-        SettingRow(label: "Toggle sidebar") {
-            KeyPills(keys: ["⌘", "\\"])
-        }
-        SettingRow(label: "Settings") {
-            KeyPills(keys: ["⌘", ","])
+        ForEach(ShortcutAction.allCases, id: \.self) { action in
+            SettingRow(label: action.label) {
+                KeyRecorderField(action: action)
+            }
         }
     }
 }

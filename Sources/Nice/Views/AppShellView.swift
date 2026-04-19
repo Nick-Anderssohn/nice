@@ -31,6 +31,7 @@ import SwiftUI
 struct AppShellView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
+    @EnvironmentObject private var shortcuts: KeyboardShortcuts
     @Environment(\.colorScheme) private var scheme
 
     private var palette: Palette { tweaks.theme.palette }
@@ -46,6 +47,7 @@ struct AppShellView: View {
             WindowAccessor { window in
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
                 TitleBarZoomMonitor.install()
+                KeyboardShortcutMonitor.install(appState: appState, shortcuts: shortcuts)
             }
         )
         .background(windowBackground.ignoresSafeArea())

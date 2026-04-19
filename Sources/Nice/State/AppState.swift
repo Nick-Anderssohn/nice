@@ -544,6 +544,60 @@ final class AppState: ObservableObject {
         session.sendToPane("exit", paneId: paneId)
     }
 
+    // MARK: - Keyboard navigation
+
+    /// Flat list of sidebar tab ids in displayed order, respecting
+    /// `filteredProjects`. Terminals tab is always first; project tabs
+    /// follow in project/then-tab order. Used by the keyboard shortcut
+    /// handlers to walk a deterministic visible set — when the user has
+    /// typed into the search field, navigation cycles only through the
+    /// matching tabs.
+    var navigableSidebarTabIds: [String] {
+        var ids: [String] = [Self.terminalsTabId]
+        for project in filteredProjects {
+            ids.append(contentsOf: project.tabs.map(\.id))
+        }
+        return ids
+    }
+
+    /// Move focus to the next sidebar tab, wrapping. No-op when there's
+    /// only one navigable tab (Terminals alone).
+    func selectNextSidebarTab() { stepSidebarTab(by: +1) }
+
+    /// Move focus to the previous sidebar tab, wrapping.
+    func selectPrevSidebarTab() { stepSidebarTab(by: -1) }
+
+    private func stepSidebarTab(by offset: Int) {
+        let ids = navigableSidebarTabIds
+        guard ids.count > 1 else { return }
+        let currentIdx = activeTabId.flatMap { ids.firstIndex(of: $0) } ?? 0
+        let nextIdx = ((currentIdx + offset) % ids.count + ids.count) % ids.count
+        activeTabId = ids[nextIdx]
+    }
+
+    /// Move focus to the next pane within the active tab, wrapping. No-op
+    /// when the active tab has fewer than two panes.
+    func selectNextPane() { stepActivePane(by: +1) }
+
+    /// Move focus to the previous pane within the active tab, wrapping.
+    func selectPrevPane() { stepActivePane(by: -1) }
+
+    private func stepActivePane(by offset: Int) {
+        guard let tabId = activeTabId, let tab = tab(for: tabId) else { return }
+        guard tab.panes.count > 1, let activeId = tab.activePaneId,
+              let currentIdx = tab.panes.firstIndex(where: { $0.id == activeId })
+        else { return }
+        let nextIdx = ((currentIdx + offset) % tab.panes.count + tab.panes.count) % tab.panes.count
+        setActivePane(tabId: tabId, paneId: tab.panes[nextIdx].id)
+    }
+
+    /// Append a new terminal pane to the active tab and focus it. No-op
+    /// when there is no active tab.
+    func addTerminalToActiveTab() {
+        guard let id = activeTabId else { return }
+        _ = addPane(tabId: id, kind: .terminal)
+    }
+
     // MARK: - MCP tool handlers
 
     func mcpSwitchTab(tabId: String?, titleQuery: String?) -> String? {
