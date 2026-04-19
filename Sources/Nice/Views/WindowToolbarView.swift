@@ -45,7 +45,7 @@ struct WindowToolbarView: View {
                 .padding(.horizontal, 6)
 
             // Pill strip fills the remaining width.
-            InlineTabsView()
+            InlinePaneStrip()
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.leading, 14)
@@ -70,12 +70,12 @@ struct WindowToolbarView: View {
     }
 }
 
-// MARK: - Inline tabs strip
+// MARK: - Inline pane strip
 
 /// Scrolls horizontally through the active tab's panes, rendering each as
-/// an `InlineTabPill`. The trailing `NewTabBtn` stays pinned; it adds a
+/// an `InlinePanePill`. The trailing `NewTabBtn` stays pinned; it adds a
 /// terminal pane to the active tab.
-private struct InlineTabsView: View {
+private struct InlinePaneStrip: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
 
@@ -95,7 +95,7 @@ private struct InlineTabsView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 2) {
                         ForEach(tab.panes) { pane in
-                            InlineTabPill(
+                            InlinePanePill(
                                 pane: pane,
                                 isActive: tab.activePaneId == pane.id,
                                 canClose: tab.panes.count > 1,
@@ -142,7 +142,7 @@ private struct InlineTabsView: View {
 
 // MARK: - Individual pill
 
-private struct InlineTabPill: View {
+private struct InlinePanePill: View {
     @Environment(\.colorScheme) private var scheme
 
     let pane: Pane
