@@ -142,7 +142,11 @@ final class AppState: ObservableObject {
             object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.controlSocket?.stop()
+                guard let self else { return }
+                for session in self.ptySessions.values {
+                    session.terminateAll()
+                }
+                self.controlSocket?.stop()
             }
         }
     }
