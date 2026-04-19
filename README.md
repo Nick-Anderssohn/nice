@@ -13,7 +13,23 @@ Early but functional. The app runs end-to-end, native controls respect the user'
 - [`claude`](https://github.com/anthropics/claude-code) on your `$PATH` (optional — tabs fall back to `zsh` in the chat pane if missing)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`) to regenerate the project from `project.yml`
 
-## Build & run
+## Install
+
+To use Nice as a regular Mac app (Spotlight, Launchpad, Dock), install it into `/Applications`:
+
+```sh
+git clone https://github.com/Nick-Anderssohn/nice.git
+cd nice
+scripts/install.sh
+```
+
+The script builds Release, quits any running instance, and replaces `/Applications/Nice.app` in place — re-run it to upgrade. Settings (UserDefaults under `dev.nickanderssohn.nice`) survive an upgrade.
+
+If you're running Claude Code inside the repo, the `/nice-install` slash command does the same thing and walks you through any missing prerequisites first.
+
+To remove: `scripts/uninstall.sh` (add `--purge` to also wipe settings).
+
+## Build & run (development)
 
 ```sh
 git clone https://github.com/Nick-Anderssohn/nice.git
