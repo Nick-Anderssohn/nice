@@ -144,14 +144,14 @@ final class TabPtySession: ObservableObject {
         // and the choice doesn't trigger iTerm-specific OSC extensions.
         let claudeEnv = Self.buildEnv(extraEnv: ["TERM_PROGRAM": "ghostty"])
         if let claude = claudeBinary {
-            var parts = ["exec", Self.shellQuote(claude)]
+            var parts = ["exec", shellSingleQuote(claude)]
             if !isOverride {
                 if let cfg = mcpConfigPath?.path {
                     parts.append("--mcp-config")
-                    parts.append(Self.shellQuote(cfg))
+                    parts.append(shellSingleQuote(cfg))
                 }
                 for a in extraClaudeArgs {
-                    parts.append(Self.shellQuote(a))
+                    parts.append(shellSingleQuote(a))
                 }
             }
             view.startProcess(
@@ -267,13 +267,6 @@ final class TabPtySession: ObservableObject {
     }
 
     // MARK: - IO
-
-    /// Single-quote a string for safe inclusion in a zsh `-c` command.
-    /// Embedded single quotes are escaped with the standard `'\''`
-    /// close-open-escape-reopen sequence.
-    private static func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
 
     /// Send `text` plus a newline into the specified pane's pty.
     /// No-op if `paneId` isn't currently hosted in this session.
