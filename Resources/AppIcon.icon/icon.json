@@ -1,0 +1,30 @@
+{
+  "fill" : {
+    "solid" : "display-p3:0.30566,0.50195,0.93457,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "fill" : "automatic",
+          "image-name" : "nice_glyph_1024.png",
+          "name" : "nice_glyph_1024"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
