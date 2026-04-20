@@ -25,6 +25,10 @@ packages:
     #   - pixel-precise smooth scrolling on the Metal path: row vertex
     #     positions live in yDisp-independent buffer-space and the
     #     scroll position is applied at draw time via a shader uniform
+    #   - route the nil-drawable fallback through MTKView.draw() too
+    #     (the last setNeedsDisplay site that slipped through the
+    #     original draw() rewrite and left output stuck after a
+    #     transient nil drawable until the user interacted)
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -37,7 +41,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: e48765f4ed97aa01e67232d70a3c0a476dfd3faf
+    revision: 36d71903d42a99cea45f736c93c11d65b027112f
 
 targets:
   Nice:
