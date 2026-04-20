@@ -1462,7 +1462,12 @@ final class AppState: ObservableObject {
     /// tab-creation (Main Terminal → `claude`) and session restore.
     private func addTabToProjects(_ tab: Tab, cwd: String) {
         let normalizedCwd = Self.expandTilde(cwd)
+        // Exclude the pinned Terminals group: its path is seeded from the
+        // Main Terminal's cwd (typically $HOME), so it would prefix-match
+        // almost any cwd and swallow new Claude tabs that belong in a
+        // fresh project group.
         if let idx = projects.enumerated()
+            .filter({ $0.element.id != Self.terminalsProjectId })
             .filter({ normalizedCwd.hasPrefix(Self.expandTilde($0.element.path)) })
             .max(by: { $0.element.path.count < $1.element.path.count })?
             .offset

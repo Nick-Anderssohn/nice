@@ -1067,6 +1067,64 @@ final class NiceUITests: XCTestCase {
         )
     }
 
+    /// Regression: typing `claude` in the Main Terminal when the cwd
+    /// isn't under any existing project must create a **new project
+    /// group** in the sidebar — not append the Claude tab to the pinned
+    /// Terminals group. The bug: `addTabToProjects` longest-prefix-
+    /// matched the cwd against every project including Terminals
+    /// (whose path is seeded from the Main Terminal cwd, i.e. $HOME),
+    /// so any claude invocation under $HOME got stuffed under Terminals.
+    ///
+    /// Observable signal: each project group renders an Add button with
+    /// identifier `sidebar.group.<project.id>.add`. Pre-invocation only
+    /// `sidebar.group.terminals.add` exists; after a successful fix a
+    /// second `sidebar.group.p-*.add` must appear.
+    func testTypeClaudeInTerminalsCreatesNewProjectGroup() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath,
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        // Precondition: only the Terminals group's add button exists.
+        XCTAssertEqual(
+            countElements(in: app, withIdentifierPrefix: "sidebar.group."),
+            1,
+            "Launch state should have exactly one project group (Terminals)"
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.group.terminals.add"].exists,
+            "Terminals add button must exist as the identifier baseline"
+        )
+
+        Thread.sleep(forTimeInterval: 1.0)
+        focusMainTerminal(in: app)
+        app.typeText("claude\n")
+
+        // A fresh project group (non-Terminals) must appear.
+        let newGroupQuery = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND identifier ENDSWITH %@ AND NOT (identifier CONTAINS %@)",
+                "sidebar.group.",
+                ".add",
+                "terminals"
+            )
+        )
+        let appeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in newGroupQuery.count >= 1 }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [appeared], timeout: 10), .completed,
+            "Typing `claude` in Terminals should create a new project group — not append a Claude tab to the pinned Terminals group"
+        )
+    }
+
     // MARK: - Settings appearance pane
 
     /// Opens the Settings window and navigates to the Appearance pane.
