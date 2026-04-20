@@ -781,8 +781,8 @@ final class AppState: ObservableObject {
     /// Append a new terminal-only tab to the pinned Terminals group,
     /// focus it, and spawn its pty. Used by the sidebar's group-level
     /// `+` button. First tab added to an empty group is titled "Main";
-    /// subsequent tabs are auto-numbered "Terminal 2", "Terminal 3",
-    /// etc. Cwd inherits the Terminals project's path.
+    /// subsequent tabs are auto-numbered "Main 2", "Main 3", etc.
+    /// Cwd inherits the Terminals project's path.
     @discardableResult
     func createTerminalTab() -> String? {
         guard let pi = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) else {
@@ -793,7 +793,7 @@ final class AppState: ObservableObject {
         if project.tabs.isEmpty {
             title = "Main"
         } else {
-            title = "Terminal \(project.tabs.count + 1)"
+            title = "Main \(project.tabs.count + 1)"
         }
         let newId = "tt\(Int(Date().timeIntervalSince1970 * 1000))"
         let paneId = "\(newId)-p0"
