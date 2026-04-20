@@ -28,12 +28,22 @@ import Foundation
 /// parser in `readClient`, consumed by `AppState.init`'s handler, which
 /// dispatches each case to the appropriate MainActor method.
 enum SocketMessage: Sendable {
-    /// `claude` shadow asking for a brand-new tab rooted at `cwd` with
-    /// the given argv. Every interactive `claude` invocation — in the
-    /// built-in Terminals tab or in a companion terminal — takes this
-    /// path; the app enforces "at most one Claude pane per tab" by
-    /// always opening a fresh tab for claude.
-    case newtab(cwd: String, args: [String])
+    /// `claude` shadow asking Nice whether to open a new sidebar tab
+    /// (the default) or promote the sending pane in place. `tabId` /
+    /// `paneId` identify the sending pty — both are empty strings for
+    /// the Main Terminals tab, which always gets a "newtab" response.
+    /// The handler calls `reply` exactly once with one of:
+    ///   - "newtab"            — wrapper returns without exec-ing claude
+    ///   - "inplace"           — wrapper `exec`s claude with the user's args
+    ///   - "inplace <session>" — wrapper `exec`s `claude --session-id <session>`
+    /// The reply closure owns closing the client fd.
+    case claude(
+        cwd: String,
+        args: [String],
+        tabId: String,
+        paneId: String,
+        reply: @Sendable (String) -> Void
+    )
 }
 
 final class NiceControlSocket: @unchecked Sendable {
@@ -149,7 +159,10 @@ final class NiceControlSocket: @unchecked Sendable {
     // MARK: - Connection handling (runs on a background queue)
 
     private func readClient(_ client: Int32) {
-        defer { close(client) }
+        // Closing the client fd is the reply closure's job once we
+        // dispatch a `.claude` message — the handler runs on a different
+        // queue (MainActor) and we need the fd open until it writes a
+        // response. Any early-return path below must close manually.
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
         while buffer.count < 64 * 1024 {
@@ -160,7 +173,7 @@ final class NiceControlSocket: @unchecked Sendable {
             buffer.append(contentsOf: chunk[0..<n])
             if buffer.contains(0x0A) { break }
         }
-        guard !buffer.isEmpty else { return }
+        guard !buffer.isEmpty else { close(client); return }
 
         if let nl = buffer.firstIndex(of: 0x0A) {
             buffer = buffer.subdata(in: buffer.startIndex..<nl)
@@ -170,17 +183,33 @@ final class NiceControlSocket: @unchecked Sendable {
             let obj = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any],
             let action = obj["action"] as? String
         else {
+            close(client)
             return
         }
         let args = (obj["args"] as? [String]) ?? []
         switch action {
-        case "newtab":
-            guard let cwd = obj["cwd"] as? String else { return }
-            handler(.newtab(cwd: cwd, args: args))
+        case "claude":
+            guard let cwd = obj["cwd"] as? String else {
+                close(client)
+                return
+            }
+            let tabId = (obj["tabId"] as? String) ?? ""
+            let paneId = (obj["paneId"] as? String) ?? ""
+            let reply: @Sendable (String) -> Void = { line in
+                let payload = line + "\n"
+                payload.withCString { p in
+                    _ = write(client, p, strlen(p))
+                }
+                close(client)
+            }
+            handler(.claude(
+                cwd: cwd, args: args, tabId: tabId, paneId: paneId, reply: reply
+            ))
         default:
             // Unknown action — log and drop, matching the silent-drop
             // behavior used elsewhere for malformed payloads.
             NSLog("NiceControlSocket: unknown action '\(action)' — ignoring")
+            close(client)
             return
         }
     }

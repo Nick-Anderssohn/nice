@@ -38,14 +38,20 @@ struct AppShellView: View {
     @EnvironmentObject private var services: NiceServices
     @SceneStorage("sidebarCollapsed") private var storedSidebarCollapsed: Bool = false
     @SceneStorage("mainTerminalCwd") private var storedMainCwd: String = ""
+    /// Stable per-window id that survives quits via scene storage.
+    /// `AppState` uses it to look up this window's entry in
+    /// `sessions.json` so restore rebuilds the right tabs.
+    @SceneStorage("windowSessionId") private var storedWindowSessionId: String = ""
 
     var body: some View {
         AppShellHost(
             services: services,
             initialSidebarCollapsed: storedSidebarCollapsed,
             initialMainCwd: storedMainCwd.isEmpty ? nil : storedMainCwd,
+            windowSessionId: storedWindowSessionId,
             sidebarCollapsedBinding: $storedSidebarCollapsed,
-            mainCwdBinding: $storedMainCwd
+            mainCwdBinding: $storedMainCwd,
+            windowSessionIdBinding: $storedWindowSessionId
         )
     }
 }
@@ -64,6 +70,7 @@ private struct AppShellHost: View {
     let services: NiceServices
     @Binding var sidebarCollapsedBinding: Bool
     @Binding var mainCwdBinding: String
+    @Binding var windowSessionIdBinding: String
 
     /// True while the cursor is over the floating peek sidebar. Keeps
     /// the overlay rendered after the keyboard modifiers are released
@@ -74,17 +81,21 @@ private struct AppShellHost: View {
         services: NiceServices,
         initialSidebarCollapsed: Bool,
         initialMainCwd: String?,
+        windowSessionId: String,
         sidebarCollapsedBinding: Binding<Bool>,
-        mainCwdBinding: Binding<String>
+        mainCwdBinding: Binding<String>,
+        windowSessionIdBinding: Binding<String>
     ) {
         self.services = services
         _appState = StateObject(wrappedValue: AppState(
             services: services,
             initialSidebarCollapsed: initialSidebarCollapsed,
-            initialMainCwd: initialMainCwd
+            initialMainCwd: initialMainCwd,
+            windowSessionId: windowSessionId
         ))
         _sidebarCollapsedBinding = sidebarCollapsedBinding
         _mainCwdBinding = mainCwdBinding
+        _windowSessionIdBinding = windowSessionIdBinding
     }
 
     private var palette: Palette { tweaks.activeChromePalette }
@@ -150,6 +161,12 @@ private struct AppShellHost: View {
             Text(pendingCloseMessage(request))
         }
         .onAppear {
+            // Brand-new scene: write the id AppState minted back
+            // into SceneStorage so this window restores the same
+            // slot on relaunch.
+            if windowSessionIdBinding.isEmpty {
+                windowSessionIdBinding = appState.windowSessionId
+            }
             appState.updateTerminalFontFamily(tweaks.terminalFontFamily)
             // updateScheme before updateTerminalTheme — see
             // `AppState.makeSession` for why ordering matters (the
@@ -217,6 +234,14 @@ private struct AppShellHost: View {
         }
         .onChange(of: appState.terminalsTab.cwd) { _, new in
             mainCwdBinding = new
+        }
+        // Mirror AppState's windowSessionId back to scene storage —
+        // restore may have adopted a different slot (e.g. bootstrap)
+        // and the pairing must survive relaunch.
+        .onChange(of: appState.windowSessionId) { _, new in
+            if new != windowSessionIdBinding {
+                windowSessionIdBinding = new
+            }
         }
     }
 

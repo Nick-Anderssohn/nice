@@ -51,6 +51,7 @@ final class AppState: ObservableObject {
             // that flips `activeTabId` gets the same acknowledgment.
             if let id = activeTabId, id != oldValue {
                 acknowledgeWaitingOnActivePane(tabId: id)
+                scheduleSessionSave()
             }
         }
     }
@@ -94,6 +95,29 @@ final class AppState: ObservableObject {
     /// `cancelPendingClose` (user backs out). `AppShellView` binds an
     /// `.alert` to this.
     @Published var pendingCloseRequest: PendingCloseRequest?
+
+    /// Stable identifier for this window's entry in `sessions.json`.
+    /// Pulled in from `@SceneStorage("windowSessionId")` on
+    /// `AppShellView`; survives quits via standard SwiftUI scene
+    /// storage so the same window restores the same tab list on
+    /// relaunch. `@Published` so the view layer can mirror adoption
+    /// changes back into SceneStorage — `restoreSavedWindow` may
+    /// switch us to the bootstrap id, and that re-pairing must
+    /// persist.
+    @Published private(set) var windowSessionId: String
+
+    /// Blocks `scheduleSessionSave` while `init` is still running.
+    /// Swift fires `activeTabId`'s `didSet` for the seed assignment
+    /// in some optional-typed cases, which would otherwise upsert an
+    /// empty window entry before `restoreSavedWindow` has a chance to
+    /// adopt the bootstrap. Cleared on the last line of `init`.
+    private var isInitializing: Bool = true
+
+    /// False in preview/test mode (`services == nil` at init). Blocks
+    /// `scheduleSessionSave` so unit tests can't pollute the real
+    /// `~/Library/Application Support/Nice/sessions.json` by exercising
+    /// the tab-mutation surface.
+    private let persistenceEnabled: Bool
 
     /// Cached cwd for the Terminals tab so `cancelQuitPrompt` / directory
     /// changes can respawn at the same place.
@@ -159,14 +183,29 @@ final class AppState: ObservableObject {
     /// `AppShellView` passing its window's `NiceServices` and the
     /// per-window `@SceneStorage` values.
     convenience init() {
-        self.init(services: nil, initialSidebarCollapsed: false, initialMainCwd: nil)
+        self.init(
+            services: nil,
+            initialSidebarCollapsed: false,
+            initialMainCwd: nil,
+            windowSessionId: UUID().uuidString
+        )
     }
 
     init(
         services: NiceServices?,
         initialSidebarCollapsed: Bool,
-        initialMainCwd: String?
+        initialMainCwd: String?,
+        windowSessionId: String
     ) {
+        // Brand-new scenes come in with an empty SceneStorage value;
+        // mint a UUID here so the scene has a stable id for save/
+        // restore from the first body evaluation onward. The view's
+        // `onChange(of: windowSessionId)` mirrors this back to
+        // SceneStorage so the pairing survives relaunch.
+        self.windowSessionId = windowSessionId.isEmpty
+            ? UUID().uuidString
+            : windowSessionId
+        self.persistenceEnabled = services != nil
         self.projects = Project.seed
         self.sidebarCollapsed = initialSidebarCollapsed
 
@@ -252,14 +291,33 @@ final class AppState: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     switch message {
-                    case let .newtab(cwd, args):
-                        self.createTabFromMainTerminal(cwd: cwd, args: args)
+                    case let .claude(cwd, args, tabId, paneId, reply):
+                        self.handleClaudeSocketRequest(
+                            cwd: cwd, args: args,
+                            tabId: tabId, paneId: paneId,
+                            reply: reply
+                        )
                     }
                 }
             }
         } catch {
             NSLog("AppState: control socket failed to bind: \(error)")
         }
+
+        // Restore runs after the control socket is up so respawned
+        // tabs can reach it if they spawn children via the shadow.
+        // Preview/test callers pass `services: nil`; skip the disk
+        // read so unit tests don't pick up the user's real
+        // sessions.json.
+        if persistenceEnabled {
+            restoreSavedWindow()
+        }
+
+        // Release the save-gate now that restore has populated the
+        // tab list. Before this point a didSet-triggered save would
+        // write a ghost empty window we'd trip over next launch.
+        isInitializing = false
+        scheduleSessionSave()
     }
 
     /// Snapshot of this window's live panes grouped by kind. Used by
@@ -287,6 +345,16 @@ final class AppState: ObservableObject {
     /// Safe to call more than once. The shared ZDOTDIR is owned by
     /// `NiceServices` and removed at app terminate, not here.
     func tearDown() {
+        // Persist the current tab list synchronously before killing
+        // any ptys. The final model state (including auto-titles
+        // that arrived mid-session) must make it to disk so the next
+        // launch can resume. Skipped in preview/test mode so tests
+        // can't pollute the real sessions.json.
+        if persistenceEnabled {
+            SessionStore.shared.upsert(window: snapshotPersistedWindow())
+            SessionStore.shared.flush()
+        }
+
         for session in ptySessions.values {
             session.terminateAll()
         }
@@ -360,6 +428,11 @@ final class AppState: ObservableObject {
         }()
         let claudePaneId = "\(newId)-claude"
         let terminalPaneId = "\(newId)-t1"
+        // Pre-mint the session UUID so we can pass --session-id to
+        // claude and persist the same id for later --resume.
+        let sessionId = UUID().uuidString.lowercased()
+        var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
+        claudePane.isClaudeRunning = true
         let tab = Tab(
             id: newId,
             title: title,
@@ -367,27 +440,14 @@ final class AppState: ObservableObject {
             branch: nil,
             isBuiltIn: false,
             panes: [
-                Pane(id: claudePaneId, title: "Claude", kind: .claude),
+                claudePane,
                 Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
             ],
-            activePaneId: claudePaneId
+            activePaneId: claudePaneId,
+            claudeSessionId: sessionId
         )
 
-        let normalizedCwd = cwd.replacingOccurrences(of: "~", with: NSHomeDirectory())
-        if let idx = projects.enumerated()
-            .filter({ normalizedCwd.hasPrefix($0.element.path.replacingOccurrences(of: "~", with: NSHomeDirectory())) })
-            .max(by: { $0.element.path.count < $1.element.path.count })?
-            .offset
-        {
-            projects[idx].tabs.append(tab)
-        } else {
-            let dirName = (normalizedCwd as NSString).lastPathComponent.uppercased()
-            let projectId = "p-\(dirName.lowercased())-\(Int(Date().timeIntervalSince1970))"
-            let newProject = Project(
-                id: projectId, name: dirName, path: normalizedCwd, tabs: [tab]
-            )
-            projects.append(newProject)
-        }
+        addTabToProjects(tab, cwd: cwd)
         activeTabId = newId
         // The companion terminal pane is modelled up front so its pill
         // renders in the toolbar, but its PTY is deferred until the user
@@ -396,8 +456,102 @@ final class AppState: ObservableObject {
             for: newId, cwd: cwd,
             extraClaudeArgs: args,
             initialClaudePaneId: claudePaneId,
-            initialTerminalPaneId: nil
+            initialTerminalPaneId: nil,
+            claudeSessionMode: .new(id: sessionId)
         )
+        scheduleSessionSave()
+    }
+
+    /// Handle a `claude` invocation from a pane's zsh wrapper. The
+    /// wrapper is blocked reading a single-line reply from the socket;
+    /// we must call `reply` exactly once. Three outcomes:
+    ///
+    /// - "newtab": no promotion candidate (Main Terminals tab, unknown
+    ///   tabId, or the target sidebar tab already has a live Claude).
+    ///   Open a fresh sidebar tab via `createTabFromMainTerminal`.
+    /// - "inplace": promote the sending pane — flip its kind to
+    ///   `.claude` and mark it running. The wrapper `exec`s claude
+    ///   with the user's args as-is (they already contain `--resume`
+    ///   or `--session-id`).
+    /// - "inplace <uuid>": same promotion, but mint a new session id
+    ///   so we can later resume it. The wrapper prepends
+    ///   `--session-id <uuid>`.
+    private func handleClaudeSocketRequest(
+        cwd: String,
+        args: [String],
+        tabId: String,
+        paneId: String,
+        reply: @Sendable (String) -> Void
+    ) {
+        // No/unknown tabId, or the request came from the Main Terminals
+        // tab: always open a new sidebar tab.
+        guard !tabId.isEmpty,
+              tabId != Self.terminalsTabId,
+              let existingTab = self.tab(for: tabId),
+              existingTab.panes.contains(where: { $0.id == paneId })
+        else {
+            reply("newtab")
+            self.createTabFromMainTerminal(cwd: cwd, args: args)
+            return
+        }
+
+        // Sidebar tab already has a running Claude: spawn-in-place
+        // would create a second Claude pane in this tab, violating
+        // the "at most one Claude pane per tab" invariant. Open a
+        // new tab instead.
+        if existingTab.panes.contains(where: { $0.isClaudeRunning }) {
+            reply("newtab")
+            self.createTabFromMainTerminal(cwd: cwd, args: args)
+            return
+        }
+
+        // Promotion path. Extract --resume/--session-id from args if
+        // present (e.g. the pre-typed `claude --resume <uuid>` on a
+        // restored tab); otherwise mint a fresh session id so we can
+        // persist it for next relaunch.
+        let parsedId = Self.extractClaudeSessionId(from: args)
+        let sessionId = parsedId ?? UUID().uuidString.lowercased()
+
+        mutateTab(id: tabId) { tab in
+            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
+                return
+            }
+            tab.panes[idx].kind = .claude
+            tab.panes[idx].isClaudeRunning = true
+            // Let the upcoming OSC title from claude set the real label;
+            // seed with "Claude" so the pill doesn't render stale text.
+            tab.panes[idx].title = "Claude"
+            tab.activePaneId = paneId
+            tab.claudeSessionId = sessionId
+        }
+        scheduleSessionSave()
+
+        if parsedId != nil {
+            reply("inplace")
+        } else {
+            reply("inplace \(sessionId)")
+        }
+    }
+
+    /// Scan `args` for the session UUID the user already supplied via
+    /// `--resume <id>`, `--session-id <id>`, `--resume=<id>`, or
+    /// `--session-id=<id>`. Returns nil if none is present.
+    private static func extractClaudeSessionId(from args: [String]) -> String? {
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if a == "--resume" || a == "--session-id" {
+                if i + 1 < args.count {
+                    return args[i + 1]
+                }
+            } else if a.hasPrefix("--resume=") {
+                return String(a.dropFirst("--resume=".count))
+            } else if a.hasPrefix("--session-id=") {
+                return String(a.dropFirst("--session-id=".count))
+            }
+            i += 1
+        }
+        return nil
     }
 
     // MARK: - Theme
@@ -516,6 +670,7 @@ final class AppState: ObservableObject {
             if activeTabId == tabId {
                 activeTabId = Self.terminalsTabId
             }
+            scheduleSessionSave()
         }
     }
 
@@ -596,10 +751,15 @@ final class AppState: ObservableObject {
     func applyAutoTitle(tabId: String, rawTitle: String) {
         let humanized = Self.humanizeSessionTitle(rawTitle)
         guard !humanized.isEmpty else { return }
+        var changed = false
         mutateTab(id: tabId) { tab in
-            tab.title = humanized
+            if tab.title != humanized {
+                tab.title = humanized
+                changed = true
+            }
             tab.titleAutoGenerated = true
         }
+        if changed { scheduleSessionSave() }
     }
 
     private static func humanizeSessionTitle(_ raw: String) -> String {
@@ -831,7 +991,8 @@ final class AppState: ObservableObject {
         cwd: String,
         extraClaudeArgs: [String] = [],
         initialClaudePaneId: String? = nil,
-        initialTerminalPaneId: String? = nil
+        initialTerminalPaneId: String? = nil,
+        claudeSessionMode: TabPtySession.ClaudeSessionMode = .none
     ) -> TabPtySession {
         if let existing = ptySessions[tabId] {
             return existing
@@ -867,6 +1028,7 @@ final class AppState: ObservableObject {
             initialTerminalPaneId: terminalPaneId,
             socketPath: controlSocket?.path,
             zdotdirPath: zdotdirPath,
+            claudeSessionMode: claudeSessionMode,
             onPaneExit: { [weak self] paneId, code in
                 self?.paneExited(tabId: tabId, paneId: paneId, exitCode: code)
             },
@@ -959,6 +1121,205 @@ final class AppState: ObservableObject {
         return nil
     }
 
+    // MARK: - Session persistence
+
+    /// Walk projects for every Claude tab with a `claudeSessionId`,
+    /// pack into a `PersistedWindow`, and hand to the debounced
+    /// `SessionStore`. Called from every mutation site that changes
+    /// the restorable tab set: creation, close, pane-exit dissolve,
+    /// auto-title, and active-tab switches. Cheap — the store
+    /// coalesces 500ms of rapid updates into a single write.
+    private func scheduleSessionSave() {
+        guard persistenceEnabled, !isInitializing else { return }
+        let persisted = snapshotPersistedWindow()
+        SessionStore.shared.upsert(window: persisted)
+    }
+
+    /// Build a `PersistedWindow` from the current model. Mirrors the
+    /// sidebar's project grouping so relaunch recreates the same
+    /// sidebar structure — in particular, multi-worktree projects
+    /// like "NICE" stay a single project. Excludes the built-in
+    /// Terminals tab and any tabs missing a `claudeSessionId`
+    /// (e.g. a half-formed restore candidate before its pty spawns).
+    /// Empty projects (all tabs filtered out) are dropped.
+    private func snapshotPersistedWindow() -> PersistedWindow {
+        var persistedProjects: [PersistedProject] = []
+        for project in projects {
+            var tabs: [PersistedTab] = []
+            for tab in project.tabs {
+                guard let sid = tab.claudeSessionId else { continue }
+                let panes = tab.panes.map {
+                    PersistedPane(id: $0.id, title: $0.title, kind: $0.kind)
+                }
+                tabs.append(PersistedTab(
+                    id: tab.id,
+                    title: tab.title,
+                    cwd: tab.cwd,
+                    branch: tab.branch,
+                    claudeSessionId: sid,
+                    activePaneId: tab.activePaneId,
+                    panes: panes
+                ))
+            }
+            guard !tabs.isEmpty else { continue }
+            persistedProjects.append(PersistedProject(
+                id: project.id,
+                name: project.name,
+                path: project.path,
+                tabs: tabs
+            ))
+        }
+        return PersistedWindow(
+            id: windowSessionId,
+            activeTabId: activeTabId,
+            sidebarCollapsed: sidebarCollapsed,
+            mainTerminalCwd: storedMainCwd,
+            projects: persistedProjects
+        )
+    }
+
+    /// On init: look up this window's saved entry (by
+    /// `windowSessionId`) and rebuild its tabs, spawning each with
+    /// `claude --resume <uuid>`. Falls back to adopting an unclaimed
+    /// entry if nothing matches this window id — that's how the very
+    /// first launch after installing this build picks up the bootstrap
+    /// file that was written before `sessions.json` had any live
+    /// window ids in it.
+    ///
+    /// The spawn step is deferred to the next main-queue cycle so
+    /// SwiftUI has a chance to mount the new tabs' terminal views
+    /// before `startProcess` runs. Claude reads its tty size at
+    /// startup and errors out on a 0×0 pty — which is what we got
+    /// when the process was spawned synchronously during init, before
+    /// the views were ever laid out.
+    private func restoreSavedWindow() {
+        let state = SessionStore.shared.load()
+        // Try exact match first. If that entry is empty, fall through
+        // to the first non-empty entry — a matched-but-empty slot
+        // usually means a prior launch crashed mid-restore; adopting
+        // the bootstrap (or whichever window still has tabs) is the
+        // right recovery.
+        let matched = state.windows.first(where: { $0.id == windowSessionId })
+        let adopted: PersistedWindow?
+        if let m = matched, m.totalTabCount > 0 {
+            adopted = m
+        } else {
+            adopted = state.windows.first(where: { $0.totalTabCount > 0 })
+        }
+        guard let snapshot = adopted, snapshot.totalTabCount > 0 else { return }
+
+        // Adopt the entry's id so subsequent saves update that slot
+        // instead of creating a duplicate. The view's onChange on
+        // `windowSessionId` mirrors the new value back to
+        // `@SceneStorage` so the pairing survives relaunch.
+        if snapshot.id != windowSessionId {
+            windowSessionId = snapshot.id
+        }
+        // Garbage-collect empty ghost entries left behind by prior
+        // launches that failed mid-restore. Keep our newly-adopted
+        // slot so scheduleSessionSave has something to upsert into.
+        SessionStore.shared.pruneEmptyWindows(keeping: snapshot.id)
+
+        // Build the Tab/Pane model now so the sidebar shows the tabs
+        // immediately; defer the pty spawn so views can lay out first.
+        // Trust the saved project grouping — don't re-bucket by cwd.
+        var pendingSpawns: [(tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String, title: String)] = []
+        for persistedProject in snapshot.projects {
+            let projectIdx = ensureProject(
+                id: persistedProject.id,
+                name: persistedProject.name,
+                path: persistedProject.path
+            )
+            for persistedTab in persistedProject.tabs {
+                if let spawn = addRestoredTabModel(
+                    persistedTab, toProjectIndex: projectIdx
+                ) {
+                    pendingSpawns.append(spawn)
+                }
+            }
+        }
+        if let active = snapshot.activeTabId,
+           active != Self.terminalsTabId,
+           tab(for: active) != nil
+        {
+            activeTabId = active
+        }
+
+        // Defer spawning until SwiftUI has laid out the terminal
+        // views — the pty reads its size at startup. Two main-queue
+        // hops: one for SwiftUI's layout pass, one for the terminal
+        // view's first setFrameSize.
+        //
+        // The restored pane is a plain shell with `claude --resume
+        // <uuid>` pre-typed at the prompt (see
+        // `ClaudeSessionMode.resumeDeferred`). Nothing runs until the
+        // user hits Enter, at which point the zsh `claude()` wrapper
+        // handshakes with our control socket and gets promoted in
+        // place (see `handleClaudeSocketRequest`).
+        DispatchQueue.main.async { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                for spawn in pendingSpawns {
+                    _ = self.makeSession(
+                        for: spawn.tabId,
+                        cwd: spawn.cwd,
+                        extraClaudeArgs: [],
+                        initialClaudePaneId: spawn.claudePaneId,
+                        initialTerminalPaneId: nil,
+                        claudeSessionMode: .resumeDeferred(id: spawn.claudeSessionId)
+                    )
+                }
+            }
+        }
+    }
+
+    /// Look up `projects` by saved id; append a fresh `Project` with
+    /// the saved name/path if absent. Returns the index of the
+    /// matched-or-appended project. Used by restore to bypass the
+    /// cwd-based bucketing that would otherwise split a multi-worktree
+    /// project like "NICE" into one project per worktree on relaunch.
+    private func ensureProject(id: String, name: String, path: String) -> Int {
+        if let existing = projects.firstIndex(where: { $0.id == id }) {
+            return existing
+        }
+        projects.append(Project(id: id, name: name, path: path, tabs: []))
+        return projects.count - 1
+    }
+
+    /// Append one restored tab's model to `projects[projectIndex]`
+    /// without spawning the pty. Returns the info needed to spawn
+    /// later; nil if the tab has no Claude pane id to resume.
+    private func addRestoredTabModel(
+        _ persisted: PersistedTab,
+        toProjectIndex projectIndex: Int
+    ) -> (tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String, title: String)? {
+        let panes = persisted.panes.map { pp in
+            Pane(id: pp.id, title: pp.title, kind: pp.kind)
+        }
+        let tab = Tab(
+            id: persisted.id,
+            title: persisted.title,
+            cwd: persisted.cwd,
+            branch: persisted.branch,
+            isBuiltIn: false,
+            panes: panes,
+            activePaneId: persisted.activePaneId ?? panes.first(where: { $0.kind == .claude })?.id,
+            titleAutoGenerated: true,
+            claudeSessionId: persisted.claudeSessionId
+        )
+
+        projects[projectIndex].tabs.append(tab)
+
+        let claudePaneId = panes.first(where: { $0.kind == .claude })?.id
+        return (
+            tabId: tab.id,
+            cwd: persisted.cwd,
+            claudePaneId: claudePaneId,
+            claudeSessionId: persisted.claudeSessionId,
+            title: persisted.title
+        )
+    }
+
     // MARK: - Helpers
 
     private static func expandTilde(_ path: String) -> String {
@@ -967,5 +1328,25 @@ final class AppState: ObservableObject {
             return NSHomeDirectory() + path.dropFirst(1)
         }
         return path
+    }
+
+    /// Bucket `tab` into the longest-prefix-matching project under
+    /// `cwd`, creating a new project if none matches. Shared by
+    /// tab-creation (Main Terminal → `claude`) and session restore.
+    private func addTabToProjects(_ tab: Tab, cwd: String) {
+        let normalizedCwd = Self.expandTilde(cwd)
+        if let idx = projects.enumerated()
+            .filter({ normalizedCwd.hasPrefix(Self.expandTilde($0.element.path)) })
+            .max(by: { $0.element.path.count < $1.element.path.count })?
+            .offset
+        {
+            projects[idx].tabs.append(tab)
+        } else {
+            let dirName = (normalizedCwd as NSString).lastPathComponent.uppercased()
+            let projectId = "p-\(dirName.lowercased())-\(Int(Date().timeIntervalSince1970 * 1000))"
+            projects.append(Project(
+                id: projectId, name: dirName, path: normalizedCwd, tabs: [tab]
+            ))
+        }
     }
 }

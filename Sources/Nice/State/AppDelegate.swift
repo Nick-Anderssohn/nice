@@ -136,6 +136,16 @@ enum QuitConfirmation {
             parts.append("\(terminal) terminal\(terminal == 1 ? "" : "s")")
         }
         let list = parts.joined(separator: " and ")
-        return "You still have \(list) open. They will be terminated."
+        // Claude sessions are saved to disk; next launch reopens the
+        // tab with `claude --resume <uuid>` pre-typed at the prompt,
+        // and the user decides whether to run it. Terminals don't
+        // have a restorable transcript so they're just closed.
+        if claude > 0 && terminal > 0 {
+            return "You still have \(list) open. Claude sessions will be saved for next launch; terminals will be closed."
+        }
+        if claude > 0 {
+            return "You still have \(list) open. They will be saved for next launch."
+        }
+        return "You still have \(list) open. They will be closed."
     }
 }
