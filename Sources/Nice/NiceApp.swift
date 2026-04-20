@@ -35,7 +35,7 @@ struct NiceApp: App {
                 .environmentObject(services.shortcuts)
                 .environmentObject(services.fontSettings)
                 .environmentObject(services.terminalThemeCatalog)
-                .environment(\.palette, services.tweaks.theme.palette)
+                .environment(\.palette, services.tweaks.activeChromePalette)
                 .tint(services.tweaks.accent.color)
                 .onAppear {
                     AppDelegate.registryProvider = { [weak services] in
@@ -57,7 +57,7 @@ struct NiceApp: App {
                 .environmentObject(services.shortcuts)
                 .environmentObject(services.fontSettings)
                 .environmentObject(services.terminalThemeCatalog)
-                .environment(\.palette, services.tweaks.theme.palette)
+                .environment(\.palette, services.tweaks.activeChromePalette)
                 .frame(width: 640, height: 440)
                 .tint(services.tweaks.accent.color)
         }

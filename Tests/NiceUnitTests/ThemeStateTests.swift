@@ -292,68 +292,98 @@ final class ThemeStateTests: XCTestCase {
 
     // MARK: - UserDefaults migration (Tweaks.loadOrMigrate)
 
-    func test_migration_legacySystem_mapsToMacOSPaletteWithSync() {
-        // Legacy "system" now prefers the macOS palette, scheme
-        // resolved against the OS.
+    func test_migration_legacySystem_mapsToMacOSChromeWithSync() {
         defaults.set("system", forKey: Tweaks.themeKey)
 
-        let (themeLight, syncLight) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
-        XCTAssertEqual(themeLight, .macLight)
-        XCTAssertEqual(themeLight.palette, .macOS)
-        XCTAssertTrue(syncLight)
+        let light = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertEqual(light.scheme, .light)
+        XCTAssertEqual(light.chromeLightPalette, .macOS)
+        XCTAssertEqual(light.chromeDarkPalette, .macOS)
+        XCTAssertTrue(light.syncWithOS)
 
-        let (themeDark, syncDark) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
-        XCTAssertEqual(themeDark, .macDark)
-        XCTAssertEqual(themeDark.palette, .macOS)
-        XCTAssertTrue(syncDark)
+        defaults.set("system", forKey: Tweaks.themeKey) // the first call defer-removed it
+        let dark = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
+        XCTAssertEqual(dark.scheme, .dark)
+        XCTAssertEqual(dark.chromeDarkPalette, .macOS)
+        XCTAssertTrue(dark.syncWithOS)
     }
 
-    func test_migration_legacyLight_mapsToNiceLightPinned() {
+    func test_migration_legacyLight_mapsToNiceChromePinned() {
         defaults.set("light", forKey: Tweaks.themeKey)
-        let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
-        XCTAssertEqual(theme, .niceLight)
-        XCTAssertFalse(sync)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
+        XCTAssertEqual(m.scheme, .light)
+        XCTAssertEqual(m.chromeLightPalette, .nice)
+        XCTAssertEqual(m.chromeDarkPalette, .nice)
+        XCTAssertFalse(m.syncWithOS)
     }
 
-    func test_migration_legacyDark_mapsToNiceDarkPinned() {
+    func test_migration_legacyDark_mapsToNiceChromePinned() {
         defaults.set("dark", forKey: Tweaks.themeKey)
-        let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
-        XCTAssertEqual(theme, .niceDark)
-        XCTAssertFalse(sync)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertEqual(m.scheme, .dark)
+        XCTAssertEqual(m.chromeLightPalette, .nice)
+        XCTAssertEqual(m.chromeDarkPalette, .nice)
+        XCTAssertFalse(m.syncWithOS)
     }
 
-    func test_migration_freshInstall_osLight_mapsToMacLightWithSync() {
-        // No theme key present at all — fresh installs now default to
-        // the macOS palette, synced with the OS scheme.
+    func test_migration_freshInstall_osLight_mapsToMacOSWithSync() {
         XCTAssertNil(defaults.object(forKey: Tweaks.themeKey))
-        let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
-        XCTAssertEqual(theme, .macLight)
-        XCTAssertEqual(theme.palette, .macOS)
-        XCTAssertTrue(sync)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertEqual(m.scheme, .light)
+        XCTAssertEqual(m.chromeLightPalette, .macOS)
+        XCTAssertEqual(m.chromeDarkPalette, .macOS)
+        XCTAssertTrue(m.syncWithOS)
     }
 
-    func test_migration_freshInstall_osDark_mapsToMacDarkWithSync() {
+    func test_migration_freshInstall_osDark_mapsToMacOSWithSync() {
         XCTAssertNil(defaults.object(forKey: Tweaks.themeKey))
-        let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
-        XCTAssertEqual(theme, .macDark)
-        XCTAssertEqual(theme.palette, .macOS)
-        XCTAssertTrue(sync)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
+        XCTAssertEqual(m.scheme, .dark)
+        XCTAssertEqual(m.chromeLightPalette, .macOS)
+        XCTAssertEqual(m.chromeDarkPalette, .macOS)
+        XCTAssertTrue(m.syncWithOS)
     }
 
-    func test_migration_newValues_roundtrip() {
+    func test_migration_themeChoice_macDark() {
         defaults.set("macDark", forKey: Tweaks.themeKey)
         defaults.set(true,      forKey: Tweaks.syncKey)
 
-        let (theme, sync) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
-        XCTAssertEqual(theme, .macDark)
-        XCTAssertTrue(sync)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertEqual(m.scheme, .dark)
+        XCTAssertEqual(m.chromeLightPalette, .macOS)
+        XCTAssertEqual(m.chromeDarkPalette, .macOS)
+        XCTAssertTrue(m.syncWithOS)
+    }
 
-        // And the converse — macLight + sync=false should also round-trip.
-        defaults.set("macLight", forKey: Tweaks.themeKey)
-        defaults.set(false,      forKey: Tweaks.syncKey)
-        let (theme2, sync2) = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
-        XCTAssertEqual(theme2, .macLight)
-        XCTAssertFalse(sync2)
+    func test_migration_themeChoice_niceLight_unsynced() {
+        defaults.set("niceLight", forKey: Tweaks.themeKey)
+        defaults.set(false,       forKey: Tweaks.syncKey)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
+        XCTAssertEqual(m.scheme, .light)
+        XCTAssertEqual(m.chromeLightPalette, .nice)
+        XCTAssertEqual(m.chromeDarkPalette, .nice)
+        XCTAssertFalse(m.syncWithOS)
+    }
+
+    func test_migration_removesLegacyThemeKey() {
+        defaults.set("macDark", forKey: Tweaks.themeKey)
+        _ = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertNil(
+            defaults.object(forKey: Tweaks.themeKey),
+            "Migration should delete the legacy theme key so subsequent reads take the fast path."
+        )
+    }
+
+    func test_migration_newChromeKeys_roundtrip() {
+        defaults.set("nice",  forKey: Tweaks.chromeLightPaletteKey)
+        defaults.set("macOS", forKey: Tweaks.chromeDarkPaletteKey)
+        defaults.set("dark",  forKey: Tweaks.schemeKey)
+        defaults.set(false,   forKey: Tweaks.syncKey)
+        let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
+        XCTAssertEqual(m.scheme, .dark)
+        XCTAssertEqual(m.chromeLightPalette, .nice)
+        XCTAssertEqual(m.chromeDarkPalette, .macOS)
+        XCTAssertFalse(m.syncWithOS)
     }
 
     // MARK: - Init integration

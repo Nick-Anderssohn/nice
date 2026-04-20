@@ -160,11 +160,18 @@ extension Color {
 /// `syncWithOS` flips to true, and from the OS-scheme notification handler.
 @MainActor
 final class Tweaks: ObservableObject {
+    /// Legacy single-choice theme key. Preserved as a read-only source
+    /// during migration, then removed from UserDefaults so the new
+    /// `scheme` / `chromeLightPaletteKey` / `chromeDarkPaletteKey`
+    /// entries become the only persistent story.
     static let themeKey         = "theme"
     static let syncKey          = "syncWithOS"
     static let accentKey        = "accent"
     static let gpuRenderingKey  = "gpuRendering"
     static let smoothScrollingKey = "smoothScrolling"
+    static let schemeKey               = "scheme"
+    static let chromeLightPaletteKey   = "chromeLightPalette"
+    static let chromeDarkPaletteKey    = "chromeDarkPalette"
     static let terminalThemeLightKey = "terminalThemeLightId"
     static let terminalThemeDarkKey  = "terminalThemeDarkId"
     static let terminalFontFamilyKey = "terminalFontFamily"
@@ -175,10 +182,29 @@ final class Tweaks: ObservableObject {
     static let defaultTerminalThemeLightId = "nice-default-light"
     static let defaultTerminalThemeDarkId  = "nice-default-dark"
 
-    @Published var theme: ThemeChoice {
+    /// The active color scheme. Pinned to `.aqua` / `.darkAqua` via
+    /// `NSApp.appearance` on every set so AppKit chrome and SwiftUI's
+    /// `@Environment(\.colorScheme)` stay in lockstep with this value.
+    @Published var scheme: ColorScheme {
         didSet {
-            UserDefaults.standard.set(theme.rawValue, forKey: Self.themeKey)
-            NSApp?.appearance = theme.nsAppearance
+            UserDefaults.standard.set(Self.encodeScheme(scheme), forKey: Self.schemeKey)
+            NSApp?.appearance = Self.nsAppearance(for: scheme)
+        }
+    }
+
+    /// Chrome palette used when `scheme == .light`. Read via
+    /// `activeChromePalette` everywhere in the app; the view layer
+    /// never branches on `scheme` itself.
+    @Published var chromeLightPalette: Palette {
+        didSet {
+            UserDefaults.standard.set(chromeLightPalette.rawValue, forKey: Self.chromeLightPaletteKey)
+        }
+    }
+
+    /// Chrome palette used when `scheme == .dark`.
+    @Published var chromeDarkPalette: Palette {
+        didSet {
+            UserDefaults.standard.set(chromeDarkPalette.rawValue, forKey: Self.chromeDarkPaletteKey)
         }
     }
 
@@ -187,6 +213,35 @@ final class Tweaks: ObservableObject {
             UserDefaults.standard.set(syncWithOS, forKey: Self.syncKey)
             if syncWithOS { reconcileWithOS() }
         }
+    }
+
+    /// Legacy single-value accessor for call sites that still read
+    /// `tweaks.theme.palette` / `.scheme`. Setters decompose into
+    /// `(scheme, both chrome slots)` so old tests and call patterns
+    /// keep working; removing them is a follow-up cleanup.
+    var theme: ThemeChoice {
+        get {
+            switch (activeChromePalette, scheme) {
+            case (.nice, .light):   return .niceLight
+            case (.nice, .dark):    return .niceDark
+            case (.macOS, .light):  return .macLight
+            case (.macOS, .dark):   return .macDark
+            case (.nice, _):        return .niceLight
+            case (.macOS, _):       return .macLight
+            }
+        }
+        set {
+            scheme = newValue.scheme
+            chromeLightPalette = newValue.palette
+            chromeDarkPalette = newValue.palette
+        }
+    }
+
+    /// The chrome palette to use right now, picked from the matching
+    /// scheme slot. Chrome views should always read through this
+    /// helper rather than branching on scheme themselves.
+    var activeChromePalette: Palette {
+        scheme == .light ? chromeLightPalette : chromeDarkPalette
     }
 
     @Published var accent: AccentPreset {
@@ -272,10 +327,12 @@ final class Tweaks: ObservableObject {
             ?? Self.defaultTerminalThemeDarkId
         let fontFamily = defaults.string(forKey: Self.terminalFontFamilyKey)
 
-        let (theme, sync) = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
+        let migrated = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
-        self.theme = theme
-        self.syncWithOS = sync
+        self.scheme = migrated.scheme
+        self.chromeLightPalette = migrated.chromeLightPalette
+        self.chromeDarkPalette = migrated.chromeDarkPalette
+        self.syncWithOS = migrated.syncWithOS
         self.accent = accent
         self.gpuRendering = gpu
         self.smoothScrolling = smooth
@@ -283,7 +340,7 @@ final class Tweaks: ObservableObject {
         self.terminalThemeDarkId = terminalDark
         self.terminalFontFamily = fontFamily
 
-        NSApp?.appearance = theme.nsAppearance
+        NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
 
         if installOSObserver {
             installAppearanceObserver()
@@ -291,7 +348,7 @@ final class Tweaks: ObservableObject {
 
         // Catch-up: if syncWithOS was persisted as true but the OS flipped
         // while the app was closed, this aligns us on launch.
-        if sync {
+        if migrated.syncWithOS {
             reconcileWithOS()
         }
     }
@@ -304,39 +361,24 @@ final class Tweaks: ObservableObject {
 
     // MARK: - Theme transitions
 
-    /// Called when the user taps a theme button in settings.
-    ///
-    /// When `syncWithOS` is on and the clicked choice matches the OS
-    /// scheme, we stay synced and just update the family — the scheme
-    /// axis is still driven by the OS.
-    ///
-    /// When `syncWithOS` is on and the clicked choice's scheme does
-    /// *not* match the OS, we treat the click as an explicit override:
-    /// sync is turned off and the theme is pinned to exactly what the
-    /// user picked. This is less surprising than silently flipping to
-    /// the counterpart (which can produce a "click did nothing" feel
-    /// when the counterpart is already the current theme).
-    ///
-    /// Ordering matters: set `syncWithOS = false` before `theme` so
-    /// that the `syncWithOS` didSet observer — which only reconciles
-    /// when sync flips ON — doesn't fire, and the subsequent theme
-    /// assignment writes through cleanly.
+    /// Legacy helper kept for tests that poke a single ThemeChoice
+    /// through the old API. New UI sets `scheme` / `chromeLightPalette`
+    /// / `chromeDarkPalette` directly via SwiftUI bindings; this
+    /// function just forwards to the `theme` computed setter.
     func userPicked(_ choice: ThemeChoice) {
         if syncWithOS, choice.scheme != osSchemeProvider() {
             syncWithOS = false
-            theme = choice
-        } else {
-            theme = choice
         }
+        theme = choice
     }
 
-    /// Align `theme.scheme` with the OS scheme when `syncWithOS` is on.
+    /// Align `scheme` with the OS scheme when `syncWithOS` is on.
     /// No-op when sync is off.
     func reconcileWithOS() {
         guard syncWithOS else { return }
         let osScheme = osSchemeProvider()
-        if theme.scheme != osScheme {
-            theme = theme.counterpart
+        if scheme != osScheme {
+            scheme = osScheme
         }
     }
 
@@ -364,42 +406,132 @@ final class Tweaks: ObservableObject {
 
     // MARK: - Load & migrate
 
-    /// Returns `(theme, syncWithOS)` from defaults, migrating legacy
-    /// `"system" | "light" | "dark"` values written by earlier versions of
-    /// the app. Legacy mapping:
-    ///
-    ///   system → macLight/macDark (per OS) + syncWithOS = true
-    ///   light  → niceLight + syncWithOS = false (pinned, user's explicit choice)
-    ///   dark   → niceDark  + syncWithOS = false (pinned, user's explicit choice)
-    ///
-    /// Fresh install: macLight or macDark (per OS) + syncWithOS = true.
-    /// The macOS palette is the default because it integrates with the
-    /// system's Desktop Tinting and matches Xcode/Finder/Mail out of the
-    /// box; users who want the nice palette can pick it explicitly.
+    /// Snapshot of every value that `init()` needs to seed, populated
+    /// by reading the new per-scheme keys if they exist and falling
+    /// back to legacy `theme` / `"system" | "light" | "dark"` values
+    /// (or a fresh-install default) otherwise. After reading, the
+    /// legacy `themeKey` is deleted from `defaults` so subsequent
+    /// launches take the fast path.
+    struct MigratedTheme {
+        var scheme: ColorScheme
+        var chromeLightPalette: Palette
+        var chromeDarkPalette: Palette
+        var syncWithOS: Bool
+    }
+
     static func loadOrMigrate(
         defaults: UserDefaults,
         osScheme: ColorScheme
-    ) -> (ThemeChoice, Bool) {
-        let raw = defaults.string(forKey: Self.themeKey)
-        let hasSyncKey = defaults.object(forKey: Self.syncKey) != nil
-
-        if let raw, let parsed = ThemeChoice(rawValue: raw) {
-            let sync = hasSyncKey ? defaults.bool(forKey: Self.syncKey) : false
-            return (parsed, sync)
+    ) -> MigratedTheme {
+        // Happy path: new per-scheme keys already present. Read them
+        // and we're done — this is what every launch after the first
+        // post-upgrade one hits.
+        if
+            let lightRaw = defaults.string(forKey: Self.chromeLightPaletteKey),
+            let darkRaw = defaults.string(forKey: Self.chromeDarkPaletteKey),
+            let light = Palette(rawValue: lightRaw),
+            let dark = Palette(rawValue: darkRaw)
+        {
+            let schemeRaw = defaults.string(forKey: Self.schemeKey)
+            let scheme: ColorScheme
+            if let schemeRaw, let decoded = Self.decodeScheme(schemeRaw) {
+                scheme = decoded
+            } else {
+                scheme = osScheme
+            }
+            let sync: Bool = defaults.object(forKey: Self.syncKey) as? Bool ?? true
+            return MigratedTheme(
+                scheme: scheme,
+                chromeLightPalette: light,
+                chromeDarkPalette: dark,
+                syncWithOS: sync
+            )
         }
 
-        switch raw {
+        // Migrate legacy theme key — either the ThemeChoice rawValue
+        // form (niceLight / niceDark / macLight / macDark) from the
+        // post-v1 codebase, or the older "system" / "light" / "dark"
+        // strings from pre-v1. After migration the legacy key is
+        // cleared so it can't leak into future reads.
+        defer { defaults.removeObject(forKey: Self.themeKey) }
+
+        let hasSyncKey = defaults.object(forKey: Self.syncKey) != nil
+        let legacySync: Bool = hasSyncKey ? defaults.bool(forKey: Self.syncKey) : true
+        let legacyRaw = defaults.string(forKey: Self.themeKey)
+
+        if let legacyRaw, let parsed = ThemeChoice(rawValue: legacyRaw) {
+            // The user previously had a single-choice theme. Honour
+            // their palette pick by seeding both chrome slots with
+            // it; their scheme pick becomes the current scheme (sync
+            // is preserved from its own key, defaulting to false so
+            // we don't flip the pinned scheme next to the OS).
+            return MigratedTheme(
+                scheme: parsed.scheme,
+                chromeLightPalette: parsed.palette,
+                chromeDarkPalette: parsed.palette,
+                syncWithOS: hasSyncKey ? legacySync : false
+            )
+        }
+
+        switch legacyRaw {
         case "system":
-            // Legacy "follow system" maps to macOS palette + sync on,
-            // starting from whichever scheme the OS currently is.
-            return (osScheme == .dark ? .macDark : .macLight, true)
+            return MigratedTheme(
+                scheme: osScheme,
+                chromeLightPalette: .macOS,
+                chromeDarkPalette: .macOS,
+                syncWithOS: true
+            )
         case "light":
-            return (.niceLight, false)
+            return MigratedTheme(
+                scheme: .light,
+                chromeLightPalette: .nice,
+                chromeDarkPalette: .nice,
+                syncWithOS: false
+            )
         case "dark":
-            return (.niceDark, false)
+            return MigratedTheme(
+                scheme: .dark,
+                chromeLightPalette: .nice,
+                chromeDarkPalette: .nice,
+                syncWithOS: false
+            )
         default:
-            // Fresh install — macOS palette, synced with current OS.
-            return (osScheme == .dark ? .macDark : .macLight, true)
+            // Fresh install: macOS palette for both scheme slots,
+            // synced with the OS. Matches historical fresh-install
+            // behavior so existing screenshots / onboarding still
+            // apply.
+            return MigratedTheme(
+                scheme: osScheme,
+                chromeLightPalette: .macOS,
+                chromeDarkPalette: .macOS,
+                syncWithOS: true
+            )
+        }
+    }
+
+    // MARK: - Scheme encoding / NSAppearance helpers
+
+    static func encodeScheme(_ scheme: ColorScheme) -> String {
+        switch scheme {
+        case .light: return "light"
+        case .dark:  return "dark"
+        @unknown default: return "light"
+        }
+    }
+
+    static func decodeScheme(_ raw: String) -> ColorScheme? {
+        switch raw {
+        case "light": return .light
+        case "dark":  return .dark
+        default: return nil
+        }
+    }
+
+    static func nsAppearance(for scheme: ColorScheme) -> NSAppearance {
+        switch scheme {
+        case .light: return NSAppearance(named: .aqua) ?? NSAppearance()
+        case .dark:  return NSAppearance(named: .darkAqua) ?? NSAppearance()
+        @unknown default: return NSAppearance()
         }
     }
 

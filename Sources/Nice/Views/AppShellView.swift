@@ -87,7 +87,7 @@ private struct AppShellHost: View {
         _mainCwdBinding = mainCwdBinding
     }
 
-    private var palette: Palette { tweaks.theme.palette }
+    private var palette: Palette { tweaks.activeChromePalette }
 
     var body: some View {
         shell

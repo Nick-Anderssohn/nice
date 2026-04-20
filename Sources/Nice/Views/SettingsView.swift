@@ -46,7 +46,7 @@ struct SettingsView: View {
     @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
 
-    private var palette: Palette { tweaks.theme.palette }
+    private var palette: Palette { tweaks.activeChromePalette }
 
     @State private var active: SettingsSection = .general
 
@@ -280,7 +280,7 @@ private struct AppearancePane: View {
 
         SettingRow(
             label: "Sync with OS theme",
-            hint: "Flip between light and dark as the system does, within the chosen palette."
+            hint: "Flip between light and dark as the system does."
         ) {
             Toggle("", isOn: $tweaks.syncWithOS)
                 .labelsHidden()
@@ -290,10 +290,46 @@ private struct AppearancePane: View {
         }
 
         SettingRow(
-            label: "Theme",
-            hint: "Pick a palette and scheme. Sync with OS overrides the scheme."
+            label: "Scheme",
+            hint: "Manual light/dark override. Disabled when Sync with OS is on."
         ) {
-            ThemeButtonGrid()
+            Picker("", selection: $tweaks.scheme) {
+                Text("Light").tag(ColorScheme.light)
+                Text("Dark").tag(ColorScheme.dark)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 160)
+            .disabled(tweaks.syncWithOS)
+            .accessibilityIdentifier("settings.appearance.scheme")
+        }
+
+        SettingRow(
+            label: "Light mode chrome",
+            hint: "Palette used for the sidebar, window background, and toolbar when the scheme is light."
+        ) {
+            Picker("", selection: $tweaks.chromeLightPalette) {
+                Text("Nice").tag(Palette.nice)
+                Text("macOS").tag(Palette.macOS)
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(minWidth: 120)
+            .accessibilityIdentifier("settings.appearance.chromeLight")
+        }
+
+        SettingRow(
+            label: "Dark mode chrome",
+            hint: "Palette used for the sidebar, window background, and toolbar when the scheme is dark."
+        ) {
+            Picker("", selection: $tweaks.chromeDarkPalette) {
+                Text("Nice").tag(Palette.nice)
+                Text("macOS").tag(Palette.macOS)
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(minWidth: 120)
+            .accessibilityIdentifier("settings.appearance.chromeDark")
         }
 
         SettingRow(
