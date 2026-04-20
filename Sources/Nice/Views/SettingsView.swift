@@ -28,9 +28,9 @@ import SwiftUI
 // MARK: - Section enum
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case shortcuts   = "Shortcuts"
     case appearance  = "Appearance"
     case terminal    = "Terminal themes"
+    case shortcuts   = "Shortcuts"
     case font        = "Font"
     case about       = "About"
 
@@ -46,7 +46,7 @@ struct SettingsView: View {
 
     private var palette: Palette { tweaks.activeChromePalette }
 
-    @State private var active: SettingsSection = .shortcuts
+    @State private var active: SettingsSection = .appearance
 
     var body: some View {
         HStack(spacing: 0) {
@@ -407,7 +407,7 @@ private struct AboutPane: View {
             Text("Nice v0.1.0")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.niceInk(scheme, palette))
-            Text("A companion app for the Claude CLI.")
+            Text("A terminal emulator that auto-organizes claude instances.")
                 .font(.system(size: 12))
                 .foregroundStyle(Color.niceInk2(scheme, palette))
         }
