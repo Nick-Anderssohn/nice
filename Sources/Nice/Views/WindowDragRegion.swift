@@ -16,10 +16,11 @@
 //     by SwiftUI's hosting machinery, so `mouseDownCanMoveWindow`
 //     alone doesn't trigger double-click-to-zoom. The monitor fills
 //     that gap: on a double left-click, it walks the hit view's
-//     ancestor chain looking for the `mouseDownCanMoveWindow = true`
-//     marker we planted via `WindowDragRegion`, and if found calls
-//     `NSWindow.performZoom(_:)` — the same action the native title
-//     bar would have performed.
+//     ancestor chain and zooms if any view reports
+//     `mouseDownCanMoveWindow = true`. `NSVisualEffectView` with
+//     `.behindWindow` blending returns true by default, so we skip
+//     that class — otherwise double-clicks anywhere in the vibrancy-
+//     tinted sidebar would zoom.
 //
 
 import AppKit
@@ -51,7 +52,22 @@ enum TitleBarZoomMonitor {
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
             guard event.clickCount == 2 else { return event }
             guard let window = event.window else { return event }
-            guard let hit = window.contentView?.hitTest(event.locationInWindow) else {
+            guard let contentView = window.contentView else { return event }
+
+            // Gate on the top 52pt chrome strip. Several AppKit views
+            // lower in the window (NSVisualEffectView in the sidebar,
+            // SwiftTerm's terminal view, etc.) report
+            // `mouseDownCanMoveWindow = true` either by default or via
+            // subclass overrides, so the hit-test walk alone would zoom
+            // on double-clicks in the sidebar body or terminal pane.
+            // Restricting the monitor to the visual chrome row (which
+            // spans both the sidebar card's top strip and the toolbar,
+            // edge-to-edge at window y=0..52) matches the native title-
+            // bar's own footprint.
+            let yFromTop = contentView.bounds.height - event.locationInWindow.y
+            guard yFromTop <= 52 else { return event }
+
+            guard let hit = contentView.hitTest(event.locationInWindow) else {
                 return event
             }
             // Walk up from the hit view — the draggable marker may be
@@ -59,7 +75,7 @@ enum TitleBarZoomMonitor {
             // own hosting layer.
             var cursor: NSView? = hit
             while let v = cursor {
-                if v.mouseDownCanMoveWindow {
+                if v.mouseDownCanMoveWindow && !(v is NSVisualEffectView) {
                     window.performZoom(nil)
                     return nil
                 }
