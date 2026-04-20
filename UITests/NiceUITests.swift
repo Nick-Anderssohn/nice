@@ -1164,13 +1164,26 @@ final class NiceUITests: XCTestCase {
         )
     }
 
-    // MARK: - Settings terminal theme block (inside Appearance pane)
+    // MARK: - Settings terminal pane
 
-    /// The terminal-theme block lives inside Appearance: both per-scheme
-    /// theme pickers and the Ghostty import button must be present.
-    /// Accessibility ids here are the hook for future finer-grained
-    /// picker-contents tests, which we don't attempt to drive through
-    /// the menu-style picker popup.
+    private func openTerminalPane(_ app: XCUIApplication) {
+        let gear = app.descendants(matching: .any)["sidebar.settings"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.click()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["settings.root"]
+                .waitForExistence(timeout: 5),
+            "Settings window must open before navigating panes"
+        )
+        let row = app.staticTexts["Terminal themes"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        row.click()
+    }
+
+    /// The Terminal pane must surface both per-scheme theme pickers
+    /// and the Ghostty import button. Accessibility ids here are the
+    /// hook for future finer-grained picker-contents tests, which we
+    /// don't attempt to drive through the menu-style picker popup.
     func testSettingsTerminal_showsPerSchemePickersAndImportButton() throws {
         let app = launchApp()
         XCTAssertTrue(
@@ -1178,7 +1191,7 @@ final class NiceUITests: XCTestCase {
                 .waitForExistence(timeout: 5)
         )
 
-        openAppearancePane(app)
+        openTerminalPane(app)
 
         for id in [
             "settings.terminal.lightPicker",
@@ -1210,7 +1223,7 @@ final class NiceUITests: XCTestCase {
                 .waitForExistence(timeout: 5)
         )
 
-        openAppearancePane(app)
+        openTerminalPane(app)
 
         let lightPicker = app.descendants(matching: .any)["settings.terminal.lightPicker"]
         XCTAssertTrue(lightPicker.waitForExistence(timeout: 3))
