@@ -24,6 +24,12 @@ final class NiceUITests: XCTestCase {
     @discardableResult
     private func launchApp() -> XCUIApplication {
         let app = XCUIApplication()
+        // Suppress AppKit state restoration. Stale per-scene state
+        // saved by an earlier run (or a killed Nice process) can
+        // replay as "no windows were open," which SwiftUI honours and
+        // never opens the default WindowGroup window — the test then
+        // sees a running app with zero children.
+        app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         app.launch()
         return app
     }
@@ -31,6 +37,7 @@ final class NiceUITests: XCTestCase {
     @discardableResult
     private func launchApp(extraEnv: [String: String]) -> XCUIApplication {
         let app = XCUIApplication()
+        app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         for (k, v) in extraEnv {
             app.launchEnvironment[k] = v
         }
@@ -1041,10 +1048,11 @@ final class NiceUITests: XCTestCase {
         row.click()
     }
 
-    /// The Appearance pane must offer all four theme cells + a sync
-    /// toggle. Guards against accidental renames or one-of-four drops
-    /// in `ThemeButtonGrid`.
-    func testSettingsAppearance_showsFourThemeCellsAndSyncToggle() throws {
+    /// The Appearance pane must offer the sync toggle, scheme picker,
+    /// and two per-scheme chrome palette pickers. Guards against the
+    /// old 2×2 `ThemeButtonGrid` cells leaking back (they shouldn't
+    /// exist any more) and against rename drift on the new ids.
+    func testSettingsAppearance_showsSchemeAndPerSchemeChromePickers() throws {
         let app = launchApp()
         XCTAssertTrue(
             app.descendants(matching: .any)["sidebar.terminals"]
@@ -1054,33 +1062,40 @@ final class NiceUITests: XCTestCase {
         openAppearancePane(app)
 
         for id in [
+            "settings.theme.sync",
+            "settings.appearance.scheme",
+            "settings.appearance.chromeLight",
+            "settings.appearance.chromeDark",
+        ] {
+            XCTAssertTrue(
+                app.descendants(matching: .any)[id].waitForExistence(timeout: 3),
+                "Missing Appearance control \(id)"
+            )
+        }
+
+        for legacyId in [
             "settings.theme.cell.niceLight",
             "settings.theme.cell.niceDark",
             "settings.theme.cell.macLight",
             "settings.theme.cell.macDark",
         ] {
-            XCTAssertTrue(
-                app.descendants(matching: .any)[id].waitForExistence(timeout: 3),
-                "Missing theme cell \(id)"
+            XCTAssertFalse(
+                app.descendants(matching: .any)[legacyId].exists,
+                "Legacy 2×2 theme grid cell \(legacyId) should be gone"
             )
         }
-
-        XCTAssertTrue(
-            app.descendants(matching: .any)["settings.theme.sync"]
-                .waitForExistence(timeout: 3),
-            "Sync with OS toggle must be present in the Appearance pane"
-        )
     }
 
-    /// Tapping a theme cell must move the selected state to it.
-    /// This guards the `tweaks.userPicked` wiring — if the action
-    /// doesn't fire, no cell ever reports selected after the click.
-    /// Launch arguments pre-seed UserDefaults so the app starts with
-    /// `syncWithOS=false` + `theme=niceLight`, giving a deterministic
-    /// starting state regardless of the host OS appearance.
-    func testSettingsAppearance_tappingCellSelectsIt() throws {
+    /// Legacy `-theme niceLight` launch arg must still seed the
+    /// Appearance pane to its matching chrome state. Migration on
+    /// launch converts the old single-choice value to
+    /// `chromeLightPalette == .nice` (+ `chromeDarkPalette == .nice`),
+    /// and the scheme picker lands on Light because that's what
+    /// niceLight scheme is.
+    func testSettingsAppearance_legacyThemeLaunchArgStillSeedsState() throws {
         let app = XCUIApplication()
         app.launchArguments += [
+            "-ApplePersistenceIgnoreState", "YES",
             "-theme", "niceLight",
             "-syncWithOS", "NO",
         ]
@@ -1093,32 +1108,127 @@ final class NiceUITests: XCTestCase {
 
         openAppearancePane(app)
 
-        // Each cell exposes its selected/unselected bit as the
-        // element's accessibility value (see ThemeCell).
-        let niceLight = app.descendants(matching: .any)["settings.theme.cell.niceLight"]
-        XCTAssertTrue(niceLight.waitForExistence(timeout: 3))
-        XCTAssertEqual(
-            niceLight.value as? String, "selected",
-            "Launch-arg seeded theme=niceLight should render as the selected cell"
+        // The segmented scheme picker exposes the selected value
+        // directly; chrome pickers expose their current selection
+        // through `.value`. Both forms must reflect migration.
+        let scheme = app.descendants(matching: .any)["settings.appearance.scheme"]
+        XCTAssertTrue(scheme.waitForExistence(timeout: 3))
+
+        let chromeLight = app.descendants(matching: .any)["settings.appearance.chromeLight"]
+        XCTAssertTrue(chromeLight.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            (chromeLight.value as? String)?.lowercased().contains("nice") ?? false,
+            "Legacy niceLight should migrate chromeLightPalette → Nice; got value=\(chromeLight.value ?? "nil")"
+        )
+    }
+
+    // MARK: - Settings terminal pane
+
+    private func openTerminalPane(_ app: XCUIApplication) {
+        let gear = app.descendants(matching: .any)["sidebar.settings"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.click()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["settings.root"]
+                .waitForExistence(timeout: 5),
+            "Settings window must open before navigating panes"
+        )
+        let row = app.staticTexts["Terminal"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        row.click()
+    }
+
+    /// The Terminal pane must surface both per-scheme theme pickers
+    /// and the Ghostty import button. Accessibility ids here are the
+    /// hook for future finer-grained picker-contents tests, which we
+    /// don't attempt to drive through the menu-style picker popup.
+    func testSettingsTerminal_showsPerSchemePickersAndImportButton() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
         )
 
-        let macDark = app.descendants(matching: .any)["settings.theme.cell.macDark"]
-        XCTAssertTrue(macDark.waitForExistence(timeout: 3))
-        macDark.click()
+        openTerminalPane(app)
 
-        let becameSelected = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "value == %@", "selected"),
-            object: macDark
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [becameSelected], timeout: 3), .completed,
-            "macDark cell value should become 'selected' after being tapped"
+        for id in [
+            "settings.terminal.lightPicker",
+            "settings.terminal.darkPicker",
+            "settings.terminal.import",
+        ] {
+            XCTAssertTrue(
+                app.descendants(matching: .any)[id].waitForExistence(timeout: 3),
+                "Missing Terminal pane control \(id)"
+            )
+        }
+    }
+
+    /// Launch-arg-seeded terminal theme ids must render on the
+    /// per-scheme pickers. Guards the wiring from UserDefaults →
+    /// `Tweaks.terminalThemeLightId` / `...DarkId` → SwiftUI
+    /// picker selection.
+    func testSettingsTerminal_pickersReflectSeededIds() throws {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-ApplePersistenceIgnoreState", "YES",
+            "-terminalThemeLightId", "solarized-light",
+            "-terminalThemeDarkId",  "dracula",
+        ]
+        app.launch()
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
         )
 
-        // And the previously-selected niceLight must clear its selected value.
-        XCTAssertEqual(
-            niceLight.value as? String, "unselected",
-            "Previously-selected cell must clear its selected value once another cell is picked"
+        openTerminalPane(app)
+
+        let lightPicker = app.descendants(matching: .any)["settings.terminal.lightPicker"]
+        XCTAssertTrue(lightPicker.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            (lightPicker.value as? String)?.lowercased().contains("solarized") ?? false,
+            "Light-slot picker should show Solarized Light; got value=\(lightPicker.value ?? "nil")"
+        )
+
+        let darkPicker = app.descendants(matching: .any)["settings.terminal.darkPicker"]
+        XCTAssertTrue(darkPicker.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            (darkPicker.value as? String)?.lowercased().contains("dracula") ?? false,
+            "Dark-slot picker should show Dracula; got value=\(darkPicker.value ?? "nil")"
+        )
+    }
+
+    // MARK: - Settings font pane
+
+    private func openFontPane(_ app: XCUIApplication) {
+        let gear = app.descendants(matching: .any)["sidebar.settings"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.click()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["settings.root"]
+                .waitForExistence(timeout: 5)
+        )
+        let row = app.staticTexts["Font"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        row.click()
+    }
+
+    /// The Font pane must expose the terminal font family picker.
+    /// Guards against the picker going missing or its id drifting;
+    /// the curated candidate list itself is covered by unit tests.
+    func testSettingsFont_showsTerminalFontFamilyPicker() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        openFontPane(app)
+
+        let picker = app.descendants(matching: .any)["settings.font.terminalFamily"]
+        XCTAssertTrue(
+            picker.waitForExistence(timeout: 3),
+            "Terminal font family picker must be present in the Font pane"
         )
     }
 
