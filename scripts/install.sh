@@ -90,16 +90,16 @@ xcodebuild \
 [[ -d "$SRC_APP" ]] || fail "build finished but $SRC_APP not found"
 
 # ── 3. quit running instance, if any ──────────────────────────────────
-if pgrep -x Nice >/dev/null 2>&1; then
+if pgrep -f "/Applications/Nice.app/Contents/MacOS/Nice" >/dev/null 2>&1; then
     log "Nice is running — asking it to quit"
     osascript -e 'tell application "Nice" to quit' >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        pgrep -x Nice >/dev/null 2>&1 || break
+        pgrep -f "/Applications/Nice.app/Contents/MacOS/Nice" >/dev/null 2>&1 || break
         sleep 0.5
     done
-    if pgrep -x Nice >/dev/null 2>&1; then
+    if pgrep -f "/Applications/Nice.app/Contents/MacOS/Nice" >/dev/null 2>&1; then
         log "Nice did not quit cleanly — sending SIGTERM"
-        pkill -x Nice 2>/dev/null || true
+        pkill -f "/Applications/Nice.app/Contents/MacOS/Nice" 2>/dev/null || true
         sleep 1
     fi
 fi

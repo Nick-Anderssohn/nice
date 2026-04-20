@@ -88,6 +88,27 @@ final class TabPtySession: ObservableObject {
     /// Captured for the optional initial claude pane spawn.
     private let claudeBinary: String?
     private let extraClaudeArgs: [String]
+    private let claudeSessionMode: ClaudeSessionMode
+
+    /// How to attach this tab to the Claude CLI's session layer.
+    enum ClaudeSessionMode: Sendable, Equatable {
+        /// No session id; the CLI picks one. Kept for previews/tests
+        /// and any pre-feature call site that hasn't been updated.
+        case none
+        /// Fresh session under a caller-provided UUID. Emits
+        /// `--session-id <uuid>`; `extraClaudeArgs` are appended.
+        case new(id: String)
+        /// Resume a prior session by UUID. Emits `--resume <uuid>`;
+        /// `extraClaudeArgs` are ignored (the transcript already
+        /// carries the session's flags).
+        case resume(id: String)
+        /// Restore path: don't run claude. Spawn a plain `zsh -il` with
+        /// `claude --resume <uuid>` pre-typed at the prompt via
+        /// `print -z`. User hits Enter to actually resume — avoids the
+        /// auto-resume token cost for sessions they weren't going to
+        /// reopen anyway.
+        case resumeDeferred(id: String)
+    }
 
     init(
         tabId: String,
@@ -98,6 +119,7 @@ final class TabPtySession: ObservableObject {
         initialTerminalPaneId: String? = nil,
         socketPath: String? = nil,
         zdotdirPath: String? = nil,
+        claudeSessionMode: ClaudeSessionMode = .none,
         onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
         onPaneTitleChange: @escaping @MainActor (String, String) -> Void
     ) {
@@ -109,6 +131,7 @@ final class TabPtySession: ObservableObject {
         self.zdotdirPath = zdotdirPath
         self.claudeBinary = claudeBinary
         self.extraClaudeArgs = extraClaudeArgs
+        self.claudeSessionMode = claudeSessionMode
 
         if let claudeId = initialClaudePaneId {
             _ = spawnClaudePane(id: claudeId, cwd: cwd)
@@ -126,6 +149,11 @@ final class TabPtySession: ObservableObject {
     /// nil, falls back to a plain zsh — the pane still renders as a
     /// claude pane at the model layer, but what's actually running
     /// inside is just a shell.
+    ///
+    /// The `.resumeDeferred(id:)` mode is special: it spawns a plain
+    /// shell (no `exec claude ...`) with `NICE_PREFILL_COMMAND` set so
+    /// the injected zshrc pre-types `claude --resume <uuid>` at the
+    /// prompt. Nothing runs until the user hits Enter.
     @discardableResult
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
@@ -144,18 +172,52 @@ final class TabPtySession: ObservableObject {
         // as ghostty so the in-app session label updates automatically
         // — SwiftTerm handles the resulting OSC 0/1/2 sequences natively
         // and the choice doesn't trigger iTerm-specific OSC extensions.
-        let claudeEnv = Self.buildEnv(extraEnv: ["TERM_PROGRAM": "ghostty"])
-        if let claude = claudeBinary {
+        var claudeExtraEnv: [String: String] = ["TERM_PROGRAM": "ghostty"]
+        // Pane/tab identity for the zsh `claude()` wrapper's handshake
+        // with Nice's control socket. Only meaningful for the deferred
+        // path (the wrapper is what runs the pre-typed command), but
+        // harmless for the direct-exec paths too.
+        claudeExtraEnv["NICE_TAB_ID"] = tabId
+        claudeExtraEnv["NICE_PANE_ID"] = id
+
+        if case .resumeDeferred(let sessionId) = claudeSessionMode {
+            // Pane renders as Claude but the pty is a plain shell with
+            // the resume command pre-typed. The socket handshake will
+            // flip the pane to actually running-Claude when the user
+            // hits Enter and the wrapper promotes this pane in place.
+            if let sp = socketPath { claudeExtraEnv["NICE_SOCKET"] = sp }
+            if let zp = zdotdirPath { claudeExtraEnv["ZDOTDIR"] = zp }
+            claudeExtraEnv["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
+            view.startProcess(
+                executable: "/bin/zsh",
+                args: ["-il"],
+                environment: Self.buildEnv(extraEnv: claudeExtraEnv),
+                execName: nil,
+                currentDirectory: resolvedCwd
+            )
+        } else if let claude = claudeBinary {
             var parts = ["exec", shellSingleQuote(claude)]
             if !isOverride {
-                for a in extraClaudeArgs {
-                    parts.append(shellSingleQuote(a))
+                // --session-id / --resume must precede extraClaudeArgs
+                // so they aren't parsed as the trailing flag's value.
+                switch claudeSessionMode {
+                case .none:
+                    parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))
+                case .new(let id):
+                    parts.append("--session-id")
+                    parts.append(shellSingleQuote(id))
+                    parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))
+                case .resume(let id):
+                    parts.append("--resume")
+                    parts.append(shellSingleQuote(id))
+                case .resumeDeferred:
+                    break  // handled above
                 }
             }
             view.startProcess(
                 executable: "/bin/zsh",
                 args: ["-ilc", parts.joined(separator: " ")],
-                environment: claudeEnv,
+                environment: Self.buildEnv(extraEnv: claudeExtraEnv),
                 execName: nil,
                 currentDirectory: resolvedCwd
             )
@@ -199,6 +261,11 @@ final class TabPtySession: ObservableObject {
         if let zp = zdotdirPath ?? self.zdotdirPath {
             extraEnv["ZDOTDIR"] = zp
         }
+        // Tab/pane identity for the zsh `claude()` wrapper's handshake.
+        // The wrapper includes these in its socket payload so Nice can
+        // decide whether to open a new sidebar tab or promote this pane.
+        extraEnv["NICE_TAB_ID"] = tabId
+        extraEnv["NICE_PANE_ID"] = id
 
         let resolvedCwd = Self.expandTilde(cwd ?? self.cwd)
         view.startProcess(

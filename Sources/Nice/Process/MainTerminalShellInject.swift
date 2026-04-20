@@ -73,8 +73,9 @@ enum MainTerminalShellInject {
 
     private static let zshrcBody = #"""
     # Nice: chain back to the user's real .zshrc, then shadow `claude`
-    # so running it in the Main Terminal opens a new tab instead of
-    # exec'ing the CLI in place.
+    # so running it handshakes with Nice over NICE_SOCKET. The socket
+    # either tells us to exit (Nice is opening a new tab) or to exec
+    # claude in place (Nice is promoting this pane to Claude).
     [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
 
     _nice_json_escape() {
@@ -88,8 +89,8 @@ enum MainTerminalShellInject {
     }
 
     claude() {
-        # Passthrough to the real binary (no new tab) when:
-        #   1. Not inside a Nice Main Terminal ($NICE_SOCKET unset).
+        # Passthrough to the real binary (no handshake) when:
+        #   1. Not inside a Nice pty ($NICE_SOCKET unset).
         #   2. stdin is piped — caller is streaming input to claude.
         #   3. User passed a flag that makes claude non-interactive.
         #   4. User invoked a non-interactive subcommand.
@@ -126,18 +127,54 @@ enum MainTerminalShellInject {
         done
         args_json+="]"
 
-        # Always ask Nice to open a new tab rooted at PWD. Running
-        # `claude` from a companion terminal inside an existing Nice
-        # tab would otherwise add a second Claude pane there; we want
-        # the invariant "at most one Claude pane per tab", so every
-        # interactive `claude` invocation opens its own tab.
-        local cwd_json
+        # Send {cwd, args, tabId, paneId} and read a single-line reply.
+        # NICE_TAB_ID / NICE_PANE_ID are empty in the Main Terminal —
+        # Nice uses empty tabId as the signal for "always open a new
+        # sidebar tab."
+        local cwd_json tab_id_json pane_id_json
         cwd_json=$(_nice_json_escape "$PWD")
-        local payload="{\"action\":\"newtab\",\"cwd\":${cwd_json},\"args\":${args_json}}"
-        if ! printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 1 2>/dev/null; then
+        tab_id_json=$(_nice_json_escape "${NICE_TAB_ID:-}")
+        pane_id_json=$(_nice_json_escape "${NICE_PANE_ID:-}")
+        local payload="{\"action\":\"claude\",\"cwd\":${cwd_json},\"args\":${args_json},\"tabId\":${tab_id_json},\"paneId\":${pane_id_json}}"
+
+        local response
+        response=$(printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 2 2>/dev/null)
+        if [[ -z "$response" ]]; then
             print -u2 "nice: control socket unreachable; running claude directly"
-            command claude "$@"
+            exec command claude "$@"
         fi
+
+        local mode sid
+        read -r mode sid <<< "$response"
+        case "$mode" in
+            newtab)
+                # Nice is opening a new sidebar tab; nothing to do here.
+                return 0
+                ;;
+            inplace)
+                # Nice promoted this pane to Claude. If it minted a
+                # session id for us, prepend --session-id so it can
+                # resume the session later; otherwise the user's own
+                # args (e.g. --resume <uuid>) already identify it.
+                if [[ -n "$sid" ]]; then
+                    exec command claude --session-id "$sid" "$@"
+                else
+                    exec command claude "$@"
+                fi
+                ;;
+            *)
+                print -u2 "nice: unexpected response '$response'; running claude directly"
+                exec command claude "$@"
+                ;;
+        esac
     }
+
+    # Nice: if the app asked us to pre-type a command at the next
+    # prompt (set when a restored Claude tab boots), push it onto zsh's
+    # line-editor buffer. The user sees the command typed and ready;
+    # nothing runs until they hit Enter.
+    if [[ -n "$NICE_PREFILL_COMMAND" ]]; then
+        print -z "$NICE_PREFILL_COMMAND"
+    fi
     """#
 }
