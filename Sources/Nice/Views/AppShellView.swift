@@ -123,6 +123,7 @@ private struct AppShellHost: View {
             appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalFontSize(fontSettings.terminalFontSize)
             appState.updateGpuRendering(tweaks.gpuRendering)
+            appState.updateSmoothScrolling(tweaks.smoothScrolling)
         }
         .onChange(of: scheme) { _, newScheme in
             appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
@@ -138,6 +139,9 @@ private struct AppShellHost: View {
         }
         .onChange(of: tweaks.gpuRendering) { _, newValue in
             appState.updateGpuRendering(newValue)
+        }
+        .onChange(of: tweaks.smoothScrolling) { _, newValue in
+            appState.updateSmoothScrolling(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar and Main-Terminal cwd across relaunch.

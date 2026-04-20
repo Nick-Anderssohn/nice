@@ -320,6 +320,19 @@ private struct AppearancePane: View {
                 .controlSize(.small)
                 .accessibilityIdentifier("settings.appearance.gpuRendering")
         }
+
+        SettingRow(
+            label: "Smooth scrolling",
+            hint: "Pixel-precise trackpad scrolling. Requires GPU rendering; mouse wheels keep using line-based scroll."
+        ) {
+            Toggle("", isOn: $tweaks.smoothScrolling)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(!tweaks.gpuRendering)
+                .help(tweaks.gpuRendering ? "" : "Turn on GPU rendering to enable smooth scrolling.")
+                .accessibilityIdentifier("settings.appearance.smoothScrolling")
+        }
     }
 }
 

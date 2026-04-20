@@ -164,6 +164,7 @@ final class Tweaks: ObservableObject {
     static let syncKey          = "syncWithOS"
     static let accentKey        = "accent"
     static let gpuRenderingKey  = "gpuRendering"
+    static let smoothScrollingKey = "smoothScrolling"
 
     @Published var theme: ThemeChoice {
         didSet {
@@ -191,6 +192,14 @@ final class Tweaks: ObservableObject {
         didSet { UserDefaults.standard.set(gpuRendering, forKey: Self.gpuRenderingKey) }
     }
 
+    /// Pixel-precise trackpad scrolling on the Metal path. Default
+    /// `true`. Has no effect when `gpuRendering` is off (CG falls back
+    /// to line-snap behavior). Mouse wheels without precise deltas
+    /// keep using the existing line-velocity scroll either way.
+    @Published var smoothScrolling: Bool {
+        didSet { UserDefaults.standard.set(smoothScrolling, forKey: Self.smoothScrollingKey) }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
@@ -215,6 +224,9 @@ final class Tweaks: ObservableObject {
         let gpu: Bool = defaults.object(forKey: Self.gpuRenderingKey) == nil
             ? true
             : defaults.bool(forKey: Self.gpuRenderingKey)
+        let smooth: Bool = defaults.object(forKey: Self.smoothScrollingKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.smoothScrollingKey)
 
         let (theme, sync) = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
@@ -222,6 +234,7 @@ final class Tweaks: ObservableObject {
         self.syncWithOS = sync
         self.accent = accent
         self.gpuRendering = gpu
+        self.smoothScrolling = smooth
 
         NSApp?.appearance = theme.nsAppearance
 

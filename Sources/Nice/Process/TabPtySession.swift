@@ -66,6 +66,12 @@ final class TabPtySession: ObservableObject {
     /// `Tweaks.gpuRendering`'s default.
     private var currentGpuRendering: Bool = true
 
+    /// Cached "Smooth scrolling" preference. Same wiring story as
+    /// `currentGpuRendering` — panes read it through a closure so the
+    /// Settings toggle takes effect live. Defaults match
+    /// `Tweaks.smoothScrolling` (on).
+    private var currentSmoothScrolling: Bool = true
+
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
     /// ZDOTDIR directory injected into terminal panes so the shadowed
@@ -127,6 +133,7 @@ final class TabPtySession: ObservableObject {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(size: currentTerminalFontSize)
         view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
+        view.smoothScrollPreferenceProvider = { [weak self] in self?.currentSmoothScrolling ?? true }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -184,6 +191,7 @@ final class TabPtySession: ObservableObject {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(size: currentTerminalFontSize)
         view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
+        view.smoothScrollPreferenceProvider = { [weak self] in self?.currentSmoothScrolling ?? true }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -353,6 +361,17 @@ final class TabPtySession: ObservableObject {
         currentGpuRendering = enabled
         for view in panes.values {
             view.applyGpuPreference()
+        }
+    }
+
+    /// Re-apply the smooth-scrolling preference to every live pane.
+    /// Mirrors `applyGpuRendering` — the preference is read live by
+    /// each pane's `smoothScrollPreferenceProvider`, so a Settings
+    /// toggle propagates instantly without restarting any pty.
+    func applySmoothScrolling(enabled: Bool) {
+        currentSmoothScrolling = enabled
+        for view in panes.values {
+            view.applySmoothScrollPreference()
         }
     }
 

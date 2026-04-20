@@ -17,22 +17,27 @@ settings:
 
 packages:
   SwiftTerm:
-    # Nick-Anderssohn/SwiftTerm fast-render branch: upstream's PR #484
-    # Metal-renderer revision (f37922e, March 2026) plus local patches:
+    # Nick-Anderssohn/SwiftTerm fork: upstream PR #484's Metal renderer
+    # (f37922e, March 2026) plus our local patches:
     #   - drop the legacy 1/60s render throttle on the Metal path
     #   - paint via MTKView.draw() instead of setNeedsDisplay so rapid
     #     PTY bursts can't be dropped by AppKit's display scheduling
-    # Together these cut ~16-33ms off typing latency (visibly smoother
-    # held backspace) without the missing-output regression the
-    # throttle was masking.
-    # To pick up an upstream bump, rebase `fast-render` onto the new
+    #   - pixel-precise smooth scrolling on the Metal path: row vertex
+    #     positions live in yDisp-independent buffer-space and the
+    #     scroll position is applied at draw time via a shader uniform
+    # The throttle/draw work cut ~16-33ms off typing latency
+    # (visibly smoother held backspace) without the missing-output
+    # regression the throttle was masking. Smooth scrolling is opt-in
+    # via `MacTerminalView.smoothScrollingEnabled` (Nice plumbs it
+    # through `Tweaks.smoothScrolling`, default on).
+    # To pick up an upstream bump, rebase the fork branch onto the new
     # revision and update the pin here.
     #
     # While iterating on SwiftTerm itself, swap to a local path:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 85b0395391ab82ab813c2e84a4027ca40b746e0a
+    revision: e48765f4ed97aa01e67232d70a3c0a476dfd3faf
 
 targets:
   Nice:

@@ -99,6 +99,11 @@ final class AppState: ObservableObject {
     /// place. Defaults to `true` to match `Tweaks.gpuRendering`.
     private var currentGpuRendering: Bool = true
 
+    /// Tracks the smooth-scrolling preference (`Tweaks.smoothScrolling`).
+    /// Same fan-out story as `currentGpuRendering`. Defaults match
+    /// `Tweaks.smoothScrolling` (on).
+    private var currentSmoothScrolling: Bool = true
+
     /// Absolute path to the `claude` binary if we've resolved it; nil
     /// falls back to zsh inside claude panes.
     private var resolvedClaudePath: String?
@@ -346,6 +351,14 @@ final class AppState: ObservableObject {
         currentGpuRendering = enabled
         for session in ptySessions.values {
             session.applyGpuRendering(enabled: enabled)
+        }
+    }
+
+    /// Mirror of `updateGpuRendering` for the smooth-scrolling toggle.
+    func updateSmoothScrolling(_ enabled: Bool) {
+        currentSmoothScrolling = enabled
+        for session in ptySessions.values {
+            session.applySmoothScrolling(enabled: enabled)
         }
     }
 
@@ -746,6 +759,7 @@ final class AppState: ObservableObject {
         session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
         session.applyTerminalFont(size: currentTerminalFontSize)
         session.applyGpuRendering(enabled: currentGpuRendering)
+        session.applySmoothScrolling(enabled: currentSmoothScrolling)
         ptySessions[tabId] = session
         return session
     }

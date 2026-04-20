@@ -33,6 +33,11 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// `Tweaks.gpuRendering` default.
     var gpuPreferenceProvider: (() -> Bool)?
 
+    /// Reads the live "Smooth scrolling" preference. `nil` means "no
+    /// session has wired this up yet" — treated as on, matching the
+    /// `Tweaks.smoothScrolling` default.
+    var smoothScrollPreferenceProvider: (() -> Bool)?
+
     /// Latch set by `TerminalHost.makeNSView` when this pane is the one
     /// SwiftUI is about to mount as the active pane. Consumed on the
     /// next `viewDidMoveToWindow` / `viewDidMoveToSuperview` so focus
@@ -88,9 +93,18 @@ final class NiceTerminalView: LocalProcessTerminalView {
         }
     }
 
+    /// Re-evaluates the smooth-scrolling preference and writes it to
+    /// SwiftTerm's `smoothScrollingEnabled` flag. Cheap: just a Bool
+    /// write that the next `scrollWheel` event consults. Safe to call
+    /// before the view is in a window.
+    func applySmoothScrollPreference() {
+        smoothScrollingEnabled = smoothScrollPreferenceProvider?() ?? true
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyGpuPreference()
+        applySmoothScrollPreference()
         claimFocusIfRequested()
     }
 
