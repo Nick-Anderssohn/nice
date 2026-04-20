@@ -24,5 +24,8 @@ xcuserdata/
 Nice.xcodeproj/
 Resources/Info.generated.plist
 
+# Release signing credentials (sourced by scripts/release.sh for local runs)
+scripts/.env.release
+
 # macOS
 .DS_Store

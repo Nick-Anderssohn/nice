@@ -119,7 +119,6 @@ fi
 
 log "copying Nice.app → $DEST_APP"
 $SUDO ditto "$SRC_APP" "$DEST_APP"
-$SUDO xattr -dr com.apple.quarantine "$DEST_APP" 2>/dev/null || true
 
 # ── 5. report ─────────────────────────────────────────────────────────
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \

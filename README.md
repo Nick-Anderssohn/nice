@@ -15,7 +15,15 @@ Early but functional. The app runs end-to-end, native controls respect the user'
 
 ## Install
 
-To use Nice as a regular Mac app (Spotlight, Launchpad, Dock), install it into `/Applications`:
+```sh
+brew install --cask Nick-Anderssohn/nice/nice
+```
+
+This pulls a signed + notarized build from [GitHub Releases](https://github.com/Nick-Anderssohn/nice/releases) and installs it as a normal Mac app (Spotlight, Launchpad, Dock). `brew upgrade --cask nice` picks up new versions; `brew uninstall --cask --zap nice` removes the app and wipes its settings.
+
+### Build from source
+
+For contributors, or if you want to run ahead of the latest release:
 
 ```sh
 git clone https://github.com/Nick-Anderssohn/nice.git
@@ -23,7 +31,7 @@ cd nice
 scripts/install.sh
 ```
 
-The script builds Release, quits any running instance, and replaces `/Applications/Nice.app` in place — re-run it to upgrade. Settings (UserDefaults under `dev.nickanderssohn.nice`) survive an upgrade.
+The script builds Release, quits any running instance, and replaces `/Applications/Nice.app` in place. Settings (UserDefaults under `dev.nickanderssohn.nice`) survive an upgrade.
 
 If you're running Claude Code inside the repo, the `/nice-install` slash command does the same thing and walks you through any missing prerequisites first.
 
