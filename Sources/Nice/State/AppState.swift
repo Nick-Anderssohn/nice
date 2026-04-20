@@ -99,10 +99,6 @@ final class AppState: ObservableObject {
     /// place. Defaults to `true` to match `Tweaks.gpuRendering`.
     private var currentGpuRendering: Bool = true
 
-    // MARK: - MCP server
-
-    @Published private(set) var mcp = NiceMCPServer()
-
     /// Absolute path to the `claude` binary if we've resolved it; nil
     /// falls back to zsh inside claude panes.
     private var resolvedClaudePath: String?
@@ -233,8 +229,6 @@ final class AppState: ObservableObject {
         ptySessions.removeAll()
         controlSocket?.stop()
         controlSocket = nil
-        let mcpRef = mcp
-        Task { await mcpRef.stop() }
     }
 
     // MARK: - Selection
@@ -322,15 +316,6 @@ final class AppState: ObservableObject {
             initialClaudePaneId: claudePaneId,
             initialTerminalPaneId: terminalPaneId
         )
-    }
-
-    // MARK: - Bootstrap
-
-    func bootstrap() async {
-        let defaults = UserDefaults.standard
-        let shouldAutoStart = (defaults.object(forKey: "mcpAutoStart") as? Bool) ?? true
-        guard shouldAutoStart else { return }
-        await mcp.start(appState: self)
     }
 
     // MARK: - Theme
@@ -696,90 +681,6 @@ final class AppState: ObservableObject {
         _ = addPane(tabId: id, kind: .terminal)
     }
 
-    // MARK: - MCP tool handlers
-
-    func mcpSwitchTab(tabId: String?, titleQuery: String?) -> String? {
-        if let tabId, tab(for: tabId) != nil {
-            activeTabId = tabId
-            return tabId
-        }
-        if let q = titleQuery?.lowercased(), !q.isEmpty {
-            if terminalsTab.title.lowercased().contains(q) {
-                activeTabId = terminalsTab.id
-                return terminalsTab.id
-            }
-            for project in projects {
-                if let hit = project.tabs.first(where: {
-                    $0.title.lowercased().contains(q)
-                }) {
-                    activeTabId = hit.id
-                    return hit.id
-                }
-            }
-        }
-        return nil
-    }
-
-    /// Flatten every tab (Terminals + user sessions) into dicts for MCP.
-    func mcpListTabs() -> [[String: String]] {
-        var rows: [[String: String]] = []
-        rows.append([
-            "id": terminalsTab.id,
-            "title": terminalsTab.title,
-            "cwd": terminalsTab.cwd,
-            "branch": "",
-            "status": terminalsTab.status.rawValue,
-            "project": "terminals",
-        ])
-        for project in projects {
-            for tab in project.tabs {
-                rows.append([
-                    "id": tab.id,
-                    "title": tab.title,
-                    "cwd": tab.cwd,
-                    "branch": tab.branch ?? "",
-                    "status": tab.status.rawValue,
-                    "project": project.id,
-                ])
-            }
-        }
-        return rows
-    }
-
-    /// Spawn a new terminal pane in a tab. Defaults to the active tab
-    /// when `tabId` is nil; uses the tab's cwd when `cwd` is nil.
-    func mcpOpenTerminal(tabId: String?, cwd: String?, title: String?) -> String? {
-        let targetId = tabId ?? activeTabId
-        guard let targetId else { return nil }
-        guard tab(for: targetId) != nil else { return nil }
-        return addPane(tabId: targetId, kind: .terminal, cwd: cwd, title: title)
-    }
-
-    /// Write `command + "\n"` into the target tab's active pane if it's
-    /// a terminal; otherwise the first terminal pane on the tab.
-    func mcpRun(tabId: String?, command: String) -> Bool {
-        let targetId = tabId ?? activeTabId
-        guard let targetId else { return false }
-        guard let tab = tab(for: targetId) else { return false }
-
-        let paneId: String? = {
-            if let active = tab.activePane, active.kind == .terminal {
-                return active.id
-            }
-            return tab.panes.first { $0.kind == .terminal }?.id
-        }()
-        guard let paneId else { return false }
-
-        let session: TabPtySession
-        if let existing = ptySessions[targetId] {
-            session = existing
-        } else {
-            session = makeSession(for: targetId, cwd: tab.cwd)
-        }
-        session.sendToPane(command, paneId: paneId)
-        return true
-    }
-
     // MARK: - Pty sessions
 
     /// Return the pty session for `tabId`, creating and caching one if
@@ -797,14 +698,6 @@ final class AppState: ObservableObject {
             return existing
         }
         let resolvedCwd = Self.expandTilde(cwd)
-        let cfgPath: URL? = {
-            do {
-                return try ClaudeConfigWriter.writeConfig(port: mcp.port)
-            } catch {
-                NSLog("AppState: ClaudeConfigWriter failed: \(error)")
-                return nil
-            }
-        }()
 
         // Work out which panes to spawn. Callers can pass ids explicitly
         // (e.g. createTabFromMainTerminal) or we infer them from the
@@ -837,7 +730,6 @@ final class AppState: ObservableObject {
             tabId: tabId,
             cwd: resolvedCwd,
             claudeBinary: resolvedClaudePath,
-            mcpConfigPath: cfgPath,
             extraClaudeArgs: extraClaudeArgs,
             initialClaudePaneId: claudePaneId,
             initialTerminalPaneId: terminalPaneId,

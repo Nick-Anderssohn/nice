@@ -9,11 +9,11 @@
 //
 //  Each `AppShellView` registers on mount via `WindowAccessor`. The
 //  registry observes `willCloseNotification` so it can tear down the
-//  window's AppState (terminate ptys, stop control socket, stop MCP
-//  server) without each view needing its own `.onDisappear` plumbing.
-//  `didBecomeKeyNotification` updates `lastActiveAppState` so MCP tool
-//  calls arriving while the app is backgrounded still have a sensible
-//  target.
+//  window's AppState (terminate ptys, stop control socket) without each
+//  view needing its own `.onDisappear` plumbing.
+//  `didBecomeKeyNotification` updates `lastActiveAppState` so process-
+//  wide subsystems arriving while the app is backgrounded still have a
+//  sensible target.
 //
 //  Registration also installs a `CloseConfirmationDelegate` on the
 //  window so red-button / ⌘W closes with live panes surface a
@@ -87,8 +87,8 @@ final class WindowRegistry: ObservableObject {
             closeConfirmer: closeConfirmer
         )
 
-        // Seed the fallback so the first window is reachable from MCP
-        // tool calls before it ever becomes key.
+        // Seed the fallback so the first window has a stable identity
+        // before it ever becomes key.
         if lastActiveAppState == nil {
             lastActiveAppState = appState
         }

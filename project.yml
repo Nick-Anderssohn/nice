@@ -33,9 +33,6 @@ packages:
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
     revision: 85b0395391ab82ab813c2e84a4027ca40b746e0a
-  MCP:
-    url: https://github.com/modelcontextprotocol/swift-sdk.git
-    from: 0.12.0
 
 targets:
   Nice:
@@ -49,8 +46,6 @@ targets:
     dependencies:
       - package: SwiftTerm
         product: SwiftTerm
-      - package: MCP
-        product: MCP
     entitlements:
       path: Resources/Nice.entitlements
       properties:

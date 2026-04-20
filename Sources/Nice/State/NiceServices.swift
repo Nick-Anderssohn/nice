@@ -12,8 +12,8 @@
 //      every window; computing it once at app launch keeps second-
 //      window open below the user's latency threshold.
 //
-//  Per-window services (`AppState`, `NiceMCPServer`, `NiceControlSocket`)
-//  stay with their owning window so each window is fully isolated.
+//  Per-window services (`AppState`, `NiceControlSocket`) stay with
+//  their owning window so each window is fully isolated.
 //
 
 import AppKit

@@ -11,8 +11,7 @@
 //  (a) the payload is a single short line per connection, so
 //  NWConnection's buffering/state machine adds no value, and (b) we
 //  want precise control over `unlink` before bind and `chmod 0600`
-//  after bind. The listener is intentionally isolated from the MCP
-//  server so it survives if MCP is later removed.
+//  after bind.
 //
 //  The class is deliberately *not* `@MainActor`. DispatchSource event
 //  handlers fire on a background queue; a MainActor class capturing

@@ -74,7 +74,6 @@ final class TabPtySession: ObservableObject {
 
     /// Captured for the optional initial claude pane spawn.
     private let claudeBinary: String?
-    private let mcpConfigPath: URL?
     private let extraClaudeArgs: [String]
 
     /// When true, terminal panes on this session get `NICE_TAB_ID` in
@@ -88,7 +87,6 @@ final class TabPtySession: ObservableObject {
         tabId: String,
         cwd: String,
         claudeBinary: String?,
-        mcpConfigPath: URL? = nil,
         extraClaudeArgs: [String] = [],
         initialClaudePaneId: String? = nil,
         initialTerminalPaneId: String? = nil,
@@ -105,7 +103,6 @@ final class TabPtySession: ObservableObject {
         self.socketPath = socketPath
         self.zdotdirPath = zdotdirPath
         self.claudeBinary = claudeBinary
-        self.mcpConfigPath = mcpConfigPath
         self.extraClaudeArgs = extraClaudeArgs
         self.injectTabIdEnv = injectTabIdEnv
 
@@ -146,10 +143,6 @@ final class TabPtySession: ObservableObject {
         if let claude = claudeBinary {
             var parts = ["exec", shellSingleQuote(claude)]
             if !isOverride {
-                if let cfg = mcpConfigPath?.path {
-                    parts.append("--mcp-config")
-                    parts.append(shellSingleQuote(cfg))
-                }
                 for a in extraClaudeArgs {
                     parts.append(shellSingleQuote(a))
                 }

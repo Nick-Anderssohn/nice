@@ -5,10 +5,10 @@
 //  App entry point. App-wide services (`Tweaks`, `KeyboardShortcuts`,
 //  the shared `WindowRegistry`, and the cached `claude` path) live on
 //  one `NiceServices` instance owned here. Per-window state
-//  (`AppState`, `NiceMCPServer`, `NiceControlSocket`) lives inside
-//  each `AppShellView` — every `WindowGroup` instance gets its own,
-//  so opening a second window via ⌘N yields a fully isolated window
-//  with its own tabs, panes, pty sessions, and MCP endpoint.
+//  (`AppState`, `NiceControlSocket`) lives inside each `AppShellView`
+//  — every `WindowGroup` instance gets its own, so opening a second
+//  window via ⌘N yields a fully isolated window with its own tabs,
+//  panes, and pty sessions.
 //
 //  Theme is driven via `NSApp.appearance` from `Tweaks` rather than
 //  `.preferredColorScheme`, because the latter can't clear a

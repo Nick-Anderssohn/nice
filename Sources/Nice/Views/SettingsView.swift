@@ -13,8 +13,8 @@
 //      - content area (18/24 padding, scrollable, panel per selection)
 //
 //  The accent swatches live in the Appearance tab and write through the
-//  `Tweaks` environment object so the rest of the app (Logo, MCP chip,
-//  selection tints…) repaints live the moment a new swatch is picked.
+//  `Tweaks` environment object so the rest of the app (Logo, selection
+//  tints…) repaints live the moment a new swatch is picked.
 //
 //  The Appearance pane owns the theme picker (four choices: Nice
 //  light/dark + macOS light/dark) and a `Sync with OS theme` toggle that
@@ -31,7 +31,6 @@ import SwiftUI
 enum SettingsSection: String, CaseIterable, Identifiable {
     case general     = "General"
     case shortcuts   = "Shortcuts"
-    case mcp         = "MCP"
     case appearance  = "Appearance"
     case font        = "Font"
     case about       = "About"
@@ -107,7 +106,6 @@ struct SettingsView: View {
                 switch active {
                 case .general:    GeneralPane()
                 case .shortcuts:  ShortcutsPane()
-                case .mcp:        MCPPane()
                 case .appearance: AppearancePane()
                 case .font:       FontPane()
                 case .about:      AboutPane()
@@ -268,79 +266,6 @@ private struct ShortcutsPane: View {
     }
 }
 
-// MARK: - MCP pane
-
-private struct MCPPane: View {
-    @EnvironmentObject private var services: NiceServices
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-    @AppStorage("mcpAutoStart") private var autoStart: Bool = true
-
-    /// oklch(0.65 0.18 145) — the settings.jsx "running" dot.
-    private let runningGreen = Color(
-        .sRGB, red: 0.31, green: 0.74, blue: 0.43, opacity: 1.0
-    )
-    /// Muted red for the "stopped" state.
-    private let stoppedRed = Color(
-        .sRGB, red: 0.76, green: 0.32, blue: 0.32, opacity: 1.0
-    )
-
-    /// AppState for the window the user last interacted with. Each
-    /// window runs its own MCP server on a distinct ephemeral port, so
-    /// this row surfaces whichever one is currently in focus. `nil`
-    /// only when no windows are open (Settings alone).
-    private var focusedAppState: AppState? {
-        services.registry.activeAppState(preferKey: false)
-    }
-
-    var body: some View {
-        SettingTitle("MCP Server")
-
-        SettingRow(label: "Status") {
-            HStack(spacing: 8) {
-                let mcp = focusedAppState?.mcp
-                let isRunning = mcp?.isRunning ?? false
-                Circle()
-                    .fill(isRunning ? runningGreen : stoppedRed)
-                    .frame(width: 8, height: 8)
-                Text(statusText(running: isRunning, port: mcp?.port ?? 0))
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.niceInk(scheme, palette))
-                if !isRunning, let state = focusedAppState {
-                    Button("Start") {
-                        Task { await state.mcp.start(appState: state) }
-                    }
-                    .controlSize(.small)
-                }
-            }
-        }
-
-        SettingRow(
-            label: "Exposed tools",
-            hint: "Lets Claude create tabs, switch, list, and run commands."
-        ) {
-            Text("nice.tab.new, nice.tab.switch, nice.tab.list, nice.run")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(Color.niceInk2(scheme, palette))
-                .multilineTextAlignment(.trailing)
-                .frame(maxWidth: 260, alignment: .trailing)
-        }
-
-        SettingRow(label: "Auto-start at login") {
-            Toggle("", isOn: $autoStart)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-        }
-    }
-
-    private func statusText(running: Bool, port: Int) -> String {
-        if !running { return "Stopped" }
-        if port == 0 { return "Starting…" }
-        return "Running on :\(port)"
-    }
-}
-
 // MARK: - Appearance pane
 
 private struct AppearancePane: View {
@@ -371,7 +296,7 @@ private struct AppearancePane: View {
 
         SettingRow(
             label: "Accent",
-            hint: "Also drives the logo, MCP chip, and selection tint."
+            hint: "Also drives the logo and selection tint."
         ) {
             HStack(spacing: 8) {
                 ForEach(AccentPreset.allCases) { preset in

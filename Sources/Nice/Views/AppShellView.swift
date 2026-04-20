@@ -119,9 +119,6 @@ private struct AppShellHost: View {
         } message: {
             Text("Your last terminal just exited. You still have open sessions.")
         }
-        .task {
-            await appState.bootstrap()
-        }
         .onAppear {
             appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalFontSize(fontSettings.terminalFontSize)
