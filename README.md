@@ -4,7 +4,7 @@ A native macOS GUI that sits in front of the [`claude`](https://github.com/anthr
 
 ## Status
 
-Early but functional. The app runs end-to-end, native controls respect the user's accent, SwiftTerm panes theme to match `niceBg3`, "Launch at login" is wired to `SMAppService`, and typing `claude …` in the Main Terminal opens a new tab with the args passed through.
+Early but functional. The app runs end-to-end, native controls respect the user's accent, SwiftTerm panes theme to match `niceBg3`, and typing `claude …` in the Main Terminal opens a new tab with the args passed through.
 
 ## Requirements
 

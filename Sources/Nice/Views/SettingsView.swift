@@ -23,13 +23,11 @@
 //
 
 import AppKit
-import ServiceManagement
 import SwiftUI
 
 // MARK: - Section enum
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general     = "General"
     case shortcuts   = "Shortcuts"
     case appearance  = "Appearance"
     case terminal    = "Terminal"
@@ -48,7 +46,7 @@ struct SettingsView: View {
 
     private var palette: Palette { tweaks.activeChromePalette }
 
-    @State private var active: SettingsSection = .general
+    @State private var active: SettingsSection = .shortcuts
 
     var body: some View {
         HStack(spacing: 0) {
@@ -105,7 +103,6 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 switch active {
-                case .general:    GeneralPane()
                 case .shortcuts:  ShortcutsPane()
                 case .appearance: AppearancePane()
                 case .terminal:   SettingsTerminalPane()
@@ -148,108 +145,6 @@ private struct SettingsSectionRow: View {
             )
             .contentShape(Rectangle())
             .onTapGesture { action() }
-    }
-}
-
-// MARK: - General pane
-
-private struct GeneralPane: View {
-    @EnvironmentObject private var services: NiceServices
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-
-    @AppStorage("launchAtLogin") private var launchAtLogin: Bool = false
-
-    /// The "Main terminal directory" row targets the focused window's
-    /// Main Terminal. Each window keeps its own cwd; this is the one
-    /// the user currently sees.
-    private var focusedAppState: AppState? {
-        services.registry.activeAppState(preferKey: false)
-    }
-
-    private var focusedMainCwd: String {
-        focusedAppState?.terminalsTab.cwd ?? NSHomeDirectory()
-    }
-
-    private var cwdDisplayName: String {
-        let cwd = focusedMainCwd
-        let home = NSHomeDirectory()
-        if cwd == home { return "~" }
-        if cwd.hasPrefix(home + "/") {
-            return "~" + cwd.dropFirst(home.count)
-        }
-        return cwd
-    }
-
-    /// Custom binding so flipping the Toggle calls SMAppService.register/
-    /// unregister instead of just writing @AppStorage. If the call
-    /// throws, we snap the UI back to whatever SMAppService reports —
-    /// common in dev builds where the app isn't in /Applications.
-    private var launchAtLoginBinding: Binding<Bool> {
-        Binding(
-            get: { launchAtLogin },
-            set: { newValue in
-                do {
-                    if newValue {
-                        try SMAppService.mainApp.register()
-                    } else {
-                        try SMAppService.mainApp.unregister()
-                    }
-                    launchAtLogin = newValue
-                } catch {
-                    NSLog("SMAppService \(newValue ? "register" : "unregister") failed: \(error)")
-                    launchAtLogin = SMAppService.mainApp.status == .enabled
-                }
-            }
-        )
-    }
-
-    var body: some View {
-        SettingTitle("General")
-            .onAppear {
-                // Sync the stored flag with reality — the user may have
-                // toggled the Login Items entry via System Settings, or
-                // a previous register() call may have silently failed.
-                launchAtLogin = SMAppService.mainApp.status == .enabled
-            }
-
-        SettingRow(label: "Launch at login") {
-            Toggle("", isOn: launchAtLoginBinding)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-        }
-
-        SettingRow(
-            label: "Main terminal directory",
-            hint: "Where the shared main terminal boots `zsh`."
-        ) {
-            HStack(spacing: 8) {
-                Text(cwdDisplayName)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Color.niceInk2(scheme, palette))
-                    .lineLimit(1)
-                    .truncationMode(.head)
-                    .frame(maxWidth: 200, alignment: .trailing)
-                Button("Choose…") { pickDirectory() }
-                    .controlSize(.small)
-            }
-        }
-
-        SettingRow(label: "Default shell") {
-            ReadOnlyValuePill(value: "zsh")
-        }
-    }
-
-    private func pickDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        if panel.runModal() == .OK, let url = panel.url {
-            focusedAppState?.restartTerminalsFirstPane(cwd: url.path)
-        }
     }
 }
 
@@ -618,30 +513,6 @@ struct KeyPills: View {
                     }
             }
         }
-    }
-}
-
-/// Read-only value pill mirroring the JSX `Select` component when a
-/// dropdown is overkill (e.g. "zsh" with no alternatives).
-private struct ReadOnlyValuePill: View {
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-    let value: String
-
-    var body: some View {
-        Text(value)
-            .font(.system(size: 12))
-            .foregroundStyle(Color.niceInk(scheme, palette))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.niceBg3(scheme, palette))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(Color.niceLineStrong(scheme, palette), lineWidth: 1)
-            )
     }
 }
 
