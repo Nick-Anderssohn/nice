@@ -1,17 +1,58 @@
 # Nice
 
-A native macOS GUI that sits in front of the [`claude`](https://github.com/anthropics/claude-code) CLI. Each sidebar tab is a long-lived Claude Code session running in a pseudo-terminal; the companion pane on the right is a `zsh` rooted in the same working directory. You open a new tab the same way you'd start Claude anywhere else — by typing `claude …` at the Main Terminal prompt.
+> **Never lose track of a Claude session again.**
 
-## Status
+A native macOS terminal that organizes your Claude Code sessions for you. Run `claude` anywhere — Nice spawns it in a fresh pty and files it under the right project in the sidebar. No config, no setup, no "new tab" dance.
 
-Early but functional. The app runs end-to-end, native controls respect the user's accent, SwiftTerm panes theme to match `niceBg3`, and typing `claude …` in the Main Terminal opens a new tab with the args passed through.
+```sh
+brew install --cask Nick-Anderssohn/nice/nice
+```
+
+<p align="center">
+  <img src="docs/images/nice-mocha.png" alt="Nice running on the Catppuccin Mocha terminal theme">
+</p>
+
+## Auto-organized sessions
+
+You don't file your Claude sessions. Nice does.
+
+Type `claude` at any shell, from any project directory — a new tab opens in Nice, grouped under that project, running in its own long-lived pty with a plain `zsh` pane alongside. Walk away, come back hours later, and the session is exactly where you left it. The projects in the sidebar are the working directories you actually use, populated as you go.
+
+It's the way `claude` was meant to live: always open, already where it should be, never guessing which window it's in.
+
+## Themes that look like you want them to
+
+Twelve built-in terminal themes — Catppuccin (all four), Dracula, Nord, Gruvbox, Tokyo Night, Solarized, Atom One, and more — plus five native-chrome accents (Terracotta, Ocean, Fern, Iris, Graphite). Switch live from Settings; the whole window repaints instantly.
+
+Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty's theme file format directly. Drop it in and it's a one-click swap.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/nice-latte.png" alt="Catppuccin Latte"></td>
+    <td width="50%"><img src="docs/images/nice-mocha.png" alt="Catppuccin Mocha"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Catppuccin Latte</b></sub></td>
+    <td align="center"><sub><b>Catppuccin Mocha</b></sub></td>
+  </tr>
+</table>
+
+## Keyboard-first
+
+| Shortcut | Action |
+|---|---|
+| `⌘⌥↓` / `⌘⌥↑` | Next / previous sidebar tab |
+| `⌘⌥→` / `⌘⌥←` | Next / previous pane within a tab |
+| `⌘T` | New terminal pane |
+| `⌘B` | Toggle sidebar |
+| `⌘=` / `⌘-` / `⌘0` | Zoom in, out, reset |
+
+All rebindable in Settings (`⌘,`).
 
 ## Requirements
 
 - macOS 14 (Sonoma) or later
-- Xcode 16+ (Swift 6)
-- [`claude`](https://github.com/anthropics/claude-code) on your `$PATH` (optional — tabs fall back to `zsh` in the chat pane if missing)
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`) to regenerate the project from `project.yml`
+- [Claude Code](https://github.com/anthropics/claude-code) on your `$PATH` — optional; tabs fall back to a plain `zsh` if it's missing
 
 ## Install
 
@@ -19,88 +60,8 @@ Early but functional. The app runs end-to-end, native controls respect the user'
 brew install --cask Nick-Anderssohn/nice/nice
 ```
 
-This pulls a signed + notarized build from [GitHub Releases](https://github.com/Nick-Anderssohn/nice/releases) and installs it as a normal Mac app (Spotlight, Launchpad, Dock). `brew upgrade --cask nice` picks up new versions; `brew uninstall --cask --zap nice` removes the app and wipes its settings.
-
-### Build from source
-
-For contributors, or if you want to run ahead of the latest release:
-
-```sh
-git clone https://github.com/Nick-Anderssohn/nice.git
-cd nice
-scripts/install.sh
-```
-
-The script builds Release, quits any running instance, and replaces `/Applications/Nice.app` in place. Settings (UserDefaults under `dev.nickanderssohn.nice`) survive an upgrade.
-
-If you're running Claude Code inside the repo, the `/nice-install` slash command does the same thing and walks you through any missing prerequisites first.
-
-To remove: `scripts/uninstall.sh` (add `--purge` to also wipe settings).
-
-## Build & run (development)
-
-```sh
-git clone https://github.com/Nick-Anderssohn/nice.git
-cd nice
-xcodegen generate
-open Nice.xcodeproj
-# ⌘R in Xcode, or:
-xcodebuild -project Nice.xcodeproj -scheme Nice -configuration Debug build -destination 'platform=macOS'
-open ~/Library/Developer/Xcode/DerivedData/Nice-*/Build/Products/Debug/Nice.app
-```
-
-The app ships with **App Sandbox disabled** (`Resources/Nice.entitlements`) — required for spawning child processes via pty. Not distributable via the Mac App Store.
-
-## Architecture
-
-```
-Nice.app                                    (single process)
-├─ SwiftUI          3-column shell: Sidebar / Chat / Terminal
-├─ AppState         @MainActor ObservableObject
-│                   projects, activeTabId, pty sessions
-└─ Process layer
-    TabPtySession   two LocalProcessTerminalViews per tab:
-                    - claude (middle)
-                    - zsh    (right)
-    MainTerminalSession  singleton zsh for the "Main terminal" row
-```
-
-Tab creation flows through a Unix-domain control socket — see **Opening tabs** below.
-
-## Stack
-
-- **UI:** SwiftUI
-- **Terminals:** [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`LocalProcessTerminalView`)
-
-## Customization
-
-Settings (`⌘,`):
-- **Appearance** — theme (Match system / Light / Dark) and one of 5 accent presets: Terracotta (default), Ocean, Fern, Iris, Graphite. Changes apply live.
-- **General** — main terminal working directory
-
-## Design
-
-The look was mocked up in HTML/React at [claude.ai/design](https://claude.ai/design) and ported to SwiftUI 1:1. The terracotta-accent, 3-column Xcode-flavored aesthetic is a direct translation of that design; all dimensions, paddings, and animation curves were lifted from the CSS source.
-
-## Opening tabs
-
-The Main Terminal ships with a `claude` zsh function that intercepts interactive invocations and asks the app to open a new tab in its place:
-
-```sh
-claude                        # → new tab, claude starts fresh
-claude "fix foo.swift"        # → new tab, claude gets that prompt as argv
-cd ~/Projects/nice && claude  # → new tab rooted at the nice repo
-```
-
-Non-interactive runs stay on the Main Terminal — the function passes through to the real binary when you use `-p` / `--print`, info flags (`--version`, `--help`), subcommands (`claude mcp …`, `claude config …`, `claude update`), or piped stdin. The channel is a Unix-domain socket in `$TMPDIR`, set into the shell as `$NICE_SOCKET`; if the socket isn't reachable the function still falls back to running claude directly.
-
-Regular tabs' right-side `zsh` is untouched — it's a plain interactive shell with no shadow.
-
-## Non-goals
-
-- **Mac App Store distribution.** Blocked by the sandbox requirement — the App Sandbox forbids spawning child processes via pty.
+Signed, notarized, universal (Apple Silicon + Intel). `brew upgrade --cask nice` picks up new releases; `brew uninstall --cask --zap nice` removes the app and wipes its settings.
 
 ## Credits
 
-- Design: mocked in [claude.ai/design](https://claude.ai/design)
-- Terminal rendering: [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) by Miguel de Icaza
+Designed at [claude.ai/design](https://claude.ai/design). Terminal rendering by [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm).
