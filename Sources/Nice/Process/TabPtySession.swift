@@ -241,6 +241,49 @@ final class TabPtySession: ObservableObject {
         delegates.removeValue(forKey: id)
     }
 
+    /// Force the pane's child process to exit. Sends SIGHUP first
+    /// (the traditional "your tty is gone" signal that interactive
+    /// shells like zsh handle by exiting cleanly); after a short
+    /// grace, follows up with SIGKILL for anything that ignored it
+    /// (e.g. a script catching SIGHUP). Uses `kill(2)` directly rather
+    /// than `LocalProcess.terminate()` because SwiftTerm's helper
+    /// cancels its own child-exit monitor before the child actually
+    /// dies, which swallows the delegate notification we rely on for
+    /// model cleanup. `kill` alone lets the monitor observe the real
+    /// exit and drive `paneExited` as usual.
+    func terminatePane(id: String) {
+        guard let view = panes[id] else { return }
+        let pid = view.process.shellPid
+        guard pid > 0 else { return }
+        kill(pid, SIGHUP)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            // If the child is still alive half a second later, be blunt.
+            // `kill(pid, 0)` probes liveness without sending a signal —
+            // returns 0 iff we can signal it (i.e. it exists and is ours).
+            if kill(pid, 0) == 0 {
+                kill(pid, SIGKILL)
+            }
+        }
+    }
+
+    /// Whether the shell inside `id` currently has a foreground child —
+    /// i.e. the user has something running at an interactive prompt.
+    /// Compares the pty's foreground process group to the shell's own
+    /// pgrp; they differ only when the shell has `fork+setpgrp+tcsetpgrp`'d
+    /// a subprocess. Returns `false` if the pane isn't hosted, the pty
+    /// isn't alive, or the query fails — callers treat that as "idle".
+    func shellHasForegroundChild(id: String) -> Bool {
+        guard let view = panes[id] else { return false }
+        let fd = view.process.childfd
+        let pid = view.process.shellPid
+        guard fd >= 0, pid > 0 else { return false }
+        let fgPgrp = tcgetpgrp(fd)
+        guard fgPgrp > 0 else { return false }
+        let shellPgrp = getpgid(pid)
+        guard shellPgrp > 0 else { return false }
+        return fgPgrp != shellPgrp
+    }
+
     // MARK: - IO
 
     /// Send `text` plus a newline into the specified pane's pty.

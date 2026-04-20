@@ -17,6 +17,24 @@ import AppKit
 import Foundation
 import SwiftUI
 
+/// Pending "processes still running" confirmation. Lives outside
+/// `AppState` so it can be used as an `Identifiable` for SwiftUI's
+/// item-based `.alert`.
+struct PendingCloseRequest: Identifiable, Equatable {
+    enum Scope: Equatable {
+        /// Close one pane inside the given tab.
+        case pane(tabId: String, paneId: String)
+        /// Close every pane on the tab (and dissolve the tab).
+        case tab(tabId: String)
+    }
+
+    let id = UUID()
+    let scope: Scope
+    /// Human-readable descriptions of the busy panes, one per entry,
+    /// for display in the alert body.
+    let busyPanes: [String]
+}
+
 @MainActor
 final class AppState: ObservableObject {
     /// Reserved id for the built-in Terminals tab.
@@ -70,6 +88,13 @@ final class AppState: ObservableObject {
     /// `.alert` to this flag and calls `cancelQuitPrompt()` /
     /// `NSApp.terminate(nil)` from the two buttons.
     @Published var showQuitPrompt: Bool = false
+
+    /// In-flight "processes still running" confirmation. Set by
+    /// `requestClosePane` / `requestCloseTab` when they find something
+    /// busy; cleared by `confirmPendingClose` (after the kill) or
+    /// `cancelPendingClose` (user backs out). `AppShellView` binds an
+    /// `.alert` to this.
+    @Published var pendingCloseRequest: PendingCloseRequest?
 
     /// Cached cwd for the Terminals tab so `cancelQuitPrompt` / directory
     /// changes can respawn at the same place.
@@ -629,12 +654,97 @@ final class AppState: ObservableObject {
         return newId
     }
 
-    /// Ask a pane to quit by writing `"exit\n"` into its pty. The
-    /// process-exit delegate (`paneExited`) handles cleanup once the
-    /// shell actually dies, so this is a "soft" close.
+    /// Request to close a pane. If the pane is busy — a thinking or
+    /// waiting Claude, or a shell with a foreground child — stage a
+    /// confirmation prompt; the UI binds an alert to
+    /// `pendingCloseRequest` and calls `confirmPendingClose` /
+    /// `cancelPendingClose`. Idle panes are killed immediately.
     func requestClosePane(tabId: String, paneId: String) {
-        guard let session = ptySessions[tabId] else { return }
-        session.sendToPane("exit", paneId: paneId)
+        guard let tab = tab(for: tabId),
+              let pane = tab.panes.first(where: { $0.id == paneId })
+        else { return }
+
+        if isBusy(tabId: tabId, pane: pane) {
+            pendingCloseRequest = PendingCloseRequest(
+                scope: .pane(tabId: tabId, paneId: paneId),
+                busyPanes: [describe(pane: pane)]
+            )
+        } else {
+            hardKillPane(tabId: tabId, paneId: paneId)
+        }
+    }
+
+    /// Request to close an entire tab. Built-in tabs can't be closed —
+    /// that goes through the "Quit NICE?" alert via `paneExited` instead.
+    /// If any live pane on the tab is busy, show the confirmation alert;
+    /// otherwise tear all panes down.
+    func requestCloseTab(tabId: String) {
+        guard tabId != Self.terminalsTabId,
+              let tab = tab(for: tabId)
+        else { return }
+
+        let busy = tab.panes.filter { $0.isAlive && isBusy(tabId: tabId, pane: $0) }
+        if !busy.isEmpty {
+            pendingCloseRequest = PendingCloseRequest(
+                scope: .tab(tabId: tabId),
+                busyPanes: busy.map(describe(pane:))
+            )
+        } else {
+            hardKillTab(tabId: tabId)
+        }
+    }
+
+    /// User confirmed the pending close — force the kill.
+    func confirmPendingClose() {
+        guard let pending = pendingCloseRequest else { return }
+        pendingCloseRequest = nil
+        switch pending.scope {
+        case let .pane(tabId, paneId):
+            hardKillPane(tabId: tabId, paneId: paneId)
+        case let .tab(tabId):
+            hardKillTab(tabId: tabId)
+        }
+    }
+
+    /// User dismissed the pending close — leave everything running.
+    func cancelPendingClose() {
+        pendingCloseRequest = nil
+    }
+
+    private func isBusy(tabId: String, pane: Pane) -> Bool {
+        guard pane.isAlive else { return false }
+        switch pane.kind {
+        case .claude:
+            // `.thinking` is an active computation; `.waiting` is a live
+            // conversation the user might not want to throw away. Only
+            // the pre-first-title `.idle` state counts as disposable.
+            return pane.status == .thinking || pane.status == .waiting
+        case .terminal:
+            return ptySessions[tabId]?.shellHasForegroundChild(id: pane.id) ?? false
+        }
+    }
+
+    private func describe(pane: Pane) -> String {
+        switch pane.kind {
+        case .claude:   return "Claude (\(pane.title))"
+        case .terminal: return pane.title
+        }
+    }
+
+    private func hardKillPane(tabId: String, paneId: String) {
+        // `terminatePane` sends SIGTERM and tears down the pty; the
+        // usual `paneExited` delegate fires and removes the pane from
+        // the model, dissolving the tab if it was the last pane.
+        ptySessions[tabId]?.terminatePane(id: paneId)
+    }
+
+    private func hardKillTab(tabId: String) {
+        guard let tab = tab(for: tabId) else { return }
+        let paneIds = tab.panes.map(\.id)
+        let session = ptySessions[tabId]
+        for id in paneIds {
+            session?.terminatePane(id: id)
+        }
     }
 
     // MARK: - Keyboard navigation

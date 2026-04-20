@@ -307,6 +307,12 @@ private struct TabRow: View {
         .onTapGesture {
             appState.selectTab(tab.id)
         }
+        .contextMenu {
+            Button("Close Tab") {
+                appState.requestCloseTab(tabId: tab.id)
+            }
+            .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sidebar.tab.\(tab.id)")
     }

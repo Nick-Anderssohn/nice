@@ -89,6 +89,23 @@ private struct AppShellHost: View {
 
     private var palette: Palette { tweaks.activeChromePalette }
 
+    /// Body text for the "processes still running" alert. Lists the
+    /// busy pane(s) so the user knows what they'd be force-quitting.
+    private func pendingCloseMessage(_ request: PendingCloseRequest) -> String {
+        let scopeHint: String
+        switch request.scope {
+        case .pane:
+            scopeHint = "Closing this pane will force it to quit."
+        case .tab:
+            scopeHint = "Closing this tab will force everything in it to quit."
+        }
+        let list = request.busyPanes.joined(separator: ", ")
+        let running = request.busyPanes.count == 1
+            ? "\(list) is still running."
+            : "These are still running: \(list)."
+        return "\(running) \(scopeHint)"
+    }
+
     var body: some View {
         shell
         .ignoresSafeArea(edges: .top)
@@ -118,6 +135,19 @@ private struct AppShellHost: View {
             Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
         } message: {
             Text("Your last terminal just exited. You still have open sessions.")
+        }
+        .alert(
+            "Processes are still running",
+            isPresented: Binding(
+                get: { appState.pendingCloseRequest != nil },
+                set: { if !$0 { appState.cancelPendingClose() } }
+            ),
+            presenting: appState.pendingCloseRequest
+        ) { _ in
+            Button("Cancel", role: .cancel) { appState.cancelPendingClose() }
+            Button("Force quit", role: .destructive) { appState.confirmPendingClose() }
+        } message: { request in
+            Text(pendingCloseMessage(request))
         }
         .onAppear {
             appState.updateTerminalFontFamily(tweaks.terminalFontFamily)
