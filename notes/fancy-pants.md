@@ -2,7 +2,7 @@
 
 ## Context
 
-The macOS / Catppuccin chrome palettes already give the sidebar wallpaper-blur through an `NSVisualEffectView` (`Sources/Nice/Views/SidebarBackground.swift`). The user wants the same treatment available in the terminal area as an opt-in toggle — so the terminal pane becomes a translucent pane over a `.behindWindow` vibrant material, same as the sidebar. Applies to both terminal kinds (main terminal + Claude pane, both `NiceTerminalView`). The user also reminded us we own a SwiftTerm fork (`~/Projects/SwiftTerm`) so if SwiftTerm's cell renderer draws backgrounds opaquely and fights transparency, we can fix upstream.
+The macOS / Catppuccin chrome palettes already give the sidebar wallpaper-blur through an `NSVisualEffectView` (`Sources/Nice/Views/SidebarBackground.swift`). The user wants the same treatment available in the terminal area as an opt-in toggle — so the terminal pane becomes a translucent pane over a `.behindWindow` vibrant material, same as the sidebar. Applies to both terminal kinds (main terminal + Claude pane, both `NiceTerminalView`). The user also reminded us we own a SwiftTerm fork (`~/Projects/SwiftTerm`) so if SwiftTerm's cell renderer draws backgrounds opaquely and fights transparency, we can fix upstream. 
 
 ## Approach
 
