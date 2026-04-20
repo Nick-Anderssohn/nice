@@ -282,47 +282,28 @@ final class TabPtySession: ObservableObject {
 
     // MARK: - Theming
 
-    /// Paint every live pane with the active chrome palette for the
-    /// given color scheme. Called from `AppState` on scheme, palette,
-    /// or accent changes. When the current terminal theme is one of
-    /// the Nice defaults, terminal bg / fg / ANSI derive from chrome
-    /// (the original Nice look). Otherwise the terminal keeps the
-    /// theme it was last given via `applyTerminalTheme` — only the
-    /// caret re-applies so accent changes still hot-update themes
-    /// that left `cursor = nil`.
+    /// Caches the chrome scheme / palette / accent. Every terminal
+    /// theme (Nice Defaults included) is self-contained and carries
+    /// its own concrete bg / fg / ANSI, so chrome changes no longer
+    /// re-paint terminal colors. The only chrome-driven bit left is
+    /// the caret — for themes that leave `cursor = nil` it follows
+    /// the accent, and this method re-applies it so accent changes
+    /// hot-update live.
     func applyTheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
         currentScheme = scheme
         currentPalette = palette
         currentAccent = accent
-        for view in panes.values {
-            applyTheme(
-                scheme, palette: palette, accent: accent, to: view,
-                background: SwiftUI.Color.nicePanelNS(scheme, palette)
-            )
+        if currentTerminalTheme.cursor == nil {
+            for view in panes.values {
+                view.caretColor = accent
+            }
         }
     }
 
-    private func applyTheme(
-        _ scheme: ColorScheme,
-        palette: Palette,
-        accent: NSColor,
-        to view: LocalProcessTerminalView,
-        background: NSColor
-    ) {
-        if Self.isChromeCoupledTerminalThemeId(currentTerminalTheme.id) {
-            let fg = SwiftUI.Color.niceInkNS(scheme, palette)
-            let ansi = NiceANSIPalette.colors(for: scheme)
-            view.nativeBackgroundColor = background
-            view.nativeForegroundColor = fg
-            view.installColors(ansi)
-        }
-        view.caretColor = currentTerminalTheme.cursor?.nsColor ?? accent
-    }
-
-    /// Repaint every live pane with `theme`. Overrides whatever
-    /// chrome-derived colors `applyTheme` previously installed,
-    /// unless `theme` is one of the Nice defaults in which case
-    /// the next `applyTheme` call will re-derive from chrome.
+    /// Repaint every live pane with `theme`. Each theme is self-
+    /// contained: bg / fg / ANSI come straight from `theme`, and
+    /// the caret uses `theme.cursor` when set or falls back to the
+    /// current accent otherwise.
     func applyTerminalTheme(_ theme: TerminalTheme) {
         currentTerminalTheme = theme
         for view in panes.values {
@@ -334,29 +315,10 @@ final class TabPtySession: ObservableObject {
         _ theme: TerminalTheme,
         to view: LocalProcessTerminalView
     ) {
-        if Self.isChromeCoupledTerminalThemeId(theme.id) {
-            // Nice Defaults re-derive from chrome on the next
-            // `applyTheme` pass. We still install the theme's ANSI
-            // values here so the pane isn't left with stale colors
-            // in the window between theme selection and the scheme
-            // apply that follows.
-            view.nativeBackgroundColor = SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
-            view.nativeForegroundColor = SwiftUI.Color.niceInkNS(currentScheme, currentPalette)
-        } else {
-            view.nativeBackgroundColor = theme.background.nsColor
-            view.nativeForegroundColor = theme.foreground.nsColor
-        }
+        view.nativeBackgroundColor = theme.background.nsColor
+        view.nativeForegroundColor = theme.foreground.nsColor
         view.installColors(theme.ansi.map(\.swiftTermColor))
         view.caretColor = theme.cursor?.nsColor ?? currentAccent
-    }
-
-    /// Nice Defaults intentionally leave bg / fg / ANSI derived from
-    /// chrome instead of carrying hard-coded colors — keeps "Nice
-    /// Default" looking consistent with the rest of the app as the
-    /// chrome palette and accent change. Every other theme is
-    /// self-contained and overrides chrome.
-    static func isChromeCoupledTerminalThemeId(_ id: String) -> Bool {
-        id == "nice-default-light" || id == "nice-default-dark"
     }
 
     /// Rebuild the font for every live pane with the new family,

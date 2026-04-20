@@ -392,30 +392,20 @@ private struct AppShellHost: View {
             }
             .frame(height: 52)
 
-            if let themeBackground = customTerminalBackgroundColor {
-                themeBackground
-            } else {
-                switch palette {
-                case .nice:  Color.nicePanel(scheme, palette)
-                case .macOS: Color(nsColor: .windowBackgroundColor)
-                }
-            }
+            terminalBackgroundColor
         }
     }
 
-    /// Returns the active terminal theme's background as a SwiftUI
-    /// `Color` when a non-Nice-default theme is active, or `nil` to
-    /// indicate "use the chrome-derived underlay." Callers that need
-    /// a concrete color in the chrome case should fall back to
-    /// `Color.nicePanel(scheme, palette)`.
-    private var customTerminalBackgroundColor: Color? {
+    /// The active terminal theme's background color, used to paint
+    /// the window body (area around the terminal pane, including
+    /// the gap behind the floating sidebar card) so every theme —
+    /// Nice Defaults included — bleeds a unified color behind the
+    /// terminal instead of revealing chrome underneath.
+    private var terminalBackgroundColor: Color {
         let theme = tweaks.effectiveTerminalTheme(
             for: scheme,
             catalog: services.terminalThemeCatalog
         )
-        guard !TabPtySession.isChromeCoupledTerminalThemeId(theme.id) else {
-            return nil
-        }
         return Color(nsColor: theme.background.nsColor)
     }
 
@@ -437,11 +427,11 @@ private struct AppShellHost: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.top, 12)
                 .padding(.leading, 20)
-                .background(customTerminalBackgroundColor ?? Color.nicePanel(scheme, palette))
+                .background(terminalBackgroundColor)
         } else {
             // Transient: no pane currently hosted (e.g. Terminals tab
             // with its last pane just exited, awaiting the quit alert).
-            (customTerminalBackgroundColor ?? Color.nicePanel(scheme, palette))
+            terminalBackgroundColor
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.leading, 20)
         }
