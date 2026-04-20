@@ -477,9 +477,8 @@ final class NiceUITests: XCTestCase {
         )
         XCTAssertEqual(XCTWaiter.wait(for: [pillReady], timeout: 5), .completed)
 
-        // If the Terminals tab only has one pane, the close button isn't
-        // shown (canClose == false). Add another so both pills have close
-        // buttons, then close them until zero.
+        // Add another pane so we can verify the multi-pane close path
+        // before exercising the last-pane exit flow below.
         let addButton = app.buttons["tab.add"]
         XCTAssertTrue(addButton.waitForExistence(timeout: 5))
         addButton.click()
@@ -515,11 +514,9 @@ final class NiceUITests: XCTestCase {
         )
         XCTAssertEqual(XCTWaiter.wait(for: [onePill], timeout: 5), .completed)
 
-        // Exactly one pill left. `canClose` goes back to false, so closing
-        // the last pane via the close button isn't directly possible
-        // through the UI. Drive it via the terminal: focus the pane and
-        // type `exit\n` — that's the same trigger path the old
-        // Main Terminal used.
+        // Exactly one pill left. Drive the quit path via the terminal:
+        // focus the pane and type `exit\n` — that's the same trigger
+        // path the old Main Terminal used.
         let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 5))
         let focusPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.5))

@@ -98,7 +98,6 @@ private struct InlinePaneStrip: View {
                             InlinePanePill(
                                 pane: pane,
                                 isActive: tab.activePaneId == pane.id,
-                                canClose: tab.panes.count > 1,
                                 isHovered: hoveredPaneId == pane.id,
                                 onHoverChange: { hovering in
                                     if hovering {
@@ -147,7 +146,6 @@ private struct InlinePanePill: View {
 
     let pane: Pane
     let isActive: Bool
-    let canClose: Bool
     let isHovered: Bool
     let onHoverChange: (Bool) -> Void
     let onSelect: () -> Void
@@ -180,7 +178,7 @@ private struct InlinePanePill: View {
     }
 
     private var showClose: Bool {
-        canClose && (isHovered || isActive)
+        isHovered || isActive
     }
 
     var body: some View {
