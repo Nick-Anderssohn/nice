@@ -7,17 +7,19 @@ on:
 
 jobs:
   release:
-    runs-on: macos-14
+    # Pinned to macos-26 so we can use Xcode 26, which matches local dev.
+    # Swift 6.0 (Xcode 16.2 on macos-14) flags several strict-concurrency
+    # patterns that Swift 6.3 (Xcode 26) has relaxed, so older images fail
+    # this repo's Release archive.
+    runs-on: macos-26
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      # macos-14 runners default to Xcode 15.4, which can't read the
-      # format-77 project xcodegen emits. Nice also needs Swift 6 → Xcode 16.
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: "26.4"
 
       - name: Install xcodegen
         run: brew install xcodegen
