@@ -20,6 +20,12 @@
 //  responsible for hopping to MainActor if it wants to touch app state
 //  — see the `AppState.init()` call site.
 //
+//  Self-healing: the listener rebuilds itself if the accept
+//  DispatchSource cancels unexpectedly (fd error, OOM) or the socket
+//  file is unlinked externally (a periodic stat() catches that case).
+//  Rebuilding reuses `self.path`, so NICE_SOCKET in existing shells
+//  stays correct across restarts.
+//
 
 import Darwin
 import Foundation
@@ -54,11 +60,22 @@ final class NiceControlSocket: @unchecked Sendable {
     /// `nc -U "$NICE_SOCKET"` into it.
     let path: String
 
+    // All mutable state below is accessed from `stateQueue`, with one
+    // documented exception: `handler` is set exactly once from
+    // `start(handler:)` before the first dispatch source resumes and
+    // is never rewritten, so `readClient`'s read of it from a global
+    // queue is safe without a lock. Rebuilds of the accept source
+    // reuse the same handler closure.
+    private let stateQueue = DispatchQueue(label: "nice.control-socket.state")
+    private let healthCheckInterval: TimeInterval
+    private let initialRestartDelay: TimeInterval
+
     private var fd: Int32 = -1
     private var acceptSource: DispatchSourceRead?
-    // Set once from `start(handler:)` before the source resumes, so
-    // readClient's read of it from a bg queue is safe without a lock.
+    private var healthCheckTimer: DispatchSourceTimer?
     private var handler: Handler = { _ in }
+    private var isStopping = false
+    private var restartAttempt = 0
 
     /// Allocates only — the socket path is derived from the process
     /// pid plus a UUID so multiple sockets (one per window) can coexist
@@ -66,7 +83,24 @@ final class NiceControlSocket: @unchecked Sendable {
     /// can be injected into the Main Terminal's env before
     /// `start(handler:)` is called. `NICE_SOCKET_PATH` still overrides
     /// for UI tests.
-    init() {
+    ///
+    /// `healthCheckInterval` is the period of the periodic `stat(path)`
+    /// that detects an externally-unlinked socket file and triggers a
+    /// rebind. 30s is plenty for production — socket-file loss is rare
+    /// and a user hitting `claude` hits `nc -U ... -w 2`'s timeout at
+    /// most once. Unit tests pass a smaller value (e.g. 0.05s) to
+    /// exercise the path without real-time waits.
+    ///
+    /// `initialRestartDelay` is the base delay for the exponential
+    /// backoff used between rebind attempts (caps at 5s). The default
+    /// keeps a visible gap between retries when something is genuinely
+    /// broken; tests override it so retries happen in tens of ms.
+    init(
+        healthCheckInterval: TimeInterval = 30,
+        initialRestartDelay: TimeInterval = 0.5
+    ) {
+        self.healthCheckInterval = healthCheckInterval
+        self.initialRestartDelay = initialRestartDelay
         if let override = ProcessInfo.processInfo.environment["NICE_SOCKET_PATH"] {
             self.path = override
         } else {
@@ -76,16 +110,52 @@ final class NiceControlSocket: @unchecked Sendable {
     }
 
     /// Bind, listen, and start accepting connections on a background
-    /// queue. Safe to call once; subsequent calls are no-ops.
+    /// queue. Also arms the periodic file-presence health check. Safe
+    /// to call once; subsequent calls are no-ops.
     func start(handler: @escaping Handler) throws {
-        guard fd < 0 else { return }
-        self.handler = handler
+        try stateQueue.sync {
+            guard fd < 0 else { return }
+            self.handler = handler
+            try bindAndListenLocked()
+            startHealthCheckTimerLocked()
+            NSLog("NiceControlSocket: listening on \(path)")
+        }
+    }
 
+    /// Stop accepting, close the socket fd, cancel the health-check
+    /// timer, and unlink the file. Safe to call multiple times.
+    func stop() {
+        stateQueue.sync {
+            isStopping = true
+            healthCheckTimer?.cancel()
+            healthCheckTimer = nil
+            acceptSource?.cancel()
+            acceptSource = nil
+            fd = -1
+            _ = unlink(path)
+        }
+    }
+
+    /// Test hook: force-cancel the accept source as if the kernel had
+    /// dropped it. The self-healing path should rebuild the listener
+    /// without any external trigger. Internal so the XCTest target
+    /// (`@testable import Nice`) can call it; production code never
+    /// should.
+    func _testForceCancelAcceptSource() {
+        stateQueue.sync {
+            acceptSource?.cancel()
+        }
+    }
+
+    // MARK: - Bind / listen (runs on stateQueue)
+
+    private func bindAndListenLocked() throws {
         let serverFd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard serverFd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        // Clear any stale socket file from a prior crashed run.
+        // Clear any stale socket file — either from a prior crashed
+        // run or from the listener we're replacing right now.
         _ = unlink(path)
 
         var addr = sockaddr_un()
@@ -138,22 +208,81 @@ final class NiceControlSocket: @unchecked Sendable {
                 self.readClient(client)
             }
         }
-        src.setCancelHandler {
+        src.setCancelHandler { [weak self] in
             close(serverFd)
+            self?.stateQueue.async {
+                self?.handleAcceptSourceCancelledLocked()
+            }
         }
         src.resume()
         acceptSource = src
-
-        NSLog("NiceControlSocket: listening on \(path)")
     }
 
-    /// Stop accepting, close the socket fd, and unlink the file. Safe
-    /// to call multiple times.
-    func stop() {
-        acceptSource?.cancel()
-        acceptSource = nil
+    // MARK: - Self-healing (runs on stateQueue)
+
+    private func handleAcceptSourceCancelledLocked() {
+        // If stop() set isStopping (or we cancelled the source
+        // ourselves for reasons unrelated to restart), do nothing.
+        if isStopping { return }
+        // The old serverFd is already closed by the cancel handler.
+        // Drop our reference and schedule a rebind.
         fd = -1
-        _ = unlink(path)
+        acceptSource = nil
+        scheduleRestartLocked()
+    }
+
+    private func scheduleRestartLocked() {
+        // Exponential backoff capped at 5s: with the default base of
+        // 500ms the sequence is 500, 1000, 2000, 4000, 5000, 5000, …
+        let exp = min(restartAttempt, 20) // prevent pow overflow
+        let delaySec = min(initialRestartDelay * pow(2.0, Double(exp)), 5.0)
+        restartAttempt += 1
+        let delayUs = Int(delaySec * 1_000_000)
+        stateQueue.asyncAfter(deadline: .now() + .microseconds(delayUs)) { [weak self] in
+            self?.attemptRestartLocked()
+        }
+    }
+
+    private func attemptRestartLocked() {
+        guard !isStopping else { return }
+        guard fd < 0 else { return } // Another path already rebuilt.
+        do {
+            try bindAndListenLocked()
+            NSLog("NiceControlSocket: restarted at \(path)")
+            restartAttempt = 0
+        } catch {
+            NSLog("NiceControlSocket: rebind failed: \(error); will retry (attempt \(restartAttempt))")
+            scheduleRestartLocked()
+        }
+    }
+
+    private func startHealthCheckTimerLocked() {
+        let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+        timer.schedule(
+            deadline: .now() + healthCheckInterval,
+            repeating: healthCheckInterval
+        )
+        timer.setEventHandler { [weak self] in
+            self?.checkSocketFilePresenceLocked()
+        }
+        timer.resume()
+        healthCheckTimer = timer
+    }
+
+    private func checkSocketFilePresenceLocked() {
+        if isStopping { return }
+        // If we're already in the middle of a rebuild, the restart
+        // loop will recreate the file; nothing to do here.
+        guard let source = acceptSource, fd >= 0 else { return }
+        var st = stat()
+        if stat(path, &st) != 0 {
+            // File is missing (typically ENOENT). Cancel the current
+            // accept source and let the normal restart path kick in
+            // so we don't duplicate the rebuild logic.
+            NSLog("NiceControlSocket: socket file missing at \(path); rebuilding")
+            source.cancel()
+            acceptSource = nil
+        }
     }
 
     // MARK: - Connection handling (runs on a background queue)
