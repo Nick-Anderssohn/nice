@@ -120,12 +120,19 @@ private struct AppShellHost: View {
             Text("Your last terminal just exited. You still have open sessions.")
         }
         .onAppear {
+            appState.updateTerminalFontFamily(tweaks.terminalFontFamily)
+            appState.updateTerminalTheme(
+                tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
+            )
             appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalFontSize(fontSettings.terminalFontSize)
             appState.updateGpuRendering(tweaks.gpuRendering)
             appState.updateSmoothScrolling(tweaks.smoothScrolling)
         }
         .onChange(of: scheme) { _, newScheme in
+            appState.updateTerminalTheme(
+                tweaks.effectiveTerminalTheme(for: newScheme, catalog: services.terminalThemeCatalog)
+            )
             appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
         }
         .onChange(of: palette) { _, newPalette in
@@ -142,6 +149,24 @@ private struct AppShellHost: View {
         }
         .onChange(of: tweaks.smoothScrolling) { _, newValue in
             appState.updateSmoothScrolling(newValue)
+        }
+        .onChange(of: tweaks.terminalThemeLightId) { _, _ in
+            // Only applies if the active scheme is light — otherwise the
+            // dark slot is active and this change is latent until the
+            // next scheme flip.
+            guard scheme == .light else { return }
+            appState.updateTerminalTheme(
+                tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
+            )
+        }
+        .onChange(of: tweaks.terminalThemeDarkId) { _, _ in
+            guard scheme == .dark else { return }
+            appState.updateTerminalTheme(
+                tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
+            )
+        }
+        .onChange(of: tweaks.terminalFontFamily) { _, newValue in
+            appState.updateTerminalFontFamily(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar and Main-Terminal cwd across relaunch.

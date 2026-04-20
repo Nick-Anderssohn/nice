@@ -25,6 +25,7 @@ final class NiceServices: ObservableObject {
     let shortcuts: KeyboardShortcuts
     let fontSettings: FontSettings
     let registry: WindowRegistry
+    let terminalThemeCatalog: TerminalThemeCatalog
 
     /// Absolute path to the `claude` binary if resolvable; nil falls
     /// back to zsh inside claude panes. Computed once at init so
@@ -47,6 +48,9 @@ final class NiceServices: ObservableObject {
         self.shortcuts = KeyboardShortcuts()
         self.fontSettings = FontSettings()
         self.registry = WindowRegistry()
+        self.terminalThemeCatalog = TerminalThemeCatalog(
+            supportDirectory: TerminalThemeCatalog.defaultSupportDirectory()
+        )
         // Sweep `$TMPDIR` debris from prior crashed runs *before*
         // writing this run's zdotdir — otherwise the cleanup would
         // race the freshly-written dir and delete it, causing every

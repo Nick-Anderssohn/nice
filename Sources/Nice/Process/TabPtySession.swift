@@ -77,6 +77,13 @@ final class TabPtySession: ObservableObject {
     /// monospaced), matching `Tweaks.terminalFontFamily`'s default.
     private var currentTerminalFontFamily: String? = nil
 
+    /// Cached terminal theme. Seeded with the Nice dark default so
+    /// panes created before `applyTerminalTheme` has been called still
+    /// get reasonable colors — `AppState.makeSession` seeds with the
+    /// actual current theme immediately, so this only matters if
+    /// something creates a `TabPtySession` directly (tests, previews).
+    private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
+
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
     /// ZDOTDIR directory injected into terminal panes so the shadowed
@@ -176,10 +183,7 @@ final class TabPtySession: ObservableObject {
             )
         }
 
-        applyTheme(
-            currentScheme, palette: currentPalette, accent: currentAccent, to: view,
-            background: SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
-        )
+        applyTerminalTheme(currentTerminalTheme, to: view)
         return view
     }
 
@@ -222,10 +226,7 @@ final class TabPtySession: ObservableObject {
             currentDirectory: resolvedCwd
         )
 
-        applyTheme(
-            currentScheme, palette: currentPalette, accent: currentAccent, to: view,
-            background: SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
-        )
+        applyTerminalTheme(currentTerminalTheme, to: view)
         return view
     }
 
@@ -265,10 +266,7 @@ final class TabPtySession: ObservableObject {
     @discardableResult
     func promotePaneToClaude(id: String) -> LocalProcessTerminalView? {
         guard let view = panes[id] else { return nil }
-        applyTheme(
-            currentScheme, palette: currentPalette, accent: currentAccent, to: view,
-            background: SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
-        )
+        applyTerminalTheme(currentTerminalTheme, to: view)
         return view
     }
 
@@ -286,8 +284,12 @@ final class TabPtySession: ObservableObject {
 
     /// Paint every live pane with the active chrome palette for the
     /// given color scheme. Called from `AppState` on scheme, palette,
-    /// or accent changes. All panes use the `nicePanel` background so
-    /// the single-pane main area looks consistent across kinds.
+    /// or accent changes. When the current terminal theme is one of
+    /// the Nice defaults, terminal bg / fg / ANSI derive from chrome
+    /// (the original Nice look). Otherwise the terminal keeps the
+    /// theme it was last given via `applyTerminalTheme` — only the
+    /// caret re-applies so accent changes still hot-update themes
+    /// that left `cursor = nil`.
     func applyTheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
         currentScheme = scheme
         currentPalette = palette
@@ -307,12 +309,64 @@ final class TabPtySession: ObservableObject {
         to view: LocalProcessTerminalView,
         background: NSColor
     ) {
-        let fg = SwiftUI.Color.niceInkNS(scheme, palette)
-        let ansi = NiceANSIPalette.colors(for: scheme)
-        view.nativeBackgroundColor = background
-        view.nativeForegroundColor = fg
-        view.installColors(ansi)
-        view.caretColor = accent
+        if Self.isChromeCoupledTerminalThemeId(currentTerminalTheme.id) {
+            let fg = SwiftUI.Color.niceInkNS(scheme, palette)
+            let ansi = NiceANSIPalette.colors(for: scheme)
+            view.nativeBackgroundColor = background
+            view.nativeForegroundColor = fg
+            view.installColors(ansi)
+        }
+        view.caretColor = currentTerminalTheme.cursor?.nsColor ?? accent
+    }
+
+    /// Repaint every live pane with `theme`. Overrides whatever
+    /// chrome-derived colors `applyTheme` previously installed,
+    /// unless `theme` is one of the Nice defaults in which case
+    /// the next `applyTheme` call will re-derive from chrome.
+    func applyTerminalTheme(_ theme: TerminalTheme) {
+        currentTerminalTheme = theme
+        for view in panes.values {
+            applyTerminalTheme(theme, to: view)
+        }
+    }
+
+    private func applyTerminalTheme(
+        _ theme: TerminalTheme,
+        to view: LocalProcessTerminalView
+    ) {
+        if Self.isChromeCoupledTerminalThemeId(theme.id) {
+            // Nice Defaults re-derive from chrome on the next
+            // `applyTheme` pass. We still install the theme's ANSI
+            // values here so the pane isn't left with stale colors
+            // in the window between theme selection and the scheme
+            // apply that follows.
+            view.nativeBackgroundColor = SwiftUI.Color.nicePanelNS(currentScheme, currentPalette)
+            view.nativeForegroundColor = SwiftUI.Color.niceInkNS(currentScheme, currentPalette)
+        } else {
+            view.nativeBackgroundColor = theme.background.nsColor
+            view.nativeForegroundColor = theme.foreground.nsColor
+        }
+        view.installColors(theme.ansi.map(\.swiftTermColor))
+        view.caretColor = theme.cursor?.nsColor ?? currentAccent
+    }
+
+    /// Nice Defaults intentionally leave bg / fg / ANSI derived from
+    /// chrome instead of carrying hard-coded colors — keeps "Nice
+    /// Default" looking consistent with the rest of the app as the
+    /// chrome palette and accent change. Every other theme is
+    /// self-contained and overrides chrome.
+    static func isChromeCoupledTerminalThemeId(_ id: String) -> Bool {
+        id == "nice-default-light" || id == "nice-default-dark"
+    }
+
+    /// Rebuild the font for every live pane with the new family,
+    /// preserving the current size. `nil` resets to the default chain.
+    func applyTerminalFontFamily(_ name: String?) {
+        currentTerminalFontFamily = name
+        let font = Self.terminalFont(named: name, size: currentTerminalFontSize)
+        for view in panes.values {
+            view.font = font
+        }
     }
 
     /// Terminate every live pane's process. Used when a tab is being

@@ -104,6 +104,17 @@ final class AppState: ObservableObject {
     /// `Tweaks.smoothScrolling` (on).
     private var currentSmoothScrolling: Bool = true
 
+    /// Tracks the terminal theme that every live pane is currently
+    /// painted with. Seeded from Nice's built-in dark default so new
+    /// sessions created before `updateTerminalTheme` runs still get
+    /// sensible colors. `AppShellHost` calls `updateTerminalTheme`
+    /// eagerly on first appear, so this only acts as a fallback.
+    private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
+
+    /// Tracks the user-chosen terminal font family. `nil` => default
+    /// chain (SF Mono → JetBrains Mono NL → system monospaced).
+    private var currentTerminalFontFamily: String? = nil
+
     /// Absolute path to the `claude` binary if we've resolved it; nil
     /// falls back to zsh inside claude panes.
     private var resolvedClaudePath: String?
@@ -359,6 +370,26 @@ final class AppState: ObservableObject {
         currentSmoothScrolling = enabled
         for session in ptySessions.values {
             session.applySmoothScrolling(enabled: enabled)
+        }
+    }
+
+    /// Fan out a terminal-theme change to every live session. Called by
+    /// `AppShellHost` when the user picks a new theme in Settings, when
+    /// the active scheme flips (sync-with-OS), or when an imported
+    /// theme is removed while selected.
+    func updateTerminalTheme(_ theme: TerminalTheme) {
+        currentTerminalTheme = theme
+        for session in ptySessions.values {
+            session.applyTerminalTheme(theme)
+        }
+    }
+
+    /// Fan out a terminal-font-family change. `nil` resets to the
+    /// default chain defined in `TabPtySession.terminalFont(named:size:)`.
+    func updateTerminalFontFamily(_ name: String?) {
+        currentTerminalFontFamily = name
+        for session in ptySessions.values {
+            session.applyTerminalFontFamily(name)
         }
     }
 
@@ -756,6 +787,8 @@ final class AppState: ObservableObject {
                 self?.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
             }
         )
+        session.applyTerminalFontFamily(currentTerminalFontFamily)
+        session.applyTerminalTheme(currentTerminalTheme)
         session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
         session.applyTerminalFont(size: currentTerminalFontSize)
         session.applyGpuRendering(enabled: currentGpuRendering)

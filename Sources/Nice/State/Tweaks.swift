@@ -165,6 +165,15 @@ final class Tweaks: ObservableObject {
     static let accentKey        = "accent"
     static let gpuRenderingKey  = "gpuRendering"
     static let smoothScrollingKey = "smoothScrolling"
+    static let terminalThemeLightKey = "terminalThemeLightId"
+    static let terminalThemeDarkKey  = "terminalThemeDarkId"
+    static let terminalFontFamilyKey = "terminalFontFamily"
+
+    /// Default terminal-theme ids. These are the ones in
+    /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
+    /// through to the catalog's "unknown id" fallback.
+    static let defaultTerminalThemeLightId = "nice-default-light"
+    static let defaultTerminalThemeDarkId  = "nice-default-dark"
 
     @Published var theme: ThemeChoice {
         didSet {
@@ -200,6 +209,35 @@ final class Tweaks: ObservableObject {
         didSet { UserDefaults.standard.set(smoothScrolling, forKey: Self.smoothScrollingKey) }
     }
 
+    /// Terminal theme id used when the active scheme is light.
+    /// Resolved via `TerminalThemeCatalog.theme(withId:)` at apply
+    /// time; an unknown id (e.g. a deleted imported theme) falls back
+    /// to Nice Default (Light).
+    @Published var terminalThemeLightId: String {
+        didSet {
+            UserDefaults.standard.set(terminalThemeLightId, forKey: Self.terminalThemeLightKey)
+        }
+    }
+
+    /// Terminal theme id used when the active scheme is dark.
+    @Published var terminalThemeDarkId: String {
+        didSet {
+            UserDefaults.standard.set(terminalThemeDarkId, forKey: Self.terminalThemeDarkKey)
+        }
+    }
+
+    /// PostScript name of the terminal font, or nil to use the default
+    /// chain (SF Mono → JetBrains Mono NL → system monospaced).
+    @Published var terminalFontFamily: String? {
+        didSet {
+            if let terminalFontFamily {
+                UserDefaults.standard.set(terminalFontFamily, forKey: Self.terminalFontFamilyKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.terminalFontFamilyKey)
+            }
+        }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
@@ -228,6 +266,12 @@ final class Tweaks: ObservableObject {
             ? true
             : defaults.bool(forKey: Self.smoothScrollingKey)
 
+        let terminalLight = defaults.string(forKey: Self.terminalThemeLightKey)
+            ?? Self.defaultTerminalThemeLightId
+        let terminalDark = defaults.string(forKey: Self.terminalThemeDarkKey)
+            ?? Self.defaultTerminalThemeDarkId
+        let fontFamily = defaults.string(forKey: Self.terminalFontFamilyKey)
+
         let (theme, sync) = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
         self.theme = theme
@@ -235,6 +279,9 @@ final class Tweaks: ObservableObject {
         self.accent = accent
         self.gpuRendering = gpu
         self.smoothScrolling = smooth
+        self.terminalThemeLightId = terminalLight
+        self.terminalThemeDarkId = terminalDark
+        self.terminalFontFamily = fontFamily
 
         NSApp?.appearance = theme.nsAppearance
 
@@ -354,5 +401,36 @@ final class Tweaks: ObservableObject {
             // Fresh install — macOS palette, synced with current OS.
             return (osScheme == .dark ? .macDark : .macLight, true)
         }
+    }
+
+    // MARK: - Terminal theme resolution
+
+    /// Resolves the terminal-theme id for the given scheme against the
+    /// catalog. Falls back to the Nice Default for that scheme when
+    /// the persisted id isn't found — happens naturally when a user
+    /// deletes an imported theme that was selected in either slot.
+    func effectiveTerminalTheme(
+        for scheme: ColorScheme,
+        catalog: TerminalThemeCatalog
+    ) -> TerminalTheme {
+        let id: String
+        let fallbackId: String
+        switch scheme {
+        case .light:
+            id = terminalThemeLightId
+            fallbackId = Self.defaultTerminalThemeLightId
+        case .dark:
+            id = terminalThemeDarkId
+            fallbackId = Self.defaultTerminalThemeDarkId
+        @unknown default:
+            id = terminalThemeLightId
+            fallbackId = Self.defaultTerminalThemeLightId
+        }
+        if let theme = catalog.theme(withId: id) { return theme }
+        // Known fallback id is always a built-in; force-unwrap is safe
+        // unless someone renames a built-in without updating the
+        // `defaultTerminalThemeXId` constants, which is exactly the
+        // kind of drift the unit tests catch.
+        return catalog.theme(withId: fallbackId)!
     }
 }

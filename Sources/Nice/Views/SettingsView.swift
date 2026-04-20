@@ -32,6 +32,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case general     = "General"
     case shortcuts   = "Shortcuts"
     case appearance  = "Appearance"
+    case terminal    = "Terminal"
     case font        = "Font"
     case about       = "About"
 
@@ -107,6 +108,7 @@ struct SettingsView: View {
                 case .general:    GeneralPane()
                 case .shortcuts:  ShortcutsPane()
                 case .appearance: AppearancePane()
+                case .terminal:   SettingsTerminalPane()
                 case .font:       FontPane()
                 case .about:      AboutPane()
                 }
