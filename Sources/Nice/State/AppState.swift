@@ -363,7 +363,7 @@ final class AppState: ObservableObject {
             .max(by: { $0.element.path.count < $1.element.path.count })?
             .offset
         {
-            projects[idx].tabs.insert(tab, at: 0)
+            projects[idx].tabs.append(tab)
         } else {
             let dirName = (normalizedCwd as NSString).lastPathComponent.uppercased()
             let projectId = "p-\(dirName.lowercased())-\(Int(Date().timeIntervalSince1970))"
