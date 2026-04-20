@@ -160,6 +160,33 @@ final class AppState: ObservableObject {
         self.controlSocket = socket
         self.zdotdirPath = services?.zdotdirPath
 
+        // Seed scheme / palette / accent / terminal-theme / font
+        // family from `Tweaks` so the very first `makeSession` call
+        // below (for the Terminals tab) paints with the user's real
+        // preferences. Without this seeding the session is themed
+        // against the defaults above (.dark / .nice / terracotta)
+        // and only repainted when `AppShellView.onAppear` broadcasts
+        // `updateScheme` / `updateTerminalTheme` — a visible flash
+        // on launch, and a stubborn mis-theme for chrome-coupled
+        // Nice Defaults because their bg/fg derivation reads the
+        // session's stale palette.
+        if let tweaks = services?.tweaks {
+            self.currentScheme = tweaks.scheme
+            self.currentPalette = tweaks.activeChromePalette
+            self.currentAccent = tweaks.accent.nsColor
+            self.currentGpuRendering = tweaks.gpuRendering
+            self.currentSmoothScrolling = tweaks.smoothScrolling
+            self.currentTerminalFontFamily = tweaks.terminalFontFamily
+            if let catalog = services?.terminalThemeCatalog {
+                self.currentTerminalTheme = tweaks.effectiveTerminalTheme(
+                    for: tweaks.scheme,
+                    catalog: catalog
+                )
+            }
+        }
+        self.currentTerminalFontSize = services?.fontSettings.terminalFontSize
+            ?? FontSettings.defaultSize
+
         var extraEnv: [String: String] = [:]
         extraEnv["NICE_SOCKET"] = socket.path
         if let zdotdirPath {
@@ -788,8 +815,13 @@ final class AppState: ObservableObject {
             }
         )
         session.applyTerminalFontFamily(currentTerminalFontFamily)
-        session.applyTerminalTheme(currentTerminalTheme)
+        // applyTheme must run before applyTerminalTheme so the session
+        // has its current scheme / palette cached — the Nice Default
+        // (chrome-coupled) paths in applyTerminalTheme derive
+        // bg / fg from those values, and reading them stale paints
+        // the terminal with the wrong light/dark variant.
         session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
+        session.applyTerminalTheme(currentTerminalTheme)
         session.applyTerminalFont(size: currentTerminalFontSize)
         session.applyGpuRendering(enabled: currentGpuRendering)
         session.applySmoothScrolling(enabled: currentSmoothScrolling)

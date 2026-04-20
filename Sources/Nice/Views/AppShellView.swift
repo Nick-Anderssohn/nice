@@ -121,19 +121,24 @@ private struct AppShellHost: View {
         }
         .onAppear {
             appState.updateTerminalFontFamily(tweaks.terminalFontFamily)
+            // updateScheme before updateTerminalTheme — see
+            // `AppState.makeSession` for why ordering matters (the
+            // chrome-coupled Nice Defaults read the session's cached
+            // scheme, so it must be current before their bg / fg
+            // derivation runs).
+            appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalTheme(
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
-            appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalFontSize(fontSettings.terminalFontSize)
             appState.updateGpuRendering(tweaks.gpuRendering)
             appState.updateSmoothScrolling(tweaks.smoothScrolling)
         }
         .onChange(of: scheme) { _, newScheme in
+            appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
             appState.updateTerminalTheme(
                 tweaks.effectiveTerminalTheme(for: newScheme, catalog: services.terminalThemeCatalog)
             )
-            appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
         }
         .onChange(of: palette) { _, newPalette in
             appState.updateScheme(scheme, palette: newPalette, accent: tweaks.accent.nsColor)
@@ -355,17 +360,63 @@ private struct AppShellHost: View {
 
     // MARK: - Window background
 
-    /// In the macOS palette the window background is transparent so the
-    /// NSVisualEffectView sidebar can pull wallpaper pixels through the
-    /// window without a solid color blocking the effect at the seam
-    /// between sidebar and main content. The main content area paints
-    /// its own `nicePanel` underlay.
+    /// Bleed the terminal theme's background across the entire window
+    /// when the user has picked a non-Nice-default theme — otherwise
+    /// the chrome-colored gap between the floating sidebar and the
+    /// terminal pane, and the 12pt strip under the toolbar, spoil the
+    /// look by revealing chrome against (e.g.) Solarized cream.
+    ///
+    /// Nice Defaults fall back to the existing per-palette rules so
+    /// the macOS palette keeps its vibrant `NSVisualEffectView`
+    /// sidebar blending (the sidebar pulls wallpaper pixels through
+    /// the transparent `windowBackgroundColor`) and the Nice palette
+    /// keeps its flat `nicePanel` underlay.
     @ViewBuilder
     private var windowBackground: some View {
-        switch palette {
-        case .nice:  Color.nicePanel(scheme, palette)
-        case .macOS: Color(nsColor: .windowBackgroundColor)
+        // Toolbar chrome runs edge-to-edge across the window top so
+        // the 6pt gap around the sidebar card's top / leading edges
+        // reveals the same white band that the toolbar shows to the
+        // right of the sidebar — otherwise the strip cuts off at the
+        // sidebar's left edge, which looks asymmetric.
+        //
+        // 52pt matches `WindowToolbarView`'s fixed height; the 1pt
+        // bottom border matches its `.overlay(alignment: .bottom)`
+        // `niceLine` separator so the toolbar's visual footprint is
+        // continuous across the full window width.
+        VStack(spacing: 0) {
+            ZStack(alignment: .bottom) {
+                Color.niceChrome(scheme, palette)
+                Rectangle()
+                    .fill(Color.niceLine(scheme, palette))
+                    .frame(height: 1)
+            }
+            .frame(height: 52)
+
+            if let themeBackground = customTerminalBackgroundColor {
+                themeBackground
+            } else {
+                switch palette {
+                case .nice:  Color.nicePanel(scheme, palette)
+                case .macOS: Color(nsColor: .windowBackgroundColor)
+                }
+            }
         }
+    }
+
+    /// Returns the active terminal theme's background as a SwiftUI
+    /// `Color` when a non-Nice-default theme is active, or `nil` to
+    /// indicate "use the chrome-derived underlay." Callers that need
+    /// a concrete color in the chrome case should fall back to
+    /// `Color.nicePanel(scheme, palette)`.
+    private var customTerminalBackgroundColor: Color? {
+        let theme = tweaks.effectiveTerminalTheme(
+            for: scheme,
+            catalog: services.terminalThemeCatalog
+        )
+        guard !TabPtySession.isChromeCoupledTerminalThemeId(theme.id) else {
+            return nil
+        }
+        return Color(nsColor: theme.background.nsColor)
     }
 
     // MARK: - Main content
@@ -386,11 +437,11 @@ private struct AppShellHost: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.top, 12)
                 .padding(.leading, 20)
-                .background(Color.nicePanel(scheme, palette))
+                .background(customTerminalBackgroundColor ?? Color.nicePanel(scheme, palette))
         } else {
             // Transient: no pane currently hosted (e.g. Terminals tab
             // with its last pane just exited, awaiting the quit alert).
-            Color.nicePanel(scheme, palette)
+            (customTerminalBackgroundColor ?? Color.nicePanel(scheme, palette))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.leading, 20)
         }
