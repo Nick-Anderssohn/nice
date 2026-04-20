@@ -2,9 +2,10 @@
 //  SettingsTerminalPane.swift
 //  Nice
 //
-//  Terminal-specific preferences: per-scheme theme selection,
-//  Ghostty-format theme import, and management of imported themes.
-//  Chrome palette lives in `AppearancePane`; font size in `FontPane`.
+//  The terminal-theme block inside the Appearance pane: per-scheme theme
+//  selection, Ghostty-format theme import, and management of imported
+//  themes. Chrome palette and accent sit above this block; font size
+//  lives in `FontPane`.
 //
 //  Two independently-editable slots — light and dark — so "Sync with
 //  OS" can flip between a user-tuned light look and a user-tuned dark
@@ -15,7 +16,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct SettingsTerminalPane: View {
+struct TerminalAppearanceSection: View {
     @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var catalog: TerminalThemeCatalog
     @Environment(\.colorScheme) private var scheme
@@ -25,8 +26,6 @@ struct SettingsTerminalPane: View {
 
     var body: some View {
         Group {
-            SettingTitle("Terminal")
-
             SettingRow(
                 label: "Light mode theme",
                 hint: "Palette used when the active scheme is light."

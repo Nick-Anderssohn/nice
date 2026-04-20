@@ -30,7 +30,6 @@ import SwiftUI
 enum SettingsSection: String, CaseIterable, Identifiable {
     case shortcuts   = "Shortcuts"
     case appearance  = "Appearance"
-    case terminal    = "Terminal"
     case font        = "Font"
     case about       = "About"
 
@@ -105,7 +104,6 @@ struct SettingsView: View {
                 switch active {
                 case .shortcuts:  ShortcutsPane()
                 case .appearance: AppearancePane()
-                case .terminal:   SettingsTerminalPane()
                 case .font:       FontPane()
                 case .about:      AboutPane()
                 }
@@ -242,6 +240,8 @@ private struct AppearancePane: View {
                 }
             }
         }
+
+        TerminalAppearanceSection()
 
         SettingRow(
             label: "GPU rendering",
