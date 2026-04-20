@@ -41,9 +41,21 @@ do, and wait for confirmation before re-checking. Do not silently skip.
 
 ## Install
 
-Once all prerequisites pass, run `scripts/install.sh` from the repo root.
-Stream its output so the user sees build progress. If the script fails,
-surface the last ~20 lines of output and stop.
+Once all prerequisites pass, run `scripts/install.sh` from the repo root
+**under the worktree lock** so it doesn't race with another worktree's
+install or UI tests (see the `worktree-lock` skill for the full rules):
+
+```
+scripts/worktree-lock.sh acquire install \
+  && { scripts/install.sh; rc=$?; scripts/worktree-lock.sh release; exit $rc; } \
+  || scripts/worktree-lock.sh release
+```
+
+Stream the output so the user sees build progress. If another worktree is
+currently holding the lock, `acquire` will print the holder and poll every
+5 seconds until it's free — let the user know we're waiting and on whom.
+If the script fails, surface the last ~20 lines of output and stop (the
+chain above releases the lock automatically on failure).
 
 On success, report:
 - The installed bundle path (`/Applications/Nice.app`).
