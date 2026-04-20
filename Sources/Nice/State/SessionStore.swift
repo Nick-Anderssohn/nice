@@ -2,14 +2,14 @@
 //  SessionStore.swift
 //  Nice
 //
-//  Persists the list of live Claude tabs per window to
-//  `~/Library/Application Support/Nice/sessions.json` so a relaunch can
-//  pick up where the user left off via `claude --resume <uuid>`.
+//  Persists the list of live tabs per window to
+//  `~/Library/Application Support/Nice/sessions.json` so a relaunch
+//  can pick up where the user left off. Claude tabs resume via
+//  `claude --resume <uuid>`; terminal-only tabs (including every tab
+//  in the pinned Terminals group) restore with a fresh shell.
 //
-//  Only Claude tabs are stored — the built-in Terminals tab and any
-//  tabs without a `claudeSessionId` are filtered out by `AppState`
-//  before they reach the store. Window identity is preserved across
-//  quits via `@SceneStorage("windowSessionId")` on `AppShellView`.
+//  Window identity is preserved across quits via
+//  `@SceneStorage("windowSessionId")` on `AppShellView`.
 //
 //  Writes are debounced (500ms) so rapid-fire state mutations during
 //  normal use don't thrash the disk. `flush()` cancels the pending
@@ -31,9 +31,10 @@ struct PersistedTab: Codable, Hashable, Sendable {
     let title: String
     let cwd: String
     let branch: String?
-    /// Must be non-nil for the tab to be restorable — the store drops
-    /// entries with no session id before persisting.
-    let claudeSessionId: String
+    /// Non-nil for Claude tabs (used for `claude --resume <uuid>` on
+    /// restore). Nil for terminal-only tabs — these come back as a
+    /// fresh shell in the persisted cwd.
+    let claudeSessionId: String?
     let activePaneId: String?
     let panes: [PersistedPane]
 }
@@ -54,7 +55,6 @@ struct PersistedWindow: Codable, Hashable, Sendable {
     let id: String
     let activeTabId: String?
     let sidebarCollapsed: Bool
-    let mainTerminalCwd: String?
     let projects: [PersistedProject]
 }
 
@@ -71,11 +71,14 @@ struct PersistedState: Codable, Hashable, Sendable {
     let version: Int
     let windows: [PersistedWindow]
 
-    /// Bumped to 2 when we moved from flat `tabs` per window to
-    /// `projects` → `tabs`. v1 files fail to decode and we start
-    /// fresh; users with a v1 sessions.json will lose saved tabs on
-    /// first launch of this build. Acceptable one-off migration.
-    static let currentVersion = 2
+    /// Bumped to 3 when the pinned Terminals group started persisting
+    /// terminal-only tabs (making `PersistedTab.claudeSessionId`
+    /// optional and dropping the `mainTerminalCwd` window-level
+    /// field). v1/v2 files fail to decode and we start fresh; users
+    /// with older sessions.json lose saved tabs on first launch of
+    /// this build. Acceptable one-off migration, mirroring the v1→v2
+    /// bump.
+    static let currentVersion = 3
     static let empty = PersistedState(version: currentVersion, windows: [])
 }
 

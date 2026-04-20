@@ -168,7 +168,7 @@ final class AppStateStatusDotTests: XCTestCase {
     }
 
     private func allTabIds() -> Set<String> {
-        var ids: Set<String> = [appState.terminalsTab.id]
+        var ids: Set<String> = []
         for project in appState.projects {
             for tab in project.tabs {
                 ids.insert(tab.id)

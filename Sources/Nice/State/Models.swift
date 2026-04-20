@@ -87,10 +87,6 @@ struct Tab: Identifiable, Hashable, Sendable, Codable {
     var title: String
     var cwd: String
     var branch: String?
-    /// Built-in tabs (the "Terminals" session) cannot be deleted by the
-    /// user and always exist. Non-built-in tabs dissolve when their
-    /// last pane closes.
-    var isBuiltIn: Bool = false
     /// Ordered panes shown as pills in the toolbar. Expected non-empty
     /// while the tab is alive; the invariant is maintained by `AppState`.
     var panes: [Pane] = []
@@ -106,7 +102,8 @@ struct Tab: Identifiable, Hashable, Sendable, Codable {
     /// resumed across Nice relaunches via `claude --resume <uuid>`.
     /// Set at tab creation (we pass `--session-id <uuid>` to claude so
     /// the CLI writes its transcript under the expected UUID), `nil`
-    /// for the built-in Terminals tab and any non-claude tab.
+    /// for terminal-only tabs (including everything in the Terminals
+    /// group).
     var claudeSessionId: String? = nil
 }
 

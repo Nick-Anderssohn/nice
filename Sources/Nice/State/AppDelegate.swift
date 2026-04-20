@@ -13,9 +13,6 @@
 //    • `CloseConfirmationDelegate.windowShouldClose` — red traffic
 //      light or ⌘W. Counts only the window being closed.
 //
-//  The existing "last pane exited" path in `AppState.paneExited` already
-//  surfaces its own prompt (`showQuitPrompt`); when its Quit button
-//  fires it sets `skipNextTerminateConfirmation` so we don't double-ask.
 //
 
 import AppKit
@@ -28,18 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// so the app sets this pointer from `NiceApp` once services exist.
     static var registryProvider: (@MainActor () -> WindowRegistry?)?
 
-    /// One-shot override flipped by flows that have already asked the
-    /// user to confirm quitting (the "last pane exited" alert on the
-    /// Terminals tab). Read-and-reset in `applicationShouldTerminate`.
-    static var skipNextTerminateConfirmation = false
-
     func applicationShouldTerminate(
         _ sender: NSApplication
     ) -> NSApplication.TerminateReply {
-        if Self.skipNextTerminateConfirmation {
-            Self.skipNextTerminateConfirmation = false
-            return .terminateNow
-        }
         guard let registry = Self.registryProvider?() else {
             return .terminateNow
         }

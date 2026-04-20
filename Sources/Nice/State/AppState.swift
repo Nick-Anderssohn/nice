@@ -6,11 +6,12 @@
 //  `ptySessions` keyed by tab id) and fans process-exit / title-change
 //  events back into the data model so the sidebar and toolbar can react.
 //
-//  The "Terminals" row at the top of the sidebar is a built-in `Tab`
-//  (`isBuiltIn = true`) — it participates in the same tab/pane model as
-//  every user session, so it can host the same toolbar pill bar. It is
-//  created once at launch, cannot be dissolved, and its pane lifecycle
-//  still drives the "Quit NICE?" alert.
+//  The "Terminals" group at the top of the sidebar is a regular
+//  `Project` with the reserved id `AppState.terminalsProjectId`. It is
+//  always present at index 0 and cannot be removed by the user, but its
+//  tabs are ordinary `Tab` values with terminal-only panes. On first
+//  launch the group holds one "Main" tab; users can add more via the
+//  group's `+` button, and the group may be emptied freely.
 //
 
 import AppKit
@@ -37,13 +38,18 @@ struct PendingCloseRequest: Identifiable, Equatable {
 
 @MainActor
 final class AppState: ObservableObject {
-    /// Reserved id for the built-in Terminals tab.
-    static let terminalsTabId = "terminals"
+    /// Reserved id for the pinned Terminals project at index 0 of
+    /// `projects`. The project is always present and cannot be deleted
+    /// by the user; its tabs are ordinary terminal-only tabs.
+    static let terminalsProjectId = "terminals"
+    /// Stable id for the default "Main" tab seeded into the Terminals
+    /// project on fresh launches. UI tests key off a `sidebar.terminals`
+    /// accessibility alias on this tab.
+    static let mainTerminalTabId = "terminals-main"
 
     @Published var projects: [Project]
-    /// Built-in "Terminals" session. Always present, never removable.
-    @Published var terminalsTab: Tab
-    /// Currently-selected tab. Defaults to the Terminals tab on launch.
+    /// Currently-selected tab. Defaults to the Main terminal tab on
+    /// launch.
     @Published var activeTabId: String? {
         didSet {
             // Viewing a tab dismisses the attention pulse on its active
@@ -83,12 +89,6 @@ final class AppState: ObservableObject {
 
     @Published private(set) var ptySessions: [String: TabPtySession] = [:]
 
-    /// Surfaces a "Quit NICE?" alert when the Terminals tab's last pane
-    /// exits while user sessions still exist. `AppShellView` binds its
-    /// `.alert` to this flag and calls `cancelQuitPrompt()` /
-    /// `NSApp.terminate(nil)` from the two buttons.
-    @Published var showQuitPrompt: Bool = false
-
     /// In-flight "processes still running" confirmation. Set by
     /// `requestClosePane` / `requestCloseTab` when they find something
     /// busy; cleared by `confirmPendingClose` (after the kill) or
@@ -118,10 +118,6 @@ final class AppState: ObservableObject {
     /// `~/Library/Application Support/Nice/sessions.json` by exercising
     /// the tab-mutation surface.
     private let persistenceEnabled: Bool
-
-    /// Cached cwd for the Terminals tab so `cancelQuitPrompt` / directory
-    /// changes can respawn at the same place.
-    private var storedMainCwd: String
 
     /// Tracks the SwiftUI `ColorScheme` currently showing. New sessions
     /// are themed at creation using this.
@@ -206,11 +202,9 @@ final class AppState: ObservableObject {
             ? UUID().uuidString
             : windowSessionId
         self.persistenceEnabled = services != nil
-        self.projects = Project.seed
         self.sidebarCollapsed = initialSidebarCollapsed
 
         let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
-        self.storedMainCwd = resolvedMainCwd
 
         // Allocate the control socket *before* spawning any ptys — the
         // shells need NICE_SOCKET in their environment at startup or
@@ -268,23 +262,31 @@ final class AppState: ObservableObject {
                 ?? Self.runWhich(binary: "claude")
         }
 
-        // Seed the built-in Terminals tab with one terminal pane.
-        let initialPaneId = "\(Self.terminalsTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
+        // Seed the pinned Terminals project with one "Main" tab
+        // hosting a single terminal pane.
+        let mainTabId = Self.mainTerminalTabId
+        let initialPaneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
         let initialPane = Pane(id: initialPaneId, title: "zsh", kind: .terminal)
-        self.terminalsTab = Tab(
-            id: Self.terminalsTabId,
-            title: "Terminals",
+        let mainTab = Tab(
+            id: mainTabId,
+            title: "Main",
             cwd: resolvedMainCwd,
             branch: nil,
-            isBuiltIn: true,
             panes: [initialPane],
             activePaneId: initialPaneId
         )
-        self.activeTabId = Self.terminalsTabId
+        let terminalsProject = Project(
+            id: Self.terminalsProjectId,
+            name: "Terminals",
+            path: resolvedMainCwd,
+            tabs: [mainTab]
+        )
+        self.projects = [terminalsProject]
+        self.activeTabId = mainTabId
 
         // All stored properties set — now bring up the session for the
-        // Terminals tab and start the control socket.
-        _ = self.makeSession(for: Self.terminalsTabId, cwd: resolvedMainCwd)
+        // Main terminal tab and start the control socket.
+        _ = self.makeSession(for: mainTabId, cwd: resolvedMainCwd)
 
         do {
             try socket.start { [weak self] message in
@@ -327,12 +329,13 @@ final class AppState: ObservableObject {
     var livePaneCounts: (claude: Int, terminal: Int) {
         var claude = 0
         var terminal = 0
-        let allTabs = [terminalsTab] + projects.flatMap { $0.tabs }
-        for tab in allTabs {
-            for pane in tab.panes where pane.isAlive {
-                switch pane.kind {
-                case .claude: claude += 1
-                case .terminal: terminal += 1
+        for project in projects {
+            for tab in project.tabs {
+                for pane in tab.panes where pane.isAlive {
+                    switch pane.kind {
+                    case .claude: claude += 1
+                    case .terminal: terminal += 1
+                    }
                 }
             }
         }
@@ -438,7 +441,6 @@ final class AppState: ObservableObject {
             title: title,
             cwd: cwd,
             branch: nil,
-            isBuiltIn: false,
             panes: [
                 claudePane,
                 Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
@@ -466,9 +468,10 @@ final class AppState: ObservableObject {
     /// wrapper is blocked reading a single-line reply from the socket;
     /// we must call `reply` exactly once. Three outcomes:
     ///
-    /// - "newtab": no promotion candidate (Main Terminals tab, unknown
-    ///   tabId, or the target sidebar tab already has a live Claude).
-    ///   Open a fresh sidebar tab via `createTabFromMainTerminal`.
+    /// - "newtab": no promotion candidate (the sending tab lives in
+    ///   the pinned Terminals group, unknown tabId, or the target
+    ///   sidebar tab already has a live Claude). Open a fresh sidebar
+    ///   tab via `createTabFromMainTerminal`.
     /// - "inplace": promote the sending pane — flip its kind to
     ///   `.claude` and mark it running. The wrapper `exec`s claude
     ///   with the user's args as-is (they already contain `--resume`
@@ -483,10 +486,10 @@ final class AppState: ObservableObject {
         paneId: String,
         reply: @Sendable (String) -> Void
     ) {
-        // No/unknown tabId, or the request came from the Main Terminals
-        // tab: always open a new sidebar tab.
+        // No/unknown tabId, or the request came from a tab in the
+        // pinned Terminals group: always open a new sidebar tab.
         guard !tabId.isEmpty,
-              tabId != Self.terminalsTabId,
+              !isTerminalsProjectTab(tabId),
               let existingTab = self.tab(for: tabId),
               existingTab.panes.contains(where: { $0.id == paneId })
         else {
@@ -616,14 +619,12 @@ final class AppState: ObservableObject {
     // MARK: - Lifecycle handlers
 
     /// A pane exited. Remove it from its tab, pick a neighbor to focus,
-    /// and dissolve the tab if nothing remains (non-builtin tabs only).
-    /// For the built-in Terminals tab: surface the quit prompt when all
-    /// panes close while user sessions still exist; terminate the app
-    /// otherwise.
+    /// and dissolve the tab if nothing remains. If the last tab in any
+    /// project empties out (including the pinned Terminals group), the
+    /// project stays in place but its tab list goes to zero — the user
+    /// re-adds from the sidebar `+`. If every project is empty after
+    /// the dissolve, terminate the app.
     func paneExited(tabId: String, paneId: String, exitCode: Int32?) {
-        let isBuiltIn = (tabId == Self.terminalsTabId)
-
-        var removedActiveFromBuiltIn = false
         mutateTab(id: tabId) { tab in
             guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                 return
@@ -638,9 +639,6 @@ final class AppState: ObservableObject {
                     tab.activePaneId = nil
                 }
             }
-            if tab.panes.isEmpty && isBuiltIn {
-                removedActiveFromBuiltIn = true
-            }
         }
 
         ptySessions[tabId]?.removePane(id: paneId)
@@ -648,30 +646,30 @@ final class AppState: ObservableObject {
         // terminal as a result of this exit, start its shell now.
         ensureActivePaneSpawned(tabId: tabId)
 
-        if isBuiltIn {
-            // The Terminals tab lives forever. If its last pane just
-            // exited, show the quit prompt (unless nothing else is
-            // open, in which case terminate outright).
-            if removedActiveFromBuiltIn {
-                if projects.allSatisfy({ $0.tabs.isEmpty }) {
-                    NSApp.terminate(nil)
-                } else {
-                    showQuitPrompt = true
-                }
-            }
-            return
-        }
+        guard let (pi, ti) = projectTabIndex(for: tabId),
+              projects[pi].tabs[ti].panes.isEmpty
+        else { return }
 
-        // Non-builtin: drop the tab entirely once it has no panes left.
-        if let (pi, ti) = projectTabIndex(for: tabId),
-           projects[pi].tabs[ti].panes.isEmpty {
-            projects[pi].tabs.remove(at: ti)
-            ptySessions.removeValue(forKey: tabId)
-            if activeTabId == tabId {
-                activeTabId = Self.terminalsTabId
-            }
-            scheduleSessionSave()
+        projects[pi].tabs.remove(at: ti)
+        ptySessions.removeValue(forKey: tabId)
+        if activeTabId == tabId {
+            activeTabId = firstAvailableTabId()
         }
+        scheduleSessionSave()
+
+        if projects.allSatisfy({ $0.tabs.isEmpty }) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// First tab id in sidebar order (Terminals project, then project
+    /// tabs). Used to fall back to a sensible selection when the
+    /// active tab dissolves. Returns nil when no tab exists anywhere.
+    private func firstAvailableTabId() -> String? {
+        for project in projects {
+            if let id = project.tabs.first?.id { return id }
+        }
+        return nil
     }
 
     /// A pane emitted a window-title update via OSC 0/1/2. Claude panes
@@ -780,20 +778,91 @@ final class AppState: ObservableObject {
         return joined
     }
 
-    /// Cancel the post-exit quit prompt: hide the alert and bring a
-    /// fresh terminal pane back up in the Terminals tab.
-    func cancelQuitPrompt() {
-        showQuitPrompt = false
-        let newId = "\(Self.terminalsTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        mutateTab(id: Self.terminalsTabId) { tab in
-            tab.panes.append(Pane(id: newId, title: "zsh", kind: .terminal))
-            tab.activePaneId = newId
+    /// Append a new terminal-only tab to the pinned Terminals group,
+    /// focus it, and spawn its pty. Used by the sidebar's group-level
+    /// `+` button. First tab added to an empty group is titled "Main";
+    /// subsequent tabs are auto-numbered "Terminal 2", "Terminal 3",
+    /// etc. Cwd inherits the Terminals project's path.
+    @discardableResult
+    func createTerminalTab() -> String? {
+        guard let pi = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) else {
+            return nil
         }
-        if let session = ptySessions[Self.terminalsTabId] {
-            _ = session.addTerminalPane(id: newId, cwd: storedMainCwd)
+        let project = projects[pi]
+        let title: String
+        if project.tabs.isEmpty {
+            title = "Main"
         } else {
-            _ = makeSession(for: Self.terminalsTabId, cwd: storedMainCwd)
+            title = "Terminal \(project.tabs.count + 1)"
         }
+        let newId = "tt\(Int(Date().timeIntervalSince1970 * 1000))"
+        let paneId = "\(newId)-p0"
+        let cwd = project.path
+        let tab = Tab(
+            id: newId,
+            title: title,
+            cwd: cwd,
+            branch: nil,
+            panes: [Pane(id: paneId, title: "zsh", kind: .terminal)],
+            activePaneId: paneId
+        )
+        projects[pi].tabs.append(tab)
+        activeTabId = newId
+        _ = makeSession(for: newId, cwd: cwd)
+        scheduleSessionSave()
+        return newId
+    }
+
+    /// Create a fresh Claude tab in an existing project group. Mirrors
+    /// `createTabFromMainTerminal` but targets `projectId` directly so
+    /// the sidebar's per-project `+` button can add into that project
+    /// instead of bucketing by cwd. No-op for the pinned Terminals
+    /// group (which only holds terminal tabs).
+    @discardableResult
+    func createClaudeTabInProject(projectId: String) -> String? {
+        guard projectId != Self.terminalsProjectId,
+              let pi = projects.firstIndex(where: { $0.id == projectId })
+        else { return nil }
+        let project = projects[pi]
+        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
+        let claudePaneId = "\(newId)-claude"
+        let terminalPaneId = "\(newId)-t1"
+        let sessionId = UUID().uuidString.lowercased()
+        var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
+        claudePane.isClaudeRunning = true
+        let tab = Tab(
+            id: newId,
+            title: "New tab",
+            cwd: project.path,
+            branch: nil,
+            panes: [
+                claudePane,
+                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
+            ],
+            activePaneId: claudePaneId,
+            claudeSessionId: sessionId
+        )
+        projects[pi].tabs.append(tab)
+        activeTabId = newId
+        _ = makeSession(
+            for: newId, cwd: project.path,
+            extraClaudeArgs: [],
+            initialClaudePaneId: claudePaneId,
+            initialTerminalPaneId: nil,
+            claudeSessionMode: .new(id: sessionId)
+        )
+        scheduleSessionSave()
+        return newId
+    }
+
+    /// True when `tabId` lives inside the pinned Terminals project.
+    /// Used by the socket handler to treat `claude` invocations from
+    /// the Terminals group as "always open a new tab elsewhere".
+    func isTerminalsProjectTab(_ tabId: String) -> Bool {
+        guard let terminals = projects.first(where: { $0.id == Self.terminalsProjectId }) else {
+            return false
+        }
+        return terminals.tabs.contains { $0.id == tabId }
     }
 
     // MARK: - Pane management
@@ -855,14 +924,12 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Request to close an entire tab. Built-in tabs can't be closed —
-    /// that goes through the "Quit NICE?" alert via `paneExited` instead.
-    /// If any live pane on the tab is busy, show the confirmation alert;
-    /// otherwise tear all panes down.
+    /// Request to close an entire tab. If any live pane on the tab is
+    /// busy, show the confirmation alert; otherwise tear all panes
+    /// down. The tab dissolves when its last pane exits (see
+    /// `paneExited`).
     func requestCloseTab(tabId: String) {
-        guard tabId != Self.terminalsTabId,
-              let tab = tab(for: tabId)
-        else { return }
+        guard let tab = tab(for: tabId) else { return }
 
         let busy = tab.panes.filter { $0.isAlive && isBusy(tabId: tabId, pane: $0) }
         if !busy.isEmpty {
@@ -930,16 +997,12 @@ final class AppState: ObservableObject {
 
     // MARK: - Keyboard navigation
 
-    /// Flat list of sidebar tab ids in displayed order. Terminals tab is
-    /// always first; project tabs follow in project/then-tab order. Used
-    /// by the keyboard shortcut handlers to walk a deterministic visible
-    /// set.
+    /// Flat list of sidebar tab ids in displayed order. The pinned
+    /// Terminals project is always first, so its tabs lead; project
+    /// tabs follow in project/then-tab order. Used by the keyboard
+    /// shortcut handlers to walk a deterministic visible set.
     var navigableSidebarTabIds: [String] {
-        var ids: [String] = [Self.terminalsTabId]
-        for project in projects {
-            ids.append(contentsOf: project.tabs.map(\.id))
-        }
-        return ids
+        projects.flatMap { $0.tabs.map(\.id) }
     }
 
     /// Move focus to the next sidebar tab, wrapping. No-op when there's
@@ -1084,9 +1147,9 @@ final class AppState: ObservableObject {
 
     // MARK: - Lookup
 
-    /// Look up a tab by id, including the built-in Terminals tab.
+    /// Look up a tab by id across every project, including the pinned
+    /// Terminals group.
     func tab(for id: String) -> Tab? {
-        if id == Self.terminalsTabId { return terminalsTab }
         for project in projects {
             if let hit = project.tabs.first(where: { $0.id == id }) {
                 return hit
@@ -1100,18 +1163,13 @@ final class AppState: ObservableObject {
     /// `projects`). Returns true if the tab was found.
     @discardableResult
     private func mutateTab(id: String, _ transform: (inout Tab) -> Void) -> Bool {
-        if id == Self.terminalsTabId {
-            transform(&terminalsTab)
-            return true
-        }
         guard let (pi, ti) = projectTabIndex(for: id) else { return false }
         transform(&projects[pi].tabs[ti])
         return true
     }
 
     /// Project + tab index for the tab with id `id`, for in-place
-    /// mutation in the `projects` array. Returns nil for the built-in
-    /// Terminals tab.
+    /// mutation in the `projects` array.
     private func projectTabIndex(for id: String) -> (Int, Int)? {
         for (pi, project) in projects.enumerated() {
             if let ti = project.tabs.firstIndex(where: { $0.id == id }) {
@@ -1138,16 +1196,16 @@ final class AppState: ObservableObject {
     /// Build a `PersistedWindow` from the current model. Mirrors the
     /// sidebar's project grouping so relaunch recreates the same
     /// sidebar structure — in particular, multi-worktree projects
-    /// like "NICE" stay a single project. Excludes the built-in
-    /// Terminals tab and any tabs missing a `claudeSessionId`
-    /// (e.g. a half-formed restore candidate before its pty spawns).
-    /// Empty projects (all tabs filtered out) are dropped.
+    /// like "NICE" stay a single project. Persists every tab,
+    /// including terminal-only tabs in the pinned Terminals group
+    /// (they restore with a fresh shell). Empty projects are dropped
+    /// except the Terminals project, which is always persisted so
+    /// its cwd survives even when every tab was closed.
     private func snapshotPersistedWindow() -> PersistedWindow {
         var persistedProjects: [PersistedProject] = []
         for project in projects {
             var tabs: [PersistedTab] = []
             for tab in project.tabs {
-                guard let sid = tab.claudeSessionId else { continue }
                 let panes = tab.panes.map {
                     PersistedPane(id: $0.id, title: $0.title, kind: $0.kind)
                 }
@@ -1156,12 +1214,14 @@ final class AppState: ObservableObject {
                     title: tab.title,
                     cwd: tab.cwd,
                     branch: tab.branch,
-                    claudeSessionId: sid,
+                    claudeSessionId: tab.claudeSessionId,
                     activePaneId: tab.activePaneId,
                     panes: panes
                 ))
             }
-            guard !tabs.isEmpty else { continue }
+            if tabs.isEmpty && project.id != Self.terminalsProjectId {
+                continue
+            }
             persistedProjects.append(PersistedProject(
                 id: project.id,
                 name: project.name,
@@ -1173,40 +1233,46 @@ final class AppState: ObservableObject {
             id: windowSessionId,
             activeTabId: activeTabId,
             sidebarCollapsed: sidebarCollapsed,
-            mainTerminalCwd: storedMainCwd,
             projects: persistedProjects
         )
     }
 
     /// On init: look up this window's saved entry (by
-    /// `windowSessionId`) and rebuild its tabs, spawning each with
-    /// `claude --resume <uuid>`. Falls back to adopting an unclaimed
-    /// entry if nothing matches this window id — that's how the very
-    /// first launch after installing this build picks up the bootstrap
-    /// file that was written before `sessions.json` had any live
-    /// window ids in it.
+    /// `windowSessionId`) and rebuild its tabs, spawning Claude tabs
+    /// with `claude --resume <uuid>` and terminal-only tabs with a
+    /// fresh shell. Falls back to adopting an unclaimed entry if
+    /// nothing matches this window id — that's how the very first
+    /// launch after installing this build picks up the bootstrap file
+    /// that was written before `sessions.json` had any live window ids
+    /// in it.
     ///
-    /// The spawn step is deferred to the next main-queue cycle so
-    /// SwiftUI has a chance to mount the new tabs' terminal views
+    /// The Claude spawn step is deferred to the next main-queue cycle
+    /// so SwiftUI has a chance to mount the new tabs' terminal views
     /// before `startProcess` runs. Claude reads its tty size at
     /// startup and errors out on a 0×0 pty — which is what we got
     /// when the process was spawned synchronously during init, before
     /// the views were ever laid out.
+    ///
+    /// The pinned Terminals project is guaranteed to exist at index 0
+    /// after this runs, regardless of what the snapshot contained.
     private func restoreSavedWindow() {
         let state = SessionStore.shared.load()
-        // Try exact match first. If that entry is empty, fall through
-        // to the first non-empty entry — a matched-but-empty slot
-        // usually means a prior launch crashed mid-restore; adopting
-        // the bootstrap (or whichever window still has tabs) is the
-        // right recovery.
+        // Try exact match first. If that entry has no projects at all,
+        // fall through to the first entry that does — a matched-but-
+        // empty slot usually means a prior launch crashed mid-restore;
+        // adopting the bootstrap (or whichever window still has state)
+        // is the right recovery.
         let matched = state.windows.first(where: { $0.id == windowSessionId })
         let adopted: PersistedWindow?
-        if let m = matched, m.totalTabCount > 0 {
+        if let m = matched, !m.projects.isEmpty {
             adopted = m
         } else {
-            adopted = state.windows.first(where: { $0.totalTabCount > 0 })
+            adopted = state.windows.first(where: { !$0.projects.isEmpty })
         }
-        guard let snapshot = adopted, snapshot.totalTabCount > 0 else { return }
+
+        defer { ensureTerminalsProjectSeeded() }
+
+        guard let snapshot = adopted else { return }
 
         // Adopt the entry's id so subsequent saves update that slot
         // instead of creating a duplicate. The view's onChange on
@@ -1220,10 +1286,21 @@ final class AppState: ObservableObject {
         // slot so scheduleSessionSave has something to upsert into.
         SessionStore.shared.pruneEmptyWindows(keeping: snapshot.id)
 
+        // Drop any in-init seed from the plain constructor — we want
+        // the restored Terminals project (with its own tabs and cwd)
+        // to win, not collide with the default one.
+        let previousMainTabId = projects.first(where: { $0.id == Self.terminalsProjectId })?.tabs.first?.id
+        if let mainTabId = previousMainTabId {
+            ptySessions[mainTabId]?.terminateAll()
+            ptySessions.removeValue(forKey: mainTabId)
+        }
+        projects.removeAll()
+
         // Build the Tab/Pane model now so the sidebar shows the tabs
-        // immediately; defer the pty spawn so views can lay out first.
-        // Trust the saved project grouping — don't re-bucket by cwd.
-        var pendingSpawns: [(tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String, title: String)] = []
+        // immediately; defer the Claude pty spawn so views can lay out
+        // first. Trust the saved project grouping — don't re-bucket by
+        // cwd.
+        var pendingClaudeSpawns: [(tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String)] = []
         for persistedProject in snapshot.projects {
             let projectIdx = ensureProject(
                 id: persistedProject.id,
@@ -1234,21 +1311,19 @@ final class AppState: ObservableObject {
                 if let spawn = addRestoredTabModel(
                     persistedTab, toProjectIndex: projectIdx
                 ) {
-                    pendingSpawns.append(spawn)
+                    pendingClaudeSpawns.append(spawn)
                 }
             }
         }
-        if let active = snapshot.activeTabId,
-           active != Self.terminalsTabId,
-           tab(for: active) != nil
-        {
+
+        if let active = snapshot.activeTabId, tab(for: active) != nil {
             activeTabId = active
         }
 
-        // Defer spawning until SwiftUI has laid out the terminal
-        // views — the pty reads its size at startup. Two main-queue
-        // hops: one for SwiftUI's layout pass, one for the terminal
-        // view's first setFrameSize.
+        // Defer Claude spawning until SwiftUI has laid out the
+        // terminal views — the pty reads its size at startup. Two
+        // main-queue hops: one for SwiftUI's layout pass, one for the
+        // terminal view's first setFrameSize.
         //
         // The restored pane is a plain shell with `claude --resume
         // <uuid>` pre-typed at the prompt (see
@@ -1259,7 +1334,7 @@ final class AppState: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                for spawn in pendingSpawns {
+                for spawn in pendingClaudeSpawns {
                     _ = self.makeSession(
                         for: spawn.tabId,
                         cwd: spawn.cwd,
@@ -1271,6 +1346,49 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Guarantee a pinned Terminals project sits at `projects[0]`. If
+    /// it's absent (first launch of this build, or a restore adopted
+    /// a snapshot predating the Terminals group), synthesize one with
+    /// a "Main" tab holding a fresh terminal pane. If it's present
+    /// but not at index 0, move it. Called at the tail of
+    /// `restoreSavedWindow`.
+    private func ensureTerminalsProjectSeeded() {
+        if let idx = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) {
+            if idx != 0 {
+                let project = projects.remove(at: idx)
+                projects.insert(project, at: 0)
+            }
+            if activeTabId == nil, let firstId = projects[0].tabs.first?.id {
+                activeTabId = firstId
+            }
+            return
+        }
+
+        let cwd = NSHomeDirectory()
+        let mainTabId = Self.mainTerminalTabId
+        let paneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
+        let pane = Pane(id: paneId, title: "zsh", kind: .terminal)
+        let mainTab = Tab(
+            id: mainTabId,
+            title: "Main",
+            cwd: cwd,
+            branch: nil,
+            panes: [pane],
+            activePaneId: paneId
+        )
+        let project = Project(
+            id: Self.terminalsProjectId,
+            name: "Terminals",
+            path: cwd,
+            tabs: [mainTab]
+        )
+        projects.insert(project, at: 0)
+        if activeTabId == nil {
+            activeTabId = mainTabId
+        }
+        _ = makeSession(for: mainTabId, cwd: cwd)
     }
 
     /// Look up `projects` by saved id; append a fresh `Project` with
@@ -1286,38 +1404,47 @@ final class AppState: ObservableObject {
         return projects.count - 1
     }
 
-    /// Append one restored tab's model to `projects[projectIndex]`
-    /// without spawning the pty. Returns the info needed to spawn
-    /// later; nil if the tab has no Claude pane id to resume.
+    /// Append one restored tab's model to `projects[projectIndex]`.
+    /// Claude tabs (tabs with a `claudeSessionId`) return info so the
+    /// caller can defer the pty spawn to `claude --resume`. Terminal-
+    /// only tabs spawn their shell eagerly and return nil.
     private func addRestoredTabModel(
         _ persisted: PersistedTab,
         toProjectIndex projectIndex: Int
-    ) -> (tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String, title: String)? {
+    ) -> (tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String)? {
         let panes = persisted.panes.map { pp in
             Pane(id: pp.id, title: pp.title, kind: pp.kind)
         }
+        let defaultActive = panes.first(where: { $0.kind == .claude })?.id
+            ?? panes.first?.id
         let tab = Tab(
             id: persisted.id,
             title: persisted.title,
             cwd: persisted.cwd,
             branch: persisted.branch,
-            isBuiltIn: false,
             panes: panes,
-            activePaneId: persisted.activePaneId ?? panes.first(where: { $0.kind == .claude })?.id,
-            titleAutoGenerated: true,
+            activePaneId: persisted.activePaneId ?? defaultActive,
+            titleAutoGenerated: persisted.claudeSessionId != nil,
             claudeSessionId: persisted.claudeSessionId
         )
 
         projects[projectIndex].tabs.append(tab)
 
-        let claudePaneId = panes.first(where: { $0.kind == .claude })?.id
-        return (
-            tabId: tab.id,
-            cwd: persisted.cwd,
-            claudePaneId: claudePaneId,
-            claudeSessionId: persisted.claudeSessionId,
-            title: persisted.title
-        )
+        if let sid = persisted.claudeSessionId {
+            let claudePaneId = panes.first(where: { $0.kind == .claude })?.id
+            return (
+                tabId: tab.id,
+                cwd: persisted.cwd,
+                claudePaneId: claudePaneId,
+                claudeSessionId: sid
+            )
+        }
+
+        // Terminal-only tab: bring its shell up now. `makeSession`
+        // picks the first terminal pane from the tab's model when
+        // callers don't pass ids explicitly.
+        _ = makeSession(for: tab.id, cwd: persisted.cwd)
+        return nil
     }
 
     // MARK: - Helpers

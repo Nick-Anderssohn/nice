@@ -28,8 +28,6 @@
 //                 `.behindWindow` blending, so the OS's Desktop Tinting
 //                 mixes wallpaper color into the chrome.
 //
-//  The "Quit NICE?" alert still hangs off `appState.showQuitPrompt`.
-//
 
 import AppKit
 import SwiftUI
@@ -37,7 +35,6 @@ import SwiftUI
 struct AppShellView: View {
     @EnvironmentObject private var services: NiceServices
     @SceneStorage("sidebarCollapsed") private var storedSidebarCollapsed: Bool = false
-    @SceneStorage("mainTerminalCwd") private var storedMainCwd: String = ""
     /// Stable per-window id that survives quits via scene storage.
     /// `AppState` uses it to look up this window's entry in
     /// `sessions.json` so restore rebuilds the right tabs.
@@ -47,10 +44,8 @@ struct AppShellView: View {
         AppShellHost(
             services: services,
             initialSidebarCollapsed: storedSidebarCollapsed,
-            initialMainCwd: storedMainCwd.isEmpty ? nil : storedMainCwd,
             windowSessionId: storedWindowSessionId,
             sidebarCollapsedBinding: $storedSidebarCollapsed,
-            mainCwdBinding: $storedMainCwd,
             windowSessionIdBinding: $storedWindowSessionId
         )
     }
@@ -69,7 +64,6 @@ private struct AppShellHost: View {
     @StateObject private var appState: AppState
     let services: NiceServices
     @Binding var sidebarCollapsedBinding: Bool
-    @Binding var mainCwdBinding: String
     @Binding var windowSessionIdBinding: String
 
     /// True while the cursor is over the floating peek sidebar. Keeps
@@ -80,21 +74,18 @@ private struct AppShellHost: View {
     init(
         services: NiceServices,
         initialSidebarCollapsed: Bool,
-        initialMainCwd: String?,
         windowSessionId: String,
         sidebarCollapsedBinding: Binding<Bool>,
-        mainCwdBinding: Binding<String>,
         windowSessionIdBinding: Binding<String>
     ) {
         self.services = services
         _appState = StateObject(wrappedValue: AppState(
             services: services,
             initialSidebarCollapsed: initialSidebarCollapsed,
-            initialMainCwd: initialMainCwd,
+            initialMainCwd: nil,
             windowSessionId: windowSessionId
         ))
         _sidebarCollapsedBinding = sidebarCollapsedBinding
-        _mainCwdBinding = mainCwdBinding
         _windowSessionIdBinding = windowSessionIdBinding
     }
 
@@ -135,18 +126,6 @@ private struct AppShellHost: View {
         .background(windowBackground.ignoresSafeArea())
         .environment(\.palette, palette)
         .environmentObject(appState)
-        .alert("Quit NICE?", isPresented: $appState.showQuitPrompt) {
-            Button("Quit", role: .destructive) {
-                // The user already confirmed here; skip the redundant
-                // `applicationShouldTerminate` confirmation on the way
-                // out so ⌘Q isn't presented twice.
-                AppDelegate.skipNextTerminateConfirmation = true
-                NSApp.terminate(nil)
-            }
-            Button("Cancel", role: .cancel) { appState.cancelQuitPrompt() }
-        } message: {
-            Text("Your last terminal just exited. You still have open sessions.")
-        }
         .alert(
             "Processes are still running",
             isPresented: Binding(
@@ -221,19 +200,16 @@ private struct AppShellHost: View {
             appState.updateTerminalFontFamily(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
-        // collapsed-sidebar and Main-Terminal cwd across relaunch.
-        // Also clear any in-flight peek state when the sidebar is
-        // explicitly expanded (via ⌘B or the chevron) so we don't carry
-        // a stale peek flag into the expanded shell.
+        // collapsed-sidebar state across relaunch. Also clear any
+        // in-flight peek state when the sidebar is explicitly
+        // expanded (via ⌘B or the chevron) so we don't carry a stale
+        // peek flag into the expanded shell.
         .onChange(of: appState.sidebarCollapsed) { _, new in
             sidebarCollapsedBinding = new
             if !new {
                 appState.sidebarPeeking = false
                 peekMousePinned = false
             }
-        }
-        .onChange(of: appState.terminalsTab.cwd) { _, new in
-            mainCwdBinding = new
         }
         // Mirror AppState's windowSessionId back to scene storage —
         // restore may have adopted a different slot (e.g. bootstrap)
@@ -484,8 +460,10 @@ private struct AppShellHost: View {
                 .padding(.leading, 20)
                 .background(terminalBackgroundColor)
         } else {
-            // Transient: no pane currently hosted (e.g. Terminals tab
-            // with its last pane just exited, awaiting the quit alert).
+            // Transient: no pane currently hosted (e.g. every tab in
+            // every project just dissolved — the app is about to
+            // terminate, or the user emptied the Terminals group and
+            // hasn't hit `+` yet).
             terminalBackgroundColor
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.leading, 20)

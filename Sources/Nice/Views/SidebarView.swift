@@ -29,8 +29,6 @@ struct SidebarView: View {
 
     private var expandedSidebar: some View {
         VStack(spacing: 0) {
-            TerminalsRow()
-                .padding(.top, 8)
             tabList
             footer
         }
@@ -73,70 +71,6 @@ struct SidebarView: View {
     }
 }
 
-// MARK: - Terminals row (built-in)
-
-private struct TerminalsRow: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var fontSettings: FontSettings
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-    @State private var hover = false
-
-    private var isActive: Bool { appState.activeTabId == AppState.terminalsTabId }
-
-    /// The Main Terminal cwd is per-window state now, read directly
-    /// from the built-in tab so two windows with different cwds don't
-    /// share a label.
-    private var mainTerminalCwd: String { appState.terminalsTab.cwd }
-
-    /// Collapse `$HOME` to `~` for the right-side cwd label.
-    private var cwdDisplayName: String {
-        let home = NSHomeDirectory()
-        if mainTerminalCwd == home { return "~" }
-        if mainTerminalCwd.hasPrefix(home + "/") {
-            return "~" + mainTerminalCwd.dropFirst(home.count)
-        }
-        return mainTerminalCwd
-    }
-
-    private var backgroundColor: Color {
-        if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
-        return .clear
-    }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "terminal")
-                .font(.system(size: fontSettings.sidebarSize(13), weight: .regular))
-            Text("Terminals")
-                .font(.system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .medium))
-            Spacer(minLength: 6)
-            Text(cwdDisplayName)
-                .font(.system(size: fontSettings.sidebarSize(10)))
-                .foregroundStyle(Color.niceInk3(scheme, palette))
-                .lineLimit(1)
-                .truncationMode(.head)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .foregroundStyle(isActive ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(backgroundColor)
-        )
-        .padding(.horizontal, 6)
-        .contentShape(Rectangle())
-        .onHover { hover = $0 }
-        .onTapGesture {
-            appState.selectTab(AppState.terminalsTabId)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("sidebar.terminals")
-    }
-}
-
 // MARK: - Project group
 
 private struct ProjectGroup: View {
@@ -147,6 +81,18 @@ private struct ProjectGroup: View {
 
     let project: Project
     @State private var isOpen: Bool = true
+    @State private var headerHover: Bool = false
+
+    private var isTerminalsGroup: Bool {
+        project.id == AppState.terminalsProjectId
+    }
+
+    /// Always show the `+` for the Terminals group (so the user can
+    /// re-add after emptying it) but only reveal it on hover for
+    /// ordinary project groups — keeps the sidebar clean by default.
+    private var showAddButton: Bool {
+        isTerminalsGroup || headerHover
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -167,20 +113,35 @@ private struct ProjectGroup: View {
                 .rotationEffect(.degrees(isOpen ? 90 : 0))
                 .opacity(0.7)
                 .animation(.easeInOut(duration: 0.12), value: isOpen)
+                .contentShape(Rectangle())
+                .onTapGesture { isOpen.toggle() }
             Text(project.name.uppercased())
                 .font(.system(size: fontSettings.sidebarSize(11), weight: .semibold))
                 .tracking(0.2)
                 .foregroundStyle(Color.niceInk2(scheme, palette))
+                .contentShape(Rectangle())
+                .onTapGesture { isOpen.toggle() }
             Spacer(minLength: 4)
             CountPill(count: project.tabs.count)
+            AddTabButton(
+                accessibilityId: "sidebar.group.\(project.id).add",
+                help: isTerminalsGroup ? "New terminal tab" : "New Claude tab"
+            ) {
+                if isTerminalsGroup {
+                    _ = appState.createTerminalTab()
+                } else {
+                    _ = appState.createClaudeTabInProject(projectId: project.id)
+                }
+            }
+            .opacity(showAddButton ? 1 : 0)
+            .animation(.easeInOut(duration: 0.12), value: showAddButton)
+            .allowsHitTesting(showAddButton)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
-        .onTapGesture {
-            isOpen.toggle()
-        }
+        .onHover { headerHover = $0 }
     }
 }
 
@@ -199,6 +160,42 @@ private struct CountPill: View {
             .background(
                 Capsule().fill(Color.niceInk(scheme, palette).opacity(0.07))
             )
+    }
+}
+
+// MARK: - Group "+" button
+
+private struct AddTabButton: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+
+    let accessibilityId: String
+    let help: String
+    let action: () -> Void
+
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.niceInk2(scheme, palette))
+                .frame(width: 18, height: 18)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(
+                            hover
+                                ? Color.niceInk(scheme, palette).opacity(0.10)
+                                : .clear
+                        )
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help(help)
+        .accessibilityIdentifier(accessibilityId)
+        .accessibilityLabel(help)
     }
 }
 
@@ -266,7 +263,18 @@ private struct TabRow: View {
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
         }
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("sidebar.tab.\(tab.id)")
+        .accessibilityIdentifier(accessibilityIdentifier)
+    }
+
+    /// The Main terminal tab keeps the legacy `sidebar.terminals`
+    /// identifier so UI tests that targeted the old single top-level
+    /// terminals row continue to locate it. All other tabs use the
+    /// standard `sidebar.tab.<id>` form.
+    private var accessibilityIdentifier: String {
+        if tab.id == AppState.mainTerminalTabId {
+            return "sidebar.terminals"
+        }
+        return "sidebar.tab.\(tab.id)"
     }
 }
 
