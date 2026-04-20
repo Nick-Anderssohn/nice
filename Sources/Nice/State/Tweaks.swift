@@ -31,9 +31,18 @@ import SwiftUI
 /// Public because the `Color.niceX(scheme:palette:)` helpers in Palette.swift
 /// live in a public extension and need Palette as a default-argument value.
 public enum Palette: String, CaseIterable, Identifiable, Sendable {
-    case nice, macOS
+    case nice, macOS, catppuccinLatte, catppuccinMocha
 
     public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .nice:            "Nice"
+        case .macOS:           "macOS"
+        case .catppuccinLatte: "Catppuccin Latte"
+        case .catppuccinMocha: "Catppuccin Mocha"
+        }
+    }
 }
 
 // MARK: - Theme choice
@@ -179,8 +188,8 @@ final class Tweaks: ObservableObject {
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
     /// through to the catalog's "unknown id" fallback.
-    static let defaultTerminalThemeLightId = "nice-default-light"
-    static let defaultTerminalThemeDarkId  = "nice-default-dark"
+    static let defaultTerminalThemeLightId = "catppuccin-latte"
+    static let defaultTerminalThemeDarkId  = "catppuccin-mocha"
 
     /// The active color scheme. Pinned to `.aqua` / `.darkAqua` via
     /// `NSApp.appearance` on every set so AppKit chrome and SwiftUI's
@@ -222,12 +231,16 @@ final class Tweaks: ObservableObject {
     var theme: ThemeChoice {
         get {
             switch (activeChromePalette, scheme) {
-            case (.nice, .light):   return .niceLight
-            case (.nice, .dark):    return .niceDark
-            case (.macOS, .light):  return .macLight
-            case (.macOS, .dark):   return .macDark
-            case (.nice, _):        return .niceLight
-            case (.macOS, _):       return .macLight
+            case (.nice, .light):            return .niceLight
+            case (.nice, .dark):             return .niceDark
+            case (.macOS, .light):           return .macLight
+            case (.macOS, .dark):            return .macDark
+            case (.catppuccinLatte, .dark):  return .niceDark
+            case (.catppuccinLatte, _):      return .niceLight
+            case (.catppuccinMocha, .light): return .niceLight
+            case (.catppuccinMocha, _):      return .niceDark
+            case (.nice, _):                 return .niceLight
+            case (.macOS, _):                return .macLight
             }
         }
         set {
@@ -496,14 +509,14 @@ final class Tweaks: ObservableObject {
                 syncWithOS: false
             )
         default:
-            // Fresh install: macOS palette for both scheme slots,
-            // synced with the OS. Matches historical fresh-install
-            // behavior so existing screenshots / onboarding still
-            // apply.
+            // Fresh install: Catppuccin Latte for light, Mocha for dark,
+            // synced with the OS. Pairs with the matching terminal-theme
+            // defaults above so the whole app opens in Catppuccin for a
+            // new user — our preferred out-of-the-box look.
             return MigratedTheme(
                 scheme: osScheme,
-                chromeLightPalette: .macOS,
-                chromeDarkPalette: .macOS,
+                chromeLightPalette: .catppuccinLatte,
+                chromeDarkPalette: .catppuccinMocha,
                 syncWithOS: true
             )
         }

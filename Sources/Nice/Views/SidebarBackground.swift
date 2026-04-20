@@ -31,6 +31,15 @@ struct SidebarBackground<Content: View>: View {
                             blendingMode: .behindWindow,
                             state: .active
                         )
+                    case .catppuccinLatte, .catppuccinMocha:
+                        ZStack {
+                            VisualEffectView(
+                                material: .sidebar,
+                                blendingMode: .behindWindow,
+                                state: .active
+                            )
+                            Color.niceBg2(scheme, palette).opacity(0.68)
+                        }
                     }
                 }
             )

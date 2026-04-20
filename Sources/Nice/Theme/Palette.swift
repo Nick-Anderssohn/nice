@@ -80,6 +80,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.080, green: 0.066, blue: 0.055, opacity: 1.0)
                 : Self(.sRGB, red: 0.989, green: 0.978, blue: 0.970, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.937, green: 0.945, blue: 0.961, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.118, green: 0.118, blue: 0.180, opacity: 1.0)
         }
     }
 
@@ -90,6 +94,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.058, green: 0.045, blue: 0.035, opacity: 1.0)
                 : Self(.sRGB, red: 0.965, green: 0.952, blue: 0.942, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.902, green: 0.914, blue: 0.937, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.094, green: 0.094, blue: 0.145, opacity: 1.0)
         }
     }
 
@@ -100,6 +108,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.037, green: 0.026, blue: 0.019, opacity: 1.0)
                 : Self(.sRGB, red: 0.934, green: 0.919, blue: 0.907, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.863, green: 0.878, blue: 0.910, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.067, green: 0.067, blue: 0.106, opacity: 1.0)
         }
     }
 
@@ -110,6 +122,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.097, green: 0.083, blue: 0.072, opacity: 1.0)
                 : Self(.sRGB, red: 1.000, green: 0.992, blue: 0.986, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.937, green: 0.945, blue: 0.961, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.118, green: 0.118, blue: 0.180, opacity: 1.0)
         }
     }
 
@@ -122,6 +138,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.956, green: 0.946, blue: 0.938, opacity: 1.0)
                 : Self(.sRGB, red: 0.091, green: 0.074, blue: 0.060, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.298, green: 0.310, blue: 0.412, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.804, green: 0.839, blue: 0.957, opacity: 1.0)
         }
     }
 
@@ -132,6 +152,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.693, green: 0.679, blue: 0.667, opacity: 1.0)
                 : Self(.sRGB, red: 0.273, green: 0.257, blue: 0.244, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.361, green: 0.373, blue: 0.467, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.729, green: 0.761, blue: 0.871, opacity: 1.0)
         }
     }
 
@@ -142,6 +166,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.460, green: 0.441, blue: 0.427, opacity: 1.0)
                 : Self(.sRGB, red: 0.494, green: 0.475, blue: 0.461, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.424, green: 0.435, blue: 0.522, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.651, green: 0.678, blue: 0.784, opacity: 1.0)
         }
     }
 
@@ -154,6 +182,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.172, green: 0.157, blue: 0.145, opacity: 1.0)
                 : Self(.sRGB, red: 0.857, green: 0.841, blue: 0.829, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.800, green: 0.816, blue: 0.855, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.192, green: 0.196, blue: 0.267, opacity: 1.0)
         }
     }
 
@@ -164,6 +196,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.252, green: 0.236, blue: 0.223, opacity: 1.0)
                 : Self(.sRGB, red: 0.735, green: 0.715, blue: 0.699, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.737, green: 0.753, blue: 0.800, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.271, green: 0.278, blue: 0.353, opacity: 1.0)
         }
     }
 
@@ -197,6 +233,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.134, green: 0.119, blue: 0.108, opacity: 1.0)
                 : Self(.sRGB, red: 0.939, green: 0.918, blue: 0.902, opacity: 1.0)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.800, green: 0.816, blue: 0.855, opacity: 1.0)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.192, green: 0.196, blue: 0.267, opacity: 1.0)
         }
     }
 
@@ -209,6 +249,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? Self(.sRGB, red: 0.080, green: 0.066, blue: 0.055, opacity: 0.70)
                 : Self(.sRGB, red: 0.989, green: 0.978, blue: 0.970, opacity: 0.70)
+        case .catppuccinLatte:
+            Self(.sRGB, red: 0.937, green: 0.945, blue: 0.961, opacity: 0.70)
+        case .catppuccinMocha:
+            Self(.sRGB, red: 0.118, green: 0.118, blue: 0.180, opacity: 0.70)
         }
     }
 
@@ -225,6 +269,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? NSColor(srgbRed: 0.037, green: 0.026, blue: 0.019, alpha: 1.0)
                 : NSColor(srgbRed: 0.934, green: 0.919, blue: 0.907, alpha: 1.0)
+        case .catppuccinLatte:
+            NSColor(srgbRed: 0.863, green: 0.878, blue: 0.910, alpha: 1.0)
+        case .catppuccinMocha:
+            NSColor(srgbRed: 0.067, green: 0.067, blue: 0.106, alpha: 1.0)
         }
     }
 
@@ -236,6 +284,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? NSColor(srgbRed: 0.097, green: 0.083, blue: 0.072, alpha: 1.0)
                 : NSColor(srgbRed: 1.000, green: 0.992, blue: 0.986, alpha: 1.0)
+        case .catppuccinLatte:
+            NSColor(srgbRed: 0.937, green: 0.945, blue: 0.961, alpha: 1.0)
+        case .catppuccinMocha:
+            NSColor(srgbRed: 0.118, green: 0.118, blue: 0.180, alpha: 1.0)
         }
     }
 
@@ -248,6 +300,10 @@ public extension SwiftUI.Color {
             scheme == .dark
                 ? NSColor(srgbRed: 0.956, green: 0.946, blue: 0.938, alpha: 1.0)
                 : NSColor(srgbRed: 0.091, green: 0.074, blue: 0.060, alpha: 1.0)
+        case .catppuccinLatte:
+            NSColor(srgbRed: 0.298, green: 0.310, blue: 0.412, alpha: 1.0)
+        case .catppuccinMocha:
+            NSColor(srgbRed: 0.804, green: 0.839, blue: 0.957, alpha: 1.0)
         }
     }
 }

@@ -204,8 +204,9 @@ private struct AppearancePane: View {
             hint: "Palette used for the sidebar, window background, and toolbar when the scheme is light."
         ) {
             Picker("", selection: $tweaks.chromeLightPalette) {
-                Text("Nice").tag(Palette.nice)
-                Text("macOS").tag(Palette.macOS)
+                ForEach(Palette.allCases) { palette in
+                    Text(palette.displayName).tag(palette)
+                }
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -218,8 +219,9 @@ private struct AppearancePane: View {
             hint: "Palette used for the sidebar, window background, and toolbar when the scheme is dark."
         ) {
             Picker("", selection: $tweaks.chromeDarkPalette) {
-                Text("Nice").tag(Palette.nice)
-                Text("macOS").tag(Palette.macOS)
+                ForEach(Palette.allCases) { palette in
+                    Text(palette.displayName).tag(palette)
+                }
             }
             .labelsHidden()
             .pickerStyle(.menu)

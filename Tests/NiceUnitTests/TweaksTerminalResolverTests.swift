@@ -83,18 +83,18 @@ final class TweaksTerminalResolverTests: XCTestCase {
         )
     }
 
-    func test_effectiveTerminalTheme_unknownId_fallsBackToNiceDefault() {
+    func test_effectiveTerminalTheme_unknownId_fallsBackToCatppuccinDefault() {
         let tweaks = makeTweaks()
         tweaks.terminalThemeLightId = "this-theme-was-deleted"
         tweaks.terminalThemeDarkId  = "also-gone"
 
         XCTAssertEqual(
             tweaks.effectiveTerminalTheme(for: .light, catalog: catalog).id,
-            "nice-default-light"
+            "catppuccin-latte"
         )
         XCTAssertEqual(
             tweaks.effectiveTerminalTheme(for: .dark, catalog: catalog).id,
-            "nice-default-dark"
+            "catppuccin-mocha"
         )
     }
 

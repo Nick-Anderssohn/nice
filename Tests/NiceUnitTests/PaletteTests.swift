@@ -99,6 +99,49 @@ final class PaletteTests: XCTestCase {
         assertSameColor(actualLight, expectedLight, appearance: aqua)
     }
 
+    // MARK: - Catppuccin palettes: scheme-ignoring literal colors
+
+    func test_palette_catppuccinLatte_returnsBaseLiteral() {
+        // `#eff1f5` base → sRGB(0.937, 0.945, 0.961).
+        let expected = SwiftUI.Color(.sRGB, red: 0.937, green: 0.945, blue: 0.961, opacity: 1.0)
+        assertSameColor(SwiftUI.Color.niceBg(.light, .catppuccinLatte), expected)
+    }
+
+    func test_palette_catppuccinLatte_ignoresScheme() {
+        // Latte is intrinsically light; scheme argument has no effect.
+        assertSameColor(
+            SwiftUI.Color.niceBg(.light, .catppuccinLatte),
+            SwiftUI.Color.niceBg(.dark,  .catppuccinLatte)
+        )
+    }
+
+    func test_palette_catppuccinMocha_returnsBaseLiteral() {
+        // `#1e1e2e` base → sRGB(0.118, 0.118, 0.180).
+        let expected = SwiftUI.Color(.sRGB, red: 0.118, green: 0.118, blue: 0.180, opacity: 1.0)
+        assertSameColor(SwiftUI.Color.niceBg(.dark, .catppuccinMocha), expected)
+    }
+
+    func test_palette_catppuccinMocha_text_returnsTextLiteral() {
+        // `#cdd6f4` text → sRGB(0.804, 0.839, 0.957).
+        let expected = SwiftUI.Color(.sRGB, red: 0.804, green: 0.839, blue: 0.957, opacity: 1.0)
+        assertSameColor(SwiftUI.Color.niceInk(.light, .catppuccinMocha), expected)
+    }
+
+    // MARK: - Palette enum shape
+
+    func test_palette_allCases_includesCatppuccinVariants() {
+        XCTAssertEqual(Palette.allCases.count, 4)
+        XCTAssertTrue(Palette.allCases.contains(.catppuccinLatte))
+        XCTAssertTrue(Palette.allCases.contains(.catppuccinMocha))
+    }
+
+    func test_palette_displayName_forEachCase() {
+        XCTAssertEqual(Palette.nice.displayName,            "Nice")
+        XCTAssertEqual(Palette.macOS.displayName,           "macOS")
+        XCTAssertEqual(Palette.catppuccinLatte.displayName, "Catppuccin Latte")
+        XCTAssertEqual(Palette.catppuccinMocha.displayName, "Catppuccin Mocha")
+    }
+
     // MARK: - Environment key default
 
     func test_environmentKey_defaultsToNice() {

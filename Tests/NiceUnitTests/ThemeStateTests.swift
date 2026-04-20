@@ -326,21 +326,21 @@ final class ThemeStateTests: XCTestCase {
         XCTAssertFalse(m.syncWithOS)
     }
 
-    func test_migration_freshInstall_osLight_mapsToMacOSWithSync() {
+    func test_migration_freshInstall_osLight_mapsToCatppuccinWithSync() {
         XCTAssertNil(defaults.object(forKey: Tweaks.themeKey))
         let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .light)
         XCTAssertEqual(m.scheme, .light)
-        XCTAssertEqual(m.chromeLightPalette, .macOS)
-        XCTAssertEqual(m.chromeDarkPalette, .macOS)
+        XCTAssertEqual(m.chromeLightPalette, .catppuccinLatte)
+        XCTAssertEqual(m.chromeDarkPalette, .catppuccinMocha)
         XCTAssertTrue(m.syncWithOS)
     }
 
-    func test_migration_freshInstall_osDark_mapsToMacOSWithSync() {
+    func test_migration_freshInstall_osDark_mapsToCatppuccinWithSync() {
         XCTAssertNil(defaults.object(forKey: Tweaks.themeKey))
         let m = Tweaks.loadOrMigrate(defaults: defaults, osScheme: .dark)
         XCTAssertEqual(m.scheme, .dark)
-        XCTAssertEqual(m.chromeLightPalette, .macOS)
-        XCTAssertEqual(m.chromeDarkPalette, .macOS)
+        XCTAssertEqual(m.chromeLightPalette, .catppuccinLatte)
+        XCTAssertEqual(m.chromeDarkPalette, .catppuccinMocha)
         XCTAssertTrue(m.syncWithOS)
     }
 
