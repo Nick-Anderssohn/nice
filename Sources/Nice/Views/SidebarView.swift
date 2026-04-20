@@ -132,26 +132,8 @@ private struct TerminalsRow: View {
         .onTapGesture {
             appState.selectTab(AppState.terminalsTabId)
         }
-        .contextMenu {
-            Button("Change directory…") {
-                pickDirectory()
-            }
-        }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("sidebar.terminals")
-    }
-
-    private func pickDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        if panel.runModal() == .OK, let url = panel.url {
-            // `restartTerminalsFirstPane` updates `terminalsTab.cwd`
-            // which the AppShellView bridges back to `@SceneStorage`.
-            appState.restartTerminalsFirstPane(cwd: url.path)
-        }
     }
 }
 

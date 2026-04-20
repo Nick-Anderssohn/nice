@@ -867,35 +867,6 @@ final class AppState: ObservableObject {
         return session
     }
 
-    /// Called from the sidebar when the user picks a new directory for
-    /// the Terminals tab. Replaces the Terminals tab's first terminal
-    /// pane with a fresh one rooted at `cwd`.
-    func restartTerminalsFirstPane(cwd: String) {
-        storedMainCwd = cwd
-        mutateTab(id: Self.terminalsTabId) { tab in
-            tab.cwd = cwd
-        }
-        guard let session = ptySessions[Self.terminalsTabId],
-              let firstId = terminalsTab.panes.first?.id else { return }
-        // Terminate the existing pane; its exit delegate will remove
-        // the pane from the model and session. Then add a fresh one.
-        session.panes[firstId]?.process.terminate()
-        // Schedule the respawn slightly after — the delegate's exit
-        // removes the old pane first. We queue on main so the model
-        // update from `paneExited` lands before our insert.
-        let newId = "\(Self.terminalsTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            guard let self else { return }
-            self.mutateTab(id: Self.terminalsTabId) { tab in
-                tab.panes.append(Pane(id: newId, title: "zsh", kind: .terminal))
-                tab.activePaneId = newId
-            }
-            if let session = self.ptySessions[Self.terminalsTabId] {
-                _ = session.addTerminalPane(id: newId, cwd: cwd)
-            }
-        }
-    }
-
     // MARK: - Claude binary resolution
 
     /// Resolve `binary` via a login+interactive zsh so `.zprofile` /
