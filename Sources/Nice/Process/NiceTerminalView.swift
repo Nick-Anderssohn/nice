@@ -122,6 +122,7 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         let paths = extractImagePaths(from: sender.draggingPasteboard)
+            .filter(Self.isSafePath)
         guard !paths.isEmpty else { return super.performDragOperation(sender) }
 
         let bytes: [UInt8]
@@ -176,6 +177,18 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     private static func isImageFile(_ url: URL) -> Bool {
         imageExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// Reject paths containing C0 control bytes (ESC, LF, CR, tab, etc.)
+    /// or DEL. macOS filenames legally contain those bytes; letting them
+    /// through would break out of the `ESC [200~ … ESC [201~` paste
+    /// frame we wrap the path in, delivering crafted input to the TUI
+    /// as if typed at the prompt.
+    private static func isSafePath(_ path: String) -> Bool {
+        for scalar in path.unicodeScalars {
+            if scalar.value < 0x20 || scalar.value == 0x7f { return false }
+        }
+        return true
     }
 
     /// Re-encode whatever's on the pasteboard to PNG so the file Claude
