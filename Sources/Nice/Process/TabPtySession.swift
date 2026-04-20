@@ -72,6 +72,11 @@ final class TabPtySession: ObservableObject {
     /// `Tweaks.smoothScrolling` (on).
     private var currentSmoothScrolling: Bool = true
 
+    /// Cached terminal font family (PostScript name). `nil` means "use
+    /// the default chain" (SF Mono → JetBrains Mono NL → system
+    /// monospaced), matching `Tweaks.terminalFontFamily`'s default.
+    private var currentTerminalFontFamily: String? = nil
+
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
     /// ZDOTDIR directory injected into terminal panes so the shadowed
@@ -131,7 +136,7 @@ final class TabPtySession: ObservableObject {
     @discardableResult
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
-        view.font = Self.terminalFont(size: currentTerminalFontSize)
+        view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
         view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
         view.smoothScrollPreferenceProvider = { [weak self] in self?.currentSmoothScrolling ?? true }
         let delegate = makePaneDelegate(paneId: id)
@@ -189,7 +194,7 @@ final class TabPtySession: ObservableObject {
         zdotdirPath: String? = nil
     ) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
-        view.font = Self.terminalFont(size: currentTerminalFontSize)
+        view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
         view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
         view.smoothScrollPreferenceProvider = { [weak self] in self?.currentSmoothScrolling ?? true }
         let delegate = makePaneDelegate(paneId: id)
@@ -332,10 +337,11 @@ final class TabPtySession: ObservableObject {
 
     // MARK: - Helpers
 
-    private static func terminalFont(size: CGFloat) -> NSFont {
-        NSFont(name: "JetBrainsMono-Regular", size: size)
-            ?? NSFont.userFixedPitchFont(ofSize: size)
-            ?? NSFont.systemFont(ofSize: size)
+    static func terminalFont(named name: String?, size: CGFloat) -> NSFont {
+        if let name, let font = NSFont(name: name, size: size) { return font }
+        return NSFont(name: "SFMono-Regular", size: size)
+            ?? NSFont(name: "JetBrainsMonoNL-Regular", size: size)
+            ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
     /// Re-apply the terminal font to every live pane on this session.
@@ -346,7 +352,7 @@ final class TabPtySession: ObservableObject {
     /// pty — the terminal reflows automatically.
     func applyTerminalFont(size: CGFloat) {
         currentTerminalFontSize = size
-        let font = Self.terminalFont(size: size)
+        let font = Self.terminalFont(named: currentTerminalFontFamily, size: size)
         for view in panes.values {
             view.font = font
         }
