@@ -184,7 +184,7 @@ final class AppStateNavigationTests: XCTestCase {
             id: "p1", name: "P1", path: "/tmp/p1",
             tabs: p1Titles.enumerated().map { i, title in
                 Tab(
-                    id: "p1t\(i)", title: title, status: .idle,
+                    id: "p1t\(i)", title: title,
                     cwd: "/tmp/p1", panes: [
                         Pane(id: "p1t\(i)-p0", title: "zsh", kind: .terminal)
                     ],
@@ -196,7 +196,7 @@ final class AppStateNavigationTests: XCTestCase {
             id: "p2", name: "P2", path: "/tmp/p2",
             tabs: p2Titles.enumerated().map { i, title in
                 Tab(
-                    id: "p2t\(i)", title: title, status: .idle,
+                    id: "p2t\(i)", title: title,
                     cwd: "/tmp/p2", panes: [
                         Pane(id: "p2t\(i)-p0", title: "zsh", kind: .terminal)
                     ],

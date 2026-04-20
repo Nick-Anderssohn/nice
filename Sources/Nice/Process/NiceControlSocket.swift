@@ -28,13 +28,12 @@ import Foundation
 /// parser in `readClient`, consumed by `AppState.init`'s handler, which
 /// dispatches each case to the appropriate MainActor method.
 enum SocketMessage: Sendable {
-    /// Main-Terminal `claude` shadow asking for a brand-new tab rooted
-    /// at `cwd` with the given argv.
+    /// `claude` shadow asking for a brand-new tab rooted at `cwd` with
+    /// the given argv. Every interactive `claude` invocation — in the
+    /// built-in Terminals tab or in a companion terminal — takes this
+    /// path; the app enforces "at most one Claude pane per tab" by
+    /// always opening a fresh tab for claude.
     case newtab(cwd: String, args: [String])
-    /// Companion-shell `claude` shadow asking to promote the tab it's
-    /// running inside back to Claude-tab state. `tabId` is read from
-    /// `$NICE_TAB_ID` in the companion's env.
-    case promoteTab(tabId: String, args: [String])
 }
 
 final class NiceControlSocket: @unchecked Sendable {
@@ -178,9 +177,6 @@ final class NiceControlSocket: @unchecked Sendable {
         case "newtab":
             guard let cwd = obj["cwd"] as? String else { return }
             handler(.newtab(cwd: cwd, args: args))
-        case "promoteTab":
-            guard let tabId = obj["tabId"] as? String, !tabId.isEmpty else { return }
-            handler(.promoteTab(tabId: tabId, args: args))
         default:
             // Unknown action — log and drop, matching the silent-drop
             // behavior used elsewhere for malformed payloads.

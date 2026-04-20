@@ -8,10 +8,9 @@
 //  startup files in `$HOME`, then (in `.zshrc`) define a `claude()`
 //  function that intercepts *interactive* invocations and forwards
 //  them to Nice's control socket so a new tab opens instead of the
-//  shell exec'ing claude in place.
-//
-//  Only the Main Terminal gets this inject — regular tabs' right-side
-//  zsh stays a plain interactive shell.
+//  shell exec'ing claude in place. Every interactive `claude` — whether
+//  typed in the built-in Terminals tab or in a companion terminal
+//  inside an existing Claude tab — opens its own new tab.
 //
 
 import Foundation
@@ -127,35 +126,11 @@ enum MainTerminalShellInject {
         done
         args_json+="]"
 
-        # Resolve the real claude binary up front so we can exec it
-        # regardless of which branch posts to the socket. `command -v`
-        # follows `$PATH` without consulting aliases/functions, so it
-        # doesn't recurse into this shadow.
-        local real_claude
-        real_claude=$(command -v claude 2>/dev/null)
-
-        if [[ -n "$NICE_TAB_ID" ]]; then
-            # Inside an existing Nice tab's companion terminal. Ask Nice
-            # to promote this tab back to Claude-tab state, then exec
-            # the real claude in-place so the promoted view shows a
-            # live claude running in the same pty. We exec regardless
-            # of socket success — if the socket is down, running claude
-            # inline is still the right UX for the user.
-            local tab_json
-            tab_json=$(_nice_json_escape "$NICE_TAB_ID")
-            local payload="{\"action\":\"promoteTab\",\"tabId\":${tab_json},\"args\":${args_json}}"
-            printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 1 2>/dev/null
-            if [[ -n "$real_claude" ]]; then
-                exec "$real_claude" "$@"
-            else
-                command claude "$@"
-            fi
-            return
-        fi
-
-        # Main Terminal path: ask Nice to open a new tab rooted at PWD.
-        # On socket failure, fall back to running claude inline so the
-        # user's command still works.
+        # Always ask Nice to open a new tab rooted at PWD. Running
+        # `claude` from a companion terminal inside an existing Nice
+        # tab would otherwise add a second Claude pane there; we want
+        # the invariant "at most one Claude pane per tab", so every
+        # interactive `claude` invocation opens its own tab.
         local cwd_json
         cwd_json=$(_nice_json_escape "$PWD")
         local payload="{\"action\":\"newtab\",\"cwd\":${cwd_json},\"args\":${args_json}}"

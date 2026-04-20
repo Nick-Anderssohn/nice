@@ -228,6 +228,13 @@ private struct InlinePanePill: View {
         .onHover { onHoverChange($0) }
         .animation(.easeInOut(duration: 0.12), value: isActive)
         .animation(.easeInOut(duration: 0.12), value: isHovered)
+        // Expose the pill as a single AXButton that contains the close
+        // button as a child (not a merged peer). Without `.contain`,
+        // `.onTapGesture` + `.accessibilityAddTraits(.isButton)` emit
+        // two AXButton nodes sharing this identifier, which breaks any
+        // XCUITest that counts pills; with `.combine` we'd instead
+        // swallow the close button's own identity.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tab.pill.\(pane.id)")
         .accessibilityLabel(pane.title)
         .accessibilityAddTraits(isActive ? [.isSelected, .isButton] : .isButton)

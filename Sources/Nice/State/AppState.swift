@@ -211,7 +211,6 @@ final class AppState: ObservableObject {
         self.terminalsTab = Tab(
             id: Self.terminalsTabId,
             title: "Terminals",
-            status: .idle,
             cwd: resolvedMainCwd,
             branch: nil,
             isBuiltIn: true,
@@ -231,8 +230,6 @@ final class AppState: ObservableObject {
                     switch message {
                     case let .newtab(cwd, args):
                         self.createTabFromMainTerminal(cwd: cwd, args: args)
-                    case let .promoteTab(tabId, args):
-                        self.promoteTabToClaude(tabId: tabId, args: args)
                     }
                 }
             }
@@ -326,7 +323,6 @@ final class AppState: ObservableObject {
         let tab = Tab(
             id: newId,
             title: title,
-            status: .idle,
             cwd: cwd,
             branch: nil,
             isBuiltIn: false,
@@ -536,9 +532,6 @@ final class AppState: ObservableObject {
                     to: newStatus,
                     isCurrentlyBeingViewed: viewing && isActivePane
                 )
-                if isActivePane && tab.status != newStatus {
-                    tab.status = newStatus
-                }
             }
         }
 
@@ -597,61 +590,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Promote a terminal-only tab back to Claude-tab state. Called
-    /// from the control socket's `promoteTab` handler when a terminal
-    /// pane's shadowed `claude()` fires (the pty is already about to
-    /// exec claude inline — this just flips the pane's kind and adds a
-    /// fresh terminal pane alongside).
-    func promoteTabToClaude(tabId: String, args: [String]) {
-        // The Terminals built-in never hosts a claude pane — the zsh
-        // shadow there triggers `newtab`, not `promoteTab`. Belt &
-        // braces guard.
-        guard tabId != Self.terminalsTabId else {
-            NSLog("AppState: promoteTab on Terminals tab — ignoring")
-            return
-        }
-
-        guard let tab = tab(for: tabId) else {
-            NSLog("AppState: promoteTabToClaude for unknown tab \(tabId) — ignoring")
-            return
-        }
-        guard let activeId = tab.activePaneId,
-              let active = tab.panes.first(where: { $0.id == activeId })
-        else {
-            NSLog("AppState: promoteTabToClaude with no active pane on \(tabId)")
-            return
-        }
-        if active.kind == .claude {
-            // Already a claude pane — the shadow will still exec claude
-            // inline, giving the user a second claude inside. Nothing
-            // for the model to do.
-            return
-        }
-
-        // Flip the active pane to claude kind and retheme.
-        let promotedId = activeId
-        mutateTab(id: tabId) { tab in
-            if let i = tab.panes.firstIndex(where: { $0.id == promotedId }) {
-                tab.panes[i].kind = .claude
-                tab.panes[i].isAlive = true
-                tab.panes[i].title = "Claude"
-            }
-        }
-        ptySessions[tabId]?.promotePaneToClaude(id: promotedId)
-
-        // Append a fresh terminal pane so the session still has a shell.
-        let newPaneId = "\(tabId)-t\(Int(Date().timeIntervalSince1970 * 1000))"
-        let tabCwd: String = {
-            if let updated = self.tab(for: tabId) { return updated.cwd }
-            return tab.cwd
-        }()
-        mutateTab(id: tabId) { tab in
-            let title = "Terminal \(tab.panes.filter { $0.kind == .terminal }.count + 1)"
-            tab.panes.append(Pane(id: newPaneId, title: title, kind: .terminal))
-        }
-        _ = ptySessions[tabId]?.addTerminalPane(id: newPaneId, cwd: tabCwd)
-    }
-
     // MARK: - Pane management
 
     /// Append a new terminal pane to `tabId`, spawn its pty, and focus
@@ -664,7 +602,8 @@ final class AppState: ObservableObject {
         title: String? = nil
     ) -> String? {
         // Only terminal kind is exposed to callers. Claude panes are
-        // created by `createTabFromMainTerminal` or `promoteTabToClaude`.
+        // created exclusively by `createTabFromMainTerminal` — this
+        // preserves the "at most one Claude pane per tab" invariant.
         guard kind == .terminal else { return nil }
 
         guard let tab = self.tab(for: tabId) else { return nil }
@@ -790,13 +729,6 @@ final class AppState: ObservableObject {
             }
         }
 
-        // Built-in Terminals session: skip `NICE_TAB_ID` injection so
-        // the zsh shadow's `claude()` falls through to the `newtab`
-        // flow (open a new sidebar session), same behaviour as the old
-        // Main Terminal. For user sessions, keep injecting so the
-        // shadow fires `promoteTab` inside companion terminals.
-        let injectTabIdEnv = (tabId != Self.terminalsTabId)
-
         let session = TabPtySession(
             tabId: tabId,
             cwd: resolvedCwd,
@@ -806,7 +738,6 @@ final class AppState: ObservableObject {
             initialTerminalPaneId: terminalPaneId,
             socketPath: controlSocket?.path,
             zdotdirPath: zdotdirPath,
-            injectTabIdEnv: injectTabIdEnv,
             onPaneExit: { [weak self] paneId, code in
                 self?.paneExited(tabId: tabId, paneId: paneId, exitCode: code)
             },

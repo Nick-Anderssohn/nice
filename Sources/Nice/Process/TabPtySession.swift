@@ -13,11 +13,6 @@
 //  the underlying processes persist across tab switches and SwiftUI
 //  redraws.
 //
-//  `promotePaneToClaude` handles the `claude` zsh-shadow flow — the
-//  user's terminal pane is about to exec claude in place, so the session
-//  just re-themes the pane to the claude background. The `Pane.kind`
-//  flip lives in `AppState` alongside the model update.
-//
 
 import AppKit
 import SwiftTerm
@@ -94,13 +89,6 @@ final class TabPtySession: ObservableObject {
     private let claudeBinary: String?
     private let extraClaudeArgs: [String]
 
-    /// When true, terminal panes on this session get `NICE_TAB_ID` in
-    /// their env so the shadowed `claude()` zsh function fires the
-    /// `promoteTab` flow. For the built-in Terminals session this is
-    /// false — typing `claude` there should open a new sidebar session
-    /// (the `newtab` flow), just like the old Main Terminal did.
-    private let injectTabIdEnv: Bool
-
     init(
         tabId: String,
         cwd: String,
@@ -110,7 +98,6 @@ final class TabPtySession: ObservableObject {
         initialTerminalPaneId: String? = nil,
         socketPath: String? = nil,
         zdotdirPath: String? = nil,
-        injectTabIdEnv: Bool = true,
         onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
         onPaneTitleChange: @escaping @MainActor (String, String) -> Void
     ) {
@@ -122,7 +109,6 @@ final class TabPtySession: ObservableObject {
         self.zdotdirPath = zdotdirPath
         self.claudeBinary = claudeBinary
         self.extraClaudeArgs = extraClaudeArgs
-        self.injectTabIdEnv = injectTabIdEnv
 
         if let claudeId = initialClaudePaneId {
             _ = spawnClaudePane(id: claudeId, cwd: cwd)
@@ -188,8 +174,8 @@ final class TabPtySession: ObservableObject {
     }
 
     /// Spawn a terminal-kind pane — a plain `zsh -il` with injected
-    /// `ZDOTDIR` + `NICE_SOCKET` + `NICE_TAB_ID` so the shadowed
-    /// `claude()` function is available inside.
+    /// `ZDOTDIR` + `NICE_SOCKET` so the shadowed `claude()` function
+    /// is available inside.
     @discardableResult
     func addTerminalPane(
         id: String,
@@ -212,9 +198,6 @@ final class TabPtySession: ObservableObject {
         }
         if let zp = zdotdirPath ?? self.zdotdirPath {
             extraEnv["ZDOTDIR"] = zp
-        }
-        if injectTabIdEnv {
-            extraEnv["NICE_TAB_ID"] = tabId
         }
 
         let resolvedCwd = Self.expandTilde(cwd ?? self.cwd)
@@ -256,18 +239,6 @@ final class TabPtySession: ObservableObject {
     func removePane(id: String) {
         panes.removeValue(forKey: id)
         delegates.removeValue(forKey: id)
-    }
-
-    /// Flip a terminal pane's visual role to claude. The pty already
-    /// `exec`s claude inline (the zsh-shadow flow is the only caller),
-    /// so there's no process swap — we just repaint with the claude
-    /// background. Returns the affected view, or nil if `id` isn't
-    /// currently hosted.
-    @discardableResult
-    func promotePaneToClaude(id: String) -> LocalProcessTerminalView? {
-        guard let view = panes[id] else { return nil }
-        applyTerminalTheme(currentTerminalTheme, to: view)
-        return view
     }
 
     // MARK: - IO

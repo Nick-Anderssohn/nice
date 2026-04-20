@@ -141,30 +141,116 @@ final class PaneAcknowledgmentTests: XCTestCase {
     }
 
     // MARK: - Tab aggregation
+    //
+    // `Tab.status` and `Tab.waitingAcknowledged` are pure functions of
+    // `panes` — they don't consult `activePaneId`. This is the invariant
+    // that keeps the sidebar dot (reads Tab-level) from drifting away
+    // from the toolbar pill dot (reads Pane-level) when the user
+    // focuses a non-Claude pane.
 
-    func test_tab_waitingAcknowledged_mirrorsActivePane() {
-        var claudePane = Pane(id: "claude", title: "Claude", kind: .claude)
-        claudePane.applyStatusTransition(to: .waiting, isCurrentlyBeingViewed: true)
-        let terminalPane = Pane(id: "term", title: "Terminal", kind: .terminal)
+    func test_tabStatus_noClaudePane_isIdle() {
+        let tab = Tab(
+            id: "t", title: "", cwd: "/",
+            panes: [Pane(id: "p", title: "zsh", kind: .terminal)],
+            activePaneId: "p"
+        )
+        XCTAssertEqual(tab.status, .idle)
+    }
+
+    func test_tabStatus_claudeThinking_isThinking_regardlessOfActivePane() {
+        var claude = Pane(id: "claude", title: "Claude", kind: .claude)
+        claude.applyStatusTransition(to: .thinking, isCurrentlyBeingViewed: false)
+        let term = Pane(id: "term", title: "Terminal", kind: .terminal)
 
         var tab = Tab(
-            id: "t", title: "Session", status: .waiting, cwd: "/",
-            panes: [claudePane, terminalPane], activePaneId: "claude"
+            id: "t", title: "", cwd: "/",
+            panes: [claude, term], activePaneId: "claude"
         )
-        XCTAssertTrue(tab.waitingAcknowledged,
-                      "When Claude is the active pane, the tab dot follows its acknowledgment.")
+        XCTAssertEqual(tab.status, .thinking)
 
-        // Flip focus to the terminal pane — its flag is false, so the
-        // tab surface acts as "not acknowledged" (matches existing model
-        // where tab.status already mirrors the active pane).
         tab.activePaneId = "term"
+        XCTAssertEqual(tab.status, .thinking,
+                       "Focusing the terminal must not freeze tab.status on an old value.")
+    }
+
+    func test_tabStatus_claudeWaiting_isWaiting_regardlessOfActivePane() {
+        var claude = Pane(id: "claude", title: "Claude", kind: .claude)
+        claude.applyStatusTransition(to: .waiting, isCurrentlyBeingViewed: false)
+        let term = Pane(id: "term", title: "Terminal", kind: .terminal)
+
+        var tab = Tab(
+            id: "t", title: "", cwd: "/",
+            panes: [claude, term], activePaneId: "term"
+        )
+        XCTAssertEqual(tab.status, .waiting,
+                       "This is the reported bug: Claude transitions to waiting while the companion terminal is active; sidebar must reflect waiting.")
+        XCTAssertFalse(tab.waitingAcknowledged,
+                       "User is not viewing the Claude pane, so the pulse must not be suppressed.")
+
+        tab.activePaneId = "claude"
+        XCTAssertEqual(tab.status, .waiting)
+    }
+
+    func test_tabStatus_deadClaudePane_excluded() {
+        var claude = Pane(id: "claude", title: "Claude", kind: .claude)
+        claude.applyStatusTransition(to: .thinking, isCurrentlyBeingViewed: false)
+        claude.isAlive = false
+        let tab = Tab(
+            id: "t", title: "", cwd: "/",
+            panes: [claude], activePaneId: "claude"
+        )
+        XCTAssertEqual(tab.status, .idle,
+                       "A dead Claude pane must not keep the sidebar dot lit.")
+    }
+
+    func test_tabWaitingAcknowledged_waitingAcked_returnsTrue() {
+        var claude = Pane(id: "claude", title: "Claude", kind: .claude)
+        claude.applyStatusTransition(to: .waiting, isCurrentlyBeingViewed: true)
+        XCTAssertTrue(claude.waitingAcknowledged)
+
+        let term = Pane(id: "term", title: "Terminal", kind: .terminal)
+        var tab = Tab(
+            id: "t", title: "", cwd: "/",
+            panes: [claude, term], activePaneId: "claude"
+        )
+        XCTAssertTrue(tab.waitingAcknowledged)
+
+        // Rewritten-in-place of the old test: flipping the active pane
+        // to the terminal MUST NOT change the tab's acknowledgment —
+        // that's what was driving the sidebar out of sync with the
+        // toolbar.
+        tab.activePaneId = "term"
+        XCTAssertTrue(tab.waitingAcknowledged,
+                      "tab.waitingAcknowledged is a pure function of panes; active-pane selection must not mutate it.")
+    }
+
+    func test_tabWaitingAcknowledged_waitingUnacked_returnsFalse() {
+        var claude = Pane(id: "claude", title: "Claude", kind: .claude)
+        claude.applyStatusTransition(to: .waiting, isCurrentlyBeingViewed: false)
+
+        let tab = Tab(
+            id: "t", title: "", cwd: "/",
+            panes: [claude], activePaneId: "claude"
+        )
         XCTAssertFalse(tab.waitingAcknowledged)
     }
 
-    func test_tab_waitingAcknowledged_noActivePane_isFalse() {
+    func test_tabWaitingAcknowledged_noWaitingPane_returnsFalse() {
+        var claude = Pane(id: "claude", title: "Claude", kind: .claude)
+        claude.applyStatusTransition(to: .thinking, isCurrentlyBeingViewed: true)
         let tab = Tab(
-            id: "t", title: "", status: .idle, cwd: "/", panes: [], activePaneId: nil
+            id: "t", title: "", cwd: "/",
+            panes: [claude], activePaneId: "claude"
+        )
+        XCTAssertFalse(tab.waitingAcknowledged,
+                       "No waiting pane → acknowledgment is meaningless and reported as false.")
+    }
+
+    func test_tabWaitingAcknowledged_noPanes_isFalse() {
+        let tab = Tab(
+            id: "t", title: "", cwd: "/", panes: [], activePaneId: nil
         )
         XCTAssertFalse(tab.waitingAcknowledged)
+        XCTAssertEqual(tab.status, .idle)
     }
 }

@@ -72,9 +72,6 @@ extension Pane {
 struct Tab: Identifiable, Hashable, Sendable {
     let id: String
     var title: String
-    /// Aggregate status surfaced in the sidebar. Mirrors the status of
-    /// the active pane when it's a claude pane; `.idle` otherwise.
-    var status: TabStatus
     var cwd: String
     var branch: String?
     /// Built-in tabs (the "Terminals" session) cannot be deleted by the
@@ -106,10 +103,30 @@ extension Tab {
         return panes.first { $0.id == id }
     }
 
-    /// Sidebar-dot acknowledgment: mirrors the active pane's flag, since
-    /// `tab.status` already mirrors the active pane's status.
+    /// Aggregate status shown in the sidebar dot. Derived from live
+    /// Claude panes so the sidebar can't drift from the toolbar pill
+    /// (which reads `Pane.status` directly). The app maintains "at most
+    /// one Claude pane per tab", so in practice this reduces to that
+    /// pane's status — the aggregation is written defensively for
+    /// transient multi-pane states during creation/teardown.
+    var status: TabStatus {
+        let live = panes.filter { $0.kind == .claude && $0.isAlive }
+        if live.contains(where: { $0.status == .thinking }) { return .thinking }
+        if live.contains(where: { $0.status == .waiting })  { return .waiting }
+        return .idle
+    }
+
+    /// Sidebar-dot pulse suppression: true iff every waiting Claude
+    /// pane on the tab has been acknowledged by the user. Returns
+    /// false when no Claude pane is waiting — the sidebar only reads
+    /// this field while `status == .waiting`, so the value is only
+    /// meaningful in that case.
     var waitingAcknowledged: Bool {
-        activePane?.waitingAcknowledged ?? false
+        let waiting = panes.filter {
+            $0.kind == .claude && $0.isAlive && $0.status == .waiting
+        }
+        guard !waiting.isEmpty else { return false }
+        return waiting.allSatisfy { $0.waitingAcknowledged }
     }
 }
 

@@ -753,54 +753,6 @@ final class NiceUITests: XCTestCase {
         )
     }
 
-    // MARK: - Promotion
-
-    /// After Claude exits, a promoteTab message over the control socket
-    /// flips the tab back to Claude-mode (claudeIcon reappears).
-    func testSocketPromoteFlow() throws {
-        let socketPath = Self.testSocketPath
-        try? FileManager.default.removeItem(atPath: socketPath)
-        let app = launchApp(extraEnv: [
-            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
-            "NICE_SOCKET_PATH": socketPath
-        ])
-        XCTAssertTrue(
-            app.descendants(matching: .any)["sidebar.terminals"]
-                .waitForExistence(timeout: 5)
-        )
-
-        let rowId = try createTabViaSocket(in: app, socketPath: socketPath)
-        let tid = tabId(from: rowId)
-
-        let tabRow = iconElement(in: app, identifier: rowId)
-        tabRow.click()
-
-        let claudeIcon = iconElement(in: app, identifier: "sidebar.tab.\(tid).claudeIcon")
-        XCTAssertTrue(
-            claudeIcon.waitForExistence(timeout: 5),
-            "precondition: claudeIcon visible before exit"
-        )
-
-        let window = app.windows.firstMatch
-        XCTAssertTrue(window.waitForExistence(timeout: 5))
-        window.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.5)).click()
-        app.typeKey("d", modifierFlags: .control)
-
-        let terminalIcon = iconElement(in: app, identifier: "sidebar.tab.\(tid).terminalIcon")
-        XCTAssertTrue(
-            terminalIcon.waitForExistence(timeout: 10),
-            "precondition: terminalIcon visible after fake-claude exits"
-        )
-
-        let promoteJson = #"{"action":"promoteTab","tabId":"\#(tid)","args":[]}"#
-        try sendSocketLine(promoteJson, to: socketPath)
-
-        XCTAssertTrue(
-            claudeIcon.waitForExistence(timeout: 10),
-            "claudeIcon should reappear after promoteTab over socket"
-        )
-    }
-
     // MARK: - Regression guard
 
     /// Exercise a handful of actions (add, switch, close) and assert no
@@ -900,12 +852,13 @@ final class NiceUITests: XCTestCase {
 
     // MARK: - Typing `claude` in a pane (regression tests)
     //
-    // These exercise the full zsh-shadow → control-socket → AppState path
-    // that broke after the refactor. A pre-fix run crashed the app when
-    // the Terminals tab's pane injected `NICE_TAB_ID` and the shadow
-    // chose the `promoteTab` branch; the guarded no-op + claude's
-    // inline exec caused a runaway socket-event storm that tripped a
-    // Swift 6 concurrency assertion. These tests would have caught it.
+    // These exercise the full zsh-shadow → control-socket → AppState
+    // path. Every interactive `claude` invocation — in the built-in
+    // Terminals tab or in a companion terminal inside an existing
+    // Claude tab — must post a `newtab` message and produce a fresh
+    // sidebar session. The invariant "at most one Claude pane per tab"
+    // depends on the companion path going this way too, rather than
+    // promoting the current tab.
 
     /// Focus the main terminal area of the app window. XCUITest sends
     /// keystrokes to whichever view has focus, so every typing test
@@ -920,11 +873,8 @@ final class NiceUITests: XCTestCase {
 
     /// Regression: typing `claude` in the built-in Terminals tab must
     /// fire the `newtab` control-socket path (creating a new sidebar
-    /// session), not `promoteTab`. The shadow uses `$NICE_TAB_ID` to
-    /// pick branches, so the Terminals session deliberately omits that
-    /// env var. If it's re-introduced, this test catches it: a
-    /// `sidebar.tab.*` row must appear after typing, and the app must
-    /// still be running.
+    /// session). A `sidebar.tab.*` row must appear after typing, and
+    /// the app must still be running.
     func testTypeClaudeInTerminalsFiresNewtab() throws {
         let socketPath = Self.testSocketPath
         try? FileManager.default.removeItem(atPath: socketPath)
@@ -1022,6 +972,101 @@ final class NiceUITests: XCTestCase {
         XCTAssertTrue(
             app.descendants(matching: .any)["sidebar.terminals"].exists,
             "App must survive repeated `claude` invocations"
+        )
+    }
+
+    /// Regression: the "at most one Claude pane per tab" invariant.
+    /// Typing `claude` in a companion terminal inside an existing
+    /// Claude tab must open a NEW sidebar session (via `newtab`), not
+    /// add a second Claude pane to the current tab. Before the fix,
+    /// the shadow fired `promoteTab` which flipped the terminal pane
+    /// to claude and appended a fresh terminal — leaving the original
+    /// tab with two Claude panes, the state that produced the
+    /// sidebar/toolbar status-dot drift.
+    func testTypeClaudeInCompanionFiresNewtab() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        // Create a Claude tab via the socket; the new tab becomes active
+        // and shows two pane pills (claude + companion terminal).
+        let originalRowId = try createTabViaSocket(in: app, socketPath: socketPath)
+        let originalTid = tabId(from: originalRowId)
+        iconElement(in: app, identifier: originalRowId).click()
+
+        // Wait for the original tab's two pane pills to render.
+        let twoPills = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") == 2
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [twoPills], timeout: 5), .completed,
+            "Precondition: Claude tab should have exactly two pills (claude + companion terminal)."
+        )
+
+        // Click the companion terminal pill to make it active, then
+        // focus the main area and type `claude`. The shadow must hit
+        // `newtab`, not the removed `promoteTab`.
+        let pillIds = panePillIds(in: app)
+        XCTAssertEqual(pillIds.count, 2)
+        let terminalPillId = pillIds.first { !$0.hasSuffix("-claude") }
+            ?? pillIds[1]
+        let terminalPill = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", "tab.pill.\(terminalPillId)"))
+            .element(boundBy: 0)
+        XCTAssertTrue(terminalPill.waitForExistence(timeout: 3))
+        terminalPill.click()
+
+        // Give zsh a moment to load .zshrc and define the `claude()`
+        // shadow function inside the companion terminal's pty.
+        Thread.sleep(forTimeInterval: 1.0)
+
+        focusMainTerminal(in: app)
+        app.typeText("claude\n")
+
+        // A second sidebar session must appear.
+        let tabQuery = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                "sidebar.tab.",
+                ".claudeIcon",
+                ".terminalIcon"
+            )
+        )
+        let appeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in tabQuery.count >= 2 }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [appeared], timeout: 10), .completed,
+            "Typing `claude` in a companion terminal must open a new sidebar session via newtab."
+        )
+
+        // Original tab must still exist and still have exactly two
+        // pane pills — no promotion, no extra Claude pane.
+        iconElement(in: app, identifier: originalRowId).click()
+        let stillTwoPills = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") == 2
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [stillTwoPills], timeout: 5), .completed,
+            "Original tab must still have exactly two pane pills — the \"one Claude pane per tab\" invariant forbids a third."
+        )
+        XCTAssertTrue(
+            iconElement(in: app, identifier: "sidebar.tab.\(originalTid).claudeIcon").exists,
+            "Original tab should still have its (single) Claude pane visible."
         )
     }
 
