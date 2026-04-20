@@ -17,8 +17,6 @@ import SwiftUI
 
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
@@ -31,39 +29,11 @@ struct SidebarView: View {
 
     private var expandedSidebar: some View {
         VStack(spacing: 0) {
-            searchBar
             TerminalsRow()
+                .padding(.top, 8)
             tabList
             footer
         }
-    }
-
-    // MARK: - Search
-
-    private var searchBar: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: fontSettings.sidebarSize(12), weight: .regular))
-                .foregroundStyle(Color.niceInk3(scheme, palette))
-            TextField("Search tabs", text: $appState.sidebarQuery)
-                .textFieldStyle(.plain)
-                .font(.system(size: fontSettings.sidebarSize(12)))
-                .foregroundStyle(Color.niceInk(scheme, palette))
-            KbdPill(text: "⌘K")
-        }
-        .padding(.horizontal, 8)
-        .frame(height: 26)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.niceBg3(scheme, palette))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Color.niceLine(scheme, palette), lineWidth: 1)
-        )
-        .padding(.top, 8)
-        .padding(.horizontal, 10)
-        .padding(.bottom, 8)
     }
 
     // MARK: - Tab list
@@ -71,7 +41,7 @@ struct SidebarView: View {
     private var tabList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(appState.filteredProjects) { project in
+                ForEach(appState.projects) { project in
                     ProjectGroup(project: project)
                 }
             }
@@ -346,27 +316,6 @@ private struct SidebarIconButton: View {
             .onTapGesture { action() }
             .help(help)
             .accessibilityIdentifier(accessibilityId ?? "")
-    }
-}
-
-// MARK: - Small shared pill
-
-private struct KbdPill: View {
-    @EnvironmentObject private var fontSettings: FontSettings
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.system(size: fontSettings.sidebarSize(10), design: .monospaced))
-            .foregroundStyle(Color.niceInk3(scheme, palette))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(
-                RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .fill(Color.niceInk(scheme, palette).opacity(0.06))
-            )
     }
 }
 

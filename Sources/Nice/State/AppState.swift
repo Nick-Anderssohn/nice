@@ -54,7 +54,6 @@ final class AppState: ObservableObject {
             }
         }
     }
-    @Published var sidebarQuery: String = ""
     /// Whether the sidebar is collapsed. Seeded from the per-window
     /// `@SceneStorage` value by the owning view so each window keeps
     /// its own state; the view writes back on changes.
@@ -749,15 +748,13 @@ final class AppState: ObservableObject {
 
     // MARK: - Keyboard navigation
 
-    /// Flat list of sidebar tab ids in displayed order, respecting
-    /// `filteredProjects`. Terminals tab is always first; project tabs
-    /// follow in project/then-tab order. Used by the keyboard shortcut
-    /// handlers to walk a deterministic visible set — when the user has
-    /// typed into the search field, navigation cycles only through the
-    /// matching tabs.
+    /// Flat list of sidebar tab ids in displayed order. Terminals tab is
+    /// always first; project tabs follow in project/then-tab order. Used
+    /// by the keyboard shortcut handlers to walk a deterministic visible
+    /// set.
     var navigableSidebarTabIds: [String] {
         var ids: [String] = [Self.terminalsTabId]
-        for project in filteredProjects {
+        for project in projects {
             ids.append(contentsOf: project.tabs.map(\.id))
         }
         return ids
@@ -930,24 +927,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    // MARK: - Filtering / lookup
-
-    /// Case-insensitive title filter over user projects (the Terminals
-    /// tab isn't part of any project and is rendered separately).
-    var filteredProjects: [Project] {
-        let q = sidebarQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return projects }
-        let needle = q.lowercased()
-        return projects.compactMap { project in
-            let matches = project.tabs.filter {
-                $0.title.lowercased().contains(needle)
-            }
-            guard !matches.isEmpty else { return nil }
-            var copy = project
-            copy.tabs = matches
-            return copy
-        }
-    }
+    // MARK: - Lookup
 
     /// Look up a tab by id, including the built-in Terminals tab.
     func tab(for id: String) -> Tab? {

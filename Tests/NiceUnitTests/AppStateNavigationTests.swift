@@ -82,24 +82,6 @@ final class AppStateNavigationTests: XCTestCase {
         XCTAssertEqual(appState.activeTabId, ids[ids.count - 2])
     }
 
-    func test_nextSidebarTab_respectsSidebarQueryFilter() {
-        seedTwoProjects(p1Titles: ["needle", "first"], p2Titles: ["second", "third"])
-        // Filter to titles containing "needle" — only the first project's
-        // first tab matches. Terminals tab is always present (search
-        // filters projects, not built-ins).
-        appState.sidebarQuery = "needle"
-
-        let ids = appState.navigableSidebarTabIds
-        XCTAssertEqual(ids.first, AppState.terminalsTabId)
-        XCTAssertEqual(ids.count, 2, "Terminals + 1 matching project tab")
-
-        appState.activeTabId = ids[0]
-        appState.selectNextSidebarTab()
-        XCTAssertEqual(appState.activeTabId, ids[1])
-        appState.selectNextSidebarTab()
-        XCTAssertEqual(appState.activeTabId, ids[0], "wraps back to Terminals")
-    }
-
     // MARK: - Pane navigation
 
     func test_nextPane_movesRightWhenNotAtEnd() {
