@@ -314,6 +314,22 @@ final class AppState: ObservableObject {
                 tab.panes[pi].markAcknowledgedIfWaiting()
             }
         }
+        ensureActivePaneSpawned(tabId: tabId)
+    }
+
+    /// Spawn the active pane's PTY if it was deferred at tab creation.
+    /// The companion terminal in Claude tabs is modelled up front but its
+    /// shell isn't started until the user first switches to it (via click,
+    /// keyboard shortcut, or auto-focus after the Claude pane exits).
+    private func ensureActivePaneSpawned(tabId: String) {
+        guard let tab = tab(for: tabId),
+              let paneId = tab.activePaneId,
+              let pane = tab.panes.first(where: { $0.id == paneId }),
+              pane.kind == .terminal,
+              let session = ptySessions[tabId],
+              session.panes[paneId] == nil
+        else { return }
+        _ = session.addTerminalPane(id: paneId, cwd: tab.cwd)
     }
 
     /// Clear the waiting-attention pulse on whichever pane is currently
@@ -373,11 +389,14 @@ final class AppState: ObservableObject {
             projects.append(newProject)
         }
         activeTabId = newId
+        // The companion terminal pane is modelled up front so its pill
+        // renders in the toolbar, but its PTY is deferred until the user
+        // first focuses it — see `ensureActivePaneSpawned`.
         _ = makeSession(
             for: newId, cwd: cwd,
             extraClaudeArgs: args,
             initialClaudePaneId: claudePaneId,
-            initialTerminalPaneId: terminalPaneId
+            initialTerminalPaneId: nil
         )
     }
 
@@ -471,6 +490,9 @@ final class AppState: ObservableObject {
         }
 
         ptySessions[tabId]?.removePane(id: paneId)
+        // If focus auto-switched onto the lazily-spawned companion
+        // terminal as a result of this exit, start its shell now.
+        ensureActivePaneSpawned(tabId: tabId)
 
         if isBuiltIn {
             // The Terminals tab lives forever. If its last pane just
