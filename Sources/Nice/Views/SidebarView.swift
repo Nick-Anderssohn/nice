@@ -223,6 +223,15 @@ private struct TabRow: View {
     /// double-click window) can't also trigger an edit — matches Finder.
     @State private var activatedAt: Date?
     @FocusState private var titleFocused: Bool
+    /// AppKit mouse-down monitor installed while editing. SwiftUI's
+    /// `@FocusState` does not deassert when an embedded `NSView`
+    /// (the terminal) steals first responder, so `onChange(of:
+    /// titleFocused)` alone can't catch click-away. The monitor
+    /// commits the draft on any click outside the field's window-
+    /// local frame — terminal, window chrome, empty sidebar, etc.
+    @State private var mouseMonitor: Any?
+    @State private var fieldFrameInWindow: NSRect = .zero
+    @State private var fieldWindowNumber: Int = 0
 
     private var isActive: Bool { tab.id == appState.activeTabId }
 
@@ -247,18 +256,47 @@ private struct TabRow: View {
         draftTitle = tab.title
         isEditing = true
         titleFocused = true
+        installMouseMonitor()
     }
 
     private func commitEdit() {
         guard isEditing else { return }
         isEditing = false
         titleFocused = false
+        removeMouseMonitor()
         appState.renameTab(id: tab.id, to: draftTitle)
+        appState.focusActiveTerminal()
     }
 
     private func cancelEdit() {
+        guard isEditing else { return }
         isEditing = false
         titleFocused = false
+        removeMouseMonitor()
+        appState.focusActiveTerminal()
+    }
+
+    private func installMouseMonitor() {
+        removeMouseMonitor()
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            guard isEditing else { return event }
+            if event.window?.windowNumber == fieldWindowNumber,
+               !fieldFrameInWindow.insetBy(dx: -2, dy: -2).contains(event.locationInWindow) {
+                // Defer so the mouse-down finishes dispatching to its
+                // destination view (e.g. the terminal grabbing focus,
+                // or a different tab row receiving its tap) before we
+                // tear down the field.
+                DispatchQueue.main.async { commitEdit() }
+            }
+            return event
+        }
+    }
+
+    private func removeMouseMonitor() {
+        if let monitor = mouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMonitor = nil
+        }
     }
 
     var body: some View {
@@ -312,7 +350,15 @@ private struct TabRow: View {
             if isActive && activatedAt == nil { activatedAt = Date() }
         }
         .onChange(of: isActive) { _, nowActive in
-            if nowActive { activatedAt = Date() } else { activatedAt = nil }
+            if nowActive {
+                activatedAt = Date()
+            } else {
+                activatedAt = nil
+                // Keyboard tab switches (⌘1…⌘9, ⌘⇧[ / ⌘⇧]) don't go
+                // through the mouse monitor, so commit the rename
+                // when the tab is deactivated while editing.
+                if isEditing { commitEdit() }
+            }
         }
     }
 
@@ -347,11 +393,16 @@ private struct TabRow: View {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(Color.niceLineStrong(scheme, palette), lineWidth: 1)
                 )
+                .background(WindowFrameReporter { frame, windowNumber in
+                    fieldFrameInWindow = frame
+                    fieldWindowNumber = windowNumber
+                })
                 .onSubmit { commitEdit() }
                 .onExitCommand { cancelEdit() }
                 .onChange(of: titleFocused) { _, focused in
                     if !focused && isEditing { commitEdit() }
                 }
+                .onDisappear { removeMouseMonitor() }
                 .accessibilityIdentifier("sidebar.tab.\(tab.id).titleField")
         } else {
             Text(tab.title)
@@ -412,4 +463,46 @@ private struct SidebarIconButton: View {
         .environmentObject(Tweaks())
         .environmentObject(FontSettings())
         .frame(width: 240, height: 680)
+}
+
+// MARK: - Window frame reporter
+
+/// Transparent `NSView` that reports its window-local frame and the
+/// enclosing window's `windowNumber` back to SwiftUI. Used by the tab
+/// rename field to know where to check for click-outside events —
+/// `NSEvent.locationInWindow` is in window coordinates, and
+/// `NSWindow.windowNumber` identifies the window across the process.
+private struct WindowFrameReporter: NSViewRepresentable {
+    var onReport: (NSRect, Int) -> Void
+
+    func makeNSView(context: Context) -> Reporter {
+        let view = Reporter()
+        view.onReport = onReport
+        return view
+    }
+
+    func updateNSView(_ nsView: Reporter, context: Context) {
+        nsView.onReport = onReport
+        nsView.report()
+    }
+
+    final class Reporter: NSView {
+        var onReport: ((NSRect, Int) -> Void)?
+
+        override func layout() {
+            super.layout()
+            report()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            report()
+        }
+
+        func report() {
+            guard let window else { return }
+            let frame = convert(bounds, to: nil)
+            onReport?(frame, window.windowNumber)
+        }
+    }
 }

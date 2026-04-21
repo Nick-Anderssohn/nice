@@ -854,6 +854,26 @@ final class AppState: ObservableObject {
         if changed { scheduleSessionSave() }
     }
 
+    /// Hand AppKit first-responder status back to the active pane's
+    /// terminal view. Call after any SwiftUI control (e.g. the sidebar
+    /// rename field) finishes editing — SwiftUI does not restore focus
+    /// to an embedded `NSView` when a TextField is torn down, so keys
+    /// fall off the responder chain until the user clicks the terminal.
+    /// The async hop lets SwiftUI finish its current update before the
+    /// responder change, matching the pattern in `TerminalHost`.
+    func focusActiveTerminal() {
+        guard let tabId = activeTabId,
+              let tab = tab(for: tabId),
+              let paneId = tab.activePaneId,
+              let session = ptySessions[tabId],
+              let view = session.panes[paneId]
+        else { return }
+        view.wantsFocusOnAttach = true
+        DispatchQueue.main.async {
+            view.window?.makeFirstResponder(view)
+        }
+    }
+
     /// User-initiated rename from the sidebar inline editor. Trims
     /// whitespace, ignores empty input, and marks the tab so subsequent
     /// `applyAutoTitle` calls skip it. Persists via `scheduleSessionSave`
