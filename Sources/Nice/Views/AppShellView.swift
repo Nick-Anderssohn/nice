@@ -100,6 +100,8 @@ private struct AppShellHost: View {
             scopeHint = "Closing this pane will force it to quit."
         case .tab:
             scopeHint = "Closing this tab will force everything in it to quit."
+        case .project:
+            scopeHint = "Closing this project will force every tab in it to quit."
         }
         let list = request.busyPanes.joined(separator: ", ")
         let running = request.busyPanes.count == 1

@@ -147,6 +147,14 @@ private struct ProjectGroup: View {
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
         .onHover { headerHover = $0 }
+        .contextMenu {
+            if !isTerminalsGroup {
+                Button("Close Project") {
+                    appState.requestCloseProject(projectId: project.id)
+                }
+                .accessibilityIdentifier("sidebar.group.\(project.id).closeProject")
+            }
+        }
     }
 }
 
