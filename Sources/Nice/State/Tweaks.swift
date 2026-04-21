@@ -43,6 +43,18 @@ public enum Palette: String, CaseIterable, Identifiable, Sendable {
         case .catppuccinMocha: "Catppuccin Mocha"
         }
     }
+
+    /// Whether this palette belongs in the chrome picker for `scheme`.
+    /// `.nice` and `.macOS` adapt to either scheme; the Catppuccin
+    /// variants are single-scheme by design (Latte is light-only, Mocha
+    /// dark-only) so they only appear in the picker that matches.
+    public func matches(scheme: SwiftUI.ColorScheme) -> Bool {
+        switch self {
+        case .nice, .macOS:    true
+        case .catppuccinLatte: scheme == .light
+        case .catppuccinMocha: scheme == .dark
+        }
+    }
 }
 
 // MARK: - Theme choice
