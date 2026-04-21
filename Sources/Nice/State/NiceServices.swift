@@ -132,28 +132,82 @@ final class NiceServices: ObservableObject {
 
     // MARK: - Temp cleanup
 
+    /// Decision for a file encountered during the `$TMPDIR` sweep.
+    /// `.ignore` — not a Nice artifact; leave it alone.
+    /// `.keep` — a Nice artifact whose owning pid is still alive.
+    /// `.remove` — leftover from a prior crashed run.
+    enum TempFileDecision: Equatable {
+        case ignore
+        case keep
+        case remove
+    }
+
     /// Remove `nice-*.sock` and `nice-zdotdir-*` leftovers from prior
-    /// runs that crashed without running `tearDown`. Files belonging to
-    /// *this* process's pid are left alone: live windows may still own
-    /// the socket, and the next step of init writes the zdotdir we
-    /// must not delete here.
+    /// runs that crashed without running `tearDown`. Files whose
+    /// embedded pid names a still-running process are left alone — in
+    /// particular, running `Nice Dev` while prod `Nice` is open must
+    /// not wipe prod's zdotdir, or prod's zsh children suddenly source
+    /// nothing and lose the user's `~/.zshrc` aliases.
     private nonisolated static func cleanupStaleTempFiles() {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
         let fm = FileManager.default
-        let pid = getpid()
-        let pidSocketPrefix = "nice-\(pid)-"
-        let pidZdotdirName = "nice-zdotdir-\(pid)"
         guard let contents = try? fm.contentsOfDirectory(
             at: tmp, includingPropertiesForKeys: nil
         ) else { return }
         for url in contents {
-            let name = url.lastPathComponent
-            let isSocket = name.hasPrefix("nice-") && name.hasSuffix(".sock")
-            let isZdotdir = name.hasPrefix("nice-zdotdir-")
-            guard isSocket || isZdotdir else { continue }
-            if isSocket, name.hasPrefix(pidSocketPrefix) { continue }
-            if isZdotdir, name == pidZdotdirName { continue }
-            try? fm.removeItem(at: url)
+            switch tempFileDecision(
+                filename: url.lastPathComponent,
+                isAlive: pidIsAlive
+            ) {
+            case .ignore, .keep:
+                continue
+            case .remove:
+                try? fm.removeItem(at: url)
+            }
         }
+    }
+
+    /// Pure classifier for a single temp-dir entry. Extracted from
+    /// `cleanupStaleTempFiles` so the ownership policy can be unit
+    /// tested without touching the filesystem or spawning siblings.
+    nonisolated static func tempFileDecision(
+        filename: String,
+        isAlive: (pid_t) -> Bool
+    ) -> TempFileDecision {
+        if let pid = parsePid(fromZdotdirName: filename) {
+            return isAlive(pid) ? .keep : .remove
+        }
+        if let pid = parsePid(fromSocketName: filename) {
+            return isAlive(pid) ? .keep : .remove
+        }
+        return .ignore
+    }
+
+    /// Extract `<pid>` from `nice-zdotdir-<pid>`. Returns nil when the
+    /// filename doesn't match the pattern or the pid isn't parseable.
+    private nonisolated static func parsePid(fromZdotdirName name: String) -> pid_t? {
+        let prefix = "nice-zdotdir-"
+        guard name.hasPrefix(prefix) else { return nil }
+        return pid_t(name.dropFirst(prefix.count))
+    }
+
+    /// Extract `<pid>` from `nice-<pid>-<suffix>.sock` (the socket
+    /// naming used by `NiceControlSocket`).
+    private nonisolated static func parsePid(fromSocketName name: String) -> pid_t? {
+        guard name.hasPrefix("nice-"), name.hasSuffix(".sock") else { return nil }
+        let body = name.dropFirst("nice-".count).dropLast(".sock".count)
+        guard let dashIdx = body.firstIndex(of: "-") else { return nil }
+        return pid_t(body[..<dashIdx])
+    }
+
+    /// `kill(pid, 0)` probes liveness without sending a signal. It
+    /// returns 0 when the signal *would* have been delivered, -1 with
+    /// `ESRCH` when the pid is gone, and -1 with `EPERM` when the
+    /// process exists but we can't signal it (different user). Treat
+    /// anything other than `ESRCH` as "alive" so we never reap another
+    /// live Nice's tempfile.
+    private nonisolated static func pidIsAlive(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno != ESRCH
     }
 }
