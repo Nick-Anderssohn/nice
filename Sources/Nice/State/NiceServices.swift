@@ -26,6 +26,7 @@ final class NiceServices: ObservableObject {
     let fontSettings: FontSettings
     let registry: WindowRegistry
     let terminalThemeCatalog: TerminalThemeCatalog
+    let releaseChecker: ReleaseChecker
 
     /// Absolute path to the `claude` binary if resolvable; nil falls
     /// back to zsh inside claude panes. Computed once at init so
@@ -51,6 +52,7 @@ final class NiceServices: ObservableObject {
         self.terminalThemeCatalog = TerminalThemeCatalog(
             supportDirectory: TerminalThemeCatalog.defaultSupportDirectory()
         )
+        self.releaseChecker = ReleaseChecker()
         // Sweep `$TMPDIR` debris from prior crashed runs *before*
         // writing this run's zdotdir — otherwise the cleanup would
         // race the freshly-written dir and delete it, causing every
@@ -80,6 +82,8 @@ final class NiceServices: ObservableObject {
             fontSettings: fontSettings
         )
 
+        releaseChecker.start()
+
         terminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
@@ -87,6 +91,7 @@ final class NiceServices: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             MainActor.assumeIsolated {
+                self.releaseChecker.stop()
                 for state in self.registry.allAppStates {
                     state.tearDown()
                 }

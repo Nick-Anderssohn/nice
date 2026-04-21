@@ -47,6 +47,11 @@ struct WindowToolbarView: View {
             // Pill strip fills the remaining width.
             InlinePaneStrip()
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Trailing: update-available nudge. Renders nothing when
+            // no update is known, so the toolbar is layout-identical
+            // to before this feature in the common case.
+            UpdateAvailablePill()
         }
         .padding(.leading, 14)
         .padding(.trailing, 20)
