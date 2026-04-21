@@ -16,9 +16,9 @@ brew install --cask Nick-Anderssohn/nice/nice
 
 You don't organize your Claude sessions. Nice does.
 
-Type `claude <args>` in any shell, from any project directory — a new tab opens in Nice, grouped under that project, running in its own long-lived pty with a plain `zsh` pane alongside.
+Type `claude <args>` in any shell, from any project directory — a new tab opens in Nice, auto-grouped under the right project, running in its own long-lived pty with a plain `zsh` pane alongside.
 
-## Themes that look like you want them to
+## The themes are lit 🔥
 
 Twelve built-in terminal themes — Catppuccin (all four), Dracula, Nord, Gruvbox, Tokyo Night, Solarized, Atom One, and more — plus five native-chrome accents (Terracotta, Ocean, Fern, Iris, Graphite). Switch live from Settings; the whole window repaints instantly. OS Theme Sync is supported.
 
