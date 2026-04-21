@@ -240,6 +240,12 @@ private struct TabRow: View {
     @State private var mouseMonitor: Any?
     @State private var fieldFrameInWindow: NSRect = .zero
     @State private var fieldWindowNumber: Int = 0
+    @State private var isDropTarget = false
+    /// Row height captured for the drop-destination midpoint split
+    /// (above midpoint → insert before target, below → insert after).
+    /// Seeded with a reasonable default so the first drop before any
+    /// layout tick still behaves sanely.
+    @State private var rowHeight: CGFloat = 24
 
     private var isActive: Bool { tab.id == appState.activeTabId }
 
@@ -252,6 +258,7 @@ private struct TabRow: View {
 
     private var backgroundColor: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
+        if isDropTarget { return Color.niceInk(scheme, palette).opacity(0.12) }
         if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
     }
@@ -335,6 +342,17 @@ private struct TabRow: View {
         )
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: TabRowHeightKey.self,
+                    value: geo.size.height
+                )
+            }
+        )
+        .onPreferenceChange(TabRowHeightKey.self) { height in
+            Task { @MainActor in rowHeight = height }
+        }
         .onHover { hover = $0 }
         .onTapGesture {
             if !isEditing {
@@ -351,6 +369,17 @@ private struct TabRow: View {
                 appState.requestCloseTab(tabId: tab.id)
             }
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
+        }
+        .draggable(tab.id)
+        .dropDestination(for: String.self) { items, location in
+            guard let draggedId = items.first, draggedId != tab.id else {
+                return false
+            }
+            let placeAfter = location.y > (rowHeight / 2)
+            appState.moveTab(draggedId, relativeTo: tab.id, placeAfter: placeAfter)
+            return true
+        } isTargeted: { hovering in
+            isDropTarget = hovering
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
@@ -431,6 +460,13 @@ private struct TabRow: View {
                 }
                 .accessibilityIdentifier("sidebar.tab.\(tab.id).title")
         }
+    }
+}
+
+private struct TabRowHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

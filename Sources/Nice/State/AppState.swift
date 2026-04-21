@@ -1256,6 +1256,29 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Reordering
+
+    /// Move `tabId` to a new slot within the same project, relative to
+    /// `targetTabId`: either just before it (`placeAfter == false`) or
+    /// just after it. No-op when the two tabs aren't in the same
+    /// project, when either id is unknown, when either id refers to the
+    /// built-in Terminals tab, or when the move wouldn't change order.
+    func moveTab(_ tabId: String, relativeTo targetTabId: String, placeAfter: Bool) {
+        guard tabId != targetTabId else { return }
+        guard let (srcProject, srcIndex) = projectTabIndex(for: tabId),
+              let (dstProject, dstIndex) = projectTabIndex(for: targetTabId),
+              srcProject == dstProject
+        else { return }
+        // `placeAfter` picks the slot just past the target; then account
+        // for the fact that removing the source first shifts everything
+        // after it down by one.
+        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
+        if srcIndex < insertIndex { insertIndex -= 1 }
+        guard insertIndex != srcIndex else { return }
+        let tab = projects[srcProject].tabs.remove(at: srcIndex)
+        projects[srcProject].tabs.insert(tab, at: insertIndex)
+    }
+
     // MARK: - Keyboard navigation
 
     /// Flat list of sidebar tab ids in displayed order. The pinned
