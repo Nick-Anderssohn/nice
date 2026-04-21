@@ -14,13 +14,18 @@
 #
 #   --prod             → `Nice` (dev.nickanderssohn.nice) into
 #                        /Applications/Nice.app, built in ./build. The
-#                        production install, used for real work. This
-#                        quits the user's running Nice and replaces the
-#                        bundle — run only when the user explicitly
-#                        asked to upgrade prod.
+#                        production install, used for real work. Leaves
+#                        any running Nice untouched — the bundle on
+#                        disk is swapped in place via staged rename,
+#                        and the running process picks up the new
+#                        version on next relaunch, so long-lived
+#                        Claude Code sessions hosted in the current
+#                        Nice survive the upgrade. Run only when the
+#                        user explicitly asked to upgrade prod.
 #
-# Idempotent: re-running upgrades in place. If the variant being
-# installed is running it is asked to quit first; user state lives in
+# Idempotent: re-running upgrades in place. Dev installs quit a
+# running `Nice Dev` first so the next launch picks up the new build;
+# prod installs never quit the running app. User state lives in
 # UserDefaults outside the bundle, so settings survive an upgrade.
 #
 # Requires: Xcode (full IDE, not just Command Line Tools), xcodegen,
@@ -140,12 +145,17 @@ xcodebuild \
 
 [[ -d "$SRC_APP" ]] || fail "build finished but $SRC_APP not found"
 
-# ── 4. quit running instance of THIS variant, if any ──────────────────
+# ── 4. quit running instance of THIS variant (dev only) ──────────────
 # Path-based match so we only target the variant being installed —
 # installing 'Nice Dev' must never quit a running prod 'Nice', and
-# vice versa.
+# vice versa. For --prod we intentionally leave the running process
+# alone: the staging+swap install below keeps the on-disk bundle
+# consistent at every moment, the running Nice keeps its already-open
+# file handles across the rename, and any live Claude Code sessions
+# hosted in that Nice survive the upgrade. The user picks up the new
+# version on their next relaunch.
 RUNNING_PATH="/Applications/$APP_NAME.app/Contents/MacOS/$APP_NAME"
-if pgrep -f "$RUNNING_PATH" >/dev/null 2>&1; then
+if [[ "$PROD" -eq 0 ]] && pgrep -f "$RUNNING_PATH" >/dev/null 2>&1; then
     log "$APP_NAME is running — asking it to quit"
     osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -159,7 +169,17 @@ if pgrep -f "$RUNNING_PATH" >/dev/null 2>&1; then
     fi
 fi
 
-# ── 5. install (with sudo only if needed) ─────────────────────────────
+# ── 5. install via staging path + atomic rename ──────────────────────
+# Install into a sibling path first, then rename old→trash and new→
+# final. Each rename is a single syscall, so the path $DEST_APP is
+# never in a half-populated state. That matters for --prod, where the
+# app we're upgrading may still be running: its open file handles
+# follow the inode across the rename, and any lazy resource loads
+# hit either the old fully-formed bundle (pre-swap) or the new
+# fully-formed bundle (post-swap) — never a torn one. Also guards
+# against a demo/launch that happens during the ~μs window between
+# the two renames; worst case is a single launch failing, not a
+# running app faulting.
 SUDO=""
 if [[ ! -w "$DEST" ]]; then
     SUDO="sudo"
@@ -167,16 +187,31 @@ if [[ ! -w "$DEST" ]]; then
 fi
 
 DEST_APP="$DEST/$APP_NAME.app"
-if [[ -e "$DEST_APP" ]]; then
-    log "removing existing $DEST_APP"
-    $SUDO rm -rf "$DEST_APP"
-fi
+STAGING_APP="$DEST/.$APP_NAME.new.$$"
+TRASH_APP="$DEST/.$APP_NAME.old.$$"
 
-log "copying $APP_NAME.app → $DEST_APP"
-$SUDO ditto "$SRC_APP" "$DEST_APP"
+# Clean up any leftovers from a crashed previous install.
+$SUDO rm -rf "$STAGING_APP" "$TRASH_APP"
+
+log "staging $APP_NAME.app → $STAGING_APP"
+$SUDO ditto "$SRC_APP" "$STAGING_APP"
+
+if [[ -e "$DEST_APP" ]]; then
+    log "swapping bundle at $DEST_APP"
+    $SUDO mv "$DEST_APP" "$TRASH_APP"
+    $SUDO mv "$STAGING_APP" "$DEST_APP"
+    $SUDO rm -rf "$TRASH_APP"
+else
+    log "installing bundle at $DEST_APP"
+    $SUDO mv "$STAGING_APP" "$DEST_APP"
+fi
 
 # ── 6. report ─────────────────────────────────────────────────────────
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
     "$DEST_APP/Contents/Info.plist" 2>/dev/null || echo "?")
 log "installed $APP_NAME $VERSION at $DEST_APP"
-log "launch with:  open -a \"$APP_NAME\""
+if [[ "$PROD" -eq 1 ]] && pgrep -f "$RUNNING_PATH" >/dev/null 2>&1; then
+    log "$APP_NAME is still running — quit and relaunch to pick up $VERSION"
+else
+    log "launch with:  open -a \"$APP_NAME\""
+fi
