@@ -1491,4 +1491,83 @@ final class NiceUITests: XCTestCase {
             "⌘T should add exactly one pill to the focused window (got \(uniquePillIds()))"
         )
     }
+
+    // MARK: - Inline tab rename
+
+    /// Tapping the active tab's title swaps the row's `Text` for a
+    /// `TextField` (`sidebar.tab.<id>.titleField`). Typing a new name
+    /// and pressing Return commits the rename and restores the `Text`
+    /// branch with the updated label. Guards against regressions where
+    /// the edit-mode swap fails (which is what hid today behind "I
+    /// couldn't tell I was in edit mode" — the field not appearing at
+    /// all looks identical to the field appearing unstyled).
+    func testTapActiveTabTitleEntersEditModeAndCommits() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        let rowId = try createTabViaSocket(in: app, socketPath: socketPath)
+        let tid = tabId(from: rowId)
+        let fieldId = "sidebar.tab.\(tid).titleField"
+
+        // The freshly-created tab is already active. Clicking the row
+        // centroid hits the title Text's inner `.onTapGesture`, which
+        // only triggers edit mode on the active tab. If the SwiftUI
+        // gesture priority regressed (parent row's selectTab gesture
+        // swallowing the tap), the field below never appears and the
+        // test fails — guarding the exact path that hid today behind
+        // "I couldn't tell I was in edit mode."
+        let row = iconElement(in: app, identifier: rowId)
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.click()
+
+        let fieldElement = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", fieldId))
+            .element(boundBy: 0)
+        let fieldAppeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in fieldElement.exists }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [fieldAppeared], timeout: 5), .completed,
+            "Clicking the active tab's title must swap in `.titleField`."
+        )
+
+        // Replace the title and commit with Return. `typeText` targets
+        // the focused field directly — the TextField grabs focus on
+        // appearance via `$titleFocused = true`.
+        let newName = "Renamed by UI test"
+        app.typeKey("a", modifierFlags: .command)
+        app.typeText(newName)
+        app.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+
+        let fieldDismissed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in !fieldElement.exists }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [fieldDismissed], timeout: 3), .completed,
+            "Pressing Return must commit the rename and dismiss the field."
+        )
+
+        // The renamed title now renders as a static text under the
+        // sidebar row. Any staticTexts query matching the new name is a
+        // reliable signal the `renameTab` / `Text` swap-back landed.
+        let renamedText = app.staticTexts[newName]
+        let titleUpdated = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in renamedText.exists }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [titleUpdated], timeout: 5), .completed,
+            "Sidebar row should display the renamed title after commit."
+        )
+    }
 }

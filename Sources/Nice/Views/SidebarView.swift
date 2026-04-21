@@ -215,6 +215,9 @@ private struct TabRow: View {
 
     let tab: Tab
     @State private var hover = false
+    @State private var isEditing = false
+    @State private var draftTitle = ""
+    @FocusState private var titleFocused: Bool
 
     private var isActive: Bool { tab.id == appState.activeTabId }
 
@@ -222,6 +225,28 @@ private struct TabRow: View {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
         if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
+    }
+
+    private var titleFont: Font {
+        .system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .regular)
+    }
+
+    private func beginEditing() {
+        draftTitle = tab.title
+        isEditing = true
+        titleFocused = true
+    }
+
+    private func commitEdit() {
+        guard isEditing else { return }
+        isEditing = false
+        titleFocused = false
+        appState.renameTab(id: tab.id, to: draftTitle)
+    }
+
+    private func cancelEdit() {
+        isEditing = false
+        titleFocused = false
     }
 
     var body: some View {
@@ -241,12 +266,7 @@ private struct TabRow: View {
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).terminalIcon")
             }
-            Text(tab.title)
-                .font(.system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .regular))
-                .foregroundStyle(isActive ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            titleView
         }
         .padding(.leading, 22)
         .padding(.trailing, 10)
@@ -259,9 +279,16 @@ private struct TabRow: View {
         .contentShape(Rectangle())
         .onHover { hover = $0 }
         .onTapGesture {
-            appState.selectTab(tab.id)
+            if !isEditing {
+                appState.selectTab(tab.id)
+            }
         }
         .contextMenu {
+            Button("Rename Tab") {
+                appState.selectTab(tab.id)
+                beginEditing()
+            }
+            .accessibilityIdentifier("sidebar.tab.\(tab.id).renameTab")
             Button("Close Tab") {
                 appState.requestCloseTab(tabId: tab.id)
             }
@@ -280,6 +307,53 @@ private struct TabRow: View {
             return "sidebar.terminals"
         }
         return "sidebar.tab.\(tab.id)"
+    }
+
+    @ViewBuilder
+    private var titleView: some View {
+        if isEditing {
+            TextField("", text: $draftTitle)
+                .textFieldStyle(.plain)
+                .font(titleFont)
+                .foregroundStyle(Color.niceInk(scheme, palette))
+                .focused($titleFocused)
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.niceBg3(scheme, palette))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.niceLineStrong(scheme, palette), lineWidth: 1)
+                )
+                .onSubmit { commitEdit() }
+                .onExitCommand { cancelEdit() }
+                .onChange(of: titleFocused) { _, focused in
+                    if !focused && isEditing { commitEdit() }
+                }
+                .accessibilityIdentifier("sidebar.tab.\(tab.id).titleField")
+        } else {
+            Text(tab.title)
+                .font(titleFont)
+                .foregroundStyle(isActive ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if isActive {
+                        beginEditing()
+                    } else {
+                        appState.selectTab(tab.id)
+                    }
+                }
+                .accessibilityIdentifier("sidebar.tab.\(tab.id).title")
+        }
     }
 }
 

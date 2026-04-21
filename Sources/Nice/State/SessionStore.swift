@@ -37,6 +37,30 @@ struct PersistedTab: Codable, Hashable, Sendable {
     let claudeSessionId: String?
     let activePaneId: String?
     let panes: [PersistedPane]
+    /// Whether the user renamed this tab via the sidebar inline
+    /// editor. Optional so v3 session files (written before this flag
+    /// existed) still decode — callers hydrate with `?? false`.
+    let titleManuallySet: Bool?
+
+    init(
+        id: String,
+        title: String,
+        cwd: String,
+        branch: String?,
+        claudeSessionId: String?,
+        activePaneId: String?,
+        panes: [PersistedPane],
+        titleManuallySet: Bool? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.cwd = cwd
+        self.branch = branch
+        self.claudeSessionId = claudeSessionId
+        self.activePaneId = activePaneId
+        self.panes = panes
+        self.titleManuallySet = titleManuallySet
+    }
 }
 
 /// Sidebar project grouping. Preserves the name/path the user actually
