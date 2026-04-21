@@ -7,10 +7,18 @@
 # tests with the production bundle ID, which means the test process
 # reads and writes the user's real UserDefaults domain and contends for
 # the production DerivedData. This wrapper patches project.yml so only
-# the Nice target's PRODUCT_NAME / PRODUCT_BUNDLE_IDENTIFIER change, then
-# xcodegen + xcodebuild test run without CLI overrides. (CLI overrides
-# leak into the SwiftTerm package dependency and break its resource
-# bundle.) project.yml is restored on exit.
+# the Nice target's PRODUCT_BUNDLE_IDENTIFIER changes, then xcodegen +
+# xcodebuild test run without CLI overrides. (CLI overrides leak into
+# the SwiftTerm package dependency and break its resource bundle.)
+# project.yml is restored on exit.
+#
+# PRODUCT_NAME is deliberately NOT patched: changing it to "Nice Dev"
+# would rename the Swift module (PRODUCT_MODULE_NAME defaults to
+# PRODUCT_NAME.c99ExtIdentifier → "Nice_Dev") and every `@testable
+# import Nice` in the unit tests would stop resolving. The Nice Dev
+# install.sh variant renames the .app on disk to avoid the Applications
+# collision, but tests build into ./build-dev and never touch
+# /Applications, so a name collision can't happen here.
 #
 # Forwarded args: anything after the script name is passed through to
 # xcodebuild, e.g.
@@ -42,18 +50,15 @@ PROJECT_YML_BACKUP=$(mktemp -t nice-test-project-yml)
 cp "$PROJECT_YML" "$PROJECT_YML_BACKUP"
 trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP"' EXIT
 
-log "patching project.yml → Nice Dev / dev.nickanderssohn.nice-dev"
+log "patching project.yml → dev.nickanderssohn.nice-dev"
 /usr/bin/sed -i '' -E \
     "s|^( *PRODUCT_BUNDLE_IDENTIFIER: dev\.nickanderssohn\.nice)\$|\\1-dev|" \
-    "$PROJECT_YML"
-/usr/bin/sed -i '' -E \
-    "s|^( *)PRODUCT_NAME: Nice\$|\\1PRODUCT_NAME: \"Nice Dev\"|" \
     "$PROJECT_YML"
 
 log "generating Xcode project via xcodegen"
 xcodegen generate >/dev/null
 
-log "running tests against Nice Dev (dev.nickanderssohn.nice-dev)"
+log "running tests against dev.nickanderssohn.nice-dev"
 xcodebuild test \
     -project Nice.xcodeproj \
     -scheme Nice \
