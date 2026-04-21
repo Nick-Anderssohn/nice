@@ -440,7 +440,7 @@ private struct AboutPane: View {
     var body: some View {
         SettingTitle("About")
         VStack(alignment: .leading, spacing: 6) {
-            Text("Nice v0.1.0")
+            Text("Nice v\(Self.shortVersion)")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.niceInk(scheme, palette))
             Text("A terminal emulator that auto-organizes claude instances.")
@@ -449,6 +449,9 @@ private struct AboutPane: View {
         }
         .padding(.top, 2)
     }
+
+    private static let shortVersion: String =
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
 }
 
 // MARK: - Shared building blocks
