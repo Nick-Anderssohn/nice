@@ -453,12 +453,25 @@ private struct AppShellHost: View {
            let paneId = tab.activePaneId,
            let session = appState.ptySessions[tabId],
            let view = session.panes[paneId] {
-            TerminalHost(view: view, focus: true)
-                .id(paneId)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.top, 12)
-                .padding(.leading, 20)
-                .background(terminalBackgroundColor)
+            let pane = tab.panes.first(where: { $0.id == paneId })
+            ZStack {
+                TerminalHost(view: view, focus: true)
+                    .id(paneId)
+                if case .visible(let command)? = appState.paneLaunchStates[paneId] {
+                    LaunchingOverlay(
+                        title: pane?.kind == .terminal
+                            ? "Launching terminal…"
+                            : "Launching claude…",
+                        command: command
+                    )
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: appState.paneLaunchStates[paneId])
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.top, 12)
+            .padding(.leading, 20)
+            .background(terminalBackgroundColor)
         } else {
             // Transient: no pane currently hosted (e.g. every tab in
             // every project just dissolved — the app is about to

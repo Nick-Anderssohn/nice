@@ -34,6 +34,17 @@ final class TabPtySession: ObservableObject {
 
     private let onPaneExit: @MainActor (String, Int32?) -> Void
     private let onPaneTitleChange: @MainActor (String, String) -> Void
+    /// Called when a new pane is spawned. Second argument is the
+    /// display-friendly command (e.g. `claude -w foo`) that the overlay
+    /// should show if the pane stays silent past the grace window.
+    /// `nil` callback leaves the overlay wiring disabled entirely — kept
+    /// optional so tests / previews can instantiate `TabPtySession`
+    /// without bothering with the placeholder lifecycle.
+    private let onPaneLaunched: (@MainActor (String, String) -> Void)?
+    /// Called the first time the pane's child process writes any byte
+    /// to the pty. AppState uses this to clear the "Launching…" overlay
+    /// for that pane.
+    private let onPaneFirstOutput: (@MainActor (String) -> Void)?
 
     /// Cached SwiftUI `ColorScheme` so panes added after init can be
     /// themed at creation without round-tripping through `AppState`.
@@ -121,12 +132,16 @@ final class TabPtySession: ObservableObject {
         zdotdirPath: String? = nil,
         claudeSessionMode: ClaudeSessionMode = .none,
         onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
-        onPaneTitleChange: @escaping @MainActor (String, String) -> Void
+        onPaneTitleChange: @escaping @MainActor (String, String) -> Void,
+        onPaneLaunched: (@MainActor (String, String) -> Void)? = nil,
+        onPaneFirstOutput: (@MainActor (String) -> Void)? = nil
     ) {
         self.tabId = tabId
         self.cwd = cwd
         self.onPaneExit = onPaneExit
         self.onPaneTitleChange = onPaneTitleChange
+        self.onPaneLaunched = onPaneLaunched
+        self.onPaneFirstOutput = onPaneFirstOutput
         self.socketPath = socketPath
         self.zdotdirPath = zdotdirPath
         self.claudeBinary = claudeBinary
@@ -164,6 +179,7 @@ final class TabPtySession: ObservableObject {
         view.processDelegate = delegate
         panes[id] = view
         delegates[id] = delegate
+        installLaunchOverlayHooks(on: view, paneId: id, kind: .claude)
 
         let resolvedCwd = Self.expandTilde(cwd)
         let isOverride = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] != nil
@@ -241,6 +257,7 @@ final class TabPtySession: ObservableObject {
         view.processDelegate = delegate
         panes[id] = view
         delegates[id] = delegate
+        installLaunchOverlayHooks(on: view, paneId: id, kind: .terminal)
 
         var extraEnv: [String: String] = [:]
         if let sp = socketPath ?? self.socketPath {
@@ -294,6 +311,51 @@ final class TabPtySession: ObservableObject {
     func removePane(id: String) {
         panes.removeValue(forKey: id)
         delegates.removeValue(forKey: id)
+    }
+
+    /// Wire up the "Launching…" placeholder for a newly-spawned pane.
+    /// Calls `onPaneLaunched` so AppState starts the grace timer and
+    /// sets `view.onFirstData` so the overlay lifts on first pty byte.
+    /// The `.resumeDeferred` path is suppressed for claude panes because
+    /// that pane is really a quiescent shell with a pre-typed command —
+    /// no child is "launching", just waiting for the user to hit Enter.
+    private func installLaunchOverlayHooks(
+        on view: NiceTerminalView,
+        paneId: String,
+        kind: PaneKind
+    ) {
+        if kind == .claude, case .resumeDeferred = claudeSessionMode {
+            return
+        }
+        let command = launchDisplayCommand(kind: kind)
+        onPaneLaunched?(paneId, command)
+        let handler = onPaneFirstOutput
+        view.onFirstData = { [handler, paneId] in
+            handler?(paneId)
+        }
+    }
+
+    /// Produce the human-readable command string shown in the overlay.
+    /// Deliberately skips the `zsh -ilc "exec …"` wrapper and the
+    /// `--session-id <uuid>` plumbing Nice injects — the point is to
+    /// show the user what *they* asked for, not the shell arithmetic.
+    private func launchDisplayCommand(kind: PaneKind) -> String {
+        switch kind {
+        case .claude:
+            switch claudeSessionMode {
+            case .resume:
+                return "claude --resume"
+            case .none, .new, .resumeDeferred:
+                // .resumeDeferred is excluded by the caller; the case is
+                // listed so the switch stays exhaustive.
+                if extraClaudeArgs.isEmpty {
+                    return "claude"
+                }
+                return (["claude"] + extraClaudeArgs).joined(separator: " ")
+            }
+        case .terminal:
+            return "zsh"
+        }
     }
 
     /// Force the pane's child process to exit. Sends SIGHUP first

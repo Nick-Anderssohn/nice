@@ -47,6 +47,16 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// the responder chain and beeps.
     var wantsFocusOnAttach: Bool = false
 
+    /// Fires exactly once, the first time the hosted process writes any
+    /// byte to the pty. Cleared on first invocation so a later chunk
+    /// can't retrigger it. `TabPtySession` uses this to dismiss the
+    /// "Launching…" overlay — the placeholder we render while a slow
+    /// child (e.g. `claude -w foo` with heavy post-checkout git hooks)
+    /// is still silent. The callback runs on the main actor because
+    /// SwiftTerm's pty read loop hops to `DispatchQueue.main` before
+    /// invoking `dataReceived(slice:)`.
+    var onFirstData: (@MainActor () -> Void)?
+
     private static let acceptedDragTypes: [NSPasteboard.PasteboardType] = [
         .fileURL,
         .png,
@@ -122,6 +132,22 @@ final class NiceTerminalView: LocalProcessTerminalView {
         if window.makeFirstResponder(self) {
             wantsFocusOnAttach = false
         }
+    }
+
+    // MARK: - First-byte hook
+
+    /// SwiftTerm's `LocalProcessTerminalView` forwards pty bytes to the
+    /// renderer here. Call `super` first so the byte actually paints
+    /// before the overlay lifts — otherwise there's a visible flash of
+    /// empty terminal between dismiss and first-paint — then fire the
+    /// one-shot `onFirstData` callback. Nil'd immediately so a later
+    /// chunk can't retrigger; skipped entirely for empty slices (some
+    /// pty reads deliver a zero-length chunk on EOF).
+    override func dataReceived(slice: ArraySlice<UInt8>) {
+        super.dataReceived(slice: slice)
+        guard !slice.isEmpty, let callback = onFirstData else { return }
+        onFirstData = nil
+        callback()
     }
 
     // MARK: - Image drag-and-drop

@@ -36,6 +36,17 @@ struct PendingCloseRequest: Identifiable, Equatable {
     let busyPanes: [String]
 }
 
+/// Per-pane placeholder lifecycle. `pending` is set the instant a pane is
+/// spawned; if the child emits its first byte before the 0.75 s grace
+/// window elapses the entry is cleared and the overlay never appears. If
+/// the grace window elapses first the entry is promoted to `visible` and
+/// the "Launching…" overlay shows with the captured command string. On
+/// first byte (or pane exit) the entry is removed entirely.
+enum PaneLaunchStatus: Equatable {
+    case pending(command: String)
+    case visible(command: String)
+}
+
 @MainActor
 final class AppState: ObservableObject {
     /// Reserved id for the pinned Terminals project at index 0 of
@@ -97,6 +108,15 @@ final class AppState: ObservableObject {
     // MARK: - Process plumbing
 
     @Published private(set) var ptySessions: [String: TabPtySession] = [:]
+
+    /// Launch state per pane, used to overlay a "Launching…" placeholder
+    /// while a freshly-spawned child is still silent. Entries are created
+    /// by `registerPaneLaunch` at spawn time (`.pending`), flip to
+    /// `.visible` if the child stays quiet for more than 0.75 s, and are
+    /// cleared on first pty byte or pane exit. The 0.75 s grace window
+    /// exists so fast-starting processes (regular `claude`, a plain
+    /// shell) never flash the overlay — the common case is uninterrupted.
+    @Published private(set) var paneLaunchStates: [String: PaneLaunchStatus] = [:]
 
     /// In-flight "processes still running" confirmation. Set by
     /// `requestClosePane` / `requestCloseTab` when they find something
@@ -649,6 +669,41 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Launch overlay
+
+    /// Seam for the pending → visible grace window. Unit tests set this
+    /// to 0 so promotion is synchronous.
+    var launchOverlayGraceSeconds: Double = 0.75
+
+    /// Record that a pane was just spawned and start the grace timer. If
+    /// `clearPaneLaunch` is called before the timer fires (first byte
+    /// arrived, or the pane exited) the overlay never appears. If the
+    /// timer fires first the entry is promoted to `.visible` and
+    /// `AppShellView` starts rendering the "Launching…" overlay.
+    func registerPaneLaunch(paneId: String, command: String) {
+        paneLaunchStates[paneId] = .pending(command: command)
+        let grace = launchOverlayGraceSeconds
+        let promote: @MainActor () -> Void = { [weak self] in
+            guard let self,
+                  case .pending(let cmd)? = self.paneLaunchStates[paneId]
+            else { return }
+            self.paneLaunchStates[paneId] = .visible(command: cmd)
+        }
+        if grace <= 0 {
+            promote()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + grace, execute: promote)
+        }
+    }
+
+    /// Remove any pending or visible overlay for this pane. Called from
+    /// `NiceTerminalView.onFirstData` on first pty byte and from
+    /// `paneExited` so a process that dies before emitting anything
+    /// doesn't leave an orphan entry.
+    func clearPaneLaunch(paneId: String) {
+        paneLaunchStates[paneId] = nil
+    }
+
     // MARK: - Lifecycle handlers
 
     /// A pane exited. Remove it from its tab, pick a neighbor to focus,
@@ -658,6 +713,7 @@ final class AppState: ObservableObject {
     /// re-adds from the sidebar `+`. If every project is empty after
     /// the dissolve, terminate the app.
     func paneExited(tabId: String, paneId: String, exitCode: Int32?) {
+        clearPaneLaunch(paneId: paneId)
         mutateTab(id: tabId) { tab in
             guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                 return
@@ -1153,6 +1209,12 @@ final class AppState: ObservableObject {
             },
             onPaneTitleChange: { [weak self] paneId, title in
                 self?.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
+            },
+            onPaneLaunched: { [weak self] paneId, command in
+                self?.registerPaneLaunch(paneId: paneId, command: command)
+            },
+            onPaneFirstOutput: { [weak self] paneId in
+                self?.clearPaneLaunch(paneId: paneId)
             }
         )
         session.applyTerminalFontFamily(currentTerminalFontFamily)
