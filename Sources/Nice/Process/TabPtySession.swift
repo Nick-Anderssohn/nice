@@ -196,27 +196,15 @@ final class TabPtySession: ObservableObject {
                 currentDirectory: resolvedCwd
             )
         } else if let claude = claudeBinary {
-            var parts = ["exec", shellSingleQuote(claude)]
-            if !isOverride {
-                // --session-id / --resume must precede extraClaudeArgs
-                // so they aren't parsed as the trailing flag's value.
-                switch claudeSessionMode {
-                case .none:
-                    parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))
-                case .new(let id):
-                    parts.append("--session-id")
-                    parts.append(shellSingleQuote(id))
-                    parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))
-                case .resume(let id):
-                    parts.append("--resume")
-                    parts.append(shellSingleQuote(id))
-                case .resumeDeferred:
-                    break  // handled above
-                }
-            }
+            let command = Self.buildClaudeExecCommand(
+                claude: claude,
+                mode: claudeSessionMode,
+                extraClaudeArgs: extraClaudeArgs,
+                isOverride: isOverride
+            )
             view.startProcess(
                 executable: "/bin/zsh",
-                args: ["-ilc", parts.joined(separator: " ")],
+                args: ["-ilc", command],
                 environment: Self.buildEnv(extraEnv: claudeExtraEnv),
                 execName: nil,
                 currentDirectory: resolvedCwd
@@ -433,6 +421,50 @@ final class TabPtySession: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    /// Assemble the `exec <claude> ...` command line for the inner
+    /// `zsh -ilc` invocation. Pure — factored out so unit tests can
+    /// lock down the flag ordering contract without spawning a pty.
+    ///
+    /// Flag-order rule: `--session-id` / `--resume` and their UUID
+    /// arguments must precede `extraClaudeArgs` so the UUID isn't
+    /// consumed as the value of the trailing flag.
+    ///
+    /// `isOverride == true` (set when `NICE_CLAUDE_OVERRIDE` is in the
+    /// environment) suppresses every Nice-injected flag — the caller
+    /// is responsible for the full argv via their override wrapper.
+    /// `.resumeDeferred` is handled outside this helper (it spawns a
+    /// plain shell, not `exec claude`) and passing it here returns
+    /// just `exec <claude>` defensively.
+    ///
+    /// `nonisolated` because the function is pure — it touches no
+    /// instance or static state — so tests can call it from their
+    /// default nonisolated `XCTestCase.test*` methods without hopping
+    /// onto the main actor.
+    nonisolated static func buildClaudeExecCommand(
+        claude: String,
+        mode: ClaudeSessionMode,
+        extraClaudeArgs: [String],
+        isOverride: Bool
+    ) -> String {
+        var parts = ["exec", shellSingleQuote(claude)]
+        if !isOverride {
+            switch mode {
+            case .none:
+                parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))
+            case .new(let id):
+                parts.append("--session-id")
+                parts.append(shellSingleQuote(id))
+                parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))
+            case .resume(let id):
+                parts.append("--resume")
+                parts.append(shellSingleQuote(id))
+            case .resumeDeferred:
+                break
+            }
+        }
+        return parts.joined(separator: " ")
+    }
 
     static func terminalFont(named name: String?, size: CGFloat) -> NSFont {
         if let name, let font = NSFont(name: name, size: size) { return font }

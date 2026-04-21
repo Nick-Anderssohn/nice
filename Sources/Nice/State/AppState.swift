@@ -1214,7 +1214,11 @@ final class AppState: ObservableObject {
     /// (they restore with a fresh shell). Empty projects are dropped
     /// except the Terminals project, which is always persisted so
     /// its cwd survives even when every tab was closed.
-    private func snapshotPersistedWindow() -> PersistedWindow {
+    /// Internal (not private) so unit tests can assert the
+    /// serialization contract without going through disk — projects
+    /// round-trip, empty non-terminals projects are dropped, the
+    /// Terminals project is always persisted.
+    func snapshotPersistedWindow() -> PersistedWindow {
         var persistedProjects: [PersistedProject] = []
         for project in projects {
             var tabs: [PersistedTab] = []
