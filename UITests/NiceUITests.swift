@@ -212,10 +212,11 @@ final class NiceUITests: XCTestCase {
 
         let tabQuery = app.descendants(matching: .any).matching(
             NSPredicate(
-                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
                 "sidebar.tab.",
                 ".claudeIcon",
-                ".terminalIcon"
+                ".terminalIcon",
+                ".title"
             )
         )
         let appeared = XCTNSPredicateExpectation(
@@ -239,6 +240,19 @@ final class NiceUITests: XCTestCase {
             NSPredicate(format: "identifier == %@", identifier)
         )
         return query.element(boundBy: 0)
+    }
+
+    /// Click a sidebar tab row at an offset that lands on the row's
+    /// leading padding / icon, not the title label. The title has its
+    /// own tap gesture that enters rename mode when the tab is already
+    /// active (see `SidebarView.titleView`) — default `.click()` on the
+    /// row's accessibility element resolves to the title centroid and
+    /// accidentally starts an edit, swallowing any subsequent typing.
+    private func clickSidebarRow(in app: XCUIApplication, rowIdentifier: String) {
+        let row = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier == %@", rowIdentifier)
+        ).element(boundBy: 0)
+        row.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).click()
     }
 
     /// Scan the app for the first `tab.pill.*` element and return the pane
@@ -717,8 +731,7 @@ final class NiceUITests: XCTestCase {
         let rowId = try createTabViaSocket(in: app, socketPath: socketPath)
         let tid = tabId(from: rowId)
 
-        let tabRow = iconElement(in: app, identifier: rowId)
-        tabRow.click()
+        clickSidebarRow(in: app, rowIdentifier: rowId)
 
         let claudeIcon = iconElement(in: app, identifier: "sidebar.tab.\(tid).claudeIcon")
         XCTAssertTrue(
@@ -956,10 +969,11 @@ final class NiceUITests: XCTestCase {
         // row. Filter out the sub-element icon identifiers.
         let tabQuery = app.descendants(matching: .any).matching(
             NSPredicate(
-                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
                 "sidebar.tab.",
                 ".claudeIcon",
-                ".terminalIcon"
+                ".terminalIcon",
+                ".title"
             )
         )
         let appeared = XCTNSPredicateExpectation(
@@ -999,10 +1013,11 @@ final class NiceUITests: XCTestCase {
 
         let tabQuery = app.descendants(matching: .any).matching(
             NSPredicate(
-                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
                 "sidebar.tab.",
                 ".claudeIcon",
-                ".terminalIcon"
+                ".terminalIcon",
+                ".title"
             )
         )
 
@@ -1010,7 +1025,7 @@ final class NiceUITests: XCTestCase {
         for i in 1...rounds {
             // Each round needs to drop back into the Terminals tab so
             // the next `claude` invocation lands in its zsh pane.
-            app.descendants(matching: .any)["sidebar.terminals"].click()
+            clickSidebarRow(in: app, rowIdentifier: "sidebar.terminals")
             Thread.sleep(forTimeInterval: 0.3)
             focusMainTerminal(in: app)
             app.typeText("claude\n")
@@ -1093,10 +1108,11 @@ final class NiceUITests: XCTestCase {
         // A second sidebar session must appear.
         let tabQuery = app.descendants(matching: .any).matching(
             NSPredicate(
-                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
                 "sidebar.tab.",
                 ".claudeIcon",
-                ".terminalIcon"
+                ".terminalIcon",
+                ".title"
             )
         )
         let appeared = XCTNSPredicateExpectation(

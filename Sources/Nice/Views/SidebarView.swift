@@ -217,9 +217,21 @@ private struct TabRow: View {
     @State private var hover = false
     @State private var isEditing = false
     @State private var draftTitle = ""
+    /// Wall-clock time at which this row most recently became the active
+    /// tab. Used to gate click-to-rename by `NSEvent.doubleClickInterval`
+    /// so the same click that selects a tab (or arrives within the
+    /// double-click window) can't also trigger an edit — matches Finder.
+    @State private var activatedAt: Date?
     @FocusState private var titleFocused: Bool
 
     private var isActive: Bool { tab.id == appState.activeTabId }
+
+    /// True if this row was activated long enough ago for a subsequent
+    /// tap on the title to count as a deliberate rename request.
+    private var renameAllowed: Bool {
+        guard let activatedAt else { return false }
+        return Date().timeIntervalSince(activatedAt) >= NSEvent.doubleClickInterval
+    }
 
     private var backgroundColor: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
@@ -296,6 +308,12 @@ private struct TabRow: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
+        .onAppear {
+            if isActive && activatedAt == nil { activatedAt = Date() }
+        }
+        .onChange(of: isActive) { _, nowActive in
+            if nowActive { activatedAt = Date() } else { activatedAt = nil }
+        }
     }
 
     /// The Main terminal tab keeps the legacy `sidebar.terminals`
@@ -347,7 +365,7 @@ private struct TabRow: View {
                 .contentShape(Rectangle())
                 .onTapGesture {
                     if isActive {
-                        beginEditing()
+                        if renameAllowed { beginEditing() }
                     } else {
                         appState.selectTab(tab.id)
                     }
