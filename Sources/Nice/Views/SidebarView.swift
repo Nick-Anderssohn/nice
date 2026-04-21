@@ -82,6 +82,12 @@ private struct ProjectGroup: View {
     let project: Project
     @State private var isOpen: Bool = true
     @State private var headerHover: Bool = false
+    @State private var isDropTarget = false
+    /// Captured header height for the midpoint split on project drops
+    /// (above midpoint → insert before, below → insert after). Seeded
+    /// with a sensible default so the first drop before layout still
+    /// behaves sanely.
+    @State private var headerHeight: CGFloat = 24
 
     private var isTerminalsGroup: Bool {
         project.id == AppState.terminalsProjectId
@@ -145,8 +151,35 @@ private struct ProjectGroup: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isDropTarget
+                      ? Color.niceInk(scheme, palette).opacity(0.12)
+                      : .clear)
+                .padding(.horizontal, 6)
+        )
         .contentShape(Rectangle())
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: ProjectHeaderHeightKey.self,
+                    value: geo.size.height
+                )
+            }
+        )
+        .onPreferenceChange(ProjectHeaderHeightKey.self) { height in
+            Task { @MainActor in headerHeight = height }
+        }
         .onHover { headerHover = $0 }
+        .modifier(ProjectHeaderDragModifier(
+            project: project,
+            isTerminalsGroup: isTerminalsGroup,
+            headerHeight: headerHeight,
+            isDropTarget: $isDropTarget,
+            moveProject: { dragged, target, after in
+                appState.moveProject(dragged, relativeTo: target, placeAfter: after)
+            }
+        ))
         .contextMenu {
             if !isTerminalsGroup {
                 Button("Close Project") {
@@ -154,6 +187,40 @@ private struct ProjectGroup: View {
                 }
                 .accessibilityIdentifier("sidebar.group.\(project.id).closeProject")
             }
+        }
+    }
+}
+
+/// Applies `.draggable` / `.dropDestination` to a project header. Split
+/// out as a ViewModifier because the Terminals group is pinned — it
+/// must be neither draggable nor a drop target — and the only way to
+/// conditionally attach these modifiers without changing the view's
+/// underlying identity on hover state changes is through a single
+/// modifier that branches internally.
+private struct ProjectHeaderDragModifier: ViewModifier {
+    let project: Project
+    let isTerminalsGroup: Bool
+    let headerHeight: CGFloat
+    @Binding var isDropTarget: Bool
+    let moveProject: (String, String, Bool) -> Void
+
+    func body(content: Content) -> some View {
+        if isTerminalsGroup {
+            content
+        } else {
+            content
+                .draggable(SidebarDragPayload.project(project.id).encoded)
+                .dropDestination(for: String.self) { items, location in
+                    guard let first = items.first,
+                          case let .project(draggedId) = SidebarDragPayload(encoded: first),
+                          draggedId != project.id
+                    else { return false }
+                    let placeAfter = location.y > (headerHeight / 2)
+                    moveProject(draggedId, project.id, placeAfter)
+                    return true
+                } isTargeted: { hovering in
+                    isDropTarget = hovering
+                }
         }
     }
 }
@@ -370,11 +437,12 @@ private struct TabRow: View {
             }
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
         }
-        .draggable(tab.id)
+        .draggable(SidebarDragPayload.tab(tab.id).encoded)
         .dropDestination(for: String.self) { items, location in
-            guard let draggedId = items.first, draggedId != tab.id else {
-                return false
-            }
+            guard let first = items.first,
+                  case let .tab(draggedId) = SidebarDragPayload(encoded: first),
+                  draggedId != tab.id
+            else { return false }
             let placeAfter = location.y > (rowHeight / 2)
             appState.moveTab(draggedId, relativeTo: tab.id, placeAfter: placeAfter)
             return true
@@ -467,6 +535,50 @@ private struct TabRowHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private struct ProjectHeaderHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// Sidebar drag payload discriminator. Tab rows and project headers
+/// both present themselves as drop destinations, and we need each to
+/// reject the wrong kind of drop (a project header shouldn't consume
+/// a tab drag, and a tab row shouldn't consume a project drag). The
+/// `Transferable` payload is a single `String` so SwiftUI's
+/// auto-generated drag preview works; the prefix namespaces the id.
+private enum SidebarDragPayload {
+    case tab(String)
+    case project(String)
+
+    var encoded: String {
+        switch self {
+        case let .tab(id):     return "tab:\(id)"
+        case let .project(id): return "project:\(id)"
+        }
+    }
+
+    init(encoded: String) {
+        if let id = encoded.dropPrefix("tab:") {
+            self = .tab(id)
+        } else if let id = encoded.dropPrefix("project:") {
+            self = .project(id)
+        } else {
+            // Unknown payload — treat as a tab with a no-match id so
+            // the drop destinations naturally reject it.
+            self = .tab("")
+        }
+    }
+}
+
+private extension String {
+    func dropPrefix(_ prefix: String) -> String? {
+        guard hasPrefix(prefix) else { return nil }
+        return String(dropFirst(prefix.count))
     }
 }
 

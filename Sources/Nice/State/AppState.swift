@@ -1277,6 +1277,28 @@ final class AppState: ObservableObject {
         guard insertIndex != srcIndex else { return }
         let tab = projects[srcProject].tabs.remove(at: srcIndex)
         projects[srcProject].tabs.insert(tab, at: insertIndex)
+        scheduleSessionSave()
+    }
+
+    /// Move `projectId` to a new slot relative to `targetProjectId`:
+    /// either just before it (`placeAfter == false`) or just after it.
+    /// The pinned Terminals project can neither be moved nor displaced
+    /// from index 0 — both roles are no-ops, as are unknown ids, same-
+    /// id drops, and moves that wouldn't change order.
+    func moveProject(_ projectId: String, relativeTo targetProjectId: String, placeAfter: Bool) {
+        guard projectId != targetProjectId,
+              projectId != Self.terminalsProjectId,
+              targetProjectId != Self.terminalsProjectId
+        else { return }
+        guard let srcIndex = projects.firstIndex(where: { $0.id == projectId }),
+              let dstIndex = projects.firstIndex(where: { $0.id == targetProjectId })
+        else { return }
+        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
+        if srcIndex < insertIndex { insertIndex -= 1 }
+        guard insertIndex != srcIndex else { return }
+        let project = projects.remove(at: srcIndex)
+        projects.insert(project, at: insertIndex)
+        scheduleSessionSave()
     }
 
     // MARK: - Keyboard navigation
