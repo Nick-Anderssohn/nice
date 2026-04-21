@@ -100,15 +100,28 @@ final class SessionStore {
 
     init() {
         let fm = FileManager.default
-        // `create: true` already creates the directory; we still
-        // append "Nice" ourselves and create that subdir below.
-        let root = (try? fm.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )) ?? URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Application Support", isDirectory: true)
+        // Tests set `NICE_APPLICATION_SUPPORT_ROOT` to redirect session
+        // state into a sandbox directory. `FileManager.url(for:
+        // .applicationSupportDirectory, ...)` resolves the user's home
+        // via `getpwuid(getuid())` and ignores `$HOME`, so overriding
+        // HOME alone isn't enough to keep UITests from reading and
+        // mutating the user's real `~/Library/Application Support/Nice/
+        // sessions.json`. Production leaves this unset.
+        let root: URL
+        if let override = ProcessInfo.processInfo.environment["NICE_APPLICATION_SUPPORT_ROOT"],
+           !override.isEmpty {
+            root = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            // `create: true` already creates the directory; we still
+            // append "Nice" ourselves and create that subdir below.
+            root = (try? fm.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )) ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        }
         let supportDir = root.appendingPathComponent("Nice", isDirectory: true)
         try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
         self.fileURL = supportDir.appendingPathComponent("sessions.json")

@@ -15,11 +15,70 @@ import XCTest
 
 final class NiceUITests: XCTestCase {
 
+    /// Per-test fake HOME. Redirects `NSHomeDirectory()` (and everything
+    /// downstream: Main Terminal cwd, SessionStore's Application Support
+    /// root, the zsh chain-back probes in MainTerminalShellInject) away
+    /// from the real `$HOME` so the spawned app never touches protected
+    /// subdirectories like `~/Documents` / `~/Downloads` / `~/Music`.
+    /// Without this, the DerivedData test build — which has no TCC
+    /// grants of its own — triggers a fresh permission prompt on every
+    /// run when the user's real dotfiles or their plugins fan out into
+    /// those folders.
+    private var fakeHomeURL: URL?
+
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
 
+    override func tearDownWithError() throws {
+        if let url = fakeHomeURL {
+            try? FileManager.default.removeItem(at: url)
+            fakeHomeURL = nil
+        }
+    }
+
     // MARK: - Helpers
+
+    /// Lazily create a per-test temp directory and return its path. The
+    /// directory is real (so zsh can cd into it) but empty, so the
+    /// `[[ -f "$HOME/.zshrc" ]] && source ...` chain-backs in
+    /// `MainTerminalShellInject` silently skip.
+    private func fakeHomePath() -> String {
+        if let url = fakeHomeURL { return url.path }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "nice-uitest-home-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try? FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: true
+        )
+        fakeHomeURL = url
+        return url.path
+    }
+
+    /// Seed `HOME`, plus USER/LOGNAME. `app.launchEnvironment` replaces
+    /// — not merges with — the host process's env, so SwiftTerm's
+    /// `getEnvironmentVariables()` would otherwise drop USER/LOGNAME on
+    /// the floor and zsh prompt frameworks can misbehave without them.
+    private func applySandboxEnv(to app: XCUIApplication) {
+        let home = fakeHomePath()
+        app.launchEnvironment["HOME"] = home
+        // `FileManager.url(for: .applicationSupportDirectory)` bypasses
+        // `$HOME` and resolves via the user record, so `SessionStore`
+        // would still read the user's real `sessions.json` and the
+        // test-launched app would restore their live Claude sessions.
+        // Pin the Application Support root inside the fake HOME.
+        app.launchEnvironment["NICE_APPLICATION_SUPPORT_ROOT"] =
+            (home as NSString).appendingPathComponent("Library/Application Support")
+        let hostEnv = ProcessInfo.processInfo.environment
+        if let user = hostEnv["USER"] {
+            app.launchEnvironment["USER"] = user
+        }
+        if let logname = hostEnv["LOGNAME"] {
+            app.launchEnvironment["LOGNAME"] = logname
+        }
+    }
 
     @discardableResult
     private func launchApp() -> XCUIApplication {
@@ -30,6 +89,7 @@ final class NiceUITests: XCTestCase {
         // never opens the default WindowGroup window — the test then
         // sees a running app with zero children.
         app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
+        applySandboxEnv(to: app)
         app.launch()
         return app
     }
@@ -38,6 +98,7 @@ final class NiceUITests: XCTestCase {
     private func launchApp(extraEnv: [String: String]) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
+        applySandboxEnv(to: app)
         for (k, v) in extraEnv {
             app.launchEnvironment[k] = v
         }
@@ -85,6 +146,22 @@ final class NiceUITests: XCTestCase {
             throw NSError(domain: "NiceUITests", code: Int(errno),
                           userInfo: [NSLocalizedDescriptionKey: "write() failed: wrote \(written)/\(payload.count)"])
         }
+
+        // The "claude" action replies with one line ("newtab" /
+        // "inplace" / "inplace <uuid>"). Drain until the newline (or
+        // peer close) so the server's write succeeds instead of
+        // SIGPIPE-crashing the app when we close the fd. A short read
+        // timeout keeps the test from hanging if the handler drops the
+        // message. Payload-less actions close cleanly on EOF here.
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                       socklen_t(MemoryLayout<timeval>.size))
+        var buf = [UInt8](repeating: 0, count: 256)
+        while true {
+            let n = Darwin.read(fd, &buf, buf.count)
+            if n <= 0 { break }
+            if buf[..<n].contains(0x0A) { break }
+        }
     }
 
     private func firstDescendant(
@@ -116,13 +193,21 @@ final class NiceUITests: XCTestCase {
 
     /// Create a tab via the control socket and wait for it to appear in
     /// the sidebar. Returns the tab row's accessibility identifier.
+    ///
+    /// Protocol note: commit 8ec1644 unified the socket API — there is
+    /// no standalone `"newtab"` action anymore. The only inbound action
+    /// is `"claude"`, and an empty `tabId` tells the app "open a new
+    /// sidebar tab" (see `AppState.handleClaudeSocketRequest`, which
+    /// replies `newtab` and calls `createTabFromMainTerminal` whenever
+    /// `tabId` is empty).
     @discardableResult
     private func createTabViaSocket(
         in app: XCUIApplication,
         socketPath: String,
-        cwd: String = NSHomeDirectory()
+        cwd: String? = nil
     ) throws -> String {
-        let json = #"{"action":"newtab","cwd":"\#(cwd)","args":[]}"#
+        let cwd = cwd ?? fakeHomePath()
+        let json = #"{"action":"claude","cwd":"\#(cwd)","args":[],"tabId":"","paneId":""}"#
         try sendSocketLine(json, to: socketPath)
 
         let tabQuery = app.descendants(matching: .any).matching(
@@ -449,10 +534,17 @@ final class NiceUITests: XCTestCase {
         )
     }
 
-    /// Closing the last pane of the Terminals tab while other user
-    /// sessions exist surfaces the "Quit NICE?" sheet. Cancel dismisses
-    /// the sheet and the tab is reseeded with a fresh pill.
-    func testTerminalsCloseLastPaneShowsQuitAlert() throws {
+    /// Closing every pane of the Terminals tab empties that tab but must
+    /// not quit the app when other user projects are still alive. The
+    /// Terminals sidebar group's `+` button remains available so the
+    /// user can add a fresh terminal tab.
+    ///
+    /// Pre-`7c8c0aa` the last-pane exit surfaced a "Quit NICE?" sheet;
+    /// that behavior was replaced when Terminals became a multi-tab
+    /// group (tabs can always be re-added from the group `+`). This
+    /// test pins the new contract so neither the sheet nor a silent
+    /// app-terminate creeps back in.
+    func testTerminalsCloseLastPaneKeepsAppAliveWithOtherProjects() throws {
         let socketPath = Self.testSocketPath
         try? FileManager.default.removeItem(atPath: socketPath)
         let app = launchApp(extraEnv: [
@@ -463,10 +555,12 @@ final class NiceUITests: XCTestCase {
         let terminalsRow = app.descendants(matching: .any)["sidebar.terminals"]
         XCTAssertTrue(terminalsRow.waitForExistence(timeout: 5))
 
-        // Seed a user session so non-builtin tabs exist.
+        // Seed a user session so a non-Terminals project tab exists.
+        // Without this, closing Terminals' only tab would empty every
+        // project and legitimately terminate the app.
         try createTabViaSocket(in: app, socketPath: socketPath)
 
-        // Select the Terminals tab.
+        // Select the Terminals tab (the Main terminal inside it).
         terminalsRow.click()
 
         let pillReady = XCTNSPredicateExpectation(
@@ -477,87 +571,53 @@ final class NiceUITests: XCTestCase {
         )
         XCTAssertEqual(XCTWaiter.wait(for: [pillReady], timeout: 5), .completed)
 
-        // Add another pane so we can verify the multi-pane close path
-        // before exercising the last-pane exit flow below.
-        let addButton = app.buttons["tab.add"]
-        XCTAssertTrue(addButton.waitForExistence(timeout: 5))
-        addButton.click()
-
-        let twoPills = XCTNSPredicateExpectation(
-            predicate: NSPredicate(block: { _, _ in
-                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") == 2
-            }),
-            object: nil
+        // Snapshot which pills belong to the Terminals tab *now*, while
+        // it's still the active tab. Once we close them all, the active
+        // tab switches away and the toolbar repaints with the other
+        // project's pills — we'd lose the Terminals pill ids otherwise.
+        let terminalsPillIds = panePillIds(in: app)
+        XCTAssertFalse(
+            terminalsPillIds.isEmpty,
+            "Terminals tab should have at least one pane pill after selecting it"
         )
-        XCTAssertEqual(XCTWaiter.wait(for: [twoPills], timeout: 5), .completed)
 
-        // Close the first of the two pills (active pill has its close
-        // button hit-testable).
-        let ids = panePillIds(in: app)
-        XCTAssertEqual(ids.count, 2)
-        let activePill = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier == %@", "tab.pill.\(ids[1])"))
-            .element(boundBy: 0)
-        activePill.click()
+        // Close every pane in the active Terminals tab via its close
+        // button. The last close dissolves the tab entirely.
+        for id in terminalsPillIds {
+            let closeButton = app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier == %@", "tab.close.\(id)"))
+                .element(boundBy: 0)
+            XCTAssertTrue(closeButton.waitForExistence(timeout: 5))
+            closeButton.click()
+        }
 
-        let firstClose = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier == %@", "tab.close.\(ids[1])"))
-            .element(boundBy: 0)
-        XCTAssertTrue(firstClose.waitForExistence(timeout: 5))
-        firstClose.click()
-
-        let onePill = XCTNSPredicateExpectation(
-            predicate: NSPredicate(block: { _, _ in
-                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") == 1
-            }),
-            object: nil
-        )
-        XCTAssertEqual(XCTWaiter.wait(for: [onePill], timeout: 5), .completed)
-
-        // Exactly one pill left. Drive the quit path via the terminal:
-        // focus the pane and type `exit\n` — that's the same trigger
-        // path the old Main Terminal used.
-        let window = app.windows.firstMatch
-        XCTAssertTrue(window.waitForExistence(timeout: 5))
-        let focusPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.5))
-        focusPoint.click()
-        app.typeText("exit\n")
-
+        // No Quit sheet should appear — other projects still have
+        // tabs, so the app stays alive.
         let sheet = app.windows.firstMatch.sheets.firstMatch
-        let alertShown = XCTNSPredicateExpectation(
-            predicate: NSPredicate(block: { _, _ in
-                sheet.exists
-                    && sheet.buttons["Cancel"].exists
-                    && sheet.buttons["Quit"].exists
-            }),
-            object: nil
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [alertShown], timeout: 10), .completed,
-            "Expected Quit NICE? sheet with Cancel + Quit buttons when Terminals' last pane exits"
-        )
-
-        sheet.buttons["Cancel"].click()
-
-        let dismissed = XCTNSPredicateExpectation(
+        let noSheet = XCTNSPredicateExpectation(
             predicate: NSPredicate(block: { _, _ in !sheet.exists }),
             object: nil
         )
         XCTAssertEqual(
-            XCTWaiter.wait(for: [dismissed], timeout: 5), .completed,
-            "Cancel should dismiss the Quit NICE? sheet"
+            XCTWaiter.wait(for: [noSheet], timeout: 3), .completed,
+            "No Quit sheet should appear when Terminals empties while another project has tabs"
         )
 
-        // After cancel, the Terminals tab should have a fresh pill again.
-        let reseeded = XCTNSPredicateExpectation(
-            predicate: NSPredicate(block: { _, _ in
-                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") >= 1
-            }),
-            object: nil
+        // The Terminals sidebar group row stays (pinned project) with
+        // its `+` button available so the user can add another terminal
+        // tab on demand.
+        let terminalsGroupAdd = app.descendants(matching: .any)["sidebar.group.terminals.add"]
+        XCTAssertTrue(
+            terminalsGroupAdd.waitForExistence(timeout: 5),
+            "Terminals sidebar group's `+` button must remain available after its last tab dissolves"
         )
+
+        // App is still running — the XCUIApplication state should be
+        // running (not terminated). Use a quick query that would throw
+        // on a dead app.
         XCTAssertEqual(
-            XCTWaiter.wait(for: [reseeded], timeout: 10), .completed,
-            "A new tab.pill.* should appear after Cancel"
+            app.state, .runningForeground,
+            "App must stay alive; other projects still have tabs"
         )
     }
 
@@ -1091,25 +1151,42 @@ final class NiceUITests: XCTestCase {
                 .waitForExistence(timeout: 5)
         )
 
-        // Precondition: only the Terminals group's add button exists.
+        // Precondition: only the Terminals group exists at launch.
+        // Counts both the container (`sidebar.group.terminals`) and
+        // its add button (`sidebar.group.terminals.add`), which share
+        // the prefix.
+        let baselineGroupQuery = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND NOT (identifier ENDSWITH %@)",
+                "sidebar.group.",
+                ".add"
+            )
+        )
         XCTAssertEqual(
-            countElements(in: app, withIdentifierPrefix: "sidebar.group."),
-            1,
+            baselineGroupQuery.count, 1,
             "Launch state should have exactly one project group (Terminals)"
         )
         XCTAssertTrue(
-            app.descendants(matching: .any)["sidebar.group.terminals.add"].exists,
-            "Terminals add button must exist as the identifier baseline"
+            app.descendants(matching: .any)["sidebar.group.terminals"].exists,
+            "Terminals group container must exist as the identifier baseline"
         )
 
         Thread.sleep(forTimeInterval: 1.0)
         focusMainTerminal(in: app)
         app.typeText("claude\n")
 
-        // A fresh project group (non-Terminals) must appear.
+        // A fresh project group (non-Terminals) must appear — otherwise
+        // the claude tab got bucketed into Terminals despite the
+        // `addTabToProjects` exclusion filter.
+        //
+        // Non-Terminals groups hide their `+` button at opacity 0 until
+        // hover, which also removes it from the a11y tree — so the test
+        // targets the group container identifier (`sidebar.group.<id>`)
+        // rather than the `.add` child, which would only materialize
+        // under the cursor.
         let newGroupQuery = app.descendants(matching: .any).matching(
             NSPredicate(
-                format: "identifier BEGINSWITH %@ AND identifier ENDSWITH %@ AND NOT (identifier CONTAINS %@)",
+                format: "identifier BEGINSWITH %@ AND NOT (identifier ENDSWITH %@) AND NOT (identifier CONTAINS %@)",
                 "sidebar.group.",
                 ".add",
                 "terminals"
@@ -1141,9 +1218,10 @@ final class NiceUITests: XCTestCase {
             "Settings window must open before navigating panes"
         )
 
-        // The left rail lists sections as plain tappable Text rows —
-        // "Appearance" is the label in the `SettingsSectionRow`.
-        let row = app.staticTexts["Appearance"]
+        // Target the sidebar row by its stable identifier — the pane
+        // title on the right also renders "Appearance" as a plain
+        // staticText, so a raw-label lookup would be ambiguous.
+        let row = app.descendants(matching: .any)["settings.section.appearance"]
         XCTAssertTrue(row.waitForExistence(timeout: 3))
         row.click()
     }
@@ -1199,6 +1277,7 @@ final class NiceUITests: XCTestCase {
             "-theme", "niceLight",
             "-syncWithOS", "NO",
         ]
+        applySandboxEnv(to: app)
         app.launch()
 
         XCTAssertTrue(
@@ -1233,7 +1312,7 @@ final class NiceUITests: XCTestCase {
                 .waitForExistence(timeout: 5),
             "Settings window must open before navigating panes"
         )
-        let row = app.staticTexts["Terminal themes"]
+        let row = app.descendants(matching: .any)["settings.section.terminal"]
         XCTAssertTrue(row.waitForExistence(timeout: 3))
         row.click()
     }
@@ -1274,6 +1353,7 @@ final class NiceUITests: XCTestCase {
             "-terminalThemeLightId", "solarized-light",
             "-terminalThemeDarkId",  "dracula",
         ]
+        applySandboxEnv(to: app)
         app.launch()
 
         XCTAssertTrue(
@@ -1308,7 +1388,7 @@ final class NiceUITests: XCTestCase {
             app.descendants(matching: .any)["settings.root"]
                 .waitForExistence(timeout: 5)
         )
-        let row = app.staticTexts["Font"]
+        let row = app.descendants(matching: .any)["settings.section.font"]
         XCTAssertTrue(row.waitForExistence(timeout: 3))
         row.click()
     }

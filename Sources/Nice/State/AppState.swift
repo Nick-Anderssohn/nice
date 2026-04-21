@@ -47,6 +47,15 @@ final class AppState: ObservableObject {
     /// accessibility alias on this tab.
     static let mainTerminalTabId = "terminals-main"
 
+    /// Set of `windowSessionId`s already claimed by live AppStates in
+    /// this process. Populated by `restoreSavedWindow` after it picks
+    /// a slot. `restoreSavedWindow` consults this to decide whether a
+    /// miss-on-match should adopt an unclaimed saved entry (legitimate
+    /// first-launch migration) or stay fresh (⌘N opened a second
+    /// window; adopting the first window's slot would duplicate pane
+    /// ids and defeat per-window isolation).
+    private static var claimedWindowIds: Set<String> = []
+
     @Published var projects: [Project]
     /// Currently-selected tab. Defaults to the Main terminal tab on
     /// launch.
@@ -364,6 +373,10 @@ final class AppState: ObservableObject {
         ptySessions.removeAll()
         controlSocket?.stop()
         controlSocket = nil
+        // Release the session-id claim so a future window in this
+        // process isn't prevented from adopting this (now-closed)
+        // slot if the user wants to "reopen" it.
+        Self.claimedWindowIds.remove(windowSessionId)
     }
 
     // MARK: - Selection
@@ -1262,15 +1275,40 @@ final class AppState: ObservableObject {
         // empty slot usually means a prior launch crashed mid-restore;
         // adopting the bootstrap (or whichever window still has state)
         // is the right recovery.
+        //
+        // If there's no matched slot at all, it's either (a) the first
+        // launch of a build where `windowSessionId` semantics changed
+        // and the saved state predates it — adopt an unclaimed saved
+        // slot as migration, or (b) ⌘N just opened a second window on
+        // top of an already-running process — start fresh. Distinguish
+        // via the process-wide `claimedWindowIds` set: if some other
+        // live AppState already claimed every saved slot we could
+        // adopt, we're case (b).
         let matched = state.windows.first(where: { $0.id == windowSessionId })
         let adopted: PersistedWindow?
         if let m = matched, !m.projects.isEmpty {
             adopted = m
+        } else if matched != nil {
+            // Matched slot exists but is empty — likely a crashed
+            // mid-restore. Adopt the first non-empty unclaimed slot.
+            adopted = state.windows.first(where: {
+                !$0.projects.isEmpty && !Self.claimedWindowIds.contains($0.id)
+            })
         } else {
-            adopted = state.windows.first(where: { !$0.projects.isEmpty })
+            // No matched slot. Adopt an unclaimed non-empty slot on
+            // first-launch migration; stay fresh if every non-empty
+            // slot is already owned by another window in this process.
+            adopted = state.windows.first(where: {
+                !$0.projects.isEmpty && !Self.claimedWindowIds.contains($0.id)
+            })
         }
 
-        defer { ensureTerminalsProjectSeeded() }
+        defer {
+            // Claim our slot (either adopted one or our own minted id)
+            // so sibling windows spawned next know not to adopt it.
+            Self.claimedWindowIds.insert(windowSessionId)
+            ensureTerminalsProjectSeeded()
+        }
 
         guard let snapshot = adopted else { return }
 

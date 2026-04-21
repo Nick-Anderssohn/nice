@@ -104,6 +104,11 @@ private struct ProjectGroup: View {
             }
         }
         .padding(.bottom, 4)
+        // Make the whole project group addressable by UI tests even
+        // when its add button is hover-gated (non-Terminals groups
+        // hide it at opacity 0, which also strips accessibility).
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sidebar.group.\(project.id)")
     }
 
     private var header: some View {

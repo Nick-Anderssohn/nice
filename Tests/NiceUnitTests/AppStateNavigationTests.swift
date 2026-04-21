@@ -27,14 +27,18 @@ import XCTest
 final class AppStateNavigationTests: XCTestCase {
 
     private var appState: AppState!
+    private var homeSandbox: TestHomeSandbox!
 
     override func setUp() {
         super.setUp()
+        homeSandbox = TestHomeSandbox()
         appState = AppState()
     }
 
     override func tearDown() {
         appState = nil
+        homeSandbox.teardown()
+        homeSandbox = nil
         super.tearDown()
     }
 

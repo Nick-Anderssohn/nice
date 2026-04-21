@@ -27,10 +27,12 @@ import XCTest
 final class AppStateProjectBucketingTests: XCTestCase {
 
     private var appState: AppState!
+    private var homeSandbox: TestHomeSandbox!
     private let mainCwd = "/tmp/nice-test-home"
 
     override func setUp() {
         super.setUp()
+        homeSandbox = TestHomeSandbox()
         setenv("NICE_CLAUDE_OVERRIDE", "/bin/cat", 1)
         appState = AppState(
             services: nil,
@@ -43,6 +45,8 @@ final class AppStateProjectBucketingTests: XCTestCase {
     override func tearDown() {
         appState = nil
         unsetenv("NICE_CLAUDE_OVERRIDE")
+        homeSandbox.teardown()
+        homeSandbox = nil
         super.tearDown()
     }
 

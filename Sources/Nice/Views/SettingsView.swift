@@ -36,6 +36,21 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
     var label: String { rawValue }
+
+    /// Short, stable token used as the suffix of the sidebar-row
+    /// accessibility identifier (`settings.section.<slug>`). Kept
+    /// separate from `rawValue` so renaming the user-visible label
+    /// (e.g. "Terminal themes" → something else) doesn't break the
+    /// UI-test identifier hook.
+    var slug: String {
+        switch self {
+        case .appearance: return "appearance"
+        case .terminal:   return "terminal"
+        case .shortcuts:  return "shortcuts"
+        case .font:       return "font"
+        case .about:      return "about"
+        }
+    }
 }
 
 // MARK: - Root
@@ -56,6 +71,14 @@ struct SettingsView: View {
         .frame(width: 640, height: 440)
         .background(Color.nicePanel(scheme, palette))
         .environment(\.palette, palette)
+        // `.accessibilityElement(children: .contain)` groups the whole
+        // shell under one container element that carries the id, so
+        // child rows / pickers keep their own identifiers instead of
+        // inheriting `settings.root` from the parent chain. Without
+        // `.contain`, SwiftUI applies the identifier to every
+        // descendant element, which silently masks the per-row
+        // `settings.section.*` ids the tests need.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("settings.root")
     }
 
@@ -131,20 +154,31 @@ private struct SettingsSectionRow: View {
     let action: () -> Void
 
     var body: some View {
-        Text(section.label)
-            .font(.system(size: 12.5, weight: active ? .semibold : .medium))
-            .foregroundStyle(active ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(active
-                          ? Color.niceSel(scheme, accent: accent)
-                          : Color.clear)
-            )
-            .contentShape(Rectangle())
-            .onTapGesture { action() }
+        // Wrap in a Button so XCUITest sees a proper focusable button
+        // element (with the identifier reliably attached) rather than
+        // a bare Text — we'd get static-text label collisions with the
+        // pane's `SettingTitle` on the right otherwise, and identifier
+        // bindings don't always land on a plain Text reliably. The
+        // visuals are preserved via `.buttonStyle(.plain)`.
+        Button(action: action) {
+            Text(section.label)
+                .font(.system(size: 12.5, weight: active ? .semibold : .medium))
+                .foregroundStyle(active ? Color.niceInk(scheme, palette) : Color.niceInk2(scheme, palette))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(active
+                              ? Color.niceSel(scheme, accent: accent)
+                              : Color.clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("settings.section.\(section.slug)")
+        .accessibilityLabel(section.label)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 }
 
