@@ -137,7 +137,8 @@ final class SessionStore {
             root = URL(fileURLWithPath: override, isDirectory: true)
         } else {
             // `create: true` already creates the directory; we still
-            // append "Nice" ourselves and create that subdir below.
+            // append the folder name ourselves and create that subdir
+            // below.
             root = (try? fm.url(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask,
@@ -146,7 +147,11 @@ final class SessionStore {
             )) ?? URL(fileURLWithPath: NSHomeDirectory())
                 .appendingPathComponent("Library/Application Support", isDirectory: true)
         }
-        let supportDir = root.appendingPathComponent("Nice", isDirectory: true)
+        // Folder name tracks CFBundleName so the `Nice Dev` variant
+        // lands at `~/Library/Application Support/Nice Dev/` and can't
+        // clobber the user's real sessions in `…/Nice/`.
+        let folder = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Nice"
+        let supportDir = root.appendingPathComponent(folder, isDirectory: true)
         try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
         self.fileURL = supportDir.appendingPathComponent("sessions.json")
         self.cached = Self.read(from: fileURL)

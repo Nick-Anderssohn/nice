@@ -1,13 +1,19 @@
 ---
-description: Build and install Nice.app to /Applications, installing any missing build dependencies first.
+description: Build and install the Nice Dev development build to /Applications, installing any missing build dependencies first.
 ---
 
 # /nice-install
 
-Install the Nice app globally on this Mac. Verify each prerequisite first; if
-anything is missing, guide the user through installing it before running
-`scripts/install.sh`. Do not proceed to `scripts/install.sh` until every
-prerequisite is satisfied.
+Install the **`Nice Dev`** development build on this Mac. This is the safe
+default for Claude-run installs — it lands at `/Applications/Nice Dev.app`
+with its own bundle ID (`dev.nickanderssohn.nice-dev`), its own Application
+Support folder, and its own UserDefaults domain. Rebuilding or killing
+`Nice Dev` does **not** touch the user's real `/Applications/Nice.app`
+session host.
+
+Verify each prerequisite first; if anything is missing, guide the user
+through installing it before running `scripts/install.sh`. Do not proceed
+to `scripts/install.sh` until every prerequisite is satisfied.
 
 Run independent checks in parallel.
 
@@ -58,6 +64,16 @@ If the script fails, surface the last ~20 lines of output and stop (the
 chain above releases the lock automatically on failure).
 
 On success, report:
-- The installed bundle path (`/Applications/Nice.app`).
-- The version (`/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Nice.app/Contents/Info.plist`).
-- That the user can launch Nice from Spotlight, Launchpad, or `open -a Nice`.
+- The installed bundle path (`/Applications/Nice Dev.app`).
+- The version (`/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' '/Applications/Nice Dev.app/Contents/Info.plist'`).
+- That the user can launch `Nice Dev` from Spotlight, Launchpad, or
+  `open -a "Nice Dev"`.
+
+## Promoting a release: installing prod
+
+`scripts/install.sh --prod` installs the production `/Applications/Nice.app`
+instead. **Only run this when the user has explicitly asked to upgrade
+prod** (e.g. "reinstall Nice", "promote this branch", "update my working
+Nice"). It will quit the user's running prod `Nice` and replace the bundle
+with whatever the current worktree builds — destructive to live session
+state if you get it wrong. If in doubt, ask first.

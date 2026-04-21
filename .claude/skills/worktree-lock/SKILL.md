@@ -1,6 +1,6 @@
 ---
 name: worktree-lock
-description: Serialize operations that can't run concurrently across this repo's git worktrees. Use BEFORE running `scripts/install.sh` (or the /nice-install command), BEFORE running UI tests in `UITests/` (any `xcodebuild test` that drives `Nice.app`), and BEFORE any `xcodebuild` invocation that uses shared DerivedData (i.e. no `-derivedDataPath` override). Acquire a single global lock via `scripts/worktree-lock.sh acquire <op>`, run the operation, then always release with `scripts/worktree-lock.sh release`. Also use this skill when a build/install/test fails with errors that smell like a concurrent-access race (e.g. "/Applications/Nice.app is busy", Xcode module-cache corruption, XCUITest "application is not running") — those often mean another worktree is holding the resource.
+description: Serialize operations that can't run concurrently across this repo's git worktrees. Use BEFORE running `scripts/install.sh` (or the /nice-install command — dev or `--prod`), BEFORE running `scripts/test.sh` (or any `xcodebuild test` that drives a Nice app bundle), and BEFORE any `xcodebuild` invocation that uses shared DerivedData (i.e. no `-derivedDataPath` override). Acquire a single global lock via `scripts/worktree-lock.sh acquire <op>`, run the operation, then always release with `scripts/worktree-lock.sh release`. Also use this skill when a build/install/test fails with errors that smell like a concurrent-access race (e.g. "/Applications/Nice Dev.app is busy", Xcode module-cache corruption, XCUITest "application is not running") — those often mean another worktree is holding the resource.
 ---
 
 # Nice worktree lock
@@ -14,16 +14,22 @@ mutually exclusive via a single file-based lock at `~/.claude/locks/nice.lock`.
 
 **Always acquire before these operations:**
 
-1. **Global install** — `scripts/install.sh`, or the `/nice-install` command.
-   Writes `/Applications/Nice.app` and kills any running Nice process. Two
-   worktrees racing on this interleave file writes and kill each other's
-   running app.
+1. **Global install** — `scripts/install.sh` (with or without `--prod`),
+   or the `/nice-install` command. Default writes `/Applications/Nice
+   Dev.app`; `--prod` writes `/Applications/Nice.app`. Both also modify
+   `project.yml` in place during the build (restored on exit) and quit
+   any matching running app. Two worktrees racing on this — even on
+   different variants — interleave `project.yml` edits and `/Applications`
+   writes.
 
-2. **UI tests** — anything that runs `NiceUITests` (the XCUITest suite in
-   `UITests/`). These launch and drive `Nice.app` via XCUITest; two suites
-   running at once fight over the app window. Typical command:
-   `xcodebuild test -scheme Nice -destination 'platform=macOS' -only-testing:NiceUITests`.
-   Also conflicts with an in-flight install (install kills Nice mid-test).
+2. **Tests** — `scripts/test.sh` or any `xcodebuild test` that drives a
+   Nice app bundle (`NiceUITests`, `NiceUnitTests`). `test.sh` also
+   patches `project.yml` in place during the run. UITests drive
+   `Nice Dev.app` via XCUITest; two suites running at once fight over
+   the app window, and the shared `dev.nickanderssohn.nice-dev` bundle
+   ID across worktrees means macOS refuses to launch two copies.
+   Also conflicts with an in-flight install (install quits the running
+   app mid-test).
 
 3. **`xcodebuild` against shared DerivedData** — any `xcodebuild` invocation
    that does **not** pass `-derivedDataPath` to a worktree-local path. The
@@ -32,17 +38,20 @@ mutually exclusive via a single file-based lock at `~/.claude/locks/nice.lock`.
    module cache.
 
    **Note:** `scripts/install.sh` already uses `-derivedDataPath
-   "$REPO_ROOT/build"`, so the *build step* of install doesn't need the lock
-   on DerivedData grounds — but install itself is still gated on the
-   `/Applications` write, so the whole script runs under the lock.
+   "$REPO_ROOT/build"` (or `./build-dev` for the dev variant) and
+   `scripts/test.sh` uses `./build-dev`, so the *build step* of either
+   doesn't need the lock on DerivedData grounds — but they're still
+   gated on the `/Applications` write and `project.yml` patching, so
+   the whole script runs under the lock.
 
 **You do NOT need the lock for:**
 
 - `xcodegen generate` (writes inside the worktree).
 - `xcodebuild` with `-derivedDataPath` pointing into the worktree (e.g.
-  `./build`).
-- Reading source files, running unit tests that don't launch `Nice.app`,
-  editing code, etc.
+  `./build` or `./build-dev`) AND no in-place `project.yml` patch AND
+  no XCUITest run.
+- Reading source files, running unit tests that don't launch a Nice app
+  bundle, editing code, etc.
 
 ## How to use it
 
@@ -54,9 +63,9 @@ scripts/worktree-lock.sh acquire <op-name>
 scripts/worktree-lock.sh release
 ```
 
-Pick an `<op-name>` that describes what you're doing: `install`, `ui-tests`,
-`xcodebuild`. It's stored in the lock metadata so other worktrees see what
-you're up to while they wait.
+Pick an `<op-name>` that describes what you're doing: `install`,
+`install-prod`, `test`, `xcodebuild`. It's stored in the lock metadata
+so other worktrees see what you're up to while they wait.
 
 **Always chain acquire + op + release in one shell invocation**, using `&&`
 so a failed acquire aborts, plus a trap or `||` to make release fire even on
@@ -71,9 +80,9 @@ scripts/worktree-lock.sh acquire install \
 Or, more simply, with a trap:
 
 ```
-scripts/worktree-lock.sh acquire ui-tests
+scripts/worktree-lock.sh acquire test
 trap 'scripts/worktree-lock.sh release' EXIT
-xcodebuild test -scheme Nice -destination 'platform=macOS' -only-testing:NiceUITests
+scripts/test.sh
 ```
 
 If you're running the acquire + op as separate Bash tool calls, remember:
@@ -119,11 +128,14 @@ new holder is now responsibly using the lock.
 ## Why this exists
 
 Git worktrees give each feature branch its own working tree and its own
-`./build/` DerivedData directory, so parallel *code edits* and *builds* work
-fine. But anything that touches:
+`./build/` / `./build-dev/` DerivedData directory, so parallel *code
+edits* and *builds* work fine. But anything that touches:
 
-- `/Applications/Nice.app` (the installed bundle),
-- the running `Nice.app` process, or
+- `/Applications/Nice.app` or `/Applications/Nice Dev.app` (the installed
+  bundles),
+- a running `Nice` / `Nice Dev` process,
+- `project.yml` in place (install.sh and test.sh sed-patch it for the dev
+  variant and restore on exit), or
 - `~/Library/Developer/Xcode/DerivedData/` (shared default DerivedData)
 
 is inherently shared across worktrees, and two of them hitting it at once

@@ -32,7 +32,7 @@ final class TerminalThemeCatalog: ObservableObject {
         reloadImported()
     }
 
-    /// Default Application Support path: `~/Library/Application Support/Nice/terminal-themes/`.
+    /// Default Application Support path: `~/Library/Application Support/<CFBundleName>/terminal-themes/`.
     /// Creates the directory if missing. Falls back to a temporary
     /// directory if the standard path is unavailable — in that rare
     /// case imports won't persist, but the app still functions.
@@ -49,7 +49,11 @@ final class TerminalThemeCatalog: ObservableObject {
         } else {
             base = fm.temporaryDirectory
         }
-        let dir = base.appendingPathComponent("Nice/terminal-themes", isDirectory: true)
+        // Folder name tracks CFBundleName so the `Nice Dev` variant
+        // keeps its imported themes separate from the user's real
+        // `…/Nice/terminal-themes/`.
+        let folder = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Nice"
+        let dir = base.appendingPathComponent("\(folder)/terminal-themes", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

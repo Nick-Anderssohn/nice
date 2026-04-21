@@ -64,11 +64,15 @@ targets:
     info:
       path: Resources/Info.generated.plist
       properties:
-        CFBundleName: Nice
-        CFBundleDisplayName: Nice
+        # $(PRODUCT_NAME) / $(PRODUCT_BUNDLE_IDENTIFIER) let install.sh
+        # and test.sh build a separate `Nice Dev` variant by overriding
+        # those build settings on the xcodebuild command line. See
+        # scripts/install.sh for the override flow.
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleDisplayName: $(PRODUCT_NAME)
         CFBundleShortVersionString: "0.1.5"
         CFBundleVersion: "1"
-        CFBundleIdentifier: dev.nickanderssohn.nice
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
         CFBundlePackageType: APPL
         CFBundleExecutable: $(EXECUTABLE_NAME)
         CFBundleIconName: AppIcon
