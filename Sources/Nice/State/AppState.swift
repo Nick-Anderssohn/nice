@@ -413,7 +413,7 @@ final class AppState: ObservableObject {
               let session = ptySessions[tabId],
               session.panes[paneId] == nil
         else { return }
-        _ = session.addTerminalPane(id: paneId, cwd: tab.cwd)
+        _ = session.addTerminalPane(id: paneId, cwd: resolvedSpawnCwd(for: tab))
     }
 
     /// Clear the waiting-attention pulse on whichever pane is currently
@@ -449,10 +449,28 @@ final class AppState: ObservableObject {
         let sessionId = UUID().uuidString.lowercased()
         var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
         claudePane.isClaudeRunning = true
+
+        // If the user ran `claude -w <name>`, the Claude CLI creates
+        // (and runs inside) a worktree at
+        // `<cwd>/.claude/worktrees/<name>`. Keep `projectPath` pointing
+        // at the original $PWD so sidebar bucketing still lands under
+        // the parent project, and store the worktree path in `Tab.cwd`
+        // so the companion terminal follows the session in.
+        let projectPath = cwd
+        let sessionCwd: String = {
+            guard let name = Self.extractWorktreeName(from: args) else { return cwd }
+            // Claude sanitizes `/` to `+` when deriving the on-disk
+            // directory name from the `-w` value (so `foo/bar` becomes
+            // `foo+bar`). Mirror that here so the companion terminal
+            // lands in the same directory Claude actually created.
+            let sanitized = name.replacingOccurrences(of: "/", with: "+")
+            return (cwd as NSString).appendingPathComponent(".claude/worktrees/\(sanitized)")
+        }()
+
         let tab = Tab(
             id: newId,
             title: title,
-            cwd: cwd,
+            cwd: sessionCwd,
             branch: nil,
             panes: [
                 claudePane,
@@ -462,13 +480,15 @@ final class AppState: ObservableObject {
             claudeSessionId: sessionId
         )
 
-        addTabToProjects(tab, cwd: cwd)
+        addTabToProjects(tab, cwd: projectPath)
         activeTabId = newId
         // The companion terminal pane is modelled up front so its pill
         // renders in the toolbar, but its PTY is deferred until the user
         // first focuses it — see `ensureActivePaneSpawned`.
+        // Claude pane still launches from `projectPath` so `exec claude
+        // -w <name>` continues to resolve/create the worktree itself.
         _ = makeSession(
-            for: newId, cwd: cwd,
+            for: newId, cwd: projectPath,
             extraClaudeArgs: args,
             initialClaudePaneId: claudePaneId,
             initialTerminalPaneId: nil,
@@ -1474,7 +1494,10 @@ final class AppState: ObservableObject {
     /// Claude tabs (tabs with a `claudeSessionId`) return info so the
     /// caller can defer the pty spawn to `claude --resume`. Terminal-
     /// only tabs spawn their shell eagerly and return nil.
-    private func addRestoredTabModel(
+    ///
+    /// Internal (not private) so tests can assert the returned spawn
+    /// cwd falls back from a missing worktree to the project path.
+    func addRestoredTabModel(
         _ persisted: PersistedTab,
         toProjectIndex projectIndex: Int
     ) -> (tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String)? {
@@ -1497,11 +1520,17 @@ final class AppState: ObservableObject {
 
         projects[projectIndex].tabs.append(tab)
 
+        // Resolve after appending so `resolvedSpawnCwd` can see the tab's
+        // new project context. Falls back to the project path if the
+        // persisted cwd (e.g. a worktree directory) has been deleted
+        // since the last launch.
+        let spawnCwd = resolvedSpawnCwd(for: tab)
+
         if let sid = persisted.claudeSessionId {
             let claudePaneId = panes.first(where: { $0.kind == .claude })?.id
             return (
                 tabId: tab.id,
-                cwd: persisted.cwd,
+                cwd: spawnCwd,
                 claudePaneId: claudePaneId,
                 claudeSessionId: sid
             )
@@ -1510,7 +1539,7 @@ final class AppState: ObservableObject {
         // Terminal-only tab: bring its shell up now. `makeSession`
         // picks the first terminal pane from the tab's model when
         // callers don't pass ids explicitly.
-        _ = makeSession(for: tab.id, cwd: persisted.cwd)
+        _ = makeSession(for: tab.id, cwd: spawnCwd)
         return nil
     }
 
@@ -1522,6 +1551,39 @@ final class AppState: ObservableObject {
             return NSHomeDirectory() + path.dropFirst(1)
         }
         return path
+    }
+
+    /// Extract the value of `-w` / `--worktree` from Claude args. Only
+    /// the space-delimited form is recognized (matches Claude Code's
+    /// CLI). Returns nil if the flag is absent, trailing with no
+    /// value, or the value is empty.
+    static func extractWorktreeName(from args: [String]) -> String? {
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if (a == "-w" || a == "--worktree") && i + 1 < args.count {
+                let v = args[i + 1]
+                return v.isEmpty ? nil : v
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    /// Resolve the cwd to use when spawning a pane for `tab`. Prefers
+    /// `tab.cwd` (which may be a worktree path Claude Code created via
+    /// `-w`), falling back to the containing project's path if the
+    /// tab's cwd no longer exists on disk — covers the case where a
+    /// user deleted a worktree between app launches.
+    func resolvedSpawnCwd(for tab: Tab) -> String {
+        let expanded = Self.expandTilde(tab.cwd)
+        if FileManager.default.fileExists(atPath: expanded) { return expanded }
+        if let project = projects.first(where: { p in
+            p.tabs.contains(where: { $0.id == tab.id })
+        }) {
+            return Self.expandTilde(project.path)
+        }
+        return expanded
     }
 
     /// Bucket `tab` into the longest-prefix-matching project under
