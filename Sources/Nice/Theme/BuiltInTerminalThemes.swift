@@ -45,7 +45,7 @@ enum BuiltInTerminalThemes {
         background: ThemeColor(0xff, 0xfc, 0xfc),
         foreground: ThemeColor(0x17, 0x13, 0x0f),
         cursor: nil,
-        selection: nil,
+        selection: ThemeColor(0xe8, 0xdf, 0xd6),
         ansi: [
             ThemeColor(0x17, 0x13, 0x0f), // 0  black = niceInk
             ThemeColor(0xb7, 0x40, 0x20), // 1  red
@@ -77,7 +77,7 @@ enum BuiltInTerminalThemes {
         background: ThemeColor(0x09, 0x07, 0x05),
         foreground: ThemeColor(0xf4, 0xf0, 0xef),
         cursor: nil,
-        selection: nil,
+        selection: ThemeColor(0x3a, 0x34, 0x30),
         ansi: [
             ThemeColor(0x09, 0x07, 0x05), // 0  black = niceBg3
             ThemeColor(0xc2, 0x36, 0x21), // 1  red

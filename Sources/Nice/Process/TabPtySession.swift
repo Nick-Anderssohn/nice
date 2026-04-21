@@ -370,9 +370,9 @@ final class TabPtySession: ObservableObject {
     }
 
     /// Repaint every live pane with `theme`. Each theme is self-
-    /// contained: bg / fg / ANSI come straight from `theme`, and
-    /// the caret uses `theme.cursor` when set or falls back to the
-    /// current accent otherwise.
+    /// contained: bg / fg / ANSI / selection come straight from
+    /// `theme`, and the caret uses `theme.cursor` when set or falls
+    /// back to the current accent otherwise.
     func applyTerminalTheme(_ theme: TerminalTheme) {
         currentTerminalTheme = theme
         for view in panes.values {
@@ -388,6 +388,8 @@ final class TabPtySession: ObservableObject {
         view.nativeForegroundColor = theme.foreground.nsColor
         view.installColors(theme.ansi.map(\.swiftTermColor))
         view.caretColor = theme.cursor?.nsColor ?? currentAccent
+        view.selectedTextBackgroundColor = theme.selection?.nsColor
+            ?? NSColor.selectedTextBackgroundColor
     }
 
     /// Rebuild the font for every live pane with the new family,
