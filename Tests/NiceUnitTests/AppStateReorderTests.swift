@@ -180,6 +180,47 @@ final class AppStateReorderTests: XCTestCase {
         XCTAssertEqual(projectIds(), [AppState.terminalsProjectId, "p2", "p1"])
     }
 
+    // MARK: - wouldMoveTab / wouldMoveProject (drop-indicator predicates)
+
+    func test_wouldMoveTab_realMove_isTrue() {
+        seedTwoProjects()
+        XCTAssertTrue(appState.wouldMoveTab("p1t2", relativeTo: "p1t0", placeAfter: false))
+    }
+
+    func test_wouldMoveTab_sameId_isFalse() {
+        seedTwoProjects()
+        XCTAssertFalse(appState.wouldMoveTab("p1t0", relativeTo: "p1t0", placeAfter: false))
+    }
+
+    func test_wouldMoveTab_adjacent_noOp_isFalse() {
+        seedTwoProjects()
+        // p1t1 sits just after p1t0 → "after p1t0" is a no-op.
+        XCTAssertFalse(appState.wouldMoveTab("p1t1", relativeTo: "p1t0", placeAfter: true))
+        // And "before p1t2" is also a no-op (same final slot).
+        XCTAssertFalse(appState.wouldMoveTab("p1t1", relativeTo: "p1t2", placeAfter: false))
+    }
+
+    func test_wouldMoveTab_crossProject_isFalse() {
+        seedTwoProjects()
+        XCTAssertFalse(appState.wouldMoveTab("p1t0", relativeTo: "p2t0", placeAfter: false))
+    }
+
+    func test_wouldMoveProject_realMove_isTrue() {
+        seedThreeRegularProjects()
+        XCTAssertTrue(appState.wouldMoveProject("p3", relativeTo: "p1", placeAfter: false))
+    }
+
+    func test_wouldMoveProject_adjacent_noOp_isFalse() {
+        seedThreeRegularProjects()
+        XCTAssertFalse(appState.wouldMoveProject("p2", relativeTo: "p1", placeAfter: true))
+    }
+
+    func test_wouldMoveProject_terminals_isFalse() {
+        seedWithTerminals()
+        XCTAssertFalse(appState.wouldMoveProject(AppState.terminalsProjectId, relativeTo: "p1", placeAfter: true))
+        XCTAssertFalse(appState.wouldMoveProject("p1", relativeTo: AppState.terminalsProjectId, placeAfter: false))
+    }
+
     // MARK: - Fixtures
 
     /// Seeds two projects, three tabs each, each tab with one terminal

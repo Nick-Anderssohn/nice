@@ -1301,6 +1301,43 @@ final class AppState: ObservableObject {
         scheduleSessionSave()
     }
 
+    /// Mirrors `moveTab` without mutating — returns true iff the drop
+    /// would actually reorder. The sidebar drop indicator uses this to
+    /// suppress the insertion line for no-op drops (e.g. hovering the
+    /// top half of a tab that already sits just after the source).
+    func wouldMoveTab(_ tabId: String, relativeTo targetTabId: String, placeAfter: Bool) -> Bool {
+        guard tabId != targetTabId,
+              let (srcProject, srcIndex) = projectTabIndex(for: tabId),
+              let (dstProject, dstIndex) = projectTabIndex(for: targetTabId),
+              srcProject == dstProject
+        else { return false }
+        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
+        if srcIndex < insertIndex { insertIndex -= 1 }
+        return insertIndex != srcIndex
+    }
+
+    /// Mirrors `moveProject` without mutating. See `wouldMoveTab`.
+    func wouldMoveProject(_ projectId: String, relativeTo targetProjectId: String, placeAfter: Bool) -> Bool {
+        guard projectId != targetProjectId,
+              projectId != Self.terminalsProjectId,
+              targetProjectId != Self.terminalsProjectId,
+              let srcIndex = projects.firstIndex(where: { $0.id == projectId }),
+              let dstIndex = projects.firstIndex(where: { $0.id == targetProjectId })
+        else { return false }
+        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
+        if srcIndex < insertIndex { insertIndex -= 1 }
+        return insertIndex != srcIndex
+    }
+
+    /// Payload of the in-flight sidebar drag, if any. Set by the
+    /// draggable row/header's `onDrag` closure; read by drop delegates
+    /// so the insertion-line indicator can tell which row is the drag
+    /// source (the SwiftUI Transferable drop API exposes location but
+    /// not the payload until the drop commits). Stale between drags is
+    /// harmless: drop delegates only run while a drag is active, and
+    /// every new drag overwrites the value.
+    var draggingSidebarPayload: String? = nil
+
     // MARK: - Keyboard navigation
 
     /// Flat list of sidebar tab ids in displayed order. The pinned

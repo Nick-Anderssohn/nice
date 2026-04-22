@@ -14,6 +14,7 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject private var appState: AppState
@@ -75,6 +76,7 @@ struct SidebarView: View {
 
 private struct ProjectGroup: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
@@ -82,7 +84,9 @@ private struct ProjectGroup: View {
     let project: Project
     @State private var isOpen: Bool = true
     @State private var headerHover: Bool = false
-    @State private var isDropTarget = false
+    /// Which edge of the header the project-reorder insertion line
+    /// is currently painted on, if any. `nil` means no indicator.
+    @State private var dropSide: SidebarDropSide?
     /// Captured header height for the midpoint split on project drops
     /// (above midpoint → insert before, below → insert after). Seeded
     /// with a sensible default so the first drop before layout still
@@ -151,14 +155,13 @@ private struct ProjectGroup: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isDropTarget
-                      ? Color.niceInk(scheme, palette).opacity(0.12)
-                      : .clear)
-                .padding(.horizontal, 6)
-        )
         .contentShape(Rectangle())
+        .overlay(alignment: .top) {
+            if dropSide == .before { insertionLine }
+        }
+        .overlay(alignment: .bottom) {
+            if dropSide == .after { insertionLine }
+        }
         .background(
             GeometryReader { geo in
                 Color.clear.preference(
@@ -174,11 +177,9 @@ private struct ProjectGroup: View {
         .modifier(ProjectHeaderDragModifier(
             project: project,
             isTerminalsGroup: isTerminalsGroup,
-            headerHeight: headerHeight,
-            isDropTarget: $isDropTarget,
-            moveProject: { dragged, target, after in
-                appState.moveProject(dragged, relativeTo: target, placeAfter: after)
-            }
+            headerHeightProvider: { headerHeight },
+            appState: appState,
+            dropSide: $dropSide
         ))
         .contextMenu {
             if !isTerminalsGroup {
@@ -189,38 +190,51 @@ private struct ProjectGroup: View {
             }
         }
     }
+
+    /// 2pt accent-colored insertion line painted at the top or bottom
+    /// edge of the project header. Matches the TabRow indicator so
+    /// project and tab reorders feel identical.
+    private var insertionLine: some View {
+        Rectangle()
+            .fill(tweaks.accent.color)
+            .frame(height: 2)
+            .padding(.horizontal, 6)
+            .offset(y: dropSide == .after ? 1 : -1)
+            .allowsHitTesting(false)
+    }
 }
 
-/// Applies `.draggable` / `.dropDestination` to a project header. Split
-/// out as a ViewModifier because the Terminals group is pinned — it
-/// must be neither draggable nor a drop target — and the only way to
-/// conditionally attach these modifiers without changing the view's
-/// underlying identity on hover state changes is through a single
-/// modifier that branches internally.
+/// Attaches `.onDrag` / `.onDrop` to a project header, skipping the
+/// pinned Terminals group entirely. A ViewModifier keeps the
+/// conditional attachment from churning view identity between the
+/// Terminals and non-Terminals branches as `isTerminalsGroup` is
+/// resolved once at construction.
 private struct ProjectHeaderDragModifier: ViewModifier {
     let project: Project
     let isTerminalsGroup: Bool
-    let headerHeight: CGFloat
-    @Binding var isDropTarget: Bool
-    let moveProject: (String, String, Bool) -> Void
+    let headerHeightProvider: () -> CGFloat
+    let appState: AppState
+    @Binding var dropSide: SidebarDropSide?
 
     func body(content: Content) -> some View {
         if isTerminalsGroup {
             content
         } else {
             content
-                .draggable(SidebarDragPayload.project(project.id).encoded)
-                .dropDestination(for: String.self) { items, location in
-                    guard let first = items.first,
-                          case let .project(draggedId) = SidebarDragPayload(encoded: first),
-                          draggedId != project.id
-                    else { return false }
-                    let placeAfter = location.y > (headerHeight / 2)
-                    moveProject(draggedId, project.id, placeAfter)
-                    return true
-                } isTargeted: { hovering in
-                    isDropTarget = hovering
+                .onDrag {
+                    let encoded = SidebarDragPayload.project(project.id).encoded
+                    appState.draggingSidebarPayload = encoded
+                    return NSItemProvider(object: encoded as NSString)
                 }
+                .onDrop(
+                    of: [.text],
+                    delegate: ProjectHeaderDropDelegate(
+                        targetProjectId: project.id,
+                        headerHeightProvider: headerHeightProvider,
+                        appState: appState,
+                        dropSide: $dropSide
+                    )
+                )
         }
     }
 }
@@ -307,7 +321,10 @@ private struct TabRow: View {
     @State private var mouseMonitor: Any?
     @State private var fieldFrameInWindow: NSRect = .zero
     @State private var fieldWindowNumber: Int = 0
-    @State private var isDropTarget = false
+    /// Which edge of this row the insertion indicator is currently
+    /// painted on, if any. `nil` means no indicator. Updated live by
+    /// `TabRowDropDelegate` as the cursor moves through this row.
+    @State private var dropSide: SidebarDropSide?
     /// Row height captured for the drop-destination midpoint split
     /// (above midpoint → insert before target, below → insert after).
     /// Seeded with a reasonable default so the first drop before any
@@ -325,13 +342,26 @@ private struct TabRow: View {
 
     private var backgroundColor: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if isDropTarget { return Color.niceInk(scheme, palette).opacity(0.12) }
         if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
     }
 
     private var titleFont: Font {
         .system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .regular)
+    }
+
+    /// 2pt accent-colored insertion line painted at the top or bottom
+    /// of the row to preview where a dragged tab will land. Inset by
+    /// 6pt horizontally so it lines up with the row's rounded
+    /// background, and offset by 1pt past the edge so adjacent rows
+    /// draw it on the same visual seam.
+    private var insertionLine: some View {
+        Rectangle()
+            .fill(tweaks.accent.color)
+            .frame(height: 2)
+            .padding(.horizontal, 6)
+            .offset(y: dropSide == .after ? 1 : -1)
+            .allowsHitTesting(false)
     }
 
     private func beginEditing() {
@@ -409,6 +439,12 @@ private struct TabRow: View {
         )
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
+        .overlay(alignment: .top) {
+            if dropSide == .before { insertionLine }
+        }
+        .overlay(alignment: .bottom) {
+            if dropSide == .after { insertionLine }
+        }
         .background(
             GeometryReader { geo in
                 Color.clear.preference(
@@ -437,18 +473,20 @@ private struct TabRow: View {
             }
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
         }
-        .draggable(SidebarDragPayload.tab(tab.id).encoded)
-        .dropDestination(for: String.self) { items, location in
-            guard let first = items.first,
-                  case let .tab(draggedId) = SidebarDragPayload(encoded: first),
-                  draggedId != tab.id
-            else { return false }
-            let placeAfter = location.y > (rowHeight / 2)
-            appState.moveTab(draggedId, relativeTo: tab.id, placeAfter: placeAfter)
-            return true
-        } isTargeted: { hovering in
-            isDropTarget = hovering
+        .onDrag {
+            let encoded = SidebarDragPayload.tab(tab.id).encoded
+            appState.draggingSidebarPayload = encoded
+            return NSItemProvider(object: encoded as NSString)
         }
+        .onDrop(
+            of: [.text],
+            delegate: TabRowDropDelegate(
+                targetTabId: tab.id,
+                rowHeightProvider: { rowHeight },
+                appState: appState,
+                dropSide: $dropSide
+            )
+        )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
         .onAppear {
@@ -579,6 +617,135 @@ private extension String {
     func dropPrefix(_ prefix: String) -> String? {
         guard hasPrefix(prefix) else { return nil }
         return String(dropFirst(prefix.count))
+    }
+}
+
+// MARK: - Drop indicator
+
+/// Which edge of a drop-target row the insertion-line indicator
+/// should paint on. `before` → above the row, `after` → below.
+private enum SidebarDropSide {
+    case before
+    case after
+}
+
+/// Drop delegate for a sidebar tab row. Reads `AppState.draggingSidebarPayload`
+/// synchronously on every `dropUpdated` so the insertion line can
+/// reflect the drop destination live; the SwiftUI Transferable API
+/// only exposes the payload once the drop commits. The line is
+/// suppressed whenever the drop would be a no-op (same tab, different
+/// project, already-adjacent slot), so the indicator only appears
+/// when a real reorder is about to happen.
+private struct TabRowDropDelegate: DropDelegate {
+    let targetTabId: String
+    let rowHeightProvider: () -> CGFloat
+    let appState: AppState
+    @Binding var dropSide: SidebarDropSide?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.text])
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateDropSide(for: info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateDropSide(for: info)
+        return DropProposal(operation: dropSide == nil ? .forbidden : .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        dropSide = nil
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        defer {
+            dropSide = nil
+            appState.draggingSidebarPayload = nil
+        }
+        guard let payload = appState.draggingSidebarPayload,
+              case let .tab(draggedId) = SidebarDragPayload(encoded: payload)
+        else { return false }
+        let placeAfter = info.location.y > (rowHeightProvider() / 2)
+        guard appState.wouldMoveTab(draggedId, relativeTo: targetTabId, placeAfter: placeAfter) else {
+            return false
+        }
+        appState.moveTab(draggedId, relativeTo: targetTabId, placeAfter: placeAfter)
+        return true
+    }
+
+    private func updateDropSide(for info: DropInfo) {
+        guard let payload = appState.draggingSidebarPayload,
+              case let .tab(draggedId) = SidebarDragPayload(encoded: payload)
+        else {
+            dropSide = nil
+            return
+        }
+        let placeAfter = info.location.y > (rowHeightProvider() / 2)
+        guard appState.wouldMoveTab(draggedId, relativeTo: targetTabId, placeAfter: placeAfter) else {
+            dropSide = nil
+            return
+        }
+        dropSide = placeAfter ? .after : .before
+    }
+}
+
+/// Drop delegate for a sidebar project header. Mirrors `TabRowDropDelegate`
+/// but routes to `moveProject` / `wouldMoveProject` so Terminals stays
+/// pinned and only real project reorders paint the indicator.
+private struct ProjectHeaderDropDelegate: DropDelegate {
+    let targetProjectId: String
+    let headerHeightProvider: () -> CGFloat
+    let appState: AppState
+    @Binding var dropSide: SidebarDropSide?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.text])
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateDropSide(for: info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateDropSide(for: info)
+        return DropProposal(operation: dropSide == nil ? .forbidden : .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        dropSide = nil
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        defer {
+            dropSide = nil
+            appState.draggingSidebarPayload = nil
+        }
+        guard let payload = appState.draggingSidebarPayload,
+              case let .project(draggedId) = SidebarDragPayload(encoded: payload)
+        else { return false }
+        let placeAfter = info.location.y > (headerHeightProvider() / 2)
+        guard appState.wouldMoveProject(draggedId, relativeTo: targetProjectId, placeAfter: placeAfter) else {
+            return false
+        }
+        appState.moveProject(draggedId, relativeTo: targetProjectId, placeAfter: placeAfter)
+        return true
+    }
+
+    private func updateDropSide(for info: DropInfo) {
+        guard let payload = appState.draggingSidebarPayload,
+              case let .project(draggedId) = SidebarDragPayload(encoded: payload)
+        else {
+            dropSide = nil
+            return
+        }
+        let placeAfter = info.location.y > (headerHeightProvider() / 2)
+        guard appState.wouldMoveProject(draggedId, relativeTo: targetProjectId, placeAfter: placeAfter) else {
+            dropSide = nil
+            return
+        }
+        dropSide = placeAfter ? .after : .before
     }
 }
 
