@@ -29,19 +29,25 @@ packages:
     #     (the last setNeedsDisplay site that slipped through the
     #     original draw() rewrite and left output stuck after a
     #     transient nil drawable until the user interacted)
+    #   - wire `Terminal.userScrolling` on every scroll path so PTY
+    #     output no longer yanks the viewport back to the bottom
+    #     while the user is scrolled up. Sticky-bottom auto-resumes
+    #     when yDisp returns to yBase; typing snaps to bottom via
+    #     the existing ensureCaretIsVisible() path.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
     # via `MacTerminalView.smoothScrollingEnabled` (Nice plumbs it
     # through `Tweaks.smoothScrolling`, default on).
-    # To pick up an upstream bump, rebase the fork branch onto the new
-    # revision and update the pin here.
+    # These patches all live on the fork's `main` branch now; no
+    # feature branches needed. To pick up an upstream bump, rebase
+    # the fork onto the new revision and update the pin here.
     #
     # While iterating on SwiftTerm itself, swap to a local path:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 36d71903d42a99cea45f736c93c11d65b027112f
+    revision: 49fb1cdb02e28d1b1f9712baf0cc7d08ff697ba6
 
 targets:
   Nice:
