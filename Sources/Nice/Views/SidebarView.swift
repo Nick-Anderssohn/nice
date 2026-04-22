@@ -96,9 +96,18 @@ private struct ProjectGroup: View {
     /// insertion line on the row's top or bottom edge.
     @State private var tabFrames: [String: CGRect] = [:]
     /// Total height of the project group in its own coordinate space.
-    /// Used for project-drop before/after midpoint split and for
-    /// painting the "after this project" line at the group's bottom.
+    /// Used for painting the "after this project" insertion line at
+    /// the group's bottom edge (below the last tab, above the next
+    /// project's header).
     @State private var groupHeight: CGFloat = 0
+    /// Height of the header row alone. Drop delegates split project
+    /// drops on the header's bottom edge — anywhere in the header →
+    /// before the project, anywhere in the tab area or trailing gap
+    /// → after the project. Using the header instead of the group's
+    /// vertical midpoint matches user expectation: hovering over any
+    /// of a project's tabs means "place after this project", not
+    /// "place before it".
+    @State private var headerHeight: CGFloat = 0
 
     private var isTerminalsGroup: Bool {
         project.id == AppState.terminalsProjectId
@@ -169,7 +178,7 @@ private struct ProjectGroup: View {
                 project: project,
                 isTerminalsGroup: isTerminalsGroup,
                 tabFramesProvider: { tabFrames },
-                groupHeightProvider: { groupHeight },
+                headerHeightProvider: { headerHeight },
                 tabOrderProvider: { project.tabs.map(\.id) },
                 appState: appState,
                 indicator: $dropIndicator
@@ -217,6 +226,17 @@ private struct ProjectGroup: View {
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: HeaderHeightKey.self,
+                    value: geo.size.height
+                )
+            }
+        )
+        .onPreferenceChange(HeaderHeightKey.self) { h in
+            Task { @MainActor in headerHeight = h }
+        }
         .onHover { headerHover = $0 }
         .modifier(ProjectHeaderDragModifier(
             project: project,
@@ -563,8 +583,9 @@ private struct TabFramesKey: PreferenceKey {
 }
 
 /// Total height of a project group's VStack in its own coordinate
-/// space. Used for project-drop midpoint and for painting the
-/// "after this project" line at the group's bottom edge.
+/// space. Used only for painting the "after this project" line at
+/// the group's bottom edge — before/after splits use the header's
+/// bottom instead, via `HeaderHeightKey`.
 private struct GroupHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -572,13 +593,23 @@ private struct GroupHeightKey: PreferenceKey {
     }
 }
 
+/// Height of a project group's header row, used as the before/after
+/// divider for project drops. Separate from `GroupHeightKey` so the
+/// delegate can classify "cursor anywhere in the tab area → place
+/// after this project" without the group's tab count skewing the
+/// split deep into the tabs.
+private struct HeaderHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 /// Sidebar drag payload discriminator. Tab rows and project headers
-/// both present themselves as drop destinations, and we need each to
-/// reject the wrong kind of drop (a project header shouldn't consume
-/// a tab drag, and a tab row shouldn't consume a project drag). The
-/// `Transferable` payload is a single `String` so SwiftUI's
-/// auto-generated drag preview works; the prefix namespaces the id.
-private enum SidebarDragPayload {
+/// both route through a single NSItemProvider-carried String, so the
+/// prefix namespaces the id. Internal (not private) so the
+/// resolver's unit tests can construct payloads directly.
+enum SidebarDragPayload: Equatable {
     case tab(String)
     case project(String)
 
@@ -602,8 +633,8 @@ private enum SidebarDragPayload {
     }
 }
 
-private extension String {
-    func dropPrefix(_ prefix: String) -> String? {
+extension String {
+    fileprivate func dropPrefix(_ prefix: String) -> String? {
         guard hasPrefix(prefix) else { return nil }
         return String(dropFirst(prefix.count))
     }
@@ -615,8 +646,9 @@ private extension String {
 /// painted. Tab cases carry the target tab id so the overlay can
 /// look up its frame; project cases resolve to the group's top and
 /// bottom edges without needing a target id. `nil` (absent from the
-/// group's state) means no indicator.
-private enum DropIndicator: Equatable {
+/// group's state) means no indicator. Internal so the drop resolver
+/// tests can assert the expected indicator for a drop outcome.
+enum DropIndicator: Equatable {
     case tabBefore(String)
     case tabAfter(String)
     case projectBefore
@@ -625,23 +657,23 @@ private enum DropIndicator: Equatable {
 
 /// Unified drop delegate for a project group. Attached to the group's
 /// VStack so the drop region covers the header, every tab row, and
-/// the 4pt trailing padding — which means a tab can be dropped
-/// "above the first tab" (cursor in the header area) or "below the
-/// last tab" (cursor in the trailing gap), and a project can be
-/// dropped anywhere in another group to land before or after it.
+/// the 4pt trailing padding — a tab can be dropped "above the first
+/// tab" (cursor in the header area) or "below the last tab" (cursor
+/// in the trailing gap), and a project can be dropped anywhere in
+/// another group to land before or after it.
 ///
-/// Tab and project payloads are routed internally by the payload
-/// prefix. Tab drops consult the per-tab frames to pick a target and
-/// before/after split; project drops use the group midpoint. All
-/// drops defer to `wouldMoveTab` / `wouldMoveProject` so the
-/// indicator is hidden (and the drop rejected) whenever the move
-/// would be a no-op — same id, adjacent slot, cross-project tab,
-/// Terminals as source or target.
+/// The drop-slot math lives in `SidebarDropResolver` so it can be
+/// unit-tested without a live drag session. This delegate only wires
+/// that pure computation to SwiftUI's DropInfo and commits the
+/// resulting mutation on the next runloop tick — committing inline
+/// during `performDrop` can leave AppKit's drag tracking stuck on the
+/// old view hierarchy, which manifests as subsequent drags not
+/// registering.
 private struct ProjectGroupDropDelegate: DropDelegate {
     let project: Project
     let isTerminalsGroup: Bool
     let tabFramesProvider: () -> [String: CGRect]
-    let groupHeightProvider: () -> CGFloat
+    let headerHeightProvider: () -> CGFloat
     let tabOrderProvider: () -> [String]
     let appState: AppState
     @Binding var indicator: DropIndicator?
@@ -664,76 +696,152 @@ private struct ProjectGroupDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        defer {
+        guard let resolved = resolve(for: info) else {
             indicator = nil
             appState.draggingSidebarPayload = nil
+            return false
         }
-        guard let payloadString = appState.draggingSidebarPayload else { return false }
-        switch SidebarDragPayload(encoded: payloadString) {
-        case let .tab(draggedId):
-            guard let (targetId, placeAfter) = tabTarget(at: info.location) else { return false }
-            guard appState.wouldMoveTab(draggedId, relativeTo: targetId, placeAfter: placeAfter) else {
-                return false
+        // Clear drag state synchronously so the overlay vanishes as
+        // the drop commits, but defer the actual reorder to the next
+        // runloop tick. Mutating `appState.projects` inline from here
+        // rearranges the view hierarchy while SwiftUI is still
+        // finishing the drop session, which has been observed to
+        // leave the drag tracker unable to start a subsequent drag.
+        indicator = nil
+        appState.draggingSidebarPayload = nil
+        let appState = self.appState
+        DispatchQueue.main.async {
+            switch resolved {
+            case let .tab(draggedId, targetId, placeAfter):
+                appState.moveTab(draggedId, relativeTo: targetId, placeAfter: placeAfter)
+            case let .project(draggedId, targetId, placeAfter):
+                appState.moveProject(draggedId, relativeTo: targetId, placeAfter: placeAfter)
             }
-            appState.moveTab(draggedId, relativeTo: targetId, placeAfter: placeAfter)
-            return true
-        case let .project(draggedId):
-            guard !isTerminalsGroup else { return false }
-            let placeAfter = info.location.y > groupHeightProvider() / 2
-            guard appState.wouldMoveProject(draggedId, relativeTo: project.id, placeAfter: placeAfter) else {
-                return false
-            }
-            appState.moveProject(draggedId, relativeTo: project.id, placeAfter: placeAfter)
-            return true
         }
+        return true
     }
 
     private func updateIndicator(for info: DropInfo) {
-        guard let payloadString = appState.draggingSidebarPayload else {
-            indicator = nil
-            return
-        }
-        switch SidebarDragPayload(encoded: payloadString) {
-        case let .tab(draggedId):
-            guard let (targetId, placeAfter) = tabTarget(at: info.location),
-                  appState.wouldMoveTab(draggedId, relativeTo: targetId, placeAfter: placeAfter)
-            else {
-                indicator = nil
-                return
+        indicator = resolve(for: info)?.indicator
+    }
+
+    /// Run the pure drop-resolver against this delegate's current
+    /// geometry snapshot and the sidebar's drag payload. Returns nil
+    /// when the drop wouldn't reorder anything (empty project,
+    /// no-op slot, cross-project tab, Terminals as source/target).
+    private func resolve(for info: DropInfo) -> SidebarDropResolver.Outcome? {
+        guard let payloadString = appState.draggingSidebarPayload else { return nil }
+        return SidebarDropResolver.resolve(
+            payload: SidebarDragPayload(encoded: payloadString),
+            location: info.location,
+            targetProjectId: project.id,
+            isTerminalsGroup: isTerminalsGroup,
+            headerHeight: headerHeightProvider(),
+            tabOrder: tabOrderProvider(),
+            tabFrames: tabFramesProvider(),
+            wouldMoveTab: appState.wouldMoveTab,
+            wouldMoveProject: appState.wouldMoveProject
+        )
+    }
+}
+
+/// Pure, side-effect-free drop-position logic for the sidebar. Takes
+/// a snapshot of the geometry (header height, tab frames, tab order)
+/// plus the drag payload and cursor location, and returns what the
+/// drop would do — or `nil` for a no-op. Separate from the
+/// `DropDelegate` so unit tests can exercise the slot-picking rules
+/// without constructing a live SwiftUI `DropInfo`.
+enum SidebarDropResolver {
+    enum Outcome: Equatable {
+        case tab(draggedId: String, targetId: String, placeAfter: Bool)
+        case project(draggedId: String, targetId: String, placeAfter: Bool)
+
+        var indicator: DropIndicator {
+            switch self {
+            case let .tab(_, targetId, placeAfter):
+                return placeAfter ? .tabAfter(targetId) : .tabBefore(targetId)
+            case let .project(_, _, placeAfter):
+                return placeAfter ? .projectAfter : .projectBefore
             }
-            indicator = placeAfter ? .tabAfter(targetId) : .tabBefore(targetId)
-        case let .project(draggedId):
-            guard !isTerminalsGroup else {
-                indicator = nil
-                return
-            }
-            let placeAfter = info.location.y > groupHeightProvider() / 2
-            guard appState.wouldMoveProject(draggedId, relativeTo: project.id, placeAfter: placeAfter) else {
-                indicator = nil
-                return
-            }
-            indicator = placeAfter ? .projectAfter : .projectBefore
         }
     }
 
-    /// Pick which tab slot the cursor is currently in. Cursor above
-    /// the first tab (header area) → before the first tab. Cursor
-    /// below the last tab (trailing gap) → after the last tab.
-    /// Otherwise, the tab whose frame contains the cursor, split on
-    /// its vertical midpoint. Returns nil for empty projects.
-    private func tabTarget(at location: CGPoint) -> (tabId: String, placeAfter: Bool)? {
-        let ids = tabOrderProvider()
-        guard !ids.isEmpty else { return nil }
-        let frames = tabFramesProvider()
-        let y = location.y
-        if let firstId = ids.first, let firstFrame = frames[firstId], y < firstFrame.minY {
+    /// Resolve a sidebar drop to a concrete reorder operation, or
+    /// `nil` when the drop would be a no-op.
+    ///
+    /// - Parameters:
+    ///   - payload: the drag payload (tab or project).
+    ///   - location: cursor point in the project group's coordinate
+    ///     space.
+    ///   - targetProjectId: id of the project group owning the drop
+    ///     region.
+    ///   - isTerminalsGroup: whether that group is the pinned
+    ///     Terminals row (project drops onto or out of Terminals
+    ///     return nil).
+    ///   - headerHeight: measured pixel height of the group's header
+    ///     row. Used as the before/after divider for project drops:
+    ///     cursor y <= headerHeight → before this project; else →
+    ///     after. Using the header instead of the group midpoint
+    ///     keeps "drop anywhere on the tabs" meaning "after this
+    ///     project", which matches the user's intuition.
+    ///   - tabOrder: ids of the target group's tabs in display order.
+    ///   - tabFrames: per-tab frames in the group coordinate space.
+    ///   - wouldMoveTab / wouldMoveProject: no-op predicates. Passed
+    ///     in so the resolver stays pure — callers inject
+    ///     `AppState.wouldMoveTab(_:relativeTo:placeAfter:)` etc.
+    static func resolve(
+        payload: SidebarDragPayload,
+        location: CGPoint,
+        targetProjectId: String,
+        isTerminalsGroup: Bool,
+        headerHeight: CGFloat,
+        tabOrder: [String],
+        tabFrames: [String: CGRect],
+        wouldMoveTab: (String, String, Bool) -> Bool,
+        wouldMoveProject: (String, String, Bool) -> Bool
+    ) -> Outcome? {
+        switch payload {
+        case let .tab(draggedId):
+            guard let (targetId, placeAfter) = tabTarget(
+                y: location.y,
+                tabOrder: tabOrder,
+                tabFrames: tabFrames
+            ) else { return nil }
+            guard wouldMoveTab(draggedId, targetId, placeAfter) else { return nil }
+            return .tab(draggedId: draggedId, targetId: targetId, placeAfter: placeAfter)
+
+        case let .project(draggedId):
+            guard !isTerminalsGroup else { return nil }
+            // Header owns "before this project"; anything past its
+            // bottom edge counts as "after this project". Fall back
+            // to a strict `> 0` split when the header hasn't been
+            // measured yet — for a zero-tab project this just means
+            // any drop lands "after", which is a no-op against
+            // Terminals and harmless otherwise.
+            let divider = headerHeight > 0 ? headerHeight : 0
+            let placeAfter = location.y > divider
+            guard wouldMoveProject(draggedId, targetProjectId, placeAfter) else { return nil }
+            return .project(draggedId: draggedId, targetId: targetProjectId, placeAfter: placeAfter)
+        }
+    }
+
+    /// Pick the tab slot a cursor y-coordinate points at within a
+    /// project group: above the first tab → before it; below the
+    /// last tab → after it; over a tab → midpoint split.
+    static func tabTarget(
+        y: CGFloat,
+        tabOrder: [String],
+        tabFrames: [String: CGRect]
+    ) -> (targetId: String, placeAfter: Bool)? {
+        guard !tabOrder.isEmpty else { return nil }
+        if let firstId = tabOrder.first, let firstFrame = tabFrames[firstId], y < firstFrame.minY {
             return (firstId, false)
         }
-        if let lastId = ids.last, let lastFrame = frames[lastId], y > lastFrame.maxY {
+        if let lastId = tabOrder.last, let lastFrame = tabFrames[lastId], y > lastFrame.maxY {
             return (lastId, true)
         }
-        for id in ids {
-            guard let frame = frames[id] else { continue }
+        for id in tabOrder {
+            guard let frame = tabFrames[id] else { continue }
             if y >= frame.minY, y <= frame.maxY {
                 return (id, y > frame.midY)
             }
