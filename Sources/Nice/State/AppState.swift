@@ -1296,25 +1296,6 @@ final class AppState: ObservableObject {
         return insertIndex != srcIndex
     }
 
-    /// Id of the tab currently being dragged in the sidebar, if any.
-    /// Set by `TabRow`'s `onDrag` closure when a drag starts; read by
-    /// the project-group drop delegate to pick a target slot. The
-    /// SwiftUI Transferable drop API exposes the cursor location but
-    /// not the payload until the drop commits, so we stash the
-    /// dragged id here for synchronous access during hover. Stale
-    /// between drags is harmless: drop delegates only run while a
-    /// drag is active, and every new drag overwrites the value.
-    var draggingSidebarTabId: String? = nil
-
-    /// Sidebar-wide drop indicator — which project group is currently
-    /// painting an insertion line, and which slot within it. Shared
-    /// across all project groups rather than held in per-group
-    /// `@State` so one delegate's new update implicitly clears any
-    /// stale indicator from a previous group. Closes the
-    /// stale-`dropExited` race where two adjacent groups could
-    /// briefly paint lines at the same time.
-    @Published var sidebarDropTarget: SidebarDropTarget?
-
     // MARK: - Keyboard navigation
 
     /// Flat list of sidebar tab ids in displayed order. The pinned

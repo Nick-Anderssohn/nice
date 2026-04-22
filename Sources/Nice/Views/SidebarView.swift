@@ -21,9 +21,11 @@ struct SidebarView: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
+    @StateObject private var dragState = SidebarDragState()
 
     var body: some View {
         expandedSidebar
+            .environmentObject(dragState)
     }
 
     // MARK: - Expanded sidebar
@@ -78,6 +80,7 @@ private struct ProjectGroup: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var fontSettings: FontSettings
+    @EnvironmentObject private var dragState: SidebarDragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -104,12 +107,11 @@ private struct ProjectGroup: View {
     private var coordSpace: String { "sidebar.group.\(project.id)" }
 
     /// The indicator for this project group, if any. Reads from the
-    /// sidebar-wide `appState.sidebarDropTarget` and filters to this
-    /// group's own project id, so a new delegate writing to the
-    /// shared state automatically clears any stale line in another
-    /// group.
+    /// sidebar-wide drag session and filters to this group's own
+    /// project id, so a new delegate writing to the shared state
+    /// automatically clears any stale line in another group.
     private var myIndicator: DropIndicator? {
-        guard let target = appState.sidebarDropTarget,
+        guard let target = dragState.session?.target,
               target.projectId == project.id
         else { return nil }
         return target.indicator
@@ -158,7 +160,8 @@ private struct ProjectGroup: View {
                 project: project,
                 tabFramesProvider: { tabFrames },
                 tabOrderProvider: { project.tabs.map(\.id) },
-                appState: appState
+                appState: appState,
+                dragState: dragState
             )
         )
         // Make the whole project group addressable by UI tests even
@@ -288,6 +291,7 @@ private struct TabRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var fontSettings: FontSettings
+    @EnvironmentObject private var dragState: SidebarDragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -423,7 +427,7 @@ private struct TabRow: View {
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
         }
         .onDrag {
-            appState.draggingSidebarTabId = tab.id
+            dragState.session = SidebarDragSession(draggedTabId: tab.id, target: nil)
             return NSItemProvider(object: tab.id as NSString)
         }
         .accessibilityElement(children: .contain)
@@ -519,12 +523,11 @@ private struct TabFramesKey: PreferenceKey {
     }
 }
 
-// MARK: - Drop indicator
+// MARK: - Drag session
 
 /// Where a project group's insertion-line indicator is currently
 /// painted. Carries the target tab id so the overlay can look up its
-/// frame. `nil` (absent from `AppState.sidebarDropTarget`) means no
-/// indicator. Internal so the drop resolver tests can assert the
+/// frame. Internal so the drop resolver tests can assert the
 /// expected indicator for a drop outcome.
 enum DropIndicator: Equatable {
     case tabBefore(String)
@@ -532,13 +535,35 @@ enum DropIndicator: Equatable {
 }
 
 /// Scoped drop-indicator state: which project's group is currently
-/// painting an indicator, and which slot within it. Stored
-/// single-valued on `AppState` so only one project group ever paints
-/// an insertion line at a time — the previous indicator is
-/// implicitly cleared whenever a new delegate writes.
+/// painting an indicator, and which slot within it. Single-valued so
+/// only one project group ever paints an insertion line at a time —
+/// a new delegate writing this field implicitly clears any stale
+/// indicator from another group.
 struct SidebarDropTarget: Equatable {
     let projectId: String
     let indicator: DropIndicator
+}
+
+/// One active sidebar drag, start to finish. Bundles the dragged-tab
+/// id with the current insertion-line target so clearing the session
+/// (`dragState.session = nil`) wipes both in one assignment — a
+/// caller physically cannot end the drag while leaving stale state
+/// half-set.
+struct SidebarDragSession: Equatable {
+    let draggedTabId: String
+    var target: SidebarDropTarget?
+}
+
+/// Ephemeral, view-layer sidebar-drag state. Owned by `SidebarView`
+/// via `@StateObject` and propagated to its subtree via
+/// `.environmentObject`; deliberately kept off `AppState` so the
+/// persistent model doesn't accumulate transient UI scratchpads.
+/// The SwiftUI Transferable drop API exposes the cursor location but
+/// not the payload until the drop commits, so `TabRow`'s `onDrag`
+/// stashes the dragged id here for synchronous access during hover.
+@MainActor
+final class SidebarDragState: ObservableObject {
+    @Published var session: SidebarDragSession?
 }
 
 /// Drop delegate attached to each project group's VStack. The
@@ -558,6 +583,7 @@ private struct ProjectGroupDropDelegate: DropDelegate {
     let tabFramesProvider: () -> [String: CGRect]
     let tabOrderProvider: () -> [String]
     let appState: AppState
+    let dragState: SidebarDragState
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(to: [.text])
@@ -569,29 +595,23 @@ private struct ProjectGroupDropDelegate: DropDelegate {
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         updateIndicator(for: info)
-        let targeted = appState.sidebarDropTarget?.projectId == project.id
-        return DropProposal(operation: targeted ? .move : .forbidden)
+        return DropProposal(operation: ownsCurrentIndicator ? .move : .forbidden)
     }
 
     func dropExited(info: DropInfo) {
         // Only clear if this group owns the current indicator —
         // another group's `dropEntered` may already have overwritten
         // it.
-        if appState.sidebarDropTarget?.projectId == project.id {
-            appState.sidebarDropTarget = nil
+        if ownsCurrentIndicator {
+            dragState.session?.target = nil
         }
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        // Resolve BEFORE clearing drag state: `resolve` reads
-        // `appState.draggingSidebarTabId` to know which tab the drag
-        // started from, so clearing it first strands every drop as a
-        // no-op.
-        let outcome = resolve(for: info)
-        if appState.sidebarDropTarget?.projectId == project.id {
-            appState.sidebarDropTarget = nil
+        let outcome = dragState.session.flatMap {
+            resolve(draggedTabId: $0.draggedTabId, info: info)
         }
-        appState.draggingSidebarTabId = nil
+        dragState.session = nil
         guard let outcome else { return false }
         // Defer the model mutation to the next runloop tick — see the
         // type-level doc for `ProjectGroupDropDelegate` on why
@@ -608,22 +628,28 @@ private struct ProjectGroupDropDelegate: DropDelegate {
     }
 
     private func updateIndicator(for info: DropInfo) {
-        guard let outcome = resolve(for: info) else {
-            if appState.sidebarDropTarget?.projectId == project.id {
-                appState.sidebarDropTarget = nil
+        let outcome = dragState.session.flatMap {
+            resolve(draggedTabId: $0.draggedTabId, info: info)
+        }
+        guard let outcome else {
+            if ownsCurrentIndicator {
+                dragState.session?.target = nil
             }
             return
         }
-        appState.sidebarDropTarget = SidebarDropTarget(
+        dragState.session?.target = SidebarDropTarget(
             projectId: project.id,
             indicator: outcome.indicator
         )
     }
 
-    private func resolve(for info: DropInfo) -> SidebarDropResolver.Outcome? {
-        guard let draggedId = appState.draggingSidebarTabId else { return nil }
-        return SidebarDropResolver.resolve(
-            draggedTabId: draggedId,
+    private var ownsCurrentIndicator: Bool {
+        dragState.session?.target?.projectId == project.id
+    }
+
+    private func resolve(draggedTabId: String, info: DropInfo) -> SidebarDropResolver.Outcome? {
+        SidebarDropResolver.resolve(
+            draggedTabId: draggedTabId,
             location: info.location,
             tabOrder: tabOrderProvider(),
             tabFrames: tabFramesProvider(),
