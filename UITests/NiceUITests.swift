@@ -1586,4 +1586,5 @@ final class NiceUITests: XCTestCase {
             "Sidebar row should display the renamed title after commit."
         )
     }
+
 }
