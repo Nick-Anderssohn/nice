@@ -126,6 +126,34 @@ final class AppStateReorderTests: XCTestCase {
         XCTAssertFalse(appState.wouldMoveTab("p1t0", relativeTo: "p2t0", placeAfter: false))
     }
 
+    // MARK: - Terminals project
+
+    // Tabs inside the pinned Terminals project aren't special-cased
+    // — they reorder like any other project's tabs. These tests pin
+    // that behavior so it stays explicit and can't quietly regress.
+
+    func test_moveTab_withinTerminalsProject_reorders() {
+        seedTerminalsAndOneProject()
+        // Terminals starts with [terminals-main, term-t1, term-t2] —
+        // move term-t2 before terminals-main.
+        appState.moveTab("term-t2", relativeTo: AppState.mainTerminalTabId, placeAfter: false)
+        XCTAssertEqual(
+            tabIds(inProject: AppState.terminalsProjectId),
+            ["term-t2", AppState.mainTerminalTabId, "term-t1"]
+        )
+    }
+
+    func test_moveTab_terminalsToUserProject_isNoOp() {
+        seedTerminalsAndOneProject()
+        // Cross-project drops still no-op even when the source is
+        // the Main Terminals tab — sidebar drag is within-project.
+        let termBefore = tabIds(inProject: AppState.terminalsProjectId)
+        let p1Before = tabIds(inProject: "p1")
+        appState.moveTab(AppState.mainTerminalTabId, relativeTo: "p1t0", placeAfter: true)
+        XCTAssertEqual(tabIds(inProject: AppState.terminalsProjectId), termBefore)
+        XCTAssertEqual(tabIds(inProject: "p1"), p1Before)
+    }
+
     // MARK: - Fixtures
 
     /// Seeds two projects, three tabs each, each tab with one terminal
@@ -134,6 +162,39 @@ final class AppStateReorderTests: XCTestCase {
         let p1 = makeProject(id: "p1", name: "P1", tabCount: 3)
         let p2 = makeProject(id: "p2", name: "P2", tabCount: 2)
         appState.projects = [p1, p2]
+    }
+
+    /// Seeds the pinned Terminals project (with its Main tab plus
+    /// two extra terminal tabs) and one regular project. Used by the
+    /// within-Terminals reorder tests.
+    private func seedTerminalsAndOneProject() {
+        let terminals = Project(
+            id: AppState.terminalsProjectId,
+            name: "Terminals",
+            path: "/tmp/terminals",
+            tabs: [
+                Tab(
+                    id: AppState.mainTerminalTabId, title: "Main",
+                    cwd: "/tmp/terminals",
+                    panes: [Pane(id: "\(AppState.mainTerminalTabId)-p0", title: "zsh", kind: .terminal)],
+                    activePaneId: "\(AppState.mainTerminalTabId)-p0"
+                ),
+                Tab(
+                    id: "term-t1", title: "Term 1",
+                    cwd: "/tmp/terminals",
+                    panes: [Pane(id: "term-t1-p0", title: "zsh", kind: .terminal)],
+                    activePaneId: "term-t1-p0"
+                ),
+                Tab(
+                    id: "term-t2", title: "Term 2",
+                    cwd: "/tmp/terminals",
+                    panes: [Pane(id: "term-t2-p0", title: "zsh", kind: .terminal)],
+                    activePaneId: "term-t2-p0"
+                ),
+            ]
+        )
+        let p1 = makeProject(id: "p1", name: "P1", tabCount: 2)
+        appState.projects = [terminals, p1]
     }
 
     private func makeProject(id: String, name: String, tabCount: Int) -> Project {

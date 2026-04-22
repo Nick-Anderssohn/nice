@@ -583,18 +583,15 @@ private struct ProjectGroupDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard let resolved = resolve(for: info) else {
-            if appState.sidebarDropTarget?.projectId == project.id {
-                appState.sidebarDropTarget = nil
-            }
-            appState.draggingSidebarTabId = nil
-            return false
-        }
         if appState.sidebarDropTarget?.projectId == project.id {
             appState.sidebarDropTarget = nil
         }
         appState.draggingSidebarTabId = nil
-        let appState = self.appState
+        guard let resolved = resolve(for: info) else { return false }
+        // Defer the model mutation to the next runloop tick — see the
+        // type-level doc for `ProjectGroupDropDelegate` on why
+        // rearranging `appState.projects` inline here leaves AppKit's
+        // drag tracker stuck on a subsequent drag.
         DispatchQueue.main.async {
             appState.moveTab(
                 resolved.draggedId,

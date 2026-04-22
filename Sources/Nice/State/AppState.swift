@@ -1261,8 +1261,9 @@ final class AppState: ObservableObject {
     /// Move `tabId` to a new slot within the same project, relative to
     /// `targetTabId`: either just before it (`placeAfter == false`) or
     /// just after it. No-op when the two tabs aren't in the same
-    /// project, when either id is unknown, when either id refers to the
-    /// built-in Terminals tab, or when the move wouldn't change order.
+    /// project, when either id is unknown, or when the move wouldn't
+    /// change order. Tabs inside the pinned Terminals project reorder
+    /// like any other project's tabs.
     func moveTab(_ tabId: String, relativeTo targetTabId: String, placeAfter: Bool) {
         guard tabId != targetTabId else { return }
         guard let (srcProject, srcIndex) = projectTabIndex(for: tabId),
