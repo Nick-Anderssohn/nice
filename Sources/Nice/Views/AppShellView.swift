@@ -71,6 +71,18 @@ private struct AppShellHost: View {
     /// so the user can click a tab without holding any keys.
     @State private var peekMousePinned: Bool = false
 
+    /// Current docked-sidebar width, in points. Per-window and in-memory:
+    /// resets to the 240pt default on every launch by design. Only read
+    /// by `floatingSidebarCard(resizable:)` in its expanded (docked)
+    /// variant; the peek overlay always uses the fixed 240pt.
+    @State private var sidebarWidth: CGFloat = 240
+
+    /// Width at the start of the current drag, captured on first
+    /// `onChanged`. Kept separate from `sidebarWidth` so translation is
+    /// always applied to a fixed baseline — avoids accumulated error and
+    /// sticky behavior when reversing direction from a clamped edge.
+    @State private var dragStartWidth: CGFloat? = nil
+
     init(
         services: NiceServices,
         initialSidebarCollapsed: Bool,
@@ -238,7 +250,7 @@ private struct AppShellHost: View {
     /// content stacked to its right.
     private var expandedShell: some View {
         HStack(spacing: 0) {
-            floatingSidebarCard
+            floatingSidebarCard(resizable: true)
 
             VStack(spacing: 0) {
                 WindowToolbarView()
@@ -261,7 +273,7 @@ private struct AppShellHost: View {
     /// No trailing padding — the gap between sidebar and main content
     /// is just the card's own edge. Tweak pixel values here if it
     /// starts to look off relative to Xcode in dark mode.
-    private var floatingSidebarCard: some View {
+    private func floatingSidebarCard(resizable: Bool = false) -> some View {
         SidebarBackground(palette: palette, scheme: scheme) {
             VStack(spacing: 0) {
                 // Reserve the traffic-light safe zone at the top of
@@ -294,7 +306,7 @@ private struct AppShellHost: View {
                 SidebarView()
             }
         }
-        .frame(width: 240)
+        .frame(width: resizable ? sidebarWidth : 240)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -303,6 +315,11 @@ private struct AppShellHost: View {
                     lineWidth: 0.5
                 )
         )
+        .overlay(alignment: .trailing) {
+            if resizable {
+                sidebarResizeHandle
+            }
+        }
         .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 2)
         .padding(.leading, 6)
         .padding(.top, 6)
@@ -311,6 +328,47 @@ private struct AppShellHost: View {
         // isn't clipped by the opaque nicePanel / niceChrome
         // backgrounds of the toolbar and terminal host next to it.
         .zIndex(1)
+    }
+
+    /// Invisible 6pt hit zone on the sidebar's trailing edge. No visible
+    /// affordance — `.onHover` flips the cursor to `.resizeLeftRight` so
+    /// the edge is discoverable by feel. Drag to resize, double-click to
+    /// reset to 240pt. Offset 3pt so the hit zone straddles the visible
+    /// edge (3pt inside the card, 3pt in the gap).
+    private var sidebarResizeHandle: some View {
+        Color.clear
+            .frame(width: 6)
+            .contentShape(Rectangle())
+            .offset(x: 3)
+            .onHover { hovering in
+                if hovering {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                TapGesture(count: 2)
+                    .onEnded {
+                        sidebarWidth = 240
+                        dragStartWidth = nil
+                    }
+                    .simultaneously(with:
+                        // .global, not .local: the handle moves with the
+                        // sidebar as it resizes, so a .local translation
+                        // would feed back on itself (widen → handle moves
+                        // right → translation grows → widen more → shake).
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                            .onChanged { value in
+                                if dragStartWidth == nil {
+                                    dragStartWidth = sidebarWidth
+                                }
+                                let baseline = dragStartWidth ?? sidebarWidth
+                                sidebarWidth = min(480, max(160, baseline + value.translation.width))
+                            }
+                            .onEnded { _ in dragStartWidth = nil }
+                    )
+            )
     }
 
     /// Collapsed: no sidebar column. A small floating card sits in the
@@ -334,7 +392,7 @@ private struct AppShellHost: View {
         }
         .overlay(alignment: .topLeading) {
             if appState.sidebarPeeking || peekMousePinned {
-                floatingSidebarCard
+                floatingSidebarCard()
                     .onHover { hovering in
                         peekMousePinned = hovering
                     }
