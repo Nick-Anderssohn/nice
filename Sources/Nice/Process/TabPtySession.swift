@@ -34,6 +34,11 @@ final class TabPtySession: ObservableObject {
 
     private let onPaneExit: @MainActor (String, Int32?) -> Void
     private let onPaneTitleChange: @MainActor (String, String) -> Void
+    /// Called when a pane's shell emits OSC 7 with a new working
+    /// directory (via the injected zsh `chpwd_functions` hook). Second
+    /// argument is the absolute path. Optional so tests/previews can
+    /// instantiate without wiring it up.
+    private let onPaneCwdChange: (@MainActor (String, String) -> Void)?
     /// Called when a new pane is spawned. Second argument is the
     /// display-friendly command (e.g. `claude -w foo`) that the overlay
     /// should show if the pane stays silent past the grace window.
@@ -133,6 +138,7 @@ final class TabPtySession: ObservableObject {
         claudeSessionMode: ClaudeSessionMode = .none,
         onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
         onPaneTitleChange: @escaping @MainActor (String, String) -> Void,
+        onPaneCwdChange: (@MainActor (String, String) -> Void)? = nil,
         onPaneLaunched: (@MainActor (String, String) -> Void)? = nil,
         onPaneFirstOutput: (@MainActor (String) -> Void)? = nil
     ) {
@@ -140,6 +146,7 @@ final class TabPtySession: ObservableObject {
         self.cwd = cwd
         self.onPaneExit = onPaneExit
         self.onPaneTitleChange = onPaneTitleChange
+        self.onPaneCwdChange = onPaneCwdChange
         self.onPaneLaunched = onPaneLaunched
         self.onPaneFirstOutput = onPaneFirstOutput
         self.socketPath = socketPath
@@ -287,6 +294,17 @@ final class TabPtySession: ObservableObject {
     private func makePaneDelegate(paneId: String) -> ProcessTerminationDelegate {
         let onExit = self.onPaneExit
         let onTitleChange = self.onPaneTitleChange
+        let onCwdChange = self.onPaneCwdChange
+        let cwdForwarder: (@MainActor (ProcessTerminationDelegate.Role, String) -> Void)?
+        if let onCwdChange {
+            cwdForwarder = { role, cwd in
+                if case let .pane(_, paneId) = role {
+                    onCwdChange(paneId, cwd)
+                }
+            }
+        } else {
+            cwdForwarder = nil
+        }
         return ProcessTerminationDelegate(
             role: .pane(tabId: tabId, paneId: paneId),
             onExit: { [onExit] role, code in
@@ -298,7 +316,8 @@ final class TabPtySession: ObservableObject {
                 if case let .pane(_, paneId) = role {
                     onTitleChange(paneId, title)
                 }
-            }
+            },
+            onCwdChange: cwdForwarder
         )
     }
 

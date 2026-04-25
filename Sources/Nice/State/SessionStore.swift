@@ -24,6 +24,18 @@ struct PersistedPane: Codable, Hashable, Sendable {
     let id: String
     let title: String
     let kind: PaneKind
+    /// Last-observed cwd for this pane, captured from OSC 7 in the
+    /// injected zsh `chpwd_functions` hook. Optional so v3 session
+    /// files (written before per-pane cwd existed) still decode —
+    /// restore falls back to `PersistedTab.cwd` when nil.
+    let cwd: String?
+
+    init(id: String, title: String, kind: PaneKind, cwd: String? = nil) {
+        self.id = id
+        self.title = title
+        self.kind = kind
+        self.cwd = cwd
+    }
 }
 
 struct PersistedTab: Codable, Hashable, Sendable {

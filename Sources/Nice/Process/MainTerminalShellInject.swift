@@ -169,6 +169,30 @@ enum MainTerminalShellInject {
         esac
     }
 
+    # Nice: emit OSC 7 (current working directory) on every cd so the
+    # host terminal can capture and persist it. Format:
+    #   ESC ] 7 ; file://hostname/path BEL
+    # The injected hook appends to chpwd_functions rather than replacing
+    # chpwd directly so anything the user already registered (in their
+    # real .zshrc, sourced above) keeps firing.
+    _nice_emit_cwd_osc7() {
+        # Minimal URL encoding: % first (so we don't double-encode the
+        # %20 we're about to emit), then space. macOS paths almost
+        # never need more; anything exotic (?, #, non-ASCII) flows
+        # through unencoded and SwiftTerm tolerates the raw bytes.
+        # The `\%` escape is load-bearing — a bare `%` in a zsh
+        # parameter pattern is the "anchor at end of string" matcher,
+        # which makes `${PWD//%/%25}` append `%25` to every path.
+        local p=${PWD//\%/%25}
+        p=${p// /%20}
+        printf '\e]7;file://%s%s\a' "${HOST}" "$p"
+    }
+    typeset -ga chpwd_functions
+    chpwd_functions+=(_nice_emit_cwd_osc7)
+    # Fire once at shell startup so the initial cwd is reported even
+    # if the user never cd's.
+    _nice_emit_cwd_osc7
+
     # Nice: if the app asked us to pre-type a command at the next
     # prompt (set when a restored Claude tab boots), push it onto zsh's
     # line-editor buffer. The user sees the command typed and ready;

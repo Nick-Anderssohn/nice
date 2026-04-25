@@ -26,15 +26,18 @@ final class ProcessTerminationDelegate: NSObject, LocalProcessTerminalViewDelega
     private let role: Role
     private let onExit: @MainActor (Role, Int32?) -> Void
     private let onTitleChange: (@MainActor (Role, String) -> Void)?
+    private let onCwdChange: (@MainActor (Role, String) -> Void)?
 
     init(
         role: Role,
         onExit: @escaping @MainActor (Role, Int32?) -> Void,
-        onTitleChange: (@MainActor (Role, String) -> Void)? = nil
+        onTitleChange: (@MainActor (Role, String) -> Void)? = nil,
+        onCwdChange: (@MainActor (Role, String) -> Void)? = nil
     ) {
         self.role = role
         self.onExit = onExit
         self.onTitleChange = onTitleChange
+        self.onCwdChange = onCwdChange
     }
 
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
@@ -46,7 +49,37 @@ final class ProcessTerminationDelegate: NSObject, LocalProcessTerminalViewDelega
             onTitleChange(role, title)
         }
     }
-    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+
+    /// SwiftTerm hands us the raw OSC 7 payload — typically
+    /// `file://hostname/path` from the injected `_nice_emit_cwd_osc7`
+    /// chpwd hook. Parse out the path component and forward to
+    /// `AppState`. SwiftTerm itself does no validation, so an
+    /// unparseable URL or empty/nil payload is silently dropped.
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+        guard let onCwdChange,
+              let raw = directory,
+              let path = Self.parseOsc7Path(raw),
+              !path.isEmpty
+        else { return }
+        let role = self.role
+        Task { @MainActor in
+            onCwdChange(role, path)
+        }
+    }
+
+    /// Extract the filesystem path from an OSC 7 `file://host/path`
+    /// payload. Falls back to returning `raw` verbatim when it already
+    /// looks absolute (no scheme, starts with `/`) — mirrors the
+    /// permissive behavior of other terminals so a shell that emits a
+    /// bare path still updates the cwd.
+    static func parseOsc7Path(_ raw: String) -> String? {
+        if raw.hasPrefix("/") { return raw }
+        guard let url = URL(string: raw), url.scheme == "file" else {
+            return nil
+        }
+        let path = url.path
+        return path.isEmpty ? nil : path
+    }
 
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         let role = self.role

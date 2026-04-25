@@ -57,9 +57,15 @@ struct Pane: Identifiable, Hashable, Sendable, Codable {
     /// a new tab. Excluded from `Codable` — restored tabs always come
     /// back `false`, which is what we want.
     var isClaudeRunning: Bool = false
+    /// Last-observed cwd for this pane's shell, captured from OSC 7
+    /// emitted by the injected `chpwd_functions` hook. Persisted so a
+    /// relaunched pane respawns where the user left it. `nil` until the
+    /// shell has emitted at least one OSC 7 — callers fall back to
+    /// `Tab.cwd` in that case.
+    var cwd: String? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, kind, isAlive, status, waitingAcknowledged
+        case id, title, kind, isAlive, status, waitingAcknowledged, cwd
     }
 }
 

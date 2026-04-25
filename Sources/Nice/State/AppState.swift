@@ -513,7 +513,9 @@ final class AppState: ObservableObject {
               let session = ptySessions[tabId],
               session.panes[paneId] == nil
         else { return }
-        _ = session.addTerminalPane(id: paneId, cwd: resolvedSpawnCwd(for: tab))
+        _ = session.addTerminalPane(
+            id: paneId, cwd: resolvedSpawnCwd(for: tab, pane: pane)
+        )
     }
 
     /// Clear the waiting-attention pulse on whichever pane is currently
@@ -937,6 +939,28 @@ final class AppState: ObservableObject {
         // Ignore Claude's generic placeholder before a session is named.
         if rawLabel == "Claude Code" { return }
         applyAutoTitle(tabId: tabId, rawTitle: rawLabel)
+    }
+
+    /// A pane's shell emitted OSC 7 with a new working directory. Stash
+    /// it on `Pane.cwd` so a relaunch respawns the pane in the same
+    /// place. Persistence is debounced inside `SessionStore`, so naive
+    /// save-on-every-update is cheap. We deliberately don't touch
+    /// `Tab.cwd` — that field is load-bearing for `claude --resume`'s
+    /// working dir on Claude tabs, and overwriting it from a companion
+    /// terminal's cwd would silently relocate the session on restore.
+    func paneCwdChanged(tabId: String, paneId: String, cwd: String) {
+        var changed = false
+        mutateTab(id: tabId) { tab in
+            guard let pi = tab.panes.firstIndex(where: { $0.id == paneId })
+            else { return }
+            if tab.panes[pi].cwd != cwd {
+                tab.panes[pi].cwd = cwd
+                changed = true
+            }
+        }
+        if changed {
+            scheduleSessionSave()
+        }
     }
 
     /// Apply a Claude-generated session title to the tab. Humanizes the
@@ -1472,6 +1496,9 @@ final class AppState: ObservableObject {
             onPaneTitleChange: { [weak self] paneId, title in
                 self?.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
             },
+            onPaneCwdChange: { [weak self] paneId, cwd in
+                self?.paneCwdChanged(tabId: tabId, paneId: paneId, cwd: cwd)
+            },
             onPaneLaunched: { [weak self] paneId, command in
                 self?.registerPaneLaunch(paneId: paneId, command: command)
             },
@@ -1639,7 +1666,9 @@ final class AppState: ObservableObject {
             var tabs: [PersistedTab] = []
             for tab in project.tabs {
                 let panes = tab.panes.map {
-                    PersistedPane(id: $0.id, title: $0.title, kind: $0.kind)
+                    PersistedPane(
+                        id: $0.id, title: $0.title, kind: $0.kind, cwd: $0.cwd
+                    )
                 }
                 tabs.append(PersistedTab(
                     id: tab.id,
@@ -1882,7 +1911,7 @@ final class AppState: ObservableObject {
         toProjectIndex projectIndex: Int
     ) -> (tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String)? {
         let panes = persisted.panes.map { pp in
-            Pane(id: pp.id, title: pp.title, kind: pp.kind)
+            Pane(id: pp.id, title: pp.title, kind: pp.kind, cwd: pp.cwd)
         }
         let defaultActive = panes.first(where: { $0.kind == .claude })?.id
             ?? panes.first?.id
@@ -1916,10 +1945,22 @@ final class AppState: ObservableObject {
             )
         }
 
-        // Terminal-only tab: bring its shell up now. `makeSession`
-        // picks the first terminal pane from the tab's model when
-        // callers don't pass ids explicitly.
-        _ = makeSession(for: tab.id, cwd: spawnCwd)
+        // Terminal-only tab: bring its shell up now at the first
+        // terminal pane's last-observed cwd (falls back to the tab's
+        // cwd when the pane has none persisted, or its cwd no longer
+        // exists). Pass `initialTerminalPaneId` explicitly so
+        // `makeSession`'s auto-pick doesn't reset the spawn dir to the
+        // session-level value.
+        if let firstTerm = tab.panes.first(where: { $0.kind == .terminal }) {
+            let paneCwd = resolvedSpawnCwd(for: tab, pane: firstTerm)
+            _ = makeSession(
+                for: tab.id,
+                cwd: paneCwd,
+                initialTerminalPaneId: firstTerm.id
+            )
+        } else {
+            _ = makeSession(for: tab.id, cwd: spawnCwd)
+        }
         return nil
     }
 
@@ -1996,6 +2037,21 @@ final class AppState: ObservableObject {
             return Self.expandTilde(project.path)
         }
         return expanded
+    }
+
+    /// Per-pane variant: prefers `pane.cwd` (last-observed via OSC 7)
+    /// when set and still exists on disk. Falls back to the tab-level
+    /// resolution when nil or pointing at a deleted directory — covers
+    /// the case where the pane's last cwd was a worktree or temp dir
+    /// the user removed between app launches.
+    func resolvedSpawnCwd(for tab: Tab, pane: Pane) -> String {
+        if let raw = pane.cwd {
+            let expanded = Self.expandTilde(raw)
+            if FileManager.default.fileExists(atPath: expanded) {
+                return expanded
+            }
+        }
+        return resolvedSpawnCwd(for: tab)
     }
 
     /// Bucket `tab` into the project that anchors `cwd`'s git repo,
