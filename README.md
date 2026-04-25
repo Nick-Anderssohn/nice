@@ -1,4 +1,4 @@
-# Nice
+# This is Nice
 
 > **Never lose track of a Claude session again.**
 

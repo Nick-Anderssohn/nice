@@ -404,6 +404,10 @@ final class AppState: ObservableObject {
                             tabId: tabId, paneId: paneId,
                             reply: reply
                         )
+                    case let .sessionUpdate(paneId, sessionId):
+                        self.handleClaudeSessionUpdate(
+                            paneId: paneId, sessionId: sessionId
+                        )
                     }
                 }
             }
@@ -1556,6 +1560,54 @@ final class AppState: ObservableObject {
     }
 
     // MARK: - Session persistence
+
+    /// Handle a `session_update` socket message from Claude Code's
+    /// UserPromptSubmit hook. Looks up the tab whose pane set contains
+    /// `paneId` and forwards to `updateClaudeSessionId`. Silent no-op
+    /// if the pane is stale (exited while the hook's `nc` was in
+    /// flight) or isn't a claude pane.
+    /// `internal` so unit tests can drive the dispatch path directly
+    /// without standing up a real socket — matches `paneExited`'s
+    /// access level for the same reason.
+    func handleClaudeSessionUpdate(paneId: String, sessionId: String) {
+        guard let tabId = tabIdOwning(paneId: paneId) else { return }
+        updateClaudeSessionId(tabId: tabId, sessionId: sessionId)
+    }
+
+    /// Reverse-index: walk every project's tabs for the one whose pane
+    /// list includes `paneId`. Cheap — pane counts are small — and
+    /// tolerant of projects added/removed mid-loop because the socket
+    /// handler runs on the main actor.
+    private func tabIdOwning(paneId: String) -> String? {
+        for project in projects {
+            for tab in project.tabs {
+                if tab.panes.contains(where: { $0.id == paneId }) {
+                    return tab.id
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Update `tab.claudeSessionId` when claude rotates its session
+    /// mid-process — `/clear`, `/compact`, and `/branch` all swap the
+    /// UUID without restarting the process, so the pre-minted id we
+    /// stored at tab creation goes stale. Persist the new id immediately
+    /// so an unexpected Nice shutdown still resumes the correct
+    /// conversation. No-op if the tab already has this id or no longer
+    /// exists.
+    private func updateClaudeSessionId(tabId: String, sessionId: String) {
+        var changed = false
+        mutateTab(id: tabId) { tab in
+            if tab.claudeSessionId != sessionId {
+                tab.claudeSessionId = sessionId
+                changed = true
+            }
+        }
+        if changed {
+            scheduleSessionSave()
+        }
+    }
 
     /// Walk projects for every Claude tab with a `claudeSessionId`,
     /// pack into a `PersistedWindow`, and hand to the debounced

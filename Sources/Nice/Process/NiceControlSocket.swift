@@ -50,6 +50,13 @@ enum SocketMessage: Sendable {
         paneId: String,
         reply: @Sendable (String) -> Void
     )
+
+    /// Claude Code UserPromptSubmit hook reporting the active session
+    /// UUID for the sending pane. Fires on every user message, which
+    /// covers every in-process rotation source (/clear, /compact,
+    /// /branch / --fork-session). Fire-and-forget — no reply is written
+    /// and the client fd is closed before dispatch.
+    case sessionUpdate(paneId: String, sessionId: String)
 }
 
 final class NiceControlSocket: @unchecked Sendable {
@@ -334,6 +341,18 @@ final class NiceControlSocket: @unchecked Sendable {
             handler(.claude(
                 cwd: cwd, args: args, tabId: tabId, paneId: paneId, reply: reply
             ))
+        case "session_update":
+            guard let paneId = obj["paneId"] as? String, !paneId.isEmpty,
+                  let sessionId = obj["sessionId"] as? String, !sessionId.isEmpty
+            else {
+                close(client)
+                return
+            }
+            // Hook is fire-and-forget: close before dispatch so the
+            // helper script's `nc` returns promptly even if the
+            // MainActor handler is backed up.
+            close(client)
+            handler(.sessionUpdate(paneId: paneId, sessionId: sessionId))
         default:
             // Unknown action — log and drop, matching the silent-drop
             // behavior used elsewhere for malformed payloads.
