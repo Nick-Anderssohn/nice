@@ -41,6 +41,8 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable {
     case prevPane
     case newTerminalPane
     case toggleSidebar
+    case toggleSidebarMode
+    case toggleHiddenFiles
     case increaseFontSize
     case decreaseFontSize
     case resetFontSizes
@@ -54,6 +56,8 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable {
         case .prevPane:         "Previous pane"
         case .newTerminalPane:  "New terminal pane"
         case .toggleSidebar:    "Toggle sidebar"
+        case .toggleSidebarMode: "Toggle sidebar mode"
+        case .toggleHiddenFiles: "Toggle hidden files"
         case .increaseFontSize: "Increase font size"
         case .decreaseFontSize: "Decrease font size"
         case .resetFontSizes:   "Reset font size"
@@ -181,6 +185,8 @@ final class KeyboardShortcuts: ObservableObject {
         .prevPane:         KeyCombo(keyCode: UInt16(kVK_LeftArrow),  modifierFlags: [.command, .option]),
         .newTerminalPane:  KeyCombo(keyCode: UInt16(kVK_ANSI_T),     modifierFlags: [.command]),
         .toggleSidebar:    KeyCombo(keyCode: UInt16(kVK_ANSI_B),     modifierFlags: [.command]),
+        .toggleSidebarMode: KeyCombo(keyCode: UInt16(kVK_ANSI_B),    modifierFlags: [.command, .shift]),
+        .toggleHiddenFiles: KeyCombo(keyCode: UInt16(kVK_ANSI_Period), modifierFlags: [.command, .shift]),
         .increaseFontSize: KeyCombo(keyCode: UInt16(kVK_ANSI_Equal), modifierFlags: [.command]),
         .decreaseFontSize: KeyCombo(keyCode: UInt16(kVK_ANSI_Minus), modifierFlags: [.command]),
         .resetFontSizes:   KeyCombo(keyCode: UInt16(kVK_ANSI_0),     modifierFlags: [.command]),

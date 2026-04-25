@@ -62,9 +62,9 @@ final class TabPtySession: ObservableObject {
     private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
 
     /// Cached terminal font size so panes spawned after the first
-    /// `applyTerminalFont` pick it up at construction. Seeded with the
-    /// pre-feature 12pt default.
-    private var currentTerminalFontSize: CGFloat = FontSettings.defaultSize
+    /// `applyTerminalFont` pick it up at construction. Seeded with
+    /// the Xcode-matched 13pt terminal default.
+    private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
 
     /// Cached "GPU rendering" preference. Read by every pane's
     /// `gpuPreferenceProvider` closure so a Settings toggle propagates

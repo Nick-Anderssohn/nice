@@ -29,10 +29,19 @@ final class FontSettings: ObservableObject {
     static let terminalKey = "terminalFontSize"
     static let sidebarKey  = "sidebarFontSize"
 
-    /// Both defaults are 12pt — matches the pre-feature hardcoded
-    /// terminal font, and the sidebar's "tab title" element (the 1.0
-    /// ratio anchor for proportional scaling).
+    /// Sidebar default and proportional-scaling anchor. The sidebar's
+    /// design ratios (e.g. 13pt tab title vs 12pt group header vs 10pt
+    /// chevron) are tuned against this 12pt baseline and recomputed by
+    /// `sidebarSize(_:)`, so changing this would shift every sidebar
+    /// element. Keep it 12.
     static let defaultSize: CGFloat = 12
+
+    /// Terminal default — matches Xcode's editor default (13pt SF
+    /// Mono Regular). Decoupled from `defaultSize` because the
+    /// terminal is its own visual context: a code-editor surface
+    /// where reading comfort favors a slightly larger glyph than
+    /// the sidebar's UI text.
+    static let defaultTerminalSize: CGFloat = 13
 
     /// Allowed size range. 8pt is the smallest size at which JetBrainsMono
     /// is still legible; 32pt is large enough for accessibility zoom
@@ -52,8 +61,8 @@ final class FontSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.terminalFontSize = Self.loadClamped(defaults, key: Self.terminalKey)
-        self.sidebarFontSize  = Self.loadClamped(defaults, key: Self.sidebarKey)
+        self.terminalFontSize = Self.loadClamped(defaults, key: Self.terminalKey, default: Self.defaultTerminalSize)
+        self.sidebarFontSize  = Self.loadClamped(defaults, key: Self.sidebarKey, default: Self.defaultSize)
     }
 
     // MARK: - Derived sizes
@@ -86,16 +95,17 @@ final class FontSettings: ObservableObject {
         sidebarFontSize = newSidebar
     }
 
-    /// Snap both sizes to the 12pt defaults.
+    /// Snap both sizes back to their respective defaults — terminal
+    /// to its Xcode-matched 13pt, sidebar to the 12pt UI baseline.
     func resetToDefaults() {
-        terminalFontSize = Self.defaultSize
+        terminalFontSize = Self.defaultTerminalSize
         sidebarFontSize  = Self.defaultSize
     }
 
     // MARK: - Load / clamp
 
-    private static func loadClamped(_ defaults: UserDefaults, key: String) -> CGFloat {
-        let raw = defaults.object(forKey: key) as? Double ?? Double(Self.defaultSize)
+    private static func loadClamped(_ defaults: UserDefaults, key: String, default fallback: CGFloat) -> CGFloat {
+        let raw = defaults.object(forKey: key) as? Double ?? Double(fallback)
         return clamp(CGFloat(raw))
     }
 

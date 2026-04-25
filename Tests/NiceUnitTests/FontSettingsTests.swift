@@ -35,7 +35,7 @@ final class FontSettingsTests: XCTestCase {
 
     func test_freshInstall_usesDefaults() {
         let fs = FontSettings(defaults: defaults)
-        XCTAssertEqual(fs.terminalFontSize, FontSettings.defaultSize)
+        XCTAssertEqual(fs.terminalFontSize, FontSettings.defaultTerminalSize)
         XCTAssertEqual(fs.sidebarFontSize,  FontSettings.defaultSize)
     }
 
@@ -59,6 +59,21 @@ final class FontSettingsTests: XCTestCase {
         let fs = FontSettings(defaults: defaults)
         XCTAssertEqual(fs.terminalFontSize, FontSettings.minSize)
         XCTAssertEqual(fs.sidebarFontSize,  FontSettings.maxSize)
+    }
+
+    /// Locks in the per-key default contract from `loadClamped`: a
+    /// missing key falls back to its *own* default, not a shared
+    /// constant. Regression guard for the split between
+    /// `defaultTerminalSize` (13) and `defaultSize` (12).
+    func test_loadClamped_missingKey_usesPerKeyDefault() {
+        // Persist only the sidebar; terminal must fall back to its
+        // own default, sidebar to the persisted value.
+        defaults.set(20.0, forKey: FontSettings.sidebarKey)
+
+        let fs = FontSettings(defaults: defaults)
+        XCTAssertEqual(fs.terminalFontSize, FontSettings.defaultTerminalSize,
+                       "Missing terminalKey must fall back to defaultTerminalSize, not defaultSize.")
+        XCTAssertEqual(fs.sidebarFontSize, 20)
     }
 
     // MARK: - sidebarSize proportional scaling
@@ -98,7 +113,12 @@ final class FontSettingsTests: XCTestCase {
 
     func test_zoom_withEqualSizes_movesBothTogether() {
         let fs = FontSettings(defaults: defaults)
-        // Defaults are 12/12 — ratio 1:1.
+        // Force the equal-ratio precondition explicitly — fresh
+        // defaults are now 13/12 (terminal matches Xcode editor;
+        // sidebar matches the UI baseline), so we can't rely on
+        // defaults to start at parity.
+        fs.terminalFontSize = 12
+        fs.sidebarFontSize  = 12
         fs.zoom(by: +1)
         XCTAssertEqual(fs.terminalFontSize, 13)
         XCTAssertEqual(fs.sidebarFontSize,  13)
@@ -117,6 +137,27 @@ final class FontSettingsTests: XCTestCase {
         XCTAssertEqual(fs.terminalFontSize, 19)
         // round(12 * 19 / 18) = round(12.667) = 13
         XCTAssertEqual(fs.sidebarFontSize, 13)
+    }
+
+    /// Locks in the most-likely-to-execute zoom path for real users:
+    /// fresh defaults (terminal=13, sidebar=12, ratio 13:12) zoomed
+    /// up by 1, then back. Catches rounding regressions specific to
+    /// the new split-default ratio that the equal-sizes test misses.
+    func test_zoom_atFreshDefaults_preservesNon1Ratio() {
+        let fs = FontSettings(defaults: defaults)
+        XCTAssertEqual(fs.terminalFontSize, FontSettings.defaultTerminalSize)
+        XCTAssertEqual(fs.sidebarFontSize,  FontSettings.defaultSize)
+
+        fs.zoom(by: +1)
+        XCTAssertEqual(fs.terminalFontSize, 14)
+        // round(12 * 14 / 13) = round(12.923) = 13
+        XCTAssertEqual(fs.sidebarFontSize, 13)
+
+        fs.zoom(by: -1)
+        XCTAssertEqual(fs.terminalFontSize, 13)
+        // round(13 * 13 / 14) = round(12.07) = 12 — back to the
+        // original 13:12 ratio after a symmetric round-trip.
+        XCTAssertEqual(fs.sidebarFontSize, 12)
     }
 
     func test_zoom_clampsAtMax_butLeavesSidebarAtExisting() {
@@ -141,12 +182,12 @@ final class FontSettingsTests: XCTestCase {
 
     // MARK: - resetToDefaults
 
-    func test_resetToDefaults_snapsBothTo12() {
+    func test_resetToDefaults_snapsBothToDefaults() {
         let fs = FontSettings(defaults: defaults)
         fs.terminalFontSize = 20
         fs.sidebarFontSize  = 8
         fs.resetToDefaults()
-        XCTAssertEqual(fs.terminalFontSize, FontSettings.defaultSize)
+        XCTAssertEqual(fs.terminalFontSize, FontSettings.defaultTerminalSize)
         XCTAssertEqual(fs.sidebarFontSize,  FontSettings.defaultSize)
     }
 
@@ -157,7 +198,7 @@ final class FontSettingsTests: XCTestCase {
             fs.resetToDefaults()
         }
         let reloaded = FontSettings(defaults: defaults)
-        XCTAssertEqual(reloaded.terminalFontSize, FontSettings.defaultSize)
+        XCTAssertEqual(reloaded.terminalFontSize, FontSettings.defaultTerminalSize)
         XCTAssertEqual(reloaded.sidebarFontSize,  FontSettings.defaultSize)
     }
 }
