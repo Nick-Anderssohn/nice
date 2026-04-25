@@ -28,12 +28,20 @@ final class AppStateProjectBucketingTests: XCTestCase {
 
     private var appState: AppState!
     private var homeSandbox: TestHomeSandbox!
+    private var gitFsRoot: URL!
     private let mainCwd = "/tmp/nice-test-home"
 
     override func setUp() {
         super.setUp()
         homeSandbox = TestHomeSandbox()
         setenv("NICE_CLAUDE_OVERRIDE", "/bin/cat", 1)
+        gitFsRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "nice-bucketing-\(UUID().uuidString)", isDirectory: true
+            )
+        try? FileManager.default.createDirectory(
+            at: gitFsRoot, withIntermediateDirectories: true
+        )
         appState = AppState(
             services: nil,
             initialSidebarCollapsed: false,
@@ -45,6 +53,8 @@ final class AppStateProjectBucketingTests: XCTestCase {
     override func tearDown() {
         appState = nil
         unsetenv("NICE_CLAUDE_OVERRIDE")
+        try? FileManager.default.removeItem(at: gitFsRoot)
+        gitFsRoot = nil
         homeSandbox.teardown()
         homeSandbox = nil
         super.tearDown()
@@ -393,7 +403,151 @@ final class AppStateProjectBucketingTests: XCTestCase {
         XCTAssertEqual(spawn.cwd, existingDir)
     }
 
+    // MARK: - Git-root bucketing
+
+    /// A nested repo under an existing project must not be absorbed
+    /// by longest-prefix-matching — it gets its own project anchored
+    /// at the inner git root.
+    func test_nestedGitRepo_createsSeparateProjectFromOuter() throws {
+        let outer = makeGitRepo(at: "outer")
+        let nested = makeGitRepo(at: "outer/nested-1")
+
+        seedProject(id: "outer", name: "OUTER", path: outer)
+
+        appState.createTabFromMainTerminal(cwd: nested, args: [])
+
+        let outerProject = try XCTUnwrap(
+            appState.projects.first { $0.id == "outer" }
+        )
+        XCTAssertEqual(outerProject.tabs.count, 1,
+                       "Outer must not absorb the nested-repo tab")
+
+        let nestedProject = try XCTUnwrap(
+            appState.projects.first {
+                $0.id != AppState.terminalsProjectId
+                    && $0.id != "outer"
+            },
+            "A separate project rooted at the nested repo must exist"
+        )
+        XCTAssertEqual(nestedProject.path, nested)
+        XCTAssertEqual(nestedProject.name, "NESTED-1")
+        XCTAssertEqual(nestedProject.tabs.count, 1)
+    }
+
+    /// A cwd that's a sub-directory of an existing project's git
+    /// repo must bucket into that project — git-root anchoring is
+    /// what makes intra-repo navigation cluster, not prefix matching.
+    func test_subdirOfExistingRepo_bucketsIntoExistingProject() throws {
+        let repo = makeGitRepo(at: "repo")
+        let sub = makeDir(at: "repo/src/deep")
+
+        seedProject(id: "repo", name: "REPO", path: repo)
+
+        appState.createTabFromMainTerminal(cwd: sub, args: [])
+
+        let repoProject = try XCTUnwrap(
+            appState.projects.first { $0.id == "repo" }
+        )
+        XCTAssertEqual(repoProject.tabs.count, 2,
+                       "Sub-dir tab must bucket into the existing repo project")
+
+        XCTAssertNil(
+            appState.projects.first {
+                $0.id != AppState.terminalsProjectId && $0.id != "repo"
+            },
+            "No spurious project should have been created for the sub-dir"
+        )
+    }
+
+    /// First-launch behavior: opening Claude in a sub-directory of a
+    /// fresh repo creates a project anchored at the git root, not at
+    /// the cwd. Locks in that the new project's `path` is the repo
+    /// root so subsequent intra-repo tabs cluster correctly.
+    func test_firstCwdInsideRepo_anchorsProjectAtGitRoot() throws {
+        let repo = makeGitRepo(at: "repo")
+        let sub = makeDir(at: "repo/src/deep")
+
+        appState.createTabFromMainTerminal(cwd: sub, args: [])
+
+        let new = try XCTUnwrap(
+            appState.projects.first { $0.id != AppState.terminalsProjectId },
+            "A non-Terminals project must be created"
+        )
+        XCTAssertEqual(new.path, repo,
+                       "Project must be anchored at the git root, not the cwd")
+        XCTAssertEqual(new.name, "REPO")
+        XCTAssertEqual(new.tabs.count, 1)
+    }
+
+    /// The rare manual case: the user `cd`'d into a Nice-managed
+    /// worktree before invoking `claude`. The new tab should still
+    /// bucket into the parent repo's project, matching the bucketing
+    /// behavior of `claude -w` (whose pre-worktree cwd is what gets
+    /// passed to `addTabToProjects` today).
+    func test_cwdInsideNiceWorktree_bucketsIntoParentRepo() throws {
+        let repo = makeGitRepo(at: "repo")
+        let worktree = makeWorktreeMarker(at: "repo/.claude/worktrees/bug")
+
+        seedProject(id: "repo", name: "REPO", path: repo)
+
+        appState.createTabFromMainTerminal(cwd: worktree, args: [])
+
+        let repoProject = try XCTUnwrap(
+            appState.projects.first { $0.id == "repo" }
+        )
+        XCTAssertEqual(repoProject.tabs.count, 2,
+                       "Manual cd into a worktree must still bucket into the parent repo")
+
+        XCTAssertNil(
+            appState.projects.first {
+                $0.id != AppState.terminalsProjectId && $0.id != "repo"
+            },
+            "No worktree-named project should have been created"
+        )
+    }
+
     // MARK: - Helpers
+
+    /// Plant a `.git` directory under the test's temp filesystem root
+    /// so `findGitRoot` walks the real filesystem. Returns the
+    /// absolute path of the repo dir (suitable for use as a cwd).
+    private func makeGitRepo(at relativePath: String) -> String {
+        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true
+        )
+        let dotGit = dir.appendingPathComponent(".git", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dotGit, withIntermediateDirectories: true
+        )
+        return dir.path
+    }
+
+    /// Create a plain directory (no `.git`) under the test root so
+    /// the cwd exists on disk but resolves to an enclosing git root
+    /// when one is planted nearby.
+    private func makeDir(at relativePath: String) -> String {
+        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true
+        )
+        return dir.path
+    }
+
+    /// Plant a `.git` *file* (the marker git uses for worktrees and
+    /// submodules) so we can test the worktree pre-strip without
+    /// also tripping the inner repo as a self-contained git root.
+    private func makeWorktreeMarker(at relativePath: String) -> String {
+        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true
+        )
+        let dotGit = dir.appendingPathComponent(".git")
+        try? "gitdir: /placeholder\n".write(
+            to: dotGit, atomically: true, encoding: .utf8
+        )
+        return dir.path
+    }
 
     /// Append a bare (no-tabs) project to the sidebar. Keeps Terminals
     /// at index 0 to preserve the invariant tests elsewhere depend on.

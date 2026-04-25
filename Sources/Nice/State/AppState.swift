@@ -1653,6 +1653,14 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Self-heal any drift that pre-dates the git-aware bucketing
+        // (mis-bucketed tabs from nested repos, projects rooted at
+        // sub-directories of a git repo, duplicates, or empties left
+        // behind by repair). Idempotent in steady state, so the cost
+        // is just the .git existence checks.
+        repairProjectStructure()
+        scheduleSessionSave()
+
         if let active = snapshot.activeTabId, tab(for: active) != nil {
             activeTabId = active
         }
@@ -1804,6 +1812,38 @@ final class AppState: ObservableObject {
         return path
     }
 
+    /// Strip any `<X>/.claude/worktrees/<name>/...` suffix and return
+    /// `<X>`. A Nice-specific convention: sessions running inside a
+    /// Nice-managed worktree should resolve to the parent repo, not
+    /// to the worktree's own internal `.git` marker. Mirrors the
+    /// pre-worktree cwd that `createTabFromMainTerminal` passes when
+    /// `claude -w` is invoked.
+    static func stripNiceWorktreeSuffix(_ path: String) -> String {
+        guard let range = path.range(of: "/.claude/worktrees/") else {
+            return path
+        }
+        return String(path[..<range.lowerBound])
+    }
+
+    /// Walk up from `cwd` (after stripping any Nice worktree suffix),
+    /// returning the absolute path of the nearest ancestor directory
+    /// that contains a `.git` entry — matches both `.git/` (normal
+    /// repo) and `.git` files (submodules and git worktrees). Returns
+    /// nil if no `.git` is found before reaching the filesystem root.
+    static func findGitRoot(forCwd cwd: String) -> String? {
+        var current = stripNiceWorktreeSuffix(cwd)
+        while !current.isEmpty && current != "/" {
+            let dotGit = (current as NSString).appendingPathComponent(".git")
+            if FileManager.default.fileExists(atPath: dotGit) {
+                return current
+            }
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current { break }
+            current = parent
+        }
+        return nil
+    }
+
     /// Extract the value of `-w` / `--worktree` from Claude args. Only
     /// the space-delimited form is recognized (matches Claude Code's
     /// CLI). Returns nil if the flag is absent, trailing with no
@@ -1837,15 +1877,22 @@ final class AppState: ObservableObject {
         return expanded
     }
 
-    /// Bucket `tab` into the longest-prefix-matching project under
-    /// `cwd`, creating a new project if none matches. Shared by
-    /// tab-creation (Main Terminal → `claude`) and session restore.
+    /// Bucket `tab` into the project that anchors `cwd`'s git repo,
+    /// creating a new project at the git root when none matches. Falls
+    /// back to longest-prefix matching when `cwd` is not inside any
+    /// git repo, preserving the legacy behavior for ad-hoc non-repo
+    /// directories.
     private func addTabToProjects(_ tab: Tab, cwd: String) {
         let normalizedCwd = Self.expandTilde(cwd)
-        // Exclude the pinned Terminals group: its path is seeded from the
-        // Main Terminal's cwd (typically $HOME), so it would prefix-match
-        // almost any cwd and swallow new Claude tabs that belong in a
-        // fresh project group.
+        if let gitRoot = Self.findGitRoot(forCwd: normalizedCwd) {
+            appendOrInsert(tab, intoProjectAt: gitRoot)
+            return
+        }
+        // No git root: legacy longest-prefix behavior. Excludes the
+        // pinned Terminals group, whose path is seeded from the Main
+        // Terminal's cwd (typically $HOME) and would otherwise prefix-
+        // match almost any cwd and swallow new Claude tabs that belong
+        // in a fresh project group.
         if let idx = projects.enumerated()
             .filter({ $0.element.id != Self.terminalsProjectId })
             .filter({ normalizedCwd.hasPrefix(Self.expandTilde($0.element.path)) })
@@ -1854,11 +1901,121 @@ final class AppState: ObservableObject {
         {
             projects[idx].tabs.append(tab)
         } else {
-            let dirName = (normalizedCwd as NSString).lastPathComponent.uppercased()
-            let projectId = "p-\(dirName.lowercased())-\(Int(Date().timeIntervalSince1970 * 1000))"
-            projects.append(Project(
-                id: projectId, name: dirName, path: normalizedCwd, tabs: [tab]
-            ))
+            appendNewProject(at: normalizedCwd, with: tab)
+        }
+    }
+
+    /// Append `tab` to the existing non-Terminals project rooted at
+    /// `path`, or create a new project there if none matches.
+    private func appendOrInsert(_ tab: Tab, intoProjectAt path: String) {
+        if let idx = firstIndex(ofNonTerminalsProjectAt: path) {
+            projects[idx].tabs.append(tab)
+        } else {
+            appendNewProject(at: path, with: tab)
+        }
+    }
+
+    /// Index of the first non-Terminals project whose `path` (after
+    /// `expandTilde`) equals `path`. Single source of truth for
+    /// project lookup by anchor — used by `addTabToProjects`,
+    /// `repairProjectStructure`, and any future code that needs to
+    /// find a project by its filesystem anchor.
+    private func firstIndex(ofNonTerminalsProjectAt path: String) -> Int? {
+        projects.firstIndex {
+            $0.id != Self.terminalsProjectId
+                && Self.expandTilde($0.path) == path
+        }
+    }
+
+    /// Append a fresh project rooted at `path`, deriving the display
+    /// name from the path's last component. Centralised so creation
+    /// from `addTabToProjects` and `repairProjectStructure` stays in
+    /// sync (id format, name casing). Uses a UUID prefix instead of a
+    /// timestamp so back-to-back appends in the same millisecond
+    /// (e.g. inside the repair tab-move loop) can't collide on `id`.
+    private func appendNewProject(at path: String, with tab: Tab) {
+        let dirName = (path as NSString).lastPathComponent.uppercased()
+        let projectId = "p-\(dirName.lowercased())-\(UUID().uuidString.prefix(8).lowercased())"
+        projects.append(Project(
+            id: projectId, name: dirName, path: path, tabs: [tab]
+        ))
+    }
+
+    /// Self-heal the persisted project structure. Idempotent. Skips
+    /// the pinned Terminals project entirely.
+    ///
+    /// Four passes:
+    /// 1. Promote each non-Terminals project's `path` to its enclosing
+    ///    git root if `path` is a strict descendant of one.
+    /// 2. Move tabs whose own git-root anchor (computed from
+    ///    `tab.cwd`) differs from the containing project's path. Tabs
+    ///    whose `cwd` no longer exists on disk stay put.
+    /// 3. Merge non-Terminals projects that ended up at the same
+    ///    expanded path (lowest-index wins; later dupes are emptied).
+    /// 4. Drop empty non-Terminals projects.
+    ///
+    /// Internal (not private) so tests can drive it directly with
+    /// hand-seeded `projects` state.
+    func repairProjectStructure() {
+        // 1. Promote project paths to their git roots.
+        for i in projects.indices where projects[i].id != Self.terminalsProjectId {
+            let path = Self.expandTilde(projects[i].path)
+            guard FileManager.default.fileExists(atPath: path),
+                  let root = Self.findGitRoot(forCwd: path),
+                  root != path
+            else { continue }
+            projects[i].path = root
+            projects[i].name = (root as NSString).lastPathComponent.uppercased()
+        }
+
+        // 2. Collect mis-bucketed tabs, then re-insert them at the
+        //    right anchor. Two phases so the index-stable mutation
+        //    (rewriting each project's tabs in place) finishes before
+        //    we start appending new projects for unmatched anchors.
+        struct Move { let tab: Tab; let targetGitRoot: String }
+        var moves: [Move] = []
+        for i in projects.indices where projects[i].id != Self.terminalsProjectId {
+            let projectAnchor = Self.expandTilde(projects[i].path)
+            var keep: [Tab] = []
+            keep.reserveCapacity(projects[i].tabs.count)
+            for tab in projects[i].tabs {
+                let tabCwd = Self.expandTilde(tab.cwd)
+                guard FileManager.default.fileExists(atPath: tabCwd) else {
+                    keep.append(tab)
+                    continue
+                }
+                let anchor = Self.findGitRoot(forCwd: tabCwd) ?? tabCwd
+                if anchor == projectAnchor {
+                    keep.append(tab)
+                } else {
+                    moves.append(Move(tab: tab, targetGitRoot: anchor))
+                }
+            }
+            projects[i].tabs = keep
+        }
+        for move in moves {
+            appendOrInsert(move.tab, intoProjectAt: move.targetGitRoot)
+        }
+
+        // 3. Merge duplicates targeting the same expanded path.
+        var canonicalIndexByPath: [String: Int] = [:]
+        var dupes: [Int] = []
+        for i in projects.indices where projects[i].id != Self.terminalsProjectId {
+            let key = Self.expandTilde(projects[i].path)
+            if let canonical = canonicalIndexByPath[key] {
+                projects[canonical].tabs.append(contentsOf: projects[i].tabs)
+                dupes.append(i)
+            } else {
+                canonicalIndexByPath[key] = i
+            }
+        }
+        for idx in dupes.sorted(by: >) {
+            projects.remove(at: idx)
+        }
+
+        // 4. Drop empty non-Terminals projects.
+        projects.removeAll {
+            $0.id != Self.terminalsProjectId && $0.tabs.isEmpty
         }
     }
 }
