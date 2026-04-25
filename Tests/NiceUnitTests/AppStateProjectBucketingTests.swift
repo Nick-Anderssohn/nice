@@ -375,6 +375,46 @@ final class AppStateProjectBucketingTests: XCTestCase {
         XCTAssertEqual(spawn.claudePaneId, "restored-claude")
     }
 
+    /// A terminal-only tab restored with a non-first active pane must
+    /// spawn that active pane (not the first terminal). `mainContent`
+    /// gates rendering on `session.panes[activePaneId]`, so spawning
+    /// the wrong pane leaves the user staring at the blank-background
+    /// fallback after relaunch.
+    func test_addRestoredTabModel_terminalTab_spawnsActivePane_notFirst() throws {
+        let existingDir = NSTemporaryDirectory()
+        seedProject(id: "tmp", name: "TMP", path: "/does-not-matter")
+        let projectIdx = try XCTUnwrap(
+            appState.projects.firstIndex { $0.id == "tmp" }
+        )
+
+        let persisted = PersistedTab(
+            id: "restored-multi-term",
+            title: "split",
+            cwd: existingDir,
+            branch: nil,
+            claudeSessionId: nil,
+            activePaneId: "restored-multi-term-p2",
+            panes: [
+                PersistedPane(id: "restored-multi-term-p1", title: "zsh", kind: .terminal),
+                PersistedPane(id: "restored-multi-term-p2", title: "zsh", kind: .terminal),
+            ]
+        )
+
+        XCTAssertNil(
+            appState.addRestoredTabModel(persisted, toProjectIndex: projectIdx),
+            "Terminal-only tabs must not return a Claude spawn tuple"
+        )
+
+        let session = try XCTUnwrap(
+            appState.ptySessions["restored-multi-term"],
+            "Session must be created on restore"
+        )
+        XCTAssertNotNil(
+            session.panes["restored-multi-term-p2"],
+            "Active pane (p2) must be spawned so mainContent has a pty to render"
+        )
+    }
+
     /// Happy path: when the persisted cwd still exists, the restored
     /// spawn uses it unchanged so `claude --resume` launches in the
     /// worktree the session originally lived in.

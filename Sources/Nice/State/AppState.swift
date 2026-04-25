@@ -1838,6 +1838,12 @@ final class AppState: ObservableObject {
                         initialTerminalPaneId: nil,
                         claudeSessionMode: .resumeDeferred(id: spawn.claudeSessionId)
                     )
+                    // If the user was last focused on the terminal
+                    // companion (rather than the Claude pane), spawn
+                    // it now too so `mainContent` has a pty to render
+                    // — otherwise the restored tab opens to a blank
+                    // background until the user clicks something.
+                    self.ensureActivePaneSpawned(tabId: spawn.tabId)
                 }
             }
         }
@@ -1945,18 +1951,24 @@ final class AppState: ObservableObject {
             )
         }
 
-        // Terminal-only tab: bring its shell up now at the first
-        // terminal pane's last-observed cwd (falls back to the tab's
-        // cwd when the pane has none persisted, or its cwd no longer
-        // exists). Pass `initialTerminalPaneId` explicitly so
-        // `makeSession`'s auto-pick doesn't reset the spawn dir to the
-        // session-level value.
-        if let firstTerm = tab.panes.first(where: { $0.kind == .terminal }) {
-            let paneCwd = resolvedSpawnCwd(for: tab, pane: firstTerm)
+        // Terminal-only tab: bring its active pane's shell up now at
+        // that pane's last-observed cwd. We honour `activePaneId`
+        // instead of letting `makeSession` infer the first terminal —
+        // if the user quit while focused on a secondary pane,
+        // spawning the first instead leaves `session.panes[activePaneId]`
+        // empty and `mainContent` renders the blank fallback. Per-pane
+        // cwd falls back to the tab cwd when the pane has none
+        // persisted, or its cwd no longer exists. Other panes stay
+        // lazy until first focus.
+        let activeTerminal = tab.activePaneId.flatMap { id in
+            tab.panes.first(where: { $0.id == id && $0.kind == .terminal })
+        } ?? tab.panes.first(where: { $0.kind == .terminal })
+        if let pane = activeTerminal {
+            let paneCwd = resolvedSpawnCwd(for: tab, pane: pane)
             _ = makeSession(
                 for: tab.id,
                 cwd: paneCwd,
-                initialTerminalPaneId: firstTerm.id
+                initialTerminalPaneId: pane.id
             )
         } else {
             _ = makeSession(for: tab.id, cwd: spawnCwd)
