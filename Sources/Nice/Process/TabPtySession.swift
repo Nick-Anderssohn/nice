@@ -188,22 +188,19 @@ final class TabPtySession: ObservableObject {
         // as ghostty so the in-app session label updates automatically
         // — SwiftTerm handles the resulting OSC 0/1/2 sequences natively
         // and the choice doesn't trigger iTerm-specific OSC extensions.
-        var claudeExtraEnv: [String: String] = ["TERM_PROGRAM": "ghostty"]
-        // Pane/tab identity + control-socket path. The deferred path
-        // uses these for the zsh `claude()` wrapper's handshake; every
-        // path needs them so the UserPromptSubmit hook can post
-        // session_update messages back to Nice.
-        claudeExtraEnv["NICE_TAB_ID"] = tabId
-        claudeExtraEnv["NICE_PANE_ID"] = id
-        if let sp = socketPath { claudeExtraEnv["NICE_SOCKET"] = sp }
+        let claudeExtraEnv = Self.buildClaudeExtraEnv(
+            mode: claudeSessionMode,
+            tabId: tabId,
+            paneId: id,
+            socketPath: socketPath,
+            zdotdirPath: zdotdirPath
+        )
 
-        if case .resumeDeferred(let sessionId) = claudeSessionMode {
+        if case .resumeDeferred = claudeSessionMode {
             // Pane renders as Claude but the pty is a plain shell with
             // the resume command pre-typed. The socket handshake will
             // flip the pane to actually running-Claude when the user
             // hits Enter and the wrapper promotes this pane in place.
-            if let zp = zdotdirPath { claudeExtraEnv["ZDOTDIR"] = zp }
-            claudeExtraEnv["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
             view.startProcess(
                 executable: "/bin/zsh",
                 args: ["-il"],
@@ -505,6 +502,31 @@ final class TabPtySession: ObservableObject {
     /// instance or static state — so tests can call it from their
     /// default nonisolated `XCTestCase.test*` methods without hopping
     /// onto the main actor.
+    /// Build the extra-env dictionary for a Claude pane. Pure helper so
+    /// per-mode contracts (every mode injects `NICE_SOCKET` so the
+    /// UserPromptSubmit hook can reach Nice; only `.resumeDeferred`
+    /// needs `ZDOTDIR` + `NICE_PREFILL_COMMAND` for the wrapper-driven
+    /// pre-typed `claude --resume <uuid>`) are checkable from tests
+    /// without spinning up a pty. `nonisolated` for the same reason
+    /// as `buildClaudeExecCommand`.
+    nonisolated static func buildClaudeExtraEnv(
+        mode: ClaudeSessionMode,
+        tabId: String,
+        paneId: String,
+        socketPath: String?,
+        zdotdirPath: String?
+    ) -> [String: String] {
+        var env: [String: String] = ["TERM_PROGRAM": "ghostty"]
+        env["NICE_TAB_ID"] = tabId
+        env["NICE_PANE_ID"] = paneId
+        if let sp = socketPath { env["NICE_SOCKET"] = sp }
+        if case .resumeDeferred(let sessionId) = mode {
+            if let zp = zdotdirPath { env["ZDOTDIR"] = zp }
+            env["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
+        }
+        return env
+    }
+
     nonisolated static func buildClaudeExecCommand(
         claude: String,
         mode: ClaudeSessionMode,
