@@ -30,10 +30,25 @@ struct SidebarView: View {
 
     // MARK: - Expanded sidebar
 
+    @ViewBuilder
     private var expandedSidebar: some View {
-        VStack(spacing: 0) {
-            tabList
-            footer
+        // Peek state always shows the tabs view: holding the
+        // tab-cycling shortcut means the user is picking a tab, so
+        // even if `sidebarMode == .files` we surface the project list
+        // here. The non-peek expanded sidebar respects sidebarMode.
+        if appState.sidebarPeeking {
+            VStack(spacing: 0) {
+                tabList
+                footer
+            }
+        } else {
+            VStack(spacing: 0) {
+                switch appState.sidebarMode {
+                case .tabs:  tabList
+                case .files: FileBrowserView()
+                }
+                footer
+            }
         }
     }
 
@@ -181,7 +196,7 @@ private struct ProjectGroup: View {
                 .contentShape(Rectangle())
                 .onTapGesture { isOpen.toggle() }
             Text(project.name.uppercased())
-                .font(.system(size: fontSettings.sidebarSize(11), weight: .semibold))
+                .font(.system(size: fontSettings.sidebarSize(12), weight: .semibold))
                 .tracking(0.2)
                 .foregroundStyle(Color.niceInk2(scheme, palette))
                 .contentShape(Rectangle())
@@ -331,7 +346,7 @@ private struct TabRow: View {
     }
 
     private var titleFont: Font {
-        .system(size: fontSettings.sidebarSize(12), weight: isActive ? .semibold : .regular)
+        .system(size: fontSettings.sidebarSize(13), weight: isActive ? .semibold : .regular)
     }
 
     private func beginEditing() {
@@ -382,7 +397,11 @@ private struct TabRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
+        // Sized for parity with Xcode's Project Navigator and the
+        // file-browser rows: 13pt title, 6pt HStack spacing, 4pt
+        // vertical padding, 4pt corner radius. The row reads as one
+        // consistent sidebar regardless of mode.
+        HStack(spacing: 6) {
             if tab.hasClaude {
                 StatusDot(
                     status: tab.status,
@@ -392,9 +411,9 @@ private struct TabRow: View {
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).claudeIcon")
             } else {
                 Image(systemName: "terminal")
-                    .font(.system(size: fontSettings.sidebarSize(10), weight: .regular))
+                    .font(.system(size: fontSettings.sidebarSize(12), weight: .regular))
                     .foregroundStyle(Color.niceInk3(scheme, palette))
-                    .frame(width: 12, height: 12)
+                    .frame(width: 16, height: 16)
                     .accessibilityElement()
                     .accessibilityIdentifier("sidebar.tab.\(tab.id).terminalIcon")
             }
@@ -402,9 +421,9 @@ private struct TabRow: View {
         }
         .padding(.leading, 22)
         .padding(.trailing, 10)
-        .padding(.vertical, 5)
+        .padding(.vertical, 4)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
                 .fill(backgroundColor)
         )
         .padding(.horizontal, 6)

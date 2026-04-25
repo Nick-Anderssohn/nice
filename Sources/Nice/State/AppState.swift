@@ -88,6 +88,19 @@ final class AppState: ObservableObject {
     /// its own state; the view writes back on changes.
     @Published var sidebarCollapsed: Bool = false
 
+    /// Which content the sidebar is showing (tabs vs file browser).
+    /// Seeded from the per-window `@SceneStorage` value upstream so
+    /// each window restores its last-used mode across relaunch.
+    @Published var sidebarMode: SidebarMode = .tabs
+
+    /// Per-window catalog of file-browser states keyed by `Tab.id`.
+    /// Lifecycle: states are lazily created on first access and
+    /// removed in `finalizeDissolvedTab` when a tab dissolves. The
+    /// store is `@Published` indirectly via its own `ObservableObject`
+    /// surface — views observing it pick up changes without
+    /// `AppState` re-publishing.
+    let fileBrowserStore: FileBrowserStore = FileBrowserStore()
+
     /// Transient: sidebar is floating over the terminal as a peek
     /// triggered by the tab-cycling shortcut while collapsed. Set by
     /// `KeyboardShortcutMonitor` after a sidebar-tab dispatch, cleared
@@ -98,6 +111,58 @@ final class AppState: ObservableObject {
 
     func toggleSidebar() {
         sidebarCollapsed.toggle()
+    }
+
+    /// Flip the sidebar between projects/tabs and file-browser views.
+    /// Bound to `ShortcutAction.toggleSidebarMode` (default ⌘⇧B) and
+    /// the two mode icons in the sidebar header.
+    func toggleSidebarMode() {
+        sidebarMode = (sidebarMode == .tabs) ? .files : .tabs
+    }
+
+    /// Flip the active tab's file-browser hidden-file visibility.
+    /// Bound to `ShortcutAction.toggleHiddenFiles` (default ⌘⇧.) and
+    /// the eye toggle in the file browser's breadcrumb. Mirrors
+    /// Finder's standard ⌘⇧. shortcut.
+    ///
+    /// Gated on `sidebarMode == .files` so pressing the shortcut
+    /// from tabs mode is a true no-op — no allocation, no published
+    /// change for a feature the user isn't looking at. The store's
+    /// `toggleHiddenFilesIfExists` further skips toggling for tabs
+    /// that have never opened the file browser.
+    func toggleFileBrowserHiddenFiles() {
+        guard sidebarMode == .files,
+              let tabId = activeTabId else { return }
+        fileBrowserStore.toggleHiddenFilesIfExists(forTab: tabId)
+    }
+
+    /// Project that owns the given tab, or `nil` if no such tab is
+    /// currently in the model. Used internally — callers outside
+    /// `AppState` should prefer the more specific helpers below
+    /// (e.g. `fileBrowserHeaderTitle(forTab:)`) so they don't grow
+    /// dependencies on `Project`'s shape.
+    private func project(forTab id: String) -> Project? {
+        for project in projects where project.tabs.contains(where: { $0.id == id }) {
+            return project
+        }
+        return nil
+    }
+
+    /// Title to show at the top of the file browser for `tabId`.
+    /// Encapsulates the rule "use the owning project's name unless
+    /// the tab is in the pinned Terminals project (whose name is
+    /// generic), in which case fall back to the tab's own title."
+    /// Lives here so the file-browser view doesn't have to know
+    /// about `terminalsProjectId` or how tabs nest into projects.
+    func fileBrowserHeaderTitle(forTab id: String) -> String {
+        let tabTitle = tab(for: id)?.title
+        guard let project = project(forTab: id) else {
+            return tabTitle ?? "Files"
+        }
+        if project.id == Self.terminalsProjectId {
+            return tabTitle ?? project.name
+        }
+        return project.name
     }
 
     /// Called by the keyboard monitor when all relevant shortcut
@@ -172,7 +237,7 @@ final class AppState: ObservableObject {
     /// Tracks the user's terminal font size. New sessions pick this up
     /// at creation; `updateTerminalFontSize` fans changes out to every
     /// live `TabPtySession`.
-    private var currentTerminalFontSize: CGFloat = FontSettings.defaultSize
+    private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
 
     /// Tracks the GPU rendering preference (`Tweaks.gpuRendering`). New
     /// sessions seed from this; `updateGpuRendering` fans changes out
@@ -219,6 +284,7 @@ final class AppState: ObservableObject {
         self.init(
             services: nil,
             initialSidebarCollapsed: false,
+            initialSidebarMode: .tabs,
             initialMainCwd: nil,
             windowSessionId: UUID().uuidString
         )
@@ -227,6 +293,7 @@ final class AppState: ObservableObject {
     init(
         services: NiceServices?,
         initialSidebarCollapsed: Bool,
+        initialSidebarMode: SidebarMode = .tabs,
         initialMainCwd: String?,
         windowSessionId: String
     ) {
@@ -240,6 +307,7 @@ final class AppState: ObservableObject {
             : windowSessionId
         self.persistenceEnabled = services != nil
         self.sidebarCollapsed = initialSidebarCollapsed
+        self.sidebarMode = initialSidebarMode
 
         let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
 
@@ -279,7 +347,7 @@ final class AppState: ObservableObject {
             }
         }
         self.currentTerminalFontSize = services?.fontSettings.terminalFontSize
-            ?? FontSettings.defaultSize
+            ?? FontSettings.defaultTerminalSize
 
         var extraEnv: [String: String] = [:]
         extraEnv["NICE_SOCKET"] = socket.path
@@ -764,6 +832,7 @@ final class AppState: ObservableObject {
     ) {
         projects[pi].tabs.remove(at: ti)
         ptySessions.removeValue(forKey: tabId)
+        fileBrowserStore.removeState(forTab: tabId)
         if activeTabId == tabId {
             activeTabId = firstAvailableTabId()
         }

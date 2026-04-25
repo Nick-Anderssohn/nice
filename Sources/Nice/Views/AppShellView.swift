@@ -35,6 +35,10 @@ import SwiftUI
 struct AppShellView: View {
     @EnvironmentObject private var services: NiceServices
     @SceneStorage("sidebarCollapsed") private var storedSidebarCollapsed: Bool = false
+    /// Per-window persisted sidebar content mode. Default is `.tabs`
+    /// so existing users get exactly the same first-launch experience
+    /// they had before the file-browser feature shipped.
+    @SceneStorage("sidebarMode") private var storedSidebarMode: SidebarMode = .tabs
     /// Stable per-window id that survives quits via scene storage.
     /// `AppState` uses it to look up this window's entry in
     /// `sessions.json` so restore rebuilds the right tabs.
@@ -44,8 +48,10 @@ struct AppShellView: View {
         AppShellHost(
             services: services,
             initialSidebarCollapsed: storedSidebarCollapsed,
+            initialSidebarMode: storedSidebarMode,
             windowSessionId: storedWindowSessionId,
             sidebarCollapsedBinding: $storedSidebarCollapsed,
+            sidebarModeBinding: $storedSidebarMode,
             windowSessionIdBinding: $storedWindowSessionId
         )
     }
@@ -64,6 +70,7 @@ private struct AppShellHost: View {
     @StateObject private var appState: AppState
     let services: NiceServices
     @Binding var sidebarCollapsedBinding: Bool
+    @Binding var sidebarModeBinding: SidebarMode
     @Binding var windowSessionIdBinding: String
 
     /// True while the cursor is over the floating peek sidebar. Keeps
@@ -86,18 +93,22 @@ private struct AppShellHost: View {
     init(
         services: NiceServices,
         initialSidebarCollapsed: Bool,
+        initialSidebarMode: SidebarMode,
         windowSessionId: String,
         sidebarCollapsedBinding: Binding<Bool>,
+        sidebarModeBinding: Binding<SidebarMode>,
         windowSessionIdBinding: Binding<String>
     ) {
         self.services = services
         _appState = StateObject(wrappedValue: AppState(
             services: services,
             initialSidebarCollapsed: initialSidebarCollapsed,
+            initialSidebarMode: initialSidebarMode,
             initialMainCwd: nil,
             windowSessionId: windowSessionId
         ))
         _sidebarCollapsedBinding = sidebarCollapsedBinding
+        _sidebarModeBinding = sidebarModeBinding
         _windowSessionIdBinding = windowSessionIdBinding
     }
 
@@ -225,6 +236,11 @@ private struct AppShellHost: View {
                 peekMousePinned = false
             }
         }
+        // Mirror AppState's sidebarMode back to scene storage so each
+        // window restores its last-used mode across relaunch.
+        .onChange(of: appState.sidebarMode) { _, new in
+            sidebarModeBinding = new
+        }
         // Mirror AppState's windowSessionId back to scene storage —
         // restore may have adopted a different slot (e.g. bootstrap)
         // and the pairing must survive relaunch.
@@ -289,16 +305,40 @@ private struct AppShellHost: View {
                 WindowDragRegion()
                     .frame(height: 52)
                     .overlay(alignment: .topTrailing) {
-                        // Button top at strip-y=8 places the 24pt
+                        // Mode toggles + collapse all live as a single
+                        // trailing row. Collapse stays rightmost so its
+                        // window-x position is unchanged (UITests + the
+                        // collapsed-cap restore button align on it).
+                        // Button top at strip-y=8 places each 24pt
                         // button's center at strip-y=20, i.e. 26pt
                         // from the window top — matching the collapsed
                         // cap's button (40pt card, 6pt top padding,
                         // HStack-centered button → same window-y=26).
-                        SidebarToggleButton(
-                            help: "Collapse sidebar",
-                            accessibilityId: "sidebar.collapse"
-                        ) {
-                            appState.toggleSidebar()
+                        HStack(spacing: 4) {
+                            SidebarModeIconButton(
+                                systemImage: "list.bullet",
+                                help: "Show tabs",
+                                accessibilityId: "sidebar.mode.tabs",
+                                active: appState.sidebarMode == .tabs,
+                                accent: tweaks.accent.color
+                            ) {
+                                appState.sidebarMode = .tabs
+                            }
+                            SidebarModeIconButton(
+                                systemImage: "folder",
+                                help: "Show files",
+                                accessibilityId: "sidebar.mode.files",
+                                active: appState.sidebarMode == .files,
+                                accent: tweaks.accent.color
+                            ) {
+                                appState.sidebarMode = .files
+                            }
+                            SidebarToggleButton(
+                                help: "Collapse sidebar",
+                                accessibilityId: "sidebar.collapse"
+                            ) {
+                                appState.toggleSidebar()
+                            }
                         }
                         .padding(.top, 8)
                         .padding(.trailing, 10)
@@ -541,6 +581,51 @@ private struct AppShellHost: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.leading, 20)
         }
+    }
+}
+
+// MARK: - Mode toggle icon
+
+/// Sidebar-header icon button that selects between `SidebarMode.tabs`
+/// and `SidebarMode.files`. Active mode gets an accent-tinted filled
+/// background (mirrors `SettingsSectionRow` styling); inactive picks
+/// up only a hover background, matching `SidebarToggleButton`.
+private struct SidebarModeIconButton: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+
+    let systemImage: String
+    let help: String
+    let accessibilityId: String
+    let active: Bool
+    let accent: Color
+    let action: () -> Void
+
+    @State private var hover = false
+
+    private var backgroundFill: Color {
+        if active { return Color.niceSel(scheme, accent: accent) }
+        if hover  { return Color.niceInk(scheme, palette).opacity(0.08) }
+        return .clear
+    }
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 13, weight: active ? .semibold : .regular))
+            .foregroundStyle(active
+                ? Color.niceInk(scheme, palette)
+                : Color.niceInk2(scheme, palette))
+            .frame(width: 24, height: 24)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(backgroundFill)
+            )
+            .contentShape(Rectangle())
+            .onHover { hover = $0 }
+            .onTapGesture { action() }
+            .help(help)
+            .accessibilityIdentifier(accessibilityId)
+            .accessibilityAddTraits(active ? .isSelected : [])
     }
 }
 

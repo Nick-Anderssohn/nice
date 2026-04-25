@@ -15,6 +15,16 @@ enum PaneKind: String, Hashable, Sendable, Codable {
     case terminal
 }
 
+/// Which content the expanded sidebar is currently showing. Window-global
+/// (one mode at a time per window) and bridged to `@SceneStorage` upstream
+/// in `AppShellView` so each window restores its mode across relaunch.
+enum SidebarMode: String, Hashable, Sendable, Codable {
+    /// Default — projects and tabs.
+    case tabs
+    /// File system browser rooted at the active tab's CWD.
+    case files
+}
+
 enum TabStatus: String, CaseIterable, Hashable, Sendable, Codable {
     case thinking
     case waiting

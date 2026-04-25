@@ -195,6 +195,8 @@ enum KeyboardShortcutMonitor {
         case .prevPane:        appState.selectPrevPane()
         case .newTerminalPane: appState.addTerminalToActiveTab()
         case .toggleSidebar:   appState.toggleSidebar()
+        case .toggleSidebarMode: appState.toggleSidebarMode()
+        case .toggleHiddenFiles: appState.toggleFileBrowserHiddenFiles()
         case .increaseFontSize, .decreaseFontSize, .resetFontSizes:
             // Handled by dispatchFontAction before we reach here.
             break
