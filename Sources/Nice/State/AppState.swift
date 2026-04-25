@@ -1809,6 +1809,12 @@ final class AppState: ObservableObject {
                         initialTerminalPaneId: nil,
                         claudeSessionMode: .resumeDeferred(id: spawn.claudeSessionId)
                     )
+                    // If the user was last focused on the terminal
+                    // companion (rather than the Claude pane), spawn
+                    // it now too so `mainContent` has a pty to render
+                    // — otherwise the restored tab opens to a blank
+                    // background until the user clicks something.
+                    self.ensureActivePaneSpawned(tabId: spawn.tabId)
                 }
             }
         }
@@ -1916,10 +1922,21 @@ final class AppState: ObservableObject {
             )
         }
 
-        // Terminal-only tab: bring its shell up now. `makeSession`
-        // picks the first terminal pane from the tab's model when
-        // callers don't pass ids explicitly.
-        _ = makeSession(for: tab.id, cwd: spawnCwd)
+        // Terminal-only tab: bring its active pane's shell up now.
+        // We honour `activePaneId` instead of letting `makeSession`
+        // infer the first terminal — if the user quit while focused
+        // on a secondary pane, spawning the first instead leaves
+        // `session.panes[activePaneId]` empty and `mainContent`
+        // renders the blank fallback. Other panes stay lazy until
+        // first focus, matching the steady-state behaviour.
+        let activeTerminalPaneId = tab.activePaneId.flatMap { id in
+            tab.panes.first(where: { $0.id == id && $0.kind == .terminal })?.id
+        }
+        _ = makeSession(
+            for: tab.id,
+            cwd: spawnCwd,
+            initialTerminalPaneId: activeTerminalPaneId
+        )
         return nil
     }
 
