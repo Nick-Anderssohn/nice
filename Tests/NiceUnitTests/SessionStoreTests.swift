@@ -265,6 +265,72 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(restored, window)
     }
 
+    // MARK: - Per-pane cwd round-trip
+
+    func test_persistedPane_roundTripsCwd() throws {
+        // Per-pane cwd is what restores split-pane fidelity — each
+        // pane comes back where the user left it.
+        let panes = [
+            PersistedPane(id: "p1", title: "zsh", kind: .terminal, cwd: "/usr"),
+            PersistedPane(id: "p2", title: "zsh", kind: .terminal, cwd: "/var/log"),
+        ]
+        let tab = PersistedTab(
+            id: "t1", title: "Splits", cwd: "/tmp", branch: nil,
+            claudeSessionId: nil, activePaneId: "p1", panes: panes
+        )
+        let window = makeWindow(id: "w1", tabs: [tab])
+
+        do {
+            let store = SessionStore()
+            store.upsert(window: window)
+            store.flush()
+        }
+        let restored = SessionStore().load().windows.first
+        let restoredPanes = restored?.projects.first?.tabs.first?.panes
+        XCTAssertEqual(restoredPanes?.map(\.cwd), ["/usr", "/var/log"],
+                       "Per-pane cwd must survive save → load round-trip.")
+    }
+
+    func test_persistedPane_decodesWithoutCwdField_backwardsCompat() throws {
+        // Sessions written by Nice builds before per-pane cwd
+        // existed don't have a `cwd` key on each pane. The decoder
+        // must tolerate that — Codable's optional-property synthesis
+        // does the right thing, but we lock the behavior in so a
+        // future migration that drops the optionality is forced to
+        // think about it.
+        let json = #"""
+        {
+            "version": 3,
+            "windows": [{
+                "id": "w1",
+                "activeTabId": "t1",
+                "sidebarCollapsed": false,
+                "projects": [{
+                    "id": "terminals",
+                    "name": "Terminals",
+                    "path": "/tmp",
+                    "tabs": [{
+                        "id": "t1",
+                        "title": "Main",
+                        "cwd": "/Users/nick",
+                        "branch": null,
+                        "claudeSessionId": null,
+                        "activePaneId": "p1",
+                        "panes": [
+                            {"id": "p1", "title": "zsh", "kind": "terminal"}
+                        ]
+                    }]
+                }]
+            }]
+        }
+        """#
+        let data = Data(json.utf8)
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: data)
+        let pane = decoded.windows.first?.projects.first?.tabs.first?.panes.first
+        XCTAssertEqual(pane?.id, "p1")
+        XCTAssertNil(pane?.cwd, "Missing cwd field must decode as nil, not crash.")
+    }
+
     // MARK: - helpers
 
     private func makeWindow(id: String, tabs: [PersistedTab]) -> PersistedWindow {
