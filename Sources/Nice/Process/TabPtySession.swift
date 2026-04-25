@@ -189,19 +189,19 @@ final class TabPtySession: ObservableObject {
         // — SwiftTerm handles the resulting OSC 0/1/2 sequences natively
         // and the choice doesn't trigger iTerm-specific OSC extensions.
         var claudeExtraEnv: [String: String] = ["TERM_PROGRAM": "ghostty"]
-        // Pane/tab identity for the zsh `claude()` wrapper's handshake
-        // with Nice's control socket. Only meaningful for the deferred
-        // path (the wrapper is what runs the pre-typed command), but
-        // harmless for the direct-exec paths too.
+        // Pane/tab identity + control-socket path. The deferred path
+        // uses these for the zsh `claude()` wrapper's handshake; every
+        // path needs them so the UserPromptSubmit hook can post
+        // session_update messages back to Nice.
         claudeExtraEnv["NICE_TAB_ID"] = tabId
         claudeExtraEnv["NICE_PANE_ID"] = id
+        if let sp = socketPath { claudeExtraEnv["NICE_SOCKET"] = sp }
 
         if case .resumeDeferred(let sessionId) = claudeSessionMode {
             // Pane renders as Claude but the pty is a plain shell with
             // the resume command pre-typed. The socket handshake will
             // flip the pane to actually running-Claude when the user
             // hits Enter and the wrapper promotes this pane in place.
-            if let sp = socketPath { claudeExtraEnv["NICE_SOCKET"] = sp }
             if let zp = zdotdirPath { claudeExtraEnv["ZDOTDIR"] = zp }
             claudeExtraEnv["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
             view.startProcess(

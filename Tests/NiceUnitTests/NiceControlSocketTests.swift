@@ -89,6 +89,96 @@ final class NiceControlSocketTests: XCTestCase {
                      "no listener should respond after stop()")
     }
 
+    // MARK: - session_update parsing
+
+    func test_sessionUpdate_dispatchesParsedFields() throws {
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1"}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertEqual(got?.paneId, "P1")
+        XCTAssertEqual(got?.sessionId, "S1")
+    }
+
+    func test_sessionUpdate_missingPaneId_dropsSilently() throws {
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","sessionId":"S1"}"#
+        )
+        // Give the dispatch path a beat to run if it were going to.
+        Thread.sleep(forTimeInterval: 0.1)
+        XCTAssertEqual(captured.count, 0)
+    }
+
+    func test_sessionUpdate_emptyStrings_dropsSilently() throws {
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"","sessionId":""}"#
+        )
+        Thread.sleep(forTimeInterval: 0.1)
+        XCTAssertEqual(captured.count, 0,
+                       "empty paneId/sessionId must not dispatch")
+    }
+
+    func test_sessionUpdate_nonStringFields_dropsSilently() throws {
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":42,"sessionId":["S"]}"#
+        )
+        Thread.sleep(forTimeInterval: 0.1)
+        XCTAssertEqual(captured.count, 0,
+                       "non-string paneId/sessionId must not dispatch")
+    }
+
+    func test_unknownAction_dropsSilently() throws {
+        // Default branch in `readClient`'s switch — covered here
+        // because it's the same parser surface as the new
+        // session_update case and one bad-action test guards both.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"frobnicate","x":"y"}"#
+        )
+        Thread.sleep(forTimeInterval: 0.1)
+        XCTAssertEqual(captured.count, 0)
+    }
+
     // MARK: - Helpers
 
     /// Handler that treats every `.claude` as a newtab and replies
@@ -98,6 +188,83 @@ final class NiceControlSocketTests: XCTestCase {
         switch message {
         case let .claude(_, _, _, _, reply):
             reply("newtab")
+        case .sessionUpdate:
+            // Fire-and-forget; not exercised by these tests.
+            break
+        }
+    }
+
+    /// Thread-safe collector for `.sessionUpdate` payloads dispatched
+    /// to the test's socket handler. The socket fires its handler from
+    /// a background queue, so a plain Swift array would race the test
+    /// thread reading `count`.
+    private final class CapturedSessionUpdates: @unchecked Sendable {
+        struct Update { let paneId: String; let sessionId: String }
+        private let lock = NSLock()
+        private var updates: [Update] = []
+        private let signal = DispatchSemaphore(value: 0)
+
+        var handler: NiceControlSocket.Handler {
+            { [weak self] message in
+                switch message {
+                case let .sessionUpdate(paneId, sessionId):
+                    self?.append(.init(paneId: paneId, sessionId: sessionId))
+                case let .claude(_, _, _, _, reply):
+                    // Tests don't exercise .claude here, but the handler
+                    // must close the client fd via `reply` to match
+                    // production's contract.
+                    reply("newtab")
+                }
+            }
+        }
+
+        var count: Int {
+            lock.lock(); defer { lock.unlock() }
+            return updates.count
+        }
+
+        func waitForOne(timeout: TimeInterval) -> Update? {
+            guard signal.wait(timeout: .now() + timeout) == .success else {
+                return nil
+            }
+            lock.lock(); defer { lock.unlock() }
+            return updates.first
+        }
+
+        private func append(_ u: Update) {
+            lock.lock(); updates.append(u); lock.unlock()
+            signal.signal()
+        }
+    }
+
+    /// Send a raw newline-terminated payload to `path` and close the
+    /// fd. Used for fire-and-forget messages like `session_update`
+    /// where the socket doesn't write a reply.
+    private func sendRaw(to path: String, payload: String) {
+        let clientFd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard clientFd >= 0 else { return }
+        defer { close(clientFd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        withUnsafeMutablePointer(to: &addr.sun_path) { tuple in
+            tuple.withMemoryRebound(to: CChar.self, capacity: capacity) { p in
+                _ = path.withCString { src in
+                    strncpy(p, src, capacity - 1)
+                }
+            }
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(clientFd, sa, size)
+            }
+        }
+        guard connectResult == 0 else { return }
+        let line = payload + "\n"
+        _ = line.withCString { p -> Int in
+            write(clientFd, p, strlen(p))
         }
     }
 

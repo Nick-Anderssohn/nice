@@ -66,6 +66,13 @@ final class NiceServices: ObservableObject {
         }
         self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
             ?? Self.runWhich(binary: "claude")
+
+        // Install Claude Code's UserPromptSubmit hook so Nice-spawned
+        // claudes phone home with their current session id on every
+        // user message. Handles /clear, /compact, /branch rotations
+        // that the tab's pre-minted UUID otherwise misses. Idempotent
+        // and safe to run on every launch.
+        ClaudeHookInstaller.install()
     }
 
     /// Idempotent process-wide wiring. Installs the single keyboard
