@@ -124,6 +124,190 @@ final class FileBrowserContextMenuUITests: XCTestCase {
         )
     }
 
+    /// Right-clicking a directory must hide Open and Open With —
+    /// those entries don't make sense for folders.
+    func testRightClickFolder_omitsOpenAndOpenWith() throws {
+        let (app, _, project) = launchWithSeed()
+        let sub = makeDir("sub", in: project)
+
+        showFileBrowser(in: app)
+        waitForRow(in: app, atPath: sub.path).rightClick()
+
+        XCTAssertTrue(app.menuItems["Reveal in Finder"].waitForExistence(timeout: 5))
+        XCTAssertFalse(
+            app.menuItems["Open"].exists,
+            "Open must be hidden on directory rows."
+        )
+        XCTAssertFalse(
+            app.menuItems["Open With"].exists,
+            "Open With must be hidden on directory rows."
+        )
+        XCTAssertTrue(app.menuItems["Copy"].exists)
+        XCTAssertTrue(app.menuItems["Cut"].exists)
+        XCTAssertTrue(app.menuItems["Move to Trash"].exists)
+
+        app.typeKey(.escape, modifierFlags: [])
+    }
+
+    /// Copy a file → right-click a folder → Paste. The file must
+    /// land inside that folder; the original stays in place.
+    func testCopyFile_pasteIntoFolder_landsInTargetFolder() throws {
+        let (app, file, project) = launchWithSeed()
+        let dest = makeDir("dest", in: project)
+
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: file.path).rightClick()
+        clickMenuItem("Copy", in: app)
+
+        waitForRow(in: app, atPath: dest.path).rightClick()
+        clickMenuItem("Paste", in: app)
+
+        waitForFileExistence(at: dest.appendingPathComponent("file.txt"))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: file.path),
+            "Copy must leave the source in place."
+        )
+    }
+
+    /// Right-clicking a *file* and choosing Paste must resolve the
+    /// destination to that file's parent directory — Finder behaviour.
+    func testPasteIntoFile_resolvesToParentDirectory() throws {
+        let (app, file, project) = launchWithSeed()
+        let sub = makeDir("sub", in: project)
+        let nested = sub.appendingPathComponent("nested.txt")
+        FileManager.default.createFile(atPath: nested.path, contents: Data())
+
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: file.path).rightClick()
+        clickMenuItem("Copy", in: app)
+
+        // Expand sub so the nested row materialises, then right-click
+        // the nested file (not the folder).
+        waitForRow(in: app, atPath: sub.path).click()
+        waitForRow(in: app, atPath: nested.path).rightClick()
+        clickMenuItem("Paste", in: app)
+
+        // Pasted file should land in `sub/` (the parent of the
+        // right-clicked file), not next to nested at the root.
+        waitForFileExistence(at: sub.appendingPathComponent("file.txt"))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: project.appendingPathComponent("file copy.txt").path
+            ),
+            "Paste must NOT land at root when the right-click target is a file inside a subdirectory."
+        )
+    }
+
+    /// Pasting where the destination already has a file with that
+    /// name auto-renames the copy with a `" copy"` suffix.
+    func testCollisionPaste_autoRenamesWithCopySuffix() throws {
+        let (app, file, project) = launchWithSeed()
+        let dest = makeDir("dest", in: project)
+        // Pre-populate dest with file.txt to force a collision.
+        FileManager.default.createFile(
+            atPath: dest.appendingPathComponent("file.txt").path,
+            contents: Data("existing".utf8)
+        )
+
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: file.path).rightClick()
+        clickMenuItem("Copy", in: app)
+
+        waitForRow(in: app, atPath: dest.path).rightClick()
+        clickMenuItem("Paste", in: app)
+
+        waitForFileExistence(at: dest.appendingPathComponent("file copy.txt"))
+        // Original collision target wasn't clobbered.
+        let existing = try? String(
+            contentsOf: dest.appendingPathComponent("file.txt"), encoding: .utf8
+        )
+        XCTAssertEqual(existing, "existing", "Collision must not overwrite the existing file.")
+    }
+
+    /// Cut a file → paste into another folder → file moves (source
+    /// gone, destination gets it).
+    func testCutFile_paste_movesFile() throws {
+        let (app, file, project) = launchWithSeed()
+        let dest = makeDir("dest", in: project)
+
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: file.path).rightClick()
+        clickMenuItem("Cut", in: app)
+
+        waitForRow(in: app, atPath: dest.path).rightClick()
+        clickMenuItem("Paste", in: app)
+
+        waitForFileExistence(at: dest.appendingPathComponent("file.txt"))
+        waitForFileMissing(at: file)
+    }
+
+    /// Cut a folder containing children → paste into another folder
+    /// → entire tree relocates.
+    func testCutFolder_paste_movesEntireTree() throws {
+        let (app, _, project) = launchWithSeed()
+        let src = makeDir("src", in: project)
+        FileManager.default.createFile(
+            atPath: src.appendingPathComponent("inside.txt").path,
+            contents: Data("data".utf8)
+        )
+        let dest = makeDir("dest", in: project)
+
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: src.path).rightClick()
+        clickMenuItem("Cut", in: app)
+
+        waitForRow(in: app, atPath: dest.path).rightClick()
+        clickMenuItem("Paste", in: app)
+
+        waitForFileExistence(at: dest.appendingPathComponent("src/inside.txt"))
+        waitForFileMissing(at: src)
+    }
+
+    /// Trash a folder containing a child file → ⌘Z must restore the
+    /// folder *and* the child intact, not just the directory entry.
+    func testTrashFolder_undoRestoresChildrenIntact() throws {
+        let (app, _, project) = launchWithSeed()
+        let folder = makeDir("dir", in: project)
+        let nested = folder.appendingPathComponent("inside.txt")
+        FileManager.default.createFile(
+            atPath: nested.path, contents: Data("data".utf8)
+        )
+
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: folder.path).rightClick()
+        clickMenuItem("Move to Trash", in: app)
+        waitForFileMissing(at: folder)
+
+        app.typeKey("z", modifierFlags: [.command])
+
+        waitForFileExistence(at: nested)
+        let body = try? String(contentsOf: nested, encoding: .utf8)
+        XCTAssertEqual(body, "data", "Restored child must keep its contents.")
+    }
+
+    /// Trash → ⌘Z restores → ⌘⇧Z must re-trash. Verifies the redo
+    /// keypath is wired.
+    func testCmdShiftZ_redoesTrashedFile() throws {
+        let (app, file, _) = launchWithSeed()
+        showFileBrowser(in: app)
+
+        waitForRow(in: app, atPath: file.path).rightClick()
+        clickMenuItem("Move to Trash", in: app)
+        waitForFileMissing(at: file)
+
+        app.typeKey("z", modifierFlags: [.command])
+        waitForFileExistence(at: file)
+
+        app.typeKey("z", modifierFlags: [.command, .shift])
+        waitForFileMissing(at: file)
+    }
+
     /// Right-click a file → Move to Trash → file disappears from
     /// the tree → ⌘Z restores it. End-to-end coverage of the
     /// trash + undo flow.
@@ -234,5 +418,82 @@ final class FileBrowserContextMenuUITests: XCTestCase {
             "Expected file browser row \(id) to exist within 10s."
         )
         return element
+    }
+
+    /// Click a context-menu item by its title. Some titles (Copy,
+    /// Cut, Paste) collide with menu-bar entries — `app.menuItems[title]`
+    /// then matches multiple elements and `.click()` refuses to act.
+    /// Resolve by iterating all matches and clicking the first
+    /// hittable one (the menu bar entries are in collapsed menus and
+    /// aren't hittable; the visible context popup is).
+    private func clickMenuItem(_ title: String, in app: XCUIApplication) {
+        let predicate = NSPredicate(format: "label == %@ OR title == %@", title, title)
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let matches = app.menuItems.matching(predicate).allElementsBoundByIndex
+            for item in matches where item.isHittable {
+                item.click()
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTFail("No hittable context-menu item titled '\(title)' found within 5s.")
+    }
+
+    /// Create a subdirectory inside the test project. Returns the
+    /// folder's URL so tests can build paths under it.
+    @discardableResult
+    private func makeDir(_ name: String, in project: URL) -> URL {
+        let url = project.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: true
+        )
+        return url
+    }
+
+    /// Spin until `url` exists on disk, or fail the test. File ops
+    /// dispatched through the menu run synchronously on the main
+    /// thread, but we poll with a short timeout to absorb
+    /// XCUIApplication command-relay latency between the menu click
+    /// and the action firing.
+    private func waitForFileExistence(
+        at url: URL,
+        timeout: TimeInterval = 5,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !FileManager.default.fileExists(atPath: url.path) {
+            if Date() > deadline {
+                XCTFail(
+                    "File never appeared at \(url.path) within \(timeout)s",
+                    file: file, line: line
+                )
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    /// Inverse of `waitForFileExistence` — spin until the path is
+    /// gone (or fail). Used after Trash and Cut+Paste to confirm
+    /// the source went away.
+    private func waitForFileMissing(
+        at url: URL,
+        timeout: TimeInterval = 5,
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while FileManager.default.fileExists(atPath: url.path) {
+            if Date() > deadline {
+                XCTFail(
+                    "File still exists at \(url.path) after \(timeout)s",
+                    file: file, line: line
+                )
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 }
