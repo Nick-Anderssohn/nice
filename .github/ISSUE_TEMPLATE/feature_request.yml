@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where you wish Nice behaved differently
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution (optional)
+      description: If you have an idea how to address it, share it — "I just have the problem" is a fine answer too
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered (optional)
