@@ -286,7 +286,14 @@ private struct FileTreeRow: View {
         .onDisappear { watcher.stop() }
         .onChange(of: isExpanded) { _, newValue in
             if newValue {
-                if children == nil { reloadChildren() }
+                // Always reload on expand. While the row was
+                // collapsed the watcher was stopped, so any changes
+                // since then (e.g. an undo restoring a trashed file
+                // into this directory, or the user editing the dir
+                // in Finder) wouldn't have invalidated the cache.
+                // Re-reading once on expand is cheap; the watcher
+                // takes over for incremental updates.
+                reloadChildren()
                 startWatching()
             } else {
                 watcher.stop()
