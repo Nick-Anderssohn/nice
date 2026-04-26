@@ -1,6 +1,6 @@
 # Contributing to Nice
 
-Thanks for your interest in contributing! Nice is a young project maintained by one person — contributions are welcome, and the bar for small improvements is low.
+Thanks for your interest in contributing! Nice is a young project maintained by one person — contributions are welcome.
 
 ## Before you start
 
