@@ -119,6 +119,112 @@ final class FileBrowserListingTests: XCTestCase {
         XCTAssertTrue(result.isEmpty)
     }
 
+    // MARK: - visibleOrder
+
+    /// Standardise a path the same way `URL.standardizedFileURL.path`
+    /// would, so test inputs match what `contentsOfDirectory` returns
+    /// (macOS canonicalises `/var` → `/private/var` on tmp paths).
+    private func canonicalPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private var canonicalRoot: String { canonicalPath(tempDir) }
+
+    func test_visibleOrder_flatRoot_listsRootThenChildren() throws {
+        try touchFile("a.txt")
+        try touchFile("b.txt")
+        try makeDir("Z_dir")
+
+        let order = FileBrowserListing.visibleOrder(
+            rootPath: canonicalRoot,
+            expandedPaths: [canonicalRoot],
+            showHidden: true
+        )
+
+        XCTAssertEqual(order.first, canonicalRoot)
+        XCTAssertEqual(order.dropFirst().map { ($0 as NSString).lastPathComponent },
+                       ["Z_dir", "a.txt", "b.txt"])
+    }
+
+    func test_visibleOrder_collapsedSubdir_omitsItsChildren() throws {
+        try makeDir("subdir")
+        let inner = tempDir.appendingPathComponent("subdir/inner.txt")
+        FileManager.default.createFile(atPath: inner.path, contents: Data())
+
+        // Subdir is NOT in the expanded set.
+        let order = FileBrowserListing.visibleOrder(
+            rootPath: canonicalRoot,
+            expandedPaths: [canonicalRoot],
+            showHidden: true
+        )
+
+        let innerCanonical = canonicalPath(inner)
+        XCTAssertFalse(order.contains(innerCanonical),
+                       "Children of a collapsed directory must not appear in the visible order.")
+    }
+
+    func test_visibleOrder_expandedSubdir_includesChildrenInDirsFirstOrder() throws {
+        try makeDir("subdir")
+        let subdir = tempDir.appendingPathComponent("subdir")
+        FileManager.default.createFile(
+            atPath: subdir.appendingPathComponent("zfile.txt").path, contents: Data()
+        )
+        try FileManager.default.createDirectory(
+            at: subdir.appendingPathComponent("anest", isDirectory: true),
+            withIntermediateDirectories: false
+        )
+
+        // Use the path `entries(at:)` actually produces for subdir
+        // — that's the same path the production tree stores in
+        // `expandedPaths` when the user clicks the disclosure
+        // triangle. Avoids any /var vs /private/var canonicalisation
+        // mismatch in the test setup.
+        let rootURL = URL(fileURLWithPath: tempDir.path)
+        let subdirChild = FileBrowserListing.entries(at: rootURL, showHidden: true)
+            .first { $0.lastPathComponent == "subdir" }
+        let subdirPath = try XCTUnwrap(subdirChild?.path)
+
+        let order = FileBrowserListing.visibleOrder(
+            rootPath: tempDir.path,
+            expandedPaths: [tempDir.path, subdirPath],
+            showHidden: true
+        )
+
+        let names = order.map { ($0 as NSString).lastPathComponent }
+        // Root, subdir, then dirs-first within subdir.
+        XCTAssertEqual(Array(names.prefix(4)),
+                       [tempDir.lastPathComponent, "subdir", "anest", "zfile.txt"])
+    }
+
+    func test_visibleOrder_missingRoot_returnsEmpty() {
+        let nonexistent = tempDir.appendingPathComponent("does-not-exist", isDirectory: true)
+        let order = FileBrowserListing.visibleOrder(
+            rootPath: nonexistent.path,
+            expandedPaths: [nonexistent.path],
+            showHidden: true
+        )
+        XCTAssertTrue(order.isEmpty)
+    }
+
+    func test_visibleOrder_respectsShowHidden() throws {
+        try touchFile(".hidden.txt")
+        try touchFile("visible.txt")
+
+        let withHidden = FileBrowserListing.visibleOrder(
+            rootPath: canonicalRoot,
+            expandedPaths: [canonicalRoot],
+            showHidden: true
+        )
+        let withoutHidden = FileBrowserListing.visibleOrder(
+            rootPath: canonicalRoot,
+            expandedPaths: [canonicalRoot],
+            showHidden: false
+        )
+
+        XCTAssertTrue(withHidden.contains { ($0 as NSString).lastPathComponent == ".hidden.txt" })
+        XCTAssertFalse(withoutHidden.contains { ($0 as NSString).lastPathComponent == ".hidden.txt" })
+    }
+
     // MARK: - Helpers
 
     @discardableResult

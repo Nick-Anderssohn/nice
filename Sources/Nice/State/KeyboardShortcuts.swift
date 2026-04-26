@@ -46,6 +46,8 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable {
     case increaseFontSize
     case decreaseFontSize
     case resetFontSizes
+    case undoFileOperation
+    case redoFileOperation
 
     /// Human-readable label for the recorder row.
     var label: String {
@@ -61,6 +63,8 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable {
         case .increaseFontSize: "Increase font size"
         case .decreaseFontSize: "Decrease font size"
         case .resetFontSizes:   "Reset font size"
+        case .undoFileOperation: "Undo file operation"
+        case .redoFileOperation: "Redo file operation"
         }
     }
 }
@@ -190,6 +194,8 @@ final class KeyboardShortcuts: ObservableObject {
         .increaseFontSize: KeyCombo(keyCode: UInt16(kVK_ANSI_Equal), modifierFlags: [.command]),
         .decreaseFontSize: KeyCombo(keyCode: UInt16(kVK_ANSI_Minus), modifierFlags: [.command]),
         .resetFontSizes:   KeyCombo(keyCode: UInt16(kVK_ANSI_0),     modifierFlags: [.command]),
+        .undoFileOperation: KeyCombo(keyCode: UInt16(kVK_ANSI_Z),    modifierFlags: [.command]),
+        .redoFileOperation: KeyCombo(keyCode: UInt16(kVK_ANSI_Z),    modifierFlags: [.command, .shift]),
     ]
 
     /// Current map. `nil` value = action is unbound. Always reflects what

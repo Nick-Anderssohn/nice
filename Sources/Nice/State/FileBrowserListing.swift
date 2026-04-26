@@ -66,4 +66,36 @@ enum FileBrowserListing {
                 .localizedCaseInsensitiveCompare(rhs.lastPathComponent) == .orderedAscending
         }
     }
+
+    /// In-order traversal of the visible rows in the tree rooted at
+    /// `rootPath`, using the same listing rules `entries` produces.
+    /// A directory's children are emitted only when its path is in
+    /// `expandedPaths` — matches what the user actually sees on
+    /// screen, so it's the right ordering for Shift-range selection.
+    static func visibleOrder(
+        rootPath: String,
+        expandedPaths: Set<String>,
+        showHidden: Bool
+    ) -> [String] {
+        let rootURL = URL(fileURLWithPath: rootPath)
+        guard FileManager.default.fileExists(atPath: rootPath) else { return [] }
+        var out: [String] = []
+        visit(rootURL, into: &out, expandedPaths: expandedPaths, showHidden: showHidden)
+        return out
+    }
+
+    private static func visit(
+        _ url: URL,
+        into out: inout [String],
+        expandedPaths: Set<String>,
+        showHidden: Bool
+    ) {
+        out.append(url.path)
+        guard expandedPaths.contains(url.path) else { return }
+        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+        guard isDir else { return }
+        for child in entries(at: url, showHidden: showHidden) {
+            visit(child, into: &out, expandedPaths: expandedPaths, showHidden: showHidden)
+        }
+    }
 }

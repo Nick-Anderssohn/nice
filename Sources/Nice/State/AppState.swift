@@ -276,6 +276,13 @@ final class AppState: ObservableObject {
     private var zdotdirPath: String?
     private var controlSocketExtraEnv: [String: String] = [:]
 
+    /// File-browser context-menu services. Set at init time —
+    /// production passes the shared instances from `NiceServices`,
+    /// tests pass private instances built against a fake pasteboard
+    /// and trasher. `nil` for `#Preview` and unit-test paths that
+    /// don't exercise the orchestration.
+    let fileExplorer: FileExplorerServices?
+
     /// Convenience init for `#Preview` blocks and unit tests. Each
     /// AppState is otherwise expected to be constructed by
     /// `AppShellView` passing its window's `NiceServices` and the
@@ -295,7 +302,8 @@ final class AppState: ObservableObject {
         initialSidebarCollapsed: Bool,
         initialSidebarMode: SidebarMode = .tabs,
         initialMainCwd: String?,
-        windowSessionId: String
+        windowSessionId: String,
+        fileExplorer: FileExplorerServices? = nil
     ) {
         // Brand-new scenes come in with an empty SceneStorage value;
         // mint a UUID here so the scene has a stable id for save/
@@ -306,6 +314,9 @@ final class AppState: ObservableObject {
             ? UUID().uuidString
             : windowSessionId
         self.persistenceEnabled = services != nil
+        // Production: take the file-explorer triple from the shared
+        // NiceServices. Tests can override by passing their own.
+        self.fileExplorer = fileExplorer ?? services?.fileExplorer
         self.sidebarCollapsed = initialSidebarCollapsed
         self.sidebarMode = initialSidebarMode
 

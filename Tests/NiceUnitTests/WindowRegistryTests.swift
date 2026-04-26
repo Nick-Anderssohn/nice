@@ -177,6 +177,94 @@ final class WindowRegistryTests: XCTestCase {
         XCTAssertNil(registry.activeAppState(preferKey: true))
     }
 
+    // MARK: - Session-id lookups (cross-window undo focus follow)
+
+    func test_appStateForSessionId_returnsRegisteredAppState() {
+        let registry = WindowRegistry()
+        let appState = AppState(
+            services: nil,
+            initialSidebarCollapsed: false,
+            initialMainCwd: nil,
+            windowSessionId: "win-A"
+        )
+        let window = makeWindow()
+        defer {
+            appState.tearDown()
+            window.close()
+        }
+        registry.register(appState: appState, window: window)
+
+        XCTAssertIdentical(registry.appState(forSessionId: "win-A"), appState)
+    }
+
+    func test_appStateForSessionId_returnsNilForUnknownId() {
+        let registry = WindowRegistry()
+        let appState = AppState(
+            services: nil,
+            initialSidebarCollapsed: false,
+            initialMainCwd: nil,
+            windowSessionId: "win-A"
+        )
+        let window = makeWindow()
+        defer {
+            appState.tearDown()
+            window.close()
+        }
+        registry.register(appState: appState, window: window)
+
+        XCTAssertNil(registry.appState(forSessionId: "win-other"))
+    }
+
+    func test_windowForSessionId_returnsRegisteredWindow() {
+        let registry = WindowRegistry()
+        let appState = AppState(
+            services: nil,
+            initialSidebarCollapsed: false,
+            initialMainCwd: nil,
+            windowSessionId: "win-B"
+        )
+        let window = makeWindow()
+        defer {
+            appState.tearDown()
+            window.close()
+        }
+        registry.register(appState: appState, window: window)
+
+        XCTAssertIdentical(registry.window(forSessionId: "win-B"), window)
+    }
+
+    func test_bringToFront_callsMakeKeyAndOrderFront_onRegisteredWindow() {
+        let registry = WindowRegistry()
+        let appState = AppState(
+            services: nil,
+            initialSidebarCollapsed: false,
+            initialMainCwd: nil,
+            windowSessionId: "win-C"
+        )
+        let window = RecordingWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer {
+            appState.tearDown()
+            window.close()
+        }
+        registry.register(appState: appState, window: window)
+
+        registry.bringToFront(sessionId: "win-C")
+
+        XCTAssertEqual(window.makeKeyAndOrderFrontCallCount, 1)
+    }
+
+    func test_bringToFront_unknownSessionId_isNoOp() {
+        let registry = WindowRegistry()
+        // Should not crash; nothing observable.
+        registry.bringToFront(sessionId: "unknown")
+    }
+
     // MARK: - helpers
 
     /// A minimally-viable NSWindow for unit tests. Off-screen, no style,
@@ -190,5 +278,17 @@ final class WindowRegistryTests: XCTestCase {
         )
         w.isReleasedWhenClosed = false
         return w
+    }
+}
+
+/// `NSWindow` subclass that counts `makeKeyAndOrderFront` calls so
+/// tests can assert focus-routing without poking AppKit globals.
+final class RecordingWindow: NSWindow {
+    var makeKeyAndOrderFrontCallCount: Int = 0
+
+    override func makeKeyAndOrderFront(_ sender: Any?) {
+        makeKeyAndOrderFrontCallCount += 1
+        // Don't call super — we don't want the test to actually
+        // bring the window forward and steal focus from the runner.
     }
 }
