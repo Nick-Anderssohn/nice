@@ -379,10 +379,13 @@ private struct FileTreeRow: View {
         // (expand-then-reroot ends at the new root either way).
         .onTapGesture { handleTap() }
         .contextMenu {
-            // Resolve "act on selection vs. act on this row" before
-            // building the menu. This also has the side effect of
-            // visibly snapping the selection to the right-clicked
-            // row when the click is outside the prior selection.
+            // PURE read of "which paths should the menu act on".
+            // SwiftUI evaluates this closure as part of body, so it
+            // must not mutate `@Published` state — the visible
+            // "snap selection to right-clicked row" side effect is
+            // moved into `onWillAct` below, which fires inside each
+            // menu Button's action closure (i.e. *after* the menu
+            // is dismissed, not during render).
             let actionPaths = selection.selectionPaths(forRightClickOn: path)
             FileBrowserContextMenu(
                 clickedPath: path,
@@ -390,6 +393,7 @@ private struct FileTreeRow: View {
                 isRoot: isRoot,
                 actionPaths: actionPaths,
                 tabId: tabId,
+                onWillAct: { selection.snapIfRightClickOutside(path) },
                 actions: appState
             )
         }

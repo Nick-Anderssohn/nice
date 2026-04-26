@@ -88,17 +88,31 @@ final class FileBrowserSelection: ObservableObject {
         selectedPaths.contains(path)
     }
 
-    /// Resolve the effective set of paths to act on for a right-
-    /// click on `clickedPath`. If the clicked path is in the
-    /// selection, return the whole selection. Otherwise, replace
-    /// the selection with just `clickedPath` (a side effect — the
-    /// selection visibly snaps to the clicked row, matching
-    /// Finder), and return that single path.
+    /// Pure resolution of "which paths should the menu act on" for
+    /// a right-click on `clickedPath`. If the clicked path is in
+    /// the selection, return the whole selection; otherwise, return
+    /// just the clicked path. No state mutation — this is called
+    /// from inside SwiftUI's `.contextMenu` view builder, which
+    /// SwiftUI evaluates as part of body, so any `objectWillChange`
+    /// fired here would loop the render.
+    ///
+    /// The selection's visible "snap to clicked row" side effect
+    /// happens via `snapIfRightClickOutside(_:)`, which the menu's
+    /// action buttons call before they run.
     func selectionPaths(forRightClickOn clickedPath: String) -> [String] {
         if selectedPaths.contains(clickedPath) {
             return Array(selectedPaths)
         }
-        replace(with: [clickedPath])
         return [clickedPath]
+    }
+
+    /// Apply the Finder-style "right-click outside selection
+    /// replaces it" rule. Called by menu action handlers right
+    /// before they fire, so the selection visibly snaps to the
+    /// clicked row when the user picked a menu item that wasn't
+    /// already part of the selection.
+    func snapIfRightClickOutside(_ clickedPath: String) {
+        guard !selectedPaths.contains(clickedPath) else { return }
+        replace(with: [clickedPath])
     }
 }

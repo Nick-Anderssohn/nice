@@ -112,23 +112,53 @@ final class FileBrowserSelectionTests: XCTestCase {
         XCTAssertEqual(s.selectedPaths, ["/a", "/b", "/c"])
     }
 
-    func test_rightClick_outsideSelection_replacesAndReturnsOne() {
+    /// `selectionPaths` is called from inside SwiftUI's `.contextMenu`
+    /// view builder — which is part of body — so it must NOT mutate
+    /// `@Published` state. Verifies the pure-read contract.
+    func test_rightClick_outsideSelection_returnsOnePath_doesNotMutate() {
         let s = FileBrowserSelection()
         s.replace(with: ["/a", "/b"])
 
         let paths = s.selectionPaths(forRightClickOn: "/c")
 
         XCTAssertEqual(paths, ["/c"])
-        XCTAssertEqual(s.selectedPaths, ["/c"])
+        XCTAssertEqual(s.selectedPaths, ["/a", "/b"],
+                       "selectionPaths must be a pure read — no mutation during body eval.")
     }
 
-    func test_rightClick_emptySelection_replacesAndReturnsOne() {
+    func test_rightClick_emptySelection_returnsOnePath_doesNotMutate() {
         let s = FileBrowserSelection()
 
         let paths = s.selectionPaths(forRightClickOn: "/x")
 
         XCTAssertEqual(paths, ["/x"])
-        XCTAssertEqual(s.selectedPaths, ["/x"])
+        XCTAssertTrue(s.selectedPaths.isEmpty,
+                      "Empty selection must remain empty until a menu action snaps it.")
+    }
+
+    // MARK: - snapIfRightClickOutside
+
+    /// `snapIfRightClickOutside` runs from a menu Button's action
+    /// closure, *after* the body has rendered, so it can mutate
+    /// freely. Mirrors Finder: right-clicking a row outside the
+    /// selection and picking an action snaps the selection to it.
+    func test_snapIfRightClickOutside_outsideSelection_replaces() {
+        let s = FileBrowserSelection()
+        s.replace(with: ["/a", "/b"])
+
+        s.snapIfRightClickOutside("/c")
+
+        XCTAssertEqual(s.selectedPaths, ["/c"])
+    }
+
+    func test_snapIfRightClickOutside_insideSelection_isNoOp() {
+        let s = FileBrowserSelection()
+        s.replace(with: ["/a", "/b", "/c"])
+
+        s.snapIfRightClickOutside("/b")
+
+        XCTAssertEqual(s.selectedPaths, ["/a", "/b", "/c"],
+                       "Right-click on a row already in the selection must not collapse the selection.")
     }
 
     // MARK: - clear

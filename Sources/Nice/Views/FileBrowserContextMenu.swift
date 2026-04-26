@@ -118,6 +118,15 @@ struct FileBrowserContextMenu: View {
     /// Tab id this file browser is bound to. Recorded with each op
     /// so undo/redo can route focus back to it.
     let tabId: String?
+    /// Called once, just before each menu button fires its action.
+    /// Used by `FileTreeRow` to snap the selection to the clicked
+    /// row when the user picked a menu item on a row outside the
+    /// prior selection (Finder behaviour). Doing the snap here —
+    /// inside a button's action closure — instead of inside the
+    /// `.contextMenu` view builder avoids triggering an
+    /// `objectWillChange` during body evaluation, which would loop
+    /// the render.
+    let onWillAct: () -> Void
     /// The app-side action surface. Held weakly via the unowned
     /// keyword wouldn't compile because Menu / Button capture it in
     /// closures; we use a regular reference and trust the menu's
@@ -144,30 +153,36 @@ struct FileBrowserContextMenu: View {
         switch item {
         case .open:
             Button("Open") {
+                onWillAct()
                 actions.open(url: URL(fileURLWithPath: clickedPath))
             }
         case .openWith:
             openWithMenu
         case .revealInFinder:
             Button("Reveal in Finder") {
+                onWillAct()
                 actions.revealInFinder(url: URL(fileURLWithPath: clickedPath))
             }
         case .dividerOpen:
             Divider()
         case .copy:
             Button("Copy") {
+                onWillAct()
                 actions.copyToPasteboard(paths: actionPaths)
             }
         case .copyPath:
             Button("Copy Path") {
+                onWillAct()
                 actions.copyPathsToPasteboard(actionPaths)
             }
         case .cut:
             Button("Cut") {
+                onWillAct()
                 actions.cutToPasteboard(paths: actionPaths)
             }
         case .paste:
             Button("Paste") {
+                onWillAct()
                 actions.pasteFromPasteboard(
                     into: URL(fileURLWithPath: clickedPath),
                     originatingTabId: tabId
@@ -175,6 +190,7 @@ struct FileBrowserContextMenu: View {
             }
         case .trash:
             Button("Move to Trash") {
+                onWillAct()
                 actions.trash(paths: actionPaths, originatingTabId: tabId)
             }
         }
