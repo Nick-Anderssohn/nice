@@ -2,7 +2,7 @@
 
 > **Never lose track of a Claude session again - even between restarts.**
 
-A native macOS terminal that organizes your Claude Code sessions for you. Run `claude` anywhere — Nice spawns it in a fresh pty and files it under the right project in the sidebar. No config, no setup, no "where did that window go" dance. Sessions are persisted through restarts — tabs will be reopened with prepopulated `claude --resume id-here` commands.
+A native macOS terminal that organizes your Claude Code sessions for you. Run `claude` anywhere — Nice spawns it in a fresh pty and files it under the right project in the sidebar. No config, no setup, no "where did that window go" dance. Sessions persist through restarts — tabs are reopened with prepopulated `claude --resume id-here` commands.
 
 ```sh
 brew install --cask Nick-Anderssohn/nice/nice
