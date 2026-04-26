@@ -61,6 +61,69 @@ final class FileBrowserContextMenuUITests: XCTestCase {
         app.typeKey(.escape, modifierFlags: [])
     }
 
+    /// Regression: trash a file inside an expanded subdir, collapse
+    /// the subdir, ⌘Z to undo, re-expand. The restored file must
+    /// appear immediately — without forcing the user to collapse and
+    /// re-expand the *parent* of the subdir to invalidate a stale
+    /// row-level cache.
+    ///
+    /// Bug history: each `FileTreeRow` cached its `children` listing
+    /// in `@State`. The watcher that kept that cache fresh was
+    /// stopped on collapse, so any change while collapsed (an undo
+    /// move-back, or an external Finder edit) didn't invalidate the
+    /// cache. The expand handler then skipped the reload because
+    /// `children != nil`, leaving the user looking at a stale tree.
+    /// Fix was to *always* reload on expand.
+    func testTrashInsideSubdir_collapseUndoExpand_showsRestoredFile() throws {
+        let (app, _, project) = launchWithSeed()
+        let subdir = project.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: subdir, withIntermediateDirectories: false
+        )
+        let nested = subdir.appendingPathComponent("inside.txt")
+        FileManager.default.createFile(atPath: nested.path, contents: Data())
+
+        showFileBrowser(in: app)
+
+        // Expand the subdir so its child row materialises.
+        let subRow = waitForRow(in: app, atPath: subdir.path)
+        subRow.click()
+        let nestedRow = waitForRow(in: app, atPath: nested.path)
+
+        // Trash the nested file.
+        nestedRow.rightClick()
+        let trash = app.menuItems["Move to Trash"]
+        XCTAssertTrue(trash.waitForExistence(timeout: 5))
+        trash.click()
+
+        // Collapse the subdir while the trash is in effect.
+        let nestedAfterTrash = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier == %@", "fileBrowser.row.\(nested.path)")
+        ).firstMatch
+        XCTAssertFalse(
+            nestedAfterTrash.waitForExistence(timeout: 3),
+            "Trashed nested file row should disappear."
+        )
+        // Click subdir row again to collapse.
+        waitForRow(in: app, atPath: subdir.path).click()
+
+        // Undo the trash. File is back on disk under the (collapsed)
+        // subdir; the watcher there is stopped because the subdir is
+        // collapsed.
+        app.typeKey("z", modifierFlags: [.command])
+
+        // Re-expand the subdir. The restored file must appear *now*,
+        // not after a separate parent collapse / re-expand cycle.
+        waitForRow(in: app, atPath: subdir.path).click()
+        let nestedRestored = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier == %@", "fileBrowser.row.\(nested.path)")
+        ).firstMatch
+        XCTAssertTrue(
+            nestedRestored.waitForExistence(timeout: 5),
+            "Re-expanding the subdir after an undo must surface the restored file."
+        )
+    }
+
     /// Right-click a file → Move to Trash → file disappears from
     /// the tree → ⌘Z restores it. End-to-end coverage of the
     /// trash + undo flow.
