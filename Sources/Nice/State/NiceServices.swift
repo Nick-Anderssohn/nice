@@ -28,6 +28,12 @@ final class NiceServices: ObservableObject {
     let terminalThemeCatalog: TerminalThemeCatalog
     let releaseChecker: ReleaseChecker
 
+    /// Process-wide bundle of file-browser context-menu services:
+    /// pasteboard adapter, undo history, OpenWith provider, and the
+    /// shared FS worker. Lives here (not on AppState) so multiple
+    /// windows share one undo stack and one pasteboard.
+    let fileExplorer: FileExplorerServices
+
     /// Absolute path to the `claude` binary if resolvable; nil falls
     /// back to zsh inside claude panes. Computed once at init so
     /// opening a second window doesn't re-run the login-shell probe.
@@ -53,6 +59,19 @@ final class NiceServices: ObservableObject {
             supportDirectory: TerminalThemeCatalog.defaultSupportDirectory()
         )
         self.releaseChecker = ReleaseChecker()
+        // Build the file-explorer service bundle. The history shares
+        // its `service` with the orchestration layer so a fake
+        // `FileManager` or `Trasher` injected for tests reaches
+        // every code path. The history holds a weak reference to the
+        // registry so cross-window undo can route focus back; both
+        // outlive each other for the process lifetime.
+        let foService = FileOperationsService()
+        let history = FileOperationHistory(service: foService, registry: self.registry)
+        self.fileExplorer = FileExplorerServices(
+            pasteboard: FilePasteboardAdapter(),
+            history: history,
+            openWithProvider: OpenWithProvider()
+        )
         // Sweep `$TMPDIR` debris from prior crashed runs *before*
         // writing this run's zdotdir — otherwise the cleanup would
         // race the freshly-written dir and delete it, causing every
@@ -86,7 +105,8 @@ final class NiceServices: ObservableObject {
         KeyboardShortcutMonitor.install(
             registry: registry,
             shortcuts: shortcuts,
-            fontSettings: fontSettings
+            fontSettings: fontSettings,
+            fileOperationHistory: fileExplorer.history
         )
 
         releaseChecker.start()

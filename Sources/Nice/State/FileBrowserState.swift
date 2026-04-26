@@ -47,6 +47,13 @@ final class FileBrowserState: ObservableObject {
     /// even after they navigate into or out of $HOME.
     @Published var showHidden: Bool
 
+    /// Multi-row selection model. One per file browser, owned here
+    /// so the view layer doesn't have to thread it through. Plain
+    /// click → replace; Cmd-click → toggle; Shift-click → range.
+    /// The right-click menu calls `selectionPaths(forRightClickOn:)`
+    /// to resolve "act on selection vs. act on clicked row".
+    let selection: FileBrowserSelection = FileBrowserSelection()
+
     init(rootPath: String) {
         self.rootPath = rootPath
         self.showHidden = Self.defaultShowHidden(forCwd: rootPath)

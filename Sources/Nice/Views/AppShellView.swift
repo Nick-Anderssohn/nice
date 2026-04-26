@@ -100,11 +100,15 @@ private struct AppShellHost: View {
         windowSessionIdBinding: Binding<String>
     ) {
         self.services = services
+        // `NICE_MAIN_CWD` lets UI tests pin the Main Terminal tab's
+        // CWD to a sandboxed test directory. Production launches
+        // don't set it; AppState falls through to NSHomeDirectory().
+        let testCwd = ProcessInfo.processInfo.environment["NICE_MAIN_CWD"]
         _appState = StateObject(wrappedValue: AppState(
             services: services,
             initialSidebarCollapsed: initialSidebarCollapsed,
             initialSidebarMode: initialSidebarMode,
-            initialMainCwd: nil,
+            initialMainCwd: testCwd,
             windowSessionId: windowSessionId
         ))
         _sidebarCollapsedBinding = sidebarCollapsedBinding
@@ -149,6 +153,12 @@ private struct AppShellHost: View {
             }
         )
         .background(windowBackground.ignoresSafeArea())
+        // Bottom-anchored banner for cross-window undo / drift
+        // notifications from the shared file-operation history.
+        .overlay(alignment: .bottom) {
+            FileOperationDriftBanner(history: services.fileExplorer.history)
+                .animation(.easeInOut(duration: 0.18), value: services.fileExplorer.history.lastDriftMessage)
+        }
         .environment(\.palette, palette)
         .environmentObject(appState)
         .alert(

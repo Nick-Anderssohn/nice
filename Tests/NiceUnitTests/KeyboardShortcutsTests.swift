@@ -59,6 +59,36 @@ final class KeyboardShortcutsTests: XCTestCase {
         XCTAssertTrue(combo?.modifierFlags.contains(.option) ?? false)
     }
 
+    func test_defaults_undoRedo_areBoundCmdZAndCmdShiftZ() {
+        let undo = KeyboardShortcuts.defaults[.undoFileOperation]
+        XCTAssertEqual(undo?.keyCode, UInt16(kVK_ANSI_Z))
+        XCTAssertEqual(undo?.modifierFlags, [.command])
+
+        let redo = KeyboardShortcuts.defaults[.redoFileOperation]
+        XCTAssertEqual(redo?.keyCode, UInt16(kVK_ANSI_Z))
+        XCTAssertEqual(redo?.modifierFlags, [.command, .shift])
+    }
+
+    func test_undoRedo_appearInAllCases() {
+        // Settings ▸ Shortcuts iterates `allCases`; confirm the new
+        // actions are surfaced so the user can rebind them.
+        XCTAssertTrue(ShortcutAction.allCases.contains(.undoFileOperation))
+        XCTAssertTrue(ShortcutAction.allCases.contains(.redoFileOperation))
+    }
+
+    func test_undoRedo_actionMatching_returnsActionForCmdZAndCmdShiftZ() {
+        let shortcuts = KeyboardShortcuts(defaults: defaults)
+
+        XCTAssertEqual(
+            shortcuts.actionMatching(keyCode: UInt16(kVK_ANSI_Z), modifiers: [.command]),
+            .undoFileOperation
+        )
+        XCTAssertEqual(
+            shortcuts.actionMatching(keyCode: UInt16(kVK_ANSI_Z), modifiers: [.command, .shift]),
+            .redoFileOperation
+        )
+    }
+
     func test_defaults_fontShortcuts_bindCmdPlusMinusZero() {
         let inc = KeyboardShortcuts.defaults[.increaseFontSize]
         XCTAssertEqual(inc?.keyCode, UInt16(kVK_ANSI_Equal))

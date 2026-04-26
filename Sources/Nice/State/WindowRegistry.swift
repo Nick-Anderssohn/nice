@@ -114,6 +114,32 @@ final class WindowRegistry: ObservableObject {
         entries.values.compactMap { $0.appState }
     }
 
+    /// Look up an `AppState` by its `windowSessionId`. Returns `nil`
+    /// if no live window owns that session. Used by
+    /// `FileOperationHistory` to route undo/redo focus back to the
+    /// window where an op originated.
+    func appState(forSessionId id: String) -> AppState? {
+        for entry in entries.values {
+            if let appState = entry.appState, appState.windowSessionId == id {
+                return appState
+            }
+        }
+        return nil
+    }
+
+    /// Look up the live `NSWindow` for a given `windowSessionId`.
+    /// Used by `FileOperationHistory` to bring the originating
+    /// window to the front before applying the inverse op.
+    func window(forSessionId id: String) -> NSWindow? {
+        for entry in entries.values {
+            if let appState = entry.appState,
+               appState.windowSessionId == id {
+                return entry.window
+            }
+        }
+        return nil
+    }
+
     /// True when the given window hosts the Settings scene. The key
     /// monitor uses this to skip shortcut dispatch while the user is in
     /// Preferences so ⌘B et al. don't reach through into the focused

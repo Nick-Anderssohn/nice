@@ -153,6 +153,8 @@ private struct FileBrowserContent: View {
                         url: URL(fileURLWithPath: state.rootPath),
                         depth: 0,
                         state: state,
+                        selection: state.selection,
+                        tabId: tabId,
                         isRoot: true
                     )
                     // Pin SwiftUI identity to rootPath so a change of
@@ -204,6 +206,7 @@ private struct FileBrowserContent: View {
 /// A single row in the file tree. Renders itself plus, for an
 /// expanded directory, its children as nested `FileTreeRow` views.
 private struct FileTreeRow: View {
+    @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var fontSettings: FontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
@@ -211,6 +214,13 @@ private struct FileTreeRow: View {
     let url: URL
     let depth: Int
     @ObservedObject var state: FileBrowserState
+    /// Mirror of `state.selection` so re-renders trigger when the
+    /// selection set changes. Cmd-click / Shift-click handlers and
+    /// the selection background both read from this.
+    @ObservedObject var selection: FileBrowserSelection
+    /// Tab id this row's file browser is bound to. Recorded with
+    /// each file op so undo/redo can route focus back to this tab.
+    let tabId: String?
     /// True for the very first row (the root). Keeps the disclosure
     /// triangle but nudges the visual treatment so the root reads as
     /// distinct from its children — and we always treat the root as
@@ -257,7 +267,13 @@ private struct FileTreeRow: View {
 
             if isDirectory && isExpanded, let kids = children {
                 ForEach(kids, id: \.self) { childURL in
-                    FileTreeRow(url: childURL, depth: depth + 1, state: state)
+                    FileTreeRow(
+                        url: childURL,
+                        depth: depth + 1,
+                        state: state,
+                        selection: selection,
+                        tabId: tabId
+                    )
                 }
             }
         }
@@ -270,7 +286,14 @@ private struct FileTreeRow: View {
         .onDisappear { watcher.stop() }
         .onChange(of: isExpanded) { _, newValue in
             if newValue {
-                if children == nil { reloadChildren() }
+                // Always reload on expand. While the row was
+                // collapsed the watcher was stopped, so any changes
+                // since then (e.g. an undo restoring a trashed file
+                // into this directory, or the user editing the dir
+                // in Finder) wouldn't have invalidated the cache.
+                // Re-reading once on expand is cheap; the watcher
+                // takes over for incremental updates.
+                reloadChildren()
                 startWatching()
             } else {
                 watcher.stop()
@@ -332,14 +355,25 @@ private struct FileTreeRow: View {
 
             Spacer(minLength: 0)
         }
+        // Cut rows render at half opacity to mirror what the user
+        // sees in Finder: the source dims while it's queued to
+        // move, restoring once the paste completes (the adapter
+        // clears the cut companion at that point).
+        .opacity(isCut ? 0.45 : 1)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .fill(hover ? Color.niceInk(scheme, palette).opacity(0.06) : Color.clear)
+                .fill(rowBackground)
         )
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
+        // Combine the row's name + icon + indent slot into one
+        // addressable accessibility element. Pair with
+        // `.accessibilityIdentifier` so XCUITest can locate a row
+        // by its absolute path.
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("fileBrowser.row.\(path)")
         .onHover { hover = $0 }
         // Single `.onTapGesture` instead of `.onTapGesture(count: 2)`
         // + `(count: 1)` — the latter introduces a SwiftUI delay on
@@ -351,8 +385,46 @@ private struct FileTreeRow: View {
         // either idempotent (NSWorkspace.open) or compatible
         // (expand-then-reroot ends at the new root either way).
         .onTapGesture { handleTap() }
-        .contextMenu { contextMenu }
+        .contextMenu {
+            // PURE read of "which paths should the menu act on".
+            // SwiftUI evaluates this closure as part of body, so it
+            // must not mutate `@Published` state — the visible
+            // "snap selection to right-clicked row" side effect is
+            // moved into `onWillAct` below, which fires inside each
+            // menu Button's action closure (i.e. *after* the menu
+            // is dismissed, not during render).
+            let actionPaths = selection.selectionPaths(forRightClickOn: path)
+            FileBrowserContextMenu(
+                clickedPath: path,
+                isDirectory: isDirectory,
+                isRoot: isRoot,
+                actionPaths: actionPaths,
+                tabId: tabId,
+                onWillAct: { selection.snapIfRightClickOutside(path) },
+                actions: appState
+            )
+        }
         .help(path)
+    }
+
+    /// Composite background: selection accent (highest priority),
+    /// hover (next), or transparent. Matches the rounded-rectangle
+    /// shape used for hover so the visual size doesn't jump.
+    private var rowBackground: Color {
+        if selection.contains(path) {
+            return Color.accentColor.opacity(0.18)
+        }
+        if hover {
+            return Color.niceInk(scheme, palette).opacity(0.06)
+        }
+        return Color.clear
+    }
+
+    /// True when this row's path is on the pasteboard with cut
+    /// intent. Drives a dimmed rendering so the user can see what
+    /// will move when they paste.
+    private var isCut: Bool {
+        appState.cutPaths().contains(url)
     }
 
     private var iconName: String {
@@ -369,37 +441,41 @@ private struct FileTreeRow: View {
         return Color.niceInk2(scheme, palette).opacity(0.75)
     }
 
-    @ViewBuilder
-    private var contextMenu: some View {
-        if !isDirectory {
-            Button("Open") { NSWorkspace.shared.open(url) }
-        }
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        }
-        Divider()
-        Button("Copy Path") {
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(path, forType: .string)
-        }
-    }
-
     /// Single tap entry point. Fires `primaryClick()` for instant
     /// feedback on the first tap of a window; on the second tap (a
     /// double-click), runs `doubleClick()` instead so the primary
     /// action doesn't toggle expansion redundantly. Avoids SwiftUI's
     /// built-in `.onTapGesture(count:)` disambig delay, which makes
     /// expand/collapse feel laggy.
+    ///
+    /// Cmd-click and Shift-click are intercepted before the
+    /// double-click path so they only adjust the selection (and
+    /// don't expand or open).
     private func handleTap() {
+        let mods = NSEvent.modifierFlags
+            .intersection(KeyCombo.relevantModifierMask)
+        if mods.contains(.command) {
+            selection.toggle(path)
+            return
+        }
+        if mods.contains(.shift) {
+            let order = FileBrowserListing.visibleOrder(
+                rootPath: state.rootPath,
+                expandedPaths: state.expandedPaths,
+                showHidden: state.showHidden
+            )
+            selection.extend(through: path, visibleOrder: order)
+            return
+        }
+        // Plain click: replace selection with this row, then run the
+        // primary/double-click action.
         let now = Date()
         let isDouble = now.timeIntervalSince(lastTapTime) < Self.doubleClickWindow
         if isDouble {
             doubleClick()
-            // Reset so a third tap right after isn't read as another
-            // double — each double needs a fresh first tap.
             lastTapTime = .distantPast
         } else {
+            selection.replace(with: [path])
             primaryClick()
             lastTapTime = now
         }

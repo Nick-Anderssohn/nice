@@ -45,11 +45,18 @@ enum KeyboardShortcutMonitor {
     /// registry, shortcuts, and font settings weakly so teardown isn't
     /// blocked by the monitor's retain; in practice all live for the
     /// whole process.
+    /// Reference to the global file-operation history. Set by
+    /// `install(...)` so undo/redo dispatch can route through the
+    /// shared stack regardless of which window currently has focus.
+    private static weak var fileOperationHistory: FileOperationHistory?
+
     static func install(
         registry: WindowRegistry,
         shortcuts: KeyboardShortcuts,
-        fontSettings: FontSettings
+        fontSettings: FontSettings,
+        fileOperationHistory: FileOperationHistory? = nil
     ) {
+        Self.fileOperationHistory = fileOperationHistory
         guard !installed else { return }
         installed = true
 
@@ -115,6 +122,13 @@ enum KeyboardShortcutMonitor {
         // lookup so Cmd+=/-/0 still zoom even with no windows open
         // (e.g. only Settings visible).
         if let fontSettings, dispatchFontAction(action, fontSettings: fontSettings) {
+            return true
+        }
+
+        // Undo/redo route through the process-wide history (it
+        // tracks origin and follows focus internally), so they
+        // don't need a focused window either.
+        if dispatchHistoryAction(action) {
             return true
         }
 
@@ -187,6 +201,34 @@ enum KeyboardShortcutMonitor {
         }
     }
 
+    /// Handle undo/redo actions. Returns `true` if `action` was an
+    /// undo or redo (and was dispatched into the shared history);
+    /// `false` if unrelated. The history routes focus internally to
+    /// the originating window/tab.
+    private static func dispatchHistoryAction(_ action: ShortcutAction) -> Bool {
+        Self.dispatchHistory(action: action, history: fileOperationHistory)
+    }
+
+    /// Pure testable form of `dispatchHistoryAction`. Static and
+    /// internal so unit tests can pass a private history instance
+    /// and verify the routing without standing up the global
+    /// monitor or triggering a real `NSEvent`.
+    static func dispatchHistory(
+        action: ShortcutAction,
+        history: FileOperationHistory?
+    ) -> Bool {
+        switch action {
+        case .undoFileOperation:
+            history?.undo()
+            return true
+        case .redoFileOperation:
+            history?.redo()
+            return true
+        default:
+            return false
+        }
+    }
+
     private static func dispatch(_ action: ShortcutAction, on appState: AppState) {
         switch action {
         case .nextSidebarTab:  appState.selectNextSidebarTab()
@@ -199,6 +241,9 @@ enum KeyboardShortcutMonitor {
         case .toggleHiddenFiles: appState.toggleFileBrowserHiddenFiles()
         case .increaseFontSize, .decreaseFontSize, .resetFontSizes:
             // Handled by dispatchFontAction before we reach here.
+            break
+        case .undoFileOperation, .redoFileOperation:
+            // Handled by dispatchHistoryAction before we reach here.
             break
         }
     }
