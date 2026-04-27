@@ -23,10 +23,13 @@
 //  The double-click routing decision (mapped → editor, unmapped →
 //  NSWorkspace) is covered by `AppStateOpenInEditorPaneTests`.
 //
-//  The test uses `sleep 30` as the stub editor command so the spawned
-//  pane stays alive long enough to verify without depending on `vim`
-//  being installed on the test machine. Process teardown happens at
-//  app shutdown.
+//  The test uses `tail -f` as the stub editor command: it accepts the
+//  appended file path (`editorPaneSpec` appends it after the command),
+//  reads the seeded "hello" content, and then idles waiting for more
+//  data. `sleep 30` would die immediately because BSD sleep rejects
+//  the trailing path arg with exit 1, so the spawned pane would be
+//  removed via `paneExited` before the test could observe its pill.
+//  Process teardown happens at app shutdown.
 //
 
 import XCTest
@@ -56,7 +59,7 @@ final class FileBrowserOpenInEditorUITests: XCTestCase {
     /// configuration-not-loaded problem.
     func testSeedEnvVar_appearsInOpenInEditorPaneSubmenu() throws {
         let editorId = UUID()
-        let editor = EditorEntry(id: editorId, name: "TestEditor", command: "sleep 30")
+        let editor = EditorEntry(id: editorId, name: "TestEditor", command: "tail -f")
         let (app, file, _) = launchWithSeed(editors: [editor], mappings: [:])
 
         showFileBrowser(in: app)
@@ -86,7 +89,7 @@ final class FileBrowserOpenInEditorUITests: XCTestCase {
     /// with `command:` → toolbar repaint) holds end-to-end.
     func testOpenInEditorPaneSubmenu_clickEditor_spawnsPane() throws {
         let editorId = UUID()
-        let editor = EditorEntry(id: editorId, name: "TestEditor", command: "sleep 30")
+        let editor = EditorEntry(id: editorId, name: "TestEditor", command: "tail -f")
         let (app, file, _) = launchWithSeed(editors: [editor], mappings: [:])
 
         showFileBrowser(in: app)
@@ -102,16 +105,7 @@ final class FileBrowserOpenInEditorUITests: XCTestCase {
 
         let editorItem = app.menuItems["TestEditor"]
         XCTAssertTrue(editorItem.waitForExistence(timeout: 5))
-        // Hover the editor item itself before clicking. Without this,
-        // XCUITest clicks the snapshot frame captured while the submenu
-        // was still animating open, which on CI lands outside the
-        // item's final position once macOS auto-positions the submenu.
-        // Hovering forces a fresh layout query, and the coordinate
-        // click then targets the element's current center.
-        editorItem.hover()
-        editorItem.coordinate(
-            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
-        ).click()
+        editorItem.click()
 
         // Pane spawn is synchronous from the menu click down to
         // addPane; poll briefly to absorb XCUITest command-relay
