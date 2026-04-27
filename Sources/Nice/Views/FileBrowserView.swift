@@ -674,12 +674,22 @@ private struct FileBrowserRowDropDelegate: DropDelegate {
         guard isCurrentTarget else {
             return DropProposal(operation: .forbidden)
         }
-        let mods = NSEvent.modifierFlags
-        return DropProposal(operation: mods.contains(.option) ? .copy : .move)
+        // Route through the same resolver that `scheduleDrop` uses so
+        // the cursor cue agrees with the actual op — Option held or
+        // any source on a different volume than the target both flip
+        // the result to `.copy`.
+        return DropProposal(operation: proposedDragOperation())
     }
 
     func dropExited(info: DropInfo) {
-        if isCurrentTarget {
+        guard isCurrentTarget else { return }
+        // External drag (paths empty by convention): tear the whole
+        // session down so it doesn't linger past the user backing out
+        // of every folder row. Internal drag: keep the session alive
+        // for the next folder's `dropEntered` to overwrite.
+        if dragState.session?.paths.isEmpty == true {
+            dragState.session = nil
+        } else {
             dragState.session?.targetPath = nil
         }
     }
@@ -718,24 +728,57 @@ private struct FileBrowserRowDropDelegate: DropDelegate {
     }
 
     /// Decide whether to highlight this folder as the drop target.
-    /// For internal drags, the folder-into-self / no-op rules in
-    /// `FileBrowserDropResolver.canDrop` decide. For external drags
-    /// (no session yet), highlight unconditionally — Finder won't
-    /// drop a folder onto itself.
+    /// Three cases:
+    ///   1. Internal drag (`paths` non-empty) — gated by the
+    ///      folder-into-self / no-op rules in
+    ///      `FileBrowserDropResolver.canDrop`.
+    ///   2. External drag, session already seeded (`paths` empty) —
+    ///      always highlight; cycle rules can't apply because the
+    ///      source isn't one of our rows.
+    ///   3. No session yet — seed one with empty paths to mark this
+    ///      folder as the external-drag target.
     private func updateTarget() {
-        if let session = dragState.session {
-            let urls = session.paths.map { URL(fileURLWithPath: $0) }
-            if FileBrowserDropResolver.canDrop(sources: urls, into: folderURL) {
-                dragState.session?.targetPath = folderPath
-            } else if isCurrentTarget {
-                dragState.session?.targetPath = nil
-            }
-        } else {
+        guard let session = dragState.session else {
             dragState.session = FileBrowserDragSession(
                 paths: [],
                 targetPath: folderPath
             )
+            return
         }
+        if session.paths.isEmpty {
+            dragState.session?.targetPath = folderPath
+            return
+        }
+        let urls = session.paths.map { URL(fileURLWithPath: $0) }
+        if FileBrowserDropResolver.canDrop(sources: urls, into: folderURL) {
+            dragState.session?.targetPath = folderPath
+        } else if isCurrentTarget {
+            dragState.session?.targetPath = nil
+        }
+    }
+
+    /// Compute the SwiftUI `DropOperation` to surface in the cursor
+    /// cue. Matches what `scheduleDrop` will actually do: routes
+    /// through `FileBrowserDropResolver.operation`. For external
+    /// drags the source URLs aren't known synchronously, so we
+    /// conservatively assume same-volume and let `scheduleDrop`
+    /// correct if a cross-volume drop turns into a copy on commit.
+    private func proposedDragOperation() -> DropOperation {
+        let mods = NSEvent.modifierFlags
+        let sameVolume: Bool
+        if let session = dragState.session, !session.paths.isEmpty {
+            let urls = session.paths.map { URL(fileURLWithPath: $0) }
+            sameVolume = urls.allSatisfy {
+                FileBrowserDropResolver.areOnSameVolume($0, folderURL)
+            }
+        } else {
+            sameVolume = true
+        }
+        let op = FileBrowserDropResolver.operation(
+            modifierFlags: mods,
+            sameVolume: sameVolume
+        )
+        return op == .copy ? .copy : .move
     }
 
     /// Validate, classify (move vs copy), and apply on the next
