@@ -21,6 +21,7 @@ final class FileBrowserContextMenuModelTests: XCTestCase {
         )
         XCTAssertTrue(model.items.contains(.open))
         XCTAssertTrue(model.items.contains(.openWith))
+        XCTAssertTrue(model.items.contains(.openInEditorPane))
     }
 
     func test_menuItems_onDirectory_omitsOpenAndOpenWith() {
@@ -29,6 +30,7 @@ final class FileBrowserContextMenuModelTests: XCTestCase {
         )
         XCTAssertFalse(model.items.contains(.open))
         XCTAssertFalse(model.items.contains(.openWith))
+        XCTAssertFalse(model.items.contains(.openInEditorPane))
     }
 
     func test_menuItems_onRoot_omitsCutCopyTrash() {
@@ -63,16 +65,16 @@ final class FileBrowserContextMenuModelTests: XCTestCase {
     }
 
     /// File rows show the menu in the documented order:
-    /// Open / Open With / Reveal in Finder / divider / Copy / Copy
-    /// Path / Cut / Paste (when canPaste) / Trash. The trailing
-    /// divider is intentionally absent — the user asked for Copy
-    /// Path to sit directly under Copy.
+    /// Open / Open With / Open in Editor Pane / Reveal in Finder /
+    /// divider / Copy / Copy Path / Cut / Paste (when canPaste) /
+    /// Trash. The trailing divider is intentionally absent — the user
+    /// asked for Copy Path to sit directly under Copy.
     func test_menuItems_orderMatchesSpec_fileRow_canPaste() {
         let model = FileBrowserContextMenuModel.build(
             isDirectory: false, isRoot: false, canPaste: true
         )
         XCTAssertEqual(model.items, [
-            .open, .openWith, .revealInFinder,
+            .open, .openWith, .openInEditorPane, .revealInFinder,
             .dividerOpen,
             .copy, .copyPath, .cut, .paste, .trash
         ])

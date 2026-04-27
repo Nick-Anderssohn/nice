@@ -14,7 +14,8 @@
 //
 //  Menu order, top to bottom:
 //     Open
-//     Open With ▸  (submenu of detected apps + Other...)
+//     Open With ▸           (submenu of detected apps + Other...)
+//     Open in Editor Pane ▸ (submenu of user editors + auto-detected)
 //     Reveal in Finder
 //     ─────
 //     Copy
@@ -23,9 +24,9 @@
 //     Paste
 //     Move to Trash
 //
-//  Open / Open With are hidden on directories. Cut / Copy / Trash are
-//  hidden on the file-browser root. Paste is hidden when the
-//  pasteboard has no eligible file URLs.
+//  Open / Open With / Open in Editor Pane are hidden on directories.
+//  Cut / Copy / Trash are hidden on the file-browser root. Paste is
+//  hidden when the pasteboard has no eligible file URLs.
 //
 
 import AppKit
@@ -49,6 +50,8 @@ protocol FileExplorerActions: AnyObject {
     func revealInFinder(url: URL)
     func canPaste() -> Bool
     func openWithEntries(for url: URL) -> [OpenWithEntry]
+    func editorPaneEntries() -> EditorPaneEntries
+    func openInEditorPane(url: URL, editorId: UUID)
 }
 
 // MARK: - Pure model
@@ -60,6 +63,7 @@ struct FileBrowserContextMenuModel: Equatable {
     enum Item: Equatable {
         case open
         case openWith
+        case openInEditorPane
         case revealInFinder
         case dividerOpen
         case copy
@@ -80,6 +84,7 @@ struct FileBrowserContextMenuModel: Equatable {
         if !isDirectory {
             out.append(.open)
             out.append(.openWith)
+            out.append(.openInEditorPane)
         }
         out.append(.revealInFinder)
         out.append(.dividerOpen)
@@ -158,6 +163,8 @@ struct FileBrowserContextMenu: View {
             }
         case .openWith:
             openWithMenu
+        case .openInEditorPane:
+            editorPaneMenu
         case .revealInFinder:
             Button("Reveal in Finder") {
                 onWillAct()
@@ -193,6 +200,47 @@ struct FileBrowserContextMenu: View {
                 onWillAct()
                 actions.trash(paths: actionPaths, originatingTabId: tabId)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var editorPaneMenu: some View {
+        // Built lazily on menu open. Detected editors are populated
+        // off-thread at app startup; if the scan hasn't returned yet
+        // we just show user-configured ones (which is also what we'd
+        // show on a fresh install with nothing detected).
+        let url = URL(fileURLWithPath: clickedPath)
+        let entries = actions.editorPaneEntries()
+        Menu("Open in Editor Pane") {
+            if entries.isEmpty {
+                Text("No editors available")
+                    .foregroundStyle(.secondary)
+            } else if entries.user.isEmpty || entries.detected.isEmpty {
+                // Flat list — no need for section headers when only
+                // one source has entries.
+                ForEach(entries.user + entries.detected) { editor in
+                    editorButton(for: editor, url: url)
+                }
+            } else {
+                Section("My editors") {
+                    ForEach(entries.user) { editor in
+                        editorButton(for: editor, url: url)
+                    }
+                }
+                Section("Detected") {
+                    ForEach(entries.detected) { editor in
+                        editorButton(for: editor, url: url)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func editorButton(for editor: EditorCommand, url: URL) -> some View {
+        Button(editor.name) {
+            onWillAct()
+            actions.openInEditorPane(url: url, editorId: editor.id)
         }
     }
 

@@ -27,6 +27,7 @@ final class NiceServices: ObservableObject {
     let registry: WindowRegistry
     let terminalThemeCatalog: TerminalThemeCatalog
     let releaseChecker: ReleaseChecker
+    let editorDetector: EditorDetector
 
     /// Process-wide bundle of file-browser context-menu services:
     /// pasteboard adapter, undo history, OpenWith provider, and the
@@ -59,6 +60,7 @@ final class NiceServices: ObservableObject {
             supportDirectory: TerminalThemeCatalog.defaultSupportDirectory()
         )
         self.releaseChecker = ReleaseChecker()
+        self.editorDetector = EditorDetector()
         // Build the file-explorer service bundle. The history shares
         // its `service` with the orchestration layer so a fake
         // `FileManager` or `Trasher` injected for tests reaches
@@ -85,6 +87,14 @@ final class NiceServices: ObservableObject {
         }
         self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
             ?? Self.runWhich(binary: "claude")
+
+        // Kick off editor auto-detection on a background queue. The
+        // scan probes the user's PATH for well-known terminal editors
+        // (vim, nvim, hx, …) so the File Explorer's "Open in Editor
+        // Pane" submenu can populate without any prior config. Empty
+        // until the scan returns; UI just shows whatever's
+        // user-configured in the meantime.
+        editorDetector.scan()
 
         // Install Claude Code's UserPromptSubmit hook so Nice-spawned
         // claudes phone home with their current session id on every

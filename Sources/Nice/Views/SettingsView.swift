@@ -30,6 +30,7 @@ import SwiftUI
 enum SettingsSection: String, CaseIterable, Identifiable {
     case appearance  = "Appearance"
     case terminal    = "Terminal themes"
+    case editors     = "Editors"
     case shortcuts   = "Shortcuts"
     case font        = "Font"
     case about       = "About"
@@ -46,6 +47,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .appearance: return "appearance"
         case .terminal:   return "terminal"
+        case .editors:    return "editors"
         case .shortcuts:  return "shortcuts"
         case .font:       return "font"
         case .about:      return "about"
@@ -129,6 +131,7 @@ struct SettingsView: View {
                 case .shortcuts:  ShortcutsPane()
                 case .appearance: AppearancePane()
                 case .terminal:   SettingsTerminalPane()
+                case .editors:    SettingsEditorsPane()
                 case .font:       FontPane()
                 case .about:      AboutPane()
                 }

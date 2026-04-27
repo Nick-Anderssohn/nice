@@ -169,6 +169,19 @@ extension Color {
     }
 }
 
+// MARK: - Editor command
+
+/// A user-configured (or auto-detected) terminal editor that can open
+/// files from the File Explorer in a new pane. The `command` is parsed
+/// by zsh, so callers can include arguments (e.g. `nvim -p`,
+/// `emacs -nw`). Identity is by UUID so renames don't break extension
+/// mappings.
+struct EditorCommand: Identifiable, Hashable, Codable, Sendable {
+    let id: UUID
+    var name: String
+    var command: String
+}
+
 // MARK: - Tweaks store
 
 /// Observable store owning the theme + accent values. `theme`, `syncWithOS`,
@@ -196,6 +209,8 @@ final class Tweaks: ObservableObject {
     static let terminalThemeLightKey = "terminalThemeLightId"
     static let terminalThemeDarkKey  = "terminalThemeDarkId"
     static let terminalFontFamilyKey = "terminalFontFamily"
+    static let editorCommandsKey       = "editorCommands"
+    static let extensionEditorMapKey   = "extensionEditorMap"
 
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
@@ -318,9 +333,32 @@ final class Tweaks: ObservableObject {
         }
     }
 
+    /// User-configured terminal editors that can open files from the
+    /// File Explorer in a new pane. Each entry has a stable UUID so
+    /// extension mappings survive renames.
+    @Published var editorCommands: [EditorCommand] {
+        didSet { persistEditorCommands() }
+    }
+
+    /// Maps a normalised file extension (lowercase, no leading dot) to
+    /// an `EditorCommand.id`. Mappings are pruned automatically when
+    /// the referenced editor is removed via `removeEditor(id:)`.
+    @Published var extensionEditorMap: [String: UUID] {
+        didSet { persistExtensionEditorMap() }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
+
+    /// The `UserDefaults` domain to persist editor settings into.
+    /// Pre-existing properties (theme, accent, terminal-theme ids, …)
+    /// still write to `.standard` directly via their `didSet`s — this
+    /// new ivar is the start of routing those through an injectable
+    /// domain instead. New code that calls `persistEditorCommands` and
+    /// `persistExtensionEditorMap` writes here so tests can isolate
+    /// without scrubbing `.standard`.
+    private let defaults: UserDefaults
 
     /// Retains the distributed-notification observer so it outlives init.
     private var osObserver: NSObjectProtocol?
@@ -331,6 +369,7 @@ final class Tweaks: ObservableObject {
         installOSObserver: Bool = true
     ) {
         self.osSchemeProvider = osSchemeProvider
+        self.defaults = defaults
 
         let accentRaw = defaults.string(forKey: Self.accentKey) ?? AccentPreset.ocean.rawValue
         let accent = AccentPreset(rawValue: accentRaw) ?? .ocean
@@ -352,6 +391,9 @@ final class Tweaks: ObservableObject {
             ?? Self.defaultTerminalThemeDarkId
         let fontFamily = defaults.string(forKey: Self.terminalFontFamilyKey)
 
+        let editors = Self.loadEditorCommands(defaults: defaults)
+        let extMap  = Self.loadExtensionEditorMap(defaults: defaults)
+
         let migrated = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
         self.scheme = migrated.scheme
@@ -364,6 +406,8 @@ final class Tweaks: ObservableObject {
         self.terminalThemeLightId = terminalLight
         self.terminalThemeDarkId = terminalDark
         self.terminalFontFamily = fontFamily
+        self.editorCommands = editors
+        self.extensionEditorMap = extMap
 
         NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
 
@@ -589,5 +633,79 @@ final class Tweaks: ObservableObject {
         // `defaultTerminalThemeXId` constants, which is exactly the
         // kind of drift the unit tests catch.
         return catalog.theme(withId: fallbackId)!
+    }
+
+    // MARK: - Editor commands
+
+    /// Lower-cased, dot-stripped form so `MD`, `.md`, and `md` all
+    /// resolve to the same mapping key.
+    static func normalizeExtension(_ ext: String) -> String {
+        var s = ext
+        if s.hasPrefix(".") { s.removeFirst() }
+        return s.lowercased()
+    }
+
+    func editor(for id: UUID) -> EditorCommand? {
+        editorCommands.first { $0.id == id }
+    }
+
+    func editor(forExtension ext: String) -> EditorCommand? {
+        let key = Self.normalizeExtension(ext)
+        guard let id = extensionEditorMap[key] else { return nil }
+        return editor(for: id)
+    }
+
+    func addEditor(_ editor: EditorCommand) {
+        editorCommands.append(editor)
+    }
+
+    func updateEditor(id: UUID, name: String, command: String) {
+        guard let idx = editorCommands.firstIndex(where: { $0.id == id }) else { return }
+        editorCommands[idx].name = name
+        editorCommands[idx].command = command
+    }
+
+    /// Removes the editor and any extension mappings that pointed at it.
+    /// Single enforcement point for the "no orphaned mappings" invariant —
+    /// UI must go through this rather than mutating `editorCommands` directly.
+    func removeEditor(id: UUID) {
+        editorCommands.removeAll { $0.id == id }
+        for (ext, mapped) in extensionEditorMap where mapped == id {
+            extensionEditorMap.removeValue(forKey: ext)
+        }
+    }
+
+    func setMapping(extension ext: String, editorId: UUID) {
+        extensionEditorMap[Self.normalizeExtension(ext)] = editorId
+    }
+
+    func removeMapping(forExtension ext: String) {
+        extensionEditorMap.removeValue(forKey: Self.normalizeExtension(ext))
+    }
+
+    private func persistEditorCommands() {
+        if let data = try? JSONEncoder().encode(editorCommands) {
+            defaults.set(data, forKey: Self.editorCommandsKey)
+        }
+    }
+
+    private func persistExtensionEditorMap() {
+        if let data = try? JSONEncoder().encode(extensionEditorMap) {
+            defaults.set(data, forKey: Self.extensionEditorMapKey)
+        }
+    }
+
+    static func loadEditorCommands(defaults: UserDefaults) -> [EditorCommand] {
+        guard let data = defaults.data(forKey: editorCommandsKey),
+              let decoded = try? JSONDecoder().decode([EditorCommand].self, from: data)
+        else { return [] }
+        return decoded
+    }
+
+    static func loadExtensionEditorMap(defaults: UserDefaults) -> [String: UUID] {
+        guard let data = defaults.data(forKey: extensionEditorMapKey),
+              let decoded = try? JSONDecoder().decode([String: UUID].self, from: data)
+        else { return [:] }
+        return decoded
     }
 }

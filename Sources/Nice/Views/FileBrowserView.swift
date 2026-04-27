@@ -208,6 +208,7 @@ private struct FileBrowserContent: View {
 private struct FileTreeRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var fontSettings: FontSettings
+    @EnvironmentObject private var tweaks: Tweaks
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -496,6 +497,13 @@ private struct FileTreeRow: View {
             // `.id(state.rootPath)` on the top-level row, the tree
             // re-renders fresh at the new root.
             state.rootPath = path
+            return
+        }
+        // If the user mapped this extension to a configured editor,
+        // spawn it in a new pane in the active tab; otherwise fall
+        // through to the OS default app handler.
+        if let editor = tweaks.editor(forExtension: url.pathExtension) {
+            appState.openInEditorPane(url: url, editorId: editor.id)
         } else {
             NSWorkspace.shared.open(url)
         }
