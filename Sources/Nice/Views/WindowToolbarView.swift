@@ -77,6 +77,12 @@ struct WindowToolbarView: View {
 
 // MARK: - Inline pane strip
 
+/// Animation duration shared by all pill / chrome state transitions in
+/// this toolbar. The pills established 0.12s as the convention; the
+/// overflow chrome (edge fades, chevron badge, menu show/hide) follows
+/// suit so timings don't feel staggered.
+private let panePillAnimationDuration: Double = 0.12
+
 /// Scrolls horizontally through the active tab's panes, rendering each as
 /// an `InlinePanePill`. The trailing `NewTabBtn` stays pinned; it adds a
 /// terminal pane to the active tab.
@@ -92,6 +98,11 @@ struct WindowToolbarView: View {
 ///
 /// Layout-identical to its predecessor when the strip fits — the chevron
 /// only renders when overflowing.
+///
+/// All overflow / visibility math lives in the pure-Swift
+/// `PaneStripGeometry` value type so it can be unit-tested without a
+/// SwiftUI host. This view's only job is to drive that struct from
+/// SwiftUI preferences and feed its outputs to the chrome subviews.
 private struct InlinePaneStrip: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
@@ -101,11 +112,9 @@ private struct InlinePaneStrip: View {
     /// (e.g. only one close "×" ever visible at a time).
     @State private var hoveredPaneId: String? = nil
 
-    /// Each pill's frame as reported in the ScrollView's named coordinate
-    /// space `paneStripCoordinateSpace`. In that space the visible
-    /// viewport is fixed at `[0, visibleWidth]` regardless of scroll
-    /// offset, so a pill is fully offscreen iff `frame.maxX <= 0` or
-    /// `frame.minX >= visibleWidth`.
+    /// Each pill's frame in the ScrollView's named coordinate space
+    /// `paneStripCoordinateSpace` — populated via `PaneFramePreferenceKey`
+    /// and fed straight into `PaneStripGeometry`.
     @State private var paneFrames: [String: CGRect] = [:]
     @State private var visibleWidth: CGFloat = 0
 
@@ -114,46 +123,8 @@ private struct InlinePaneStrip: View {
         return appState.tab(for: id)
     }
 
-    /// Hidden-to-the-left iff any pill's right edge is at or past 0
-    /// while its left edge is negative.
-    private var canScrollLeading: Bool {
-        paneFrames.values.contains { $0.minX < -0.5 }
-    }
-
-    /// Hidden-to-the-right iff any pill's right edge extends past the
-    /// viewport. Guard against the initial `visibleWidth == 0` frame
-    /// before layout has run.
-    private var canScrollTrailing: Bool {
-        guard visibleWidth > 0 else { return false }
-        return paneFrames.values.contains { $0.maxX > visibleWidth + 0.5 }
-    }
-
-    private var isOverflowing: Bool {
-        canScrollLeading || canScrollTrailing
-    }
-
-    private var offscreenPaneIds: Set<String> {
-        guard visibleWidth > 0 else { return [] }
-        var ids: Set<String> = []
-        for (id, frame) in paneFrames {
-            if frame.maxX <= 0.5 || frame.minX >= visibleWidth - 0.5 {
-                ids.insert(id)
-            }
-        }
-        return ids
-    }
-
-    private func hasOffscreenAttention(in tab: Tab) -> Bool {
-        let offscreen = offscreenPaneIds
-        guard !offscreen.isEmpty else { return false }
-        return tab.panes.contains { pane in
-            guard offscreen.contains(pane.id) else { return false }
-            switch pane.status {
-            case .thinking: return true
-            case .waiting:  return !pane.waitingAcknowledged
-            case .idle:     return false
-            }
-        }
+    private var geometry: PaneStripGeometry {
+        PaneStripGeometry(paneFrames: paneFrames, visibleWidth: visibleWidth)
     }
 
     var body: some View {
@@ -161,11 +132,13 @@ private struct InlinePaneStrip: View {
             if let tab = activeTab {
                 strip(for: tab)
 
-                if isOverflowing {
+                if geometry.isOverflowing {
                     OverflowMenuButton(
                         panes: tab.panes,
                         activePaneId: tab.activePaneId,
-                        hasAttention: hasOffscreenAttention(in: tab),
+                        hasAttention: tab.hasOffscreenAttention(
+                            offscreenIds: geometry.offscreenPaneIds
+                        ),
                         onSelect: { paneId in
                             appState.setActivePane(
                                 tabId: tab.id,
@@ -189,16 +162,21 @@ private struct InlinePaneStrip: View {
                 Spacer(minLength: 0)
             }
         }
-        .animation(.easeInOut(duration: 0.15), value: isOverflowing)
+        .animation(
+            .easeInOut(duration: panePillAnimationDuration),
+            value: geometry.isOverflowing
+        )
     }
 
     @ViewBuilder
     private func strip(for tab: Tab) -> some View {
-        // Avoid wrapping the ScrollView in a `GeometryReader` — that
-        // expands the strip to fill the toolbar's 52pt height instead of
-        // staying at the pills' natural ~28pt. Instead, read the
-        // ScrollView's bounds via a `.background` GeometryReader feeding
-        // a preference, which doesn't influence layout.
+        // Why `.background(GeometryReader)` instead of wrapping the
+        // ScrollView in one: a wrapping GeometryReader inherits its
+        // parent's full proposed size and forces the ScrollView to fill
+        // the toolbar's 52pt height, which top-anchors the 28pt pills
+        // instead of centering them. A background GeometryReader emits
+        // a preference value but does not influence layout, so the
+        // ScrollView keeps sizing to its content.
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
@@ -271,18 +249,18 @@ private struct InlinePaneStrip: View {
             }
             .overlay(alignment: .leading) {
                 edgeFade(trailing: false)
-                    .opacity(canScrollLeading ? 1 : 0)
+                    .opacity(geometry.canScrollLeading ? 1 : 0)
                     .animation(
-                        .easeInOut(duration: 0.15),
-                        value: canScrollLeading
+                        .easeInOut(duration: panePillAnimationDuration),
+                        value: geometry.canScrollLeading
                     )
             }
             .overlay(alignment: .trailing) {
                 edgeFade(trailing: true)
-                    .opacity(canScrollTrailing ? 1 : 0)
+                    .opacity(geometry.canScrollTrailing ? 1 : 0)
                     .animation(
-                        .easeInOut(duration: 0.15),
-                        value: canScrollTrailing
+                        .easeInOut(duration: panePillAnimationDuration),
+                        value: geometry.canScrollTrailing
                     )
             }
         }
@@ -548,7 +526,10 @@ private struct OverflowMenuButton: View {
                         .transition(.scale.combined(with: .opacity))
                 }
             }
-            .animation(.easeInOut(duration: 0.15), value: hasAttention)
+            .animation(
+                .easeInOut(duration: panePillAnimationDuration),
+                value: hasAttention
+            )
             .contentShape(Rectangle())
             .onHover { hovering = $0 }
     }
@@ -577,6 +558,27 @@ private struct OverflowMenuButton: View {
                 Image(systemName: "terminal")
             }
         }
+        .accessibilityLabel(rowAccessibilityLabel(for: pane))
+    }
+
+    /// VoiceOver text for a menu row. Surfaces the same "thinking" /
+    /// "waiting" status that the inline pill's `StatusDot` exposes,
+    /// since the dot in the menu row is decorative and merged into the
+    /// Label's combined element.
+    private func rowAccessibilityLabel(for pane: Pane) -> String {
+        let suffix: String
+        switch pane.kind {
+        case .claude:
+            switch pane.status {
+            case .thinking: suffix = ", thinking"
+            case .waiting:  suffix = ", waiting for input"
+            case .idle:     suffix = ""
+            }
+        case .terminal:
+            suffix = ", terminal"
+        }
+        let active = pane.id == activePaneId ? ", selected" : ""
+        return pane.title + suffix + active
     }
 }
 

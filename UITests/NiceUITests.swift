@@ -1589,4 +1589,56 @@ final class NiceUITests: XCTestCase {
         )
     }
 
+    // MARK: - Toolbar overflow chevron
+
+    /// Adding panes one at a time eventually causes the overflow chevron
+    /// (`tab.overflow`) to appear. Bounded loop; fails fast if the
+    /// chevron's overflow detection ever stops wiring up.
+    ///
+    /// Note: only one UITest covers the chevron directly because
+    /// `PaneStripGeometryTests` already exercises the overflow /
+    /// offscreen / attention math exhaustively in pure Swift. This
+    /// test's job is just to prove the geometry struct is actually
+    /// wired into the view hierarchy.
+    func testOverflowChevronAppearsAfterEnoughPanes() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        let pillReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") >= 1
+            }),
+            object: nil
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [pillReady], timeout: 5), .completed)
+
+        // Sanity — chevron should NOT be visible with the single
+        // launch-time pane.
+        XCTAssertFalse(
+            app.descendants(matching: .any)["tab.overflow"].exists,
+            "Overflow chevron should not render when one pill fits trivially"
+        )
+
+        // Drive overflow: keep clicking `+` until the chevron appears.
+        // Generous budget for wide monitors; tight per-iteration wait so
+        // a regression fails in seconds, not minutes.
+        let addButton = app.buttons["tab.add"]
+        XCTAssertTrue(addButton.waitForExistence(timeout: 5))
+        let chevron = app.descendants(matching: .any)["tab.overflow"]
+
+        let budget = 20
+        for _ in 0..<budget {
+            addButton.click()
+            if chevron.waitForExistence(timeout: 0.3) { break }
+        }
+
+        XCTAssertTrue(
+            chevron.exists,
+            "Overflow chevron must appear after adding up to \(budget) panes"
+        )
+    }
+
 }
