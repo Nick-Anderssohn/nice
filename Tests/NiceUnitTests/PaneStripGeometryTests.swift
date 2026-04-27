@@ -2,12 +2,11 @@
 //  PaneStripGeometryTests.swift
 //  NiceUnitTests
 //
-//  Tests the pure-Swift overflow / visibility math that drives the
-//  toolbar's `InlinePaneStrip` chrome (edge fades, overflow chevron,
-//  attention badge). The view itself is exercised by UITests; these
-//  tests cover the geometry struct and the `Tab.hasOffscreenAttention`
-//  predicate so a regression in the math doesn't have to wait for a
-//  full XCUITest run to surface.
+//  Tests the pure-Swift visibility math that drives the toolbar's
+//  cosmetic chrome — leading/trailing edge fades and the offscreen
+//  pane set used by the overflow chevron's attention badge. The
+//  chevron's *existence* is decided by `PaneStripOverflowEstimator`
+//  (covered separately).
 //
 //  Coordinate convention (see `PaneStripGeometry.swift`): pill frames
 //  are reported in the ScrollView's named coordinate space, where the
@@ -33,9 +32,9 @@ final class PaneStripGeometryTests: XCTestCase {
         PaneStripGeometry(paneFrames: paneFrames, visibleWidth: visibleWidth)
     }
 
-    // MARK: - Overflow detection
+    // MARK: - Edge / offscreen detection
 
-    /// Three pills that fit inside the viewport: no overflow, no scroll
+    /// Three pills that fit inside the viewport: no scroll
     /// affordances, no offscreen panes.
     func test_noOverflow_whenAllPanesFit() {
         let geo = geometry(
@@ -47,7 +46,6 @@ final class PaneStripGeometryTests: XCTestCase {
             visibleWidth: 320
         )
 
-        XCTAssertFalse(geo.isOverflowing)
         XCTAssertFalse(geo.canScrollLeading)
         XCTAssertFalse(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
@@ -67,7 +65,6 @@ final class PaneStripGeometryTests: XCTestCase {
 
         XCTAssertTrue(geo.canScrollLeading)
         XCTAssertFalse(geo.canScrollTrailing)
-        XCTAssertTrue(geo.isOverflowing)
         XCTAssertEqual(geo.offscreenPaneIds, ["p1"])
     }
 
@@ -85,7 +82,6 @@ final class PaneStripGeometryTests: XCTestCase {
 
         XCTAssertFalse(geo.canScrollLeading)
         XCTAssertTrue(geo.canScrollTrailing)
-        XCTAssertTrue(geo.isOverflowing)
         XCTAssertEqual(geo.offscreenPaneIds, ["p3"])
     }
 
@@ -106,23 +102,22 @@ final class PaneStripGeometryTests: XCTestCase {
         XCTAssertEqual(geo.offscreenPaneIds, ["p1", "p3"])
     }
 
-    /// One pane wider than the viewport always overflows; the chevron
-    /// should still appear so the user can reach it via the menu.
-    func test_singleHugePane_overflows() {
+    /// A single pane wider than the viewport extends past the trailing
+    /// edge — the trailing fade fires.
+    func test_singleHugePane_extendsPastTrailingEdge() {
         let geo = geometry(
             paneFrames: ["p1": rect(x: 0, width: 500)],
             visibleWidth: 200
         )
 
-        XCTAssertTrue(geo.isOverflowing)
         XCTAssertTrue(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
     }
 
     // MARK: - Edge cases
 
-    /// Pre-layout the view emits `visibleWidth == 0`. Geometry must stay
-    /// quiet in that frame so the chevron / fades don't briefly flash on
+    /// Pre-layout the view emits `visibleWidth == 0`. Geometry must
+    /// stay quiet in that frame so the fades don't briefly flash on
     /// initial appearance.
     func test_zeroVisibleWidth_isQuiet() {
         let geo = geometry(
@@ -130,27 +125,22 @@ final class PaneStripGeometryTests: XCTestCase {
             visibleWidth: 0
         )
 
-        XCTAssertFalse(geo.isOverflowing)
         XCTAssertFalse(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
     }
 
-    /// Frames straddling each edge by sub-pixel amounts must not be
-    /// classified as offscreen — that's the `edgeTolerance` contract.
-    /// Without the tolerance, snapping pills would flicker the chrome
-    /// on layout passes.
-    func test_subPixelClipping_doesNotCountAsOverflow() {
+    /// Frames straddling each edge by sub-pixel amounts must not flip
+    /// the edge bools — that's the `edgeTolerance` contract. Without
+    /// it, snapping pills would flicker the fades on layout passes.
+    func test_subPixelClipping_doesNotFlipEdges() {
         let geo = geometry(
             paneFrames: [
                 "p1": rect(x: -0.3, width: 100),
-                // Content fits the viewport within `edgeTolerance`:
-                // contentWidth = 200.1 - (-0.3) = 200.4.
-                "p2": rect(x: 99.7, width: 100.4),
+                "p2": rect(x: 99.7, width: 100.4),  // maxX = 200.1
             ],
             visibleWidth: 200
         )
 
-        XCTAssertFalse(geo.isOverflowing)
         XCTAssertFalse(geo.canScrollLeading)
         XCTAssertFalse(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
@@ -161,7 +151,8 @@ final class PaneStripGeometryTests: XCTestCase {
     func test_emptyFrames_isQuiet() {
         let geo = geometry(paneFrames: [:], visibleWidth: 400)
 
-        XCTAssertFalse(geo.isOverflowing)
+        XCTAssertFalse(geo.canScrollLeading)
+        XCTAssertFalse(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
     }
 

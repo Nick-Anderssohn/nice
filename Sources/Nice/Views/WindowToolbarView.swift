@@ -99,10 +99,16 @@ private let panePillAnimationDuration: Double = 0.12
 /// Layout-identical to its predecessor when the strip fits — the chevron
 /// only renders when overflowing.
 ///
-/// All overflow / visibility math lives in the pure-Swift
-/// `PaneStripGeometry` value type so it can be unit-tested without a
-/// SwiftUI host. This view's only job is to drive that struct from
-/// SwiftUI preferences and feed its outputs to the chrome subviews.
+/// The decision is split across two pure-Swift helpers so they can be
+/// unit-tested without a SwiftUI host:
+///   • `PaneStripOverflowEstimator` decides whether the chevron renders,
+///     using this view's outer bounds and a per-pill width estimate
+///     (independent of the ScrollView, so it doesn't suffer from
+///     SwiftUI's off-screen preference virtualization).
+///   • `PaneStripGeometry` decides the cosmetic chrome — leading /
+///     trailing edge fades and the offscreen pane set used by the
+///     attention badge — from the per-pill frames the ScrollView does
+///     emit for visible pills.
 private struct InlinePaneStrip: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
@@ -144,15 +150,18 @@ private struct InlinePaneStrip: View {
         )
     }
 
+    private var showChevron: Bool {
+        guard let tab = activeTab else { return false }
+        return PaneStripOverflowEstimator.shouldShowChevron(
+            panes: tab.panes,
+            availableWidth: availableWidth
+        )
+    }
+
     var body: some View {
         HStack(spacing: 2) {
             if let tab = activeTab {
                 strip(for: tab)
-
-                let showChevron = PaneStripOverflowEstimator.shouldShowChevron(
-                    panes: tab.panes,
-                    availableWidth: availableWidth
-                )
 
                 if showChevron {
                     OverflowMenuButton(
@@ -186,10 +195,7 @@ private struct InlinePaneStrip: View {
         }
         .animation(
             .easeInOut(duration: panePillAnimationDuration),
-            value: PaneStripOverflowEstimator.shouldShowChevron(
-                panes: activeTab?.panes ?? [],
-                availableWidth: availableWidth
-            )
+            value: showChevron
         )
         // Measure our own bounds. We write directly to `@State` from
         // the GeometryReader closure rather than going through a

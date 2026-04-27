@@ -2,20 +2,19 @@
 //  PaneStripGeometry.swift
 //  Nice
 //
-//  Pure value type capturing the layout state of the toolbar's pane
-//  strip: which pills are where, how wide the visible viewport is, and
-//  the derived facts the strip's chrome cares about (overflow, scroll
-//  affordances, offscreen pane ids). Lives in its own file so unit
-//  tests can exercise the math without spinning up SwiftUI — the
-//  `InlinePaneStrip` view in `WindowToolbarView.swift` is a thin shell
-//  around this struct.
+//  Pure value type capturing the cosmetic chrome of the toolbar's pane
+//  strip: which pills are scrolled past which edge of the viewport.
+//  Drives the leading/trailing edge fades and the offscreen-pane set
+//  used by the overflow chevron's attention badge. The chevron's own
+//  existence is decided separately by `PaneStripOverflowEstimator`,
+//  which doesn't depend on per-pill frames at all.
 //
 //  Coordinate convention: pill frames are reported in the ScrollView's
 //  named coordinate space, where the viewport is fixed at
-//  `[0, visibleWidth]` regardless of the current scroll offset. So a
-//  pill is fully offscreen iff `frame.maxX <= 0` (scrolled off the
-//  leading edge) or `frame.minX >= visibleWidth` (off the trailing
-//  edge), and partially clipped iff its frame straddles either edge.
+//  `[0, visibleWidth]` regardless of the current scroll offset. A
+//  pill is fully offscreen iff `frame.maxX <= 0` (scrolled past the
+//  leading edge) or `frame.minX >= visibleWidth` (past the trailing
+//  edge); partially clipped iff its frame straddles either edge.
 //
 
 import CoreGraphics
@@ -25,17 +24,9 @@ struct PaneStripGeometry: Equatable {
     let visibleWidth: CGFloat
 
     /// Tolerance for floating-point rounding in frame math. Sub-pixel
-    /// drift below this magnitude does not count as overflowing — keeps
-    /// the chevron and edge fades from flickering on layout snaps.
+    /// drift below this magnitude does not flip an edge — keeps the
+    /// fades from flickering on layout snaps.
     static let edgeTolerance: CGFloat = 0.5
-
-    /// Whether the strip's content can't fit in the viewport. Drives
-    /// the chevron's existence. OR-of-edges so that the chevron stays
-    /// shown when content extends past the trailing edge OR has been
-    /// scrolled past the leading edge.
-    var isOverflowing: Bool {
-        canScrollLeading || canScrollTrailing
-    }
 
     /// Some pill is hidden past the leading edge. Drives the leading
     /// edge fade.
