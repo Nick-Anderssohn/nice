@@ -192,8 +192,6 @@ private struct AppShellHost: View {
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
             appState.updateTerminalFontSize(fontSettings.terminalFontSize)
-            appState.updateGpuRendering(tweaks.gpuRendering)
-            appState.updateSmoothScrolling(tweaks.smoothScrolling)
         }
         .onChange(of: scheme) { _, newScheme in
             appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
@@ -209,12 +207,6 @@ private struct AppShellHost: View {
         }
         .onChange(of: fontSettings.terminalFontSize) { _, newSize in
             appState.updateTerminalFontSize(newSize)
-        }
-        .onChange(of: tweaks.gpuRendering) { _, newValue in
-            appState.updateGpuRendering(newValue)
-        }
-        .onChange(of: tweaks.smoothScrolling) { _, newValue in
-            appState.updateSmoothScrolling(newValue)
         }
         .onChange(of: tweaks.terminalThemeLightId) { _, _ in
             // Only applies if the active scheme is light — otherwise the

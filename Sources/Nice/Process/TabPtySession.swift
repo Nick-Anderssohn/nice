@@ -23,9 +23,9 @@ final class TabPtySession: ObservableObject {
     let tabId: String
     let cwd: String
 
-    /// All live panes (claude + terminal) keyed by pane id.
-    /// Typed as `NiceTerminalView` (subclass of `LocalProcessTerminalView`)
-    /// so `applyGpuRendering` can call subclass-only helpers; the values
+    /// All live panes (claude + terminal) keyed by pane id. Typed as
+    /// `NiceTerminalView` (the `LocalProcessTerminalView` subclass that
+    /// owns Nice-side behaviours like image drag-and-drop); the values
     /// still pass anywhere the supertype is expected (e.g. `TerminalHost`).
     var panes: [String: NiceTerminalView] = [:]
     /// Retains the per-view termination delegates so SwiftTerm's weak
@@ -70,18 +70,6 @@ final class TabPtySession: ObservableObject {
     /// `applyTerminalFont` pick it up at construction. Seeded with
     /// the Xcode-matched 13pt terminal default.
     private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
-
-    /// Cached "GPU rendering" preference. Read by every pane's
-    /// `gpuPreferenceProvider` closure so a Settings toggle propagates
-    /// without restarting the session. Defaults to `true` to match
-    /// `Tweaks.gpuRendering`'s default.
-    private var currentGpuRendering: Bool = true
-
-    /// Cached "Smooth scrolling" preference. Same wiring story as
-    /// `currentGpuRendering` — panes read it through a closure so the
-    /// Settings toggle takes effect live. Defaults match
-    /// `Tweaks.smoothScrolling` (on).
-    private var currentSmoothScrolling: Bool = true
 
     /// Cached terminal font family (PostScript name). `nil` means "use
     /// the default chain" (SF Mono → JetBrains Mono NL → system
@@ -180,8 +168,6 @@ final class TabPtySession: ObservableObject {
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
-        view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
-        view.smoothScrollPreferenceProvider = { [weak self] in self?.currentSmoothScrolling ?? true }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -263,8 +249,6 @@ final class TabPtySession: ObservableObject {
     ) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
-        view.gpuPreferenceProvider = { [weak self] in self?.currentGpuRendering ?? true }
-        view.smoothScrollPreferenceProvider = { [weak self] in self?.currentSmoothScrolling ?? true }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         panes[id] = view
@@ -619,29 +603,6 @@ final class TabPtySession: ObservableObject {
         let font = Self.terminalFont(named: currentTerminalFontFamily, size: size)
         for view in panes.values {
             view.font = font
-        }
-    }
-
-    /// Re-apply the GPU rendering preference to every live pane.
-    /// Called by `AppState.updateGpuRendering` when the user flips the
-    /// Settings toggle. Each pane's `gpuPreferenceProvider` reads back
-    /// through `currentGpuRendering`, so updating the cached value plus
-    /// calling `applyGpuPreference` is enough to flip every live pane.
-    func applyGpuRendering(enabled: Bool) {
-        currentGpuRendering = enabled
-        for view in panes.values {
-            view.applyGpuPreference()
-        }
-    }
-
-    /// Re-apply the smooth-scrolling preference to every live pane.
-    /// Mirrors `applyGpuRendering` — the preference is read live by
-    /// each pane's `smoothScrollPreferenceProvider`, so a Settings
-    /// toggle propagates instantly without restarting any pty.
-    func applySmoothScrolling(enabled: Bool) {
-        currentSmoothScrolling = enabled
-        for view in panes.values {
-            view.applySmoothScrollPreference()
         }
     }
 

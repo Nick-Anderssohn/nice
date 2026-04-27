@@ -1328,7 +1328,9 @@ final class NiceUITests: XCTestCase {
                 .waitForExistence(timeout: 5),
             "Settings window must open before navigating panes"
         )
-        let row = app.descendants(matching: .any)["settings.section.terminal"]
+        // Terminal-theme controls live under the Appearance section
+        // since the two were merged.
+        let row = app.descendants(matching: .any)["settings.section.appearance"]
         XCTAssertTrue(row.waitForExistence(timeout: 3))
         row.click()
     }

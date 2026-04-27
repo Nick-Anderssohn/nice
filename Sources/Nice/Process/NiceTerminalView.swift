@@ -9,9 +9,9 @@
 //     March 2026) once it's attached to a window. The Metal path
 //     requires window attachment because the `MTKView` it installs
 //     needs a live `CAMetalLayer`; calling `setUseMetal(true)` from
-//     `init` would crash. The current GPU preference is read through
-//     a closure rather than captured by value so a Settings toggle
-//     can flip it live without rebuilding the view.
+//     `init` would crash. Metal is always on; if the device can't
+//     create one (e.g. on a VM or some CI runner), SwiftTerm falls
+//     back to its CoreGraphics path silently.
 //
 //  2. Accepts image drops (file URLs from Finder, raw image data
 //     from browsers / Messages / Preview) and types the resulting
@@ -28,16 +28,6 @@ import SwiftTerm
 
 @MainActor
 final class NiceTerminalView: LocalProcessTerminalView {
-    /// Reads the live "GPU rendering" preference. `nil` means "no
-    /// session has wired this up yet" — treated as on, matching the
-    /// `Tweaks.gpuRendering` default.
-    var gpuPreferenceProvider: (() -> Bool)?
-
-    /// Reads the live "Smooth scrolling" preference. `nil` means "no
-    /// session has wired this up yet" — treated as on, matching the
-    /// `Tweaks.smoothScrolling` default.
-    var smoothScrollPreferenceProvider: (() -> Bool)?
-
     /// Latch set by `TerminalHost.makeNSView` when this pane is the one
     /// SwiftUI is about to mount as the active pane. Consumed on the
     /// next `viewDidMoveToWindow` / `viewDidMoveToSuperview` so focus
@@ -85,36 +75,25 @@ final class NiceTerminalView: LocalProcessTerminalView {
         registerForDraggedTypes(Self.acceptedDragTypes)
     }
 
-    /// Re-evaluates the GPU preference and toggles the Metal renderer
-    /// to match. No-op when the view isn't yet in a window — the
-    /// `viewDidMoveToWindow` override applies the current preference
-    /// once attachment happens. Idempotent: SwiftTerm's `setUseMetal`
-    /// short-circuits when the renderer is already in the requested state.
-    func applyGpuPreference() {
+    /// Enables SwiftTerm's Metal renderer. No-op when the view isn't
+    /// yet in a window — `viewDidMoveToWindow` calls this once
+    /// attachment happens. Idempotent: SwiftTerm's `setUseMetal`
+    /// short-circuits when the renderer is already in the requested
+    /// state. Falls back silently to CoreGraphics on devices where
+    /// Metal isn't available (VMs, some CI runners).
+    private func enableGpuRendering() {
         guard window != nil else { return }
-        let desired = gpuPreferenceProvider?() ?? true
         do {
-            try setUseMetal(desired)
+            try setUseMetal(true)
         } catch {
-            // Metal unavailable (deviceUnavailable on VMs / CI).
-            // Stay on the CG path silently — `setUseMetal(false)`
-            // is also a no-op when Metal was never enabled.
             NSLog("NiceTerminalView: Metal renderer unavailable, falling back to CoreGraphics: \(error)")
         }
     }
 
-    /// Re-evaluates the smooth-scrolling preference and writes it to
-    /// SwiftTerm's `smoothScrollingEnabled` flag. Cheap: just a Bool
-    /// write that the next `scrollWheel` event consults. Safe to call
-    /// before the view is in a window.
-    func applySmoothScrollPreference() {
-        smoothScrollingEnabled = smoothScrollPreferenceProvider?() ?? true
-    }
-
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        applyGpuPreference()
-        applySmoothScrollPreference()
+        enableGpuRendering()
+        smoothScrollingEnabled = true
         claimFocusIfRequested()
     }
 

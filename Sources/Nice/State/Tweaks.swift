@@ -201,8 +201,6 @@ final class Tweaks: ObservableObject {
     static let themeKey         = "theme"
     static let syncKey          = "syncWithOS"
     static let accentKey        = "accent"
-    static let gpuRenderingKey  = "gpuRendering"
-    static let smoothScrollingKey = "smoothScrolling"
     static let schemeKey               = "scheme"
     static let chromeLightPaletteKey   = "chromeLightPalette"
     static let chromeDarkPaletteKey    = "chromeDarkPalette"
@@ -286,22 +284,6 @@ final class Tweaks: ObservableObject {
 
     @Published var accent: AccentPreset {
         didSet { UserDefaults.standard.set(accent.rawValue, forKey: Self.accentKey) }
-    }
-
-    /// Toggles the SwiftTerm Metal renderer for every live terminal pane.
-    /// Default `true`: the upstream Metal path landed in SwiftTerm
-    /// PR #484 and falls back to CoreGraphics automatically when Metal
-    /// isn't available (`MetalError.deviceUnavailable` — VMs, some CI).
-    @Published var gpuRendering: Bool {
-        didSet { UserDefaults.standard.set(gpuRendering, forKey: Self.gpuRenderingKey) }
-    }
-
-    /// Pixel-precise trackpad scrolling on the Metal path. Default
-    /// `true`. Has no effect when `gpuRendering` is off (CG falls back
-    /// to line-snap behavior). Mouse wheels without precise deltas
-    /// keep using the existing line-velocity scroll either way.
-    @Published var smoothScrolling: Bool {
-        didSet { UserDefaults.standard.set(smoothScrolling, forKey: Self.smoothScrollingKey) }
     }
 
     /// Terminal theme id used when the active scheme is light.
@@ -388,17 +370,6 @@ final class Tweaks: ObservableObject {
         let accentRaw = defaults.string(forKey: Self.accentKey) ?? AccentPreset.ocean.rawValue
         let accent = AccentPreset(rawValue: accentRaw) ?? .ocean
 
-        // Default GPU rendering on; explicit `false` from a previous
-        // launch sticks. `bool(forKey:)` returns `false` for an absent
-        // key, so check `object(forKey:)` to distinguish unset from
-        // explicit-off.
-        let gpu: Bool = defaults.object(forKey: Self.gpuRenderingKey) == nil
-            ? true
-            : defaults.bool(forKey: Self.gpuRenderingKey)
-        let smooth: Bool = defaults.object(forKey: Self.smoothScrollingKey) == nil
-            ? true
-            : defaults.bool(forKey: Self.smoothScrollingKey)
-
         let terminalLight = defaults.string(forKey: Self.terminalThemeLightKey)
             ?? Self.defaultTerminalThemeLightId
         let terminalDark = defaults.string(forKey: Self.terminalThemeDarkKey)
@@ -415,8 +386,6 @@ final class Tweaks: ObservableObject {
         self.chromeDarkPalette = migrated.chromeDarkPalette
         self.syncWithOS = migrated.syncWithOS
         self.accent = accent
-        self.gpuRendering = gpu
-        self.smoothScrolling = smooth
         self.terminalThemeLightId = terminalLight
         self.terminalThemeDarkId = terminalDark
         self.terminalFontFamily = fontFamily

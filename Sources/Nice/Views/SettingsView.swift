@@ -24,12 +24,12 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Section enum
 
 enum SettingsSection: String, CaseIterable, Identifiable {
     case appearance  = "Appearance"
-    case terminal    = "Terminal themes"
     case editors     = "Editors"
     case shortcuts   = "Shortcuts"
     case font        = "Font"
@@ -41,12 +41,10 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     /// Short, stable token used as the suffix of the sidebar-row
     /// accessibility identifier (`settings.section.<slug>`). Kept
     /// separate from `rawValue` so renaming the user-visible label
-    /// (e.g. "Terminal themes" → something else) doesn't break the
-    /// UI-test identifier hook.
+    /// doesn't break the UI-test identifier hook.
     var slug: String {
         switch self {
         case .appearance: return "appearance"
-        case .terminal:   return "terminal"
         case .editors:    return "editors"
         case .shortcuts:  return "shortcuts"
         case .font:       return "font"
@@ -70,8 +68,23 @@ struct SettingsView: View {
             sidebar
             content
         }
-        .frame(width: 640, height: 440)
+        .frame(
+            minWidth: 560, idealWidth: 640, maxWidth: .infinity,
+            minHeight: 380, idealHeight: 440, maxHeight: .infinity
+        )
         .background(Color.nicePanel(scheme, palette))
+        .background(
+            // SwiftUI's `Settings` scene historically renders its window
+            // without `.resizable` in its styleMask, ignoring
+            // `.windowResizability(.contentMinSize)` on the scene. Reach
+            // into AppKit and OR the bit in once the window is live so
+            // the user can drag any edge / corner like a normal window.
+            WindowAccessor { window in
+                if !window.styleMask.contains(.resizable) {
+                    window.styleMask.insert(.resizable)
+                }
+            }
+        )
         .environment(\.palette, palette)
         // `.accessibilityElement(children: .contain)` groups the whole
         // shell under one container element that carries the id, so
@@ -130,7 +143,6 @@ struct SettingsView: View {
                 switch active {
                 case .shortcuts:  ShortcutsPane()
                 case .appearance: AppearancePane()
-                case .terminal:   SettingsTerminalPane()
                 case .editors:    SettingsEditorsPane()
                 case .font:       FontPane()
                 case .about:      AboutPane()
@@ -204,106 +216,193 @@ private struct ShortcutsPane: View {
 
 private struct AppearancePane: View {
     @EnvironmentObject private var tweaks: Tweaks
+    @EnvironmentObject private var catalog: TerminalThemeCatalog
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
+    @State private var importError: ImportErrorWrapper?
+
     var body: some View {
-        SettingTitle("Appearance")
+        Group {
+            SettingTitle("Appearance")
 
-        SettingRow(
-            label: "Sync with OS theme",
-            hint: "Flip between light and dark as the system does."
-        ) {
-            Toggle("", isOn: $tweaks.syncWithOS)
+            SettingRow(
+                label: "Sync with OS theme",
+                hint: "Flip between light and dark as the system does."
+            ) {
+                Toggle("", isOn: $tweaks.syncWithOS)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("settings.theme.sync")
+            }
+
+            SettingRow(
+                label: "Scheme",
+                hint: "Manual light/dark override. Disabled when Sync with OS is on."
+            ) {
+                Picker("", selection: $tweaks.scheme) {
+                    Text("Light").tag(ColorScheme.light)
+                    Text("Dark").tag(ColorScheme.dark)
+                }
                 .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .accessibilityIdentifier("settings.theme.sync")
-        }
-
-        SettingRow(
-            label: "Scheme",
-            hint: "Manual light/dark override. Disabled when Sync with OS is on."
-        ) {
-            Picker("", selection: $tweaks.scheme) {
-                Text("Light").tag(ColorScheme.light)
-                Text("Dark").tag(ColorScheme.dark)
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .disabled(tweaks.syncWithOS)
+                .accessibilityIdentifier("settings.appearance.scheme")
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 160)
-            .disabled(tweaks.syncWithOS)
-            .accessibilityIdentifier("settings.appearance.scheme")
-        }
 
-        SettingRow(
-            label: "Light mode chrome",
-            hint: "Palette used for the sidebar, window background, and toolbar when the scheme is light."
-        ) {
-            Picker("", selection: $tweaks.chromeLightPalette) {
-                ForEach(Palette.allCases.filter { $0.matches(scheme: .light) }) { palette in
-                    Text(palette.displayName).tag(palette)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(minWidth: 120)
-            .accessibilityIdentifier("settings.appearance.chromeLight")
-        }
-
-        SettingRow(
-            label: "Dark mode chrome",
-            hint: "Palette used for the sidebar, window background, and toolbar when the scheme is dark."
-        ) {
-            Picker("", selection: $tweaks.chromeDarkPalette) {
-                ForEach(Palette.allCases.filter { $0.matches(scheme: .dark) }) { palette in
-                    Text(palette.displayName).tag(palette)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(minWidth: 120)
-            .accessibilityIdentifier("settings.appearance.chromeDark")
-        }
-
-        SettingRow(
-            label: "Accent",
-            hint: "Also drives the logo and selection tint."
-        ) {
-            HStack(spacing: 8) {
-                ForEach(AccentPreset.allCases) { preset in
-                    AccentSwatch(
-                        preset: preset,
-                        selected: tweaks.accent == preset
-                    ) {
-                        tweaks.accent = preset
+            SettingRow(
+                label: "Accent",
+                hint: "Also drives the logo and selection tint."
+            ) {
+                HStack(spacing: 8) {
+                    ForEach(AccentPreset.allCases) { preset in
+                        AccentSwatch(
+                            preset: preset,
+                            selected: tweaks.accent == preset
+                        ) {
+                            tweaks.accent = preset
+                        }
                     }
                 }
             }
-        }
 
-        SettingRow(
-            label: "GPU rendering",
-            hint: "Use Metal for terminal drawing. Faster on most Macs; falls back to CPU automatically if Metal is unavailable."
-        ) {
-            Toggle("", isOn: $tweaks.gpuRendering)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .accessibilityIdentifier("settings.appearance.gpuRendering")
-        }
+            SettingSubtitle("Light mode")
 
-        SettingRow(
-            label: "Smooth scrolling",
-            hint: "Pixel-precise trackpad scrolling. Requires GPU rendering; mouse wheels keep using line-based scroll."
-        ) {
-            Toggle("", isOn: $tweaks.smoothScrolling)
+            SettingRow(
+                label: "Chrome",
+                hint: "Palette used for the sidebar, window background, and toolbar."
+            ) {
+                Picker("", selection: $tweaks.chromeLightPalette) {
+                    ForEach(Palette.allCases.filter { $0.matches(scheme: .light) }) { palette in
+                        Text(palette.displayName).tag(palette)
+                    }
+                }
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .pickerStyle(.menu)
+                .fixedSize()
+                .accessibilityIdentifier("settings.appearance.chromeLight")
+            }
+
+            SettingRow(
+                label: "Terminal theme",
+                hint: "Palette used inside terminal panes."
+            ) {
+                ThemePicker(
+                    selection: $tweaks.terminalThemeLightId,
+                    options: catalog.themes(for: .light),
+                    accessibilityIdentifier: "settings.terminal.lightPicker"
+                )
+            }
+
+            SettingSubtitle("Dark mode")
+
+            SettingRow(
+                label: "Chrome",
+                hint: "Palette used for the sidebar, window background, and toolbar."
+            ) {
+                Picker("", selection: $tweaks.chromeDarkPalette) {
+                    ForEach(Palette.allCases.filter { $0.matches(scheme: .dark) }) { palette in
+                        Text(palette.displayName).tag(palette)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+                .accessibilityIdentifier("settings.appearance.chromeDark")
+            }
+
+            SettingRow(
+                label: "Terminal theme",
+                hint: "Palette used inside terminal panes."
+            ) {
+                ThemePicker(
+                    selection: $tweaks.terminalThemeDarkId,
+                    options: catalog.themes(for: .dark),
+                    accessibilityIdentifier: "settings.terminal.darkPicker"
+                )
+            }
+
+            SettingSubtitle("Custom themes")
+
+            SettingRow(
+                label: "Import theme",
+                hint: "Load a Ghostty-format theme file (.ghostty or .conf). Imported themes appear in both light and dark pickers."
+            ) {
+                Button("Import…") {
+                    runImportPanel()
+                }
                 .controlSize(.small)
-                .disabled(!tweaks.gpuRendering)
-                .help(tweaks.gpuRendering ? "" : "Turn on GPU rendering to enable smooth scrolling.")
-                .accessibilityIdentifier("settings.appearance.smoothScrolling")
+                .accessibilityIdentifier("settings.terminal.import")
+            }
+
+            if !catalog.imported.isEmpty {
+                SettingRow(
+                    label: "Imported themes",
+                    hint: "Remove a theme to delete its file from Nice's support directory."
+                ) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(catalog.imported) { theme in
+                            ImportedThemeRow(theme: theme, onDelete: { deleteImported(theme) })
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .alert(item: $importError) { wrapper in
+            Alert(
+                title: Text(wrapper.title),
+                message: Text(wrapper.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+    }
+
+    // MARK: - Theme import
+
+    private func runImportPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if let ghosttyType = UTType(filenameExtension: "ghostty") {
+            panel.allowedContentTypes = [ghosttyType, .plainText, .propertyList]
+        }
+        panel.allowsOtherFileTypes = true
+        panel.prompt = "Import"
+        panel.message = "Choose a Ghostty-format terminal theme (.ghostty or .conf)."
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let theme = try catalog.importTheme(from: url)
+            // Auto-select in the active-scheme slot so the user sees
+            // immediate feedback without having to open the picker.
+            switch scheme {
+            case .light: tweaks.terminalThemeLightId = theme.id
+            case .dark:  tweaks.terminalThemeDarkId = theme.id
+            @unknown default: tweaks.terminalThemeLightId = theme.id
+            }
+        } catch let error as TerminalThemeCatalog.ImportError {
+            importError = ImportErrorWrapper(error: error)
+        } catch {
+            importError = ImportErrorWrapper(
+                error: .cannotRead(message: error.localizedDescription)
+            )
+        }
+    }
+
+    private func deleteImported(_ theme: TerminalTheme) {
+        try? catalog.remove(theme)
+        // If the deleted theme was selected in either slot, fall back
+        // to the Nice default for that scheme so the resolver doesn't
+        // churn on a dangling id.
+        if tweaks.terminalThemeLightId == theme.id {
+            tweaks.terminalThemeLightId = Tweaks.defaultTerminalThemeLightId
+        }
+        if tweaks.terminalThemeDarkId == theme.id {
+            tweaks.terminalThemeDarkId = Tweaks.defaultTerminalThemeDarkId
         }
     }
 }
@@ -473,6 +572,33 @@ struct SettingTitle: View {
             .tracking(-0.2)
             .foregroundStyle(Color.niceInk(scheme, palette))
             .padding(.bottom, 14)
+    }
+}
+
+/// Subgroup header inside a settings pane — between `SettingTitle`
+/// (the pane heading) and `SettingRow` (the controls). 14pt bold,
+/// primary ink, with extra top breathing room and a hairline rule
+/// below so it reads as a clear section break — louder than the
+/// 13pt-medium row labels it groups together.
+struct SettingSubtitle: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 14, weight: .bold))
+            .tracking(-0.1)
+            .foregroundStyle(Color.niceInk(scheme, palette))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 24)
+            .padding(.bottom, 6)
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color.niceLine(scheme, palette))
+                    .frame(height: 1)
+            }
     }
 }
 

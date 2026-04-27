@@ -240,17 +240,6 @@ final class AppState: ObservableObject {
     /// live `TabPtySession`.
     private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
 
-    /// Tracks the GPU rendering preference (`Tweaks.gpuRendering`). New
-    /// sessions seed from this; `updateGpuRendering` fans changes out
-    /// to every live `TabPtySession` so the Metal renderer toggles in
-    /// place. Defaults to `true` to match `Tweaks.gpuRendering`.
-    private var currentGpuRendering: Bool = true
-
-    /// Tracks the smooth-scrolling preference (`Tweaks.smoothScrolling`).
-    /// Same fan-out story as `currentGpuRendering`. Defaults match
-    /// `Tweaks.smoothScrolling` (on).
-    private var currentSmoothScrolling: Bool = true
-
     /// Tracks the terminal theme that every live pane is currently
     /// painted with. Seeded from Nice's built-in dark default so new
     /// sessions created before `updateTerminalTheme` runs still get
@@ -367,8 +356,6 @@ final class AppState: ObservableObject {
             self.currentScheme = tweaks.scheme
             self.currentPalette = tweaks.activeChromePalette
             self.currentAccent = tweaks.accent.nsColor
-            self.currentGpuRendering = tweaks.gpuRendering
-            self.currentSmoothScrolling = tweaks.smoothScrolling
             self.currentTerminalFontFamily = tweaks.terminalFontFamily
             if let catalog = services?.terminalThemeCatalog {
                 self.currentTerminalTheme = tweaks.effectiveTerminalTheme(
@@ -760,24 +747,6 @@ final class AppState: ObservableObject {
         currentTerminalFontSize = size
         for session in ptySessions.values {
             session.applyTerminalFont(size: size)
-        }
-    }
-
-    /// Pushed by `AppShellView` whenever `Tweaks.gpuRendering` changes
-    /// (and once on launch). Updates the cached value used to seed
-    /// future sessions and broadcasts to every live one.
-    func updateGpuRendering(_ enabled: Bool) {
-        currentGpuRendering = enabled
-        for session in ptySessions.values {
-            session.applyGpuRendering(enabled: enabled)
-        }
-    }
-
-    /// Mirror of `updateGpuRendering` for the smooth-scrolling toggle.
-    func updateSmoothScrolling(_ enabled: Bool) {
-        currentSmoothScrolling = enabled
-        for session in ptySessions.values {
-            session.applySmoothScrolling(enabled: enabled)
         }
     }
 
@@ -1575,8 +1544,6 @@ final class AppState: ObservableObject {
         session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
         session.applyTerminalTheme(currentTerminalTheme)
         session.applyTerminalFont(size: currentTerminalFontSize)
-        session.applyGpuRendering(enabled: currentGpuRendering)
-        session.applySmoothScrolling(enabled: currentSmoothScrolling)
         ptySessions[tabId] = session
         return session
     }
