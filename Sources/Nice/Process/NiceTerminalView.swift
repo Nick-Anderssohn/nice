@@ -13,13 +13,14 @@
 //     create one (e.g. on a VM or some CI runner), SwiftTerm falls
 //     back to its CoreGraphics path silently.
 //
-//  2. Accepts image drops (file URLs from Finder, raw image data
-//     from browsers / Messages / Preview) and types the resulting
-//     path into the pty. When the hosted app has bracketed paste
-//     enabled (DEC 2004 — Claude Code's TUI does), the path is
-//     wrapped in `ESC [200~ … ESC [201~` so Claude treats the drop
-//     as a paste and substitutes `[Image #N]` instead of echoing the
-//     raw characters. With bracketed paste off it falls back to a
+//  2. Accepts file drops (any file URL from Finder or the in-app
+//     File Explorer, plus raw image data from browsers / Messages /
+//     Preview) and types the resulting path into the pty. When the
+//     hosted app has bracketed paste enabled (DEC 2004 — Claude
+//     Code's TUI does), the path is wrapped in `ESC [200~ … ESC
+//     [201~` so Claude treats the drop as a paste — and for image
+//     paths, substitutes `[Image #N]` instead of echoing the raw
+//     characters. With bracketed paste off it falls back to a
 //     single-quoted path so spaces survive at a plain zsh prompt.
 //
 
@@ -51,10 +52,6 @@ final class NiceTerminalView: LocalProcessTerminalView {
         .fileURL,
         .png,
         .tiff,
-    ]
-
-    private static let imageExtensions: Set<String> = [
-        "png", "jpg", "jpeg", "gif", "tiff", "tif", "bmp", "webp", "heic", "heif",
     ]
 
     // ESC [ 2 0 0 ~ / ESC [ 2 0 1 ~ — DEC mode 2004 bracketed-paste
@@ -129,18 +126,18 @@ final class NiceTerminalView: LocalProcessTerminalView {
         callback()
     }
 
-    // MARK: - Image drag-and-drop
+    // MARK: - File drag-and-drop
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        hasImagePayload(sender) ? .copy : super.draggingEntered(sender)
+        hasFilePayload(sender) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        hasImagePayload(sender) ? .copy : super.draggingUpdated(sender)
+        hasFilePayload(sender) ? .copy : super.draggingUpdated(sender)
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        let paths = extractImagePaths(from: sender.draggingPasteboard)
+        let paths = extractDroppedPaths(from: sender.draggingPasteboard)
             .filter(Self.isSafePath)
         guard !paths.isEmpty else { return super.performDragOperation(sender) }
 
@@ -148,8 +145,9 @@ final class NiceTerminalView: LocalProcessTerminalView {
         if getTerminal().bracketedPasteMode {
             // Unquoted, wrapped in bracketed-paste markers — Claude
             // Code (and other paste-aware TUIs) treat this as a single
-            // pasted path and can swap it for `[Image #N]`. Adding
-            // quotes here would defeat the filepath detection.
+            // pasted path and can swap it for `[Image #N]` (or other
+            // attachment indicators). Adding quotes here would defeat
+            // the filepath detection.
             var buf = Self.bracketedPasteStart
             buf.append(contentsOf: Array(paths.joined(separator: " ").utf8))
             buf.append(contentsOf: Self.bracketedPasteEnd)
@@ -165,37 +163,38 @@ final class NiceTerminalView: LocalProcessTerminalView {
         return true
     }
 
-    private func hasImagePayload(_ sender: any NSDraggingInfo) -> Bool {
+    private func hasFilePayload(_ sender: any NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
         if let urls = pb.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL], urls.contains(where: Self.isImageFile) {
+        ) as? [URL], !urls.isEmpty {
             return true
         }
         return pb.data(forType: .png) != nil || pb.data(forType: .tiff) != nil
     }
 
-    private func extractImagePaths(from pb: NSPasteboard) -> [String] {
+    private func extractDroppedPaths(from pb: NSPasteboard) -> [String] {
         var paths: [String] = []
         if let urls = pb.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
         ) as? [URL] {
-            for url in urls where Self.isImageFile(url) {
+            for url in urls {
                 paths.append(url.path)
             }
         }
+        // Raw image data fallback (browser drag, Preview screenshot,
+        // Messages thumbnail) — no file URL on the pasteboard, so we
+        // transcode to PNG and stash in a cache directory, then paste
+        // the temp path. Only runs when no file URLs were present;
+        // otherwise the explicit file drop wins.
         if paths.isEmpty,
            let pngData = Self.pngData(from: pb),
            let tempPath = Self.writeDroppedImage(pngData) {
             paths.append(tempPath)
         }
         return paths
-    }
-
-    private static func isImageFile(_ url: URL) -> Bool {
-        imageExtensions.contains(url.pathExtension.lowercased())
     }
 
     /// Reject paths containing C0 control bytes (ESC, LF, CR, tab, etc.)

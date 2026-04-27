@@ -280,6 +280,217 @@ final class AppStateFileOperationsTests: XCTestCase {
                        state.windowSessionId)
     }
 
+    // MARK: - Drag-and-drop moveOrCopy
+
+    func test_moveOrCopy_move_movesFileAndPushesUndo() {
+        let (state, _, history) = makeState()
+        let src = makeFile("file.txt", body: "data")
+        let folder = makeDir("folder")
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .move,
+            originatingTabId: nil
+        )
+
+        XCTAssertTrue(fileExists(folder.appendingPathComponent("file.txt")))
+        XCTAssertFalse(fileExists(src), "Move must remove the source.")
+        XCTAssertEqual(history.undoStack.count, 1)
+    }
+
+    func test_moveOrCopy_copy_leavesSourceAndPushesUndo() {
+        let (state, _, history) = makeState()
+        let src = makeFile("file.txt", body: "data")
+        let folder = makeDir("folder")
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .copy,
+            originatingTabId: nil
+        )
+
+        XCTAssertTrue(fileExists(folder.appendingPathComponent("file.txt")))
+        XCTAssertTrue(fileExists(src), "Copy must leave the source in place.")
+        XCTAssertEqual(history.undoStack.count, 1)
+    }
+
+    func test_moveOrCopy_emptyUrls_isNoOp() {
+        let (state, _, history) = makeState()
+        let folder = makeDir("folder")
+
+        state.moveOrCopy(
+            urls: [],
+            into: folder,
+            operation: .move,
+            originatingTabId: nil
+        )
+
+        XCTAssertEqual(
+            history.undoStack.count, 0,
+            "Empty drag must not push a no-op operation onto undo."
+        )
+    }
+
+    func test_moveOrCopy_collisionAutoRenamesWithCopySuffix() {
+        let (state, _, _) = makeState()
+        let src = makeFile("a.txt", body: "alpha")
+        let folder = makeDir("folder")
+        FileManager.default.createFile(
+            atPath: folder.appendingPathComponent("a.txt").path,
+            contents: Data("existing".utf8)
+        )
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .copy,
+            originatingTabId: nil
+        )
+
+        XCTAssertTrue(fileExists(folder.appendingPathComponent("a copy.txt")))
+        let existing = try? String(
+            contentsOf: folder.appendingPathComponent("a.txt"),
+            encoding: .utf8
+        )
+        XCTAssertEqual(
+            existing, "existing",
+            "Auto-rename must not clobber the existing destination file."
+        )
+    }
+
+    func test_moveOrCopy_undoAfterMove_restoresOriginalLocation() {
+        let (state, _, history) = makeState()
+        let src = makeFile("file.txt", body: "data")
+        let folder = makeDir("folder")
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .move,
+            originatingTabId: nil
+        )
+        XCTAssertFalse(fileExists(src))
+
+        state.undoFileOperation()
+
+        XCTAssertTrue(fileExists(src))
+        XCTAssertFalse(fileExists(folder.appendingPathComponent("file.txt")))
+        XCTAssertEqual(history.redoStack.count, 1)
+    }
+
+    func test_moveOrCopy_undoAfterCopy_deletesCopiedFile() {
+        let (state, _, history) = makeState()
+        let src = makeFile("file.txt", body: "data")
+        let folder = makeDir("folder")
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .copy,
+            originatingTabId: nil
+        )
+        XCTAssertTrue(fileExists(folder.appendingPathComponent("file.txt")))
+
+        state.undoFileOperation()
+
+        XCTAssertTrue(fileExists(src), "Copy undo must leave the source.")
+        XCTAssertFalse(fileExists(folder.appendingPathComponent("file.txt")))
+        XCTAssertEqual(history.redoStack.count, 1)
+    }
+
+    func test_moveOrCopy_sourceMissing_publishesDriftMessage_andSkipsHistory() {
+        let (state, _, history) = makeState()
+        let folder = makeDir("folder")
+        let ghost = tempDir.appendingPathComponent("ghost.txt")
+
+        state.moveOrCopy(
+            urls: [ghost],
+            into: folder,
+            operation: .move,
+            originatingTabId: nil
+        )
+
+        XCTAssertNotNil(history.lastDriftMessage)
+        XCTAssertTrue(
+            history.lastDriftMessage?.contains("ghost.txt") ?? false,
+            "Drift message should name the missing file: \(history.lastDriftMessage ?? "<nil>")"
+        )
+        XCTAssertEqual(
+            history.undoStack.count, 0,
+            "Failed op must not push onto undo."
+        )
+    }
+
+    func test_moveOrCopy_originIncludesPassedTabId() {
+        let (state, _, history) = makeState()
+        let src = makeFile("file.txt")
+        let folder = makeDir("folder")
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .move,
+            originatingTabId: "drag-source-tab"
+        )
+
+        XCTAssertEqual(history.undoStack.last?.origin.tabId, "drag-source-tab")
+        XCTAssertEqual(
+            history.undoStack.last?.origin.windowSessionId,
+            state.windowSessionId
+        )
+    }
+
+    func test_moveOrCopy_nilTabId_fallsBackToActiveTab() {
+        let (state, _, history) = makeState()
+        let src = makeFile("file.txt")
+        let folder = makeDir("folder")
+        let activeId = state.activeTabId
+
+        state.moveOrCopy(
+            urls: [src],
+            into: folder,
+            operation: .move,
+            originatingTabId: nil
+        )
+
+        XCTAssertEqual(
+            history.undoStack.last?.origin.tabId, activeId,
+            "Without an explicit tab id, origin should fall back to the active tab."
+        )
+    }
+
+    func test_moveOrCopy_directoryWithChildren_movesEntireTree_undoRestores() {
+        let (state, _, _) = makeState()
+        let folder = makeDir("project")
+        let nested = folder.appendingPathComponent("nested.txt")
+        FileManager.default.createFile(
+            atPath: nested.path,
+            contents: Data("data".utf8)
+        )
+        let outer = makeDir("outer")
+
+        state.moveOrCopy(
+            urls: [folder],
+            into: outer,
+            operation: .move,
+            originatingTabId: nil
+        )
+
+        XCTAssertFalse(fileExists(folder))
+        let movedNested = outer.appendingPathComponent("project/nested.txt")
+        XCTAssertTrue(fileExists(movedNested))
+
+        state.undoFileOperation()
+
+        XCTAssertTrue(
+            fileExists(nested),
+            "Undoing a directory move must restore the whole tree."
+        )
+        XCTAssertFalse(fileExists(movedNested))
+    }
+
     // MARK: - Helpers
 
     /// Build a bare AppState (services: nil) wired to a private

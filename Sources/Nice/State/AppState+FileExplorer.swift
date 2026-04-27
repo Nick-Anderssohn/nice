@@ -92,6 +92,53 @@ extension AppState: FileExplorerActions {
         return target.deletingLastPathComponent()
     }
 
+    // MARK: - Drag-and-drop move / copy
+
+    /// Move or copy `urls` into `dest`, recording an undoable
+    /// `FileOperation` on the shared history. Drag-and-drop calls
+    /// this directly rather than going through the pasteboard:
+    /// there's no pasteboard intent to read, the destination is
+    /// already known, and the operation is one-shot.
+    ///
+    /// Errors are surfaced via the same `lastDriftMessage` channel
+    /// the cut-and-paste flow uses, so the UI's drift banner stays
+    /// the single user-facing surface for filesystem-op failures.
+    func moveOrCopy(
+        urls: [URL],
+        into dest: URL,
+        operation: FileDragOperation,
+        originatingTabId: String?
+    ) {
+        guard let fileExplorer else { return }
+        guard !urls.isEmpty else { return }
+        let origin = FileOperationOrigin(
+            windowSessionId: windowSessionId,
+            tabId: originatingTabId ?? activeTabId
+        )
+
+        do {
+            let op: FileOperation
+            switch operation {
+            case .copy:
+                op = try fileExplorer.service.copy(items: urls, into: dest, origin: origin)
+            case .move:
+                op = try fileExplorer.service.move(items: urls, into: dest, origin: origin)
+            }
+            fileExplorer.history.push(op)
+        } catch let FileOperationError.sourceMissing(url) {
+            let verb = (operation == .copy) ? "copy" : "move"
+            fileExplorer.history.lastDriftMessage =
+                "Couldn't \(verb): '\(url.lastPathComponent)' is no longer there."
+        } catch let FileOperationError.underlying(message) {
+            let verb = (operation == .copy) ? "Copy" : "Move"
+            fileExplorer.history.lastDriftMessage = "\(verb) failed: \(message)"
+        } catch {
+            let verb = (operation == .copy) ? "Copy" : "Move"
+            fileExplorer.history.lastDriftMessage =
+                "\(verb) failed: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Trash
 
     func trash(paths: [String], originatingTabId: String?) {
