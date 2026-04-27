@@ -33,37 +33,6 @@ final class PaneStripGeometryTests: XCTestCase {
         PaneStripGeometry(paneFrames: paneFrames, visibleWidth: visibleWidth)
     }
 
-    // MARK: - contentWidth
-
-    /// `contentWidth` must be invariant under scroll. The same three
-    /// pills, viewed at scroll-zero and after scrolling 80pt right,
-    /// report identical `contentWidth`. Drives the chevron's
-    /// scroll-stability.
-    func test_contentWidth_isInvariantUnderScroll() {
-        let atRest = geometry(
-            paneFrames: [
-                "p1": rect(x: 0,   width: 100),
-                "p2": rect(x: 102, width: 100),
-                "p3": rect(x: 204, width: 100),
-            ],
-            visibleWidth: 200
-        )
-
-        let scrolled = geometry(
-            paneFrames: [
-                "p1": rect(x: -80, width: 100),
-                "p2": rect(x:  22, width: 100),
-                "p3": rect(x: 124, width: 100),
-            ],
-            visibleWidth: 200
-        )
-
-        XCTAssertEqual(atRest.contentWidth, scrolled.contentWidth)
-        XCTAssertEqual(atRest.contentWidth, 304)
-        XCTAssertTrue(atRest.isOverflowing)
-        XCTAssertTrue(scrolled.isOverflowing)
-    }
-
     // MARK: - Overflow detection
 
     /// Three pills that fit inside the viewport: no overflow, no scroll
@@ -193,7 +162,6 @@ final class PaneStripGeometryTests: XCTestCase {
         let geo = geometry(paneFrames: [:], visibleWidth: 400)
 
         XCTAssertFalse(geo.isOverflowing)
-        XCTAssertEqual(geo.contentWidth, 0)
         XCTAssertEqual(geo.offscreenPaneIds, [])
     }
 

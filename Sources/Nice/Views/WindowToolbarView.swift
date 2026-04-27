@@ -83,13 +83,6 @@ struct WindowToolbarView: View {
 /// suit so timings don't feel staggered.
 private let panePillAnimationDuration: Double = 0.12
 
-/// How long we wait before hiding the chevron after `isOverflowing`
-/// flips false. Spans more than one display frame so brief layout-pass
-/// glitches (where SwiftUI re-emits a partial set of pill frames) can
-/// resolve before we decide the strip really fits. Latching ON is
-/// instant; only the OFF transition is debounced.
-private let chevronHideDebounce: Duration = .milliseconds(180)
-
 /// Scrolls horizontally through the active tab's panes, rendering each as
 /// an `InlinePanePill`. The trailing `NewTabBtn` stays pinned; it adds a
 /// terminal pane to the active tab.
@@ -126,20 +119,18 @@ private struct InlinePaneStrip: View {
     /// preference system inflicts during scroll/layout transitions.
     @State private var paneFrames: [String: CGRect] = [:]
 
-    /// The ScrollView's visible viewport width. Compared against
-    /// `geometry.contentWidth` (derived from `paneFrames`) to gate the
-    /// chevron's existence.
+    /// The ScrollView's visible viewport width. Used by the cosmetic
+    /// chrome only; the chevron's existence is gated on the more
+    /// reliable `availableWidth` measured outside the ScrollView.
     @State private var visibleWidth: CGFloat = 0
 
-    /// Hysteretic mirror of `geometry.isOverflowing` that drives the
-    /// chevron's existence. It snaps `true` instantly when overflow
-    /// appears, but a transition to `false` is held for
-    /// `chevronHideDebounce` so the chevron doesn't blink off during
-    /// the brief layout passes where SwiftUI re-emits per-pill frames
-    /// in a different order (e.g. during scroll animations or after
-    /// adding a pane). Without this, `geometry.isOverflowing` can flash
-    /// false for a frame even when the strip is visibly overflowing.
-    @State private var chevronVisible: Bool = false
+    /// `InlinePaneStrip`'s own bounds — measured at the body level,
+    /// which is *outside* the ScrollView. Drives the chevron's
+    /// existence: combined with a per-pill width estimate, we can
+    /// decide overflow without depending on any preference that
+    /// originates from inside the ScrollView's content (which SwiftUI
+    /// silently virtualizes for off-screen pills).
+    @State private var availableWidth: CGFloat = 0
 
     private var activeTab: Tab? {
         guard let id = appState.activeTabId else { return nil }
@@ -158,7 +149,12 @@ private struct InlinePaneStrip: View {
             if let tab = activeTab {
                 strip(for: tab)
 
-                if chevronVisible {
+                let showChevron = PaneStripOverflowEstimator.shouldShowChevron(
+                    panes: tab.panes,
+                    availableWidth: availableWidth
+                )
+
+                if showChevron {
                     OverflowMenuButton(
                         panes: tab.panes,
                         activePaneId: tab.activePaneId,
@@ -190,22 +186,29 @@ private struct InlinePaneStrip: View {
         }
         .animation(
             .easeInOut(duration: panePillAnimationDuration),
-            value: chevronVisible
+            value: PaneStripOverflowEstimator.shouldShowChevron(
+                panes: activeTab?.panes ?? [],
+                availableWidth: availableWidth
+            )
         )
-        // Latch the chevron ON instantly; debounce the OFF transition.
-        // `task(id:)` cancels any in-flight hide task whenever
-        // `isOverflowing` toggles, so a quick true→false→true bounce
-        // resolves to "stays visible" instead of flickering off.
-        .task(id: geometry.isOverflowing) {
-            if geometry.isOverflowing {
-                chevronVisible = true
-            } else if chevronVisible {
-                try? await Task.sleep(for: chevronHideDebounce)
-                if !Task.isCancelled {
-                    chevronVisible = false
-                }
+        // Measure our own bounds. We write directly to `@State` from
+        // the GeometryReader closure rather than going through a
+        // PreferenceKey + `.onPreferenceChange` because in this
+        // particular view tree (something about the ScrollView
+        // ancestry, possibly Swift 6 strict-concurrency interaction)
+        // those preference closures simply never fire — paneFrames'
+        // do, but the scalar-valued ones don't. `.onAppear` + a
+        // value-binding `.onChange` on `geo.size.width` is the
+        // boring-but-reliable alternative.
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { availableWidth = geo.size.width }
+                    .onChange(of: geo.size.width) { _, newWidth in
+                        availableWidth = newWidth
+                    }
             }
-        }
+        )
     }
 
     @ViewBuilder
@@ -276,10 +279,21 @@ private struct InlinePaneStrip: View {
                 visibleWidth = width
             }
             .onPreferenceChange(PaneFramePreferenceKey.self) { frames in
-                // Drop entries for panes that have been removed so
-                // `offscreenPaneIds` doesn't accumulate stale ids.
+                // Merge instead of replace: a SwiftUI horizontal
+                // ScrollView stops emitting `GeometryReader` preferences
+                // for pills that have scrolled off the visible region.
+                // If we overwrote `paneFrames` with each new dict, the
+                // rightmost pills' entries would silently vanish at
+                // scroll-zero — collapsing `canScrollTrailing` to false
+                // and hiding the chevron. Keep the last-known frame for
+                // every pane id that's still in `tab.panes` and
+                // overwrite only the keys we just heard about.
                 let liveIds = Set(tab.panes.map(\.id))
-                paneFrames = frames.filter { liveIds.contains($0.key) }
+                var merged = paneFrames.filter { liveIds.contains($0.key) }
+                for (id, frame) in frames where liveIds.contains(id) {
+                    merged[id] = frame
+                }
+                paneFrames = merged
             }
             .onChange(of: tab.activePaneId) { _, newId in
                 guard let newId else { return }

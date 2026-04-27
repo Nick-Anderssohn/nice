@@ -17,15 +17,6 @@
 //  leading edge) or `frame.minX >= visibleWidth` (off the trailing
 //  edge), and partially clipped iff its frame straddles either edge.
 //
-//  Why `isOverflowing` is derived from `(maxX - minX)` of all frames
-//  instead of `canScrollLeading || canScrollTrailing`: the difference
-//  is invariant under scroll (every frame shifts by the same offset,
-//  so the span doesn't change), which means it doesn't blink as the
-//  user scrolls. The OR-of-edges form is mathematically equivalent
-//  *when frames are consistent*, but races where the two booleans flip
-//  on different layout passes can briefly leave both false even though
-//  the strip is overflowing.
-//
 
 import CoreGraphics
 
@@ -38,23 +29,10 @@ struct PaneStripGeometry: Equatable {
     /// the chevron and edge fades from flickering on layout snaps.
     static let edgeTolerance: CGFloat = 0.5
 
-    /// Total width spanned by the pills, derived as `max(maxX) - min(minX)`
-    /// across `paneFrames`. Invariant under scroll because every frame
-    /// shifts by the same offset.
-    var contentWidth: CGFloat {
-        guard !paneFrames.isEmpty else { return 0 }
-        let minX = paneFrames.values.map(\.minX).min() ?? 0
-        let maxX = paneFrames.values.map(\.maxX).max() ?? 0
-        return maxX - minX
-    }
-
     /// Whether the strip's content can't fit in the viewport. Drives
-    /// whether the overflow chevron renders. OR of the two edges so that
-    /// it remains true when content extends past the trailing edge OR
-    /// has been scrolled past the leading edge — equivalent to
-    /// `contentWidth > visibleWidth` *if frames are mutually consistent*,
-    /// but doesn't blink false in the brief layout pass where SwiftUI
-    /// has reported a partial set of frames.
+    /// the chevron's existence. OR-of-edges so that the chevron stays
+    /// shown when content extends past the trailing edge OR has been
+    /// scrolled past the leading edge.
     var isOverflowing: Bool {
         canScrollLeading || canScrollTrailing
     }
