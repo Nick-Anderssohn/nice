@@ -246,12 +246,20 @@ final class TabPtySession: ObservableObject {
     /// Spawn a terminal-kind pane — a plain `zsh -il` with injected
     /// `ZDOTDIR` + `NICE_SOCKET` so the shadowed `claude()` function
     /// is available inside.
+    ///
+    /// When `command` is non-nil, the spawn replaces zsh with the
+    /// supplied command via `zsh -ilc "exec <command>"`. The login
+    /// shell still runs the user's rc files first so PATH (Homebrew,
+    /// asdf, mise, …) is the same as a regular terminal pane. On
+    /// editor exit, the pty closes and the pane drops via the
+    /// existing `paneExited` flow — same UX as a Claude pane.
     @discardableResult
     func addTerminalPane(
         id: String,
         cwd: String? = nil,
         socketPath: String? = nil,
-        zdotdirPath: String? = nil
+        zdotdirPath: String? = nil,
+        command: String? = nil
     ) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
@@ -261,7 +269,9 @@ final class TabPtySession: ObservableObject {
         view.processDelegate = delegate
         panes[id] = view
         delegates[id] = delegate
-        installLaunchOverlayHooks(on: view, paneId: id, kind: .terminal)
+        installLaunchOverlayHooks(
+            on: view, paneId: id, kind: .terminal, displayCommand: command
+        )
 
         var extraEnv: [String: String] = [:]
         if let sp = socketPath ?? self.socketPath {
@@ -277,9 +287,10 @@ final class TabPtySession: ObservableObject {
         extraEnv["NICE_PANE_ID"] = id
 
         let resolvedCwd = Self.expandTilde(cwd ?? self.cwd)
+        let args = Self.buildExecArgs(command: command)
         view.startProcess(
             executable: "/bin/zsh",
-            args: ["-il"],
+            args: args,
             environment: Self.buildEnv(extraEnv: extraEnv),
             execName: nil,
             currentDirectory: resolvedCwd
@@ -338,12 +349,16 @@ final class TabPtySession: ObservableObject {
     private func installLaunchOverlayHooks(
         on view: NiceTerminalView,
         paneId: String,
-        kind: PaneKind
+        kind: PaneKind,
+        displayCommand: String? = nil
     ) {
         if kind == .claude, case .resumeDeferred = claudeSessionMode {
             return
         }
-        let command = launchDisplayCommand(kind: kind)
+        // When the caller supplied an explicit command (e.g. an editor
+        // pane spawned by the File Explorer), show that instead of
+        // generic "zsh".
+        let command = displayCommand ?? launchDisplayCommand(kind: kind)
         onPaneLaunched?(paneId, command)
         let handler = onPaneFirstOutput
         view.onFirstData = { [handler, paneId] in
@@ -544,6 +559,21 @@ final class TabPtySession: ObservableObject {
             env["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
         }
         return env
+    }
+
+    /// Pure projection of an optional editor/command override to the
+    /// arg list passed to `/bin/zsh`. `nil` means "spawn a plain
+    /// login-interactive shell" (`-il`); a command means "run that
+    /// command in place of the shell" (`-ilc "exec <cmd>"`). The
+    /// `exec` form is important: it replaces the login shell with the
+    /// editor process so quitting the editor closes the pty (matching
+    /// Claude-pane lifecycle), and signals/resize events forward to
+    /// the editor instead of being eaten by an intermediate shell.
+    nonisolated static func buildExecArgs(command: String?) -> [String] {
+        if let command {
+            return ["-ilc", "exec \(command)"]
+        }
+        return ["-il"]
     }
 
     nonisolated static func buildClaudeExecCommand(

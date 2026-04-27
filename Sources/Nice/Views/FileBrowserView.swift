@@ -496,9 +496,11 @@ private struct FileTreeRow: View {
             // `.id(state.rootPath)` on the top-level row, the tree
             // re-renders fresh at the new root.
             state.rootPath = path
-        } else {
-            NSWorkspace.shared.open(url)
+            return
         }
+        // Routing — mapped → editor pane, otherwise NSWorkspace —
+        // lives on AppState so the rule is pinned in one place.
+        appState.openFromDoubleClick(url: url)
     }
 
     private func toggleExpansion() {

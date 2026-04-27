@@ -169,6 +169,109 @@ extension AppState: FileExplorerActions {
         fileExplorer?.openWithProvider.entries(for: url) ?? []
     }
 
+    // MARK: - Editor pane
+
+    /// Single entry point for File Explorer double-clicks on a file.
+    /// Routes to the editor-pane path when the extension is mapped,
+    /// otherwise falls through to the OS default app handler. Lives
+    /// here (not in the view) so the routing rule is pinned in one
+    /// place — the right-click submenu and the double-click default
+    /// have to agree on what an editor mapping means, and the view
+    /// layer shouldn't be the one enforcing that.
+    func openFromDoubleClick(url: URL) {
+        if let editor = tweaks?.editor(forExtension: url.pathExtension) {
+            openInEditorPane(url: url, editorId: editor.id)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Returns the user-configured + auto-detected editor lists for
+    /// the "Open in Editor Pane" submenu, deduplicated by `command`
+    /// so a manually-added `vim` doesn't appear twice when `vim` is
+    /// also auto-detected.
+    func editorPaneEntries() -> EditorPaneEntries {
+        Self.mergeEditorPaneEntries(
+            user: tweaks?.editorCommands ?? [],
+            detected: editorDetector?.detected ?? []
+        )
+    }
+
+    /// Pure dedup-by-command merge. User-configured editors win on
+    /// collision so any custom args the user set on their entry take
+    /// precedence over the detected default. Lifted out for direct
+    /// unit testing.
+    static func mergeEditorPaneEntries(
+        user: [EditorCommand],
+        detected: [EditorCommand]
+    ) -> EditorPaneEntries {
+        let userCommands = Set(user.map(\.command))
+        let filtered = detected.filter { !userCommands.contains($0.command) }
+        return EditorPaneEntries(user: user, detected: filtered)
+    }
+
+    /// Spawn an editor pane for `url` using the editor identified by
+    /// `editorId`. Looks the editor up first in user config, then in
+    /// the detected list. Pane lands in the currently active tab,
+    /// falling back to the first available tab if none is active.
+    /// No-op when no editor or no tab is available.
+    func openInEditorPane(url: URL, editorId: UUID) {
+        let editor = tweaks?.editor(for: editorId)
+            ?? editorDetector?.detected.first { $0.id == editorId }
+        guard let editor else { return }
+
+        guard let tabId = Self.resolveTargetTab(
+            activeTabId: activeTabId,
+            hasTab: { self.tab(for: $0) != nil },
+            firstAvailable: { self.firstAvailableTabId() }
+        ) else { return }
+
+        let spec = Self.editorPaneSpec(editor: editor, url: url)
+        addPane(
+            tabId: tabId,
+            kind: .terminal,
+            cwd: spec.cwd,
+            title: spec.title,
+            command: spec.command
+        )
+        if activeTabId != tabId {
+            activeTabId = tabId
+        }
+    }
+
+    /// Pure tab resolver — the active tab when present, otherwise the
+    /// first available tab in sidebar order. Lifted out for direct
+    /// unit testing without standing up an AppState. Returns nil when
+    /// no tab exists anywhere (theoretical — the Terminals project's
+    /// Main tab is the boot invariant).
+    static func resolveTargetTab(
+        activeTabId: String?,
+        hasTab: (String) -> Bool,
+        firstAvailable: () -> String?
+    ) -> String? {
+        if let active = activeTabId, hasTab(active) {
+            return active
+        }
+        return firstAvailable()
+    }
+
+    /// Pure projection of (editor, url) → spawn arguments. Pulled out
+    /// for direct unit testing — verifying shell-quoting on weird
+    /// paths and the `cwd = parent directory` decision shouldn't need
+    /// to construct an AppState.
+    static func editorPaneSpec(
+        editor: EditorCommand,
+        url: URL
+    ) -> EditorPaneSpec {
+        let parent = url.deletingLastPathComponent().path
+        let quoted = shellSingleQuote(url.path)
+        // Editor.command is parsed by zsh (so `nvim -p` works); only
+        // the file path is quoted to survive spaces/special characters.
+        let command = "\(editor.command) \(quoted)"
+        let title = "\(editor.name) \(url.lastPathComponent)"
+        return EditorPaneSpec(cwd: parent, title: title, command: command)
+    }
+
     // MARK: - Undo / Redo (also wired through KeyboardShortcutMonitor)
 
     func undoFileOperation() {
@@ -178,4 +281,28 @@ extension AppState: FileExplorerActions {
     func redoFileOperation() {
         fileExplorer?.history.redo()
     }
+}
+
+/// Partitioned view onto the editor list the context menu renders.
+/// Detected editors that share a `command` with a user-configured one
+/// have already been filtered out so each command appears at most
+/// once across both arrays.
+struct EditorPaneEntries: Hashable, Sendable {
+    let user: [EditorCommand]
+    let detected: [EditorCommand]
+
+    static let empty = EditorPaneEntries(user: [], detected: [])
+
+    var isEmpty: Bool { user.isEmpty && detected.isEmpty }
+}
+
+/// Pure projection of (editor, file URL) into the spawn arguments
+/// `AppState.openInEditorPane` hands to `addPane`. Lives as a named
+/// type so the test surface is `spec.command` against a struct rather
+/// than a positional tuple, and so adding a fourth field later isn't
+/// source-breaking.
+struct EditorPaneSpec: Hashable, Sendable {
+    let cwd: String
+    let title: String
+    let command: String
 }

@@ -283,6 +283,16 @@ final class AppState: ObservableObject {
     /// don't exercise the orchestration.
     let fileExplorer: FileExplorerServices?
 
+    /// User preferences (editor mappings, palette, …). Stored so
+    /// orchestration methods like `openInEditorPane` can resolve a
+    /// configured editor without reaching back through services.
+    let tweaks: Tweaks?
+
+    /// Auto-detected terminal editors discovered at startup. Used by
+    /// `editorPaneEntries` so the File Explorer's context menu can
+    /// surface vim/nvim/etc. without prior user config.
+    let editorDetector: EditorDetector?
+
     /// Convenience init for `#Preview` blocks and unit tests. Each
     /// AppState is otherwise expected to be constructed by
     /// `AppShellView` passing its window's `NiceServices` and the
@@ -317,6 +327,8 @@ final class AppState: ObservableObject {
         // Production: take the file-explorer triple from the shared
         // NiceServices. Tests can override by passing their own.
         self.fileExplorer = fileExplorer ?? services?.fileExplorer
+        self.tweaks = services?.tweaks
+        self.editorDetector = services?.editorDetector
         self.sidebarCollapsed = initialSidebarCollapsed
         self.sidebarMode = initialSidebarMode
 
@@ -875,7 +887,12 @@ final class AppState: ObservableObject {
     /// First tab id in sidebar order (Terminals project, then project
     /// tabs). Used to fall back to a sensible selection when the
     /// active tab dissolves. Returns nil when no tab exists anywhere.
-    private func firstAvailableTabId() -> String? {
+    ///
+    /// Internal — not private — so `AppState+FileExplorer.openInEditorPane`
+    /// can use it as the active-tab fallback when the user clicks an
+    /// editor entry while no tab is focused. Keep at internal; no
+    /// external module needs it.
+    func firstAvailableTabId() -> String? {
         for project in projects {
             if let id = project.tabs.first?.id { return id }
         }
@@ -1144,12 +1161,17 @@ final class AppState: ObservableObject {
 
     /// Append a new terminal pane to `tabId`, spawn its pty, and focus
     /// it. Returns the new pane id, or nil if the tab doesn't exist.
+    ///
+    /// `command`, when set, runs that command instead of a plain login
+    /// shell (used by the File Explorer's "Open in Editor Pane" path).
+    /// On exit the pane drops via the existing `paneExited` flow.
     @discardableResult
     func addPane(
         tabId: String,
         kind: PaneKind = .terminal,
         cwd: String? = nil,
-        title: String? = nil
+        title: String? = nil,
+        command: String? = nil
     ) -> String? {
         // Only terminal kind is exposed to callers. Claude panes are
         // created exclusively by `createTabFromMainTerminal` — this
@@ -1175,7 +1197,7 @@ final class AppState: ObservableObject {
         } else {
             session = makeSession(for: tabId, cwd: tabCwd)
         }
-        _ = session.addTerminalPane(id: newId, cwd: tabCwd)
+        _ = session.addTerminalPane(id: newId, cwd: tabCwd, command: command)
         return newId
     }
 
