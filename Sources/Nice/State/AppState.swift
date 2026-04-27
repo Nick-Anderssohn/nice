@@ -94,6 +94,15 @@ final class AppState {
     /// forwarders below.
     let sidebar: SidebarModel
 
+    /// Per-window close-confirmation flow: pendingCloseRequest +
+    /// requestClose*/confirm/cancel + busy classification + hard-kill.
+    /// Holds weak references to `tabs` and `sessions`; AppState wires
+    /// `onSyncFinalizeDissolve` to `finalizeDissolvedTab` so the
+    /// all-unspawned hard-kill path runs the dissolve cascade
+    /// synchronously, and `onScheduleSave` so empty-project removal
+    /// persists.
+    let closer: CloseRequestCoordinator
+
     /// Forwarder for `tabs.projects` so existing call sites (views,
     /// tests) keep working unchanged. The view-side rename pass that
     /// points UI directly at `tabs.projects` is a separate step.
@@ -174,19 +183,13 @@ final class AppState {
 
     // MARK: - Window-state plumbing
 
-    /// In-flight "processes still running" confirmation. Set by
-    /// `requestClosePane` / `requestCloseTab` / `requestCloseProject`
-    /// when they find something busy; cleared by `confirmPendingClose`
-    /// (after the kill) or `cancelPendingClose` (user backs out).
-    /// `AppShellView` binds an `.alert` to this.
-    var pendingCloseRequest: PendingCloseRequest?
-
-    /// Project ids the user asked to fully close. When a tab in one of
-    /// these projects finishes dissolving in `paneExited`, the empty
-    /// project row is also removed from `projects`. The Terminals
-    /// project is excluded upstream (its id is never added).
-    @ObservationIgnored
-    private var projectsPendingRemoval: Set<String> = []
+    /// In-flight "processes still running" confirmation. Forwarder
+    /// onto `CloseRequestCoordinator.pendingCloseRequest`. Settable so
+    /// `AppShellView`'s alert binding can clear it via `nil`-write.
+    var pendingCloseRequest: PendingCloseRequest? {
+        get { closer.pendingCloseRequest }
+        set { closer.pendingCloseRequest = newValue }
+    }
 
     /// Stable identifier for this window's entry in `sessions.json`.
     /// Pulled in from `@SceneStorage("windowSessionId")` on
@@ -281,9 +284,12 @@ final class AppState {
 
         // Build the data model first (its init seeds the Terminals
         // project + Main tab) and then the sessions subsystem which
-        // holds a weak pointer back to the model.
+        // holds a weak pointer back to the model. The closer holds
+        // weak references to both — fine because AppState owns all
+        // three and they share its lifetime.
         self.tabs = TabModel(initialMainCwd: resolvedMainCwd)
         self.sessions = SessionsModel(tabs: tabs)
+        self.closer = CloseRequestCoordinator(tabs: tabs, sessions: sessions)
         self.trackedServices = services
 
         // Seed scheme / palette / accent / terminal-theme / font
@@ -338,6 +344,12 @@ final class AppState {
         }
         self.sessions.onTabBecameEmpty = { [weak self] tabId, pi, ti in
             self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+        }
+        self.closer.onSyncFinalizeDissolve = { [weak self] tabId, pi, ti in
+            self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+        }
+        self.closer.onScheduleSave = { [weak self] in
+            self?.scheduleSessionSave()
         }
     }
 
@@ -578,12 +590,15 @@ final class AppState {
 
         // If the user asked to close this whole project (right-click →
         // Close Project), drop the now-empty project row too. Terminals
-        // is guarded upstream but double-check here defensively.
+        // is guarded upstream but double-check here defensively. Read
+        // the flag without clearing first — earlier-tab dissolves in a
+        // multi-tab project must leave the flag set so subsequent
+        // dissolves still see it.
         let projectId = tabs.projects[pi].id
-        if projectsPendingRemoval.contains(projectId),
+        if closer.isProjectPendingRemoval(projectId),
            tabs.projects[pi].tabs.isEmpty,
            projectId != TabModel.terminalsProjectId {
-            projectsPendingRemoval.remove(projectId)
+            closer.clearProjectPendingRemoval(projectId)
             tabs.projects.remove(at: pi)
         }
 
@@ -654,190 +669,31 @@ final class AppState {
         )
     }
 
-    // MARK: - Close coordinator
+    // MARK: - Close coordinator (forwarders)
 
-    /// Request to close a pane. If the pane is busy — a thinking or
-    /// waiting Claude, or a shell with a foreground child — stage a
-    /// confirmation prompt; the UI binds an alert to
-    /// `pendingCloseRequest` and calls `confirmPendingClose` /
-    /// `cancelPendingClose`. Idle panes are killed immediately.
+    /// Forwarder onto `CloseRequestCoordinator.requestClosePane`.
     func requestClosePane(tabId: String, paneId: String) {
-        guard let tab = tabs.tab(for: tabId),
-              let pane = tab.panes.first(where: { $0.id == paneId })
-        else { return }
-
-        if isBusy(tabId: tabId, pane: pane) {
-            pendingCloseRequest = PendingCloseRequest(
-                scope: .pane(tabId: tabId, paneId: paneId),
-                busyPanes: [describe(pane: pane)]
-            )
-        } else {
-            hardKillPane(tabId: tabId, paneId: paneId)
-        }
+        closer.requestClosePane(tabId: tabId, paneId: paneId)
     }
 
-    /// Request to close an entire tab. If any live pane on the tab is
-    /// busy, show the confirmation alert; otherwise tear all panes
-    /// down. The tab dissolves when its last pane exits (see
-    /// `paneExited`).
+    /// Forwarder onto `CloseRequestCoordinator.requestCloseTab`.
     func requestCloseTab(tabId: String) {
-        guard let tab = tabs.tab(for: tabId) else { return }
-
-        let busy = tab.panes.filter { $0.isAlive && isBusy(tabId: tabId, pane: $0) }
-        if !busy.isEmpty {
-            pendingCloseRequest = PendingCloseRequest(
-                scope: .tab(tabId: tabId),
-                busyPanes: busy.map(describe(pane:))
-            )
-        } else {
-            hardKillTab(tabId: tabId)
-        }
+        closer.requestCloseTab(tabId: tabId)
     }
 
-    /// Request to close an entire project: every tab's panes plus the
-    /// project row itself. Refused for the pinned Terminals project,
-    /// which is always present by design. If any pane in any tab is
-    /// busy, show the confirmation alert; otherwise tear everything
-    /// down. The project dissolves once its last tab dissolves (see
-    /// `paneExited`).
+    /// Forwarder onto `CloseRequestCoordinator.requestCloseProject`.
     func requestCloseProject(projectId: String) {
-        guard projectId != TabModel.terminalsProjectId,
-              let project = tabs.projects.first(where: { $0.id == projectId })
-        else { return }
-
-        let busy = project.tabs.flatMap { tab in
-            tab.panes.filter { $0.isAlive && isBusy(tabId: tab.id, pane: $0) }
-        }
-        if !busy.isEmpty {
-            pendingCloseRequest = PendingCloseRequest(
-                scope: .project(projectId: projectId),
-                busyPanes: busy.map(describe(pane:))
-            )
-        } else {
-            hardKillProject(projectId: projectId)
-        }
+        closer.requestCloseProject(projectId: projectId)
     }
 
-    /// User confirmed the pending close — force the kill.
+    /// Forwarder onto `CloseRequestCoordinator.confirmPendingClose`.
     func confirmPendingClose() {
-        guard let pending = pendingCloseRequest else { return }
-        pendingCloseRequest = nil
-        switch pending.scope {
-        case let .pane(tabId, paneId):
-            hardKillPane(tabId: tabId, paneId: paneId)
-        case let .tab(tabId):
-            hardKillTab(tabId: tabId)
-        case let .project(projectId):
-            hardKillProject(projectId: projectId)
-        }
+        closer.confirmPendingClose()
     }
 
-    /// User dismissed the pending close — leave everything running.
+    /// Forwarder onto `CloseRequestCoordinator.cancelPendingClose`.
     func cancelPendingClose() {
-        pendingCloseRequest = nil
-    }
-
-    private func isBusy(tabId: String, pane: Pane) -> Bool {
-        guard pane.isAlive else { return false }
-        switch pane.kind {
-        case .claude:
-            // `.thinking` is an active computation; `.waiting` is a live
-            // conversation the user might not want to throw away. Only
-            // the pre-first-title `.idle` state counts as disposable.
-            return pane.status == .thinking || pane.status == .waiting
-        case .terminal:
-            return sessions.shellHasForegroundChild(tabId: tabId, paneId: pane.id)
-        }
-    }
-
-    private func describe(pane: Pane) -> String {
-        switch pane.kind {
-        case .claude:   return "Claude (\(pane.title))"
-        case .terminal: return pane.title
-        }
-    }
-
-    private func hardKillPane(tabId: String, paneId: String) {
-        // `terminatePane` sends SIGTERM and tears down the pty; the
-        // usual `paneExited` delegate fires and removes the pane from
-        // the model, dissolving the tab if it was the last pane.
-        sessions.terminatePane(tabId: tabId, paneId: paneId)
-    }
-
-    private func hardKillTab(tabId: String) {
-        guard let tab = tabs.tab(for: tabId) else { return }
-
-        // Split panes by whether they've actually been spawned.
-        // `terminatePane` is a no-op for unspawned panes (the lazy
-        // companion terminal on a Claude tab the user never focused,
-        // for example), so if we only SIGHUP we'd leave those panes
-        // in the model and the tab would never dissolve — on Claude
-        // tabs `ensureActivePaneSpawned` would then start the
-        // companion shell and the tab would keep living as a
-        // terminal. Drop unspawned panes from the model directly so
-        // the tab reaches empty-panes and dissolves.
-        var spawnedIds: [String] = []
-        var unspawnedIds: [String] = []
-        for pane in tab.panes {
-            if sessions.paneIsSpawned(tabId: tabId, paneId: pane.id) {
-                spawnedIds.append(pane.id)
-            } else {
-                unspawnedIds.append(pane.id)
-            }
-        }
-
-        for id in spawnedIds {
-            sessions.terminatePane(tabId: tabId, paneId: id)
-        }
-
-        guard !unspawnedIds.isEmpty else { return }
-
-        if spawnedIds.isEmpty {
-            // Nothing async to hook into — finalize right now.
-            tabs.mutateTab(id: tabId) { tab in
-                tab.panes.removeAll()
-                tab.activePaneId = nil
-            }
-            if let (pi, ti) = tabs.projectTabIndex(for: tabId) {
-                finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
-            }
-        } else {
-            // At least one spawned pane will fire `paneExited` later;
-            // clear the unspawned rows now so that exit sees an empty
-            // panes list and dissolves through the normal path.
-            let toDrop = Set(unspawnedIds)
-            tabs.mutateTab(id: tabId) { tab in
-                tab.panes.removeAll { toDrop.contains($0.id) }
-                if let active = tab.activePaneId, toDrop.contains(active) {
-                    tab.activePaneId = tab.panes.first?.id
-                }
-            }
-        }
-    }
-
-    /// Force-close every tab in a project and mark the project for
-    /// removal so `paneExited` drops the empty row once the last tab
-    /// dissolves. Empty projects (no tabs) are removed synchronously
-    /// since there's no async pane-exit to wait on.
-    private func hardKillProject(projectId: String) {
-        guard projectId != TabModel.terminalsProjectId,
-              let idx = tabs.projects.firstIndex(where: { $0.id == projectId })
-        else { return }
-
-        let tabIds = tabs.projects[idx].tabs.map(\.id)
-        if tabIds.isEmpty {
-            tabs.projects.remove(at: idx)
-            if let active = activeTabId, tabs.tab(for: active) == nil {
-                activeTabId = tabs.firstAvailableTabId()
-            }
-            scheduleSessionSave()
-            return
-        }
-
-        projectsPendingRemoval.insert(projectId)
-        for id in tabIds {
-            hardKillTab(tabId: id)
-        }
+        closer.cancelPendingClose()
     }
 
     // MARK: - Reordering
