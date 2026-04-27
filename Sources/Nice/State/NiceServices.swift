@@ -36,9 +36,15 @@ final class NiceServices: ObservableObject {
     let fileExplorer: FileExplorerServices
 
     /// Absolute path to the `claude` binary if resolvable; nil falls
-    /// back to zsh inside claude panes. Computed once at init so
-    /// opening a second window doesn't re-run the login-shell probe.
-    let resolvedClaudePath: String?
+    /// back to zsh inside claude panes. Resolved off the main thread
+    /// so SwiftUI scene-graph init isn't blocked on a login-shell
+    /// probe — `Process.waitUntilExit` pumps a CFRunLoop while
+    /// waiting, which re-enters SwiftUI mid-`@StateObject` update and
+    /// trips AttributeGraph's "setting value during update" abort
+    /// (see Sources/Nice/NiceApp.swift). Stays nil until the probe
+    /// returns; `AppState` subscribes via `$resolvedClaudePath` so
+    /// tabs created after resolution still pick up the path.
+    @Published private(set) var resolvedClaudePath: String?
 
     /// Process-wide ZDOTDIR directory whose stub `.zshrc` chains back to
     /// the user's real `$HOME/.zshrc` and shadows `claude` to talk to
@@ -85,8 +91,23 @@ final class NiceServices: ObservableObject {
             NSLog("NiceServices: ZDOTDIR inject failed: \(error)")
             self.zdotdirPath = nil
         }
-        self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
-            ?? Self.runWhich(binary: "claude")
+        // The env-var override is a cheap dict read — apply it
+        // synchronously so UI tests that set NICE_CLAUDE_OVERRIDE see
+        // the path immediately (no resolution race for tabs spawned
+        // during early launch). The expensive login-shell probe is
+        // deferred to `Task.detached` to avoid blocking SwiftUI's
+        // scene-graph init on `Process.waitUntilExit`.
+        if let override = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] {
+            self.resolvedClaudePath = override
+        } else {
+            self.resolvedClaudePath = nil
+            Task.detached(priority: .utility) { [weak self] in
+                let resolved = Self.runWhich(binary: "claude")
+                await MainActor.run { [weak self] in
+                    self?.resolvedClaudePath = resolved
+                }
+            }
+        }
 
         // Kick off editor auto-detection on a background queue. The
         // scan probes the user's PATH for well-known terminal editors

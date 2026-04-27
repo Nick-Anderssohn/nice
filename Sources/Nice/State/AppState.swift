@@ -15,6 +15,7 @@
 //
 
 import AppKit
+import Combine
 import Foundation
 import SwiftUI
 
@@ -262,8 +263,15 @@ final class AppState: ObservableObject {
     private var currentTerminalFontFamily: String? = nil
 
     /// Absolute path to the `claude` binary if we've resolved it; nil
-    /// falls back to zsh inside claude panes.
+    /// falls back to zsh inside claude panes. Mirrors
+    /// `services.resolvedClaudePath` and is updated via the Combine
+    /// subscription below when the async probe completes.
     private var resolvedClaudePath: String?
+
+    /// Holds the subscription to `services.$resolvedClaudePath` for
+    /// the lifetime of this window. Drops automatically when AppState
+    /// deinits.
+    private var claudePathCancellable: AnyCancellable?
 
     // MARK: - Control socket
 
@@ -379,15 +387,19 @@ final class AppState: ObservableObject {
         }
         self.controlSocketExtraEnv = extraEnv
 
-        // Prefer the process-wide cached `claude` path from services;
-        // fall back to probing if services isn't available (previews /
-        // unit tests). Probing a login shell costs 200–500ms so the
-        // cache materially improves second-window open latency.
-        if let cached = services?.resolvedClaudePath {
-            self.resolvedClaudePath = cached
+        // Read the process-wide path from services (or the env-var
+        // override when there's no services, for previews / unit
+        // tests). Never probe synchronously here — `Process.run`'s
+        // `waitUntilExit` pumps a CFRunLoop while waiting, which
+        // re-enters SwiftUI mid-`@StateObject` update on the macOS-26
+        // CI runner and trips AttributeGraph's "setting value during
+        // update" abort. Services owns the async probe; we subscribe
+        // below to pick up the resolved path when it lands so tabs
+        // spawned later still get a real `claude`.
+        if let services {
+            self.resolvedClaudePath = services.resolvedClaudePath
         } else {
             self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
-                ?? Self.runWhich(binary: "claude")
         }
 
         // Seed the pinned Terminals project with one "Main" tab
@@ -452,6 +464,21 @@ final class AppState: ObservableObject {
         // write a ghost empty window we'd trip over next launch.
         isInitializing = false
         scheduleSessionSave()
+
+        // Subscribe to the services' async claude-path resolution so a
+        // tab spawned via `makeSession` after the probe completes picks
+        // up the real binary. `dropFirst()` skips the synchronous
+        // replay of the current value already snapshot above.
+        // Installed at the end of init so `[weak self]` doesn't hit
+        // Swift's "self used before fully initialized" check.
+        if let services {
+            self.claudePathCancellable = services.$resolvedClaudePath
+                .dropFirst()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] path in
+                    self?.resolvedClaudePath = path
+                }
+        }
     }
 
     /// Snapshot of this window's live panes grouped by kind. Used by
@@ -1552,37 +1579,6 @@ final class AppState: ObservableObject {
         session.applySmoothScrolling(enabled: currentSmoothScrolling)
         ptySessions[tabId] = session
         return session
-    }
-
-    // MARK: - Claude binary resolution
-
-    /// Resolve `binary` via a login+interactive zsh so `.zprofile` /
-    /// `.zshrc` PATH customizations (Homebrew, nvm, `~/.local/bin`) are
-    /// applied. Nice launched from Finder/Spotlight inherits only the
-    /// macOS default PATH, so `/usr/bin/which` misses anything the user
-    /// put on PATH from their shell rc — the common case for `claude`.
-    private nonisolated static func runWhich(binary: String) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        proc.arguments = ["-ilc", "command -v -- \(binary)"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            guard proc.terminationStatus == 0 else { return nil }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let raw = String(data: data, encoding: .utf8) else { return nil }
-            // `command -v` on a shell function or alias prints the name
-            // or a definition rather than an absolute path — only accept
-            // an absolute path.
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.hasPrefix("/") else { return nil }
-            return trimmed
-        } catch {
-            return nil
-        }
     }
 
     // MARK: - Lookup
