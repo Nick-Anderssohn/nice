@@ -284,6 +284,45 @@ final class FileBrowserListingTests: XCTestCase {
                        [tempDir.lastPathComponent, "subdir", "anest", "zfile.txt"])
     }
 
+    /// Locks in the sort-parameter pass-through from `visibleOrder`
+    /// to its recursive `visit` helper to `entries`. Shift-range
+    /// selection reads `visibleOrder` with the user's current sort,
+    /// so a future refactor that drops the params from one of the
+    /// pass-through sites would silently extend selection in the
+    /// wrong order. The Selection tests can't catch it because they
+    /// pass synthetic order arrays.
+    func test_visibleOrder_passesSortParamsThroughExpandedSubdir() throws {
+        try makeDir("subdir")
+        let subdir = tempDir.appendingPathComponent("subdir")
+        let oldChild = subdir.appendingPathComponent("a_old.txt")
+        let newChild = subdir.appendingPathComponent("z_new.txt")
+        FileManager.default.createFile(atPath: oldChild.path, contents: Data())
+        FileManager.default.createFile(atPath: newChild.path, contents: Data())
+        try setModificationDate(.init(timeIntervalSince1970: 1_000_000), on: oldChild)
+        try setModificationDate(.init(timeIntervalSince1970: 2_000_000), on: newChild)
+
+        // Use the path `entries(at:)` actually produces for subdir,
+        // matching what production stores in `expandedPaths`.
+        let subdirChild = FileBrowserListing.entries(at: tempDir, showHidden: true)
+            .first { $0.lastPathComponent == "subdir" }
+        let subdirPath = try XCTUnwrap(subdirChild?.path)
+
+        let order = FileBrowserListing.visibleOrder(
+            rootPath: tempDir.path,
+            expandedPaths: [tempDir.path, subdirPath],
+            showHidden: true,
+            criterion: .dateModified,
+            ascending: false
+        )
+
+        let names = order.map { ($0 as NSString).lastPathComponent }
+        // Root, subdir, then date-desc within subdir: newer file
+        // before older file even though alpha-order disagrees.
+        XCTAssertEqual(Array(names.prefix(4)),
+                       [tempDir.lastPathComponent, "subdir", "z_new.txt", "a_old.txt"],
+                       "visibleOrder must pass criterion + ascending through to the recursive entries() call.")
+    }
+
     func test_visibleOrder_missingRoot_returnsEmpty() {
         let nonexistent = tempDir.appendingPathComponent("does-not-exist", isDirectory: true)
         let order = FileBrowserListing.visibleOrder(

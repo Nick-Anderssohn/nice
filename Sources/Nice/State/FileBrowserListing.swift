@@ -17,6 +17,23 @@
 
 import Foundation
 
+/// Sort key applied within the dirs / files buckets of a directory
+/// listing. Lives at file scope (not nested inside
+/// `FileBrowserSortSettings`) so the pure listing module doesn't have
+/// to reach into the settings type just to name the enum it
+/// dispatches on. `FileBrowserSortSettings` re-exposes it as a
+/// nested `Criterion` typealias for callers that prefer the
+/// namespaced spelling.
+enum FileBrowserSortCriterion: String, CaseIterable {
+    /// Case-insensitive lexicographic on the entry's last path
+    /// component. The default for fresh installs, matches pre-sort
+    /// versions of the file browser.
+    case name
+    /// `URLResourceValues.contentModificationDate`. Useful for "what
+    /// did I touch most recently" workflows.
+    case dateModified
+}
+
 enum FileBrowserListing {
     /// Read `url`'s children, optionally filtering hidden entries,
     /// and return them sorted dirs-first then by `criterion` /
@@ -42,7 +59,7 @@ enum FileBrowserListing {
     static func entries(
         at url: URL,
         showHidden: Bool,
-        criterion: FileBrowserSortSettings.Criterion = .name,
+        criterion: FileBrowserSortCriterion = .name,
         ascending: Bool = true
     ) -> [URL] {
         let fm = FileManager.default
@@ -88,7 +105,7 @@ enum FileBrowserListing {
         rootPath: String,
         expandedPaths: Set<String>,
         showHidden: Bool,
-        criterion: FileBrowserSortSettings.Criterion = .name,
+        criterion: FileBrowserSortCriterion = .name,
         ascending: Bool = true
     ) -> [String] {
         let rootURL = URL(fileURLWithPath: rootPath)
@@ -110,7 +127,7 @@ enum FileBrowserListing {
         into out: inout [String],
         expandedPaths: Set<String>,
         showHidden: Bool,
-        criterion: FileBrowserSortSettings.Criterion,
+        criterion: FileBrowserSortCriterion,
         ascending: Bool
     ) {
         out.append(url.path)
@@ -141,7 +158,7 @@ enum FileBrowserListing {
     private static func compareWithinBucket(
         _ lhs: URL,
         _ rhs: URL,
-        criterion: FileBrowserSortSettings.Criterion,
+        criterion: FileBrowserSortCriterion,
         ascending: Bool
     ) -> Bool {
         switch criterion {

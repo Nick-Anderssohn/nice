@@ -25,16 +25,12 @@ final class FileBrowserSortSettings: ObservableObject {
     static let criterionKey = "fileBrowser.sort.criterion"
     static let ascendingKey = "fileBrowser.sort.ascending"
 
-    /// Sort key applied within the dirs / files buckets.
-    enum Criterion: String, CaseIterable {
-        /// Case-insensitive lexicographic on the entry's last path
-        /// component. Today's behavior, kept as the default so a
-        /// fresh install reads identically to prior versions.
-        case name
-        /// `URLResourceValues.contentModificationDate`. Useful for
-        /// "what did I touch most recently" workflows.
-        case dateModified
-    }
+    /// Nested-spelling alias for the file-scope `FileBrowserSortCriterion`
+    /// enum (defined in `FileBrowserListing.swift`). The enum lives
+    /// next to the comparator that dispatches on it; this typealias
+    /// keeps `FileBrowserSortSettings.Criterion` working for callers
+    /// that prefer the namespaced form.
+    typealias Criterion = FileBrowserSortCriterion
 
     @Published var criterion: Criterion {
         didSet { defaults.set(criterion.rawValue, forKey: Self.criterionKey) }
