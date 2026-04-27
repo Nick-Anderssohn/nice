@@ -96,6 +96,18 @@ extension Pane {
             waitingAcknowledged = true
         }
     }
+
+    /// Whether this pane is currently competing for the user's attention.
+    /// Mirrors the rule the sidebar/toolbar status dots use: `.thinking`
+    /// always counts; `.waiting` counts only until the user has looked
+    /// at it (`waitingAcknowledged`); `.idle` never counts.
+    var needsAttention: Bool {
+        switch status {
+        case .thinking: return true
+        case .waiting:  return !waitingAcknowledged
+        case .idle:     return false
+        }
+    }
 }
 
 struct Tab: Identifiable, Hashable, Sendable, Codable {
@@ -135,6 +147,17 @@ extension Tab {
     var activePane: Pane? {
         guard let id = activePaneId else { return nil }
         return panes.first { $0.id == id }
+    }
+
+    /// Whether any pane in `offscreenIds` currently needs attention. Used
+    /// by the toolbar's overflow chevron to badge itself when an attention-
+    /// worthy pane has scrolled out of view. Visible panes are excluded
+    /// because their pill's own `StatusDot` already pulses for the user.
+    func hasOffscreenAttention(offscreenIds: Set<String>) -> Bool {
+        guard !offscreenIds.isEmpty else { return false }
+        return panes.contains { pane in
+            offscreenIds.contains(pane.id) && pane.needsAttention
+        }
     }
 
     /// Aggregate status shown in the sidebar dot. Derived from live
