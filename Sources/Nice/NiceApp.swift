@@ -47,6 +47,17 @@ struct NiceApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
+        // Workaround for a SwiftUI 7.3.2 / AttributeGraph 7.0.80 launch
+        // crash on macOS 26.3: SwiftUI's internal AppDelegate calls
+        // `applicationDidChangeScreenParameters` during
+        // `applicationWillFinishLaunching` and writes to its own scene
+        // graph mid-update, tripping AttributeGraph's "setting value
+        // during update" precondition. Reproducible on the GitHub
+        // Actions `macos-26` runner (1024×768 default display) and not
+        // locally. Pinning a `defaultSize` gives SwiftUI an unambiguous
+        // initial scene size so it doesn't depend on the screen-
+        // parameter computation that races its own scene init.
+        .defaultSize(width: 1200, height: 750)
 
         // ⌘, binds to this scene automatically on macOS. SettingsView
         // sets its own 640×440 frame, but we repeat it here so the
