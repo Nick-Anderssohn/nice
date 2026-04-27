@@ -781,6 +781,7 @@ private struct SidebarIconButton: View {
         .environmentObject(AppState())
         .environmentObject(Tweaks())
         .environmentObject(FontSettings())
+        .environmentObject(FileBrowserSortSettings())
         .frame(width: 240, height: 680)
 }
 

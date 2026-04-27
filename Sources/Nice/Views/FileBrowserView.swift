@@ -51,6 +51,7 @@ struct FileBrowserView: View {
 private struct FileBrowserContent: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var fontSettings: FontSettings
+    @EnvironmentObject private var sortSettings: FileBrowserSortSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -107,13 +108,16 @@ private struct FileBrowserContent: View {
                 state.rootPath = (state.rootPath as NSString).deletingLastPathComponent
             }
 
-            Text(displayPath)
-                .font(.system(size: fontSettings.sidebarSize(11), weight: .regular))
-                .foregroundStyle(Color.niceInk2(scheme, palette))
-                .lineLimit(1)
-                .truncationMode(.head)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(state.rootPath)
+            Spacer(minLength: 0)
+
+            sortCriterionMenu
+
+            SidebarSmallIconButton(
+                systemImage: sortSettings.ascending ? "arrow.up" : "arrow.down",
+                help: directionTooltip
+            ) {
+                sortSettings.ascending.toggle()
+            }
 
             SidebarSmallIconButton(
                 systemImage: state.showHidden ? "eye" : "eye.slash",
@@ -127,19 +131,55 @@ private struct FileBrowserContent: View {
         .padding(.top, 2)
     }
 
-    private var isAtFilesystemRoot: Bool {
-        state.rootPath == "/" || state.rootPath.isEmpty
+    /// Dropdown for the sort criterion. Icon reflects the active
+    /// criterion (`textformat` for Name, `clock` for Date Modified)
+    /// so the user sees the current sort without opening the menu.
+    /// Wrapped in a `Menu` styled to match `SidebarSmallIconButton`.
+    private var sortCriterionMenu: some View {
+        Menu {
+            Button {
+                sortSettings.criterion = .name
+            } label: {
+                Label("Name", systemImage: sortSettings.criterion == .name ? "checkmark" : "")
+            }
+            Button {
+                sortSettings.criterion = .dateModified
+            } label: {
+                Label("Date Modified", systemImage: sortSettings.criterion == .dateModified ? "checkmark" : "")
+            }
+        } label: {
+            Image(systemName: sortCriterionIcon)
+                .font(.system(size: fontSettings.sidebarSize(11), weight: .regular))
+                .foregroundStyle(Color.niceInk2(scheme, palette))
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Sort by…")
     }
 
-    /// Compact path display: `~/foo/bar` if under home, last 2-3
-    /// components otherwise. The tooltip carries the full path.
-    private var displayPath: String {
-        let home = NSHomeDirectory()
-        if state.rootPath == home { return "~" }
-        if state.rootPath.hasPrefix(home + "/") {
-            return "~" + state.rootPath.dropFirst(home.count)
+    private var sortCriterionIcon: String {
+        switch sortSettings.criterion {
+        case .name: return "textformat"
+        case .dateModified: return "clock"
         }
-        return state.rootPath
+    }
+
+    /// Tooltip phrased per-criterion so direction's meaning is
+    /// unambiguous — "ascending" alone reads cryptically for dates.
+    private var directionTooltip: String {
+        switch sortSettings.criterion {
+        case .name:
+            return sortSettings.ascending ? "Sort A→Z (click for Z→A)" : "Sort Z→A (click for A→Z)"
+        case .dateModified:
+            return sortSettings.ascending ? "Oldest first (click for newest)" : "Newest first (click for oldest)"
+        }
+    }
+
+    private var isAtFilesystemRoot: Bool {
+        state.rootPath == "/" || state.rootPath.isEmpty
     }
 
     // MARK: Tree
@@ -208,6 +248,7 @@ private struct FileBrowserContent: View {
 private struct FileTreeRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var fontSettings: FontSettings
+    @EnvironmentObject private var sortSettings: FileBrowserSortSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -312,6 +353,25 @@ private struct FileTreeRow: View {
             } else {
                 children = nil
             }
+        }
+        .onChange(of: sortSettings.criterion) { _, _ in
+            invalidateChildrenForSortChange()
+        }
+        .onChange(of: sortSettings.ascending) { _, _ in
+            invalidateChildrenForSortChange()
+        }
+    }
+
+    /// Same invalidation rule as `state.showHidden`: reload now if
+    /// visible, clear the cache otherwise so the next expand re-reads
+    /// in the new order. Without this, a collapsed dir's stale cache
+    /// would replay the old sort when the user re-expands.
+    private func invalidateChildrenForSortChange() {
+        guard isDirectory else { return }
+        if isExpanded {
+            reloadChildren()
+        } else {
+            children = nil
         }
     }
 
@@ -462,7 +522,9 @@ private struct FileTreeRow: View {
             let order = FileBrowserListing.visibleOrder(
                 rootPath: state.rootPath,
                 expandedPaths: state.expandedPaths,
-                showHidden: state.showHidden
+                showHidden: state.showHidden,
+                criterion: sortSettings.criterion,
+                ascending: sortSettings.ascending
             )
             selection.extend(through: path, visibleOrder: order)
             return
@@ -520,7 +582,12 @@ private struct FileTreeRow: View {
     }
 
     private func reloadChildren() {
-        children = FileBrowserListing.entries(at: url, showHidden: state.showHidden)
+        children = FileBrowserListing.entries(
+            at: url,
+            showHidden: state.showHidden,
+            criterion: sortSettings.criterion,
+            ascending: sortSettings.ascending
+        )
     }
 
     /// Minimal extension → SF Symbol mapping. Anything not listed
