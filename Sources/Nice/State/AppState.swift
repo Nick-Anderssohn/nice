@@ -2,16 +2,20 @@
 //  AppState.swift
 //  Nice
 //
-//  Central app state. Owns the long-lived pty sessions (cached in
-//  `ptySessions` keyed by tab id) and fans process-exit / title-change
-//  events back into the data model so the sidebar and toolbar can react.
+//  Per-window composition root. Holds the pure data model
+//  (`TabModel`, the projects/tabs/panes tree) and the long-lived
+//  pty/socket subsystem (`SessionsModel`); wires their callbacks
+//  together; owns the cross-cutting concerns that don't belong on
+//  either sub-model — the close-confirmation alert, sidebar UI flags,
+//  the file-browser state catalog, and the per-window persistence
+//  bookkeeping (`windowSessionId`, restore, debounced save,
+//  `claimedWindowIds`).
 //
-//  The "Terminals" group at the top of the sidebar is a regular
-//  `Project` with the reserved id `AppState.terminalsProjectId`. It is
-//  always present at index 0 and cannot be removed by the user, but its
-//  tabs are ordinary `Tab` values with terminal-only panes. On first
-//  launch the group holds one "Main" tab; users can add more via the
-//  group's `+` button, and the group may be emptied freely.
+//  Public surface is preserved as forwarders so views and unit tests
+//  keep calling `appState.tab(for:)`, `appState.selectTab(...)`,
+//  `appState.paneLaunchStates[...]`, etc. The view-side rename pass
+//  that points UI directly at the most specific sub-model is a
+//  separate Phase 2 step.
 //
 
 import AppKit
@@ -77,6 +81,13 @@ final class AppState {
     /// so persistence keeps firing on tree edits.
     let tabs: TabModel
 
+    /// Per-window pty / socket / theme-fan-out subsystem. AppState
+    /// wires its `onSessionMutation` callback to `scheduleSessionSave`
+    /// (so socket-driven mutations like in-place Claude promotion
+    /// persist) and `onTabBecameEmpty` to `finalizeDissolvedTab`
+    /// (so the dissolve cascade keeps running on the orchestrator).
+    let sessions: SessionsModel
+
     /// Forwarder for `tabs.projects` so existing call sites (views,
     /// tests) keep working unchanged. The view-side rename pass that
     /// points UI directly at `tabs.projects` is a separate step.
@@ -91,6 +102,7 @@ final class AppState {
         get { tabs.activeTabId }
         set { tabs.activeTabId = newValue }
     }
+
     /// Whether the sidebar is collapsed. Seeded from the per-window
     /// `@SceneStorage` value by the owning view so each window keeps
     /// its own state; the view writes back on changes.
@@ -144,9 +156,7 @@ final class AppState {
     }
 
     /// Title to show at the top of the file browser for `tabId`.
-    /// Forwarder onto `TabModel.fileBrowserHeaderTitle` — view-side
-    /// callers go through AppState today; the rename pass will point
-    /// them at `tabs` directly.
+    /// Forwarder onto `TabModel.fileBrowserHeaderTitle`.
     func fileBrowserHeaderTitle(forTab id: String) -> String {
         tabs.fileBrowserHeaderTitle(forTab: id)
     }
@@ -158,18 +168,7 @@ final class AppState {
         sidebarPeeking = false
     }
 
-    // MARK: - Process plumbing
-
-    private(set) var ptySessions: [String: TabPtySession] = [:]
-
-    /// Launch state per pane, used to overlay a "Launching…" placeholder
-    /// while a freshly-spawned child is still silent. Entries are created
-    /// by `registerPaneLaunch` at spawn time (`.pending`), flip to
-    /// `.visible` if the child stays quiet for more than 0.75 s, and are
-    /// cleared on first pty byte or pane exit. The 0.75 s grace window
-    /// exists so fast-starting processes (regular `claude`, a plain
-    /// shell) never flash the overlay — the common case is uninterrupted.
-    private(set) var paneLaunchStates: [String: PaneLaunchStatus] = [:]
+    // MARK: - Window-state plumbing
 
     /// In-flight "processes still running" confirmation. Set by
     /// `requestClosePane` / `requestCloseTab` / `requestCloseProject`
@@ -210,67 +209,11 @@ final class AppState {
     @ObservationIgnored
     private let persistenceEnabled: Bool
 
-    /// Tracks the SwiftUI `ColorScheme` currently showing. New sessions
-    /// are themed at creation using this.
-    @ObservationIgnored
-    private var currentScheme: ColorScheme = .dark
-
-    /// Tracks the active chrome `Palette` (nice | macOS). New sessions
-    /// are themed at creation using this alongside `currentScheme`.
-    @ObservationIgnored
-    private var currentPalette: Palette = .nice
-
-    /// Tracks the user's active accent as an `NSColor`, used to paint
-    /// the terminal caret so the blinking cursor matches the app tint.
-    /// Seeded with terracotta; `updateScheme` overwrites on every call.
-    @ObservationIgnored
-    private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
-
-    /// Tracks the user's terminal font size. New sessions pick this up
-    /// at creation; `updateTerminalFontSize` fans changes out to every
-    /// live `TabPtySession`.
-    @ObservationIgnored
-    private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
-
-    /// Tracks the terminal theme that every live pane is currently
-    /// painted with. Seeded from Nice's built-in dark default so new
-    /// sessions created before `updateTerminalTheme` runs still get
-    /// sensible colors. `AppShellHost` calls `updateTerminalTheme`
-    /// eagerly on first appear, so this only acts as a fallback.
-    @ObservationIgnored
-    private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
-
-    /// Tracks the user-chosen terminal font family. `nil` => default
-    /// chain (SF Mono → JetBrains Mono NL → system monospaced).
-    @ObservationIgnored
-    private var currentTerminalFontFamily: String? = nil
-
-    /// Absolute path to the `claude` binary if we've resolved it; nil
-    /// falls back to zsh inside claude panes. Mirrors
-    /// `services.resolvedClaudePath` and is updated by re-arming
-    /// `withObservationTracking` when the async probe completes.
-    @ObservationIgnored
-    private var resolvedClaudePath: String?
-
-    /// Toggled true once `trackClaudePath` has armed its first
-    /// observation closure for this AppState's services. Prevents
-    /// re-arming when there's no live services pointer.
+    /// Live `NiceServices` pointer (weak) used by `start()` to read
+    /// `zdotdirPath` / `resolvedClaudePath` and by `armClaudePathTracking`
+    /// to mirror async path resolution into `SessionsModel`.
     @ObservationIgnored
     private weak var trackedServices: NiceServices?
-
-    // MARK: - Control socket
-
-    @ObservationIgnored
-    private var controlSocket: NiceControlSocket?
-    /// Process-wide ZDOTDIR path owned by `NiceServices`. Stored here
-    /// so terminal-pane spawns can inject it as an env var without
-    /// reaching back through the services reference. Never deleted by
-    /// this AppState — the owning `NiceServices` cleans it up at app
-    /// terminate.
-    @ObservationIgnored
-    private var zdotdirPath: String?
-    @ObservationIgnored
-    private var controlSocketExtraEnv: [String: String] = [:]
 
     /// File-browser context-menu services. Set at init time —
     /// production passes the shared instances from `NiceServices`,
@@ -330,58 +273,65 @@ final class AppState {
 
         let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
 
+        // Build the data model first (its init seeds the Terminals
+        // project + Main tab) and then the sessions subsystem which
+        // holds a weak pointer back to the model.
+        self.tabs = TabModel(initialMainCwd: resolvedMainCwd)
+        self.sessions = SessionsModel(tabs: tabs)
+        self.trackedServices = services
+
         // Seed scheme / palette / accent / terminal-theme / font
         // family from `Tweaks` so the very first `makeSession` call
         // (for the Terminals tab, in `start()`) paints with the user's
         // real preferences. Without this seeding the session is themed
-        // against the defaults above (.dark / .nice / terracotta)
-        // and only repainted when `AppShellView.onAppear` broadcasts
-        // `updateScheme` / `updateTerminalTheme` — a visible flash
-        // on launch, and a stubborn mis-theme for chrome-coupled
-        // Nice Defaults because their bg/fg derivation reads the
-        // session's stale palette.
+        // against `SessionsModel`'s defaults (.dark / .nice /
+        // terracotta) and only repainted when `AppShellView.onAppear`
+        // broadcasts `updateScheme` / `updateTerminalTheme` — a
+        // visible flash on launch, and a stubborn mis-theme for
+        // chrome-coupled Nice Defaults because their bg/fg derivation
+        // reads the session's stale palette.
         if let tweaks = services?.tweaks {
-            self.currentScheme = tweaks.scheme
-            self.currentPalette = tweaks.activeChromePalette
-            self.currentAccent = tweaks.accent.nsColor
-            self.currentTerminalFontFamily = tweaks.terminalFontFamily
+            sessions.updateScheme(
+                tweaks.scheme,
+                palette: tweaks.activeChromePalette,
+                accent: tweaks.accent.nsColor
+            )
+            sessions.updateTerminalFontFamily(tweaks.terminalFontFamily)
             if let catalog = services?.terminalThemeCatalog {
-                self.currentTerminalTheme = tweaks.effectiveTerminalTheme(
-                    for: tweaks.scheme,
-                    catalog: catalog
+                sessions.updateTerminalTheme(
+                    tweaks.effectiveTerminalTheme(
+                        for: tweaks.scheme,
+                        catalog: catalog
+                    )
                 )
             }
         }
-        self.currentTerminalFontSize = services?.fontSettings.terminalFontSize
-            ?? FontSettings.defaultTerminalSize
+        if let fontSize = services?.fontSettings.terminalFontSize {
+            sessions.updateTerminalFontSize(fontSize)
+        }
 
         // Preview / unit-test path: `services == nil` means `start()`
         // is unlikely to be called, so seed `NICE_CLAUDE_OVERRIDE`
         // here. Production reads `services.resolvedClaudePath` in
         // `start()` (after `services.bootstrap()` has populated it).
         if services == nil {
-            self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
+            sessions.setResolvedClaudePath(
+                ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
+            )
         }
 
-        // Seed the pinned Terminals project with one "Main" tab
-        // hosting a single terminal pane. The pty session itself is
-        // spawned in `start()` so the init is side-effect free.
-        self.tabs = TabModel(initialMainCwd: resolvedMainCwd)
-
-        // Stash the services pointer (weak) so `start()` can read
-        // `zdotdirPath` / `resolvedClaudePath` and arm claude-path
-        // tracking. Doubles as the "services available?" flag for
-        // `armClaudePathTracking`.
-        self.trackedServices = services
-
-        // Wire tree-mutation save fan-out. `scheduleSessionSave` is
-        // gated by `isInitializing` and `persistenceEnabled`, so it's
-        // safe for `tabs` to fire this callback synchronously during
-        // init (e.g. from `activeTabId`'s `didSet`). Set after the
-        // model is built so the very-first seed assignment doesn't
-        // bounce through a partially-initialized AppState.
+        // Wire callbacks last so any `didSet` triggered during seed
+        // assignment above bounces through a fully-constructed AppState
+        // where `scheduleSessionSave`'s `isInitializing` /
+        // `persistenceEnabled` gates are honored.
         self.tabs.onTreeMutation = { [weak self] in
             self?.scheduleSessionSave()
+        }
+        self.sessions.onSessionMutation = { [weak self] in
+            self?.scheduleSessionSave()
+        }
+        self.sessions.onTabBecameEmpty = { [weak self] tabId, pi, ti in
+            self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
         }
     }
 
@@ -408,9 +358,10 @@ final class AppState {
         // `services.bootstrap()` has populated them. Tests with
         // `services == nil` rely on the env-var override seeded in
         // `init`.
+        var zdotdirPath: String?
         if let services = trackedServices {
-            self.zdotdirPath = services.zdotdirPath
-            self.resolvedClaudePath = services.resolvedClaudePath
+            zdotdirPath = services.zdotdirPath
+            sessions.setResolvedClaudePath(services.resolvedClaudePath)
         }
 
         // Allocate the control socket *before* spawning any ptys —
@@ -418,44 +369,16 @@ final class AppState {
         // or the `claude()` shadow can't reach us. Each window owns
         // its own socket so a `claude` invocation in one window's
         // Main Terminal only opens a tab in that window.
-        let socket = NiceControlSocket()
-        self.controlSocket = socket
-
-        var extraEnv: [String: String] = [:]
-        extraEnv["NICE_SOCKET"] = socket.path
-        if let zdotdirPath {
-            extraEnv["ZDOTDIR"] = zdotdirPath
-        }
-        self.controlSocketExtraEnv = extraEnv
+        sessions.bootstrapSocket(zdotdirPath: zdotdirPath)
 
         // Spawn the seed Main terminal pty. `restoreSavedWindow`
         // below may dissolve and rebuild this if a snapshot exists —
         // that's the existing choreography and is preserved here.
         if let mainTab = tabs.projects.first(where: { $0.id == TabModel.terminalsProjectId })?.tabs.first {
-            _ = makeSession(for: mainTab.id, cwd: mainTab.cwd)
+            _ = sessions.makeSession(for: mainTab.id, cwd: mainTab.cwd)
         }
 
-        do {
-            try socket.start { [weak self] message in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    switch message {
-                    case let .claude(cwd, args, tabId, paneId, reply):
-                        self.handleClaudeSocketRequest(
-                            cwd: cwd, args: args,
-                            tabId: tabId, paneId: paneId,
-                            reply: reply
-                        )
-                    case let .sessionUpdate(paneId, sessionId):
-                        self.handleClaudeSessionUpdate(
-                            paneId: paneId, sessionId: sessionId
-                        )
-                    }
-                }
-            }
-        } catch {
-            NSLog("AppState: control socket failed to bind: \(error)")
-        }
+        sessions.startSocketListener()
 
         // Restore runs after the control socket is up so respawned
         // tabs can reach it if they spawn children via the shadow.
@@ -483,7 +406,7 @@ final class AppState {
     }
 
     /// Re-arm a one-shot observation closure that mirrors
-    /// `services.resolvedClaudePath` into our local cache. The
+    /// `services.resolvedClaudePath` into `SessionsModel`'s cache. The
     /// `onChange` handler fires once per mutation and must re-call
     /// this method to stay subscribed for the next change. Bails out
     /// if `trackedServices` has been released — covers the deinit
@@ -496,7 +419,7 @@ final class AppState {
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, let services = self.trackedServices else { return }
-                self.resolvedClaudePath = services.resolvedClaudePath
+                self.sessions.setResolvedClaudePath(services.resolvedClaudePath)
                 self.armClaudePathTracking()
             }
         }
@@ -505,21 +428,9 @@ final class AppState {
     /// Snapshot of this window's live panes grouped by kind. Used by
     /// the quit / window-close confirmation alerts to word the prompt
     /// ("N Claude sessions and M terminals") without exposing the model
-    /// to callers outside AppState.
+    /// to callers outside AppState. Forwarder onto `TabModel`.
     var livePaneCounts: (claude: Int, terminal: Int) {
-        var claude = 0
-        var terminal = 0
-        for project in projects {
-            for tab in project.tabs {
-                for pane in tab.panes where pane.isAlive {
-                    switch pane.kind {
-                    case .claude: claude += 1
-                    case .terminal: terminal += 1
-                    }
-                }
-            }
-        }
-        return (claude, terminal)
+        tabs.livePaneCounts
     }
 
     /// Stop every resource this window owns. Called by
@@ -538,12 +449,7 @@ final class AppState {
             SessionStore.shared.flush()
         }
 
-        for session in ptySessions.values {
-            session.terminateAll()
-        }
-        ptySessions.removeAll()
-        controlSocket?.stop()
-        controlSocket = nil
+        sessions.tearDown()
         // Release the session-id claim so a future window in this
         // process isn't prevented from adopting this (now-closed)
         // slot if the user wants to "reopen" it.
@@ -558,308 +464,107 @@ final class AppState {
         tabs.selectTab(id)
     }
 
-    /// Pick which pane is focused in `tabId`. No-op if `paneId` isn't a
-    /// pane on the tab.
+    /// Pick which pane is focused in `tabId`. Forwarder onto
+    /// `SessionsModel.setActivePane`.
     func setActivePane(tabId: String, paneId: String) {
-        let viewing = activeTabId == tabId
-        tabs.mutateTab(id: tabId) { tab in
-            guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
-                return
-            }
-            tab.activePaneId = paneId
-            if viewing {
-                tab.panes[pi].markAcknowledgedIfWaiting()
-            }
-        }
-        ensureActivePaneSpawned(tabId: tabId)
-    }
-
-    /// Spawn the active pane's PTY if it was deferred at tab creation.
-    /// The companion terminal in Claude tabs is modelled up front but its
-    /// shell isn't started until the user first switches to it (via click,
-    /// keyboard shortcut, or auto-focus after the Claude pane exits).
-    private func ensureActivePaneSpawned(tabId: String) {
-        guard let tab = tabs.tab(for: tabId),
-              let paneId = tab.activePaneId,
-              let pane = tab.panes.first(where: { $0.id == paneId }),
-              pane.kind == .terminal,
-              let session = ptySessions[tabId],
-              session.panes[paneId] == nil
-        else { return }
-        _ = session.addTerminalPane(
-            id: paneId, cwd: tabs.resolvedSpawnCwd(for: tab, pane: pane)
-        )
+        sessions.setActivePane(tabId: tabId, paneId: paneId)
     }
 
     // MARK: - Tab creation
 
     /// Open a new tab rooted at `cwd`, running `claude` with any `args`
-    /// forwarded through. Called from the control socket's `newtab`
-    /// handler when a zsh shadow's `claude` fires.
+    /// forwarded through. Forwarder onto `SessionsModel`.
     func createTabFromMainTerminal(cwd: String, args: [String]) {
-        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
-        let title: String = {
-            guard !args.isEmpty else { return "New tab" }
-            let joined = args.joined(separator: " ")
-            let trimmed = String(joined.prefix(40))
-                .trimmingCharacters(in: .whitespaces)
-            return trimmed.isEmpty ? "New tab" : trimmed
-        }()
-        let claudePaneId = "\(newId)-claude"
-        let terminalPaneId = "\(newId)-t1"
-        // Pre-mint the session UUID so we can pass --session-id to
-        // claude and persist the same id for later --resume.
-        let sessionId = UUID().uuidString.lowercased()
-        var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
-        claudePane.isClaudeRunning = true
-
-        // If the user ran `claude -w <name>`, the Claude CLI creates
-        // (and runs inside) a worktree at
-        // `<cwd>/.claude/worktrees/<name>`. Keep `projectPath` pointing
-        // at the original $PWD so sidebar bucketing still lands under
-        // the parent project, and store the worktree path in `Tab.cwd`
-        // so the companion terminal follows the session in.
-        let projectPath = cwd
-        let sessionCwd: String = {
-            guard let name = TabModel.extractWorktreeName(from: args) else { return cwd }
-            // Claude sanitizes `/` to `+` when deriving the on-disk
-            // directory name from the `-w` value (so `foo/bar` becomes
-            // `foo+bar`). Mirror that here so the companion terminal
-            // lands in the same directory Claude actually created.
-            let sanitized = name.replacingOccurrences(of: "/", with: "+")
-            return (cwd as NSString).appendingPathComponent(".claude/worktrees/\(sanitized)")
-        }()
-
-        let tab = Tab(
-            id: newId,
-            title: title,
-            cwd: sessionCwd,
-            branch: nil,
-            panes: [
-                claudePane,
-                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
-            ],
-            activePaneId: claudePaneId,
-            claudeSessionId: sessionId
-        )
-
-        tabs.addTabToProjects(tab, cwd: projectPath)
-        activeTabId = newId
-        // The companion terminal pane is modelled up front so its pill
-        // renders in the toolbar, but its PTY is deferred until the user
-        // first focuses it — see `ensureActivePaneSpawned`.
-        // Claude pane still launches from `projectPath` so `exec claude
-        // -w <name>` continues to resolve/create the worktree itself.
-        _ = makeSession(
-            for: newId, cwd: projectPath,
-            extraClaudeArgs: args,
-            initialClaudePaneId: claudePaneId,
-            initialTerminalPaneId: nil,
-            claudeSessionMode: .new(id: sessionId)
-        )
-        scheduleSessionSave()
-    }
-
-    /// Handle a `claude` invocation from a pane's zsh wrapper. The
-    /// wrapper is blocked reading a single-line reply from the socket;
-    /// we must call `reply` exactly once. Three outcomes:
-    ///
-    /// - "newtab": no promotion candidate (the sending tab lives in
-    ///   the pinned Terminals group, unknown tabId, or the target
-    ///   sidebar tab already has a live Claude). Open a fresh sidebar
-    ///   tab via `createTabFromMainTerminal`.
-    /// - "inplace": promote the sending pane — flip its kind to
-    ///   `.claude` and mark it running. The wrapper `exec`s claude
-    ///   with the user's args as-is (they already contain `--resume`
-    ///   or `--session-id`).
-    /// - "inplace <uuid>": same promotion, but mint a new session id
-    ///   so we can later resume it. The wrapper prepends
-    ///   `--session-id <uuid>`.
-    private func handleClaudeSocketRequest(
-        cwd: String,
-        args: [String],
-        tabId: String,
-        paneId: String,
-        reply: @Sendable (String) -> Void
-    ) {
-        // No/unknown tabId, or the request came from a tab in the
-        // pinned Terminals group: always open a new sidebar tab.
-        guard !tabId.isEmpty,
-              !tabs.isTerminalsProjectTab(tabId),
-              let existingTab = tabs.tab(for: tabId),
-              existingTab.panes.contains(where: { $0.id == paneId })
-        else {
-            reply("newtab")
-            self.createTabFromMainTerminal(cwd: cwd, args: args)
-            return
-        }
-
-        // Sidebar tab already has a running Claude: spawn-in-place
-        // would create a second Claude pane in this tab, violating
-        // the "at most one Claude pane per tab" invariant. Open a
-        // new tab instead.
-        if existingTab.panes.contains(where: { $0.isClaudeRunning }) {
-            reply("newtab")
-            self.createTabFromMainTerminal(cwd: cwd, args: args)
-            return
-        }
-
-        // Promotion path. Extract --resume/--session-id from args if
-        // present (e.g. the pre-typed `claude --resume <uuid>` on a
-        // restored tab); otherwise mint a fresh session id so we can
-        // persist it for next relaunch.
-        let parsedId = TabModel.extractClaudeSessionId(from: args)
-        let sessionId = parsedId ?? UUID().uuidString.lowercased()
-
-        tabs.mutateTab(id: tabId) { tab in
-            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
-                return
-            }
-            tab.panes[idx].kind = .claude
-            tab.panes[idx].isClaudeRunning = true
-            // Let the upcoming OSC title from claude set the real label;
-            // seed with "Claude" so the pill doesn't render stale text.
-            tab.panes[idx].title = "Claude"
-            tab.activePaneId = paneId
-            tab.claudeSessionId = sessionId
-        }
-        scheduleSessionSave()
-
-        if parsedId != nil {
-            reply("inplace")
-        } else {
-            reply("inplace \(sessionId)")
-        }
+        sessions.createTabFromMainTerminal(cwd: cwd, args: args)
     }
 
     // MARK: - Theme
 
+    /// Forwarder onto `SessionsModel.updateScheme`.
     func updateScheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
-        currentScheme = scheme
-        currentPalette = palette
-        currentAccent = accent
-        for session in ptySessions.values {
-            session.applyTheme(scheme, palette: palette, accent: accent)
-        }
+        sessions.updateScheme(scheme, palette: palette, accent: accent)
     }
 
-    /// Fan a new terminal font size out to every live session. Called
-    /// by `AppShellHost` on launch and whenever `FontSettings.terminalFontSize`
-    /// changes (slider drag or Cmd+/-).
+    /// Forwarder onto `SessionsModel.updateTerminalFontSize`.
     func updateTerminalFontSize(_ size: CGFloat) {
-        currentTerminalFontSize = size
-        for session in ptySessions.values {
-            session.applyTerminalFont(size: size)
-        }
+        sessions.updateTerminalFontSize(size)
     }
 
-    /// Fan out a terminal-theme change to every live session. Called by
-    /// `AppShellHost` when the user picks a new theme in Settings, when
-    /// the active scheme flips (sync-with-OS), or when an imported
-    /// theme is removed while selected.
+    /// Forwarder onto `SessionsModel.updateTerminalTheme`.
     func updateTerminalTheme(_ theme: TerminalTheme) {
-        currentTerminalTheme = theme
-        for session in ptySessions.values {
-            session.applyTerminalTheme(theme)
-        }
+        sessions.updateTerminalTheme(theme)
     }
 
-    /// Fan out a terminal-font-family change. `nil` resets to the
-    /// default chain defined in `TabPtySession.terminalFont(named:size:)`.
+    /// Forwarder onto `SessionsModel.updateTerminalFontFamily`.
     func updateTerminalFontFamily(_ name: String?) {
-        currentTerminalFontFamily = name
-        for session in ptySessions.values {
-            session.applyTerminalFontFamily(name)
-        }
+        sessions.updateTerminalFontFamily(name)
     }
 
-    // MARK: - Launch overlay
+    // MARK: - Launch overlay / pty cache (forwarders)
 
-    /// Seam for the pending → visible grace window. Unit tests set this
-    /// to 0 so promotion is synchronous.
-    var launchOverlayGraceSeconds: Double = 0.75
+    /// Read-only forwarder for `SessionsModel.ptySessions`. Views
+    /// (`AppShellView`'s focus restoration path) and tests
+    /// (`AppStateProjectBucketingTests`) read this.
+    var ptySessions: [String: TabPtySession] {
+        sessions.ptySessions
+    }
 
-    /// Record that a pane was just spawned and start the grace timer. If
-    /// `clearPaneLaunch` is called before the timer fires (first byte
-    /// arrived, or the pane exited) the overlay never appears. If the
-    /// timer fires first the entry is promoted to `.visible` and
-    /// `AppShellView` starts rendering the "Launching…" overlay.
+    /// Read-only forwarder for `SessionsModel.paneLaunchStates`.
+    /// `AppShellView` binds the launch overlay to per-pane entries.
+    var paneLaunchStates: [String: PaneLaunchStatus] {
+        sessions.paneLaunchStates
+    }
+
+    /// Test seam — forwarder onto `SessionsModel.launchOverlayGraceSeconds`.
+    var launchOverlayGraceSeconds: Double {
+        get { sessions.launchOverlayGraceSeconds }
+        set { sessions.launchOverlayGraceSeconds = newValue }
+    }
+
+    /// Forwarder onto `SessionsModel.registerPaneLaunch`.
     func registerPaneLaunch(paneId: String, command: String) {
-        paneLaunchStates[paneId] = .pending(command: command)
-        let grace = launchOverlayGraceSeconds
-        let promote: @MainActor () -> Void = { [weak self] in
-            guard let self,
-                  case .pending(let cmd)? = self.paneLaunchStates[paneId]
-            else { return }
-            self.paneLaunchStates[paneId] = .visible(command: cmd)
-        }
-        if grace <= 0 {
-            promote()
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + grace, execute: promote)
-        }
+        sessions.registerPaneLaunch(paneId: paneId, command: command)
     }
 
-    /// Remove any pending or visible overlay for this pane. Called from
-    /// `NiceTerminalView.onFirstData` on first pty byte and from
-    /// `paneExited` so a process that dies before emitting anything
-    /// doesn't leave an orphan entry.
+    /// Forwarder onto `SessionsModel.clearPaneLaunch`.
     func clearPaneLaunch(paneId: String) {
-        paneLaunchStates[paneId] = nil
+        sessions.clearPaneLaunch(paneId: paneId)
     }
 
     // MARK: - Lifecycle handlers
 
-    /// A pane exited. Remove it from its tab, pick a neighbor to focus,
-    /// and dissolve the tab if nothing remains. If the last tab in any
-    /// project empties out (including the pinned Terminals group), the
-    /// project stays in place but its tab list goes to zero — the user
-    /// re-adds from the sidebar `+`. If every project is empty after
-    /// the dissolve, terminate the app.
+    /// Forwarder onto `SessionsModel.paneExited`. Tests call this
+    /// directly to drive the dispatch path without standing up a real
+    /// pty.
     func paneExited(tabId: String, paneId: String, exitCode: Int32?) {
-        clearPaneLaunch(paneId: paneId)
-        tabs.mutateTab(id: tabId) { tab in
-            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
-                return
-            }
-            tab.panes.remove(at: idx)
-            if tab.activePaneId == paneId {
-                if idx < tab.panes.count {
-                    tab.activePaneId = tab.panes[idx].id
-                } else if idx > 0 {
-                    tab.activePaneId = tab.panes[idx - 1].id
-                } else {
-                    tab.activePaneId = nil
-                }
-            }
-        }
+        sessions.paneExited(tabId: tabId, paneId: paneId, exitCode: exitCode)
+    }
 
-        ptySessions[tabId]?.removePane(id: paneId)
-        // If focus auto-switched onto the lazily-spawned companion
-        // terminal as a result of this exit, start its shell now.
-        ensureActivePaneSpawned(tabId: tabId)
+    /// Forwarder onto `SessionsModel.paneTitleChanged`.
+    func paneTitleChanged(tabId: String, paneId: String, title: String) {
+        sessions.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
+    }
 
-        guard let (pi, ti) = tabs.projectTabIndex(for: tabId),
-              tabs.projects[pi].tabs[ti].panes.isEmpty
-        else { return }
-
-        finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+    /// Forwarder onto `SessionsModel.paneCwdChanged`.
+    func paneCwdChanged(tabId: String, paneId: String, cwd: String) {
+        sessions.paneCwdChanged(tabId: tabId, paneId: paneId, cwd: cwd)
     }
 
     /// Finish tearing down a tab whose panes array has gone to zero:
     /// drop it from its project, release the pty session, reassign
     /// `activeTabId` if it was focused, and drop the project row
     /// itself when the user asked to close the whole project. Called
-    /// from `paneExited` after an async pane exit empties the panes
-    /// list, and from `hardKillTab` when every pane was unspawned and
-    /// there's no async exit to wait on.
+    /// by `SessionsModel.paneExited` (via the `onTabBecameEmpty`
+    /// callback) after an async pane exit empties the panes list, and
+    /// from `hardKillTab` when every pane was unspawned and there's no
+    /// async exit to wait on.
     private func finalizeDissolvedTab(
         projectIndex pi: Int,
         tabIndex ti: Int,
         tabId: String
     ) {
         tabs.projects[pi].tabs.remove(at: ti)
-        ptySessions.removeValue(forKey: tabId)
+        sessions.removePtySession(tabId: tabId)
         fileBrowserStore.removeState(forTab: tabId)
         if activeTabId == tabId {
             activeTabId = tabs.firstAvailableTabId()
@@ -891,207 +596,33 @@ final class AppState {
         tabs.firstAvailableTabId()
     }
 
-    /// A pane emitted a window-title update via OSC 0/1/2. Claude panes
-    /// encode thinking/waiting as a leading braille-spinner or asterisk;
-    /// the trailing text is the session label (e.g. "fix-top-bar-height")
-    /// which becomes the sidebar tab title. The claude-pane pill itself
-    /// stays pinned to "Claude". Terminal panes take the emitted title
-    /// verbatim as their toolbar pill label.
-    func paneTitleChanged(tabId: String, paneId: String, title: String) {
-        guard let tab = tabs.tab(for: tabId),
-              let pane = tab.panes.first(where: { $0.id == paneId })
-        else { return }
-
-        if pane.kind == .terminal {
-            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            let clipped: String = {
-                guard trimmed.count > 40 else { return trimmed }
-                let idx = trimmed.index(trimmed.startIndex, offsetBy: 40)
-                return String(trimmed[..<idx]).trimmingCharacters(in: .whitespaces)
-            }()
-            tabs.mutateTab(id: tabId) { tab in
-                guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
-                    return
-                }
-                if tab.panes[pi].title != clipped {
-                    tab.panes[pi].title = clipped
-                }
-            }
-            return
-        }
-
-        // Claude pane: split off the status prefix, update pane/tab
-        // status, and feed the trailing label into the tab title.
-        guard let first = title.unicodeScalars.first else { return }
-        let newStatus: TabStatus?
-        let labelStart: String.Index
-        if first.value >= 0x2800 && first.value <= 0x28FF {
-            // Braille-spinner prefix: Claude is thinking.
-            newStatus = .thinking
-            labelStart = title.index(after: title.startIndex)
-        } else if first == "\u{2733}" {
-            // Sparkle: Claude is waiting for input.
-            newStatus = .waiting
-            labelStart = title.index(after: title.startIndex)
-        } else {
-            newStatus = nil
-            labelStart = title.startIndex
-        }
-
-        if let newStatus {
-            let viewing = (activeTabId == tabId)
-            tabs.mutateTab(id: tabId) { tab in
-                guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
-                    return
-                }
-                let isActivePane = (tab.activePaneId == paneId)
-                tab.panes[pi].applyStatusTransition(
-                    to: newStatus,
-                    isCurrentlyBeingViewed: viewing && isActivePane
-                )
-            }
-        }
-
-        let rawLabel = title[labelStart...]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawLabel.isEmpty else { return }
-        // Ignore Claude's generic placeholder before a session is named.
-        if rawLabel == "Claude Code" { return }
-        tabs.applyAutoTitle(tabId: tabId, rawTitle: rawLabel)
-    }
-
-    /// A pane's shell emitted OSC 7 with a new working directory. Stash
-    /// it on `Pane.cwd` so a relaunch respawns the pane in the same
-    /// place. Persistence is debounced inside `SessionStore`, so naive
-    /// save-on-every-update is cheap. We deliberately don't touch
-    /// `Tab.cwd` — that field is load-bearing for `claude --resume`'s
-    /// working dir on Claude tabs, and overwriting it from a companion
-    /// terminal's cwd would silently relocate the session on restore.
-    func paneCwdChanged(tabId: String, paneId: String, cwd: String) {
-        var changed = false
-        tabs.mutateTab(id: tabId) { tab in
-            guard let pi = tab.panes.firstIndex(where: { $0.id == paneId })
-            else { return }
-            if tab.panes[pi].cwd != cwd {
-                tab.panes[pi].cwd = cwd
-                changed = true
-            }
-        }
-        if changed {
-            scheduleSessionSave()
-        }
-    }
-
-    /// Forwarder onto `TabModel.applyAutoTitle`. Kept on AppState so
-    /// any external caller (and the existing internal call from
-    /// `paneTitleChanged` before its own move) keeps working.
+    /// Forwarder onto `TabModel.applyAutoTitle`.
     func applyAutoTitle(tabId: String, rawTitle: String) {
         tabs.applyAutoTitle(tabId: tabId, rawTitle: rawTitle)
     }
 
-    /// Hand AppKit first-responder status back to the active pane's
-    /// terminal view. Call after any SwiftUI control (e.g. the sidebar
-    /// rename field) finishes editing — SwiftUI does not restore focus
-    /// to an embedded `NSView` when a TextField is torn down, so keys
-    /// fall off the responder chain until the user clicks the terminal.
-    /// The async hop lets SwiftUI finish its current update before the
-    /// responder change, matching the pattern in `TerminalHost`.
+    /// Forwarder onto `SessionsModel.focusActiveTerminal`.
     func focusActiveTerminal() {
-        guard let tabId = activeTabId,
-              let tab = tabs.tab(for: tabId),
-              let paneId = tab.activePaneId,
-              let session = ptySessions[tabId],
-              let view = session.panes[paneId]
-        else { return }
-        view.wantsFocusOnAttach = true
-        DispatchQueue.main.async {
-            view.window?.makeFirstResponder(view)
-        }
+        sessions.focusActiveTerminal()
     }
 
-    /// Forwarder onto `TabModel.renameTab`. Views call
-    /// `appState.renameTab(...)` from the sidebar inline editor; the
-    /// rename pass will eventually point them at `tabs` directly.
+    /// Forwarder onto `TabModel.renameTab`.
     func renameTab(id tabId: String, to newTitle: String) {
         tabs.renameTab(id: tabId, to: newTitle)
     }
 
     /// Append a new terminal-only tab to the pinned Terminals group,
-    /// focus it, and spawn its pty. Used by the sidebar's group-level
-    /// `+` button. First tab added to an empty group is titled "Main";
-    /// subsequent tabs are auto-numbered "Main 2", "Main 3", etc.
-    /// Cwd inherits the Terminals project's path.
+    /// focus it, and spawn its pty. Forwarder onto `SessionsModel`.
     @discardableResult
     func createTerminalTab() -> String? {
-        guard let pi = tabs.projects.firstIndex(where: { $0.id == TabModel.terminalsProjectId }) else {
-            return nil
-        }
-        let project = tabs.projects[pi]
-        let title: String
-        if project.tabs.isEmpty {
-            title = "Main"
-        } else {
-            title = "Main \(project.tabs.count + 1)"
-        }
-        let newId = "tt\(Int(Date().timeIntervalSince1970 * 1000))"
-        let paneId = "\(newId)-p0"
-        let cwd = project.path
-        let tab = Tab(
-            id: newId,
-            title: title,
-            cwd: cwd,
-            branch: nil,
-            panes: [Pane(id: paneId, title: "zsh", kind: .terminal)],
-            activePaneId: paneId
-        )
-        tabs.projects[pi].tabs.append(tab)
-        activeTabId = newId
-        _ = makeSession(for: newId, cwd: cwd)
-        scheduleSessionSave()
-        return newId
+        sessions.createTerminalTab()
     }
 
-    /// Create a fresh Claude tab in an existing project group. Mirrors
-    /// `createTabFromMainTerminal` but targets `projectId` directly so
-    /// the sidebar's per-project `+` button can add into that project
-    /// instead of bucketing by cwd. No-op for the pinned Terminals
-    /// group (which only holds terminal tabs).
+    /// Create a fresh Claude tab in an existing project group.
+    /// Forwarder onto `SessionsModel`.
     @discardableResult
     func createClaudeTabInProject(projectId: String) -> String? {
-        guard projectId != TabModel.terminalsProjectId,
-              let pi = tabs.projects.firstIndex(where: { $0.id == projectId })
-        else { return nil }
-        let project = tabs.projects[pi]
-        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
-        let claudePaneId = "\(newId)-claude"
-        let terminalPaneId = "\(newId)-t1"
-        let sessionId = UUID().uuidString.lowercased()
-        var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
-        claudePane.isClaudeRunning = true
-        let tab = Tab(
-            id: newId,
-            title: "New tab",
-            cwd: project.path,
-            branch: nil,
-            panes: [
-                claudePane,
-                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
-            ],
-            activePaneId: claudePaneId,
-            claudeSessionId: sessionId
-        )
-        tabs.projects[pi].tabs.append(tab)
-        activeTabId = newId
-        _ = makeSession(
-            for: newId, cwd: project.path,
-            extraClaudeArgs: [],
-            initialClaudePaneId: claudePaneId,
-            initialTerminalPaneId: nil,
-            claudeSessionMode: .new(id: sessionId)
-        )
-        scheduleSessionSave()
-        return newId
+        sessions.createClaudeTabInProject(projectId: projectId)
     }
 
     /// True when `tabId` lives inside the pinned Terminals project.
@@ -1103,11 +634,7 @@ final class AppState {
     // MARK: - Pane management
 
     /// Append a new terminal pane to `tabId`, spawn its pty, and focus
-    /// it. Returns the new pane id, or nil if the tab doesn't exist.
-    ///
-    /// `command`, when set, runs that command instead of a plain login
-    /// shell (used by the File Explorer's "Open in Editor Pane" path).
-    /// On exit the pane drops via the existing `paneExited` flow.
+    /// it. Forwarder onto `SessionsModel.addPane`.
     @discardableResult
     func addPane(
         tabId: String,
@@ -1116,37 +643,12 @@ final class AppState {
         title: String? = nil,
         command: String? = nil
     ) -> String? {
-        // Only terminal kind is exposed to callers. Claude panes are
-        // created exclusively by `createTabFromMainTerminal` — this
-        // preserves the "at most one Claude pane per tab" invariant.
-        guard kind == .terminal else { return nil }
-
-        guard let tab = tabs.tab(for: tabId) else { return nil }
-        let newId = "\(tabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        let termCount = tab.panes.filter { $0.kind == .terminal }.count
-        let resolvedTitle = title ?? "Terminal \(termCount + 1)"
-
-        // Resolve the spawn cwd before mutating the tab — once we
-        // re-point `activePaneId` at the new pane below, the "spawning"
-        // pane is no longer recoverable.
-        let spawnCwd = tabs.spawnCwdForNewPane(in: tab, callerProvided: cwd)
-
-        tabs.mutateTab(id: tabId) { tab in
-            tab.panes.append(
-                Pane(id: newId, title: resolvedTitle, kind: .terminal)
-            )
-            tab.activePaneId = newId
-        }
-
-        let session: TabPtySession
-        if let existing = ptySessions[tabId] {
-            session = existing
-        } else {
-            session = makeSession(for: tabId, cwd: spawnCwd)
-        }
-        _ = session.addTerminalPane(id: newId, cwd: spawnCwd, command: command)
-        return newId
+        sessions.addPane(
+            tabId: tabId, kind: kind, cwd: cwd, title: title, command: command
+        )
     }
+
+    // MARK: - Close coordinator
 
     /// Request to close a pane. If the pane is busy — a thinking or
     /// waiting Claude, or a shell with a foreground child — stage a
@@ -1238,7 +740,7 @@ final class AppState {
             // the pre-first-title `.idle` state counts as disposable.
             return pane.status == .thinking || pane.status == .waiting
         case .terminal:
-            return ptySessions[tabId]?.shellHasForegroundChild(id: pane.id) ?? false
+            return sessions.shellHasForegroundChild(tabId: tabId, paneId: pane.id)
         }
     }
 
@@ -1253,12 +755,11 @@ final class AppState {
         // `terminatePane` sends SIGTERM and tears down the pty; the
         // usual `paneExited` delegate fires and removes the pane from
         // the model, dissolving the tab if it was the last pane.
-        ptySessions[tabId]?.terminatePane(id: paneId)
+        sessions.terminatePane(tabId: tabId, paneId: paneId)
     }
 
     private func hardKillTab(tabId: String) {
         guard let tab = tabs.tab(for: tabId) else { return }
-        let session = ptySessions[tabId]
 
         // Split panes by whether they've actually been spawned.
         // `terminatePane` is a no-op for unspawned panes (the lazy
@@ -1272,7 +773,7 @@ final class AppState {
         var spawnedIds: [String] = []
         var unspawnedIds: [String] = []
         for pane in tab.panes {
-            if session?.panes[pane.id] != nil {
+            if sessions.paneIsSpawned(tabId: tabId, paneId: pane.id) {
                 spawnedIds.append(pane.id)
             } else {
                 unspawnedIds.append(pane.id)
@@ -1280,7 +781,7 @@ final class AppState {
         }
 
         for id in spawnedIds {
-            session?.terminatePane(id: id)
+            sessions.terminatePane(tabId: tabId, paneId: id)
         }
 
         guard !unspawnedIds.isEmpty else { return }
@@ -1362,105 +863,19 @@ final class AppState {
         tabs.selectPrevSidebarTab()
     }
 
-    /// Move focus to the next pane within the active tab, wrapping. No-op
-    /// when the active tab has fewer than two panes.
-    func selectNextPane() { stepActivePane(by: +1) }
-
-    /// Move focus to the previous pane within the active tab, wrapping.
-    func selectPrevPane() { stepActivePane(by: -1) }
-
-    private func stepActivePane(by offset: Int) {
-        guard let tabId = activeTabId, let tab = tabs.tab(for: tabId) else { return }
-        guard tab.panes.count > 1, let activeId = tab.activePaneId,
-              let currentIdx = tab.panes.firstIndex(where: { $0.id == activeId })
-        else { return }
-        let nextIdx = ((currentIdx + offset) % tab.panes.count + tab.panes.count) % tab.panes.count
-        setActivePane(tabId: tabId, paneId: tab.panes[nextIdx].id)
+    /// Forwarder onto `SessionsModel.selectNextPane`.
+    func selectNextPane() {
+        sessions.selectNextPane()
     }
 
-    /// Append a new terminal pane to the active tab and focus it. No-op
-    /// when there is no active tab.
+    /// Forwarder onto `SessionsModel.selectPrevPane`.
+    func selectPrevPane() {
+        sessions.selectPrevPane()
+    }
+
+    /// Forwarder onto `SessionsModel.addTerminalToActiveTab`.
     func addTerminalToActiveTab() {
-        guard let id = activeTabId else { return }
-        _ = addPane(tabId: id, kind: .terminal)
-    }
-
-    // MARK: - Pty sessions
-
-    /// Return the pty session for `tabId`, creating and caching one if
-    /// it doesn't exist yet. Spawns initial panes based on the tab's
-    /// model state.
-    @discardableResult
-    private func makeSession(
-        for tabId: String,
-        cwd: String,
-        extraClaudeArgs: [String] = [],
-        initialClaudePaneId: String? = nil,
-        initialTerminalPaneId: String? = nil,
-        claudeSessionMode: TabPtySession.ClaudeSessionMode = .none
-    ) -> TabPtySession {
-        if let existing = ptySessions[tabId] {
-            return existing
-        }
-        let resolvedCwd = TabModel.expandTilde(cwd)
-
-        // Work out which panes to spawn. Callers can pass ids explicitly
-        // (e.g. createTabFromMainTerminal) or we infer them from the
-        // model.
-        var claudePaneId = initialClaudePaneId
-        var terminalPaneId = initialTerminalPaneId
-        if claudePaneId == nil && terminalPaneId == nil {
-            if let tab = tabs.tab(for: tabId) {
-                for pane in tab.panes {
-                    switch pane.kind {
-                    case .claude where claudePaneId == nil:
-                        claudePaneId = pane.id
-                    case .terminal where terminalPaneId == nil:
-                        terminalPaneId = pane.id
-                    default:
-                        break
-                    }
-                }
-            }
-        }
-
-        let session = TabPtySession(
-            tabId: tabId,
-            cwd: resolvedCwd,
-            claudeBinary: resolvedClaudePath,
-            extraClaudeArgs: extraClaudeArgs,
-            initialClaudePaneId: claudePaneId,
-            initialTerminalPaneId: terminalPaneId,
-            socketPath: controlSocket?.path,
-            zdotdirPath: zdotdirPath,
-            claudeSessionMode: claudeSessionMode,
-            onPaneExit: { [weak self] paneId, code in
-                self?.paneExited(tabId: tabId, paneId: paneId, exitCode: code)
-            },
-            onPaneTitleChange: { [weak self] paneId, title in
-                self?.paneTitleChanged(tabId: tabId, paneId: paneId, title: title)
-            },
-            onPaneCwdChange: { [weak self] paneId, cwd in
-                self?.paneCwdChanged(tabId: tabId, paneId: paneId, cwd: cwd)
-            },
-            onPaneLaunched: { [weak self] paneId, command in
-                self?.registerPaneLaunch(paneId: paneId, command: command)
-            },
-            onPaneFirstOutput: { [weak self] paneId in
-                self?.clearPaneLaunch(paneId: paneId)
-            }
-        )
-        session.applyTerminalFontFamily(currentTerminalFontFamily)
-        // applyTheme must run before applyTerminalTheme so the session
-        // has its current scheme / palette cached — the Nice Default
-        // (chrome-coupled) paths in applyTerminalTheme derive
-        // bg / fg from those values, and reading them stale paints
-        // the terminal with the wrong light/dark variant.
-        session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
-        session.applyTerminalTheme(currentTerminalTheme)
-        session.applyTerminalFont(size: currentTerminalFontSize)
-        ptySessions[tabId] = session
-        return session
+        sessions.addTerminalToActiveTab()
     }
 
     // MARK: - Lookup
@@ -1474,37 +889,10 @@ final class AppState {
 
     // MARK: - Session persistence
 
-    /// Handle a `session_update` socket message from Claude Code's
-    /// UserPromptSubmit hook. Looks up the tab whose pane set contains
-    /// `paneId` and forwards to `updateClaudeSessionId`. Silent no-op
-    /// if the pane is stale (exited while the hook's `nc` was in
-    /// flight) or isn't a claude pane.
-    /// `internal` so unit tests can drive the dispatch path directly
-    /// without standing up a real socket — matches `paneExited`'s
-    /// access level for the same reason.
+    /// Forwarder onto `SessionsModel.handleClaudeSessionUpdate`. Tests
+    /// drive this directly without standing up a real socket.
     func handleClaudeSessionUpdate(paneId: String, sessionId: String) {
-        guard let tabId = tabs.tabIdOwning(paneId: paneId) else { return }
-        updateClaudeSessionId(tabId: tabId, sessionId: sessionId)
-    }
-
-    /// Update `tab.claudeSessionId` when claude rotates its session
-    /// mid-process — `/clear`, `/compact`, and `/branch` all swap the
-    /// UUID without restarting the process, so the pre-minted id we
-    /// stored at tab creation goes stale. Persist the new id immediately
-    /// so an unexpected Nice shutdown still resumes the correct
-    /// conversation. No-op if the tab already has this id or no longer
-    /// exists.
-    private func updateClaudeSessionId(tabId: String, sessionId: String) {
-        var changed = false
-        tabs.mutateTab(id: tabId) { tab in
-            if tab.claudeSessionId != sessionId {
-                tab.claudeSessionId = sessionId
-                changed = true
-            }
-        }
-        if changed {
-            scheduleSessionSave()
-        }
+        sessions.handleClaudeSessionUpdate(paneId: paneId, sessionId: sessionId)
     }
 
     /// Walk projects for every Claude tab with a `claudeSessionId`,
@@ -1649,8 +1037,8 @@ final class AppState {
         // to win, not collide with the default one.
         let previousMainTabId = tabs.projects.first(where: { $0.id == TabModel.terminalsProjectId })?.tabs.first?.id
         if let mainTabId = previousMainTabId {
-            ptySessions[mainTabId]?.terminateAll()
-            ptySessions.removeValue(forKey: mainTabId)
+            sessions.terminateAll(tabId: mainTabId)
+            sessions.removePtySession(tabId: mainTabId)
         }
         tabs.projects.removeAll()
 
@@ -1701,7 +1089,7 @@ final class AppState {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 for spawn in pendingClaudeSpawns {
-                    _ = self.makeSession(
+                    _ = self.sessions.makeSession(
                         for: spawn.tabId,
                         cwd: spawn.cwd,
                         extraClaudeArgs: [],
@@ -1714,7 +1102,7 @@ final class AppState {
                     // it now too so `mainContent` has a pty to render
                     // — otherwise the restored tab opens to a blank
                     // background until the user clicks something.
-                    self.ensureActivePaneSpawned(tabId: spawn.tabId)
+                    self.sessions.ensureActivePaneSpawned(tabId: spawn.tabId)
                 }
             }
         }
@@ -1729,11 +1117,11 @@ final class AppState {
         case .existed:
             break
         case let .synthesized(tabId, cwd):
-            _ = makeSession(for: tabId, cwd: cwd)
+            _ = sessions.makeSession(for: tabId, cwd: cwd)
         }
     }
 
-    /// Append one restored tab's model to `projects[projectIndex]`.
+    /// Append one restored tab's model to `tabs.projects[projectIndex]`.
     /// Claude tabs (tabs with a `claudeSessionId`) return info so the
     /// caller can defer the pty spawn to `claude --resume`. Terminal-
     /// only tabs spawn their shell eagerly and return nil.
@@ -1793,13 +1181,13 @@ final class AppState {
         } ?? tab.panes.first(where: { $0.kind == .terminal })
         if let pane = activeTerminal {
             let paneCwd = tabs.resolvedSpawnCwd(for: tab, pane: pane)
-            _ = makeSession(
+            _ = sessions.makeSession(
                 for: tab.id,
                 cwd: paneCwd,
                 initialTerminalPaneId: pane.id
             )
         } else {
-            _ = makeSession(for: tab.id, cwd: spawnCwd)
+            _ = sessions.makeSession(for: tab.id, cwd: spawnCwd)
         }
         return nil
     }
