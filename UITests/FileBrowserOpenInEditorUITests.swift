@@ -102,7 +102,16 @@ final class FileBrowserOpenInEditorUITests: XCTestCase {
 
         let editorItem = app.menuItems["TestEditor"]
         XCTAssertTrue(editorItem.waitForExistence(timeout: 5))
-        editorItem.click()
+        // Hover the editor item itself before clicking. Without this,
+        // XCUITest clicks the snapshot frame captured while the submenu
+        // was still animating open, which on CI lands outside the
+        // item's final position once macOS auto-positions the submenu.
+        // Hovering forces a fresh layout query, and the coordinate
+        // click then targets the element's current center.
+        editorItem.hover()
+        editorItem.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
+        ).click()
 
         // Pane spawn is synchronous from the menu click down to
         // addPane; poll briefly to absorb XCUITest command-relay
