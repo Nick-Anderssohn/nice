@@ -80,6 +80,18 @@ struct WindowToolbarView: View {
 /// Scrolls horizontally through the active tab's panes, rendering each as
 /// an `InlinePanePill`. The trailing `NewTabBtn` stays pinned; it adds a
 /// terminal pane to the active tab.
+///
+/// Overflow handling: pills render at their natural width inside a
+/// horizontal `ScrollView`. When the content exceeds the visible width:
+///   • edge-fade gradients hint at offscreen content,
+///   • an `OverflowMenuButton` appears between the strip and the "+",
+///     listing every pane on the active tab,
+///   • the active pane auto-scrolls into view,
+///   • a status badge on the chevron flags any *fully offscreen* pane
+///     that needs attention (`.thinking` or unacknowledged `.waiting`).
+///
+/// Layout-identical to its predecessor when the strip fits — the chevron
+/// only renders when overflowing.
 private struct InlinePaneStrip: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var scheme
@@ -89,45 +101,81 @@ private struct InlinePaneStrip: View {
     /// (e.g. only one close "×" ever visible at a time).
     @State private var hoveredPaneId: String? = nil
 
+    /// Each pill's frame as reported in the ScrollView's named coordinate
+    /// space `paneStripCoordinateSpace`. In that space the visible
+    /// viewport is fixed at `[0, visibleWidth]` regardless of scroll
+    /// offset, so a pill is fully offscreen iff `frame.maxX <= 0` or
+    /// `frame.minX >= visibleWidth`.
+    @State private var paneFrames: [String: CGRect] = [:]
+    @State private var visibleWidth: CGFloat = 0
+
     private var activeTab: Tab? {
         guard let id = appState.activeTabId else { return nil }
         return appState.tab(for: id)
     }
 
+    /// Hidden-to-the-left iff any pill's right edge is at or past 0
+    /// while its left edge is negative.
+    private var canScrollLeading: Bool {
+        paneFrames.values.contains { $0.minX < -0.5 }
+    }
+
+    /// Hidden-to-the-right iff any pill's right edge extends past the
+    /// viewport. Guard against the initial `visibleWidth == 0` frame
+    /// before layout has run.
+    private var canScrollTrailing: Bool {
+        guard visibleWidth > 0 else { return false }
+        return paneFrames.values.contains { $0.maxX > visibleWidth + 0.5 }
+    }
+
+    private var isOverflowing: Bool {
+        canScrollLeading || canScrollTrailing
+    }
+
+    private var offscreenPaneIds: Set<String> {
+        guard visibleWidth > 0 else { return [] }
+        var ids: Set<String> = []
+        for (id, frame) in paneFrames {
+            if frame.maxX <= 0.5 || frame.minX >= visibleWidth - 0.5 {
+                ids.insert(id)
+            }
+        }
+        return ids
+    }
+
+    private func hasOffscreenAttention(in tab: Tab) -> Bool {
+        let offscreen = offscreenPaneIds
+        guard !offscreen.isEmpty else { return false }
+        return tab.panes.contains { pane in
+            guard offscreen.contains(pane.id) else { return false }
+            switch pane.status {
+            case .thinking: return true
+            case .waiting:  return !pane.waitingAcknowledged
+            case .idle:     return false
+            }
+        }
+    }
+
     var body: some View {
         HStack(spacing: 2) {
             if let tab = activeTab {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 2) {
-                        ForEach(tab.panes) { pane in
-                            InlinePanePill(
-                                pane: pane,
-                                isActive: tab.activePaneId == pane.id,
-                                isHovered: hoveredPaneId == pane.id,
-                                onHoverChange: { hovering in
-                                    if hovering {
-                                        hoveredPaneId = pane.id
-                                    } else if hoveredPaneId == pane.id {
-                                        hoveredPaneId = nil
-                                    }
-                                },
-                                onSelect: {
-                                    appState.setActivePane(
-                                        tabId: tab.id,
-                                        paneId: pane.id
-                                    )
-                                },
-                                onClose: {
-                                    appState.requestClosePane(
-                                        tabId: tab.id,
-                                        paneId: pane.id
-                                    )
-                                }
+                strip(for: tab)
+
+                if isOverflowing {
+                    OverflowMenuButton(
+                        panes: tab.panes,
+                        activePaneId: tab.activePaneId,
+                        hasAttention: hasOffscreenAttention(in: tab),
+                        onSelect: { paneId in
+                            appState.setActivePane(
+                                tabId: tab.id,
+                                paneId: paneId
                             )
                         }
-                    }
+                    )
+                    .padding(.leading, 4)
+                    .transition(.opacity)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
                 NewTabBtn {
                     _ = appState.addPane(tabId: tab.id, kind: .terminal)
@@ -141,6 +189,147 @@ private struct InlinePaneStrip: View {
                 Spacer(minLength: 0)
             }
         }
+        .animation(.easeInOut(duration: 0.15), value: isOverflowing)
+    }
+
+    @ViewBuilder
+    private func strip(for tab: Tab) -> some View {
+        // Avoid wrapping the ScrollView in a `GeometryReader` — that
+        // expands the strip to fill the toolbar's 52pt height instead of
+        // staying at the pills' natural ~28pt. Instead, read the
+        // ScrollView's bounds via a `.background` GeometryReader feeding
+        // a preference, which doesn't influence layout.
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(tab.panes) { pane in
+                        InlinePanePill(
+                            pane: pane,
+                            isActive: tab.activePaneId == pane.id,
+                            isHovered: hoveredPaneId == pane.id,
+                            onHoverChange: { hovering in
+                                if hovering {
+                                    hoveredPaneId = pane.id
+                                } else if hoveredPaneId == pane.id {
+                                    hoveredPaneId = nil
+                                }
+                            },
+                            onSelect: {
+                                appState.setActivePane(
+                                    tabId: tab.id,
+                                    paneId: pane.id
+                                )
+                            },
+                            onClose: {
+                                appState.requestClosePane(
+                                    tabId: tab.id,
+                                    paneId: pane.id
+                                )
+                            }
+                        )
+                        .id(pane.id)
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear.preference(
+                                    key: PaneFramePreferenceKey.self,
+                                    value: [
+                                        pane.id: geo.frame(
+                                            in: .named(
+                                                paneStripCoordinateSpace
+                                            )
+                                        )
+                                    ]
+                                )
+                            }
+                        )
+                    }
+                }
+            }
+            .coordinateSpace(name: paneStripCoordinateSpace)
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: VisibleWidthPreferenceKey.self,
+                        value: geo.size.width
+                    )
+                }
+            )
+            .onPreferenceChange(VisibleWidthPreferenceKey.self) { width in
+                visibleWidth = width
+            }
+            .onPreferenceChange(PaneFramePreferenceKey.self) { frames in
+                // Drop entries for panes that have been removed so
+                // `offscreenPaneIds` doesn't accumulate stale ids.
+                let liveIds = Set(tab.panes.map(\.id))
+                paneFrames = frames.filter { liveIds.contains($0.key) }
+            }
+            .onChange(of: tab.activePaneId) { _, newId in
+                guard let newId else { return }
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    proxy.scrollTo(newId, anchor: .center)
+                }
+            }
+            .overlay(alignment: .leading) {
+                edgeFade(trailing: false)
+                    .opacity(canScrollLeading ? 1 : 0)
+                    .animation(
+                        .easeInOut(duration: 0.15),
+                        value: canScrollLeading
+                    )
+            }
+            .overlay(alignment: .trailing) {
+                edgeFade(trailing: true)
+                    .opacity(canScrollTrailing ? 1 : 0)
+                    .animation(
+                        .easeInOut(duration: 0.15),
+                        value: canScrollTrailing
+                    )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func edgeFade(trailing: Bool) -> some View {
+        LinearGradient(
+            colors: [
+                Color.niceChrome(scheme),
+                Color.niceChrome(scheme).opacity(0)
+            ],
+            startPoint: trailing ? .trailing : .leading,
+            endPoint: trailing ? .leading : .trailing
+        )
+        .frame(width: 16)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Coordinate-space identifier used by `InlinePaneStrip` so each pill can
+/// report its frame relative to the ScrollView's viewport (not the
+/// underlying content) — that's what makes "is this pane visible right
+/// now" a pure frame-vs-`[0, visibleWidth]` comparison.
+private let paneStripCoordinateSpace = "InlinePaneStrip.scrollContent"
+
+/// Collects each pill's frame keyed by `Pane.id`. The reduce merges
+/// children's contributions; later writes for the same key win, which is
+/// what we want when a pane resizes.
+private struct PaneFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+
+    static func reduce(
+        value: inout [String: CGRect],
+        nextValue: () -> [String: CGRect]
+    ) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// The ScrollView's measured viewport width. Read via a `.background`
+/// GeometryReader so it doesn't influence layout.
+private struct VisibleWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -295,6 +484,99 @@ private struct CloseXButton: View {
         .onHover { hovering = $0 }
         .accessibilityIdentifier("tab.close.\(paneId)")
         .accessibilityLabel("Close \(paneId)")
+    }
+}
+
+// MARK: - Overflow menu
+
+/// 22×22 square chevron button shown only when the pill strip overflows.
+/// Tapping pops a SwiftUI `Menu` listing every pane on the active tab so
+/// every pane is reachable in one click even when scrolled off-screen.
+///
+/// The menu doubles as an attention surface: when an offscreen pane is
+/// `.thinking` or unacknowledged-`.waiting`, a small accent dot overlays
+/// the chevron so the user notices without having to scan the strip.
+private struct OverflowMenuButton: View {
+    @Environment(\.colorScheme) private var scheme
+    @State private var hovering = false
+
+    let panes: [Pane]
+    let activePaneId: String?
+    let hasAttention: Bool
+    let onSelect: (String) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(panes) { pane in
+                Button {
+                    onSelect(pane.id)
+                } label: {
+                    rowLabel(for: pane)
+                }
+                .accessibilityIdentifier("tab.overflow.row.\(pane.id)")
+            }
+        } label: {
+            chevron
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Show all panes")
+        .accessibilityIdentifier("tab.overflow")
+        .accessibilityLabel("Show all panes")
+    }
+
+    private var chevron: some View {
+        Image(systemName: "chevron.down")
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(Color.niceInk2(scheme))
+            .frame(width: 22, height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(
+                        hovering
+                            ? Color.niceInk(scheme).opacity(0.08)
+                            : .clear
+                    )
+            )
+            .overlay(alignment: .topTrailing) {
+                if hasAttention {
+                    Circle()
+                        .fill(Color.niceAccent)
+                        .frame(width: 6, height: 6)
+                        .offset(x: -3, y: 3)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.15), value: hasAttention)
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+    }
+
+    @ViewBuilder
+    private func rowLabel(for pane: Pane) -> some View {
+        // Use Label so the system menu lays out icon + text the standard
+        // way; `Image(systemName: "checkmark")` on the active row mirrors
+        // AppKit menu conventions.
+        Label {
+            HStack(spacing: 6) {
+                Text(pane.title)
+                if pane.id == activePaneId {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+            }
+        } icon: {
+            switch pane.kind {
+            case .claude:
+                StatusDot(
+                    status: pane.status,
+                    suppressWaitingPulse: pane.waitingAcknowledged
+                )
+            case .terminal:
+                Image(systemName: "terminal")
+            }
+        }
     }
 }
 
