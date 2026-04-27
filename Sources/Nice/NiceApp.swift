@@ -65,7 +65,7 @@ private final class TestHostStubDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct NiceApp: App {
-    @StateObject private var services = NiceServices()
+    @State private var services = NiceServices()
     // Owns `applicationShouldTerminate` so ⌘Q / Quit-menu goes through
     // the "you have live panes" confirmation before willTerminate fires.
     // The adaptor instantiates the delegate before SwiftUI builds the
@@ -89,7 +89,6 @@ struct NiceApp: App {
                     AppDelegate.registryProvider = { [weak services] in
                         services?.registry
                     }
-                    services.bootstrap()
                 }
         }
         .windowStyle(.hiddenTitleBar)

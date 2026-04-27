@@ -58,16 +58,16 @@ struct AppShellView: View {
 }
 
 /// The stateful inner view. Splitting it out lets us read
-/// `@EnvironmentObject services` and `@SceneStorage` values from
+/// `@Environment` services and `@SceneStorage` values from
 /// `AppShellView` before constructing the per-window `AppState`
-/// (`@StateObject` can't reach environment in its own `init`).
+/// (`@State` can't reach environment in its own `init`).
 private struct AppShellHost: View {
     @Environment(Tweaks.self) private var tweaks
     @Environment(KeyboardShortcuts.self) private var shortcuts
     @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
 
-    @StateObject private var appState: AppState
+    @State private var appState: AppState
     let services: NiceServices
     @Binding var sidebarCollapsedBinding: Bool
     @Binding var sidebarModeBinding: SidebarMode
@@ -104,7 +104,12 @@ private struct AppShellHost: View {
         // CWD to a sandboxed test directory. Production launches
         // don't set it; AppState falls through to NSHomeDirectory().
         let testCwd = ProcessInfo.processInfo.environment["NICE_MAIN_CWD"]
-        _appState = StateObject(wrappedValue: AppState(
+        // AppState's init is side-effect free, so re-evaluation on
+        // parent body re-renders is safe — `@State` keeps the first
+        // instance via View identity. `start()` (called from `.task`
+        // below) is what brings the socket up and spawns ptys, and is
+        // idempotent.
+        _appState = State(wrappedValue: AppState(
             services: services,
             initialSidebarCollapsed: initialSidebarCollapsed,
             initialSidebarMode: initialSidebarMode,
@@ -173,6 +178,16 @@ private struct AppShellHost: View {
             Button("Force quit", role: .destructive) { appState.confirmPendingClose() }
         } message: { request in
             Text(pendingCloseMessage(request))
+        }
+        .task {
+            // Order matters: `services.bootstrap()` writes the
+            // process-wide ZDOTDIR and seeds `resolvedClaudePath`
+            // from the env-var override; `appState.start()` reads
+            // both when building pty env. Both are idempotent so
+            // it's safe if `.task` re-fires across SwiftUI lifecycle
+            // edges (e.g. window restoration).
+            services.bootstrap()
+            appState.start()
         }
         .onAppear {
             // Brand-new scene: write the id AppState minted back

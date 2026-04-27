@@ -50,22 +50,9 @@ enum PaneLaunchStatus: Equatable {
     case visible(command: String)
 }
 
-/// Conforms to both `@Observable` (for fine-grained per-property
-/// view invalidation through `@Environment(AppState.self)`) and
-/// `ObservableObject` (so `@StateObject` can own the lifecycle). The
-/// `ObservableObject` conformance is a SwiftUI lifecycle hook only —
-/// `objectWillChange` never fires; observation flows through the
-/// `@Observable` macro's registrar. We need `@StateObject` because
-/// `@State` evaluates `AppState(...)` eagerly on every parent body
-/// re-render — each call spawns a control socket and child processes,
-/// most of which get discarded by `@State`'s identity rule. The
-/// surviving instance is *not* the one whose socket handler captured
-/// the live `self`, so socket messages mutate a discarded AppState
-/// the views never see. `@StateObject` takes the init as
-/// `@autoclosure`, evaluating it exactly once.
 @MainActor
 @Observable
-final class AppState: ObservableObject {
+final class AppState {
     /// Reserved id for the pinned Terminals project at index 0 of
     /// `projects`. The project is always present and cannot be deleted
     /// by the user; its tabs are ordinary terminal-only tabs.
@@ -358,21 +345,10 @@ final class AppState: ObservableObject {
 
         let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
 
-        // Allocate the control socket *before* spawning any ptys — the
-        // shells need NICE_SOCKET in their environment at startup or
-        // the `claude()` shadow can't reach us. Each window owns its
-        // own socket so a `claude` invocation in one window's Main
-        // Terminal only opens a tab in that window. The ZDOTDIR is
-        // process-wide and written by `NiceServices` before the first
-        // AppState is constructed; we just read its path here.
-        let socket = NiceControlSocket()
-        self.controlSocket = socket
-        self.zdotdirPath = services?.zdotdirPath
-
         // Seed scheme / palette / accent / terminal-theme / font
         // family from `Tweaks` so the very first `makeSession` call
-        // below (for the Terminals tab) paints with the user's real
-        // preferences. Without this seeding the session is themed
+        // (for the Terminals tab, in `start()`) paints with the user's
+        // real preferences. Without this seeding the session is themed
         // against the defaults above (.dark / .nice / terracotta)
         // and only repainted when `AppShellView.onAppear` broadcasts
         // `updateScheme` / `updateTerminalTheme` — a visible flash
@@ -394,30 +370,17 @@ final class AppState: ObservableObject {
         self.currentTerminalFontSize = services?.fontSettings.terminalFontSize
             ?? FontSettings.defaultTerminalSize
 
-        var extraEnv: [String: String] = [:]
-        extraEnv["NICE_SOCKET"] = socket.path
-        if let zdotdirPath {
-            extraEnv["ZDOTDIR"] = zdotdirPath
-        }
-        self.controlSocketExtraEnv = extraEnv
-
-        // Read the process-wide path from services (or the env-var
-        // override when there's no services, for previews / unit
-        // tests). Never probe synchronously here — `Process.run`'s
-        // `waitUntilExit` pumps a CFRunLoop while waiting, which
-        // re-enters SwiftUI mid-`@State` update on the macOS-26
-        // CI runner and trips AttributeGraph's "setting value during
-        // update" abort. Services owns the async probe; we subscribe
-        // below to pick up the resolved path when it lands so tabs
-        // spawned later still get a real `claude`.
-        if let services {
-            self.resolvedClaudePath = services.resolvedClaudePath
-        } else {
+        // Preview / unit-test path: `services == nil` means `start()`
+        // is unlikely to be called, so seed `NICE_CLAUDE_OVERRIDE`
+        // here. Production reads `services.resolvedClaudePath` in
+        // `start()` (after `services.bootstrap()` has populated it).
+        if services == nil {
             self.resolvedClaudePath = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"]
         }
 
         // Seed the pinned Terminals project with one "Main" tab
-        // hosting a single terminal pane.
+        // hosting a single terminal pane. The pty session itself is
+        // spawned in `start()` so the init is side-effect free.
         let mainTabId = Self.mainTerminalTabId
         let initialPaneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
         let initialPane = Pane(id: initialPaneId, title: "zsh", kind: .terminal)
@@ -438,9 +401,62 @@ final class AppState: ObservableObject {
         self.projects = [terminalsProject]
         self.activeTabId = mainTabId
 
-        // All stored properties set — now bring up the session for the
-        // Main terminal tab and start the control socket.
-        _ = self.makeSession(for: mainTabId, cwd: resolvedMainCwd)
+        // Stash the services pointer (weak) so `start()` can read
+        // `zdotdirPath` / `resolvedClaudePath` and arm claude-path
+        // tracking. Doubles as the "services available?" flag for
+        // `armClaudePathTracking`.
+        self.trackedServices = services
+    }
+
+    /// Bring the per-window subsystem online: allocate the control
+    /// socket, spawn the seed Main terminal pty, restore any saved
+    /// window snapshot, and arm the claude-path observation. Idempotent
+    /// — safe to call from `.task` on the owning view, which can fire
+    /// more than once across SwiftUI lifecycle edges.
+    ///
+    /// Side effects are deliberately kept out of `init` so the owning
+    /// view can use a plain `@State` for the AppState. With `@State`,
+    /// `AppState(...)` would otherwise re-evaluate on every parent
+    /// body re-render — each call would bind a new socket, only one of
+    /// which `@State`'s identity rule keeps. Socket messages then
+    /// mutate AppStates the views never see, breaking the `claude`
+    /// shadow handshake.
+    @ObservationIgnored
+    private var started = false
+    func start() {
+        guard !started else { return }
+        started = true
+
+        // Read the services-owned path values now that
+        // `services.bootstrap()` has populated them. Tests with
+        // `services == nil` rely on the env-var override seeded in
+        // `init`.
+        if let services = trackedServices {
+            self.zdotdirPath = services.zdotdirPath
+            self.resolvedClaudePath = services.resolvedClaudePath
+        }
+
+        // Allocate the control socket *before* spawning any ptys —
+        // the shells need NICE_SOCKET in their environment at startup
+        // or the `claude()` shadow can't reach us. Each window owns
+        // its own socket so a `claude` invocation in one window's
+        // Main Terminal only opens a tab in that window.
+        let socket = NiceControlSocket()
+        self.controlSocket = socket
+
+        var extraEnv: [String: String] = [:]
+        extraEnv["NICE_SOCKET"] = socket.path
+        if let zdotdirPath {
+            extraEnv["ZDOTDIR"] = zdotdirPath
+        }
+        self.controlSocketExtraEnv = extraEnv
+
+        // Spawn the seed Main terminal pty. `restoreSavedWindow`
+        // below may dissolve and rebuild this if a snapshot exists —
+        // that's the existing choreography and is preserved here.
+        if let mainTab = projects.first(where: { $0.id == Self.terminalsProjectId })?.tabs.first {
+            _ = makeSession(for: mainTab.id, cwd: mainTab.cwd)
+        }
 
         do {
             try socket.start { [weak self] message in
@@ -480,15 +496,12 @@ final class AppState: ObservableObject {
         scheduleSessionSave()
 
         // Track the services' async claude-path resolution so a tab
-        // spawned via `makeSession` after the probe completes picks up
-        // the real binary. `withObservationTracking` only fires on the
-        // *next* mutation, so it naturally skips the synchronous value
-        // already snapshot above. Installed at the end of init so
-        // `[weak self]` doesn't hit Swift's "self used before fully
-        // initialized" check.
-        if let services {
-            self.trackedServices = services
-            self.armClaudePathTracking()
+        // spawned via `makeSession` after the probe completes picks
+        // up the real binary. `withObservationTracking` only fires on
+        // the *next* mutation, so it naturally skips the synchronous
+        // value already snapshot above.
+        if trackedServices != nil {
+            armClaudePathTracking()
         }
     }
 

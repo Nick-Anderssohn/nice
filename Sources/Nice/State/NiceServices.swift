@@ -19,16 +19,9 @@
 import AppKit
 import Foundation
 
-/// Conforms to both `@Observable` and `ObservableObject` so the App
-/// scene can own its lifecycle via `@StateObject` (one-time init via
-/// autoclosure) while views read it through `@Environment(NiceServices.self)`.
-/// `objectWillChange` is never published; tracking flows through the
-/// `@Observable` macro's registrar. Without this, `@State` would
-/// evaluate `NiceServices()` eagerly on every App-scene re-render, and
-/// each call writes a new ZDOTDIR + spawns a new `which claude` task.
 @MainActor
 @Observable
-final class NiceServices: ObservableObject {
+final class NiceServices {
     let tweaks: Tweaks
     let shortcuts: KeyboardShortcuts
     let fontSettings: FontSettings
@@ -59,11 +52,13 @@ final class NiceServices: ObservableObject {
     /// the user's real `$HOME/.zshrc` and shadows `claude` to talk to
     /// our control socket. Owned here (not per-AppState) so multi-window
     /// scenarios share one dir and a closing window can't yank it out
-    /// from under another window's still-spawning shells. Created at
-    /// init *after* `cleanupStaleTempFiles` so the cleanup never wipes
-    /// the dir we just wrote. Deleted by the `willTerminate` observer.
-    let zdotdirPath: String?
+    /// from under another window's still-spawning shells. Written by
+    /// `bootstrap()` *after* `cleanupStaleTempFiles` so the cleanup
+    /// never wipes the dir we just wrote. Deleted by the
+    /// `willTerminate` observer.
+    private(set) var zdotdirPath: String?
 
+    @ObservationIgnored
     private var terminateObserver: NSObjectProtocol?
 
     init() {
@@ -90,6 +85,21 @@ final class NiceServices: ObservableObject {
             history: history,
             openWithProvider: OpenWithProvider()
         )
+    }
+
+    /// Idempotent process-wide wiring. Sweeps stale temp files, writes
+    /// this run's ZDOTDIR, kicks off the async `which claude` probe,
+    /// installs the keyboard monitor / Claude-Code hook, and registers
+    /// the terminate observer that tears every window down. Called
+    /// from `AppShellHost.task` before any AppState's `start()` so
+    /// `zdotdirPath` and the env-var override are populated by the
+    /// time pty children inherit env.
+    @ObservationIgnored
+    private var booted = false
+    func bootstrap() {
+        guard !booted else { return }
+        booted = true
+
         // Sweep `$TMPDIR` debris from prior crashed runs *before*
         // writing this run's zdotdir — otherwise the cleanup would
         // race the freshly-written dir and delete it, causing every
@@ -110,7 +120,6 @@ final class NiceServices: ObservableObject {
         if let override = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] {
             self.resolvedClaudePath = override
         } else {
-            self.resolvedClaudePath = nil
             Task.detached(priority: .utility) { [weak self] in
                 let resolved = Self.runWhich(binary: "claude")
                 await MainActor.run { [weak self] in
@@ -133,15 +142,6 @@ final class NiceServices: ObservableObject {
         // that the tab's pre-minted UUID otherwise misses. Idempotent
         // and safe to run on every launch.
         ClaudeHookInstaller.install()
-    }
-
-    /// Idempotent process-wide wiring. Installs the single keyboard
-    /// monitor and registers the terminate observer that tears every
-    /// window down and removes the shared ZDOTDIR.
-    private var booted = false
-    func bootstrap() {
-        guard !booted else { return }
-        booted = true
 
         KeyboardShortcutMonitor.install(
             registry: registry,
