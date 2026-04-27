@@ -9,7 +9,7 @@
 //  and window — sort feels like a "view preference" akin to Finder's,
 //  not a per-folder setting.
 //
-//  Mirrors the `FontSettings` shape: an `@MainActor ObservableObject`
+//  Mirrors the `FontSettings` shape: an `@MainActor @Observable` class
 //  whose mutations write through to an injectable `UserDefaults`
 //  instance (so unit tests can stand it up against an isolated suite).
 //
@@ -21,7 +21,8 @@
 import Foundation
 
 @MainActor
-final class FileBrowserSortSettings: ObservableObject {
+@Observable
+final class FileBrowserSortSettings {
     static let criterionKey = "fileBrowser.sort.criterion"
     static let ascendingKey = "fileBrowser.sort.ascending"
 
@@ -32,7 +33,7 @@ final class FileBrowserSortSettings: ObservableObject {
     /// that prefer the namespaced form.
     typealias Criterion = FileBrowserSortCriterion
 
-    @Published var criterion: Criterion {
+    var criterion: Criterion {
         didSet { defaults.set(criterion.rawValue, forKey: Self.criterionKey) }
     }
 
@@ -41,10 +42,11 @@ final class FileBrowserSortSettings: ObservableObject {
     /// user toggles it explicitly via the breadcrumb's ↑/↓ button, so
     /// switching criterion does not silently flip "newest first" to
     /// "A→Z" or vice versa.
-    @Published var ascending: Bool {
+    var ascending: Bool {
         didSet { defaults.set(ascending, forKey: Self.ascendingKey) }
     }
 
+    @ObservationIgnored
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {

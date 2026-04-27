@@ -19,7 +19,7 @@
 //  static `isRecording` flag) for the duration of recording, so the user's
 //  keystrokes don't fire actions while we're trying to capture them.
 //
-//  We keep the recorder's mutable state on a `@StateObject` coordinator
+//  We keep the recorder's mutable state on a `@State` coordinator
 //  so the NSEvent monitor lifecycle (install on `start`, remove on
 //  `teardown`) lives on a stable owner — directly storing the monitor
 //  token in `@State` would be brittle across redraws.
@@ -32,11 +32,11 @@ import SwiftUI
 struct KeyRecorderField: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
-    @EnvironmentObject private var shortcuts: KeyboardShortcuts
+    @Environment(KeyboardShortcuts.self) private var shortcuts
 
     let action: ShortcutAction
 
-    @StateObject private var coordinator = RecorderCoordinator()
+    @State private var coordinator = RecorderCoordinator()
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 6) {
@@ -127,18 +127,23 @@ struct KeyRecorderField: View {
 
 /// Owns the recording state machine and the live `NSEvent` monitor token.
 /// Lifted out of the view so the monitor's install/teardown hangs off a
-/// stable identity (`@StateObject`) rather than transient `@State`.
+/// stable identity (`@State` retained reference type) rather than
+/// transient value-type `@State`.
 @MainActor
-final class RecorderCoordinator: ObservableObject {
-    @Published var recording: Bool = false
+@Observable
+final class RecorderCoordinator {
+    var recording: Bool = false
     /// When non-nil during recording, the user pressed a combo that
     /// conflicts with another action — the recorder is awaiting Replace
     /// or Cancel before committing.
-    @Published var pendingCombo: KeyCombo?
-    @Published var conflictAction: ShortcutAction?
+    var pendingCombo: KeyCombo?
+    var conflictAction: ShortcutAction?
 
+    @ObservationIgnored
     private var monitor: Any?
+    @ObservationIgnored
     private weak var shortcuts: KeyboardShortcuts?
+    @ObservationIgnored
     private var action: ShortcutAction?
 
     /// Begin recording for `action`. Suspends the global monitor and

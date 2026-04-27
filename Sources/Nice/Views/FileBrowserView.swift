@@ -17,8 +17,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct FileBrowserView: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var fontSettings: FontSettings
+    @Environment(AppState.self) private var appState
+    @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -49,9 +49,9 @@ struct FileBrowserView: View {
 // MARK: - Content (with bound state)
 
 private struct FileBrowserContent: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var fontSettings: FontSettings
-    @EnvironmentObject private var sortSettings: FileBrowserSortSettings
+    @Environment(AppState.self) private var appState
+    @Environment(FontSettings.self) private var fontSettings
+    @Environment(FileBrowserSortSettings.self) private var sortSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -59,12 +59,12 @@ private struct FileBrowserContent: View {
     /// Tab's spawn-time CWD. Used by the breadcrumb's "Go to CWD"
     /// affordance when the current root has gone missing.
     let tabCwd: String
-    @ObservedObject var state: FileBrowserState
+    var state: FileBrowserState
 
     /// Ephemeral state for an in-flight file-row drag. Off `AppState`
     /// so transient drag UI doesn't pollute the persistent model —
     /// matches the `SidebarDragState` pattern used by the tab list.
-    @StateObject private var dragState = FileBrowserDragState()
+    @State private var dragState = FileBrowserDragState()
 
     /// Window-local frame of the file browser, used by the
     /// `mouseMonitor` below to decide whether a click happened
@@ -88,7 +88,7 @@ private struct FileBrowserContent: View {
             Divider().opacity(0.5)
             tree
         }
-        .environmentObject(dragState)
+        .environment(dragState)
         .contentShape(Rectangle())
         .onTapGesture { state.selection.clear() }
         .background(WindowFrameReporter { frame, number in
@@ -293,21 +293,21 @@ private struct FileBrowserContent: View {
 /// A single row in the file tree. Renders itself plus, for an
 /// expanded directory, its children as nested `FileTreeRow` views.
 private struct FileTreeRow: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var fontSettings: FontSettings
-    @EnvironmentObject private var sortSettings: FileBrowserSortSettings
-    @EnvironmentObject private var dragState: FileBrowserDragState
+    @Environment(AppState.self) private var appState
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(FontSettings.self) private var fontSettings
+    @Environment(FileBrowserSortSettings.self) private var sortSettings
+    @Environment(FileBrowserDragState.self) private var dragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
     let url: URL
     let depth: Int
-    @ObservedObject var state: FileBrowserState
+    var state: FileBrowserState
     /// Mirror of `state.selection` so re-renders trigger when the
     /// selection set changes. Cmd-click / Shift-click handlers and
     /// the selection background both read from this.
-    @ObservedObject var selection: FileBrowserSelection
+    var selection: FileBrowserSelection
     /// Tab id this row's file browser is bound to. Recorded with
     /// each file op so undo/redo can route focus back to this tab.
     let tabId: String?
@@ -321,10 +321,10 @@ private struct FileTreeRow: View {
     @State private var children: [URL]? = nil
     /// kqueue-backed watcher started while this row is expanded.
     /// Fires a debounced reload when the directory's entries
-    /// change. `@StateObject` so the instance survives view
-    /// re-renders but is destroyed (and its FD released) when the
-    /// row leaves the hierarchy.
-    @StateObject private var watcher = DirectoryWatcher()
+    /// change. `@State` so the instance survives view re-renders
+    /// but is destroyed (and its FD released) when the row leaves
+    /// the hierarchy.
+    @State private var watcher = DirectoryWatcher()
     /// Time of the last single-click. Used to detect a double-click
     /// without paying SwiftUI's `.onTapGesture(count:2)` disambig
     /// delay — we fire the single-click action immediately on every
@@ -502,7 +502,7 @@ private struct FileTreeRow: View {
         .contextMenu {
             // PURE read of "which paths should the menu act on".
             // SwiftUI evaluates this closure as part of body, so it
-            // must not mutate `@Published` state — the visible
+            // must not mutate observed state — the visible
             // "snap selection to right-clicked row" side effect is
             // moved into `onWillAct` below, which fires inside each
             // menu Button's action closure (i.e. *after* the menu
@@ -950,7 +950,7 @@ private struct FileBrowserRowDropDelegate: DropDelegate {
 /// than `SidebarIconButton` (24pt) so the breadcrumb doesn't dominate
 /// the sidebar's vertical rhythm.
 private struct SidebarSmallIconButton: View {
-    @EnvironmentObject private var fontSettings: FontSettings
+    @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 

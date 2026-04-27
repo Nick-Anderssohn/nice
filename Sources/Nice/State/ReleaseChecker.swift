@@ -20,7 +20,8 @@
 import Foundation
 
 @MainActor
-final class ReleaseChecker: ObservableObject {
+@Observable
+final class ReleaseChecker {
     nonisolated static let lastKnownLatestVersionKey = "releaseChecker.lastKnownLatestVersion"
 
     /// Default delay before the first check after `start()`. Keeps the
@@ -34,17 +35,23 @@ final class ReleaseChecker: ObservableObject {
     /// req/day).
     nonisolated static let defaultInterval: TimeInterval = 6 * 60 * 60
 
-    @Published private(set) var latestVersion: String?
-    @Published private(set) var updateAvailable: Bool = false
+    private(set) var latestVersion: String?
+    private(set) var updateAvailable: Bool = false
 
     let currentVersion: String
 
+    @ObservationIgnored
     private let fetcher: ReleaseFetcher
+    @ObservationIgnored
     private let defaults: UserDefaults
+    @ObservationIgnored
     private let initialDelay: TimeInterval
+    @ObservationIgnored
     private let interval: TimeInterval
 
+    @ObservationIgnored
     private var timer: DispatchSourceTimer?
+    @ObservationIgnored
     private var started = false
 
     init(
@@ -80,7 +87,7 @@ final class ReleaseChecker: ObservableObject {
         timer.setEventHandler { [weak self] in
             // The timer fires on the main queue, but we need
             // MainActor isolation explicitly so we can mutate
-            // `@Published` properties.
+            // observed properties.
             Task { @MainActor [weak self] in
                 await self?.checkNow()
             }

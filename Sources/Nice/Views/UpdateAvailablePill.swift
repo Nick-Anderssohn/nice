@@ -16,7 +16,7 @@ import AppKit
 import SwiftUI
 
 struct UpdateAvailablePill: View {
-    @EnvironmentObject private var checker: ReleaseChecker
+    @Environment(ReleaseChecker.self) private var checker
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @State private var hovering = false

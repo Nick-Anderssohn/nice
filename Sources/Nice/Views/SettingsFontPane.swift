@@ -16,12 +16,13 @@ import AppKit
 import SwiftUI
 
 struct FontPane: View {
-    @EnvironmentObject private var fontSettings: FontSettings
-    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(FontSettings.self) private var fontSettings
+    @Environment(Tweaks.self) private var tweaks
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
     var body: some View {
+        @Bindable var fontSettings = fontSettings
         SettingTitle("Font")
 
         SettingRow(

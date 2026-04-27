@@ -15,8 +15,8 @@
 //
 
 import AppKit
-import Combine
 import Foundation
+import Observation
 import SwiftUI
 
 /// Pending "processes still running" confirmation. Lives outside
@@ -50,7 +50,21 @@ enum PaneLaunchStatus: Equatable {
     case visible(command: String)
 }
 
+/// Conforms to both `@Observable` (for fine-grained per-property
+/// view invalidation through `@Environment(AppState.self)`) and
+/// `ObservableObject` (so `@StateObject` can own the lifecycle). The
+/// `ObservableObject` conformance is a SwiftUI lifecycle hook only —
+/// `objectWillChange` never fires; observation flows through the
+/// `@Observable` macro's registrar. We need `@StateObject` because
+/// `@State` evaluates `AppState(...)` eagerly on every parent body
+/// re-render — each call spawns a control socket and child processes,
+/// most of which get discarded by `@State`'s identity rule. The
+/// surviving instance is *not* the one whose socket handler captured
+/// the live `self`, so socket messages mutate a discarded AppState
+/// the views never see. `@StateObject` takes the init as
+/// `@autoclosure`, evaluating it exactly once.
 @MainActor
+@Observable
 final class AppState: ObservableObject {
     /// Reserved id for the pinned Terminals project at index 0 of
     /// `projects`. The project is always present and cannot be deleted
@@ -70,10 +84,10 @@ final class AppState: ObservableObject {
     /// ids and defeat per-window isolation).
     private static var claimedWindowIds: Set<String> = []
 
-    @Published var projects: [Project]
+    var projects: [Project]
     /// Currently-selected tab. Defaults to the Main terminal tab on
     /// launch.
-    @Published var activeTabId: String? {
+    var activeTabId: String? {
         didSet {
             // Viewing a tab dismisses the attention pulse on its active
             // pane's waiting state — centralised here so every call site
@@ -87,19 +101,18 @@ final class AppState: ObservableObject {
     /// Whether the sidebar is collapsed. Seeded from the per-window
     /// `@SceneStorage` value by the owning view so each window keeps
     /// its own state; the view writes back on changes.
-    @Published var sidebarCollapsed: Bool = false
+    var sidebarCollapsed: Bool = false
 
     /// Which content the sidebar is showing (tabs vs file browser).
     /// Seeded from the per-window `@SceneStorage` value upstream so
     /// each window restores its last-used mode across relaunch.
-    @Published var sidebarMode: SidebarMode = .tabs
+    var sidebarMode: SidebarMode = .tabs
 
     /// Per-window catalog of file-browser states keyed by `Tab.id`.
     /// Lifecycle: states are lazily created on first access and
     /// removed in `finalizeDissolvedTab` when a tab dissolves. The
-    /// store is `@Published` indirectly via its own `ObservableObject`
-    /// surface — views observing it pick up changes without
-    /// `AppState` re-publishing.
+    /// store is its own `@Observable` surface — views observing it
+    /// pick up changes without `AppState` re-emitting.
     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
 
     /// Transient: sidebar is floating over the terminal as a peek
@@ -108,7 +121,7 @@ final class AppState: ObservableObject {
     /// when the user releases the shortcut's modifiers. Never set while
     /// `sidebarCollapsed == false`. The view layer ORs this with its own
     /// mouse-hover pin so a hovered peek stays open after the keys lift.
-    @Published var sidebarPeeking: Bool = false
+    var sidebarPeeking: Bool = false
 
     func toggleSidebar() {
         sidebarCollapsed.toggle()
@@ -175,7 +188,7 @@ final class AppState: ObservableObject {
 
     // MARK: - Process plumbing
 
-    @Published private(set) var ptySessions: [String: TabPtySession] = [:]
+    private(set) var ptySessions: [String: TabPtySession] = [:]
 
     /// Launch state per pane, used to overlay a "Launching…" placeholder
     /// while a freshly-spawned child is still silent. Entries are created
@@ -184,60 +197,67 @@ final class AppState: ObservableObject {
     /// cleared on first pty byte or pane exit. The 0.75 s grace window
     /// exists so fast-starting processes (regular `claude`, a plain
     /// shell) never flash the overlay — the common case is uninterrupted.
-    @Published private(set) var paneLaunchStates: [String: PaneLaunchStatus] = [:]
+    private(set) var paneLaunchStates: [String: PaneLaunchStatus] = [:]
 
     /// In-flight "processes still running" confirmation. Set by
     /// `requestClosePane` / `requestCloseTab` / `requestCloseProject`
     /// when they find something busy; cleared by `confirmPendingClose`
     /// (after the kill) or `cancelPendingClose` (user backs out).
     /// `AppShellView` binds an `.alert` to this.
-    @Published var pendingCloseRequest: PendingCloseRequest?
+    var pendingCloseRequest: PendingCloseRequest?
 
     /// Project ids the user asked to fully close. When a tab in one of
     /// these projects finishes dissolving in `paneExited`, the empty
     /// project row is also removed from `projects`. The Terminals
     /// project is excluded upstream (its id is never added).
+    @ObservationIgnored
     private var projectsPendingRemoval: Set<String> = []
 
     /// Stable identifier for this window's entry in `sessions.json`.
     /// Pulled in from `@SceneStorage("windowSessionId")` on
     /// `AppShellView`; survives quits via standard SwiftUI scene
     /// storage so the same window restores the same tab list on
-    /// relaunch. `@Published` so the view layer can mirror adoption
+    /// relaunch. Observed so the view layer can mirror adoption
     /// changes back into SceneStorage — `restoreSavedWindow` may
     /// switch us to the bootstrap id, and that re-pairing must
     /// persist.
-    @Published private(set) var windowSessionId: String
+    private(set) var windowSessionId: String
 
     /// Blocks `scheduleSessionSave` while `init` is still running.
     /// Swift fires `activeTabId`'s `didSet` for the seed assignment
     /// in some optional-typed cases, which would otherwise upsert an
     /// empty window entry before `restoreSavedWindow` has a chance to
     /// adopt the bootstrap. Cleared on the last line of `init`.
+    @ObservationIgnored
     private var isInitializing: Bool = true
 
     /// False in preview/test mode (`services == nil` at init). Blocks
     /// `scheduleSessionSave` so unit tests can't pollute the real
     /// `~/Library/Application Support/Nice/sessions.json` by exercising
     /// the tab-mutation surface.
+    @ObservationIgnored
     private let persistenceEnabled: Bool
 
     /// Tracks the SwiftUI `ColorScheme` currently showing. New sessions
     /// are themed at creation using this.
+    @ObservationIgnored
     private var currentScheme: ColorScheme = .dark
 
     /// Tracks the active chrome `Palette` (nice | macOS). New sessions
     /// are themed at creation using this alongside `currentScheme`.
+    @ObservationIgnored
     private var currentPalette: Palette = .nice
 
     /// Tracks the user's active accent as an `NSColor`, used to paint
     /// the terminal caret so the blinking cursor matches the app tint.
     /// Seeded with terracotta; `updateScheme` overwrites on every call.
+    @ObservationIgnored
     private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
 
     /// Tracks the user's terminal font size. New sessions pick this up
     /// at creation; `updateTerminalFontSize` fans changes out to every
     /// live `TabPtySession`.
+    @ObservationIgnored
     private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
 
     /// Tracks the terminal theme that every live pane is currently
@@ -245,32 +265,39 @@ final class AppState: ObservableObject {
     /// sessions created before `updateTerminalTheme` runs still get
     /// sensible colors. `AppShellHost` calls `updateTerminalTheme`
     /// eagerly on first appear, so this only acts as a fallback.
+    @ObservationIgnored
     private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
 
     /// Tracks the user-chosen terminal font family. `nil` => default
     /// chain (SF Mono → JetBrains Mono NL → system monospaced).
+    @ObservationIgnored
     private var currentTerminalFontFamily: String? = nil
 
     /// Absolute path to the `claude` binary if we've resolved it; nil
     /// falls back to zsh inside claude panes. Mirrors
-    /// `services.resolvedClaudePath` and is updated via the Combine
-    /// subscription below when the async probe completes.
+    /// `services.resolvedClaudePath` and is updated by re-arming
+    /// `withObservationTracking` when the async probe completes.
+    @ObservationIgnored
     private var resolvedClaudePath: String?
 
-    /// Holds the subscription to `services.$resolvedClaudePath` for
-    /// the lifetime of this window. Drops automatically when AppState
-    /// deinits.
-    private var claudePathCancellable: AnyCancellable?
+    /// Toggled true once `trackClaudePath` has armed its first
+    /// observation closure for this AppState's services. Prevents
+    /// re-arming when there's no live services pointer.
+    @ObservationIgnored
+    private weak var trackedServices: NiceServices?
 
     // MARK: - Control socket
 
+    @ObservationIgnored
     private var controlSocket: NiceControlSocket?
     /// Process-wide ZDOTDIR path owned by `NiceServices`. Stored here
     /// so terminal-pane spawns can inject it as an env var without
     /// reaching back through the services reference. Never deleted by
     /// this AppState — the owning `NiceServices` cleans it up at app
     /// terminate.
+    @ObservationIgnored
     private var zdotdirPath: String?
+    @ObservationIgnored
     private var controlSocketExtraEnv: [String: String] = [:]
 
     /// File-browser context-menu services. Set at init time —
@@ -378,7 +405,7 @@ final class AppState: ObservableObject {
         // override when there's no services, for previews / unit
         // tests). Never probe synchronously here — `Process.run`'s
         // `waitUntilExit` pumps a CFRunLoop while waiting, which
-        // re-enters SwiftUI mid-`@StateObject` update on the macOS-26
+        // re-enters SwiftUI mid-`@State` update on the macOS-26
         // CI runner and trips AttributeGraph's "setting value during
         // update" abort. Services owns the async probe; we subscribe
         // below to pick up the resolved path when it lands so tabs
@@ -452,19 +479,36 @@ final class AppState: ObservableObject {
         isInitializing = false
         scheduleSessionSave()
 
-        // Subscribe to the services' async claude-path resolution so a
-        // tab spawned via `makeSession` after the probe completes picks
-        // up the real binary. `dropFirst()` skips the synchronous
-        // replay of the current value already snapshot above.
-        // Installed at the end of init so `[weak self]` doesn't hit
-        // Swift's "self used before fully initialized" check.
+        // Track the services' async claude-path resolution so a tab
+        // spawned via `makeSession` after the probe completes picks up
+        // the real binary. `withObservationTracking` only fires on the
+        // *next* mutation, so it naturally skips the synchronous value
+        // already snapshot above. Installed at the end of init so
+        // `[weak self]` doesn't hit Swift's "self used before fully
+        // initialized" check.
         if let services {
-            self.claudePathCancellable = services.$resolvedClaudePath
-                .dropFirst()
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self] path in
-                    self?.resolvedClaudePath = path
-                }
+            self.trackedServices = services
+            self.armClaudePathTracking()
+        }
+    }
+
+    /// Re-arm a one-shot observation closure that mirrors
+    /// `services.resolvedClaudePath` into our local cache. The
+    /// `onChange` handler fires once per mutation and must re-call
+    /// this method to stay subscribed for the next change. Bails out
+    /// if `trackedServices` has been released — covers the deinit
+    /// race so we don't reinstall after the AppState is going away.
+    @MainActor
+    private func armClaudePathTracking() {
+        guard let services = trackedServices else { return }
+        withObservationTracking {
+            _ = services.resolvedClaudePath
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, let services = self.trackedServices else { return }
+                self.resolvedClaudePath = services.resolvedClaudePath
+                self.armClaudePathTracking()
+            }
         }
     }
 

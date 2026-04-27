@@ -19,7 +19,15 @@
 import AppKit
 import Foundation
 
+/// Conforms to both `@Observable` and `ObservableObject` so the App
+/// scene can own its lifecycle via `@StateObject` (one-time init via
+/// autoclosure) while views read it through `@Environment(NiceServices.self)`.
+/// `objectWillChange` is never published; tracking flows through the
+/// `@Observable` macro's registrar. Without this, `@State` would
+/// evaluate `NiceServices()` eagerly on every App-scene re-render, and
+/// each call writes a new ZDOTDIR + spawns a new `which claude` task.
 @MainActor
+@Observable
 final class NiceServices: ObservableObject {
     let tweaks: Tweaks
     let shortcuts: KeyboardShortcuts
@@ -40,12 +48,12 @@ final class NiceServices: ObservableObject {
     /// back to zsh inside claude panes. Resolved off the main thread
     /// so SwiftUI scene-graph init isn't blocked on a login-shell
     /// probe — `Process.waitUntilExit` pumps a CFRunLoop while
-    /// waiting, which re-enters SwiftUI mid-`@StateObject` update and
+    /// waiting, which re-enters SwiftUI mid-`@State` update and
     /// trips AttributeGraph's "setting value during update" abort
     /// (see Sources/Nice/NiceApp.swift). Stays nil until the probe
-    /// returns; `AppState` subscribes via `$resolvedClaudePath` so
-    /// tabs created after resolution still pick up the path.
-    @Published private(set) var resolvedClaudePath: String?
+    /// returns; `AppState` re-arms `withObservationTracking` so tabs
+    /// created after resolution still pick up the path.
+    private(set) var resolvedClaudePath: String?
 
     /// Process-wide ZDOTDIR directory whose stub `.zshrc` chains back to
     /// the user's real `$HOME/.zshrc` and shadows `claude` to talk to

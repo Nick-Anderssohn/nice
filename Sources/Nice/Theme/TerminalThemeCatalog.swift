@@ -8,19 +8,20 @@
 //  can share, version-control, or hand-edit them.
 //
 
-import Combine
 import Foundation
+import Observation
 import SwiftUI
 
 @MainActor
-final class TerminalThemeCatalog: ObservableObject {
+@Observable
+final class TerminalThemeCatalog {
 
     /// Frozen list of Nice's own themes.
     let builtIn: [TerminalTheme] = BuiltInTerminalThemes.all
 
     /// Themes parsed from `supportDirectory`. Mutated by `importTheme`
-    /// and `remove`. Published so the Settings UI rebuilds when it changes.
-    @Published private(set) var imported: [TerminalTheme] = []
+    /// and `remove`. Observed so the Settings UI rebuilds when it changes.
+    private(set) var imported: [TerminalTheme] = []
 
     /// Directory scanned for `.ghostty` / `.conf` files. Injectable so
     /// tests can point at a temp dir instead of the real Application

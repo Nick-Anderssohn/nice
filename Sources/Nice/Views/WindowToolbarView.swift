@@ -23,7 +23,7 @@ import AppKit
 import SwiftUI
 
 struct WindowToolbarView: View {
-    @EnvironmentObject private var appState: AppState
+    @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -110,7 +110,7 @@ private let panePillAnimationDuration: Double = 0.12
 ///     attention badge — from the per-pill frames the ScrollView does
 ///     emit for visible pills.
 private struct InlinePaneStrip: View {
-    @EnvironmentObject private var appState: AppState
+    @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var scheme
 
     /// Tracks which pill (if any) the mouse is currently over, keyed by
@@ -680,16 +680,16 @@ private struct NewTabBtn: View {
 
 #Preview("Toolbar — light") {
     WindowToolbarView()
-        .environmentObject(AppState())
-        .environmentObject(Tweaks())
+        .environment(AppState())
+        .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.light)
 }
 
 #Preview("Toolbar — dark") {
     WindowToolbarView()
-        .environmentObject(AppState())
-        .environmentObject(Tweaks())
+        .environment(AppState())
+        .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.dark)
 }

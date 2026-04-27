@@ -21,8 +21,8 @@ import AppKit
 import SwiftUI
 
 struct SettingsEditorsPane: View {
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var editorDetector: EditorDetector
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(EditorDetector.self) private var editorDetector
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -275,7 +275,7 @@ private struct LabeledField: View {
 // MARK: - Extension mapping row
 
 private struct ExtensionMappingRow: View {
-    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(Tweaks.self) private var tweaks
 
     let ext: String
     let editorId: UUID

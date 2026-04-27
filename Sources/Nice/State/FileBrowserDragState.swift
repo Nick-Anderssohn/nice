@@ -3,8 +3,8 @@
 //  Nice
 //
 //  Ephemeral, view-layer state for an in-flight file-browser drag.
-//  Owned by `FileBrowserContent` via `@StateObject` and propagated to
-//  the row subtree via `.environmentObject` — same pattern as
+//  Owned by `FileBrowserContent` via `@State` and propagated to the
+//  row subtree via `.environment(_:)` — same pattern as
 //  `SidebarDragState`. Off `AppState` deliberately so transient drag
 //  scratchpads don't show up in the persistent model.
 //
@@ -34,6 +34,7 @@ struct FileBrowserDragSession: Equatable {
 }
 
 @MainActor
-final class FileBrowserDragState: ObservableObject {
-    @Published var session: FileBrowserDragSession?
+@Observable
+final class FileBrowserDragState {
+    var session: FileBrowserDragSession?
 }

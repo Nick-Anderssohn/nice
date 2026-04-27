@@ -3,7 +3,7 @@
 //  Nice
 //
 //  Source of truth for the user-rebindable keyboard shortcuts. Mirrors the
-//  `Tweaks` pattern: an `@MainActor ObservableObject` whose mutations write
+//  `Tweaks` pattern: an `@MainActor @Observable` class whose mutations write
 //  through to `UserDefaults` immediately, and an injectable `defaults`
 //  parameter on the initializer so unit tests can stand it up against an
 //  isolated suite.
@@ -175,7 +175,8 @@ struct KeyCombo: Hashable, Codable, Sendable {
 /// combo will trigger it). The default map (`Self.defaults`) is what
 /// `resetToDefault` restores.
 @MainActor
-final class KeyboardShortcuts: ObservableObject {
+@Observable
+final class KeyboardShortcuts {
     static let defaultsKey = "keyboardShortcuts"
 
     /// Default binding map applied on first run and restored by
@@ -201,7 +202,7 @@ final class KeyboardShortcuts: ObservableObject {
     /// Current map. `nil` value = action is unbound. Always reflects what
     /// the next save would write — `setBinding` updates this and the
     /// persisted blob in lock-step.
-    @Published private(set) var bindings: [ShortcutAction: KeyCombo]
+    private(set) var bindings: [ShortcutAction: KeyCombo]
 
     private let defaults: UserDefaults
 

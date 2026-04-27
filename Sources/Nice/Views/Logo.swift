@@ -25,7 +25,7 @@ struct Logo: View {
     var fill: Color? = nil
     var size: CGFloat = 22
 
-    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(Tweaks.self) private var tweaks
 
     var body: some View {
         // Source viewBox is 22×22; scale factor lets us render at any size

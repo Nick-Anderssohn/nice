@@ -18,14 +18,15 @@
 import Foundation
 
 @MainActor
-final class FileBrowserSelection: ObservableObject {
+@Observable
+final class FileBrowserSelection {
     /// Absolute paths currently selected. Empty by default.
-    @Published private(set) var selectedPaths: Set<String> = []
+    private(set) var selectedPaths: Set<String> = []
 
     /// Anchor for Shift-range. Set on plain click and Cmd-click;
     /// not set by Shift-click (Finder keeps the original anchor
     /// across multiple range extensions).
-    @Published private(set) var lastClickedPath: String?
+    private(set) var lastClickedPath: String?
 
     init() {}
 

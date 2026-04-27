@@ -75,14 +75,14 @@ struct NiceApp: App {
     var body: some Scene {
         WindowGroup {
             AppShellView()
-                .environmentObject(services)
-                .environmentObject(services.tweaks)
-                .environmentObject(services.shortcuts)
-                .environmentObject(services.fontSettings)
-                .environmentObject(services.fileBrowserSortSettings)
-                .environmentObject(services.terminalThemeCatalog)
-                .environmentObject(services.releaseChecker)
-                .environmentObject(services.editorDetector)
+                .environment(services)
+                .environment(services.tweaks)
+                .environment(services.shortcuts)
+                .environment(services.fontSettings)
+                .environment(services.fileBrowserSortSettings)
+                .environment(services.terminalThemeCatalog)
+                .environment(services.releaseChecker)
+                .environment(services.editorDetector)
                 .environment(\.palette, services.tweaks.activeChromePalette)
                 .tint(services.tweaks.accent.color)
                 .onAppear {
@@ -102,13 +102,13 @@ struct NiceApp: App {
         // the window edges (`.windowResizability(.contentSize)`).
         Settings {
             SettingsView()
-                .environmentObject(services)
-                .environmentObject(services.tweaks)
-                .environmentObject(services.shortcuts)
-                .environmentObject(services.fontSettings)
-                .environmentObject(services.terminalThemeCatalog)
-                .environmentObject(services.releaseChecker)
-                .environmentObject(services.editorDetector)
+                .environment(services)
+                .environment(services.tweaks)
+                .environment(services.shortcuts)
+                .environment(services.fontSettings)
+                .environment(services.terminalThemeCatalog)
+                .environment(services.releaseChecker)
+                .environment(services.editorDetector)
                 .environment(\.palette, services.tweaks.activeChromePalette)
                 .frame(
                     minWidth: 560, idealWidth: 640, maxWidth: .infinity,

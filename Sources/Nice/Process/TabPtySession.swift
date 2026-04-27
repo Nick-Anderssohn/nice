@@ -19,7 +19,8 @@ import SwiftTerm
 import SwiftUI
 
 @MainActor
-final class TabPtySession: ObservableObject {
+@Observable
+final class TabPtySession {
     let tabId: String
     let cwd: String
 

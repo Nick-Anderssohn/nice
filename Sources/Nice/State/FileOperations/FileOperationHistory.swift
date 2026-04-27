@@ -43,24 +43,26 @@ extension WindowRegistry: FileOperationFocusRouter {
 }
 
 @MainActor
-final class FileOperationHistory: ObservableObject {
+@Observable
+final class FileOperationHistory {
     /// Pure FS worker the history applies / undoes through. Public
     /// so the orchestration layer (`AppState+FileExplorer`) shares
     /// the same instance — a `FakeTrasher` or stub `FileManager`
     /// injected here reaches copy/cut/trash too, not just undo/redo.
     let service: FileOperationsService
+    @ObservationIgnored
     private weak var router: FileOperationFocusRouter?
 
     /// Most recent ops on top. `push` appends; `undo` removes from
     /// the end and pushes onto `redoStack`.
-    @Published private(set) var undoStack: [FileOperation] = []
-    @Published private(set) var redoStack: [FileOperation] = []
+    private(set) var undoStack: [FileOperation] = []
+    private(set) var redoStack: [FileOperation] = []
 
     /// One-shot transient message for the UI to surface when an op
     /// can't be undone/redone cleanly because the filesystem state
     /// has changed underneath us. Cleared by callers after they've
     /// displayed it.
-    @Published var lastDriftMessage: String?
+    var lastDriftMessage: String?
 
     init(
         service: FileOperationsService = FileOperationsService(),

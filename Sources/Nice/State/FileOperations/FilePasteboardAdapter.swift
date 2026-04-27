@@ -24,7 +24,8 @@ import AppKit
 import Foundation
 
 @MainActor
-final class FilePasteboardAdapter: ObservableObject {
+@Observable
+final class FilePasteboardAdapter {
     enum Intent: Equatable, Sendable {
         case copy
         case cut
@@ -36,6 +37,7 @@ final class FilePasteboardAdapter: ObservableObject {
         let intent: Intent
     }
 
+    @ObservationIgnored
     private let pasteboard: NSPasteboard
 
     /// Companion record stamped on every `write(.cut, ...)`. Kept
@@ -45,13 +47,13 @@ final class FilePasteboardAdapter: ObservableObject {
         let changeCount: Int
         let urls: [URL]
     }
-    @Published private var cutCompanion: CutCompanion?
+    private var cutCompanion: CutCompanion?
 
     /// Track of the pasteboard's `changeCount` immediately after our
     /// last `write` call. Lets observers tell whether our copy intent
     /// is still the latest content vs. someone else has copied
     /// something else since.
-    @Published private(set) var lastWrittenChangeCount: Int?
+    private(set) var lastWrittenChangeCount: Int?
 
     init(pasteboard: NSPasteboard = .general) {
         self.pasteboard = pasteboard
@@ -134,8 +136,8 @@ final class FilePasteboardAdapter: ObservableObject {
     }
 
     /// Snapshot of paths currently in the cut companion (or empty
-    /// if cut intent isn't current). Driven by `objectWillChange`
-    /// when the companion mutates.
+    /// if cut intent isn't current). Reads `cutCompanion` so the
+    /// `@Observable` macro registers the dependency for re-renders.
     var cutPaths: Set<URL> {
         guard let companion = cutCompanion,
               companion.changeCount == pasteboard.changeCount else {

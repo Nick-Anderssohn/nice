@@ -18,7 +18,7 @@
 //
 
 import AppKit
-import Combine
+import Observation
 import SwiftUI
 
 // MARK: - Palette
@@ -186,14 +186,15 @@ struct EditorCommand: Identifiable, Hashable, Codable, Sendable {
 
 /// Observable store owning the theme + accent values. `theme`, `syncWithOS`,
 /// and `accent` write through to `UserDefaults` on every set so a relaunch
-/// restores them, and all three are `@Published` so every view that reads
-/// them via `@EnvironmentObject` repaints on change.
+/// restores them, and every observed property invalidates views that read
+/// them via `@Environment(Tweaks.self)` on change.
 ///
 /// Invariant: when `syncWithOS == true`, `theme.scheme` equals the current
 /// OS scheme. `reconcileWithOS()` enforces this and is called at init, when
 /// `syncWithOS` flips to true, and from the OS-scheme notification handler.
 @MainActor
-final class Tweaks: ObservableObject {
+@Observable
+final class Tweaks {
     /// Legacy single-choice theme key. Preserved as a read-only source
     /// during migration, then removed from UserDefaults so the new
     /// `scheme` / `chromeLightPaletteKey` / `chromeDarkPaletteKey`
@@ -219,7 +220,7 @@ final class Tweaks: ObservableObject {
     /// The active color scheme. Pinned to `.aqua` / `.darkAqua` via
     /// `NSApp.appearance` on every set so AppKit chrome and SwiftUI's
     /// `@Environment(\.colorScheme)` stay in lockstep with this value.
-    @Published var scheme: ColorScheme {
+    var scheme: ColorScheme {
         didSet {
             UserDefaults.standard.set(Self.encodeScheme(scheme), forKey: Self.schemeKey)
             NSApp?.appearance = Self.nsAppearance(for: scheme)
@@ -229,20 +230,20 @@ final class Tweaks: ObservableObject {
     /// Chrome palette used when `scheme == .light`. Read via
     /// `activeChromePalette` everywhere in the app; the view layer
     /// never branches on `scheme` itself.
-    @Published var chromeLightPalette: Palette {
+    var chromeLightPalette: Palette {
         didSet {
             UserDefaults.standard.set(chromeLightPalette.rawValue, forKey: Self.chromeLightPaletteKey)
         }
     }
 
     /// Chrome palette used when `scheme == .dark`.
-    @Published var chromeDarkPalette: Palette {
+    var chromeDarkPalette: Palette {
         didSet {
             UserDefaults.standard.set(chromeDarkPalette.rawValue, forKey: Self.chromeDarkPaletteKey)
         }
     }
 
-    @Published var syncWithOS: Bool {
+    var syncWithOS: Bool {
         didSet {
             UserDefaults.standard.set(syncWithOS, forKey: Self.syncKey)
             if syncWithOS { reconcileWithOS() }
@@ -282,7 +283,7 @@ final class Tweaks: ObservableObject {
         scheme == .light ? chromeLightPalette : chromeDarkPalette
     }
 
-    @Published var accent: AccentPreset {
+    var accent: AccentPreset {
         didSet { UserDefaults.standard.set(accent.rawValue, forKey: Self.accentKey) }
     }
 
@@ -290,14 +291,14 @@ final class Tweaks: ObservableObject {
     /// Resolved via `TerminalThemeCatalog.theme(withId:)` at apply
     /// time; an unknown id (e.g. a deleted imported theme) falls back
     /// to Nice Default (Light).
-    @Published var terminalThemeLightId: String {
+    var terminalThemeLightId: String {
         didSet {
             UserDefaults.standard.set(terminalThemeLightId, forKey: Self.terminalThemeLightKey)
         }
     }
 
     /// Terminal theme id used when the active scheme is dark.
-    @Published var terminalThemeDarkId: String {
+    var terminalThemeDarkId: String {
         didSet {
             UserDefaults.standard.set(terminalThemeDarkId, forKey: Self.terminalThemeDarkKey)
         }
@@ -305,7 +306,7 @@ final class Tweaks: ObservableObject {
 
     /// PostScript name of the terminal font, or nil to use the default
     /// chain (SF Mono → JetBrains Mono NL → system monospaced).
-    @Published var terminalFontFamily: String? {
+    var terminalFontFamily: String? {
         didSet {
             if let terminalFontFamily {
                 UserDefaults.standard.set(terminalFontFamily, forKey: Self.terminalFontFamilyKey)
@@ -326,7 +327,7 @@ final class Tweaks: ObservableObject {
     /// `removeEditor`; making the array publicly mutable would let a
     /// caller `editorCommands.removeAll { … }` silently bypass the
     /// cleanup.
-    @Published private(set) var editorCommands: [EditorCommand] {
+    private(set) var editorCommands: [EditorCommand] {
         didSet { persistEditorCommands() }
     }
 
@@ -339,7 +340,7 @@ final class Tweaks: ObservableObject {
     /// the way in, and a public setter would let callers store
     /// non-normalised keys (`"MD"`, `".md"`) that `editor(forExtension:)`
     /// then can't find.
-    @Published private(set) var extensionEditorMap: [String: UUID] {
+    private(set) var extensionEditorMap: [String: UUID] {
         didSet { persistExtensionEditorMap() }
     }
 
@@ -405,9 +406,9 @@ final class Tweaks: ObservableObject {
         }
     }
 
-    // No deinit: `Tweaks` is installed as a `@StateObject` at the App
-    // root and lives for the whole process lifetime, so the observer
-    // token is released implicitly at exit. Touching `osObserver` from a
+    // No deinit: `Tweaks` is installed as a `@State` at the App root
+    // and lives for the whole process lifetime, so the observer token
+    // is released implicitly at exit. Touching `osObserver` from a
     // nonisolated deinit would require hopping back onto the main actor,
     // which isn't allowed in Swift 6 deinits.
 

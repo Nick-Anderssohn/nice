@@ -2,7 +2,7 @@
 //  AppShellView.swift
 //  Nice
 //
-//  Per-window root: owns this window's `AppState` as a `@StateObject`
+//  Per-window root: owns this window's `AppState` as a `@State`
 //  (so every `WindowGroup` instance gets its own), bridges SwiftUI's
 //  per-scene `@SceneStorage` to AppState for things like the collapsed
 //  sidebar state, and registers the window with the app-wide
@@ -33,7 +33,7 @@ import AppKit
 import SwiftUI
 
 struct AppShellView: View {
-    @EnvironmentObject private var services: NiceServices
+    @Environment(NiceServices.self) private var services
     @SceneStorage("sidebarCollapsed") private var storedSidebarCollapsed: Bool = false
     /// Per-window persisted sidebar content mode. Default is `.tabs`
     /// so existing users get exactly the same first-launch experience
@@ -62,9 +62,9 @@ struct AppShellView: View {
 /// `AppShellView` before constructing the per-window `AppState`
 /// (`@StateObject` can't reach environment in its own `init`).
 private struct AppShellHost: View {
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var shortcuts: KeyboardShortcuts
-    @EnvironmentObject private var fontSettings: FontSettings
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(KeyboardShortcuts.self) private var shortcuts
+    @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
 
     @StateObject private var appState: AppState
@@ -160,7 +160,7 @@ private struct AppShellHost: View {
                 .animation(.easeInOut(duration: 0.18), value: services.fileExplorer.history.lastDriftMessage)
         }
         .environment(\.palette, palette)
-        .environmentObject(appState)
+        .environment(appState)
         .alert(
             "Processes are still running",
             isPresented: Binding(
@@ -666,22 +666,22 @@ private struct SidebarToggleButton: View {
 
 #Preview("Light") {
     AppShellView()
-        .environmentObject(NiceServices())
-        .environmentObject(Tweaks())
-        .environmentObject(KeyboardShortcuts())
-        .environmentObject(FontSettings())
-        .environmentObject(FileBrowserSortSettings())
+        .environment(NiceServices())
+        .environment(Tweaks())
+        .environment(KeyboardShortcuts())
+        .environment(FontSettings())
+        .environment(FileBrowserSortSettings())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.light)
 }
 
 #Preview("Dark") {
     AppShellView()
-        .environmentObject(NiceServices())
-        .environmentObject(Tweaks())
-        .environmentObject(KeyboardShortcuts())
-        .environmentObject(FontSettings())
-        .environmentObject(FileBrowserSortSettings())
+        .environment(NiceServices())
+        .environment(Tweaks())
+        .environment(KeyboardShortcuts())
+        .environment(FontSettings())
+        .environment(FileBrowserSortSettings())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.dark)
 }

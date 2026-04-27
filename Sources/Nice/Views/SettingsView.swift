@@ -56,7 +56,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 // MARK: - Root
 
 struct SettingsView: View {
-    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(Tweaks.self) private var tweaks
     @Environment(\.colorScheme) private var scheme
 
     private var palette: Palette { tweaks.activeChromePalette }
@@ -200,7 +200,7 @@ private struct SettingsSectionRow: View {
 // MARK: - Shortcuts pane
 
 private struct ShortcutsPane: View {
-    @EnvironmentObject private var shortcuts: KeyboardShortcuts
+    @Environment(KeyboardShortcuts.self) private var shortcuts
 
     var body: some View {
         SettingTitle("Shortcuts")
@@ -215,14 +215,15 @@ private struct ShortcutsPane: View {
 // MARK: - Appearance pane
 
 private struct AppearancePane: View {
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var catalog: TerminalThemeCatalog
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(TerminalThemeCatalog.self) private var catalog
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
     @State private var importError: ImportErrorWrapper?
 
     var body: some View {
+        @Bindable var tweaks = tweaks
         Group {
             SettingTitle("Appearance")
 
@@ -413,7 +414,7 @@ private struct AppearancePane: View {
 /// which respects the sync-with-OS flag (if sync is on and the tapped
 /// cell's scheme doesn't match the OS, we fall back to its counterpart).
 private struct ThemeButtonGrid: View {
-    @EnvironmentObject private var tweaks: Tweaks
+    @Environment(Tweaks.self) private var tweaks
 
     var body: some View {
         VStack(spacing: 8) {
@@ -688,8 +689,8 @@ struct KeyPills: View {
 
 #Preview("Settings") {
     SettingsView()
-        .environmentObject(NiceServices())
-        .environmentObject(Tweaks())
-        .environmentObject(KeyboardShortcuts())
-        .environmentObject(FontSettings())
+        .environment(NiceServices())
+        .environment(Tweaks())
+        .environment(KeyboardShortcuts())
+        .environment(FontSettings())
 }

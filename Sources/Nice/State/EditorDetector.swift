@@ -22,11 +22,12 @@ import Foundation
 typealias ShellRunner = @Sendable (_ script: String, _ timeout: TimeInterval) throws -> String
 
 @MainActor
-final class EditorDetector: ObservableObject {
+@Observable
+final class EditorDetector {
     /// Detected editors discovered by the most recent `scan()`. Empty
     /// before the first scan completes; UI should treat this as
     /// authoritative once published.
-    @Published private(set) var detected: [EditorCommand] = []
+    private(set) var detected: [EditorCommand] = []
 
     /// Curated list of well-known terminal editors. `binary` is what
     /// `command -v` is asked about; `command` is the full invocation
@@ -55,6 +56,7 @@ final class EditorDetector: ObservableObject {
     /// user's first interaction with the menu.
     nonisolated static let defaultTimeout: TimeInterval = 5
 
+    @ObservationIgnored
     private let shellRunner: ShellRunner
 
     /// Production callers use the default zsh runner; tests pass a
@@ -84,7 +86,7 @@ final class EditorDetector: ObservableObject {
     /// Awaitable form for tests. Runs `shellRunner` directly on the
     /// caller's task and publishes the result on the main actor. Use
     /// `scan()` from production code; this entry point exists so
-    /// tests don't have to poll `@Published` Combine state.
+    /// tests don't have to poll observation tracking.
     func performScan() async {
         let runner = shellRunner
         let found = await Task.detached(priority: .utility) {

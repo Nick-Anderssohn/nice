@@ -3,7 +3,7 @@
 //  Nice
 //
 //  User-controlled terminal and sidebar font sizes. Mirrors the `Tweaks`
-//  pattern: an `@MainActor ObservableObject` whose mutations write
+//  pattern: an `@MainActor @Observable` class whose mutations write
 //  through to `UserDefaults` immediately, with an injectable `defaults`
 //  parameter so unit tests can stand it up against an isolated suite.
 //
@@ -25,7 +25,8 @@ import Foundation
 import CoreGraphics
 
 @MainActor
-final class FontSettings: ObservableObject {
+@Observable
+final class FontSettings {
     static let terminalKey = "terminalFontSize"
     static let sidebarKey  = "sidebarFontSize"
 
@@ -49,14 +50,15 @@ final class FontSettings: ObservableObject {
     static let minSize: CGFloat = 8
     static let maxSize: CGFloat = 32
 
-    @Published var terminalFontSize: CGFloat {
+    var terminalFontSize: CGFloat {
         didSet { defaults.set(Double(terminalFontSize), forKey: Self.terminalKey) }
     }
 
-    @Published var sidebarFontSize: CGFloat {
+    var sidebarFontSize: CGFloat {
         didSet { defaults.set(Double(sidebarFontSize), forKey: Self.sidebarKey) }
     }
 
+    @ObservationIgnored
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {

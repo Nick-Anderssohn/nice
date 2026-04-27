@@ -11,7 +11,7 @@
 import SwiftUI
 
 struct FileOperationDriftBanner: View {
-    @ObservedObject var history: FileOperationHistory
+    var history: FileOperationHistory
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 

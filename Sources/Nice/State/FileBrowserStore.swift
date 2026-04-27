@@ -20,12 +20,13 @@ import Foundation
 import SwiftUI
 
 @MainActor
-final class FileBrowserStore: ObservableObject {
+@Observable
+final class FileBrowserStore {
     /// Keyed by `Tab.id`. Lazily populated by `ensureState` on first
     /// access, dropped by `removeState` when the tab closes. In-memory
     /// only — see `FileBrowserState` for why expansion / scroll
     /// state isn't worth persisting across launches.
-    @Published private(set) var states: [String: FileBrowserState] = [:]
+    private(set) var states: [String: FileBrowserState] = [:]
 
     /// Fetch the state for `tabId`, creating one rooted at `cwd` if
     /// none exists. Subsequent calls return the same object so the

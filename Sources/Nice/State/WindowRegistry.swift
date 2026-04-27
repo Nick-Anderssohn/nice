@@ -25,7 +25,8 @@ import AppKit
 import Foundation
 
 @MainActor
-final class WindowRegistry: ObservableObject {
+@Observable
+final class WindowRegistry {
     /// One entry per registered window. `appState` and `window` are
     /// weak so we don't keep either alive past natural SwiftUI teardown;
     /// `handleClose` performs eager cleanup when the window actually

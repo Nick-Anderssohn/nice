@@ -14,7 +14,8 @@ import Foundation
 import SwiftUI
 
 @MainActor
-final class FileBrowserState: ObservableObject {
+@Observable
+final class FileBrowserState {
     /// Absolute path of the directory currently shown as the tree root.
     /// Seeded from the owning tab's CWD; mutated by the breadcrumb
     /// up-arrow, the project-name header (resets to CWD), the empty-
@@ -24,7 +25,7 @@ final class FileBrowserState: ObservableObject {
     /// shows its contents by default after a re-root. Users can
     /// still collapse the root manually — the row is treated like
     /// any other directory, no `isRoot` exception in the view.
-    @Published var rootPath: String {
+    var rootPath: String {
         didSet {
             expandedPaths.insert(rootPath)
         }
@@ -36,7 +37,7 @@ final class FileBrowserState: ObservableObject {
     /// paths, not on identity. The current `rootPath` is always in
     /// this set when freshly seeded / re-rooted; the user can still
     /// remove it by clicking the disclosure triangle to collapse.
-    @Published var expandedPaths: Set<String> = []
+    var expandedPaths: Set<String> = []
 
     /// Whether dotfiles are visible. The seed value is CWD-aware (see
     /// `defaultShowHidden(forCwd:)` — hidden in $HOME so the user's
@@ -45,7 +46,7 @@ final class FileBrowserState: ObservableObject {
     /// content). Once seeded, `showHidden` is sticky against
     /// breadcrumb navigation — the user's explicit toggle persists
     /// even after they navigate into or out of $HOME.
-    @Published var showHidden: Bool
+    var showHidden: Bool
 
     /// Multi-row selection model. One per file browser, owned here
     /// so the view layer doesn't have to thread it through. Plain
@@ -98,9 +99,13 @@ final class FileBrowserState: ObservableObject {
 /// `.onDisappear`, so collapsed and offscreen directories don't hold
 /// FDs.
 @MainActor
-final class DirectoryWatcher: ObservableObject {
+@Observable
+final class DirectoryWatcher {
+    @ObservationIgnored
     private var source: DispatchSourceFileSystemObject?
+    @ObservationIgnored
     private var fd: Int32 = -1
+    @ObservationIgnored
     private var pendingWork: DispatchWorkItem?
 
     /// Begin watching `path`. Calling `start` again replaces any prior

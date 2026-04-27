@@ -17,15 +17,15 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SidebarView: View {
-    @EnvironmentObject private var appState: AppState
+    @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
-    @StateObject private var dragState = SidebarDragState()
+    @State private var dragState = SidebarDragState()
 
     var body: some View {
         expandedSidebar
-            .environmentObject(dragState)
+            .environment(dragState)
     }
 
     // MARK: - Expanded sidebar
@@ -92,10 +92,10 @@ struct SidebarView: View {
 // MARK: - Project group
 
 private struct ProjectGroup: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var fontSettings: FontSettings
-    @EnvironmentObject private var dragState: SidebarDragState
+    @Environment(AppState.self) private var appState
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(FontSettings.self) private var fontSettings
+    @Environment(SidebarDragState.self) private var dragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -247,7 +247,7 @@ private struct ProjectGroup: View {
 }
 
 private struct CountPill: View {
-    @EnvironmentObject private var fontSettings: FontSettings
+    @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     let count: Int
@@ -303,10 +303,10 @@ private struct AddTabButton: View {
 // MARK: - Tab row
 
 private struct TabRow: View {
-    @EnvironmentObject private var appState: AppState
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var fontSettings: FontSettings
-    @EnvironmentObject private var dragState: SidebarDragState
+    @Environment(AppState.self) private var appState
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(FontSettings.self) private var fontSettings
+    @Environment(SidebarDragState.self) private var dragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -574,15 +574,16 @@ struct SidebarDragSession: Equatable {
 }
 
 /// Ephemeral, view-layer sidebar-drag state. Owned by `SidebarView`
-/// via `@StateObject` and propagated to its subtree via
-/// `.environmentObject`; deliberately kept off `AppState` so the
-/// persistent model doesn't accumulate transient UI scratchpads.
-/// The SwiftUI Transferable drop API exposes the cursor location but
-/// not the payload until the drop commits, so `TabRow`'s `onDrag`
-/// stashes the dragged id here for synchronous access during hover.
+/// via `@State` and propagated to its subtree via `.environment(_:)`;
+/// deliberately kept off `AppState` so the persistent model doesn't
+/// accumulate transient UI scratchpads. The SwiftUI Transferable drop
+/// API exposes the cursor location but not the payload until the drop
+/// commits, so `TabRow`'s `onDrag` stashes the dragged id here for
+/// synchronous access during hover.
 @MainActor
-final class SidebarDragState: ObservableObject {
-    @Published var session: SidebarDragSession?
+@Observable
+final class SidebarDragState {
+    var session: SidebarDragSession?
 }
 
 /// Drop delegate attached to each project group's VStack. The
@@ -748,7 +749,7 @@ enum SidebarDropResolver {
 // MARK: - Footer controls
 
 private struct SidebarIconButton: View {
-    @EnvironmentObject private var fontSettings: FontSettings
+    @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -778,10 +779,10 @@ private struct SidebarIconButton: View {
 
 #Preview("Sidebar") {
     SidebarView()
-        .environmentObject(AppState())
-        .environmentObject(Tweaks())
-        .environmentObject(FontSettings())
-        .environmentObject(FileBrowserSortSettings())
+        .environment(AppState())
+        .environment(Tweaks())
+        .environment(FontSettings())
+        .environment(FileBrowserSortSettings())
         .frame(width: 240, height: 680)
 }
 
