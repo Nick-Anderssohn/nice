@@ -25,6 +25,22 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
+      # Pre-flight the display so the first GUI process triggers any
+      # initial WindowServer / screen-parameters setup before xctest
+      # launches the unit-test host. Without this, Nice is the first
+      # app to query the screen and a `didChangeScreenParameters`
+      # notification fires mid-launch, racing SwiftUI's own scene-graph
+      # init and tripping an AttributeGraph "setting value during
+      # update" precondition. (See SwiftUI 7.3.2 / AttributeGraph 7.0.80
+      # on macOS 26.3 — not reproducible locally.)
+      - name: Warm up WindowServer
+        run: |
+          osascript -e 'tell application "System Events" to count processes' || true
+          # Tiny no-op AppleScript window flicker to flush any deferred
+          # display-setup notifications.
+          osascript -e 'tell application "Finder" to activate' || true
+          sleep 2
+
       # Unit and UI tests are split so a unit-host crash doesn't mask
       # UI-test failures (and vice versa). Each step runs independently
       # via `if: always()` so we always get a signal from both.
