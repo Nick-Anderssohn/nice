@@ -483,6 +483,11 @@ private struct FileTreeRow: View {
         // by its absolute path.
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("fileBrowser.row.\(path)")
+        .accessibilityAddTraits(selection.contains(path) ? .isSelected : [])
+        // `.isSelected` doesn't reliably surface to `XCUIElement.isSelected`
+        // on macOS (see `SettingsView` theme cell for the same pattern);
+        // mirror the bit in `accessibilityValue` so UITests can read it.
+        .accessibilityValue(selection.contains(path) ? "selected" : "unselected")
         .onHover { hover = $0 }
         // Single `.onTapGesture` instead of `.onTapGesture(count: 2)`
         // + `(count: 1)` — the latter introduces a SwiftUI delay on
