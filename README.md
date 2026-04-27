@@ -43,7 +43,10 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 | `⌘⌥→` / `⌘⌥←` | Next / previous pane within a tab |
 | `⌘T` | New terminal pane |
 | `⌘B` | Toggle sidebar |
+| `⌘⇧B` | Toggle sidebar mode (tabs ↔ file browser) |
+| `⌘⇧.` | Toggle hidden files in the file browser |
 | `⌘+` / `⌘-` / `⌘0` | Zoom in, out, reset |
+| `⌘Z` / `⌘⇧Z` | Undo / redo file operation |
 
 All rebindable in Settings (`⌘,`).
 
