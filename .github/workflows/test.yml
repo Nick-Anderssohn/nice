@@ -18,5 +18,26 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
-      - name: Run tests
-        run: scripts/test.sh
+      # Unit and UI tests are split so a unit-host crash doesn't mask
+      # UI-test failures (and vice versa). Each step runs independently
+      # via `if: always()` so we always get a signal from both.
+      - name: Run unit tests
+        id: unit
+        run: scripts/test.sh -only-testing:NiceUnitTests
+
+      - name: Run UI tests
+        if: always()
+        id: ui
+        run: scripts/test.sh -only-testing:NiceUITests
+
+      # On any test failure, upload the xcresult bundle so we can pull
+      # the actual crash backtrace + diagnostic logs out of CI. The
+      # bundle lives under build-dev/Logs/Test/.
+      - name: Upload xcresult on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcresult-${{ github.run_id }}
+          path: build-dev/Logs/Test/*.xcresult
+          if-no-files-found: ignore
+          retention-days: 14
