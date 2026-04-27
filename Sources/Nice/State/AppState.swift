@@ -88,6 +88,12 @@ final class AppState {
     /// (so the dissolve cascade keeps running on the orchestrator).
     let sessions: SessionsModel
 
+    /// Per-window sidebar UI state (collapsed flag, mode, peek). The
+    /// `@SceneStorage` bridge in `AppShellView` seeds the initial
+    /// values via AppState.init and writes back on changes via the
+    /// forwarders below.
+    let sidebar: SidebarModel
+
     /// Forwarder for `tabs.projects` so existing call sites (views,
     /// tests) keep working unchanged. The view-side rename pass that
     /// points UI directly at `tabs.projects` is a separate step.
@@ -103,15 +109,18 @@ final class AppState {
         set { tabs.activeTabId = newValue }
     }
 
-    /// Whether the sidebar is collapsed. Seeded from the per-window
-    /// `@SceneStorage` value by the owning view so each window keeps
-    /// its own state; the view writes back on changes.
-    var sidebarCollapsed: Bool = false
+    /// Forwarder for `sidebar.sidebarCollapsed` so existing call
+    /// sites (views, tests, KeyboardShortcutMonitor) keep working.
+    var sidebarCollapsed: Bool {
+        get { sidebar.sidebarCollapsed }
+        set { sidebar.sidebarCollapsed = newValue }
+    }
 
-    /// Which content the sidebar is showing (tabs vs file browser).
-    /// Seeded from the per-window `@SceneStorage` value upstream so
-    /// each window restores its last-used mode across relaunch.
-    var sidebarMode: SidebarMode = .tabs
+    /// Forwarder for `sidebar.sidebarMode`.
+    var sidebarMode: SidebarMode {
+        get { sidebar.sidebarMode }
+        set { sidebar.sidebarMode = newValue }
+    }
 
     /// Per-window catalog of file-browser states keyed by `Tab.id`.
     /// Lifecycle: states are lazily created on first access and
@@ -120,23 +129,20 @@ final class AppState {
     /// pick up changes without `AppState` re-emitting.
     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
 
-    /// Transient: sidebar is floating over the terminal as a peek
-    /// triggered by the tab-cycling shortcut while collapsed. Set by
-    /// `KeyboardShortcutMonitor` after a sidebar-tab dispatch, cleared
-    /// when the user releases the shortcut's modifiers. Never set while
-    /// `sidebarCollapsed == false`. The view layer ORs this with its own
-    /// mouse-hover pin so a hovered peek stays open after the keys lift.
-    var sidebarPeeking: Bool = false
-
-    func toggleSidebar() {
-        sidebarCollapsed.toggle()
+    /// Forwarder for `sidebar.sidebarPeeking`.
+    var sidebarPeeking: Bool {
+        get { sidebar.sidebarPeeking }
+        set { sidebar.sidebarPeeking = newValue }
     }
 
-    /// Flip the sidebar between projects/tabs and file-browser views.
-    /// Bound to `ShortcutAction.toggleSidebarMode` (default ⌘⇧B) and
-    /// the two mode icons in the sidebar header.
+    /// Forwarder onto `SidebarModel.toggleSidebar`.
+    func toggleSidebar() {
+        sidebar.toggleSidebar()
+    }
+
+    /// Forwarder onto `SidebarModel.toggleSidebarMode`.
     func toggleSidebarMode() {
-        sidebarMode = (sidebarMode == .tabs) ? .files : .tabs
+        sidebar.toggleSidebarMode()
     }
 
     /// Flip the active tab's file-browser hidden-file visibility.
@@ -161,11 +167,9 @@ final class AppState {
         tabs.fileBrowserHeaderTitle(forTab: id)
     }
 
-    /// Called by the keyboard monitor when all relevant shortcut
-    /// modifiers have been released. The view's separate mouse-hover
-    /// pin keeps the overlay rendered if the cursor is over it.
+    /// Forwarder onto `SidebarModel.endSidebarPeek`.
     func endSidebarPeek() {
-        sidebarPeeking = false
+        sidebar.endSidebarPeek()
     }
 
     // MARK: - Window-state plumbing
@@ -268,8 +272,10 @@ final class AppState {
         self.fileExplorer = fileExplorer ?? services?.fileExplorer
         self.tweaks = services?.tweaks
         self.editorDetector = services?.editorDetector
-        self.sidebarCollapsed = initialSidebarCollapsed
-        self.sidebarMode = initialSidebarMode
+        self.sidebar = SidebarModel(
+            initialCollapsed: initialSidebarCollapsed,
+            initialMode: initialSidebarMode
+        )
 
         let resolvedMainCwd = initialMainCwd ?? NSHomeDirectory()
 
