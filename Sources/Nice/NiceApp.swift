@@ -95,8 +95,10 @@ struct NiceApp: App {
         .windowResizability(.contentSize)
 
         // ⌘, binds to this scene automatically on macOS. SettingsView
-        // sets its own 640×440 frame, but we repeat it here so the
-        // window resizes correctly even before the child view lays out.
+        // declares its own min / ideal / max frame; mirroring it here
+        // means the window picks the right initial size before
+        // SettingsView's body has run, while still letting users drag
+        // the window edges (`.windowResizability(.contentSize)`).
         Settings {
             SettingsView()
                 .environmentObject(services)
@@ -107,8 +109,12 @@ struct NiceApp: App {
                 .environmentObject(services.releaseChecker)
                 .environmentObject(services.editorDetector)
                 .environment(\.palette, services.tweaks.activeChromePalette)
-                .frame(width: 640, height: 440)
+                .frame(
+                    minWidth: 560, idealWidth: 640, maxWidth: .infinity,
+                    minHeight: 380, idealHeight: 440, maxHeight: .infinity
+                )
                 .tint(services.tweaks.accent.color)
         }
+        .windowResizability(.contentMinSize)
     }
 }

@@ -68,8 +68,23 @@ struct SettingsView: View {
             sidebar
             content
         }
-        .frame(width: 640, height: 440)
+        .frame(
+            minWidth: 560, idealWidth: 640, maxWidth: .infinity,
+            minHeight: 380, idealHeight: 440, maxHeight: .infinity
+        )
         .background(Color.nicePanel(scheme, palette))
+        .background(
+            // SwiftUI's `Settings` scene historically renders its window
+            // without `.resizable` in its styleMask, ignoring
+            // `.windowResizability(.contentMinSize)` on the scene. Reach
+            // into AppKit and OR the bit in once the window is live so
+            // the user can drag any edge / corner like a normal window.
+            WindowAccessor { window in
+                if !window.styleMask.contains(.resizable) {
+                    window.styleMask.insert(.resizable)
+                }
+            }
+        )
         .environment(\.palette, palette)
         // `.accessibilityElement(children: .contain)` groups the whole
         // shell under one container element that carries the id, so

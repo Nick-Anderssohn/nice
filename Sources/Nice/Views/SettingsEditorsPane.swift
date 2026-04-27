@@ -32,10 +32,10 @@ struct SettingsEditorsPane: View {
 
             editorsList
 
-            SettingTitle("Detected on your system")
+            SettingSubtitle("Detected on your system")
             detectedList
 
-            SettingTitle("File extension routing")
+            SettingSubtitle("File extension routing")
             extensionMappings
         }
     }
@@ -204,17 +204,23 @@ private struct EditorRow: View {
             label: editor.name.isEmpty ? "(unnamed editor)" : editor.name,
             hint: editor.command.isEmpty ? "No command set" : nil
         ) {
-            HStack(spacing: 6) {
-                TextField("Name", text: $name)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 110)
-                    .onSubmit { onCommit(name, command) }
-                    .accessibilityIdentifier("settings.editors.row.\(editor.id.uuidString).name")
-                TextField("Command", text: $command)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 140)
-                    .onSubmit { onCommit(name, command) }
-                    .accessibilityIdentifier("settings.editors.row.\(editor.id.uuidString).command")
+            HStack(alignment: .bottom, spacing: 6) {
+                LabeledField(
+                    caption: "Name",
+                    text: $name,
+                    placeholder: "Display name",
+                    width: 110,
+                    accessibilityId: "settings.editors.row.\(editor.id.uuidString).name",
+                    onSubmit: { onCommit(name, command) }
+                )
+                LabeledField(
+                    caption: "Command",
+                    text: $command,
+                    placeholder: "vim, nvim -p, …",
+                    width: 140,
+                    accessibilityId: "settings.editors.row.\(editor.id.uuidString).command",
+                    onSubmit: { onCommit(name, command) }
+                )
                 Button {
                     onCommit(name, command)
                 } label: {
@@ -222,6 +228,7 @@ private struct EditorRow: View {
                 }
                 .controlSize(.small)
                 .help("Save")
+
                 Button(role: .destructive) {
                     onDelete()
                 } label: {
@@ -231,6 +238,36 @@ private struct EditorRow: View {
                 .help("Delete editor")
                 .accessibilityIdentifier("settings.editors.row.\(editor.id.uuidString).delete")
             }
+        }
+    }
+}
+
+/// Compact captioned text field used inside `EditorRow`. The caption
+/// (10.5pt secondary ink) sits above the input so the field's purpose
+/// stays legible once the user types over the placeholder.
+private struct LabeledField: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+
+    let caption: String
+    @Binding var text: String
+    let placeholder: String
+    let width: CGFloat
+    let accessibilityId: String
+    let onSubmit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(caption)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(Color.niceInk3(scheme, palette))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: width)
+                .onSubmit(onSubmit)
+                .accessibilityIdentifier(accessibilityId)
         }
     }
 }
@@ -281,7 +318,8 @@ private struct ExtensionMappingRow: View {
                     }
                 }
                 .labelsHidden()
-                .frame(width: 140)
+                .pickerStyle(.menu)
+                .fixedSize()
                 .accessibilityIdentifier("settings.editors.mapping.\(ext).editor")
 
                 Button(role: .destructive) {
