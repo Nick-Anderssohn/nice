@@ -792,7 +792,7 @@ private struct SidebarIconButton: View {
 /// rename field to know where to check for click-outside events —
 /// `NSEvent.locationInWindow` is in window coordinates, and
 /// `NSWindow.windowNumber` identifies the window across the process.
-private struct WindowFrameReporter: NSViewRepresentable {
+struct WindowFrameReporter: NSViewRepresentable {
     var onReport: (NSRect, Int) -> Void
 
     func makeNSView(context: Context) -> Reporter {

@@ -66,6 +66,21 @@ private struct FileBrowserContent: View {
     /// matches the `SidebarDragState` pattern used by the tab list.
     @StateObject private var dragState = FileBrowserDragState()
 
+    /// Window-local frame of the file browser, used by the
+    /// `mouseMonitor` below to decide whether a click happened
+    /// outside our pane (terminal, session-tab list, etc.) and
+    /// should therefore deselect.
+    @State private var frameInWindow: NSRect = .zero
+    @State private var windowNumber: Int = 0
+    /// AppKit mouse-down monitor that clears the file selection on
+    /// any click in our window that lands outside our frame. Clicks
+    /// inside the frame are handled by SwiftUI's gesture dispatch:
+    /// row taps re-set the selection, the disclosure triangle and
+    /// breadcrumb buttons consume the tap (preserving selection),
+    /// and clicks on truly empty space fall through to the outer
+    /// `.onTapGesture` below, which clears.
+    @State private var mouseMonitor: Any?
+
     var body: some View {
         VStack(spacing: 0) {
             projectHeader
@@ -74,6 +89,32 @@ private struct FileBrowserContent: View {
             tree
         }
         .environmentObject(dragState)
+        .contentShape(Rectangle())
+        .onTapGesture { state.selection.clear() }
+        .background(WindowFrameReporter { frame, number in
+            frameInWindow = frame
+            windowNumber = number
+        })
+        .onAppear { installMouseMonitor() }
+        .onDisappear { removeMouseMonitor() }
+    }
+
+    private func installMouseMonitor() {
+        removeMouseMonitor()
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            guard event.window?.windowNumber == windowNumber else { return event }
+            if !frameInWindow.contains(event.locationInWindow) {
+                state.selection.clear()
+            }
+            return event
+        }
+    }
+
+    private func removeMouseMonitor() {
+        if let monitor = mouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMonitor = nil
+        }
     }
 
     // MARK: Project header
@@ -253,6 +294,7 @@ private struct FileBrowserContent: View {
 /// expanded directory, its children as nested `FileTreeRow` views.
 private struct FileTreeRow: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var tweaks: Tweaks
     @EnvironmentObject private var fontSettings: FontSettings
     @EnvironmentObject private var sortSettings: FileBrowserSortSettings
     @EnvironmentObject private var dragState: FileBrowserDragState
@@ -516,7 +558,7 @@ private struct FileTreeRow: View {
             return Color.accentColor.opacity(0.30)
         }
         if selection.contains(path) {
-            return Color.accentColor.opacity(0.18)
+            return Color.niceSel(scheme, accent: tweaks.accent.color)
         }
         if hover {
             return Color.niceInk(scheme, palette).opacity(0.06)
