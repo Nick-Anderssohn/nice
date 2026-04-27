@@ -159,8 +159,6 @@ final class TweaksExpansionTests: XCTestCase {
             Tweaks.terminalThemeLightKey,
             Tweaks.terminalThemeDarkKey,
             Tweaks.terminalFontFamilyKey,
-            Tweaks.gpuRenderingKey,
-            Tweaks.smoothScrollingKey,
         ] {
             UserDefaults.standard.removeObject(forKey: key)
         }

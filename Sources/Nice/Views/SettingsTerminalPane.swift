@@ -2,137 +2,23 @@
 //  SettingsTerminalPane.swift
 //  Nice
 //
-//  Terminal-specific preferences: per-scheme theme selection,
-//  Ghostty-format theme import, and management of imported themes.
-//  Chrome palette lives in `AppearancePane`; font size in `FontPane`.
+//  Building blocks shared with `AppearancePane` for picking and
+//  managing terminal themes: the swatch-strip preview, the per-scheme
+//  picker, the imported-theme row, and the import-error wrapper.
 //
-//  Two independently-editable slots — light and dark — so "Sync with
-//  OS" can flip between a user-tuned light look and a user-tuned dark
-//  look without either being an afterthought.
+//  These used to back a standalone "Terminal themes" settings section,
+//  but that section was folded into Appearance — chrome palette and
+//  terminal theme are configured side-by-side, grouped by light/dark
+//  scheme. The types are kept here (rather than inlined into
+//  SettingsView.swift) to keep that file focused on the pane shells.
 //
 
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
-
-struct SettingsTerminalPane: View {
-    @EnvironmentObject private var tweaks: Tweaks
-    @EnvironmentObject private var catalog: TerminalThemeCatalog
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.palette) private var palette
-
-    @State private var importError: ImportErrorWrapper?
-
-    var body: some View {
-        Group {
-            SettingTitle("Terminal themes")
-
-            SettingRow(
-                label: "Light mode theme",
-                hint: "Palette used when the active scheme is light."
-            ) {
-                ThemePicker(
-                    selection: $tweaks.terminalThemeLightId,
-                    options: catalog.themes(for: .light),
-                    accessibilityIdentifier: "settings.terminal.lightPicker"
-                )
-            }
-
-            SettingRow(
-                label: "Dark mode theme",
-                hint: "Palette used when the active scheme is dark."
-            ) {
-                ThemePicker(
-                    selection: $tweaks.terminalThemeDarkId,
-                    options: catalog.themes(for: .dark),
-                    accessibilityIdentifier: "settings.terminal.darkPicker"
-                )
-            }
-
-            SettingRow(
-                label: "Import theme",
-                hint: "Load a Ghostty-format theme file (.ghostty or .conf). Imported themes appear in both light and dark pickers."
-            ) {
-                Button("Import…") {
-                    runImportPanel()
-                }
-                .controlSize(.small)
-                .accessibilityIdentifier("settings.terminal.import")
-            }
-
-            if !catalog.imported.isEmpty {
-                SettingRow(
-                    label: "Imported themes",
-                    hint: "Remove a theme to delete its file from Nice's support directory."
-                ) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(catalog.imported) { theme in
-                            ImportedThemeRow(theme: theme, onDelete: { deleteImported(theme) })
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-        }
-        .alert(item: $importError) { wrapper in
-            Alert(
-                title: Text(wrapper.title),
-                message: Text(wrapper.message),
-                dismissButton: .default(Text("OK"))
-            )
-        }
-    }
-
-    // MARK: - Actions
-
-    private func runImportPanel() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if let ghosttyType = UTType(filenameExtension: "ghostty") {
-            panel.allowedContentTypes = [ghosttyType, .plainText, .propertyList]
-        }
-        panel.allowsOtherFileTypes = true
-        panel.prompt = "Import"
-        panel.message = "Choose a Ghostty-format terminal theme (.ghostty or .conf)."
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let theme = try catalog.importTheme(from: url)
-            // Auto-select in the active-scheme slot so the user sees
-            // immediate feedback without having to open the picker.
-            switch scheme {
-            case .light: tweaks.terminalThemeLightId = theme.id
-            case .dark:  tweaks.terminalThemeDarkId = theme.id
-            @unknown default: tweaks.terminalThemeLightId = theme.id
-            }
-        } catch let error as TerminalThemeCatalog.ImportError {
-            importError = ImportErrorWrapper(error: error)
-        } catch {
-            importError = ImportErrorWrapper(
-                error: .cannotRead(message: error.localizedDescription)
-            )
-        }
-    }
-
-    private func deleteImported(_ theme: TerminalTheme) {
-        try? catalog.remove(theme)
-        // If the deleted theme was selected in either slot, fall back
-        // to the Nice default for that scheme so the resolver doesn't
-        // churn on a dangling id.
-        if tweaks.terminalThemeLightId == theme.id {
-            tweaks.terminalThemeLightId = Tweaks.defaultTerminalThemeLightId
-        }
-        if tweaks.terminalThemeDarkId == theme.id {
-            tweaks.terminalThemeDarkId = Tweaks.defaultTerminalThemeDarkId
-        }
-    }
-}
 
 // MARK: - Picker
 
-private struct ThemePicker: View {
+struct ThemePicker: View {
     @Binding var selection: String
     let options: [TerminalTheme]
     let accessibilityIdentifier: String
@@ -145,7 +31,7 @@ private struct ThemePicker: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(minWidth: 220)
+        .fixedSize()
         .accessibilityIdentifier(accessibilityIdentifier)
     }
 }
@@ -181,7 +67,7 @@ private struct SwatchStrip: View {
 
 // MARK: - Imported row
 
-private struct ImportedThemeRow: View {
+struct ImportedThemeRow: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -208,7 +94,7 @@ private struct ImportedThemeRow: View {
 
 // MARK: - Import error alert
 
-private struct ImportErrorWrapper: Identifiable {
+struct ImportErrorWrapper: Identifiable {
     let id = UUID()
     let error: TerminalThemeCatalog.ImportError
 
