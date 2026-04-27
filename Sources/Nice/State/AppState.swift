@@ -1179,6 +1179,11 @@ final class AppState: ObservableObject {
         let termCount = tab.panes.filter { $0.kind == .terminal }.count
         let resolvedTitle = title ?? "Terminal \(termCount + 1)"
 
+        // Resolve the spawn cwd before mutating the tab — once we
+        // re-point `activePaneId` at the new pane below, the "spawning"
+        // pane is no longer recoverable.
+        let spawnCwd = spawnCwdForNewPane(in: tab, callerProvided: cwd)
+
         mutateTab(id: tabId) { tab in
             tab.panes.append(
                 Pane(id: newId, title: resolvedTitle, kind: .terminal)
@@ -1186,14 +1191,13 @@ final class AppState: ObservableObject {
             tab.activePaneId = newId
         }
 
-        let tabCwd = cwd ?? tab.cwd
         let session: TabPtySession
         if let existing = ptySessions[tabId] {
             session = existing
         } else {
-            session = makeSession(for: tabId, cwd: tabCwd)
+            session = makeSession(for: tabId, cwd: spawnCwd)
         }
-        _ = session.addTerminalPane(id: newId, cwd: tabCwd, command: command)
+        _ = session.addTerminalPane(id: newId, cwd: spawnCwd, command: command)
         return newId
     }
 
@@ -2045,6 +2049,20 @@ final class AppState: ObservableObject {
             return Self.expandTilde(project.path)
         }
         return expanded
+    }
+
+    /// Resolve the cwd to use when spawning a new pane in `tab`. An
+    /// explicit caller-supplied cwd wins; otherwise inherit from the
+    /// currently-active pane so the new pane opens wherever the user
+    /// just was (e.g. they `cd`'d somewhere, then hit Cmd+T). Falls back
+    /// to `tab.cwd` when there is no active pane.
+    func spawnCwdForNewPane(in tab: Tab, callerProvided cwd: String?) -> String {
+        if let cwd { return cwd }
+        if let activeId = tab.activePaneId,
+           let activePane = tab.panes.first(where: { $0.id == activeId }) {
+            return resolvedSpawnCwd(for: tab, pane: activePane)
+        }
+        return tab.cwd
     }
 
     /// Per-pane variant: prefers `pane.cwd` (last-observed via OSC 7)

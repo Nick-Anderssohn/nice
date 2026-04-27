@@ -141,6 +141,55 @@ final class AppStatePaneCwdTests: XCTestCase {
         )
     }
 
+    // MARK: - spawnCwdForNewPane
+
+    func test_spawnCwdForNewPane_callerProvidedWins() throws {
+        let liveDir = try makeTempDir()
+        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir)
+        appState.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: liveDir)
+
+        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        XCTAssertEqual(
+            appState.spawnCwdForNewPane(in: tab, callerProvided: "/explicit"),
+            "/explicit",
+            "an explicit cwd from the caller must win over inheritance"
+        )
+    }
+
+    func test_spawnCwdForNewPane_inheritsActivePaneCwd() throws {
+        // The user cd'd somewhere in the active pane, then asked for a
+        // new pane — the new pane should open at the same dir, not at
+        // wherever the tab was first launched.
+        let tabDir = try makeTempDir()
+        let paneDir = try makeTempDir()
+        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: tabDir)
+        appState.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: paneDir)
+
+        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        XCTAssertEqual(
+            appState.spawnCwdForNewPane(in: tab, callerProvided: nil),
+            paneDir
+        )
+    }
+
+    func test_spawnCwdForNewPane_fallsBackToTabCwdWhenNoActivePane() throws {
+        let tabDir = try makeTempDir()
+        // Tab with no `activePaneId` — `spawnCwdForNewPane` has no pane
+        // to inherit from and must use the tab cwd.
+        let tab = Tab(
+            id: "t1",
+            title: "Terminal",
+            cwd: tabDir,
+            branch: nil,
+            panes: [],
+            activePaneId: nil
+        )
+        XCTAssertEqual(
+            appState.spawnCwdForNewPane(in: tab, callerProvided: nil),
+            tabDir
+        )
+    }
+
     // MARK: - helpers
 
     private func seedTerminalTab(
