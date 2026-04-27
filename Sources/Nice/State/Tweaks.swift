@@ -336,14 +336,28 @@ final class Tweaks: ObservableObject {
     /// User-configured terminal editors that can open files from the
     /// File Explorer in a new pane. Each entry has a stable UUID so
     /// extension mappings survive renames.
-    @Published var editorCommands: [EditorCommand] {
+    ///
+    /// `private(set)` so callers can read for display but must mutate
+    /// through `addEditor` / `updateEditor` / `removeEditor`. The
+    /// "removing an editor cascades to drop orphan mappings"
+    /// invariant only holds if every removal flows through
+    /// `removeEditor`; making the array publicly mutable would let a
+    /// caller `editorCommands.removeAll { … }` silently bypass the
+    /// cleanup.
+    @Published private(set) var editorCommands: [EditorCommand] {
         didSet { persistEditorCommands() }
     }
 
     /// Maps a normalised file extension (lowercase, no leading dot) to
     /// an `EditorCommand.id`. Mappings are pruned automatically when
     /// the referenced editor is removed via `removeEditor(id:)`.
-    @Published var extensionEditorMap: [String: UUID] {
+    ///
+    /// `private(set)` for the same reason as `editorCommands` —
+    /// `setMapping` / `removeMapping` normalise the extension key on
+    /// the way in, and a public setter would let callers store
+    /// non-normalised keys (`"MD"`, `".md"`) that `editor(forExtension:)`
+    /// then can't find.
+    @Published private(set) var extensionEditorMap: [String: UUID] {
         didSet { persistExtensionEditorMap() }
     }
 

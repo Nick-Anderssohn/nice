@@ -887,6 +887,11 @@ final class AppState: ObservableObject {
     /// First tab id in sidebar order (Terminals project, then project
     /// tabs). Used to fall back to a sensible selection when the
     /// active tab dissolves. Returns nil when no tab exists anywhere.
+    ///
+    /// Internal — not private — so `AppState+FileExplorer.openInEditorPane`
+    /// can use it as the active-tab fallback when the user clicks an
+    /// editor entry while no tab is focused. Keep at internal; no
+    /// external module needs it.
     func firstAvailableTabId() -> String? {
         for project in projects {
             if let id = project.tabs.first?.id { return id }

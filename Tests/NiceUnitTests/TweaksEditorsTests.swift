@@ -107,9 +107,79 @@ final class TweaksEditorsTests: XCTestCase {
         // that no longer exists in `editorCommands`. Lookup should
         // return nil rather than crash so double-click falls back to
         // NSWorkspace and the user can fix the mapping in Settings.
+        // `setMapping` doesn't validate the editorId exists — that's
+        // by design, since loaders deserialise without a chance to
+        // cross-check.
         let tweaks = makeTweaks()
-        tweaks.extensionEditorMap = ["md": UUID()]
+        tweaks.setMapping(extension: "md", editorId: UUID())
         XCTAssertNil(tweaks.editor(forExtension: "md"))
+    }
+
+    // MARK: - Edge cases
+
+    func test_addEditor_duplicateUUID_keepsBothButLookupReturnsFirst() {
+        // The model doesn't enforce UUID uniqueness — the producer
+        // (the Settings UI) mints a fresh UUID on each "Add Editor"
+        // press, so duplicates can only happen if a caller is hand-
+        // constructing entries. Pin the documented semantics: the
+        // append happens, and `editor(for:)` returns the first match
+        // so behaviour is deterministic even in this degenerate case.
+        let tweaks = makeTweaks()
+        let id = UUID()
+        tweaks.addEditor(EditorCommand(id: id, name: "First",  command: "vim"))
+        tweaks.addEditor(EditorCommand(id: id, name: "Second", command: "nvim"))
+
+        XCTAssertEqual(tweaks.editorCommands.count, 2)
+        XCTAssertEqual(tweaks.editor(for: id)?.name, "First")
+    }
+
+    func test_updateEditor_unknownId_isSilentNoOp() {
+        // Hand-constructed test of the edit path: editing an editor
+        // that isn't in the list must not crash, must not append a
+        // new entry, must leave the list unchanged. Keeps the UI
+        // resilient if a stale binding tries to update a row whose
+        // editor was just deleted.
+        let tweaks = makeTweaks()
+        let id = UUID()
+        tweaks.addEditor(EditorCommand(id: id, name: "Vim", command: "vim"))
+
+        tweaks.updateEditor(id: UUID(), name: "Bogus", command: "bogus")
+
+        XCTAssertEqual(tweaks.editorCommands.count, 1)
+        XCTAssertEqual(tweaks.editor(for: id)?.name, "Vim")
+    }
+
+    func test_setMapping_unknownEditorId_storesOrphanForLaterCleanup() {
+        // `setMapping` deliberately doesn't cross-check that the
+        // editorId exists in `editorCommands`. Loaders need to
+        // accept the persisted state verbatim (the editor list
+        // may be deserialised after the map), and the lookup path
+        // is self-healing — `editor(forExtension:)` returns nil
+        // when the id is dangling, which the file explorer
+        // interprets as "fall through to NSWorkspace". This test
+        // pins that contract.
+        let tweaks = makeTweaks()
+        let orphan = UUID()
+        tweaks.setMapping(extension: "rs", editorId: orphan)
+
+        XCTAssertEqual(tweaks.extensionEditorMap["rs"], orphan)
+        XCTAssertNil(tweaks.editor(forExtension: "rs"),
+                     "Orphan mapping must self-heal at lookup time.")
+    }
+
+    func test_loadEditorCommands_corruptedJSON_returnsEmpty() {
+        // Defaults could end up holding garbage if a future schema
+        // change ships incompatible JSON, or if an external tool
+        // wrote bytes into the bundle's prefs domain. The loader
+        // must fall back to "fresh install" rather than crash on
+        // decode.
+        let suite = freshSuite()
+        defer { wipeSuite(suite) }
+        suite.set(Data("{not valid json".utf8), forKey: Tweaks.editorCommandsKey)
+        suite.set(Data("not even bytes".utf8), forKey: Tweaks.extensionEditorMapKey)
+
+        XCTAssertEqual(Tweaks.loadEditorCommands(defaults: suite), [])
+        XCTAssertEqual(Tweaks.loadExtensionEditorMap(defaults: suite), [:])
     }
 
     // MARK: - Persistence round-trip
