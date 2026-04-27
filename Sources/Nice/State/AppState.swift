@@ -54,13 +54,13 @@ enum PaneLaunchStatus: Equatable {
 @Observable
 final class AppState {
     /// Reserved id for the pinned Terminals project at index 0 of
-    /// `projects`. The project is always present and cannot be deleted
-    /// by the user; its tabs are ordinary terminal-only tabs.
-    static let terminalsProjectId = "terminals"
+    /// `projects`. Forwarded to `TabModel` so the source-of-truth is
+    /// the model that owns the value.
+    static var terminalsProjectId: String { TabModel.terminalsProjectId }
     /// Stable id for the default "Main" tab seeded into the Terminals
     /// project on fresh launches. UI tests key off a `sidebar.terminals`
-    /// accessibility alias on this tab.
-    static let mainTerminalTabId = "terminals-main"
+    /// accessibility alias on this tab. Forwarded to `TabModel`.
+    static var mainTerminalTabId: String { TabModel.mainTerminalTabId }
 
     /// Set of `windowSessionId`s already claimed by live AppStates in
     /// this process. Populated by `restoreSavedWindow` after it picks
@@ -71,19 +71,25 @@ final class AppState {
     /// ids and defeat per-window isolation).
     private static var claimedWindowIds: Set<String> = []
 
-    var projects: [Project]
-    /// Currently-selected tab. Defaults to the Main terminal tab on
-    /// launch.
+    /// Per-window data model: projects, tabs, panes, and active-tab
+    /// selection plus the pure helpers that operate on them. AppState
+    /// wires `tabs.onTreeMutation` to `scheduleSessionSave` in `init`
+    /// so persistence keeps firing on tree edits.
+    let tabs: TabModel
+
+    /// Forwarder for `tabs.projects` so existing call sites (views,
+    /// tests) keep working unchanged. The view-side rename pass that
+    /// points UI directly at `tabs.projects` is a separate step.
+    var projects: [Project] {
+        get { tabs.projects }
+        set { tabs.projects = newValue }
+    }
+
+    /// Forwarder for `tabs.activeTabId`. The mutating `didSet` (waiting
+    /// ack + save fan-out via `onTreeMutation`) lives on `TabModel`.
     var activeTabId: String? {
-        didSet {
-            // Viewing a tab dismisses the attention pulse on its active
-            // pane's waiting state — centralised here so every call site
-            // that flips `activeTabId` gets the same acknowledgment.
-            if let id = activeTabId, id != oldValue {
-                acknowledgeWaitingOnActivePane(tabId: id)
-                scheduleSessionSave()
-            }
-        }
+        get { tabs.activeTabId }
+        set { tabs.activeTabId = newValue }
     }
     /// Whether the sidebar is collapsed. Seeded from the per-window
     /// `@SceneStorage` value by the owning view so each window keeps
@@ -137,33 +143,12 @@ final class AppState {
         fileBrowserStore.toggleHiddenFilesIfExists(forTab: tabId)
     }
 
-    /// Project that owns the given tab, or `nil` if no such tab is
-    /// currently in the model. Used internally — callers outside
-    /// `AppState` should prefer the more specific helpers below
-    /// (e.g. `fileBrowserHeaderTitle(forTab:)`) so they don't grow
-    /// dependencies on `Project`'s shape.
-    private func project(forTab id: String) -> Project? {
-        for project in projects where project.tabs.contains(where: { $0.id == id }) {
-            return project
-        }
-        return nil
-    }
-
     /// Title to show at the top of the file browser for `tabId`.
-    /// Encapsulates the rule "use the owning project's name unless
-    /// the tab is in the pinned Terminals project (whose name is
-    /// generic), in which case fall back to the tab's own title."
-    /// Lives here so the file-browser view doesn't have to know
-    /// about `terminalsProjectId` or how tabs nest into projects.
+    /// Forwarder onto `TabModel.fileBrowserHeaderTitle` — view-side
+    /// callers go through AppState today; the rename pass will point
+    /// them at `tabs` directly.
     func fileBrowserHeaderTitle(forTab id: String) -> String {
-        let tabTitle = tab(for: id)?.title
-        guard let project = project(forTab: id) else {
-            return tabTitle ?? "Files"
-        }
-        if project.id == Self.terminalsProjectId {
-            return tabTitle ?? project.name
-        }
-        return project.name
+        tabs.fileBrowserHeaderTitle(forTab: id)
     }
 
     /// Called by the keyboard monitor when all relevant shortcut
@@ -381,31 +366,23 @@ final class AppState {
         // Seed the pinned Terminals project with one "Main" tab
         // hosting a single terminal pane. The pty session itself is
         // spawned in `start()` so the init is side-effect free.
-        let mainTabId = Self.mainTerminalTabId
-        let initialPaneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        let initialPane = Pane(id: initialPaneId, title: "zsh", kind: .terminal)
-        let mainTab = Tab(
-            id: mainTabId,
-            title: "Main",
-            cwd: resolvedMainCwd,
-            branch: nil,
-            panes: [initialPane],
-            activePaneId: initialPaneId
-        )
-        let terminalsProject = Project(
-            id: Self.terminalsProjectId,
-            name: "Terminals",
-            path: resolvedMainCwd,
-            tabs: [mainTab]
-        )
-        self.projects = [terminalsProject]
-        self.activeTabId = mainTabId
+        self.tabs = TabModel(initialMainCwd: resolvedMainCwd)
 
         // Stash the services pointer (weak) so `start()` can read
         // `zdotdirPath` / `resolvedClaudePath` and arm claude-path
         // tracking. Doubles as the "services available?" flag for
         // `armClaudePathTracking`.
         self.trackedServices = services
+
+        // Wire tree-mutation save fan-out. `scheduleSessionSave` is
+        // gated by `isInitializing` and `persistenceEnabled`, so it's
+        // safe for `tabs` to fire this callback synchronously during
+        // init (e.g. from `activeTabId`'s `didSet`). Set after the
+        // model is built so the very-first seed assignment doesn't
+        // bounce through a partially-initialized AppState.
+        self.tabs.onTreeMutation = { [weak self] in
+            self?.scheduleSessionSave()
+        }
     }
 
     /// Bring the per-window subsystem online: allocate the control
@@ -454,7 +431,7 @@ final class AppState {
         // Spawn the seed Main terminal pty. `restoreSavedWindow`
         // below may dissolve and rebuild this if a snapshot exists —
         // that's the existing choreography and is preserved here.
-        if let mainTab = projects.first(where: { $0.id == Self.terminalsProjectId })?.tabs.first {
+        if let mainTab = tabs.projects.first(where: { $0.id == TabModel.terminalsProjectId })?.tabs.first {
             _ = makeSession(for: mainTab.id, cwd: mainTab.cwd)
         }
 
@@ -575,15 +552,17 @@ final class AppState {
 
     // MARK: - Selection
 
+    /// Forwarder so views and tests keep using `appState.selectTab(...)`.
+    /// The body lives on `TabModel`.
     func selectTab(_ id: String) {
-        activeTabId = id
+        tabs.selectTab(id)
     }
 
     /// Pick which pane is focused in `tabId`. No-op if `paneId` isn't a
     /// pane on the tab.
     func setActivePane(tabId: String, paneId: String) {
         let viewing = activeTabId == tabId
-        mutateTab(id: tabId) { tab in
+        tabs.mutateTab(id: tabId) { tab in
             guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                 return
             }
@@ -600,7 +579,7 @@ final class AppState {
     /// shell isn't started until the user first switches to it (via click,
     /// keyboard shortcut, or auto-focus after the Claude pane exits).
     private func ensureActivePaneSpawned(tabId: String) {
-        guard let tab = tab(for: tabId),
+        guard let tab = tabs.tab(for: tabId),
               let paneId = tab.activePaneId,
               let pane = tab.panes.first(where: { $0.id == paneId }),
               pane.kind == .terminal,
@@ -608,20 +587,8 @@ final class AppState {
               session.panes[paneId] == nil
         else { return }
         _ = session.addTerminalPane(
-            id: paneId, cwd: resolvedSpawnCwd(for: tab, pane: pane)
+            id: paneId, cwd: tabs.resolvedSpawnCwd(for: tab, pane: pane)
         )
-    }
-
-    /// Clear the waiting-attention pulse on whichever pane is currently
-    /// focused in `tabId`. Called from the `activeTabId` `didSet` when
-    /// the user navigates to a different tab.
-    private func acknowledgeWaitingOnActivePane(tabId: String) {
-        mutateTab(id: tabId) { tab in
-            guard let paneId = tab.activePaneId,
-                  let pi = tab.panes.firstIndex(where: { $0.id == paneId })
-            else { return }
-            tab.panes[pi].markAcknowledgedIfWaiting()
-        }
     }
 
     // MARK: - Tab creation
@@ -654,7 +621,7 @@ final class AppState {
         // so the companion terminal follows the session in.
         let projectPath = cwd
         let sessionCwd: String = {
-            guard let name = Self.extractWorktreeName(from: args) else { return cwd }
+            guard let name = TabModel.extractWorktreeName(from: args) else { return cwd }
             // Claude sanitizes `/` to `+` when deriving the on-disk
             // directory name from the `-w` value (so `foo/bar` becomes
             // `foo+bar`). Mirror that here so the companion terminal
@@ -676,7 +643,7 @@ final class AppState {
             claudeSessionId: sessionId
         )
 
-        addTabToProjects(tab, cwd: projectPath)
+        tabs.addTabToProjects(tab, cwd: projectPath)
         activeTabId = newId
         // The companion terminal pane is modelled up front so its pill
         // renders in the toolbar, but its PTY is deferred until the user
@@ -718,8 +685,8 @@ final class AppState {
         // No/unknown tabId, or the request came from a tab in the
         // pinned Terminals group: always open a new sidebar tab.
         guard !tabId.isEmpty,
-              !isTerminalsProjectTab(tabId),
-              let existingTab = self.tab(for: tabId),
+              !tabs.isTerminalsProjectTab(tabId),
+              let existingTab = tabs.tab(for: tabId),
               existingTab.panes.contains(where: { $0.id == paneId })
         else {
             reply("newtab")
@@ -741,10 +708,10 @@ final class AppState {
         // present (e.g. the pre-typed `claude --resume <uuid>` on a
         // restored tab); otherwise mint a fresh session id so we can
         // persist it for next relaunch.
-        let parsedId = Self.extractClaudeSessionId(from: args)
+        let parsedId = TabModel.extractClaudeSessionId(from: args)
         let sessionId = parsedId ?? UUID().uuidString.lowercased()
 
-        mutateTab(id: tabId) { tab in
+        tabs.mutateTab(id: tabId) { tab in
             guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                 return
             }
@@ -763,27 +730,6 @@ final class AppState {
         } else {
             reply("inplace \(sessionId)")
         }
-    }
-
-    /// Scan `args` for the session UUID the user already supplied via
-    /// `--resume <id>`, `--session-id <id>`, `--resume=<id>`, or
-    /// `--session-id=<id>`. Returns nil if none is present.
-    private static func extractClaudeSessionId(from args: [String]) -> String? {
-        var i = 0
-        while i < args.count {
-            let a = args[i]
-            if a == "--resume" || a == "--session-id" {
-                if i + 1 < args.count {
-                    return args[i + 1]
-                }
-            } else if a.hasPrefix("--resume=") {
-                return String(a.dropFirst("--resume=".count))
-            } else if a.hasPrefix("--session-id=") {
-                return String(a.dropFirst("--session-id=".count))
-            }
-            i += 1
-        }
-        return nil
     }
 
     // MARK: - Theme
@@ -872,7 +818,7 @@ final class AppState {
     /// the dissolve, terminate the app.
     func paneExited(tabId: String, paneId: String, exitCode: Int32?) {
         clearPaneLaunch(paneId: paneId)
-        mutateTab(id: tabId) { tab in
+        tabs.mutateTab(id: tabId) { tab in
             guard let idx = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                 return
             }
@@ -893,8 +839,8 @@ final class AppState {
         // terminal as a result of this exit, start its shell now.
         ensureActivePaneSpawned(tabId: tabId)
 
-        guard let (pi, ti) = projectTabIndex(for: tabId),
-              projects[pi].tabs[ti].panes.isEmpty
+        guard let (pi, ti) = tabs.projectTabIndex(for: tabId),
+              tabs.projects[pi].tabs[ti].panes.isEmpty
         else { return }
 
         finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
@@ -912,44 +858,37 @@ final class AppState {
         tabIndex ti: Int,
         tabId: String
     ) {
-        projects[pi].tabs.remove(at: ti)
+        tabs.projects[pi].tabs.remove(at: ti)
         ptySessions.removeValue(forKey: tabId)
         fileBrowserStore.removeState(forTab: tabId)
         if activeTabId == tabId {
-            activeTabId = firstAvailableTabId()
+            activeTabId = tabs.firstAvailableTabId()
         }
 
         // If the user asked to close this whole project (right-click →
         // Close Project), drop the now-empty project row too. Terminals
         // is guarded upstream but double-check here defensively.
-        let projectId = projects[pi].id
+        let projectId = tabs.projects[pi].id
         if projectsPendingRemoval.contains(projectId),
-           projects[pi].tabs.isEmpty,
-           projectId != Self.terminalsProjectId {
+           tabs.projects[pi].tabs.isEmpty,
+           projectId != TabModel.terminalsProjectId {
             projectsPendingRemoval.remove(projectId)
-            projects.remove(at: pi)
+            tabs.projects.remove(at: pi)
         }
 
         scheduleSessionSave()
 
-        if projects.allSatisfy({ $0.tabs.isEmpty }) {
+        if tabs.projects.allSatisfy({ $0.tabs.isEmpty }) {
             NSApp.terminate(nil)
         }
     }
 
-    /// First tab id in sidebar order (Terminals project, then project
-    /// tabs). Used to fall back to a sensible selection when the
-    /// active tab dissolves. Returns nil when no tab exists anywhere.
-    ///
-    /// Internal — not private — so `AppState+FileExplorer.openInEditorPane`
-    /// can use it as the active-tab fallback when the user clicks an
-    /// editor entry while no tab is focused. Keep at internal; no
-    /// external module needs it.
+    /// Forwarder onto `TabModel.firstAvailableTabId()`. Used by
+    /// `AppState+FileExplorer.openInEditorPane` as the active-tab
+    /// fallback when the user clicks an editor entry while no tab is
+    /// focused.
     func firstAvailableTabId() -> String? {
-        for project in projects {
-            if let id = project.tabs.first?.id { return id }
-        }
-        return nil
+        tabs.firstAvailableTabId()
     }
 
     /// A pane emitted a window-title update via OSC 0/1/2. Claude panes
@@ -959,7 +898,7 @@ final class AppState {
     /// stays pinned to "Claude". Terminal panes take the emitted title
     /// verbatim as their toolbar pill label.
     func paneTitleChanged(tabId: String, paneId: String, title: String) {
-        guard let tab = tab(for: tabId),
+        guard let tab = tabs.tab(for: tabId),
               let pane = tab.panes.first(where: { $0.id == paneId })
         else { return }
 
@@ -971,7 +910,7 @@ final class AppState {
                 let idx = trimmed.index(trimmed.startIndex, offsetBy: 40)
                 return String(trimmed[..<idx]).trimmingCharacters(in: .whitespaces)
             }()
-            mutateTab(id: tabId) { tab in
+            tabs.mutateTab(id: tabId) { tab in
                 guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                     return
                 }
@@ -1002,7 +941,7 @@ final class AppState {
 
         if let newStatus {
             let viewing = (activeTabId == tabId)
-            mutateTab(id: tabId) { tab in
+            tabs.mutateTab(id: tabId) { tab in
                 guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
                     return
                 }
@@ -1019,7 +958,7 @@ final class AppState {
         guard !rawLabel.isEmpty else { return }
         // Ignore Claude's generic placeholder before a session is named.
         if rawLabel == "Claude Code" { return }
-        applyAutoTitle(tabId: tabId, rawTitle: rawLabel)
+        tabs.applyAutoTitle(tabId: tabId, rawTitle: rawLabel)
     }
 
     /// A pane's shell emitted OSC 7 with a new working directory. Stash
@@ -1031,7 +970,7 @@ final class AppState {
     /// terminal's cwd would silently relocate the session on restore.
     func paneCwdChanged(tabId: String, paneId: String, cwd: String) {
         var changed = false
-        mutateTab(id: tabId) { tab in
+        tabs.mutateTab(id: tabId) { tab in
             guard let pi = tab.panes.firstIndex(where: { $0.id == paneId })
             else { return }
             if tab.panes[pi].cwd != cwd {
@@ -1044,27 +983,11 @@ final class AppState {
         }
     }
 
-    /// Apply a Claude-generated session title to the tab. Humanizes the
-    /// kebab-case string Claude records (e.g. "fix-top-bar-height") into
-    /// sentence-case ("Fix top bar height"). Skipped entirely once the
-    /// user has manually renamed the tab, so late-arriving auto-titles
-    /// can't clobber a user edit. The guard is keyed on `tabId`, so
-    /// manually renaming one tab never affects another tab's flow.
+    /// Forwarder onto `TabModel.applyAutoTitle`. Kept on AppState so
+    /// any external caller (and the existing internal call from
+    /// `paneTitleChanged` before its own move) keeps working.
     func applyAutoTitle(tabId: String, rawTitle: String) {
-        guard let existing = tab(for: tabId), !existing.titleManuallySet else {
-            return
-        }
-        let humanized = Self.humanizeSessionTitle(rawTitle)
-        guard !humanized.isEmpty else { return }
-        var changed = false
-        mutateTab(id: tabId) { tab in
-            if tab.title != humanized {
-                tab.title = humanized
-                changed = true
-            }
-            tab.titleAutoGenerated = true
-        }
-        if changed { scheduleSessionSave() }
+        tabs.applyAutoTitle(tabId: tabId, rawTitle: rawTitle)
     }
 
     /// Hand AppKit first-responder status back to the active pane's
@@ -1076,7 +999,7 @@ final class AppState {
     /// responder change, matching the pattern in `TerminalHost`.
     func focusActiveTerminal() {
         guard let tabId = activeTabId,
-              let tab = tab(for: tabId),
+              let tab = tabs.tab(for: tabId),
               let paneId = tab.activePaneId,
               let session = ptySessions[tabId],
               let view = session.panes[paneId]
@@ -1087,40 +1010,11 @@ final class AppState {
         }
     }
 
-    /// User-initiated rename from the sidebar inline editor. Trims
-    /// whitespace, ignores empty input, and marks the tab so subsequent
-    /// `applyAutoTitle` calls skip it. Persists via `scheduleSessionSave`
-    /// so the rename survives an app relaunch.
+    /// Forwarder onto `TabModel.renameTab`. Views call
+    /// `appState.renameTab(...)` from the sidebar inline editor; the
+    /// rename pass will eventually point them at `tabs` directly.
     func renameTab(id tabId: String, to newTitle: String) {
-        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        var changed = false
-        mutateTab(id: tabId) { tab in
-            if tab.title != trimmed || !tab.titleManuallySet {
-                tab.title = trimmed
-                tab.titleManuallySet = true
-                changed = true
-            }
-        }
-        if changed { scheduleSessionSave() }
-    }
-
-    private static func humanizeSessionTitle(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        let pieces = trimmed
-            .split(whereSeparator: { $0 == "-" || $0 == "_" })
-            .map(String.init)
-        guard !pieces.isEmpty else { return "" }
-        var joined = pieces.joined(separator: " ")
-        if let first = joined.first, first.isLowercase {
-            joined = first.uppercased() + joined.dropFirst()
-        }
-        if joined.count > 40 {
-            let idx = joined.index(joined.startIndex, offsetBy: 40)
-            joined = String(joined[..<idx]).trimmingCharacters(in: .whitespaces)
-        }
-        return joined
+        tabs.renameTab(id: tabId, to: newTitle)
     }
 
     /// Append a new terminal-only tab to the pinned Terminals group,
@@ -1130,10 +1024,10 @@ final class AppState {
     /// Cwd inherits the Terminals project's path.
     @discardableResult
     func createTerminalTab() -> String? {
-        guard let pi = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) else {
+        guard let pi = tabs.projects.firstIndex(where: { $0.id == TabModel.terminalsProjectId }) else {
             return nil
         }
-        let project = projects[pi]
+        let project = tabs.projects[pi]
         let title: String
         if project.tabs.isEmpty {
             title = "Main"
@@ -1151,7 +1045,7 @@ final class AppState {
             panes: [Pane(id: paneId, title: "zsh", kind: .terminal)],
             activePaneId: paneId
         )
-        projects[pi].tabs.append(tab)
+        tabs.projects[pi].tabs.append(tab)
         activeTabId = newId
         _ = makeSession(for: newId, cwd: cwd)
         scheduleSessionSave()
@@ -1165,10 +1059,10 @@ final class AppState {
     /// group (which only holds terminal tabs).
     @discardableResult
     func createClaudeTabInProject(projectId: String) -> String? {
-        guard projectId != Self.terminalsProjectId,
-              let pi = projects.firstIndex(where: { $0.id == projectId })
+        guard projectId != TabModel.terminalsProjectId,
+              let pi = tabs.projects.firstIndex(where: { $0.id == projectId })
         else { return nil }
-        let project = projects[pi]
+        let project = tabs.projects[pi]
         let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
         let claudePaneId = "\(newId)-claude"
         let terminalPaneId = "\(newId)-t1"
@@ -1187,7 +1081,7 @@ final class AppState {
             activePaneId: claudePaneId,
             claudeSessionId: sessionId
         )
-        projects[pi].tabs.append(tab)
+        tabs.projects[pi].tabs.append(tab)
         activeTabId = newId
         _ = makeSession(
             for: newId, cwd: project.path,
@@ -1201,13 +1095,9 @@ final class AppState {
     }
 
     /// True when `tabId` lives inside the pinned Terminals project.
-    /// Used by the socket handler to treat `claude` invocations from
-    /// the Terminals group as "always open a new tab elsewhere".
+    /// Forwarder onto `TabModel.isTerminalsProjectTab`.
     func isTerminalsProjectTab(_ tabId: String) -> Bool {
-        guard let terminals = projects.first(where: { $0.id == Self.terminalsProjectId }) else {
-            return false
-        }
-        return terminals.tabs.contains { $0.id == tabId }
+        tabs.isTerminalsProjectTab(tabId)
     }
 
     // MARK: - Pane management
@@ -1231,7 +1121,7 @@ final class AppState {
         // preserves the "at most one Claude pane per tab" invariant.
         guard kind == .terminal else { return nil }
 
-        guard let tab = self.tab(for: tabId) else { return nil }
+        guard let tab = tabs.tab(for: tabId) else { return nil }
         let newId = "\(tabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
         let termCount = tab.panes.filter { $0.kind == .terminal }.count
         let resolvedTitle = title ?? "Terminal \(termCount + 1)"
@@ -1239,9 +1129,9 @@ final class AppState {
         // Resolve the spawn cwd before mutating the tab — once we
         // re-point `activePaneId` at the new pane below, the "spawning"
         // pane is no longer recoverable.
-        let spawnCwd = spawnCwdForNewPane(in: tab, callerProvided: cwd)
+        let spawnCwd = tabs.spawnCwdForNewPane(in: tab, callerProvided: cwd)
 
-        mutateTab(id: tabId) { tab in
+        tabs.mutateTab(id: tabId) { tab in
             tab.panes.append(
                 Pane(id: newId, title: resolvedTitle, kind: .terminal)
             )
@@ -1264,7 +1154,7 @@ final class AppState {
     /// `pendingCloseRequest` and calls `confirmPendingClose` /
     /// `cancelPendingClose`. Idle panes are killed immediately.
     func requestClosePane(tabId: String, paneId: String) {
-        guard let tab = tab(for: tabId),
+        guard let tab = tabs.tab(for: tabId),
               let pane = tab.panes.first(where: { $0.id == paneId })
         else { return }
 
@@ -1283,7 +1173,7 @@ final class AppState {
     /// down. The tab dissolves when its last pane exits (see
     /// `paneExited`).
     func requestCloseTab(tabId: String) {
-        guard let tab = tab(for: tabId) else { return }
+        guard let tab = tabs.tab(for: tabId) else { return }
 
         let busy = tab.panes.filter { $0.isAlive && isBusy(tabId: tabId, pane: $0) }
         if !busy.isEmpty {
@@ -1303,8 +1193,8 @@ final class AppState {
     /// down. The project dissolves once its last tab dissolves (see
     /// `paneExited`).
     func requestCloseProject(projectId: String) {
-        guard projectId != Self.terminalsProjectId,
-              let project = projects.first(where: { $0.id == projectId })
+        guard projectId != TabModel.terminalsProjectId,
+              let project = tabs.projects.first(where: { $0.id == projectId })
         else { return }
 
         let busy = project.tabs.flatMap { tab in
@@ -1367,7 +1257,7 @@ final class AppState {
     }
 
     private func hardKillTab(tabId: String) {
-        guard let tab = tab(for: tabId) else { return }
+        guard let tab = tabs.tab(for: tabId) else { return }
         let session = ptySessions[tabId]
 
         // Split panes by whether they've actually been spawned.
@@ -1397,11 +1287,11 @@ final class AppState {
 
         if spawnedIds.isEmpty {
             // Nothing async to hook into — finalize right now.
-            mutateTab(id: tabId) { tab in
+            tabs.mutateTab(id: tabId) { tab in
                 tab.panes.removeAll()
                 tab.activePaneId = nil
             }
-            if let (pi, ti) = projectTabIndex(for: tabId) {
+            if let (pi, ti) = tabs.projectTabIndex(for: tabId) {
                 finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
             }
         } else {
@@ -1409,7 +1299,7 @@ final class AppState {
             // clear the unspawned rows now so that exit sees an empty
             // panes list and dissolves through the normal path.
             let toDrop = Set(unspawnedIds)
-            mutateTab(id: tabId) { tab in
+            tabs.mutateTab(id: tabId) { tab in
                 tab.panes.removeAll { toDrop.contains($0.id) }
                 if let active = tab.activePaneId, toDrop.contains(active) {
                     tab.activePaneId = tab.panes.first?.id
@@ -1423,15 +1313,15 @@ final class AppState {
     /// dissolves. Empty projects (no tabs) are removed synchronously
     /// since there's no async pane-exit to wait on.
     private func hardKillProject(projectId: String) {
-        guard projectId != Self.terminalsProjectId,
-              let idx = projects.firstIndex(where: { $0.id == projectId })
+        guard projectId != TabModel.terminalsProjectId,
+              let idx = tabs.projects.firstIndex(where: { $0.id == projectId })
         else { return }
 
-        let tabIds = projects[idx].tabs.map(\.id)
+        let tabIds = tabs.projects[idx].tabs.map(\.id)
         if tabIds.isEmpty {
-            projects.remove(at: idx)
-            if let active = activeTabId, tab(for: active) == nil {
-                activeTabId = firstAvailableTabId()
+            tabs.projects.remove(at: idx)
+            if let active = activeTabId, tabs.tab(for: active) == nil {
+                activeTabId = tabs.firstAvailableTabId()
             }
             scheduleSessionSave()
             return
@@ -1445,67 +1335,31 @@ final class AppState {
 
     // MARK: - Reordering
 
-    /// Move `tabId` to a new slot within the same project, relative to
-    /// `targetTabId`: either just before it (`placeAfter == false`) or
-    /// just after it. No-op when the two tabs aren't in the same
-    /// project, when either id is unknown, or when the move wouldn't
-    /// change order. Tabs inside the pinned Terminals project reorder
-    /// like any other project's tabs.
+    /// Forwarder onto `TabModel.moveTab`.
     func moveTab(_ tabId: String, relativeTo targetTabId: String, placeAfter: Bool) {
-        guard tabId != targetTabId else { return }
-        guard let (srcProject, srcIndex) = projectTabIndex(for: tabId),
-              let (dstProject, dstIndex) = projectTabIndex(for: targetTabId),
-              srcProject == dstProject
-        else { return }
-        // `placeAfter` picks the slot just past the target; then account
-        // for the fact that removing the source first shifts everything
-        // after it down by one.
-        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
-        if srcIndex < insertIndex { insertIndex -= 1 }
-        guard insertIndex != srcIndex else { return }
-        let tab = projects[srcProject].tabs.remove(at: srcIndex)
-        projects[srcProject].tabs.insert(tab, at: insertIndex)
-        scheduleSessionSave()
+        tabs.moveTab(tabId, relativeTo: targetTabId, placeAfter: placeAfter)
     }
 
-    /// Mirrors `moveTab` without mutating — returns true iff the drop
-    /// would actually reorder. The sidebar drop indicator uses this to
-    /// suppress the insertion line for no-op drops (e.g. hovering the
-    /// top half of a tab that already sits just after the source).
+    /// Forwarder onto `TabModel.wouldMoveTab`.
     func wouldMoveTab(_ tabId: String, relativeTo targetTabId: String, placeAfter: Bool) -> Bool {
-        guard tabId != targetTabId,
-              let (srcProject, srcIndex) = projectTabIndex(for: tabId),
-              let (dstProject, dstIndex) = projectTabIndex(for: targetTabId),
-              srcProject == dstProject
-        else { return false }
-        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
-        if srcIndex < insertIndex { insertIndex -= 1 }
-        return insertIndex != srcIndex
+        tabs.wouldMoveTab(tabId, relativeTo: targetTabId, placeAfter: placeAfter)
     }
 
     // MARK: - Keyboard navigation
 
-    /// Flat list of sidebar tab ids in displayed order. The pinned
-    /// Terminals project is always first, so its tabs lead; project
-    /// tabs follow in project/then-tab order. Used by the keyboard
-    /// shortcut handlers to walk a deterministic visible set.
+    /// Forwarder onto `TabModel.navigableSidebarTabIds`.
     var navigableSidebarTabIds: [String] {
-        projects.flatMap { $0.tabs.map(\.id) }
+        tabs.navigableSidebarTabIds
     }
 
-    /// Move focus to the next sidebar tab, wrapping. No-op when there's
-    /// only one navigable tab (Terminals alone).
-    func selectNextSidebarTab() { stepSidebarTab(by: +1) }
+    /// Forwarder onto `TabModel.selectNextSidebarTab`.
+    func selectNextSidebarTab() {
+        tabs.selectNextSidebarTab()
+    }
 
-    /// Move focus to the previous sidebar tab, wrapping.
-    func selectPrevSidebarTab() { stepSidebarTab(by: -1) }
-
-    private func stepSidebarTab(by offset: Int) {
-        let ids = navigableSidebarTabIds
-        guard ids.count > 1 else { return }
-        let currentIdx = activeTabId.flatMap { ids.firstIndex(of: $0) } ?? 0
-        let nextIdx = ((currentIdx + offset) % ids.count + ids.count) % ids.count
-        activeTabId = ids[nextIdx]
+    /// Forwarder onto `TabModel.selectPrevSidebarTab`.
+    func selectPrevSidebarTab() {
+        tabs.selectPrevSidebarTab()
     }
 
     /// Move focus to the next pane within the active tab, wrapping. No-op
@@ -1516,7 +1370,7 @@ final class AppState {
     func selectPrevPane() { stepActivePane(by: -1) }
 
     private func stepActivePane(by offset: Int) {
-        guard let tabId = activeTabId, let tab = tab(for: tabId) else { return }
+        guard let tabId = activeTabId, let tab = tabs.tab(for: tabId) else { return }
         guard tab.panes.count > 1, let activeId = tab.activePaneId,
               let currentIdx = tab.panes.firstIndex(where: { $0.id == activeId })
         else { return }
@@ -1548,7 +1402,7 @@ final class AppState {
         if let existing = ptySessions[tabId] {
             return existing
         }
-        let resolvedCwd = Self.expandTilde(cwd)
+        let resolvedCwd = TabModel.expandTilde(cwd)
 
         // Work out which panes to spawn. Callers can pass ids explicitly
         // (e.g. createTabFromMainTerminal) or we infer them from the
@@ -1556,7 +1410,7 @@ final class AppState {
         var claudePaneId = initialClaudePaneId
         var terminalPaneId = initialTerminalPaneId
         if claudePaneId == nil && terminalPaneId == nil {
-            if let tab = self.tab(for: tabId) {
+            if let tab = tabs.tab(for: tabId) {
                 for pane in tab.panes {
                     switch pane.kind {
                     case .claude where claudePaneId == nil:
@@ -1611,36 +1465,11 @@ final class AppState {
 
     // MARK: - Lookup
 
-    /// Look up a tab by id across every project, including the pinned
-    /// Terminals group.
+    /// Forwarder onto `TabModel.tab(for:)`. Views and tests still call
+    /// `appState.tab(for:)`; the rename pass will retarget them at
+    /// `tabs` directly.
     func tab(for id: String) -> Tab? {
-        for project in projects {
-            if let hit = project.tabs.first(where: { $0.id == id }) {
-                return hit
-            }
-        }
-        return nil
-    }
-
-    /// Mutate the tab identified by `id` in place. Calls `transform`
-    /// with the right backing storage (Terminals tab, or an element of
-    /// `projects`). Returns true if the tab was found.
-    @discardableResult
-    private func mutateTab(id: String, _ transform: (inout Tab) -> Void) -> Bool {
-        guard let (pi, ti) = projectTabIndex(for: id) else { return false }
-        transform(&projects[pi].tabs[ti])
-        return true
-    }
-
-    /// Project + tab index for the tab with id `id`, for in-place
-    /// mutation in the `projects` array.
-    private func projectTabIndex(for id: String) -> (Int, Int)? {
-        for (pi, project) in projects.enumerated() {
-            if let ti = project.tabs.firstIndex(where: { $0.id == id }) {
-                return (pi, ti)
-            }
-        }
-        return nil
+        tabs.tab(for: id)
     }
 
     // MARK: - Session persistence
@@ -1654,23 +1483,8 @@ final class AppState {
     /// without standing up a real socket — matches `paneExited`'s
     /// access level for the same reason.
     func handleClaudeSessionUpdate(paneId: String, sessionId: String) {
-        guard let tabId = tabIdOwning(paneId: paneId) else { return }
+        guard let tabId = tabs.tabIdOwning(paneId: paneId) else { return }
         updateClaudeSessionId(tabId: tabId, sessionId: sessionId)
-    }
-
-    /// Reverse-index: walk every project's tabs for the one whose pane
-    /// list includes `paneId`. Cheap — pane counts are small — and
-    /// tolerant of projects added/removed mid-loop because the socket
-    /// handler runs on the main actor.
-    private func tabIdOwning(paneId: String) -> String? {
-        for project in projects {
-            for tab in project.tabs {
-                if tab.panes.contains(where: { $0.id == paneId }) {
-                    return tab.id
-                }
-            }
-        }
-        return nil
     }
 
     /// Update `tab.claudeSessionId` when claude rotates its session
@@ -1682,7 +1496,7 @@ final class AppState {
     /// exists.
     private func updateClaudeSessionId(tabId: String, sessionId: String) {
         var changed = false
-        mutateTab(id: tabId) { tab in
+        tabs.mutateTab(id: tabId) { tab in
             if tab.claudeSessionId != sessionId {
                 tab.claudeSessionId = sessionId
                 changed = true
@@ -1719,15 +1533,15 @@ final class AppState {
     /// Terminals project is always persisted.
     func snapshotPersistedWindow() -> PersistedWindow {
         var persistedProjects: [PersistedProject] = []
-        for project in projects {
-            var tabs: [PersistedTab] = []
+        for project in tabs.projects {
+            var persistedTabs: [PersistedTab] = []
             for tab in project.tabs {
                 let panes = tab.panes.map {
                     PersistedPane(
                         id: $0.id, title: $0.title, kind: $0.kind, cwd: $0.cwd
                     )
                 }
-                tabs.append(PersistedTab(
+                persistedTabs.append(PersistedTab(
                     id: tab.id,
                     title: tab.title,
                     cwd: tab.cwd,
@@ -1738,14 +1552,14 @@ final class AppState {
                     titleManuallySet: tab.titleManuallySet ? true : nil
                 ))
             }
-            if tabs.isEmpty && project.id != Self.terminalsProjectId {
+            if persistedTabs.isEmpty && project.id != TabModel.terminalsProjectId {
                 continue
             }
             persistedProjects.append(PersistedProject(
                 id: project.id,
                 name: project.name,
                 path: project.path,
-                tabs: tabs
+                tabs: persistedTabs
             ))
         }
         return PersistedWindow(
@@ -1813,7 +1627,7 @@ final class AppState {
             // Claim our slot (either adopted one or our own minted id)
             // so sibling windows spawned next know not to adopt it.
             Self.claimedWindowIds.insert(windowSessionId)
-            ensureTerminalsProjectSeeded()
+            ensureTerminalsProjectSeededAndSpawn()
         }
 
         guard let snapshot = adopted else { return }
@@ -1833,12 +1647,12 @@ final class AppState {
         // Drop any in-init seed from the plain constructor — we want
         // the restored Terminals project (with its own tabs and cwd)
         // to win, not collide with the default one.
-        let previousMainTabId = projects.first(where: { $0.id == Self.terminalsProjectId })?.tabs.first?.id
+        let previousMainTabId = tabs.projects.first(where: { $0.id == TabModel.terminalsProjectId })?.tabs.first?.id
         if let mainTabId = previousMainTabId {
             ptySessions[mainTabId]?.terminateAll()
             ptySessions.removeValue(forKey: mainTabId)
         }
-        projects.removeAll()
+        tabs.projects.removeAll()
 
         // Build the Tab/Pane model now so the sidebar shows the tabs
         // immediately; defer the Claude pty spawn so views can lay out
@@ -1846,7 +1660,7 @@ final class AppState {
         // cwd.
         var pendingClaudeSpawns: [(tabId: String, cwd: String, claudePaneId: String?, claudeSessionId: String)] = []
         for persistedProject in snapshot.projects {
-            let projectIdx = ensureProject(
+            let projectIdx = tabs.ensureProject(
                 id: persistedProject.id,
                 name: persistedProject.name,
                 path: persistedProject.path
@@ -1865,10 +1679,10 @@ final class AppState {
         // sub-directories of a git repo, duplicates, or empties left
         // behind by repair). Idempotent in steady state, so the cost
         // is just the .git existence checks.
-        repairProjectStructure()
+        tabs.repairProjectStructure()
         scheduleSessionSave()
 
-        if let active = snapshot.activeTabId, tab(for: active) != nil {
+        if let active = snapshot.activeTabId, tabs.tab(for: active) != nil {
             activeTabId = active
         }
 
@@ -1906,60 +1720,17 @@ final class AppState {
         }
     }
 
-    /// Guarantee a pinned Terminals project sits at `projects[0]`. If
-    /// it's absent (first launch of this build, or a restore adopted
-    /// a snapshot predating the Terminals group), synthesize one with
-    /// a "Main" tab holding a fresh terminal pane. If it's present
-    /// but not at index 0, move it. Called at the tail of
-    /// `restoreSavedWindow`.
-    private func ensureTerminalsProjectSeeded() {
-        if let idx = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) {
-            if idx != 0 {
-                let project = projects.remove(at: idx)
-                projects.insert(project, at: 0)
-            }
-            if activeTabId == nil, let firstId = projects[0].tabs.first?.id {
-                activeTabId = firstId
-            }
-            return
+    /// AppState-side wrapper around `tabs.ensureTerminalsProjectSeeded()`
+    /// that also spawns a pty for a freshly-synthesized Main tab. The
+    /// pure tree-mutation half lives on `TabModel`; the pty side-effect
+    /// is bolted on here so the model itself stays process-free.
+    private func ensureTerminalsProjectSeededAndSpawn() {
+        switch tabs.ensureTerminalsProjectSeeded() {
+        case .existed:
+            break
+        case let .synthesized(tabId, cwd):
+            _ = makeSession(for: tabId, cwd: cwd)
         }
-
-        let cwd = NSHomeDirectory()
-        let mainTabId = Self.mainTerminalTabId
-        let paneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        let pane = Pane(id: paneId, title: "zsh", kind: .terminal)
-        let mainTab = Tab(
-            id: mainTabId,
-            title: "Main",
-            cwd: cwd,
-            branch: nil,
-            panes: [pane],
-            activePaneId: paneId
-        )
-        let project = Project(
-            id: Self.terminalsProjectId,
-            name: "Terminals",
-            path: cwd,
-            tabs: [mainTab]
-        )
-        projects.insert(project, at: 0)
-        if activeTabId == nil {
-            activeTabId = mainTabId
-        }
-        _ = makeSession(for: mainTabId, cwd: cwd)
-    }
-
-    /// Look up `projects` by saved id; append a fresh `Project` with
-    /// the saved name/path if absent. Returns the index of the
-    /// matched-or-appended project. Used by restore to bypass the
-    /// cwd-based bucketing that would otherwise split a multi-worktree
-    /// project like "NICE" into one project per worktree on relaunch.
-    private func ensureProject(id: String, name: String, path: String) -> Int {
-        if let existing = projects.firstIndex(where: { $0.id == id }) {
-            return existing
-        }
-        projects.append(Project(id: id, name: name, path: path, tabs: []))
-        return projects.count - 1
     }
 
     /// Append one restored tab's model to `projects[projectIndex]`.
@@ -1990,13 +1761,13 @@ final class AppState {
             claudeSessionId: persisted.claudeSessionId
         )
 
-        projects[projectIndex].tabs.append(tab)
+        tabs.projects[projectIndex].tabs.append(tab)
 
         // Resolve after appending so `resolvedSpawnCwd` can see the tab's
         // new project context. Falls back to the project path if the
         // persisted cwd (e.g. a worktree directory) has been deleted
         // since the last launch.
-        let spawnCwd = resolvedSpawnCwd(for: tab)
+        let spawnCwd = tabs.resolvedSpawnCwd(for: tab)
 
         if let sid = persisted.claudeSessionId {
             let claudePaneId = panes.first(where: { $0.kind == .claude })?.id
@@ -2021,7 +1792,7 @@ final class AppState {
             tab.panes.first(where: { $0.id == id && $0.kind == .terminal })
         } ?? tab.panes.first(where: { $0.kind == .terminal })
         if let pane = activeTerminal {
-            let paneCwd = resolvedSpawnCwd(for: tab, pane: pane)
+            let paneCwd = tabs.resolvedSpawnCwd(for: tab, pane: pane)
             _ = makeSession(
                 for: tab.id,
                 cwd: paneCwd,
@@ -2033,249 +1804,41 @@ final class AppState {
         return nil
     }
 
-    // MARK: - Helpers
+    // MARK: - Helper forwarders
 
-    private static func expandTilde(_ path: String) -> String {
-        if path == "~" { return NSHomeDirectory() }
-        if path.hasPrefix("~/") {
-            return NSHomeDirectory() + path.dropFirst(1)
-        }
-        return path
-    }
-
-    /// Strip any `<X>/.claude/worktrees/<name>/...` suffix and return
-    /// `<X>`. A Nice-specific convention: sessions running inside a
-    /// Nice-managed worktree should resolve to the parent repo, not
-    /// to the worktree's own internal `.git` marker. Mirrors the
-    /// pre-worktree cwd that `createTabFromMainTerminal` passes when
-    /// `claude -w` is invoked.
+    /// Forwarder onto `TabModel.stripNiceWorktreeSuffix`.
     static func stripNiceWorktreeSuffix(_ path: String) -> String {
-        guard let range = path.range(of: "/.claude/worktrees/") else {
-            return path
-        }
-        return String(path[..<range.lowerBound])
+        TabModel.stripNiceWorktreeSuffix(path)
     }
 
-    /// Walk up from `cwd` (after stripping any Nice worktree suffix),
-    /// returning the absolute path of the nearest ancestor directory
-    /// that contains a `.git` entry — matches both `.git/` (normal
-    /// repo) and `.git` files (submodules and git worktrees). Returns
-    /// nil if no `.git` is found before reaching the filesystem root.
+    /// Forwarder onto `TabModel.findGitRoot(forCwd:)`.
     static func findGitRoot(forCwd cwd: String) -> String? {
-        var current = stripNiceWorktreeSuffix(cwd)
-        while !current.isEmpty && current != "/" {
-            let dotGit = (current as NSString).appendingPathComponent(".git")
-            if FileManager.default.fileExists(atPath: dotGit) {
-                return current
-            }
-            let parent = (current as NSString).deletingLastPathComponent
-            if parent == current { break }
-            current = parent
-        }
-        return nil
+        TabModel.findGitRoot(forCwd: cwd)
     }
 
-    /// Extract the value of `-w` / `--worktree` from Claude args. Only
-    /// the space-delimited form is recognized (matches Claude Code's
-    /// CLI). Returns nil if the flag is absent, trailing with no
-    /// value, or the value is empty.
+    /// Forwarder onto `TabModel.extractWorktreeName(from:)`.
     static func extractWorktreeName(from args: [String]) -> String? {
-        var i = 0
-        while i < args.count {
-            let a = args[i]
-            if (a == "-w" || a == "--worktree") && i + 1 < args.count {
-                let v = args[i + 1]
-                return v.isEmpty ? nil : v
-            }
-            i += 1
-        }
-        return nil
+        TabModel.extractWorktreeName(from: args)
     }
 
-    /// Resolve the cwd to use when spawning a pane for `tab`. Prefers
-    /// `tab.cwd` (which may be a worktree path Claude Code created via
-    /// `-w`), falling back to the containing project's path if the
-    /// tab's cwd no longer exists on disk — covers the case where a
-    /// user deleted a worktree between app launches.
+    /// Forwarder onto `TabModel.resolvedSpawnCwd(for:)`. Used by tests
+    /// and by `AppState+FileExplorer`.
     func resolvedSpawnCwd(for tab: Tab) -> String {
-        let expanded = Self.expandTilde(tab.cwd)
-        if FileManager.default.fileExists(atPath: expanded) { return expanded }
-        if let project = projects.first(where: { p in
-            p.tabs.contains(where: { $0.id == tab.id })
-        }) {
-            return Self.expandTilde(project.path)
-        }
-        return expanded
+        tabs.resolvedSpawnCwd(for: tab)
     }
 
-    /// Resolve the cwd to use when spawning a new pane in `tab`. An
-    /// explicit caller-supplied cwd wins; otherwise inherit from the
-    /// currently-active pane so the new pane opens wherever the user
-    /// just was (e.g. they `cd`'d somewhere, then hit Cmd+T). Falls back
-    /// to `tab.cwd` when there is no active pane.
+    /// Forwarder onto `TabModel.spawnCwdForNewPane(in:callerProvided:)`.
     func spawnCwdForNewPane(in tab: Tab, callerProvided cwd: String?) -> String {
-        if let cwd { return cwd }
-        if let activeId = tab.activePaneId,
-           let activePane = tab.panes.first(where: { $0.id == activeId }) {
-            return resolvedSpawnCwd(for: tab, pane: activePane)
-        }
-        return tab.cwd
+        tabs.spawnCwdForNewPane(in: tab, callerProvided: cwd)
     }
 
-    /// Per-pane variant: prefers `pane.cwd` (last-observed via OSC 7)
-    /// when set and still exists on disk. Falls back to the tab-level
-    /// resolution when nil or pointing at a deleted directory — covers
-    /// the case where the pane's last cwd was a worktree or temp dir
-    /// the user removed between app launches.
+    /// Forwarder onto `TabModel.resolvedSpawnCwd(for:pane:)`.
     func resolvedSpawnCwd(for tab: Tab, pane: Pane) -> String {
-        if let raw = pane.cwd {
-            let expanded = Self.expandTilde(raw)
-            if FileManager.default.fileExists(atPath: expanded) {
-                return expanded
-            }
-        }
-        return resolvedSpawnCwd(for: tab)
+        tabs.resolvedSpawnCwd(for: tab, pane: pane)
     }
 
-    /// Bucket `tab` into the project that anchors `cwd`'s git repo,
-    /// creating a new project at the git root when none matches. Falls
-    /// back to longest-prefix matching when `cwd` is not inside any
-    /// git repo, preserving the legacy behavior for ad-hoc non-repo
-    /// directories.
-    private func addTabToProjects(_ tab: Tab, cwd: String) {
-        let normalizedCwd = Self.expandTilde(cwd)
-        if let gitRoot = Self.findGitRoot(forCwd: normalizedCwd) {
-            appendOrInsert(tab, intoProjectAt: gitRoot)
-            return
-        }
-        // No git root: legacy longest-prefix behavior. Excludes the
-        // pinned Terminals group, whose path is seeded from the Main
-        // Terminal's cwd (typically $HOME) and would otherwise prefix-
-        // match almost any cwd and swallow new Claude tabs that belong
-        // in a fresh project group.
-        if let idx = projects.enumerated()
-            .filter({ $0.element.id != Self.terminalsProjectId })
-            .filter({ normalizedCwd.hasPrefix(Self.expandTilde($0.element.path)) })
-            .max(by: { $0.element.path.count < $1.element.path.count })?
-            .offset
-        {
-            projects[idx].tabs.append(tab)
-        } else {
-            appendNewProject(at: normalizedCwd, with: tab)
-        }
-    }
-
-    /// Append `tab` to the existing non-Terminals project rooted at
-    /// `path`, or create a new project there if none matches.
-    private func appendOrInsert(_ tab: Tab, intoProjectAt path: String) {
-        if let idx = firstIndex(ofNonTerminalsProjectAt: path) {
-            projects[idx].tabs.append(tab)
-        } else {
-            appendNewProject(at: path, with: tab)
-        }
-    }
-
-    /// Index of the first non-Terminals project whose `path` (after
-    /// `expandTilde`) equals `path`. Single source of truth for
-    /// project lookup by anchor — used by `addTabToProjects`,
-    /// `repairProjectStructure`, and any future code that needs to
-    /// find a project by its filesystem anchor.
-    private func firstIndex(ofNonTerminalsProjectAt path: String) -> Int? {
-        projects.firstIndex {
-            $0.id != Self.terminalsProjectId
-                && Self.expandTilde($0.path) == path
-        }
-    }
-
-    /// Append a fresh project rooted at `path`, deriving the display
-    /// name from the path's last component. Centralised so creation
-    /// from `addTabToProjects` and `repairProjectStructure` stays in
-    /// sync (id format, name casing). Uses a UUID prefix instead of a
-    /// timestamp so back-to-back appends in the same millisecond
-    /// (e.g. inside the repair tab-move loop) can't collide on `id`.
-    private func appendNewProject(at path: String, with tab: Tab) {
-        let dirName = (path as NSString).lastPathComponent.uppercased()
-        let projectId = "p-\(dirName.lowercased())-\(UUID().uuidString.prefix(8).lowercased())"
-        projects.append(Project(
-            id: projectId, name: dirName, path: path, tabs: [tab]
-        ))
-    }
-
-    /// Self-heal the persisted project structure. Idempotent. Skips
-    /// the pinned Terminals project entirely.
-    ///
-    /// Four passes:
-    /// 1. Promote each non-Terminals project's `path` to its enclosing
-    ///    git root if `path` is a strict descendant of one.
-    /// 2. Move tabs whose own git-root anchor (computed from
-    ///    `tab.cwd`) differs from the containing project's path. Tabs
-    ///    whose `cwd` no longer exists on disk stay put.
-    /// 3. Merge non-Terminals projects that ended up at the same
-    ///    expanded path (lowest-index wins; later dupes are emptied).
-    /// 4. Drop empty non-Terminals projects.
-    ///
-    /// Internal (not private) so tests can drive it directly with
-    /// hand-seeded `projects` state.
+    /// Forwarder onto `TabModel.repairProjectStructure()`.
     func repairProjectStructure() {
-        // 1. Promote project paths to their git roots.
-        for i in projects.indices where projects[i].id != Self.terminalsProjectId {
-            let path = Self.expandTilde(projects[i].path)
-            guard FileManager.default.fileExists(atPath: path),
-                  let root = Self.findGitRoot(forCwd: path),
-                  root != path
-            else { continue }
-            projects[i].path = root
-            projects[i].name = (root as NSString).lastPathComponent.uppercased()
-        }
-
-        // 2. Collect mis-bucketed tabs, then re-insert them at the
-        //    right anchor. Two phases so the index-stable mutation
-        //    (rewriting each project's tabs in place) finishes before
-        //    we start appending new projects for unmatched anchors.
-        struct Move { let tab: Tab; let targetGitRoot: String }
-        var moves: [Move] = []
-        for i in projects.indices where projects[i].id != Self.terminalsProjectId {
-            let projectAnchor = Self.expandTilde(projects[i].path)
-            var keep: [Tab] = []
-            keep.reserveCapacity(projects[i].tabs.count)
-            for tab in projects[i].tabs {
-                let tabCwd = Self.expandTilde(tab.cwd)
-                guard FileManager.default.fileExists(atPath: tabCwd) else {
-                    keep.append(tab)
-                    continue
-                }
-                let anchor = Self.findGitRoot(forCwd: tabCwd) ?? tabCwd
-                if anchor == projectAnchor {
-                    keep.append(tab)
-                } else {
-                    moves.append(Move(tab: tab, targetGitRoot: anchor))
-                }
-            }
-            projects[i].tabs = keep
-        }
-        for move in moves {
-            appendOrInsert(move.tab, intoProjectAt: move.targetGitRoot)
-        }
-
-        // 3. Merge duplicates targeting the same expanded path.
-        var canonicalIndexByPath: [String: Int] = [:]
-        var dupes: [Int] = []
-        for i in projects.indices where projects[i].id != Self.terminalsProjectId {
-            let key = Self.expandTilde(projects[i].path)
-            if let canonical = canonicalIndexByPath[key] {
-                projects[canonical].tabs.append(contentsOf: projects[i].tabs)
-                dupes.append(i)
-            } else {
-                canonicalIndexByPath[key] = i
-            }
-        }
-        for idx in dupes.sorted(by: >) {
-            projects.remove(at: idx)
-        }
-
-        // 4. Drop empty non-Terminals projects.
-        projects.removeAll {
-            $0.id != Self.terminalsProjectId && $0.tabs.isEmpty
-        }
+        tabs.repairProjectStructure()
     }
 }
