@@ -79,8 +79,25 @@ ZIP_FINAL="$BUILD_DIR/Nice-$VERSION.zip"
 
 log "version=$VERSION skip_notarize=$SKIP_NOTARIZE"
 
-# ── 1. bump project.yml (restored on exit — the tag is the source of truth) ──
+# ── 1. assert project.yml already declares $VERSION ──────────────────
+# The marketing-version fields must be committed before tagging.
+# release.sh patches the YAML in-memory below so the artifact picks up
+# the build-number override, but anything else built from the tagged
+# commit (e.g. scripts/install.sh, contributors building from source)
+# reads the on-disk file and would otherwise show the previous
+# release's version in the About menu. v0.13.0 shipped that way once;
+# this guard makes sure it can't happen again.
 PROJECT_YML="$REPO_ROOT/project.yml"
+declared_short=$(/usr/bin/awk -F\" '/CFBundleShortVersionString:/ {print $2; exit}' "$PROJECT_YML")
+declared_marketing=$(/usr/bin/awk -F\" '/MARKETING_VERSION:/ {print $2; exit}' "$PROJECT_YML")
+if [[ "$declared_short" != "$VERSION" || "$declared_marketing" != "$VERSION" ]]; then
+    fail "project.yml is at CFBundleShortVersionString=\"$declared_short\" MARKETING_VERSION=\"$declared_marketing\" but --version=$VERSION; commit the version bump before tagging the release"
+fi
+
+# ── 2. bump project.yml (restored on exit — the tag is the source of truth) ──
+# The marketing-version fields above are already $VERSION (we just
+# asserted that); these sed lines are mainly to override the build-
+# number fields, which intentionally diverge from the committed "1".
 PROJECT_YML_BACKUP="$BUILD_DIR/project.yml.orig"
 mkdir -p "$BUILD_DIR"
 cp "$PROJECT_YML" "$PROJECT_YML_BACKUP"
@@ -92,14 +109,14 @@ log "patching project.yml versions → $VERSION"
 /usr/bin/sed -i '' -E "s|MARKETING_VERSION: \".*\"|MARKETING_VERSION: \"$VERSION\"|"                   "$PROJECT_YML"
 /usr/bin/sed -i '' -E "s|CURRENT_PROJECT_VERSION: \".*\"|CURRENT_PROJECT_VERSION: \"$VERSION\"|"       "$PROJECT_YML"
 
-# ── 2. regenerate the Xcode project from the patched YAML ────────────
+# ── 3. regenerate the Xcode project from the patched YAML ────────────
 log "xcodegen generate"
 xcodegen generate
 
-# ── 3. clean previous outputs in this build dir ──────────────────────
+# ── 4. clean previous outputs in this build dir ──────────────────────
 rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$EXPORT_OPTIONS" "$ZIP_PRE" "$ZIP_FINAL"
 
-# ── 4. archive (Developer ID Application, manual signing) ────────────
+# ── 5. archive (Developer ID Application, manual signing) ────────────
 log "xcodebuild archive"
 xcodebuild \
     -project Nice.xcodeproj \
@@ -113,7 +130,7 @@ xcodebuild \
     DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
     archive
 
-# ── 5. export .app from the archive ──────────────────────────────────
+# ── 6. export .app from the archive ──────────────────────────────────
 log "generating $EXPORT_OPTIONS from template"
 /usr/bin/sed "s|__TEAM_ID__|$APPLE_TEAM_ID|g" "$SCRIPT_DIR/ExportOptions.plist" > "$EXPORT_OPTIONS"
 
@@ -126,7 +143,7 @@ xcodebuild \
 
 [[ -d "$APP_PATH" ]] || fail "exportArchive produced no bundle at $APP_PATH"
 
-# ── 6. signing sanity check (fast; catches problems before notarize) ──
+# ── 7. signing sanity check (fast; catches problems before notarize) ──
 log "codesign --verify --deep --strict"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
@@ -139,11 +156,11 @@ if [[ "$SKIP_NOTARIZE" -eq 1 ]]; then
     exit 0
 fi
 
-# ── 7. pre-notarize zip ──────────────────────────────────────────────
+# ── 8. pre-notarize zip ──────────────────────────────────────────────
 log "ditto zip (pre-notarize) → $ZIP_PRE"
 ditto -c -k --keepParent "$APP_PATH" "$ZIP_PRE"
 
-# ── 8. notarize (blocking, may take minutes) ─────────────────────────
+# ── 9. notarize (blocking, may take minutes) ─────────────────────────
 SUBMIT_LOG=$(mktemp)
 trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$SUBMIT_LOG"' EXIT
 
@@ -168,21 +185,21 @@ if ! grep -qE "^ *status: Accepted" "$SUBMIT_LOG"; then
     fail "notarytool exited 0 but status was not Accepted — see output above"
 fi
 
-# ── 9. staple the ticket onto the .app (offline Gatekeeper verify) ──
+# ── 10. staple the ticket onto the .app (offline Gatekeeper verify) ──
 log "xcrun stapler staple"
 xcrun stapler staple "$APP_PATH"
 xcrun stapler validate "$APP_PATH"
 
-# ── 10. final zip (with staple baked into the bundle) ───────────────
+# ── 11. final zip (with staple baked into the bundle) ───────────────
 log "ditto zip (stapled, final) → $ZIP_FINAL"
 ditto -c -k --keepParent "$APP_PATH" "$ZIP_FINAL"
 
-# ── 11. Gatekeeper assessment (informational; authoritative test is on a clean Mac) ──
+# ── 12. Gatekeeper assessment (informational; authoritative test is on a clean Mac) ──
 log "spctl --assess --type execute"
 spctl --assess --type execute --verbose=4 "$APP_PATH" || \
     log "note: spctl assessment non-zero — verify on a Mac that hasn't run this signing identity"
 
-# ── 12. report ───────────────────────────────────────────────────────
+# ── 13. report ───────────────────────────────────────────────────────
 SHA=$(shasum -a 256 "$ZIP_FINAL" | awk '{print $1}')
 log "release artifact ready:"
 printf '  zip:    %s\n' "$ZIP_FINAL"
