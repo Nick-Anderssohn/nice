@@ -26,12 +26,50 @@ final class PaneStripGeometryTests: XCTestCase {
         CGRect(x: x, y: 0, width: width, height: 28)
     }
 
+    private func geometry(
+        paneFrames: [String: CGRect],
+        visibleWidth: CGFloat
+    ) -> PaneStripGeometry {
+        PaneStripGeometry(paneFrames: paneFrames, visibleWidth: visibleWidth)
+    }
+
+    // MARK: - contentWidth
+
+    /// `contentWidth` must be invariant under scroll. The same three
+    /// pills, viewed at scroll-zero and after scrolling 80pt right,
+    /// report identical `contentWidth`. Drives the chevron's
+    /// scroll-stability.
+    func test_contentWidth_isInvariantUnderScroll() {
+        let atRest = geometry(
+            paneFrames: [
+                "p1": rect(x: 0,   width: 100),
+                "p2": rect(x: 102, width: 100),
+                "p3": rect(x: 204, width: 100),
+            ],
+            visibleWidth: 200
+        )
+
+        let scrolled = geometry(
+            paneFrames: [
+                "p1": rect(x: -80, width: 100),
+                "p2": rect(x:  22, width: 100),
+                "p3": rect(x: 124, width: 100),
+            ],
+            visibleWidth: 200
+        )
+
+        XCTAssertEqual(atRest.contentWidth, scrolled.contentWidth)
+        XCTAssertEqual(atRest.contentWidth, 304)
+        XCTAssertTrue(atRest.isOverflowing)
+        XCTAssertTrue(scrolled.isOverflowing)
+    }
+
     // MARK: - Overflow detection
 
     /// Three pills that fit inside the viewport: no overflow, no scroll
     /// affordances, no offscreen panes.
     func test_noOverflow_whenAllPanesFit() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: [
                 "p1": rect(x: 0,   width: 100),
                 "p2": rect(x: 102, width: 100),
@@ -49,7 +87,7 @@ final class PaneStripGeometryTests: XCTestCase {
     /// p1 is scrolled past the leading edge; p2/p3 are visible. Only the
     /// leading fade should fire and only p1 is offscreen.
     func test_leadingOnlyOverflow() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: [
                 "p1": rect(x: -120, width: 100),  // fully past left
                 "p2": rect(x: -16,  width: 100),  // partially clipped
@@ -67,7 +105,7 @@ final class PaneStripGeometryTests: XCTestCase {
     /// p3 extends past the trailing edge; p1/p2 are visible. Trailing
     /// fade only, only p3 is offscreen.
     func test_trailingOnlyOverflow() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: [
                 "p1": rect(x: 0,   width: 100),
                 "p2": rect(x: 102, width: 100),  // partially clipped
@@ -85,7 +123,7 @@ final class PaneStripGeometryTests: XCTestCase {
     /// Active pane in the middle scrolled into view, with hidden panes
     /// on both sides — both fades fire and both offscreen ids surface.
     func test_bothEdgesOverflow() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: [
                 "p1": rect(x: -130, width: 100),  // off left
                 "p2": rect(x: 50,   width: 100),  // visible
@@ -99,11 +137,10 @@ final class PaneStripGeometryTests: XCTestCase {
         XCTAssertEqual(geo.offscreenPaneIds, ["p1", "p3"])
     }
 
-    /// One pane wider than the viewport always overflows on the trailing
-    /// side at scroll-zero; the chevron should still appear so the user
-    /// can reach it via the menu.
+    /// One pane wider than the viewport always overflows; the chevron
+    /// should still appear so the user can reach it via the menu.
     func test_singleHugePane_overflows() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: ["p1": rect(x: 0, width: 500)],
             visibleWidth: 200
         )
@@ -119,11 +156,12 @@ final class PaneStripGeometryTests: XCTestCase {
     /// quiet in that frame so the chevron / fades don't briefly flash on
     /// initial appearance.
     func test_zeroVisibleWidth_isQuiet() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: ["p1": rect(x: 0, width: 100)],
             visibleWidth: 0
         )
 
+        XCTAssertFalse(geo.isOverflowing)
         XCTAssertFalse(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
     }
@@ -133,14 +171,17 @@ final class PaneStripGeometryTests: XCTestCase {
     /// Without the tolerance, snapping pills would flicker the chrome
     /// on layout passes.
     func test_subPixelClipping_doesNotCountAsOverflow() {
-        let geo = PaneStripGeometry(
+        let geo = geometry(
             paneFrames: [
                 "p1": rect(x: -0.3, width: 100),
-                "p2": rect(x: 99.7, width: 100.4),  // maxX = 200.1
+                // Content fits the viewport within `edgeTolerance`:
+                // contentWidth = 200.1 - (-0.3) = 200.4.
+                "p2": rect(x: 99.7, width: 100.4),
             ],
             visibleWidth: 200
         )
 
+        XCTAssertFalse(geo.isOverflowing)
         XCTAssertFalse(geo.canScrollLeading)
         XCTAssertFalse(geo.canScrollTrailing)
         XCTAssertEqual(geo.offscreenPaneIds, [])
@@ -149,9 +190,10 @@ final class PaneStripGeometryTests: XCTestCase {
     /// No panes at all (e.g. between active-tab swaps) must be safe and
     /// produce no chrome.
     func test_emptyFrames_isQuiet() {
-        let geo = PaneStripGeometry(paneFrames: [:], visibleWidth: 400)
+        let geo = geometry(paneFrames: [:], visibleWidth: 400)
 
         XCTAssertFalse(geo.isOverflowing)
+        XCTAssertEqual(geo.contentWidth, 0)
         XCTAssertEqual(geo.offscreenPaneIds, [])
     }
 

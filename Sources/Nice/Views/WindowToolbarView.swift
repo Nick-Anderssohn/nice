@@ -83,6 +83,13 @@ struct WindowToolbarView: View {
 /// suit so timings don't feel staggered.
 private let panePillAnimationDuration: Double = 0.12
 
+/// How long we wait before hiding the chevron after `isOverflowing`
+/// flips false. Spans more than one display frame so brief layout-pass
+/// glitches (where SwiftUI re-emits a partial set of pill frames) can
+/// resolve before we decide the strip really fits. Latching ON is
+/// instant; only the OFF transition is debounced.
+private let chevronHideDebounce: Duration = .milliseconds(180)
+
 /// Scrolls horizontally through the active tab's panes, rendering each as
 /// an `InlinePanePill`. The trailing `NewTabBtn` stays pinned; it adds a
 /// terminal pane to the active tab.
@@ -113,10 +120,26 @@ private struct InlinePaneStrip: View {
     @State private var hoveredPaneId: String? = nil
 
     /// Each pill's frame in the ScrollView's named coordinate space
-    /// `paneStripCoordinateSpace` — populated via `PaneFramePreferenceKey`
-    /// and fed straight into `PaneStripGeometry`.
+    /// `paneStripCoordinateSpace` — populated via `PaneFramePreferenceKey`.
+    /// Used for cosmetic chrome (edge fades, attention badge) only;
+    /// these can tolerate the one-frame propagation lag SwiftUI's
+    /// preference system inflicts during scroll/layout transitions.
     @State private var paneFrames: [String: CGRect] = [:]
+
+    /// The ScrollView's visible viewport width. Compared against
+    /// `geometry.contentWidth` (derived from `paneFrames`) to gate the
+    /// chevron's existence.
     @State private var visibleWidth: CGFloat = 0
+
+    /// Hysteretic mirror of `geometry.isOverflowing` that drives the
+    /// chevron's existence. It snaps `true` instantly when overflow
+    /// appears, but a transition to `false` is held for
+    /// `chevronHideDebounce` so the chevron doesn't blink off during
+    /// the brief layout passes where SwiftUI re-emits per-pill frames
+    /// in a different order (e.g. during scroll animations or after
+    /// adding a pane). Without this, `geometry.isOverflowing` can flash
+    /// false for a frame even when the strip is visibly overflowing.
+    @State private var chevronVisible: Bool = false
 
     private var activeTab: Tab? {
         guard let id = appState.activeTabId else { return nil }
@@ -124,7 +147,10 @@ private struct InlinePaneStrip: View {
     }
 
     private var geometry: PaneStripGeometry {
-        PaneStripGeometry(paneFrames: paneFrames, visibleWidth: visibleWidth)
+        PaneStripGeometry(
+            paneFrames: paneFrames,
+            visibleWidth: visibleWidth
+        )
     }
 
     var body: some View {
@@ -132,7 +158,7 @@ private struct InlinePaneStrip: View {
             if let tab = activeTab {
                 strip(for: tab)
 
-                if geometry.isOverflowing {
+                if chevronVisible {
                     OverflowMenuButton(
                         panes: tab.panes,
                         activePaneId: tab.activePaneId,
@@ -164,8 +190,22 @@ private struct InlinePaneStrip: View {
         }
         .animation(
             .easeInOut(duration: panePillAnimationDuration),
-            value: geometry.isOverflowing
+            value: chevronVisible
         )
+        // Latch the chevron ON instantly; debounce the OFF transition.
+        // `task(id:)` cancels any in-flight hide task whenever
+        // `isOverflowing` toggles, so a quick true→false→true bounce
+        // resolves to "stays visible" instead of flickering off.
+        .task(id: geometry.isOverflowing) {
+            if geometry.isOverflowing {
+                chevronVisible = true
+            } else if chevronVisible {
+                try? await Task.sleep(for: chevronHideDebounce)
+                if !Task.isCancelled {
+                    chevronVisible = false
+                }
+            }
+        }
     }
 
     @ViewBuilder
