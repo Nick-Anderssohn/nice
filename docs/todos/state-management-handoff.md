@@ -1,224 +1,155 @@
 # State management refactor — handoff
 
-This file picks up the work documented in `state-and-AppState-refactor.md`.
-It captures where Phase 1 landed, what code review surfaced, and what
-the next session needs to do **before Phase 2 starts**.
+Phase 1 (the `@Observable` migration) and its follow-up cleanup
+(extracting side effects out of `init` and dropping the dual
+`ObservableObject` conformance) are both **done**. This file points
+the next session at Phase 2.
 
 ## Status
 
-Branch: `worktree-state-management`. Phase 1 commit is
-`6689548` ("Phase 1: Migrate state management to the @Observable macro").
-All 707 tests pass (664 unit + 43 UI). Build is clean.
+Branch: `worktree-state-management` (same worktree, same branch — Phase
+2 lands on top of Phase 1).
 
-The plan in `state-and-AppState-refactor.md` is otherwise still
-authoritative — Phase 2 hasn't started.
+Commits on top of `main`:
 
-## What Phase 1 actually did
+- `220e708` — Add state-management refactor plan
+- `6689548` — Phase 1: Migrate state management to the @Observable macro
+- `1c481eb` — Add Phase 1 handoff doc with code-review feedback (this file's prior incarnation)
+- `1fa3d87` — Phase 1 cleanup: extract side effects into start() / bootstrap(), drop ObservableObject carve-out
 
-- Every `ObservableObject` + `@Published` pair in `Sources/Nice/State/`,
-  `Sources/Nice/Process/TabPtySession.swift`, and
-  `Sources/Nice/Theme/TerminalThemeCatalog.swift` now uses the
-  `@Observable` macro. ~45 `@Published` annotations removed.
-- View-local classes `RecorderCoordinator` (KeyRecorderField.swift) and
-  `SidebarDragState` (SidebarView.swift), plus
-  `FileBrowserDragState`, are also `@Observable`.
-- Combine `services.$resolvedClaudePath.sink` replaced with
-  re-arming `withObservationTracking` in `AppState.armClaudePathTracking`.
-- View sites migrated: `@EnvironmentObject` → `@Environment(Type.self)`,
-  `@ObservedObject` → plain stored property, `.environmentObject(_:)` →
-  `.environment(_:)`. `@Bindable var foo = foo` added inside
-  `AppearancePane.body` and `FontPane.body` for `$foo.bar` bindings.
-- `@ObservationIgnored` placement: inspected in the code review,
-  considered correct.
+707 tests pass (664 unit + 43 UI). Acceptance grep
+(`ObservableObject|@Published|@StateObject|@ObservedObject|@EnvironmentObject`)
+returns zero matches in `Sources/`. Manual smoke tests against the
+installed `Nice Dev`:
 
-## Carve-out that breaks the plan's acceptance criterion
+- Typing `claude` in a fresh Main terminal opens a new sidebar tab via
+  the socket handshake. ✅
+- Rotating `~/.local/bin/claude` (rm + re-symlink to the same target)
+  and re-typing `claude` still spawns a new claude tab — the cached
+  resolved path survives the rotation. ✅
 
-The plan said `grep -r "ObservableObject\|@Published\|@StateObject..." Sources/`
-should return zero matches outside comments. **Phase 1 violates this at
-four sites by design**, all related to a single SwiftUI lifecycle
-problem:
+## Phase 2 — what's next
 
-- `Sources/Nice/State/AppState.swift` — `final class AppState: ObservableObject`
-- `Sources/Nice/State/NiceServices.swift` — `final class NiceServices: ObservableObject`
-- `Sources/Nice/Views/AppShellView.swift:70` — `@StateObject private var appState: AppState`
-- `Sources/Nice/NiceApp.swift:68` — `@StateObject private var services = NiceServices()`
+The authoritative plan lives in
+[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md).
+Goal: split `AppState` (~2275 lines) into five cohesive sub-models —
+`TabModel`, `SessionsModel`, `SidebarModel`, `CloseRequestCoordinator`,
+`WindowSession` — with `AppState` shrinking to a thin composition root
+(~200 lines, init + lifecycle choreography only).
 
-`objectWillChange` is never published — observation flows entirely through
-the `@Observable` registrar. `ObservableObject` is purely a SwiftUI
-lifecycle hook. There are big comments on both classes explaining this.
+Suggested PR sequence (per the plan):
 
-## Why the carve-out exists
+1. Extract `TabModel`. Cleanest cut; other sub-models depend on it.
+2. Extract `SessionsModel`. Owns the control socket and the
+   `TabPtySession` callbacks.
+3. Extract `SidebarModel`. Trivial; can ride with #2 or its own PR.
+4. Extract `WindowSession`. Touches `tearDown` and `restoreSavedWindow`.
+5. Extract `CloseRequestCoordinator`. Touches the alert binding in
+   `AppShellView`.
+6. View-side rename pass to read from the most specific sub-model.
 
-`@State`'s `wrappedValue` is **not** `@autoclosure`. `@StateObject`'s **is**.
+We're shipping Phase 2 on this same branch (no separate PR stream),
+so each step doesn't need to be a standalone PR — but each should
+keep `scripts/test.sh` green and the manual smoke from the plan
+passing before moving on.
 
-`AppState.init` and `NiceServices.init` do heavy side-effectful work:
-bind a UNIX-domain control socket, write a per-process ZDOTDIR, spawn
-child processes for the Main terminal pane, kick off a `which claude`
-probe, install Claude Code's UserPromptSubmit hook.
+## What changed in Phase 1 cleanup that matters for Phase 2
 
-With `@State private var appState: AppState` and
-`_appState = State(wrappedValue: AppState(...))` in `init`, the
-`AppState(...)` expression evaluates eagerly **on every parent body
-re-render**. Each call constructs a new socket. SwiftUI's `@State`
-identity rule keeps the *first* instance for the View, but the socket
-whose bind succeeded ended up on a *later* instance that got discarded.
-Mutations from socket messages (the `claude` shadow's handshake) then
-updated an `AppState` the views never saw. The UI symptom: typing
-`claude` in the Main terminal stopped opening a new sidebar tab.
-Diagnosis logged the addresses: socket handler `self` ≠ View-side
-`appState`.
+The plan's "Risks / things to watch" section warns about init-ordering
+choreography (socket up → seed Main pty → restore → release save-gate
+→ arm claude tracking). **That choreography is no longer in
+`AppState.init` — it's in `AppState.start()`** (`Sources/Nice/State/AppState.swift`,
+look for `func start()`). Init is now pure data construction:
 
-`@StateObject(wrappedValue: AppState(...))` evaluates the closure
-exactly once, so the lifecycle is stable. Hence the dual conformance.
+- Builds the seed Terminals project + Main tab in `projects`.
+- Stashes `services` as `trackedServices` (weak).
+- Reads pure values from `services` (tweaks/scheme/palette/font caches).
+- Does NOT touch the control socket, ZDOTDIR, `resolvedClaudePath`,
+  `restoreSavedWindow`, or `armClaudePathTracking`.
 
-## Code-review verdict
+`AppState.start()` (called from `AppShellHost.body`'s `.task`, after
+`services.bootstrap()`) is where all the side-effectful wiring lives.
+It's idempotent (`started` flag).
 
-A general-purpose code-review subagent inspected the diff. Verdict: **net
-improvement, with one architectural debt to pay off**.
+`NiceServices.bootstrap()` similarly absorbed the side effects that
+used to live in its init: `cleanupStaleTempFiles`, ZDOTDIR write,
+async `which claude` probe, `editorDetector.scan()`,
+`ClaudeHookInstaller.install()`. Already idempotent (`booted` flag).
 
-The reviewer's specific finding on the carve-out:
+### Implication for Phase 2
 
-> The cleaner fix is to make the init side-effect-free and add an
-> explicit `start()` (or move the side effects into `.task` /
-> `.onAppear` on the owning view). That collapses to a normal `@State`
-> + `@Observable` model, drops one of two registrars from each class,
-> and removes a permanent footgun where someone reaches for
-> `objectWillChange.send()` because the type "is" an ObservableObject.
+The plan suggests the new `start()` method "may be the natural seam
+for Phase 2's composition root" — i.e., construct `TabModel`,
+`SessionsModel`, etc. inside `start()` rather than `init`, and wire
+them together there. Worth thinking about up front:
 
-Other findings (no action needed, captured for context):
-- Per-property invalidation is real — storage mechanism (`@StateObject`
-  vs `@State`) is independent of tracking mechanism (`@Environment`
-  routes through the `@Observable` registrar regardless).
-- `withObservationTracking` re-arming is idiomatic; `trackedServices`
-  weak property is load-bearing (handles the deinit race + lets the
-  re-arm be re-entrant without a strong arg).
-- `@ObservationIgnored` placement is sound across all categories
-  (lifecycle bookkeeping; cached settings driven by external onChange;
-  plumbing). Tracked vs ignored matches view-side reads.
-- The Combine gotcha was handled cleanly per the plan.
-- Phase 1 acceptance criterion at line 187 of the plan ("kill
-  `~/.local/bin/claude`, re-symlink, open a new tab") was **not**
-  smoked manually. It exercises the `withObservationTracking`
-  re-arming under real binary rotation. Worth running before declaring
-  Phase 1 fully soaked.
+- **Construct in init, wire in start()** — sub-models exist as soon
+  as AppState is constructed (so views can `@Environment` them
+  immediately), but the side-effectful cross-wiring (e.g. passing
+  `TabModel` into `SessionsModel`'s socket handler) happens in
+  `start()`.
+- **Construct in start()** — sub-models don't exist until `start()`
+  runs. Cleaner but means views have to handle the "not yet
+  constructed" window. Probably worse.
 
-## Decision: expand Phase 1 scope to address the review
+The handoff doesn't prescribe either; pick one based on what shakes
+out when you start sketching `TabModel`'s shape.
 
-The user has decided to **expand Phase 1 to drop the dual conformance
-before starting Phase 2**. The cleanup is a prerequisite for Phase 2,
-not a follow-up.
+## Things still worth being careful about (carried from the plan)
 
-## Work for the next session
-
-1. **Extract side effects out of `AppState.init` and `NiceServices.init`**
-   into a `start()` (or equivalent — pick a name) called from
-   `.onAppear` or `.task` on the owning view.
-
-   For `AppState`: socket creation/bind, `controlSocketExtraEnv`
-   assembly, the seed `makeSession` call for the Main terminal,
-   `restoreSavedWindow`, the `isInitializing` save-gate flip, and
-   `armClaudePathTracking`. The init should leave the object in a
-   well-defined "constructed but not started" state — empty `projects`
-   is acceptable; views are guarded on `activeTabId != nil` etc. so an
-   empty interim state should not crash.
-
-   For `NiceServices`: ZDOTDIR write, the async `which claude` probe,
-   `editorDetector.scan()`, `ClaudeHookInstaller.install()`, the
-   `cleanupStaleTempFiles` call. All currently in `init`. Move to a
-   `start()` called from the App's body (`.task` is cleanest).
-
-2. **Drop `: ObservableObject` from both classes.** Drop the big
-   carve-out comments (or shrink them to a one-liner pointing at the
-   commit history).
-
-3. **Switch the view sites back to `@State`:**
-   - `Sources/Nice/Views/AppShellView.swift:70` — `@State private var appState: AppState`
-   - `Sources/Nice/NiceApp.swift:68` — `@State private var services = NiceServices()`
-
-4. **Verify the eager-init issue does not recur.** The two empirical
-   symptoms to watch for:
-   - Typing `claude` in the Main terminal must open a new sidebar tab
-     (`testTypeClaudeInTerminalsFiresNewtab` and the other 10 socket-
-     touching UI tests in `UITests/NiceUITests.swift`).
-   - The Main terminal pane must actually start spawning. In the
-     diagnostic session, the test app's terminal worked because the
-     first AppState's pty session was stored in `ptySessions`, but
-     this is fragile.
-
-5. **Run the manual smoke from the plan** (line 187 in
-   `state-and-AppState-refactor.md`). Specifically: kill
-   `~/.local/bin/claude` if present, re-symlink it, open a new tab, and
-   verify the new pane spawns claude rather than a bare zsh fallback.
-   This is the single test that exercises `armClaudePathTracking` in
-   anger.
-
-6. **Re-run the full suite.** `scripts/test.sh` under the worktree lock
-   (see CLAUDE.md and the `worktree-lock` skill). All 707 tests must
-   stay green.
-
-7. **Verify the acceptance criterion is now satisfied:**
-   `grep -rE "ObservableObject|@Published|@StateObject|@ObservedObject|@EnvironmentObject" Sources/`
-   should return only comment lines or nothing.
-
-## Things to be careful about
-
-- **Init ordering choreography in `AppState.init` is load-bearing.**
-  Read the existing comments around lines 333–469 carefully. The
-  socket must be up before pty spawns inject `NICE_SOCKET` env;
-  `restoreSavedWindow` must run after the socket is up; the
-  `isInitializing` save-gate must release after restore; the
-  `armClaudePathTracking` install must happen at the end so
-  `[weak self]` doesn't trip Swift's "self before fully initialized"
-  check. Whatever shape `start()` takes, this ordering must survive.
-- **`AppShellHost` currently passes `services: NiceServices` into
-  `AppState.init` which immediately reads `services.tweaks`,
-  `services.fontSettings.terminalFontSize`, etc.** That's fine — those
-  reads are pure. The side effects to move out are below them in
-  init: socket bind, makeSession, restore.
-- **Tests that construct `AppState` directly** (in
-  `Tests/NiceUnitTests/AppStateProjectBucketingTests.swift` and
-  similar) pass `services: nil` and currently work because the
-  `controlSocket` is created either way but `restoreSavedWindow` is
-  guarded on `persistenceEnabled`. After the refactor, those unit
-  tests will need to call `start()` themselves if they want the side
-  effects, or skip it if they don't. Decide which tests need which.
-- **Two windows can be open simultaneously** (⌘N spawns a new
-  WindowGroup scene). Each gets its own `AppState`; they share
-  `NiceServices`. The lifecycle change must preserve this.
-- **The `WindowAccessor` block in `AppShellHost.body`
-  (AppShellView.swift:149)** registers the AppState with
-  `services.registry`. That registration currently happens after
-  AppState init has already done all its side-effect work. After the
-  refactor, you may want to move `appState.start()` into this same
-  block, or into `.task { }`. `.task { }` is preferred because it's
-  scoped to view lifetime and runs before the first render frame.
+- **`isInitializing` save-gate.** Today it's flipped at the end of
+  `start()` (was: end of `init`). Whichever sub-model owns
+  persistence (`WindowSession` per the plan) inherits this flag.
+- **Static `claimedWindowIds` set.** Process-wide; lives on
+  `WindowSession` after the split.
+- **`@SceneStorage` bridge.** `AppShellView` reads
+  `storedSidebarCollapsed`, `storedSidebarMode`, `storedWindowSessionId`
+  and threads them in. After the split the bindings still flow through
+  `AppShellView` — they just hand to `SidebarModel` / `WindowSession`
+  instead of one big `AppState`.
+- **UI-test selectors.** The `sidebar.terminals` accessibility alias
+  and any other identifiers must be preserved across the rename.
+- **`#Preview` blocks and unit tests.** The convenience `AppState()`
+  init currently builds a complete preview-safe instance with
+  `services: nil`. After the split, an equivalent — likely an
+  `AppState.preview()` factory — is needed.
+- **Tests construct `AppState` directly via the convenience init**
+  (`Tests/NiceUnitTests/AppStateProjectBucketingTests.swift` and ~20
+  other files). They pass `services: nil` and never call `start()` —
+  they rely on the seed Main tab being built in `init` (so
+  `projects[0].tabs[0]` exists). After the split, the same
+  contract needs to hold: construct-without-`start()` should leave the
+  data model in a usable state for unit tests.
 
 ## Useful commands
 
 ```sh
 # From /Users/nick/Projects/nice/.claude/worktrees/state-management:
-scripts/worktree-lock.sh acquire phase1-cleanup
+scripts/worktree-lock.sh acquire phase2
 scripts/test.sh
 scripts/worktree-lock.sh release
 
-# A single-test fast-iteration loop:
+# Single-test fast loop:
 scripts/test.sh -only-testing:NiceUITests/NiceUITests/testTypeClaudeInTerminalsFiresNewtab
 
-# Check the acceptance grep:
+# Acceptance grep (must stay clean):
 grep -rE "ObservableObject|@Published|@StateObject|@ObservedObject|@EnvironmentObject" Sources/
+
+# Install Nice Dev for manual smoke:
+scripts/install.sh    # under the worktree lock — see CLAUDE.md
 ```
 
-## Once this cleanup is done
+## Phase 2 acceptance criteria (from the plan)
 
-Phase 2 from `state-and-AppState-refactor.md` becomes safe to start.
-The plan there describes splitting `AppState` into `TabModel`,
-`SessionsModel`, `SidebarModel`, `CloseRequestCoordinator`, and
-`WindowSession`. The init choreography you'll have just untangled is
-exactly the choreography Phase 2's "Risks / things to watch" section
-calls out as the hardest part of Phase 2.
-
-If `start()` ends up being the natural seam for "construct sub-models
-and wire them together", consider whether to land Phase 2's
-composition root in `start()` directly rather than re-doing the work.
-But that's a judgment call to make in the moment, not something this
-handoff prescribes.
+- [ ] `Sources/Nice/State/AppState.swift` is under ~300 lines.
+- [ ] `TabModel`, `SessionsModel`, `SidebarModel`,
+      `CloseRequestCoordinator`, `WindowSession` each live in their
+      own file under `Sources/Nice/State/`.
+- [ ] No view reads `appState.<thing>` for a `<thing>` that lives on
+      a sub-model — it reads the sub-model directly via
+      `@Environment(SubModel.self)`.
+- [ ] `scripts/test.sh` green.
+- [ ] `#Preview` blocks compile and render.
+- [ ] Manual smoke (typing `claude` in Main terminal opens a tab;
+      rotating `~/.local/bin/claude` and re-typing still spawns
+      claude) still passes.
