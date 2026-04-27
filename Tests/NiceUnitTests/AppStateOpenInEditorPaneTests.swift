@@ -178,6 +178,23 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
                        "Unknown editor id must not spawn a pane.")
     }
 
+    // MARK: - openFromDoubleClick
+
+    /// With no Tweaks injected (services-less AppState), the editor
+    /// lookup returns nil for every extension, so the call falls
+    /// through to NSWorkspace. We can't assert NSWorkspace from a
+    /// unit test, but we *can* assert the pane count is unchanged —
+    /// which pins "no editor pane is spawned when nothing is mapped".
+    func test_openFromDoubleClick_noMapping_noPaneSpawned() {
+        let appState = AppState()
+        let initial = countAllPanes(appState)
+
+        appState.openFromDoubleClick(url: URL(fileURLWithPath: "/tmp/x.png"))
+
+        XCTAssertEqual(countAllPanes(appState), initial,
+                       "Unmapped extension must not spawn an editor pane.")
+    }
+
     // MARK: - helpers
 
     private func countAllPanes(_ appState: AppState) -> Int {

@@ -696,6 +696,9 @@ final class Tweaks: ObservableObject {
     }
 
     static func loadEditorCommands(defaults: UserDefaults) -> [EditorCommand] {
+        if let seed = TestSeed.decode() {
+            return seed.editorCommands
+        }
         guard let data = defaults.data(forKey: editorCommandsKey),
               let decoded = try? JSONDecoder().decode([EditorCommand].self, from: data)
         else { return [] }
@@ -703,9 +706,41 @@ final class Tweaks: ObservableObject {
     }
 
     static func loadExtensionEditorMap(defaults: UserDefaults) -> [String: UUID] {
+        if let seed = TestSeed.decode() {
+            return seed.extensionEditorMap
+        }
         guard let data = defaults.data(forKey: extensionEditorMapKey),
               let decoded = try? JSONDecoder().decode([String: UUID].self, from: data)
         else { return [:] }
         return decoded
+    }
+
+    /// Test-only override hook. UITests can't reliably seed the
+    /// running app's `UserDefaults` from outside the process —
+    /// `cfprefsd` doesn't honour the sandboxed `HOME` env var, so a
+    /// plist written to the fake home would be invisible. The
+    /// `NICE_TEST_EDITOR_SEED` env var provides a deterministic
+    /// alternative: a JSON blob with `editorCommands` and
+    /// `extensionEditorMap` keys that loaders return verbatim,
+    /// bypassing UserDefaults entirely.
+    ///
+    /// Production callers set `NICE_TEST_EDITOR_SEED=` (unset or
+    /// empty) so the loaders fall through to UserDefaults as normal.
+    /// Decode failures also fall through, so a malformed seed
+    /// behaves like a fresh install.
+    private struct TestSeed: Decodable {
+        let editorCommands: [EditorCommand]
+        let extensionEditorMap: [String: UUID]
+
+        static func decode() -> TestSeed? {
+            // `ProcessInfo.processInfo.environment` is documented as
+            // immutable for the process lifetime — `setenv` from a
+            // unit test wouldn't show up. Read via `getenv` so the
+            // unit test for this hook can flip the var at runtime.
+            guard let cstr = getenv("NICE_TEST_EDITOR_SEED") else { return nil }
+            let raw = String(cString: cstr)
+            guard !raw.isEmpty, let data = raw.data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode(TestSeed.self, from: data)
+        }
     }
 }

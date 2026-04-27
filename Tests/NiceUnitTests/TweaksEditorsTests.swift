@@ -179,6 +179,61 @@ final class TweaksEditorsTests: XCTestCase {
         )
     }
 
+    // MARK: - Test-seed env-var override
+
+    /// `NICE_TEST_EDITOR_SEED` short-circuits the loaders so UITests
+    /// can deterministically seed the running app's editor config
+    /// without going through cfprefsd-mediated UserDefaults. Pin the
+    /// override for both loaders so a future refactor doesn't
+    /// silently drop one branch.
+    func test_loadersHonourTestSeedEnvVar() {
+        let id = UUID()
+        let payload = """
+        {"editorCommands":[{"id":"\(id.uuidString)","name":"Vim","command":"vim"}],"extensionEditorMap":{"md":"\(id.uuidString)"}}
+        """
+        setenv("NICE_TEST_EDITOR_SEED", payload, 1)
+        defer { unsetenv("NICE_TEST_EDITOR_SEED") }
+
+        let suite = freshSuite()  // empty — seed must override
+        defer { wipeSuite(suite) }
+
+        let editors = Tweaks.loadEditorCommands(defaults: suite)
+        XCTAssertEqual(editors.count, 1)
+        XCTAssertEqual(editors.first?.id, id)
+        XCTAssertEqual(editors.first?.command, "vim")
+
+        let map = Tweaks.loadExtensionEditorMap(defaults: suite)
+        XCTAssertEqual(map["md"], id)
+    }
+
+    func test_loadersIgnoreEmptyTestSeed() {
+        // Empty string is treated as "not set" so production builds
+        // (where the env var is either unset or empty) flow through
+        // to UserDefaults as normal.
+        setenv("NICE_TEST_EDITOR_SEED", "", 1)
+        defer { unsetenv("NICE_TEST_EDITOR_SEED") }
+
+        let suite = freshSuite()
+        defer { wipeSuite(suite) }
+
+        XCTAssertEqual(Tweaks.loadEditorCommands(defaults: suite), [])
+        XCTAssertEqual(Tweaks.loadExtensionEditorMap(defaults: suite), [:])
+    }
+
+    func test_loadersIgnoreMalformedTestSeed() {
+        // A garbled seed must fall through to UserDefaults — better a
+        // fresh-install state than a crash if the env var ever ends
+        // up populated by an unrelated tool.
+        setenv("NICE_TEST_EDITOR_SEED", "{not valid json", 1)
+        defer { unsetenv("NICE_TEST_EDITOR_SEED") }
+
+        let suite = freshSuite()
+        defer { wipeSuite(suite) }
+
+        XCTAssertEqual(Tweaks.loadEditorCommands(defaults: suite), [])
+        XCTAssertEqual(Tweaks.loadExtensionEditorMap(defaults: suite), [:])
+    }
+
     func test_persistence_emptyOnFreshInstall() {
         let suite = freshSuite()
         defer { wipeSuite(suite) }

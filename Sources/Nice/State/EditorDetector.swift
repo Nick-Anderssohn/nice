@@ -174,9 +174,16 @@ extension EditorDetector {
     /// otherwise inherits only macOS's default PATH.
     ///
     /// The watchdog SIGTERMs the child if it doesn't exit within
-    /// `timeout` seconds, returning whatever was captured up to that
-    /// point (typically empty). Throws only on `Process.run()`
+    /// `timeout` seconds, returning whatever was captured up to
+    /// that point (typically empty). Throws only on `Process.run()`
     /// failure.
+    ///
+    /// Watchdog cancellation: a `DispatchSourceTimer` is scheduled
+    /// for the deadline and explicitly `cancel()`ed as soon as
+    /// `waitUntilExit` returns, so the SIGTERM never fires after a
+    /// clean exit. This eliminates the PID-recycle hazard the
+    /// `asyncAfter` form had — `kill` on a recycled pid would have
+    /// signalled an unrelated process belonging to the same uid.
     @Sendable nonisolated static func zshLoginRunner(
         script: String,
         timeout: TimeInterval
@@ -190,18 +197,14 @@ extension EditorDetector {
 
         try proc.run()
 
-        // Watchdog captures the pid (a Sendable primitive) rather
-        // than the non-Sendable Process. SIGTERM is enough — zsh
-        // exits cleanly. Note: if the process already exited cleanly
-        // before the timeout fires, the SIGTERM lands on a dead pid
-        // (no-op, ESRCH) — but a recycled pid in that window is a
-        // theoretical hazard. The 5 s default is long enough that
-        // recycle is unlikely; tightening this is tracked separately.
         let pid = proc.processIdentifier
-        let deadline = DispatchTime.now() + timeout
-        DispatchQueue.global().asyncAfter(deadline: deadline) {
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + timeout)
+        timer.setEventHandler {
             kill(pid, SIGTERM)
         }
+        timer.resume()
+        defer { timer.cancel() }
 
         proc.waitUntilExit()
         let data = stdout.fileHandleForReading.readDataToEndOfFile()

@@ -171,6 +171,21 @@ extension AppState: FileExplorerActions {
 
     // MARK: - Editor pane
 
+    /// Single entry point for File Explorer double-clicks on a file.
+    /// Routes to the editor-pane path when the extension is mapped,
+    /// otherwise falls through to the OS default app handler. Lives
+    /// here (not in the view) so the routing rule is pinned in one
+    /// place — the right-click submenu and the double-click default
+    /// have to agree on what an editor mapping means, and the view
+    /// layer shouldn't be the one enforcing that.
+    func openFromDoubleClick(url: URL) {
+        if let editor = tweaks?.editor(forExtension: url.pathExtension) {
+            openInEditorPane(url: url, editorId: editor.id)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     /// Returns the user-configured + auto-detected editor lists for
     /// the "Open in Editor Pane" submenu, deduplicated by `command`
     /// so a manually-added `vim` doesn't appear twice when `vim` is
