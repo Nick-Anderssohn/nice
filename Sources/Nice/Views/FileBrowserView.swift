@@ -60,6 +60,11 @@ private struct FileBrowserContent: View {
     let tabCwd: String
     @ObservedObject var state: FileBrowserState
 
+    /// Ephemeral state for an in-flight file-row drag. Off `AppState`
+    /// so transient drag UI doesn't pollute the persistent model —
+    /// matches the `SidebarDragState` pattern used by the tab list.
+    @StateObject private var dragState = FileBrowserDragState()
+
     var body: some View {
         VStack(spacing: 0) {
             projectHeader
@@ -67,6 +72,7 @@ private struct FileBrowserContent: View {
             Divider().opacity(0.5)
             tree
         }
+        .environmentObject(dragState)
     }
 
     // MARK: Project header
@@ -208,6 +214,7 @@ private struct FileBrowserContent: View {
 private struct FileTreeRow: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var fontSettings: FontSettings
+    @EnvironmentObject private var dragState: FileBrowserDragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -404,13 +411,50 @@ private struct FileTreeRow: View {
                 actions: appState
             )
         }
+        .onDrag { beginDrag() }
+        .modifier(FileTreeRowDropTarget(
+            isDirectory: isDirectory,
+            folderURL: url,
+            folderPath: path,
+            dragState: dragState,
+            appState: appState,
+            tabId: tabId
+        ))
         .help(path)
     }
 
-    /// Composite background: selection accent (highest priority),
-    /// hover (next), or transparent. Matches the rounded-rectangle
-    /// shape used for hover so the visual size doesn't jump.
+    /// Fires when SwiftUI begins dragging this row. Snapshots which
+    /// paths to drag (the whole selection if this row is part of it,
+    /// otherwise just this row — Finder behavior) into `dragState` so
+    /// the drop delegate can read the source set without having to
+    /// load it back out of the `NSItemProvider` synchronously.
+    /// Returns an `NSItemProvider` carrying this row's file URL so
+    /// external receivers (Finder, the terminal pane) recognize the
+    /// payload as a real file.
+    private func beginDrag() -> NSItemProvider {
+        let dragPaths: [String]
+        if selection.contains(path) {
+            dragPaths = Array(selection.selectedPaths)
+        } else {
+            // Finder: dragging an unselected row first selects it.
+            selection.replace(with: [path])
+            dragPaths = [path]
+        }
+        dragState.session = FileBrowserDragSession(
+            paths: dragPaths,
+            targetPath: nil
+        )
+        return NSItemProvider(object: url as NSURL)
+    }
+
+    /// Composite background: drop-target highlight (highest priority
+    /// during a drag), then selection accent, then hover, then
+    /// transparent. The drop-target case uses a stronger accent than
+    /// selection so the eye picks it out against any selected rows.
     private var rowBackground: Color {
+        if isDropTarget {
+            return Color.accentColor.opacity(0.30)
+        }
         if selection.contains(path) {
             return Color.accentColor.opacity(0.18)
         }
@@ -418,6 +462,13 @@ private struct FileTreeRow: View {
             return Color.niceInk(scheme, palette).opacity(0.06)
         }
         return Color.clear
+    }
+
+    /// True when an in-flight file-browser drag has chosen this row's
+    /// folder as its current drop target. Drives the row-background
+    /// highlight so the user sees where the drop will land.
+    private var isDropTarget: Bool {
+        isDirectory && dragState.session?.targetPath == path
     }
 
     /// True when this row's path is on the pasteboard with cut
@@ -548,6 +599,190 @@ private struct FileTreeRow: View {
             return "terminal"
         default:
             return "doc"
+        }
+    }
+}
+
+// MARK: - Drop target
+
+/// Conditional `.onDrop` modifier — only directory rows accept drops.
+/// `ViewModifier` rather than an inline ternary so we can attach the
+/// real `DropDelegate` without constructing a useless one for files,
+/// and so the modifier reads cleanly at the call site.
+private struct FileTreeRowDropTarget: ViewModifier {
+    let isDirectory: Bool
+    let folderURL: URL
+    let folderPath: String
+    let dragState: FileBrowserDragState
+    let appState: AppState
+    let tabId: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isDirectory {
+            content.onDrop(
+                of: [UTType.fileURL],
+                delegate: FileBrowserRowDropDelegate(
+                    folderURL: folderURL,
+                    folderPath: folderPath,
+                    dragState: dragState,
+                    appState: appState,
+                    tabId: tabId
+                )
+            )
+        } else {
+            content
+        }
+    }
+}
+
+/// Drop delegate attached to each directory row. Handles two source
+/// kinds:
+///
+///   - **Internal drag** — `FileBrowserDragState.session.paths` is set
+///     by the source row's `.onDrag`. The delegate reads it directly
+///     for both highlight validation (folder-into-self check) and the
+///     final move/copy. The `NSItemProvider` payload is ignored on
+///     internal drags so a multi-select drag can move all selected
+///     paths even though the provider only carries the anchor URL.
+///
+///   - **External drag** — `dragState.session` is nil; URLs are
+///     loaded asynchronously from `info.itemProviders(for:)` at drop
+///     time. We still light up the highlight on hover so the user
+///     gets the same visual confirmation as an internal drag.
+///
+/// The actual move/copy is dispatched on the next runloop tick, same
+/// trick `SidebarView`'s tab drop uses, so AppKit's drag tracker
+/// isn't mid-mutation when we touch model state.
+private struct FileBrowserRowDropDelegate: DropDelegate {
+    let folderURL: URL
+    let folderPath: String
+    let dragState: FileBrowserDragState
+    let appState: AppState
+    let tabId: String?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [UTType.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateTarget()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateTarget()
+        guard isCurrentTarget else {
+            return DropProposal(operation: .forbidden)
+        }
+        let mods = NSEvent.modifierFlags
+        return DropProposal(operation: mods.contains(.option) ? .copy : .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        if isCurrentTarget {
+            dragState.session?.targetPath = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let session = dragState.session
+        dragState.session = nil
+
+        if let session, !session.paths.isEmpty {
+            let urls = session.paths.map { URL(fileURLWithPath: $0) }
+            scheduleDrop(urls: urls)
+            return true
+        }
+
+        // External drag — load file URLs from the dropped item providers.
+        let providers = info.itemProviders(for: [UTType.fileURL])
+        guard !providers.isEmpty else { return false }
+        Task { @MainActor in
+            var urls: [URL] = []
+            for provider in providers {
+                if let url = await Self.loadFileURL(from: provider) {
+                    urls.append(url)
+                }
+            }
+            scheduleDrop(urls: urls)
+        }
+        return true
+    }
+
+    /// True when this delegate's folder is the current highlight
+    /// target. Reading via path equality (rather than comparing
+    /// folderURL identity) keeps this consistent with how
+    /// `dragState.session?.targetPath` is set on enter / exit.
+    private var isCurrentTarget: Bool {
+        dragState.session?.targetPath == folderPath
+    }
+
+    /// Decide whether to highlight this folder as the drop target.
+    /// For internal drags, the folder-into-self / no-op rules in
+    /// `FileBrowserDropResolver.canDrop` decide. For external drags
+    /// (no session yet), highlight unconditionally — Finder won't
+    /// drop a folder onto itself.
+    private func updateTarget() {
+        if let session = dragState.session {
+            let urls = session.paths.map { URL(fileURLWithPath: $0) }
+            if FileBrowserDropResolver.canDrop(sources: urls, into: folderURL) {
+                dragState.session?.targetPath = folderPath
+            } else if isCurrentTarget {
+                dragState.session?.targetPath = nil
+            }
+        } else {
+            dragState.session = FileBrowserDragSession(
+                paths: [],
+                targetPath: folderPath
+            )
+        }
+    }
+
+    /// Validate, classify (move vs copy), and apply on the next
+    /// runloop tick — see the type-level note for why we defer.
+    private func scheduleDrop(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard FileBrowserDropResolver.canDrop(sources: urls, into: folderURL) else {
+            return
+        }
+        let mods = NSEvent.modifierFlags
+        let sameVolume = urls.allSatisfy {
+            FileBrowserDropResolver.areOnSameVolume($0, folderURL)
+        }
+        let operation = FileBrowserDropResolver.operation(
+            modifierFlags: mods,
+            sameVolume: sameVolume
+        )
+        DispatchQueue.main.async {
+            appState.moveOrCopy(
+                urls: urls,
+                into: folderURL,
+                operation: operation,
+                originatingTabId: tabId
+            )
+        }
+    }
+
+    /// Bridge `NSItemProvider`'s callback-based file-URL load to
+    /// async/await so `performDrop` can `await` each provider in a
+    /// loop. External drags arrive on the system drag queue; this
+    /// hop ends on whichever continuation queue Foundation picks,
+    /// which is fine because the caller is already in a `Task`.
+    private static func loadFileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+            provider.loadItem(
+                forTypeIdentifier: UTType.fileURL.identifier,
+                options: nil
+            ) { item, _ in
+                if let url = item as? URL {
+                    cont.resume(returning: url)
+                } else if let data = item as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    cont.resume(returning: url)
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
         }
     }
 }
