@@ -8,6 +8,13 @@ on:
 jobs:
   test:
     runs-on: macos-26
+    # Job-level env so the Swift runtime backtrace dumper turns on for
+    # every child process xcodebuild forks — including the test host.
+    # On abort the runtime prints a full stack to stderr, which xctest
+    # captures into StandardOutputAndStandardError.txt inside the
+    # xcresult diagnostics bundle.
+    env:
+      SWIFT_BACKTRACE: "enable=yes,output-to=stderr,interactive=no"
     steps:
       - uses: actions/checkout@v4
 
@@ -39,5 +46,19 @@ jobs:
         with:
           name: xcresult-${{ github.run_id }}
           path: build-dev/Logs/Test/*.xcresult
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # macOS writes per-process .ips crash reports here when a process
+      # aborts. The xcresult diagnostics bundle doesn't include these,
+      # so collect them separately.
+      - name: Upload macOS crash reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-reports-${{ github.run_id }}
+          path: |
+            ~/Library/Logs/DiagnosticReports/Nice*
+            /Library/Logs/DiagnosticReports/Nice*
           if-no-files-found: ignore
           retention-days: 14
