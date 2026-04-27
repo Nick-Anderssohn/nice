@@ -24,6 +24,7 @@ final class NiceServices: ObservableObject {
     let tweaks: Tweaks
     let shortcuts: KeyboardShortcuts
     let fontSettings: FontSettings
+    let fileBrowserSortSettings: FileBrowserSortSettings
     let registry: WindowRegistry
     let terminalThemeCatalog: TerminalThemeCatalog
     let releaseChecker: ReleaseChecker
@@ -61,6 +62,7 @@ final class NiceServices: ObservableObject {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
         self.fontSettings = FontSettings()
+        self.fileBrowserSortSettings = FileBrowserSortSettings()
         self.registry = WindowRegistry()
         self.terminalThemeCatalog = TerminalThemeCatalog(
             supportDirectory: TerminalThemeCatalog.defaultSupportDirectory()

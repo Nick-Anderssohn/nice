@@ -670,6 +670,7 @@ private struct SidebarToggleButton: View {
         .environmentObject(Tweaks())
         .environmentObject(KeyboardShortcuts())
         .environmentObject(FontSettings())
+        .environmentObject(FileBrowserSortSettings())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.light)
 }
@@ -680,6 +681,7 @@ private struct SidebarToggleButton: View {
         .environmentObject(Tweaks())
         .environmentObject(KeyboardShortcuts())
         .environmentObject(FontSettings())
+        .environmentObject(FileBrowserSortSettings())
         .frame(width: 1180, height: 680)
         .preferredColorScheme(.dark)
 }

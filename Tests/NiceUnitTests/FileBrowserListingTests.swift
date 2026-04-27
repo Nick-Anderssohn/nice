@@ -53,6 +53,94 @@ final class FileBrowserListingTests: XCTestCase {
         XCTAssertEqual(names, ["M_dir", "Z_dir", "a_file.swift", "regular.txt"])
     }
 
+    /// Name-descending flips both buckets (dirs and files) but keeps
+    /// dirs above files. Same pivot rule, opposite intra-bucket order.
+    func test_entries_nameDescending_reversesEachBucket() throws {
+        try touchFile("regular.txt")
+        try touchFile("a_file.swift")
+        try makeDir("Z_dir")
+        try makeDir("M_dir")
+
+        let names = FileBrowserListing
+            .entries(at: tempDir, showHidden: true, criterion: .name, ascending: false)
+            .map { $0.lastPathComponent }
+
+        XCTAssertEqual(names, ["Z_dir", "M_dir", "regular.txt", "a_file.swift"])
+    }
+
+    /// Date-modified ascending = oldest first. Files written earlier
+    /// in test setup land above files written later, regardless of
+    /// alphabetical order. Dirs-first still holds.
+    func test_entries_dateModifiedAscending_oldestFirstWithinBucket() throws {
+        let oldFile = try touchFile("z_old.txt")
+        let newFile = try touchFile("a_new.txt")
+        try setModificationDate(.init(timeIntervalSince1970: 1_000_000), on: oldFile)
+        try setModificationDate(.init(timeIntervalSince1970: 2_000_000), on: newFile)
+
+        let names = FileBrowserListing
+            .entries(at: tempDir, showHidden: true, criterion: .dateModified, ascending: true)
+            .map { $0.lastPathComponent }
+
+        XCTAssertEqual(names, ["z_old.txt", "a_new.txt"],
+                       "Date-asc must put older mtime first even when alpha-order disagrees.")
+    }
+
+    /// Date-modified descending = newest first.
+    func test_entries_dateModifiedDescending_newestFirstWithinBucket() throws {
+        let oldFile = try touchFile("a_old.txt")
+        let newFile = try touchFile("z_new.txt")
+        try setModificationDate(.init(timeIntervalSince1970: 1_000_000), on: oldFile)
+        try setModificationDate(.init(timeIntervalSince1970: 2_000_000), on: newFile)
+
+        let names = FileBrowserListing
+            .entries(at: tempDir, showHidden: true, criterion: .dateModified, ascending: false)
+            .map { $0.lastPathComponent }
+
+        XCTAssertEqual(names, ["z_new.txt", "a_old.txt"],
+                       "Date-desc must put newer mtime first.")
+    }
+
+    /// When two entries share an mtime (common after a `git
+    /// checkout`), the order must be deterministic. Tie-break is
+    /// always A→Z by name regardless of direction so two same-mtime
+    /// neighbors don't swap when the user toggles direction.
+    func test_entries_dateModifiedTiebreak_byNameAscendingEvenWhenDescending() throws {
+        let aFile = try touchFile("a.txt")
+        let bFile = try touchFile("b.txt")
+        let sameDate = Date(timeIntervalSince1970: 1_500_000)
+        try setModificationDate(sameDate, on: aFile)
+        try setModificationDate(sameDate, on: bFile)
+
+        let asc = FileBrowserListing
+            .entries(at: tempDir, showHidden: true, criterion: .dateModified, ascending: true)
+            .map { $0.lastPathComponent }
+        let desc = FileBrowserListing
+            .entries(at: tempDir, showHidden: true, criterion: .dateModified, ascending: false)
+            .map { $0.lastPathComponent }
+
+        XCTAssertEqual(asc, ["a.txt", "b.txt"])
+        XCTAssertEqual(desc, ["a.txt", "b.txt"],
+                       "Same-mtime entries must keep stable alpha order under both directions.")
+    }
+
+    /// Dirs-first invariant must hold regardless of criterion. Even
+    /// if the file's mtime is newer than the dir's, the dir comes
+    /// first under date-desc — sort applies *within* each bucket.
+    func test_entries_dirsAlwaysAboveFiles_evenUnderDateModified() throws {
+        let dir = tempDir.appendingPathComponent("oldDir", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        let file = try touchFile("newFile.txt")
+        try setModificationDate(.init(timeIntervalSince1970: 1_000_000), on: dir)
+        try setModificationDate(.init(timeIntervalSince1970: 2_000_000), on: file)
+
+        let names = FileBrowserListing
+            .entries(at: tempDir, showHidden: true, criterion: .dateModified, ascending: false)
+            .map { $0.lastPathComponent }
+
+        XCTAssertEqual(names.first, "oldDir",
+                       "Dirs-first must hold even when a file's mtime is newer than the dir's.")
+    }
+
     // MARK: - Hidden filter
 
     func test_entries_showHiddenFalse_filtersDotPrefixedNames() throws {
@@ -196,6 +284,45 @@ final class FileBrowserListingTests: XCTestCase {
                        [tempDir.lastPathComponent, "subdir", "anest", "zfile.txt"])
     }
 
+    /// Locks in the sort-parameter pass-through from `visibleOrder`
+    /// to its recursive `visit` helper to `entries`. Shift-range
+    /// selection reads `visibleOrder` with the user's current sort,
+    /// so a future refactor that drops the params from one of the
+    /// pass-through sites would silently extend selection in the
+    /// wrong order. The Selection tests can't catch it because they
+    /// pass synthetic order arrays.
+    func test_visibleOrder_passesSortParamsThroughExpandedSubdir() throws {
+        try makeDir("subdir")
+        let subdir = tempDir.appendingPathComponent("subdir")
+        let oldChild = subdir.appendingPathComponent("a_old.txt")
+        let newChild = subdir.appendingPathComponent("z_new.txt")
+        FileManager.default.createFile(atPath: oldChild.path, contents: Data())
+        FileManager.default.createFile(atPath: newChild.path, contents: Data())
+        try setModificationDate(.init(timeIntervalSince1970: 1_000_000), on: oldChild)
+        try setModificationDate(.init(timeIntervalSince1970: 2_000_000), on: newChild)
+
+        // Use the path `entries(at:)` actually produces for subdir,
+        // matching what production stores in `expandedPaths`.
+        let subdirChild = FileBrowserListing.entries(at: tempDir, showHidden: true)
+            .first { $0.lastPathComponent == "subdir" }
+        let subdirPath = try XCTUnwrap(subdirChild?.path)
+
+        let order = FileBrowserListing.visibleOrder(
+            rootPath: tempDir.path,
+            expandedPaths: [tempDir.path, subdirPath],
+            showHidden: true,
+            criterion: .dateModified,
+            ascending: false
+        )
+
+        let names = order.map { ($0 as NSString).lastPathComponent }
+        // Root, subdir, then date-desc within subdir: newer file
+        // before older file even though alpha-order disagrees.
+        XCTAssertEqual(Array(names.prefix(4)),
+                       [tempDir.lastPathComponent, "subdir", "z_new.txt", "a_old.txt"],
+                       "visibleOrder must pass criterion + ascending through to the recursive entries() call.")
+    }
+
     func test_visibleOrder_missingRoot_returnsEmpty() {
         let nonexistent = tempDir.appendingPathComponent("does-not-exist", isDirectory: true)
         let order = FileBrowserListing.visibleOrder(
@@ -238,6 +365,17 @@ final class FileBrowserListingTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: tempDir.appendingPathComponent(name, isDirectory: true),
             withIntermediateDirectories: false
+        )
+    }
+
+    /// Force a known modification date so date-sort tests don't race
+    /// the wall clock. The default `touchFile` helper creates files
+    /// fast enough that consecutive calls share the same second on
+    /// some filesystems, which would let the test pass spuriously.
+    private func setModificationDate(_ date: Date, on url: URL) throws {
+        try FileManager.default.setAttributes(
+            [.modificationDate: date],
+            ofItemAtPath: url.path
         )
     }
 }

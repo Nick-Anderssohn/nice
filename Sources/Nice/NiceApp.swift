@@ -79,6 +79,7 @@ struct NiceApp: App {
                 .environmentObject(services.tweaks)
                 .environmentObject(services.shortcuts)
                 .environmentObject(services.fontSettings)
+                .environmentObject(services.fileBrowserSortSettings)
                 .environmentObject(services.terminalThemeCatalog)
                 .environmentObject(services.releaseChecker)
                 .environmentObject(services.editorDetector)
