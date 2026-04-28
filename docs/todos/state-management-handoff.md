@@ -1,155 +1,289 @@
 # State management refactor — handoff
 
-Phase 1 (the `@Observable` migration) and its follow-up cleanup
-(extracting side effects out of `init` and dropping the dual
-`ObservableObject` conformance) are both **done**. This file points
-the next session at Phase 2.
+Phase 1 (the `@Observable` migration) and four of Phase 2's five
+sub-model extractions are **done**. This file points the next session
+at what's left: extract `WindowSession` (step 4 of the plan), and the
+view-side rename pass that follows (step 6).
 
 ## Status
 
-Branch: `worktree-state-management` (same worktree, same branch — Phase
-2 lands on top of Phase 1).
+Branch: `worktree-state-management`. Worktree:
+`/Users/nick/Projects/nice/.claude/worktrees/state-management`. All
+Phase 2 work lands on this branch.
 
-Commits on top of `main`:
+Recent commits on top of `main`:
 
 - `220e708` — Add state-management refactor plan
 - `6689548` — Phase 1: Migrate state management to the @Observable macro
-- `1c481eb` — Add Phase 1 handoff doc with code-review feedback (this file's prior incarnation)
-- `1fa3d87` — Phase 1 cleanup: extract side effects into start() / bootstrap(), drop ObservableObject carve-out
+- `1fa3d87` — Phase 1 cleanup: extract side effects into start() / bootstrap()
+- `1b4e0fe` — Phase 2 step 1: Extract TabModel
+- `c39cf3b` — Phase 2 step 2: Extract SessionsModel
+- `c595e88` — Phase 2 step 3: Extract SidebarModel
+- `27949c1` — Phase 2 step 5: Extract CloseRequestCoordinator
 
-707 tests pass (664 unit + 43 UI). Acceptance grep
-(`ObservableObject|@Published|@StateObject|@ObservedObject|@EnvironmentObject`)
-returns zero matches in `Sources/`. Manual smoke tests against the
-installed `Nice Dev`:
+707 tests pass (664 unit + 43 UI) at every commit.
 
-- Typing `claude` in a fresh Main terminal opens a new sidebar tab via
-  the socket handshake. ✅
-- Rotating `~/.local/bin/claude` (rm + re-symlink to the same target)
-  and re-typing `claude` still spawns a new claude tab — the cached
-  resolved path survives the rotation. ✅
+The plan in
+[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md) is
+still the authoritative outline. This handoff is the running diary.
 
-## Phase 2 — what's next
+## What's already extracted
 
-The authoritative plan lives in
-[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md).
-Goal: split `AppState` (~2275 lines) into five cohesive sub-models —
-`TabModel`, `SessionsModel`, `SidebarModel`, `CloseRequestCoordinator`,
-`WindowSession` — with `AppState` shrinking to a thin composition root
-(~200 lines, init + lifecycle choreography only).
+`Sources/Nice/State/`:
 
-Suggested PR sequence (per the plan):
+| File | Lines | Owns |
+|---|---:|---|
+| `TabModel.swift` | 656 | `projects`, `activeTabId`, lookup, reordering, project-structure repair, cwd resolution, kebab→sentence title humanization, static path/arg helpers |
+| `SessionsModel.swift` | 929 | `ptySessions`, `paneLaunchStates`, control socket, theme caches, launch overlay, pane lifecycle handlers, pane management, tab creation w/ spawn, `focusActiveTerminal` |
+| `SidebarModel.swift` | 61 | `sidebarCollapsed`, `sidebarMode`, `sidebarPeeking` + 3 toggle methods |
+| `CloseRequestCoordinator.swift` | 286 | `pendingCloseRequest`, `projectsPendingRemoval`, `requestClose×3`/`confirm`/`cancel`, `isBusy`, `hardKill×3` |
+| `AppState.swift` | 1094 | Composition root: holds the four sub-models, owns `windowSessionId` + persistence, owns sidebar UI flags' `@SceneStorage` bridge, owns `fileBrowserStore`, has the `start()`/`tearDown()` choreography, runs `finalizeDissolvedTab` |
 
-1. Extract `TabModel`. Cleanest cut; other sub-models depend on it.
-2. Extract `SessionsModel`. Owns the control socket and the
-   `TabPtySession` callbacks.
-3. Extract `SidebarModel`. Trivial; can ride with #2 or its own PR.
-4. Extract `WindowSession`. Touches `tearDown` and `restoreSavedWindow`.
-5. Extract `CloseRequestCoordinator`. Touches the alert binding in
-   `AppShellView`.
-6. View-side rename pass to read from the most specific sub-model.
+Public API is preserved everywhere via forwarders on `AppState`. Views
+and unit tests still call `appState.tab(for:)`,
+`appState.paneLaunchStates[...]`, `appState.requestCloseTab(...)`,
+etc. The view-side rename pass (step 6 of the plan) is not done yet.
 
-We're shipping Phase 2 on this same branch (no separate PR stream),
-so each step doesn't need to be a standalone PR — but each should
-keep `scripts/test.sh` green and the manual smoke from the plan
-passing before moving on.
+## Callback wiring conventions
 
-## What changed in Phase 1 cleanup that matters for Phase 2
+A pattern emerged across the four extractions that step 4 should
+follow:
 
-The plan's "Risks / things to watch" section warns about init-ordering
-choreography (socket up → seed Main pty → restore → release save-gate
-→ arm claude tracking). **That choreography is no longer in
-`AppState.init` — it's in `AppState.start()`** (`Sources/Nice/State/AppState.swift`,
-look for `func start()`). Init is now pure data construction:
+- A sub-model holds a **weak** reference to the sub-models it reads
+  from (`SessionsModel.tabs`, `CloseRequestCoordinator.tabs` and
+  `.sessions`). Cycle insurance — they're co-owned by AppState and
+  share its lifetime.
+- A sub-model exposes **`@ObservationIgnored var on…: (...) -> Void`**
+  callbacks that AppState wires in `init` (`[weak self] in self?…`).
+  Used when the sub-model needs to fan an event out to a concern it
+  doesn't own (persistence, dissolve cascade, file-browser cleanup).
+- Persistence saves are routed through a single AppState method,
+  `scheduleSessionSave`, gated on `isInitializing` and
+  `persistenceEnabled`. Sub-models that care call
+  `onSessionMutation?()` (or, via TabModel's `onTreeMutation`,
+  whatever name the model uses internally — pick whichever name fits
+  the model's vocabulary).
 
-- Builds the seed Terminals project + Main tab in `projects`.
-- Stashes `services` as `trackedServices` (weak).
-- Reads pure values from `services` (tweaks/scheme/palette/font caches).
-- Does NOT touch the control socket, ZDOTDIR, `resolvedClaudePath`,
-  `restoreSavedWindow`, or `armClaudePathTracking`.
+Current callbacks wired in `AppState.init`:
 
-`AppState.start()` (called from `AppShellHost.body`'s `.task`, after
-`services.bootstrap()`) is where all the side-effectful wiring lives.
-It's idempotent (`started` flag).
+```swift
+tabs.onTreeMutation         = { [weak self] in self?.scheduleSessionSave() }
+sessions.onSessionMutation  = { [weak self] in self?.scheduleSessionSave() }
+sessions.onTabBecameEmpty   = { [weak self] tabId, pi, ti in
+    self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+}
+closer.onSyncFinalizeDissolve = { [weak self] tabId, pi, ti in
+    self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+}
+closer.onScheduleSave       = { [weak self] in self?.scheduleSessionSave() }
+```
 
-`NiceServices.bootstrap()` similarly absorbed the side effects that
-used to live in its init: `cleanupStaleTempFiles`, ZDOTDIR write,
-async `which claude` probe, `editorDetector.scan()`,
-`ClaudeHookInstaller.install()`. Already idempotent (`booted` flag).
+`WindowSession` will absorb `scheduleSessionSave` itself, so this
+section will get rewired during step 4.
 
-### Implication for Phase 2
+## Lessons learned (read these before step 4)
 
-The plan suggests the new `start()` method "may be the natural seam
-for Phase 2's composition root" — i.e., construct `TabModel`,
-`SessionsModel`, etc. inside `start()` rather than `init`, and wire
-them together there. Worth thinking about up front:
+### Split read/clear when intermediate state spans multiple events
 
-- **Construct in init, wire in start()** — sub-models exist as soon
-  as AppState is constructed (so views can `@Environment` them
-  immediately), but the side-effectful cross-wiring (e.g. passing
-  `TabModel` into `SessionsModel`'s socket handler) happens in
-  `start()`.
-- **Construct in start()** — sub-models don't exist until `start()`
-  runs. Cleaner but means views have to handle the "not yet
-  constructed" window. Probably worse.
+Step 5's first cut had `closer.consumeProjectPendingRemoval(_:)` —
+read-and-clear in one call. That broke
+`test_requestCloseProject_idleProject_removesProjectAndAllTabs`:
+when closing a project with multiple tabs, the *first* tab to dissolve
+cleared the flag, leaving subsequent dissolves unable to see it. The
+fix was to split into `isProjectPendingRemoval` (read) +
+`clearProjectPendingRemoval` (clear), and have AppState's
+`finalizeDissolvedTab` only clear when the project is actually being
+removed. Lesson: when a flag is consulted across multiple async
+events, expose read and clear as separate operations on the model.
 
-The handoff doesn't prescribe either; pick one based on what shakes
-out when you start sketching `TabModel`'s shape.
+### Construct sub-models in `init`, not `start()`
 
-## Things still worth being careful about (carried from the plan)
+Many unit tests construct `AppState()` via the convenience init,
+never call `start()`, and rely on the seed Main tab being present.
+Every sub-model has been constructed inside AppState.init — TabModel
+builds the seed tab, SessionsModel takes a TabModel reference but
+spawns nothing until `start()`. Keep that contract: the
+construct-without-`start()` instance must be a usable data model.
 
-- **`isInitializing` save-gate.** Today it's flipped at the end of
-  `start()` (was: end of `init`). Whichever sub-model owns
-  persistence (`WindowSession` per the plan) inherits this flag.
-- **Static `claimedWindowIds` set.** Process-wide; lives on
-  `WindowSession` after the split.
-- **`@SceneStorage` bridge.** `AppShellView` reads
-  `storedSidebarCollapsed`, `storedSidebarMode`, `storedWindowSessionId`
-  and threads them in. After the split the bindings still flow through
-  `AppShellView` — they just hand to `SidebarModel` / `WindowSession`
-  instead of one big `AppState`.
-- **UI-test selectors.** The `sidebar.terminals` accessibility alias
-  and any other identifiers must be preserved across the rename.
-- **`#Preview` blocks and unit tests.** The convenience `AppState()`
-  init currently builds a complete preview-safe instance with
-  `services: nil`. After the split, an equivalent — likely an
-  `AppState.preview()` factory — is needed.
-- **Tests construct `AppState` directly via the convenience init**
-  (`Tests/NiceUnitTests/AppStateProjectBucketingTests.swift` and ~20
-  other files). They pass `services: nil` and never call `start()` —
-  they rely on the seed Main tab being built in `init` (so
-  `projects[0].tabs[0]` exists). After the split, the same
-  contract needs to hold: construct-without-`start()` should leave the
-  data model in a usable state for unit tests.
+### Don't fire callbacks from inside the sub-model's init
+
+A few times I tripped over this: sub-models that have `didSet`
+observers (e.g. TabModel.activeTabId) can fire those during their
+own `init` for optional-typed assignments. AppState wires callbacks
+*after* `tabs = TabModel(...)`, so the seed assignment doesn't bounce
+through a partially-constructed AppState. `scheduleSessionSave`'s
+`isInitializing` gate covers any straggling fires.
+
+### SourceKit diagnostics lag behind file creation
+
+After creating a new file under `Sources/Nice/State/`, SourceKit will
+spit out "Cannot find type X" errors for several minutes — even after
+`xcodegen generate`. The actual build (`scripts/test.sh`) is
+authoritative. Ignore the inline diagnostics; trust the test run.
+
+### Save full test output to a file
+
+UI flakes happen. When `scripts/test.sh` fails and you've grep-piped
+the output for summaries, you've thrown away the failure detail. Pipe
+to a log file first, then grep:
+
+```sh
+scripts/test.sh > /tmp/nice-test.log 2>&1
+echo "exit=$?"
+grep -E "TEST FAILED|TEST SUCCEEDED|with [0-9]+ failures" /tmp/nice-test.log
+# If failed, grep the full log for the failing case:
+grep -E "Test Case .* failed|XCTAssert|: error:" /tmp/nice-test.log
+```
+
+## Phase 2 — what's left
+
+### Step 4: Extract `WindowSession` (~250 lines)
+
+The plan's authoritative section is in
+[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md)
+under "WindowSession (persistence)". Owns this window's identity and
+disk state.
+
+Properties to move from AppState onto a new `WindowSession`:
+
+- `var windowSessionId: String` (currently `private(set)`; observed
+  so `AppShellView`'s `onChange(of: appState.windowSessionId)` can
+  mirror adoption back into `@SceneStorage`)
+- `let persistenceEnabled: Bool`
+- `var isInitializing: Bool`
+- `static var claimedWindowIds: Set<String>` (process-wide; stays a
+  `static` on `WindowSession`)
+
+Methods to move:
+
+- `private func scheduleSessionSave()`
+- `func snapshotPersistedWindow() -> PersistedWindow` (internal — unit
+  tests call this)
+- `private func restoreSavedWindow()`
+- `private func ensureTerminalsProjectSeededAndSpawn()` — straddles
+  WindowSession + SessionsModel. The pure tree half is already on
+  TabModel; the pty side-effect lives on SessionsModel; the orchestration
+  belongs on WindowSession (it's only called from `restoreSavedWindow`).
+- `func addRestoredTabModel(...)` — internal; tests call this. Mixed
+  concern: builds a Tab, appends to `tabs.projects`, optionally calls
+  `sessions.makeSession`. Lives on WindowSession with weak references
+  to both.
+- `tearDown`'s persistence half: the
+  `if persistenceEnabled { SessionStore.shared.upsert/flush }` block.
+  AppState's `tearDown` would call `windowSession.tearDown()` plus
+  `sessions.tearDown()` plus the `claimedWindowIds.remove(...)` that
+  also moves with this carve.
+
+What stays on AppState after step 4 lands:
+
+- The composition root: `let tabs / sessions / sidebar / closer /
+  windowSession`, init, callback wiring, `start()`, `tearDown()`
+  orchestration, `livePaneCounts` forwarder.
+- `fileBrowserStore` (it's already its own observable; lives on
+  AppState because dissolve cascade owns its cleanup).
+- `finalizeDissolvedTab` — the dissolve cascade orchestrator.
+- `armClaudePathTracking` (writes through to sessions).
+- All the public surface forwarders.
+- `let fileExplorer / tweaks / editorDetector` (NiceServices pointers
+  threaded down for `AppState+FileExplorer`).
+- `weak var trackedServices` (used by `armClaudePathTracking`).
+
+### Subtleties to watch in step 4
+
+- **`isInitializing` save-gate timing.** Today it's set true in init,
+  flipped false at the end of `start()` after `restoreSavedWindow`
+  runs. Multiple sub-model didSets fire *during* init (especially
+  TabModel.activeTabId's didSet for the seed assignment) and bounce
+  through `scheduleSessionSave` — which short-circuits because
+  `isInitializing` is true. Step 4 must preserve that ordering even
+  as `scheduleSessionSave` moves to WindowSession. The simplest shape:
+  `windowSession.scheduleSessionSave()` checks the gate; AppState's
+  callbacks call `windowSession.scheduleSessionSave()` instead of a
+  private method.
+
+- **`windowSessionId` adoption mid-restore.** `restoreSavedWindow` may
+  switch the id to an adopted slot's id. The `@SceneStorage` mirror
+  in `AppShellView` reads `appState.windowSessionId` via observation
+  to write the new value back. After step 4, `windowSessionId` lives
+  on `WindowSession`; expose it as `appState.windowSessionId` via a
+  forwarder so `AppShellView` doesn't need a rename.
+
+- **`claimedWindowIds` is process-static.** Shared across every live
+  window. Stays as `static var` on `WindowSession`.
+
+- **`restoreSavedWindow` reaches into three sub-models.** It uses
+  TabModel (mutate `projects`, ensureProject, repairProjectStructure,
+  ensureTerminalsProjectSeeded), SessionsModel (terminateAll,
+  removePtySession, makeSession), and itself (claimedWindowIds,
+  windowSessionId, scheduleSessionSave). Pass weak references to tabs
+  and sessions in `WindowSession.init`.
+
+- **`addRestoredTabModel` is called from tests via `appState.…`.**
+  Three test files call it. After moving to WindowSession, keep an
+  `appState.addRestoredTabModel(...)` forwarder.
+
+- **`snapshotPersistedWindow` reads sidebar state too.** The
+  `PersistedWindow` includes `sidebarCollapsed`. After moving to
+  WindowSession, that read is `sidebar.sidebarCollapsed` (via the
+  forwarder or a direct reference held by WindowSession). I'd just
+  read `appState.sidebarCollapsed` via a back-reference, but cleaner:
+  WindowSession holds weak `sidebar: SidebarModel`.
+
+- **`addRestoredTabModel`'s pty fallback** for terminal-only tabs
+  spawns the active pane's shell at its last-observed cwd. That's
+  `sessions.makeSession(...)`. Keep the fallback exact — there's a
+  comment explaining why we honour `activePaneId` over inferring the
+  first terminal.
+
+- **The deferred Claude spawn** in `restoreSavedWindow` (two nested
+  `DispatchQueue.main.async` hops) calls `sessions.makeSession` and
+  `sessions.ensureActivePaneSpawned`. Both stay on SessionsModel; the
+  outer call site moves to WindowSession.
+
+- **Test contract: convenience init seeds projects[0].tabs[0].** Same
+  as steps 1–3. WindowSession constructed without start() must be a
+  usable dummy; tests don't call WindowSession methods directly other
+  than `addRestoredTabModel` (currently via AppState forwarder).
+
+### Step 6: View-side rename pass
+
+The plan's "View-side changes" section. Pre-conditions: all five
+sub-models exist. The pass updates views to read from the most
+specific sub-model — e.g. `WindowToolbarView` becomes
+`@Environment(SessionsModel.self)` instead of going through
+`AppState`. Likely a separate session.
+
+Until step 6, the AppState forwarders carry the public surface. None
+of the sub-models are exposed via `.environment(...)` yet —
+`AppShellView.swift:163` still does `.environment(appState)` only.
+
+## Acceptance criteria for step 4
+
+- [ ] `WindowSession.swift` exists under `Sources/Nice/State/`.
+- [ ] `Sources/Nice/State/AppState.swift` is under ~600 lines (mostly
+      composition root + forwarders).
+- [ ] `scripts/test.sh` green: 707/707.
+- [ ] `#Preview` blocks compile and render.
+- [ ] Manual smoke (typing `claude` in Main terminal opens a tab;
+      rotating `~/.local/bin/claude` and re-typing still spawns
+      claude; close window with running pty triggers confirmation
+      alert) still passes.
 
 ## Useful commands
 
 ```sh
-# From /Users/nick/Projects/nice/.claude/worktrees/state-management:
-scripts/worktree-lock.sh acquire phase2
-scripts/test.sh
+# From the worktree:
+scripts/worktree-lock.sh acquire phase2-step4
+scripts/test.sh > /tmp/nice-test.log 2>&1 ; echo "exit=$?"
+grep -E "TEST FAILED|TEST SUCCEEDED|with [0-9]+ failures" /tmp/nice-test.log
 scripts/worktree-lock.sh release
 
 # Single-test fast loop:
-scripts/test.sh -only-testing:NiceUITests/NiceUITests/testTypeClaudeInTerminalsFiresNewtab
+scripts/test.sh -only-testing:NiceUnitTests/AppStateSerializationTests > /tmp/x.log 2>&1
 
-# Acceptance grep (must stay clean):
+# Acceptance grep for Phase 1 (must stay clean):
 grep -rE "ObservableObject|@Published|@StateObject|@ObservedObject|@EnvironmentObject" Sources/
 
 # Install Nice Dev for manual smoke:
 scripts/install.sh    # under the worktree lock — see CLAUDE.md
 ```
-
-## Phase 2 acceptance criteria (from the plan)
-
-- [ ] `Sources/Nice/State/AppState.swift` is under ~300 lines.
-- [ ] `TabModel`, `SessionsModel`, `SidebarModel`,
-      `CloseRequestCoordinator`, `WindowSession` each live in their
-      own file under `Sources/Nice/State/`.
-- [ ] No view reads `appState.<thing>` for a `<thing>` that lives on
-      a sub-model — it reads the sub-model directly via
-      `@Environment(SubModel.self)`.
-- [ ] `scripts/test.sh` green.
-- [ ] `#Preview` blocks compile and render.
-- [ ] Manual smoke (typing `claude` in Main terminal opens a tab;
-      rotating `~/.local/bin/claude` and re-typing still spawns
-      claude) still passes.
