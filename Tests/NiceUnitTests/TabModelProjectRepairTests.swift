@@ -27,20 +27,14 @@ final class TabModelProjectRepairTests: XCTestCase {
 
     private var appState: AppState!
     private var homeSandbox: TestHomeSandbox!
-    private var gitFsRoot: URL!
+    private var gitFs: GitFsFixtures!
     private let mainCwd = "/tmp/nice-test-home-repair"
 
     override func setUp() {
         super.setUp()
         homeSandbox = TestHomeSandbox()
         setenv("NICE_CLAUDE_OVERRIDE", "/bin/cat", 1)
-        gitFsRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "nice-repair-\(UUID().uuidString)", isDirectory: true
-            )
-        try? FileManager.default.createDirectory(
-            at: gitFsRoot, withIntermediateDirectories: true
-        )
+        gitFs = GitFsFixtures(label: "repair")
         appState = AppState(
             services: nil,
             initialSidebarCollapsed: false,
@@ -52,8 +46,8 @@ final class TabModelProjectRepairTests: XCTestCase {
     override func tearDown() {
         appState = nil
         unsetenv("NICE_CLAUDE_OVERRIDE")
-        try? FileManager.default.removeItem(at: gitFsRoot)
-        gitFsRoot = nil
+        gitFs.cleanup()
+        gitFs = nil
         homeSandbox.teardown()
         homeSandbox = nil
         super.tearDown()
@@ -110,7 +104,7 @@ final class TabModelProjectRepairTests: XCTestCase {
         let outer = makeGitRepo(at: "outer")
         let _ = makeDir(at: "outer/sub")
         let nested = makeGitRepo(at: "outer/sub/nested")
-        let subPath = "\(gitFsRoot.path)/outer/sub"
+        let subPath = "\(gitFs.root.path)/outer/sub"
 
         appState.tabs.projects.append(Project(
             id: "p-sub-original", name: "SUB", path: subPath,
@@ -145,7 +139,7 @@ final class TabModelProjectRepairTests: XCTestCase {
     /// missing-cwd case at spawn time.
     func test_repair_skipsTabsWithMissingCwd() throws {
         let repo = makeGitRepo(at: "repo")
-        let missing = "\(gitFsRoot.path)/repo/.claude/worktrees/deleted-\(UUID().uuidString)"
+        let missing = "\(gitFs.root.path)/repo/.claude/worktrees/deleted-\(UUID().uuidString)"
         XCTAssertFalse(FileManager.default.fileExists(atPath: missing),
                        "Precondition: missing cwd must not exist on disk")
 
@@ -350,28 +344,11 @@ final class TabModelProjectRepairTests: XCTestCase {
         )
     }
 
-    /// Plant a `.git` directory at `<gitFsRoot>/<relativePath>` and
-    /// return the absolute path of the containing dir.
     private func makeGitRepo(at relativePath: String) -> String {
-        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true
-        )
-        let dotGit = dir.appendingPathComponent(".git", isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dotGit, withIntermediateDirectories: true
-        )
-        return dir.path
+        gitFs.makeGitRepo(at: relativePath)
     }
 
-    /// Plain directory under the test root — exists on disk but has
-    /// no `.git`, so `findGitRoot` walks past it to the enclosing
-    /// repo.
     private func makeDir(at relativePath: String) -> String {
-        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true
-        )
-        return dir.path
+        gitFs.makeDir(at: relativePath)
     }
 }

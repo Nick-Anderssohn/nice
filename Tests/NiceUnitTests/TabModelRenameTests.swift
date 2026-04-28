@@ -132,39 +132,17 @@ final class TabModelRenameTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Build a `Tab` directly in `projects` without spawning a pty.
-    /// Fast, deterministic ids, and supports creating multiple distinct
-    /// tabs in the same test.
     @discardableResult
     private func injectTab(
         title: String,
         projectPath: String = "/tmp/rename-test",
         withClaudePane: Bool = false
     ) -> String {
-        let uid = UUID().uuidString
-        let tabId = "t-\(uid)"
-        let panes: [Pane] = withClaudePane
-            ? [Pane(id: "\(tabId)-claude", title: "Claude", kind: .claude)]
-            : [Pane(id: "\(tabId)-term", title: "Terminal", kind: .terminal)]
-        let tab = Tab(
-            id: tabId,
+        TabModelFixtures.injectTab(
+            into: appState.tabs,
             title: title,
-            cwd: projectPath,
-            branch: nil,
-            panes: panes,
-            activePaneId: panes.first?.id
+            projectPath: projectPath,
+            kind: withClaudePane ? .claude : .terminal
         )
-        if let idx = appState.tabs.projects.firstIndex(where: { $0.path == projectPath }) {
-            appState.tabs.projects[idx].tabs.append(tab)
-        } else {
-            let project = Project(
-                id: "p-\(uid)",
-                name: (projectPath as NSString).lastPathComponent,
-                path: projectPath,
-                tabs: [tab]
-            )
-            appState.tabs.projects.append(project)
-        }
-        return tabId
     }
 }

@@ -176,50 +176,22 @@ final class AppStateCloseProjectTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Seed a claude + terminal tab into a new or existing project
-    /// without driving pty creation. Matches the shape of tabs built
-    /// by `createTabFromMainTerminal` but stays in the model layer.
     private func seedProjectWithClaudeTab(
         projectId: String,
         tabId: String,
         appendToExistingProject: Bool = false
     ) {
-        let claudePaneId = "\(tabId)-claude"
-        let terminalPaneId = "\(tabId)-t1"
-        let tab = Tab(
-            id: tabId,
-            title: "New tab",
-            cwd: "/tmp/\(projectId)",
-            branch: nil,
-            panes: [
-                Pane(id: claudePaneId, title: "Claude", kind: .claude),
-                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
-            ],
-            activePaneId: claudePaneId,
-            claudeSessionId: "session-\(tabId)"
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs,
+            projectId: projectId,
+            tabId: tabId,
+            appendToExisting: appendToExistingProject
         )
-        if appendToExistingProject,
-           let pi = appState.tabs.projects.firstIndex(where: { $0.id == projectId }) {
-            appState.tabs.projects[pi].tabs.append(tab)
-        } else {
-            let project = Project(id: projectId, name: projectId.uppercased(),
-                                  path: "/tmp/\(projectId)", tabs: [tab])
-            appState.tabs.projects.append(project)
-        }
     }
 
-    /// Flip every claude pane inside `projectId` to `status`. Used to
-    /// force the `isBusy` path for tests that want a pending-close
-    /// alert instead of an immediate tear-down.
     private func setClaudeStatusOnEveryTab(in projectId: String, status: TabStatus) {
-        var projects = appState.tabs.projects
-        guard let pi = projects.firstIndex(where: { $0.id == projectId }) else { return }
-        for ti in projects[pi].tabs.indices {
-            for pxi in projects[pi].tabs[ti].panes.indices
-            where projects[pi].tabs[ti].panes[pxi].kind == .claude {
-                projects[pi].tabs[ti].panes[pxi].status = status
-            }
-        }
-        appState.tabs.projects = projects
+        TabModelFixtures.setClaudeStatusOnEveryTab(
+            in: appState.tabs, projectId: projectId, status: status
+        )
     }
 }

@@ -44,7 +44,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
     // MARK: - Lookup
 
     func test_unknownPaneId_isNoOp() {
-        seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "S1")
+        seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S1")
 
         appState.sessions.handleClaudeSessionUpdate(
             paneId: "definitely-not-a-real-pane-id",
@@ -58,9 +58,9 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
     }
 
     func test_updatesTargetTab_whenMultipleProjectsExist() {
-        seedClaudeTab(projectId: "p1", tabId: "t1", initialSessionId: "S1")
-        seedClaudeTab(projectId: "p2", tabId: "t2", initialSessionId: "S2")
-        seedClaudeTab(projectId: "p3", tabId: "t3", initialSessionId: "S3")
+        seedClaudeTab(projectId: "p1", tabId: "t1", sessionId: "S1")
+        seedClaudeTab(projectId: "p2", tabId: "t2", sessionId: "S2")
+        seedClaudeTab(projectId: "p3", tabId: "t3", sessionId: "S3")
 
         // Update the middle tab. Other tabs must stay untouched —
         // tabIdOwning's reverse scan must hit the right project even
@@ -78,7 +78,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // Pane ids and tab ids are different namespaces. The reverse
         // scan keys off the pane list, not the tab id, so passing a
         // tab id (even an existing one) must not match a tab.
-        seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "S1")
+        seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S1")
 
         appState.sessions.handleClaudeSessionUpdate(
             paneId: "t1", // tab id, not a pane id
@@ -98,7 +98,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // observe scheduleSessionSave from the test (services == nil
         // disables persistence), but the public state must round-trip
         // cleanly.
-        seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "S1")
+        seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S1")
 
         appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
         appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
@@ -107,7 +107,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
     }
 
     func test_newSessionIdReplacesOld() {
-        seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "OLD")
+        seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "OLD")
 
         appState.sessions.handleClaudeSessionUpdate(
             paneId: "t1-claude", sessionId: "NEW"
@@ -119,26 +119,13 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
     // MARK: - helpers
 
     private func seedClaudeTab(
-        projectId: String, tabId: String, initialSessionId: String
+        projectId: String, tabId: String, sessionId: String
     ) {
-        let claudePaneId = "\(tabId)-claude"
-        let terminalPaneId = "\(tabId)-t1"
-        let tab = Tab(
-            id: tabId,
-            title: "New tab",
-            cwd: "/tmp/\(projectId)",
-            branch: nil,
-            panes: [
-                Pane(id: claudePaneId, title: "Claude", kind: .claude),
-                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
-            ],
-            activePaneId: claudePaneId,
-            claudeSessionId: initialSessionId
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs,
+            projectId: projectId,
+            tabId: tabId,
+            sessionId: sessionId
         )
-        let project = Project(
-            id: projectId, name: projectId.uppercased(),
-            path: "/tmp/\(projectId)", tabs: [tab]
-        )
-        appState.tabs.projects.append(project)
     }
 }

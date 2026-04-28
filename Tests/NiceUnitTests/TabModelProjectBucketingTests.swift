@@ -28,20 +28,14 @@ final class TabModelProjectBucketingTests: XCTestCase {
 
     private var appState: AppState!
     private var homeSandbox: TestHomeSandbox!
-    private var gitFsRoot: URL!
+    private var gitFs: GitFsFixtures!
     private let mainCwd = "/tmp/nice-test-home"
 
     override func setUp() {
         super.setUp()
         homeSandbox = TestHomeSandbox()
         setenv("NICE_CLAUDE_OVERRIDE", "/bin/cat", 1)
-        gitFsRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "nice-bucketing-\(UUID().uuidString)", isDirectory: true
-            )
-        try? FileManager.default.createDirectory(
-            at: gitFsRoot, withIntermediateDirectories: true
-        )
+        gitFs = GitFsFixtures(label: "bucketing")
         appState = AppState(
             services: nil,
             initialSidebarCollapsed: false,
@@ -53,8 +47,8 @@ final class TabModelProjectBucketingTests: XCTestCase {
     override func tearDown() {
         appState = nil
         unsetenv("NICE_CLAUDE_OVERRIDE")
-        try? FileManager.default.removeItem(at: gitFsRoot)
-        gitFsRoot = nil
+        gitFs.cleanup()
+        gitFs = nil
         homeSandbox.teardown()
         homeSandbox = nil
         super.tearDown()
@@ -548,57 +542,21 @@ final class TabModelProjectBucketingTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Plant a `.git` directory under the test's temp filesystem root
-    /// so `findGitRoot` walks the real filesystem. Returns the
-    /// absolute path of the repo dir (suitable for use as a cwd).
     private func makeGitRepo(at relativePath: String) -> String {
-        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true
-        )
-        let dotGit = dir.appendingPathComponent(".git", isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dotGit, withIntermediateDirectories: true
-        )
-        return dir.path
+        gitFs.makeGitRepo(at: relativePath)
     }
 
-    /// Create a plain directory (no `.git`) under the test root so
-    /// the cwd exists on disk but resolves to an enclosing git root
-    /// when one is planted nearby.
     private func makeDir(at relativePath: String) -> String {
-        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true
-        )
-        return dir.path
+        gitFs.makeDir(at: relativePath)
     }
 
-    /// Plant a `.git` *file* (the marker git uses for worktrees and
-    /// submodules) so we can test the worktree pre-strip without
-    /// also tripping the inner repo as a self-contained git root.
     private func makeWorktreeMarker(at relativePath: String) -> String {
-        let dir = gitFsRoot.appendingPathComponent(relativePath, isDirectory: true)
-        try? FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true
-        )
-        let dotGit = dir.appendingPathComponent(".git")
-        try? "gitdir: /placeholder\n".write(
-            to: dotGit, atomically: true, encoding: .utf8
-        )
-        return dir.path
+        gitFs.makeWorktreeMarker(at: relativePath)
     }
 
-    /// Append a bare (no-tabs) project to the sidebar. Keeps Terminals
-    /// at index 0 to preserve the invariant tests elsewhere depend on.
     private func seedProject(id: String, name: String, path: String) {
-        let project = Project(id: id, name: name, path: path, tabs: [
-            Tab(
-                id: "\(id)-seed", title: "seed", cwd: path,
-                panes: [Pane(id: "\(id)-seed-p0", title: "zsh", kind: .terminal)],
-                activePaneId: "\(id)-seed-p0"
-            )
-        ])
-        appState.tabs.projects.append(project)
+        TabModelFixtures.seedTerminalProject(
+            into: appState.tabs, id: id, name: name, path: path
+        )
     }
 }

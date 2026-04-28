@@ -193,34 +193,8 @@ final class AppStateFileBrowserTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Insert a Claude tab into a fresh project. Mirrors the helper
-    /// shape used in `AppStateRenameTabTests` and
-    /// `AppStateCloseProjectTests`.
     @discardableResult
     private func injectClaudeTab(projectName: String = "TestProject") -> String {
-        let uid = UUID().uuidString
-        let tabId = "t-\(uid)"
-        let claudePaneId = "\(tabId)-claude"
-        let terminalPaneId = "\(tabId)-t1"
-        let tab = Tab(
-            id: tabId,
-            title: "New tab",
-            cwd: "/tmp/\(projectName)",
-            branch: nil,
-            panes: [
-                Pane(id: claudePaneId, title: "Claude", kind: .claude),
-                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
-            ],
-            activePaneId: claudePaneId,
-            claudeSessionId: "session-\(tabId)"
-        )
-        let project = Project(
-            id: "p-\(uid)",
-            name: projectName,
-            path: "/tmp/\(projectName)",
-            tabs: [tab]
-        )
-        appState.tabs.projects.append(project)
-        return tabId
+        TabModelFixtures.injectClaudeTab(into: appState.tabs, projectName: projectName)
     }
 }

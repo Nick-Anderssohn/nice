@@ -272,28 +272,10 @@ final class AppStatePaneLifecycleTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Seed a new project with a claude + terminal tab without going
-    /// through createTabFromMainTerminal (which depends on the control
-    /// socket + claude binary). The pane objects exist in the data
-    /// model only — no pty — which is fine for logic-layer tests.
     private func seedProjectWithClaudeTab(projectId: String, tabId: String) {
-        let claudePaneId = "\(tabId)-claude"
-        let terminalPaneId = "\(tabId)-t1"
-        let tab = Tab(
-            id: tabId,
-            title: "New tab",
-            cwd: "/tmp/\(projectId)",
-            branch: nil,
-            panes: [
-                Pane(id: claudePaneId, title: "Claude", kind: .claude),
-                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
-            ],
-            activePaneId: claudePaneId,
-            claudeSessionId: "session-\(tabId)"
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: projectId, tabId: tabId
         )
-        let project = Project(id: projectId, name: projectId.uppercased(),
-                              path: "/tmp/\(projectId)", tabs: [tab])
-        appState.tabs.projects.append(project)
     }
 
     /// Mutate a tab in-place from the test by rewriting the projects
