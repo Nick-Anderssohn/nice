@@ -334,22 +334,21 @@ final class TabModel {
 
     // MARK: - Project structure
 
-    /// Outcome of `ensureTerminalsProjectSeeded`. The synthesize case
-    /// lets the owning AppState spawn a pty for the freshly-minted
-    /// Main tab — this model intentionally has no pty knowledge.
-    enum TerminalsSeedResult: Equatable {
-        case existed
-        case synthesized(tabId: String, cwd: String)
-    }
-
     /// Guarantee a pinned Terminals project sits at `projects[0]`. If
     /// it's absent (first launch of this build, or a restore adopted
     /// a snapshot predating the Terminals group), synthesize one with
     /// a "Main" tab holding a fresh terminal pane. If it's present
-    /// but not at index 0, move it. Returns whether a fresh tab was
-    /// synthesized — the caller is expected to spawn its pty.
-    @discardableResult
-    func ensureTerminalsProjectSeeded() -> TerminalsSeedResult {
+    /// but not at index 0, move it.
+    ///
+    /// `spawnHook` is invoked exactly once with the synthesized
+    /// `Tab` when the project had to be created from scratch — the
+    /// caller (`WindowSession.ensureTerminalsProjectSeededAndSpawn`)
+    /// uses this to spawn a pty for the freshly-minted Main tab.
+    /// The hook is *not* called when an existing Terminals project
+    /// was just reordered. This model intentionally has no pty
+    /// knowledge; the hook is the one-way bridge into pty-aware
+    /// callers.
+    func ensureTerminalsProjectSeeded(spawnHook: (Tab) -> Void = { _ in }) {
         if let idx = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) {
             if idx != 0 {
                 let project = projects.remove(at: idx)
@@ -358,7 +357,7 @@ final class TabModel {
             if activeTabId == nil, let firstId = projects[0].tabs.first?.id {
                 activeTabId = firstId
             }
-            return .existed
+            return
         }
 
         let cwd = NSHomeDirectory()
@@ -383,7 +382,7 @@ final class TabModel {
         if activeTabId == nil {
             activeTabId = mainTabId
         }
-        return .synthesized(tabId: mainTabId, cwd: cwd)
+        spawnHook(mainTab)
     }
 
     /// Look up `projects` by saved id; append a fresh `Project` with

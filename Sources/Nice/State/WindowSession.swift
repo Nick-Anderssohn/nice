@@ -344,17 +344,14 @@ final class WindowSession {
         }
     }
 
-    /// WindowSession-side wrapper around `tabs.ensureTerminalsProjectSeeded()`
+    /// WindowSession-side wrapper around `tabs.ensureTerminalsProjectSeeded(spawnHook:)`
     /// that also spawns a pty for a freshly-synthesized Main tab. The
     /// pure tree-mutation half lives on `TabModel`; the pty side-effect
     /// is bolted on here so the model itself stays process-free.
     private func ensureTerminalsProjectSeededAndSpawn() {
         guard let tabs, let sessions else { return }
-        switch tabs.ensureTerminalsProjectSeeded() {
-        case .existed:
-            break
-        case let .synthesized(tabId, cwd):
-            _ = sessions.makeSession(for: tabId, cwd: cwd)
+        tabs.ensureTerminalsProjectSeeded { [weak sessions] tab in
+            _ = sessions?.makeSession(for: tab.id, cwd: tab.cwd)
         }
     }
 
