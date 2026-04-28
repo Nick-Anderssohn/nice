@@ -1,14 +1,15 @@
 # State management refactor — handoff
 
-Phase 1 (the `@Observable` migration) and all five of Phase 2's
-sub-model extractions are **done**. This file points the next session
-at what's left: the view-side rename pass (step 6 of the plan).
+Phase 1 (the `@Observable` migration) and all of Phase 2 — including
+the view-side rename pass — are **done**. The refactor outlined in
+[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md) is
+complete.
 
 ## Status
 
 Branch: `worktree-state-management`. Worktree:
 `/Users/nick/Projects/nice/.claude/worktrees/state-management`. All
-Phase 2 work lands on this branch.
+Phase 2 work landed on this branch.
 
 Recent commits on top of `main`:
 
@@ -19,15 +20,16 @@ Recent commits on top of `main`:
 - `c39cf3b` — Phase 2 step 2: Extract SessionsModel
 - `c595e88` — Phase 2 step 3: Extract SidebarModel
 - `27949c1` — Phase 2 step 5: Extract CloseRequestCoordinator
-- _step 4_ — Phase 2 step 4: Extract WindowSession
+- `4e2f94b` — Phase 2 step 4: Extract WindowSession
+- _step 6_ — Phase 2 step 6: View-side rename pass
 
 707 tests pass (664 unit + 43 UI) at every commit.
 
 The plan in
-[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md) is
-still the authoritative outline. This handoff is the running diary.
+[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md)
+remains the authoritative outline.
 
-## What's already extracted
+## What's extracted
 
 `Sources/Nice/State/`:
 
@@ -38,12 +40,27 @@ still the authoritative outline. This handoff is the running diary.
 | `SidebarModel.swift` | 61 | `sidebarCollapsed`, `sidebarMode`, `sidebarPeeking` + 3 toggle methods |
 | `CloseRequestCoordinator.swift` | 286 | `pendingCloseRequest`, `projectsPendingRemoval`, `requestClose×3`/`confirm`/`cancel`, `isBusy`, `hardKill×3` |
 | `WindowSession.swift` | 426 | `windowSessionId`, `persistenceEnabled`, `isInitializing`, static `claimedWindowIds`, `scheduleSessionSave`, `snapshotPersistedWindow`, `restoreSavedWindow`, `ensureTerminalsProjectSeededAndSpawn`, `addRestoredTabModel`, persistence-half `tearDown` |
-| `AppState.swift` | 796 | Composition root: holds the five sub-models, wires their callbacks, owns `fileBrowserStore`, has the `start()`/`tearDown()` choreography, runs `finalizeDissolvedTab`, exposes the public-surface forwarders |
+| `AppState.swift` | 721 | Composition root: holds the five sub-models, wires their callbacks, owns `fileBrowserStore` and the `toggleFileBrowserHiddenFiles` orchestration that spans sidebar+store, has the `start()`/`tearDown()` choreography, runs `finalizeDissolvedTab`, retains a thin set of test-only forwarders for the unit suite |
 
-Public API is preserved everywhere via forwarders on `AppState`. Views
-and unit tests still call `appState.tab(for:)`,
-`appState.paneLaunchStates[...]`, `appState.requestCloseTab(...)`,
-etc. The view-side rename pass (step 6 of the plan) is not done yet.
+After step 6, views read sub-models directly:
+- `AppShellView` injects `tabs`, `sessions`, `sidebar`, `closer`, and
+  `windowSession` into the environment alongside `appState` itself
+  (kept for the `start()`/`tearDown()` lifecycle hooks and the
+  cross-cutting `fileBrowserStore` / `AppState+FileExplorer` surface).
+- `SidebarView`, `WindowToolbarView`, and the inner `ProjectGroup` /
+  `TabRow` / `InlinePaneStrip` views declare exactly the sub-models
+  they observe.
+- `FileBrowserView` reads `tabs` for `activeTabId` / `tab(for:)` /
+  `fileBrowserHeaderTitle`, and keeps `appState` only for
+  `fileBrowserStore` and the `AppState+FileExplorer` action surface
+  (`cutPaths`, `openFromDoubleClick`, `moveOrCopy`).
+- `KeyboardShortcutMonitor` and `FileOperationHistory` route through
+  `appState.<sub-model>` paths instead of the AppState forwarders.
+
+The remaining `AppState` forwarders are documented as test-only and
+pass straight through to a sub-model. A future cleanup PR can
+migrate the unit suite to call sub-models directly and delete those
+forwarders entirely.
 
 ## Callback wiring conventions
 
@@ -135,100 +152,49 @@ grep -E "TEST FAILED|TEST SUCCEEDED|with [0-9]+ failures" /tmp/nice-test.log
 grep -E "Test Case .* failed|XCTAssert|: error:" /tmp/nice-test.log
 ```
 
-## Phase 2 — what's left
+## Follow-up work (optional)
 
-### Step 6: View-side rename pass
+The refactor is functionally complete. One housekeeping item remains
+that's worth picking up if a future session is in this code:
 
-The plan's "View-side changes" section in
-[`state-and-AppState-refactor.md`](state-and-AppState-refactor.md).
-Pre-conditions: all five sub-models exist (✅). The pass updates
-views to read from the most specific sub-model — e.g.
-`WindowToolbarView` becomes `@Environment(SessionsModel.self)`
-instead of going through `AppState`.
+### Migrate the unit-test surface to sub-models
 
-Today the AppState forwarders carry the public surface — `AppState`
-is still 796 lines, mostly forwarders. Step 6 retires those by
-threading the sub-models through `.environment(...)`:
+About 45 `appState.X` accessors remain in `Tests/NiceUnitTests/` —
+e.g. `appState.activeTabId`, `appState.requestCloseTab(...)`,
+`appState.snapshotPersistedWindow()`. AppState keeps a thin set of
+forwarders alive solely for those tests. Migrating each call site to
+the sub-model (`appState.tabs.activeTabId`,
+`appState.closer.requestCloseTab(...)`,
+`appState.windowSession.snapshotPersistedWindow()`) lets us delete
+the rest of the forwarders. AppState would shrink to ~250 lines
+(composition root + `start()`/`tearDown()` + `finalizeDissolvedTab`
++ `toggleFileBrowserHiddenFiles` + `armClaudePathTracking`).
 
-```swift
-// In AppShellView, replacing the single `.environment(appState)`:
-.environment(appState.tabs)
-.environment(appState.sessions)
-.environment(appState.sidebar)
-.environment(appState.closer)
-.environment(appState.windowSession)
-.environment(appState) // composition root, for lifecycle hooks
-```
+This is a mechanical sweep — every forwarder kept on AppState today
+has a one-line equivalent on a sub-model. The unique-surface list
+(`grep -rE "appState\.[a-zA-Z]+" Tests/NiceUnitTests/ | sed -E
+'s/.*appState\.([a-zA-Z_]+).*/\1/' | sort -u`) tells you exactly
+which forwarders to retire. Do this in its own PR.
 
-Each view migrates to `@Environment(<SubModel>.self)` for the
-slice it actually reads. Once the rename pass lands, AppState should
-shrink to ~200 lines (init + lifecycle choreography +
-`finalizeDissolvedTab` + the few pieces that genuinely cross
-sub-models like `armClaudePathTracking`).
+## Acceptance criteria — Phase 2 ✅
 
-Pieces of work:
-
-1. Update `AppShellView.swift` to inject all five sub-models via
-   `.environment(...)`.
-2. Walk `Sources/Nice/Views/`: replace `@Environment(AppState.self)`
-   with the most specific sub-model. Many views need only one or two.
-3. Rename call sites: `appState.projects` → `tabs.projects`,
-   `appState.sidebarCollapsed` → `sidebar.sidebarCollapsed`,
-   `appState.pendingCloseRequest` → `closer.pendingCloseRequest`,
-   `appState.paneLaunchStates` → `sessions.paneLaunchStates`, etc.
-4. Delete the now-unused forwarders from `AppState`. Keep only
-   surface that's genuinely cross-cutting (e.g. `livePaneCounts`,
-   `tearDown()`, the `start()`/`init` plumbing).
-5. UI-test selectors must survive: the `sidebar.terminals`
-   accessibility alias and any other `accessibilityIdentifier`s
-   on AppState-bound views.
-6. Tests: many unit tests still call `appState.tab(for:)`,
-   `appState.addRestoredTabModel(...)`, etc. Decide whether to
-   migrate them to the sub-model directly (purer) or keep test-only
-   forwarders. The simpler call would be to migrate.
-
-### Subtleties to watch in step 6
-
-- **`@Bindable` for two-way bindings.** `AppShellView`'s alert binds
-  to `appState.pendingCloseRequest` via a `Binding(get:set:)`. After
-  the rename, the `closer` is what to bind. Use `@Bindable var
-  closer: CloseRequestCoordinator` if you want `$closer.pendingCloseRequest`,
-  or keep the manual `Binding(get:set:)` form.
-
-- **Preview safety.** `#Preview` blocks construct `AppState()` via
-  the convenience init and do `.environment(appState)`. After step
-  6 they must also inject every sub-model the previewed view needs.
-  Either add a `.previewEnvironment()` helper on AppState that fans
-  them all out, or update each preview block by hand.
-
-- **Test conveniences.** Several tests do
-  `appState.requestCloseTab(...)`. Keeping a thin pass-through
-  layer just for tests is fine — the goal of step 6 is to clean up
-  the *view* surface, not the test surface.
-
-- **Avoid a giant single PR.** The plan suggests splitting if it
-  gets large. A reasonable cut: (a) inject sub-models +
-  migrate views by file, (b) follow up with a smaller PR removing
-  AppState forwarders that have no remaining callers.
-
-## Acceptance criteria for step 6
-
-- [ ] No view declares `@Environment(AppState.self)` for state that
-      lives on a sub-model — it reads the sub-model directly.
-- [ ] AppState's forwarder count drops materially (target: composition
-      root + cross-cutting only).
-- [ ] `scripts/test.sh` green: 707/707.
-- [ ] `#Preview` blocks compile and render.
-- [ ] Manual smoke (typing `claude` in Main terminal opens a tab;
-      rotating `~/.local/bin/claude` and re-typing still spawns
-      claude; close window with running pty triggers confirmation
-      alert) still passes.
+- [x] `TabModel`, `SessionsModel`, `SidebarModel`,
+      `CloseRequestCoordinator`, `WindowSession` each in their own
+      file under `Sources/Nice/State/`.
+- [x] No view reads `appState.<x>` for a `<x>` that lives on a
+      sub-model — views declare `@Environment(<SubModel>.self)` and
+      read the sub-model directly. AppState stays in scope only
+      where genuinely cross-cutting (lifecycle hooks +
+      `fileBrowserStore` + `AppState+FileExplorer` actions).
+- [x] `scripts/test.sh` green (664 unit + 43 UI = 707 tests).
+- [x] `#Preview` blocks compile and inject every sub-model the
+      previewed view observes.
 
 ## Useful commands
 
 ```sh
 # From the worktree:
-scripts/worktree-lock.sh acquire phase2-step6
+scripts/worktree-lock.sh acquire phase2-followup
 scripts/test.sh > /tmp/nice-test.log 2>&1 ; echo "exit=$?"
 grep -E "TEST FAILED|TEST SUCCEEDED|with [0-9]+ failures" /tmp/nice-test.log
 scripts/worktree-lock.sh release
@@ -239,8 +205,13 @@ scripts/test.sh -only-testing:NiceUnitTests/AppStateSerializationTests > /tmp/x.
 # Acceptance grep for Phase 1 (must stay clean):
 grep -rE "ObservableObject|@Published|@StateObject|@ObservedObject|@EnvironmentObject" Sources/
 
-# Find AppState environment readers (step 6 entry point):
+# Acceptance grep for Phase 2 step 6 (must stay clean — only
+# `FileBrowserView` keeps `@Environment(AppState.self)` for the
+# cross-cutting `fileBrowserStore` + `AppState+FileExplorer` surface):
 grep -rn "@Environment(AppState.self)" Sources/Nice/Views/
+
+# Find remaining AppState forwarder users (test-suite migration entry):
+grep -rE "appState\.[a-zA-Z]+" Tests/NiceUnitTests/ | sed -E 's/.*appState\.([a-zA-Z_]+).*/\1/' | sort -u
 
 # Install Nice Dev for manual smoke:
 scripts/install.sh    # under the worktree lock — see CLAUDE.md
