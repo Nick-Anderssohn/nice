@@ -277,7 +277,7 @@ final class AppStateFileOperationsTests: XCTestCase {
 
         XCTAssertEqual(history.undoStack.last?.origin.tabId, "explicit-tab")
         XCTAssertEqual(history.undoStack.last?.origin.windowSessionId,
-                       state.windowSessionId)
+                       state.windowSession.windowSessionId)
     }
 
     // MARK: - Drag-and-drop moveOrCopy
@@ -438,7 +438,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         XCTAssertEqual(history.undoStack.last?.origin.tabId, "drag-source-tab")
         XCTAssertEqual(
             history.undoStack.last?.origin.windowSessionId,
-            state.windowSessionId
+            state.windowSession.windowSessionId
         )
     }
 

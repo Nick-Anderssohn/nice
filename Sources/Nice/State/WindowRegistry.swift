@@ -121,7 +121,7 @@ final class WindowRegistry {
     /// window where an op originated.
     func appState(forSessionId id: String) -> AppState? {
         for entry in entries.values {
-            if let appState = entry.appState, appState.windowSessionId == id {
+            if let appState = entry.appState, appState.windowSession.windowSessionId == id {
                 return appState
             }
         }
@@ -134,7 +134,7 @@ final class WindowRegistry {
     func window(forSessionId id: String) -> NSWindow? {
         for entry in entries.values {
             if let appState = entry.appState,
-               appState.windowSessionId == id {
+               appState.windowSession.windowSessionId == id {
                 return entry.window
             }
         }

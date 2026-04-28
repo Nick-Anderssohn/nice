@@ -6,9 +6,7 @@
 //  their callbacks, and runs `start()` / `tearDown()`. Views and
 //  tests address sub-models directly — only composition-root
 //  concerns live here (lifecycle, dissolve cascade, the cross-
-//  cutting `toggleFileBrowserHiddenFiles`), plus read-only
-//  forwarders external callers need (`windowSessionId`,
-//  `livePaneCounts`).
+//  cutting `toggleFileBrowserHiddenFiles`).
 //
 
 import AppKit
@@ -70,13 +68,6 @@ final class AppState {
 
     @ObservationIgnored
     private var started = false
-
-    /// Read-only forwarder used by `WindowRegistry` and
-    /// `AppShellView.onChange(of:)`.
-    var windowSessionId: String { windowSession.windowSessionId }
-
-    /// Live panes by kind. Used by `AppDelegate`'s close alerts.
-    var livePaneCounts: (claude: Int, terminal: Int) { tabs.livePaneCounts }
 
     /// Convenience init for previews and tests.
     convenience init() {

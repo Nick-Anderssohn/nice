@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var claude = 0
         var terminal = 0
         for state in registry.allAppStates {
-            let counts = state.livePaneCounts
+            let counts = state.tabs.livePaneCounts
             claude += counts.claude
             terminal += counts.terminal
         }
@@ -68,7 +68,7 @@ final class CloseConfirmationDelegate: NSObject, NSWindowDelegate {
         let delegateAllows = originalDelegate?.windowShouldClose?(sender) ?? true
         guard delegateAllows else { return false }
         guard let state = appState else { return true }
-        let counts = state.livePaneCounts
+        let counts = state.tabs.livePaneCounts
         guard counts.claude + counts.terminal > 0 else { return true }
         return QuitConfirmation.run(
             messageText: "Close this window?",
