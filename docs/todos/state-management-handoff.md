@@ -152,29 +152,17 @@ grep -E "TEST FAILED|TEST SUCCEEDED|with [0-9]+ failures" /tmp/nice-test.log
 grep -E "Test Case .* failed|XCTAssert|: error:" /tmp/nice-test.log
 ```
 
-## Follow-up work (optional)
+## Follow-up work
 
-The refactor is functionally complete. One housekeeping item remains
-that's worth picking up if a future session is in this code:
+The refactor is functionally complete. One housekeeping follow-up is
+spec'd separately and ready to start:
 
-### Migrate the unit-test surface to sub-models
-
-About 45 `appState.X` accessors remain in `Tests/NiceUnitTests/` —
-e.g. `appState.activeTabId`, `appState.requestCloseTab(...)`,
-`appState.snapshotPersistedWindow()`. AppState keeps a thin set of
-forwarders alive solely for those tests. Migrating each call site to
-the sub-model (`appState.tabs.activeTabId`,
-`appState.closer.requestCloseTab(...)`,
-`appState.windowSession.snapshotPersistedWindow()`) lets us delete
-the rest of the forwarders. AppState would shrink to ~250 lines
-(composition root + `start()`/`tearDown()` + `finalizeDissolvedTab`
-+ `toggleFileBrowserHiddenFiles` + `armClaudePathTracking`).
-
-This is a mechanical sweep — every forwarder kept on AppState today
-has a one-line equivalent on a sub-model. The unique-surface list
-(`grep -rE "appState\.[a-zA-Z]+" Tests/NiceUnitTests/ | sed -E
-'s/.*appState\.([a-zA-Z_]+).*/\1/' | sort -u`) tells you exactly
-which forwarders to retire. Do this in its own PR.
+- [`state-management-test-migration.md`](state-management-test-migration.md)
+  — migrate ~425 `appState.X` accessors in `Tests/NiceUnitTests/` to
+  the most specific sub-model and delete the now-unused AppState
+  forwarders. AppState would drop from 721 → ~250 lines. Mechanical
+  sweep with a precise migration table; expected to land in 1–2
+  commits.
 
 ## Acceptance criteria — Phase 2 ✅
 
