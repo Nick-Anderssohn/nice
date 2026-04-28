@@ -447,7 +447,7 @@ private struct AppShellHost: View {
     /// sidebar card (rounded corners, border, shadow, sidebar material),
     /// just sized down. The main content fills the full width below.
     ///
-    /// When a sidebar-tab shortcut is held (`appState.sidebarPeeking`)
+    /// When a sidebar-tab shortcut is held (`sidebar.sidebarPeeking`)
     /// or the cursor is pinning a peek (`peekMousePinned`), the full
     /// 240pt sidebar card overlays the terminal at top-leading without
     /// reflowing the layout below.
