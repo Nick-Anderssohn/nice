@@ -27,7 +27,7 @@ final class AppStateReorderTests: XCTestCase {
     }
 
     private func tabIds(inProject projectId: String) -> [String] {
-        appState.projects.first(where: { $0.id == projectId })?.tabs.map(\.id) ?? []
+        appState.tabs.projects.first(where: { $0.id == projectId })?.tabs.map(\.id) ?? []
     }
 
     // MARK: - moveTab
@@ -35,21 +35,21 @@ final class AppStateReorderTests: XCTestCase {
     func test_moveTab_before_movesSourceIntoTargetSlot() {
         seedTwoProjects()
         // [p1t0, p1t1, p1t2] — drop p1t2 before p1t0.
-        appState.moveTab("p1t2", relativeTo: "p1t0", placeAfter: false)
+        appState.tabs.moveTab("p1t2", relativeTo: "p1t0", placeAfter: false)
         XCTAssertEqual(tabIds(inProject: "p1"), ["p1t2", "p1t0", "p1t1"])
     }
 
     func test_moveTab_after_landsJustPastTarget() {
         seedTwoProjects()
         // [p1t0, p1t1, p1t2] — drop p1t0 after p1t1.
-        appState.moveTab("p1t0", relativeTo: "p1t1", placeAfter: true)
+        appState.tabs.moveTab("p1t0", relativeTo: "p1t1", placeAfter: true)
         XCTAssertEqual(tabIds(inProject: "p1"), ["p1t1", "p1t0", "p1t2"])
     }
 
     func test_moveTab_after_lastTab_movesToEnd() {
         seedTwoProjects()
         // [p1t0, p1t1, p1t2] — drop p1t0 after last (p1t2).
-        appState.moveTab("p1t0", relativeTo: "p1t2", placeAfter: true)
+        appState.tabs.moveTab("p1t0", relativeTo: "p1t2", placeAfter: true)
         XCTAssertEqual(tabIds(inProject: "p1"), ["p1t1", "p1t2", "p1t0"])
     }
 
@@ -58,21 +58,21 @@ final class AppStateReorderTests: XCTestCase {
         // p1t1 already sits just after p1t0 → dropping "after p1t0" is a
         // no-op rather than churning the array.
         let before = tabIds(inProject: "p1")
-        appState.moveTab("p1t1", relativeTo: "p1t0", placeAfter: true)
+        appState.tabs.moveTab("p1t1", relativeTo: "p1t0", placeAfter: true)
         XCTAssertEqual(tabIds(inProject: "p1"), before)
     }
 
     func test_moveTab_adjacent_beforeSuccessor_isNoOp() {
         seedTwoProjects()
         let before = tabIds(inProject: "p1")
-        appState.moveTab("p1t0", relativeTo: "p1t1", placeAfter: false)
+        appState.tabs.moveTab("p1t0", relativeTo: "p1t1", placeAfter: false)
         XCTAssertEqual(tabIds(inProject: "p1"), before)
     }
 
     func test_moveTab_sameId_isNoOp() {
         seedTwoProjects()
         let before = tabIds(inProject: "p1")
-        appState.moveTab("p1t0", relativeTo: "p1t0", placeAfter: false)
+        appState.tabs.moveTab("p1t0", relativeTo: "p1t0", placeAfter: false)
         XCTAssertEqual(tabIds(inProject: "p1"), before)
     }
 
@@ -82,7 +82,7 @@ final class AppStateReorderTests: XCTestCase {
         // their project". Both projects should stay untouched.
         let p1Before = tabIds(inProject: "p1")
         let p2Before = tabIds(inProject: "p2")
-        appState.moveTab("p1t0", relativeTo: "p2t0", placeAfter: false)
+        appState.tabs.moveTab("p1t0", relativeTo: "p2t0", placeAfter: false)
         XCTAssertEqual(tabIds(inProject: "p1"), p1Before)
         XCTAssertEqual(tabIds(inProject: "p2"), p2Before)
     }
@@ -90,14 +90,14 @@ final class AppStateReorderTests: XCTestCase {
     func test_moveTab_unknownSource_isNoOp() {
         seedTwoProjects()
         let before = tabIds(inProject: "p1")
-        appState.moveTab("ghost", relativeTo: "p1t0", placeAfter: true)
+        appState.tabs.moveTab("ghost", relativeTo: "p1t0", placeAfter: true)
         XCTAssertEqual(tabIds(inProject: "p1"), before)
     }
 
     func test_moveTab_unknownTarget_isNoOp() {
         seedTwoProjects()
         let before = tabIds(inProject: "p1")
-        appState.moveTab("p1t0", relativeTo: "ghost", placeAfter: false)
+        appState.tabs.moveTab("p1t0", relativeTo: "ghost", placeAfter: false)
         XCTAssertEqual(tabIds(inProject: "p1"), before)
     }
 
@@ -105,25 +105,25 @@ final class AppStateReorderTests: XCTestCase {
 
     func test_wouldMoveTab_realMove_isTrue() {
         seedTwoProjects()
-        XCTAssertTrue(appState.wouldMoveTab("p1t2", relativeTo: "p1t0", placeAfter: false))
+        XCTAssertTrue(appState.tabs.wouldMoveTab("p1t2", relativeTo: "p1t0", placeAfter: false))
     }
 
     func test_wouldMoveTab_sameId_isFalse() {
         seedTwoProjects()
-        XCTAssertFalse(appState.wouldMoveTab("p1t0", relativeTo: "p1t0", placeAfter: false))
+        XCTAssertFalse(appState.tabs.wouldMoveTab("p1t0", relativeTo: "p1t0", placeAfter: false))
     }
 
     func test_wouldMoveTab_adjacent_noOp_isFalse() {
         seedTwoProjects()
         // p1t1 sits just after p1t0 → "after p1t0" is a no-op.
-        XCTAssertFalse(appState.wouldMoveTab("p1t1", relativeTo: "p1t0", placeAfter: true))
+        XCTAssertFalse(appState.tabs.wouldMoveTab("p1t1", relativeTo: "p1t0", placeAfter: true))
         // And "before p1t2" is also a no-op (same final slot).
-        XCTAssertFalse(appState.wouldMoveTab("p1t1", relativeTo: "p1t2", placeAfter: false))
+        XCTAssertFalse(appState.tabs.wouldMoveTab("p1t1", relativeTo: "p1t2", placeAfter: false))
     }
 
     func test_wouldMoveTab_crossProject_isFalse() {
         seedTwoProjects()
-        XCTAssertFalse(appState.wouldMoveTab("p1t0", relativeTo: "p2t0", placeAfter: false))
+        XCTAssertFalse(appState.tabs.wouldMoveTab("p1t0", relativeTo: "p2t0", placeAfter: false))
     }
 
     // MARK: - Terminals project
@@ -136,10 +136,10 @@ final class AppStateReorderTests: XCTestCase {
         seedTerminalsAndOneProject()
         // Terminals starts with [terminals-main, term-t1, term-t2] —
         // move term-t2 before terminals-main.
-        appState.moveTab("term-t2", relativeTo: AppState.mainTerminalTabId, placeAfter: false)
+        appState.tabs.moveTab("term-t2", relativeTo: TabModel.mainTerminalTabId, placeAfter: false)
         XCTAssertEqual(
-            tabIds(inProject: AppState.terminalsProjectId),
-            ["term-t2", AppState.mainTerminalTabId, "term-t1"]
+            tabIds(inProject: TabModel.terminalsProjectId),
+            ["term-t2", TabModel.mainTerminalTabId, "term-t1"]
         )
     }
 
@@ -147,10 +147,10 @@ final class AppStateReorderTests: XCTestCase {
         seedTerminalsAndOneProject()
         // Cross-project drops still no-op even when the source is
         // the Main Terminals tab — sidebar drag is within-project.
-        let termBefore = tabIds(inProject: AppState.terminalsProjectId)
+        let termBefore = tabIds(inProject: TabModel.terminalsProjectId)
         let p1Before = tabIds(inProject: "p1")
-        appState.moveTab(AppState.mainTerminalTabId, relativeTo: "p1t0", placeAfter: true)
-        XCTAssertEqual(tabIds(inProject: AppState.terminalsProjectId), termBefore)
+        appState.tabs.moveTab(TabModel.mainTerminalTabId, relativeTo: "p1t0", placeAfter: true)
+        XCTAssertEqual(tabIds(inProject: TabModel.terminalsProjectId), termBefore)
         XCTAssertEqual(tabIds(inProject: "p1"), p1Before)
     }
 
@@ -161,7 +161,7 @@ final class AppStateReorderTests: XCTestCase {
     private func seedTwoProjects() {
         let p1 = makeProject(id: "p1", name: "P1", tabCount: 3)
         let p2 = makeProject(id: "p2", name: "P2", tabCount: 2)
-        appState.projects = [p1, p2]
+        appState.tabs.projects = [p1, p2]
     }
 
     /// Seeds the pinned Terminals project (with its Main tab plus
@@ -169,15 +169,15 @@ final class AppStateReorderTests: XCTestCase {
     /// within-Terminals reorder tests.
     private func seedTerminalsAndOneProject() {
         let terminals = Project(
-            id: AppState.terminalsProjectId,
+            id: TabModel.terminalsProjectId,
             name: "Terminals",
             path: "/tmp/terminals",
             tabs: [
                 Tab(
-                    id: AppState.mainTerminalTabId, title: "Main",
+                    id: TabModel.mainTerminalTabId, title: "Main",
                     cwd: "/tmp/terminals",
-                    panes: [Pane(id: "\(AppState.mainTerminalTabId)-p0", title: "zsh", kind: .terminal)],
-                    activePaneId: "\(AppState.mainTerminalTabId)-p0"
+                    panes: [Pane(id: "\(TabModel.mainTerminalTabId)-p0", title: "zsh", kind: .terminal)],
+                    activePaneId: "\(TabModel.mainTerminalTabId)-p0"
                 ),
                 Tab(
                     id: "term-t1", title: "Term 1",
@@ -194,7 +194,7 @@ final class AppStateReorderTests: XCTestCase {
             ]
         )
         let p1 = makeProject(id: "p1", name: "P1", tabCount: 2)
-        appState.projects = [terminals, p1]
+        appState.tabs.projects = [terminals, p1]
     }
 
     private func makeProject(id: String, name: String, tabCount: Int) -> Project {

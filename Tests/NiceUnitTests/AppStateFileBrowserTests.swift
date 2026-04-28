@@ -40,13 +40,13 @@ final class AppStateFileBrowserTests: XCTestCase {
     // MARK: - toggleSidebarMode
 
     func test_toggleSidebarMode_flipsBetweenTabsAndFiles() {
-        XCTAssertEqual(appState.sidebarMode, .tabs, "Default starts in tabs mode.")
+        XCTAssertEqual(appState.sidebar.sidebarMode, .tabs, "Default starts in tabs mode.")
 
-        appState.toggleSidebarMode()
-        XCTAssertEqual(appState.sidebarMode, .files)
+        appState.sidebar.toggleSidebarMode()
+        XCTAssertEqual(appState.sidebar.sidebarMode, .files)
 
-        appState.toggleSidebarMode()
-        XCTAssertEqual(appState.sidebarMode, .tabs)
+        appState.sidebar.toggleSidebarMode()
+        XCTAssertEqual(appState.sidebar.sidebarMode, .tabs)
     }
 
     // MARK: - toggleFileBrowserHiddenFiles gating
@@ -57,10 +57,10 @@ final class AppStateFileBrowserTests: XCTestCase {
         // Otherwise pressing ⌘⇧. from tabs mode flips a preference
         // for a feature they aren't currently looking at.
         let tabId = injectClaudeTab()
-        appState.activeTabId = tabId
+        appState.tabs.activeTabId = tabId
         let state = appState.fileBrowserStore.ensureState(forTab: tabId, cwd: "/tmp/proj")
         let before = state.showHidden
-        XCTAssertEqual(appState.sidebarMode, .tabs)
+        XCTAssertEqual(appState.sidebar.sidebarMode, .tabs)
 
         appState.toggleFileBrowserHiddenFiles()
 
@@ -74,8 +74,8 @@ final class AppStateFileBrowserTests: XCTestCase {
         // never open the file browser still accumulate state per tab
         // every time the shortcut fires.
         let tabId = injectClaudeTab()
-        appState.activeTabId = tabId
-        appState.sidebarMode = .files
+        appState.tabs.activeTabId = tabId
+        appState.sidebar.sidebarMode = .files
         XCTAssertNil(appState.fileBrowserStore.states[tabId])
 
         appState.toggleFileBrowserHiddenFiles()
@@ -86,8 +86,8 @@ final class AppStateFileBrowserTests: XCTestCase {
 
     func test_toggleHiddenFiles_inFilesMode_withState_flips() {
         let tabId = injectClaudeTab()
-        appState.activeTabId = tabId
-        appState.sidebarMode = .files
+        appState.tabs.activeTabId = tabId
+        appState.sidebar.sidebarMode = .files
         let state = appState.fileBrowserStore.ensureState(forTab: tabId, cwd: "/tmp/proj")
         let before = state.showHidden
 
@@ -99,8 +99,8 @@ final class AppStateFileBrowserTests: XCTestCase {
     func test_toggleHiddenFiles_withNilActiveTab_isNoop() {
         // Manufacture the no-active-tab state. The Main terminal tab
         // is seeded by AppState's init, so explicitly clear it.
-        appState.activeTabId = nil
-        appState.sidebarMode = .files
+        appState.tabs.activeTabId = nil
+        appState.sidebar.sidebarMode = .files
 
         // Must not crash, must not allocate.
         appState.toggleFileBrowserHiddenFiles()
@@ -111,7 +111,7 @@ final class AppStateFileBrowserTests: XCTestCase {
     // MARK: - fileBrowserHeaderTitle
 
     func test_fileBrowserHeaderTitle_unknownTab_returnsFiles() {
-        XCTAssertEqual(appState.fileBrowserHeaderTitle(forTab: "no-such-tab"),
+        XCTAssertEqual(appState.tabs.fileBrowserHeaderTitle(forTab: "no-such-tab"),
                        "Files",
                        "An unknown tab has no project to name; fall back to a generic label.")
     }
@@ -120,17 +120,17 @@ final class AppStateFileBrowserTests: XCTestCase {
         // The pinned Terminals project's name is generic ("Terminals")
         // — not useful as a header. The rule is to fall back to the
         // tab's own title there.
-        let mainId = AppState.mainTerminalTabId
-        XCTAssertNotNil(appState.tab(for: mainId),
+        let mainId = TabModel.mainTerminalTabId
+        XCTAssertNotNil(appState.tabs.tab(for: mainId),
                         "The Main terminal tab is seeded into the Terminals project at init.")
 
-        XCTAssertEqual(appState.fileBrowserHeaderTitle(forTab: mainId),
-                       appState.tab(for: mainId)?.title)
+        XCTAssertEqual(appState.tabs.fileBrowserHeaderTitle(forTab: mainId),
+                       appState.tabs.tab(for: mainId)?.title)
     }
 
     func test_fileBrowserHeaderTitle_realProjectTab_returnsProjectName() {
         let tabId = injectClaudeTab(projectName: "MyCoolProject")
-        XCTAssertEqual(appState.fileBrowserHeaderTitle(forTab: tabId),
+        XCTAssertEqual(appState.tabs.fileBrowserHeaderTitle(forTab: tabId),
                        "MyCoolProject")
     }
 
@@ -156,9 +156,9 @@ final class AppStateFileBrowserTests: XCTestCase {
         // Switch active tab to B and back to A — purely a flip on
         // appState, no view code involved. The store contract says
         // the same instances come back unchanged.
-        appState.activeTabId = tabA
-        appState.activeTabId = tabB
-        appState.activeTabId = tabA
+        appState.tabs.activeTabId = tabA
+        appState.tabs.activeTabId = tabB
+        appState.tabs.activeTabId = tabA
 
         let stateAAgain = appState.fileBrowserStore.ensureState(forTab: tabA, cwd: "/tmp/A")
         let stateBAgain = appState.fileBrowserStore.ensureState(forTab: tabB, cwd: "/tmp/B")
@@ -185,7 +185,7 @@ final class AppStateFileBrowserTests: XCTestCase {
         _ = appState.fileBrowserStore.ensureState(forTab: tabId, cwd: "/tmp/proj")
         XCTAssertNotNil(appState.fileBrowserStore.states[tabId])
 
-        appState.requestCloseTab(tabId: tabId)
+        appState.closer.requestCloseTab(tabId: tabId)
 
         XCTAssertNil(appState.fileBrowserStore.states[tabId],
                      "finalizeDissolvedTab must call fileBrowserStore.removeState so closed tabs don't linger.")
@@ -220,7 +220,7 @@ final class AppStateFileBrowserTests: XCTestCase {
             path: "/tmp/\(projectName)",
             tabs: [tab]
         )
-        appState.projects.append(project)
+        appState.tabs.projects.append(project)
         return tabId
     }
 }

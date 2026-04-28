@@ -446,7 +446,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let (state, _, history) = makeState()
         let src = makeFile("file.txt")
         let folder = makeDir("folder")
-        let activeId = state.activeTabId
+        let activeId = state.tabs.activeTabId
 
         state.moveOrCopy(
             urls: [src],

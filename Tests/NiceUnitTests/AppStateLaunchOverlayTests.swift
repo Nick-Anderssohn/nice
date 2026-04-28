@@ -31,7 +31,7 @@ final class AppStateLaunchOverlayTests: XCTestCase {
         // inline inside `registerPaneLaunch`, so tests that don't
         // care about the async path can assert against the final
         // state immediately.
-        appState.launchOverlayGraceSeconds = 0
+        appState.sessions.launchOverlayGraceSeconds = 0
     }
 
     override func tearDown() {
@@ -42,23 +42,23 @@ final class AppStateLaunchOverlayTests: XCTestCase {
     }
 
     func test_registerPaneLaunch_zeroGrace_immediatelyVisible() {
-        appState.registerPaneLaunch(paneId: "p1", command: "claude -w foo")
+        appState.sessions.registerPaneLaunch(paneId: "p1", command: "claude -w foo")
 
         XCTAssertEqual(
-            appState.paneLaunchStates["p1"],
+            appState.sessions.paneLaunchStates["p1"],
             .visible(command: "claude -w foo"),
             "With a zero-second grace the overlay is promoted immediately."
         )
     }
 
     func test_clearPaneLaunch_removesVisibleEntry() {
-        appState.registerPaneLaunch(paneId: "p1", command: "claude")
-        XCTAssertEqual(appState.paneLaunchStates["p1"], .visible(command: "claude"))
+        appState.sessions.registerPaneLaunch(paneId: "p1", command: "claude")
+        XCTAssertEqual(appState.sessions.paneLaunchStates["p1"], .visible(command: "claude"))
 
-        appState.clearPaneLaunch(paneId: "p1")
+        appState.sessions.clearPaneLaunch(paneId: "p1")
 
         XCTAssertNil(
-            appState.paneLaunchStates["p1"],
+            appState.sessions.paneLaunchStates["p1"],
             "First-byte clear must remove the entry entirely so the overlay stops rendering."
         )
     }
@@ -66,11 +66,11 @@ final class AppStateLaunchOverlayTests: XCTestCase {
     func test_clearPaneLaunch_beforeTimerFires_suppressesOverlay() {
         // Non-zero grace so the timer is real, then clear before it
         // fires. The overlay must never reach `.visible`.
-        appState.launchOverlayGraceSeconds = 0.2
-        appState.registerPaneLaunch(paneId: "p1", command: "claude")
-        XCTAssertEqual(appState.paneLaunchStates["p1"], .pending(command: "claude"))
+        appState.sessions.launchOverlayGraceSeconds = 0.2
+        appState.sessions.registerPaneLaunch(paneId: "p1", command: "claude")
+        XCTAssertEqual(appState.sessions.paneLaunchStates["p1"], .pending(command: "claude"))
 
-        appState.clearPaneLaunch(paneId: "p1")
+        appState.sessions.clearPaneLaunch(paneId: "p1")
 
         // Wait past the grace window and verify the promotion DIDN'T
         // bring the entry back — the `.pending` guard inside the
@@ -80,17 +80,17 @@ final class AppStateLaunchOverlayTests: XCTestCase {
         wait(for: [exp], timeout: 1.0)
 
         XCTAssertNil(
-            appState.paneLaunchStates["p1"],
+            appState.sessions.paneLaunchStates["p1"],
             "A cleared pane must stay cleared even after the grace timer fires."
         )
     }
 
     func test_registerPaneLaunch_asyncPath_promotesAfterGrace() {
-        appState.launchOverlayGraceSeconds = 0.15
-        appState.registerPaneLaunch(paneId: "p1", command: "claude -w slow")
+        appState.sessions.launchOverlayGraceSeconds = 0.15
+        appState.sessions.registerPaneLaunch(paneId: "p1", command: "claude -w slow")
 
         XCTAssertEqual(
-            appState.paneLaunchStates["p1"],
+            appState.sessions.paneLaunchStates["p1"],
             .pending(command: "claude -w slow"),
             "Before the grace window elapses the state is .pending — overlay stays hidden."
         )
@@ -100,7 +100,7 @@ final class AppStateLaunchOverlayTests: XCTestCase {
         wait(for: [exp], timeout: 1.0)
 
         XCTAssertEqual(
-            appState.paneLaunchStates["p1"],
+            appState.sessions.paneLaunchStates["p1"],
             .visible(command: "claude -w slow"),
             "After the grace window the entry is promoted to .visible."
         )
@@ -110,13 +110,13 @@ final class AppStateLaunchOverlayTests: XCTestCase {
         // A second register for the same paneId replaces the first.
         // Defends against in-place pane promotion (e.g. .resumeDeferred
         // → running-Claude) re-using an id that already had state.
-        appState.registerPaneLaunch(paneId: "p1", command: "claude")
-        XCTAssertEqual(appState.paneLaunchStates["p1"], .visible(command: "claude"))
+        appState.sessions.registerPaneLaunch(paneId: "p1", command: "claude")
+        XCTAssertEqual(appState.sessions.paneLaunchStates["p1"], .visible(command: "claude"))
 
-        appState.registerPaneLaunch(paneId: "p1", command: "claude --resume")
+        appState.sessions.registerPaneLaunch(paneId: "p1", command: "claude --resume")
 
         XCTAssertEqual(
-            appState.paneLaunchStates["p1"],
+            appState.sessions.paneLaunchStates["p1"],
             .visible(command: "claude --resume"),
             "Re-registering must overwrite the command string, not stack entries."
         )
@@ -136,17 +136,17 @@ final class AppStateLaunchOverlayTests: XCTestCase {
             activePaneId: paneId,
             claudeSessionId: nil
         )
-        appState.projects.append(
+        appState.tabs.projects.append(
             Project(id: "p", name: "P", path: "/tmp", tabs: [tab])
         )
 
-        appState.registerPaneLaunch(paneId: paneId, command: "claude")
-        XCTAssertEqual(appState.paneLaunchStates[paneId], .visible(command: "claude"))
+        appState.sessions.registerPaneLaunch(paneId: paneId, command: "claude")
+        XCTAssertEqual(appState.sessions.paneLaunchStates[paneId], .visible(command: "claude"))
 
-        appState.paneExited(tabId: "t1", paneId: paneId, exitCode: 0)
+        appState.sessions.paneExited(tabId: "t1", paneId: paneId, exitCode: 0)
 
         XCTAssertNil(
-            appState.paneLaunchStates[paneId],
+            appState.sessions.paneLaunchStates[paneId],
             "A pane that exits — even silently, before emitting any byte — must not leave a stale overlay entry behind."
         )
     }

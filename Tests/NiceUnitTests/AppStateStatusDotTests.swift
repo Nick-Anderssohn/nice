@@ -46,7 +46,7 @@ final class AppStateStatusDotTests: XCTestCase {
 
     func test_paneTitleChanged_onInactiveClaudePane_updatesTabStatus() {
         let tabId = createClaudeTab(cwd: "/tmp/nice-status-dot-test")
-        guard let tab = appState.tab(for: tabId),
+        guard let tab = appState.tabs.tab(for: tabId),
               let claude = tab.panes.first(where: { $0.kind == .claude }),
               let term = tab.panes.first(where: { $0.kind == .terminal })
         else {
@@ -55,23 +55,23 @@ final class AppStateStatusDotTests: XCTestCase {
         }
 
         // User focuses the terminal pane — the setup for the bug.
-        appState.setActivePane(tabId: tabId, paneId: term.id)
+        appState.sessions.setActivePane(tabId: tabId, paneId: term.id)
 
         // Claude emits a braille-prefixed title: thinking.
-        appState.paneTitleChanged(
+        appState.sessions.paneTitleChanged(
             tabId: tabId, paneId: claude.id, title: "\u{2800} fix-bug"
         )
-        XCTAssertEqual(appState.tab(for: tabId)?.status, .thinking,
+        XCTAssertEqual(appState.tabs.tab(for: tabId)?.status, .thinking,
                        "tab.status must track the Claude pane even when the companion terminal is active.")
-        XCTAssertEqual(appState.tab(for: tabId)?.panes.first(where: { $0.id == claude.id })?.status,
+        XCTAssertEqual(appState.tabs.tab(for: tabId)?.panes.first(where: { $0.id == claude.id })?.status,
                        .thinking)
 
         // Claude transitions to waiting — the exact moment the sidebar
         // used to freeze on thinking.
-        appState.paneTitleChanged(
+        appState.sessions.paneTitleChanged(
             tabId: tabId, paneId: claude.id, title: "\u{2733} fix-bug"
         )
-        let after = appState.tab(for: tabId)
+        let after = appState.tabs.tab(for: tabId)
         XCTAssertEqual(after?.status, .waiting,
                        "Sidebar dot MUST match toolbar dot: both were supposed to flip blue.")
         XCTAssertEqual(after?.panes.first(where: { $0.id == claude.id })?.status,
@@ -82,7 +82,7 @@ final class AppStateStatusDotTests: XCTestCase {
 
     func test_paneTitleChanged_onActiveClaudePane_acksWaiting() {
         let tabId = createClaudeTab(cwd: "/tmp/nice-status-dot-test")
-        guard let tab = appState.tab(for: tabId),
+        guard let tab = appState.tabs.tab(for: tabId),
               let claude = tab.panes.first(where: { $0.kind == .claude })
         else {
             XCTFail("Expected claude pane")
@@ -90,13 +90,13 @@ final class AppStateStatusDotTests: XCTestCase {
         }
         // Claude pane is already active after tab creation. Ensure the
         // user is also viewing the tab.
-        appState.activeTabId = tabId
-        XCTAssertEqual(appState.tab(for: tabId)?.activePaneId, claude.id)
+        appState.tabs.activeTabId = tabId
+        XCTAssertEqual(appState.tabs.tab(for: tabId)?.activePaneId, claude.id)
 
-        appState.paneTitleChanged(
+        appState.sessions.paneTitleChanged(
             tabId: tabId, paneId: claude.id, title: "\u{2733} hello"
         )
-        let t = appState.tab(for: tabId)
+        let t = appState.tabs.tab(for: tabId)
         XCTAssertEqual(t?.status, .waiting)
         XCTAssertTrue(t?.waitingAcknowledged ?? false,
                       "Waiting that arrives while the user is on the Claude pane must land already-acked — no pulse.")
@@ -104,7 +104,7 @@ final class AppStateStatusDotTests: XCTestCase {
 
     func test_sidebarAndToolbar_agreeAfterArbitraryTransitions() {
         let tabId = createClaudeTab(cwd: "/tmp/nice-status-dot-test")
-        guard let tab = appState.tab(for: tabId),
+        guard let tab = appState.tabs.tab(for: tabId),
               let claude = tab.panes.first(where: { $0.kind == .claude }),
               let term = tab.panes.first(where: { $0.kind == .terminal })
         else {
@@ -120,11 +120,11 @@ final class AppStateStatusDotTests: XCTestCase {
         ]
 
         for step in transitions {
-            appState.setActivePane(tabId: tabId, paneId: step.activePane)
-            appState.paneTitleChanged(
+            appState.sessions.setActivePane(tabId: tabId, paneId: step.activePane)
+            appState.sessions.paneTitleChanged(
                 tabId: tabId, paneId: claude.id, title: step.title
             )
-            let t = appState.tab(for: tabId)
+            let t = appState.tabs.tab(for: tabId)
             let claudePane = t?.panes.first(where: { $0.id == claude.id })
             XCTAssertEqual(t?.status, step.expected,
                            "tab.status (sidebar source) drifted at step '\(step.title)'")
@@ -137,18 +137,18 @@ final class AppStateStatusDotTests: XCTestCase {
 
     func test_createTabFromMainTerminal_hasExactlyOneClaudePane() {
         let tabId = createClaudeTab(cwd: "/tmp/nice-status-dot-test")
-        let count = appState.tab(for: tabId)?.panes
+        let count = appState.tabs.tab(for: tabId)?.panes
             .filter { $0.kind == .claude }.count
         XCTAssertEqual(count, 1)
     }
 
     func test_addPane_cannotCreateClaudePane() {
         let tabId = createClaudeTab(cwd: "/tmp/nice-status-dot-test")
-        let result = appState.addPane(tabId: tabId, kind: .claude)
+        let result = appState.sessions.addPane(tabId: tabId, kind: .claude)
         XCTAssertNil(result,
                      "addPane must refuse to create a second Claude pane — that would violate the one-Claude-per-tab invariant.")
 
-        let claudeCount = appState.tab(for: tabId)?.panes
+        let claudeCount = appState.tabs.tab(for: tabId)?.panes
             .filter { $0.kind == .claude }.count
         XCTAssertEqual(claudeCount, 1)
     }
@@ -161,7 +161,7 @@ final class AppStateStatusDotTests: XCTestCase {
     @discardableResult
     private func createClaudeTab(cwd: String) -> String {
         let before = allTabIds()
-        appState.createTabFromMainTerminal(cwd: cwd, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: cwd, args: [])
         let after = allTabIds()
         let newIds = after.subtracting(before)
         guard let id = newIds.first else {
@@ -173,7 +173,7 @@ final class AppStateStatusDotTests: XCTestCase {
 
     private func allTabIds() -> Set<String> {
         var ids: Set<String> = []
-        for project in appState.projects {
+        for project in appState.tabs.projects {
             for tab in project.tabs {
                 ids.insert(tab.id)
             }

@@ -11,7 +11,7 @@
 //
 //  Each test plants real `.git` markers under a per-test temp dir so
 //  `findGitRoot` walks the actual filesystem (matches production).
-//  Hand-seeds `appState.projects` for full control over starting state
+//  Hand-seeds `appState.tabs.projects` for full control over starting state
 //  rather than going through `createTabFromMainTerminal` (which would
 //  pre-route the tab via the new bucketing logic and obscure what the
 //  repair pass is doing on its own).
@@ -68,7 +68,7 @@ final class AppStateProjectRepairTests: XCTestCase {
         let outer = makeGitRepo(at: "outer")
         let nested = makeGitRepo(at: "outer/nested-1")
 
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "outer", name: "OUTER", path: outer,
             tabs: [
                 makeTab(id: "outer-seed", cwd: outer),
@@ -76,10 +76,10 @@ final class AppStateProjectRepairTests: XCTestCase {
             ]
         ))
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
         let outerProject = try XCTUnwrap(
-            appState.projects.first { $0.id == "outer" },
+            appState.tabs.projects.first { $0.id == "outer" },
             "Outer project must survive — its seed tab still belongs to it"
         )
         XCTAssertEqual(outerProject.tabs.count, 1,
@@ -87,10 +87,10 @@ final class AppStateProjectRepairTests: XCTestCase {
         XCTAssertEqual(outerProject.tabs.first?.id, "outer-seed")
 
         let nestedProject = try XCTUnwrap(
-            appState.projects.first { $0.path == nested },
+            appState.tabs.projects.first { $0.path == nested },
             "A new project anchored at the nested repo must exist"
         )
-        XCTAssertNotEqual(nestedProject.id, AppState.terminalsProjectId,
+        XCTAssertNotEqual(nestedProject.id, TabModel.terminalsProjectId,
                           "Nested project must not collide with the Terminals id")
         XCTAssertNotEqual(nestedProject.id, "outer",
                           "Nested project must have its own id, not reuse outer's")
@@ -112,7 +112,7 @@ final class AppStateProjectRepairTests: XCTestCase {
         let nested = makeGitRepo(at: "outer/sub/nested")
         let subPath = "\(gitFsRoot.path)/outer/sub"
 
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "p-sub-original", name: "SUB", path: subPath,
             tabs: [
                 makeTab(id: "sub-seed", cwd: subPath),
@@ -120,10 +120,10 @@ final class AppStateProjectRepairTests: XCTestCase {
             ]
         ))
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
         let promoted = try XCTUnwrap(
-            appState.projects.first { $0.id == "p-sub-original" },
+            appState.tabs.projects.first { $0.id == "p-sub-original" },
             "Original project id must survive promotion"
         )
         XCTAssertEqual(promoted.path, outer,
@@ -133,7 +133,7 @@ final class AppStateProjectRepairTests: XCTestCase {
                        "After promotion, sub-seed's anchor matches outer; deep-nested moves out")
 
         let nestedProject = try XCTUnwrap(
-            appState.projects.first { $0.path == nested },
+            appState.tabs.projects.first { $0.path == nested },
             "Pass 2 must create a project for the nested-cwd tab"
         )
         XCTAssertEqual(nestedProject.tabs.map(\.id), ["deep-nested"])
@@ -149,15 +149,15 @@ final class AppStateProjectRepairTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: missing),
                        "Precondition: missing cwd must not exist on disk")
 
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "repo", name: "REPO", path: repo,
             tabs: [makeTab(id: "ghost", cwd: missing)]
         ))
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
         let project = try XCTUnwrap(
-            appState.projects.first { $0.id == "repo" },
+            appState.tabs.projects.first { $0.id == "repo" },
             "Repo project must remain because its tab can't be re-bucketed"
         )
         XCTAssertEqual(project.tabs.count, 1)
@@ -174,20 +174,20 @@ final class AppStateProjectRepairTests: XCTestCase {
         let repo = makeGitRepo(at: "repo")
         let deep = makeDir(at: "repo/src/deep")
 
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "p-deep-123", name: "DEEP", path: deep,
             tabs: [makeTab(id: "deep-tab", cwd: deep)]
         ))
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
         XCTAssertEqual(
-            appState.projects.filter { $0.id != AppState.terminalsProjectId }.count,
+            appState.tabs.projects.filter { $0.id != TabModel.terminalsProjectId }.count,
             1,
             "Promotion shouldn't create or drop projects on its own"
         )
         let promoted = try XCTUnwrap(
-            appState.projects.first { $0.id == "p-deep-123" },
+            appState.tabs.projects.first { $0.id == "p-deep-123" },
             "Project id must be preserved across promotion"
         )
         XCTAssertEqual(promoted.path, repo,
@@ -208,25 +208,25 @@ final class AppStateProjectRepairTests: XCTestCase {
     func test_repair_mergesDuplicateProjectsAtSameGitRoot() throws {
         let repo = makeGitRepo(at: "repo")
 
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "first", name: "REPO", path: repo,
             tabs: [makeTab(id: "first-tab", cwd: repo)]
         ))
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "second", name: "REPO", path: repo,
             tabs: [makeTab(id: "second-tab", cwd: repo)]
         ))
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
-        let nonTerminals = appState.projects.filter {
-            $0.id != AppState.terminalsProjectId
+        let nonTerminals = appState.tabs.projects.filter {
+            $0.id != TabModel.terminalsProjectId
         }
         XCTAssertEqual(nonTerminals.count, 1,
                        "Duplicate at the same path must be merged into one")
 
         let canonical = try XCTUnwrap(
-            appState.projects.first { $0.id == "first" },
+            appState.tabs.projects.first { $0.id == "first" },
             "Lowest-index duplicate wins as canonical"
         )
         XCTAssertEqual(canonical.tabs.count, 2,
@@ -236,7 +236,7 @@ final class AppStateProjectRepairTests: XCTestCase {
             ["first-tab", "second-tab"],
             "Tab order: canonical's own tabs first, then the merged dupe's"
         )
-        XCTAssertNil(appState.projects.first { $0.id == "second" },
+        XCTAssertNil(appState.tabs.projects.first { $0.id == "second" },
                      "Merged dupe must be removed")
     }
 
@@ -246,18 +246,18 @@ final class AppStateProjectRepairTests: XCTestCase {
     /// repair must be dropped from the sidebar. Terminals stays even
     /// if it ends up empty (it's pinned, not data-driven).
     func test_repair_dropsEmptyProjectsButPreservesTerminals() throws {
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "abandoned", name: "GHOST", path: "/tmp/no-tabs-here", tabs: []
         ))
 
-        let terminalsBeforeId = appState.projects.first?.id
+        let terminalsBeforeId = appState.tabs.projects.first?.id
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
-        XCTAssertEqual(appState.projects.first?.id, terminalsBeforeId,
+        XCTAssertEqual(appState.tabs.projects.first?.id, terminalsBeforeId,
                        "Terminals must remain pinned at index 0")
-        XCTAssertEqual(appState.projects.first?.id, AppState.terminalsProjectId)
-        XCTAssertNil(appState.projects.first { $0.id == "abandoned" },
+        XCTAssertEqual(appState.tabs.projects.first?.id, TabModel.terminalsProjectId)
+        XCTAssertNil(appState.tabs.projects.first { $0.id == "abandoned" },
                      "Empty non-Terminals project must be dropped")
     }
 
@@ -267,16 +267,16 @@ final class AppStateProjectRepairTests: XCTestCase {
     /// into another project, or remove it.
     func test_repair_leavesTerminalsProjectAlone() throws {
         let terminalsBefore = try XCTUnwrap(
-            appState.projects.first { $0.id == AppState.terminalsProjectId }
+            appState.tabs.projects.first { $0.id == TabModel.terminalsProjectId }
         )
         let beforePath = terminalsBefore.path
         let beforeName = terminalsBefore.name
         let beforeTabIds = terminalsBefore.tabs.map(\.id)
 
-        appState.repairProjectStructure()
+        appState.tabs.repairProjectStructure()
 
         let terminalsAfter = try XCTUnwrap(
-            appState.projects.first { $0.id == AppState.terminalsProjectId }
+            appState.tabs.projects.first { $0.id == TabModel.terminalsProjectId }
         )
         XCTAssertEqual(terminalsAfter.path, beforePath)
         XCTAssertEqual(terminalsAfter.name, beforeName)
@@ -293,7 +293,7 @@ final class AppStateProjectRepairTests: XCTestCase {
         let nested = makeGitRepo(at: "outer/nested-1")
         let deep = makeDir(at: "outer/src/deep")
 
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "outer", name: "OUTER", path: outer,
             tabs: [
                 makeTab(id: "outer-seed", cwd: outer),
@@ -301,12 +301,12 @@ final class AppStateProjectRepairTests: XCTestCase {
                 makeTab(id: "deep-sub", cwd: deep),
             ]
         ))
-        appState.projects.append(Project(
+        appState.tabs.projects.append(Project(
             id: "p-deep-123", name: "DEEP", path: deep, tabs: []
         ))
 
-        appState.repairProjectStructure()
-        let snapshot = appState.projects.map { project -> ProjectSnapshot in
+        appState.tabs.repairProjectStructure()
+        let snapshot = appState.tabs.projects.map { project -> ProjectSnapshot in
             ProjectSnapshot(
                 id: project.id,
                 name: project.name,
@@ -315,8 +315,8 @@ final class AppStateProjectRepairTests: XCTestCase {
             )
         }
 
-        appState.repairProjectStructure()
-        let after = appState.projects.map { project -> ProjectSnapshot in
+        appState.tabs.repairProjectStructure()
+        let after = appState.tabs.projects.map { project -> ProjectSnapshot in
             ProjectSnapshot(
                 id: project.id,
                 name: project.name,

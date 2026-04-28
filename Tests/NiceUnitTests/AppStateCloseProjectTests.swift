@@ -47,13 +47,13 @@ final class AppStateCloseProjectTests: XCTestCase {
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t2",
                                  appendToExistingProject: true)
 
-        appState.requestCloseProject(projectId: "p1")
+        appState.closer.requestCloseProject(projectId: "p1")
 
-        XCTAssertNil(appState.projects.first { $0.id == "p1" },
+        XCTAssertNil(appState.tabs.projects.first { $0.id == "p1" },
                      "Project must be removed once all its tabs dissolve.")
-        XCTAssertNil(appState.tab(for: "t1"))
-        XCTAssertNil(appState.tab(for: "t2"))
-        XCTAssertNil(appState.pendingCloseRequest,
+        XCTAssertNil(appState.tabs.tab(for: "t1"))
+        XCTAssertNil(appState.tabs.tab(for: "t2"))
+        XCTAssertNil(appState.closer.pendingCloseRequest,
                      "No busy panes → no confirmation prompt.")
     }
 
@@ -61,15 +61,15 @@ final class AppStateCloseProjectTests: XCTestCase {
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
         setClaudeStatusOnEveryTab(in: "p1", status: .thinking)
 
-        appState.requestCloseProject(projectId: "p1")
+        appState.closer.requestCloseProject(projectId: "p1")
 
-        XCTAssertNotNil(appState.projects.first { $0.id == "p1" },
+        XCTAssertNotNil(appState.tabs.projects.first { $0.id == "p1" },
                         "Busy panes must block synchronous removal.")
-        guard case let .project(projectId)? = appState.pendingCloseRequest?.scope else {
-            return XCTFail("Expected .project scope; got \(String(describing: appState.pendingCloseRequest?.scope))")
+        guard case let .project(projectId)? = appState.closer.pendingCloseRequest?.scope else {
+            return XCTFail("Expected .project scope; got \(String(describing: appState.closer.pendingCloseRequest?.scope))")
         }
         XCTAssertEqual(projectId, "p1")
-        XCTAssertFalse(appState.pendingCloseRequest!.busyPanes.isEmpty,
+        XCTAssertFalse(appState.closer.pendingCloseRequest!.busyPanes.isEmpty,
                        "busyPanes must list the blocker(s) for the alert body.")
     }
 
@@ -78,48 +78,48 @@ final class AppStateCloseProjectTests: XCTestCase {
         // just Terminals (the test exercises the guard, not the
         // NSApp.terminate path).
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
-        let before = appState.projects.map(\.id)
+        let before = appState.tabs.projects.map(\.id)
 
-        appState.requestCloseProject(projectId: AppState.terminalsProjectId)
+        appState.closer.requestCloseProject(projectId: TabModel.terminalsProjectId)
 
-        XCTAssertEqual(appState.projects.map(\.id), before,
+        XCTAssertEqual(appState.tabs.projects.map(\.id), before,
                        "The pinned Terminals project must never be removable via right-click.")
-        XCTAssertNil(appState.pendingCloseRequest)
+        XCTAssertNil(appState.closer.pendingCloseRequest)
     }
 
     func test_requestCloseProject_unknownProjectId_isNoOp() {
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
-        let before = appState.projects.map(\.id)
+        let before = appState.tabs.projects.map(\.id)
 
-        appState.requestCloseProject(projectId: "does-not-exist")
+        appState.closer.requestCloseProject(projectId: "does-not-exist")
 
-        XCTAssertEqual(appState.projects.map(\.id), before)
-        XCTAssertNil(appState.pendingCloseRequest)
+        XCTAssertEqual(appState.tabs.projects.map(\.id), before)
+        XCTAssertNil(appState.closer.pendingCloseRequest)
     }
 
     func test_requestCloseProject_emptyProject_removesSynchronously() {
         // Keep a seeded project so the termination guard stays happy.
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
-        appState.projects.append(
+        appState.tabs.projects.append(
             Project(id: "p2", name: "P2", path: "/tmp/p2", tabs: [])
         )
 
-        appState.requestCloseProject(projectId: "p2")
+        appState.closer.requestCloseProject(projectId: "p2")
 
-        XCTAssertNil(appState.projects.first { $0.id == "p2" },
+        XCTAssertNil(appState.tabs.projects.first { $0.id == "p2" },
                      "An empty project has no async pane-exit to wait on — it must be removed synchronously.")
     }
 
     func test_requestCloseProject_reassignsActiveTabOffClosedProject() {
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
         seedProjectWithClaudeTab(projectId: "p2", tabId: "t2")
-        appState.activeTabId = "t1"
+        appState.tabs.activeTabId = "t1"
 
-        appState.requestCloseProject(projectId: "p1")
+        appState.closer.requestCloseProject(projectId: "p1")
 
-        XCTAssertNotEqual(appState.activeTabId, "t1",
+        XCTAssertNotEqual(appState.tabs.activeTabId, "t1",
                           "activeTabId must move off the closed project's tabs.")
-        XCTAssertNotNil(appState.activeTabId.flatMap { appState.tab(for: $0) },
+        XCTAssertNotNil(appState.tabs.activeTabId.flatMap { appState.tabs.tab(for: $0) },
                         "activeTabId must point at a real, still-existing tab.")
     }
 
@@ -129,29 +129,29 @@ final class AppStateCloseProjectTests: XCTestCase {
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
         setClaudeStatusOnEveryTab(in: "p1", status: .thinking)
 
-        appState.requestCloseProject(projectId: "p1")
-        XCTAssertNotNil(appState.pendingCloseRequest)
+        appState.closer.requestCloseProject(projectId: "p1")
+        XCTAssertNotNil(appState.closer.pendingCloseRequest)
 
-        appState.confirmPendingClose()
+        appState.closer.confirmPendingClose()
 
-        XCTAssertNil(appState.pendingCloseRequest,
+        XCTAssertNil(appState.closer.pendingCloseRequest,
                      "Confirming must clear the pending request.")
-        XCTAssertNil(appState.projects.first { $0.id == "p1" },
+        XCTAssertNil(appState.tabs.projects.first { $0.id == "p1" },
                      "Force-quit from a .project-scoped pending close must remove the project.")
-        XCTAssertNil(appState.tab(for: "t1"))
+        XCTAssertNil(appState.tabs.tab(for: "t1"))
     }
 
     func test_cancelPendingClose_projectScope_leavesEverythingIntact() {
         seedProjectWithClaudeTab(projectId: "p1", tabId: "t1")
         setClaudeStatusOnEveryTab(in: "p1", status: .thinking)
 
-        appState.requestCloseProject(projectId: "p1")
-        appState.cancelPendingClose()
+        appState.closer.requestCloseProject(projectId: "p1")
+        appState.closer.cancelPendingClose()
 
-        XCTAssertNil(appState.pendingCloseRequest)
-        XCTAssertNotNil(appState.projects.first { $0.id == "p1" },
+        XCTAssertNil(appState.closer.pendingCloseRequest)
+        XCTAssertNotNil(appState.tabs.projects.first { $0.id == "p1" },
                         "Cancel must leave the project in place.")
-        XCTAssertNotNil(appState.tab(for: "t1"))
+        XCTAssertNotNil(appState.tabs.tab(for: "t1"))
     }
 
     // MARK: - requestCloseTab with lazy companion (regression)
@@ -166,11 +166,11 @@ final class AppStateCloseProjectTests: XCTestCase {
         // Extra project keeps us off the all-empty NSApp.terminate path.
         seedProjectWithClaudeTab(projectId: "p2", tabId: "t2")
 
-        appState.requestCloseTab(tabId: "t1")
+        appState.closer.requestCloseTab(tabId: "t1")
 
-        XCTAssertNil(appState.tab(for: "t1"),
+        XCTAssertNil(appState.tabs.tab(for: "t1"),
                      "Close Tab must dissolve the tab even when the companion terminal was never spawned.")
-        XCTAssertNotNil(appState.projects.first { $0.id == "p1" },
+        XCTAssertNotNil(appState.tabs.projects.first { $0.id == "p1" },
                         "Close Tab must leave the containing project in place — only Close Project removes it.")
     }
 
@@ -199,12 +199,12 @@ final class AppStateCloseProjectTests: XCTestCase {
             claudeSessionId: "session-\(tabId)"
         )
         if appendToExistingProject,
-           let pi = appState.projects.firstIndex(where: { $0.id == projectId }) {
-            appState.projects[pi].tabs.append(tab)
+           let pi = appState.tabs.projects.firstIndex(where: { $0.id == projectId }) {
+            appState.tabs.projects[pi].tabs.append(tab)
         } else {
             let project = Project(id: projectId, name: projectId.uppercased(),
                                   path: "/tmp/\(projectId)", tabs: [tab])
-            appState.projects.append(project)
+            appState.tabs.projects.append(project)
         }
     }
 
@@ -212,7 +212,7 @@ final class AppStateCloseProjectTests: XCTestCase {
     /// force the `isBusy` path for tests that want a pending-close
     /// alert instead of an immediate tear-down.
     private func setClaudeStatusOnEveryTab(in projectId: String, status: TabStatus) {
-        var projects = appState.projects
+        var projects = appState.tabs.projects
         guard let pi = projects.firstIndex(where: { $0.id == projectId }) else { return }
         for ti in projects[pi].tabs.indices {
             for pxi in projects[pi].tabs[ti].panes.indices
@@ -220,6 +220,6 @@ final class AppStateCloseProjectTests: XCTestCase {
                 projects[pi].tabs[ti].panes[pxi].status = status
             }
         }
-        appState.projects = projects
+        appState.tabs.projects = projects
     }
 }

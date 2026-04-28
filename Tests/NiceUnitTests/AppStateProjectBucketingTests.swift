@@ -69,19 +69,19 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_underMainCwd_createsNewProjectGroup() throws {
         let cwd = "\(mainCwd)/Projects/zephyr"
 
-        appState.createTabFromMainTerminal(cwd: cwd, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: cwd, args: [])
 
-        XCTAssertEqual(appState.projects.count, 2,
+        XCTAssertEqual(appState.tabs.projects.count, 2,
                        "Expected Terminals + one new project group")
 
-        let terminals = appState.projects.first!
-        XCTAssertEqual(terminals.id, AppState.terminalsProjectId)
+        let terminals = appState.tabs.projects.first!
+        XCTAssertEqual(terminals.id, TabModel.terminalsProjectId)
         XCTAssertEqual(terminals.tabs.count, 1,
                        "Terminals group must not absorb Claude tabs")
-        XCTAssertEqual(terminals.tabs.first?.id, AppState.mainTerminalTabId)
+        XCTAssertEqual(terminals.tabs.first?.id, TabModel.mainTerminalTabId)
 
         let newProject = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId },
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId },
             "No non-Terminals project created — the new Claude tab was swallowed by the Terminals group"
         )
         XCTAssertEqual(newProject.name, "ZEPHYR")
@@ -98,15 +98,15 @@ final class AppStateProjectBucketingTests: XCTestCase {
     /// filter, the trivial prefix match would win and the tab would
     /// land under Terminals.
     func test_claudeFromMainTerminal_cwdEqualsMainCwd_stillCreatesNewProject() throws {
-        appState.createTabFromMainTerminal(cwd: mainCwd, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: mainCwd, args: [])
 
-        XCTAssertEqual(appState.projects.count, 2)
-        let terminals = appState.projects.first!
+        XCTAssertEqual(appState.tabs.projects.count, 2)
+        let terminals = appState.tabs.projects.first!
         XCTAssertEqual(terminals.tabs.count, 1,
                        "Terminals must still have only the Main tab")
 
         let newProject = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId },
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId },
             "No non-Terminals project created — Terminals swallowed the new Claude tab"
         )
         XCTAssertEqual(newProject.path, mainCwd)
@@ -122,17 +122,17 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_picksExistingProjectWhenCwdMatches() {
         seedProject(id: "p1", name: "P1", path: "/tmp/p1")
 
-        appState.createTabFromMainTerminal(cwd: "/tmp/p1/sub", args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: "/tmp/p1/sub", args: [])
 
-        XCTAssertEqual(appState.projects.count, 2,
+        XCTAssertEqual(appState.tabs.projects.count, 2,
                        "Should reuse p1, not create a third project")
-        let p1 = appState.projects.first { $0.id == "p1" }!
+        let p1 = appState.tabs.projects.first { $0.id == "p1" }!
         XCTAssertEqual(p1.tabs.count, 2,
                        "New Claude tab must be appended to p1")
         XCTAssertTrue(p1.tabs.last!.panes.contains { $0.kind == .claude })
 
-        let terminals = appState.projects.first!
-        XCTAssertEqual(terminals.id, AppState.terminalsProjectId)
+        let terminals = appState.tabs.projects.first!
+        XCTAssertEqual(terminals.id, TabModel.terminalsProjectId)
         XCTAssertEqual(terminals.tabs.count, 1)
     }
 
@@ -143,12 +143,12 @@ final class AppStateProjectBucketingTests: XCTestCase {
         seedProject(id: "p1", name: "P1", path: "/tmp/p1")
         seedProject(id: "p1-nested", name: "Nested", path: "/tmp/p1/nested")
 
-        appState.createTabFromMainTerminal(
+        appState.sessions.createTabFromMainTerminal(
             cwd: "/tmp/p1/nested/x", args: []
         )
 
-        let p1 = appState.projects.first { $0.id == "p1" }!
-        let nested = appState.projects.first { $0.id == "p1-nested" }!
+        let p1 = appState.tabs.projects.first { $0.id == "p1" }!
+        let nested = appState.tabs.projects.first { $0.id == "p1-nested" }!
         XCTAssertEqual(p1.tabs.count, 1, "Shallower project must not win")
         XCTAssertEqual(nested.tabs.count, 2,
                        "Deeper project is the longest-prefix match")
@@ -165,10 +165,10 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_withWorktreeFlag_splitsProjectAndTabCwd() throws {
         let parent = "\(mainCwd)/Projects/nice"
 
-        appState.createTabFromMainTerminal(cwd: parent, args: ["-w", "worktree-bug"])
+        appState.sessions.createTabFromMainTerminal(cwd: parent, args: ["-w", "worktree-bug"])
 
         let project = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId },
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId },
             "A fresh project group should have been created"
         )
         XCTAssertEqual(project.name, "NICE",
@@ -185,12 +185,12 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_withLongWorktreeFlag_splitsProjectAndTabCwd() throws {
         let parent = "\(mainCwd)/Projects/nice"
 
-        appState.createTabFromMainTerminal(
+        appState.sessions.createTabFromMainTerminal(
             cwd: parent, args: ["--worktree", "feature-x"]
         )
 
         let project = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId }
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId }
         )
         XCTAssertEqual(project.name, "NICE")
         XCTAssertEqual(project.path, parent)
@@ -205,15 +205,15 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_withWorktreeFlag_bucketsIntoExistingProject() throws {
         seedProject(id: "nice", name: "NICE", path: "/tmp/nice")
 
-        appState.createTabFromMainTerminal(cwd: "/tmp/nice", args: ["-w", "bug"])
+        appState.sessions.createTabFromMainTerminal(cwd: "/tmp/nice", args: ["-w", "bug"])
 
-        let nice = try XCTUnwrap(appState.projects.first { $0.id == "nice" })
+        let nice = try XCTUnwrap(appState.tabs.projects.first { $0.id == "nice" })
         XCTAssertEqual(nice.tabs.count, 2,
                        "Existing nice project should have absorbed the worktree tab")
         XCTAssertEqual(nice.tabs.last?.cwd,
                        "/tmp/nice/.claude/worktrees/bug")
 
-        XCTAssertNil(appState.projects.first { $0.name == "BUG" },
+        XCTAssertNil(appState.tabs.projects.first { $0.name == "BUG" },
                      "No BUG project should have been created")
     }
 
@@ -224,12 +224,12 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_withWorktreeFlag_slashesInNameReplacedWithPlus() throws {
         let parent = "\(mainCwd)/Projects/nice"
 
-        appState.createTabFromMainTerminal(
+        appState.sessions.createTabFromMainTerminal(
             cwd: parent, args: ["-w", "feature/foo/bar"]
         )
 
         let project = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId }
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId }
         )
         XCTAssertEqual(project.tabs.first?.cwd,
                        "\(parent)/.claude/worktrees/feature+foo+bar",
@@ -242,10 +242,10 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_claudeFromMainTerminal_withoutWorktreeFlag_tabCwdMatchesProjectPath() throws {
         let cwd = "\(mainCwd)/Projects/plain"
 
-        appState.createTabFromMainTerminal(cwd: cwd, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: cwd, args: [])
 
         let project = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId }
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId }
         )
         XCTAssertEqual(project.path, cwd)
         XCTAssertEqual(project.tabs.first?.cwd, cwd)
@@ -254,25 +254,25 @@ final class AppStateProjectBucketingTests: XCTestCase {
     // MARK: - extractWorktreeName
 
     func test_extractWorktreeName_shortFlag() {
-        XCTAssertEqual(AppState.extractWorktreeName(from: ["-w", "foo"]), "foo")
+        XCTAssertEqual(TabModel.extractWorktreeName(from: ["-w", "foo"]), "foo")
     }
 
     func test_extractWorktreeName_longFlag() {
-        XCTAssertEqual(AppState.extractWorktreeName(from: ["--worktree", "foo"]), "foo")
+        XCTAssertEqual(TabModel.extractWorktreeName(from: ["--worktree", "foo"]), "foo")
     }
 
     func test_extractWorktreeName_trailingFlagReturnsNil() {
-        XCTAssertNil(AppState.extractWorktreeName(from: ["-w"]))
-        XCTAssertNil(AppState.extractWorktreeName(from: ["a", "--worktree"]))
+        XCTAssertNil(TabModel.extractWorktreeName(from: ["-w"]))
+        XCTAssertNil(TabModel.extractWorktreeName(from: ["a", "--worktree"]))
     }
 
     func test_extractWorktreeName_emptyValueReturnsNil() {
-        XCTAssertNil(AppState.extractWorktreeName(from: ["-w", ""]))
+        XCTAssertNil(TabModel.extractWorktreeName(from: ["-w", ""]))
     }
 
     func test_extractWorktreeName_scansPastOtherArgs() {
         XCTAssertEqual(
-            AppState.extractWorktreeName(from: ["--model", "sonnet", "-w", "foo"]),
+            TabModel.extractWorktreeName(from: ["--model", "sonnet", "-w", "foo"]),
             "foo"
         )
     }
@@ -280,13 +280,13 @@ final class AppStateProjectBucketingTests: XCTestCase {
     func test_extractWorktreeName_equalsFormNotRecognized() {
         // Design decision: only space-delimited is supported. `-w=foo`
         // would be a single arg and should return nil.
-        XCTAssertNil(AppState.extractWorktreeName(from: ["-w=foo"]))
-        XCTAssertNil(AppState.extractWorktreeName(from: ["--worktree=foo"]))
+        XCTAssertNil(TabModel.extractWorktreeName(from: ["-w=foo"]))
+        XCTAssertNil(TabModel.extractWorktreeName(from: ["--worktree=foo"]))
     }
 
     func test_extractWorktreeName_absentReturnsNil() {
-        XCTAssertNil(AppState.extractWorktreeName(from: []))
-        XCTAssertNil(AppState.extractWorktreeName(from: ["--model", "sonnet"]))
+        XCTAssertNil(TabModel.extractWorktreeName(from: []))
+        XCTAssertNil(TabModel.extractWorktreeName(from: ["--model", "sonnet"]))
     }
 
     // MARK: - resolvedSpawnCwd
@@ -310,10 +310,10 @@ final class AppStateProjectBucketingTests: XCTestCase {
             panes: [Pane(id: "tmp-worktree-tab-p0", title: "zsh", kind: .terminal)],
             activePaneId: "tmp-worktree-tab-p0"
         )
-        let tmpIdx = appState.projects.firstIndex { $0.id == "tmp" }!
-        appState.projects[tmpIdx].tabs.append(tab)
+        let tmpIdx = appState.tabs.projects.firstIndex { $0.id == "tmp" }!
+        appState.tabs.projects[tmpIdx].tabs.append(tab)
 
-        XCTAssertEqual(appState.resolvedSpawnCwd(for: tab), existingProjectPath)
+        XCTAssertEqual(appState.tabs.resolvedSpawnCwd(for: tab), existingProjectPath)
     }
 
     /// When the tab's cwd exists, the resolver returns it unchanged —
@@ -328,10 +328,10 @@ final class AppStateProjectBucketingTests: XCTestCase {
             panes: [Pane(id: "tmp-real-tab-p0", title: "zsh", kind: .terminal)],
             activePaneId: "tmp-real-tab-p0"
         )
-        let tmpIdx = appState.projects.firstIndex { $0.id == "tmp" }!
-        appState.projects[tmpIdx].tabs.append(tab)
+        let tmpIdx = appState.tabs.projects.firstIndex { $0.id == "tmp" }!
+        appState.tabs.projects[tmpIdx].tabs.append(tab)
 
-        XCTAssertEqual(appState.resolvedSpawnCwd(for: tab), existingDir)
+        XCTAssertEqual(appState.tabs.resolvedSpawnCwd(for: tab), existingDir)
     }
 
     // MARK: - Restore path fallback
@@ -349,7 +349,7 @@ final class AppStateProjectBucketingTests: XCTestCase {
 
         seedProject(id: "nice", name: "NICE", path: projectPath)
         let projectIdx = try XCTUnwrap(
-            appState.projects.firstIndex { $0.id == "nice" }
+            appState.tabs.projects.firstIndex { $0.id == "nice" }
         )
 
         let persisted = PersistedTab(
@@ -366,7 +366,7 @@ final class AppStateProjectBucketingTests: XCTestCase {
         )
 
         let spawn = try XCTUnwrap(
-            appState.addRestoredTabModel(persisted, toProjectIndex: projectIdx),
+            appState.windowSession.addRestoredTabModel(persisted, toProjectIndex: projectIdx),
             "Claude tabs must return a pending-spawn tuple"
         )
         XCTAssertEqual(spawn.cwd, projectPath,
@@ -384,7 +384,7 @@ final class AppStateProjectBucketingTests: XCTestCase {
         let existingDir = NSTemporaryDirectory()
         seedProject(id: "tmp", name: "TMP", path: "/does-not-matter")
         let projectIdx = try XCTUnwrap(
-            appState.projects.firstIndex { $0.id == "tmp" }
+            appState.tabs.projects.firstIndex { $0.id == "tmp" }
         )
 
         let persisted = PersistedTab(
@@ -401,12 +401,12 @@ final class AppStateProjectBucketingTests: XCTestCase {
         )
 
         XCTAssertNil(
-            appState.addRestoredTabModel(persisted, toProjectIndex: projectIdx),
+            appState.windowSession.addRestoredTabModel(persisted, toProjectIndex: projectIdx),
             "Terminal-only tabs must not return a Claude spawn tuple"
         )
 
         let session = try XCTUnwrap(
-            appState.ptySessions["restored-multi-term"],
+            appState.sessions.ptySessions["restored-multi-term"],
             "Session must be created on restore"
         )
         XCTAssertNotNil(
@@ -422,7 +422,7 @@ final class AppStateProjectBucketingTests: XCTestCase {
         let existingDir = NSTemporaryDirectory()
         seedProject(id: "nice", name: "NICE", path: "/does-not-matter")
         let projectIdx = try XCTUnwrap(
-            appState.projects.firstIndex { $0.id == "nice" }
+            appState.tabs.projects.firstIndex { $0.id == "nice" }
         )
 
         let persisted = PersistedTab(
@@ -438,7 +438,7 @@ final class AppStateProjectBucketingTests: XCTestCase {
         )
 
         let spawn = try XCTUnwrap(
-            appState.addRestoredTabModel(persisted, toProjectIndex: projectIdx)
+            appState.windowSession.addRestoredTabModel(persisted, toProjectIndex: projectIdx)
         )
         XCTAssertEqual(spawn.cwd, existingDir)
     }
@@ -454,17 +454,17 @@ final class AppStateProjectBucketingTests: XCTestCase {
 
         seedProject(id: "outer", name: "OUTER", path: outer)
 
-        appState.createTabFromMainTerminal(cwd: nested, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: nested, args: [])
 
         let outerProject = try XCTUnwrap(
-            appState.projects.first { $0.id == "outer" }
+            appState.tabs.projects.first { $0.id == "outer" }
         )
         XCTAssertEqual(outerProject.tabs.count, 1,
                        "Outer must not absorb the nested-repo tab")
 
         let nestedProject = try XCTUnwrap(
-            appState.projects.first {
-                $0.id != AppState.terminalsProjectId
+            appState.tabs.projects.first {
+                $0.id != TabModel.terminalsProjectId
                     && $0.id != "outer"
             },
             "A separate project rooted at the nested repo must exist"
@@ -483,17 +483,17 @@ final class AppStateProjectBucketingTests: XCTestCase {
 
         seedProject(id: "repo", name: "REPO", path: repo)
 
-        appState.createTabFromMainTerminal(cwd: sub, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: sub, args: [])
 
         let repoProject = try XCTUnwrap(
-            appState.projects.first { $0.id == "repo" }
+            appState.tabs.projects.first { $0.id == "repo" }
         )
         XCTAssertEqual(repoProject.tabs.count, 2,
                        "Sub-dir tab must bucket into the existing repo project")
 
         XCTAssertNil(
-            appState.projects.first {
-                $0.id != AppState.terminalsProjectId && $0.id != "repo"
+            appState.tabs.projects.first {
+                $0.id != TabModel.terminalsProjectId && $0.id != "repo"
             },
             "No spurious project should have been created for the sub-dir"
         )
@@ -507,10 +507,10 @@ final class AppStateProjectBucketingTests: XCTestCase {
         let repo = makeGitRepo(at: "repo")
         let sub = makeDir(at: "repo/src/deep")
 
-        appState.createTabFromMainTerminal(cwd: sub, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: sub, args: [])
 
         let new = try XCTUnwrap(
-            appState.projects.first { $0.id != AppState.terminalsProjectId },
+            appState.tabs.projects.first { $0.id != TabModel.terminalsProjectId },
             "A non-Terminals project must be created"
         )
         XCTAssertEqual(new.path, repo,
@@ -530,17 +530,17 @@ final class AppStateProjectBucketingTests: XCTestCase {
 
         seedProject(id: "repo", name: "REPO", path: repo)
 
-        appState.createTabFromMainTerminal(cwd: worktree, args: [])
+        appState.sessions.createTabFromMainTerminal(cwd: worktree, args: [])
 
         let repoProject = try XCTUnwrap(
-            appState.projects.first { $0.id == "repo" }
+            appState.tabs.projects.first { $0.id == "repo" }
         )
         XCTAssertEqual(repoProject.tabs.count, 2,
                        "Manual cd into a worktree must still bucket into the parent repo")
 
         XCTAssertNil(
-            appState.projects.first {
-                $0.id != AppState.terminalsProjectId && $0.id != "repo"
+            appState.tabs.projects.first {
+                $0.id != TabModel.terminalsProjectId && $0.id != "repo"
             },
             "No worktree-named project should have been created"
         )
@@ -599,6 +599,6 @@ final class AppStateProjectBucketingTests: XCTestCase {
                 activePaneId: "\(id)-seed-p0"
             )
         ])
-        appState.projects.append(project)
+        appState.tabs.projects.append(project)
     }
 }

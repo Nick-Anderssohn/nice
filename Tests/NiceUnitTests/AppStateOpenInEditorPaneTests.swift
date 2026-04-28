@@ -165,7 +165,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
     /// silent fallthrough" contract.
     func test_openInEditorPane_unknownEditorId_isNoOp() {
         let appState = AppState()
-        let initialActiveTabId = appState.activeTabId
+        let initialActiveTabId = appState.tabs.activeTabId
         let initialPaneCount = countAllPanes(appState)
 
         appState.openInEditorPane(
@@ -173,7 +173,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
             editorId: UUID()
         )
 
-        XCTAssertEqual(appState.activeTabId, initialActiveTabId)
+        XCTAssertEqual(appState.tabs.activeTabId, initialActiveTabId)
         XCTAssertEqual(countAllPanes(appState), initialPaneCount,
                        "Unknown editor id must not spawn a pane.")
     }
@@ -198,7 +198,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
     // MARK: - helpers
 
     private func countAllPanes(_ appState: AppState) -> Int {
-        appState.projects.reduce(0) { acc, project in
+        appState.tabs.projects.reduce(0) { acc, project in
             acc + project.tabs.reduce(0) { $0 + $1.panes.count }
         }
     }

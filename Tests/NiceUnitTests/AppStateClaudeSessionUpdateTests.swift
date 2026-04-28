@@ -46,13 +46,13 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
     func test_unknownPaneId_isNoOp() {
         seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "S1")
 
-        appState.handleClaudeSessionUpdate(
+        appState.sessions.handleClaudeSessionUpdate(
             paneId: "definitely-not-a-real-pane-id",
             sessionId: "should-be-ignored"
         )
 
         XCTAssertEqual(
-            appState.tab(for: "t1")?.claudeSessionId, "S1",
+            appState.tabs.tab(for: "t1")?.claudeSessionId, "S1",
             "unknown paneId must not mutate any tab"
         )
     }
@@ -65,13 +65,13 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // Update the middle tab. Other tabs must stay untouched —
         // tabIdOwning's reverse scan must hit the right project even
         // when it's not first.
-        appState.handleClaudeSessionUpdate(
+        appState.sessions.handleClaudeSessionUpdate(
             paneId: "t2-claude", sessionId: "S2-NEW"
         )
 
-        XCTAssertEqual(appState.tab(for: "t1")?.claudeSessionId, "S1")
-        XCTAssertEqual(appState.tab(for: "t2")?.claudeSessionId, "S2-NEW")
-        XCTAssertEqual(appState.tab(for: "t3")?.claudeSessionId, "S3")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "S1")
+        XCTAssertEqual(appState.tabs.tab(for: "t2")?.claudeSessionId, "S2-NEW")
+        XCTAssertEqual(appState.tabs.tab(for: "t3")?.claudeSessionId, "S3")
     }
 
     func test_resolvesByPaneId_notTabId() {
@@ -80,13 +80,13 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // tab id (even an existing one) must not match a tab.
         seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "S1")
 
-        appState.handleClaudeSessionUpdate(
+        appState.sessions.handleClaudeSessionUpdate(
             paneId: "t1", // tab id, not a pane id
             sessionId: "should-not-apply"
         )
 
         XCTAssertEqual(
-            appState.tab(for: "t1")?.claudeSessionId, "S1",
+            appState.tabs.tab(for: "t1")?.claudeSessionId, "S1",
             "tabId-shaped paneId must not match pane list"
         )
     }
@@ -100,20 +100,20 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // cleanly.
         seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "S1")
 
-        appState.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
-        appState.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
+        appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
+        appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
 
-        XCTAssertEqual(appState.tab(for: "t1")?.claudeSessionId, "S1")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "S1")
     }
 
     func test_newSessionIdReplacesOld() {
         seedClaudeTab(projectId: "p", tabId: "t1", initialSessionId: "OLD")
 
-        appState.handleClaudeSessionUpdate(
+        appState.sessions.handleClaudeSessionUpdate(
             paneId: "t1-claude", sessionId: "NEW"
         )
 
-        XCTAssertEqual(appState.tab(for: "t1")?.claudeSessionId, "NEW")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "NEW")
     }
 
     // MARK: - helpers
@@ -139,6 +139,6 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
             id: projectId, name: projectId.uppercased(),
             path: "/tmp/\(projectId)", tabs: [tab]
         )
-        appState.projects.append(project)
+        appState.tabs.projects.append(project)
     }
 }

@@ -39,7 +39,7 @@ final class AppStateSerializationTests: XCTestCase {
     // MARK: - Basic shape
 
     func test_snapshot_includesWindowSessionId() {
-        let snap = appState.snapshotPersistedWindow()
+        let snap = appState.windowSession.snapshotPersistedWindow()
         XCTAssertFalse(snap.id.isEmpty,
                        "Snapshot must carry windowSessionId so SessionStore can upsert by window identity.")
     }
@@ -48,14 +48,14 @@ final class AppStateSerializationTests: XCTestCase {
         // Start from a fresh AppState and empty the Terminals group —
         // the project itself must still persist so its cwd survives
         // relaunch even with zero tabs.
-        appState.projects = [
-            Project(id: AppState.terminalsProjectId, name: "Terminals",
+        appState.tabs.projects = [
+            Project(id: TabModel.terminalsProjectId, name: "Terminals",
                     path: "/tmp/terminals", tabs: [])
         ]
 
-        let snap = appState.snapshotPersistedWindow()
+        let snap = appState.windowSession.snapshotPersistedWindow()
         XCTAssertEqual(snap.projects.count, 1)
-        XCTAssertEqual(snap.projects.first?.id, AppState.terminalsProjectId,
+        XCTAssertEqual(snap.projects.first?.id, TabModel.terminalsProjectId,
                        "Terminals project must survive a snapshot even with zero tabs; user's picked cwd would otherwise be lost on quit.")
     }
 
@@ -63,10 +63,10 @@ final class AppStateSerializationTests: XCTestCase {
         // Seed an empty project alongside the Terminals group. It
         // should be dropped from the snapshot — empty user projects
         // are noise on restore.
-        appState.projects.append(
+        appState.tabs.projects.append(
             Project(id: "empty", name: "Empty", path: "/tmp/empty", tabs: [])
         )
-        let snap = appState.snapshotPersistedWindow()
+        let snap = appState.windowSession.snapshotPersistedWindow()
         let ids = snap.projects.map(\.id)
         XCTAssertFalse(ids.contains("empty"),
                        "Empty non-terminals projects must be pruned — user can re-add.")
@@ -89,12 +89,12 @@ final class AppStateSerializationTests: XCTestCase {
             activePaneId: claudeId,
             claudeSessionId: "e4f1a2b3-c0d4-4e5f-9a0b-1c2d3e4f5a6b"
         )
-        appState.projects.append(
+        appState.tabs.projects.append(
             Project(id: "nice", name: "Nice",
                     path: "/Users/nick/Projects/nice", tabs: [tab])
         )
 
-        let snap = appState.snapshotPersistedWindow()
+        let snap = appState.windowSession.snapshotPersistedWindow()
         guard let persistedProject = snap.projects.first(where: { $0.id == "nice" }),
               let persistedTab = persistedProject.tabs.first
         else {
@@ -116,11 +116,11 @@ final class AppStateSerializationTests: XCTestCase {
     }
 
     func test_snapshot_preservesActiveTabIdAndSidebarCollapsed() {
-        appState.sidebarCollapsed = true
-        appState.activeTabId = AppState.mainTerminalTabId
+        appState.sidebar.sidebarCollapsed = true
+        appState.tabs.activeTabId = TabModel.mainTerminalTabId
 
-        let snap = appState.snapshotPersistedWindow()
-        XCTAssertEqual(snap.activeTabId, AppState.mainTerminalTabId)
+        let snap = appState.windowSession.snapshotPersistedWindow()
+        XCTAssertEqual(snap.activeTabId, TabModel.mainTerminalTabId)
         XCTAssertTrue(snap.sidebarCollapsed)
     }
 
@@ -129,8 +129,8 @@ final class AppStateSerializationTests: XCTestCase {
         // Terminals group) carry claudeSessionId == nil. They must
         // still round-trip — the Terminals group's persistence was
         // the point of the v2→v3 schema bump.
-        let snap = appState.snapshotPersistedWindow()
-        guard let terminals = snap.projects.first(where: { $0.id == AppState.terminalsProjectId }),
+        let snap = appState.windowSession.snapshotPersistedWindow()
+        guard let terminals = snap.projects.first(where: { $0.id == TabModel.terminalsProjectId }),
               let mainTab = terminals.tabs.first
         else {
             XCTFail("Expected Main terminal tab in snapshot")
@@ -159,12 +159,12 @@ final class AppStateSerializationTests: XCTestCase {
             activePaneId: claudeId,
             claudeSessionId: "sid-123"
         )
-        appState.projects.append(
+        appState.tabs.projects.append(
             Project(id: "nice", name: "Nice",
                     path: "/Users/nick/Projects/nice", tabs: [tab])
         )
 
-        let snap = appState.snapshotPersistedWindow()
+        let snap = appState.windowSession.snapshotPersistedWindow()
         let encoded = try JSONEncoder().encode(snap)
         let decoded = try JSONDecoder().decode(PersistedWindow.self, from: encoded)
         XCTAssertEqual(decoded, snap)

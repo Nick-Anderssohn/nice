@@ -46,45 +46,45 @@ final class AppStateNavigationTests: XCTestCase {
 
     func test_navigableSidebarTabIds_terminalsAlwaysFirst() {
         // Fresh AppState: only the Main terminal tab exists.
-        XCTAssertEqual(appState.navigableSidebarTabIds, [AppState.mainTerminalTabId])
+        XCTAssertEqual(appState.tabs.navigableSidebarTabIds, [TabModel.mainTerminalTabId])
     }
 
     func test_nextSidebarTab_isNoOpWhenOnlyMainTerminalExists() {
-        appState.activeTabId = AppState.mainTerminalTabId
-        appState.selectNextSidebarTab()
-        XCTAssertEqual(appState.activeTabId, AppState.mainTerminalTabId)
+        appState.tabs.activeTabId = TabModel.mainTerminalTabId
+        appState.tabs.selectNextSidebarTab()
+        XCTAssertEqual(appState.tabs.activeTabId, TabModel.mainTerminalTabId)
 
-        appState.selectPrevSidebarTab()
-        XCTAssertEqual(appState.activeTabId, AppState.mainTerminalTabId)
+        appState.tabs.selectPrevSidebarTab()
+        XCTAssertEqual(appState.tabs.activeTabId, TabModel.mainTerminalTabId)
     }
 
     func test_nextSidebarTab_cyclesThroughVisibleTabs() {
         seedTwoProjects()
-        let ids = appState.navigableSidebarTabIds
+        let ids = appState.tabs.navigableSidebarTabIds
         XCTAssertEqual(ids.count, 5,
                        "Main + (P1: T1, T2) + (P2: T1, T2) = 5 navigable ids")
 
-        appState.activeTabId = ids[0]
+        appState.tabs.activeTabId = ids[0]
         for expectedIdx in 1..<ids.count {
-            appState.selectNextSidebarTab()
-            XCTAssertEqual(appState.activeTabId, ids[expectedIdx])
+            appState.tabs.selectNextSidebarTab()
+            XCTAssertEqual(appState.tabs.activeTabId, ids[expectedIdx])
         }
         // One more step wraps back to Main.
-        appState.selectNextSidebarTab()
-        XCTAssertEqual(appState.activeTabId, ids[0])
+        appState.tabs.selectNextSidebarTab()
+        XCTAssertEqual(appState.tabs.activeTabId, ids[0])
     }
 
     func test_prevSidebarTab_cyclesBackward() {
         seedTwoProjects()
-        let ids = appState.navigableSidebarTabIds
+        let ids = appState.tabs.navigableSidebarTabIds
 
-        appState.activeTabId = ids[0]
+        appState.tabs.activeTabId = ids[0]
         // From Main, prev wraps to the last id.
-        appState.selectPrevSidebarTab()
-        XCTAssertEqual(appState.activeTabId, ids.last)
+        appState.tabs.selectPrevSidebarTab()
+        XCTAssertEqual(appState.tabs.activeTabId, ids.last)
 
-        appState.selectPrevSidebarTab()
-        XCTAssertEqual(appState.activeTabId, ids[ids.count - 2])
+        appState.tabs.selectPrevSidebarTab()
+        XCTAssertEqual(appState.tabs.activeTabId, ids[ids.count - 2])
     }
 
     // MARK: - Pane navigation
@@ -99,8 +99,8 @@ final class AppStateNavigationTests: XCTestCase {
         let secondId = tab.panes[1].id
 
         // Force focus to the first pane.
-        appState.setActivePane(tabId: tab.id, paneId: firstId)
-        appState.selectNextPane()
+        appState.sessions.setActivePane(tabId: tab.id, paneId: firstId)
+        appState.sessions.selectNextPane()
         XCTAssertEqual(mainTab().activePaneId, secondId)
     }
 
@@ -110,8 +110,8 @@ final class AppStateNavigationTests: XCTestCase {
         let firstId = tab.panes[0].id
         let lastId = tab.panes.last!.id
 
-        appState.setActivePane(tabId: tab.id, paneId: lastId)
-        appState.selectNextPane()
+        appState.sessions.setActivePane(tabId: tab.id, paneId: lastId)
+        appState.sessions.selectNextPane()
         XCTAssertEqual(mainTab().activePaneId, firstId)
     }
 
@@ -121,24 +121,24 @@ final class AppStateNavigationTests: XCTestCase {
         let firstId = tab.panes[0].id
         let lastId = tab.panes.last!.id
 
-        appState.setActivePane(tabId: tab.id, paneId: firstId)
-        appState.selectPrevPane()
+        appState.sessions.setActivePane(tabId: tab.id, paneId: firstId)
+        appState.sessions.selectPrevPane()
         XCTAssertEqual(mainTab().activePaneId, lastId)
     }
 
     func test_nextPane_isNoOpWhenSinglePane() {
         // Main tab starts with a single pane.
         let originalActive = mainTab().activePaneId
-        appState.selectNextPane()
+        appState.sessions.selectNextPane()
         XCTAssertEqual(mainTab().activePaneId, originalActive)
     }
 
     // MARK: - Add terminal
 
     func test_addTerminalToActiveTab_appendsTerminalAndFocuses() {
-        appState.activeTabId = AppState.mainTerminalTabId
+        appState.tabs.activeTabId = TabModel.mainTerminalTabId
         let originalCount = mainTab().panes.count
-        appState.addTerminalToActiveTab()
+        appState.sessions.addTerminalToActiveTab()
         XCTAssertEqual(mainTab().panes.count, originalCount + 1)
         let newPane = mainTab().panes.last!
         XCTAssertEqual(newPane.kind, .terminal)
@@ -146,17 +146,17 @@ final class AppStateNavigationTests: XCTestCase {
     }
 
     func test_helpers_areNoOpWhenActiveTabIdIsNil() {
-        appState.activeTabId = nil
+        appState.tabs.activeTabId = nil
         // Should not crash; should not mutate state.
-        appState.selectNextPane()
-        appState.selectPrevPane()
-        appState.addTerminalToActiveTab()
-        XCTAssertNil(appState.activeTabId)
+        appState.sessions.selectNextPane()
+        appState.sessions.selectPrevPane()
+        appState.sessions.addTerminalToActiveTab()
+        XCTAssertNil(appState.tabs.activeTabId)
         // navigableSidebarTabIds still includes Main; selectNext
         // resolves currentIdx to 0 and steps from there.
-        appState.selectNextSidebarTab()
+        appState.tabs.selectNextSidebarTab()
         // Single navigable id ⇒ no-op, activeTabId stays nil.
-        XCTAssertNil(appState.activeTabId)
+        XCTAssertNil(appState.tabs.activeTabId)
     }
 
     // MARK: - Helpers
@@ -194,20 +194,20 @@ final class AppStateNavigationTests: XCTestCase {
                 )
             }
         )
-        let terminals = appState.projects.first(where: {
-            $0.id == AppState.terminalsProjectId
+        let terminals = appState.tabs.projects.first(where: {
+            $0.id == TabModel.terminalsProjectId
         }) ?? Project(
-            id: AppState.terminalsProjectId, name: "Terminals",
+            id: TabModel.terminalsProjectId, name: "Terminals",
             path: "/tmp", tabs: []
         )
-        appState.projects = [terminals, p1, p2]
+        appState.tabs.projects = [terminals, p1, p2]
     }
 
     /// Snapshot of the Main terminal tab. Re-read on each access so
     /// assertions observe the latest mutation — Swift value semantics
     /// mean a captured `tab` would be stale after any model write.
     private func mainTab() -> Tab {
-        appState.tab(for: AppState.mainTerminalTabId)!
+        appState.tabs.tab(for: TabModel.mainTerminalTabId)!
     }
 
     /// Append a second terminal pane to the Main terminal tab so pane-
@@ -216,6 +216,6 @@ final class AppStateNavigationTests: XCTestCase {
     /// For these tests we accept the real pty being created; assertions
     /// only read the data model.
     private func addExtraTerminalPaneToMain() {
-        _ = appState.addPane(tabId: AppState.mainTerminalTabId, kind: .terminal)
+        _ = appState.sessions.addPane(tabId: TabModel.mainTerminalTabId, kind: .terminal)
     }
 }

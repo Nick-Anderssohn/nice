@@ -44,12 +44,12 @@ final class AppStatePaneCwdTests: XCTestCase {
     func test_paneCwdChanged_storesOnPane() {
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
 
-        appState.paneCwdChanged(
+        appState.sessions.paneCwdChanged(
             tabId: "t1", paneId: "p1", cwd: "/Users/nick/Downloads"
         )
 
         XCTAssertEqual(
-            appState.tab(for: "t1")?.panes.first?.cwd,
+            appState.tabs.tab(for: "t1")?.panes.first?.cwd,
             "/Users/nick/Downloads",
             "OSC 7 update must land on Pane.cwd"
         )
@@ -61,12 +61,12 @@ final class AppStatePaneCwdTests: XCTestCase {
         // silently relocate the session on restore.
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp/anchor")
 
-        appState.paneCwdChanged(
+        appState.sessions.paneCwdChanged(
             tabId: "t1", paneId: "p1", cwd: "/Users/nick/Downloads"
         )
 
         XCTAssertEqual(
-            appState.tab(for: "t1")?.cwd, "/tmp/anchor",
+            appState.tabs.tab(for: "t1")?.cwd, "/tmp/anchor",
             "Tab.cwd must stay anchored even when a pane cd's elsewhere"
         )
     }
@@ -74,12 +74,12 @@ final class AppStatePaneCwdTests: XCTestCase {
     func test_paneCwdChanged_unknownPane_isNoOp() {
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
 
-        appState.paneCwdChanged(
+        appState.sessions.paneCwdChanged(
             tabId: "t1", paneId: "ghost", cwd: "/Users/nick"
         )
 
         XCTAssertNil(
-            appState.tab(for: "t1")?.panes.first?.cwd,
+            appState.tabs.tab(for: "t1")?.panes.first?.cwd,
             "stale paneId must not invent a cwd on the wrong pane"
         )
     }
@@ -88,11 +88,11 @@ final class AppStatePaneCwdTests: XCTestCase {
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
 
         // Just shouldn't crash or mutate anything.
-        appState.paneCwdChanged(
+        appState.sessions.paneCwdChanged(
             tabId: "ghost-tab", paneId: "p1", cwd: "/Users/nick"
         )
 
-        XCTAssertNil(appState.tab(for: "t1")?.panes.first?.cwd)
+        XCTAssertNil(appState.tabs.tab(for: "t1")?.panes.first?.cwd)
     }
 
     // MARK: - resolvedSpawnCwd(for:pane:)
@@ -100,12 +100,12 @@ final class AppStatePaneCwdTests: XCTestCase {
     func test_resolvedSpawnCwd_prefersPaneCwdWhenItExists() throws {
         let dir = try makeTempDir()
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
-        appState.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: dir)
+        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: dir)
 
-        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         let pane = try XCTUnwrap(tab.panes.first)
         XCTAssertEqual(
-            appState.resolvedSpawnCwd(for: tab, pane: pane), dir,
+            appState.tabs.resolvedSpawnCwd(for: tab, pane: pane), dir,
             "pane cwd that exists on disk must be the spawn dir"
         )
     }
@@ -119,12 +119,12 @@ final class AppStatePaneCwdTests: XCTestCase {
         try FileManager.default.removeItem(atPath: deadDir)
 
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir)
-        appState.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: deadDir)
+        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: deadDir)
 
-        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         let pane = try XCTUnwrap(tab.panes.first)
         XCTAssertEqual(
-            appState.resolvedSpawnCwd(for: tab, pane: pane), liveDir,
+            appState.tabs.resolvedSpawnCwd(for: tab, pane: pane), liveDir,
             "deleted pane cwd must fall back to the tab's cwd"
         )
     }
@@ -133,11 +133,11 @@ final class AppStatePaneCwdTests: XCTestCase {
         let liveDir = try makeTempDir()
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir)
 
-        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         let pane = try XCTUnwrap(tab.panes.first)
         XCTAssertNil(pane.cwd, "fixture must start without a pane cwd")
         XCTAssertEqual(
-            appState.resolvedSpawnCwd(for: tab, pane: pane), liveDir
+            appState.tabs.resolvedSpawnCwd(for: tab, pane: pane), liveDir
         )
     }
 
@@ -146,11 +146,11 @@ final class AppStatePaneCwdTests: XCTestCase {
     func test_spawnCwdForNewPane_callerProvidedWins() throws {
         let liveDir = try makeTempDir()
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir)
-        appState.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: liveDir)
+        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: liveDir)
 
-        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         XCTAssertEqual(
-            appState.spawnCwdForNewPane(in: tab, callerProvided: "/explicit"),
+            appState.tabs.spawnCwdForNewPane(in: tab, callerProvided: "/explicit"),
             "/explicit",
             "an explicit cwd from the caller must win over inheritance"
         )
@@ -163,11 +163,11 @@ final class AppStatePaneCwdTests: XCTestCase {
         let tabDir = try makeTempDir()
         let paneDir = try makeTempDir()
         seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: tabDir)
-        appState.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: paneDir)
+        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: paneDir)
 
-        let tab = try XCTUnwrap(appState.tab(for: "t1"))
+        let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         XCTAssertEqual(
-            appState.spawnCwdForNewPane(in: tab, callerProvided: nil),
+            appState.tabs.spawnCwdForNewPane(in: tab, callerProvided: nil),
             paneDir
         )
     }
@@ -185,7 +185,7 @@ final class AppStatePaneCwdTests: XCTestCase {
             activePaneId: nil
         )
         XCTAssertEqual(
-            appState.spawnCwdForNewPane(in: tab, callerProvided: nil),
+            appState.tabs.spawnCwdForNewPane(in: tab, callerProvided: nil),
             tabDir
         )
     }
@@ -206,7 +206,7 @@ final class AppStatePaneCwdTests: XCTestCase {
         let project = Project(
             id: "p", name: "P", path: tabCwd, tabs: [tab]
         )
-        appState.projects.append(project)
+        appState.tabs.projects.append(project)
     }
 
     private func makeTempDir() throws -> String {
