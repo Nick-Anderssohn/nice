@@ -26,8 +26,15 @@ the actionable next-round shopping list.
 Branch: `worktree-state-management`. Worktree:
 `/Users/nick/Projects/nice/.claude/worktrees/state-management`.
 
-Recent commits at HEAD:
+Recent commits at HEAD (closeout round on top of the brief baseline):
 
+- `b7bca06` — Move state-management Phase 3 docs to docs/done/
+- `acd60d1` — Phase 3 follow-up: cover SessionsModel theme fan-out
+- `0faa4e6` — Phase 3 follow-up: cover WindowSession.tearDown invariants
+- `e693a12` — Phase 3 follow-up: cover WindowSession.scheduleSessionSave save-gate
+- `6a4fe9c` — Phase 3 follow-up: cover WindowSession.restoreSavedWindow branches
+- `bd9203a` — Phase 3 follow-up item 8: inject SessionStorePersisting + claimedWindowIds seam
+- `bdf6846` — Add Phase 3 follow-up handoff: fakes + remaining gaps
 - `a0372b6` — Update Phase 3 spec with completion status
 - `39ccd62` — Phase 3 item 5: add direct coverage for low-cost gaps
 - `f6405e2` — Phase 3 item 4: extract FileExplorerOrchestrator from AppState
@@ -35,7 +42,8 @@ Recent commits at HEAD:
 - `8b66f0d` — Phase 3 item 2: rename AppState*Tests files into sub-model test files
 - `c038214` — Phase 3 item 1: drop the last two AppState forwarders
 
-730 tests pass at HEAD (687 unit + 43 UI).
+752 tests pass at HEAD (709 unit + 43 UI). Pre-closeout baseline
+was 730.
 
 ## Goals
 
