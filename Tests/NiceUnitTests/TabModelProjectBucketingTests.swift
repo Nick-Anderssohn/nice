@@ -283,6 +283,56 @@ final class TabModelProjectBucketingTests: XCTestCase {
         XCTAssertNil(TabModel.extractWorktreeName(from: ["--model", "sonnet"]))
     }
 
+    // MARK: - extractClaudeSessionId
+
+    func test_extractClaudeSessionId_resumeSpaceDelimited() {
+        XCTAssertEqual(
+            TabModel.extractClaudeSessionId(from: ["--resume", "abc-123"]),
+            "abc-123"
+        )
+    }
+
+    func test_extractClaudeSessionId_sessionIdSpaceDelimited() {
+        XCTAssertEqual(
+            TabModel.extractClaudeSessionId(from: ["--session-id", "uuid-1"]),
+            "uuid-1"
+        )
+    }
+
+    func test_extractClaudeSessionId_resumeEqualsForm() {
+        XCTAssertEqual(
+            TabModel.extractClaudeSessionId(from: ["--resume=xyz"]),
+            "xyz"
+        )
+    }
+
+    func test_extractClaudeSessionId_sessionIdEqualsForm() {
+        XCTAssertEqual(
+            TabModel.extractClaudeSessionId(from: ["--session-id=qwe"]),
+            "qwe"
+        )
+    }
+
+    func test_extractClaudeSessionId_scansPastOtherArgs() {
+        XCTAssertEqual(
+            TabModel.extractClaudeSessionId(
+                from: ["--model", "sonnet", "--resume", "abc"]
+            ),
+            "abc"
+        )
+    }
+
+    func test_extractClaudeSessionId_trailingResumeReturnsNil() {
+        // `--resume` with no value behind it must not crash; returns nil.
+        XCTAssertNil(TabModel.extractClaudeSessionId(from: ["--resume"]))
+        XCTAssertNil(TabModel.extractClaudeSessionId(from: ["a", "--session-id"]))
+    }
+
+    func test_extractClaudeSessionId_absentReturnsNil() {
+        XCTAssertNil(TabModel.extractClaudeSessionId(from: []))
+        XCTAssertNil(TabModel.extractClaudeSessionId(from: ["--model", "sonnet"]))
+    }
+
     // MARK: - resolvedSpawnCwd
 
     /// When the tab's cwd no longer exists on disk (e.g. a worktree
