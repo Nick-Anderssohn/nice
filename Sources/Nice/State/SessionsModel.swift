@@ -136,6 +136,16 @@ final class SessionsModel {
     @ObservationIgnored
     var onTabBecameEmpty: ((_ tabId: String, _ projectIndex: Int, _ tabIndex: Int) -> Void)?
 
+    /// Test-only fan-out targets for `updateScheme` /
+    /// `updateTerminalFontSize` / `updateTerminalTheme` /
+    /// `updateTerminalFontFamily`. Production never writes to this —
+    /// new sessions land in `ptySessions` via `makeSession`. The
+    /// theme fan-out walks both collections so tests can register a
+    /// `FakeTabPtySession` here and observe the apply calls without
+    /// having to spawn a real `TabPtySession`.
+    @ObservationIgnored
+    var _testing_themeReceivers: [String: any TabPtySessionThemeable] = [:]
+
     init(tabs: TabModel) {
         self.tabs = tabs
     }
@@ -152,6 +162,9 @@ final class SessionsModel {
         for session in ptySessions.values {
             session.applyTheme(scheme, palette: palette, accent: accent)
         }
+        for receiver in _testing_themeReceivers.values {
+            receiver.applyTheme(scheme, palette: palette, accent: accent)
+        }
     }
 
     /// Fan a new terminal font size out to every live session. Called
@@ -161,6 +174,9 @@ final class SessionsModel {
         currentTerminalFontSize = size
         for session in ptySessions.values {
             session.applyTerminalFont(size: size)
+        }
+        for receiver in _testing_themeReceivers.values {
+            receiver.applyTerminalFont(size: size)
         }
     }
 
@@ -173,6 +189,9 @@ final class SessionsModel {
         for session in ptySessions.values {
             session.applyTerminalTheme(theme)
         }
+        for receiver in _testing_themeReceivers.values {
+            receiver.applyTerminalTheme(theme)
+        }
     }
 
     /// Fan out a terminal-font-family change. `nil` resets to the
@@ -182,6 +201,24 @@ final class SessionsModel {
         for session in ptySessions.values {
             session.applyTerminalFontFamily(name)
         }
+        for receiver in _testing_themeReceivers.values {
+            receiver.applyTerminalFontFamily(name)
+        }
+    }
+
+    // MARK: - Test-only cache readbacks
+
+    /// Read the cached scheme/palette/accent triple. Tests use this
+    /// to verify that `updateScheme` updated the source-of-truth that
+    /// future `makeSession` calls will read when seeding a new
+    /// `TabPtySession`.
+    var _testing_themeCache: (
+        scheme: ColorScheme, palette: Palette, accent: NSColor,
+        fontSize: CGFloat, theme: TerminalTheme, fontFamily: String?
+    ) {
+        (currentScheme, currentPalette, currentAccent,
+         currentTerminalFontSize, currentTerminalTheme,
+         currentTerminalFontFamily)
     }
 
     /// Update the resolved `claude` binary path. Called by AppState

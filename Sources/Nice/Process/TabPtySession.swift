@@ -18,9 +18,26 @@ import AppKit
 import SwiftTerm
 import SwiftUI
 
+/// Theme-fan-out surface that `SessionsModel` invokes for every live
+/// session when `updateScheme` / `updateTerminalFontSize` /
+/// `updateTerminalTheme` / `updateTerminalFontFamily` fires. Extracted
+/// as a protocol so unit tests can substitute a `FakeTabPtySession`
+/// recording the calls without standing up real ptys —
+/// `SessionsModel`'s `ptySessions` itself stays typed as
+/// `TabPtySession` (real production sessions need the full subprocess
+/// surface), and tests reach the fan-out through a separate test-only
+/// receivers list on `SessionsModel`.
+@MainActor
+protocol TabPtySessionThemeable: AnyObject {
+    func applyTheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor)
+    func applyTerminalFont(size: CGFloat)
+    func applyTerminalTheme(_ theme: TerminalTheme)
+    func applyTerminalFontFamily(_ name: String?)
+}
+
 @MainActor
 @Observable
-final class TabPtySession {
+final class TabPtySession: TabPtySessionThemeable {
     let tabId: String
     let cwd: String
 
