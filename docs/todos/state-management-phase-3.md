@@ -19,11 +19,38 @@ Branch: `worktree-state-management`. Worktree:
 items below are scoped against the head of that branch (which is
 also the merge target if/when this merges to `main`).
 
-707 tests pass (664 unit + 43 UI) at HEAD.
+730 unit tests pass (664 → 687 → 730 across phase-3 commits;
+SessionsModel theme fan-out + WindowSession restore/save-gate/
+tearDown gaps still open and need item 8 fakes — see below).
+
+## Recent commits — Phase 3
+
+- `c038214` — Item 1 (spec item 2): drop the last two AppState
+  forwarders. AppDelegate / WindowRegistry / one test now read the
+  sub-models directly. AppState's surface is composition-root only.
+- `8b66f0d` — Item 2 (spec item 1): rename AppState*Tests files into
+  sub-model test files. Pure-tabs files renamed; Navigation /
+  PaneCwd split by which sub-model API the test exercises.
+- `27d7e2b` — Item 3 (spec item 7): promote duplicated test fixtures
+  to `Tests/NiceUnitTests/Fixtures/{TabModelFixtures, GitFsFixtures}.swift`.
+  Migrates seven test files; existing per-file private helpers stay
+  as thin pass-throughs.
+- `f6405e2` — Item 4 (spec item 3): extract `FileExplorerOrchestrator`
+  from `AppState`. New `@Observable` sub-model holds the file-browser
+  action surface; AppState wires it as a peer alongside the other
+  five sub-models. AppShellView injects it into the environment.
+- `39ccd62` — Item 5 (spec item 6, partial): add direct coverage for
+  the three must-add gaps that don't need fakes —
+  `TabModel.extractClaudeSessionId`, `SidebarModel` toggle paths,
+  `CloseRequestCoordinator.requestClosePane` + `.pane` scope through
+  `confirmPendingClose`. The remaining must-add gaps need item 8
+  (FakeSessionStore / FakePtySpawner) — see status notes below.
 
 ## Items, ranked by leverage
 
-### 1. Add `TabModelTests.swift` — direct unit tests for the tab tree
+> Status legend: ✅ landed, ◾ partial, ⏭ deferred.
+
+### 1. ✅ Add `TabModelTests.swift` — direct unit tests for the tab tree
 
 **Why this is the single highest-leverage item.** `TabModel` is 656
 lines of pure-ish logic (no pty, no socket, no disk). Today every
@@ -63,7 +90,7 @@ what they're actually testing.
 **Risk:** low. Mechanical move; same assertions against the same
 underlying behavior.
 
-### 2. Drop the last two AppState forwarders
+### 2. ✅ Drop the last two AppState forwarders
 
 `Sources/Nice/State/AppState.swift:74-79` still exposes
 `windowSessionId` and `livePaneCounts` as read-only forwarders. Two
@@ -85,7 +112,7 @@ sub-model's value.
 
 **Risk:** trivial. Two call sites, both checked in by the compiler.
 
-### 3. Extract `AppState+FileExplorer` into its own sub-model
+### 3. ✅ Extract `AppState+FileExplorer` into its own sub-model
 
 `Sources/Nice/State/AppState+FileExplorer.swift` is still 355 lines
 on AppState. Its actual dependencies are `fileExplorer`, `tweaks`,
@@ -124,7 +151,7 @@ becomes empty everywhere).
 **Risk:** moderate. ~15 view callers + a handful of test files. The
 work pattern is well-rehearsed (this is exactly Phase 2 step *N*+1).
 
-### 4. Split `SessionsModel` theming from pty plumbing
+### 4. ⏭ Split `SessionsModel` theming from pty plumbing
 
 `Sources/Nice/State/SessionsModel.swift` is 929 lines. Two loosely
 related concerns:
@@ -147,7 +174,7 @@ remaining file; unblocks direct unit tests for the fan-out behavior
 **Risk:** low. No call-site changes if forwarders remain on
 SessionsModel.
 
-### 5. Replace `TerminalsSeedResult` with a `spawnHook:` callback
+### 5. ⏭ Replace `TerminalsSeedResult` with a `spawnHook:` callback
 
 `Sources/Nice/State/TabModel.swift:340-387` returns a
 `TerminalsSeedResult` enum so `Sources/Nice/State/WindowSession.swift:326-334`
@@ -161,45 +188,48 @@ solely to thread an action through a result.
 
 **Risk:** trivial. Single caller.
 
-### 6. Cover the missing test paths the testability review flagged
+### 6. ◾ Cover the missing test paths the testability review flagged
 
 These are real coverage gaps the decomposition exposed but didn't
-fill:
+fill. Three of the must-add items landed in `39ccd62`; the other
+four need fakes from item 8 to exercise.
 
 **Must-add:**
 
-- `WindowSession.restoreSavedWindow`
+- ⏭ `WindowSession.restoreSavedWindow`
   (`Sources/Nice/State/WindowSession.swift:188-320`). Three branches:
   matched-non-empty, matched-empty fallback, unmatched-adopt-or-fresh.
   The `claimedWindowIds` collision-prevention path (lines 213/221)
   and the deferred Claude-spawn double-`DispatchQueue.main.async`
   (lines 299-319) are unverified.
-- `WindowSession.scheduleSessionSave` save-gate
+- ⏭ `WindowSession.scheduleSessionSave` save-gate
   (`Sources/Nice/State/WindowSession.swift:112-116`). No test
   verifies that `isInitializing == true` blocks the upsert. The
   whole point of `markInitializationComplete` (handoff-documented as
   load-bearing) is untested.
-- `WindowSession.tearDown`
+- ⏭ `WindowSession.tearDown`
   (`Sources/Nice/State/WindowSession.swift:416-425`). The
   `claimedWindowIds.remove` invariant (line 424) — "second window
   can adopt the slot after first closes" — is uncovered.
-- `CloseRequestCoordinator.requestClosePane`
+- ✅ `CloseRequestCoordinator.requestClosePane`
   (`Sources/Nice/State/CloseRequestCoordinator.swift:102-115`) and
-  the `.pane` scope through `confirmPendingClose`. `grep -rn
-  requestClosePane Tests/` returns nothing.
-- `SessionsModel.updateScheme` /
+  the `.pane` scope through `confirmPendingClose`. Landed as
+  `Tests/NiceUnitTests/CloseRequestCoordinatorPaneTests.swift` —
+  idle Claude / busy Claude (thinking + waiting) / idle terminal /
+  unknown tab+pane / confirm clears request / cancel leaves pane.
+- ⏭ `SessionsModel.updateScheme` /
   `updateTerminalFontSize` / `updateTerminalTheme` /
   `updateTerminalFontFamily` fan-out
   (`Sources/Nice/State/SessionsModel.swift:148-185`). No tests for
   the live-session walk.
-- `TabModel.extractClaudeSessionId`
-  (`Sources/Nice/State/TabModel.swift:639`). Same shape and same 4
-  input forms as `extractWorktreeName` (which has 7 dedicated tests
-  in `AppStateProjectBucketingTests.swift:256-290`). Mechanical
-  addition.
-- `SidebarModel.toggleSidebar()`, `endSidebarPeek()`, the
-  `sidebarPeeking` toggle path. One test (`AppStateFileBrowserTests.swift:42`)
-  hits `toggleSidebarMode`; the rest of the surface is uncovered.
+- ✅ `TabModel.extractClaudeSessionId`
+  (`Sources/Nice/State/TabModel.swift:639`). Landed in
+  `TabModelProjectBucketingTests.swift` — 7 tests covering both
+  `--resume` / `--session-id`, both space-delimited and equals
+  forms, scan-past-other-args, trailing flag, and absent.
+- ✅ `SidebarModel.toggleSidebar()`, `endSidebarPeek()`, the
+  `sidebarPeeking` toggle path. Landed as
+  `Tests/NiceUnitTests/SidebarModelTests.swift`.
 
 **Nice-to-have:**
 
@@ -233,7 +263,7 @@ fill:
   through the synchronous all-unspawned `hardKillTab` branch — the
   async-interleave path isn't exercised.
 
-### 7. Promote duplicated test fixtures to a shared file
+### 7. ✅ Promote duplicated test fixtures to a shared file
 
 `seedProjectWithClaudeTab` is duplicated nearly verbatim in
 `AppStateCloseProjectTests.swift:182`,
@@ -257,7 +287,7 @@ Promote to:
   `makeWorktreeMarker`, `makeDir`, `makeFile`. Keep
   `TestHomeSandbox.swift` next door.
 
-### 8. Optional: introduce `FakeSessionStore` / fake pty spawner
+### 8. ⏭ Optional: introduce `FakeSessionStore` / fake pty spawner
 
 Today the test trick to skip persistence is "construct AppState with
 `services: nil`" — which disables `persistenceEnabled`. That gates
@@ -308,14 +338,26 @@ lose their failure context that way.
 
 ## After this
 
-`AppState.swift` should be ~150 lines (post-items 2 + 3): just the
-sub-model `let`s, `init`/`start`/`tearDown`/`finalizeDissolvedTab`,
-and `toggleFileBrowserHiddenFiles`. The test suite organizes by
-sub-model. `WindowSession.restoreSavedWindow`'s three branches all
-have direct tests. The save-gate has an explicit test. `SessionsModel`
-either splits its theming concern or stays a 929-line file with the
-relevant fan-out covered.
+`AppState.swift` is now 288 lines (down from 721 pre-Phase-2 and
+300 pre-Phase-3): six sub-model `let`s + `fileBrowserStore`, the
+`init` / `start` / `tearDown` / `finalizeDissolvedTab` /
+`toggleFileBrowserHiddenFiles` surface, plus the theme-seed and
+claude-path-tracking choreography that genuinely lives at the
+composition root. The test suite organizes by sub-model. The
+remaining `@Environment(AppState.self)` injection in
+`FileBrowserView` is for `fileBrowserStore.ensureState(...)`; the
+file-operation surface is now `FileExplorerOrchestrator`.
 
-The state-management refactor would be done-done at that point —
-no follow-ups, no "future cleanup" comments, no test-only forwarders
-of any kind.
+Open work (deferred per the spec's "skip unless prompted"
+guidance):
+
+- Item 4: split `SessionsModel` theming from pty plumbing.
+- Item 5: replace `TerminalsSeedResult` with a `spawnHook:`
+  callback.
+- Item 8: introduce `FakeSessionStore` / `FakePtySpawner`.
+- The four must-add coverage gaps in item 6 that depend on item 8
+  (WindowSession restore-flow / save-gate / tearDown invariant +
+  SessionsModel theme fan-out walk).
+
+A future round picks these up if and when the failure modes they'd
+cover start mattering.
