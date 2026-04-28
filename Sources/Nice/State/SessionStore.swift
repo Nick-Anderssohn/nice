@@ -118,8 +118,20 @@ struct PersistedState: Codable, Hashable, Sendable {
     static let empty = PersistedState(version: currentVersion, windows: [])
 }
 
+/// Surface used by `WindowSession` for persistence — a protocol so
+/// unit tests can swap in `FakeSessionStore` to capture upserts /
+/// flushes without touching `~/Library/Application Support/Nice/`.
+/// `SessionStore.shared` is the only production implementer.
 @MainActor
-final class SessionStore {
+protocol SessionStorePersisting: AnyObject {
+    func load() -> PersistedState
+    func upsert(window: PersistedWindow)
+    func pruneEmptyWindows(keeping: String)
+    func flush()
+}
+
+@MainActor
+final class SessionStore: SessionStorePersisting {
     static let shared = SessionStore()
 
     private let fileURL: URL

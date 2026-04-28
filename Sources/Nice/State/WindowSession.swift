@@ -75,12 +75,19 @@ final class WindowSession {
     @ObservationIgnored
     private weak var sidebar: SidebarModel?
 
+    /// Persistence backend. Defaults to `SessionStore.shared` in
+    /// production; tests inject a `FakeSessionStore` so they can
+    /// assert upsert / prune / flush calls without touching disk.
+    @ObservationIgnored
+    private let store: SessionStorePersisting
+
     init(
         tabs: TabModel,
         sessions: SessionsModel,
         sidebar: SidebarModel,
         windowSessionId: String,
-        persistenceEnabled: Bool
+        persistenceEnabled: Bool,
+        store: SessionStorePersisting = SessionStore.shared
     ) {
         // Brand-new scenes come in with an empty SceneStorage value;
         // mint a UUID here so the scene has a stable id for save/
@@ -94,6 +101,7 @@ final class WindowSession {
         self.tabs = tabs
         self.sessions = sessions
         self.sidebar = sidebar
+        self.store = store
     }
 
     /// AppState calls this at the end of `start()` after
@@ -101,6 +109,23 @@ final class WindowSession {
     /// save-gate so subsequent mutations persist normally.
     func markInitializationComplete() {
         isInitializing = false
+    }
+
+    /// Test-only escape hatch: reset the process-wide
+    /// `claimedWindowIds` set so a unit test that constructs multiple
+    /// `WindowSession` instances starts each test from a clean slate.
+    /// Production never calls this — the only legitimate remover is
+    /// `tearDown()` releasing its own id. Internal (visible only via
+    /// `@testable import Nice`) so production code can't reach it.
+    static func _testing_resetClaimedWindowIds() {
+        claimedWindowIds.removeAll()
+    }
+
+    /// Test-only readback for the claim set. Used by tests that
+    /// assert "second window can adopt the slot after first tears
+    /// down" without exposing the storage as a writable seam.
+    static func _testing_isClaimed(_ id: String) -> Bool {
+        claimedWindowIds.contains(id)
     }
 
     /// Walk projects for every Claude tab with a `claudeSessionId`,
@@ -112,7 +137,7 @@ final class WindowSession {
     func scheduleSessionSave() {
         guard persistenceEnabled, !isInitializing else { return }
         let persisted = snapshotPersistedWindow()
-        SessionStore.shared.upsert(window: persisted)
+        store.upsert(window: persisted)
     }
 
     /// Build a `PersistedWindow` from the current model. Mirrors the
@@ -188,7 +213,7 @@ final class WindowSession {
     func restoreSavedWindow() {
         guard let tabs, let sessions else { return }
 
-        let state = SessionStore.shared.load()
+        let state = store.load()
         // Try exact match first. If that entry has no projects at all,
         // fall through to the first entry that does — a matched-but-
         // empty slot usually means a prior launch crashed mid-restore;
@@ -241,7 +266,7 @@ final class WindowSession {
         // Garbage-collect empty ghost entries left behind by prior
         // launches that failed mid-restore. Keep our newly-adopted
         // slot so scheduleSessionSave has something to upsert into.
-        SessionStore.shared.pruneEmptyWindows(keeping: snapshot.id)
+        store.pruneEmptyWindows(keeping: snapshot.id)
 
         // Drop any in-init seed from the plain constructor — we want
         // the restored Terminals project (with its own tabs and cwd)
@@ -415,8 +440,8 @@ final class WindowSession {
     /// tests can't pollute the real sessions.json.
     func tearDown() {
         if persistenceEnabled {
-            SessionStore.shared.upsert(window: snapshotPersistedWindow())
-            SessionStore.shared.flush()
+            store.upsert(window: snapshotPersistedWindow())
+            store.flush()
         }
         // Release the session-id claim so a future window in this
         // process isn't prevented from adopting this (now-closed)
