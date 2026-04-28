@@ -158,6 +158,63 @@ grep -E "TEST FAILED|TEST SUCCEEDED|with [0-9]+ failures" /tmp/nice-test.log
 grep -E "Test Case .* failed|XCTAssert|: error:" /tmp/nice-test.log
 ```
 
+## Phase 3 closeout (2026-04-28)
+
+Phase 3 (the optional polish follow-ups) and the Phase 3 follow-up
+(fakes + remaining must-add coverage) are also done. The state-
+management refactor is **done-done**: no test-only forwarders, no
+"future cleanup" comments, every must-add coverage gap covered, and
+all spec docs live under `docs/done/`.
+
+What landed across Phase 3 and its follow-up:
+
+- AppState's last two read-only forwarders (`windowSessionId`,
+  `livePaneCounts`) deleted. Production callers (`WindowRegistry`,
+  `AppDelegate`) read sub-models directly.
+- `AppState*Tests.swift` files split / renamed into
+  `<SubModel>Tests.swift`. Test files name what they're actually
+  testing.
+- `FileExplorerOrchestrator` extracted from `AppState` —
+  AppShellView injects the orchestrator into the environment;
+  `FileBrowserView` keeps `AppState` only for `fileBrowserStore`.
+- Test fixtures promoted to
+  `Tests/NiceUnitTests/Fixtures/{TabModelFixtures, GitFsFixtures,
+  FakeSessionStore, FakeTabPtySession}.swift`.
+- Direct unit coverage for the must-add gaps the testability review
+  flagged: `TabModel.extractClaudeSessionId`, `SidebarModel`
+  toggles, `CloseRequestCoordinator.requestClosePane` + the `.pane`
+  scope through `confirmPendingClose`,
+  `WindowSession.restoreSavedWindow` (matched-non-empty,
+  matched-empty fallback, unmatched adoption + sibling-window
+  refusal, prune-empty-ghosts, empty-state no-op),
+  `WindowSession.scheduleSessionSave` save-gate, `WindowSession.tearDown`'s
+  `claimedWindowIds` invariant, and `SessionsModel`'s four-method
+  theme fan-out.
+- Persistence injection: `SessionStorePersisting` protocol;
+  `WindowSession` reads persistence through an injected
+  `store: SessionStorePersisting` that defaults to
+  `SessionStore.shared`. Production wiring untouched; tests inject
+  `FakeSessionStore`.
+- Theme-fan-out injection: `TabPtySessionThemeable` protocol on
+  `TabPtySession` exposing the four `applyX` methods. Tests register
+  `FakeTabPtySession`s on `SessionsModel._testing_themeReceivers`,
+  which the four `updateX` methods walk alongside `ptySessions`.
+- Test seam on `WindowSession.claimedWindowIds`:
+  `_testing_resetClaimedWindowIds()` and `_testing_isClaimed(_:)`,
+  internal-only via `@testable import Nice`.
+
+Suite: 752 tests (709 unit + 43 UI), all green. AppState weighs
+~290 lines as a pure composition root. The view-side rename pass,
+the test-suite forwarder migration, and every must-add coverage gap
+are all closed.
+
+Items 4 and 5 from the Phase 3 spec (split `SessionsModel` theming;
+replace `TerminalsSeedResult` with a `spawnHook:` callback) stay
+deferred. Both are nice-to-haves with clear, low-risk specs in
+[`state-management-phase-3.md`](state-management-phase-3.md) — pick
+them up if and when the cohesion or indirection costs they describe
+start mattering.
+
 ## Follow-up work
 
 The refactor is functionally complete. One housekeeping follow-up is
