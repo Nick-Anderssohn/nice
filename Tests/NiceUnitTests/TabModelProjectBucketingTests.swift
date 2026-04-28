@@ -1,5 +1,5 @@
 //
-//  AppStateProjectBucketingTests.swift
+//  TabModelProjectBucketingTests.swift
 //  NiceUnitTests
 //
 //  Locks in the contract that `claude` invocations from a Main Terminal
@@ -11,7 +11,7 @@
 //
 //  Drives through the public `createTabFromMainTerminal` surface so the
 //  full tab-build-and-bucket path is covered, not just the private
-//  helper. Like AppStateNavigationTests, this touches the real pty
+//  helper. Like TabModelNavigationTests, this touches the real pty
 //  spawn path inside `makeSession`; assertions only read the data
 //  model. NICE_CLAUDE_OVERRIDE is set to /bin/cat so claude resolution
 //  doesn't hit a login shell or depend on the host having `claude`
@@ -24,7 +24,7 @@ import XCTest
 @testable import Nice
 
 @MainActor
-final class AppStateProjectBucketingTests: XCTestCase {
+final class TabModelProjectBucketingTests: XCTestCase {
 
     private var appState: AppState!
     private var homeSandbox: TestHomeSandbox!

@@ -1,8 +1,8 @@
 //
-//  AppStateReorderTests.swift
+//  TabModelReorderTests.swift
 //  NiceUnitTests
 //
-//  Unit tests for AppState.moveTab and AppState.wouldMoveTab — the
+//  Unit tests for TabModel.moveTab and TabModel.wouldMoveTab — the
 //  sidebar drag-to-reorder helper and its no-op predicate. Tests
 //  exercise only the in-memory model; no pty sessions involved.
 //
@@ -12,7 +12,7 @@ import XCTest
 @testable import Nice
 
 @MainActor
-final class AppStateReorderTests: XCTestCase {
+final class TabModelReorderTests: XCTestCase {
 
     private var appState: AppState!
 

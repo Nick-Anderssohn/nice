@@ -1,5 +1,5 @@
 //
-//  AppStateProjectRepairTests.swift
+//  TabModelProjectRepairTests.swift
 //  NiceUnitTests
 //
 //  Self-heal pass for the persisted project structure. Locks in that
@@ -23,7 +23,7 @@ import XCTest
 @testable import Nice
 
 @MainActor
-final class AppStateProjectRepairTests: XCTestCase {
+final class TabModelProjectRepairTests: XCTestCase {
 
     private var appState: AppState!
     private var homeSandbox: TestHomeSandbox!

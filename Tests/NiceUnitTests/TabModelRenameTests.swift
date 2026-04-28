@@ -1,5 +1,5 @@
 //
-//  AppStateRenameTabTests.swift
+//  TabModelRenameTests.swift
 //  NiceUnitTests
 //
 //  Tests for the manual-rename path. Two invariants matter:
@@ -12,7 +12,7 @@ import XCTest
 @testable import Nice
 
 @MainActor
-final class AppStateRenameTabTests: XCTestCase {
+final class TabModelRenameTests: XCTestCase {
 
     private var appState: AppState!
 

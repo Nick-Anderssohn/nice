@@ -1,14 +1,12 @@
 //
-//  AppStatePaneCwdTests.swift
+//  TabModelCwdResolutionTests.swift
 //  NiceUnitTests
 //
-//  Locks down the per-pane cwd plumbing:
-//    • `paneCwdChanged(tabId:paneId:cwd:)` — the OSC 7 callback path,
-//      called from `TabPtySession.onPaneCwdChange`.
-//    • `resolvedSpawnCwd(for:pane:)` — used at restore/spawn to pick
-//      the right working directory. Falls back to the tab/project
-//      cwd when the pane's last-observed dir was deleted between
-//      launches.
+//  Cwd resolution helpers used at restore/spawn time:
+//    • `resolvedSpawnCwd(for:pane:)` — falls back to the tab cwd when
+//      the pane's last-observed dir was deleted between launches.
+//    • `spawnCwdForNewPane(in:callerProvided:)` — caller wins, then
+//      active-pane cwd, then tab cwd.
 //
 //  Tests use the convenience `AppState()` init (services == nil),
 //  which disables SessionStore persistence — same pattern the other
@@ -21,7 +19,7 @@ import XCTest
 @testable import Nice
 
 @MainActor
-final class AppStatePaneCwdTests: XCTestCase {
+final class TabModelCwdResolutionTests: XCTestCase {
 
     private var appState: AppState!
     private var homeSandbox: TestHomeSandbox!
@@ -39,68 +37,11 @@ final class AppStatePaneCwdTests: XCTestCase {
         super.tearDown()
     }
 
-    // MARK: - paneCwdChanged
-
-    func test_paneCwdChanged_storesOnPane() {
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
-
-        appState.sessions.paneCwdChanged(
-            tabId: "t1", paneId: "p1", cwd: "/Users/nick/Downloads"
-        )
-
-        XCTAssertEqual(
-            appState.tabs.tab(for: "t1")?.panes.first?.cwd,
-            "/Users/nick/Downloads",
-            "OSC 7 update must land on Pane.cwd"
-        )
-    }
-
-    func test_paneCwdChanged_doesNotMutateTabCwd() {
-        // Tab.cwd is load-bearing for `claude --resume` on Claude
-        // tabs — overwriting it from a companion terminal's cd would
-        // silently relocate the session on restore.
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp/anchor")
-
-        appState.sessions.paneCwdChanged(
-            tabId: "t1", paneId: "p1", cwd: "/Users/nick/Downloads"
-        )
-
-        XCTAssertEqual(
-            appState.tabs.tab(for: "t1")?.cwd, "/tmp/anchor",
-            "Tab.cwd must stay anchored even when a pane cd's elsewhere"
-        )
-    }
-
-    func test_paneCwdChanged_unknownPane_isNoOp() {
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
-
-        appState.sessions.paneCwdChanged(
-            tabId: "t1", paneId: "ghost", cwd: "/Users/nick"
-        )
-
-        XCTAssertNil(
-            appState.tabs.tab(for: "t1")?.panes.first?.cwd,
-            "stale paneId must not invent a cwd on the wrong pane"
-        )
-    }
-
-    func test_paneCwdChanged_unknownTab_isNoOp() {
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
-
-        // Just shouldn't crash or mutate anything.
-        appState.sessions.paneCwdChanged(
-            tabId: "ghost-tab", paneId: "p1", cwd: "/Users/nick"
-        )
-
-        XCTAssertNil(appState.tabs.tab(for: "t1")?.panes.first?.cwd)
-    }
-
     // MARK: - resolvedSpawnCwd(for:pane:)
 
     func test_resolvedSpawnCwd_prefersPaneCwdWhenItExists() throws {
         let dir = try makeTempDir()
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp")
-        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: dir)
+        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: "/tmp", paneCwd: dir)
 
         let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         let pane = try XCTUnwrap(tab.panes.first)
@@ -118,8 +59,7 @@ final class AppStatePaneCwdTests: XCTestCase {
         let deadDir = try makeTempDir()
         try FileManager.default.removeItem(atPath: deadDir)
 
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir)
-        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: deadDir)
+        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir, paneCwd: deadDir)
 
         let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         let pane = try XCTUnwrap(tab.panes.first)
@@ -145,8 +85,7 @@ final class AppStatePaneCwdTests: XCTestCase {
 
     func test_spawnCwdForNewPane_callerProvidedWins() throws {
         let liveDir = try makeTempDir()
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir)
-        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: liveDir)
+        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: liveDir, paneCwd: liveDir)
 
         let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         XCTAssertEqual(
@@ -162,8 +101,7 @@ final class AppStatePaneCwdTests: XCTestCase {
         // wherever the tab was first launched.
         let tabDir = try makeTempDir()
         let paneDir = try makeTempDir()
-        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: tabDir)
-        appState.sessions.paneCwdChanged(tabId: "t1", paneId: "p1", cwd: paneDir)
+        seedTerminalTab(tabId: "t1", paneId: "p1", tabCwd: tabDir, paneCwd: paneDir)
 
         let tab = try XCTUnwrap(appState.tabs.tab(for: "t1"))
         XCTAssertEqual(
@@ -193,14 +131,16 @@ final class AppStatePaneCwdTests: XCTestCase {
     // MARK: - helpers
 
     private func seedTerminalTab(
-        tabId: String, paneId: String, tabCwd: String
+        tabId: String, paneId: String, tabCwd: String, paneCwd: String? = nil
     ) {
+        var pane = Pane(id: paneId, title: "zsh", kind: .terminal)
+        pane.cwd = paneCwd
         let tab = Tab(
             id: tabId,
             title: "Terminal",
             cwd: tabCwd,
             branch: nil,
-            panes: [Pane(id: paneId, title: "zsh", kind: .terminal)],
+            panes: [pane],
             activePaneId: paneId
         )
         let project = Project(
@@ -211,7 +151,7 @@ final class AppStatePaneCwdTests: XCTestCase {
 
     private func makeTempDir() throws -> String {
         let path = NSTemporaryDirectory()
-            + "nice-pane-cwd-test-\(UUID().uuidString)"
+            + "nice-tab-cwd-test-\(UUID().uuidString)"
         try FileManager.default.createDirectory(
             atPath: path, withIntermediateDirectories: true
         )
