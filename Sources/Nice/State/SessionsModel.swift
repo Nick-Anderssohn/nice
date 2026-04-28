@@ -71,40 +71,16 @@ final class SessionsModel {
     @ObservationIgnored
     private(set) var controlSocketExtraEnv: [String: String] = [:]
 
-    /// Tracks the SwiftUI `ColorScheme` currently showing. New sessions
-    /// are themed at creation using this.
-    @ObservationIgnored
-    private var currentScheme: ColorScheme = .dark
-
-    /// Tracks the active chrome `Palette` (nice | macOS). New sessions
-    /// are themed at creation using this alongside `currentScheme`.
-    @ObservationIgnored
-    private var currentPalette: Palette = .nice
-
-    /// Tracks the user's active accent as an `NSColor`, used to paint
-    /// the terminal caret so the blinking cursor matches the app tint.
-    /// Seeded with terracotta; `updateScheme` overwrites on every call.
-    @ObservationIgnored
-    private var currentAccent: NSColor = AccentPreset.terracotta.nsColor
-
-    /// Tracks the user's terminal font size. New sessions pick this up
-    /// at creation; `updateTerminalFontSize` fans changes out to every
-    /// live `TabPtySession`.
-    @ObservationIgnored
-    private var currentTerminalFontSize: CGFloat = FontSettings.defaultTerminalSize
-
-    /// Tracks the terminal theme that every live pane is currently
-    /// painted with. Seeded from Nice's built-in dark default so new
-    /// sessions created before `updateTerminalTheme` runs still get
-    /// sensible colors. `AppShellHost` calls `updateTerminalTheme`
-    /// eagerly on first appear, so this only acts as a fallback.
-    @ObservationIgnored
-    private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
-
-    /// Tracks the user-chosen terminal font family. `nil` => default
-    /// chain (SF Mono → JetBrains Mono NL → system monospaced).
-    @ObservationIgnored
-    private var currentTerminalFontFamily: String? = nil
+    /// Theme/font cache + fan-out target. Holds the chrome
+    /// scheme/palette/accent triple, the terminal theme, and the
+    /// terminal font family/size — the values every live pty session
+    /// is painted with. `updateScheme` / `updateTerminalFontSize` /
+    /// `updateTerminalTheme` / `updateTerminalFontFamily` on
+    /// `SessionsModel` are thin forwarders to this cache; the cache
+    /// walks `ptySessions.values` (via the closure passed at init)
+    /// to fan out. `makeSession` calls `themeCache.applyAll(to:)` to
+    /// seed a freshly-spawned session with the current cache state.
+    let themeCache: SessionThemeCache
 
     /// Absolute path to the `claude` binary if we've resolved it; nil
     /// falls back to zsh inside claude panes. Mirrors
@@ -136,89 +112,44 @@ final class SessionsModel {
     @ObservationIgnored
     var onTabBecameEmpty: ((_ tabId: String, _ projectIndex: Int, _ tabIndex: Int) -> Void)?
 
-    /// Test-only fan-out targets for `updateScheme` /
-    /// `updateTerminalFontSize` / `updateTerminalTheme` /
-    /// `updateTerminalFontFamily`. Production never writes to this —
-    /// new sessions land in `ptySessions` via `makeSession`. The
-    /// theme fan-out walks both collections so tests can register a
-    /// `FakeTabPtySession` here and observe the apply calls without
-    /// having to spawn a real `TabPtySession`.
-    @ObservationIgnored
-    var _testing_themeReceivers: [String: any TabPtySessionThemeable] = [:]
-
     init(tabs: TabModel) {
         self.tabs = tabs
+        // Build the cache with a placeholder receivers closure
+        // first — `self` isn't usable until every stored property is
+        // assigned. Once init is complete we rebind the closure to
+        // `[weak self]` querying `ptySessions.values`, so newly-
+        // spawned sessions auto-join the receiver list each fan-out
+        // call without any add/remove notification.
+        self.themeCache = SessionThemeCache()
+        self.themeCache.receivers = { [weak self] in
+            guard let self else { return [] }
+            return Array(self.ptySessions.values)
+        }
     }
 
-    // MARK: - Theme cache mutators
+    // MARK: - Theme cache forwarders
 
-    /// Set the currently-chosen terminal scheme/palette/accent. Used
-    /// both for the initial seed (before any spawn) and for live fan-out
-    /// once sessions exist.
+    /// Forward to `themeCache.updateScheme`. Production callers
+    /// (`AppState.init`, `AppShellHost`) drive the theme through
+    /// `appState.sessions.updateScheme(...)` — the forwarder keeps
+    /// that surface stable now that the cache lives on a peer type.
     func updateScheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
-        currentScheme = scheme
-        currentPalette = palette
-        currentAccent = accent
-        for session in ptySessions.values {
-            session.applyTheme(scheme, palette: palette, accent: accent)
-        }
-        for receiver in _testing_themeReceivers.values {
-            receiver.applyTheme(scheme, palette: palette, accent: accent)
-        }
+        themeCache.updateScheme(scheme, palette: palette, accent: accent)
     }
 
-    /// Fan a new terminal font size out to every live session. Called
-    /// by `AppShellHost` on launch and whenever `FontSettings.terminalFontSize`
-    /// changes (slider drag or Cmd+/-).
+    /// Forward to `themeCache.updateTerminalFontSize`.
     func updateTerminalFontSize(_ size: CGFloat) {
-        currentTerminalFontSize = size
-        for session in ptySessions.values {
-            session.applyTerminalFont(size: size)
-        }
-        for receiver in _testing_themeReceivers.values {
-            receiver.applyTerminalFont(size: size)
-        }
+        themeCache.updateTerminalFontSize(size)
     }
 
-    /// Fan out a terminal-theme change to every live session. Called by
-    /// `AppShellHost` when the user picks a new theme in Settings, when
-    /// the active scheme flips (sync-with-OS), or when an imported
-    /// theme is removed while selected.
+    /// Forward to `themeCache.updateTerminalTheme`.
     func updateTerminalTheme(_ theme: TerminalTheme) {
-        currentTerminalTheme = theme
-        for session in ptySessions.values {
-            session.applyTerminalTheme(theme)
-        }
-        for receiver in _testing_themeReceivers.values {
-            receiver.applyTerminalTheme(theme)
-        }
+        themeCache.updateTerminalTheme(theme)
     }
 
-    /// Fan out a terminal-font-family change. `nil` resets to the
-    /// default chain defined in `TabPtySession.terminalFont(named:size:)`.
+    /// Forward to `themeCache.updateTerminalFontFamily`.
     func updateTerminalFontFamily(_ name: String?) {
-        currentTerminalFontFamily = name
-        for session in ptySessions.values {
-            session.applyTerminalFontFamily(name)
-        }
-        for receiver in _testing_themeReceivers.values {
-            receiver.applyTerminalFontFamily(name)
-        }
-    }
-
-    // MARK: - Test-only cache readbacks
-
-    /// Read the cached scheme/palette/accent triple. Tests use this
-    /// to verify that `updateScheme` updated the source-of-truth that
-    /// future `makeSession` calls will read when seeding a new
-    /// `TabPtySession`.
-    var _testing_themeCache: (
-        scheme: ColorScheme, palette: Palette, accent: NSColor,
-        fontSize: CGFloat, theme: TerminalTheme, fontFamily: String?
-    ) {
-        (currentScheme, currentPalette, currentAccent,
-         currentTerminalFontSize, currentTerminalTheme,
-         currentTerminalFontFamily)
+        themeCache.updateTerminalFontFamily(name)
     }
 
     /// Update the resolved `claude` binary path. Called by AppState
@@ -888,15 +819,7 @@ final class SessionsModel {
                 self?.clearPaneLaunch(paneId: paneId)
             }
         )
-        session.applyTerminalFontFamily(currentTerminalFontFamily)
-        // applyTheme must run before applyTerminalTheme so the session
-        // has its current scheme / palette cached — the Nice Default
-        // (chrome-coupled) paths in applyTerminalTheme derive
-        // bg / fg from those values, and reading them stale paints
-        // the terminal with the wrong light/dark variant.
-        session.applyTheme(currentScheme, palette: currentPalette, accent: currentAccent)
-        session.applyTerminalTheme(currentTerminalTheme)
-        session.applyTerminalFont(size: currentTerminalFontSize)
+        themeCache.applyAll(to: session)
         ptySessions[tabId] = session
         return session
     }
