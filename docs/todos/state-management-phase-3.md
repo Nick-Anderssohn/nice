@@ -2,9 +2,9 @@
 
 Phase 1 (`@Observable`), Phase 2 (sub-model extraction + view rename),
 and the test-suite forwarder migration are all **done**. See
-[`state-management-handoff.md`](state-management-handoff.md) for the
+[`state-management-handoff.md`](../done/state-management-handoff.md) for the
 landed shape and
-[`state-management-test-migration.md`](state-management-test-migration.md)
+[`state-management-test-migration.md`](../done/state-management-test-migration.md)
 for what the follow-up rewrote.
 
 This file collects the optional follow-ups that two independent
