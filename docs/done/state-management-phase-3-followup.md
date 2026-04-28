@@ -1,14 +1,17 @@
 # State management — Phase 3 follow-up: fakes + remaining gaps
 
 **Status: done.** Item 8 landed (`SessionStorePersisting` protocol +
-`FakeSessionStore` + `FakeTabPtySession` + `_testing_themeReceivers`
-seam on `SessionsModel`). All four blocked must-add coverage gaps
-are now covered: `WindowSession.restoreSavedWindow`'s three
-branches, `WindowSession.scheduleSessionSave` save-gate,
-`WindowSession.tearDown`'s `claimedWindowIds` invariant, and
-`SessionsModel`'s four-method theme fan-out. Items 4 and 5 stay
-deferred per the spec's default — nothing in this round surfaced a
-reason to take them. 752 tests pass at HEAD (709 unit + 43 UI).
+`FakeSessionStore` + `FakeTabPtySession` + the test-only
+fan-out seam). All four blocked must-add coverage gaps are now
+covered: `WindowSession.restoreSavedWindow`'s three branches,
+`WindowSession.scheduleSessionSave` save-gate,
+`WindowSession.tearDown`'s `claimedWindowIds` invariant, and the
+four-method theme fan-out (now living on `SessionThemeCache`).
+Items 4 and 5 also landed — the theme split extracted
+`SessionThemeCache` from `SessionsModel` (which let the test seam
+collapse into the cache's natural surface) and
+`TerminalsSeedResult` was replaced with a `spawnHook:` callback.
+754 tests pass at HEAD (711 unit + 43 UI).
 
 ## Original brief (preserved for context)
 
@@ -28,6 +31,8 @@ Branch: `worktree-state-management`. Worktree:
 
 Recent commits at HEAD (closeout round on top of the brief baseline):
 
+- `a6b867a` — Phase 3 item 5: replace TerminalsSeedResult with a spawnHook callback
+- `c46952a` — Phase 3 item 4: extract SessionThemeCache from SessionsModel
 - `b7bca06` — Move state-management Phase 3 docs to docs/done/
 - `acd60d1` — Phase 3 follow-up: cover SessionsModel theme fan-out
 - `0faa4e6` — Phase 3 follow-up: cover WindowSession.tearDown invariants
@@ -42,8 +47,9 @@ Recent commits at HEAD (closeout round on top of the brief baseline):
 - `8b66f0d` — Phase 3 item 2: rename AppState*Tests files into sub-model test files
 - `c038214` — Phase 3 item 1: drop the last two AppState forwarders
 
-752 tests pass at HEAD (709 unit + 43 UI). Pre-closeout baseline
-was 730.
+754 tests pass at HEAD (711 unit + 43 UI). Items 4 and 5 (the
+previously-deferred theme split and `TerminalsSeedResult` removal)
+also landed; no remaining follow-ups from the Phase 3 spec.
 
 ## Goals
 
@@ -309,7 +315,7 @@ forwarders, every must-add coverage gap covered.
 
 ## Closeout (2026-04-28)
 
-Landed:
+Landed in this round:
 
 - `SessionStorePersisting` protocol on `SessionStore`. `WindowSession`
   reads through `store: SessionStorePersisting`, defaulting to
@@ -323,22 +329,30 @@ Landed:
 - `WindowSession._testing_resetClaimedWindowIds()` and
   `_testing_isClaimed(_:)` test seams. Internal-only via
   `@testable import Nice`.
-- `SessionsModel._testing_themeReceivers` (test-only fan-out
-  collection that the four `updateX` methods walk alongside
-  `ptySessions`) and `_testing_themeCache` readback for cache-state
-  verification.
-- Four new test files:
+- Four new test files for the must-add coverage gaps:
   `WindowSessionRestoreTests.swift` (6),
   `WindowSessionSaveGateTests.swift` (4),
   `WindowSessionTearDownTests.swift` (4),
-  `SessionsModelThemeFanOutTests.swift` (9).
+  `SessionThemeCacheTests.swift` (11 — formerly
+  `SessionsModelThemeFanOutTests.swift`, rewritten against the
+  extracted cache below).
+- `SessionThemeCache` (item 4): the six cached fields and four
+  `updateX` fan-out methods now live on a peer class.
+  `SessionsModel` keeps thin forwarders. `makeSession`'s four-line
+  apply block becomes a single `themeCache.applyAll(to:)`. The
+  cache walks `ptySessions.values` via the closure passed at init,
+  so newly-spawned sessions auto-join the receiver list. Tests now
+  drive the cache directly with a controllable receivers array;
+  the test-only `_testing_themeReceivers` /
+  `_testing_themeCache` plumbing on `SessionsModel` was dropped
+  because the cache itself is now the unit under test.
+- `spawnHook:` callback on `TabModel.ensureTerminalsProjectSeeded`
+  (item 5). Drops the `TerminalsSeedResult` enum that existed
+  solely to thread an action through a result; the single caller
+  (`WindowSession.ensureTerminalsProjectSeededAndSpawn`) becomes a
+  one-liner.
 
-Unit suite grew 687 → 709 (+22, three Restore tests share helpers
-that don't double-count). UI suite stays at 43. Full suite green.
+Unit suite grew 687 → 711 (+24). UI suite stays at 43. Full suite
+green at every commit.
 
-Items 4 and 5 stay deferred. Item 4's "split SessionsModel theming"
-would entail moving the just-landed `_testing_themeReceivers` /
-`_testing_themeCache` plumbing into the new peer; net wash for the
-pure refactor. Item 5 ("replace `TerminalsSeedResult`") is
-truly mechanical but didn't come up while writing the must-add
-tests. Both can land in a future round if motivation appears.
+No remaining follow-ups from the Phase 3 spec.

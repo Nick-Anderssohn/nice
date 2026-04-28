@@ -208,12 +208,29 @@ Suite: 752 tests (709 unit + 43 UI), all green. AppState weighs
 the test-suite forwarder migration, and every must-add coverage gap
 are all closed.
 
-Items 4 and 5 from the Phase 3 spec (split `SessionsModel` theming;
-replace `TerminalsSeedResult` with a `spawnHook:` callback) stay
-deferred. Both are nice-to-haves with clear, low-risk specs in
-[`state-management-phase-3.md`](state-management-phase-3.md) — pick
-them up if and when the cohesion or indirection costs they describe
-start mattering.
+Items 4 and 5 from the Phase 3 spec also landed in a follow-on
+round:
+
+- Item 4: extracted `SessionThemeCache` from `SessionsModel`. The
+  six cached fields and four `updateX` fan-out methods now live on
+  the peer cache; `SessionsModel` keeps thin forwarders so
+  production callers' `appState.sessions.updateScheme(...)` surface
+  is unchanged. `makeSession`'s four-line apply block becomes a
+  single `themeCache.applyAll(to:)`. Migrated the fan-out tests to
+  `SessionThemeCacheTests`, driving the cache directly with a
+  controllable receivers list — dropped the test-only
+  `_testing_themeReceivers` / `_testing_themeCache` plumbing that
+  existed because the cache used to be a SessionsModel
+  implementation detail.
+- Item 5: replaced `TabModel.TerminalsSeedResult` with a
+  `spawnHook: (Tab) -> Void` callback parameter on
+  `ensureTerminalsProjectSeeded`. Single caller
+  (`WindowSession.ensureTerminalsProjectSeededAndSpawn`) becomes a
+  one-liner; the enum that existed solely to thread an action
+  through a result is gone.
+
+Final suite: 754 tests (711 unit + 43 UI), all green. No remaining
+follow-ups from the Phase 3 spec.
 
 ## Follow-up work
 
