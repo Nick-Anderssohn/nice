@@ -21,7 +21,9 @@ Recent commits on top of `main`:
 - `c595e88` — Phase 2 step 3: Extract SidebarModel
 - `27949c1` — Phase 2 step 5: Extract CloseRequestCoordinator
 - `4e2f94b` — Phase 2 step 4: Extract WindowSession
-- _step 6_ — Phase 2 step 6: View-side rename pass
+- `47c306f` — Phase 2 step 6: View-side rename pass
+- `75faeea` — Phase 2 follow-up: migrate test surface to sub-model calls
+- `a498c04` — Phase 2 follow-up: drop test-only AppState forwarders
 
 707 tests pass (664 unit + 43 UI) at every commit.
 
@@ -40,7 +42,7 @@ remains the authoritative outline.
 | `SidebarModel.swift` | 61 | `sidebarCollapsed`, `sidebarMode`, `sidebarPeeking` + 3 toggle methods |
 | `CloseRequestCoordinator.swift` | 286 | `pendingCloseRequest`, `projectsPendingRemoval`, `requestClose×3`/`confirm`/`cancel`, `isBusy`, `hardKill×3` |
 | `WindowSession.swift` | 426 | `windowSessionId`, `persistenceEnabled`, `isInitializing`, static `claimedWindowIds`, `scheduleSessionSave`, `snapshotPersistedWindow`, `restoreSavedWindow`, `ensureTerminalsProjectSeededAndSpawn`, `addRestoredTabModel`, persistence-half `tearDown` |
-| `AppState.swift` | 721 | Composition root: holds the five sub-models, wires their callbacks, owns `fileBrowserStore` and the `toggleFileBrowserHiddenFiles` orchestration that spans sidebar+store, has the `start()`/`tearDown()` choreography, runs `finalizeDissolvedTab`, retains a thin set of test-only forwarders for the unit suite |
+| `AppState.swift` | 300 | Composition root: holds the five sub-models, wires their callbacks, owns `fileBrowserStore` and the `toggleFileBrowserHiddenFiles` orchestration that spans sidebar+store, has the `start()`/`tearDown()` choreography, runs `finalizeDissolvedTab`, exposes read-only `windowSessionId` / `livePaneCounts` forwarders for `WindowRegistry` and `AppDelegate` |
 
 After step 6, views read sub-models directly:
 - `AppShellView` injects `tabs`, `sessions`, `sidebar`, `closer`, and
@@ -57,10 +59,14 @@ After step 6, views read sub-models directly:
 - `KeyboardShortcutMonitor` and `FileOperationHistory` route through
   `appState.<sub-model>` paths instead of the AppState forwarders.
 
-The remaining `AppState` forwarders are documented as test-only and
-pass straight through to a sub-model. A future cleanup PR can
-migrate the unit suite to call sub-models directly and delete those
-forwarders entirely.
+The transitional test-only forwarders have been deleted in the
+follow-up commit. Tests now call `appState.tabs.X`,
+`appState.sessions.X`, etc., directly. The only AppState members
+that survive are the composition-root concerns (lifecycle, dissolve
+cascade, `toggleFileBrowserHiddenFiles`) plus the read-only
+`windowSessionId` / `livePaneCounts` forwarders external callers
+need. See [`state-management-test-migration.md`](state-management-test-migration.md)
+for the migration table.
 
 ## Callback wiring conventions
 

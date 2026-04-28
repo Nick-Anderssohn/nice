@@ -1,15 +1,12 @@
 # State management — test-suite forwarder migration
 
 Phase 2 of the state-management refactor (the AppState decomposition
-+ view-side rename pass) is **done**. This file is the working spec
-for the one remaining housekeeping item: migrating `Tests/NiceUnitTests/`
-off the `appState.X` forwarders that AppState only keeps alive for
-the test suite, and then deleting those forwarders.
++ view-side rename pass) and the test-suite migration follow-up are
+both **done**. This file documents the migration that landed; the
+acceptance criteria below are all checked.
 
-The previous phase's diary is in
-[`state-management-handoff.md`](state-management-handoff.md). Read
-that *first* for the architectural shape; this file assumes you
-already understand it.
+The architectural shape is in
+[`state-management-handoff.md`](state-management-handoff.md).
 
 ## Status
 
@@ -19,10 +16,11 @@ Most recent commits:
 
 - `47c306f` — Phase 2 step 6: View-side rename pass
 - `0a88f9b` — Update Phase 2 handoff after step 6
+- `75faeea` — Phase 2 follow-up: migrate test surface to sub-model calls
+- `a498c04` — Phase 2 follow-up: drop test-only AppState forwarders
 
-707 tests pass (664 unit + 43 UI) at every commit. After this
-follow-up they should still pass — no test-coverage changes here,
-just a mechanical call-site rewrite.
+707 tests pass (664 unit + 43 UI) at every commit. The follow-up was
+a mechanical call-site rewrite — no test-coverage changes.
 
 ## What this PR does
 
@@ -115,9 +113,12 @@ Static rewrites (search the test suite for these too):
 | `AppState.extractWorktreeName(from:)` | `TabModel.extractWorktreeName(from:)` |
 
 A handful of tests use a different variable name (`state` instead of
-`appState`). Search both. As of writing, only
-`AppStateFileOperationsTests.swift` uses `state.windowSessionId` /
-`state.activeTabId` (3 hits).
+`appState`). The actual migration also caught `stateA.X` in
+`CrossWindowUndoTests.swift` (6 hits) — the initial grep scope had
+missed it. `AppStateFileOperationsTests.swift` had `state.activeTabId`
+/ `state.windowSessionId` (3 hits); the former migrated to
+`state.tabs.activeTabId`, the latter is a kept read-only forwarder
+and stays as-is.
 
 ## Working plan
 
@@ -158,16 +159,15 @@ scripts/worktree-lock.sh release
 
 Acceptance:
 
-- [ ] No `appState.X` accessor in `Tests/NiceUnitTests/` resolves to
+- [x] No `appState.X` accessor in `Tests/NiceUnitTests/` resolves to
       a forwarder marked **rewrite to sub-model** in the table above.
-      Spot-check: `grep -rE "appState\.(activeTabId|projects|sidebarMode|sidebarCollapsed|pendingCloseRequest|ptySessions|paneLaunchStates|tab\()" Tests/` should be empty.
-- [ ] No `AppState.terminalsProjectId` / `AppState.mainTerminalTabId`
+      Spot-check: `grep -rE "appState\.(activeTabId|projects|sidebarMode|sidebarCollapsed|pendingCloseRequest|ptySessions|paneLaunchStates|tab\()" Tests/` is empty.
+- [x] No `AppState.terminalsProjectId` / `AppState.mainTerminalTabId`
       / `AppState.extractWorktreeName` in tests.
-- [ ] `AppState.swift` ≤ 300 lines.
-- [ ] `scripts/test.sh` green (664 unit + 43 UI = 707).
-- [ ] No view file regressed onto `appState.X` for any of the
-      removed forwarders (compile would catch this — but eyeball
-      `Sources/Nice/Views/` once anyway).
+- [x] `AppState.swift` ≤ 300 lines (now exactly 300).
+- [x] `scripts/test.sh` green (664 unit + 43 UI = 707).
+- [x] No view file regressed onto `appState.X` for any of the
+      removed forwarders — verified by full-suite compile + UI tests.
 
 ## Subtleties to watch
 
