@@ -165,17 +165,29 @@ private struct AppShellHost: View {
                 .animation(.easeInOut(duration: 0.18), value: services.fileExplorer.history.lastDriftMessage)
         }
         .environment(\.palette, palette)
+        // Each sub-model is injected separately so views downstream
+        // can declare exactly which slice they observe (e.g.
+        // `WindowToolbarView` reads only `TabModel` + `SessionsModel`).
+        // AppState itself stays in the environment for the genuinely
+        // cross-cutting hooks: `start()` / `tearDown()` choreography,
+        // `fileBrowserStore` lifecycle, and the `AppState+FileExplorer`
+        // file-operation surface that spans tabs and persistence.
+        .environment(appState.tabs)
+        .environment(appState.sessions)
+        .environment(appState.sidebar)
+        .environment(appState.closer)
+        .environment(appState.windowSession)
         .environment(appState)
         .alert(
             "Processes are still running",
             isPresented: Binding(
-                get: { appState.pendingCloseRequest != nil },
-                set: { if !$0 { appState.cancelPendingClose() } }
+                get: { appState.closer.pendingCloseRequest != nil },
+                set: { if !$0 { appState.closer.cancelPendingClose() } }
             ),
-            presenting: appState.pendingCloseRequest
+            presenting: appState.closer.pendingCloseRequest
         ) { _ in
-            Button("Cancel", role: .cancel) { appState.cancelPendingClose() }
-            Button("Force quit", role: .destructive) { appState.confirmPendingClose() }
+            Button("Cancel", role: .cancel) { appState.closer.cancelPendingClose() }
+            Button("Force quit", role: .destructive) { appState.closer.confirmPendingClose() }
         } message: { request in
             Text(pendingCloseMessage(request))
         }
@@ -190,78 +202,78 @@ private struct AppShellHost: View {
             appState.start()
         }
         .onAppear {
-            // Brand-new scene: write the id AppState minted back
+            // Brand-new scene: write the id WindowSession minted back
             // into SceneStorage so this window restores the same
             // slot on relaunch.
             if windowSessionIdBinding.isEmpty {
-                windowSessionIdBinding = appState.windowSessionId
+                windowSessionIdBinding = appState.windowSession.windowSessionId
             }
-            appState.updateTerminalFontFamily(tweaks.terminalFontFamily)
+            appState.sessions.updateTerminalFontFamily(tweaks.terminalFontFamily)
             // updateScheme before updateTerminalTheme — see
-            // `AppState.makeSession` for why ordering matters (the
-            // chrome-coupled Nice Defaults read the session's cached
-            // scheme, so it must be current before their bg / fg
-            // derivation runs).
-            appState.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
-            appState.updateTerminalTheme(
+            // `SessionsModel.makeSession` for why ordering matters
+            // (the chrome-coupled Nice Defaults read the session's
+            // cached scheme, so it must be current before their
+            // bg / fg derivation runs).
+            appState.sessions.updateScheme(scheme, palette: palette, accent: tweaks.accent.nsColor)
+            appState.sessions.updateTerminalTheme(
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
-            appState.updateTerminalFontSize(fontSettings.terminalFontSize)
+            appState.sessions.updateTerminalFontSize(fontSettings.terminalFontSize)
         }
         .onChange(of: scheme) { _, newScheme in
-            appState.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
-            appState.updateTerminalTheme(
+            appState.sessions.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
+            appState.sessions.updateTerminalTheme(
                 tweaks.effectiveTerminalTheme(for: newScheme, catalog: services.terminalThemeCatalog)
             )
         }
         .onChange(of: palette) { _, newPalette in
-            appState.updateScheme(scheme, palette: newPalette, accent: tweaks.accent.nsColor)
+            appState.sessions.updateScheme(scheme, palette: newPalette, accent: tweaks.accent.nsColor)
         }
         .onChange(of: tweaks.accent) { _, newAccent in
-            appState.updateScheme(scheme, palette: palette, accent: newAccent.nsColor)
+            appState.sessions.updateScheme(scheme, palette: palette, accent: newAccent.nsColor)
         }
         .onChange(of: fontSettings.terminalFontSize) { _, newSize in
-            appState.updateTerminalFontSize(newSize)
+            appState.sessions.updateTerminalFontSize(newSize)
         }
         .onChange(of: tweaks.terminalThemeLightId) { _, _ in
             // Only applies if the active scheme is light — otherwise the
             // dark slot is active and this change is latent until the
             // next scheme flip.
             guard scheme == .light else { return }
-            appState.updateTerminalTheme(
+            appState.sessions.updateTerminalTheme(
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
         }
         .onChange(of: tweaks.terminalThemeDarkId) { _, _ in
             guard scheme == .dark else { return }
-            appState.updateTerminalTheme(
+            appState.sessions.updateTerminalTheme(
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
         }
         .onChange(of: tweaks.terminalFontFamily) { _, newValue in
-            appState.updateTerminalFontFamily(newValue)
+            appState.sessions.updateTerminalFontFamily(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar state across relaunch. Also clear any
         // in-flight peek state when the sidebar is explicitly
         // expanded (via ⌘B or the chevron) so we don't carry a stale
         // peek flag into the expanded shell.
-        .onChange(of: appState.sidebarCollapsed) { _, new in
+        .onChange(of: appState.sidebar.sidebarCollapsed) { _, new in
             sidebarCollapsedBinding = new
             if !new {
-                appState.sidebarPeeking = false
+                appState.sidebar.sidebarPeeking = false
                 peekMousePinned = false
             }
         }
-        // Mirror AppState's sidebarMode back to scene storage so each
-        // window restores its last-used mode across relaunch.
-        .onChange(of: appState.sidebarMode) { _, new in
+        // Mirror SidebarModel.sidebarMode back to scene storage so
+        // each window restores its last-used mode across relaunch.
+        .onChange(of: appState.sidebar.sidebarMode) { _, new in
             sidebarModeBinding = new
         }
-        // Mirror AppState's windowSessionId back to scene storage —
+        // Mirror WindowSession.windowSessionId back to scene storage —
         // restore may have adopted a different slot (e.g. bootstrap)
         // and the pairing must survive relaunch.
-        .onChange(of: appState.windowSessionId) { _, new in
+        .onChange(of: appState.windowSession.windowSessionId) { _, new in
             if new != windowSessionIdBinding {
                 windowSessionIdBinding = new
             }
@@ -272,7 +284,7 @@ private struct AppShellHost: View {
 
     @ViewBuilder
     private var shell: some View {
-        if appState.sidebarCollapsed {
+        if appState.sidebar.sidebarCollapsed {
             collapsedShell
         } else {
             expandedShell
@@ -336,25 +348,25 @@ private struct AppShellHost: View {
                                 systemImage: "list.bullet",
                                 help: "Show tabs",
                                 accessibilityId: "sidebar.mode.tabs",
-                                active: appState.sidebarMode == .tabs,
+                                active: appState.sidebar.sidebarMode == .tabs,
                                 accent: tweaks.accent.color
                             ) {
-                                appState.sidebarMode = .tabs
+                                appState.sidebar.sidebarMode = .tabs
                             }
                             SidebarModeIconButton(
                                 systemImage: "folder",
                                 help: "Show files",
                                 accessibilityId: "sidebar.mode.files",
-                                active: appState.sidebarMode == .files,
+                                active: appState.sidebar.sidebarMode == .files,
                                 accent: tweaks.accent.color
                             ) {
-                                appState.sidebarMode = .files
+                                appState.sidebar.sidebarMode = .files
                             }
                             SidebarToggleButton(
                                 help: "Collapse sidebar",
                                 accessibilityId: "sidebar.collapse"
                             ) {
-                                appState.toggleSidebar()
+                                appState.sidebar.toggleSidebar()
                             }
                         }
                         .padding(.top, 8)
@@ -448,7 +460,7 @@ private struct AppShellHost: View {
             mainContent
         }
         .overlay(alignment: .topLeading) {
-            if appState.sidebarPeeking || peekMousePinned {
+            if appState.sidebar.sidebarPeeking || peekMousePinned {
                 floatingSidebarCard()
                     .onHover { hovering in
                         peekMousePinned = hovering
@@ -461,7 +473,7 @@ private struct AppShellHost: View {
                     .zIndex(2)
             }
         }
-        .animation(.easeOut(duration: 0.15), value: appState.sidebarPeeking)
+        .animation(.easeOut(duration: 0.15), value: appState.sidebar.sidebarPeeking)
         .animation(.easeOut(duration: 0.15), value: peekMousePinned)
     }
 
@@ -484,7 +496,7 @@ private struct AppShellHost: View {
                     help: "Expand sidebar",
                     accessibilityId: "sidebar.expand"
                 ) {
-                    appState.toggleSidebar()
+                    appState.sidebar.toggleSidebar()
                 }
                 WindowDragRegion()
             }
@@ -565,16 +577,16 @@ private struct AppShellHost: View {
         // so the terminal text has the same breathing room from the sidebar
         // card that the tab strip gets from the window's right edge.
         // Worth a visual refinement pass if it looks off against Xcode.
-        if let tabId = appState.activeTabId,
-           let tab = appState.tab(for: tabId),
+        if let tabId = appState.tabs.activeTabId,
+           let tab = appState.tabs.tab(for: tabId),
            let paneId = tab.activePaneId,
-           let session = appState.ptySessions[tabId],
+           let session = appState.sessions.ptySessions[tabId],
            let view = session.panes[paneId] {
             let pane = tab.panes.first(where: { $0.id == paneId })
             ZStack {
                 TerminalHost(view: view, focus: true)
                     .id(paneId)
-                if case .visible(let command)? = appState.paneLaunchStates[paneId] {
+                if case .visible(let command)? = appState.sessions.paneLaunchStates[paneId] {
                     LaunchingOverlay(
                         title: pane?.kind == .terminal
                             ? "Launching terminal…"
@@ -584,7 +596,7 @@ private struct AppShellHost: View {
                     .transition(.opacity)
                 }
             }
-            .animation(.easeOut(duration: 0.12), value: appState.paneLaunchStates[paneId])
+            .animation(.easeOut(duration: 0.12), value: appState.sessions.paneLaunchStates[paneId])
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.top, 12)
             .padding(.leading, 20)

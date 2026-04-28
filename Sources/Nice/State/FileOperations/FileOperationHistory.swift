@@ -169,9 +169,9 @@ final class FileOperationHistory {
         // and selecting the originating tab. The tab's file browser
         // re-reads its directory via its kqueue watcher, so the
         // restored / removed entry shows up without extra plumbing.
-        appState.sidebarMode = .files
+        appState.sidebar.sidebarMode = .files
         if let tabId = origin.tabId {
-            appState.selectTab(tabId)
+            appState.tabs.selectTab(tabId)
         }
         return .routed
     }

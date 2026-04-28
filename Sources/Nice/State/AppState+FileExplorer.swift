@@ -51,8 +51,8 @@ extension AppState: FileExplorerActions {
 
         let dest = Self.resolvePasteDestination(target: target)
         let origin = FileOperationOrigin(
-            windowSessionId: windowSessionId,
-            tabId: originatingTabId ?? activeTabId
+            windowSessionId: windowSession.windowSessionId,
+            tabId: originatingTabId ?? tabs.activeTabId
         )
 
         do {
@@ -112,8 +112,8 @@ extension AppState: FileExplorerActions {
         guard let fileExplorer else { return }
         guard !urls.isEmpty else { return }
         let origin = FileOperationOrigin(
-            windowSessionId: windowSessionId,
-            tabId: originatingTabId ?? activeTabId
+            windowSessionId: windowSession.windowSessionId,
+            tabId: originatingTabId ?? tabs.activeTabId
         )
 
         do {
@@ -145,8 +145,8 @@ extension AppState: FileExplorerActions {
         guard let fileExplorer else { return }
         let urls = paths.map { URL(fileURLWithPath: $0) }
         let origin = FileOperationOrigin(
-            windowSessionId: windowSessionId,
-            tabId: originatingTabId ?? activeTabId
+            windowSessionId: windowSession.windowSessionId,
+            tabId: originatingTabId ?? tabs.activeTabId
         )
 
         do {
@@ -268,21 +268,21 @@ extension AppState: FileExplorerActions {
         guard let editor else { return }
 
         guard let tabId = Self.resolveTargetTab(
-            activeTabId: activeTabId,
-            hasTab: { self.tab(for: $0) != nil },
-            firstAvailable: { self.firstAvailableTabId() }
+            activeTabId: tabs.activeTabId,
+            hasTab: { self.tabs.tab(for: $0) != nil },
+            firstAvailable: { self.tabs.firstAvailableTabId() }
         ) else { return }
 
         let spec = Self.editorPaneSpec(editor: editor, url: url)
-        addPane(
+        sessions.addPane(
             tabId: tabId,
             kind: .terminal,
             cwd: spec.cwd,
             title: spec.title,
             command: spec.command
         )
-        if activeTabId != tabId {
-            activeTabId = tabId
+        if tabs.activeTabId != tabId {
+            tabs.activeTabId = tabId
         }
     }
 

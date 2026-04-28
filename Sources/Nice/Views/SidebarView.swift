@@ -4,7 +4,7 @@
 //
 //  The expanded 240pt sidebar column. The collapsed state is handled
 //  upstream in `AppShellView` as a small top-bar cap, so this view
-//  is only instantiated when `appState.sidebarCollapsed == false`.
+//  is only instantiated when `sidebar.sidebarCollapsed == false`.
 //
 //  The column background is owned upstream by `AppShellView` via
 //  `SidebarBackground` (flat panel for `.nice`, wallpaper-tinted
@@ -17,7 +17,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SidebarView: View {
-    @Environment(AppState.self) private var appState
+    @Environment(TabModel.self) private var tabs
+    @Environment(SidebarModel.self) private var sidebar
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
@@ -36,14 +37,14 @@ struct SidebarView: View {
         // tab-cycling shortcut means the user is picking a tab, so
         // even if `sidebarMode == .files` we surface the project list
         // here. The non-peek expanded sidebar respects sidebarMode.
-        if appState.sidebarPeeking {
+        if sidebar.sidebarPeeking {
             VStack(spacing: 0) {
                 tabList
                 footer
             }
         } else {
             VStack(spacing: 0) {
-                switch appState.sidebarMode {
+                switch sidebar.sidebarMode {
                 case .tabs:  tabList
                 case .files: FileBrowserView()
                 }
@@ -57,7 +58,7 @@ struct SidebarView: View {
     private var tabList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(appState.projects) { project in
+                ForEach(tabs.projects) { project in
                     ProjectGroup(project: project)
                 }
             }
@@ -92,7 +93,9 @@ struct SidebarView: View {
 // MARK: - Project group
 
 private struct ProjectGroup: View {
-    @Environment(AppState.self) private var appState
+    @Environment(TabModel.self) private var tabs
+    @Environment(SessionsModel.self) private var sessions
+    @Environment(CloseRequestCoordinator.self) private var closer
     @Environment(Tweaks.self) private var tweaks
     @Environment(FontSettings.self) private var fontSettings
     @Environment(SidebarDragState.self) private var dragState
@@ -109,7 +112,7 @@ private struct ProjectGroup: View {
     @State private var tabFrames: [String: CGRect] = [:]
 
     private var isTerminalsGroup: Bool {
-        project.id == AppState.terminalsProjectId
+        project.id == TabModel.terminalsProjectId
     }
 
     /// Always show the `+` for the Terminals group (so the user can
@@ -175,7 +178,7 @@ private struct ProjectGroup: View {
                 project: project,
                 tabFramesProvider: { tabFrames },
                 tabOrderProvider: { project.tabs.map(\.id) },
-                appState: appState,
+                tabs: tabs,
                 dragState: dragState
             )
         )
@@ -208,9 +211,9 @@ private struct ProjectGroup: View {
                 help: isTerminalsGroup ? "New terminal tab" : "New Claude tab"
             ) {
                 if isTerminalsGroup {
-                    _ = appState.createTerminalTab()
+                    _ = sessions.createTerminalTab()
                 } else {
-                    _ = appState.createClaudeTabInProject(projectId: project.id)
+                    _ = sessions.createClaudeTabInProject(projectId: project.id)
                 }
             }
             .opacity(showAddButton ? 1 : 0)
@@ -225,7 +228,7 @@ private struct ProjectGroup: View {
         .contextMenu {
             if !isTerminalsGroup {
                 Button("Close Project") {
-                    appState.requestCloseProject(projectId: project.id)
+                    closer.requestCloseProject(projectId: project.id)
                 }
                 .accessibilityIdentifier("sidebar.group.\(project.id).closeProject")
             }
@@ -303,7 +306,9 @@ private struct AddTabButton: View {
 // MARK: - Tab row
 
 private struct TabRow: View {
-    @Environment(AppState.self) private var appState
+    @Environment(TabModel.self) private var tabs
+    @Environment(SessionsModel.self) private var sessions
+    @Environment(CloseRequestCoordinator.self) private var closer
     @Environment(Tweaks.self) private var tweaks
     @Environment(FontSettings.self) private var fontSettings
     @Environment(SidebarDragState.self) private var dragState
@@ -330,7 +335,7 @@ private struct TabRow: View {
     @State private var fieldFrameInWindow: NSRect = .zero
     @State private var fieldWindowNumber: Int = 0
 
-    private var isActive: Bool { tab.id == appState.activeTabId }
+    private var isActive: Bool { tab.id == tabs.activeTabId }
 
     /// True if this row was activated long enough ago for a subsequent
     /// tap on the title to count as a deliberate rename request.
@@ -361,8 +366,8 @@ private struct TabRow: View {
         isEditing = false
         titleFocused = false
         removeMouseMonitor()
-        appState.renameTab(id: tab.id, to: draftTitle)
-        appState.focusActiveTerminal()
+        tabs.renameTab(id: tab.id, to: draftTitle)
+        sessions.focusActiveTerminal()
     }
 
     private func cancelEdit() {
@@ -370,7 +375,7 @@ private struct TabRow: View {
         isEditing = false
         titleFocused = false
         removeMouseMonitor()
-        appState.focusActiveTerminal()
+        sessions.focusActiveTerminal()
     }
 
     private func installMouseMonitor() {
@@ -431,17 +436,17 @@ private struct TabRow: View {
         .onHover { hover = $0 }
         .onTapGesture {
             if !isEditing {
-                appState.selectTab(tab.id)
+                tabs.selectTab(tab.id)
             }
         }
         .contextMenu {
             Button("Rename Tab") {
-                appState.selectTab(tab.id)
+                tabs.selectTab(tab.id)
                 beginEditing()
             }
             .accessibilityIdentifier("sidebar.tab.\(tab.id).renameTab")
             Button("Close Tab") {
-                appState.requestCloseTab(tabId: tab.id)
+                closer.requestCloseTab(tabId: tab.id)
             }
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
         }
@@ -472,7 +477,7 @@ private struct TabRow: View {
     /// terminals row continue to locate it. All other tabs use the
     /// standard `sidebar.tab.<id>` form.
     private var accessibilityIdentifier: String {
-        if tab.id == AppState.mainTerminalTabId {
+        if tab.id == TabModel.mainTerminalTabId {
             return "sidebar.terminals"
         }
         return "sidebar.tab.\(tab.id)"
@@ -523,7 +528,7 @@ private struct TabRow: View {
                     if isActive {
                         if renameAllowed { beginEditing() }
                     } else {
-                        appState.selectTab(tab.id)
+                        tabs.selectTab(tab.id)
                     }
                 }
                 .accessibilityIdentifier("sidebar.tab.\(tab.id).title")
@@ -594,15 +599,15 @@ final class SidebarDragState {
 ///
 /// Slot-picking lives in `SidebarDropResolver` so it stays
 /// unit-testable without a live drag session. Commits the resulting
-/// `moveTab` on the next runloop tick: rearranging
-/// `appState.projects` inline from `performDrop` has been observed
-/// to leave AppKit's drag tracking stuck on the old view hierarchy,
-/// which manifests as subsequent drags not registering.
+/// `moveTab` on the next runloop tick: rearranging `tabs.projects`
+/// inline from `performDrop` has been observed to leave AppKit's
+/// drag tracking stuck on the old view hierarchy, which manifests
+/// as subsequent drags not registering.
 private struct ProjectGroupDropDelegate: DropDelegate {
     let project: Project
     let tabFramesProvider: () -> [String: CGRect]
     let tabOrderProvider: () -> [String]
-    let appState: AppState
+    let tabs: TabModel
     let dragState: SidebarDragState
 
     func validateDrop(info: DropInfo) -> Bool {
@@ -635,10 +640,10 @@ private struct ProjectGroupDropDelegate: DropDelegate {
         guard let outcome else { return false }
         // Defer the model mutation to the next runloop tick — see the
         // type-level doc for `ProjectGroupDropDelegate` on why
-        // rearranging `appState.projects` inline here leaves AppKit's
+        // rearranging `tabs.projects` inline here leaves AppKit's
         // drag tracker stuck on a subsequent drag.
-        DispatchQueue.main.async {
-            appState.moveTab(
+        DispatchQueue.main.async { [tabs] in
+            tabs.moveTab(
                 outcome.draggedId,
                 relativeTo: outcome.targetId,
                 placeAfter: outcome.placeAfter
@@ -673,7 +678,7 @@ private struct ProjectGroupDropDelegate: DropDelegate {
             location: info.location,
             tabOrder: tabOrderProvider(),
             tabFrames: tabFramesProvider(),
-            wouldMoveTab: appState.wouldMoveTab
+            wouldMoveTab: tabs.wouldMoveTab
         )
     }
 }
@@ -778,8 +783,14 @@ private struct SidebarIconButton: View {
 }
 
 #Preview("Sidebar") {
-    SidebarView()
-        .environment(AppState())
+    let appState = AppState()
+    return SidebarView()
+        .environment(appState)
+        .environment(appState.tabs)
+        .environment(appState.sessions)
+        .environment(appState.sidebar)
+        .environment(appState.closer)
+        .environment(appState.windowSession)
         .environment(Tweaks())
         .environment(FontSettings())
         .environment(FileBrowserSortSettings())

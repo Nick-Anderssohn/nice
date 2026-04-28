@@ -142,8 +142,8 @@ enum KeyboardShortcutMonitor {
         // tab they're cycling toward. The peek dismisses on modifier
         // release (see flagsChanged monitor in `install`).
         if (action == .nextSidebarTab || action == .prevSidebarTab),
-           appState.sidebarCollapsed {
-            appState.sidebarPeeking = true
+           appState.sidebar.sidebarCollapsed {
+            appState.sidebar.sidebarPeeking = true
         }
 
         return true
@@ -160,7 +160,7 @@ enum KeyboardShortcutMonitor {
     ) {
         guard let registry, let shortcuts else { return }
         guard let appState = registry.activeAppState(preferKey: true) else { return }
-        guard appState.sidebarPeeking else { return }
+        guard appState.sidebar.sidebarPeeking else { return }
 
         var relevant: NSEvent.ModifierFlags = []
         if let combo = shortcuts.binding(for: .nextSidebarTab) {
@@ -173,7 +173,7 @@ enum KeyboardShortcutMonitor {
         guard !relevant.isEmpty else {
             // Both sidebar-tab shortcuts are unbound; nothing can hold
             // the peek open, so close it.
-            appState.endSidebarPeek()
+            appState.sidebar.endSidebarPeek()
             return
         }
 
@@ -182,7 +182,7 @@ enum KeyboardShortcutMonitor {
             .intersection(relevant)
             .isEmpty
         if !stillHeld {
-            appState.endSidebarPeek()
+            appState.sidebar.endSidebarPeek()
         }
     }
 
@@ -231,13 +231,13 @@ enum KeyboardShortcutMonitor {
 
     private static func dispatch(_ action: ShortcutAction, on appState: AppState) {
         switch action {
-        case .nextSidebarTab:  appState.selectNextSidebarTab()
-        case .prevSidebarTab:  appState.selectPrevSidebarTab()
-        case .nextPane:        appState.selectNextPane()
-        case .prevPane:        appState.selectPrevPane()
-        case .newTerminalPane: appState.addTerminalToActiveTab()
-        case .toggleSidebar:   appState.toggleSidebar()
-        case .toggleSidebarMode: appState.toggleSidebarMode()
+        case .nextSidebarTab:  appState.tabs.selectNextSidebarTab()
+        case .prevSidebarTab:  appState.tabs.selectPrevSidebarTab()
+        case .nextPane:        appState.sessions.selectNextPane()
+        case .prevPane:        appState.sessions.selectPrevPane()
+        case .newTerminalPane: appState.sessions.addTerminalToActiveTab()
+        case .toggleSidebar:   appState.sidebar.toggleSidebar()
+        case .toggleSidebarMode: appState.sidebar.toggleSidebarMode()
         case .toggleHiddenFiles: appState.toggleFileBrowserHiddenFiles()
         case .increaseFontSize, .decreaseFontSize, .resetFontSizes:
             // Handled by dispatchFontAction before we reach here.

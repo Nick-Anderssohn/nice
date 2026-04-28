@@ -23,7 +23,6 @@ import AppKit
 import SwiftUI
 
 struct WindowToolbarView: View {
-    @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -110,7 +109,9 @@ private let panePillAnimationDuration: Double = 0.12
 ///     attention badge — from the per-pill frames the ScrollView does
 ///     emit for visible pills.
 private struct InlinePaneStrip: View {
-    @Environment(AppState.self) private var appState
+    @Environment(TabModel.self) private var tabs
+    @Environment(SessionsModel.self) private var sessions
+    @Environment(CloseRequestCoordinator.self) private var closer
     @Environment(\.colorScheme) private var scheme
 
     /// Tracks which pill (if any) the mouse is currently over, keyed by
@@ -139,8 +140,8 @@ private struct InlinePaneStrip: View {
     @State private var availableWidth: CGFloat = 0
 
     private var activeTab: Tab? {
-        guard let id = appState.activeTabId else { return nil }
-        return appState.tab(for: id)
+        guard let id = tabs.activeTabId else { return nil }
+        return tabs.tab(for: id)
     }
 
     private var geometry: PaneStripGeometry {
@@ -171,7 +172,7 @@ private struct InlinePaneStrip: View {
                             offscreenIds: geometry.offscreenPaneIds
                         ),
                         onSelect: { paneId in
-                            appState.setActivePane(
+                            sessions.setActivePane(
                                 tabId: tab.id,
                                 paneId: paneId
                             )
@@ -182,7 +183,7 @@ private struct InlinePaneStrip: View {
                 }
 
                 NewTabBtn {
-                    _ = appState.addPane(tabId: tab.id, kind: .terminal)
+                    _ = sessions.addPane(tabId: tab.id, kind: .terminal)
                 }
                 .padding(.leading, 4)
             } else {
@@ -242,13 +243,13 @@ private struct InlinePaneStrip: View {
                                 }
                             },
                             onSelect: {
-                                appState.setActivePane(
+                                sessions.setActivePane(
                                     tabId: tab.id,
                                     paneId: pane.id
                                 )
                             },
                             onClose: {
-                                appState.requestClosePane(
+                                closer.requestClosePane(
                                     tabId: tab.id,
                                     paneId: pane.id
                                 )
@@ -679,16 +680,24 @@ private struct NewTabBtn: View {
 // MARK: - Previews
 
 #Preview("Toolbar — light") {
-    WindowToolbarView()
-        .environment(AppState())
+    let appState = AppState()
+    return WindowToolbarView()
+        .environment(appState)
+        .environment(appState.tabs)
+        .environment(appState.sessions)
+        .environment(appState.closer)
         .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.light)
 }
 
 #Preview("Toolbar — dark") {
-    WindowToolbarView()
-        .environment(AppState())
+    let appState = AppState()
+    return WindowToolbarView()
+        .environment(appState)
+        .environment(appState.tabs)
+        .environment(appState.sessions)
+        .environment(appState.closer)
         .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.dark)

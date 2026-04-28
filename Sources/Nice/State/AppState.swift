@@ -138,18 +138,10 @@ final class AppState {
     /// pick up changes without `AppState` re-emitting.
     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
 
-    /// Forwarder for `sidebar.sidebarPeeking`.
-    var sidebarPeeking: Bool {
-        get { sidebar.sidebarPeeking }
-        set { sidebar.sidebarPeeking = newValue }
-    }
-
-    /// Forwarder onto `SidebarModel.toggleSidebar`.
-    func toggleSidebar() {
-        sidebar.toggleSidebar()
-    }
-
-    /// Forwarder onto `SidebarModel.toggleSidebarMode`.
+    /// Forwarder onto `SidebarModel.toggleSidebarMode`. Tests still
+    /// drive sidebar-mode flips through this surface; the keyboard
+    /// monitor goes through `appState.sidebar.toggleSidebarMode()`
+    /// directly.
     func toggleSidebarMode() {
         sidebar.toggleSidebarMode()
     }
@@ -159,26 +151,26 @@ final class AppState {
     /// the eye toggle in the file browser's breadcrumb. Mirrors
     /// Finder's standard ⌘⇧. shortcut.
     ///
-    /// Gated on `sidebarMode == .files` so pressing the shortcut
-    /// from tabs mode is a true no-op — no allocation, no published
-    /// change for a feature the user isn't looking at. The store's
-    /// `toggleHiddenFilesIfExists` further skips toggling for tabs
-    /// that have never opened the file browser.
+    /// Lives on AppState (not a sub-model) because it spans both
+    /// SidebarModel (the mode gate) and FileBrowserStore (the
+    /// per-tab toggle). Gated on `sidebarMode == .files` so
+    /// pressing the shortcut from tabs mode is a true no-op — no
+    /// allocation, no published change for a feature the user isn't
+    /// looking at. The store's `toggleHiddenFilesIfExists` further
+    /// skips toggling for tabs that have never opened the file
+    /// browser.
     func toggleFileBrowserHiddenFiles() {
-        guard sidebarMode == .files,
-              let tabId = activeTabId else { return }
+        guard sidebar.sidebarMode == .files,
+              let tabId = tabs.activeTabId else { return }
         fileBrowserStore.toggleHiddenFilesIfExists(forTab: tabId)
     }
 
     /// Title to show at the top of the file browser for `tabId`.
-    /// Forwarder onto `TabModel.fileBrowserHeaderTitle`.
+    /// Forwarder onto `TabModel.fileBrowserHeaderTitle`. Tests still
+    /// assert this surface; views read `tabs.fileBrowserHeaderTitle`
+    /// directly.
     func fileBrowserHeaderTitle(forTab id: String) -> String {
         tabs.fileBrowserHeaderTitle(forTab: id)
-    }
-
-    /// Forwarder onto `SidebarModel.endSidebarPeek`.
-    func endSidebarPeek() {
-        sidebar.endSidebarPeek()
     }
 
     // MARK: - Window-state plumbing
@@ -456,14 +448,9 @@ final class AppState {
 
     // MARK: - Selection
 
-    /// Forwarder so views and tests keep using `appState.selectTab(...)`.
-    /// The body lives on `TabModel`.
-    func selectTab(_ id: String) {
-        tabs.selectTab(id)
-    }
-
-    /// Pick which pane is focused in `tabId`. Forwarder onto
-    /// `SessionsModel.setActivePane`.
+    /// Forwarder onto `SessionsModel.setActivePane`. Tests use this
+    /// surface; views go through `sessions.setActivePane(...)`
+    /// directly.
     func setActivePane(tabId: String, paneId: String) {
         sessions.setActivePane(tabId: tabId, paneId: paneId)
     }
@@ -471,31 +458,10 @@ final class AppState {
     // MARK: - Tab creation
 
     /// Open a new tab rooted at `cwd`, running `claude` with any `args`
-    /// forwarded through. Forwarder onto `SessionsModel`.
+    /// forwarded through. Forwarder onto `SessionsModel`. Tests still
+    /// drive the `claude()` shadow handshake through this surface.
     func createTabFromMainTerminal(cwd: String, args: [String]) {
         sessions.createTabFromMainTerminal(cwd: cwd, args: args)
-    }
-
-    // MARK: - Theme
-
-    /// Forwarder onto `SessionsModel.updateScheme`.
-    func updateScheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
-        sessions.updateScheme(scheme, palette: palette, accent: accent)
-    }
-
-    /// Forwarder onto `SessionsModel.updateTerminalFontSize`.
-    func updateTerminalFontSize(_ size: CGFloat) {
-        sessions.updateTerminalFontSize(size)
-    }
-
-    /// Forwarder onto `SessionsModel.updateTerminalTheme`.
-    func updateTerminalTheme(_ theme: TerminalTheme) {
-        sessions.updateTerminalTheme(theme)
-    }
-
-    /// Forwarder onto `SessionsModel.updateTerminalFontFamily`.
-    func updateTerminalFontFamily(_ name: String?) {
-        sessions.updateTerminalFontFamily(name)
     }
 
     // MARK: - Launch overlay / pty cache (forwarders)
@@ -589,53 +555,22 @@ final class AppState {
         }
     }
 
-    /// Forwarder onto `TabModel.firstAvailableTabId()`. Used by
-    /// `AppState+FileExplorer.openInEditorPane` as the active-tab
-    /// fallback when the user clicks an editor entry while no tab is
-    /// focused.
-    func firstAvailableTabId() -> String? {
-        tabs.firstAvailableTabId()
-    }
-
-    /// Forwarder onto `TabModel.applyAutoTitle`.
+    /// Forwarder onto `TabModel.applyAutoTitle`. Tests assert
+    /// auto-title application through this surface.
     func applyAutoTitle(tabId: String, rawTitle: String) {
         tabs.applyAutoTitle(tabId: tabId, rawTitle: rawTitle)
     }
 
-    /// Forwarder onto `SessionsModel.focusActiveTerminal`.
-    func focusActiveTerminal() {
-        sessions.focusActiveTerminal()
-    }
-
-    /// Forwarder onto `TabModel.renameTab`.
+    /// Forwarder onto `TabModel.renameTab`. Tests assert renames
+    /// through this surface.
     func renameTab(id tabId: String, to newTitle: String) {
         tabs.renameTab(id: tabId, to: newTitle)
     }
 
-    /// Append a new terminal-only tab to the pinned Terminals group,
-    /// focus it, and spawn its pty. Forwarder onto `SessionsModel`.
-    @discardableResult
-    func createTerminalTab() -> String? {
-        sessions.createTerminalTab()
-    }
-
-    /// Create a fresh Claude tab in an existing project group.
-    /// Forwarder onto `SessionsModel`.
-    @discardableResult
-    func createClaudeTabInProject(projectId: String) -> String? {
-        sessions.createClaudeTabInProject(projectId: projectId)
-    }
-
-    /// True when `tabId` lives inside the pinned Terminals project.
-    /// Forwarder onto `TabModel.isTerminalsProjectTab`.
-    func isTerminalsProjectTab(_ tabId: String) -> Bool {
-        tabs.isTerminalsProjectTab(tabId)
-    }
-
     // MARK: - Pane management
 
-    /// Append a new terminal pane to `tabId`, spawn its pty, and focus
-    /// it. Forwarder onto `SessionsModel.addPane`.
+    /// Forwarder onto `SessionsModel.addPane`. Tests still drive
+    /// pane spawns through this surface.
     @discardableResult
     func addPane(
         tabId: String,
@@ -651,12 +586,8 @@ final class AppState {
 
     // MARK: - Close coordinator (forwarders)
 
-    /// Forwarder onto `CloseRequestCoordinator.requestClosePane`.
-    func requestClosePane(tabId: String, paneId: String) {
-        closer.requestClosePane(tabId: tabId, paneId: paneId)
-    }
-
     /// Forwarder onto `CloseRequestCoordinator.requestCloseTab`.
+    /// Tests use this surface; views go through `closer` directly.
     func requestCloseTab(tabId: String) {
         closer.requestCloseTab(tabId: tabId)
     }
@@ -756,40 +687,34 @@ final class AppState {
         windowSession.addRestoredTabModel(persisted, toProjectIndex: projectIndex)
     }
 
-    // MARK: - Helper forwarders
+    // MARK: - Helper forwarders (test-only)
 
-    /// Forwarder onto `TabModel.stripNiceWorktreeSuffix`.
-    static func stripNiceWorktreeSuffix(_ path: String) -> String {
-        TabModel.stripNiceWorktreeSuffix(path)
-    }
-
-    /// Forwarder onto `TabModel.findGitRoot(forCwd:)`.
-    static func findGitRoot(forCwd cwd: String) -> String? {
-        TabModel.findGitRoot(forCwd: cwd)
-    }
-
-    /// Forwarder onto `TabModel.extractWorktreeName(from:)`.
+    /// Forwarder onto `TabModel.extractWorktreeName(from:)`. Tests
+    /// assert the kebab-arg parsing through this static surface.
     static func extractWorktreeName(from args: [String]) -> String? {
         TabModel.extractWorktreeName(from: args)
     }
 
-    /// Forwarder onto `TabModel.resolvedSpawnCwd(for:)`. Used by tests
-    /// and by `AppState+FileExplorer`.
+    /// Forwarder onto `TabModel.resolvedSpawnCwd(for:)`. Tests assert
+    /// worktree-fallback resolution through this surface.
     func resolvedSpawnCwd(for tab: Tab) -> String {
         tabs.resolvedSpawnCwd(for: tab)
     }
 
     /// Forwarder onto `TabModel.spawnCwdForNewPane(in:callerProvided:)`.
+    /// Tests use this surface.
     func spawnCwdForNewPane(in tab: Tab, callerProvided cwd: String?) -> String {
         tabs.spawnCwdForNewPane(in: tab, callerProvided: cwd)
     }
 
-    /// Forwarder onto `TabModel.resolvedSpawnCwd(for:pane:)`.
+    /// Forwarder onto `TabModel.resolvedSpawnCwd(for:pane:)`. Tests
+    /// assert per-pane cwd fallback through this surface.
     func resolvedSpawnCwd(for tab: Tab, pane: Pane) -> String {
         tabs.resolvedSpawnCwd(for: tab, pane: pane)
     }
 
-    /// Forwarder onto `TabModel.repairProjectStructure()`.
+    /// Forwarder onto `TabModel.repairProjectStructure()`. Tests
+    /// drive repair through this surface.
     func repairProjectStructure() {
         tabs.repairProjectStructure()
     }

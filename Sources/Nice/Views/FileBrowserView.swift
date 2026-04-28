@@ -7,8 +7,8 @@
 //  row at the top for up-nav, refresh, and a hidden-files toggle.
 //
 //  Per-tab state (root path, expanded set, hidden visibility) lives
-//  on `AppState.fileBrowserStates`; this view reads it and re-rebinds
-//  whenever `appState.activeTabId` changes so each tab's tree is
+//  on `AppState.fileBrowserStore`; this view reads it and re-rebinds
+//  whenever `tabs.activeTabId` changes so each tab's tree is
 //  preserved when the user switches away and back.
 //
 
@@ -17,6 +17,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct FileBrowserView: View {
+    /// Read for `activeTabId` / `tab(for:)`. The composition root
+    /// (`AppState`) is also in scope below for `fileBrowserStore`
+    /// (which is a cross-cutting concern that doesn't fit cleanly
+    /// onto a single sub-model — its lifecycle is owned by the
+    /// dissolve cascade in AppState).
+    @Environment(TabModel.self) private var tabs
     @Environment(AppState.self) private var appState
     @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
@@ -25,9 +31,9 @@ struct FileBrowserView: View {
     var body: some View {
         // Re-derive every time activeTabId / its CWD changes so the
         // browser snaps to whichever tab the user is now viewing,
-        // pulling that tab's preserved state from AppState.
-        if let activeId = appState.activeTabId,
-           let tab = appState.tab(for: activeId) {
+        // pulling that tab's preserved state from the store.
+        if let activeId = tabs.activeTabId,
+           let tab = tabs.tab(for: activeId) {
             FileBrowserContent(
                 tabId: activeId,
                 tabCwd: tab.cwd,
@@ -49,7 +55,7 @@ struct FileBrowserView: View {
 // MARK: - Content (with bound state)
 
 private struct FileBrowserContent: View {
-    @Environment(AppState.self) private var appState
+    @Environment(TabModel.self) private var tabs
     @Environment(FontSettings.self) private var fontSettings
     @Environment(FileBrowserSortSettings.self) private var sortSettings
     @Environment(\.colorScheme) private var scheme
@@ -127,7 +133,7 @@ private struct FileBrowserContent: View {
     /// a deep subdirectory or above the project root.
     private var projectHeader: some View {
         Button(action: { state.rootPath = tabCwd }) {
-            Text(appState.fileBrowserHeaderTitle(forTab: tabId))
+            Text(tabs.fileBrowserHeaderTitle(forTab: tabId))
                 .font(.system(size: fontSettings.sidebarSize(13), weight: .semibold))
                 .foregroundStyle(Color.niceInk(scheme, palette))
                 .lineLimit(1)
