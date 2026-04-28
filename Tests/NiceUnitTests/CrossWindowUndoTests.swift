@@ -60,7 +60,7 @@ final class CrossWindowUndoTests: XCTestCase {
         // User pressed ⌘Z while focused on Window B.
         history.undo()
 
-        XCTAssertEqual(stateA.sidebarMode, .files,
+        XCTAssertEqual(stateA.sidebar.sidebarMode, .files,
                        "Originating window must switch to file browser.")
     }
 
@@ -79,12 +79,12 @@ final class CrossWindowUndoTests: XCTestCase {
         // Pre-undo, stateA is on a different tab.
         // (selectTab is a no-op when the tab id doesn't exist on the
         // model, but the property still updates.)
-        XCTAssertEqual(stateA.sidebarMode, .tabs)
+        XCTAssertEqual(stateA.sidebar.sidebarMode, .tabs)
 
         history.undo()
 
-        XCTAssertEqual(stateA.sidebarMode, .files)
-        XCTAssertEqual(stateA.activeTabId, "tab-XYZ",
+        XCTAssertEqual(stateA.sidebar.sidebarMode, .files)
+        XCTAssertEqual(stateA.tabs.activeTabId, "tab-XYZ",
                        "Undo must select the originating tab so the user sees the change.")
     }
 
@@ -145,11 +145,11 @@ final class CrossWindowUndoTests: XCTestCase {
         history.undo()
         // Reset stateA's sidebar to tabs so we can detect the redo
         // flipping it back.
-        stateA.sidebarMode = .tabs
+        stateA.sidebar.sidebarMode = .tabs
 
         history.redo()
 
-        XCTAssertEqual(stateA.sidebarMode, .files)
+        XCTAssertEqual(stateA.sidebar.sidebarMode, .files)
     }
 
     // MARK: - Helpers
