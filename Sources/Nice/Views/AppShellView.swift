@@ -169,14 +169,15 @@ private struct AppShellHost: View {
         // can declare exactly which slice they observe (e.g.
         // `WindowToolbarView` reads only `TabModel` + `SessionsModel`).
         // AppState itself stays in the environment for the genuinely
-        // cross-cutting hooks: `start()` / `tearDown()` choreography,
-        // `fileBrowserStore` lifecycle, and the `AppState+FileExplorer`
-        // file-operation surface that spans tabs and persistence.
+        // cross-cutting hooks: `start()` / `tearDown()` choreography
+        // and `fileBrowserStore` lifecycle. The file-operation surface
+        // is injected as `FileExplorerOrchestrator` separately.
         .environment(appState.tabs)
         .environment(appState.sessions)
         .environment(appState.sidebar)
         .environment(appState.closer)
         .environment(appState.windowSession)
+        .environment(appState.fileExplorerOrchestrator)
         .environment(appState)
         .alert(
             "Processes are still running",

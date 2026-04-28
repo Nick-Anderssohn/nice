@@ -46,7 +46,7 @@ extension WindowRegistry: FileOperationFocusRouter {
 @Observable
 final class FileOperationHistory {
     /// Pure FS worker the history applies / undoes through. Public
-    /// so the orchestration layer (`AppState+FileExplorer`) shares
+    /// so the orchestration layer (`FileExplorerOrchestrator`) shares
     /// the same instance — a `FakeTrasher` or stub `FileManager`
     /// injected here reaches copy/cut/trash too, not just undo/redo.
     let service: FileOperationsService

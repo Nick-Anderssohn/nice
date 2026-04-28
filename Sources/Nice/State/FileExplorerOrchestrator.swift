@@ -1,21 +1,61 @@
 //
-//  AppState+FileExplorer.swift
+//  FileExplorerOrchestrator.swift
 //  Nice
 //
-//  Orchestration glue between the file-browser context menu and the
-//  rest of the app. The menu calls the protocol methods declared in
-//  `FileBrowserContextMenu`; AppState is the production conformance.
+//  Per-window orchestration glue between the file-browser context
+//  menu and the rest of the app. The menu calls the protocol methods
+//  declared in `FileBrowserContextMenu`; this is the production
+//  conformance.
 //
-//  Each method records a `FileOperationOrigin` from this AppState's
-//  `windowSessionId` and the active tab id so undo/redo can route
-//  focus back to where the change happened. Errors are surfaced via
-//  the shared history's `lastDriftMessage` for the UI to flash.
+//  Each method records a `FileOperationOrigin` from the owning
+//  window's `windowSessionId` and the active tab id so undo/redo can
+//  route focus back to where the change happened. Errors are surfaced
+//  via the shared history's `lastDriftMessage` for the UI to flash.
+//
+//  Carved out of `AppState` so the file-explorer surface stops
+//  inflating the composition root. AppState now holds this as one
+//  of its sub-models alongside TabModel/SessionsModel/etc.
 //
 
 import AppKit
 import Foundation
 
-extension AppState: FileExplorerActions {
+@MainActor
+@Observable
+final class FileExplorerOrchestrator: FileExplorerActions {
+
+    /// Read for `activeTabId` / `tab(for:)` / `firstAvailableTabId`.
+    /// Weak — owned by AppState alongside us.
+    @ObservationIgnored
+    weak var tabs: TabModel?
+
+    /// Reads `addPane` to spawn an editor pane on the resolved tab.
+    @ObservationIgnored
+    weak var sessions: SessionsModel?
+
+    /// Reads `windowSessionId` for `FileOperationOrigin` so undo/redo
+    /// routes focus back to this window.
+    @ObservationIgnored
+    weak var windowSession: WindowSession?
+
+    /// File-browser context-menu services. `nil` for previews/tests.
+    let fileExplorer: FileExplorerServices?
+
+    /// User preferences — `openInEditorPane` reads editor mappings.
+    let tweaks: Tweaks?
+
+    /// Auto-detected terminal editors for `editorPaneEntries`.
+    let editorDetector: EditorDetector?
+
+    init(
+        fileExplorer: FileExplorerServices?,
+        tweaks: Tweaks?,
+        editorDetector: EditorDetector?
+    ) {
+        self.fileExplorer = fileExplorer
+        self.tweaks = tweaks
+        self.editorDetector = editorDetector
+    }
 
     // MARK: - Pasteboard write
 
@@ -51,8 +91,8 @@ extension AppState: FileExplorerActions {
 
         let dest = Self.resolvePasteDestination(target: target)
         let origin = FileOperationOrigin(
-            windowSessionId: windowSession.windowSessionId,
-            tabId: originatingTabId ?? tabs.activeTabId
+            windowSessionId: windowSession?.windowSessionId ?? "",
+            tabId: originatingTabId ?? tabs?.activeTabId
         )
 
         do {
@@ -79,7 +119,7 @@ extension AppState: FileExplorerActions {
     /// Resolve where a paste should land for a given context-menu
     /// target row. Right-clicking a directory pastes inside it;
     /// right-clicking a file pastes into its parent. Pure — kept
-    /// `static` so it's testable without an AppState instance.
+    /// `static` so it's testable without an instance.
     static func resolvePasteDestination(target: URL) -> URL {
         var isDir: ObjCBool = false
         let exists = FileManager.default.fileExists(
@@ -112,8 +152,8 @@ extension AppState: FileExplorerActions {
         guard let fileExplorer else { return }
         guard !urls.isEmpty else { return }
         let origin = FileOperationOrigin(
-            windowSessionId: windowSession.windowSessionId,
-            tabId: originatingTabId ?? tabs.activeTabId
+            windowSessionId: windowSession?.windowSessionId ?? "",
+            tabId: originatingTabId ?? tabs?.activeTabId
         )
 
         do {
@@ -145,8 +185,8 @@ extension AppState: FileExplorerActions {
         guard let fileExplorer else { return }
         let urls = paths.map { URL(fileURLWithPath: $0) }
         let origin = FileOperationOrigin(
-            windowSessionId: windowSession.windowSessionId,
-            tabId: originatingTabId ?? tabs.activeTabId
+            windowSessionId: windowSession?.windowSessionId ?? "",
+            tabId: originatingTabId ?? tabs?.activeTabId
         )
 
         do {
@@ -175,9 +215,9 @@ extension AppState: FileExplorerActions {
     }
 
     /// Present a system app picker rooted at `/Applications` so the
-    /// user can pick an arbitrary app to open `url` with. Lives on
-    /// AppState rather than the menu view so the view layer doesn't
-    /// drive UI flow control via `NSOpenPanel.runModal`.
+    /// user can pick an arbitrary app to open `url` with. Lives here
+    /// rather than the menu view so the view layer doesn't drive UI
+    /// flow control via `NSOpenPanel.runModal`.
     func presentOpenWithPicker(for url: URL) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
@@ -266,11 +306,12 @@ extension AppState: FileExplorerActions {
         let editor = tweaks?.editor(for: editorId)
             ?? editorDetector?.detected.first { $0.id == editorId }
         guard let editor else { return }
+        guard let tabs, let sessions else { return }
 
         guard let tabId = Self.resolveTargetTab(
             activeTabId: tabs.activeTabId,
-            hasTab: { self.tabs.tab(for: $0) != nil },
-            firstAvailable: { self.tabs.firstAvailableTabId() }
+            hasTab: { tabs.tab(for: $0) != nil },
+            firstAvailable: { tabs.firstAvailableTabId() }
         ) else { return }
 
         let spec = Self.editorPaneSpec(editor: editor, url: url)
@@ -344,10 +385,10 @@ struct EditorPaneEntries: Hashable, Sendable {
 }
 
 /// Pure projection of (editor, file URL) into the spawn arguments
-/// `AppState.openInEditorPane` hands to `addPane`. Lives as a named
-/// type so the test surface is `spec.command` against a struct rather
-/// than a positional tuple, and so adding a fourth field later isn't
-/// source-breaking.
+/// `FileExplorerOrchestrator.openInEditorPane` hands to `addPane`.
+/// Lives as a named type so the test surface is `spec.command`
+/// against a struct rather than a positional tuple, and so adding a
+/// fourth field later isn't source-breaking.
 struct EditorPaneSpec: Hashable, Sendable {
     let cwd: String
     let title: String

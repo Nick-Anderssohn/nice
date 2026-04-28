@@ -22,7 +22,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let editor = EditorCommand(id: UUID(), name: "Vim", command: "vim")
         let url = URL(fileURLWithPath: "/tmp/notes.md")
 
-        let spec = AppState.editorPaneSpec(editor: editor, url: url)
+        let spec = FileExplorerOrchestrator.editorPaneSpec(editor: editor, url: url)
 
         XCTAssertEqual(spec.cwd, "/tmp")
         XCTAssertEqual(spec.title, "Vim notes.md")
@@ -36,7 +36,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let editor = EditorCommand(id: UUID(), name: "Neovim", command: "nvim -p")
         let url = URL(fileURLWithPath: "/Users/me/foo.swift")
 
-        let spec = AppState.editorPaneSpec(editor: editor, url: url)
+        let spec = FileExplorerOrchestrator.editorPaneSpec(editor: editor, url: url)
 
         XCTAssertEqual(spec.command, "nvim -p '/Users/me/foo.swift'")
     }
@@ -45,7 +45,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let editor = EditorCommand(id: UUID(), name: "Vim", command: "vim")
         let url = URL(fileURLWithPath: "/Users/me/My Project/README.md")
 
-        let spec = AppState.editorPaneSpec(editor: editor, url: url)
+        let spec = FileExplorerOrchestrator.editorPaneSpec(editor: editor, url: url)
 
         XCTAssertEqual(spec.cwd, "/Users/me/My Project")
         XCTAssertEqual(spec.command, "vim '/Users/me/My Project/README.md'")
@@ -58,7 +58,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let editor = EditorCommand(id: UUID(), name: "Vim", command: "vim")
         let url = URL(fileURLWithPath: "/tmp/Has 'weird' name.md")
 
-        let spec = AppState.editorPaneSpec(editor: editor, url: url)
+        let spec = FileExplorerOrchestrator.editorPaneSpec(editor: editor, url: url)
 
         // Expected form: `'/tmp/Has '\''weird'\'' name.md'`
         XCTAssertEqual(
@@ -71,7 +71,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let editor = EditorCommand(id: UUID(), name: "Glow", command: "glow")
         let url = URL(fileURLWithPath: "/tmp/some-deep-file.md")
 
-        let spec = AppState.editorPaneSpec(editor: editor, url: url)
+        let spec = FileExplorerOrchestrator.editorPaneSpec(editor: editor, url: url)
 
         XCTAssertEqual(spec.title, "Glow some-deep-file.md")
     }
@@ -85,7 +85,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let detected = [
             EditorCommand(id: UUID(), name: "Helix", command: "hx"),
         ]
-        let merged = AppState.mergeEditorPaneEntries(user: user, detected: detected)
+        let merged = FileExplorerOrchestrator.mergeEditorPaneEntries(user: user, detected: detected)
         XCTAssertEqual(merged.user.map(\.name), ["Custom Vim"])
         XCTAssertEqual(merged.detected.map(\.name), ["Helix"])
     }
@@ -103,21 +103,21 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
             EditorCommand(id: UUID(), name: "Vim",     command: "vim"),
             EditorCommand(id: UUID(), name: "Helix",   command: "hx"),
         ]
-        let merged = AppState.mergeEditorPaneEntries(user: user, detected: detected)
+        let merged = FileExplorerOrchestrator.mergeEditorPaneEntries(user: user, detected: detected)
         XCTAssertEqual(merged.user.first?.id, userId)
         XCTAssertEqual(merged.detected.map(\.command), ["hx"],
                        "Detected `vim` collides with user's custom; only `hx` should remain.")
     }
 
     func test_mergeEditorPaneEntries_emptyInputsProduceEmptyEntries() {
-        let merged = AppState.mergeEditorPaneEntries(user: [], detected: [])
+        let merged = FileExplorerOrchestrator.mergeEditorPaneEntries(user: [], detected: [])
         XCTAssertTrue(merged.isEmpty)
     }
 
     // MARK: - resolveTargetTab
 
     func test_resolveTargetTab_prefersValidActiveTab() {
-        let resolved = AppState.resolveTargetTab(
+        let resolved = FileExplorerOrchestrator.resolveTargetTab(
             activeTabId: "tab-A",
             hasTab: { _ in true },
             firstAvailable: { "tab-Z" }
@@ -129,7 +129,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         // The active tab id is set but no longer corresponds to a
         // live tab (rare, but possible mid-frame during teardown).
         // Falls through to firstAvailable.
-        let resolved = AppState.resolveTargetTab(
+        let resolved = FileExplorerOrchestrator.resolveTargetTab(
             activeTabId: "stale",
             hasTab: { _ in false },
             firstAvailable: { "tab-Z" }
@@ -138,7 +138,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
     }
 
     func test_resolveTargetTab_fallsBackWhenActiveIsNil() {
-        let resolved = AppState.resolveTargetTab(
+        let resolved = FileExplorerOrchestrator.resolveTargetTab(
             activeTabId: nil,
             hasTab: { _ in true },
             firstAvailable: { "tab-Z" }
@@ -147,7 +147,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
     }
 
     func test_resolveTargetTab_returnsNilWhenNothingAvailable() {
-        let resolved = AppState.resolveTargetTab(
+        let resolved = FileExplorerOrchestrator.resolveTargetTab(
             activeTabId: nil,
             hasTab: { _ in false },
             firstAvailable: { nil }
@@ -168,7 +168,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let initialActiveTabId = appState.tabs.activeTabId
         let initialPaneCount = countAllPanes(appState)
 
-        appState.openInEditorPane(
+        appState.fileExplorerOrchestrator.openInEditorPane(
             url: URL(fileURLWithPath: "/tmp/x.md"),
             editorId: UUID()
         )
@@ -189,7 +189,7 @@ final class AppStateOpenInEditorPaneTests: XCTestCase {
         let appState = AppState()
         let initial = countAllPanes(appState)
 
-        appState.openFromDoubleClick(url: URL(fileURLWithPath: "/tmp/x.png"))
+        appState.fileExplorerOrchestrator.openFromDoubleClick(url: URL(fileURLWithPath: "/tmp/x.png"))
 
         XCTAssertEqual(countAllPanes(appState), initial,
                        "Unmapped extension must not spawn an editor pane.")

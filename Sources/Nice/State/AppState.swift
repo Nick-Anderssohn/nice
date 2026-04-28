@@ -2,7 +2,7 @@
 //  AppState.swift
 //  Nice
 //
-//  Per-window composition root. Holds the five sub-models, wires
+//  Per-window composition root. Holds the six sub-models, wires
 //  their callbacks, and runs `start()` / `tearDown()`. Views and
 //  tests address sub-models directly — only composition-root
 //  concerns live here (lifecycle, dissolve cascade, the cross-
@@ -49,19 +49,11 @@ final class AppState {
     let sidebar: SidebarModel
     let closer: CloseRequestCoordinator
     let windowSession: WindowSession
+    let fileExplorerOrchestrator: FileExplorerOrchestrator
 
     /// Per-window file-browser states keyed by `Tab.id`. Removed in
     /// `finalizeDissolvedTab` when a tab dissolves.
     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
-
-    /// File-browser context-menu services. `nil` for previews/tests.
-    let fileExplorer: FileExplorerServices?
-
-    /// User preferences — `openInEditorPane` reads editor mappings.
-    let tweaks: Tweaks?
-
-    /// Auto-detected terminal editors for `editorPaneEntries`.
-    let editorDetector: EditorDetector?
 
     @ObservationIgnored
     private weak var trackedServices: NiceServices?
@@ -88,9 +80,6 @@ final class AppState {
         windowSessionId: String,
         fileExplorer: FileExplorerServices? = nil
     ) {
-        self.fileExplorer = fileExplorer ?? services?.fileExplorer
-        self.tweaks = services?.tweaks
-        self.editorDetector = services?.editorDetector
         self.sidebar = SidebarModel(
             initialCollapsed: initialSidebarCollapsed,
             initialMode: initialSidebarMode
@@ -100,7 +89,7 @@ final class AppState {
 
         // Build tabs first (init seeds Terminals + Main), then sessions
         // (weak ref back to tabs); closer and windowSession also hold
-        // weak refs to the models above — AppState owns all five.
+        // weak refs to the models above — AppState owns all six.
         self.tabs = TabModel(initialMainCwd: resolvedMainCwd)
         self.sessions = SessionsModel(tabs: tabs)
         self.closer = CloseRequestCoordinator(tabs: tabs, sessions: sessions)
@@ -111,6 +100,14 @@ final class AppState {
             windowSessionId: windowSessionId,
             persistenceEnabled: services != nil
         )
+        self.fileExplorerOrchestrator = FileExplorerOrchestrator(
+            fileExplorer: fileExplorer ?? services?.fileExplorer,
+            tweaks: services?.tweaks,
+            editorDetector: services?.editorDetector
+        )
+        self.fileExplorerOrchestrator.tabs = tabs
+        self.fileExplorerOrchestrator.sessions = sessions
+        self.fileExplorerOrchestrator.windowSession = windowSession
         self.trackedServices = services
 
         // Seed theme/palette/font from `Tweaks` so the first

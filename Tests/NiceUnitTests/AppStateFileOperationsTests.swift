@@ -54,8 +54,8 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("a.txt", body: "hi")
         let folder = makeDir("folder")
 
-        state.copyToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: folder, originatingTabId: nil)
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: nil)
 
         XCTAssertTrue(fileExists(folder.appendingPathComponent("a.txt")))
         XCTAssertTrue(fileExists(src), "Copy must leave source in place.")
@@ -67,10 +67,10 @@ final class AppStateFileOperationsTests: XCTestCase {
         let folder = makeDir("folder")
         let neighbor = makeFileIn(folder, "neighbor.txt")
 
-        state.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
         // Right-click target is a file inside `folder`; paste should
         // land in `folder` (the file's parent), not next to neighbor.
-        state.pasteFromPasteboard(into: neighbor, originatingTabId: nil)
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: neighbor, originatingTabId: nil)
 
         XCTAssertTrue(fileExists(folder.appendingPathComponent("a.txt")))
     }
@@ -84,8 +84,8 @@ final class AppStateFileOperationsTests: XCTestCase {
             contents: Data("existing".utf8)
         )
 
-        state.copyToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: folder, originatingTabId: nil)
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: nil)
 
         XCTAssertTrue(fileExists(folder.appendingPathComponent("a copy.txt")))
         // Original wasn't clobbered.
@@ -103,10 +103,10 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt", body: "x")
         let folder = makeDir("folder")
 
-        state.cutToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.cutToPasteboard(paths: [src.path])
         XCTAssertTrue(pasteboard.isCut(src))
 
-        state.pasteFromPasteboard(into: folder, originatingTabId: nil)
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: nil)
 
         XCTAssertTrue(fileExists(folder.appendingPathComponent("file.txt")))
         XCTAssertFalse(fileExists(src), "Cut+paste must move, not copy.")
@@ -120,12 +120,12 @@ final class AppStateFileOperationsTests: XCTestCase {
         let (state, _, history) = makeState()
         let src = makeFile("delete.txt", body: "data")
 
-        state.trash(paths: [src.path], originatingTabId: nil)
+        state.fileExplorerOrchestrator.trash(paths: [src.path], originatingTabId: nil)
 
         XCTAssertFalse(fileExists(src))
         XCTAssertEqual(history.undoStack.count, 1)
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertTrue(fileExists(src))
         XCTAssertEqual(history.undoStack.count, 0)
@@ -137,11 +137,11 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("a.txt")
         let folder = makeDir("folder")
 
-        state.copyToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: folder, originatingTabId: nil)
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: nil)
         XCTAssertTrue(fileExists(folder.appendingPathComponent("a.txt")))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertFalse(fileExists(folder.appendingPathComponent("a.txt")))
         XCTAssertTrue(fileExists(src))
@@ -153,11 +153,11 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt", body: "data")
         let folder = makeDir("folder")
 
-        state.cutToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: folder, originatingTabId: nil)
+        state.fileExplorerOrchestrator.cutToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: nil)
         XCTAssertFalse(fileExists(src))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertTrue(fileExists(src))
         XCTAssertFalse(fileExists(folder.appendingPathComponent("file.txt")))
@@ -167,12 +167,12 @@ final class AppStateFileOperationsTests: XCTestCase {
         let (state, _, _) = makeState()
         let src = makeFile("file.txt")
 
-        state.trash(paths: [src.path], originatingTabId: nil)
+        state.fileExplorerOrchestrator.trash(paths: [src.path], originatingTabId: nil)
         XCTAssertFalse(fileExists(src))
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
         XCTAssertTrue(fileExists(src))
 
-        state.redoFileOperation()
+        state.fileExplorerOrchestrator.redoFileOperation()
 
         XCTAssertFalse(fileExists(src))
     }
@@ -181,12 +181,12 @@ final class AppStateFileOperationsTests: XCTestCase {
         let (state, _, history) = makeState()
         let src = makeFile("file.txt", body: "data")
         let folder = makeDir("folder")
-        state.cutToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: folder, originatingTabId: nil)
+        state.fileExplorerOrchestrator.cutToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: nil)
         // User deletes the moved file via Finder before pressing ⌘Z.
         try? FileManager.default.removeItem(at: folder.appendingPathComponent("file.txt"))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertNotNil(history.lastDriftMessage)
     }
@@ -195,12 +195,12 @@ final class AppStateFileOperationsTests: XCTestCase {
 
     func test_canPaste_falseWhenEmpty_trueAfterCopy() {
         let (state, _, _) = makeState()
-        XCTAssertFalse(state.canPaste())
+        XCTAssertFalse(state.fileExplorerOrchestrator.canPaste())
 
         let src = makeFile("a.txt")
-        state.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
 
-        XCTAssertTrue(state.canPaste())
+        XCTAssertTrue(state.fileExplorerOrchestrator.canPaste())
     }
 
     // MARK: - Same-parent paste edge cases
@@ -210,8 +210,8 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("bar.txt", body: "data")
         // Copy into the same parent directory — should auto-rename
         // rather than fail or overwrite.
-        state.copyToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: tempDir, originatingTabId: nil)
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: tempDir, originatingTabId: nil)
 
         XCTAssertTrue(fileExists(tempDir.appendingPathComponent("bar copy.txt")))
         XCTAssertTrue(fileExists(src), "Source must remain in place after copy.")
@@ -221,8 +221,8 @@ final class AppStateFileOperationsTests: XCTestCase {
         let (state, _, _) = makeState()
         let src = makeFile("bar.txt", body: "data")
 
-        state.cutToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: tempDir, originatingTabId: nil)
+        state.fileExplorerOrchestrator.cutToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: tempDir, originatingTabId: nil)
 
         // Move into self auto-renames; the original file is moved
         // (not duplicated) so the destination is `bar copy.txt`
@@ -241,14 +241,14 @@ final class AppStateFileOperationsTests: XCTestCase {
         FileManager.default.createFile(atPath: nested.path, contents: Data("data".utf8))
         let outer = makeDir("outer")
 
-        state.cutToPasteboard(paths: [folder.path])
-        state.pasteFromPasteboard(into: outer, originatingTabId: nil)
+        state.fileExplorerOrchestrator.cutToPasteboard(paths: [folder.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: outer, originatingTabId: nil)
 
         XCTAssertFalse(fileExists(folder))
         let movedNested = outer.appendingPathComponent("project/nested.txt")
         XCTAssertTrue(fileExists(movedNested))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertTrue(fileExists(nested),
                       "Undoing a directory move must restore the whole tree.")
@@ -260,7 +260,7 @@ final class AppStateFileOperationsTests: XCTestCase {
     func test_copyPathsToPasteboard_writesNewlineSeparatedPaths() {
         let (state, _, _) = makeState()
 
-        state.copyPathsToPasteboard(["/a/b.txt", "/a/c.txt"])
+        state.fileExplorerOrchestrator.copyPathsToPasteboard(["/a/b.txt", "/a/c.txt"])
 
         XCTAssertEqual(pasteboard.string(forType: .string), "/a/b.txt\n/a/c.txt")
     }
@@ -272,8 +272,8 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("a.txt")
         let folder = makeDir("folder")
 
-        state.copyToPasteboard(paths: [src.path])
-        state.pasteFromPasteboard(into: folder, originatingTabId: "explicit-tab")
+        state.fileExplorerOrchestrator.copyToPasteboard(paths: [src.path])
+        state.fileExplorerOrchestrator.pasteFromPasteboard(into: folder, originatingTabId: "explicit-tab")
 
         XCTAssertEqual(history.undoStack.last?.origin.tabId, "explicit-tab")
         XCTAssertEqual(history.undoStack.last?.origin.windowSessionId,
@@ -287,7 +287,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt", body: "data")
         let folder = makeDir("folder")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .move,
@@ -304,7 +304,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt", body: "data")
         let folder = makeDir("folder")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .copy,
@@ -320,7 +320,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let (state, _, history) = makeState()
         let folder = makeDir("folder")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [],
             into: folder,
             operation: .move,
@@ -342,7 +342,7 @@ final class AppStateFileOperationsTests: XCTestCase {
             contents: Data("existing".utf8)
         )
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .copy,
@@ -365,7 +365,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt", body: "data")
         let folder = makeDir("folder")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .move,
@@ -373,7 +373,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         )
         XCTAssertFalse(fileExists(src))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertTrue(fileExists(src))
         XCTAssertFalse(fileExists(folder.appendingPathComponent("file.txt")))
@@ -385,7 +385,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt", body: "data")
         let folder = makeDir("folder")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .copy,
@@ -393,7 +393,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         )
         XCTAssertTrue(fileExists(folder.appendingPathComponent("file.txt")))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertTrue(fileExists(src), "Copy undo must leave the source.")
         XCTAssertFalse(fileExists(folder.appendingPathComponent("file.txt")))
@@ -405,7 +405,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let folder = makeDir("folder")
         let ghost = tempDir.appendingPathComponent("ghost.txt")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [ghost],
             into: folder,
             operation: .move,
@@ -428,7 +428,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let src = makeFile("file.txt")
         let folder = makeDir("folder")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .move,
@@ -448,7 +448,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let folder = makeDir("folder")
         let activeId = state.tabs.activeTabId
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [src],
             into: folder,
             operation: .move,
@@ -471,7 +471,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         )
         let outer = makeDir("outer")
 
-        state.moveOrCopy(
+        state.fileExplorerOrchestrator.moveOrCopy(
             urls: [folder],
             into: outer,
             operation: .move,
@@ -482,7 +482,7 @@ final class AppStateFileOperationsTests: XCTestCase {
         let movedNested = outer.appendingPathComponent("project/nested.txt")
         XCTAssertTrue(fileExists(movedNested))
 
-        state.undoFileOperation()
+        state.fileExplorerOrchestrator.undoFileOperation()
 
         XCTAssertTrue(
             fileExists(nested),

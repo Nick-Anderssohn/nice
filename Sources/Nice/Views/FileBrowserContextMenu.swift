@@ -9,8 +9,9 @@
 //  `FileBrowserContextMenuModel`.
 //
 //  The view talks to the rest of the app through `FileExplorerActions`,
-//  a protocol AppState conforms to. Tests stand up a fake conformer
-//  to verify that menu items dispatch into the correct method.
+//  a protocol `FileExplorerOrchestrator` conforms to. Tests stand up
+//  a fake conformer to verify that menu items dispatch into the
+//  correct method.
 //
 //  Menu order, top to bottom:
 //     Open
@@ -34,9 +35,9 @@ import SwiftUI
 
 // MARK: - Action surface
 
-/// Protocol the menu calls into. AppState's production conformance
-/// lives in `AppState+FileExplorer.swift`; tests provide their own
-/// fake conformer for verifying menu dispatch.
+/// Protocol the menu calls into. The production conformance lives on
+/// `FileExplorerOrchestrator`; tests provide their own fake conformer
+/// for verifying menu dispatch.
 @MainActor
 protocol FileExplorerActions: AnyObject {
     func copyToPasteboard(paths: [String])

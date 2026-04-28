@@ -299,7 +299,7 @@ private struct FileBrowserContent: View {
 /// A single row in the file tree. Renders itself plus, for an
 /// expanded directory, its children as nested `FileTreeRow` views.
 private struct FileTreeRow: View {
-    @Environment(AppState.self) private var appState
+    @Environment(FileExplorerOrchestrator.self) private var orchestrator
     @Environment(Tweaks.self) private var tweaks
     @Environment(FontSettings.self) private var fontSettings
     @Environment(FileBrowserSortSettings.self) private var sortSettings
@@ -521,7 +521,7 @@ private struct FileTreeRow: View {
                 actionPaths: actionPaths,
                 tabId: tabId,
                 onWillAct: { selection.snapIfRightClickOutside(path) },
-                actions: appState
+                actions: orchestrator
             )
         }
         .onDrag { beginDrag() }
@@ -530,7 +530,7 @@ private struct FileTreeRow: View {
             folderURL: url,
             folderPath: path,
             dragState: dragState,
-            appState: appState,
+            orchestrator: orchestrator,
             tabId: tabId
         ))
         .help(path)
@@ -588,7 +588,7 @@ private struct FileTreeRow: View {
     /// intent. Drives a dimmed rendering so the user can see what
     /// will move when they paste.
     private var isCut: Bool {
-        appState.cutPaths().contains(url)
+        orchestrator.cutPaths().contains(url)
     }
 
     private var iconName: String {
@@ -665,8 +665,8 @@ private struct FileTreeRow: View {
             return
         }
         // Routing — mapped → editor pane, otherwise NSWorkspace —
-        // lives on AppState so the rule is pinned in one place.
-        appState.openFromDoubleClick(url: url)
+        // lives on the orchestrator so the rule is pinned in one place.
+        orchestrator.openFromDoubleClick(url: url)
     }
 
     private func toggleExpansion() {
@@ -734,7 +734,7 @@ private struct FileTreeRowDropTarget: ViewModifier {
     let folderURL: URL
     let folderPath: String
     let dragState: FileBrowserDragState
-    let appState: AppState
+    let orchestrator: FileExplorerOrchestrator
     let tabId: String?
 
     @ViewBuilder
@@ -746,7 +746,7 @@ private struct FileTreeRowDropTarget: ViewModifier {
                     folderURL: folderURL,
                     folderPath: folderPath,
                     dragState: dragState,
-                    appState: appState,
+                    orchestrator: orchestrator,
                     tabId: tabId
                 )
             )
@@ -778,7 +778,7 @@ private struct FileBrowserRowDropDelegate: DropDelegate {
     let folderURL: URL
     let folderPath: String
     let dragState: FileBrowserDragState
-    let appState: AppState
+    let orchestrator: FileExplorerOrchestrator
     let tabId: String?
 
     func validateDrop(info: DropInfo) -> Bool {
@@ -917,7 +917,7 @@ private struct FileBrowserRowDropDelegate: DropDelegate {
             sameVolume: sameVolume
         )
         DispatchQueue.main.async {
-            appState.moveOrCopy(
+            orchestrator.moveOrCopy(
                 urls: urls,
                 into: folderURL,
                 operation: operation,
