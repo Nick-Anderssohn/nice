@@ -160,27 +160,40 @@ extension OrphanShellReaper.Env {
         return results
     }
 
-    /// `proc_listallpids` two-call dance: probe for size, then fill.
+    /// Enumerate every pid via `proc_listpids(PROC_ALL_PIDS, ...)`.
+    ///
+    /// Note: an earlier version used `proc_listallpids`, which the libc
+    /// header documents as a thin wrapper around `proc_listpids(...,
+    /// PROC_ALL_PIDS, ...)`. Empirically on macOS 14+ that wrapper
+    /// returns only ~200 pids even when the system has ~800; the
+    /// underlying `proc_listpids` returns the full set with the same
+    /// buffer. Whatever's wrong inside the wrapper, going one layer
+    /// down avoids it. Without this the reaper silently misses any
+    /// orphan past the truncation point.
+    ///
     /// Returns an empty array on enumeration failure and emits an NSLog
     /// breadcrumb so a "the reaper never fires" investigation has a
     /// trail; the reaper itself is best-effort and never throws.
-    private static func liveAllPids() -> [pid_t] {
-        let bytes = proc_listallpids(nil, 0)
-        guard bytes > 0 else {
-            NSLog("OrphanShellReaper: proc_listallpids size probe failed (errno=\(errno))")
+    /// `internal` so a unit test can pin the "returns the full
+    /// system pid set, not a truncated subset" invariant.
+    static func liveAllPids() -> [pid_t] {
+        let probe = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard probe > 0 else {
+            NSLog("OrphanShellReaper: proc_listpids size probe failed (errno=\(errno))")
             return []
         }
         // Pad in case the table grew between the size probe and fill.
-        let capacity = Int(bytes) / MemoryLayout<pid_t>.stride + 64
+        let capacity = Int(probe) / MemoryLayout<pid_t>.stride + 64
         var pids = [pid_t](repeating: 0, count: capacity)
         let filled = pids.withUnsafeMutableBufferPointer { buf -> Int32 in
-            proc_listallpids(
+            proc_listpids(
+                UInt32(PROC_ALL_PIDS), 0,
                 buf.baseAddress,
                 Int32(buf.count) * Int32(MemoryLayout<pid_t>.stride)
             )
         }
         guard filled > 0 else {
-            NSLog("OrphanShellReaper: proc_listallpids fill failed (errno=\(errno))")
+            NSLog("OrphanShellReaper: proc_listpids fill failed (errno=\(errno))")
             return []
         }
         let count = Int(filled) / MemoryLayout<pid_t>.stride

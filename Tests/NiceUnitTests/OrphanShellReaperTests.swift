@@ -245,4 +245,25 @@ final class OrphanShellReaperTests: XCTestCase {
         XCTAssertEqual(OrphanShellReaper.reap(env: fake.env), 0)
         XCTAssertEqual(fake.killed(), [])
     }
+
+    // MARK: - Live-enumeration regression guard
+
+    /// `proc_listallpids` (the apparent natural choice) silently
+    /// truncates to roughly 200 pids on macOS 14+, even with a
+    /// generous buffer. The reaper now uses
+    /// `proc_listpids(PROC_ALL_PIDS, ...)` instead — this test pins
+    /// that we still see the *full* system pid set so a future
+    /// "simplification" back to the wrapper would fail loudly.
+    /// Asserts only a lower bound (any modern macOS host has well
+    /// over 100 user/system processes); no upper bound, since process
+    /// count varies wildly by environment.
+    func test_liveAllPids_returnsFullSystemPidSet_notTruncated() {
+        let pids = OrphanShellReaper.Env.liveAllPids()
+        XCTAssertGreaterThan(
+            pids.count, 100,
+            "Expected hundreds of pids on a modern macOS host; got \(pids.count). " +
+            "Likely regression: enumeration switched back to proc_listallpids " +
+            "or another truncating API."
+        )
+    }
 }
