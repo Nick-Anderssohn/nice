@@ -37,12 +37,20 @@ import XCTest
 final class FileBrowserOpenInEditorUITests: XCTestCase {
 
     private var fakeHomeURL: URL?
+    /// Tracks the launched app so `tearDownWithError` can terminate it
+    /// cleanly. Without this the XCUITest harness SIGKILLs the app
+    /// between tests, orphaning every pty child to launchd as an idle
+    /// zsh holding a pty slot. See `OrphanShellReaper` for the
+    /// next-launch backstop.
+    private var launchedApp: XCUIApplication?
 
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
 
     override func tearDownWithError() throws {
+        launchedApp?.terminate()
+        launchedApp = nil
         if let url = fakeHomeURL {
             try? FileManager.default.removeItem(at: url)
         }
@@ -168,6 +176,7 @@ final class FileBrowserOpenInEditorUITests: XCTestCase {
             app.launchEnvironment["LOGNAME"] = logname
         }
         app.launch()
+        launchedApp = app
         return (app, file, project)
     }
 

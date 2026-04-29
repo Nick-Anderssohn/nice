@@ -26,11 +26,23 @@ final class NiceUITests: XCTestCase {
     /// those folders.
     private var fakeHomeURL: URL?
 
+    /// Tracks the most recently `launchApp()`'d instance so
+    /// `tearDownWithError` can terminate it cleanly. Without this the
+    /// XCUITest harness sends SIGKILL to the app between tests, which
+    /// reparents every pty child to launchd as an orphan zsh holding a
+    /// pty slot. macOS caps `kern.tty.ptmx_max` at 511; over many test
+    /// runs the orphans accumulate and starve real `forkpty()` calls.
+    /// `OrphanShellReaper` reaps them at next launch as a backstop, but
+    /// terminating cleanly here prevents the leak at the source.
+    private var launchedApp: XCUIApplication?
+
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
 
     override func tearDownWithError() throws {
+        launchedApp?.terminate()
+        launchedApp = nil
         if let url = fakeHomeURL {
             try? FileManager.default.removeItem(at: url)
             fakeHomeURL = nil
@@ -91,6 +103,7 @@ final class NiceUITests: XCTestCase {
         app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         applySandboxEnv(to: app)
         app.launch()
+        launchedApp = app
         return app
     }
 
@@ -103,6 +116,7 @@ final class NiceUITests: XCTestCase {
             app.launchEnvironment[k] = v
         }
         app.launch()
+        launchedApp = app
         return app
     }
 
@@ -1295,6 +1309,7 @@ final class NiceUITests: XCTestCase {
         ]
         applySandboxEnv(to: app)
         app.launch()
+        launchedApp = app
 
         XCTAssertTrue(
             app.descendants(matching: .any)["sidebar.terminals"]
@@ -1373,6 +1388,7 @@ final class NiceUITests: XCTestCase {
         ]
         applySandboxEnv(to: app)
         app.launch()
+        launchedApp = app
 
         XCTAssertTrue(
             app.descendants(matching: .any)["sidebar.terminals"]
