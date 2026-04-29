@@ -105,6 +105,17 @@ final class NiceServices {
         // race the freshly-written dir and delete it, causing every
         // companion shell spawned after onAppear to source nothing.
         Self.cleanupStaleTempFiles()
+
+        // Reap zsh processes orphaned by prior crashes / SIGKILLs
+        // before any new pane spawns, so we don't inherit a starved
+        // pty table. macOS caps `kern.tty.ptmx_max` at 511; without
+        // this, accumulated orphans (especially from aborted UITest
+        // runs) cause `forkpty()` inside SwiftTerm to fail and panes
+        // hang on "Launching terminal…" forever.
+        let reaped = OrphanShellReaper.reap()
+        if reaped > 0 {
+            NSLog("NiceServices: reaped \(reaped) orphan zsh shell(s) from prior runs")
+        }
         do {
             self.zdotdirPath = try MainTerminalShellInject.make().path
         } catch {
