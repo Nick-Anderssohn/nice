@@ -47,7 +47,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 49fb1cdb02e28d1b1f9712baf0cc7d08ff697ba6
+    revision: af1bb69bef60dd4a2d9db330c28d9dfac25286a0
 
 targets:
   Nice:
