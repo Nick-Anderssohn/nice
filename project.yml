@@ -34,6 +34,13 @@ packages:
     #     while the user is scrolled up. Sticky-bottom auto-resumes
     #     when yDisp returns to yBase; typing snaps to bottom via
     #     the existing ensureCaretIsVisible() path.
+    #   - preserve text selection across streaming output and
+    #     scrollback eviction. The view-layer selection clears on
+    #     `feedPrepare` / `linefeed` are gone, so a highlight no
+    #     longer blinks out on every pty chunk; selection rows are
+    #     translated when scrollback evicts a line so the highlight
+    #     stays pinned to the same content (clears only when the
+    #     entire range falls off the top of scrollback).
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -47,7 +54,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 5346cc49df3ebc9e4fd311860fa1f538a256e56b
+    revision: eb22e913dd9a2565c8a59abee7b0b36f96672af1
 
 targets:
   Nice:
