@@ -24,9 +24,20 @@
 # xcodebuild, e.g.
 #   scripts/test.sh -only-testing:NiceUnitTests/FooTests/testBar
 #
-# Acquire the worktree lock before calling this script (shared
-# dev.nickanderssohn.nice-dev bundle ID across worktrees means UITests
-# can't run concurrently). See the `worktree-lock` skill / CLAUDE.md.
+# Acquire the worktree lock before calling this script. The lock is
+# load-bearing for two reasons:
+#   1. Shared dev.nickanderssohn.nice-dev bundle ID across worktrees
+#      means UITests can't run concurrently.
+#   2. The crash-recovery dotfile .scripts-project-yml.bak is a single
+#      shared path within a worktree (also read by install.sh). Two
+#      uncoordinated runs could overwrite each other's backup with an
+#      already-patched file and bake the patch in permanently.
+# See the `worktree-lock` skill / CLAUDE.md.
+#
+# project.yml is restored on exit. If the script is killed before the
+# EXIT trap fires (kill -9, parent shell killed mid-script, power
+# loss), the next invocation finds the stale backup and restores from
+# it before doing anything else.
 #
 # Exit codes:
 #   0  tests passed
@@ -55,19 +66,39 @@ PROJECT_YML_BACKUP="$REPO_ROOT/.scripts-project-yml.bak"
 # backup file's existence is the signal: a clean run always deletes
 # it on exit. The contents are the pre-patch state captured by that
 # prior run, so restoring from it returns project.yml to whatever the
-# developer had before that run started. This recovers from in-script
+# developer had before that run started. Recovers from in-script
 # crashes regardless of which script crashed.
+#
+# Guards:
+#   - require non-empty backup. A truncated/zero-byte backup (left by
+#     a hypothetical mid-`cp` interruption, or external truncation)
+#     would otherwise replace project.yml with garbage.
+#   - skip the restore entirely when backup contents already match
+#     project.yml. Catches the case where the developer noticed the
+#     bad state and `git restore`d the file themselves but didn't
+#     know to delete the dotfile too.
 if [[ -f "$PROJECT_YML_BACKUP" ]]; then
-    log "found stale backup at .scripts-project-yml.bak — previous script run was killed; restoring project.yml"
-    cp "$PROJECT_YML_BACKUP" "$PROJECT_YML"
-    rm -f "$PROJECT_YML_BACKUP"
+    if [[ ! -s "$PROJECT_YML_BACKUP" ]]; then
+        log "WARNING: stale backup at .scripts-project-yml.bak is empty; deleting without restore"
+        rm -f "$PROJECT_YML_BACKUP"
+    elif cmp -s "$PROJECT_YML_BACKUP" "$PROJECT_YML"; then
+        log "found stale backup at .scripts-project-yml.bak; project.yml already matches it, deleting backup"
+        rm -f "$PROJECT_YML_BACKUP"
+    else
+        log "found stale backup at .scripts-project-yml.bak — treating as crashed prior run; restoring project.yml"
+        cp "$PROJECT_YML_BACKUP" "$PROJECT_YML"
+        rm -f "$PROJECT_YML_BACKUP"
+    fi
 fi
 
 # Capture the pre-patch state BEFORE applying any modifications, so
 # the EXIT trap (or the recovery block above on the next run) can
-# restore to it.
-cp "$PROJECT_YML" "$PROJECT_YML_BACKUP"
-trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP"' EXIT
+# restore to it. Write to a tmp path then atomic-rename so a partial
+# write (signal during cp, ENOSPC) never appears as a complete
+# backup that the next run's recovery would trust.
+cp "$PROJECT_YML" "${PROJECT_YML_BACKUP}.tmp"
+mv "${PROJECT_YML_BACKUP}.tmp" "$PROJECT_YML_BACKUP"
+trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP" "${PROJECT_YML_BACKUP}.tmp"' EXIT
 
 log "patching project.yml → dev.nickanderssohn.nice-dev"
 /usr/bin/sed -i '' -E \

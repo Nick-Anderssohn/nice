@@ -32,6 +32,21 @@
 # macOS 14+. xcodegen can be installed via `brew install xcodegen` or any
 # other route that puts it on PATH.
 #
+# Acquire the worktree lock before calling this script. The lock is
+# load-bearing for two reasons:
+#   1. /Applications/<variant>.app and project.yml are shared mutable
+#      state across worktrees and concurrent install runs.
+#   2. The crash-recovery dotfile .scripts-project-yml.bak is a single
+#      shared path within a worktree (also read by test.sh). Two
+#      uncoordinated runs could overwrite each other's backup with an
+#      already-patched file and bake the patch in permanently.
+# See the `worktree-lock` skill / CLAUDE.md.
+#
+# project.yml is restored on exit. If the script is killed before the
+# EXIT trap fires (kill -9, parent shell killed mid-script, power
+# loss), the next invocation finds the stale backup and restores from
+# it before doing anything else.
+#
 # Exit codes:
 #   0  installed
 #   1  prereq missing
@@ -127,18 +142,38 @@ PROJECT_YML_BACKUP="$REPO_ROOT/.scripts-project-yml.bak"
 # patch — without recovery here, a stale dev-variant patch left on
 # disk would silently make us build the dev bundle ID and install it
 # as Nice.app.
+#
+# Guards:
+#   - require non-empty backup. A truncated/zero-byte backup (left by
+#     a hypothetical mid-`cp` interruption, or external truncation)
+#     would otherwise replace project.yml with garbage.
+#   - skip the restore entirely when backup contents already match
+#     project.yml. Catches the case where the developer noticed the
+#     bad state and `git restore`d the file themselves but didn't
+#     know to delete the dotfile too.
 if [[ -f "$PROJECT_YML_BACKUP" ]]; then
-    log "found stale backup at .scripts-project-yml.bak — previous script run was killed; restoring project.yml"
-    cp "$PROJECT_YML_BACKUP" "$PROJECT_YML"
-    rm -f "$PROJECT_YML_BACKUP"
+    if [[ ! -s "$PROJECT_YML_BACKUP" ]]; then
+        log "WARNING: stale backup at .scripts-project-yml.bak is empty; deleting without restore"
+        rm -f "$PROJECT_YML_BACKUP"
+    elif cmp -s "$PROJECT_YML_BACKUP" "$PROJECT_YML"; then
+        log "found stale backup at .scripts-project-yml.bak; project.yml already matches it, deleting backup"
+        rm -f "$PROJECT_YML_BACKUP"
+    else
+        log "found stale backup at .scripts-project-yml.bak — treating as crashed prior run; restoring project.yml"
+        cp "$PROJECT_YML_BACKUP" "$PROJECT_YML"
+        rm -f "$PROJECT_YML_BACKUP"
+    fi
 fi
 
 if [[ "$PROD" -ne 1 ]]; then
     # Capture the pre-patch state BEFORE applying any modifications,
     # so the EXIT trap (or the recovery block above on the next run)
-    # can restore to it.
-    cp "$PROJECT_YML" "$PROJECT_YML_BACKUP"
-    trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP"' EXIT
+    # can restore to it. Write to a tmp path then atomic-rename so a
+    # partial write (signal during cp, ENOSPC) never appears as a
+    # complete backup that the next run's recovery would trust.
+    cp "$PROJECT_YML" "${PROJECT_YML_BACKUP}.tmp"
+    mv "${PROJECT_YML_BACKUP}.tmp" "$PROJECT_YML_BACKUP"
+    trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP" "${PROJECT_YML_BACKUP}.tmp"' EXIT
     log "patching project.yml → $APP_NAME / $BUNDLE_ID"
     /usr/bin/sed -i '' -E \
         "s|^( *PRODUCT_BUNDLE_IDENTIFIER: dev\.nickanderssohn\.nice)\$|\\1-dev|" \
