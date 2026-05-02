@@ -386,6 +386,14 @@ final class SessionsModel {
         paneLaunchStates[paneId] = nil
     }
 
+    /// Carry a launch-overlay entry over from another window's
+    /// `SessionsModel`. Used by `adoptPane` and `absorbAsNewTab` so a
+    /// pane dragged mid-launch keeps its "Launching…" overlay on the
+    /// destination side instead of orphaning on source.
+    func adoptPaneLaunchState(paneId: String, status: PaneLaunchStatus) {
+        paneLaunchStates[paneId] = status
+    }
+
     // MARK: - Selection / pane management
 
     /// Pick which pane is focused in `tabId`. No-op if `paneId` isn't a
@@ -492,6 +500,119 @@ final class SessionsModel {
     func addTerminalToActiveTab() {
         guard let id = tabs?.activeTabId else { return }
         _ = addPane(tabId: id, kind: .terminal)
+    }
+
+    /// Move a TERMINAL pane from another window's `AppState` (or this
+    /// one) into an existing destination tab in this window. The pty
+    /// stays alive and the SwiftTerm scrollback is preserved — the
+    /// underlying `NiceTerminalView` migrates between `TabPtySession`
+    /// instances rather than respawning.
+    ///
+    /// Claude panes are NOT routed through here; they always create a
+    /// new tab via `AppState.absorbAsNewTab` because the
+    /// "Claude must be at index 0" invariant rules out joining an
+    /// existing tab.
+    ///
+    /// `destIndex` is the desired final position of the pane in the
+    /// destination tab's `panes` array. Clamped to ≥1 when the
+    /// destination tab has Claude at index 0. Defaults to append.
+    ///
+    /// Returns true on success; false when the payload doesn't match
+    /// (Claude kind, missing source/destination), nothing is moved.
+    @discardableResult
+    func adoptPane(
+        from sourceAppState: AppState,
+        payload: PaneDragPayload,
+        intoTabId destTabId: String,
+        insertAt destIndex: Int? = nil
+    ) -> Bool {
+        // Claude panes go through the new-tab path.
+        guard payload.kind == .terminal else { return false }
+        guard let tabs else { return false }
+        guard let destTab = tabs.tab(for: destTabId) else { return false }
+
+        let sourceSessions = sourceAppState.sessions
+        let sourceTabs = sourceAppState.tabs
+        guard let sourceTab = sourceTabs.tab(for: payload.tabId),
+              let sourcePane = sourceTab.panes.first(where: { $0.id == payload.paneId })
+        else { return false }
+        guard sourcePane.kind == .terminal else { return false }
+
+        // Resolve insertion index, clamping to ≥1 when destination has
+        // Claude at slot 0.
+        let destCount = destTab.panes.count
+        var insertIdx = destIndex ?? destCount
+        insertIdx = max(0, min(insertIdx, destCount))
+        let destHasClaudeAtZero = destTab.panes.first?.kind == .claude
+        if destHasClaudeAtZero { insertIdx = max(insertIdx, 1) }
+
+        // Make sure destination has a TabPtySession to receive the view.
+        let destSession: TabPtySession
+        if let existing = ptySessions[destTabId] {
+            destSession = existing
+        } else {
+            destSession = makeSession(
+                for: destTabId, cwd: tabs.resolvedSpawnCwd(for: destTab)
+            )
+        }
+
+        // Detach view from source's TabPtySession (may be nil if pane is
+        // unspawned — model-only move in that case).
+        let sourcePtySession = sourceSessions.ptySessions[payload.tabId]
+        let detachedView = sourcePtySession?.detachPane(id: payload.paneId)
+        let carriedLaunchState = sourceSessions.paneLaunchStates[payload.paneId]
+
+        // STEP 1: Insert (view + new delegate) into destination
+        // TabPtySession. NSView's single-parent rule means doing this
+        // BEFORE source-detach guarantees the view never has a
+        // window-less moment.
+        if let view = detachedView {
+            destSession.attachPane(id: payload.paneId, view: view)
+        }
+        if let carriedLaunchState {
+            adoptPaneLaunchState(paneId: payload.paneId, status: carriedLaunchState)
+            sourceSessions.clearPaneLaunch(paneId: payload.paneId)
+        }
+
+        // STEP 2: Mutate destination TabModel — insert pane, focus it,
+        // select the destination tab.
+        tabs.mutateTab(id: destTabId) { tab in
+            tab.panes.insert(sourcePane, at: insertIdx)
+            tab.activePaneId = payload.paneId
+        }
+        tabs.activeTabId = destTabId
+
+        // STEP 3: Mutate source TabModel — remove pane, recover
+        // activePaneId via the same neighbor logic as paneExited.
+        var sourceBecameEmpty = false
+        sourceTabs.mutateTab(id: payload.tabId) { tab in
+            guard let idx = tab.panes.firstIndex(where: { $0.id == payload.paneId })
+            else { return }
+            tab.panes.remove(at: idx)
+            if tab.activePaneId == payload.paneId {
+                if idx < tab.panes.count {
+                    tab.activePaneId = tab.panes[idx].id
+                } else if idx > 0 {
+                    tab.activePaneId = tab.panes[idx - 1].id
+                } else {
+                    tab.activePaneId = nil
+                }
+            }
+            sourceBecameEmpty = tab.panes.isEmpty
+        }
+
+        // STEP 4: Source TabPtySession dict is already detached above.
+
+        // STEP 5: If source tab is now empty, fire its dissolve cascade.
+        if sourceBecameEmpty,
+           let (pi, ti) = sourceTabs.projectTabIndex(for: payload.tabId) {
+            sourceSessions.onTabBecameEmpty?(payload.tabId, pi, ti)
+        }
+
+        // STEP 6: Schedule saves on both windows.
+        sourceSessions.onSessionMutation?()
+        onSessionMutation?()
+        return true
     }
 
     // MARK: - Tab creation (with pty spawn)

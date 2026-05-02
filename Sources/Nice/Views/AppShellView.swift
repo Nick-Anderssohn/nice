@@ -90,6 +90,25 @@ private struct AppShellHost: View {
     /// sticky behavior when reversing direction from a clamped edge.
     @State private var dragStartWidth: CGFloat? = nil
 
+    /// Per-window observable state for an in-flight pane-pill drag.
+    /// Read by `WindowToolbarView` (source pill fade + pane-strip
+    /// drop indicator) and `SidebarView` (tab-row drop highlight).
+    @State private var paneDragState = PaneDragState()
+
+    /// Pending screen-origin to assign to this window once AppKit
+    /// hands it to us via `WindowAccessor`. Set by `.task` after
+    /// consuming a tear-off; cleared after applying. Order-independent:
+    /// the `apply` helper runs whenever EITHER `tornOffWindow` OR
+    /// `pendingTearOffOriginToApply` changes, so it doesn't matter
+    /// whether `WindowAccessor` fires before or after `.task`.
+    @State private var pendingTearOffOriginToApply: NSPoint? = nil
+
+    /// Captured `NSWindow` for this AppState. Set by `WindowAccessor`
+    /// once AppKit mounts the window. Read by the tear-off origin
+    /// applier so we can position regardless of which side of the
+    /// race wins.
+    @State private var hostedWindow: NSWindow? = nil
+
     init(
         services: NiceServices,
         initialSidebarCollapsed: Bool,
@@ -123,6 +142,22 @@ private struct AppShellHost: View {
 
     private var palette: Palette { tweaks.activeChromePalette }
 
+    /// Apply the pending tear-off cursor origin once we have both the
+    /// origin (from `.task` consuming the tear-off) and the window
+    /// reference (from `WindowAccessor`'s callback). Either may
+    /// arrive first — re-runs on each state change until both are
+    /// present, then nils the pending origin so it doesn't re-apply.
+    private func applyPendingTearOffOriginIfReady() {
+        guard let origin = pendingTearOffOriginToApply,
+              let window = hostedWindow
+        else { return }
+        // `setFrameTopLeftPoint` accepts a Cocoa screen point
+        // (origin bottom-left); the cursor coordinate from
+        // `NSDraggingSession` is in the same space.
+        window.setFrameTopLeftPoint(origin)
+        pendingTearOffOriginToApply = nil
+    }
+
     /// Body text for the "processes still running" alert. Lists the
     /// busy pane(s) so the user knows what they'd be force-quitting.
     private func pendingCloseMessage(_ request: PendingCloseRequest) -> String {
@@ -155,6 +190,9 @@ private struct AppShellHost: View {
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
                 TitleBarZoomMonitor.install()
                 services.registry.register(appState: appState, window: window)
+                hostedWindow = window
+                // Tear-off origin (if any) applied via the @State pair
+                // change handlers below — order-independent.
             }
         )
         .background(windowBackground.ignoresSafeArea())
@@ -179,6 +217,7 @@ private struct AppShellHost: View {
         .environment(appState.windowSession)
         .environment(appState.fileExplorerOrchestrator)
         .environment(appState)
+        .environment(paneDragState)
         .alert(
             "Processes are still running",
             isPresented: Binding(
@@ -201,6 +240,18 @@ private struct AppShellHost: View {
             // edges (e.g. window restoration).
             services.bootstrap()
             appState.start()
+            // Tear-off absorption: if the source window stashed a
+            // pending pane on `services.pendingTearOff` and asked the
+            // app to open a new window, this freshly-mounted AppState
+            // claims and absorbs it. The originator is filtered by
+            // `consumeTearOff` so it can't re-absorb its own.
+            if let pending = services.consumeTearOff(for: appState) {
+                appState.absorbTearOff(pending)
+                pendingTearOffOriginToApply = NSPoint(
+                    x: pending.cursorScreenPoint.x,
+                    y: pending.cursorScreenPoint.y
+                )
+            }
         }
         .onAppear {
             // Brand-new scene: write the id WindowSession minted back
@@ -254,6 +305,12 @@ private struct AppShellHost: View {
         .onChange(of: tweaks.terminalFontFamily) { _, newValue in
             appState.sessions.updateTerminalFontFamily(newValue)
         }
+        // Tear-off origin: apply when BOTH the window and the
+        // pending origin are available, regardless of which arrives
+        // first. The applier nils the pending origin so it never
+        // re-fires when an unrelated state change re-triggers body.
+        .onChange(of: hostedWindow) { _, _ in applyPendingTearOffOriginIfReady() }
+        .onChange(of: pendingTearOffOriginToApply) { _, _ in applyPendingTearOffOriginIfReady() }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar state across relaunch. Also clear any
         // in-flight peek state when the sidebar is explicitly

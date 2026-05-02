@@ -112,6 +112,10 @@ private struct InlinePaneStrip: View {
     @Environment(TabModel.self) private var tabs
     @Environment(SessionsModel.self) private var sessions
     @Environment(CloseRequestCoordinator.self) private var closer
+    @Environment(AppState.self) private var appState
+    @Environment(NiceServices.self) private var services
+    @Environment(PaneDragState.self) private var paneDragState
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.colorScheme) private var scheme
 
     /// Tracks which pill (if any) the mouse is currently over, keyed by
@@ -231,45 +235,7 @@ private struct InlinePaneStrip: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
                     ForEach(tab.panes) { pane in
-                        InlinePanePill(
-                            pane: pane,
-                            isActive: tab.activePaneId == pane.id,
-                            isHovered: hoveredPaneId == pane.id,
-                            onHoverChange: { hovering in
-                                if hovering {
-                                    hoveredPaneId = pane.id
-                                } else if hoveredPaneId == pane.id {
-                                    hoveredPaneId = nil
-                                }
-                            },
-                            onSelect: {
-                                sessions.setActivePane(
-                                    tabId: tab.id,
-                                    paneId: pane.id
-                                )
-                            },
-                            onClose: {
-                                closer.requestClosePane(
-                                    tabId: tab.id,
-                                    paneId: pane.id
-                                )
-                            }
-                        )
-                        .id(pane.id)
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear.preference(
-                                    key: PaneFramePreferenceKey.self,
-                                    value: [
-                                        pane.id: geo.frame(
-                                            in: .named(
-                                                paneStripCoordinateSpace
-                                            )
-                                        )
-                                    ]
-                                )
-                            }
-                        )
+                        pillCell(tab: tab, pane: pane)
                     }
                 }
             }
@@ -324,8 +290,120 @@ private struct InlinePaneStrip: View {
                         value: geometry.canScrollTrailing
                     )
             }
+            .overlay(alignment: .topLeading) {
+                paneStripDropIndicator(for: tab)
+            }
+            .onDrop(
+                of: [PaneDragPayload.utType],
+                delegate: PaneStripDropDelegate(
+                    destTab: tab,
+                    destAppState: appState,
+                    registry: services.registry,
+                    dragState: paneDragState,
+                    paneFramesProvider: { paneFrames }
+                )
+            )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One pane pill wrapped with the AppKit drag source plus the
+    /// frame-reporting GeometryReader. Extracted out of the ForEach
+    /// to keep that body small enough for SwiftUI's type checker.
+    @ViewBuilder
+    private func pillCell(tab: Tab, pane: Pane) -> some View {
+        let payload = PaneDragPayload(
+            windowSessionId: appState.windowSession.windowSessionId,
+            tabId: tab.id,
+            paneId: pane.id,
+            kind: pane.kind
+        )
+        PaneDragSource(
+            payload: payload,
+            dragState: paneDragState,
+            onTearOff: { screenPoint in
+                // Detach + stash on services; the freshly-spawned
+                // window's AppShellHost.task consumes it after start().
+                services.requestPaneTearOff(
+                    from: appState,
+                    tabId: tab.id,
+                    paneId: pane.id,
+                    cursorScreenPoint: screenPoint
+                )
+                openWindow(id: "main")
+            }
+        ) {
+            InlinePanePill(
+                pane: pane,
+                isActive: tab.activePaneId == pane.id,
+                isHovered: hoveredPaneId == pane.id,
+                isBeingDragged: paneDragState.session?.payload.paneId == pane.id,
+                onHoverChange: { hovering in
+                    if hovering {
+                        hoveredPaneId = pane.id
+                    } else if hoveredPaneId == pane.id {
+                        hoveredPaneId = nil
+                    }
+                },
+                onSelect: {
+                    sessions.setActivePane(tabId: tab.id, paneId: pane.id)
+                },
+                onClose: {
+                    closer.requestClosePane(tabId: tab.id, paneId: pane.id)
+                }
+            )
+        }
+        .frame(maxWidth: 220, maxHeight: 28)
+        .fixedSize()
+        .id(pane.id)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: PaneFramePreferenceKey.self,
+                    value: [
+                        pane.id: geo.frame(
+                            in: .named(paneStripCoordinateSpace)
+                        )
+                    ]
+                )
+            }
+        )
+    }
+
+    /// 2pt accent vertical line painted between pills when a pane drag
+    /// is hovering over this strip. `visualSlot` runs `[0, paneCount]`:
+    /// 0 → leading edge of first pill; N → trailing edge of last pill;
+    /// else → centered between pill `slot-1` and pill `slot`.
+    @ViewBuilder
+    private func paneStripDropIndicator(for tab: Tab) -> some View {
+        if case let .paneStrip(tabId, visualSlot, _)? = paneDragState.session?.target,
+           tabId == tab.id,
+           let x = indicatorX(for: visualSlot, in: tab) {
+            Rectangle()
+                .fill(Color.niceAccent)
+                .frame(width: 2, height: 24)
+                .offset(x: x - 1, y: 2)
+                .allowsHitTesting(false)
+        }
+    }
+
+    /// Resolve the x position of the insertion-line in the strip's
+    /// coordinate space from a visual slot.
+    private func indicatorX(for slot: Int, in tab: Tab) -> CGFloat? {
+        guard !tab.panes.isEmpty else { return 0 }
+        if slot <= 0 {
+            return paneFrames[tab.panes[0].id]?.minX
+        }
+        if slot >= tab.panes.count {
+            return paneFrames[tab.panes[tab.panes.count - 1].id]?.maxX
+        }
+        // Between pill slot-1 and pill slot.
+        let leadingMaxX = paneFrames[tab.panes[slot - 1].id]?.maxX
+        let trailingMinX = paneFrames[tab.panes[slot].id]?.minX
+        if let l = leadingMaxX, let t = trailingMinX {
+            return (l + t) / 2
+        }
+        return leadingMaxX ?? trailingMinX
     }
 
     private func edgeFade(trailing: Bool) -> some View {
@@ -380,6 +458,10 @@ private struct InlinePanePill: View {
     let pane: Pane
     let isActive: Bool
     let isHovered: Bool
+    /// True while this pane is the source of an in-flight drag — pill
+    /// renders at 0.4 opacity so the user can see where their pane
+    /// "lifted" from while they hover the cursor over a destination.
+    var isBeingDragged: Bool = false
     let onHoverChange: (Bool) -> Void
     let onSelect: () -> Void
     let onClose: () -> Void
@@ -457,8 +539,10 @@ private struct InlinePanePill: View {
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .onTapGesture { onSelect() }
         .onHover { onHoverChange($0) }
+        .opacity(isBeingDragged ? 0.4 : 1)
         .animation(.easeInOut(duration: 0.12), value: isActive)
         .animation(.easeInOut(duration: 0.12), value: isHovered)
+        .animation(.easeInOut(duration: 0.12), value: isBeingDragged)
         // Expose the pill as a single AXButton that contains the close
         // button as a child (not a merged peer). Without `.contain`,
         // `.onTapGesture` + `.accessibilityAddTraits(.isButton)` emit
@@ -677,6 +761,115 @@ private struct NewTabBtn: View {
     }
 }
 
+// MARK: - Pane-pill drop delegate
+
+/// `DropDelegate` attached to `InlinePaneStrip`. Routes terminal-pane
+/// drops through `SessionsModel.adoptPane` (joins this strip's tab)
+/// and Claude-pane drops onto a different tab through
+/// `AppState.absorbAsNewTab` (spawns a new tab in this window).
+///
+/// Slot picking + Claude-rule validation lives in
+/// `PaneStripDropResolver` so it stays unit-testable. Model mutations
+/// are deferred one runloop tick — same pattern as the sidebar tab
+/// reorder, avoids AppKit's drag tracker getting stuck on the old
+/// view hierarchy.
+private struct PaneStripDropDelegate: DropDelegate {
+    let destTab: Tab
+    let destAppState: AppState
+    let registry: WindowRegistry
+    let dragState: PaneDragState
+    let paneFramesProvider: () -> [String: CGRect]
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [PaneDragPayload.utType])
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateIndicator(for: info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateIndicator(for: info)
+        return DropProposal(operation: ownsCurrentIndicator ? .move : .forbidden)
+    }
+
+    func dropExited(info: DropInfo) {
+        if ownsCurrentIndicator {
+            dragState.session?.target = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let payload = dragState.session?.payload,
+              let outcome = resolve(payload: payload, info: info)
+        else { return false }
+        guard let sourceAppState = registry.appState(forSessionId: payload.windowSessionId)
+        else {
+            dragState.session = nil
+            return false
+        }
+
+        // Mark accepted so the AppKit drag source's
+        // `draggingSession(_:endedAt:)` skips the tear-off path.
+        dragState.session?.didDropOnTarget = true
+
+        DispatchQueue.main.async {
+            switch payload.kind {
+            case .terminal:
+                _ = destAppState.sessions.adoptPane(
+                    from: sourceAppState,
+                    payload: payload,
+                    intoTabId: destTab.id,
+                    insertAt: outcome.finalIndex
+                )
+            case .claude:
+                _ = destAppState.absorbClaudeAsNewTab(
+                    from: sourceAppState, payload: payload
+                )
+            }
+            dragState.session = nil
+        }
+        return true
+    }
+
+    private func updateIndicator(for info: DropInfo) {
+        guard let payload = dragState.session?.payload,
+              let outcome = resolve(payload: payload, info: info)
+        else {
+            if ownsCurrentIndicator {
+                dragState.session?.target = nil
+            }
+            return
+        }
+        dragState.session?.target = .paneStrip(
+            tabId: destTab.id,
+            visualSlot: outcome.visualSlot,
+            finalIndex: outcome.finalIndex
+        )
+    }
+
+    private var ownsCurrentIndicator: Bool {
+        if case .paneStrip(let tabId, _, _)? = dragState.session?.target {
+            return tabId == destTab.id
+        }
+        return false
+    }
+
+    private func resolve(
+        payload: PaneDragPayload,
+        info: DropInfo
+    ) -> PaneStripDropResolver.Outcome? {
+        PaneStripDropResolver.resolve(
+            payload: payload,
+            destTabId: destTab.id,
+            destPaneOrder: destTab.panes.map(\.id),
+            destHasClaudeAtZero: destTab.panes.first?.kind == .claude,
+            cursorX: info.location.x,
+            paneFrames: paneFramesProvider()
+        )
+    }
+}
+
 // MARK: - Previews
 
 #Preview("Toolbar — light") {
@@ -686,6 +879,8 @@ private struct NewTabBtn: View {
         .environment(appState.tabs)
         .environment(appState.sessions)
         .environment(appState.closer)
+        .environment(NiceServices())
+        .environment(PaneDragState())
         .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.light)
@@ -698,6 +893,8 @@ private struct NewTabBtn: View {
         .environment(appState.tabs)
         .environment(appState.sessions)
         .environment(appState.closer)
+        .environment(NiceServices())
+        .environment(PaneDragState())
         .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.dark)

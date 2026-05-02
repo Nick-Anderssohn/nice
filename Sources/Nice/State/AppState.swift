@@ -41,6 +41,55 @@ enum PaneLaunchStatus: Equatable {
     case visible(command: String)
 }
 
+/// In-flight tear-off awaiting absorption by a freshly-spawned
+/// window's `AppState`. Lives in a process-wide slot on
+/// `NiceServices`; the new window's `AppShellHost.task` consumes it
+/// after `appState.start()` and calls `AppState.absorbTearOff(_:)`.
+struct PendingTearOff {
+    let payload: PaneDragPayload
+    /// Live `NiceTerminalView` detached from source (nil if the pane
+    /// had no spawned pty — model-only tear-off).
+    let view: NiceTerminalView?
+    let pane: Pane
+    let sourceTab: Tab
+    /// Identity of the originating `AppState` so the originator
+    /// doesn't accidentally re-absorb its own tear-off on its next
+    /// view rebuild.
+    let originAppStateId: ObjectIdentifier
+    let projectAnchor: ProjectAnchor
+    /// Cursor position at drag-release in screen coordinates
+    /// (Cocoa: origin bottom-left). Used to position the new window's
+    /// top-left near the cursor.
+    let cursorScreenPoint: CGPoint
+    let pendingLaunchState: PaneLaunchStatus?
+}
+
+/// Where in the destination window's sidebar a torn-off / migrated
+/// new tab should land. `terminals` pins to the reserved Terminals
+/// project; `repoPath` matches an existing non-Terminals project by
+/// path or creates a fresh one rooted there. Used by the drag-and-drop
+/// new-tab path (`AppState.absorbAsNewTab`).
+enum ProjectAnchor: Sendable, Equatable {
+    case terminals
+    case repoPath(String)
+
+    /// Pick the natural anchor for `sourceTabId`'s migrated panes:
+    /// pinned Terminals when the tab lives there, otherwise the
+    /// owning project's path.
+    @MainActor
+    static func from(sourceTabId: String, sourceAppState: AppState) -> ProjectAnchor {
+        if sourceAppState.tabs.isTerminalsProjectTab(sourceTabId) {
+            return .terminals
+        }
+        if let proj = sourceAppState.tabs.projects.first(where: { p in
+            p.tabs.contains(where: { $0.id == sourceTabId })
+        }) {
+            return .repoPath(proj.path)
+        }
+        return .terminals
+    }
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -248,6 +297,158 @@ final class AppState {
         guard sidebar.sidebarMode == .files,
               let tabId = tabs.activeTabId else { return }
         fileBrowserStore.toggleHiddenFilesIfExists(forTab: tabId)
+    }
+
+    /// Absorb a `PendingTearOff` produced by the source window's drag
+    /// release. Thin wrapper around `absorbAsNewTab`; the new
+    /// window's top-left is positioned near the cursor release point.
+    @discardableResult
+    func absorbTearOff(_ pending: PendingTearOff) -> String {
+        let newTabId = absorbAsNewTab(
+            pane: pending.pane,
+            sourceTab: pending.sourceTab,
+            view: pending.view,
+            projectAnchor: pending.projectAnchor,
+            pendingLaunchState: pending.pendingLaunchState
+        )
+        // Window-position assignment is handed back to the caller —
+        // it has direct access to the NSWindow via `WindowAccessor`,
+        // and we don't want this method to depend on `WindowRegistry`
+        // resolving the still-mounting window.
+        return newTabId
+    }
+
+    /// Detach a Claude pane from `sourceAppState` and absorb it into
+    /// THIS window as a fresh tab. Used by both drop delegates (pane
+    /// strip + sidebar row) when a Claude pane lands on an existing
+    /// window — Claude can't join an existing tab so it always spawns
+    /// a new one. The pty stays alive across the migration.
+    ///
+    /// Returns the new tab id, or `nil` for invalid input (non-Claude
+    /// payload, missing source).
+    @discardableResult
+    func absorbClaudeAsNewTab(
+        from sourceAppState: AppState,
+        payload: PaneDragPayload
+    ) -> String? {
+        guard payload.kind == .claude else { return nil }
+        guard let sourceTab = sourceAppState.tabs.tab(for: payload.tabId),
+              let pane = sourceTab.panes.first(where: { $0.id == payload.paneId })
+        else { return nil }
+
+        let anchor = ProjectAnchor.from(
+            sourceTabId: payload.tabId, sourceAppState: sourceAppState
+        )
+        let sourcePty = sourceAppState.sessions.ptySessions[payload.tabId]
+        let detachedView = sourcePty?.detachPane(id: payload.paneId)
+        let launchState = sourceAppState.sessions.paneLaunchStates[payload.paneId]
+
+        var sourceBecameEmpty = false
+        sourceAppState.tabs.mutateTab(id: payload.tabId) { tab in
+            guard let idx = tab.panes.firstIndex(where: { $0.id == payload.paneId })
+            else { return }
+            tab.panes.remove(at: idx)
+            if tab.activePaneId == payload.paneId {
+                if idx < tab.panes.count {
+                    tab.activePaneId = tab.panes[idx].id
+                } else if idx > 0 {
+                    tab.activePaneId = tab.panes[idx - 1].id
+                } else {
+                    tab.activePaneId = nil
+                }
+            }
+            sourceBecameEmpty = tab.panes.isEmpty
+        }
+        if launchState != nil {
+            sourceAppState.sessions.clearPaneLaunch(paneId: payload.paneId)
+        }
+        if sourceBecameEmpty,
+           let (pi, ti) = sourceAppState.tabs.projectTabIndex(for: payload.tabId) {
+            sourceAppState.sessions.onTabBecameEmpty?(payload.tabId, pi, ti)
+        }
+
+        let newTabId = absorbAsNewTab(
+            pane: pane,
+            sourceTab: sourceTab,
+            view: detachedView,
+            projectAnchor: anchor,
+            pendingLaunchState: launchState
+        )
+        sourceAppState.sessions.onSessionMutation?()
+        return newTabId
+    }
+
+    /// Adopt a pane (kind: claude OR terminal) as the sole occupant
+    /// of a NEW tab in this window. Used for:
+    ///   - Claude pane drops onto another window's pane strip /
+    ///     sidebar row (Claude can't join an existing tab — must be at
+    ///     index 0).
+    ///   - Tear-off into a new window (any pane kind).
+    ///
+    /// The migrated `view` is attached to a freshly-minted
+    /// `TabPtySession` so the live pty + scrollback survive. Carries
+    /// `claudeSessionId` from `sourceTab` for Claude panes so future
+    /// restores can `claude --resume`.
+    ///
+    /// Returns the newly-minted tab id.
+    @discardableResult
+    func absorbAsNewTab(
+        pane: Pane,
+        sourceTab: Tab,
+        view: NiceTerminalView?,
+        projectAnchor: ProjectAnchor,
+        pendingLaunchState: PaneLaunchStatus? = nil
+    ) -> String {
+        let newTabId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
+        let carriedSessionId: String? =
+            (pane.kind == .claude) ? sourceTab.claudeSessionId : nil
+        let title: String = {
+            switch pane.kind {
+            case .claude: return sourceTab.title
+            case .terminal:
+                return pane.title.isEmpty ? "Terminal" : pane.title
+            }
+        }()
+        let newTab = Tab(
+            id: newTabId,
+            title: title,
+            cwd: sourceTab.cwd,
+            branch: sourceTab.branch,
+            panes: [pane],
+            activePaneId: pane.id,
+            titleManuallySet: sourceTab.titleManuallySet,
+            claudeSessionId: carriedSessionId
+        )
+
+        // Bucket into the right project before wiring up the pty
+        // session so the tab is fully placed when `makeSession` runs.
+        switch projectAnchor {
+        case .terminals:
+            tabs.ensureTerminalsProjectSeeded()
+            if let pi = tabs.projects.firstIndex(
+                where: { $0.id == TabModel.terminalsProjectId }
+            ) {
+                tabs.projects[pi].tabs.append(newTab)
+            }
+        case .repoPath(let path):
+            tabs.appendOrInsert(newTab, intoProjectAt: path)
+        }
+
+        // Spin up a TabPtySession and migrate the live view in.
+        let cwd = tabs.resolvedSpawnCwd(for: newTab)
+        let session = sessions.makeSession(for: newTabId, cwd: cwd)
+        if let view {
+            session.attachPane(id: pane.id, view: view)
+        }
+        if let pendingLaunchState {
+            sessions.adoptPaneLaunchState(
+                paneId: pane.id, status: pendingLaunchState
+            )
+        }
+
+        tabs.activeTabId = newTabId
+        windowSession.scheduleSessionSave()
+        return newTabId
     }
 
     /// Finish tearing down a tab whose panes array reached zero:

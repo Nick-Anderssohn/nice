@@ -61,6 +61,14 @@ final class NiceServices {
     @ObservationIgnored
     private var terminateObserver: NSObjectProtocol?
 
+    /// One pending tear-off, claimed by the next AppState that finishes
+    /// `start()`. Set by `requestPaneTearOff` from the drag source's
+    /// no-target callback; consumed by `AppShellHost` immediately after
+    /// `appState.start()`. The detached `NiceTerminalView` is parent-
+    /// less while in transit through this slot for at most one runloop
+    /// hop — AppKit allows that.
+    var pendingTearOff: PendingTearOff?
+
     init() {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
@@ -179,6 +187,87 @@ final class NiceServices {
                 }
             }
         }
+    }
+
+    // MARK: - Pane tear-off
+
+    /// Detach a pane from `sourceAppState` and stash the live view +
+    /// model template into `pendingTearOff`, then ask SwiftUI to open
+    /// a new window. The new window's `AppShellHost.task` consumes the
+    /// pending entry after `appState.start()` and absorbs the pane.
+    ///
+    /// Called from `PaneDragSource`'s `onTearOff` callback when the
+    /// drag ended outside any drop target.
+    func requestPaneTearOff(
+        from sourceAppState: AppState,
+        tabId: String,
+        paneId: String,
+        cursorScreenPoint: CGPoint
+    ) {
+        guard let sourceTab = sourceAppState.tabs.tab(for: tabId),
+              let pane = sourceTab.panes.first(where: { $0.id == paneId })
+        else { return }
+
+        let payload = PaneDragPayload(
+            windowSessionId: sourceAppState.windowSession.windowSessionId,
+            tabId: tabId, paneId: paneId, kind: pane.kind
+        )
+        let anchor = ProjectAnchor.from(
+            sourceTabId: tabId, sourceAppState: sourceAppState
+        )
+
+        let sourcePty = sourceAppState.sessions.ptySessions[tabId]
+        let detachedView = sourcePty?.detachPane(id: paneId)
+        let launchState = sourceAppState.sessions.paneLaunchStates[paneId]
+
+        // Mutate source TabModel — remove pane, recover activePaneId.
+        var sourceBecameEmpty = false
+        sourceAppState.tabs.mutateTab(id: tabId) { tab in
+            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId })
+            else { return }
+            tab.panes.remove(at: idx)
+            if tab.activePaneId == paneId {
+                if idx < tab.panes.count {
+                    tab.activePaneId = tab.panes[idx].id
+                } else if idx > 0 {
+                    tab.activePaneId = tab.panes[idx - 1].id
+                } else {
+                    tab.activePaneId = nil
+                }
+            }
+            sourceBecameEmpty = tab.panes.isEmpty
+        }
+        if launchState != nil {
+            sourceAppState.sessions.clearPaneLaunch(paneId: paneId)
+        }
+        if sourceBecameEmpty,
+           let (pi, ti) = sourceAppState.tabs.projectTabIndex(for: tabId) {
+            sourceAppState.sessions.onTabBecameEmpty?(tabId, pi, ti)
+        }
+        sourceAppState.sessions.onSessionMutation?()
+
+        pendingTearOff = PendingTearOff(
+            payload: payload,
+            view: detachedView,
+            pane: pane,
+            sourceTab: sourceTab,
+            originAppStateId: ObjectIdentifier(sourceAppState),
+            projectAnchor: anchor,
+            cursorScreenPoint: cursorScreenPoint,
+            pendingLaunchState: launchState
+        )
+    }
+
+    /// Claim and clear the pending tear-off if it was NOT originated
+    /// by the calling `AppState` — the originator must skip it so the
+    /// torn-off pane lands in a fresh sibling window, not back in the
+    /// source.
+    func consumeTearOff(for appState: AppState) -> PendingTearOff? {
+        guard let pending = pendingTearOff,
+              pending.originAppStateId != ObjectIdentifier(appState)
+        else { return nil }
+        pendingTearOff = nil
+        return pending
     }
 
     // MARK: - Resolving `claude`

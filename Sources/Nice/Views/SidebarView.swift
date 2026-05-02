@@ -312,6 +312,9 @@ private struct TabRow: View {
     @Environment(Tweaks.self) private var tweaks
     @Environment(FontSettings.self) private var fontSettings
     @Environment(SidebarDragState.self) private var dragState
+    @Environment(AppState.self) private var appState
+    @Environment(NiceServices.self) private var services
+    @Environment(PaneDragState.self) private var paneDragState
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -344,7 +347,19 @@ private struct TabRow: View {
         return Date().timeIntervalSince(activatedAt) >= NSEvent.doubleClickInterval
     }
 
+    /// True iff a pane drag is currently hovering over this row as a
+    /// drop target. Drives the row highlight.
+    private var isPaneDropTarget: Bool {
+        if case .sidebarTabRow(let id)? = paneDragState.session?.target {
+            return id == tab.id
+        }
+        return false
+    }
+
     private var backgroundColor: Color {
+        if isPaneDropTarget {
+            return Color.niceSel(scheme, accent: tweaks.accent.color)
+        }
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
         if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
@@ -454,6 +469,15 @@ private struct TabRow: View {
             dragState.session = SidebarDragSession(draggedTabId: tab.id, target: nil)
             return NSItemProvider(object: tab.id as NSString)
         }
+        .onDrop(
+            of: [PaneDragPayload.utType],
+            delegate: TabRowPaneDropDelegate(
+                destTab: tab,
+                destAppState: appState,
+                registry: services.registry,
+                paneDragState: paneDragState
+            )
+        )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
         .onAppear {
@@ -683,6 +707,104 @@ private struct ProjectGroupDropDelegate: DropDelegate {
     }
 }
 
+/// `DropDelegate` for pane-pill drops onto a sidebar tab row.
+/// Terminal payloads append into the row's tab via `adoptPane`;
+/// Claude payloads (which can't join an existing tab) create a fresh
+/// tab in the destination window via `absorbClaudeAsNewTab`. Drops on
+/// the source pane's OWN tab are no-ops.
+///
+/// Lives alongside the existing `.text`-based tab-reorder drop on
+/// `ProjectGroup`; the two systems use different UTTypes so SwiftUI
+/// routes each drag to exactly one delegate.
+private struct TabRowPaneDropDelegate: DropDelegate {
+    let destTab: Tab
+    let destAppState: AppState
+    let registry: WindowRegistry
+    let paneDragState: PaneDragState
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [PaneDragPayload.utType])
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateIndicator()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateIndicator()
+        return DropProposal(operation: isAcceptable ? .move : .forbidden)
+    }
+
+    func dropExited(info: DropInfo) {
+        if ownsCurrentIndicator {
+            paneDragState.session?.target = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let payload = paneDragState.session?.payload,
+              isAcceptable
+        else { return false }
+        guard let sourceAppState = registry.appState(forSessionId: payload.windowSessionId)
+        else {
+            paneDragState.session = nil
+            return false
+        }
+        paneDragState.session?.didDropOnTarget = true
+        DispatchQueue.main.async {
+            switch payload.kind {
+            case .terminal:
+                _ = destAppState.sessions.adoptPane(
+                    from: sourceAppState,
+                    payload: payload,
+                    intoTabId: destTab.id,
+                    insertAt: nil           // append to end of row's tab
+                )
+            case .claude:
+                // Claude on a different tab → spawn new tab in this
+                // window. Resolver guarantees same-tab Claude is
+                // already filtered (isAcceptable is false).
+                _ = destAppState.absorbClaudeAsNewTab(
+                    from: sourceAppState, payload: payload
+                )
+            }
+            paneDragState.session = nil
+        }
+        return true
+    }
+
+    /// True iff a drop here is allowed for the in-flight payload.
+    /// Forbids Claude pane on its own tab (would put Claude back where
+    /// it is, no real semantic change) and any drop that would empty
+    /// into the same tab the pane already lives in (terminal on own
+    /// tab is also a no-op via the row drop — `adoptPane` handles its
+    /// own no-op detection).
+    private var isAcceptable: Bool {
+        guard let payload = paneDragState.session?.payload else { return false }
+        if payload.kind == .claude && payload.tabId == destTab.id {
+            return false
+        }
+        return true
+    }
+
+    private func updateIndicator() {
+        guard isAcceptable else {
+            if ownsCurrentIndicator {
+                paneDragState.session?.target = nil
+            }
+            return
+        }
+        paneDragState.session?.target = .sidebarTabRow(tabId: destTab.id)
+    }
+
+    private var ownsCurrentIndicator: Bool {
+        if case .sidebarTabRow(let id)? = paneDragState.session?.target {
+            return id == destTab.id
+        }
+        return false
+    }
+}
+
 /// Pure, side-effect-free drop-slot picker for a tab drag. Takes a
 /// snapshot of the target group's tab frames plus the dragged tab id
 /// and the cursor location, and returns what the drop would do — or
@@ -791,6 +913,8 @@ private struct SidebarIconButton: View {
         .environment(appState.sidebar)
         .environment(appState.closer)
         .environment(appState.windowSession)
+        .environment(NiceServices())
+        .environment(PaneDragState())
         .environment(Tweaks())
         .environment(FontSettings())
         .environment(FileBrowserSortSettings())

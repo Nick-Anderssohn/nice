@@ -342,6 +342,44 @@ final class TabPtySession: TabPtySessionThemeable {
         delegates.removeValue(forKey: id)
     }
 
+    /// Detach a pane's view + delegate from this session WITHOUT
+    /// terminating its process. Returns the pieces so callers can
+    /// re-attach them to another `TabPtySession` (drag-and-drop pane
+    /// migration). The pty + scrollback stay alive across the move.
+    ///
+    /// Returns `nil` when the pane isn't present in this session
+    /// (model-only move — caller proceeds without view migration).
+    func detachPane(id: String) -> NiceTerminalView? {
+        delegates.removeValue(forKey: id)
+        return panes.removeValue(forKey: id)
+    }
+
+    /// Adopt a previously-spawned pane (view + live pty) into this
+    /// session and rewire its delegate so process exit / title / cwd
+    /// updates land on this session's callbacks. The view's pty stays
+    /// alive; SwiftTerm's scrollback is preserved.
+    ///
+    /// Re-applies the cached theme + font so the migrated view picks
+    /// up any divergence in this session's appearance settings, and
+    /// re-wires `view.onFirstData` so a (rare) lingering "Launching…"
+    /// overlay clears against this session's `onPaneFirstOutput`.
+    func attachPane(id: String, view: NiceTerminalView) {
+        let delegate = makePaneDelegate(paneId: id)
+        view.processDelegate = delegate
+        panes[id] = view
+        delegates[id] = delegate
+
+        view.font = Self.terminalFont(
+            named: currentTerminalFontFamily, size: currentTerminalFontSize
+        )
+        applyTerminalTheme(currentTerminalTheme, to: view)
+
+        let handler = onPaneFirstOutput
+        view.onFirstData = { [handler, id] in
+            handler?(id)
+        }
+    }
+
     /// Wire up the "Launching…" placeholder for a newly-spawned pane.
     /// Calls `onPaneLaunched` so AppState starts the grace timer and
     /// sets `view.onFirstData` so the overlay lifts on first pty byte.

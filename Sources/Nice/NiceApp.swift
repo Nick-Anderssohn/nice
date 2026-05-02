@@ -73,7 +73,7 @@ struct NiceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             AppShellView()
                 .environment(services)
                 .environment(services.tweaks)
