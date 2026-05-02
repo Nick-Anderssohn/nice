@@ -46,7 +46,26 @@ command -v xcodebuild >/dev/null 2>&1 || { printf '[test] missing dep: xcodebuil
 
 # ── patch project.yml for dev (scoped to the Nice target only) ───────
 PROJECT_YML="$REPO_ROOT/project.yml"
-PROJECT_YML_BACKUP=$(mktemp -t nice-test-project-yml)
+# Stable-named backup. Shared across scripts: install.sh writes/reads
+# the same path so install→test cross-script crashes self-heal.
+PROJECT_YML_BACKUP="$REPO_ROOT/.scripts-project-yml.bak"
+
+# Recover from a previous run that was killed before its EXIT trap
+# fired (kill -9, parent shell killed mid-script, power loss). The
+# backup file's existence is the signal: a clean run always deletes
+# it on exit. The contents are the pre-patch state captured by that
+# prior run, so restoring from it returns project.yml to whatever the
+# developer had before that run started. This recovers from in-script
+# crashes regardless of which script crashed.
+if [[ -f "$PROJECT_YML_BACKUP" ]]; then
+    log "found stale backup at .scripts-project-yml.bak — previous script run was killed; restoring project.yml"
+    cp "$PROJECT_YML_BACKUP" "$PROJECT_YML"
+    rm -f "$PROJECT_YML_BACKUP"
+fi
+
+# Capture the pre-patch state BEFORE applying any modifications, so
+# the EXIT trap (or the recovery block above on the next run) can
+# restore to it.
 cp "$PROJECT_YML" "$PROJECT_YML_BACKUP"
 trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP"' EXIT
 

@@ -113,8 +113,30 @@ log "variant=\"$APP_NAME\" bundle=$BUNDLE_ID configuration=$CONFIGURATION dest=$
 # UnitTests targets have `dev.nickanderssohn.nice.uitests` etc. so the
 # end-of-line anchor skips them).
 PROJECT_YML="$REPO_ROOT/project.yml"
+# Stable-named backup. Shared across scripts: test.sh writes/reads
+# the same path so test→install (or install→test) cross-script
+# crashes self-heal regardless of which script crashed.
+PROJECT_YML_BACKUP="$REPO_ROOT/.scripts-project-yml.bak"
+
+# Recover from a previous run (this script or test.sh) that was
+# killed before its EXIT trap fired (kill -9, parent shell killed
+# mid-script, power loss). The backup file's existence is the signal:
+# a clean run always deletes it on exit. Restoring from its contents
+# returns project.yml to whatever the developer had before the
+# crashed run started. --prod also runs this even though it doesn't
+# patch — without recovery here, a stale dev-variant patch left on
+# disk would silently make us build the dev bundle ID and install it
+# as Nice.app.
+if [[ -f "$PROJECT_YML_BACKUP" ]]; then
+    log "found stale backup at .scripts-project-yml.bak — previous script run was killed; restoring project.yml"
+    cp "$PROJECT_YML_BACKUP" "$PROJECT_YML"
+    rm -f "$PROJECT_YML_BACKUP"
+fi
+
 if [[ "$PROD" -ne 1 ]]; then
-    PROJECT_YML_BACKUP=$(mktemp -t nice-install-project-yml)
+    # Capture the pre-patch state BEFORE applying any modifications,
+    # so the EXIT trap (or the recovery block above on the next run)
+    # can restore to it.
     cp "$PROJECT_YML" "$PROJECT_YML_BACKUP"
     trap 'cp "$PROJECT_YML_BACKUP" "$PROJECT_YML" 2>/dev/null || true; rm -f "$PROJECT_YML_BACKUP"' EXIT
     log "patching project.yml → $APP_NAME / $BUNDLE_ID"

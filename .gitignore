@@ -28,5 +28,10 @@ Resources/Info.generated.plist
 # Release signing credentials (sourced by scripts/release.sh for local runs)
 scripts/.env.release
 
+# Crash-recovery backup written by scripts/test.sh and scripts/install.sh
+# while project.yml is being patched. Cleaned up on clean exit; if it
+# survives a run, the next script invocation uses it to restore.
+.scripts-project-yml.bak
+
 # macOS
 .DS_Store
