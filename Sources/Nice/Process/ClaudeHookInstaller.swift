@@ -2,14 +2,25 @@
 //  ClaudeHookInstaller.swift
 //  Nice
 //
-//  Installs a Claude Code `UserPromptSubmit` hook that relays the
-//  active session UUID back to Nice's control socket. Claude Code
-//  rotates its session id in-process on `/clear`, `/compact`, and
-//  `/branch`, and every rotation shows up in the next user message's
-//  hook payload — so by piggy-backing on that event, Nice keeps each
-//  tab's stored `claudeSessionId` pinned to whichever jsonl claude is
-//  actually writing to, per-pid, without filesystem polling or
-//  `proc_pidfdinfo`.
+//  Installs a Claude Code `SessionStart` hook that relays the active
+//  session UUID back to Nice's control socket whenever Claude rotates
+//  it in-process via `/clear` or `/branch` (and any future commands
+//  that fire SessionStart). The script forwards on every source — it
+//  does not try to distinguish "Nice already knows this id" cases
+//  client-side, because the receiver's `if newId != claudeSessionId`
+//  short-circuit makes redundant forwards a true no-op. Source-side
+//  filtering also turns out to be subtly wrong: `/branch` reports
+//  `source: "resume"` (not `"branch"`), so a `resume`-excluding gate
+//  would silently lose `/branch` rotations. `/compact`, in current
+//  Claude Code, fires SessionStart with the same id (no rotation),
+//  which the same short-circuit absorbs.
+//
+//  Why SessionStart and not UserPromptSubmit (the previous choice):
+//  UserPromptSubmit only sees a rotation on the *next* user prompt
+//  after the rotating command. If the user runs `/clear` and quits
+//  before typing again, the rotation is lost and Nice resumes the
+//  pre-clear session on relaunch. SessionStart fires synchronously
+//  with the rotation, closing that window.
 //
 //  Two empirical constraints shape where we install the script and
 //  the settings entry; both were learned the hard way:
@@ -27,8 +38,9 @@
 //  Components:
 //    • A small shell script (`nice-claude-hook.sh`) installed at
 //      `~/.nice/nice-claude-hook.sh`. Claude invokes it on every
-//      `UserPromptSubmit`; it no-ops outside Nice (NICE_SOCKET /
-//      NICE_PANE_ID unset) and otherwise posts a `session_update`
+//      `SessionStart`; it no-ops outside Nice (NICE_SOCKET /
+//      NICE_PANE_ID unset), no-ops on non-rotation sources
+//      (startup/resume), and otherwise posts a `session_update`
 //      message containing `paneId` + `sessionId` to NICE_SOCKET.
 //    • A Nice-tagged entry in `~/.claude/settings.json` pointing
 //      at that script. Merges non-destructively with any existing
@@ -78,10 +90,17 @@ enum ClaudeHookInstaller {
 
     // MARK: - Script
 
-    /// Shell script that Claude invokes on every UserPromptSubmit.
-    /// Extracts `session_id` from claude's stdin JSON (no jq dependency
-    /// — `sed` handles the UUID pattern reliably) and posts a
-    /// `session_update` socket payload. Silent no-op outside Nice.
+    /// Shell script that Claude invokes on every SessionStart. Extracts
+    /// `session_id` from claude's stdin JSON (no jq dependency — `sed`
+    /// handles the UUID pattern reliably) and posts a `session_update`
+    /// socket payload. Forwards on every source (`clear`, `compact`,
+    /// `resume`, `startup`, `branch`, anything Claude introduces
+    /// later) — the receiver's `if newId != tab.claudeSessionId`
+    /// short-circuit makes redundant forwards a true no-op (no save,
+    /// no churn), so source-side filtering is unnecessary and
+    /// occasionally wrong (e.g. `/branch` reports `source: "resume"`
+    /// in current Claude, so a `resume`-excluding gate would silently
+    /// lose `/branch` rotations).
     ///
     /// `set -u` catches typos without blocking the fast-path exits for
     /// unset NICE_* vars (`${X:-}` is the no-op form). `nc -w 1` keeps
@@ -89,7 +108,7 @@ enum ClaudeHookInstaller {
     /// unresponsive.
     static let hookScript = #"""
     #!/bin/bash
-    # nice-claude-hook.sh — relays the UserPromptSubmit hook's session_id
+    # nice-claude-hook.sh — relays the SessionStart hook's session_id
     # to Nice's control socket so each tab's stored claudeSessionId
     # tracks /clear, /compact, and /branch rotations across relaunches.
     # Installed automatically by Nice on startup; safe to delete.
@@ -131,8 +150,8 @@ enum ClaudeHookInstaller {
 
     // MARK: - Settings merge
 
-    /// Merge a `UserPromptSubmit` hook entry into `settingsURL` pointing
-    /// at `scriptPath`. If a matching entry is already present, returns
+    /// Merge a `SessionStart` hook entry into `settingsURL` pointing at
+    /// `scriptPath`. If a matching entry is already present, returns
     /// without writing. Other hooks (user-authored, other tools) pass
     /// through untouched.
     ///
@@ -164,18 +183,18 @@ enum ClaudeHookInstaller {
             root = dict
         }
         var hooks = (root["hooks"] as? [String: Any]) ?? [:]
-        var ups = (hooks["UserPromptSubmit"] as? [[String: Any]]) ?? []
-        let already = ups.contains { group in
+        var sessionStart = (hooks[hookEventName] as? [[String: Any]]) ?? []
+        let already = sessionStart.contains { group in
             guard let inner = group["hooks"] as? [[String: Any]] else { return false }
             return inner.contains { ($0["command"] as? String) == scriptPath }
         }
         if already { return }
-        ups.append([
+        sessionStart.append([
             "hooks": [
                 ["type": "command", "command": scriptPath],
             ],
         ])
-        hooks["UserPromptSubmit"] = ups
+        hooks[hookEventName] = sessionStart
         root["hooks"] = hooks
         let data = try JSONSerialization.data(
             withJSONObject: root,
@@ -186,6 +205,11 @@ enum ClaudeHookInstaller {
         }
         try data.write(to: settingsURL, options: .atomic)
     }
+
+    /// Claude Code hook event name we register under. Exposed
+    /// `internal` so tests can read the same constant rather than
+    /// hard-coding "SessionStart" in two places.
+    static let hookEventName = "SessionStart"
 
     enum ClaudeHookInstallerError: Error {
         /// `settings.json` exists with non-empty bytes that don't

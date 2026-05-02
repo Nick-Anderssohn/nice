@@ -140,4 +140,55 @@ final class TabPtySessionClaudeArgsTests: XCTestCase {
         )
         XCTAssertEqual(cmd, "exec '/claude' '$HOME' '`whoami`'")
     }
+
+    // MARK: - Resume failure modes (documents non-handling)
+    //
+    // Nice doesn't pre-validate any of the inputs to the resume path —
+    // a stale UUID, a missing claude binary, or a vanished cwd all
+    // surface as a shell-visible error after the user submits the
+    // pre-typed command. These tests pin the contract so any future
+    // refactor that adds defensive validation has to replace them
+    // deliberately.
+
+    func test_resume_staleUuid_emitsResumeFlagAnyway() {
+        // No transcript-existence check at arg-build time. The user
+        // sees claude's own "session not found" error in the pty.
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/usr/local/bin/claude",
+            mode: .resume(id: "00000000-deleted-transcript-0000"),
+            extraClaudeArgs: [],
+            isOverride: false
+        )
+        XCTAssertEqual(
+            cmd,
+            "exec '/usr/local/bin/claude' --resume '00000000-deleted-transcript-0000'"
+        )
+    }
+
+    func test_resumeDeferred_missingClaudeBinary_stillEmitsPrefillEnv() {
+        // buildClaudeExtraEnv doesn't stat the claude path. If the
+        // binary is missing, the shell prints "command not found" when
+        // the user hits Enter on the prefilled line.
+        let env = TabPtySession.buildClaudeExtraEnv(
+            mode: .resumeDeferred(id: "abc-123"),
+            tabId: "tab-1",
+            paneId: "pane-1",
+            socketPath: "/tmp/nice.sock",
+            zdotdirPath: "/tmp/zdotdir"
+        )
+        XCTAssertEqual(env["NICE_PREFILL_COMMAND"], "claude --resume abc-123")
+    }
+
+    func test_resume_nonexistentCwd_emitsResumeFlagAnyway() {
+        // cwd validation is the spawn's job, not the arg builder's.
+        // The cwd doesn't appear in the argv at all — it's set on the
+        // pty fork. This test pins that the argv is unaffected by cwd.
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/usr/local/bin/claude",
+            mode: .resume(id: "abc-123"),
+            extraClaudeArgs: [],
+            isOverride: false
+        )
+        XCTAssertEqual(cmd, "exec '/usr/local/bin/claude' --resume 'abc-123'")
+    }
 }

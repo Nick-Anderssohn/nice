@@ -540,7 +540,7 @@ final class TabPtySession: TabPtySessionThemeable {
     /// onto the main actor.
     /// Build the extra-env dictionary for a Claude pane. Pure helper so
     /// per-mode contracts (every mode injects `NICE_SOCKET` so the
-    /// UserPromptSubmit hook can reach Nice; only `.resumeDeferred`
+    /// SessionStart hook can reach Nice; only `.resumeDeferred`
     /// needs `ZDOTDIR` + `NICE_PREFILL_COMMAND` for the wrapper-driven
     /// pre-typed `claude --resume <uuid>`) are checkable from tests
     /// without spinning up a pty. `nonisolated` for the same reason

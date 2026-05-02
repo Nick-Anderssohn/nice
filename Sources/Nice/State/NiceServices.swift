@@ -147,11 +147,11 @@ final class NiceServices {
         // user-configured in the meantime.
         editorDetector.scan()
 
-        // Install Claude Code's UserPromptSubmit hook so Nice-spawned
-        // claudes phone home with their current session id on every
-        // user message. Handles /clear, /compact, /branch rotations
-        // that the tab's pre-minted UUID otherwise misses. Idempotent
-        // and safe to run on every launch.
+        // Install Claude Code's SessionStart hook so Nice-spawned
+        // claudes phone home with their current session id whenever
+        // they rotate it (/clear, /compact, /branch). The tab's
+        // pre-minted UUID otherwise misses these in-process rotations.
+        // Idempotent and safe to run on every launch.
         ClaudeHookInstaller.install()
 
         KeyboardShortcutMonitor.install(

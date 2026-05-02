@@ -3,15 +3,17 @@
 //  NiceUnitTests
 //
 //  Tests lock down the install / merge behavior that determines whether
-//  claude actually routes UserPromptSubmit payloads back to Nice:
-//  - script lands under the configured dir, is executable, and extracts
-//    `session_id` reliably from a representative payload (the bit that
-//    matters in production)
-//  - settings.local.json merges cleanly with pre-existing hooks
-//    (user's own hooks preserved; Nice's entry added once)
+//  claude actually routes SessionStart payloads back to Nice:
+//  - script lands under the configured dir, is executable, and forwards
+//    `session_id` only when `source` is a rotation event
+//    (clear/compact/branch); silent on startup/resume so we don't churn
+//    the persistence layer with redundant updates
+//  - settings.json merges cleanly with pre-existing hooks (user's own
+//    hooks preserved; Nice's entry added once under the SessionStart
+//    group key)
 //  - reinstall is idempotent — no duplicate entries, no churn writes
-//  - malformed settings.local.json bails out instead of silently
-//    overwriting the user's content
+//  - malformed settings.json bails out instead of silently overwriting
+//    the user's content
 //
 //  Tests pass paths directly via the `install(scriptDir:settingsURL:)`
 //  surface — no env-var dance, no process-global state to race under
@@ -19,6 +21,7 @@
 //  a real `~/.claude/`.
 //
 
+import Darwin
 import XCTest
 @testable import Nice
 
@@ -60,19 +63,15 @@ final class ClaudeHookInstallerTests: XCTestCase {
         XCTAssertEqual(perms & 0o777, 0o755, "script perms must be exactly 0755")
     }
 
-    func test_install_scriptExtractsSessionIdFromPayload() throws {
+    func test_install_scriptExitsZero_whenSocketUnreachable() throws {
+        // Script must fail-open (exit 0) when NICE_SOCKET points at a
+        // dead path — claude's hook timeout would otherwise punish the
+        // user. End-to-end forwarding is covered by the source-gating
+        // tests below, which run a real listener.
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
         let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")
+        let payload = sessionStartPayload(source: "clear", sessionId: UUID().uuidString)
 
-        // Shape of the payload claude actually sends, captured from a
-        // live `claude -p` run. Regression-proofs the sed regex against
-        // real-world whitespace / key ordering.
-        let payload = #"{"session_id":"fe06fd37-1bcb-41f1-af4f-2588a276798b","transcript_path":"/x.jsonl","cwd":"/private/tmp","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#
-
-        // Run with NICE_SOCKET pointing at a path nothing is listening
-        // on — the script must fail-open (exit 0) after `nc` times
-        // out, not fail the hook. The socket-side payload shape is
-        // verified end-to-end in Nice Dev once the user types in a tab.
         let (exit, _) = runScript(
             at: scriptURL.path,
             env: [
@@ -82,6 +81,70 @@ final class ClaudeHookInstallerTests: XCTestCase {
             stdin: payload
         )
         XCTAssertEqual(exit, 0, "script must exit 0 even when the socket is unreachable")
+    }
+
+    // MARK: - Source forwarding
+    //
+    // The script forwards on every SessionStart source rather than
+    // gating client-side. `/branch` reports `source: "resume"` in
+    // current Claude Code, so a resume-excluding gate would silently
+    // drop branch rotations. `/compact` reports the same id (no
+    // rotation), but the receiver's `if newId != claudeSessionId`
+    // short-circuit makes those redundant forwards a no-op. The
+    // tradeoff: one extra socket round-trip per session start, vs.
+    // robustness against Claude introducing new sources or
+    // re-mapping existing ones.
+
+    func test_script_forwardsEverySessionStartSource() throws {
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")
+
+        // Socket path lives in /tmp (not the test's tmpRoot under
+        // /var/folders/...) because macOS sun_path is 104 bytes and
+        // the temp-folder prefix alone is over 100 chars — bind would
+        // truncate and collide. Per-test UUID suffix keeps parallel
+        // suites isolated.
+        let socketPath = "/tmp/nice-hook-test-\(UUID().uuidString.prefix(8)).sock"
+        let listener = try TestSocketListener(path: socketPath)
+        defer { listener.cleanup() }
+
+        // Every documented SessionStart source. All must forward.
+        // The receiver de-dupes by comparing against the tab's stored
+        // id, so forwarding the same id twice is a true no-op.
+        let sources = ["startup", "resume", "clear", "compact", "branch"]
+
+        for (i, source) in sources.enumerated() {
+            let sessionId = UUID().uuidString.lowercased()
+            let payload = sessionStartPayload(source: source, sessionId: sessionId)
+
+            let captured = captureFirstLine(
+                listener: listener,
+                runScript: {
+                    let (exit, _) = self.runScript(
+                        at: scriptURL.path,
+                        env: [
+                            "NICE_SOCKET": socketPath,
+                            "NICE_PANE_ID": "pane-\(i)",
+                        ],
+                        stdin: payload
+                    )
+                    XCTAssertEqual(exit, 0,
+                                   "script must exit 0 for source=\(source)")
+                },
+                timeout: 1.5
+            )
+
+            let line = try XCTUnwrap(
+                captured,
+                "source=\(source) must forward a session_update"
+            )
+            XCTAssertTrue(line.contains("\"action\":\"session_update\""),
+                          "forwarded payload missing action: \(line)")
+            XCTAssertTrue(line.contains("\"sessionId\":\"\(sessionId)\""),
+                          "forwarded payload missing sessionId: \(line)")
+            XCTAssertTrue(line.contains("\"paneId\":\"pane-\(i)\""),
+                          "forwarded payload missing paneId: \(line)")
+        }
     }
 
     func test_install_scriptNoOpsOutsideNice() throws {
@@ -104,15 +167,16 @@ final class ClaudeHookInstallerTests: XCTestCase {
     func test_install_mergesIntoEmptySettings() throws {
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
         let settings = try readSettings()
-        let ups = hooksGroup(settings, name: "UserPromptSubmit")
-        XCTAssertEqual(ups.count, 1)
-        XCTAssertEqual(commandOf(ups[0]), expectedScriptPath())
+        let ss = hooksGroup(settings, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 1)
+        XCTAssertEqual(commandOf(ss[0]), expectedScriptPath())
     }
 
     func test_install_preservesUserHooks() throws {
-        // User's existing settings include an unrelated event group
-        // and a sibling under UserPromptSubmit. Nice's entry is added
-        // alongside, never replacing.
+        // User's existing settings include unrelated event groups
+        // (UserPromptSubmit, PreToolUse) and a sibling under
+        // SessionStart. Nice's entry is added alongside, never
+        // replacing user content.
         let userSettings: [String: Any] = [
             "hooks": [
                 "UserPromptSubmit": [
@@ -129,6 +193,13 @@ final class ClaudeHookInstallerTests: XCTestCase {
                         ],
                     ],
                 ],
+                "SessionStart": [
+                    [
+                        "hooks": [
+                            ["type": "command", "command": "/user/own/session-start.sh"],
+                        ],
+                    ],
+                ],
             ],
             "someOtherKey": "keepMe",
         ]
@@ -138,22 +209,27 @@ final class ClaudeHookInstallerTests: XCTestCase {
 
         let settings = try readSettings()
         XCTAssertEqual(settings["someOtherKey"] as? String, "keepMe")
-        let ups = hooksGroup(settings, name: "UserPromptSubmit")
-        XCTAssertEqual(ups.count, 2)
-        XCTAssertEqual(commandOf(ups[0]), "/user/own/hook.sh")
-        XCTAssertEqual(commandOf(ups[1]), expectedScriptPath())
+        let ss = hooksGroup(settings, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 2)
+        XCTAssertEqual(commandOf(ss[0]), "/user/own/session-start.sh",
+                       "user's existing SessionStart hook must be preserved")
+        XCTAssertEqual(commandOf(ss[1]), expectedScriptPath(),
+                       "Nice's entry must be appended after the user's")
         let pre = hooksGroup(settings, name: "PreToolUse")
         XCTAssertEqual(pre.count, 1)
         XCTAssertEqual(commandOf(pre[0]), "/user/pre-tool.sh")
+        let ups = hooksGroup(settings, name: "UserPromptSubmit")
+        XCTAssertEqual(ups.count, 1, "user's UserPromptSubmit hook untouched")
+        XCTAssertEqual(commandOf(ups[0]), "/user/own/hook.sh")
     }
 
-    func test_install_preservesMultipleUserPromptSubmitGroups() throws {
-        // Two pre-existing UPS groups, each with their own hook. After
-        // install both must still be present (in order) and Nice's
-        // entry must be appended last.
+    func test_install_preservesMultipleSessionStartGroups() throws {
+        // Two pre-existing SessionStart groups, each with their own
+        // hook. After install both must still be present (in order)
+        // and Nice's entry must be appended last as a third group.
         let userSettings: [String: Any] = [
             "hooks": [
-                "UserPromptSubmit": [
+                "SessionStart": [
                     ["hooks": [["type": "command", "command": "/first.sh"]]],
                     ["hooks": [["type": "command", "command": "/second.sh"]]],
                 ],
@@ -163,20 +239,22 @@ final class ClaudeHookInstallerTests: XCTestCase {
 
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
 
-        let ups = hooksGroup(try readSettings(), name: "UserPromptSubmit")
-        XCTAssertEqual(ups.count, 3)
-        XCTAssertEqual(commandOf(ups[0]), "/first.sh")
-        XCTAssertEqual(commandOf(ups[1]), "/second.sh")
-        XCTAssertEqual(commandOf(ups[2]), expectedScriptPath())
+        let ss = hooksGroup(try readSettings(),
+                            name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 3)
+        XCTAssertEqual(commandOf(ss[0]), "/first.sh")
+        XCTAssertEqual(commandOf(ss[1]), "/second.sh")
+        XCTAssertEqual(commandOf(ss[2]), expectedScriptPath())
     }
 
     func test_install_preservesSiblingHooksInsideSameGroup() throws {
-        // A single UPS group with multiple inner `hooks` entries — none
-        // of them ours. The dedup check at `mergeHookSettings` walks
-        // `inner.contains`, so this exercises the inner walk.
+        // A single SessionStart group with multiple inner `hooks`
+        // entries — none of them ours. The dedup check at
+        // `mergeHookSettings` walks `inner.contains`, so this
+        // exercises the inner walk.
         let userSettings: [String: Any] = [
             "hooks": [
-                "UserPromptSubmit": [
+                "SessionStart": [
                     [
                         "hooks": [
                             ["type": "command", "command": "/a.sh"],
@@ -190,22 +268,25 @@ final class ClaudeHookInstallerTests: XCTestCase {
 
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
 
-        let ups = hooksGroup(try readSettings(), name: "UserPromptSubmit")
-        XCTAssertEqual(ups.count, 2, "Nice appended as a new group, not folded into the user's")
+        let ss = hooksGroup(try readSettings(),
+                            name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 2,
+                       "Nice appended as a new group, not folded into the user's")
         // First group: user's two hooks intact.
-        let firstInner = ups[0]["hooks"] as? [[String: Any]] ?? []
+        let firstInner = ss[0]["hooks"] as? [[String: Any]] ?? []
         XCTAssertEqual(firstInner.count, 2)
         XCTAssertEqual(firstInner[0]["command"] as? String, "/a.sh")
         XCTAssertEqual(firstInner[1]["command"] as? String, "/b.sh")
-        XCTAssertEqual(commandOf(ups[1]), expectedScriptPath())
+        XCTAssertEqual(commandOf(ss[1]), expectedScriptPath())
     }
 
     func test_install_isIdempotent() throws {
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
-        let ups = hooksGroup(try readSettings(), name: "UserPromptSubmit")
-        XCTAssertEqual(ups.count, 1, "repeated install must not duplicate entries")
+        let ss = hooksGroup(try readSettings(),
+                            name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 1, "repeated install must not duplicate entries")
     }
 
     func test_install_secondCallDoesNotRewriteSettings() throws {
@@ -268,6 +349,77 @@ final class ClaudeHookInstallerTests: XCTestCase {
 
         let after = try Data(contentsOf: settingsURL)
         XCTAssertEqual(after, arr, "non-object root must be left intact")
+    }
+
+    // MARK: - Path invariant
+    //
+    // Claude's hook runner word-splits the command string, so any space
+    // in the path would silently break hook execution (the comment at
+    // ClaudeHookInstaller.swift:204-210 explains why). Pin both the
+    // dotdir name and the installed script filename so a future rename
+    // that adds a space surfaces here instead of breaking session
+    // tracking in production.
+
+    func test_defaultScriptDir_lastPathComponent_hasNoSpaces() {
+        let component = ClaudeHookInstaller.defaultScriptDir().lastPathComponent
+        XCTAssertFalse(
+            component.contains(" "),
+            "defaultScriptDir's tail must have no spaces — claude's hook runner would word-split."
+        )
+    }
+
+    func test_install_writesScriptWithNoSpacesInName() throws {
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        let entries = try FileManager.default
+            .contentsOfDirectory(atPath: scriptDir.path)
+        let shFiles = entries.filter { $0.hasSuffix(".sh") }
+        XCTAssertEqual(shFiles.count, 1, "expected exactly one installed script")
+        XCTAssertFalse(
+            shFiles[0].contains(" "),
+            "installed script filename must have no spaces — claude's hook runner would word-split."
+        )
+    }
+
+    // MARK: - Hook removal pinning
+    //
+    // If the user manually deletes Nice's entry from settings.json (no
+    // tooling, just edits the file), the next Nice launch silently
+    // re-adds it. This is intentional — Nice can't tell the difference
+    // between "user removed" and "settings.json was never written" so
+    // it always re-installs. Pin that contract.
+
+    func test_install_reAddsEntry_whenUserRemovedItButKeptOtherContent() throws {
+        // Step 1: initial install lands Nice's entry.
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        var settings = try readSettings()
+        XCTAssertEqual(
+            hooksGroup(settings, name: ClaudeHookInstaller.hookEventName).count, 1
+        )
+
+        // Step 2: user manually rewrites settings.json — Nice's entry
+        // gone, but other content preserved (e.g. a sibling SessionStart
+        // hook the user added between launches).
+        settings["someUserKey"] = "preserve"
+        settings["hooks"] = [
+            ClaudeHookInstaller.hookEventName: [
+                ["hooks": [["type": "command", "command": "/user/keep.sh"]]],
+            ],
+        ]
+        try writeSettings(settings)
+
+        // Step 3: relaunch (== second install). Nice's entry must come
+        // back AND the user's other content must survive intact.
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let after = try readSettings()
+        XCTAssertEqual(after["someUserKey"] as? String, "preserve",
+                       "non-hook user content must survive the re-install")
+        let ss = hooksGroup(after, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 2, "user's hook + re-added Nice hook")
+        XCTAssertEqual(commandOf(ss[0]), "/user/keep.sh",
+                       "user's sibling hook must still be present")
+        XCTAssertEqual(commandOf(ss[1]), expectedScriptPath(),
+                       "Nice's entry must be re-added")
     }
 
     func test_install_failureDoesNotThrow() throws {
@@ -345,5 +497,130 @@ final class ClaudeHookInstallerTests: XCTestCase {
         let outData = try? stdoutPipe.fileHandleForReading.readToEnd()
         let out = outData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         return (proc.terminationStatus, out)
+    }
+
+    /// Build a SessionStart-shape JSON payload as claude would emit it.
+    /// The script's sed regexes target `source` and `session_id`; the
+    /// other fields are present for shape realism but ignored.
+    private func sessionStartPayload(source: String, sessionId: String) -> String {
+        return #"""
+        {"hook_event_name":"SessionStart","source":"\#(source)","session_id":"\#(sessionId)","cwd":"/private/tmp","transcript_path":"/x.jsonl"}
+        """#
+    }
+
+    /// Run `runScript` with a listener bound at the script's NICE_SOCKET
+    /// path; return the first line the script wrote, or nil if nothing
+    /// arrived within the timeout. The listener thread runs on a
+    /// background queue so the main-thread script invocation can drive
+    /// the connection.
+    private func captureFirstLine(
+        listener: TestSocketListener,
+        runScript: () -> Void,
+        timeout: TimeInterval = 2.0
+    ) -> String? {
+        let group = DispatchGroup()
+        var captured: String?
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            captured = listener.acceptOne(timeout: timeout)
+            group.leave()
+        }
+        runScript()
+        // Even a "no forward" case must give the listener a moment to
+        // confirm no connection arrived. Bound by `timeout` either way.
+        _ = group.wait(timeout: .now() + timeout + 0.5)
+        return captured
+    }
+}
+
+/// Test-only Unix-domain socket listener. Binds at `path` on init,
+/// listens with backlog 1, and accepts a single connection on demand
+/// via `acceptOne(timeout:)`. Cleans up the socket file on deinit.
+final class TestSocketListener {
+    private let fd: Int32
+    private let path: String
+
+    init(path: String) throws {
+        self.path = path
+        // Best-effort: clear any stale file at the path so bind() can
+        // succeed. A leftover regular file or socket would EADDRINUSE.
+        try? FileManager.default.removeItem(atPath: path)
+
+        fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw NSError(domain: "TestSocketListener", code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey:
+                                        "socket() failed: errno=\(errno)"])
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        path.withCString { cstr in
+            withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+                let dst = buf.baseAddress!.assumingMemoryBound(to: CChar.self)
+                strncpy(dst, cstr, buf.count - 1)
+            }
+        }
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.bind(fd, sa,
+                            socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let e = errno
+            Darwin.close(fd)
+            throw NSError(domain: "TestSocketListener", code: Int(e),
+                          userInfo: [NSLocalizedDescriptionKey:
+                                        "bind(\(path)) failed: errno=\(e)"])
+        }
+        guard Darwin.listen(fd, 1) == 0 else {
+            let e = errno
+            Darwin.close(fd)
+            throw NSError(domain: "TestSocketListener", code: Int(e),
+                          userInfo: [NSLocalizedDescriptionKey:
+                                        "listen() failed: errno=\(e)"])
+        }
+    }
+
+    deinit {
+        Darwin.close(fd)
+    }
+
+    /// Explicit teardown so callers can choose deterministic cleanup
+    /// timing rather than relying on Swift's deinit ordering. Safe to
+    /// call multiple times.
+    func cleanup() {
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    /// Accept one connection and read until newline or EOF. Returns the
+    /// first line (newline trimmed), or nil if no connection arrived
+    /// before `timeout`. Blocking — call from a background queue.
+    func acceptOne(timeout: TimeInterval) -> String? {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        let ms = Int32(timeout * 1000)
+        let pollRc = withUnsafeMutablePointer(to: &pfd) {
+            Darwin.poll($0, 1, ms)
+        }
+        guard pollRc > 0, pfd.revents & Int16(POLLIN) != 0 else {
+            return nil
+        }
+        let clientFd = Darwin.accept(fd, nil, nil)
+        guard clientFd >= 0 else { return nil }
+        defer { Darwin.close(clientFd) }
+
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var collected: [UInt8] = []
+        while true {
+            let n = Darwin.read(clientFd, &buf, buf.count)
+            if n <= 0 { break }
+            collected.append(contentsOf: buf[..<n])
+            if collected.contains(0x0A) { break }
+        }
+        if let nl = collected.firstIndex(of: 0x0A) {
+            collected = Array(collected[..<nl])
+        }
+        return String(decoding: collected, as: UTF8.self)
     }
 }

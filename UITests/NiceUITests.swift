@@ -822,6 +822,185 @@ final class NiceUITests: NiceUITestCase {
         )
     }
 
+    // MARK: - Session-id rotation across restart
+
+    /// End-to-end: a session-id rotation that lands while the app is
+    /// running must survive a clean quit + relaunch. Exercises the
+    /// full path: socket → SessionsModel.handleClaudeSessionUpdate →
+    /// TabModel mutation → SessionStore debounce → flush on quit →
+    /// SessionStore.read on fresh launch.
+    ///
+    /// The hook script itself is unit-tested separately (see
+    /// ClaudeHookInstallerTests). The seam under test here is the
+    /// socket → store → resume path, so the test bypasses the hook
+    /// and forces the rotation by sending `session_update` directly.
+    /// Fake claude is `/bin/cat` (the existing `fakeClaude()` helper)
+    /// — we never need real claude to fire the hook in this test.
+    func testSessionIdRotation_persistsAcrossRestart() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+
+        // === Phase 1: launch, create tab, force rotation, verify
+        // persisted, quit cleanly ===
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath,
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        let sidebarRowId = try createTabViaSocket(in: app, socketPath: socketPath)
+        let createdTabId = self.tabId(from: sidebarRowId)
+
+        // sessions.json sandbox path. scripts/test.sh patches
+        // PRODUCT_BUNDLE_IDENTIFIER (to dev.nickanderssohn.nice-dev)
+        // but deliberately leaves PRODUCT_NAME as "Nice" so the
+        // Swift module name stays stable for `@testable import Nice`.
+        // SessionStore keys the support folder off CFBundleName, so
+        // the file lands under "Nice/", not "Nice Dev/".
+        let sessionsFile = (fakeHomePath() as NSString)
+            .appendingPathComponent(
+                "Library/Application Support/Nice/sessions.json"
+            )
+
+        // Wait for the initial save (debounced 500ms) to land. Both
+        // the claudeSessionId and the claude paneId come from the
+        // persisted file — driving the rotation through the UI's
+        // toolbar pills would require parsing pane kinds out of
+        // identifiers that don't carry them.
+        let initialPersisted = waitForPersistedSessionId(
+            at: sessionsFile, tabId: createdTabId, timeout: 5
+        )
+        XCTAssertNotNil(
+            initialPersisted,
+            "Initial claudeSessionId must be persisted after tab creation"
+        )
+        let claudePaneId = try XCTUnwrap(
+            findClaudePaneId(in: sessionsFile, tabId: createdTabId),
+            "Persisted tab must contain a claude pane"
+        )
+
+        // Force a rotation: the hook would do this on /clear,
+        // /branch, etc. — we send the same socket message directly.
+        let postRotationId = UUID().uuidString.lowercased()
+        let updateJSON = #"{"action":"session_update","paneId":"\#(claudePaneId)","sessionId":"\#(postRotationId)"}"#
+        try sendSocketLine(updateJSON, to: socketPath)
+
+        // Wait for the persisted file to reflect the rotated id.
+        let rotated = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.readPersistedSessionId(at: sessionsFile, tabId: createdTabId)
+                    == postRotationId
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [rotated], timeout: 5), .completed,
+            "sessions.json must reflect the rotated id within 5s"
+        )
+
+        // Clean quit so flush() runs synchronously and any pending
+        // debounce is cancelled with the latest state on disk.
+        app.terminate()
+
+        // === Phase 2: relaunch into the same sandbox; the persisted
+        // id must be the rotated one, not the initial one ===
+        let app2 = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath,
+        ])
+        XCTAssertTrue(
+            app2.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        // The on-disk state is the contract under test — read it
+        // directly rather than driving the app to surface it.
+        let resumedId = readPersistedSessionId(
+            at: sessionsFile, tabId: createdTabId
+        )
+        XCTAssertEqual(
+            resumedId, postRotationId,
+            "After relaunch, the persisted claudeSessionId must be the post-rotation uuid"
+        )
+    }
+
+    /// Find the Claude pane id from the persisted sessions.json by
+    /// walking windows → projects → tabs (matched by `tabId`) →
+    /// panes and returning the first pane with `kind == "claude"`.
+    /// Returns nil if the file isn't there yet, doesn't parse, or
+    /// the tab has no claude pane.
+    ///
+    /// Reading from disk (rather than from the toolbar's
+    /// `tab.pill.<paneId>` accessibility identifiers) is deliberate:
+    /// the toolbar pill identifier doesn't expose pane kind, and the
+    /// `.claudeIcon` identifier lives on the sidebar row keyed by
+    /// `tabId`, not paneId — which made the earlier UI-based lookup
+    /// return a tabId-shaped string instead of a paneId.
+    private func findClaudePaneId(
+        in sessionsFile: String, tabId: String
+    ) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: sessionsFile)),
+              let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let windows = root["windows"] as? [[String: Any]]
+        else { return nil }
+        for window in windows {
+            for project in (window["projects"] as? [[String: Any]]) ?? [] {
+                for tab in (project["tabs"] as? [[String: Any]]) ?? []
+                where (tab["id"] as? String) == tabId {
+                    let panes = (tab["panes"] as? [[String: Any]]) ?? []
+                    for pane in panes where (pane["kind"] as? String) == "claude" {
+                        return pane["id"] as? String
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Read `sessions.json` and return the `claudeSessionId` for
+    /// `tabId`, scanning every window/project. Returns nil if the
+    /// file doesn't exist, doesn't parse, or the tab isn't there.
+    private func readPersistedSessionId(
+        at path: String, tabId: String
+    ) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let windows = root["windows"] as? [[String: Any]]
+        else { return nil }
+        for window in windows {
+            let projects = (window["projects"] as? [[String: Any]]) ?? []
+            for project in projects {
+                let tabs = (project["tabs"] as? [[String: Any]]) ?? []
+                for tab in tabs where (tab["id"] as? String) == tabId {
+                    return tab["claudeSessionId"] as? String
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Block until `readPersistedSessionId` returns non-nil for
+    /// `tabId`, or `timeout` seconds elapse. Returns the value or
+    /// nil on timeout.
+    private func waitForPersistedSessionId(
+        at path: String, tabId: String, timeout: TimeInterval
+    ) -> String? {
+        let appeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.readPersistedSessionId(at: path, tabId: tabId) != nil
+            }),
+            object: nil
+        )
+        guard XCTWaiter.wait(for: [appeared], timeout: timeout) == .completed
+        else { return nil }
+        return readPersistedSessionId(at: path, tabId: tabId)
+    }
+
     // MARK: - Regression guard
 
     /// Exercise a handful of actions (add, switch, close) and assert no

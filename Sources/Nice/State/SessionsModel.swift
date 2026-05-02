@@ -722,7 +722,7 @@ final class SessionsModel {
     }
 
     /// Handle a `session_update` socket message from Claude Code's
-    /// UserPromptSubmit hook. Looks up the tab whose pane set contains
+    /// SessionStart hook. Looks up the tab whose pane set contains
     /// `paneId` and forwards to `updateClaudeSessionId`. Silent no-op
     /// if the pane is stale (exited while the hook's `nc` was in
     /// flight) or isn't a claude pane. `internal` so unit tests can

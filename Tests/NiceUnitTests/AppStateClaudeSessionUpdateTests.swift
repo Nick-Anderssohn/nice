@@ -116,6 +116,87 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "NEW")
     }
 
+    // MARK: - Per-window scoping
+    //
+    // `tabIdOwning(paneId:)` is a method on `TabModel`, not a global
+    // index — each AppState scopes the lookup to its own projects.
+    // This pins the per-window scoping so a future "centralize the
+    // index" refactor doesn't accidentally cross-route session updates
+    // between windows.
+
+    func test_handleSessionUpdate_isScopedToOwningWindow() {
+        // Window A owns paneId "tA-claude". Window B owns "tB-claude".
+        seedClaudeTab(projectId: "pA", tabId: "tA", sessionId: "A-INIT")
+
+        let stateB = AppState()
+        defer { _ = stateB } // suppress "never read" if the compiler gets clever
+        TabModelFixtures.seedClaudeTab(
+            into: stateB.tabs,
+            projectId: "pB", tabId: "tB", sessionId: "B-INIT"
+        )
+
+        // Cross-window send: A's socket receives a paneId belonging to
+        // B. A's `tabIdOwning` returns nil (B's pane isn't in A's
+        // projects), so the call is a no-op on A. B is also untouched
+        // because nothing dispatched to B's handler.
+        appState.sessions.handleClaudeSessionUpdate(
+            paneId: "tB-claude", sessionId: "LEAKED"
+        )
+
+        XCTAssertEqual(appState.tabs.tab(for: "tA")?.claudeSessionId, "A-INIT",
+                       "A's tab must be untouched by a B-shaped paneId")
+        XCTAssertEqual(stateB.tabs.tab(for: "tB")?.claudeSessionId, "B-INIT",
+                       "B's tab must be untouched until B's own handler is invoked")
+
+        // B's own handler does mutate B.
+        stateB.sessions.handleClaudeSessionUpdate(
+            paneId: "tB-claude", sessionId: "B-NEW"
+        )
+        XCTAssertEqual(stateB.tabs.tab(for: "tB")?.claudeSessionId, "B-NEW")
+        XCTAssertEqual(appState.tabs.tab(for: "tA")?.claudeSessionId, "A-INIT",
+                       "B's mutation must not bleed into A")
+    }
+
+    // MARK: - Stale-pane race
+    //
+    // The hook fires asynchronously: a `session_update` over the socket
+    // can land after the pane it refers to has already exited. This is
+    // distinct from the "unknown paneId" case above — here the paneId
+    // *was* valid moments earlier. The handler must short-circuit cleanly
+    // (the live tab's `claudeSessionId` must not be mutated, and nothing
+    // must crash).
+
+    func test_stalePaneId_afterPaneExited_isNoOp() {
+        seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S1")
+
+        // First update lands while the pane is alive — proves baseline.
+        appState.sessions.handleClaudeSessionUpdate(
+            paneId: "t1-claude", sessionId: "S1-LIVE"
+        )
+        XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "S1-LIVE")
+
+        // Pane exits (production path: pty closes, paneExited fires).
+        appState.sessions.paneExited(
+            tabId: "t1", paneId: "t1-claude", exitCode: 0
+        )
+        XCTAssertNil(
+            appState.tabs.tab(for: "t1")?.panes.first(where: { $0.id == "t1-claude" }),
+            "precondition: claude pane must be gone after paneExited"
+        )
+
+        // A late `session_update` for the now-defunct pane arrives. The
+        // tab still exists (its terminal pane is alive), but the paneId
+        // no longer maps to it.
+        appState.sessions.handleClaudeSessionUpdate(
+            paneId: "t1-claude", sessionId: "S1-STALE"
+        )
+
+        XCTAssertEqual(
+            appState.tabs.tab(for: "t1")?.claudeSessionId, "S1-LIVE",
+            "stale paneId must not mutate the surviving tab's claudeSessionId"
+        )
+    }
+
     // MARK: - helpers
 
     private func seedClaudeTab(

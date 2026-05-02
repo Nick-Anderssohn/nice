@@ -51,11 +51,12 @@ enum SocketMessage: Sendable {
         reply: @Sendable (String) -> Void
     )
 
-    /// Claude Code UserPromptSubmit hook reporting the active session
-    /// UUID for the sending pane. Fires on every user message, which
-    /// covers every in-process rotation source (/clear, /compact,
-    /// /branch / --fork-session). Fire-and-forget — no reply is written
-    /// and the client fd is closed before dispatch.
+    /// Claude Code SessionStart hook reporting the active session UUID
+    /// for the sending pane. Fires synchronously with each in-process
+    /// rotation (/clear, /compact, /branch / --fork-session); the
+    /// installer script source-gates the event so startup/resume
+    /// don't churn the persistence layer. Fire-and-forget — no reply
+    /// is written and the client fd is closed before dispatch.
     case sessionUpdate(paneId: String, sessionId: String)
 }
 

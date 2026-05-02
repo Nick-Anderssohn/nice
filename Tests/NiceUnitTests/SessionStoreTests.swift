@@ -291,6 +291,60 @@ final class SessionStoreTests: XCTestCase {
                        "Per-pane cwd must survive save → load round-trip.")
     }
 
+    func test_decodesFutureVersionWithUnknownFields_forwardCompat() throws {
+        // A v4 file written by a newer Nice build (with extra fields
+        // sprinkled at every level) must still decode under the current
+        // v3 code so a user who downgrades doesn't lose their windows.
+        // Codable's default behavior is "ignore unknown keys" — pin
+        // that contract so a future migration that adopts a stricter
+        // decoder has to think about backward compatibility.
+        let json = #"""
+        {
+            "version": 4,
+            "futureRoot": "ignore me",
+            "windows": [{
+                "id": "w1",
+                "activeTabId": "t1",
+                "sidebarCollapsed": false,
+                "futureWindow": 42,
+                "projects": [{
+                    "id": "p1",
+                    "name": "Project",
+                    "path": "/tmp",
+                    "futureProject": ["a", "b"],
+                    "tabs": [{
+                        "id": "t1",
+                        "title": "Main",
+                        "cwd": "/tmp",
+                        "branch": null,
+                        "claudeSessionId": "session-uuid",
+                        "activePaneId": "pane-1",
+                        "futureTab": {"nested": true},
+                        "panes": [
+                            {
+                                "id": "pane-1",
+                                "title": "Claude",
+                                "kind": "claude",
+                                "cwd": "/tmp",
+                                "futurePane": "ignored"
+                            }
+                        ]
+                    }]
+                }]
+            }]
+        }
+        """#
+        let data = Data(json.utf8)
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: data)
+        XCTAssertEqual(decoded.windows.count, 1)
+        let window = try XCTUnwrap(decoded.windows.first)
+        XCTAssertEqual(window.id, "w1")
+        let tab = try XCTUnwrap(window.projects.first?.tabs.first)
+        XCTAssertEqual(tab.claudeSessionId, "session-uuid",
+                       "Forward-compat must preserve the v3 fields verbatim, not just survive the decode.")
+        XCTAssertEqual(tab.panes.first?.kind, .claude)
+    }
+
     func test_persistedPane_decodesWithoutCwdField_backwardsCompat() throws {
         // Sessions written by Nice builds before per-pane cwd
         // existed don't have a `cwd` key on each pane. The decoder
