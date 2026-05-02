@@ -155,9 +155,21 @@ enum ClaudeHookInstaller {
     /// without writing. Other hooks (user-authored, other tools) pass
     /// through untouched.
     ///
+    /// Also strips any leftover `UserPromptSubmit` entries that point
+    /// at our script path — pre-952865c Nice builds registered there,
+    /// and without this cleanup an upgrader carries the redundant
+    /// entry forever (functionally harmless thanks to the receiver's
+    /// id-equality short-circuit, but adds a socket round-trip per
+    /// prompt). User-authored UPS hooks are preserved; empty groups
+    /// are dropped; the UPS key is removed entirely if it ends up
+    /// empty.
+    ///
     /// Serializes the merged dict and only writes if the bytes differ
     /// from what's on disk — avoids reformatting a hand-edited file
     /// just because we re-emitted it with `[.prettyPrinted, .sortedKeys]`.
+    /// The early-out at the top extends that protection to the no-op
+    /// case where SessionStart is present and there's no stale UPS
+    /// entry to clean.
     ///
     /// If the file exists but isn't valid JSON, throws — the caller
     /// logs and the launch proceeds without the hook. Overwriting
@@ -184,17 +196,51 @@ enum ClaudeHookInstaller {
         }
         var hooks = (root["hooks"] as? [String: Any]) ?? [:]
         var sessionStart = (hooks[hookEventName] as? [[String: Any]]) ?? []
-        let already = sessionStart.contains { group in
-            guard let inner = group["hooks"] as? [[String: Any]] else { return false }
-            return inner.contains { ($0["command"] as? String) == scriptPath }
+        let alreadyHasSessionStart = containsCommand(
+            in: sessionStart, command: scriptPath
+        )
+        let hasStaleUserPromptSubmit = containsCommand(
+            in: hooks[legacyHookEventName] as? [[String: Any]],
+            command: scriptPath
+        )
+        // Early-out preserves the user's settings.json formatting on
+        // no-op launches. Without it, parsing and re-emitting through
+        // [.prettyPrinted, .sortedKeys] would rewrite a hand-edited
+        // file even when nothing logically changed.
+        if alreadyHasSessionStart && !hasStaleUserPromptSubmit { return }
+
+        if !alreadyHasSessionStart {
+            sessionStart.append([
+                "hooks": [
+                    ["type": "command", "command": scriptPath],
+                ],
+            ])
+            hooks[hookEventName] = sessionStart
         }
-        if already { return }
-        sessionStart.append([
-            "hooks": [
-                ["type": "command", "command": scriptPath],
-            ],
-        ])
-        hooks[hookEventName] = sessionStart
+
+        if hasStaleUserPromptSubmit {
+            // Migration: pre-952865c Nice builds registered our hook
+            // under UserPromptSubmit. Strip leftovers pointing at our
+            // script path; preserve user-authored siblings; drop any
+            // group that empties out; drop the UserPromptSubmit key
+            // entirely if it ends up empty so we don't leave a husk.
+            var ups = (hooks[legacyHookEventName] as? [[String: Any]]) ?? []
+            for i in ups.indices.reversed() {
+                guard var inner = ups[i]["hooks"] as? [[String: Any]] else { continue }
+                inner.removeAll { ($0["command"] as? String) == scriptPath }
+                if inner.isEmpty {
+                    ups.remove(at: i)
+                } else {
+                    ups[i]["hooks"] = inner
+                }
+            }
+            if ups.isEmpty {
+                hooks.removeValue(forKey: legacyHookEventName)
+            } else {
+                hooks[legacyHookEventName] = ups
+            }
+        }
+
         root["hooks"] = hooks
         let data = try JSONSerialization.data(
             withJSONObject: root,
@@ -210,6 +256,27 @@ enum ClaudeHookInstaller {
     /// `internal` so tests can read the same constant rather than
     /// hard-coding "SessionStart" in two places.
     static let hookEventName = "SessionStart"
+
+    /// Pre-952865c Nice builds registered the hook under this event
+    /// instead. `mergeHookSettings` strips leftover entries pointing at
+    /// our script path so upgraders don't carry the redundant
+    /// registration forever. Exposed `internal` so tests can pin the
+    /// migration key without re-stating the literal.
+    static let legacyHookEventName = "UserPromptSubmit"
+
+    /// True when any group in `groups` has an inner hook whose
+    /// `command` equals `command`. Used both to detect "our SessionStart
+    /// entry already present" and "stale UserPromptSubmit entry from a
+    /// pre-952865c build".
+    private static func containsCommand(
+        in groups: [[String: Any]]?, command: String
+    ) -> Bool {
+        guard let groups else { return false }
+        return groups.contains { group in
+            guard let inner = group["hooks"] as? [[String: Any]] else { return false }
+            return inner.contains { ($0["command"] as? String) == command }
+        }
+    }
 
     enum ClaudeHookInstallerError: Error {
         /// `settings.json` exists with non-empty bytes that don't

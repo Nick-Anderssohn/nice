@@ -422,6 +422,295 @@ final class ClaudeHookInstallerTests: XCTestCase {
                        "Nice's entry must be re-added")
     }
 
+    // MARK: - UserPromptSubmit migration
+    //
+    // Pre-952865c Nice builds registered the hook under
+    // UserPromptSubmit. The current installer adds the new SessionStart
+    // entry and ALSO strips leftover UPS entries pointing at our
+    // script path so upgraders don't carry the redundant registration
+    // forever. User-authored UPS hooks are preserved; empty groups
+    // are dropped; the UPS key is removed entirely if it ends up empty.
+
+    func test_install_doesNotCreateEmptyUserPromptSubmitKey() throws {
+        // Settings.json with no UserPromptSubmit key at all. After
+        // install the cleanup pass must not invent an empty UPS key
+        // just to leave it dangling.
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        let settings = try readSettings()
+        let allHooks = settings["hooks"] as? [String: Any] ?? [:]
+        XCTAssertNil(allHooks[ClaudeHookInstaller.legacyHookEventName],
+                     "no UserPromptSubmit key should be created when none existed")
+    }
+
+    func test_install_removesOurStaleUPSEntry_andDropsEmptyKey() throws {
+        // Realistic minimal pre-952865c shape: the user's settings
+        // contains exactly the registration the old installer wrote —
+        // a single UPS group with our script as its only inner hook.
+        // After install, UPS key is gone entirely (no empty husk).
+        let stalePath = expectedScriptPath()
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    ["hooks": [["type": "command", "command": stalePath]]],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let settings = try readSettings()
+        let allHooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        XCTAssertNil(allHooks[ClaudeHookInstaller.legacyHookEventName],
+                     "empty UserPromptSubmit key must be removed entirely")
+        let ss = hooksGroup(settings, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 1)
+        XCTAssertEqual(commandOf(ss[0]), expectedScriptPath())
+    }
+
+    func test_install_removesOurUPSEntry_keepsSiblingInSameGroup() throws {
+        // A single UPS group with two inner hooks — ours and a
+        // user-authored sibling. Cleanup must remove only ours; the
+        // user's sibling stays inside the same group.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    [
+                        "hooks": [
+                            ["type": "command", "command": expectedScriptPath()],
+                            ["type": "command", "command": "/user/own.sh"],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let ups = hooksGroup(try readSettings(),
+                             name: ClaudeHookInstaller.legacyHookEventName)
+        XCTAssertEqual(ups.count, 1, "user's group must be preserved")
+        let inner = try XCTUnwrap(ups[0]["hooks"] as? [[String: Any]])
+        XCTAssertEqual(inner.count, 1, "only Nice's inner entry should be removed")
+        XCTAssertEqual(inner[0]["command"] as? String, "/user/own.sh")
+    }
+
+    func test_install_removesOurUPSGroup_keepsSeparateUserGroup() throws {
+        // Two UPS groups — ours and the user's, each with a single
+        // inner hook. Cleanup removes our entire group (it empties
+        // out) but leaves the user's untouched.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    ["hooks": [["type": "command", "command": expectedScriptPath()]]],
+                    ["hooks": [["type": "command", "command": "/user/own.sh"]]],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let ups = hooksGroup(try readSettings(),
+                             name: ClaudeHookInstaller.legacyHookEventName)
+        XCTAssertEqual(ups.count, 1, "only the user's group should remain")
+        XCTAssertEqual(commandOf(ups[0]), "/user/own.sh")
+    }
+
+    func test_install_migratesFromUPSToSessionStart_realisticUpgrade() throws {
+        // The realistic upgrade scenario: settings.json carries the
+        // pre-952865c registration (UPS pointing at our script) plus
+        // unrelated user content. After install: UPS gone,
+        // SessionStart present, unrelated content intact. Then a
+        // second install must be a true no-op (mtime unchanged) —
+        // proves the migration is idempotent once it has run.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    ["hooks": [["type": "command", "command": expectedScriptPath()]]],
+                ],
+            ],
+            "someUserKey": "keep",
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let after = try readSettings()
+        XCTAssertEqual(after["someUserKey"] as? String, "keep",
+                       "unrelated user content must survive the migration")
+        let allHooks = try XCTUnwrap(after["hooks"] as? [String: Any])
+        XCTAssertNil(allHooks[ClaudeHookInstaller.legacyHookEventName],
+                     "stale UserPromptSubmit registration must be gone")
+        let ss = hooksGroup(after, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 1)
+        XCTAssertEqual(commandOf(ss[0]), expectedScriptPath(),
+                       "SessionStart entry must be present after migration")
+
+        // Idempotency: a second install on the post-migration file
+        // must skip the disk write entirely. Same pattern as
+        // test_install_secondCallDoesNotRewriteSettings, but with a
+        // file that exercised the migration on the first call.
+        let firstMtime = try mtime(of: settingsURL)
+        Thread.sleep(forTimeInterval: 0.05)
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        XCTAssertEqual(try mtime(of: settingsURL), firstMtime,
+                       "second install after migration must not rewrite the file")
+    }
+
+    func test_install_cleansStaleUPS_whenSessionStartAlreadyPresent() throws {
+        // Both states coexist on entry — could happen if a previous
+        // install crashed mid-migration, the user hand-edited
+        // settings.json, or some future second installer ran without
+        // the cleanup. The cleanup must still run, AND the SessionStart
+        // entry must not be duplicated. This pins the
+        // alreadyHasSessionStart=true && hasStaleUPS=true branch
+        // explicitly — the realistic upgrade test only exercises
+        // alreadyHasSessionStart=false, so the early-out condition
+        // could regress without a dedicated test here.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.hookEventName: [
+                    ["hooks": [["type": "command", "command": expectedScriptPath()]]],
+                ],
+                ClaudeHookInstaller.legacyHookEventName: [
+                    ["hooks": [["type": "command", "command": expectedScriptPath()]]],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let after = try readSettings()
+        let allHooks = try XCTUnwrap(after["hooks"] as? [String: Any])
+        XCTAssertNil(allHooks[ClaudeHookInstaller.legacyHookEventName],
+                     "stale UPS must be removed even when SessionStart already present")
+        let ss = hooksGroup(after, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 1, "SessionStart entry must not be duplicated")
+        XCTAssertEqual(commandOf(ss[0]), expectedScriptPath())
+    }
+
+    func test_install_removesOurUPSEntry_fromMiddle_preservesOrder() throws {
+        // Our entry sandwiched between two user-authored siblings
+        // inside a single group's inner array. Surviving siblings must
+        // keep their original order — `removeAll` is order-preserving
+        // in Swift, this test pins that behavior so a future switch
+        // to a non-stable removal couldn't quietly reorder the user's
+        // hooks.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    [
+                        "hooks": [
+                            ["type": "command", "command": "/user/a.sh"],
+                            ["type": "command", "command": expectedScriptPath()],
+                            ["type": "command", "command": "/user/b.sh"],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let ups = hooksGroup(try readSettings(),
+                             name: ClaudeHookInstaller.legacyHookEventName)
+        XCTAssertEqual(ups.count, 1)
+        let inner = try XCTUnwrap(ups[0]["hooks"] as? [[String: Any]])
+        XCTAssertEqual(inner.count, 2)
+        XCTAssertEqual(inner[0]["command"] as? String, "/user/a.sh",
+                       "first sibling must keep position 0")
+        XCTAssertEqual(inner[1]["command"] as? String, "/user/b.sh",
+                       "third sibling must move to position 1, in original order")
+    }
+
+    func test_install_removesOurUPSGroup_fromMiddle_preservesOrder() throws {
+        // Our group sandwiched between two user-authored groups under
+        // UserPromptSubmit. Surviving groups must keep their original
+        // order — reverse-iteration with remove(at:) is order-preserving,
+        // this test pins it so a future iteration-direction flip can't
+        // silently reorder the user's hooks.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    ["hooks": [["type": "command", "command": "/user/first.sh"]]],
+                    ["hooks": [["type": "command", "command": expectedScriptPath()]]],
+                    ["hooks": [["type": "command", "command": "/user/last.sh"]]],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let ups = hooksGroup(try readSettings(),
+                             name: ClaudeHookInstaller.legacyHookEventName)
+        XCTAssertEqual(ups.count, 2, "only our middle group should be removed")
+        XCTAssertEqual(commandOf(ups[0]), "/user/first.sh",
+                       "user's first group must stay first")
+        XCTAssertEqual(commandOf(ups[1]), "/user/last.sh",
+                       "user's last group must keep its relative order")
+    }
+
+    func test_install_preservesMalformedUPSValue() throws {
+        // The UPS value isn't an array of groups — it's a string. A
+        // shape we don't recognize. Install must NOT touch it. To
+        // exercise the write path (so we know the value survives a
+        // round-trip through serialize+deserialize, not just the
+        // early-out), we leave SessionStart absent so a write is
+        // genuinely needed.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: "not an array, totally malformed",
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let after = try readSettings()
+        let allHooks = try XCTUnwrap(after["hooks"] as? [String: Any])
+        XCTAssertEqual(
+            allHooks[ClaudeHookInstaller.legacyHookEventName] as? String,
+            "not an array, totally malformed",
+            "malformed UPS value must round-trip verbatim — cleanup is a no-op for unrecognized shapes"
+        )
+        let ss = hooksGroup(after, name: ClaudeHookInstaller.hookEventName)
+        XCTAssertEqual(ss.count, 1, "SessionStart entry must still be added")
+        XCTAssertEqual(commandOf(ss[0]), expectedScriptPath())
+    }
+
+    func test_install_preservesMalformedInnerHooksShape_alongsideCleanup() throws {
+        // Two UPS groups: one has a malformed `"hooks"` (a string
+        // instead of an array of dicts), the other is a normal group
+        // containing our entry. After install: the malformed group
+        // passes through verbatim (the `guard ... else { continue }`
+        // skips it without dropping it); our entry is removed from the
+        // normal group; that group empties out and is dropped, leaving
+        // the malformed group as the sole survivor under UPS.
+        let userSettings: [String: Any] = [
+            "hooks": [
+                ClaudeHookInstaller.legacyHookEventName: [
+                    ["hooks": "this is not an array of dicts"],
+                    ["hooks": [["type": "command", "command": expectedScriptPath()]]],
+                ],
+            ],
+        ]
+        try writeSettings(userSettings)
+
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+
+        let ups = hooksGroup(try readSettings(),
+                             name: ClaudeHookInstaller.legacyHookEventName)
+        XCTAssertEqual(ups.count, 1, "malformed group must be preserved")
+        XCTAssertEqual(ups[0]["hooks"] as? String,
+                       "this is not an array of dicts",
+                       "malformed inner hooks value must round-trip verbatim")
+    }
+
     func test_install_failureDoesNotThrow() throws {
         // Settings dir under an unwritable parent: install should log
         // and return cleanly, not throw or crash. Mirrors what
