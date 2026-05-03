@@ -62,40 +62,34 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
         }
     }
 
-    /// `NSHostingView` subclass that opts out of AppKit's
-    /// click-to-move-window walk for the pill region. Two cooperating
-    /// overrides are needed — `mouseDownCanMoveWindow = false` alone
-    /// is not enough:
+    /// `NSHostingView` subclass that takes AppKit's cooperative
+    /// window-drag paths out of play for the pill region. Three
+    /// defences, layered:
     ///
-    /// AppKit's window-drag tracker queries `mouseDownCanMoveWindow`
-    /// on the LEAF NSView returned by `hitTest:`, not on this wrapper.
-    /// The pill's `.contentShape(RoundedRectangle(...))` makes
-    /// SwiftUI's hit-test return nil for the four rounded corners
-    /// (transparent to gestures). On a `nil` hit, AppKit descends to
-    /// the next z-order view at that point — which is the
-    /// `WindowDragRegion` sitting in the toolbar's chrome background.
-    /// That view DOES report `true`, so window-drag engages.
+    /// 1. `NSWindow.isMovable = false` — set in `AppShellView`'s
+    ///    `WindowAccessor`, disables the entire AppKit title-bar
+    ///    tracker for the window. (`performDrag(with:)` still
+    ///    works, so chrome drag remains functional.)
+    /// 2. `mouseDownCanMoveWindow = false` — opt out of the
+    ///    cooperative `mouseDownCanMoveWindow` chain. Defends
+    ///    against `isMovable` being flipped back on.
+    /// 3. `hitTest(_:)` claims `self` for every in-bounds point,
+    ///    short-circuiting AppKit's descent into transparent
+    ///    SwiftUI internals (which inherit `mouseDownCanMoveWindow
+    ///    == true` and would otherwise be the leaf).
     ///
-    /// The `hitTest:` override claims `self` for any in-bounds point
-    /// where SwiftUI's normal hit-test would have returned nil (the
-    /// transparent corners). When SwiftUI returns a real leaf — pill
-    /// body, close-X button — we forward to that leaf so SwiftUI
-    /// taps and the close button keep working unchanged. AppKit's
-    /// query then lands on `self` (corners) or on the leaf (body /
-    /// button); both report `mouseDownCanMoveWindow = false` and the
-    /// fall-through to `WindowDragRegion` is blocked.
+    /// SwiftUI's tap/hover/drag gestures still work: they're
+    /// dispatched by SwiftUI's own event router inside
+    /// `NSHostingView` once the view receives the event, descending
+    /// the SwiftUI tree internally — independent of AppKit's NSView
+    /// hit-test result.
+    /// Covered by `PaneDragWindowMoveUITests`.
     final class NonDraggableHostingView: NSHostingView<AnyView> {
         override var mouseDownCanMoveWindow: Bool { false }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
-            let local = self.convert(point, from: superview)
-            guard self.bounds.contains(local) else { return nil }
-            if let leaf = super.hitTest(point), leaf !== self {
-                return leaf
-            }
-            // Transparent pixel inside our bounds — claim it so
-            // AppKit's window-drag walk stops at us.
-            return self
+            let local = convert(point, from: superview)
+            return NSPointInRect(local, bounds) ? self : nil
         }
 
         required init(rootView: AnyView) {

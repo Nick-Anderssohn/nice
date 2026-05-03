@@ -2,86 +2,57 @@
 //  WindowDragRegion.swift
 //  Nice
 //
-//  Two cooperating pieces that give the 52pt top bar native title-bar
-//  behaviour (drag to move, double-click to zoom) even though the
-//  window uses `.hiddenTitleBar` + `.fullSizeContentView`:
+//  A transparent NSView that drags the window on click-drag and
+//  zooms on double-click. Sits in the empty chrome regions of the
+//  custom toolbar so they feel like a native title bar even though
+//  the window uses `.hiddenTitleBar` + `.fullSizeContentView`.
 //
-//  1. `WindowDragRegion` — a transparent `NSView` with
-//     `mouseDownCanMoveWindow = true`. SwiftUI lays it into the empty
-//     chrome *behind* interactive controls. AppKit's own window-drag
-//     machinery picks this up so click-and-drag moves the window.
-//
-//  2. `TitleBarZoomMonitor` — a local `NSEvent` monitor. AppKit's
-//     title-bar hit-test doesn't reliably cross into NSViews embedded
-//     by SwiftUI's hosting machinery, so `mouseDownCanMoveWindow`
-//     alone doesn't trigger double-click-to-zoom. The monitor fills
-//     that gap: on a double left-click, it walks the hit view's
-//     ancestor chain and zooms if any view reports
-//     `mouseDownCanMoveWindow = true`. `NSVisualEffectView` with
-//     `.behindWindow` blending returns true by default, so we skip
-//     that class — otherwise double-clicks anywhere in the vibrancy-
-//     tinted sidebar would zoom.
+//  Why imperative `performDrag(with:)` instead of the cooperative
+//  `mouseDownCanMoveWindow=true` pattern: the cooperative path
+//  walks the hit-tested view's ancestor chain, and any sibling /
+//  ancestor that returns `true` engages the title-bar drag
+//  tracker — including for clicks that SwiftUI hit-tests as nil
+//  (e.g. the rounded-corner pixels of an interactive widget with a
+//  `RoundedRectangle` content shape). Result: dragging a widget
+//  near its corner also drags the window. Apple's own forum
+//  guidance (developer.apple.com/forums/thread/81149) and BJ
+//  Homer's well-known gist both recommend the imperative path
+//  instead. Widgets consume their own events naturally; only
+//  events that fall past them reach this view's `mouseDown(with:)`,
+//  which then explicitly hands tracking to AppKit via
+//  `performDrag(with:)` (or `performZoom(_:)` for double-click).
 //
 
 import AppKit
 import SwiftUI
 
 struct WindowDragRegion: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        DragView()
-    }
+    func makeNSView(context: Context) -> NSView { ChromeDragView() }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 
-    fileprivate final class DragView: NSView {
-        override var mouseDownCanMoveWindow: Bool { true }
-    }
-}
+    fileprivate final class ChromeDragView: NSView {
+        // Disable AppKit's cooperative title-bar drag tracker for
+        // this view. Default for a transparent `NSView` is `true`,
+        // which would let AppKit engage window-drag *before*
+        // `mouseDown(with:)` is dispatched — bypassing our
+        // imperative path entirely. Returning `false` ensures
+        // normal event dispatch always reaches `mouseDown` so we
+        // can decide explicitly between `performDrag` and
+        // `performZoom`.
+        override var mouseDownCanMoveWindow: Bool { false }
 
-/// Installs a single process-wide local `NSEvent` monitor that turns
-/// double-clicks on any `WindowDragRegion` into `performZoom(_:)`. Safe
-/// to call repeatedly — only the first call installs the monitor.
-@MainActor
-enum TitleBarZoomMonitor {
-    private static var installed = false
+        // Allow drag/zoom even when the window is not yet key —
+        // matches a native title bar's behaviour.
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    static func install() {
-        guard !installed else { return }
-        installed = true
-
-        NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
-            guard event.clickCount == 2 else { return event }
-            guard let window = event.window else { return event }
-            guard let contentView = window.contentView else { return event }
-
-            // Gate on the top 52pt chrome strip. Several AppKit views
-            // lower in the window (NSVisualEffectView in the sidebar,
-            // SwiftTerm's terminal view, etc.) report
-            // `mouseDownCanMoveWindow = true` either by default or via
-            // subclass overrides, so the hit-test walk alone would zoom
-            // on double-clicks in the sidebar body or terminal pane.
-            // Restricting the monitor to the visual chrome row (which
-            // spans both the sidebar card's top strip and the toolbar,
-            // edge-to-edge at window y=0..52) matches the native title-
-            // bar's own footprint.
-            let yFromTop = contentView.bounds.height - event.locationInWindow.y
-            guard yFromTop <= 52 else { return event }
-
-            guard let hit = contentView.hitTest(event.locationInWindow) else {
-                return event
+        override func mouseDown(with event: NSEvent) {
+            guard let window = window else { return }
+            if event.clickCount == 2 {
+                window.performZoom(nil)
+                return
             }
-            // Walk up from the hit view — the draggable marker may be
-            // on an ancestor if SwiftUI wraps the representable in its
-            // own hosting layer.
-            var cursor: NSView? = hit
-            while let v = cursor {
-                if v.mouseDownCanMoveWindow && !(v is NSVisualEffectView) {
-                    window.performZoom(nil)
-                    return nil
-                }
-                cursor = v.superview
-            }
-            return event
+            window.performDrag(with: event)
         }
     }
 }

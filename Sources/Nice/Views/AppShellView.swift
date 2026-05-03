@@ -188,7 +188,21 @@ private struct AppShellHost: View {
             // rounded corner.
             WindowAccessor { window in
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
-                TitleBarZoomMonitor.install()
+                // Disable AppKit's cooperative window-drag entirely.
+                // With `isMovable = true` (the default), the title-
+                // bar drag tracker engages on `mouseDown` whenever
+                // the hit chain contains any view reporting
+                // `mouseDownCanMoveWindow == true` — and SwiftUI's
+                // hosting machinery sprinkles transparent NSViews
+                // throughout the toolbar that inherit that default.
+                // Result: clicking-and-dragging a pane pill drags
+                // the window. Setting `isMovable = false` shuts
+                // that path off; `WindowDragRegion`'s explicit
+                // `mouseDown(with:)` → `performDrag(with:)` still
+                // works, since `performDrag` is documented to move
+                // the window regardless of `isMovable`. Covered by
+                // `PaneDragWindowMoveUITests`.
+                window.isMovable = false
                 services.registry.register(appState: appState, window: window)
                 hostedWindow = window
                 // Tear-off origin (if any) applied via the @State pair
