@@ -61,6 +61,21 @@ final class NiceServices {
     @ObservationIgnored
     private var terminateObserver: NSObjectProtocol?
 
+    /// One pending tear-off, claimed by the new window minted by
+    /// `requestPaneTearOff`. Set immediately before `openWindow(id:)`
+    /// fires; consumed by the matching window's `AppShellHost.task`
+    /// after `appState.start()`. The detached `NiceTerminalView` is
+    /// parent-less while parked here for at most a few runloop hops —
+    /// AppKit allows that.
+    var pendingTearOff: PendingTearOff?
+
+    /// How long a `pendingTearOff` slot stays valid before
+    /// `consumeTearOff` drops it as stale. Long enough for `openWindow`
+    /// to spawn even when Stage Manager / Mission Control quirks delay
+    /// the new scene; short enough that an unrelated ⌘N a few seconds
+    /// later doesn't pick up the abandoned pane.
+    static let tearOffTTL: TimeInterval = 2.0
+
     init() {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
@@ -179,6 +194,157 @@ final class NiceServices {
                 }
             }
         }
+    }
+
+    // MARK: - Pane tear-off
+
+    /// Mint a destination window-session-id, detach the source pane's
+    /// view, and stash the migrated bundle on `pendingTearOff` so the
+    /// new window's `AppShellHost.task` can absorb it. Source-side
+    /// model mutation happens here too — but `onSessionMutation`
+    /// (which schedules disk persistence) is **deferred** until the
+    /// destination acknowledges absorption (`completeTearOff(_:)`).
+    /// That way a failed window spawn can roll back without losing
+    /// the pane on the source's next disk read.
+    ///
+    /// Returns the minted destination window-session-id — caller
+    /// passes this to `openWindow(id:value:)` so the destination can
+    /// claim its tear-off via `consumeTearOff(forWindowSessionId:)`.
+    /// Returns `nil` when the source pane / tab can't be resolved.
+    @discardableResult
+    func requestPaneTearOff(
+        from sourceAppState: AppState,
+        tabId: String,
+        paneId: String,
+        cursorScreenPoint: CGPoint,
+        pillOriginOffset: CGSize
+    ) -> String? {
+        guard let sourceTab = sourceAppState.tabs.tab(for: tabId),
+              let pane = sourceTab.panes.first(where: { $0.id == paneId })
+        else { return nil }
+        guard let anchor = ProjectAnchor.from(
+            sourceTabId: tabId, sourceAppState: sourceAppState
+        ) else { return nil }
+
+        let payload = PaneDragPayload(
+            windowSessionId: sourceAppState.windowSession.windowSessionId,
+            tabId: tabId, paneId: paneId, kind: pane.kind
+        )
+
+        let sourcePty = sourceAppState.sessions.ptySessions[tabId]
+        let detachedView = sourcePty?.detachPane(id: paneId)
+        let launchState = sourceAppState.sessions.paneLaunchStates[paneId]
+
+        // Mutate source TabModel — remove pane, recover activePaneId.
+        var sourceBecameEmpty = false
+        sourceAppState.tabs.mutateTab(id: tabId) { tab in
+            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId })
+            else { return }
+            tab.panes.remove(at: idx)
+            if tab.activePaneId == paneId {
+                if idx < tab.panes.count {
+                    tab.activePaneId = tab.panes[idx].id
+                } else if idx > 0 {
+                    tab.activePaneId = tab.panes[idx - 1].id
+                } else {
+                    tab.activePaneId = nil
+                }
+            }
+            sourceBecameEmpty = tab.panes.isEmpty
+        }
+        if launchState != nil {
+            sourceAppState.sessions.clearPaneLaunch(paneId: paneId)
+        }
+        if sourceBecameEmpty,
+           let (pi, ti) = sourceAppState.tabs.projectTabIndex(for: tabId) {
+            sourceAppState.sessions.onTabBecameEmpty?(tabId, pi, ti)
+        }
+        // Source persistence is deferred — `completeTearOff` schedules
+        // it once the destination has absorbed.
+
+        let destWindowSessionId = UUID().uuidString
+        pendingTearOff = PendingTearOff(
+            payload: payload,
+            view: detachedView,
+            pane: pane,
+            sourceTab: sourceTab,
+            originAppStateId: ObjectIdentifier(sourceAppState),
+            destinationWindowSessionId: destWindowSessionId,
+            projectAnchor: anchor,
+            cursorScreenPoint: cursorScreenPoint,
+            pillOriginOffset: pillOriginOffset,
+            pendingLaunchState: launchState,
+            createdAt: Date()
+        )
+        return destWindowSessionId
+    }
+
+    /// Claim the pending tear-off iff `windowSessionId` matches the
+    /// destination tag minted in `requestPaneTearOff` AND the entry
+    /// hasn't aged past `tearOffTTL`. Stale entries are dropped on
+    /// inspection so a later window spawn can't pick them up.
+    func consumeTearOff(forWindowSessionId windowSessionId: String) -> PendingTearOff? {
+        guard let pending = pendingTearOff else { return nil }
+        if Date().timeIntervalSince(pending.createdAt) > Self.tearOffTTL {
+            pendingTearOff = nil
+            return nil
+        }
+        guard pending.destinationWindowSessionId == windowSessionId else {
+            return nil
+        }
+        pendingTearOff = nil
+        return pending
+    }
+
+    /// Notify that destination absorption succeeded — schedules the
+    /// deferred source persistence so the disk record reflects the
+    /// completed move. Called by the new window's `AppShellHost.task`
+    /// right after `absorbTearOff(_:)`.
+    func completeTearOff(_ pending: PendingTearOff) {
+        guard let source = registry.appState(forSessionId: pending.payload.windowSessionId) else {
+            return
+        }
+        source.sessions.onSessionMutation?()
+    }
+
+    /// Source-side rollback when no destination claimed the pending
+    /// tear-off (window spawn failed, TTL expired before mount). Re-
+    /// inserts the detached view + pane back into the source tab so the
+    /// pty isn't orphaned. Idempotent — safe to call from multiple
+    /// recovery paths.
+    func recoverAbandonedTearOff() {
+        guard let pending = pendingTearOff else { return }
+        // Only reclaim if the entry is stale; otherwise the destination
+        // window may still mount and absorb.
+        guard Date().timeIntervalSince(pending.createdAt) > Self.tearOffTTL else {
+            return
+        }
+        pendingTearOff = nil
+        guard let source = registry.appState(forSessionId: pending.payload.windowSessionId) else {
+            return
+        }
+        // Re-insert the pane back into the source tab. If the source
+        // tab has been dissolved in the meantime, route through
+        // `absorbAsNewTab` so the pane lands somewhere reachable.
+        if source.tabs.tab(for: pending.payload.tabId) != nil {
+            source.tabs.mutateTab(id: pending.payload.tabId) { tab in
+                tab.panes.append(pending.pane)
+                tab.activePaneId = pending.pane.id
+            }
+            if let view = pending.view,
+               let pty = source.sessions.ptySessions[pending.payload.tabId] {
+                pty.attachPane(id: pending.pane.id, view: view)
+            }
+        } else {
+            source.absorbAsNewTab(
+                pane: pending.pane,
+                sourceTab: pending.sourceTab,
+                view: pending.view,
+                projectAnchor: pending.projectAnchor,
+                pendingLaunchState: pending.pendingLaunchState
+            )
+        }
+        source.sessions.onSessionMutation?()
     }
 
     // MARK: - Resolving `claude`

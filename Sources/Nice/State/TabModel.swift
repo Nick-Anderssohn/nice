@@ -272,6 +272,114 @@ final class TabModel {
         return insertIndex != srcIndex
     }
 
+    /// Move a pane within the same `TabModel` — either reorder inside
+    /// its own tab, or relocate to another existing tab in this window.
+    /// Cross-window moves and Claude-pane new-tab spawns live on
+    /// `SessionsModel.adoptPane` and `AppState.absorbAsNewTab`.
+    ///
+    /// `destIndex` is the desired final position of the pane in the
+    /// destination tab's `panes` array (0-based). `nil` appends. The
+    /// final position is clamped to a valid slot (and to ≥1 when the
+    /// destination tab has a Claude pane at index 0 — Claude is pinned
+    /// to position 0 by invariant).
+    ///
+    /// Rejects (returns false):
+    ///   - Source pane not found.
+    ///   - Source pane is `.claude` (Claude moves go through the
+    ///     new-tab path; reordering Claude in its own tab is forbidden).
+    ///   - Destination tab not found.
+    ///   - Same-tab move that would land on the same final position
+    ///     (no-op).
+    @discardableResult
+    func movePane(
+        paneId: String,
+        fromTabId: String,
+        toTabId: String,
+        insertAt destIndex: Int? = nil
+    ) -> Bool {
+        guard let (srcPi, srcTi) = projectTabIndex(for: fromTabId) else { return false }
+        guard let srcPaneIdx = projects[srcPi].tabs[srcTi].panes
+            .firstIndex(where: { $0.id == paneId })
+        else { return false }
+        let pane = projects[srcPi].tabs[srcTi].panes[srcPaneIdx]
+        guard pane.kind != .claude else { return false }
+        guard let (dstPi, dstTi) = projectTabIndex(for: toTabId) else { return false }
+
+        if fromTabId == toTabId {
+            let n = projects[srcPi].tabs[srcTi].panes.count
+            // Same-tab "final position" maps directly to the post-removal
+            // insert index (see TabModelMovePaneTests for the derivation).
+            var insertIdx = destIndex ?? (n - 1)
+            insertIdx = max(0, min(insertIdx, n - 1))
+            // Claude (if present) sits at index 0; terminals can't pass
+            // it. Terminal panes that *are* the index-0 element are
+            // moving themselves out of slot 0, so the clamp doesn't fire.
+            let hasClaudeAtZero = projects[srcPi].tabs[srcTi].panes.first?.kind == .claude
+            if hasClaudeAtZero { insertIdx = max(insertIdx, 1) }
+            guard insertIdx != srcPaneIdx else { return false }
+            let p = projects[srcPi].tabs[srcTi].panes.remove(at: srcPaneIdx)
+            projects[srcPi].tabs[srcTi].panes.insert(p, at: insertIdx)
+            // activePaneId stays valid by id even though indices moved.
+            onTreeMutation?()
+            return true
+        }
+
+        let destCount = projects[dstPi].tabs[dstTi].panes.count
+        var insertIdx = destIndex ?? destCount
+        insertIdx = max(0, min(insertIdx, destCount))
+        let destHasClaudeAtZero = projects[dstPi].tabs[dstTi].panes.first?.kind == .claude
+        if destHasClaudeAtZero { insertIdx = max(insertIdx, 1) }
+
+        let removed = projects[srcPi].tabs[srcTi].panes.remove(at: srcPaneIdx)
+        // Source activePaneId recovery — same neighbor logic as
+        // `SessionsModel.paneExited` so an active-pane drag falls
+        // through to the next-or-previous sibling.
+        if projects[srcPi].tabs[srcTi].activePaneId == paneId {
+            let leftover = projects[srcPi].tabs[srcTi].panes
+            if srcPaneIdx < leftover.count {
+                projects[srcPi].tabs[srcTi].activePaneId = leftover[srcPaneIdx].id
+            } else if srcPaneIdx > 0 {
+                projects[srcPi].tabs[srcTi].activePaneId = leftover[srcPaneIdx - 1].id
+            } else {
+                projects[srcPi].tabs[srcTi].activePaneId = nil
+            }
+        }
+        projects[dstPi].tabs[dstTi].panes.insert(removed, at: insertIdx)
+        projects[dstPi].tabs[dstTi].activePaneId = paneId
+        onTreeMutation?()
+        return true
+    }
+
+    /// True iff `movePane` with the same arguments would actually
+    /// mutate the tree. Drop indicators use this to suppress the
+    /// insertion line for no-op drops and to forbid Claude reorders.
+    func wouldMovePane(
+        paneId: String,
+        fromTabId: String,
+        toTabId: String,
+        insertAt destIndex: Int? = nil
+    ) -> Bool {
+        guard let (srcPi, srcTi) = projectTabIndex(for: fromTabId) else { return false }
+        guard let srcPaneIdx = projects[srcPi].tabs[srcTi].panes
+            .firstIndex(where: { $0.id == paneId })
+        else { return false }
+        let pane = projects[srcPi].tabs[srcTi].panes[srcPaneIdx]
+        guard pane.kind != .claude else { return false }
+        guard projectTabIndex(for: toTabId) != nil else { return false }
+
+        if fromTabId == toTabId {
+            let n = projects[srcPi].tabs[srcTi].panes.count
+            var insertIdx = destIndex ?? (n - 1)
+            insertIdx = max(0, min(insertIdx, n - 1))
+            let hasClaudeAtZero = projects[srcPi].tabs[srcTi].panes.first?.kind == .claude
+            if hasClaudeAtZero { insertIdx = max(insertIdx, 1) }
+            return insertIdx != srcPaneIdx
+        }
+        // Cross-tab moves are never no-ops as long as the destination
+        // exists — the pane changes membership.
+        return true
+    }
+
     // MARK: - Title application
 
     /// User-initiated rename from the sidebar inline editor. Trims
