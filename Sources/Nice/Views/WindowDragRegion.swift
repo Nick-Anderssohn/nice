@@ -22,6 +22,26 @@
 //     that class — otherwise double-clicks anywhere in the vibrancy-
 //     tinted sidebar would zoom.
 //
+//  Phase A of the title-bar refactor tried to fold (2) into a
+//  `mouseDown(_:)` override on `DragView` that calls `performZoom`
+//  for `clickCount >= 2` — eliminating the process-wide event hook.
+//  It does not work in either drag-mechanism configuration:
+//
+//    • With `mouseDownCanMoveWindow = true`, AppKit's title-bar
+//      tracker takes over the gesture and `mouseDown` is never
+//      delivered to the view for stationary clicks (verified by
+//      `WindowDragUITests.testEmptyToolbarDoubleClickZoomsWindow`
+//      against this configuration).
+//    • With `mouseDownCanMoveWindow = false`, `mouseDown` is
+//      delivered, but calling `performDrag` for the single-click
+//      case transfers event tracking to AppKit, which absorbs the
+//      second click of a double-click; `clickCount` never reaches
+//      2 (also caught by the same test).
+//
+//  The process-wide monitor sits cleanly outside both code paths, so
+//  it can observe the second mouseDown event regardless of what
+//  AppKit's drag tracker is doing. That's why it exists.
+//
 
 import AppKit
 import SwiftUI
@@ -33,7 +53,7 @@ struct WindowDragRegion: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 
-    fileprivate final class DragView: NSView {
+    final class DragView: NSView {
         override var mouseDownCanMoveWindow: Bool { true }
     }
 }
