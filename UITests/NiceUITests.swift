@@ -1690,6 +1690,175 @@ final class NiceUITests: NiceUITestCase {
         )
     }
 
+    // MARK: - Per-window-close persistence (off-main flush end-to-end)
+
+    /// End-to-end pin for the per-window-close persistence path: the
+    /// user closes a single window (red traffic light) while the app
+    /// keeps running. `WindowSession.tearDown` runs `store.upsert` +
+    /// `store.flush` on `SessionStore`'s background `ioQueue`, and the
+    /// flush blocks main on a semaphore until the off-main write
+    /// completes. The test:
+    ///   1. Launches Nice (window A) into a sandboxed Application
+    ///      Support root.
+    ///   2. Opens a second window (B) via ⌘N.
+    ///   3. Creates a Claude tab in window B via the socket so its
+    ///      persisted snapshot is distinguishable.
+    ///   4. Waits for the first debounced save to land sessions.json.
+    ///   5. Closes window B via the close button, confirming the
+    ///      "live panes" alert if it appears.
+    ///   6. Polls sessions.json until the post-close write lands. If
+    ///      the off-main `ioQueue` write never runs (e.g. a future
+    ///      regression that drops the queue or starves it under
+    ///      QoS pressure on a busy CI box), this poll times out.
+    /// Note: the test does NOT call `app.terminate()` — that path
+    /// already has coverage via `testSessionIdRotation_persistsAcrossRestart`.
+    /// What's unique here is verifying the non-terminate flush trigger
+    /// reaches disk through the new `ioQueue` plumbing.
+    func testPerWindowClose_flushesOffMainWriteToDisk() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath,
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5),
+            "Window A should appear on launch."
+        )
+        let windowsBefore = app.windows.count
+
+        // Open window B.
+        app.typeKey("n", modifierFlags: .command)
+        let twoWindows = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                app.windows.count > windowsBefore
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [twoWindows], timeout: 5), .completed,
+            "⌘N must open window B."
+        )
+
+        // Create a tab in the focused window (B) so the per-window
+        // snapshot has identifiable content. createTabViaSocket waits
+        // for the row to appear; we don't need its return value, just
+        // the resulting state mutation that the close should persist.
+        _ = try createTabViaSocket(in: app, socketPath: socketPath)
+
+        let sessionsFile = (fakeHomePath() as NSString)
+            .appendingPathComponent(
+                "Library/Application Support/Nice/sessions.json"
+            )
+
+        // Wait for the initial debounced save to land. Without this,
+        // a fast close-then-poll could observe the file before any
+        // write has happened and conclude (incorrectly) that the
+        // close-time flush worked.
+        let initialSave = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                FileManager.default.fileExists(atPath: sessionsFile)
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [initialSave], timeout: 5), .completed,
+            "Debounced save must land sessions.json within 5s."
+        )
+        XCTAssertGreaterThanOrEqual(
+            readPersistedWindowCount(at: sessionsFile), 1,
+            "Pre-close: at least one window must be persisted."
+        )
+
+        // Settle: any debounce in flight from createTabViaSocket
+        // should land before we sample `preCloseMtime`. Without this
+        // settle, a debounced write that fires *after* preCloseMtime
+        // capture but *before* the close-time flush could be the only
+        // source of mtime advancement, masking a flush regression.
+        let settle = XCTestExpectation(description: "debounce settled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            settle.fulfill()
+        }
+        wait(for: [settle], timeout: 2.0)
+
+        let preCloseMtime = (try? FileManager.default.attributesOfItem(
+            atPath: sessionsFile
+        )[.modificationDate] as? Date) ?? .distantPast
+
+        // Close the focused window (B) via the red traffic light.
+        // `XCUIIdentifierCloseWindow` is the standard accessibility
+        // identifier AppKit assigns to the close button.
+        let focused = app.windows.element(boundBy: 0)
+        let closeButton = focused.buttons[XCUIIdentifierCloseWindow]
+        XCTAssertTrue(
+            closeButton.waitForExistence(timeout: 2),
+            "Close button must be reachable on window B."
+        )
+        closeButton.click()
+
+        // The seed terminal pane triggers the live-panes confirmation.
+        // Confirm with "Close" so the close proceeds; if no dialog
+        // appears (e.g. no live panes), this branch is a fast no-op.
+        let confirm = app.dialogs.firstMatch.buttons["Close"]
+        if confirm.waitForExistence(timeout: 2) {
+            confirm.click()
+        }
+
+        // Window count drops back to the pre-⌘N count once the close
+        // delivers willClose → tearDown → registry removal.
+        let backToOne = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                app.windows.count == windowsBefore
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [backToOne], timeout: 5), .completed,
+            "Closing window B should leave only the original window(s)."
+        )
+
+        // The post-close flush enqueues a write on the off-main
+        // `ioQueue` and blocks main via semaphore. Poll until the
+        // file is updated past `preCloseMtime`. A regression that
+        // bypassed `ioQueue` (or one that broke the semaphore and let
+        // `flush` return before the write completed) would either
+        // leave the file stale or write nothing.
+        let postCloseWrite = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                guard let m = (try? FileManager.default.attributesOfItem(
+                    atPath: sessionsFile
+                )[.modificationDate] as? Date) else { return false }
+                return m > preCloseMtime
+            }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [postCloseWrite], timeout: 5), .completed,
+            "Per-window-close must reach disk via ioQueue within 5s."
+        )
+
+        // Sanity: the file is still well-formed JSON. A regression
+        // that wrote partial data on close would corrupt this.
+        let data = try Data(contentsOf: URL(fileURLWithPath: sessionsFile))
+        XCTAssertNoThrow(
+            try JSONSerialization.jsonObject(with: data),
+            "Post-close sessions.json must be valid JSON."
+        )
+    }
+
+    /// Count windows in `sessions.json`. Returns 0 if the file is
+    /// missing or fails to parse.
+    private func readPersistedWindowCount(at path: String) -> Int {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let windows = root["windows"] as? [[String: Any]]
+        else { return 0 }
+        return windows.count
+    }
+
     // MARK: - Inline tab rename
 
     /// Tapping the active tab's title swaps the row's `Text` for a

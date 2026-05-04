@@ -176,6 +176,137 @@ final class SessionStoreTests: XCTestCase {
                        "After the second flush, the latest state must survive — a pending cancelled write must not resurrect the first upsert's state.")
     }
 
+    // MARK: - threading + queue routing
+
+    func test_debouncedWrite_runsOnIOQueueAfterDebounceWindow() {
+        // Two contracts in one test, on purpose — they fail
+        // together if you regress them together:
+        //   1. The debounced write runs on `SessionStore.ioQueueLabel`
+        //      (specifically that queue, not main, not some other
+        //      background queue).
+        //   2. It does *not* fire before the 500ms debounce window
+        //      elapses. A regression that fired the write on main
+        //      synchronously inside `upsert` would fail (1); a
+        //      regression that dropped the asyncAfter and fired
+        //      immediately on ioQueue would fail (2).
+        let recorder = RecordingSessionStoreIO()
+        let writeFired = expectation(description: "debounced writer invoked")
+        recorder.onWrite = { writeFired.fulfill() }
+        let store = SessionStore(io: recorder)
+        let upsertedAt = Date()
+        store.upsert(window: makeWindow(id: "w1", tabs: []))
+        wait(for: [writeFired], timeout: 2.0)
+
+        let writes = recorder.writes
+        XCTAssertEqual(writes.count, 1)
+        let write = try! XCTUnwrap(writes.first)
+        XCTAssertEqual(write.queueLabel, SessionStore.ioQueueLabel,
+                       "Debounced write must run on SessionStore.ioQueue.")
+        XCTAssertGreaterThanOrEqual(
+            write.firedAt.timeIntervalSince(upsertedAt), 0.4,
+            "Debounced write must respect the 500ms debounce window (≥0.4s lower bound to absorb scheduling jitter)."
+        )
+    }
+
+    func test_flush_runsWriteOnIOQueue_andBlocksUntilWriteCompletes() {
+        // Two contracts:
+        //   1. `flush()` runs the write on `ioQueue` (not main).
+        //   2. `flush()` blocks the caller until the write actually
+        //      completes — pinned by injecting a sleeping writer and
+        //      asserting that `flush()` returned no earlier than the
+        //      writer's `completedAt`. A regression that removed the
+        //      semaphore would let `flush()` return before the writer
+        //      finished its sleep, failing the timing assertion.
+        let writerSleep: TimeInterval = 0.2
+        let recorder = RecordingSessionStoreIO(writeDelay: writerSleep)
+        let store = SessionStore(io: recorder)
+        store.upsert(window: makeWindow(id: "w1", tabs: []))
+        let beforeFlush = Date()
+        store.flush()
+        let afterFlush = Date()
+
+        let writes = recorder.writes
+        XCTAssertGreaterThanOrEqual(writes.count, 1)
+        let lastWrite = try! XCTUnwrap(writes.last)
+        XCTAssertEqual(lastWrite.queueLabel, SessionStore.ioQueueLabel,
+                       "flush() must dispatch the write to ioQueue, not run it on main.")
+        XCTAssertGreaterThanOrEqual(
+            afterFlush.timeIntervalSince(beforeFlush), writerSleep - 0.05,
+            "flush() must block until the off-main write completes — the call returned faster than the writer's injected sleep."
+        )
+        XCTAssertGreaterThanOrEqual(
+            afterFlush, lastWrite.completedAt,
+            "flush() returned before the last write completed; the semaphore is broken."
+        )
+    }
+
+    func test_upsertThenFlush_writesExactlyOnce() {
+        // A single upsert + flush must produce exactly one on-disk
+        // write — the cancelled debounce work item must NOT also fire
+        // a duplicate. Today's tests only check final content; this
+        // pins write count, which catches "the cancellation is broken
+        // but the writes happened to coalesce to the same content."
+        let recorder = RecordingSessionStoreIO()
+        let store = SessionStore(io: recorder)
+        store.upsert(window: makeWindow(id: "w1", tabs: []))
+        store.flush()
+        // Spin past the debounce window: if the cancelled work item
+        // fires anyway, we'd see a second write here.
+        let elapsed = expectation(description: "debounce window elapsed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { elapsed.fulfill() }
+        wait(for: [elapsed], timeout: 2.0)
+
+        XCTAssertEqual(recorder.writes.count, 1,
+                       "upsert + flush must write exactly once; a double-write means flush didn't cancel the debounce.")
+    }
+
+    func test_flushAfterInFlightDebounce_writesInOrder_latestSnapshotWins() {
+        // Sequence:
+        //   1. upsert(A) — schedules debounce on main.
+        //   2. wait past debounce so the work item fires and
+        //      enqueues write(A) onto ioQueue.
+        //   3. immediately call upsert(B) + flush() — flush enqueues
+        //      write(B); the serial ioQueue runs A first, then B.
+        // Assert: two writes, A then B (in enqueue order), and the
+        // final on-disk snapshot is B's.
+        let recorder = RecordingSessionStoreIO(writeDelay: 0.05)
+        let store = SessionStore(io: recorder)
+
+        store.upsert(window: makeWindow(id: "w1", tabs: [makePersistedTab(id: "A")]))
+        // Wait past debounce so write(A) is enqueued on ioQueue but
+        // (because of writeDelay) hasn't completed yet.
+        let debounceFired = expectation(description: "debounce timer fired")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { debounceFired.fulfill() }
+        wait(for: [debounceFired], timeout: 2.0)
+
+        store.upsert(window: makeWindow(id: "w1", tabs: [makePersistedTab(id: "B")]))
+        store.flush()
+
+        let writes = recorder.writes
+        XCTAssertEqual(writes.count, 2,
+                       "Debounced write(A) plus flush write(B) — both must land.")
+        let firstTabs = writes[0].snapshot.windows.first?.projects.flatMap(\.tabs) ?? []
+        let secondTabs = writes[1].snapshot.windows.first?.projects.flatMap(\.tabs) ?? []
+        XCTAssertEqual(firstTabs.map(\.id), ["A"], "ioQueue is serial: write(A) must complete first.")
+        XCTAssertEqual(secondTabs.map(\.id), ["B"], "Then write(B) from flush.")
+    }
+
+    func test_rapidUpserts_coalesceToSingleWrite() {
+        // Backpressure / pile-up: 100 rapid upserts must coalesce
+        // through the debounce-cancellation path to a single write
+        // when followed by a flush. A regression that broke
+        // cancel-on-rescheduling would write up to 100 times.
+        let recorder = RecordingSessionStoreIO()
+        let store = SessionStore(io: recorder)
+        for i in 0..<100 {
+            store.upsert(window: makeWindow(id: "w\(i % 5)", tabs: []))
+        }
+        store.flush()
+
+        XCTAssertEqual(recorder.writes.count, 1,
+                       "100 rapid upserts + flush must coalesce to exactly one write.")
+    }
+
     // MARK: - pruneEmptyWindows
 
     func test_pruneEmptyWindows_dropsZeroTabWindowsExceptKeep() {
@@ -404,5 +535,74 @@ final class SessionStoreTests: XCTestCase {
             claudeSessionId: nil, activePaneId: nil,
             panes: []
         )
+    }
+}
+
+/// Test double for `SessionStoreIO`. Records each `write` invocation
+/// with its queue context and timestamps, and lets the test inject a
+/// fixed sleep before the write returns (used to pin "flush blocks
+/// until writer completes" without racing the scheduler).
+///
+/// `@unchecked Sendable` because synchronization is via `NSLock` —
+/// the protocol requires `Sendable` for capture across the I/O queue.
+final class RecordingSessionStoreIO: SessionStoreIO, @unchecked Sendable {
+    struct WriteRecord {
+        /// Snapshot the writer was invoked with.
+        let snapshot: PersistedState
+        /// Label of the dispatch queue the write ran on. Tests assert
+        /// this is `SessionStore.ioQueueLabel`, never main.
+        let queueLabel: String
+        /// `Thread.isMainThread` at write time. Belt-and-suspenders
+        /// alongside `queueLabel`.
+        let isMain: Bool
+        /// When the write closure was entered.
+        let firedAt: Date
+        /// When the write closure returned (after any injected
+        /// `writeDelay`). Used by tests that pin `flush()`'s
+        /// blocking semantics.
+        let completedAt: Date
+    }
+
+    private let lock = NSLock()
+    private var _writes: [WriteRecord] = []
+    private let writeDelay: TimeInterval
+
+    /// Optional callback fired (under the lock) after each write is
+    /// recorded. Tests use this to fulfill an `XCTestExpectation` so
+    /// they don't busy-wait.
+    var onWrite: (@Sendable () -> Void)?
+
+    init(writeDelay: TimeInterval = 0) {
+        self.writeDelay = writeDelay
+    }
+
+    func write(_ state: PersistedState, to url: URL) {
+        let firedAt = Date()
+        let label = String(cString: __dispatch_queue_get_label(nil))
+        let isMain = Thread.isMainThread
+        if writeDelay > 0 {
+            Thread.sleep(forTimeInterval: writeDelay)
+        }
+        let completedAt = Date()
+        lock.lock()
+        _writes.append(WriteRecord(
+            snapshot: state,
+            queueLabel: label,
+            isMain: isMain,
+            firedAt: firedAt,
+            completedAt: completedAt
+        ))
+        let cb = onWrite
+        lock.unlock()
+        cb?()
+    }
+
+    func read(from url: URL) -> PersistedState {
+        return .empty
+    }
+
+    var writes: [WriteRecord] {
+        lock.lock(); defer { lock.unlock() }
+        return _writes
     }
 }

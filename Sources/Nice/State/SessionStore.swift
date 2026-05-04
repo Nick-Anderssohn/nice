@@ -12,10 +12,17 @@
 //  `@SceneStorage("windowSessionId")` on `AppShellView`.
 //
 //  Writes are debounced (500ms) so rapid-fire state mutations during
-//  normal use don't thrash the disk. `flush()` cancels the pending
-//  timer and writes synchronously; `willTerminate` calls it through
-//  every `AppState.tearDown` so the last state makes it to disk
-//  before the app exits.
+//  normal use don't thrash the disk, and the encode + atomic write
+//  always runs on a private serial `ioQueue` so main is never the
+//  writer. `flush()` cancels the pending timer and blocks the caller
+//  on a semaphore until the off-main write completes; per-window-close
+//  and `willTerminate` both reach `flush()` through `WindowSession.tearDown`,
+//  so the last state makes it to disk before the close/exit returns.
+//
+//  Disk I/O is funneled through `SessionStoreIO` (production:
+//  `DiskSessionStoreIO`). Tests inject a recorder to capture writes
+//  with queue/thread context — the protocol is the only path from
+//  `SessionStore` to the filesystem.
 //
 
 import Foundation
@@ -127,11 +134,62 @@ protocol SessionStorePersisting: AnyObject {
     func load() -> PersistedState
     func upsert(window: PersistedWindow)
     func pruneEmptyWindows(keeping: String)
+    /// Cancel any pending debounced write and persist the current
+    /// state. Conformers must block until the write completes so
+    /// callers (`willTerminate`, per-window-close) can rely on the
+    /// state being on disk before the call returns.
     func flush()
+}
+
+/// Disk side-effects performed by `SessionStore`. Carved out as a
+/// protocol so tests can inject a recorder that captures writes
+/// (with queue/thread context) and skip touching disk, and so the
+/// only path from `SessionStore` to the filesystem is one method
+/// call away from the I/O queue. Production uses
+/// `DiskSessionStoreIO`.
+protocol SessionStoreIO: Sendable {
+    /// Encode `state` and write it to `url` atomically. Always
+    /// invoked on `SessionStore`'s I/O queue — implementations must
+    /// be safe to call from a background thread.
+    func write(_ state: PersistedState, to url: URL)
+    /// Synchronously read the persisted state at `url`, returning
+    /// `.empty` if the file is missing or fails to decode. Called
+    /// once at `SessionStore.init`.
+    func read(from url: URL) -> PersistedState
+}
+
+/// Production `SessionStoreIO`: JSON-encode → atomic write to disk
+/// with `try?`. A failed atomic write leaves the prior file intact,
+/// which is the recovery contract pinned by
+/// `SessionStoreWriteFailureTests`.
+struct DiskSessionStoreIO: SessionStoreIO {
+    func write(_ state: PersistedState, to url: URL) {
+        let encoder = JSONEncoder()
+        // `.withoutEscapingSlashes` keeps path values readable
+        // (`/Users/...` instead of `\/Users\/...`). Both forms
+        // decode to the same string, so this is purely cosmetic.
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(state) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    func read(from url: URL) -> PersistedState {
+        guard let data = try? Data(contentsOf: url) else { return .empty }
+        guard let decoded = try? JSONDecoder().decode(PersistedState.self, from: data) else {
+            return .empty
+        }
+        return decoded
+    }
 }
 
 @MainActor
 final class SessionStore: SessionStorePersisting {
+    /// Label of the serial queue that owns every `SessionStore` write.
+    /// Exposed (internal) so tests can assert "this write ran on
+    /// `ioQueue`, not main, not some other queue" via the dispatch
+    /// queue label C API.
+    static let ioQueueLabel = "dev.nickanderssohn.nice.sessionstore.io"
+
     static let shared = SessionStore()
 
     private let fileURL: URL
@@ -141,12 +199,30 @@ final class SessionStore: SessionStorePersisting {
     /// `tearDown` runs synchronously and cancels the pending work).
     private let debounceInterval: TimeInterval = 0.5
 
+    /// Serial background queue for the encode + atomic file write.
+    /// Keeps disk I/O off the main thread; serial so a flush write
+    /// always runs after any earlier debounced write that already
+    /// left the main-thread timer. Note: `qos: .utility` plus a
+    /// main-thread `sem.wait()` in `flush()` is technically a
+    /// priority inversion, but macOS auto-promotes the queue's QoS
+    /// for the duration of the wait, so the wait isn't starved.
+    private let ioQueue = DispatchQueue(
+        label: SessionStore.ioQueueLabel,
+        qos: .utility
+    )
+
+    /// Disk-side effects. Defaults to `DiskSessionStoreIO` in
+    /// production; tests inject a recorder so they can assert on
+    /// writes (count, ordering, queue) without touching disk.
+    private let io: SessionStoreIO
+
     /// In-memory cache of the last-read / last-written state. Keeps
     /// `upsert` cheap: it mutates the cached struct and schedules a
     /// single write instead of re-reading the file on every change.
     private var cached: PersistedState
 
-    init() {
+    init(io: SessionStoreIO = DiskSessionStoreIO()) {
+        self.io = io
         let fm = FileManager.default
         // Tests set `NICE_APPLICATION_SUPPORT_ROOT` to redirect session
         // state into a sandbox directory. `FileManager.url(for:
@@ -178,7 +254,7 @@ final class SessionStore: SessionStorePersisting {
         let supportDir = root.appendingPathComponent(folder, isDirectory: true)
         try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
         self.fileURL = supportDir.appendingPathComponent("sessions.json")
-        self.cached = Self.read(from: fileURL)
+        self.cached = io.read(from: fileURL)
     }
 
     /// Return the current persisted state. Safe to call at any time —
@@ -214,23 +290,33 @@ final class SessionStore: SessionStorePersisting {
         scheduleWrite()
     }
 
-    /// Cancel any pending debounced write and flush the cache to disk
-    /// synchronously. Called from `AppState.tearDown` so `willTerminate`
-    /// never loses the last mutation.
+    /// Cancel any pending debounced write and flush the cache to disk.
+    /// The write itself runs on `ioQueue` (so main is never the
+    /// writer); the semaphore makes this call block until the write
+    /// completes, preserving the "flushed before terminate returns"
+    /// guarantee. Called from `WindowSession.tearDown` on per-window
+    /// close *and* on app terminate.
     func flush() {
+        dispatchPrecondition(condition: .onQueue(.main))
         pendingWork?.cancel()
         pendingWork = nil
-        Self.write(cached, to: fileURL)
+        enqueueWriteAndWait(snapshot: cached)
     }
 
     // MARK: - Disk I/O
 
     private func scheduleWrite() {
+        dispatchPrecondition(condition: .onQueue(.main))
         pendingWork?.cancel()
         let snapshot = cached
-        let url = fileURL
-        let work = DispatchWorkItem {
-            Self.write(snapshot, to: url)
+        // Timer still lives on main so cancel-on-rescheduling stays
+        // race-free with `pendingWork` (a `@MainActor`-isolated ivar).
+        // When it fires, it hands the snapshot to `enqueueWrite`; the
+        // actual encode + atomic write runs on the background worker.
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.enqueueWrite(snapshot: snapshot)
+            }
         }
         pendingWork = work
         DispatchQueue.main.asyncAfter(
@@ -238,22 +324,32 @@ final class SessionStore: SessionStorePersisting {
         )
     }
 
-    private static func read(from url: URL) -> PersistedState {
-        guard let data = try? Data(contentsOf: url) else { return .empty }
-        let decoder = JSONDecoder()
-        guard let decoded = try? decoder.decode(PersistedState.self, from: data) else {
-            return .empty
+    /// Single funnel for non-blocking writes. Captures `io` and `url`
+    /// as values, then dispatches to `ioQueue`. The
+    /// `dispatchPrecondition` inside the block is the structural guard
+    /// that no future caller bypasses the I/O queue: every write goes
+    /// through here.
+    private func enqueueWrite(snapshot: PersistedState) {
+        let io = self.io
+        let url = self.fileURL
+        ioQueue.async { [ioQueue] in
+            dispatchPrecondition(condition: .onQueue(ioQueue))
+            io.write(snapshot, to: url)
         }
-        return decoded
     }
 
-    private static func write(_ state: PersistedState, to url: URL) {
-        let encoder = JSONEncoder()
-        // `.withoutEscapingSlashes` keeps path values readable
-        // (`/Users/...` instead of `\/Users\/...`). Both forms
-        // decode to the same string, so this is purely cosmetic.
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        guard let data = try? encoder.encode(state) else { return }
-        try? data.write(to: url, options: .atomic)
+    /// Blocking variant for `flush`. Same enqueue path, plus a
+    /// semaphore so the caller can rely on the write being on disk
+    /// before the call returns.
+    private func enqueueWriteAndWait(snapshot: PersistedState) {
+        let io = self.io
+        let url = self.fileURL
+        let sem = DispatchSemaphore(value: 0)
+        ioQueue.async { [ioQueue] in
+            dispatchPrecondition(condition: .onQueue(ioQueue))
+            io.write(snapshot, to: url)
+            sem.signal()
+        }
+        sem.wait()
     }
 }

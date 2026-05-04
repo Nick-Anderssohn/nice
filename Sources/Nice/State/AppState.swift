@@ -78,7 +78,8 @@ final class AppState {
         initialSidebarMode: SidebarMode = .tabs,
         initialMainCwd: String?,
         windowSessionId: String,
-        fileExplorer: FileExplorerServices? = nil
+        fileExplorer: FileExplorerServices? = nil,
+        store: SessionStorePersisting? = nil
     ) {
         self.sidebar = SidebarModel(
             initialCollapsed: initialSidebarCollapsed,
@@ -93,12 +94,18 @@ final class AppState {
         self.tabs = TabModel(initialMainCwd: resolvedMainCwd)
         self.sessions = SessionsModel(tabs: tabs)
         self.closer = CloseRequestCoordinator(tabs: tabs, sessions: sessions)
+        // Persistence is enabled when the caller wired up real
+        // services, OR when a test injected a `store` (so unit tests
+        // can pin the per-window-close → flush chain end-to-end
+        // without spinning up real NiceServices). When `store` is
+        // nil, WindowSession picks up `SessionStore.shared`.
         self.windowSession = WindowSession(
             tabs: tabs,
             sessions: sessions,
             sidebar: sidebar,
             windowSessionId: windowSessionId,
-            persistenceEnabled: services != nil
+            persistenceEnabled: services != nil || store != nil,
+            store: store ?? SessionStore.shared
         )
         self.fileExplorerOrchestrator = FileExplorerOrchestrator(
             fileExplorer: fileExplorer ?? services?.fileExplorer,

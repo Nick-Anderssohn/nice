@@ -150,6 +150,48 @@ final class WindowRegistryTests: XCTestCase {
         window.close()
     }
 
+    func test_willCloseNotification_flushesSessionStore_endToEnd() {
+        // End-to-end pin for the per-window-close persistence path:
+        //   willCloseNotification → handleClose → AppState.tearDown
+        //                        → WindowSession.tearDown → store.flush()
+        // This is *not* the willTerminate path — it fires every time
+        // the user closes a single window while the app keeps running.
+        // A regression in `handleClose` that skipped `appState.tearDown`
+        // (e.g. an early return) would silently drop persistence on
+        // every per-window close until users noticed lost windows
+        // after a restart.
+        let fake = FakeSessionStore()
+        let registry = WindowRegistry()
+        let appState = AppState(
+            services: nil,
+            initialSidebarCollapsed: false,
+            initialMainCwd: nil,
+            windowSessionId: "win-close-flush",
+            store: fake
+        )
+        // Release the save-gate so `tearDown`'s upsert isn't skipped
+        // by the init-time short-circuit.
+        appState.windowSession.markInitializationComplete()
+        let window = makeWindow()
+        registry.register(appState: appState, window: window)
+        XCTAssertEqual(fake.flushCount, 0, "Pre-condition: no flush yet.")
+
+        NotificationCenter.default.post(
+            name: NSWindow.willCloseNotification, object: window
+        )
+
+        let delivered = XCTestExpectation(description: "willClose delivered")
+        DispatchQueue.main.async { delivered.fulfill() }
+        wait(for: [delivered], timeout: 1.0)
+
+        XCTAssertEqual(fake.flushCount, 1,
+                       "Per-window close must reach store.flush() exactly once via the registry → tearDown chain.")
+        XCTAssertEqual(fake.upsertCalls.last?.id, "win-close-flush",
+                       "The pre-flush upsert must carry this window's snapshot.")
+
+        window.close()
+    }
+
     // MARK: - activeAppState fallback
 
     func test_activeAppState_fallsBackToFirstRegisteredWhenNoLastActive() {
