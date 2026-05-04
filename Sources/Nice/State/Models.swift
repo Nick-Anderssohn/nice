@@ -137,20 +137,35 @@ struct Tab: Identifiable, Hashable, Sendable, Codable {
     var claudeSessionId: String? = nil
     /// ID of a sibling tab in the same project that holds an earlier
     /// pre-/branch session of this tab — created automatically by
-    /// `SessionsModel.materializeBranchParent` when the SessionStart
-    /// hook reports a `/branch` (or `--fork-session`) rotation. `nil`
-    /// for tabs that have never been part of a /branch lineage.
+    /// `SessionsModel.materializeBranchParent` (which delegates the
+    /// tree mutation to `TabModel.insertBranchParent`) when the
+    /// SessionStart hook reports a `/branch` (or `--fork-session`)
+    /// rotation. `nil` for tabs that have never been part of a
+    /// /branch lineage.
     ///
-    /// Lineage layout (depth-1 tree under the original): the FIRST
-    /// /branch in a tab's lineage promotes the new parent to root and
-    /// pulls the originating tab in as its child. Every subsequent
-    /// /branch creates another parent that is a sibling under that
-    /// same root. Both the accumulated parents and the continuing
-    /// originating tab point at the same root via this field, so the
-    /// sidebar renders the whole family as one root tab plus a flat
-    /// list of depth-1 children. The renderer maps a non-nil value to
-    /// one indent level — depth never grows past one regardless of
-    /// branch count.
+    /// Within-project constraint: this id always references a tab in
+    /// the same project as the holder. The sidebar renders children
+    /// under their parent within the same project tree; a
+    /// cross-project reference would render an indent under nothing.
+    /// `moveTab` is same-project only today (no enforcement), so the
+    /// constraint holds by construction; `insertBranchParent`
+    /// asserts it defensively before inheriting an existing root.
+    ///
+    /// Lineage layout (depth-1 tree under the original):
+    ///   • Before the FIRST /branch this is `nil` on every tab in
+    ///     the lineage (which is just the one tab).
+    ///   • The first /branch promotes the new parent to root
+    ///     (`parentTabId == nil`) and pulls the originating tab in
+    ///     as its child (`parentTabId == newRoot`).
+    ///   • Every subsequent /branch creates another parent that is a
+    ///     sibling under that same root. From the second /branch on,
+    ///     both the accumulated parents and the continuing originating
+    ///     tab point at the same root via this field, so the sidebar
+    ///     renders the whole family as one root tab plus a flat list
+    ///     of depth-1 children.
+    ///
+    /// The renderer maps a non-nil value to one indent level — depth
+    /// never grows past one regardless of branch count.
     var parentTabId: String? = nil
 }
 
