@@ -73,8 +73,19 @@ struct NiceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup {
-            AppShellView()
+        // `WindowGroup(id: "main", for: String.self)` lets pane tear-
+        // off route a freshly-spawned window straight to the right
+        // tear-off slot: `requestPaneTearOff` mints a destination
+        // window-session-id, calls `openWindow(id: "main", value:
+        // destId)`, and the new scene's binding carries that id into
+        // `AppShellView` where it overrides the default
+        // `@SceneStorage("windowSessionId")`. The destination then
+        // claims the matching `pendingTearOff` via
+        // `consumeTearOff(forWindowSessionId:)`. ⌘N (no value) is
+        // unaffected: the binding is `nil`, so AppShellView falls
+        // through to scene-storage as before.
+        WindowGroup(id: "main", for: String.self) { $tearOffSessionId in
+            AppShellView(tearOffSessionId: tearOffSessionId)
                 .environment(services)
                 .environment(services.tweaks)
                 .environment(services.shortcuts)
@@ -89,6 +100,10 @@ struct NiceApp: App {
                     AppDelegate.registryProvider = { [weak services] in
                         services?.registry
                     }
+                    // Clear the tear-off value once consumed so that
+                    // a relaunch of the saved scene doesn't try to
+                    // re-claim a stale tear-off after Nice quits.
+                    tearOffSessionId = nil
                 }
         }
         .windowStyle(.hiddenTitleBar)

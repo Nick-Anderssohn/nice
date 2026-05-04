@@ -94,6 +94,17 @@ targets:
         NSHighResolutionCapable: true
         NSMainStoryboardFile: ""
         LSApplicationCategoryType: public.app-category.developer-tools
+        # Custom pasteboard type for in-app pane-pill drags. See
+        # `Sources/Nice/State/PaneDragPayload.swift`. The runtime can
+        # construct the type without this declaration, but exporting
+        # it lets macOS register it for Spotlight/UTType enumeration
+        # and keeps the identifier owned by us.
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: dev.nickanderssohn.nice.pane
+            UTTypeDescription: Nice pane
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nickanderssohn.nice

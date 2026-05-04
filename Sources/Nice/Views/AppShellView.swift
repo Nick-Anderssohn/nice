@@ -44,12 +44,35 @@ struct AppShellView: View {
     /// `sessions.json` so restore rebuilds the right tabs.
     @SceneStorage("windowSessionId") private var storedWindowSessionId: String = ""
 
+    /// Pane-tear-off destination id: when this window was spawned by
+    /// `openWindow(id: "main", value: destId)` from
+    /// `NiceServices.requestPaneTearOff`, the value carries the new
+    /// window's pre-minted session id. Non-nil only on tear-off
+    /// landings; `nil` for ordinary ⌘N. AppShellHost prefers this
+    /// over `@SceneStorage("windowSessionId")` so the new window
+    /// claims the right `pendingTearOff` slot on mount.
+    let tearOffSessionId: String?
+
+    init(tearOffSessionId: String? = nil) {
+        self.tearOffSessionId = tearOffSessionId
+    }
+
     var body: some View {
+        // Tear-off windows skip @SceneStorage and use the value-
+        // supplied session id verbatim. Persisting it back into
+        // `storedWindowSessionId` would let a subsequent relaunch
+        // restore THIS scene as the "tear-off destination" — but
+        // there's no pending tear-off after a fresh launch, so
+        // restore would fail to find the window's tabs. Keep the
+        // tear-off id ephemeral.
+        let initialSessionId = tearOffSessionId ?? storedWindowSessionId
+        let suppressSceneIdWriteback = tearOffSessionId != nil
         AppShellHost(
             services: services,
             initialSidebarCollapsed: storedSidebarCollapsed,
             initialSidebarMode: storedSidebarMode,
-            windowSessionId: storedWindowSessionId,
+            windowSessionId: initialSessionId,
+            isTearOffWindow: suppressSceneIdWriteback,
             sidebarCollapsedBinding: $storedSidebarCollapsed,
             sidebarModeBinding: $storedSidebarMode,
             windowSessionIdBinding: $storedWindowSessionId
@@ -69,9 +92,33 @@ private struct AppShellHost: View {
 
     @State private var appState: AppState
     let services: NiceServices
+    /// True when this window was minted by a tear-off — its session
+    /// id came from the openWindow(id:value:) parameter, not scene
+    /// storage. Suppresses the writeback that would otherwise pin the
+    /// scene's @SceneStorage slot to the tear-off id.
+    let isTearOffWindow: Bool
     @Binding var sidebarCollapsedBinding: Bool
     @Binding var sidebarModeBinding: SidebarMode
     @Binding var windowSessionIdBinding: String
+
+    /// Per-window observable state for an in-flight pane-pill drag.
+    /// Read by `WindowToolbarView` (source pill fade + pane-strip
+    /// drop indicator) and `SidebarView` (tab-row drop highlight).
+    @State private var paneDragState = PaneDragState()
+
+    /// Pending screen-origin to assign to this window once AppKit
+    /// hands it to us via `WindowAccessor`. Set by `.task` after
+    /// consuming a tear-off; cleared after applying. Order-independent:
+    /// the `apply` helper runs whenever EITHER `hostedWindow` OR
+    /// `pendingTearOffOriginToApply` changes, so it doesn't matter
+    /// whether `WindowAccessor` fires before or after `.task`.
+    @State private var pendingTearOffOriginToApply: NSPoint? = nil
+
+    /// Captured `NSWindow` for this AppState. Set by `WindowAccessor`
+    /// once AppKit mounts the window. Read by the tear-off origin
+    /// applier so we can position regardless of which side of the
+    /// race wins.
+    @State private var hostedWindow: NSWindow? = nil
 
     /// True while the cursor is over the floating peek sidebar. Keeps
     /// the overlay rendered after the keyboard modifiers are released
@@ -95,11 +142,13 @@ private struct AppShellHost: View {
         initialSidebarCollapsed: Bool,
         initialSidebarMode: SidebarMode,
         windowSessionId: String,
+        isTearOffWindow: Bool,
         sidebarCollapsedBinding: Binding<Bool>,
         sidebarModeBinding: Binding<SidebarMode>,
         windowSessionIdBinding: Binding<String>
     ) {
         self.services = services
+        self.isTearOffWindow = isTearOffWindow
         // `NICE_MAIN_CWD` lets UI tests pin the Main Terminal tab's
         // CWD to a sandboxed test directory. Production launches
         // don't set it; AppState falls through to NSHomeDirectory().
@@ -119,6 +168,23 @@ private struct AppShellHost: View {
         _sidebarCollapsedBinding = sidebarCollapsedBinding
         _sidebarModeBinding = sidebarModeBinding
         _windowSessionIdBinding = windowSessionIdBinding
+    }
+
+    /// Apply the pending tear-off cursor origin once we have both the
+    /// origin (from `.task` consuming the tear-off) and the window
+    /// reference (from `WindowAccessor`'s callback). Either may
+    /// arrive first; the helper re-runs on each `@State` change until
+    /// both are present, then nils the pending origin so the apply
+    /// doesn't repeat on unrelated state changes.
+    private func applyPendingTearOffOriginIfReady() {
+        guard let origin = pendingTearOffOriginToApply,
+              let window = hostedWindow
+        else { return }
+        // `setFrameTopLeftPoint` accepts a Cocoa screen point
+        // (origin bottom-left); the cursor coordinate from
+        // `NSDraggingSession` is in the same space.
+        window.setFrameTopLeftPoint(origin)
+        pendingTearOffOriginToApply = nil
     }
 
     private var palette: Palette { tweaks.activeChromePalette }
@@ -155,6 +221,7 @@ private struct AppShellHost: View {
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
                 TitleBarZoomMonitor.install()
                 services.registry.register(appState: appState, window: window)
+                hostedWindow = window
             }
         )
         .background(windowBackground.ignoresSafeArea())
@@ -179,6 +246,7 @@ private struct AppShellHost: View {
         .environment(appState.windowSession)
         .environment(appState.fileExplorerOrchestrator)
         .environment(appState)
+        .environment(paneDragState)
         .alert(
             "Processes are still running",
             isPresented: Binding(
@@ -201,12 +269,36 @@ private struct AppShellHost: View {
             // edges (e.g. window restoration).
             services.bootstrap()
             appState.start()
+
+            // Tear-off absorption: if this window's session id was
+            // pre-minted by `requestPaneTearOff`, claim and absorb
+            // the matching `pendingTearOff` slot. The match is
+            // strict (id equality + 2s TTL), so a coincidental ⌘N
+            // can't steal a tear-off and an unrelated window can't
+            // absorb a stale one.
+            let sessionId = appState.windowSession.windowSessionId
+            if let pending = services.consumeTearOff(forWindowSessionId: sessionId) {
+                appState.absorbTearOff(pending)
+                services.completeTearOff(pending)
+                // Position the new window so the released pill lands
+                // under the cursor (subtract `pillOriginOffset` so
+                // the pill itself, not the traffic lights, sits at
+                // `cursorScreenPoint`).
+                let origin = NSPoint(
+                    x: pending.cursorScreenPoint.x - pending.pillOriginOffset.width,
+                    y: pending.cursorScreenPoint.y + pending.pillOriginOffset.height
+                )
+                pendingTearOffOriginToApply = origin
+            }
         }
         .onAppear {
             // Brand-new scene: write the id WindowSession minted back
             // into SceneStorage so this window restores the same
-            // slot on relaunch.
-            if windowSessionIdBinding.isEmpty {
+            // slot on relaunch. Skip for tear-off windows — their id
+            // came from openWindow's value parameter and is meant to
+            // be ephemeral; persisting it would let restore re-claim
+            // a tear-off slot that no longer exists.
+            if !isTearOffWindow, windowSessionIdBinding.isEmpty {
                 windowSessionIdBinding = appState.windowSession.windowSessionId
             }
             appState.sessions.updateTerminalFontFamily(tweaks.terminalFontFamily)
@@ -273,12 +365,19 @@ private struct AppShellHost: View {
         }
         // Mirror WindowSession.windowSessionId back to scene storage —
         // restore may have adopted a different slot (e.g. bootstrap)
-        // and the pairing must survive relaunch.
+        // and the pairing must survive relaunch. Skip for tear-off
+        // windows — see `isTearOffWindow` discussion.
         .onChange(of: appState.windowSession.windowSessionId) { _, new in
-            if new != windowSessionIdBinding {
+            if !isTearOffWindow, new != windowSessionIdBinding {
                 windowSessionIdBinding = new
             }
         }
+        // Tear-off origin: apply when BOTH the window and the
+        // pending origin are available, regardless of which arrives
+        // first. The applier nils the pending origin so it never
+        // re-fires when an unrelated state change re-triggers body.
+        .onChange(of: hostedWindow) { _, _ in applyPendingTearOffOriginIfReady() }
+        .onChange(of: pendingTearOffOriginToApply) { _, _ in applyPendingTearOffOriginIfReady() }
     }
 
     // MARK: - Layout modes
