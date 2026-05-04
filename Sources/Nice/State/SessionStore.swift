@@ -60,6 +60,11 @@ struct PersistedTab: Codable, Hashable, Sendable {
     /// editor. Optional so v3 session files (written before this flag
     /// existed) still decode — callers hydrate with `?? false`.
     let titleManuallySet: Bool?
+    /// Monotonic per-tab counter for auto-naming new terminal panes
+    /// "Terminal N". Optional so older session files still decode —
+    /// `WindowSession.addRestoredTabModel` recomputes the counter from
+    /// existing pane titles when this is nil.
+    let nextTerminalIndex: Int?
 
     init(
         id: String,
@@ -69,7 +74,8 @@ struct PersistedTab: Codable, Hashable, Sendable {
         claudeSessionId: String?,
         activePaneId: String?,
         panes: [PersistedPane],
-        titleManuallySet: Bool? = nil
+        titleManuallySet: Bool? = nil,
+        nextTerminalIndex: Int? = nil
     ) {
         self.id = id
         self.title = title
@@ -79,6 +85,7 @@ struct PersistedTab: Codable, Hashable, Sendable {
         self.activePaneId = activePaneId
         self.panes = panes
         self.titleManuallySet = titleManuallySet
+        self.nextTerminalIndex = nextTerminalIndex
     }
 }
 

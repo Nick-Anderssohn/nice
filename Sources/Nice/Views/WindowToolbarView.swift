@@ -232,6 +232,7 @@ private struct InlinePaneStrip: View {
                 HStack(spacing: 2) {
                     ForEach(tab.panes) { pane in
                         InlinePanePill(
+                            tabId: tab.id,
                             pane: pane,
                             isActive: tab.activePaneId == pane.id,
                             isHovered: hoveredPaneId == pane.id,
@@ -376,13 +377,35 @@ private struct VisibleWidthPreferenceKey: PreferenceKey {
 
 private struct InlinePanePill: View {
     @Environment(\.colorScheme) private var scheme
+    @Environment(TabModel.self) private var tabs
+    @Environment(SessionsModel.self) private var sessions
 
+    let tabId: String
     let pane: Pane
     let isActive: Bool
     let isHovered: Bool
     let onHoverChange: (Bool) -> Void
     let onSelect: () -> Void
     let onClose: () -> Void
+
+    @State private var isEditing = false
+    @State private var draftTitle = ""
+    /// Wall-clock time at which this pill most recently became active.
+    /// Used to gate click-to-rename by `NSEvent.doubleClickInterval` so
+    /// the same click that selects a pill (or arrives within the
+    /// double-click window) can't also trigger an edit — mirrors the
+    /// sidebar `TabRow` behavior.
+    @State private var activatedAt: Date?
+    @FocusState private var titleFocused: Bool
+    /// AppKit mouse-down monitor installed while editing. SwiftUI's
+    /// `@FocusState` does not deassert when an embedded `NSView`
+    /// (the terminal) steals first responder, so `onChange(of:
+    /// titleFocused)` alone can't catch click-away. The monitor
+    /// commits the draft on any click outside the field's window-
+    /// local frame.
+    @State private var mouseMonitor: Any?
+    @State private var fieldFrameInWindow: NSRect = .zero
+    @State private var fieldWindowNumber: Int = 0
 
     private var background: Color {
         if isActive {
@@ -414,18 +437,31 @@ private struct InlinePanePill: View {
         isHovered || isActive
     }
 
+    /// True if this pill was activated long enough ago for a subsequent
+    /// tap on the title to count as a deliberate rename request.
+    private var renameAllowed: Bool {
+        InlineRenameClickGate.canBeginEdit(
+            activatedAt: activatedAt,
+            now: Date(),
+            doubleClickInterval: NSEvent.doubleClickInterval
+        )
+    }
+
+    private var renameMenuLabel: String {
+        pane.kind == .terminal ? "Rename Terminal" : "Rename Pane"
+    }
+
+    private var closeMenuLabel: String {
+        pane.kind == .terminal ? "Close Terminal" : "Close Pane"
+    }
+
     var body: some View {
         HStack(spacing: 7) {
             // Leading icon — status dot for Claude, terminal glyph
             // otherwise.
             leadingIcon
 
-            Text(pane.title)
-                .font(.system(size: 12, weight: textWeight))
-                .foregroundStyle(textColor)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            titleView
 
             // Trailing close "×". Own hit target so the pill's tap
             // doesn't fire when you click the X. We keep the frame
@@ -455,10 +491,28 @@ private struct InlinePanePill: View {
             y: 1
         )
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .onTapGesture { onSelect() }
+        .onTapGesture {
+            // Title taps are handled by `titleView`'s own gesture; this
+            // catches taps on the icon, padding, or empty pill area.
+            // Skipped while editing so a stray tap doesn't spuriously
+            // re-select the pane mid-edit.
+            if !isEditing { onSelect() }
+        }
         .onHover { onHoverChange($0) }
         .animation(.easeInOut(duration: 0.12), value: isActive)
         .animation(.easeInOut(duration: 0.12), value: isHovered)
+        .contextMenu {
+            Button(renameMenuLabel) {
+                onSelect()
+                beginEditing()
+            }
+            .accessibilityIdentifier("tab.pill.\(pane.id).renamePane")
+            Button(closeMenuLabel) {
+                if isEditing { commitEdit() }
+                onClose()
+            }
+            .accessibilityIdentifier("tab.pill.\(pane.id).closePane")
+        }
         // Expose the pill as a single AXButton that contains the close
         // button as a child (not a merged peer). Without `.contain`,
         // `.onTapGesture` + `.accessibilityAddTraits(.isButton)` emit
@@ -469,6 +523,63 @@ private struct InlinePanePill: View {
         .accessibilityIdentifier("tab.pill.\(pane.id)")
         .accessibilityLabel(pane.title)
         .accessibilityAddTraits(isActive ? [.isSelected, .isButton] : .isButton)
+        .onAppear {
+            if isActive && activatedAt == nil { activatedAt = Date() }
+        }
+        .onChange(of: isActive) { _, nowActive in
+            if nowActive {
+                activatedAt = Date()
+            } else {
+                activatedAt = nil
+                // Keyboard pane switches and parent-driven activation
+                // changes don't go through the mouse monitor, so commit
+                // the rename when the pill is deactivated while editing.
+                if isEditing { commitEdit() }
+            }
+        }
+        .onDisappear {
+            if isEditing { commitEdit() }
+            removeMouseMonitor()
+        }
+    }
+
+    @ViewBuilder
+    private var titleView: some View {
+        if isEditing {
+            TextField("", text: $draftTitle)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, weight: textWeight))
+                .foregroundStyle(textColor)
+                .focused($titleFocused)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(WindowFrameReporter { frame, windowNumber in
+                    fieldFrameInWindow = frame
+                    fieldWindowNumber = windowNumber
+                })
+                .onSubmit { commitEdit() }
+                .onExitCommand { cancelEdit() }
+                .onChange(of: titleFocused) { _, focused in
+                    if !focused && isEditing { commitEdit() }
+                }
+                .accessibilityIdentifier("tab.pill.\(pane.id).titleField")
+        } else {
+            Text(pane.title)
+                .font(.system(size: 12, weight: textWeight))
+                .foregroundStyle(textColor)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if isActive {
+                        if renameAllowed { beginEditing() }
+                    } else {
+                        onSelect()
+                    }
+                }
+                .accessibilityIdentifier("tab.pill.\(pane.id).title")
+        }
     }
 
     @ViewBuilder
@@ -488,7 +599,60 @@ private struct InlinePanePill: View {
     }
 
     private var closeButton: some View {
-        CloseXButton(paneId: pane.id, onClose: onClose)
+        // Pre-commit any in-flight edit so a click on X doesn't drop the
+        // user's draft before the pane is destroyed.
+        CloseXButton(paneId: pane.id) {
+            if isEditing { commitEdit() }
+            onClose()
+        }
+    }
+
+    private func beginEditing() {
+        draftTitle = pane.title
+        isEditing = true
+        titleFocused = true
+        installMouseMonitor()
+    }
+
+    private func commitEdit() {
+        guard isEditing else { return }
+        isEditing = false
+        titleFocused = false
+        removeMouseMonitor()
+        // `renamePane` trims and rejects empty internally, so submitting
+        // an empty draft falls through and the pane keeps its prior name.
+        tabs.renamePane(tabId: tabId, paneId: pane.id, to: draftTitle)
+        sessions.focusActiveTerminal()
+    }
+
+    private func cancelEdit() {
+        guard isEditing else { return }
+        isEditing = false
+        titleFocused = false
+        removeMouseMonitor()
+        sessions.focusActiveTerminal()
+    }
+
+    private func installMouseMonitor() {
+        removeMouseMonitor()
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            guard isEditing else { return event }
+            if event.window?.windowNumber == fieldWindowNumber,
+               !fieldFrameInWindow.insetBy(dx: -2, dy: -2).contains(event.locationInWindow) {
+                // Defer so the mouse-down finishes dispatching to its
+                // destination view (the close X, a sibling pill, the
+                // terminal grabbing focus) before we tear down the field.
+                DispatchQueue.main.async { commitEdit() }
+            }
+            return event
+        }
+    }
+
+    private func removeMouseMonitor() {
+        if let monitor = mouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMonitor = nil
+        }
     }
 }
 

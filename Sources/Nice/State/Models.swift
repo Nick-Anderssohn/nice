@@ -135,9 +135,37 @@ struct Tab: Identifiable, Hashable, Sendable, Codable {
     /// for terminal-only tabs (including everything in the Terminals
     /// group).
     var claudeSessionId: String? = nil
+    /// Monotonically incremented per-tab counter feeding the auto-name
+    /// "Terminal N" when a new terminal pane is added. Never decremented
+    /// when a pane is closed, so a closed "Terminal 2" does not get
+    /// reused — the next add becomes "Terminal 4". Persisted via
+    /// PersistedTab so the counter survives relaunch.
+    var nextTerminalIndex: Int = 1
 }
 
 extension Tab {
+    /// Recover `nextTerminalIndex` from a tab's pane titles when an
+    /// older session file lacks the persisted counter. Parses each
+    /// title against `^terminal\s+(\d+)$` (case-insensitive) and
+    /// returns `1 + max(N)`, floored at 1 so a tab whose terminal
+    /// panes have all been renamed still starts numbering from 1.
+    /// Pure function — exposed so the hydration path stays a single
+    /// model-aware call site instead of duplicating regex grammar.
+    static func recoverNextTerminalIndex(fromPaneTitles titles: [String]) -> Int {
+        let regex = try? NSRegularExpression(
+            pattern: #"^terminal\s+(\d+)$"#,
+            options: .caseInsensitive
+        )
+        let maxN = titles.compactMap { title -> Int? in
+            let range = NSRange(title.startIndex..., in: title)
+            guard let match = regex?.firstMatch(in: title, range: range),
+                  let capture = Range(match.range(at: 1), in: title)
+            else { return nil }
+            return Int(title[capture])
+        }.max() ?? 0
+        return max(1, maxN + 1)
+    }
+
     /// True if any alive pane on this tab is a Claude pane.
     var hasClaude: Bool {
         panes.contains { $0.kind == .claude && $0.isAlive }
