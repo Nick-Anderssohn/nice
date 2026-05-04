@@ -279,6 +279,43 @@ final class WindowSessionRestoreTests: XCTestCase {
         )
     }
 
+    func test_restore_clearsDangling_parentTabId_references() {
+        // Defensive: a hand-edited or partially corrupted sessions.json
+        // can hold a child tab whose parentTabId points at a tab the
+        // snapshot does not contain (the parent was removed by hand,
+        // or the user's prior launch crashed mid-/branch after the
+        // child was persisted but before the parent was). The renderer
+        // tolerates the dangling pointer (still draws the indent), but
+        // the depth-1 invariant survives only when stale references
+        // get swept on the way in. Restore must clear them so the
+        // child renders at root and a future /branch on it starts a
+        // fresh lineage instead of inheriting the ghost.
+        let orphaned = makePersistedClaudeTab(
+            id: "tChild", sessionId: "S1", parentTabId: "tGhostParent"
+        )
+        let project = makePersistedProject(id: "p", tabs: [orphaned])
+        let window = makePersistedWindow(
+            id: "win-1", projects: [makeEmptyTerminalsProject(), project]
+        )
+        fake.upsert(window: window)
+
+        let ws = makeWindowSession(windowSessionId: "win-1")
+        ws.restoreSavedWindow()
+
+        XCTAssertNotNil(
+            tabs.tab(for: "tChild"),
+            "child tab itself must still be restored"
+        )
+        XCTAssertNil(
+            tabs.tab(for: "tChild")?.parentTabId,
+            "dangling parentTabId reference must be cleared on restore"
+        )
+        XCTAssertNil(
+            tabs.tab(for: "tGhostParent"),
+            "the ghost parent must not be conjured into existence"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeWindowSession(windowSessionId: String) -> WindowSession {

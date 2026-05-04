@@ -255,6 +255,32 @@ final class TabModel {
         }
     }
 
+    /// Sweep every `parentTabId` against the set of currently-present
+    /// tab ids and clear any that point at a tab that doesn't exist.
+    /// Called from `WindowSession.restoreSavedWindow` after the full
+    /// tree has been rebuilt from the snapshot, so a hand-edited or
+    /// partially-corrupt sessions.json (parent removed by hand, or a
+    /// prior crash mid-/branch persisted the child but not the parent)
+    /// can't leave a child rendering one indent deep under a tab that
+    /// doesn't exist. Safe to call multiple times — pure cleanup, no
+    /// side effects beyond the field clears.
+    func pruneDanglingParentReferences() {
+        var validIds = Set<String>()
+        for project in projects {
+            for tab in project.tabs {
+                validIds.insert(tab.id)
+            }
+        }
+        for pi in projects.indices {
+            for ti in projects[pi].tabs.indices {
+                if let parent = projects[pi].tabs[ti].parentTabId,
+                   !validIds.contains(parent) {
+                    projects[pi].tabs[ti].parentTabId = nil
+                }
+            }
+        }
+    }
+
     // MARK: - Selection
 
     func selectTab(_ id: String) {

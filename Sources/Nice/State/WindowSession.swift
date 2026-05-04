@@ -305,6 +305,15 @@ final class WindowSession {
         // behind by repair). Idempotent in steady state, so the cost
         // is just the .git existence checks.
         tabs.repairProjectStructure()
+        // Drop /branch lineage pointers whose target tab isn't in the
+        // restored tree — a hand-edited or partially-corrupt
+        // sessions.json (parent removed by hand, prior crash mid-/branch
+        // persisted the child but not the parent) would otherwise
+        // render the child indented under nothing. Runs after
+        // `repairProjectStructure` because a tab move doesn't change
+        // parentTabId, so the same-project invariant — which is the
+        // depth-1 contract — is left to materialization-time guards.
+        tabs.pruneDanglingParentReferences()
         scheduleSessionSave()
 
         if let active = snapshot.activeTabId, tabs.tab(for: active) != nil {
