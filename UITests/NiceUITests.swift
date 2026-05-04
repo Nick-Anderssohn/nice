@@ -1990,4 +1990,104 @@ final class NiceUITests: NiceUITestCase {
         )
     }
 
+    // MARK: - /branch tracking (socket-driven)
+
+    /// End-to-end UI proxy for `/branch` tracking. A real `/branch`
+    /// requires a live Claude Code session, which can't run in CI; we
+    /// drive the same code path the SessionStart hook would (a
+    /// `session_update` socket message with `source: "resume"` and a
+    /// new session id) and assert the sidebar's response.
+    ///
+    /// Asserts:
+    ///   • a second sidebar row appears (the materialized parent
+    ///     pinned to the pre-rotation session id),
+    ///   • a `branch.lineageChild.<originatingId>.under.<rootId>`
+    ///     marker element materializes — proves the originating
+    ///     tab carries a `parentTabId` pointing at the new root,
+    ///   • no equivalent marker exists for the new parent — proves
+    ///     it's the root, not itself indented (depth-1 invariant).
+    func testBranchSocketSpawnsParentAndIndentsOriginating() throws {
+        let socketPath = Self.testSocketPath
+        try? FileManager.default.removeItem(atPath: socketPath)
+        let app = launchApp(extraEnv: [
+            "NICE_CLAUDE_OVERRIDE": fakeClaude(),
+            "NICE_SOCKET_PATH": socketPath,
+        ])
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        // Seed: one Claude tab created via the socket. The fake claude
+        // (/bin/cat) keeps the pty alive so the claude pane id stays
+        // owned by a tab when the SessionStart payload arrives.
+        let originatingRowId = try createTabViaSocket(in: app, socketPath: socketPath)
+        let originatingTabId = tabId(from: originatingRowId)
+        let originatingClaudePaneId = "\(originatingTabId)-claude"
+
+        // Drive the SessionStart hook's payload directly. `source:
+        // "resume"` + a new session id is the wire-shape of /branch.
+        let newSessionId = "00000000-0000-4000-8000-\(String(format: "%012d", Int.random(in: 1...999_999_999_999)))"
+        let payload = #"""
+        {"action":"session_update","paneId":"\#(originatingClaudePaneId)","sessionId":"\#(newSessionId)","source":"resume"}
+        """#
+        try sendSocketLine(payload, to: socketPath)
+
+        // Wait for the parent tab to materialize. We can't predict
+        // its id (timestamp-based), so query for "any sidebar row
+        // whose identifier begins `sidebar.tab.`, excluding icon /
+        // title sub-elements" — same predicate the existing
+        // socket-newtab test uses.
+        let rowQuery = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@) AND NOT (identifier CONTAINS %@)",
+                "sidebar.tab.",
+                ".claudeIcon",
+                ".terminalIcon",
+                ".title"
+            )
+        )
+        let twoRows = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in rowQuery.count >= 2 }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [twoRows], timeout: 5), .completed,
+            "branch session_update must spawn a sibling parent tab"
+        )
+
+        // Wait for the lineage marker to render under the originating
+        // row. The marker identifier is shaped
+        // `branch.lineageChild.<id>.under.<rootId>` so a single
+        // existence check confirms both "originating tab is a
+        // depth-1 child" and "its root is some tab id we can follow."
+        let markerPrefix = "branch.lineageChild.\(originatingTabId).under."
+        let markerQuery = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", markerPrefix)
+        )
+        let markerAppears = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in markerQuery.count >= 1 }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [markerAppears], timeout: 3), .completed,
+            "originating tab must carry a /branch lineage marker pointing at the new root"
+        )
+
+        // Decode the root tab id from the marker and confirm the new
+        // parent itself has NO marker — depth-1 invariant.
+        let markerId = markerQuery.element(boundBy: 0).identifier
+        let rootId = String(markerId.dropFirst(markerPrefix.count))
+        XCTAssertNotEqual(rootId, originatingTabId,
+                          "lineage marker must point at a different tab")
+        let parentMarkerQuery = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH %@",
+                        "branch.lineageChild.\(rootId).under.")
+        )
+        XCTAssertEqual(
+            parentMarkerQuery.count, 0,
+            "the new parent (lineage root) must NOT itself carry a lineage marker — depth-1 invariant"
+        )
+    }
+
 }

@@ -57,7 +57,17 @@ enum SocketMessage: Sendable {
     /// installer script source-gates the event so startup/resume
     /// don't churn the persistence layer. Fire-and-forget — no reply
     /// is written and the client fd is closed before dispatch.
-    case sessionUpdate(paneId: String, sessionId: String)
+    ///
+    /// `source` carries the `source` field from the SessionStart hook
+    /// payload verbatim ("startup", "resume", "clear", "compact",
+    /// "branch", or anything Claude introduces later). Optional —
+    /// older hook scripts (still on disk during an upgrade window
+    /// before `ensureScriptInstalled` rewrites them) and future Claude
+    /// versions that drop the field are tolerated as `nil`. The
+    /// receiver uses `source == "resume"` plus an actual id-change to
+    /// distinguish `/branch` (and `--fork-session`) from `/clear`,
+    /// `/compact`, and the no-op resume cases.
+    case sessionUpdate(paneId: String, sessionId: String, source: String?)
 }
 
 final class NiceControlSocket: @unchecked Sendable {
@@ -349,11 +359,20 @@ final class NiceControlSocket: @unchecked Sendable {
                 close(client)
                 return
             }
+            // Source is optional: older hook scripts on disk during an
+            // upgrade and future Claude versions that omit the field
+            // both surface as nil. Empty string from the new script
+            // when Claude didn't include `source` is also normalized
+            // to nil so downstream comparisons stay simple.
+            let rawSource = obj["source"] as? String
+            let source = (rawSource?.isEmpty == false) ? rawSource : nil
             // Hook is fire-and-forget: close before dispatch so the
             // helper script's `nc` returns promptly even if the
             // MainActor handler is backed up.
             close(client)
-            handler(.sessionUpdate(paneId: paneId, sessionId: sessionId))
+            handler(.sessionUpdate(
+                paneId: paneId, sessionId: sessionId, source: source
+            ))
         default:
             // Unknown action — log and drop, matching the silent-drop
             // behavior used elsewhere for malformed payloads.

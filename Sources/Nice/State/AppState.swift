@@ -268,7 +268,11 @@ final class AppState {
         tabIndex ti: Int,
         tabId: String
     ) {
-        tabs.projects[pi].tabs.remove(at: ti)
+        // Single removal entry point — `removeTab` does the array
+        // remove plus the parent-pointer sweep atomically so we can't
+        // accidentally orphan a /branch child by adding a future
+        // close path that forgets the sweep.
+        tabs.removeTab(projectIndex: pi, tabIndex: ti)
         sessions.removePtySession(tabId: tabId)
         fileBrowserStore.removeState(forTab: tabId)
         if tabs.activeTabId == tabId {

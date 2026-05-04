@@ -144,7 +144,60 @@ final class ClaudeHookInstallerTests: XCTestCase {
                           "forwarded payload missing sessionId: \(line)")
             XCTAssertTrue(line.contains("\"paneId\":\"pane-\(i)\""),
                           "forwarded payload missing paneId: \(line)")
+            // The source field is load-bearing for /branch detection in
+            // SessionsModel.handleClaudeSessionUpdate. Forwarding it
+            // verbatim lets the receiver distinguish a /branch
+            // (source=resume + id-change) from a /clear with the same
+            // shape.
+            XCTAssertTrue(line.contains("\"source\":\"\(source)\""),
+                          "forwarded payload missing source=\(source): \(line)")
         }
+    }
+
+    func test_script_forwardsEmptySource_whenPayloadOmitsField() throws {
+        // Defensive: a future Claude version that drops the `source`
+        // field (or a malformed payload that omits it) must not break
+        // the script. The sed regex falls through to an empty match,
+        // and the receiver normalizes "" back to nil — which the
+        // handler treats as "id-update only, no parent tab" rather
+        // than misclassifying as a /branch.
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")
+
+        let socketPath = "/tmp/nice-hook-test-\(UUID().uuidString.prefix(8)).sock"
+        let listener = try TestSocketListener(path: socketPath)
+        defer { listener.cleanup() }
+
+        let sessionId = UUID().uuidString.lowercased()
+        // SessionStart payload with NO source field at all — what
+        // older Claude versions sent before `source` was added.
+        let payload = #"""
+        {"hook_event_name":"SessionStart","session_id":"\#(sessionId)","cwd":"/private/tmp"}
+        """#
+
+        let captured = captureFirstLine(
+            listener: listener,
+            runScript: {
+                let (exit, _) = self.runScript(
+                    at: scriptURL.path,
+                    env: [
+                        "NICE_SOCKET": socketPath,
+                        "NICE_PANE_ID": "pane-x",
+                    ],
+                    stdin: payload
+                )
+                XCTAssertEqual(exit, 0)
+            },
+            timeout: 1.5
+        )
+
+        let line = try XCTUnwrap(
+            captured,
+            "missing source must still forward the session_update"
+        )
+        XCTAssertTrue(line.contains("\"sessionId\":\"\(sessionId)\""))
+        XCTAssertTrue(line.contains("\"source\":\"\""),
+                      "missing source serializes as empty string for the receiver to normalize: \(line)")
     }
 
     func test_install_scriptNoOpsOutsideNice() throws {

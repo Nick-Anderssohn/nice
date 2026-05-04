@@ -48,7 +48,8 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
 
         appState.sessions.handleClaudeSessionUpdate(
             paneId: "definitely-not-a-real-pane-id",
-            sessionId: "should-be-ignored"
+            sessionId: "should-be-ignored",
+            source: nil
         )
 
         XCTAssertEqual(
@@ -66,7 +67,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // tabIdOwning's reverse scan must hit the right project even
         // when it's not first.
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t2-claude", sessionId: "S2-NEW"
+            paneId: "t2-claude", sessionId: "S2-NEW", source: nil
         )
 
         XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "S1")
@@ -82,7 +83,8 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
 
         appState.sessions.handleClaudeSessionUpdate(
             paneId: "t1", // tab id, not a pane id
-            sessionId: "should-not-apply"
+            sessionId: "should-not-apply",
+            source: nil
         )
 
         XCTAssertEqual(
@@ -100,8 +102,8 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // cleanly.
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S1")
 
-        appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
-        appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1")
+        appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1", source: nil)
+        appState.sessions.handleClaudeSessionUpdate(paneId: "t1-claude", sessionId: "S1", source: nil)
 
         XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "S1")
     }
@@ -110,7 +112,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "OLD")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW"
+            paneId: "t1-claude", sessionId: "NEW", source: nil
         )
 
         XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "NEW")
@@ -140,7 +142,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // projects), so the call is a no-op on A. B is also untouched
         // because nothing dispatched to B's handler.
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "tB-claude", sessionId: "LEAKED"
+            paneId: "tB-claude", sessionId: "LEAKED", source: nil
         )
 
         XCTAssertEqual(appState.tabs.tab(for: "tA")?.claudeSessionId, "A-INIT",
@@ -150,7 +152,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
 
         // B's own handler does mutate B.
         stateB.sessions.handleClaudeSessionUpdate(
-            paneId: "tB-claude", sessionId: "B-NEW"
+            paneId: "tB-claude", sessionId: "B-NEW", source: nil
         )
         XCTAssertEqual(stateB.tabs.tab(for: "tB")?.claudeSessionId, "B-NEW")
         XCTAssertEqual(appState.tabs.tab(for: "tA")?.claudeSessionId, "A-INIT",
@@ -171,7 +173,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
 
         // First update lands while the pane is alive — proves baseline.
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S1-LIVE"
+            paneId: "t1-claude", sessionId: "S1-LIVE", source: nil
         )
         XCTAssertEqual(appState.tabs.tab(for: "t1")?.claudeSessionId, "S1-LIVE")
 
@@ -188,7 +190,7 @@ final class AppStateClaudeSessionUpdateTests: XCTestCase {
         // tab still exists (its terminal pane is alive), but the paneId
         // no longer maps to it.
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S1-STALE"
+            paneId: "t1-claude", sessionId: "S1-STALE", source: nil
         )
 
         XCTAssertEqual(

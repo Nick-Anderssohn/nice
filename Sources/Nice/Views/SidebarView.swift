@@ -424,7 +424,15 @@ private struct TabRow: View {
             }
             titleView
         }
-        .padding(.leading, 22)
+        // 22pt is the default sidebar inset (matches the project-group
+        // header chevron + label gutter). Tabs spawned by /branch
+        // tracking carry a `parentTabId` pointing at their sibling
+        // pre-rotation tab; those render one indent level deeper so
+        // the parent/child relationship reads at a glance. The
+        // additional 16pt is roughly the visual width of a sidebar
+        // status dot — enough to register as nested without crowding
+        // the row text.
+        .padding(.leading, tab.parentTabId == nil ? 22 : 38)
         .padding(.trailing, 10)
         .padding(.vertical, 4)
         .background(
@@ -456,6 +464,14 @@ private struct TabRow: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
+        // Lineage marker for UITests: a hidden, zero-size sibling
+        // element that exists iff this row is indented under a
+        // /branch parent. The identifier carries the root tab's id so
+        // tests can assert depth-1 layout without pixel-comparing the
+        // padding constant. Lives in its own `branch.lineageChild.*`
+        // namespace so existing `sidebar.tab.<id>`-prefix queries in
+        // the UITest suite are unaffected.
+        .background(lineageMarker)
         .onAppear {
             if isActive && activatedAt == nil { activatedAt = Date() }
         }
@@ -481,6 +497,26 @@ private struct TabRow: View {
             return "sidebar.terminals"
         }
         return "sidebar.tab.\(tab.id)"
+    }
+
+    /// Hidden zero-size element whose accessibility identifier carries
+    /// the /branch lineage relationship — present iff this row is
+    /// indented under a parent tab. Lives in its own `branch.*`
+    /// namespace so existing `sidebar.tab.<id>`-prefix UITest queries
+    /// keep matching only the row itself, not this marker. UITests
+    /// that want to assert "row X is depth-1 child of root Y" look up
+    /// `branch.lineageChild.<X>.under.<Y>`.
+    @ViewBuilder
+    private var lineageMarker: some View {
+        if let parent = tab.parentTabId {
+            Color.clear
+                .frame(width: 0, height: 0)
+                .accessibilityElement()
+                .accessibilityIdentifier(
+                    "branch.lineageChild.\(tab.id).under.\(parent)"
+                )
+                .allowsHitTesting(false)
+        }
     }
 
     @ViewBuilder

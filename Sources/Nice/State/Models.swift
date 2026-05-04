@@ -135,6 +135,23 @@ struct Tab: Identifiable, Hashable, Sendable, Codable {
     /// for terminal-only tabs (including everything in the Terminals
     /// group).
     var claudeSessionId: String? = nil
+    /// ID of a sibling tab in the same project that holds an earlier
+    /// pre-/branch session of this tab — created automatically by
+    /// `SessionsModel.materializeBranchParent` when the SessionStart
+    /// hook reports a `/branch` (or `--fork-session`) rotation. `nil`
+    /// for tabs that have never been part of a /branch lineage.
+    ///
+    /// Lineage layout (depth-1 tree under the original): the FIRST
+    /// /branch in a tab's lineage promotes the new parent to root and
+    /// pulls the originating tab in as its child. Every subsequent
+    /// /branch creates another parent that is a sibling under that
+    /// same root. Both the accumulated parents and the continuing
+    /// originating tab point at the same root via this field, so the
+    /// sidebar renders the whole family as one root tab plus a flat
+    /// list of depth-1 children. The renderer maps a non-nil value to
+    /// one indent level — depth never grows past one regardless of
+    /// branch count.
+    var parentTabId: String? = nil
 }
 
 extension Tab {

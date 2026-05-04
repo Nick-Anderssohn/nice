@@ -218,6 +218,43 @@ final class TabModel {
         return nil
     }
 
+    /// Remove the tab at `(projectIndex, tabIndex)` from the model and
+    /// sweep any sibling `parentTabId` references that pointed at it.
+    /// Returns the removed tab so callers can use it for cleanup
+    /// (pty teardown, file-browser state, project-empty checks).
+    ///
+    /// Single removal entry point: every tab-removal path must funnel
+    /// through here so the parent-pointer sweep can't be skipped.
+    /// Inlining `tabs.projects[pi].tabs.remove(at:)` at a new call
+    /// site would orphan /branch children with a dangling
+    /// `parentTabId` — they'd still render indented under a tab that
+    /// doesn't exist, and the sidebar's `tab(for:)` lookup would
+    /// silently return nil for the parent. The dissolve cascade in
+    /// `AppState.finalizeDissolvedTab` is the only production caller
+    /// today; future close paths must reach for this method too.
+    @discardableResult
+    func removeTab(projectIndex pi: Int, tabIndex ti: Int) -> Tab {
+        let removed = projects[pi].tabs.remove(at: ti)
+        clearDanglingParentReferences(to: removed.id)
+        return removed
+    }
+
+    /// Clear `parentTabId` on every tab that pointed at `removedTabId`.
+    /// Internal helper for `removeTab` and the legacy direct callers
+    /// in tests; production code should reach for `removeTab` instead
+    /// so the array remove and the sweep stay atomic. Walks every
+    /// project so a (rare) cross-project move that left a stale link
+    /// still gets cleaned up.
+    func clearDanglingParentReferences(to removedTabId: String) {
+        for pi in projects.indices {
+            for ti in projects[pi].tabs.indices {
+                if projects[pi].tabs[ti].parentTabId == removedTabId {
+                    projects[pi].tabs[ti].parentTabId = nil
+                }
+            }
+        }
+    }
+
     // MARK: - Selection
 
     func selectTab(_ id: String) {

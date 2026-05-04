@@ -238,6 +238,47 @@ final class WindowSessionRestoreTests: XCTestCase {
                        "Empty ghost windows must be pruned from the persisted state.")
     }
 
+    // MARK: - /branch lineage round-trip
+
+    func test_restore_preserves_branchLineage_parentTabIds() {
+        // A /branch lineage on disk: root tab plus two depth-1
+        // children pointing at the root. restoreSavedWindow must
+        // hydrate the parentTabId pointers verbatim so the sidebar
+        // re-renders the indent, and so a future /branch on the
+        // restored child correctly sees its existing root and adds
+        // another sibling rather than a new lineage.
+        let root = makePersistedClaudeTab(id: "tRoot", sessionId: "S0")
+        let parent2 = makePersistedClaudeTab(
+            id: "tP2", sessionId: "S1", parentTabId: "tRoot"
+        )
+        let originating = makePersistedClaudeTab(
+            id: "tCurrent", sessionId: "S2", parentTabId: "tRoot"
+        )
+        let project = makePersistedProject(
+            id: "p", tabs: [root, parent2, originating]
+        )
+        let window = makePersistedWindow(
+            id: "win-1", projects: [makeEmptyTerminalsProject(), project]
+        )
+        fake.upsert(window: window)
+
+        let ws = makeWindowSession(windowSessionId: "win-1")
+        ws.restoreSavedWindow()
+
+        XCTAssertNil(
+            tabs.tab(for: "tRoot")?.parentTabId,
+            "root must hydrate without a parent"
+        )
+        XCTAssertEqual(
+            tabs.tab(for: "tP2")?.parentTabId, "tRoot",
+            "second-parent's lineage pointer must survive restore"
+        )
+        XCTAssertEqual(
+            tabs.tab(for: "tCurrent")?.parentTabId, "tRoot",
+            "originating tab's lineage pointer must survive restore"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeWindowSession(windowSessionId: String) -> WindowSession {
@@ -263,7 +304,11 @@ final class WindowSessionRestoreTests: XCTestCase {
         )
     }
 
-    private func makePersistedClaudeTab(id: String, sessionId: String) -> PersistedTab {
+    private func makePersistedClaudeTab(
+        id: String,
+        sessionId: String,
+        parentTabId: String? = nil
+    ) -> PersistedTab {
         let claudePaneId = "\(id)-claude"
         return PersistedTab(
             id: id,
@@ -274,7 +319,9 @@ final class WindowSessionRestoreTests: XCTestCase {
             activePaneId: claudePaneId,
             panes: [
                 PersistedPane(id: claudePaneId, title: "Claude", kind: .claude),
-            ]
+            ],
+            titleManuallySet: nil,
+            parentTabId: parentTabId
         )
     }
 

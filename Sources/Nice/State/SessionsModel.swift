@@ -112,8 +112,24 @@ final class SessionsModel {
     @ObservationIgnored
     var onTabBecameEmpty: ((_ tabId: String, _ projectIndex: Int, _ tabIndex: Int) -> Void)?
 
-    init(tabs: TabModel) {
+    /// Mint a unique id for a freshly-created tab (or pane). The
+    /// production default is `<prefix><ms>-<uuid4>` — millisecond
+    /// timestamp keeps ids roughly time-sortable (useful for log
+    /// triage), the four-char UUID suffix keeps two creations within
+    /// the same millisecond from colliding. Two `/branch`es fired in
+    /// quick succession by a script (`--fork-session` in a loop) used
+    /// to land in the same ms bucket and produce duplicate tab ids;
+    /// the suffix closes that hole. Injectable so unit tests can pass
+    /// a deterministic counter and assert by id when they need to.
+    @ObservationIgnored
+    private let mintTabId: @MainActor (String) -> String
+
+    init(
+        tabs: TabModel,
+        mintTabId: @escaping @MainActor (String) -> String = SessionsModel.defaultMintTabId
+    ) {
         self.tabs = tabs
+        self.mintTabId = mintTabId
         // Build the cache with a placeholder receivers closure
         // first — `self` isn't usable until every stored property is
         // assigned. Once init is complete we rebind the closure to
@@ -125,6 +141,16 @@ final class SessionsModel {
             guard let self else { return [] }
             return Array(self.ptySessions.values)
         }
+    }
+
+    /// Production minter used by `init`'s default. Format:
+    /// `<prefix><ms>-<uuid4>` (e.g. `t1751234567890-a3f2`). Lives as a
+    /// static so the default-argument expression at the init site
+    /// can reference it without capturing `self`.
+    static func defaultMintTabId(prefix: String) -> String {
+        let ms = Int(Date().timeIntervalSince1970 * 1000)
+        let suffix = UUID().uuidString.prefix(4).lowercased()
+        return "\(prefix)\(ms)-\(suffix)"
     }
 
     // MARK: - Theme cache forwarders
@@ -201,9 +227,9 @@ final class SessionsModel {
                             tabId: tabId, paneId: paneId,
                             reply: reply
                         )
-                    case let .sessionUpdate(paneId, sessionId):
+                    case let .sessionUpdate(paneId, sessionId, source):
                         self.handleClaudeSessionUpdate(
-                            paneId: paneId, sessionId: sessionId
+                            paneId: paneId, sessionId: sessionId, source: source
                         )
                     }
                 }
@@ -461,7 +487,7 @@ final class SessionsModel {
         // preserves the "at most one Claude pane per tab" invariant.
         guard kind == .terminal, let tabs else { return nil }
         guard let tab = tabs.tab(for: tabId) else { return nil }
-        let newId = "\(tabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
+        let newId = mintTabId("\(tabId)-p")
         let termCount = tab.panes.filter { $0.kind == .terminal }.count
         let resolvedTitle = title ?? "Terminal \(termCount + 1)"
 
@@ -501,7 +527,7 @@ final class SessionsModel {
     /// handler when a zsh shadow's `claude` fires.
     func createTabFromMainTerminal(cwd: String, args: [String]) {
         guard let tabs else { return }
-        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
+        let newId = mintTabId("t")
         let title: String = {
             guard !args.isEmpty else { return "New tab" }
             let joined = args.joined(separator: " ")
@@ -581,7 +607,7 @@ final class SessionsModel {
         } else {
             title = "Main \(project.tabs.count + 1)"
         }
-        let newId = "tt\(Int(Date().timeIntervalSince1970 * 1000))"
+        let newId = mintTabId("tt")
         let paneId = "\(newId)-p0"
         let cwd = project.path
         let tab = Tab(
@@ -611,7 +637,7 @@ final class SessionsModel {
               let pi = tabs.projects.firstIndex(where: { $0.id == projectId })
         else { return nil }
         let project = tabs.projects[pi]
-        let newId = "t\(Int(Date().timeIntervalSince1970 * 1000))"
+        let newId = mintTabId("t")
         let claudePaneId = "\(newId)-claude"
         let terminalPaneId = "\(newId)-t1"
         let sessionId = UUID().uuidString.lowercased()
@@ -723,14 +749,37 @@ final class SessionsModel {
 
     /// Handle a `session_update` socket message from Claude Code's
     /// SessionStart hook. Looks up the tab whose pane set contains
-    /// `paneId` and forwards to `updateClaudeSessionId`. Silent no-op
-    /// if the pane is stale (exited while the hook's `nc` was in
-    /// flight) or isn't a claude pane. `internal` so unit tests can
-    /// drive the dispatch path directly without standing up a real
-    /// socket — matches `paneExited`'s access level for the same reason.
-    func handleClaudeSessionUpdate(paneId: String, sessionId: String) {
+    /// `paneId`, captures the pre-rotation session id (so
+    /// `materializeBranchParent` can resume from it), then updates the
+    /// tab's stored id and — when this rotation is a `/branch` (or
+    /// `--fork-session`) — spawns a sibling parent tab pinned to the
+    /// old id. Silent no-op if the pane is stale (exited while the
+    /// hook's `nc` was in flight) or isn't owned by any tab.
+    /// `internal` so unit tests can drive the dispatch path directly
+    /// without standing up a real socket — matches `paneExited`'s
+    /// access level for the same reason.
+    ///
+    /// Branch detection: `source == "resume"` plus an actual id-change
+    /// is the signature of `/branch` and `--fork-session`. Real
+    /// `/resume` keeps the id stable (absorbed by
+    /// `updateClaudeSessionId`'s short-circuit), `/clear` reports
+    /// `source == "clear"`, and `/compact` typically doesn't rotate at
+    /// all in current Claude Code. A nil/unknown source (older hook
+    /// payload still in flight during upgrade, or a future Claude
+    /// version that drops the field) is treated as a plain id update
+    /// — we'd rather miss a /branch occasionally than spawn a phantom
+    /// parent tab from a /clear we mis-classified.
+    func handleClaudeSessionUpdate(
+        paneId: String, sessionId: String, source: String?
+    ) {
         guard let tabs, let tabId = tabs.tabIdOwning(paneId: paneId) else { return }
+        let oldId = tabs.tab(for: tabId)?.claudeSessionId
         updateClaudeSessionId(tabId: tabId, sessionId: sessionId)
+        guard source == "resume",
+              let oldId,
+              oldId != sessionId
+        else { return }
+        materializeBranchParent(forTabId: tabId, oldSessionId: oldId)
     }
 
     /// Update `tab.claudeSessionId` when claude rotates its session
@@ -752,6 +801,133 @@ final class SessionsModel {
         if changed {
             onSessionMutation?()
         }
+    }
+
+    /// Materialize the pre-/branch session as a sibling sidebar tab
+    /// pinned to `oldSessionId`, inserted immediately above the
+    /// originating tab in the same project. Called from
+    /// `handleClaudeSessionUpdate` once the rotation has been
+    /// classified as a `/branch` (or `--fork-session`).
+    ///
+    /// The new tab's Claude pane is wired up with
+    /// `ClaudeSessionMode.resumeDeferred(id:)` — same pattern as the
+    /// restored tabs in `WindowSession.restoreSavedWindow` — so a
+    /// plain shell starts in the companion terminal with `claude
+    /// --resume <oldId>` pre-typed via `print -z`. Nothing actually
+    /// resumes (and no tokens are spent) until the user opens the new
+    /// tab and presses Enter.
+    ///
+    /// Lineage layout — "depth-1 tree under the original":
+    ///   • The very first /branch in a tab's lineage promotes the new
+    ///     parent (which holds the pre-rotation session) to root and
+    ///     pulls the originating tab in as its child.
+    ///   • Every subsequent /branch creates another parent that is a
+    ///     sibling under that same root. The originating tab's
+    ///     `parentTabId` keeps pointing at the original root, so it
+    ///     stays a flat depth-1 sibling of every accumulated parent.
+    ///   • Indent never goes past one level regardless of how many
+    ///     times the tab is /branched. The root is always the FIRST
+    ///     pre-/branch session, since that's the only point the user
+    ///     can resume to recover the conversation as it existed
+    ///     before any forking happened.
+    ///
+    /// No-ops for tabs in the pinned Terminals group (those don't
+    /// host Claude sessions; a hook firing from one would already be
+    /// a model violation, but we guard defensively) and tabs that
+    /// have somehow vanished between dispatch and processing.
+    private func materializeBranchParent(
+        forTabId originatingTabId: String,
+        oldSessionId: String
+    ) {
+        guard let tabs,
+              let (pi, ti) = tabs.projectTabIndex(for: originatingTabId),
+              !tabs.isTerminalsProjectTab(originatingTabId)
+        else { return }
+        let originating = tabs.projects[pi].tabs[ti]
+        let newId = mintTabId("t")
+        let claudePaneId = "\(newId)-claude"
+        let terminalPaneId = "\(newId)-t1"
+
+        // Lineage rule: a tab whose `parentTabId` is already set lives
+        // under an existing root — the new parent inherits that same
+        // root and becomes a sibling. A tab at root has no lineage
+        // yet — the new parent BECOMES the root, and we pull the
+        // originating tab in as its child below. Either way the
+        // originating tab's `parentTabId` is set exactly once (on the
+        // first /branch in its lineage); subsequent branches leave it
+        // pointing at the same root.
+        let inheritedRoot = originating.parentTabId
+
+        // Same shape as createClaudeTabInProject's tab, but the
+        // Claude pane is NOT marked running — the deferred-resume
+        // path spawns a plain shell with `claude --resume <uuid>`
+        // pre-typed via print -z, and only flips to a running Claude
+        // when the user hits Enter and the zsh wrapper handshakes
+        // with handleClaudeSocketRequest.
+        var claudePane = Pane(
+            id: claudePaneId, title: "Claude", kind: .claude
+        )
+        claudePane.isClaudeRunning = false
+        let parentTab = Tab(
+            id: newId,
+            title: originating.title,
+            cwd: originating.cwd,
+            branch: originating.branch,
+            panes: [
+                claudePane,
+                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
+            ],
+            activePaneId: claudePaneId,
+            titleAutoGenerated: originating.titleAutoGenerated,
+            titleManuallySet: originating.titleManuallySet,
+            claudeSessionId: oldSessionId,
+            parentTabId: inheritedRoot
+        )
+
+        // Insert immediately above the originating tab so the visual
+        // order reads [parent, child]. After the insert, the
+        // originating tab's index shifted by one — but no live
+        // reference into the project tab array survives the insert,
+        // so subsequent updates re-look up by id.
+        tabs.projects[pi].tabs.insert(parentTab, at: ti)
+
+        if inheritedRoot == nil {
+            // Originating tab WAS the root of its lineage. The new
+            // parent now becomes the root, so we must:
+            //   (a) re-point the originating tab's `parentTabId` at
+            //       the new root, and
+            //   (b) re-parent every other tab that was pointing at
+            //       the originating tab (its former children) to the
+            //       new root, so the depth-1 invariant survives.
+            //
+            // (b) is the load-bearing step when the user runs
+            // `/branch` on a tab that had ALREADY been a parent —
+            // e.g. they opened the recovery tab, ran the deferred
+            // resume, conversation came alive, then `/branch`ed
+            // again. Without (b) the former root would slide to
+            // depth-1 while its former children still pointed at it,
+            // making them effectively depth-2 in the lineage tree
+            // even though the renderer would still draw them at one
+            // indent (matching the parent's new depth-1, not the
+            // root). Re-parenting restores the flat depth-1 layout.
+            for j in tabs.projects[pi].tabs.indices {
+                let here = tabs.projects[pi].tabs[j]
+                if here.id == originatingTabId
+                    || here.parentTabId == originatingTabId {
+                    tabs.projects[pi].tabs[j].parentTabId = newId
+                }
+            }
+        }
+
+        _ = makeSession(
+            for: newId,
+            cwd: originating.cwd,
+            extraClaudeArgs: [],
+            initialClaudePaneId: claudePaneId,
+            initialTerminalPaneId: nil,
+            claudeSessionMode: .resumeDeferred(id: oldSessionId)
+        )
+        onSessionMutation?()
     }
 
     // MARK: - Pty session creation

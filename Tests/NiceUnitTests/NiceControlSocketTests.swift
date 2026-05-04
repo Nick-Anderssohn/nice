@@ -107,6 +107,53 @@ final class NiceControlSocketTests: XCTestCase {
         let got = captured.waitForOne(timeout: 1.0)
         XCTAssertEqual(got?.paneId, "P1")
         XCTAssertEqual(got?.sessionId, "S1")
+        XCTAssertNil(
+            got?.source,
+            "missing source field must surface as nil so SessionsModel treats it as id-only"
+        )
+    }
+
+    func test_sessionUpdate_parsesSourceField() throws {
+        // /branch reports source="resume". The parser must hand the
+        // value through to the handler so SessionsModel can route the
+        // rotation as a branch (resume + id-change) rather than a
+        // plain id update.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1","source":"resume"}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertEqual(got?.source, "resume")
+    }
+
+    func test_sessionUpdate_emptySourceNormalizesToNil() throws {
+        // The hook script emits source="" when claude's payload omits
+        // the field (sed regex falls through to empty). The parser
+        // normalizes that to nil so handler-side comparisons stay
+        // simple — `source == "resume"` shouldn't have to also exclude
+        // the empty-string case.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1","source":""}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertNil(got?.source)
     }
 
     func test_sessionUpdate_missingPaneId_dropsSilently() throws {
@@ -199,7 +246,11 @@ final class NiceControlSocketTests: XCTestCase {
     /// a background queue, so a plain Swift array would race the test
     /// thread reading `count`.
     private final class CapturedSessionUpdates: @unchecked Sendable {
-        struct Update { let paneId: String; let sessionId: String }
+        struct Update {
+            let paneId: String
+            let sessionId: String
+            let source: String?
+        }
         private let lock = NSLock()
         private var updates: [Update] = []
         private let signal = DispatchSemaphore(value: 0)
@@ -207,8 +258,10 @@ final class NiceControlSocketTests: XCTestCase {
         var handler: NiceControlSocket.Handler {
             { [weak self] message in
                 switch message {
-                case let .sessionUpdate(paneId, sessionId):
-                    self?.append(.init(paneId: paneId, sessionId: sessionId))
+                case let .sessionUpdate(paneId, sessionId, source):
+                    self?.append(.init(
+                        paneId: paneId, sessionId: sessionId, source: source
+                    ))
                 case let .claude(_, _, _, _, reply):
                     // Tests don't exercise .claude here, but the handler
                     // must close the client fd via `reply` to match

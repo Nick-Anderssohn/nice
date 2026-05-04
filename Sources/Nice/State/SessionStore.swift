@@ -60,6 +60,12 @@ struct PersistedTab: Codable, Hashable, Sendable {
     /// editor. Optional so v3 session files (written before this flag
     /// existed) still decode — callers hydrate with `?? false`.
     let titleManuallySet: Bool?
+    /// ID of the sibling tab whose claudeSessionId is the pre-/branch
+    /// session of this tab. Optional so v3 session files written
+    /// before /branch tracking existed still decode (the field comes
+    /// back as nil and the restored tab renders at root). Mirrors
+    /// `Tab.parentTabId` 1:1.
+    let parentTabId: String?
 
     init(
         id: String,
@@ -69,7 +75,8 @@ struct PersistedTab: Codable, Hashable, Sendable {
         claudeSessionId: String?,
         activePaneId: String?,
         panes: [PersistedPane],
-        titleManuallySet: Bool? = nil
+        titleManuallySet: Bool? = nil,
+        parentTabId: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -79,6 +86,7 @@ struct PersistedTab: Codable, Hashable, Sendable {
         self.activePaneId = activePaneId
         self.panes = panes
         self.titleManuallySet = titleManuallySet
+        self.parentTabId = parentTabId
     }
 }
 

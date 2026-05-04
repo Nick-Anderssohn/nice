@@ -91,16 +91,23 @@ enum ClaudeHookInstaller {
     // MARK: - Script
 
     /// Shell script that Claude invokes on every SessionStart. Extracts
-    /// `session_id` from claude's stdin JSON (no jq dependency — `sed`
-    /// handles the UUID pattern reliably) and posts a `session_update`
-    /// socket payload. Forwards on every source (`clear`, `compact`,
-    /// `resume`, `startup`, `branch`, anything Claude introduces
-    /// later) — the receiver's `if newId != tab.claudeSessionId`
-    /// short-circuit makes redundant forwards a true no-op (no save,
-    /// no churn), so source-side filtering is unnecessary and
-    /// occasionally wrong (e.g. `/branch` reports `source: "resume"`
-    /// in current Claude, so a `resume`-excluding gate would silently
-    /// lose `/branch` rotations).
+    /// `session_id` and `source` from claude's stdin JSON (no jq
+    /// dependency — `sed` handles both patterns reliably) and posts a
+    /// `session_update` socket payload. Forwards on every source
+    /// (`clear`, `compact`, `resume`, `startup`, `branch`, anything
+    /// Claude introduces later) — the receiver's `if newId !=
+    /// tab.claudeSessionId` short-circuit makes redundant forwards a
+    /// true no-op (no save, no churn), so source-side filtering is
+    /// unnecessary and occasionally wrong (e.g. `/branch` reports
+    /// `source: "resume"` in current Claude, so a `resume`-excluding
+    /// gate would silently lose `/branch` rotations).
+    ///
+    /// The `source` field is forwarded verbatim so the receiver can
+    /// distinguish `/branch` (source=resume + id-change) from `/clear`
+    /// (source=clear + id-change) and materialize a sibling parent tab
+    /// only for the former. Empty source is tolerated (older payloads
+    /// in flight during upgrade, or future Claude versions that drop
+    /// the field) and treated as a plain id-only update.
     ///
     /// `set -u` catches typos without blocking the fast-path exits for
     /// unset NICE_* vars (`${X:-}` is the no-op form). `nc -w 1` keeps
@@ -109,8 +116,10 @@ enum ClaudeHookInstaller {
     static let hookScript = #"""
     #!/bin/bash
     # nice-claude-hook.sh — relays the SessionStart hook's session_id
-    # to Nice's control socket so each tab's stored claudeSessionId
-    # tracks /clear, /compact, and /branch rotations across relaunches.
+    # and source to Nice's control socket so each tab's stored
+    # claudeSessionId tracks /clear, /compact, and /branch rotations
+    # across relaunches, and so /branch can spawn a sibling parent tab
+    # holding the pre-rotation session.
     # Installed automatically by Nice on startup; safe to delete.
     set -u
     if [ -z "${NICE_SOCKET:-}" ] || [ -z "${NICE_PANE_ID:-}" ]; then
@@ -121,7 +130,8 @@ enum ClaudeHookInstaller {
     if [ -z "$SID" ]; then
       exit 0
     fi
-    PAYLOAD=$(printf '{"action":"session_update","paneId":"%s","sessionId":"%s"}' "$NICE_PANE_ID" "$SID")
+    SRC=$(printf '%s' "$INPUT" | /usr/bin/sed -nE 's/.*"source"[[:space:]]*:[[:space:]]*"([a-zA-Z0-9_-]+)".*/\1/p' | /usr/bin/head -1)
+    PAYLOAD=$(printf '{"action":"session_update","paneId":"%s","sessionId":"%s","source":"%s"}' "$NICE_PANE_ID" "$SID" "$SRC")
     printf '%s\n' "$PAYLOAD" | /usr/bin/nc -U -w 1 "$NICE_SOCKET" >/dev/null 2>&1 || true
     exit 0
     """#
