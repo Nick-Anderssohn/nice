@@ -200,6 +200,62 @@ final class ClaudeHookInstallerTests: XCTestCase {
                       "missing source serializes as empty string for the receiver to normalize: \(line)")
     }
 
+    func test_script_forwardsAdversarialSourceValues() throws {
+        // The previous `[a-zA-Z0-9_-]+` regex silently truncated any
+        // source value containing something outside that class — most
+        // notably a dot (`branch.auto` → `branch`) and a space
+        // (`fork session` → empty match → no forward at all). The
+        // widened `[^"]+` form forwards verbatim. Pin a few realistic
+        // adversarial shapes:
+        //   • dot — a future Claude could ship `branch.auto`
+        //   • space — adjacent tooling might emit `fork session`
+        //   • plus — non-identifier punctuation; documents that the
+        //     receiver doesn't get to assume an identifier shape
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")
+
+        let socketPath = "/tmp/nice-hook-test-\(UUID().uuidString.prefix(8)).sock"
+        let listener = try TestSocketListener(path: socketPath)
+        defer { listener.cleanup() }
+
+        let sources = ["branch.auto", "with space", "with+plus"]
+
+        for (i, source) in sources.enumerated() {
+            let sessionId = UUID().uuidString.lowercased()
+            let payload = sessionStartPayload(source: source, sessionId: sessionId)
+
+            let captured = captureFirstLine(
+                listener: listener,
+                runScript: {
+                    let (exit, _) = self.runScript(
+                        at: scriptURL.path,
+                        env: [
+                            "NICE_SOCKET": socketPath,
+                            "NICE_PANE_ID": "pane-adv-\(i)",
+                        ],
+                        stdin: payload
+                    )
+                    XCTAssertEqual(exit, 0,
+                                   "script must exit 0 for source=\(source)")
+                },
+                timeout: 1.5
+            )
+
+            let line = try XCTUnwrap(
+                captured,
+                "source=\(source) must forward a session_update — narrow regex would have dropped it"
+            )
+            XCTAssertTrue(
+                line.contains("\"source\":\"\(source)\""),
+                "forwarded payload must carry the verbatim source: \(line)"
+            )
+            XCTAssertTrue(
+                line.contains("\"sessionId\":\"\(sessionId)\""),
+                "forwarded payload missing sessionId: \(line)"
+            )
+        }
+    }
+
     func test_install_scriptNoOpsOutsideNice() throws {
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
         let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")

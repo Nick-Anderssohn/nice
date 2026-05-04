@@ -130,7 +130,14 @@ enum ClaudeHookInstaller {
     if [ -z "$SID" ]; then
       exit 0
     fi
-    SRC=$(printf '%s' "$INPUT" | /usr/bin/sed -nE 's/.*"source"[[:space:]]*:[[:space:]]*"([a-zA-Z0-9_-]+)".*/\1/p' | /usr/bin/head -1)
+    # Source value: any sequence of non-quote bytes between the
+    # surrounding `"`s. Wider than JSON strictly allows (which permits
+    # \" escapes), but Claude's source values are constrained
+    # identifiers in practice and have never carried embedded quotes.
+    # The narrower `[a-zA-Z0-9_-]+` form silently truncated dotted or
+    # spaced sources (e.g. "branch.auto" → "branch"); the receiver's
+    # source-classification gate would then mis-label rotations.
+    SRC=$(printf '%s' "$INPUT" | /usr/bin/sed -nE 's/.*"source"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | /usr/bin/head -1)
     PAYLOAD=$(printf '{"action":"session_update","paneId":"%s","sessionId":"%s","source":"%s"}' "$NICE_PANE_ID" "$SID" "$SRC")
     printf '%s\n' "$PAYLOAD" | /usr/bin/nc -U -w 1 "$NICE_SOCKET" >/dev/null 2>&1 || true
     exit 0
