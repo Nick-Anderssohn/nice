@@ -488,19 +488,26 @@ final class SessionsModel {
         guard kind == .terminal, let tabs else { return nil }
         guard let tab = tabs.tab(for: tabId) else { return nil }
         let newId = mintTabId("\(tabId)-p")
-        let termCount = tab.panes.filter { $0.kind == .terminal }.count
-        let resolvedTitle = title ?? "Terminal \(termCount + 1)"
 
         // Resolve the spawn cwd before mutating the tab — once we
         // re-point `activePaneId` at the new pane below, the "spawning"
         // pane is no longer recoverable.
         let spawnCwd = tabs.spawnCwdForNewPane(in: tab, callerProvided: cwd)
 
+        // Read the counter, compute the title, and increment all
+        // inside the same mutateTab closure so the inputs and outputs
+        // are one atomic unit. The counter increments unconditionally:
+        // an explicit `title` consumes the slot just like an auto-named
+        // one (callers pass titles for editor panes; reusing the slot
+        // would leak names across tab restarts).
         tabs.mutateTab(id: tabId) { tab in
+            let n = tab.nextTerminalIndex
+            let resolvedTitle = title ?? "Terminal \(n)"
             tab.panes.append(
                 Pane(id: newId, title: resolvedTitle, kind: .terminal)
             )
             tab.activePaneId = newId
+            tab.nextTerminalIndex = n + 1
         }
 
         let session: TabPtySession
@@ -560,7 +567,7 @@ final class SessionsModel {
             return (cwd as NSString).appendingPathComponent(".claude/worktrees/\(sanitized)")
         }()
 
-        let tab = Tab(
+        var tab = Tab(
             id: newId,
             title: title,
             cwd: sessionCwd,
@@ -572,6 +579,7 @@ final class SessionsModel {
             activePaneId: claudePaneId,
             claudeSessionId: sessionId
         )
+        tab.nextTerminalIndex = 2
 
         tabs.addTabToProjects(tab, cwd: projectPath)
         tabs.activeTabId = newId
@@ -610,14 +618,15 @@ final class SessionsModel {
         let newId = mintTabId("tt")
         let paneId = "\(newId)-p0"
         let cwd = project.path
-        let tab = Tab(
+        var tab = Tab(
             id: newId,
             title: title,
             cwd: cwd,
             branch: nil,
-            panes: [Pane(id: paneId, title: "zsh", kind: .terminal)],
+            panes: [Pane(id: paneId, title: "Terminal 1", kind: .terminal)],
             activePaneId: paneId
         )
+        tab.nextTerminalIndex = 2
         tabs.projects[pi].tabs.append(tab)
         tabs.activeTabId = newId
         _ = makeSession(for: newId, cwd: cwd)
@@ -643,7 +652,7 @@ final class SessionsModel {
         let sessionId = UUID().uuidString.lowercased()
         var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
         claudePane.isClaudeRunning = true
-        let tab = Tab(
+        var tab = Tab(
             id: newId,
             title: "New tab",
             cwd: project.path,
@@ -655,6 +664,7 @@ final class SessionsModel {
             activePaneId: claudePaneId,
             claudeSessionId: sessionId
         )
+        tab.nextTerminalIndex = 2
         tabs.projects[pi].tabs.append(tab)
         tabs.activeTabId = newId
         _ = makeSession(

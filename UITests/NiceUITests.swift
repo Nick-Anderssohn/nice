@@ -184,10 +184,27 @@ final class NiceUITests: NiceUITestCase {
         in app: XCUIApplication,
         withIdentifierPrefix prefix: String
     ) -> Int {
+        // Pill identifiers nest child elements under suffixes like
+        // `.title`, `.titleField`, `.renamePane`, `.closePane`. A bare
+        // `BEGINSWITH "tab.pill."` predicate would count both the
+        // outer pill and each of its children — so an active pill
+        // contributes 2-5 hits depending on hover/edit state. Strip
+        // those child identifiers from the count so callers asking
+        // "how many pills?" get the answer they expect. The list is
+        // shared with `panePillIds` / `firstPanePillId` so a new pill
+        // child suffix is added in one place.
         let query = app.descendants(matching: .any).matching(
             NSPredicate(format: "identifier BEGINSWITH %@", prefix)
         )
-        return query.count
+        var count = 0
+        for i in 0..<query.count {
+            let id = query.element(boundBy: i).identifier
+            if Self.panePillChildSuffixes.contains(where: { id.hasSuffix($0) }) {
+                continue
+            }
+            count += 1
+        }
+        return count
     }
 
     /// Create a tab via the control socket and wait for it to appear in
@@ -254,15 +271,34 @@ final class NiceUITests: NiceUITestCase {
         row.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).click()
     }
 
+    /// Suffixes added to `tab.pill.<paneId>` for nested elements (title
+    /// label, edit field, context menu items). These must be stripped
+    /// when scanning for pill identifiers so a child element doesn't
+    /// masquerade as a pane id.
+    private static let panePillChildSuffixes = [
+        ".title",
+        ".titleField",
+        ".renamePane",
+        ".closePane"
+    ]
+
+    private func isPanePillRoot(_ identifier: String) -> Bool {
+        guard identifier.hasPrefix("tab.pill.") else { return false }
+        return !Self.panePillChildSuffixes.contains(where: { identifier.hasSuffix($0) })
+    }
+
     /// Scan the app for the first `tab.pill.*` element and return the pane
     /// id portion of its identifier. Returns nil if no pill exists.
     private func firstPanePillId(in app: XCUIApplication) -> String? {
         let query = app.descendants(matching: .any).matching(
             NSPredicate(format: "identifier BEGINSWITH %@", "tab.pill.")
         )
-        guard query.count > 0 else { return nil }
-        let id = query.element(boundBy: 0).identifier
-        return String(id.dropFirst("tab.pill.".count))
+        for i in 0..<query.count {
+            let id = query.element(boundBy: i).identifier
+            guard isPanePillRoot(id) else { continue }
+            return String(id.dropFirst("tab.pill.".count))
+        }
+        return nil
     }
 
     /// Collect all current `tab.pill.*` pane ids (in query order).
@@ -273,6 +309,7 @@ final class NiceUITests: NiceUITestCase {
         var ids: [String] = []
         for i in 0..<query.count {
             let full = query.element(boundBy: i).identifier
+            guard isPanePillRoot(full) else { continue }
             ids.append(String(full.dropFirst("tab.pill.".count)))
         }
         return ids
@@ -703,7 +740,11 @@ final class NiceUITests: NiceUITestCase {
         ).element(boundBy: 0)
         row.click()
 
-        let pill = firstDescendant(in: app, withIdentifierPrefix: "tab.pill.")
+        let pill = firstDescendant(
+            in: app,
+            withIdentifierPrefix: "tab.pill.",
+            excludingInfixes: Self.panePillChildSuffixes
+        )
         XCTAssertNotNil(pill, "Expected a tab.pill.* element after selecting a session")
         XCTAssertTrue(
             pill!.waitForExistence(timeout: 5),
@@ -1935,6 +1976,82 @@ final class NiceUITests: NiceUITestCase {
         XCTAssertEqual(
             XCTWaiter.wait(for: [titleUpdated], timeout: 5), .completed,
             "Sidebar row should display the renamed title after commit."
+        )
+    }
+
+    // MARK: - Inline pane pill rename
+
+    /// Tapping the active pane pill's title swaps the pill's `Text` for
+    /// a `TextField` (`tab.pill.<paneId>.titleField`). Typing a new
+    /// name and pressing Return commits the rename and the pill renders
+    /// the new label. Mirrors `testTapActiveTabTitleEntersEditModeAndCommits`
+    /// in shape — same gating logic, different identifier namespace.
+    func testTapActivePanePillTitleEntersEditModeAndCommits() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        let pillReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                self.countElements(in: app, withIdentifierPrefix: "tab.pill.") >= 1
+            }),
+            object: nil
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [pillReady], timeout: 5), .completed)
+
+        guard let paneId = firstPanePillId(in: app) else {
+            XCTFail("No tab.pill.* element found")
+            return
+        }
+        let titleId = "tab.pill.\(paneId).title"
+        let fieldId = "tab.pill.\(paneId).titleField"
+
+        // The launch-time pane pill is already active; `onAppear`
+        // stamps `activatedAt`, and waiting on `pillReady` above ensures
+        // we're well past `NSEvent.doubleClickInterval` (~0.5s) so the
+        // first tap on the title qualifies as a deliberate rename.
+        let title = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", titleId))
+            .element(boundBy: 0)
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        title.click()
+
+        let fieldElement = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", fieldId))
+            .element(boundBy: 0)
+        let fieldAppeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in fieldElement.exists }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [fieldAppeared], timeout: 5), .completed,
+            "Clicking the active pane pill title must swap in `.titleField`."
+        )
+
+        let newName = "Renamed pane"
+        app.typeKey("a", modifierFlags: .command)
+        app.typeText(newName)
+        app.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+
+        let fieldDismissed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in !fieldElement.exists }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [fieldDismissed], timeout: 3), .completed,
+            "Pressing Return must commit the rename and dismiss the field."
+        )
+
+        let renamedText = app.staticTexts[newName]
+        let titleUpdated = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in renamedText.exists }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [titleUpdated], timeout: 5), .completed,
+            "Pane pill should display the renamed title after commit."
         )
     }
 

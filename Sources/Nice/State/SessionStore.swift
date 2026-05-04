@@ -66,6 +66,11 @@ struct PersistedTab: Codable, Hashable, Sendable {
     /// back as nil and the restored tab renders at root). Mirrors
     /// `Tab.parentTabId` 1:1.
     let parentTabId: String?
+    /// Monotonic per-tab counter for auto-naming new terminal panes
+    /// "Terminal N". Optional so older session files still decode —
+    /// `WindowSession.addRestoredTabModel` recomputes the counter from
+    /// existing pane titles when this is nil.
+    let nextTerminalIndex: Int?
 
     init(
         id: String,
@@ -76,7 +81,8 @@ struct PersistedTab: Codable, Hashable, Sendable {
         activePaneId: String?,
         panes: [PersistedPane],
         titleManuallySet: Bool? = nil,
-        parentTabId: String? = nil
+        parentTabId: String? = nil,
+        nextTerminalIndex: Int? = nil
     ) {
         self.id = id
         self.title = title
@@ -87,6 +93,7 @@ struct PersistedTab: Codable, Hashable, Sendable {
         self.panes = panes
         self.titleManuallySet = titleManuallySet
         self.parentTabId = parentTabId
+        self.nextTerminalIndex = nextTerminalIndex
     }
 }
 

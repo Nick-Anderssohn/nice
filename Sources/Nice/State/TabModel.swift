@@ -66,8 +66,8 @@ final class TabModel {
         // AppState so this initializer stays side-effect free.
         let mainTabId = Self.mainTerminalTabId
         let initialPaneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        let initialPane = Pane(id: initialPaneId, title: "zsh", kind: .terminal)
-        let mainTab = Tab(
+        let initialPane = Pane(id: initialPaneId, title: "Terminal 1", kind: .terminal)
+        var mainTab = Tab(
             id: mainTabId,
             title: "Main",
             cwd: initialMainCwd,
@@ -75,6 +75,7 @@ final class TabModel {
             panes: [initialPane],
             activePaneId: initialPaneId
         )
+        mainTab.nextTerminalIndex = 2
         let terminalsProject = Project(
             id: Self.terminalsProjectId,
             name: "Terminals",
@@ -319,7 +320,7 @@ final class TabModel {
 
         var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
         claudePane.isClaudeRunning = false
-        let parentTab = Tab(
+        var parentTab = Tab(
             id: newTabId,
             title: originating.title,
             cwd: originating.cwd,
@@ -334,6 +335,10 @@ final class TabModel {
             claudeSessionId: oldSessionId,
             parentTabId: inheritedRoot
         )
+        // Seed has "Terminal 1"; the next add should be "Terminal 2"
+        // — same convention as createTabFromMainTerminal /
+        // createClaudeTabInProject.
+        parentTab.nextTerminalIndex = 2
 
         // Insert immediately above the originating tab so the visual
         // order reads [parent, child].
@@ -459,6 +464,24 @@ final class TabModel {
 
     // MARK: - Title application
 
+    /// User-initiated rename for an individual pane (e.g. from the
+    /// inline pane-pill editor). Trims whitespace and ignores empty
+    /// input. Unlike `renameTab`, this does not set any "manually set"
+    /// lock — pane titles are purely display labels.
+    func renamePane(tabId: String, paneId: String, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var changed = false
+        mutateTab(id: tabId) { tab in
+            if let idx = tab.panes.firstIndex(where: { $0.id == paneId }),
+               tab.panes[idx].title != trimmed {
+                tab.panes[idx].title = trimmed
+                changed = true
+            }
+        }
+        if changed { onTreeMutation?() }
+    }
+
     /// User-initiated rename from the sidebar inline editor. Trims
     /// whitespace, ignores empty input, and marks the tab so subsequent
     /// `applyAutoTitle` calls skip it.
@@ -548,8 +571,8 @@ final class TabModel {
         let cwd = NSHomeDirectory()
         let mainTabId = Self.mainTerminalTabId
         let paneId = "\(mainTabId)-p\(Int(Date().timeIntervalSince1970 * 1000))"
-        let pane = Pane(id: paneId, title: "zsh", kind: .terminal)
-        let mainTab = Tab(
+        let pane = Pane(id: paneId, title: "Terminal 1", kind: .terminal)
+        var mainTab = Tab(
             id: mainTabId,
             title: "Main",
             cwd: cwd,
@@ -557,6 +580,7 @@ final class TabModel {
             panes: [pane],
             activePaneId: paneId
         )
+        mainTab.nextTerminalIndex = 2
         let project = Project(
             id: Self.terminalsProjectId,
             name: "Terminals",

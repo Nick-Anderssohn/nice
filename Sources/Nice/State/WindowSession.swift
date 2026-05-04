@@ -172,7 +172,8 @@ final class WindowSession {
                     activePaneId: tab.activePaneId,
                     panes: panes,
                     titleManuallySet: tab.titleManuallySet ? true : nil,
-                    parentTabId: tab.parentTabId
+                    parentTabId: tab.parentTabId,
+                    nextTerminalIndex: tab.nextTerminalIndex
                 ))
             }
             if persistedTabs.isEmpty && project.id != TabModel.terminalsProjectId {
@@ -384,7 +385,17 @@ final class WindowSession {
         }
         let defaultActive = panes.first(where: { $0.kind == .claude })?.id
             ?? panes.first?.id
-        let tab = Tab(
+
+        // Hydrate the monotonic terminal-index counter. Older session
+        // files lack the persisted value; recover it from the pane
+        // titles via the model-side helper so the regex grammar lives
+        // in one place.
+        let hydratedNextTerminalIndex = persisted.nextTerminalIndex
+            ?? Tab.recoverNextTerminalIndex(
+                fromPaneTitles: persisted.panes.map(\.title)
+            )
+
+        var tab = Tab(
             id: persisted.id,
             title: persisted.title,
             cwd: persisted.cwd,
@@ -396,6 +407,7 @@ final class WindowSession {
             claudeSessionId: persisted.claudeSessionId,
             parentTabId: persisted.parentTabId
         )
+        tab.nextTerminalIndex = hydratedNextTerminalIndex
 
         tabs.projects[projectIndex].tabs.append(tab)
 
