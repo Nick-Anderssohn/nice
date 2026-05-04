@@ -148,11 +148,13 @@ private struct AppShellHost: View {
         .background(
             // Host-window reach-through: once the shell is mounted,
             // register the window so shortcuts and termination route to
-            // this AppState, and nudge the native traffic lights deeper
-            // into the sidebar card so they don't sit flush against the
-            // rounded corner.
+            // this AppState, and nudge the native traffic lights into
+            // the sidebar card. dy:-10 places their visual centers at
+            // the same window-y as the sidebar collapse/expand icon
+            // (which sits at y=26pt from the window top in both the
+            // expanded sidebar and the collapsed cap).
             WindowAccessor { window in
-                TrafficLightNudger.nudge(window: window, dx: 8, dy: -8)
+                TrafficLightNudger.nudge(window: window, dx: 8, dy: -10)
                 TitleBarZoomMonitor.install()
                 services.registry.register(appState: appState, window: window)
             }
