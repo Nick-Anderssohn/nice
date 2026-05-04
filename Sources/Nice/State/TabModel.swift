@@ -101,10 +101,28 @@ final class TabModel {
     /// Mutate the tab identified by `id` in place. Calls `transform`
     /// with the right backing storage (Terminals tab, or an element of
     /// `projects`). Returns true if the tab was found.
+    ///
+    /// Skips the write-back when the closure leaves the tab byte-equal
+    /// to its prior state. With `@Observable`, assigning to
+    /// `projects[pi].tabs[ti]` always fires an observation notification
+    /// on `projects`, even when the new value is identical — and any
+    /// view that reads `projects` (the file browser header reads
+    /// `fileBrowserHeaderTitle`, which calls `tab(for:)`, which walks
+    /// `projects`) will then re-evaluate. SwiftUI re-evaluating the
+    /// parent of an open `.contextMenu` replaces the bridged
+    /// `NSMenuItem` for any nested `Menu` view, which dismisses the
+    /// currently-shown submenu. Repeated callers (Claude's title
+    /// spinner, OSC 7 chpwd echoes) would otherwise dismiss/redraw the
+    /// "Open With" submenu about once a second while a Claude pane is
+    /// thinking.
     @discardableResult
     func mutateTab(id: String, _ transform: (inout Tab) -> Void) -> Bool {
         guard let (pi, ti) = projectTabIndex(for: id) else { return false }
-        transform(&projects[pi].tabs[ti])
+        var copy = projects[pi].tabs[ti]
+        transform(&copy)
+        if copy != projects[pi].tabs[ti] {
+            projects[pi].tabs[ti] = copy
+        }
         return true
     }
 

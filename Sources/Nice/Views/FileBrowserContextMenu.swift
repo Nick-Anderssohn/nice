@@ -206,13 +206,15 @@ struct FileBrowserContextMenu: View {
 
     @ViewBuilder
     private var editorPaneMenu: some View {
-        // Built lazily on menu open. Detected editors are populated
-        // off-thread at app startup; if the scan hasn't returned yet
-        // we just show user-configured ones (which is also what we'd
-        // show on a fresh install with nothing detected).
+        // Detected editors are populated off-thread at app startup;
+        // if the scan hasn't returned yet we just show user-configured
+        // ones (which is also what we'd show on a fresh install with
+        // nothing detected). Computed inside the Menu's content
+        // closure so the lookup runs only when the submenu is
+        // actually presented (same rationale as `openWithMenu`).
         let url = URL(fileURLWithPath: clickedPath)
-        let entries = actions.editorPaneEntries()
         Menu("Open in Editor Pane") {
+            let entries = actions.editorPaneEntries()
             if entries.isEmpty {
                 Text("No editors available")
                     .foregroundStyle(.secondary)
@@ -247,14 +249,14 @@ struct FileBrowserContextMenu: View {
 
     @ViewBuilder
     private var openWithMenu: some View {
-        // Build entries lazily on menu open. On large `/Applications`
-        // installs `LSCopyApplicationURLsForURL` is a few ms; doing
-        // it on every body re-render would be noticeable. SwiftUI's
-        // Menu evaluates its body when the user opens it, not when
-        // the parent menu builds, so this is fine.
         let url = URL(fileURLWithPath: clickedPath)
-        let entries = actions.openWithEntries(for: url)
         Menu("Open With") {
+            // Computed inside the Menu's content closure so the
+            // Launch Services lookup only runs when the submenu is
+            // actually presented, not on every parent re-render.
+            // On large `/Applications` installs
+            // `LSCopyApplicationURLsForURL` is a few ms.
+            let entries = actions.openWithEntries(for: url)
             if entries.isEmpty {
                 Text("No applications found")
                     .foregroundStyle(.secondary)
