@@ -356,6 +356,74 @@ final class AppStateBranchTrackingTests: XCTestCase {
         )
     }
 
+    // MARK: - Per-window scoping
+    //
+    // `materializeBranchParent` reaches `tabs.projectTabIndex(for:)`
+    // and `tabs.tab(for:)`, both of which scope the lookup to a single
+    // `TabModel`. `AppStateClaudeSessionUpdateTests` already pins the
+    // id-update side; this mirror pins the parent-spawn side so a
+    // future "centralize the index" refactor can't accidentally
+    // cross-route /branch into a sibling window.
+
+    func test_branchMaterialization_isScopedToOwningWindow() {
+        // Window A and B each own a Claude tab. A /branch-shaped
+        // signal (resume + id-change) addressed to B's pane is
+        // dispatched into A's handler. A's `tabIdOwning` returns nil
+        // (B's pane isn't in A's projects), so neither A nor B should
+        // grow a parent — the dispatch went to A only, and A had no
+        // matching pane to act on.
+        seedClaudeTab(projectId: "pA", tabId: "tA", sessionId: "A0")
+
+        let stateB = AppState()
+        defer { stateB.tearDown() }
+        TabModelFixtures.seedClaudeTab(
+            into: stateB.tabs,
+            projectId: "pB", tabId: "tB", sessionId: "B0"
+        )
+
+        // Cross-window send into A — must be a no-op on both windows
+        // because A doesn't own paneId "tB-claude".
+        appState.sessions.handleClaudeSessionUpdate(
+            paneId: "tB-claude", sessionId: "B-LEAKED", source: "resume"
+        )
+
+        XCTAssertEqual(
+            projectById("pA").tabs.count, 1,
+            "A must not materialize a parent for a B-shaped paneId"
+        )
+        XCTAssertEqual(
+            appState.tabs.tab(for: "tA")?.claudeSessionId, "A0",
+            "A's tab must be untouched by a B-shaped paneId"
+        )
+        XCTAssertEqual(
+            stateB.tabs.projects.first(where: { $0.id == "pB" })?.tabs.count, 1,
+            "B must not materialize a parent — A's handler was the dispatch target, not B's"
+        )
+        XCTAssertEqual(
+            stateB.tabs.tab(for: "tB")?.claudeSessionId, "B0",
+            "B's tab must be untouched until B's own handler runs"
+        )
+
+        // B's own handler does materialize a parent — confirms the
+        // scoping wasn't a "/branch never works" false negative.
+        stateB.sessions.handleClaudeSessionUpdate(
+            paneId: "tB-claude", sessionId: "B1", source: "resume"
+        )
+
+        XCTAssertEqual(
+            stateB.tabs.projects.first(where: { $0.id == "pB" })?.tabs.count, 2,
+            "B's own /branch must materialize a parent in B"
+        )
+        XCTAssertEqual(
+            projectById("pA").tabs.count, 1,
+            "B's /branch must not bleed a parent into A"
+        )
+        XCTAssertEqual(
+            appState.tabs.tab(for: "tA")?.claudeSessionId, "A0",
+            "B's /branch must not mutate A's claudeSessionId"
+        )
+    }
+
     // MARK: - /branch on a root tab (re-parents former children)
 
     func test_branchOnRoot_preservesDepth1_byReparentingFormerChildren() {
