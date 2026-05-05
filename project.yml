@@ -41,6 +41,17 @@ packages:
     #     translated when scrollback evicts a line so the highlight
     #     stays pinned to the same content (clears only when the
     #     entire range falls off the top of scrollback).
+    #   - close the pendingRedraw consume-before-mark race in
+    #     `MetalTerminalRenderer.draw(in:)`: the previous order let
+    #     an in-flight buffer's completion handler read
+    #     pendingRedraw=false in the gap between the non-blocking
+    #     `wait` failing and `mark` setting it, stranding the
+    #     redraw with no consumer. Now mark before wait, consume on
+    #     success. Bumped frameSemaphore from 1 to 3 (Apple's
+    #     standard triple-buffering, so wait-fails are ~3x rarer in
+    #     steady state) and dropped the `window.isVisible` guard on
+    #     the nil-drawable reschedule that previously left the flag
+    #     set without a consumer when the window was hidden.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -54,7 +65,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: eb22e913dd9a2565c8a59abee7b0b36f96672af1
+    revision: ae71fcb8a309fdc6c5f68b13d9605512d0cd100d
 
 targets:
   Nice:
