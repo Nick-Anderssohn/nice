@@ -16,35 +16,32 @@ import SwiftUI
 
 /// Pending "processes still running" confirmation. Lives outside
 /// `AppState` so it can be used as an `Identifiable` for SwiftUI's
-/// item-based `.alert`.
+/// item-based `.alert`. One field, four scope kinds — the alert body
+/// in `AppShellView.pendingCloseMessage` switches on `scope` so a
+/// single `.alert(...)` block covers every close confirmation in
+/// the app (singular pane / tab / project, and the multi-tab batch
+/// from sidebar multi-select).
 struct PendingCloseRequest: Identifiable, Equatable {
     enum Scope: Equatable {
         case pane(tabId: String, paneId: String)
         case tab(tabId: String)
         case project(projectId: String)
+        /// Multi-tab batch from sidebar multi-select. The list
+        /// contains only the BUSY tabs — idle ones in the original
+        /// batch were torn down synchronously before the alert went
+        /// up. `busyPanes` carries one human-readable line per tab,
+        /// formatted as `"TabTitle (Pane1, Pane2)"`.
+        case tabs([String])
     }
 
     let id = UUID()
     let scope: Scope
-    /// Human-readable descriptions of the busy panes for the alert body.
+    /// Human-readable descriptions of the busy work for the alert
+    /// body. For `.pane` / `.tab` / `.project` scopes this is one
+    /// entry per busy pane (`"Claude (foo)"`, `"Terminal 1"`); for
+    /// `.tabs` it is one entry per busy tab, each a pre-formatted
+    /// `"TabTitle (Pane1, Pane2)"` summary.
     let busyPanes: [String]
-}
-
-/// Multi-tab variant of `PendingCloseRequest`. Sibling field on
-/// `CloseRequestCoordinator` so the plural alert keeps its own copy
-/// and its own Cancel/Confirm pair without bending the singular
-/// `Scope` enum into carrying a list. The two alerts can't both be
-/// presented at once in practice — `requestCloseTabs` early-returns
-/// if either pending field is set — but they bind to independent
-/// state so SwiftUI's `.alert(isPresented:)` Bindings don't fight.
-struct PendingMultiCloseRequest: Identifiable, Equatable {
-    let id = UUID()
-    /// Tabs whose busy panes blocked an immediate close. Confirming
-    /// the alert hard-kills every tab in this list.
-    let tabIds: [String]
-    /// One line per busy tab for the alert body, e.g.
-    /// `"Build (Claude (foo), bar)"`.
-    let busyTabSummaries: [String]
 }
 
 /// Per-pane placeholder lifecycle. `pending` is set the instant a pane is

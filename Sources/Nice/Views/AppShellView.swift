@@ -124,35 +124,44 @@ private struct AppShellHost: View {
     private var palette: Palette { tweaks.activeChromePalette }
 
     /// Body text for the "processes still running" alert. Lists the
-    /// busy pane(s) so the user knows what they'd be force-quitting.
+    /// busy work so the user knows what they'd be force-quitting.
+    /// The `.tabs` multi-batch case formats as a vertical list (one
+    /// tab per line) since each entry is itself a "TabTitle (Pane1,
+    /// Pane2)" summary; the singular scopes inline-comma-join because
+    /// each entry is a single pane.
     private func pendingCloseMessage(_ request: PendingCloseRequest) -> String {
-        let scopeHint: String
         switch request.scope {
         case .pane:
-            scopeHint = "Closing this pane will force it to quit."
+            return runningPrefix(request.busyPanes, joiner: ", ")
+                + " Closing this pane will force it to quit."
         case .tab:
-            scopeHint = "Closing this tab will force everything in it to quit."
+            return runningPrefix(request.busyPanes, joiner: ", ")
+                + " Closing this tab will force everything in it to quit."
         case .project:
-            scopeHint = "Closing this project will force every tab in it to quit."
+            return runningPrefix(request.busyPanes, joiner: ", ")
+                + " Closing this project will force every tab in it to quit."
+        case .tabs(let ids):
+            // The idle tabs in the original batch already closed
+            // before this alert went up — only the busy survivors
+            // are at stake here.
+            let n = ids.count
+            let lead = n == 1
+                ? "1 tab is busy:"
+                : "\(n) tabs are busy:"
+            return "\(lead)\n"
+                + request.busyPanes.joined(separator: "\n")
+                + "\nClosing them will force everything in them to quit."
         }
-        let list = request.busyPanes.joined(separator: ", ")
-        let running = request.busyPanes.count == 1
-            ? "\(list) is still running."
-            : "These are still running: \(list)."
-        return "\(running) \(scopeHint)"
     }
 
-    /// Body text for the "Tabs are busy" multi-close alert. Lists the
-    /// busy tabs (one per line) so the user can see exactly what
-    /// they'd be force-quitting. The idle tabs in the original batch
-    /// already closed before this alert went up — only the busy
-    /// survivors are at stake here.
-    private func pendingMultiCloseMessage(_ request: PendingMultiCloseRequest) -> String {
-        let n = request.tabIds.count
-        let lead = n == 1
-            ? "1 tab is busy:"
-            : "\(n) tabs are busy:"
-        return "\(lead)\n\(request.busyTabSummaries.joined(separator: "\n"))"
+    /// "X is still running." / "These are still running: X, Y."
+    /// Shared between the singular scopes; the `.tabs` scope uses a
+    /// list format instead.
+    private func runningPrefix(_ items: [String], joiner: String) -> String {
+        let list = items.joined(separator: joiner)
+        return items.count == 1
+            ? "\(list) is still running."
+            : "These are still running: \(list)."
     }
 
     var body: some View {
@@ -195,6 +204,10 @@ private struct AppShellHost: View {
         .environment(appState.fileExplorerOrchestrator)
         .environment(appState.tabSelection)
         .environment(appState)
+        // Single alert covers every close confirmation in the app —
+        // pane / tab / project / multi-tab batch all flow through
+        // `pendingCloseRequest` and `pendingCloseMessage` switches on
+        // `scope` for the body wording.
         .alert(
             "Processes are still running",
             isPresented: Binding(
@@ -207,19 +220,6 @@ private struct AppShellHost: View {
             Button("Force quit", role: .destructive) { appState.closer.confirmPendingClose() }
         } message: { request in
             Text(pendingCloseMessage(request))
-        }
-        .alert(
-            "Tabs are busy",
-            isPresented: Binding(
-                get: { appState.closer.pendingMultiCloseRequest != nil },
-                set: { if !$0 { appState.closer.cancelPendingMultiClose() } }
-            ),
-            presenting: appState.closer.pendingMultiCloseRequest
-        ) { _ in
-            Button("Cancel", role: .cancel) { appState.closer.cancelPendingMultiClose() }
-            Button("Close anyway", role: .destructive) { appState.closer.confirmPendingMultiClose() }
-        } message: { request in
-            Text(pendingMultiCloseMessage(request))
         }
         .task {
             // Order matters: `services.bootstrap()` writes the
