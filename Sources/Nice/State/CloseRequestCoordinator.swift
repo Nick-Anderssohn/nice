@@ -45,6 +45,17 @@ final class CloseRequestCoordinator {
     /// `AppShellView` binds an `.alert` to this.
     var pendingCloseRequest: PendingCloseRequest?
 
+    /// Multi-tab analogue of `pendingCloseRequest`. Set by
+    /// `requestCloseTabs` when at least one tab in the batch was busy;
+    /// the idle ones close immediately. Cleared by
+    /// `confirmPendingMultiClose` (hard-kills every busy tab) or
+    /// `cancelPendingMultiClose`. Lives separately from the singular
+    /// pending field because the singular alert in `AppShellView` has
+    /// fixed singular wording and its own confirm/cancel pair —
+    /// keeping the two state machines independent avoids cross-
+    /// cancellation and lets each alert own its own message.
+    var pendingMultiCloseRequest: PendingMultiCloseRequest?
+
     /// Project ids the user asked to fully close. When a tab in one of
     /// these projects finishes dissolving in `paneExited`, the empty
     /// project row is also removed from `projects`. The Terminals
@@ -132,6 +143,61 @@ final class CloseRequestCoordinator {
         }
     }
 
+    /// Request to close several tabs at once (sidebar multi-select →
+    /// "Close N Tabs"). Idle tabs are killed immediately so the user
+    /// sees the rows disappear right away. Busy tabs are aggregated
+    /// into a single combined confirmation alert ("N tabs are busy:
+    /// …") instead of stacking one per-tab prompt — confirming hard-
+    /// kills every busy tab in the batch, cancelling leaves them
+    /// open. The single-id case forwards to `requestCloseTab` so the
+    /// existing singular alert state machine handles it identically
+    /// to a normal right-click → Close.
+    func requestCloseTabs(ids: [String]) {
+        guard let tabs else { return }
+
+        // Single-id fast path keeps behavior identical to the
+        // singular flow — same alert wording, same Scope.tab branch.
+        if ids.count == 1, let only = ids.first {
+            requestCloseTab(tabId: only)
+            return
+        }
+
+        // Defensive: don't stack alerts. If the singular path is
+        // already showing an alert (or another multi-close is
+        // pending), drop the new request silently rather than fight
+        // SwiftUI's modal presentation.
+        if pendingCloseRequest != nil || pendingMultiCloseRequest != nil { return }
+
+        var idle: [String] = []
+        var busy: [(tabId: String, title: String, panes: [Pane])] = []
+        for id in ids {
+            guard let tab = tabs.tab(for: id) else { continue }
+            let busyPanes = tab.panes.filter { $0.isAlive && isBusy(tabId: id, pane: $0) }
+            if busyPanes.isEmpty {
+                idle.append(id)
+            } else {
+                busy.append((id, tab.title, busyPanes))
+            }
+        }
+
+        // The loop iterates `[String]` ids (not project indexes), so
+        // a synchronous `hardKillTab` cascade — `onSyncFinalizeDissolve`
+        // → `finalizeDissolvedTab` mutating `projects` — can't shift
+        // anything out from under us mid-loop.
+        for id in idle {
+            hardKillTab(tabId: id)
+        }
+
+        guard !busy.isEmpty else { return }
+
+        pendingMultiCloseRequest = PendingMultiCloseRequest(
+            tabIds: busy.map(\.tabId),
+            busyTabSummaries: busy.map { entry in
+                "\(entry.title) (\(entry.panes.map(describe(pane:)).joined(separator: ", ")))"
+            }
+        )
+    }
+
     /// Request to close an entire project: every tab's panes plus the
     /// project row itself. Refused for the pinned Terminals project,
     /// which is always present by design. If any pane in any tab is
@@ -174,6 +240,24 @@ final class CloseRequestCoordinator {
     /// User dismissed the pending close — leave everything running.
     func cancelPendingClose() {
         pendingCloseRequest = nil
+    }
+
+    /// User confirmed the multi-tab busy alert — hard-kill every
+    /// busy tab the batch staged. Idle tabs in the original batch
+    /// were already killed when the alert went up; this only acts
+    /// on the busy survivors.
+    func confirmPendingMultiClose() {
+        guard let pending = pendingMultiCloseRequest else { return }
+        pendingMultiCloseRequest = nil
+        for id in pending.tabIds {
+            hardKillTab(tabId: id)
+        }
+    }
+
+    /// User dismissed the multi-tab busy alert — leave the busy
+    /// tabs running. Idle tabs already closed before the alert.
+    func cancelPendingMultiClose() {
+        pendingMultiCloseRequest = nil
     }
 
     // MARK: - Busy classification

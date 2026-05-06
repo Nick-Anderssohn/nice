@@ -142,6 +142,19 @@ private struct AppShellHost: View {
         return "\(running) \(scopeHint)"
     }
 
+    /// Body text for the "Tabs are busy" multi-close alert. Lists the
+    /// busy tabs (one per line) so the user can see exactly what
+    /// they'd be force-quitting. The idle tabs in the original batch
+    /// already closed before this alert went up — only the busy
+    /// survivors are at stake here.
+    private func pendingMultiCloseMessage(_ request: PendingMultiCloseRequest) -> String {
+        let n = request.tabIds.count
+        let lead = n == 1
+            ? "1 tab is busy:"
+            : "\(n) tabs are busy:"
+        return "\(lead)\n\(request.busyTabSummaries.joined(separator: "\n"))"
+    }
+
     var body: some View {
         shell
         .ignoresSafeArea(edges: .top)
@@ -180,6 +193,7 @@ private struct AppShellHost: View {
         .environment(appState.closer)
         .environment(appState.windowSession)
         .environment(appState.fileExplorerOrchestrator)
+        .environment(appState.tabSelection)
         .environment(appState)
         .alert(
             "Processes are still running",
@@ -193,6 +207,19 @@ private struct AppShellHost: View {
             Button("Force quit", role: .destructive) { appState.closer.confirmPendingClose() }
         } message: { request in
             Text(pendingCloseMessage(request))
+        }
+        .alert(
+            "Tabs are busy",
+            isPresented: Binding(
+                get: { appState.closer.pendingMultiCloseRequest != nil },
+                set: { if !$0 { appState.closer.cancelPendingMultiClose() } }
+            ),
+            presenting: appState.closer.pendingMultiCloseRequest
+        ) { _ in
+            Button("Cancel", role: .cancel) { appState.closer.cancelPendingMultiClose() }
+            Button("Close anyway", role: .destructive) { appState.closer.confirmPendingMultiClose() }
+        } message: { request in
+            Text(pendingMultiCloseMessage(request))
         }
         .task {
             // Order matters: `services.bootstrap()` writes the

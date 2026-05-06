@@ -19,14 +19,92 @@ import UniformTypeIdentifiers
 struct SidebarView: View {
     @Environment(TabModel.self) private var tabs
     @Environment(SidebarModel.self) private var sidebar
+    @Environment(SidebarTabSelection.self) private var tabSelection
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
     @Environment(\.openSettings) private var openSettings
     @State private var dragState = SidebarDragState()
 
+    /// AppKit local-event monitor that intercepts Esc to collapse a
+    /// multi-selection back down to the active tab. Local (not global)
+    /// so it only sees events when this app is frontmost. The monitor
+    /// also gates strictly on `selectedTabIds.count > 1`, so we never
+    /// steal Esc from the focused pane (terminal / Claude / inline
+    /// rename field) when there's nothing meaningful to collapse.
+    /// Lives on `@State` so it survives view re-renders and tears
+    /// down deterministically in `onDisappear`. Mirrors the AppKit
+    /// monitor pattern already used in `TabRow.installMouseMonitor`.
+    @State private var escMonitor: Any?
+
     var body: some View {
         expandedSidebar
             .environment(dragState)
+            .onAppear { installEscMonitor() }
+            .onDisappear { removeEscMonitor() }
+            // Keep the multi-selection set honest with respect to
+            // `activeTabId` for every change source we don't own —
+            // app launch / session restore (active tab is set before
+            // any user interaction), keyboard tab-switching shortcuts
+            // (⌘1…⌘9, ⌘⇧[ / ⌘⇧]), socket-driven `claude newtab`,
+            // programmatic activation from `+` buttons, etc. Each of
+            // those calls `tabs.selectTab(...)` without touching the
+            // selection model, leaving the active tab visibly
+            // highlighted (via `isActive`) but absent from
+            // `selectedTabIds` — which makes the next Shift-click
+            // degenerate to a plain replace because there's no anchor.
+            //
+            // Our own tap handlers always mutate the selection BEFORE
+            // calling `selectTab`, so by the time this `.onChange`
+            // fires from a tap path the new active id is already in
+            // the set and the guard short-circuits — meaning the
+            // collapse only runs for genuinely-external nav.
+            //
+            // `initial: true` covers the launch case: the closure
+            // fires once with whatever `activeTabId` was set during
+            // `AppState.start()` / `restoreSavedWindow`, seeding the
+            // selection before the user can interact.
+            .onChange(of: tabs.activeTabId, initial: true) { _, newActive in
+                guard let newActive else { return }
+                if !tabSelection.contains(newActive) {
+                    tabSelection.collapse(to: newActive)
+                }
+            }
+    }
+
+    /// Collapse the multi-selection to just the active tab without
+    /// touching `activeTabId` (the active tab is already correct on
+    /// every collapse path — Esc, empty-area click). If the tree
+    /// happens to be empty (no active tab), drop the selection
+    /// entirely so a stale id can't survive an all-projects-empty
+    /// shutdown sequence.
+    private func collapseSelectionToActive() {
+        if let active = tabs.activeTabId {
+            tabSelection.collapse(to: active)
+        } else {
+            tabSelection.clear()
+        }
+    }
+
+    private func installEscMonitor() {
+        removeEscMonitor()
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // 53 is `kVK_Escape`. Gate on `count > 1` so the focused
+            // pane keeps its own Esc behavior whenever there's nothing
+            // here for us to do. Returning `nil` consumes the event;
+            // returning the event lets it through unchanged.
+            if event.keyCode == 53, tabSelection.selectedTabIds.count > 1 {
+                collapseSelectionToActive()
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeEscMonitor() {
+        if let monitor = escMonitor {
+            NSEvent.removeMonitor(monitor)
+            escMonitor = nil
+        }
     }
 
     // MARK: - Expanded sidebar
@@ -63,6 +141,15 @@ struct SidebarView: View {
                 }
             }
             .padding(.vertical, 10)
+            // Empty-area click collapses any active multi-selection
+            // back to the active tab. `TabRow` rows already declare
+            // `.contentShape(Rectangle())`, so they absorb their own
+            // taps and this background handler only fires on truly
+            // empty space (the 10pt vertical padding, the gap between
+            // groups, the unfilled bottom of the ScrollView).
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture { collapseSelectionToActive() }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -309,6 +396,7 @@ private struct TabRow: View {
     @Environment(TabModel.self) private var tabs
     @Environment(SessionsModel.self) private var sessions
     @Environment(CloseRequestCoordinator.self) private var closer
+    @Environment(SidebarTabSelection.self) private var selection
     @Environment(Tweaks.self) private var tweaks
     @Environment(FontSettings.self) private var fontSettings
     @Environment(SidebarDragState.self) private var dragState
@@ -346,7 +434,16 @@ private struct TabRow: View {
 
     private var backgroundColor: Color {
         if isActive { return Color.niceSel(scheme, accent: tweaks.accent.color) }
-        if hover    { return Color.niceInk(scheme, palette).opacity(0.06) }
+        // Multi-select secondary tier: rows that are part of the
+        // selection but aren't the active tab. Dimmed accent fill so
+        // the active row still pops as the primary highlight (Finder /
+        // Mail.app pattern). Opacity rather than a Palette token to
+        // keep the change scoped — easy to promote to a named token
+        // in `Theme/Palette.swift` later if a second call site appears.
+        if selection.contains(tab.id) {
+            return Color.niceSel(scheme, accent: tweaks.accent.color).opacity(0.5)
+        }
+        if hover { return Color.niceInk(scheme, palette).opacity(0.06) }
         return .clear
     }
 
@@ -401,6 +498,70 @@ private struct TabRow: View {
         }
     }
 
+    // MARK: - Multi-select tap routing
+
+    /// Modifier-aware row tap. Plain click collapses selection to this
+    /// tab and activates it; Cmd-click toggles it in/out (most-recently-
+    /// clicked stays active); Shift-click extends a contiguous range
+    /// from the last anchor. Always ends with the appropriate
+    /// `tabs.selectTab(...)` call so the active-tab invariant — that
+    /// the selection set always contains `activeTabId` — is preserved
+    /// at the view layer (the model is intentionally agnostic of
+    /// `TabModel`, mirroring `FileBrowserSelection`'s independence
+    /// from `FileBrowserState`).
+    ///
+    /// In-flight inline rename swallows all clicks until commit/cancel
+    /// so the user can finish typing without a stray click ending the
+    /// edit early — same gate as the previous single-line tap handler.
+    private func handleRowTap() {
+        guard !isEditing else { return }
+        let mods = NSEvent.modifierFlags
+            .intersection(KeyCombo.relevantModifierMask)
+        if mods.contains(.command) {
+            handleCmdClick()
+        } else if mods.contains(.shift) {
+            handleShiftClick()
+        } else {
+            handlePlainClick()
+        }
+    }
+
+    private func handlePlainClick() {
+        selection.replace(with: tab.id)
+        tabs.selectTab(tab.id)
+    }
+
+    private func handleCmdClick() {
+        let wasSelected = selection.contains(tab.id)
+        selection.toggle(tab.id)
+        if !wasSelected {
+            // Newly added → most-recently-clicked rule: becomes active.
+            tabs.selectTab(tab.id)
+        } else if tabs.activeTabId == tab.id {
+            // Toggled OUT the active tab. Pick any remaining member as
+            // the new active; if nothing is left, re-insert this id so
+            // the "selection ⊇ {active}" invariant survives — the
+            // user-visible effect is "Cmd-click on the only-and-active
+            // selected row is a no-op," matching Finder.
+            if let next = selection.selectedTabIds.first {
+                tabs.selectTab(next)
+            } else {
+                selection.toggle(tab.id)
+                tabs.selectTab(tab.id)
+            }
+        }
+        // Else: toggled out a non-active selected row. Active doesn't
+        // move; nothing to do.
+    }
+
+    private func handleShiftClick() {
+        selection.extend(
+            through: tab.id,
+            visibleOrder: tabs.navigableSidebarTabIds
+        )
+        tabs.selectTab(tab.id)
+    }
+
     var body: some View {
         // Sized for parity with Xcode's Project Navigator and the
         // file-browser rows: 13pt title, 6pt HStack spacing, 4pt
@@ -442,19 +603,28 @@ private struct TabRow: View {
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
         .onHover { hover = $0 }
-        .onTapGesture {
-            if !isEditing {
-                tabs.selectTab(tab.id)
-            }
-        }
+        .onTapGesture { handleRowTap() }
         .contextMenu {
-            Button("Rename Tab") {
-                tabs.selectTab(tab.id)
-                beginEditing()
+            // PURE read of "which tabs should the menu act on". SwiftUI
+            // evaluates this view-builder as part of body, so the snap
+            // mutation lives inside each Button's action closure
+            // (mirrors `FileBrowserContextMenu`'s `onWillAct`).
+            let actionIds = selection.selectionIds(forRightClickOn: tab.id)
+            if actionIds.count == 1 {
+                Button("Rename Tab") {
+                    selection.snapIfRightClickOutside(tab.id)
+                    tabs.selectTab(tab.id)
+                    beginEditing()
+                }
+                .accessibilityIdentifier("sidebar.tab.\(tab.id).renameTab")
             }
-            .accessibilityIdentifier("sidebar.tab.\(tab.id).renameTab")
-            Button("Close Tab") {
-                closer.requestCloseTab(tabId: tab.id)
+            Button(actionIds.count > 1 ? "Close \(actionIds.count) Tabs" : "Close Tab") {
+                selection.snapIfRightClickOutside(tab.id)
+                if actionIds.count > 1 {
+                    closer.requestCloseTabs(ids: actionIds)
+                } else {
+                    closer.requestCloseTab(tabId: tab.id)
+                }
             }
             .accessibilityIdentifier("sidebar.tab.\(tab.id).closeTab")
         }
@@ -472,6 +642,16 @@ private struct TabRow: View {
         // namespace so existing `sidebar.tab.<id>`-prefix queries in
         // the UITest suite are unaffected.
         .background(lineageMarker)
+        // Selection marker for UITests: a hidden, zero-size sibling
+        // whose accessibilityValue mirrors the multi-selection bit so
+        // tests can assert "row X is selected" without depending on
+        // the row's own value (the row uses
+        // `.accessibilityElement(children: .contain)`, which doesn't
+        // surface a value to XCUIElement). Same shape as
+        // `lineageMarker`. The Active tab is included by invariant
+        // (the selection set is always a superset of `{activeTabId}`
+        // when there's an active tab on screen).
+        .background(selectionMarker)
         .onAppear {
             if isActive && activatedAt == nil { activatedAt = Date() }
         }
@@ -519,6 +699,28 @@ private struct TabRow: View {
         }
     }
 
+    /// Hidden zero-size element that exists in the accessibility tree
+    /// IFF this row is part of the multi-selection set. UITests check
+    /// for its `.exists` rather than reading a value off the row's
+    /// own element (the row uses `.accessibilityElement(children:
+    /// .contain)`, which doesn't surface a value to XCUIElement, and
+    /// `.accessibilityValue` doesn't reliably propagate onto a zero-
+    /// size `Color.clear` marker either). Identifier is
+    /// `sidebar.tab.<id>.selected`; absence ↔ unselected. Lives in
+    /// its own `.selected` suffix so existing prefix-based queries
+    /// that exclude the icon / title / button suffixes don't need
+    /// updating to also exclude this one.
+    @ViewBuilder
+    private var selectionMarker: some View {
+        if selection.contains(tab.id) {
+            Color.clear
+                .frame(width: 0, height: 0)
+                .accessibilityElement()
+                .accessibilityIdentifier("sidebar.tab.\(tab.id).selected")
+                .allowsHitTesting(false)
+        }
+    }
+
     @ViewBuilder
     private var titleView: some View {
         if isEditing {
@@ -561,10 +763,23 @@ private struct TabRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
                 .onTapGesture {
+                    // Route any modified click (Cmd / Shift) through
+                    // the same multi-select handler the row chrome
+                    // uses, so the title text isn't a back-door
+                    // entrance to rename. Inline rename remains a
+                    // strictly-unmodified-click affordance — and only
+                    // on the already-active row, gated by the
+                    // existing `renameAllowed` double-click window.
+                    let mods = NSEvent.modifierFlags
+                        .intersection(KeyCombo.relevantModifierMask)
+                    if mods.contains(.command) || mods.contains(.shift) {
+                        handleRowTap()
+                        return
+                    }
                     if isActive {
                         if renameAllowed { beginEditing() }
                     } else {
-                        tabs.selectTab(tab.id)
+                        handlePlainClick()
                     }
                 }
                 .accessibilityIdentifier("sidebar.tab.\(tab.id).title")

@@ -30,6 +30,23 @@ struct PendingCloseRequest: Identifiable, Equatable {
     let busyPanes: [String]
 }
 
+/// Multi-tab variant of `PendingCloseRequest`. Sibling field on
+/// `CloseRequestCoordinator` so the plural alert keeps its own copy
+/// and its own Cancel/Confirm pair without bending the singular
+/// `Scope` enum into carrying a list. The two alerts can't both be
+/// presented at once in practice — `requestCloseTabs` early-returns
+/// if either pending field is set — but they bind to independent
+/// state so SwiftUI's `.alert(isPresented:)` Bindings don't fight.
+struct PendingMultiCloseRequest: Identifiable, Equatable {
+    let id = UUID()
+    /// Tabs whose busy panes blocked an immediate close. Confirming
+    /// the alert hard-kills every tab in this list.
+    let tabIds: [String]
+    /// One line per busy tab for the alert body, e.g.
+    /// `"Build (Claude (foo), bar)"`.
+    let busyTabSummaries: [String]
+}
+
 /// Per-pane placeholder lifecycle. `pending` is set the instant a pane is
 /// spawned; if the child emits its first byte before the 0.75 s grace
 /// window elapses the entry is cleared and the overlay never appears. If
@@ -54,6 +71,11 @@ final class AppState {
     /// Per-window file-browser states keyed by `Tab.id`. Removed in
     /// `finalizeDissolvedTab` when a tab dissolves.
     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
+
+    /// Sidebar multi-tab selection. Transient — not persisted with the
+    /// rest of the tab tree. Pruned in `finalizeDissolvedTab` so a
+    /// dissolved tab can never linger as a stale id in the set.
+    let tabSelection: SidebarTabSelection = SidebarTabSelection()
 
     @ObservationIgnored
     private weak var trackedServices: NiceServices?
@@ -275,6 +297,10 @@ final class AppState {
         tabs.removeTab(projectIndex: pi, tabIndex: ti)
         sessions.removePtySession(tabId: tabId)
         fileBrowserStore.removeState(forTab: tabId)
+        // Drop the dissolved tab id from the multi-selection set
+        // before any view re-renders against the shrunken tree.
+        // Covers external-dissolve paths (pane crash) too.
+        tabSelection.prune(validIds: Set(tabs.navigableSidebarTabIds))
         if tabs.activeTabId == tabId {
             tabs.activeTabId = tabs.firstAvailableTabId()
         }
