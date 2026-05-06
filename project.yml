@@ -52,6 +52,15 @@ packages:
     #     steady state) and dropped the `window.isVisible` guard on
     #     the nil-drawable reschedule that previously left the flag
     #     set without a consumer when the window was hidden.
+    #   - allocate a fresh atlas texture in `GlyphAtlas.reset()`
+    #     instead of `texture.replace`-ing the existing one in
+    #     place. With frameSemaphore=3, prior in-flight frames may
+    #     still be GPU-sampling the atlas when reset() runs; the
+    #     in-place clear violated Metal's no-modify-while-bound
+    #     rule and could produce a few frames of glyph corruption
+    #     after an atlas overflow. Mirrors what grow() already
+    #     does; falls back to the in-place clear only if the
+    #     fresh allocation fails.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -65,7 +74,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: ae71fcb8a309fdc6c5f68b13d9605512d0cd100d
+    revision: d36edfc7bb6f912406abc74564d761840940b46b
 
 targets:
   Nice:
