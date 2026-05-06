@@ -33,5 +33,10 @@ scripts/.env.release
 # survives a run, the next script invocation uses it to restore.
 .scripts-project-yml.bak
 
+# Runtime lock file written by Claude Code's `/loop` scheduler. Lives
+# per-worktree so it doesn't conflict with parallel loops elsewhere;
+# never meant to be committed.
+.claude/scheduled_tasks.lock
+
 # macOS
 .DS_Store
