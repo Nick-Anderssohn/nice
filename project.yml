@@ -61,13 +61,6 @@ packages:
     #     after an atlas overflow. Mirrors what grow() already
     #     does; falls back to the in-place clear only if the
     #     fresh allocation fails.
-    #   - treat curated Nerd Font PUA subranges as double-width in
-    #     `UnicodeUtil.columnWidth`. Before this fix, Powerlevel10k
-    #     icons (and any Nerd Font glyph) overlapped the next
-    #     character because the East Asian Width tables don't cover
-    #     the PUA so wcwidth() defaulted to narrow. Configurable via
-    #     the new `TerminalOptions.nerdFontWidth` knob (.wide
-    #     default, .narrow opt-out for multiplexers).
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -81,7 +74,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 02fc5877065ed48539343034d4fb63691e830025
+    revision: d36edfc7bb6f912406abc74564d761840940b46b
 
 targets:
   Nice:
