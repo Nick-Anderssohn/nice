@@ -24,7 +24,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-1",
             paneId: "tab-1-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertEqual(env["NICE_TAB_ID"], "tab-1")
         XCTAssertEqual(env["NICE_PANE_ID"], "tab-1-claude")
@@ -38,7 +39,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-2",
             paneId: "tab-2-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertEqual(env["NICE_TAB_ID"], "tab-2")
         XCTAssertEqual(env["NICE_PANE_ID"], "tab-2-claude")
@@ -51,7 +53,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-3",
             paneId: "tab-3-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertEqual(env["NICE_TAB_ID"], "tab-3")
         XCTAssertEqual(env["NICE_PANE_ID"], "tab-3-claude")
@@ -64,7 +67,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-4",
             paneId: "tab-4-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertEqual(env["NICE_TAB_ID"], "tab-4")
         XCTAssertEqual(env["NICE_PANE_ID"], "tab-4-claude")
@@ -79,7 +83,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-5",
             paneId: "tab-5-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertEqual(env["ZDOTDIR"], "/tmp/zdotdir")
         XCTAssertEqual(env["NICE_PREFILL_COMMAND"], "claude --resume abc-123")
@@ -91,7 +96,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-6",
             paneId: "tab-6-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertNil(env["ZDOTDIR"])
         XCTAssertNil(env["NICE_PREFILL_COMMAND"])
@@ -103,7 +109,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "tab-7",
             paneId: "tab-7-claude",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertNil(env["ZDOTDIR"])
         XCTAssertNil(env["NICE_PREFILL_COMMAND"])
@@ -117,7 +124,8 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "t",
             paneId: "p",
             socketPath: nil,
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertNil(env["NICE_SOCKET"])
     }
@@ -128,9 +136,64 @@ final class TabPtySessionClaudeEnvTests: XCTestCase {
             tabId: "t",
             paneId: "p",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: nil
+            zdotdirPath: nil,
+            userZDotDir: nil
         )
         XCTAssertNil(env["ZDOTDIR"])
         XCTAssertEqual(env["NICE_PREFILL_COMMAND"], "claude --resume abc-123")
+    }
+
+    // MARK: - NICE_USER_ZDOTDIR (paired with ZDOTDIR for the
+    // resumeDeferred path so the synthetic .zshenv stub can resolve
+    // the user's intended ZDOTDIR).
+
+    func test_resumeDeferred_setsNiceUserZdotdir() {
+        let env = TabPtySession.buildClaudeExtraEnv(
+            mode: .resumeDeferred(id: "abc-123"),
+            tabId: "t",
+            paneId: "p",
+            socketPath: "/tmp/nice.sock",
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: "/Users/nick/.config/zsh"
+        )
+        XCTAssertEqual(env["NICE_USER_ZDOTDIR"], "/Users/nick/.config/zsh")
+    }
+
+    func test_resumeDeferred_nilUserZdotdir_setsEmptyString() {
+        // Empty string is the on-the-wire signal for "Nice didn't
+        // inherit a ZDOTDIR; fall back to sourcing ~/.zshenv". The
+        // shell stub keys off `[[ -n ... ]]` which treats "" the same
+        // as unset, so this is the cleanest contract.
+        let env = TabPtySession.buildClaudeExtraEnv(
+            mode: .resumeDeferred(id: "abc-123"),
+            tabId: "t",
+            paneId: "p",
+            socketPath: "/tmp/nice.sock",
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
+        )
+        XCTAssertEqual(env["NICE_USER_ZDOTDIR"], "")
+    }
+
+    func test_nonResumeDeferred_omitsNiceUserZdotdir() {
+        // For .none/.new/.resume the Claude pane execs claude directly
+        // — no zsh injection happens, so NICE_USER_ZDOTDIR is moot.
+        // Keeping it out of those envs avoids leaking a Nice-internal
+        // var into Claude's process env unnecessarily.
+        for mode in [
+            TabPtySession.ClaudeSessionMode.none,
+            .new(id: "x"),
+            .resume(id: "x"),
+        ] {
+            let env = TabPtySession.buildClaudeExtraEnv(
+                mode: mode,
+                tabId: "t",
+                paneId: "p",
+                socketPath: "/tmp/nice.sock",
+                zdotdirPath: "/tmp/zdotdir",
+                userZDotDir: "/Users/nick/.config/zsh"
+            )
+            XCTAssertNil(env["NICE_USER_ZDOTDIR"], "mode \(mode) leaked NICE_USER_ZDOTDIR")
+        }
     }
 }

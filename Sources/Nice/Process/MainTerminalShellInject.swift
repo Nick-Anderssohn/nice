@@ -4,13 +4,41 @@
 //
 //  Phase 7: writes a per-launch `ZDOTDIR` directory the Main Terminal's
 //  zsh picks up. The directory contains stub `.zshenv` / `.zprofile` /
-//  `.zlogin` / `.zshrc` that first chain back to the user's real
-//  startup files in `$HOME`, then (in `.zshrc`) define a `claude()`
-//  function that intercepts *interactive* invocations and forwards
-//  them to Nice's control socket so a new tab opens instead of the
-//  shell exec'ing claude in place. Every interactive `claude` — whether
-//  typed in the built-in Terminals tab or in a companion terminal
-//  inside an existing Claude tab — opens its own new tab.
+//  `.zlogin` / `.zshrc` that chain back to the user's real startup
+//  files (resolved from `$NICE_USER_ZDOTDIR` if set, else by sourcing
+//  `~/.zshenv` to discover the user's intended `ZDOTDIR`), then (in
+//  `.zshrc`) restore `ZDOTDIR` to that intended value and define a
+//  `claude()` function that intercepts *interactive* invocations and
+//  forwards them to Nice's control socket so a new tab opens instead
+//  of the shell exec'ing claude in place. Every interactive `claude`
+//  — whether typed in the built-in Terminals tab or in a companion
+//  terminal inside an existing Claude tab — opens its own new tab.
+//
+//  The "restore `ZDOTDIR` *before sourcing user's .zshrc*" dance is
+//  what stops shell tools (Powerlevel10k, oh-my-zsh, nvm, asdf,
+//  starship init…) from scribbling on our temp dir when they probe
+//  `${ZDOTDIR:-$HOME}/...` — both at the interactive prompt AND
+//  during user's `.zshrc` init (oh-my-zsh sets `ZSH_COMPDUMP=
+//  "${ZDOTDIR:-$HOME}/.zcompdump-..."` at load time, p10k sources
+//  `${ZDOTDIR:-$HOME}/.p10k.zsh`, etc.). Ordering "restore → source
+//  user's .zshrc → install our hooks" gives us correctness for those
+//  init-time probes and also lets our `claude()` shadow / OSC 7
+//  hook layer on top of (and survive) anything the user defines.
+//
+//  Trade-off: this means `exec zsh` inside a Nice pane drops our
+//  injection (the new zsh runs with the user's restored ZDOTDIR, not
+//  our temp value), so users who re-exec the shell mid-session lose
+//  `claude()` and OSC 7 until they open a new tab. The same caveat
+//  applies to most terminal-app shell integration (iTerm2, VS Code's
+//  terminal). Pre-fix, `exec zsh` retained the hooks because the
+//  temp ZDOTDIR was still in env; we accept this regression as the
+//  cost of doing the bigger fix.
+//
+//  Known limitation: `/etc/zshenv` setting `ZDOTDIR` bypasses our
+//  injection entirely (zsh re-resolves `$ZDOTDIR/.zshenv` from the
+//  new value before reading our stub). macOS ships no `/etc/zshenv`
+//  and setting `ZDOTDIR` system-wide is non-idiomatic; documented
+//  rather than fixed.
 //
 
 import Foundation
@@ -51,33 +79,99 @@ enum MainTerminalShellInject {
 
     // MARK: - File bodies
 
-    // Each stub explicitly sources the user's real file. When `ZDOTDIR`
-    // is set, zsh reads startup files from there and stops consulting
-    // `$HOME/.*`, so without these chain-backs the user would lose
-    // their PATH, aliases, plugins, etc.
+    // The four stubs cooperate so that:
+    //   1. zsh keeps reading our temp-dir stubs (we control startup).
+    //   2. The user's real .zshenv/.zprofile/.zshrc/.zlogin all run.
+    //   3. By the time the shell is interactive, $ZDOTDIR points at
+    //      whatever the *user* intended (XDG-style custom location,
+    //      launchctl-set value, or just $HOME) — never our temp dir —
+    //      so tools like p10k that probe ${ZDOTDIR:-$HOME}/.zshrc
+    //      write to the right files instead of our soon-to-be-deleted
+    //      temp dir.
+    //
+    // The "user's intended ZDOTDIR" is resolved in our .zshenv: prefer
+    // `$NICE_USER_ZDOTDIR` (Nice captured this from its own process env
+    // before overriding ZDOTDIR for the pty), and fall back to sourcing
+    // `~/.zshenv` ourselves to honor users who set it there
+    // (XDG-style — most common). The resolved value is stashed back
+    // into NICE_USER_ZDOTDIR so the later stubs can see it.
 
     private static let zshenvBody = """
-    # Nice: chain back to the user's real .zshenv.
-    [[ -f "$HOME/.zshenv" ]] && source "$HOME/.zshenv"
+    # Nice: discover and stash the user's intended ZDOTDIR, then
+    # restore our temp dir so zsh keeps reading our other stubs
+    # (.zprofile / .zshrc). See file header for the cooperation contract.
+    NICE_TEMP_ZDOTDIR="$ZDOTDIR"
+    if [[ -n "$NICE_USER_ZDOTDIR" ]]; then
+        # Inherited from Nice's launch env (launchctl / parent process).
+        USER_ZDOTDIR="$NICE_USER_ZDOTDIR"
+    else
+        # Source ~/.zshenv ourselves to discover any ZDOTDIR set there
+        # (XDG-style). This is the FIRST source of ~/.zshenv this
+        # session — zsh read OUR stub, not the user's, because ZDOTDIR
+        # was overridden — so no double-source / non-idempotency risk.
+        unset ZDOTDIR
+        [[ -f "$HOME/.zshenv" ]] && source "$HOME/.zshenv"
+        USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+    fi
+    export ZDOTDIR="$NICE_TEMP_ZDOTDIR"
+    export NICE_USER_ZDOTDIR="$USER_ZDOTDIR"
+    unset NICE_TEMP_ZDOTDIR USER_ZDOTDIR
     """
 
     private static let zprofileBody = """
-    # Nice: chain back to the user's real .zprofile.
-    [[ -f "$HOME/.zprofile" ]] && source "$HOME/.zprofile"
+    # Nice: source the user's real .zprofile from the location resolved
+    # in our .zshenv. (Without this, login-shell users silently lose
+    # .zprofile because zsh's $ZDOTDIR/.zprofile lookup hits our stub.)
+    [[ -n "$NICE_USER_ZDOTDIR" && -f "$NICE_USER_ZDOTDIR/.zprofile" ]] \\
+        && source "$NICE_USER_ZDOTDIR/.zprofile"
     """
 
     private static let zloginBody = """
-    # Nice: chain back to the user's real .zlogin.
-    [[ -f "$HOME/.zlogin" ]] && source "$HOME/.zlogin"
+    # Nice: defensive — if our .zshrc somehow exited before restoring
+    # ZDOTDIR (user .zshrc errored out, etc.), source the user's real
+    # .zlogin from where they actually keep it. In the success path
+    # ZDOTDIR has already been restored to the user's value by our
+    # .zshrc, so zsh reads the user's .zlogin directly and this stub
+    # is never reached.
+    [[ -n "$NICE_USER_ZDOTDIR" && -f "$NICE_USER_ZDOTDIR/.zlogin" ]] \\
+        && source "$NICE_USER_ZDOTDIR/.zlogin"
     """
 
     private static let zshrcBody = #"""
-    # Nice: chain back to the user's real .zshrc, then shadow `claude`
-    # so running it handshakes with Nice over NICE_SOCKET. The socket
-    # either tells us to exit (Nice is opening a new tab) or to exec
-    # claude in place (Nice is promoting this pane to Claude).
-    [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
+    # Stash the resolved user-side ZDOTDIR before we drop NICE_USER_ZDOTDIR.
+    # Trim trailing slashes so an accidental "/Users/nick/" (from launchctl
+    # or weird shells) compares equal to "/Users/nick" for the unset branch.
+    NICE_RESOLVED_USER_ZDOTDIR="${NICE_USER_ZDOTDIR%/}"
 
+    # Restore ZDOTDIR to the user's intended value BEFORE sourcing
+    # their .zshrc — so anything they pull in during init (oh-my-zsh
+    # `ZSH_COMPDUMP="${ZDOTDIR:-$HOME}/.zcompdump-..."`, p10k's
+    # `source "${ZDOTDIR:-$HOME}/.p10k.zsh"`, plugin-manager caches,
+    # etc.) probes the user's real config path instead of our temp
+    # dir. The whole point of this PR is closing that gap; restoring
+    # after the source would only fix tools the user runs at the
+    # interactive prompt, not the much larger surface of init-time
+    # tooling.
+    if [[ "$NICE_RESOLVED_USER_ZDOTDIR" == "${HOME%/}" ]]; then
+        unset ZDOTDIR    # match standard convention when $HOME resolves
+    else
+        export ZDOTDIR="$NICE_RESOLVED_USER_ZDOTDIR"
+    fi
+    unset NICE_USER_ZDOTDIR
+
+    # Source the user's real .zshrc from where they actually keep it
+    # (handles XDG-style ZDOTDIR layouts under e.g. ~/.config/zsh).
+    [[ -n "$NICE_RESOLVED_USER_ZDOTDIR" && -f "$NICE_RESOLVED_USER_ZDOTDIR/.zshrc" ]] \
+        && source "$NICE_RESOLVED_USER_ZDOTDIR/.zshrc"
+    unset NICE_RESOLVED_USER_ZDOTDIR
+
+    # Now shadow `claude` so running it handshakes with Nice over
+    # NICE_SOCKET. The socket either tells us to exit (Nice is opening
+    # a new tab) or to exec claude in place (Nice is promoting this
+    # pane to Claude). Defining the function AFTER user's .zshrc
+    # ensures we win over anything they may have defined themselves —
+    # if a user wants to opt out, they can still `unfunction claude`
+    # in a precmd hook.
     _nice_json_escape() {
         local s=$1
         s=${s//\\/\\\\}

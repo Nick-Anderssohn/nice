@@ -106,6 +106,11 @@ final class TabPtySession: TabPtySessionThemeable {
     /// ZDOTDIR directory injected into terminal panes so the shadowed
     /// `claude()` function is available inside them.
     private let zdotdirPath: String?
+    /// `ZDOTDIR` Nice inherited from its launch env (or nil). Forwarded
+    /// to ptys as `NICE_USER_ZDOTDIR` so the synthetic .zshenv can
+    /// restore it after our injection runs — see
+    /// `MainTerminalShellInject` for the full handshake.
+    private let userZDotDir: String?
 
     /// Captured for the optional initial claude pane spawn.
     private let claudeBinary: String?
@@ -141,6 +146,7 @@ final class TabPtySession: TabPtySessionThemeable {
         initialTerminalPaneId: String? = nil,
         socketPath: String? = nil,
         zdotdirPath: String? = nil,
+        userZDotDir: String? = nil,
         claudeSessionMode: ClaudeSessionMode = .none,
         onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
         onPaneTitleChange: @escaping @MainActor (String, String) -> Void,
@@ -157,6 +163,7 @@ final class TabPtySession: TabPtySessionThemeable {
         self.onPaneFirstOutput = onPaneFirstOutput
         self.socketPath = socketPath
         self.zdotdirPath = zdotdirPath
+        self.userZDotDir = userZDotDir
         self.claudeBinary = claudeBinary
         self.extraClaudeArgs = extraClaudeArgs
         self.claudeSessionMode = claudeSessionMode
@@ -204,7 +211,8 @@ final class TabPtySession: TabPtySessionThemeable {
             tabId: tabId,
             paneId: id,
             socketPath: socketPath,
-            zdotdirPath: zdotdirPath
+            zdotdirPath: zdotdirPath,
+            userZDotDir: userZDotDir
         )
 
         if case .resumeDeferred = claudeSessionMode {
@@ -263,6 +271,7 @@ final class TabPtySession: TabPtySessionThemeable {
         cwd: String? = nil,
         socketPath: String? = nil,
         zdotdirPath: String? = nil,
+        userZDotDir: String? = nil,
         command: String? = nil
     ) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
@@ -282,6 +291,10 @@ final class TabPtySession: TabPtySessionThemeable {
         if let zp = zdotdirPath ?? self.zdotdirPath {
             extraEnv["ZDOTDIR"] = zp
         }
+        // Always set NICE_USER_ZDOTDIR (empty when Nice didn't inherit
+        // one) so the synthetic .zshenv's check is unambiguous —
+        // empty string means "fall back to sourcing ~/.zshenv".
+        extraEnv["NICE_USER_ZDOTDIR"] = userZDotDir ?? self.userZDotDir ?? ""
         // Tab/pane identity for the zsh `claude()` wrapper's handshake.
         // The wrapper includes these in its socket payload so Nice can
         // decide whether to open a new sidebar tab or promote this pane.
@@ -550,7 +563,8 @@ final class TabPtySession: TabPtySessionThemeable {
         tabId: String,
         paneId: String,
         socketPath: String?,
-        zdotdirPath: String?
+        zdotdirPath: String?,
+        userZDotDir: String?
     ) -> [String: String] {
         var env: [String: String] = ["TERM_PROGRAM": "ghostty"]
         env["NICE_TAB_ID"] = tabId
@@ -558,6 +572,10 @@ final class TabPtySession: TabPtySessionThemeable {
         if let sp = socketPath { env["NICE_SOCKET"] = sp }
         if case .resumeDeferred(let sessionId) = mode {
             if let zp = zdotdirPath { env["ZDOTDIR"] = zp }
+            // Pair NICE_USER_ZDOTDIR with ZDOTDIR — the .zshenv stub
+            // depends on it to resolve the user's intended layout
+            // before our injection unwinds.
+            env["NICE_USER_ZDOTDIR"] = userZDotDir ?? ""
             env["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
         }
         return env

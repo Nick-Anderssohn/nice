@@ -64,6 +64,14 @@ final class SessionsModel {
     @ObservationIgnored
     private var zdotdirPath: String?
 
+    /// `ZDOTDIR` Nice inherited from its launch env (or nil). Plumbed
+    /// through to ptys as `NICE_USER_ZDOTDIR` so the synthetic .zshenv
+    /// can restore it after our injection runs. See `NiceServices`
+    /// for the why; see `MainTerminalShellInject` for how the shell
+    /// stubs use it.
+    @ObservationIgnored
+    private var userZDotDir: String?
+
     /// Extra environment variables threaded into every pty spawn:
     /// `NICE_SOCKET` so the zsh `claude()` shadow can reach this
     /// window's socket, and `ZDOTDIR` so shell rcs are sourced from
@@ -192,8 +200,9 @@ final class SessionsModel {
     /// `NICE_SOCKET` from `controlSocketExtraEnv` before the listener is
     /// armed, so AppState's choreography is bootstrap → seed-main-pty
     /// → start-listener.
-    func bootstrapSocket(zdotdirPath: String?) {
+    func bootstrapSocket(zdotdirPath: String?, userZDotDir: String?) {
         self.zdotdirPath = zdotdirPath
+        self.userZDotDir = userZDotDir
 
         // Allocate the control socket *before* spawning any ptys —
         // the shells need NICE_SOCKET in their environment at startup
@@ -208,6 +217,11 @@ final class SessionsModel {
         if let zdotdirPath {
             extraEnv["ZDOTDIR"] = zdotdirPath
         }
+        // Always set NICE_USER_ZDOTDIR (empty if Nice didn't inherit
+        // one) so the synthetic .zshenv's `[[ -n "$NICE_USER_ZDOTDIR" ]]`
+        // check distinguishes "we have a launch-env value" from "fall
+        // back to sourcing ~/.zshenv ourselves" cleanly.
+        extraEnv["NICE_USER_ZDOTDIR"] = userZDotDir ?? ""
         self.controlSocketExtraEnv = extraEnv
     }
 
@@ -908,6 +922,7 @@ final class SessionsModel {
             initialTerminalPaneId: terminalPaneId,
             socketPath: controlSocket?.path,
             zdotdirPath: zdotdirPath,
+            userZDotDir: userZDotDir,
             claudeSessionMode: claudeSessionMode,
             onPaneExit: { [weak self] paneId, code in
                 self?.paneExited(tabId: tabId, paneId: paneId, exitCode: code)

@@ -204,15 +204,17 @@ final class AppState {
         started = true
 
         var zdotdirPath: String?
+        var userZDotDir: String?
         if let services = trackedServices {
             zdotdirPath = services.zdotdirPath
+            userZDotDir = services.userZDotDir
             sessions.setResolvedClaudePath(services.resolvedClaudePath)
         }
 
         // Socket *before* any ptys — shells need NICE_SOCKET in env
         // at startup or the `claude()` shadow can't reach us. One
         // socket per window keeps `claude` invocations scoped.
-        sessions.bootstrapSocket(zdotdirPath: zdotdirPath)
+        sessions.bootstrapSocket(zdotdirPath: zdotdirPath, userZDotDir: userZDotDir)
 
         // `restoreSavedWindow` below may dissolve and rebuild this.
         if let mainTab = tabs.projects.first(where: { $0.id == TabModel.terminalsProjectId })?.tabs.first {

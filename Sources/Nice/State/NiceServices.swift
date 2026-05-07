@@ -49,14 +49,23 @@ final class NiceServices {
     private(set) var resolvedClaudePath: String?
 
     /// Process-wide ZDOTDIR directory whose stub `.zshrc` chains back to
-    /// the user's real `$HOME/.zshrc` and shadows `claude` to talk to
-    /// our control socket. Owned here (not per-AppState) so multi-window
+    /// the user's real config and shadows `claude` to talk to our
+    /// control socket. Owned here (not per-AppState) so multi-window
     /// scenarios share one dir and a closing window can't yank it out
     /// from under another window's still-spawning shells. Written by
     /// `bootstrap()` *after* `cleanupStaleTempFiles` so the cleanup
     /// never wipes the dir we just wrote. Deleted by the
     /// `willTerminate` observer.
     private(set) var zdotdirPath: String?
+
+    /// The `ZDOTDIR` value Nice inherited from its launch environment
+    /// — set if the user had `launchctl setenv ZDOTDIR …` or a parent
+    /// process exported it; nil otherwise. Plumbed into pty children as
+    /// `NICE_USER_ZDOTDIR` so the synthetic `.zshenv` can restore it
+    /// (and the user's intended layout) after our injection runs.
+    /// Captured once at `bootstrap()` because Nice's own process env
+    /// doesn't change during a session.
+    private(set) var userZDotDir: String?
 
     @ObservationIgnored
     private var terminateObserver: NSObjectProtocol?
@@ -122,6 +131,12 @@ final class NiceServices {
             NSLog("NiceServices: ZDOTDIR inject failed: \(error)")
             self.zdotdirPath = nil
         }
+        // Capture Nice's own inherited ZDOTDIR before any pty children
+        // get our overridden value. Read straight from the process env
+        // (not from a make() return) so this also works if make() threw:
+        // even with no temp dir, a pty child still benefits from being
+        // told the user's intended ZDOTDIR via NICE_USER_ZDOTDIR.
+        self.userZDotDir = ProcessInfo.processInfo.environment["ZDOTDIR"]
         // The env-var override is a cheap dict read — apply it
         // synchronously so UI tests that set NICE_CLAUDE_OVERRIDE see
         // the path immediately (no resolution race for tabs spawned

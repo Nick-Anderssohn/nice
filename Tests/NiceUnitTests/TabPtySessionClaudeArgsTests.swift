@@ -174,7 +174,8 @@ final class TabPtySessionClaudeArgsTests: XCTestCase {
             tabId: "tab-1",
             paneId: "pane-1",
             socketPath: "/tmp/nice.sock",
-            zdotdirPath: "/tmp/zdotdir"
+            zdotdirPath: "/tmp/zdotdir",
+            userZDotDir: nil
         )
         XCTAssertEqual(env["NICE_PREFILL_COMMAND"], "claude --resume abc-123")
     }
