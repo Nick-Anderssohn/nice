@@ -27,7 +27,7 @@ struct FontPane: View {
 
         SettingRow(
             label: "Terminal font",
-            hint: "Monospace typeface for every terminal and Claude pane. Lists only fonts currently installed on this Mac."
+            hint: "Typeface for every terminal and Claude pane. Lists every font installed on this Mac; monospace works best."
         ) {
             TerminalFontPicker(
                 selection: Binding(
@@ -65,11 +65,19 @@ struct FontPane: View {
     }
 }
 
-/// Curated dropdown of installed monospace fonts. The "Default" row
+/// Dropdown of installed fonts. The "Default" row
 /// (`defaultSentinel`) maps to `nil` so `TabPtySession.terminalFont`
 /// falls through to the SF Mono → JetBrains Mono NL → system
-/// monospaced chain. Candidates that aren't installed are dropped so
-/// the user never picks a font that would fail to load.
+/// monospaced chain. The curated `candidates` list of popular
+/// programming fonts is surfaced at the top of the menu; every other
+/// installed font family appears below a divider, alphabetical, one
+/// row per family. We deliberately don't filter to monospace — many
+/// terminal-oriented fonts (notably the wide-icon Nerd Font variants)
+/// don't claim the fixed-pitch trait, and any heuristic to
+/// reconstruct it ends up either over- or under-including. Trust the
+/// user to pick what works for them; SwiftTerm renders whatever it's
+/// handed. Candidates that aren't installed are dropped so the user
+/// never picks a font that would fail to load.
 struct TerminalFontPicker: View {
     @Binding var selection: String
 
@@ -78,6 +86,9 @@ struct TerminalFontPicker: View {
     /// no real font name would ever match.
     static let defaultSentinel = "__nice.default__"
 
+    /// Popular fonts shown at the top of the picker, in display order.
+    /// Anything else the system reports as monospace appears below a
+    /// divider — see `installed`.
     static let candidates: [String] = [
         "SFMono-Regular",
         "JetBrainsMonoNL-Regular",
@@ -93,24 +104,69 @@ struct TerminalFontPicker: View {
         "CascadiaCode-Regular",
     ]
 
-    /// Filter to fonts the system can actually load. `NSFont(name:size:)`
-    /// returns nil for uninstalled fonts — a better gate than
-    /// `NSFontManager.availableFontFamilies`, which returns family
-    /// names (not PostScript names) and can list fonts the concrete
-    /// face isn't available in.
-    private var installed: [(psName: String, display: String)] {
-        Self.candidates.compactMap { name in
-            guard let font = NSFont(name: name, size: 12) else { return nil }
-            return (name, font.displayName ?? name)
+    private struct Row: Hashable {
+        let psName: String
+        let display: String
+    }
+
+    /// Two ordered slices: the curated popular fonts that are actually
+    /// installed (preserving `candidates` order), and every other
+    /// installed font family — one row per family, regular face,
+    /// alphabetised. The two slices are deduplicated against each
+    /// other so a curated font never shows twice.
+    ///
+    /// We pick the regular face by walking
+    /// `availableMembers(ofFontFamily:)` (which returns
+    /// `[psName, styleName, weight, traitsBitmask]` tuples) and taking
+    /// the first non-bold, non-italic member. `NSFont(name:size:)` is
+    /// the final gate: anything it can't construct is dropped,
+    /// mirroring the curated path and keeping the load contract
+    /// identical.
+    private var installed: (curated: [Row], others: [Row]) {
+        var seen: Set<String> = []
+        var curated: [Row] = []
+
+        for psName in Self.candidates {
+            guard let font = NSFont(name: psName, size: 12),
+                  seen.insert(psName).inserted else { continue }
+            curated.append(Row(psName: psName, display: font.displayName ?? psName))
         }
+
+        let manager = NSFontManager.shared
+        var others: [Row] = []
+
+        for family in manager.availableFontFamilies {
+            guard let members = manager.availableMembers(ofFontFamily: family) else { continue }
+            for member in members {
+                guard member.count >= 4,
+                      let psName = member[0] as? String,
+                      let traitsNum = member[3] as? NSNumber else { continue }
+                let traits = NSFontTraitMask(rawValue: UInt(traitsNum.intValue))
+                if traits.contains(.italicFontMask) || traits.contains(.boldFontMask) { continue }
+                guard seen.insert(psName).inserted,
+                      let font = NSFont(name: psName, size: 12) else { continue }
+                others.append(Row(psName: psName, display: font.displayName ?? psName))
+                break
+            }
+        }
+
+        others.sort { $0.display.localizedCaseInsensitiveCompare($1.display) == .orderedAscending }
+        return (curated, others)
     }
 
     var body: some View {
+        let lists = installed
         Picker("", selection: $selection) {
             Text("Default (SF Mono)").tag(Self.defaultSentinel)
             Divider()
-            ForEach(installed, id: \.psName) { entry in
+            ForEach(lists.curated, id: \.psName) { entry in
                 Text(entry.display).tag(entry.psName)
+            }
+            if !lists.others.isEmpty {
+                Divider()
+                ForEach(lists.others, id: \.psName) { entry in
+                    Text(entry.display).tag(entry.psName)
+                }
             }
         }
         .labelsHidden()
