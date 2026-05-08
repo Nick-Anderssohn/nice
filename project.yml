@@ -61,6 +61,27 @@ packages:
     #     after an atlas overflow. Mirrors what grow() already
     #     does; falls back to the in-place clear only if the
     #     fresh allocation fails.
+    #   - coalesce UI-driven resize bursts at
+    #     `AppleTerminalView.processSizeChange`: the sidebar/window
+    #     fast-drag prompt-stack bug was a SIGWINCH-vs-shell-redraw
+    #     race. Resizes now collapse to one apply per
+    #     `resizeDebounceMs` window (default 200 ms, matches iTerm2),
+    #     latest-wins, with the timer NOT rescheduled by new
+    #     arrivals so sustained drags still land. Set
+    #     `view.resizeDebounceMs = 0` to disable. Same fix shape
+    #     Ghostty/iTerm2/kitty all use, but at the
+    #     `processSizeChange` chokepoint so it covers every
+    #     UI-driven resize source uniformly.
+    #   - opt-in `TerminalOptions.reflowCursorLine` flag (default
+    #     false, matches xterm/upstream) gates the
+    #     `getLinesToRemove` cursor-merge behavior on widen.
+    #     Setting `reflowCursorLine: true` joins wrapped blocks
+    #     containing the cursor and translates the cursor's logical
+    #     position into the merged layout — needed when the host
+    #     view briefly lays out at a tiny initial size before
+    #     real geometry resolves (the startup-duplication
+    #     variant of the resize bug). Nice constructs Terminal
+    #     with this set to true.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -74,7 +95,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: eb22e913dd9a2565c8a59abee7b0b36f96672af1
+    revision: 14f98ada437ed1b087e20f5efe49ca2b0b6211ea
 
 targets:
   Nice:

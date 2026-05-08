@@ -64,12 +64,45 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
+        applyNiceTerminalOptions()
         registerForDraggedTypes(Self.acceptedDragTypes)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        applyNiceTerminalOptions()
         registerForDraggedTypes(Self.acceptedDragTypes)
+    }
+
+    /// Flips SwiftTerm options that Nice wants different from the
+    /// upstream defaults. Must run after `super.init(frame:)` (which
+    /// constructs the underlying `Terminal`) and before the first
+    /// reflow.
+    ///
+    /// Currently:
+    /// - `reflowCursorLine = true` so wrapped blocks containing the
+    ///   cursor are joined (and the cursor is translated into the
+    ///   merged layout) on widen. Without this, the brief tiny
+    ///   initial layout of a fresh `NiceTerminalView` — before the
+    ///   sidebar/window geometry resolves — causes the shell's first
+    ///   prompt to fragment across many wrapped 2-char rows; on
+    ///   widen those fragments stay stranded above the redrawn
+    ///   prompt because zsh/bash/fish only clear below cursor on
+    ///   SIGWINCH (`\r\e[J`). This produces the "stack of partial
+    ///   prompts at startup" variant of the resize-duplication bug.
+    ///   The flag is upstream-default `false` to match xterm
+    ///   semantics; we opt in.
+    private func applyNiceTerminalOptions() {
+        // Empirically required (verified 2026-05-07): with
+        // `reflowCursorLine = false`, startup duplication still
+        // reproduces — coalescing the resize bursts isn't enough
+        // because the shell prints its first prompt into the brief
+        // tiny initial buffer BEFORE the coalesced apply fires. The
+        // merge on widen + cursor translation is what reattaches
+        // the fragmented prompt rows into the parent line, so the
+        // shell's `\r\e[J` redraw doesn't leave them stranded above.
+        // SwiftTerm default is `false` (xterm semantics); we opt in.
+        terminal.reflowCursorLine = true
     }
 
     /// Enables SwiftTerm's Metal renderer. No-op when the view isn't
