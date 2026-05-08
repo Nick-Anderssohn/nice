@@ -36,12 +36,24 @@ struct PersistedPane: Codable, Hashable, Sendable {
     /// files (written before per-pane cwd existed) still decode —
     /// restore falls back to `PersistedTab.cwd` when nil.
     let cwd: String?
+    /// Whether the user renamed this pane via the inline pane-pill
+    /// editor. Optional so v3 session files (written before this
+    /// flag existed) still decode — callers hydrate with `?? false`.
+    /// Mirrors `PersistedTab.titleManuallySet`.
+    let titleManuallySet: Bool?
 
-    init(id: String, title: String, kind: PaneKind, cwd: String? = nil) {
+    init(
+        id: String,
+        title: String,
+        kind: PaneKind,
+        cwd: String? = nil,
+        titleManuallySet: Bool? = nil
+    ) {
         self.id = id
         self.title = title
         self.kind = kind
         self.cwd = cwd
+        self.titleManuallySet = titleManuallySet
     }
 }
 

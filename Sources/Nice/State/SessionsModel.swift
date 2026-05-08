@@ -348,6 +348,12 @@ final class SessionsModel {
         if pane.kind == .terminal {
             let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
+            // Once the user has manually renamed this pane via the
+            // pane-pill editor, OSC titles from the running program
+            // (vim/zsh themes/etc.) must not overwrite their choice.
+            // The lock clears via `renamePane(... to: "")`. Mirrors the
+            // `Tab.titleManuallySet` gate in `applyAutoTitle`.
+            if pane.titleManuallySet { return }
             let clipped: String = {
                 guard trimmed.count > 40 else { return trimmed }
                 let idx = trimmed.index(trimmed.startIndex, offsetBy: 40)
@@ -818,7 +824,13 @@ final class SessionsModel {
             tab.panes[idx].isClaudeRunning = true
             // Let the upcoming OSC title from claude set the real label;
             // seed with "Claude" so the pill doesn't render stale text.
-            tab.panes[idx].title = "Claude"
+            // Skip the seed when the user has manually renamed this pane
+            // — promoting a user-named pane to Claude shouldn't blow
+            // their custom label away (and the OSC gate in
+            // `paneTitleChanged` would block the next OSC anyway).
+            if !tab.panes[idx].titleManuallySet {
+                tab.panes[idx].title = "Claude"
+            }
             tab.activePaneId = paneId
             tab.claudeSessionId = sessionId
         }

@@ -63,9 +63,18 @@ struct Pane: Identifiable, Hashable, Sendable, Codable {
     /// shell has emitted at least one OSC 7 — callers fall back to
     /// `Tab.cwd` in that case.
     var cwd: String? = nil
+    /// True once the user has explicitly renamed this pane via the
+    /// inline pane-pill editor. When true, `paneTitleChanged` skips
+    /// the terminal-branch write so OSC titles emitted by the running
+    /// program (e.g. zsh themes pushing `user@host:cwd` on every
+    /// prompt) can't clobber the user's choice. Cleared by submitting
+    /// an empty title in the editor, which also resets `title` to the
+    /// per-kind auto-default. Mirrors `Tab.titleManuallySet`.
+    var titleManuallySet: Bool = false
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, kind, isAlive, status, waitingAcknowledged, cwd
+        case id, title, kind, isAlive, status, waitingAcknowledged, cwd,
+             titleManuallySet
     }
 }
 

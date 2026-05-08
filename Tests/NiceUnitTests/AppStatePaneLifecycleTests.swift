@@ -246,6 +246,92 @@ final class AppStatePaneLifecycleTests: XCTestCase {
         XCTAssertEqual(pane.title, before, "Whitespace-only titles must not overwrite the current title.")
     }
 
+    /// Once the user has manually renamed a terminal pane via the
+    /// pill editor, OSC titles emitted by the running program (e.g.
+    /// vim's `vim foo.swift`, zsh's `user@host:cwd` theme spam) must
+    /// not overwrite their custom label. Mirrors the
+    /// `Tab.titleManuallySet` gate codified by
+    /// `test_paneTitleChanged_claudePane_deferredResume_ignoresShellTitle`.
+    func test_paneTitleChanged_terminalPane_manuallySet_ignoresOscTitle() {
+        seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
+        let terminalId = appState.tabs.tab(for: "t1")!.panes[1].id
+
+        // User renames the pane via the pill editor.
+        appState.tabs.renamePane(tabId: "t1", paneId: terminalId, to: "build watcher")
+        XCTAssertTrue(
+            appState.tabs.tab(for: "t1")!.panes.first { $0.id == terminalId }!.titleManuallySet,
+            "Pre-condition: rename must flip the lock."
+        )
+
+        // The running program emits an OSC title — must not win.
+        appState.sessions.paneTitleChanged(
+            tabId: "t1", paneId: terminalId, title: "nvim foo.rb"
+        )
+
+        let pane = appState.tabs.tab(for: "t1")!.panes.first { $0.id == terminalId }!
+        XCTAssertEqual(
+            pane.title, "build watcher",
+            "OSC titles must not overwrite a manually-renamed terminal pane."
+        )
+    }
+
+    /// Empty-submit in the pill editor releases the lock and resets
+    /// the title; the very next OSC title from the program should
+    /// flow through to the pill again.
+    func test_paneTitleChanged_terminalPane_emptySubmitReleasesLock_thenAcceptsOscTitle() {
+        seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
+        let terminalId = appState.tabs.tab(for: "t1")!.panes[1].id
+
+        // Lock, then unlock via empty submit.
+        appState.tabs.renamePane(tabId: "t1", paneId: terminalId, to: "logs")
+        appState.tabs.renamePane(tabId: "t1", paneId: terminalId, to: "")
+
+        XCTAssertFalse(
+            appState.tabs.tab(for: "t1")!.panes.first { $0.id == terminalId }!.titleManuallySet,
+            "Pre-condition: empty submit must clear the lock."
+        )
+
+        // Next OSC title flows through.
+        appState.sessions.paneTitleChanged(
+            tabId: "t1", paneId: terminalId, title: "vim x.swift"
+        )
+
+        let pane = appState.tabs.tab(for: "t1")!.panes.first { $0.id == terminalId }!
+        XCTAssertEqual(
+            pane.title, "vim x.swift",
+            "After releasing the lock, OSC titles must flow into the pill again."
+        )
+    }
+
+    /// `Pane.titleManuallySet` is a *title* lock, not a *status* lock.
+    /// A manually-renamed Claude pane must still flip
+    /// `pane.status = .thinking` when claude emits a braille-prefixed
+    /// OSC, so the pill's status dot keeps pulsing. Codifies the
+    /// design decision that the OSC gate intentionally lives in the
+    /// terminal-only branch of `paneTitleChanged` and never blocks the
+    /// status-prefix extraction.
+    func test_paneTitleChanged_claudePane_manuallySet_doesNotAffectStatusUpdate() {
+        seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
+        let claudeId = appState.tabs.tab(for: "t1")!.panes[0].id
+
+        // Rename the Claude pane (sets the pane-level lock).
+        appState.tabs.renamePane(tabId: "t1", paneId: claudeId, to: "deploy session")
+
+        // Send a braille-prefixed OSC — status must still flip.
+        let title = "\u{2840} fix-top-bar-height"
+        appState.sessions.paneTitleChanged(tabId: "t1", paneId: claudeId, title: title)
+
+        let pane = appState.tabs.tab(for: "t1")!.panes.first { $0.id == claudeId }!
+        XCTAssertEqual(
+            pane.status, .thinking,
+            "Pane-level title lock must not block status transitions on Claude panes."
+        )
+        XCTAssertEqual(
+            pane.title, "deploy session",
+            "User's custom Claude pane name must survive the OSC."
+        )
+    }
+
     func test_paneTitleChanged_terminalPane_clipsAt40Chars() {
         seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
         let terminalId = appState.tabs.tab(for: "t1")!.panes[1].id

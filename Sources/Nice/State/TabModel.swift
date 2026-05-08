@@ -464,19 +464,69 @@ final class TabModel {
 
     // MARK: - Title application
 
+    /// Default display title for a pane of `kind`. Terminal panes use
+    /// the tab's monotonic `nextTerminalIndex` (never reused — same
+    /// policy `addPane` enforces). Used by `renamePane`'s empty-submit
+    /// reset path; constructor sites today still hand-write the same
+    /// strings, but this is the single source of truth.
+    static func defaultPaneTitle(kind: PaneKind, terminalIndex: Int) -> String {
+        switch kind {
+        case .claude:   return "Claude"
+        case .terminal: return "Terminal \(terminalIndex)"
+        }
+    }
+
     /// User-initiated rename for an individual pane (e.g. from the
-    /// inline pane-pill editor). Trims whitespace and ignores empty
-    /// input. Unlike `renameTab`, this does not set any "manually set"
-    /// lock — pane titles are purely display labels.
+    /// inline pane-pill editor).
+    ///
+    /// - **Non-empty trimmed input:** sets `pane.title` and flips
+    ///   `pane.titleManuallySet = true` so subsequent OSC titles
+    ///   from the running program can't clobber the user's choice.
+    ///   Symmetric with `renameTab` flipping `Tab.titleManuallySet`.
+    /// - **Empty trimmed input:** resets the pane to its per-kind
+    ///   auto-default and clears `titleManuallySet`, releasing the
+    ///   lock so OSC titles drive the pill again. For terminal
+    ///   panes the reset consumes and increments
+    ///   `tab.nextTerminalIndex` — same monotonic-never-reuse policy
+    ///   `addPane` uses (rename → reset → rename → reset cycles
+    ///   climb the counter; acceptable for an unusual user gesture).
     func renamePane(tabId: String, paneId: String, to newTitle: String) {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
         var changed = false
         mutateTab(id: tabId) { tab in
-            if let idx = tab.panes.firstIndex(where: { $0.id == paneId }),
-               tab.panes[idx].title != trimmed {
-                tab.panes[idx].title = trimmed
-                changed = true
+            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId })
+            else { return }
+            if trimmed.isEmpty {
+                // Empty submit: release the lock and recompute the
+                // auto-default. Terminal reset consumes the next slot
+                // from the monotonic counter so a subsequent addPane
+                // won't collide with the freshly-reset pane's name.
+                let resetTitle: String
+                switch tab.panes[idx].kind {
+                case .claude:
+                    resetTitle = TabModel.defaultPaneTitle(
+                        kind: .claude, terminalIndex: 0  // unused
+                    )
+                case .terminal:
+                    let n = tab.nextTerminalIndex
+                    resetTitle = TabModel.defaultPaneTitle(
+                        kind: .terminal, terminalIndex: n
+                    )
+                    tab.nextTerminalIndex = n + 1
+                }
+                if tab.panes[idx].title != resetTitle
+                    || tab.panes[idx].titleManuallySet {
+                    tab.panes[idx].title = resetTitle
+                    tab.panes[idx].titleManuallySet = false
+                    changed = true
+                }
+            } else {
+                if tab.panes[idx].title != trimmed
+                    || !tab.panes[idx].titleManuallySet {
+                    tab.panes[idx].title = trimmed
+                    tab.panes[idx].titleManuallySet = true
+                    changed = true
+                }
             }
         }
         if changed { onTreeMutation?() }

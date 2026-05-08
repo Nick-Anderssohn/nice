@@ -160,7 +160,11 @@ final class WindowSession {
             for tab in project.tabs {
                 let panes = tab.panes.map {
                     PersistedPane(
-                        id: $0.id, title: $0.title, kind: $0.kind, cwd: $0.cwd
+                        id: $0.id, title: $0.title, kind: $0.kind, cwd: $0.cwd,
+                        // Write nil when false to keep snapshot JSON small —
+                        // mirrors `titleManuallySet: tab.titleManuallySet ? true : nil`
+                        // a few lines below for `PersistedTab`.
+                        titleManuallySet: $0.titleManuallySet ? true : nil
                     )
                 }
                 persistedTabs.append(PersistedTab(
@@ -381,7 +385,12 @@ final class WindowSession {
         guard let tabs, let sessions else { return nil }
 
         let panes = persisted.panes.map { pp in
-            Pane(id: pp.id, title: pp.title, kind: pp.kind, cwd: pp.cwd)
+            // Hydrate `nil → false` for v3 session files written before
+            // the flag existed.
+            Pane(
+                id: pp.id, title: pp.title, kind: pp.kind, cwd: pp.cwd,
+                titleManuallySet: pp.titleManuallySet ?? false
+            )
         }
         let defaultActive = panes.first(where: { $0.kind == .claude })?.id
             ?? panes.first?.id

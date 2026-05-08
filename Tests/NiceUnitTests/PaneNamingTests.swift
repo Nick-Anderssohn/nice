@@ -143,15 +143,56 @@ final class PaneNamingTests: XCTestCase {
         XCTAssertEqual(appState.tabs.tab(for: tabId)!.panes[0].title, "padded")
     }
 
-    func test_renamePane_emptyInputIsNoop() {
+    /// Submitting an empty title in the pill editor releases the
+    /// manual-set lock and resets the pane to its per-kind auto-
+    /// default. Terminal panes consume the next slot from the
+    /// monotonic counter — same policy `addPane` uses, so a future
+    /// addPane never collides with the freshly-reset pane's name.
+    func test_renamePane_emptyInput_resetsToAutoDefault_clearsFlag() {
         let tabId = TabModel.mainTerminalTabId
         let paneId = appState.tabs.tab(for: tabId)!.panes[0].id
-        let originalTitle = appState.tabs.tab(for: tabId)!.panes[0].title
+        let counterBefore = appState.tabs.tab(for: tabId)!.nextTerminalIndex
 
-        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "   ")
+        // Lock the title with a manual rename.
+        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "logs")
+        XCTAssertTrue(
+            appState.tabs.tab(for: tabId)!.panes[0].titleManuallySet,
+            "Pre-condition: a non-empty rename must flip titleManuallySet."
+        )
 
-        XCTAssertEqual(appState.tabs.tab(for: tabId)!.panes[0].title, originalTitle,
-                       "Empty/whitespace-only input must leave the pane title unchanged.")
+        // Empty submit — release the lock and reset.
+        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "  ")
+
+        let tab = appState.tabs.tab(for: tabId)!
+        let pane = tab.panes[0]
+        XCTAssertFalse(
+            pane.titleManuallySet,
+            "Empty submit must clear the manual-set lock."
+        )
+        XCTAssertEqual(
+            pane.title, "Terminal \(counterBefore)",
+            "Empty submit must reset to the auto-default consuming the next counter slot."
+        )
+        XCTAssertEqual(
+            tab.nextTerminalIndex, counterBefore + 1,
+            "The reset path must advance the monotonic counter."
+        )
+    }
+
+    /// A non-empty rename flips `titleManuallySet` so subsequent OSC
+    /// titles in `paneTitleChanged` can't overwrite the user's pick.
+    func test_renamePane_setsTitleManuallySet() {
+        let tabId = TabModel.mainTerminalTabId
+        let paneId = appState.tabs.tab(for: tabId)!.panes[0].id
+
+        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "build")
+
+        let pane = appState.tabs.tab(for: tabId)!.panes[0]
+        XCTAssertEqual(pane.title, "build")
+        XCTAssertTrue(
+            pane.titleManuallySet,
+            "renamePane with non-empty input must flip titleManuallySet so OSC titles can't clobber the user's choice."
+        )
     }
 
     func test_renamePane_firesOnTreeMutation() {
@@ -168,15 +209,18 @@ final class PaneNamingTests: XCTestCase {
     func test_renamePane_doesNotFireOnTreeMutationWhenNoChange() {
         let tabId = TabModel.mainTerminalTabId
         let paneId = appState.tabs.tab(for: tabId)!.panes[0].id
-        let originalTitle = appState.tabs.tab(for: tabId)!.panes[0].title
+
+        // First rename locks the title (title change + flag flip both
+        // count as changes). The SECOND rename to the same value is the
+        // true no-op we're pinning here.
+        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "logs")
+
         var fired = false
         appState.tabs.onTreeMutation = { fired = true }
-
-        // Rename to the same title — should be a no-op.
-        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: originalTitle)
+        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "logs")
 
         XCTAssertFalse(fired,
-                       "onTreeMutation must not fire when the title is unchanged.")
+                       "onTreeMutation must not fire when the title and lock state are both unchanged.")
     }
 
     func test_renamePane_doesNotTouchOtherPanes() {
@@ -433,6 +477,100 @@ final class PaneNamingTests: XCTestCase {
             Tab.recoverNextTerminalIndex(fromPaneTitles: ["Terminal42"]),
             1, "No whitespace between 'Terminal' and digits must NOT parse."
         )
+    }
+
+    // MARK: - PersistedPane.titleManuallySet round-trip
+
+    /// `Pane.titleManuallySet` must survive snapshot → encode → decode →
+    /// `addRestoredTabModel`, otherwise the user's lock evaporates on
+    /// app relaunch and OSC titles immediately clobber the renamed
+    /// pane's pill. Mirrors `test_persistedTab_decodesNilWhenFieldAbsent`
+    /// for `PersistedTab.titleManuallySet`.
+    func test_renamePane_persistedFlag_survivesRoundTrip() throws {
+        let tabId = TabModel.mainTerminalTabId
+        let paneId = appState.tabs.tab(for: tabId)!.panes[0].id
+        appState.tabs.renamePane(tabId: tabId, paneId: paneId, to: "build")
+        XCTAssertTrue(
+            appState.tabs.tab(for: tabId)!.panes[0].titleManuallySet,
+            "Pre-condition: rename must set the flag."
+        )
+
+        // Snapshot → JSON → decode → re-hydrate via the public restore
+        // path to exercise both the writer and reader sides at once.
+        let snap = appState.windowSession.snapshotPersistedWindow()
+        let data = try JSONEncoder().encode(snap)
+        let decoded = try JSONDecoder().decode(PersistedWindow.self, from: data)
+
+        guard let proj = decoded.projects.first(where: {
+            $0.id == TabModel.terminalsProjectId
+        }), let pTab = proj.tabs.first(where: { $0.id == tabId }),
+              let pPane = pTab.panes.first(where: { $0.id == paneId })
+        else {
+            XCTFail("Renamed pane must be in the round-tripped snapshot")
+            return
+        }
+        XCTAssertEqual(
+            pPane.titleManuallySet, true,
+            "PersistedPane.titleManuallySet must survive JSON encode/decode."
+        )
+
+        // Hydrate a fresh AppState from the decoded snapshot so we
+        // verify the reader side too: `nil → false` and `true → true`.
+        let fresh = AppState()
+        // Drop the Main tab so we can restore into a known project.
+        fresh.tabs.projects.removeAll()
+        fresh.tabs.projects.append(Project(
+            id: TabModel.terminalsProjectId,
+            name: "Terminals", path: "/tmp", tabs: []
+        ))
+        _ = fresh.windowSession.addRestoredTabModel(pTab, toProjectIndex: 0)
+        let hydratedPane = fresh.tabs.tab(for: tabId)?
+            .panes.first(where: { $0.id == paneId })
+        XCTAssertEqual(
+            hydratedPane?.titleManuallySet, true,
+            "addRestoredTabModel must hydrate the flag back onto Pane."
+        )
+    }
+
+    /// Older session files written before `titleManuallySet` existed
+    /// must decode to `nil` so callers' `?? false` hydrates them as
+    /// "not manually set" without crashing on a missing key. Mirror
+    /// of `test_persistedTab_decodesNilWhenFieldAbsent`.
+    func test_persistedPane_decodesNilWhenFieldAbsent() throws {
+        let json = """
+        {
+            "id": "p-old",
+            "title": "Terminal 1",
+            "kind": "terminal",
+            "cwd": null
+        }
+        """
+        let data = json.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(PersistedPane.self, from: data)
+
+        XCTAssertNil(decoded.titleManuallySet,
+                     "titleManuallySet absent in older JSON must decode as nil.")
+    }
+
+    /// Round-trip the optional flag in both `true` and `nil` shapes
+    /// to pin the encoder side. (`nil` is what `snapshotPersistedWindow`
+    /// writes when the flag is false, to keep snapshot JSON small.)
+    func test_persistedPane_roundTripsTitleManuallySet() throws {
+        let pp = PersistedPane(
+            id: "p-rt", title: "build", kind: .terminal,
+            cwd: nil, titleManuallySet: true
+        )
+        let data = try JSONEncoder().encode(pp)
+        let decoded = try JSONDecoder().decode(PersistedPane.self, from: data)
+        XCTAssertEqual(decoded.titleManuallySet, true)
+
+        let nilPp = PersistedPane(
+            id: "p-rt2", title: "Terminal 1", kind: .terminal,
+            cwd: nil, titleManuallySet: nil
+        )
+        let nilData = try JSONEncoder().encode(nilPp)
+        let nilDecoded = try JSONDecoder().decode(PersistedPane.self, from: nilData)
+        XCTAssertNil(nilDecoded.titleManuallySet)
     }
 
     // MARK: - Helpers

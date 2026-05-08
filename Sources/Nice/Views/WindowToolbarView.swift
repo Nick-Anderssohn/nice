@@ -619,8 +619,11 @@ private struct InlinePanePill: View {
         isEditing = false
         titleFocused = false
         removeMouseMonitor()
-        // `renamePane` trims and rejects empty internally, so submitting
-        // an empty draft falls through and the pane keeps its prior name.
+        // `renamePane` trims internally; an empty submit resets the
+        // pane to its per-kind auto-default and clears the manual-set
+        // lock (releasing OSC titles to drive the pill again). A
+        // non-empty submit flips the lock so subsequent OSC titles
+        // can't clobber the user's choice.
         tabs.renamePane(tabId: tabId, paneId: pane.id, to: draftTitle)
         sessions.focusActiveTerminal()
     }
