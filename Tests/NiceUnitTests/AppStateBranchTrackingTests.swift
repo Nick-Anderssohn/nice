@@ -613,6 +613,54 @@ final class AppStateBranchTrackingTests: XCTestCase {
         XCTAssertEqual(decoded.id, "t-legacy")
     }
 
+    // MARK: - paneTitleChanged on the materialized parent
+
+    func test_branchParentPane_isClaudeRunningFalse_ignoresShellOscTitle() {
+        // The materialized parent's claude pane is created with
+        // `isClaudeRunning = false` (deferred-resume mode — the user
+        // has to open the parent and press Enter to actually resume
+        // the conversation). Until that promotion, the pty hosts a
+        // plain zsh whose theme can emit OSC window titles like
+        // "user@host:cwd". Those must not clobber the parent's
+        // inherited title — the parent's whole point is to be a
+        // recovery handle for the pre-rotation conversation, and
+        // mislabeling it as the user's shell prompt makes it
+        // unrecognizable in the sidebar.
+        //
+        // A regression that defaults branch parents to
+        // `isClaudeRunning = true` (e.g. someone copy-pastes the
+        // `createClaudeTabInProject` body into the branch path) would
+        // be caught nowhere else — the gate would silently release on
+        // a pane whose pty is zsh, not claude.
+        seedClaudeTab(
+            projectId: "p", tabId: "t1", sessionId: "OLD",
+            title: "wire up the foo"
+        )
+
+        appState.sessions.handleClaudeSessionUpdate(
+            paneId: "t1-claude", sessionId: "NEW", source: "resume"
+        )
+
+        let parent = projectById("p").tabs[0]
+        let parentClaudePane = parent.panes.first { $0.kind == .claude }!
+        XCTAssertFalse(
+            parentClaudePane.isClaudeRunning,
+            "Sanity: branch parent's claude pane is in deferred-resume state."
+        )
+
+        appState.sessions.paneTitleChanged(
+            tabId: parent.id,
+            paneId: parentClaudePane.id,
+            title: "Nick@Nicks MacBook Air:~/Projects/nice"
+        )
+
+        XCTAssertEqual(
+            projectById("p").tabs[0].title, "wire up the foo",
+            "Branch parent's inherited title must survive shell OSC titles " +
+            "from its deferred-resume zsh."
+        )
+    }
+
     // MARK: - Helpers
 
     private func seedClaudeTab(

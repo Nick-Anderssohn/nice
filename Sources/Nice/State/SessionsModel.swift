@@ -333,6 +333,23 @@ final class SessionsModel {
             return
         }
 
+        // Claude pane but claude isn't actually running: the underlying
+        // pty is a plain zsh in `.resumeDeferred` mode — either a
+        // restored tab waiting for the user to hit Enter on the pre-
+        // typed `claude --resume <uuid>`, or a freshly-materialized
+        // /branch parent (which uses the same mode). zsh themes
+        // (oh-my-zsh, p10k, starship, …) emit OSC window titles like
+        // "user@host:cwd" on every prompt; those would otherwise flow
+        // into `applyAutoTitle` and clobber the persisted Claude
+        // session label. Skip the entire Claude branch — no status
+        // transition (zsh has no thinking/waiting semantics) and no
+        // tab-title application — until `handleClaudeSocketRequest`
+        // flips `isClaudeRunning` and the real Claude takes over the
+        // OSC stream. `false` only ever appears at pane creation; once
+        // a pane has been promoted there is no path back to false
+        // without removing the pane outright via `paneExited`.
+        guard pane.isClaudeRunning else { return }
+
         // Claude pane: split off the status prefix, update pane/tab
         // status, and feed the trailing label into the tab title.
         guard let first = title.unicodeScalars.first else { return }
@@ -709,7 +726,15 @@ final class SessionsModel {
     /// - "inplace <uuid>": same promotion, but mint a new session id
     ///   so we can later resume it. The wrapper prepends
     ///   `--session-id <uuid>`.
-    private func handleClaudeSocketRequest(
+    ///
+    /// `internal` so unit tests can drive the dispatch path directly
+    /// without standing up a real socket — matches `paneExited` and
+    /// `handleClaudeSessionUpdate`'s access level for the same reason.
+    /// The promotion path here is also the only writer that flips a
+    /// pane's `isClaudeRunning` from `false` to `true`, which is the
+    /// signal `paneTitleChanged`'s OSC-title gate releases on; testing
+    /// this dispatch in isolation pins that load-bearing transition.
+    func handleClaudeSocketRequest(
         cwd: String,
         args: [String],
         tabId: String,

@@ -42,6 +42,16 @@ enum TabModelFixtures {
     ///     `/tmp/<projectId>`.
     ///   - appendToExisting: When `true`, append to the existing
     ///     project of that id instead of creating a fresh one.
+    ///   - isClaudeRunning: Initial value of the seeded Claude pane's
+    ///     `isClaudeRunning` flag. Defaults to `true` to match
+    ///     production's `createTab*` paths (every live-Claude spawn
+    ///     site sets this true synchronously before the pty starts)
+    ///     and to satisfy `paneTitleChanged`'s `isClaudeRunning` gate,
+    ///     which existing braille/sparkle/auto-title tests now
+    ///     depend on — without the gate, restored deferred-resume
+    ///     panes' zsh OSC titles would clobber the persisted Claude
+    ///     session label. Pass `false` to exercise the deferred-
+    ///     resume / `/branch` parent path explicitly.
     @discardableResult
     static func seedClaudeTab(
         into tabs: TabModel,
@@ -50,18 +60,21 @@ enum TabModelFixtures {
         sessionId: String? = nil,
         projectName: String? = nil,
         projectPath: String? = nil,
-        appendToExisting: Bool = false
+        appendToExisting: Bool = false,
+        isClaudeRunning: Bool = true
     ) -> SeededClaudeTab {
         let claudePaneId = "\(tabId)-claude"
         let terminalPaneId = "\(tabId)-t1"
         let resolvedPath = projectPath ?? "/tmp/\(projectId)"
+        var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
+        claudePane.isClaudeRunning = isClaudeRunning
         let tab = Tab(
             id: tabId,
             title: "New tab",
             cwd: resolvedPath,
             branch: nil,
             panes: [
-                Pane(id: claudePaneId, title: "Claude", kind: .claude),
+                claudePane,
                 Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
             ],
             activePaneId: claudePaneId,

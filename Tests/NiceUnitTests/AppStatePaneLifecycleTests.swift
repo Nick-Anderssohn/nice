@@ -229,6 +229,93 @@ final class AppStatePaneLifecycleTests: XCTestCase {
         XCTAssertEqual(appState.tabs.tab(for: "t1")!.title, "Refactor auth layer")
     }
 
+    func test_paneTitleChanged_claudePane_deferredResume_ignoresShellTitle() {
+        // Restored Claude tabs (and freshly-materialized /branch parent
+        // tabs) spawn `/bin/zsh -il` in `.resumeDeferred` mode — the
+        // pty is plain zsh until the user hits Enter on the pre-typed
+        // `claude --resume <uuid>`. zsh themes (oh-my-zsh, p10k, …)
+        // emit OSC window titles like "user@host:cwd" on every prompt;
+        // those must NOT clobber the persisted Claude session label.
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            isClaudeRunning: false
+        )
+        let claudeId = appState.tabs.tab(for: "t1")!.panes[0].id
+        appState.tabs.applyAutoTitle(tabId: "t1", rawTitle: "fix-top-bar-height")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")!.title, "Fix top bar height",
+                       "Precondition: tab has a real auto-titled label.")
+
+        appState.sessions.paneTitleChanged(tabId: "t1", paneId: claudeId,
+                                  title: "Nick@Nicks MacBook Air:~/Projects/nice")
+
+        XCTAssertEqual(appState.tabs.tab(for: "t1")!.title, "Fix top bar height",
+                       "OSC titles from a deferred-resume Claude pane (zsh, not claude) " +
+                       "must not overwrite the persisted session title.")
+    }
+
+    func test_paneTitleChanged_claudePane_deferredResume_ignoresStatusPrefix() {
+        // Defensive: braille/sparkle prefixes from a non-claude process
+        // (extremely unlikely from zsh themes, but cheap to pin) must
+        // not flip the pane status either while `isClaudeRunning` is
+        // false — the spinner/sparkle vocabulary belongs to claude.
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            isClaudeRunning: false
+        )
+        let claudeId = appState.tabs.tab(for: "t1")!.panes[0].id
+        let titleBefore = appState.tabs.tab(for: "t1")!.title
+
+        appState.sessions.paneTitleChanged(tabId: "t1", paneId: claudeId,
+                                  title: "\u{2840} fix-bug")
+
+        let pane = appState.tabs.tab(for: "t1")!.panes.first { $0.id == claudeId }!
+        XCTAssertEqual(pane.status, .idle,
+                       "Status transitions are gated on isClaudeRunning.")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")!.title, titleBefore,
+                       "Tab title must not change while isClaudeRunning is false.")
+    }
+
+    func test_paneTitleChanged_claudePane_acceptsTitleAfterPromotion() {
+        // The full deferred-resume → live-claude story. A regression
+        // that breaks promotion (e.g. `handleClaudeSocketRequest`
+        // forgets to flip `isClaudeRunning`) would leave a restored
+        // tab forever silent — the gate would hold against zsh, but
+        // also hold against the real claude OSC stream that arrives
+        // after promotion. Pin both halves: gate holds before the
+        // flip, and releases after.
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            isClaudeRunning: false
+        )
+        let claudeId = appState.tabs.tab(for: "t1")!.panes[0].id
+        let titleBefore = appState.tabs.tab(for: "t1")!.title
+
+        // Pre-promotion: zsh OSC ignored.
+        appState.sessions.paneTitleChanged(tabId: "t1", paneId: claudeId,
+                                  title: "Nick@host:~/repo")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")!.title, titleBefore,
+                       "Gate must hold before isClaudeRunning flips true.")
+
+        // Simulate the socket-handshake promotion that flips the flag.
+        // We don't drive `handleClaudeSocketRequest` here (that path is
+        // covered separately in SessionsModelClaudeSocketRequestTests);
+        // poking the flag directly keeps this test focused on the gate.
+        mutateTabTestOnly(id: "t1") { tab in
+            guard let pi = tab.panes.firstIndex(where: { $0.id == claudeId }) else { return }
+            tab.panes[pi].isClaudeRunning = true
+        }
+
+        // Post-promotion: real claude OSC accepted, status flips to
+        // thinking, label humanizes onto the tab title.
+        appState.sessions.paneTitleChanged(tabId: "t1", paneId: claudeId,
+                                  title: "\u{2840} fix-bug")
+        let pane = appState.tabs.tab(for: "t1")!.panes.first { $0.id == claudeId }!
+        XCTAssertEqual(pane.status, .thinking,
+                       "Status transition must fire once isClaudeRunning flips true.")
+        XCTAssertEqual(appState.tabs.tab(for: "t1")!.title, "Fix bug",
+                       "Auto-title must apply once the gate releases.")
+    }
+
     // MARK: - applyAutoTitle
 
     func test_applyAutoTitle_humanizesKebabCase() {
