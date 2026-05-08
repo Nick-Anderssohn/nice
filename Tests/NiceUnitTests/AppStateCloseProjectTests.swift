@@ -8,7 +8,11 @@
 //  asserts that requestCloseTab dissolves a tab whose companion
 //  terminal is lazy (unspawned) — a regression caught manually when
 //  the first cut of Close Project left Claude tabs as zombie terminal
-//  tabs because terminatePane is a no-op on unspawned panes.
+//  tabs because terminatePane is a no-op on unspawned panes — and
+//  the through-line for the right-click → Close bug on a never-
+//  focused resume-deferred Claude tab (entry exists, pty never
+//  forked, terminatePane silently returned without firing paneExited
+//  before the armed-but-not-fired fast path was added).
 //
 //  Tests seed panes via plain `Project` / `Tab` / `Pane` values and
 //  never drive a pty, so every pane is "unspawned" from the
@@ -172,6 +176,57 @@ final class AppStateCloseProjectTests: XCTestCase {
                      "Close Tab must dissolve the tab even when the companion terminal was never spawned.")
         XCTAssertNotNil(appState.tabs.projects.first { $0.id == "p1" },
                         "Close Tab must leave the containing project in place — only Close Project removes it.")
+    }
+
+    func test_requestCloseTab_armedDeferredClaudePaneWithUnspawnedCompanion_dissolves() {
+        // Repro for the right-click → Close bug on a never-focused
+        // resume-deferred Claude tab. After window restore the
+        // Claude pane's NiceTerminalView captures a deferred zsh
+        // spawn, but if the user never clicks the tab the gate
+        // never fires (no non-zero frame in a window). The pane's
+        // entry exists in the session's `entries` dict, so
+        // `paneIsSpawned` returns true and `hardKillTab` routes it
+        // through `terminatePane`. Before the fix, `terminatePane`
+        // hit `guard pid > 0 else { return }` and silently no-op'd
+        // without firing `paneExited`. The companion terminal pane
+        // (also unspawned, but with no entry at all) was dropped
+        // by hardKillTab's unspawned branch — but the never-fired
+        // Claude pane stayed in `tab.panes`, so the tab welded to
+        // the sidebar.
+        //
+        // The synthetic-armed-deferred seam mirrors the production
+        // post-cancel state at the model layer: `paneIsSpawned`
+        // true, `terminatePane` fires `paneExited(_, _, nil)`
+        // synchronously. Drives the same control-flow path the
+        // user hits in production without standing up a real
+        // SwiftTerm view that AppKit would resize away from .zero.
+        let seed = TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p1", tabId: "t1"
+        )
+        // Extra project keeps us off the all-empty NSApp.terminate path.
+        seedProjectWithClaudeTab(projectId: "p2", tabId: "t2")
+        // The restored Claude pane is rendered as Claude but no
+        // claude process is running yet — match the production
+        // resume-deferred pane state at the model layer.
+        appState.tabs.mutateTab(id: "t1") { tab in
+            guard let pi = tab.panes.firstIndex(where: { $0.id == seed.claudePaneId })
+            else { return }
+            tab.panes[pi].isClaudeRunning = false
+        }
+        appState.sessions.markSyntheticArmedDeferredPaneForTesting(
+            tabId: "t1", paneId: seed.claudePaneId
+        )
+
+        appState.closer.requestCloseTab(tabId: "t1")
+
+        XCTAssertNil(
+            appState.tabs.tab(for: "t1"),
+            "Close Tab on a never-focused resume-deferred Claude tab must dissolve the sidebar row — that's the bug."
+        )
+        XCTAssertNotNil(
+            appState.tabs.projects.first { $0.id == "p1" },
+            "Close Tab must leave the containing project in place."
+        )
     }
 
     func test_requestCloseTab_heldClaudePaneWithUnspawnedCompanion_dissolves() {

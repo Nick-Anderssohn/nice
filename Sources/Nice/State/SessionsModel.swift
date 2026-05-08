@@ -1047,6 +1047,19 @@ final class SessionsModel {
             paneExited(tabId: tabId, paneId: paneId, exitCode: 1)
             return
         }
+        if syntheticArmedDeferredPanes.remove(key) != nil {
+            // Test-only synthetic-armed-deferred path: mirror the
+            // production armed-but-not-fired fast path on
+            // `TabPtySession.terminatePane`, which cancels the
+            // captured spawn and fires `onPaneExit(id, nil)`. There
+            // is no real `pendingSpawn` to cancel here — the seam
+            // simulates the post-cancel state directly. nil exit
+            // code matches the production synthesis (no real child
+            // ever ran).
+            syntheticSpawnedPanes.remove(key)
+            paneExited(tabId: tabId, paneId: paneId, exitCode: nil)
+            return
+        }
         ptySessions[tabId]?.terminatePane(id: paneId)
     }
 
@@ -1080,6 +1093,14 @@ final class SessionsModel {
     /// matching the one-shot semantics of the production held entry.
     @ObservationIgnored
     private var syntheticHeldPanes: Set<String> = []
+    /// Subset of `syntheticSpawnedPanes` whose `terminatePane` should
+    /// fire `paneExited(tabId, paneId, nil)` synchronously, mirroring
+    /// the armed-but-not-fired fast path in
+    /// `TabPtySession.terminatePane`. Removed once consumed, matching
+    /// the one-shot semantics of the production cancel — once you've
+    /// declared the pane gone you can't re-cancel.
+    @ObservationIgnored
+    private var syntheticArmedDeferredPanes: Set<String> = []
 
     private static func syntheticPaneKey(tabId: String, paneId: String) -> String {
         "\(tabId):\(paneId)"
@@ -1097,6 +1118,23 @@ final class SessionsModel {
         let key = Self.syntheticPaneKey(tabId: tabId, paneId: paneId)
         syntheticSpawnedPanes.insert(key)
         syntheticHeldPanes.insert(key)
+    }
+
+    /// Test-only: mark `paneId` on `tabId` as if its
+    /// `NiceTerminalView` had captured a deferred spawn but never
+    /// fired (the view never got a non-zero frame in a window). After
+    /// this call, `paneIsSpawned` returns true (so `hardKillTab`
+    /// routes the pane through the spawned branch) and
+    /// `terminatePane` fires `paneExited(tabId, paneId, nil)`
+    /// synchronously, matching the production armed-but-not-fired
+    /// fast path on `TabPtySession.terminatePane`. Lets close-flow
+    /// tests repro the right-click → Close on a never-focused
+    /// resume-deferred Claude tab without standing up a real
+    /// SwiftTerm view that AppKit would resize away from .zero.
+    func markSyntheticArmedDeferredPaneForTesting(tabId: String, paneId: String) {
+        let key = Self.syntheticPaneKey(tabId: tabId, paneId: paneId)
+        syntheticSpawnedPanes.insert(key)
+        syntheticArmedDeferredPanes.insert(key)
     }
 
     /// Drop the pty-session cache entry for `tabId`. Called by

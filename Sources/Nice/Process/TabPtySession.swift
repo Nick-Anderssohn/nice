@@ -587,15 +587,33 @@ final class TabPtySession: TabPtySessionThemeable {
     /// can read the output), the pty is gone and `kill` would no-op.
     /// Synthesize the deferred `onPaneExit` instead so the upper
     /// layer's tab-dissolve cascade fires through its normal path.
-    /// Marking the pane as intentionally-terminated before the SIGHUP
-    /// — and crucially before any `pid > 0` guard — also ensures
-    /// that if SIGHUP causes the child to exit non-zero (interactive
-    /// shells often do), `handlePaneExit` drops it rather than
-    /// holding a "[Process exited]" footer the user never asked to
-    /// see. The flag must be set before the pid guard so a pane
-    /// whose child never had a real pid (e.g. a spawn that failed
-    /// before allocating one) still drops cleanly if its delegate
-    /// later fires.
+    ///
+    /// Armed-but-not-fired fast path: every claude/terminal pane is
+    /// created via `armDeferredSpawn`, which captures the
+    /// `startProcess` arguments and waits for AppKit to lay the
+    /// view out at a non-zero frame inside a window before forking
+    /// (`NiceTerminalView.firePendingSpawnIfReady`). Until that
+    /// gate fires, `entries[id]` exists but `view.process.shellPid
+    /// == 0`. The most common way for a pane to sit in this state
+    /// is a sidebar tab restored from a previous session that the
+    /// user never focused — most often a `.resumeDeferred` Claude
+    /// tab. Those panes hit the same synthesize-exit need as held
+    /// panes: there's no live child to signal, but the model still
+    /// expects `onPaneExit` so the pane can drop and the tab can
+    /// dissolve. Cancel `pendingSpawn` first so a layout pass that
+    /// happens to fire mid-teardown can't fork a child after we've
+    /// already declared the pane gone.
+    ///
+    /// Marking the pane as intentionally-terminated before the
+    /// SIGHUP — and crucially before any `pid > 0` guard — also
+    /// ensures that if SIGHUP causes the child to exit non-zero
+    /// (interactive shells often do), `handlePaneExit` drops it
+    /// rather than holding a "[Process exited]" footer the user
+    /// never asked to see. The flag must be set before the pid
+    /// guard so a pane whose child never had a real pid (e.g. a
+    /// spawn that failed *after* the gate fired but before
+    /// allocating a pid) still drops cleanly if its delegate later
+    /// fires.
     func terminatePane(id: String) {
         guard var entry = entries[id] else { return }
 
@@ -605,6 +623,15 @@ final class TabPtySession: TabPtySessionThemeable {
             entry.heldExitCode = nil
             entries[id] = entry
             onPaneExit(id, code)
+            return
+        }
+
+        if entry.view.cancelPendingSpawn() {
+            // No `entries[id] = entry` writeback: unlike the held-pane
+            // branch above, this path doesn't mutate any value-typed
+            // field on `PaneEntry`. The cancellation lives on the
+            // reference-typed `view` and is already visible.
+            onPaneExit(id, nil)
             return
         }
 

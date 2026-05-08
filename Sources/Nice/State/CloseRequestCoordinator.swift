@@ -298,14 +298,20 @@ final class CloseRequestCoordinator {
         guard let tabs, let sessions, let tab = tabs.tab(for: tabId) else { return }
 
         // Split panes by whether they've actually been spawned.
-        // `terminatePane` is a no-op for unspawned panes (the lazy
-        // companion terminal on a Claude tab the user never focused,
-        // for example), so if we only SIGHUP we'd leave those panes
-        // in the model and the tab would never dissolve — on Claude
-        // tabs `ensureActivePaneSpawned` would then start the
-        // companion shell and the tab would keep living as a
-        // terminal. Drop unspawned panes from the model directly so
-        // the tab reaches empty-panes and dissolves.
+        // `terminatePane` is a no-op for panes with no `entries`
+        // row at all (the lazy companion terminal on a Claude tab
+        // the user never focused, for example), so if we only
+        // SIGHUP we'd leave those panes in the model and the tab
+        // would never dissolve — on Claude tabs
+        // `ensureActivePaneSpawned` would then start the companion
+        // shell and the tab would keep living as a terminal. Drop
+        // unspawned panes from the model directly so the tab
+        // reaches empty-panes and dissolves. Panes whose entry
+        // exists but whose pty hasn't forked yet (e.g. a restored
+        // resume-deferred Claude tab the user never focused) are
+        // routed through the spawned branch — `terminatePane`'s
+        // armed-but-not-fired fast path cancels their pending
+        // spawn and synthesizes the deferred `paneExited`.
         var spawnedIds: [String] = []
         var unspawnedIds: [String] = []
         for pane in tab.panes {

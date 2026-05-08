@@ -61,10 +61,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
         let execName: String?
         let currentDirectory: String?
     }
-    /// Visible at `internal` access so `@testable import Nice` can
-    /// inspect the gate state directly without forking a real child.
-    var pendingSpawn: PendingSpawn?
-    var hasFiredPendingSpawn = false
+    /// Getters at `internal` so `@testable import Nice` can inspect
+    /// the gate state directly without forking a real child. Setters
+    /// are private — the only legitimate state transitions are
+    /// "armed" (`armDeferredSpawn`), "fired" (`firePendingSpawnIfReady`),
+    /// and "cancelled" (`cancelPendingSpawn`); production code
+    /// outside this file should reach for those, not poke the fields.
+    private(set) var pendingSpawn: PendingSpawn?
+    private(set) var hasFiredPendingSpawn = false
 
     private static let acceptedDragTypes: [NSPasteboard.PasteboardType] = [
         .fileURL,
@@ -207,6 +211,26 @@ final class NiceTerminalView: LocalProcessTerminalView {
         }
         super.setFrameSize(newSize)
         firePendingSpawnIfReady()
+    }
+
+    /// Cancel a captured-but-unfired deferred spawn. Returns `true`
+    /// iff the gate was armed and not yet fired — i.e. there were
+    /// args to drop. No-op (returns `false`) once the gate has
+    /// fired or before any spawn was armed.
+    ///
+    /// `TabPtySession.terminatePane` calls this when tearing down a
+    /// pane whose pty never started. The cancellation is what stops
+    /// a layout pass mid-teardown from forking a child after we've
+    /// declared the pane gone — `firePendingSpawnIfReady` short-
+    /// circuits when `pendingSpawn == nil`. Centralising the
+    /// transition here (rather than letting callers poke the field)
+    /// gives the cancellation a named callsite and keeps the gate's
+    /// state machine entirely owned by this view.
+    @discardableResult
+    func cancelPendingSpawn() -> Bool {
+        guard pendingSpawn != nil, !hasFiredPendingSpawn else { return false }
+        pendingSpawn = nil
+        return true
     }
 
     /// Single readiness gate. Fires the captured spawn exactly once,
