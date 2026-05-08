@@ -136,6 +136,93 @@ final class AppStatePaneLifecycleTests: XCTestCase {
                        "Unknown paneId must not corrupt state.")
     }
 
+    // MARK: - paneHeld
+
+    func test_paneHeld_flipsIsAliveAndIdlesStatus() {
+        // The held-on-exit feature: when claude (or any process) exits
+        // non-cleanly, the pane is held open with its scrollback
+        // visible. This handler is what flips the model state to "dead
+        // but still on screen" so the rest of the app (sidebar dot,
+        // hasClaude, livePaneCounts, isBusy) stops treating the pane
+        // as live. Pane sits in `.thinking` before the exit (typical:
+        // claude was mid-response when it crashed); hold must idle
+        // it out.
+        seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
+        let claudePaneId = appState.tabs.tab(for: "t1")!.panes[0].id
+        mutateTabTestOnly(id: "t1") { tab in
+            guard let pi = tab.panes.firstIndex(where: { $0.id == claudePaneId })
+            else { return }
+            tab.panes[pi].status = .thinking
+            tab.panes[pi].waitingAcknowledged = false
+        }
+
+        appState.sessions.paneHeld(tabId: "t1", paneId: claudePaneId, exitCode: 1)
+
+        let pane = appState.tabs.tab(for: "t1")!.panes
+            .first(where: { $0.id == claudePaneId })!
+        XCTAssertFalse(pane.isAlive,
+                       "paneHeld must flip isAlive to false so the rest of the model treats the pane as dead.")
+        XCTAssertEqual(pane.status, .idle,
+                       "paneHeld must idle out the status — a held-dead pane is not thinking or waiting.")
+        XCTAssertFalse(pane.waitingAcknowledged,
+                       "paneHeld must clear waitingAcknowledged so a future fresh waiting pane can pulse again.")
+        XCTAssertFalse(pane.isClaudeRunning,
+                       "paneHeld must clear isClaudeRunning so a fresh `claude` invocation in this tab is routed correctly (no stale promotion target).")
+    }
+
+    func test_paneHeld_keepsPaneInTabPanesArray() {
+        // The whole point of the hold is that the pane (and therefore
+        // its toolbar pill + SwiftTerm view) stays mounted; only
+        // `paneExited` removes it. Distinct contract from `paneExited`
+        // — a regression that confused the two would make held panes
+        // vanish from the toolbar.
+        seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
+        let claudePaneId = appState.tabs.tab(for: "t1")!.panes[0].id
+        let paneCountBefore = appState.tabs.tab(for: "t1")!.panes.count
+
+        appState.sessions.paneHeld(tabId: "t1", paneId: claudePaneId, exitCode: 1)
+
+        let after = appState.tabs.tab(for: "t1")!
+        XCTAssertEqual(after.panes.count, paneCountBefore,
+                       "paneHeld must not remove the pane from tab.panes — that's paneExited's job.")
+        XCTAssertNotNil(after.panes.first(where: { $0.id == claudePaneId }),
+                        "The held pane must still be findable by id.")
+    }
+
+    func test_paneHeld_clearsLaunchOverlay() {
+        // Exit-before-first-byte case: the "Launching…" overlay was
+        // still visible when the process died (e.g. claude
+        // mis-resolves and exits in <0.75s). Without clearing the
+        // overlay, the launch placeholder would sit on top of the
+        // dead-pane footer until something else cleared it. Set the
+        // grace to zero so `registerPaneLaunch` promotes synchronously
+        // — no DispatchQueue dance in tests.
+        seedProjectWithClaudeTab(projectId: "p", tabId: "t1")
+        appState.sessions.launchOverlayGraceSeconds = 0
+        let claudePaneId = appState.tabs.tab(for: "t1")!.panes[0].id
+        appState.sessions.registerPaneLaunch(paneId: claudePaneId, command: "claude")
+        XCTAssertNotNil(appState.sessions.paneLaunchStates[claudePaneId],
+                        "Pre-condition: launch overlay entry must exist before paneHeld fires.")
+
+        appState.sessions.paneHeld(tabId: "t1", paneId: claudePaneId, exitCode: 1)
+
+        XCTAssertNil(appState.sessions.paneLaunchStates[claudePaneId],
+                     "paneHeld must clear the launch overlay; otherwise an exit-before-first-byte leaves the placeholder stuck on top of the held pane's footer.")
+    }
+
+    func test_paneHeld_unknownPane_isNoOp() {
+        // Defensive: a callback fires for a tab that's already been
+        // dissolved or for a pane id that's not in the model.
+        let before = appState.tabs.livePaneCounts
+        appState.sessions.paneHeld(
+            tabId: TabModel.mainTerminalTabId,
+            paneId: "does-not-exist",
+            exitCode: 1
+        )
+        XCTAssertEqual(appState.tabs.livePaneCounts.terminal, before.terminal,
+                       "Unknown paneId must not corrupt state.")
+    }
+
     // MARK: - paneTitleChanged
 
     func test_paneTitleChanged_terminalPane_updatesPaneTitle() {

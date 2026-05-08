@@ -3,7 +3,7 @@
 //  Nice
 //
 //  Each sidebar tab (session) owns a set of `Pane`s — claude or terminal.
-//  Each pane backs a `LocalProcessTerminalView` stored in `panes[paneId]`.
+//  Each pane backs a `LocalProcessTerminalView` stored in `entries[paneId]`.
 //  Panes are spawned at session init (one claude pane for user-created
 //  sessions + one terminal pane) and on demand via `addTerminalPane`.
 //
@@ -41,14 +41,53 @@ final class TabPtySession: TabPtySessionThemeable {
     let tabId: String
     let cwd: String
 
-    /// All live panes (claude + terminal) keyed by pane id. Typed as
-    /// `NiceTerminalView` (the `LocalProcessTerminalView` subclass that
-    /// owns Nice-side behaviours like image drag-and-drop); the values
-    /// still pass anywhere the supertype is expected (e.g. `TerminalHost`).
-    var panes: [String: NiceTerminalView] = [:]
-    /// Retains the per-view termination delegates so SwiftTerm's weak
-    /// `processDelegate` reference stays live.
-    private var delegates: [String: ProcessTerminationDelegate] = [:]
+    /// All panes (claude + terminal) keyed by pane id. Each entry
+    /// bundles the SwiftTerm view, its kind, the retained termination
+    /// delegate, and per-pane lifecycle flags (held, intentional-kill).
+    /// Single dict so adding any future per-pane field doesn't reopen
+    /// the parallel-dicts coherence problem — `removePane` is the one
+    /// place an entry exits the system, and an `entries.removeValue`
+    /// there is enough to clear *every* per-pane bit at once.
+    ///
+    /// Entries outlive the underlying child process — when a pane
+    /// exits non-cleanly we keep its view mounted so the user can
+    /// read whatever the process printed on the way out (see
+    /// `handlePaneExit`). The view's terminal buffer is owned by
+    /// SwiftTerm, not the pty, so keeping the view in the dict
+    /// preserves the scrollback even though the child is gone.
+    private(set) var entries: [String: PaneEntry] = [:]
+
+    /// Per-pane state. Bundles every field that's keyed by pane id so
+    /// the lifecycle invariants (everything appears at spawn,
+    /// everything disappears at `removePane`) are enforceable from
+    /// one place.
+    struct PaneEntry {
+        let view: NiceTerminalView
+        let kind: PaneKind
+        /// Strong-ref retain for SwiftTerm's weak `processDelegate`.
+        let delegate: ProcessTerminationDelegate
+        /// True once the pane's child process has exited and we've
+        /// decided to keep the view mounted so the user can read the
+        /// final output. A later user-driven dismiss (`terminatePane`)
+        /// or session teardown (`terminateAll`) reads `heldExitCode`
+        /// and synthesizes the deferred `onPaneExit` so the upper
+        /// layer's dissolve cascade fires through its normal path.
+        var isHeld: Bool = false
+        /// Saved exit code for a held pane; ignored when `isHeld` is
+        /// false. `nil` means "killed by signal, no waitstatus" — the
+        /// same semantics SwiftTerm reports.
+        var heldExitCode: Int32? = nil
+        /// True iff Nice itself initiated the kill of this pane
+        /// (`terminatePane`, `terminateAll`). Set BEFORE SIGHUP — and
+        /// before any `pid > 0` guard — so that the resulting `onExit`
+        /// delegate, regardless of exit code, drops through
+        /// `handlePaneExit` straight to `onPaneExit` instead of being
+        /// held with a "[Process exited]" footer the user explicitly
+        /// asked to dismiss. The flag is consumed (cleared) on read in
+        /// `handlePaneExit` so a future re-entry on the same id starts
+        /// from a clean state.
+        var intentionalTerminate: Bool = false
+    }
 
     private let onPaneExit: @MainActor (String, Int32?) -> Void
     private let onPaneTitleChange: @MainActor (String, String) -> Void
@@ -68,6 +107,15 @@ final class TabPtySession: TabPtySessionThemeable {
     /// to the pty. AppState uses this to clear the "Launching…" overlay
     /// for that pane.
     private let onPaneFirstOutput: (@MainActor (String) -> Void)?
+    /// Called when a pane's process has exited but Nice has chosen to
+    /// keep the view mounted so the user can read its final output. The
+    /// upper layer flips `Pane.isAlive = false` and dismisses the
+    /// launch overlay; the pane stays in the tab's `panes` array (and
+    /// in `self.entries`) until a later dismiss path tears it down.
+    /// `nil` callback degrades the feature to "drop on exit as before"
+    /// — kept optional so tests / previews can construct a session
+    /// without wiring it.
+    private let onPaneHeld: (@MainActor (String, Int32?) -> Void)?
 
     /// Cached SwiftUI `ColorScheme` so panes added after init can be
     /// themed at creation without round-tripping through `AppState`.
@@ -152,7 +200,8 @@ final class TabPtySession: TabPtySessionThemeable {
         onPaneTitleChange: @escaping @MainActor (String, String) -> Void,
         onPaneCwdChange: (@MainActor (String, String) -> Void)? = nil,
         onPaneLaunched: (@MainActor (String, String) -> Void)? = nil,
-        onPaneFirstOutput: (@MainActor (String) -> Void)? = nil
+        onPaneFirstOutput: (@MainActor (String) -> Void)? = nil,
+        onPaneHeld: (@MainActor (String, Int32?) -> Void)? = nil
     ) {
         self.tabId = tabId
         self.cwd = cwd
@@ -161,6 +210,7 @@ final class TabPtySession: TabPtySessionThemeable {
         self.onPaneCwdChange = onPaneCwdChange
         self.onPaneLaunched = onPaneLaunched
         self.onPaneFirstOutput = onPaneFirstOutput
+        self.onPaneHeld = onPaneHeld
         self.socketPath = socketPath
         self.zdotdirPath = zdotdirPath
         self.userZDotDir = userZDotDir
@@ -174,6 +224,25 @@ final class TabPtySession: TabPtySessionThemeable {
         if let termId = initialTerminalPaneId {
             _ = addTerminalPane(id: termId, cwd: cwd)
         }
+    }
+
+    // MARK: - Pane lookup (read-only)
+
+    /// SwiftTerm view for a hosted pane, or nil if the pane has never
+    /// been spawned (lazy companion terminal) or has been torn down.
+    /// Returns the view for both live and held panes — held panes are
+    /// "still hosted," just with a dead pty.
+    func view(forPane id: String) -> NiceTerminalView? {
+        entries[id]?.view
+    }
+
+    /// True iff this session currently owns an entry for `id` —
+    /// includes both live panes and held-but-dead panes (whose view is
+    /// kept around so the user can read the exit output). False for
+    /// unspawned panes (the lazy companion terminal that has never
+    /// been focused).
+    func hasPane(_ id: String) -> Bool {
+        entries[id] != nil
     }
 
     // MARK: - Pane spawn
@@ -195,8 +264,7 @@ final class TabPtySession: TabPtySessionThemeable {
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
-        panes[id] = view
-        delegates[id] = delegate
+        entries[id] = PaneEntry(view: view, kind: .claude, delegate: delegate)
         installLaunchOverlayHooks(on: view, paneId: id, kind: .claude)
 
         let resolvedCwd = Self.expandTilde(cwd)
@@ -278,8 +346,7 @@ final class TabPtySession: TabPtySessionThemeable {
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
-        panes[id] = view
-        delegates[id] = delegate
+        entries[id] = PaneEntry(view: view, kind: .terminal, delegate: delegate)
         installLaunchOverlayHooks(
             on: view, paneId: id, kind: .terminal, displayCommand: command
         )
@@ -316,9 +383,11 @@ final class TabPtySession: TabPtySessionThemeable {
     }
 
     /// Build a `.pane` role delegate that routes exit + title change
-    /// back to `AppState`.
+    /// back to `AppState`. The exit branch goes through
+    /// `handlePaneExit` (not directly to `onPaneExit`) so the hold-vs-
+    /// drop decision can intercept non-zero / unexpected exits before
+    /// the upper layer dissolves the pane and destroys its scrollback.
     private func makePaneDelegate(paneId: String) -> ProcessTerminationDelegate {
-        let onExit = self.onPaneExit
         let onTitleChange = self.onPaneTitleChange
         let onCwdChange = self.onPaneCwdChange
         let cwdForwarder: (@MainActor (ProcessTerminationDelegate.Role, String) -> Void)?
@@ -333,9 +402,9 @@ final class TabPtySession: TabPtySessionThemeable {
         }
         return ProcessTerminationDelegate(
             role: .pane(tabId: tabId, paneId: paneId),
-            onExit: { [onExit] role, code in
+            onExit: { [weak self] role, code in
                 if case let .pane(_, paneId) = role {
-                    onExit(paneId, code)
+                    self?.handlePaneExit(paneId: paneId, exitCode: code)
                 }
             },
             onTitleChange: { [onTitleChange] role, title in
@@ -347,12 +416,110 @@ final class TabPtySession: TabPtySessionThemeable {
         )
     }
 
-    /// Drop a pane's view + delegate from the dicts. Does NOT terminate
-    /// the underlying process — callers invoke this from the pane's
-    /// exit hook, by which time the process is already gone.
+    /// Decide whether a freshly-exited pane drops immediately or holds
+    /// its view (and scrollback) so the user can read what the process
+    /// printed before dying. Holding writes a dim footer line into the
+    /// SwiftTerm buffer and routes the `onPaneHeld` callback so the
+    /// model can flip `Pane.isAlive = false`; the actual model removal
+    /// is deferred until the user closes the tab (which calls back into
+    /// `terminatePane`, which then synthesizes the deferred
+    /// `onPaneExit`).
+    ///
+    /// The hold path requires the entry (so we know the kind for the
+    /// footer label and have the view to feed). A missing entry is
+    /// defensive — a freshly-instantiated session that somehow exited
+    /// before its spawn methods finished — and falls back to a drop
+    /// so the model never gets stuck on a half-initialized pane.
+    private func handlePaneExit(paneId: String, exitCode: Int32?) {
+        guard var entry = entries[paneId] else {
+            onPaneExit(paneId, exitCode)
+            return
+        }
+        // Consume the intentional-kill flag whether we hold or drop —
+        // the next exit on this id (impossible today, but cheap) must
+        // start from a clean state.
+        let intentional = entry.intentionalTerminate
+        entry.intentionalTerminate = false
+
+        let shouldHold = Self.shouldHoldOnExit(
+            exitCode: exitCode, intentionallyTerminated: intentional
+        )
+        guard shouldHold, onPaneHeld != nil else {
+            // Drop. Persist the cleared `intentionalTerminate` flag
+            // for the (vanishingly small) window before SessionsModel
+            // calls `removePane` and the entry leaves entirely.
+            entries[paneId] = entry
+            onPaneExit(paneId, exitCode)
+            return
+        }
+        let footer = Self.paneExitFooter(kind: entry.kind, exitCode: exitCode)
+        entry.view.getTerminal().feed(text: footer)
+        entry.isHeld = true
+        entry.heldExitCode = exitCode
+        entries[paneId] = entry
+        onPaneHeld?(paneId, exitCode)
+    }
+
+    /// Pure: should a pane that just emitted an exit be held open
+    /// (true) or dropped immediately (false)?
+    ///
+    /// Hold any non-zero or signal-truncated exit that wasn't initiated
+    /// by Nice itself; drop everything else. The asymmetry matches user
+    /// intent: clean exits (`exit 0`, `/exit` from claude, `vim` saved
+    /// + quit) are deliberate and the user wants the pane gone, while
+    /// non-zero exits are usually error conditions whose output the
+    /// user needs to read. `intentionallyTerminated == true` short-
+    /// circuits the hold so Cmd+W on a still-busy tab doesn't leave a
+    /// "[Process killed by signal]" footer behind.
+    nonisolated static func shouldHoldOnExit(
+        exitCode: Int32?,
+        intentionallyTerminated: Bool
+    ) -> Bool {
+        if intentionallyTerminated { return false }
+        guard let code = exitCode else {
+            // nil = no waitstatus (signal). Could be the OS, the user's
+            // own `kill <pid>` from another shell, or a parent process
+            // group hangup — Nice didn't ask for it via the UI, so hold
+            // and surface whatever the process printed last.
+            return true
+        }
+        return code != 0
+    }
+
+    /// Pure: render the dim footer line written into a held pane's
+    /// SwiftTerm buffer announcing the exit. Format intentionally
+    /// minimal — iTerm-style — because we can't intercept keystrokes
+    /// from the dead pty so there's no "press a key to dismiss"
+    /// affordance to advertise; the user closes the tab to dismiss.
+    ///
+    /// ANSI: `\r\n` (visual gap from the last byte the process wrote)
+    /// + `ESC[2m` (dim) + the bracketed footer + `ESC[0m` (reset) +
+    /// `\r\n`. Carriage returns matter because the cursor's column
+    /// when the process died is unknown — `\r` snaps it to column 0
+    /// before the footer prints, otherwise a process that exited
+    /// mid-line would render the footer indented.
+    nonisolated static func paneExitFooter(
+        kind: PaneKind, exitCode: Int32?
+    ) -> String {
+        let label = kind == .claude ? "claude" : "Process"
+        let codeStr: String
+        if let code = exitCode {
+            codeStr = "status \(code)"
+        } else {
+            codeStr = "killed by signal"
+        }
+        return "\r\n\u{1b}[2m[\(label) exited (\(codeStr))]\u{1b}[0m\r\n"
+    }
+
+    /// Drop the pane's entry — view, delegate, kind, held flag, and
+    /// intentional-kill flag, all of which live on `PaneEntry`. Does
+    /// NOT terminate the underlying process; callers invoke this from
+    /// the pane's exit hook, by which time the process is already
+    /// gone. Single removal point per the consolidation invariant: a
+    /// recycled pane id (none today, but cheap insurance) starts
+    /// from a clean slate because everything left the dict at once.
     func removePane(id: String) {
-        panes.removeValue(forKey: id)
-        delegates.removeValue(forKey: id)
+        entries.removeValue(forKey: id)
     }
 
     /// Wire up the "Launching…" placeholder for a newly-spawned pane.
@@ -414,9 +581,37 @@ final class TabPtySession: TabPtySessionThemeable {
     /// dies, which swallows the delegate notification we rely on for
     /// model cleanup. `kill` alone lets the monitor observe the real
     /// exit and drive `paneExited` as usual.
+    ///
+    /// Held-pane fast path: if the pane is already being held open
+    /// (its child exited earlier, view is still mounted so the user
+    /// can read the output), the pty is gone and `kill` would no-op.
+    /// Synthesize the deferred `onPaneExit` instead so the upper
+    /// layer's tab-dissolve cascade fires through its normal path.
+    /// Marking the pane as intentionally-terminated before the SIGHUP
+    /// — and crucially before any `pid > 0` guard — also ensures
+    /// that if SIGHUP causes the child to exit non-zero (interactive
+    /// shells often do), `handlePaneExit` drops it rather than
+    /// holding a "[Process exited]" footer the user never asked to
+    /// see. The flag must be set before the pid guard so a pane
+    /// whose child never had a real pid (e.g. a spawn that failed
+    /// before allocating one) still drops cleanly if its delegate
+    /// later fires.
     func terminatePane(id: String) {
-        guard let view = panes[id] else { return }
-        let pid = view.process.shellPid
+        guard var entry = entries[id] else { return }
+
+        if entry.isHeld {
+            let code = entry.heldExitCode
+            entry.isHeld = false
+            entry.heldExitCode = nil
+            entries[id] = entry
+            onPaneExit(id, code)
+            return
+        }
+
+        entry.intentionalTerminate = true
+        entries[id] = entry
+
+        let pid = entry.view.process.shellPid
         guard pid > 0 else { return }
         kill(pid, SIGHUP)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -436,9 +631,9 @@ final class TabPtySession: TabPtySessionThemeable {
     /// a subprocess. Returns `false` if the pane isn't hosted, the pty
     /// isn't alive, or the query fails — callers treat that as "idle".
     func shellHasForegroundChild(id: String) -> Bool {
-        guard let view = panes[id] else { return false }
-        let fd = view.process.childfd
-        let pid = view.process.shellPid
+        guard let entry = entries[id] else { return false }
+        let fd = entry.view.process.childfd
+        let pid = entry.view.process.shellPid
         guard fd >= 0, pid > 0 else { return false }
         let fgPgrp = tcgetpgrp(fd)
         guard fgPgrp > 0 else { return false }
@@ -452,9 +647,9 @@ final class TabPtySession: TabPtySessionThemeable {
     /// Send `text` plus a newline into the specified pane's pty.
     /// No-op if `paneId` isn't currently hosted in this session.
     func sendToPane(_ text: String, paneId: String) {
-        guard let view = panes[paneId] else { return }
+        guard let entry = entries[paneId] else { return }
         let data = Array((text + "\n").utf8)
-        view.send(data: ArraySlice(data))
+        entry.view.send(data: ArraySlice(data))
     }
 
     // MARK: - Theming
@@ -471,8 +666,8 @@ final class TabPtySession: TabPtySessionThemeable {
         currentPalette = palette
         currentAccent = accent
         if currentTerminalTheme.cursor == nil {
-            for view in panes.values {
-                view.caretColor = accent
+            for entry in entries.values {
+                entry.view.caretColor = accent
             }
         }
     }
@@ -483,8 +678,8 @@ final class TabPtySession: TabPtySessionThemeable {
     /// back to the current accent otherwise.
     func applyTerminalTheme(_ theme: TerminalTheme) {
         currentTerminalTheme = theme
-        for view in panes.values {
-            applyTerminalTheme(theme, to: view)
+        for entry in entries.values {
+            applyTerminalTheme(theme, to: entry.view)
         }
     }
 
@@ -505,8 +700,8 @@ final class TabPtySession: TabPtySessionThemeable {
     func applyTerminalFontFamily(_ name: String?) {
         currentTerminalFontFamily = name
         let font = Self.terminalFont(named: name, size: currentTerminalFontSize)
-        for view in panes.values {
-            view.font = font
+        for entry in entries.values {
+            entry.view.font = font
         }
     }
 
@@ -514,9 +709,30 @@ final class TabPtySession: TabPtySessionThemeable {
     /// closed while its panes are still running (e.g. the user closed
     /// the last tab; model-driven teardown). Pane-exit callbacks still
     /// fire and drive cleanup through the normal path.
+    ///
+    /// Held panes have an already-dead pty, so `process.terminate()`
+    /// would no-op and the upper-layer dissolve would never fire.
+    /// Snapshot the held entries up front and synthesize their
+    /// `onPaneExit` calls — `onPaneExit` re-enters via `removePane`,
+    /// which mutates `entries` mid-loop, so we capture (id, code)
+    /// pairs before iterating. Live panes are flagged intentional
+    /// first so the SIGTERM-induced exit codes don't trigger a hold
+    /// on the way out.
     func terminateAll() {
-        for view in panes.values {
-            view.process.terminate()
+        let heldSnapshot: [(id: String, exitCode: Int32?)] = entries.compactMap {
+            id, entry in
+            entry.isHeld ? (id, entry.heldExitCode) : nil
+        }
+        for id in entries.keys {
+            entries[id]?.intentionalTerminate = true
+            entries[id]?.isHeld = false
+            entries[id]?.heldExitCode = nil
+        }
+        for held in heldSnapshot {
+            onPaneExit(held.id, held.exitCode)
+        }
+        for entry in entries.values {
+            entry.view.process.terminate()
         }
     }
 
@@ -637,8 +853,8 @@ final class TabPtySession: TabPtySessionThemeable {
     func applyTerminalFont(size: CGFloat) {
         currentTerminalFontSize = size
         let font = Self.terminalFont(named: currentTerminalFontFamily, size: size)
-        for view in panes.values {
-            view.font = font
+        for entry in entries.values {
+            entry.view.font = font
         }
     }
 

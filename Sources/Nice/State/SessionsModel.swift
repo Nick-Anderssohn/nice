@@ -302,6 +302,37 @@ final class SessionsModel {
         onTabBecameEmpty?(tabId, pi, ti)
     }
 
+    /// A pane's process exited but `TabPtySession` decided to keep its
+    /// view mounted so the user can read whatever the process printed
+    /// before dying — typical for `claude -w foo` outside a git repo,
+    /// `claude --bad-flag`, or any non-zero exit. Flip `Pane.isAlive`
+    /// to false so the rest of the model treats it as dead (sidebar
+    /// status dot, `livePaneCounts`, `Tab.hasClaude`,
+    /// `CloseRequestCoordinator.isBusy`) while leaving the pane in the
+    /// tab's `panes` array so the toolbar pill still renders and the
+    /// SwiftTerm view stays on screen with its scrollback intact. Also
+    /// dismisses the launch overlay; without this an exit-before-first-
+    /// byte would leave the "Launching…" placeholder on screen forever.
+    /// The actual model removal happens later when the user closes the
+    /// tab and `TabPtySession.terminatePane` synthesizes the deferred
+    /// `onPaneExit`.
+    func paneHeld(tabId: String, paneId: String, exitCode: Int32?) {
+        guard let tabs else { return }
+        clearPaneLaunch(paneId: paneId)
+        tabs.mutateTab(id: tabId) { tab in
+            guard let pi = tab.panes.firstIndex(where: { $0.id == paneId }) else {
+                return
+            }
+            tab.panes[pi].isAlive = false
+            // Idle-out any pulsing status — a held-dead Claude pane is
+            // not thinking or waiting for input regardless of what its
+            // last OSC title said.
+            tab.panes[pi].status = .idle
+            tab.panes[pi].waitingAcknowledged = false
+            tab.panes[pi].isClaudeRunning = false
+        }
+    }
+
     /// A pane emitted a window-title update via OSC 0/1/2. Claude panes
     /// encode thinking/waiting as a leading braille-spinner or asterisk;
     /// the trailing text is the session label (e.g. "fix-top-bar-height")
@@ -345,9 +376,13 @@ final class SessionsModel {
         // transition (zsh has no thinking/waiting semantics) and no
         // tab-title application — until `handleClaudeSocketRequest`
         // flips `isClaudeRunning` and the real Claude takes over the
-        // OSC stream. `false` only ever appears at pane creation; once
-        // a pane has been promoted there is no path back to false
-        // without removing the pane outright via `paneExited`.
+        // OSC stream. `false` appears at pane creation, when a held
+        // pane is recorded via `paneHeld` (Claude exited; the pty is
+        // a corpse, not a live shell), and never spontaneously
+        // otherwise — every other false→true transition is driven by
+        // a deliberate Claude-startup site (`paneHeld` is the inverse
+        // direction; held panes can't go back to running without a
+        // fresh spawn).
         guard pane.isClaudeRunning else { return }
 
         // Claude pane: split off the status prefix, update pane/tab
@@ -473,7 +508,7 @@ final class SessionsModel {
               let pane = tab.panes.first(where: { $0.id == paneId }),
               pane.kind == .terminal,
               let session = ptySessions[tabId],
-              session.panes[paneId] == nil
+              !session.hasPane(paneId)
         else { return }
         _ = session.addTerminalPane(
             id: paneId, cwd: tabs.resolvedSpawnCwd(for: tab, pane: pane)
@@ -963,6 +998,9 @@ final class SessionsModel {
             },
             onPaneFirstOutput: { [weak self] paneId in
                 self?.clearPaneLaunch(paneId: paneId)
+            },
+            onPaneHeld: { [weak self] paneId, code in
+                self?.paneHeld(tabId: tabId, paneId: paneId, exitCode: code)
             }
         )
         themeCache.applyAll(to: session)
@@ -985,6 +1023,18 @@ final class SessionsModel {
     /// dissolving the tab if it was the last pane. No-op if the pane
     /// is unspawned or the tab has no session.
     func terminatePane(tabId: String, paneId: String) {
+        let key = Self.syntheticPaneKey(tabId: tabId, paneId: paneId)
+        if syntheticHeldPanes.remove(key) != nil {
+            // Test-only synthetic-held path: mirror the production
+            // held-pane fast path on `TabPtySession.terminatePane`,
+            // which fires `onPaneExit` synchronously. The exit code
+            // here only feeds `paneExited`, which ignores it; tests
+            // that need a specific code can inspect the model
+            // directly after this call returns.
+            syntheticSpawnedPanes.remove(key)
+            paneExited(tabId: tabId, paneId: paneId, exitCode: 1)
+            return
+        }
         ptySessions[tabId]?.terminatePane(id: paneId)
     }
 
@@ -999,7 +1049,42 @@ final class SessionsModel {
     /// `AppState.hardKillTab` to split panes into spawned vs unspawned
     /// before deciding which to terminate vs synchronously remove.
     func paneIsSpawned(tabId: String, paneId: String) -> Bool {
-        ptySessions[tabId]?.panes[paneId] != nil
+        let key = Self.syntheticPaneKey(tabId: tabId, paneId: paneId)
+        if syntheticSpawnedPanes.contains(key) { return true }
+        return ptySessions[tabId]?.hasPane(paneId) ?? false
+    }
+
+    // MARK: - Test-only seams
+
+    /// Set of `<tabId>:<paneId>` keys that `paneIsSpawned` should
+    /// report as spawned without needing a real `TabPtySession` entry.
+    /// Populated by `markSyntheticHeldPaneForTesting`; read by
+    /// `paneIsSpawned`.
+    @ObservationIgnored
+    private var syntheticSpawnedPanes: Set<String> = []
+    /// Subset of `syntheticSpawnedPanes` whose `terminatePane` should
+    /// fire `paneExited` synchronously, mirroring the held-pane fast
+    /// path in `TabPtySession.terminatePane`. Removed once consumed,
+    /// matching the one-shot semantics of the production held entry.
+    @ObservationIgnored
+    private var syntheticHeldPanes: Set<String> = []
+
+    private static func syntheticPaneKey(tabId: String, paneId: String) -> String {
+        "\(tabId):\(paneId)"
+    }
+
+    /// Test-only: mark `paneId` on `tabId` as if its child process had
+    /// exited and Nice had decided to keep the view mounted (the held
+    /// pane state). After this call, `paneIsSpawned` returns true for
+    /// the pane (so close-flow code routes it through the spawned
+    /// branch) and `terminatePane` fires `paneExited` synchronously
+    /// (the production held-pane fast path). Lets close-flow tests
+    /// repro the held + unspawned-companion scenario without standing
+    /// up a real pty + SwiftTerm view. No-op for any other call site.
+    func markSyntheticHeldPaneForTesting(tabId: String, paneId: String) {
+        let key = Self.syntheticPaneKey(tabId: tabId, paneId: paneId)
+        syntheticSpawnedPanes.insert(key)
+        syntheticHeldPanes.insert(key)
     }
 
     /// Drop the pty-session cache entry for `tabId`. Called by
@@ -1025,7 +1110,7 @@ final class SessionsModel {
               let tab = tabs.tab(for: tabId),
               let paneId = tab.activePaneId,
               let session = ptySessions[tabId],
-              let view = session.panes[paneId]
+              let view = session.view(forPane: paneId)
         else { return }
         view.wantsFocusOnAttach = true
         DispatchQueue.main.async {

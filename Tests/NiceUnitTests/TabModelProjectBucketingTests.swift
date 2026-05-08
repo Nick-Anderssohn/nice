@@ -421,9 +421,9 @@ final class TabModelProjectBucketingTests: XCTestCase {
 
     /// A terminal-only tab restored with a non-first active pane must
     /// spawn that active pane (not the first terminal). `mainContent`
-    /// gates rendering on `session.panes[activePaneId]`, so spawning
-    /// the wrong pane leaves the user staring at the blank-background
-    /// fallback after relaunch.
+    /// gates rendering on `session.view(forPane: activePaneId)`, so
+    /// spawning the wrong pane leaves the user staring at the blank-
+    /// background fallback after relaunch.
     func test_addRestoredTabModel_terminalTab_spawnsActivePane_notFirst() throws {
         let existingDir = NSTemporaryDirectory()
         seedProject(id: "tmp", name: "TMP", path: "/does-not-matter")
@@ -454,7 +454,7 @@ final class TabModelProjectBucketingTests: XCTestCase {
             "Session must be created on restore"
         )
         XCTAssertNotNil(
-            session.panes["restored-multi-term-p2"],
+            session.view(forPane: "restored-multi-term-p2"),
             "Active pane (p2) must be spawned so mainContent has a pty to render"
         )
     }

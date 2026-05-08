@@ -431,8 +431,8 @@ final class WindowSession {
         // that pane's last-observed cwd. We honour `activePaneId`
         // instead of letting `makeSession` infer the first terminal —
         // if the user quit while focused on a secondary pane,
-        // spawning the first instead leaves `session.panes[activePaneId]`
-        // empty and `mainContent` renders the blank fallback. Per-pane
+        // spawning the first instead leaves the active pane unhosted
+        // and `mainContent` renders the blank fallback. Per-pane
         // cwd falls back to the tab cwd when the pane has none
         // persisted, or its cwd no longer exists. Other panes stay
         // lazy until first focus.

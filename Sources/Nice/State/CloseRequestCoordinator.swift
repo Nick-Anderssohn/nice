@@ -316,25 +316,32 @@ final class CloseRequestCoordinator {
             }
         }
 
-        for id in spawnedIds {
-            sessions.terminatePane(tabId: tabId, paneId: id)
-        }
-
-        guard !unspawnedIds.isEmpty else { return }
-
-        if spawnedIds.isEmpty {
-            // Nothing async to hook into — finalize right now.
-            tabs.mutateTab(id: tabId) { tab in
-                tab.panes.removeAll()
-                tab.activePaneId = nil
+        // Drop unspawned rows from the model BEFORE terminating the
+        // spawned ones. Held panes (process already dead, view kept
+        // around so the user could read the exit output) take a
+        // synchronous fast path through `terminatePane` →
+        // `paneExited`; if we left their unspawned siblings in the
+        // panes array at that moment, the post-removal panes-empty
+        // check inside `paneExited` would fail and `onTabBecameEmpty`
+        // would never fire — the panes would vanish but the sidebar
+        // tab would stay. The order also works for the all-async path
+        // (live ptys whose exits fire later): pruning the unspawned
+        // rows here is what the comment used to say happened "later"
+        // in the else-branch — same outcome, just rephrased to a
+        // single up-front step that's correct regardless of whether
+        // the spawned-pane exits sync or async.
+        if !unspawnedIds.isEmpty {
+            if spawnedIds.isEmpty {
+                // Nothing async (or sync) to hook into — finalize now.
+                tabs.mutateTab(id: tabId) { tab in
+                    tab.panes.removeAll()
+                    tab.activePaneId = nil
+                }
+                if let (pi, ti) = tabs.projectTabIndex(for: tabId) {
+                    onSyncFinalizeDissolve?(tabId, pi, ti)
+                }
+                return
             }
-            if let (pi, ti) = tabs.projectTabIndex(for: tabId) {
-                onSyncFinalizeDissolve?(tabId, pi, ti)
-            }
-        } else {
-            // At least one spawned pane will fire `paneExited` later;
-            // clear the unspawned rows now so that exit sees an empty
-            // panes list and dissolves through the normal path.
             let toDrop = Set(unspawnedIds)
             tabs.mutateTab(id: tabId) { tab in
                 tab.panes.removeAll { toDrop.contains($0.id) }
@@ -342,6 +349,10 @@ final class CloseRequestCoordinator {
                     tab.activePaneId = tab.panes.first?.id
                 }
             }
+        }
+
+        for id in spawnedIds {
+            sessions.terminatePane(tabId: tabId, paneId: id)
         }
     }
 

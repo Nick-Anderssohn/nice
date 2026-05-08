@@ -611,7 +611,7 @@ private struct AppShellHost: View {
            let tab = appState.tabs.tab(for: tabId),
            let paneId = tab.activePaneId,
            let session = appState.sessions.ptySessions[tabId],
-           let view = session.panes[paneId] {
+           let view = session.view(forPane: paneId) {
             let pane = tab.panes.first(where: { $0.id == paneId })
             ZStack {
                 TerminalHost(view: view, focus: true)

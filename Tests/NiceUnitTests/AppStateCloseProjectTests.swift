@@ -174,6 +174,47 @@ final class AppStateCloseProjectTests: XCTestCase {
                         "Close Tab must leave the containing project in place — only Close Project removes it.")
     }
 
+    func test_requestCloseTab_heldClaudePaneWithUnspawnedCompanion_dissolves() {
+        // Repro for the held-pane close bug: `claude -w foo` outside
+        // a git repo exits non-zero, TabPtySession holds the pane open
+        // so the user can read the error, then the user right-clicks
+        // the sidebar tab and picks Close. Before the hardKillTab
+        // reorder, terminatePane on the held pane fired `paneExited`
+        // synchronously while the unspawned companion was still in
+        // tab.panes — `onTabBecameEmpty` saw a non-empty list and
+        // skipped the dissolve, so the panes vanished but the sidebar
+        // row stayed.
+        let seed = TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p1", tabId: "t1"
+        )
+        // Extra project keeps us off the all-empty NSApp.terminate path.
+        seedProjectWithClaudeTab(projectId: "p2", tabId: "t2")
+        // Mirror the production held-pane state at the model layer:
+        // `Pane.isAlive = false` (the bookkeeping `paneHeld` does on
+        // the SessionsModel side) plus the synthetic seam that makes
+        // `paneIsSpawned` true and `terminatePane` fire synchronously.
+        appState.tabs.mutateTab(id: "t1") { tab in
+            guard let pi = tab.panes.firstIndex(where: { $0.id == seed.claudePaneId })
+            else { return }
+            tab.panes[pi].isAlive = false
+            tab.panes[pi].isClaudeRunning = false
+        }
+        appState.sessions.markSyntheticHeldPaneForTesting(
+            tabId: "t1", paneId: seed.claudePaneId
+        )
+
+        appState.closer.requestCloseTab(tabId: "t1")
+
+        XCTAssertNil(
+            appState.tabs.tab(for: "t1"),
+            "Close Tab on a held-pane tab must dissolve the sidebar row, not just remove the panes."
+        )
+        XCTAssertNotNil(
+            appState.tabs.projects.first { $0.id == "p1" },
+            "Close Tab on the held-pane tab must leave the containing project in place."
+        )
+    }
+
     // MARK: - Helpers
 
     private func seedProjectWithClaudeTab(
