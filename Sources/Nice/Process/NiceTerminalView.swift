@@ -48,6 +48,24 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// invoking `dataReceived(slice:)`.
     var onFirstData: (@MainActor () -> Void)?
 
+    /// Captured `startProcess` arguments waiting for AppKit to lay this
+    /// view out at its real frame. See `armDeferredSpawn(...)` for the
+    /// motivation (TL;DR: spawning while `frame == .zero` makes the pty
+    /// boot at SwiftTerm's 80×25 fallback, the shell prints its first
+    /// prompt at the wrong cols, and the eventual real-geometry resize
+    /// reflows it into a row-1 startup quirk).
+    struct PendingSpawn: Equatable {
+        let executable: String
+        let args: [String]
+        let environment: [String]?
+        let execName: String?
+        let currentDirectory: String?
+    }
+    /// Visible at `internal` access so `@testable import Nice` can
+    /// inspect the gate state directly without forking a real child.
+    var pendingSpawn: PendingSpawn?
+    var hasFiredPendingSpawn = false
+
     private static let acceptedDragTypes: [NSPasteboard.PasteboardType] = [
         .fileURL,
         .png,
@@ -64,45 +82,12 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        applyNiceTerminalOptions()
         registerForDraggedTypes(Self.acceptedDragTypes)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        applyNiceTerminalOptions()
         registerForDraggedTypes(Self.acceptedDragTypes)
-    }
-
-    /// Flips SwiftTerm options that Nice wants different from the
-    /// upstream defaults. Must run after `super.init(frame:)` (which
-    /// constructs the underlying `Terminal`) and before the first
-    /// reflow.
-    ///
-    /// Currently:
-    /// - `reflowCursorLine = true` so wrapped blocks containing the
-    ///   cursor are joined (and the cursor is translated into the
-    ///   merged layout) on widen. Without this, the brief tiny
-    ///   initial layout of a fresh `NiceTerminalView` — before the
-    ///   sidebar/window geometry resolves — causes the shell's first
-    ///   prompt to fragment across many wrapped 2-char rows; on
-    ///   widen those fragments stay stranded above the redrawn
-    ///   prompt because zsh/bash/fish only clear below cursor on
-    ///   SIGWINCH (`\r\e[J`). This produces the "stack of partial
-    ///   prompts at startup" variant of the resize-duplication bug.
-    ///   The flag is upstream-default `false` to match xterm
-    ///   semantics; we opt in.
-    private func applyNiceTerminalOptions() {
-        // Empirically required (verified 2026-05-07): with
-        // `reflowCursorLine = false`, startup duplication still
-        // reproduces — coalescing the resize bursts isn't enough
-        // because the shell prints its first prompt into the brief
-        // tiny initial buffer BEFORE the coalesced apply fires. The
-        // merge on widen + cursor translation is what reattaches
-        // the fragmented prompt rows into the parent line, so the
-        // shell's `\r\e[J` redraw doesn't leave them stranded above.
-        // SwiftTerm default is `false` (xterm semantics); we opt in.
-        terminal.reflowCursorLine = true
     }
 
     /// Enables SwiftTerm's Metal renderer. No-op when the view isn't
@@ -125,11 +110,128 @@ final class NiceTerminalView: LocalProcessTerminalView {
         enableGpuRendering()
         smoothScrollingEnabled = true
         claimFocusIfRequested()
+        // Belt-and-suspenders: in the (rare) ordering where AppKit
+        // assigns the real frame before window attachment, our
+        // `setFrameSize` override would have skipped the spawn on the
+        // `window != nil` gate. Re-check here so attachment unblocks
+        // a view that's already laid out.
+        firePendingSpawnIfReady()
     }
 
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         claimFocusIfRequested()
+    }
+
+    // MARK: - Deferred shell spawn
+
+    /// Capture the shell-spawn parameters and hold them until the view
+    /// has a real frame. Use this instead of `startProcess(...)` from
+    /// pane-creation code paths (see `TabPtySession`).
+    ///
+    /// SwiftUI calls `NSViewRepresentable.makeNSView` with a freshly
+    /// constructed `NiceTerminalView(frame: .zero)`. If we spawn the
+    /// pty now, SwiftTerm's `setupOptions` falls back to
+    /// `TerminalOptions.default` (80×25), `getWindowSize()` returns
+    /// `winsize(rows: 25, cols: 80)`, and the pty's first
+    /// `TIOCSWINSZ` is wrong. The shell prints its first prompt at 80
+    /// cols. Then AppKit lays the view out at the real frame, the
+    /// resize coalescer fires `terminal.resize`, reflow runs against
+    /// the already-printed prompt, and (when the merged content
+    /// overflows the new cols) the cursor lands on row 1 — leaving
+    /// stranded fragments above the shell's `\r\e[J` redraw.
+    ///
+    /// Deferring until the first non-zero `setFrameSize` lets the pty
+    /// boot at the correct cols on its very first ioctl. No reflow,
+    /// no merge, no race.
+    func armDeferredSpawn(
+        executable: String,
+        args: [String],
+        environment: [String]?,
+        execName: String?,
+        currentDirectory: String?
+    ) {
+        // Single-arm contract. Calling twice would either silently
+        // clobber a still-pending spawn (the original args never run)
+        // or, worse, set `pendingSpawn` after the gate has already
+        // fired (`hasFiredPendingSpawn == true`) — in which case the
+        // new args would never run and the pane would just sit there
+        // with a stale spawn. Hard-fail in development so this gets
+        // caught immediately at the call site rather than as a
+        // confusing silent miss in production.
+        precondition(
+            !hasFiredPendingSpawn && pendingSpawn == nil,
+            "armDeferredSpawn called twice on the same NiceTerminalView"
+        )
+        pendingSpawn = PendingSpawn(
+            executable: executable,
+            args: args,
+            environment: environment,
+            execName: execName,
+            currentDirectory: currentDirectory
+        )
+        // Cheap insurance: if AppKit somehow already laid us out
+        // (recycled view, future code path), don't sit on the args.
+        firePendingSpawnIfReady()
+    }
+
+    /// AppKit calls this whenever the layout system assigns a new
+    /// frame. The first such call with a non-zero size is our cue
+    /// that the view has real geometry. To make sure
+    /// `terminal.cols × rows` reflects that geometry *before* the pty
+    /// is forked, we briefly disable SwiftTerm's resize-debounce so
+    /// `super.setFrameSize` applies the resize synchronously through
+    /// `processSizeChange → applySizeChange → terminal.resize`. The
+    /// 200 ms coalescer is restored immediately after — we only want
+    /// the synchronous path for this one bootstrap apply, runtime
+    /// fast-drag bursts still benefit from coalescing.
+    override func setFrameSize(_ newSize: NSSize) {
+        let needsImmediateApply = pendingSpawn != nil
+            && !hasFiredPendingSpawn
+            && newSize.width > 0
+            && newSize.height > 0
+        let savedDebounceMs = resizeDebounceMs
+        if needsImmediateApply {
+            resizeDebounceMs = 0
+        }
+        // `defer` so any future SwiftTerm change that introduces a
+        // throw-through path can't strand the debounce at zero. The
+        // restore is observably equivalent to running it inline today
+        // because `super.setFrameSize` is synchronous on the main
+        // thread and no timer can dispatch in the middle of its call
+        // graph.
+        defer {
+            if needsImmediateApply {
+                resizeDebounceMs = savedDebounceMs
+            }
+        }
+        super.setFrameSize(newSize)
+        firePendingSpawnIfReady()
+    }
+
+    /// Single readiness gate. Fires the captured spawn exactly once,
+    /// when the view has a non-zero frame *and* is in a window. The
+    /// `process.running` guard inside SwiftTerm's `sizeChanged`
+    /// handler already protects us against the synchronous
+    /// `terminal.resize` triggering an ioctl on a non-existent pty
+    /// (it bails when `process.running == false`), so calling
+    /// `startProcess` *after* the synchronous resize is the right
+    /// order.
+    private func firePendingSpawnIfReady() {
+        guard !hasFiredPendingSpawn,
+              let spawn = pendingSpawn,
+              window != nil,
+              frame.width > 0, frame.height > 0
+        else { return }
+        hasFiredPendingSpawn = true
+        pendingSpawn = nil
+        startProcess(
+            executable: spawn.executable,
+            args: spawn.args,
+            environment: spawn.environment,
+            execName: spawn.execName,
+            currentDirectory: spawn.currentDirectory
+        )
     }
 
     /// If a host marked us as the incoming focus target, grab first

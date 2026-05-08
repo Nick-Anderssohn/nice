@@ -288,7 +288,7 @@ final class TabPtySession: TabPtySessionThemeable {
             // the resume command pre-typed. The socket handshake will
             // flip the pane to actually running-Claude when the user
             // hits Enter and the wrapper promotes this pane in place.
-            view.startProcess(
+            view.armDeferredSpawn(
                 executable: "/bin/zsh",
                 args: ["-il"],
                 environment: Self.buildEnv(extraEnv: claudeExtraEnv),
@@ -302,7 +302,7 @@ final class TabPtySession: TabPtySessionThemeable {
                 extraClaudeArgs: extraClaudeArgs,
                 isOverride: isOverride
             )
-            view.startProcess(
+            view.armDeferredSpawn(
                 executable: "/bin/zsh",
                 args: ["-ilc", command],
                 environment: Self.buildEnv(extraEnv: claudeExtraEnv),
@@ -310,7 +310,7 @@ final class TabPtySession: TabPtySessionThemeable {
                 currentDirectory: resolvedCwd
             )
         } else {
-            view.startProcess(
+            view.armDeferredSpawn(
                 executable: "/bin/zsh",
                 args: ["-il"],
                 environment: nil,
@@ -370,7 +370,7 @@ final class TabPtySession: TabPtySessionThemeable {
 
         let resolvedCwd = Self.expandTilde(cwd ?? self.cwd)
         let args = Self.buildExecArgs(command: command)
-        view.startProcess(
+        view.armDeferredSpawn(
             executable: "/bin/zsh",
             args: args,
             environment: Self.buildEnv(extraEnv: extraEnv),
