@@ -82,6 +82,17 @@ packages:
     #     real geometry resolves (the startup-duplication
     #     variant of the resize bug). Nice constructs Terminal
     #     with this set to true.
+    #   - port Kitty's `text_composition_strategy` curve into the
+    #     Metal grayscale text fragment shader. Per-cell bg luminance
+    #     pipes through TextCell so the shader applies a luminance-
+    #     aware coverage adjustment (heavy stem-darkening for dark-
+    #     on-light, near-identity for light-on-dark) that gets light-
+    #     mode glyphs much closer to Apple Terminal's weight without
+    #     touching the dark-mode look we already shipped. macOS
+    #     defaults to Kitty's (1.7, 30) parameters via the new
+    #     `TerminalOptions.textCompositionStrategy = .appleApprox`;
+    #     iOS defaults to .identity. Color emoji are intentionally
+    #     unaffected.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -95,7 +106,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 56c2632dac14689830683ceba20adcacd3dedebe
+    revision: 9e4b179d129cace1a862fc0856bbe84dce59101a
 
 targets:
   Nice:
