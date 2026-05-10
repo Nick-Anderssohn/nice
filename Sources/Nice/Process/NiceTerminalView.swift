@@ -87,11 +87,27 @@ final class NiceTerminalView: LocalProcessTerminalView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         registerForDraggedTypes(Self.acceptedDragTypes)
+        useStandardAnsi256Palette()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerForDraggedTypes(Self.acceptedDragTypes)
+        useStandardAnsi256Palette()
+    }
+
+    /// Override SwiftTerm's `.base16Lab` default for the 256-color
+    /// palette. That strategy interpolates the 240-entry color cube
+    /// (codes 16–255) from the 16 theme colors via LAB, producing
+    /// noticeably desaturated values compared to every other terminal
+    /// emulator. Powerlevel10k / starship glyphs are typically painted
+    /// with 256-color codes, so under `.base16Lab` the prompt reads
+    /// washed out next to Apple Terminal / iTerm2 / Ghostty even when
+    /// the 16 base ANSI colors are matched. `.xterm` uses the canonical
+    /// xterm cube (the 0x00/0x5f/0x87/0xaf/0xd7/0xff levels) that those
+    /// terminals all converge on.
+    private func useStandardAnsi256Palette() {
+        getTerminal().ansi256PaletteStrategy = .xterm
     }
 
     /// Enables SwiftTerm's Metal renderer. No-op when the view isn't
@@ -104,6 +120,18 @@ final class NiceTerminalView: LocalProcessTerminalView {
         guard window != nil else { return }
         do {
             try setUseMetal(true)
+            // Disable Apple's `setShouldSmoothFonts` stem-darkening.
+            // SwiftTerm's atlas-based GPU renderer applies the dilation
+            // once at rasterization and then composites the cached
+            // mask, which empirically over-thickens glyphs vs.
+            // Apple Terminal's per-draw CG path. Turning smoothing
+            // off makes Nice's strokes read closer to Terminal.app
+            // (whose own per-draw CG dilation is in fact lighter than
+            // SwiftTerm's atlas-baked version), at the cost of
+            // matching Ghostty/Alacritty's thin aesthetic on glyphs
+            // that depend on dilation for body. The Metal rasterizer
+            // reads this flag each frame.
+            fontSmoothing = false
         } catch {
             NSLog("NiceTerminalView: Metal renderer unavailable, falling back to CoreGraphics: \(error)")
         }
