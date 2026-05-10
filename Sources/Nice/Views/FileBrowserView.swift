@@ -58,6 +58,7 @@ private struct FileBrowserContent: View {
     @Environment(TabModel.self) private var tabs
     @Environment(FontSettings.self) private var fontSettings
     @Environment(FileBrowserSortSettings.self) private var sortSettings
+    @Environment(FileExplorerOrchestrator.self) private var orchestrator
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
@@ -86,6 +87,13 @@ private struct FileBrowserContent: View {
     /// and clicks on truly empty space fall through to the outer
     /// `.onTapGesture` below, which clears.
     @State private var mouseMonitor: Any?
+    /// AppKit key-down monitor that intercepts Return when exactly
+    /// one row is selected and no text-input view holds first
+    /// responder (so typing into the terminal still works). Routes
+    /// to `orchestrator.beginRename(path:tabId:)`. Lives at this
+    /// level (not per-row) so we only register one monitor per
+    /// file browser, not one per visible row.
+    @State private var keyMonitor: Any?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -101,8 +109,14 @@ private struct FileBrowserContent: View {
             frameInWindow = frame
             windowNumber = number
         })
-        .onAppear { installMouseMonitor() }
-        .onDisappear { removeMouseMonitor() }
+        .onAppear {
+            installMouseMonitor()
+            installKeyMonitor()
+        }
+        .onDisappear {
+            removeMouseMonitor()
+            removeKeyMonitor()
+        }
     }
 
     private func installMouseMonitor() {
@@ -120,6 +134,48 @@ private struct FileBrowserContent: View {
         if let monitor = mouseMonitor {
             NSEvent.removeMonitor(monitor)
             mouseMonitor = nil
+        }
+    }
+
+    /// Install a `.keyDown` local monitor scoped to this window. We
+    /// intercept Return to start an inline rename, but only when:
+    ///   • Our window is the event target.
+    ///   • No text-input view holds first responder (the terminal
+    ///     and any open rename field are NSText / NSTextField, so
+    ///     they swallow Return through this guard).
+    ///   • Exactly one row is in the selection.
+    /// Anything else returns the event unchanged so other handlers
+    /// (terminal, menu, default key processing) keep working.
+    private func installKeyMonitor() {
+        removeKeyMonitor()
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Carbon keyCode 36 is Return / Enter. Comparing the raw
+            // keyCode avoids string-comparing against `event.characters`
+            // which varies with input source.
+            guard event.keyCode == 36 else { return event }
+            guard event.window?.windowNumber == windowNumber else { return event }
+            // If a text view / text field is first responder, the
+            // user is editing text — pass Return through. This also
+            // covers our own rename field (NSTextField), so the
+            // commit path runs through the field's coordinator.
+            if let responder = event.window?.firstResponder,
+               responder is NSText || responder is NSTextField
+            {
+                return event
+            }
+            let selected = state.selection.selectedPaths
+            guard selected.count == 1, let path = selected.first else {
+                return event
+            }
+            orchestrator.beginRename(path: path, tabId: tabId)
+            return nil
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
         }
     }
 
@@ -338,6 +394,32 @@ private struct FileTreeRow: View {
     /// second click arrives within `doubleClickWindow` of the first.
     @State private var lastTapTime: Date = .distantPast
 
+    // MARK: Inline rename state
+    /// True while this row's name is being edited. Flips the
+    /// `name` view from `Text` to `FileBrowserRenameField`.
+    @State private var isEditing = false
+    /// Live draft typed by the user. Bound into the rename field;
+    /// validated and consumed by `commitRename`.
+    @State private var draftName = ""
+    /// Wall-clock time at which this row most recently became part
+    /// of the selection. Gates the slow-second-click rename trigger
+    /// via `InlineRenameClickGate.canBeginEdit` — same pattern as
+    /// `PaneTabPill`. `nil` while the row is unselected.
+    @State private var activatedAt: Date?
+    /// AppKit mouse-down monitor installed while editing. SwiftUI's
+    /// `@FocusState` doesn't deassert when an embedded `NSView`
+    /// (the terminal, an editor pane) steals first responder, so
+    /// click-away has to be caught here. Commit is deferred via
+    /// `DispatchQueue.main.async` so the offending click finishes
+    /// dispatching to its destination before we tear the field
+    /// down.
+    @State private var renameMouseMonitor: Any?
+    /// Window-local frame of the rename field. Updated via
+    /// `WindowFrameReporter` so the mouse monitor knows where
+    /// "outside the field" is.
+    @State private var renameFieldFrame: NSRect = .zero
+    @State private var renameWindowNumber: Int = 0
+
     /// macOS's stock double-click window is ~500ms but feels long
     /// for a file tree; 280ms gives crisp feedback while still
     /// catching unhurried double-clicks.
@@ -415,6 +497,32 @@ private struct FileTreeRow: View {
         .onChange(of: sortSettings.ascending) { _, _ in
             invalidateChildrenForSortChange()
         }
+        // Right-click "Rename" reaches us via this observable
+        // pendingRenamePath. The orchestrator publishes the path; we
+        // flip into edit mode iff it's our path, then clear so the
+        // signal is one-shot (a second right-click later still
+        // works because the publisher will set it again).
+        .onChange(of: orchestrator.pendingRenamePath) { _, newValue in
+            guard let newValue, newValue == path else { return }
+            beginRename()
+            orchestrator.pendingRenamePath = nil
+        }
+        // Track selection-edge transitions for the slow-second-
+        // click rename gate. We don't want a row that re-enters the
+        // selection set via Shift-extend to forget its prior
+        // activation timestamp, so we stamp on every transition
+        // into selected and clear on transition out. The
+        // single-fire-on-mount case is handled in `handleTap` (sets
+        // `activatedAt` directly when this row's the new sole
+        // selection).
+        .onChange(of: selection.contains(path)) { _, isSelected in
+            if !isSelected {
+                activatedAt = nil
+                // Selection lost while editing → commit. Same
+                // rationale as the pane pill's `onChange(isActive)`.
+                if isEditing { commitRename() }
+            }
+        }
     }
 
     /// Same invalidation rule as `state.showHidden`: reload now if
@@ -462,11 +570,7 @@ private struct FileTreeRow: View {
                 .foregroundStyle(iconColor)
                 .frame(width: 16, height: 16)
 
-            Text(name)
-                .font(.system(size: fontSettings.sidebarSize(13)))
-                .foregroundStyle(Color.niceInk(scheme, palette))
-                .lineLimit(1)
-                .truncationMode(.middle)
+            nameView
 
             Spacer(minLength: 0)
         }
@@ -486,8 +590,11 @@ private struct FileTreeRow: View {
         // Combine the row's name + icon + indent slot into one
         // addressable accessibility element. Pair with
         // `.accessibilityIdentifier` so XCUITest can locate a row
-        // by its absolute path.
-        .accessibilityElement(children: .combine)
+        // by its absolute path. While editing, switch to `.contain`
+        // so the inline rename `NSTextField` keeps its own
+        // accessibility identity (the row would otherwise swallow
+        // the field's id and XCUITest couldn't target it).
+        .accessibilityElement(children: isEditing ? .contain : .combine)
         .accessibilityIdentifier("fileBrowser.row.\(path)")
         .accessibilityAddTraits(selection.contains(path) ? .isSelected : [])
         // `.isSelected` doesn't reliably surface to `XCUIElement.isSelected`
@@ -640,11 +747,29 @@ private struct FileTreeRow: View {
         if isDouble {
             doubleClick()
             lastTapTime = .distantPast
-        } else {
-            selection.replace(with: [path])
-            primaryClick()
-            lastTapTime = now
+            return
         }
+        // Slow-second-click rename: the row was already selected
+        // AND enough time has elapsed since it was activated. Test
+        // this BEFORE the selection.replace below, so the very click
+        // we're trying to detect doesn't reset `activatedAt`.
+        // Same gate (`NSEvent.doubleClickInterval`) the pane pill
+        // and sidebar tab use.
+        if selection.contains(path),
+           InlineRenameClickGate.canBeginEdit(
+            activatedAt: activatedAt,
+            now: now,
+            doubleClickInterval: NSEvent.doubleClickInterval
+           )
+        {
+            beginRename()
+            lastTapTime = now
+            return
+        }
+        selection.replace(with: [path])
+        activatedAt = now
+        primaryClick()
+        lastTapTime = now
     }
 
     private func primaryClick() {
@@ -692,6 +817,202 @@ private struct FileTreeRow: View {
             criterion: sortSettings.criterion,
             ascending: sortSettings.ascending
         )
+    }
+
+    // MARK: - Inline rename
+
+    /// Either the static `Text(name)` or — while `isEditing` — an
+    /// inline `FileBrowserRenameField`. The `WindowFrameReporter`
+    /// background captures the field's window-local frame so the
+    /// click-away monitor knows where the field lives.
+    @ViewBuilder
+    private var nameView: some View {
+        if isEditing {
+            // Same visual treatment the sidebar tab inline-rename
+            // uses (`SidebarView.TabRow.titleView`): rounded bg3
+            // fill + bordered stroke + 6px horizontal / 2px vertical
+            // padding. Pinning the styles to one place would be
+            // nicer; for now this matches by copy so both rename
+            // surfaces feel identical to the user.
+            FileBrowserRenameField(
+                text: $draftName,
+                initialSelectionLength: initialRenameSelectionLength(),
+                onCommit: commitRename,
+                onCancel: cancelRename,
+                accessibilityId: "fileBrowser.row.\(path).renameField"
+            )
+            .font(.system(size: fontSettings.sidebarSize(13)))
+            .foregroundStyle(Color.niceInk(scheme, palette))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.niceBg3(scheme, palette))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.niceLineStrong(scheme, palette), lineWidth: 1)
+            )
+            .background(WindowFrameReporter { frame, number in
+                renameFieldFrame = frame
+                renameWindowNumber = number
+            })
+            .onAppear { installRenameMouseMonitor() }
+            .onDisappear {
+                removeRenameMouseMonitor()
+                // If the field disappears mid-edit (row scrolled
+                // off, tab switched, file removed externally), drop
+                // the draft — committing a rename for a vanished
+                // row would surface a misleading drift error.
+                if isEditing { isEditing = false }
+            }
+        } else {
+            Text(name)
+                .font(.system(size: fontSettings.sidebarSize(13)))
+                .foregroundStyle(Color.niceInk(scheme, palette))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    /// Pre-select length for the rename field. For files with an
+    /// extension we select the basename only (so the user types over
+    /// the basename and keeps `.txt`); for folders / extension-less
+    /// files we select the full string. Matches Finder. Pure — uses
+    /// `FileOperationsService.splitNameAndExtension` which already
+    /// handles dotfiles (`.zshrc` is treated as no-extension).
+    private func initialRenameSelectionLength() -> Int {
+        let original = url.lastPathComponent
+        let (base, ext) = FileOperationsService.splitNameAndExtension(original)
+        // For files with an extension and a non-directory, select
+        // just the basename. Otherwise select everything.
+        if !ext.isEmpty && !isDirectory {
+            return base.count
+        }
+        return original.count
+    }
+
+    /// Open the rename field. Also called from a `.onChange` watcher
+    /// on `orchestrator.pendingRenamePath` so the right-click menu
+    /// (which has no row reference) can target this row.
+    private func beginRename() {
+        // Filesystem root `/` can't be renamed — defense-in-depth
+        // gate (the menu and Return-key paths already block).
+        guard FileBrowserRenameValidator.canRename(url) else { return }
+        guard !isEditing else { return }
+        draftName = url.lastPathComponent
+        isEditing = true
+    }
+
+    /// Commit the draft. Validates first; cancels for empty /
+    /// unchanged / illegal-name drafts; surfaces a drift message on
+    /// sibling collision; presents the Finder-style extension-change
+    /// confirmation when the extension differs; otherwise dispatches
+    /// to `orchestrator.rename(...)` which records an undoable
+    /// `.move` op via the shared history.
+    private func commitRename() {
+        guard isEditing else { return }
+        let draft = draftName
+        switch FileBrowserRenameValidator.validate(originalURL: url, draft: draft) {
+        case .empty, .unchanged, .isFilesystemRoot:
+            cancelRename()
+            return
+        case .containsSlash:
+            // Stay in edit mode so the user fixes the name. We
+            // can't realistically present a stronger UI (NSAlert
+            // would steal focus and tear the field down) — leaving
+            // the field open is the smallest surprise.
+            return
+        case let .wouldCollide(candidate):
+            orchestrator.fileExplorer?.history.lastDriftMessage =
+                "Couldn't rename: '\(candidate.lastPathComponent)' already exists."
+            cancelRename()
+            return
+        case .ok:
+            break
+        }
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if FileBrowserRenameValidator.isExtensionChange(
+            originalName: url.lastPathComponent, newName: trimmed
+        ), !isDirectory {
+            // Tear down the field FIRST so the modal alert isn't
+            // racing the field's resign-first-responder path.
+            isEditing = false
+            removeRenameMouseMonitor()
+            guard confirmExtensionChange(
+                from: url.lastPathComponent, to: trimmed
+            ) else {
+                // Alert-cancel: field is gone but we never called
+                // rename, so its `defer` didn't restore focus.
+                // Restore explicitly so the user can keep typing.
+                orchestrator.focusActiveTerminal()
+                return
+            }
+            orchestrator.rename(
+                from: path, to: trimmed, originatingTabId: tabId
+            )
+            // No focusActiveTerminal here — orchestrator.rename's
+            // own `defer` restores focus on every exit path.
+            return
+        }
+        isEditing = false
+        removeRenameMouseMonitor()
+        orchestrator.rename(
+            from: path, to: trimmed, originatingTabId: tabId
+        )
+    }
+
+    private func cancelRename() {
+        guard isEditing else { return }
+        isEditing = false
+        removeRenameMouseMonitor()
+        orchestrator.focusActiveTerminal()
+    }
+
+    /// Modal Finder-style confirmation when the rename changes a
+    /// file's extension. Returns `true` if the user wants to
+    /// proceed. Lives on the row (not the orchestrator) because the
+    /// extension-change decision is local to this rename — the
+    /// orchestrator's own pre-flight is a separate alert covering
+    /// the cross-window CWD impact.
+    private func confirmExtensionChange(from old: String, to new: String) -> Bool {
+        let (_, oldExt) = FileOperationsService.splitNameAndExtension(old)
+        let (_, newExt) = FileOperationsService.splitNameAndExtension(new)
+        let alert = NSAlert()
+        alert.messageText = "Are you sure you want to change the extension?"
+        let oldDisplay = oldExt.isEmpty ? "(no extension)" : ".\(oldExt)"
+        let newDisplay = newExt.isEmpty ? "(no extension)" : ".\(newExt)"
+        alert.informativeText = "If you change the extension from \(oldDisplay) to \(newDisplay), the file may open in a different app."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Keep \(oldDisplay)")
+        let useNew = alert.addButton(withTitle: "Use \(newDisplay)")
+        useNew.hasDestructiveAction = true
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private func installRenameMouseMonitor() {
+        removeRenameMouseMonitor()
+        renameMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            guard isEditing else { return event }
+            if event.window?.windowNumber == renameWindowNumber,
+               !renameFieldFrame.insetBy(dx: -2, dy: -2).contains(event.locationInWindow)
+            {
+                // Defer so the click finishes routing to its true
+                // destination (a sibling row, the disclosure
+                // triangle, the terminal grabbing focus) before we
+                // tear down the field.
+                DispatchQueue.main.async { commitRename() }
+            }
+            return event
+        }
+    }
+
+    private func removeRenameMouseMonitor() {
+        if let monitor = renameMouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            renameMouseMonitor = nil
+        }
     }
 
     /// Minimal extension → SF Symbol mapping. Anything not listed

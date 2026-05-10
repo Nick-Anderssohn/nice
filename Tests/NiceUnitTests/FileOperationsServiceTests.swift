@@ -425,6 +425,78 @@ final class FileOperationsServiceTests: XCTestCase {
         XCTAssertTrue(fileExists(dest.appendingPathComponent("with spaces.txt")))
     }
 
+    // MARK: - Rename via apply(.move)
+
+    /// The rename feature builds a one-item `.move` op whose source and
+    /// destination share a parent directory but differ in
+    /// `lastPathComponent`, then calls `apply(.move:)` directly to skip
+    /// the Finder-style `nextAvailableName` auto-suffixing. This pins
+    /// that path: a one-item rename succeeds, undo restores the
+    /// original name.
+    func test_apply_moveAsRename_inSameParent_renamesFile() throws {
+        let src = makeFile("foo.txt", body: "data")
+        let dest = src.deletingLastPathComponent().appendingPathComponent("bar.txt")
+        let service = FileOperationsService()
+
+        let op = try service.apply(.move(
+            items: [FileOperationItem(source: src, destination: dest)],
+            origin: origin()
+        ))
+
+        XCTAssertFalse(fileExists(src))
+        XCTAssertTrue(fileExists(dest))
+
+        // Undo restores.
+        try service.undo(op)
+        XCTAssertTrue(fileExists(src))
+        XCTAssertFalse(fileExists(dest))
+    }
+
+    /// `apply(.move)` for rename must NOT auto-suffix a colliding
+    /// destination — the rename UI surfaces the collision as a drift
+    /// error instead. Pin that contract: when the destination already
+    /// exists, the call throws and the source is unchanged.
+    func test_apply_moveAsRename_destinationExists_throws() throws {
+        let src = makeFile("foo.txt", body: "data")
+        let collision = makeFile("bar.txt", body: "occupied")
+        let service = FileOperationsService()
+
+        XCTAssertThrowsError(
+            try service.apply(.move(
+                items: [FileOperationItem(source: src, destination: collision)],
+                origin: origin()
+            ))
+        )
+
+        XCTAssertTrue(fileExists(src), "source must remain when collision blocks rename")
+        XCTAssertEqual(
+            try? String(contentsOf: collision, encoding: .utf8),
+            "occupied",
+            "destination contents must be untouched"
+        )
+    }
+
+    /// Rename a directory via `apply(.move)`. Same shape as the file
+    /// rename, but with a folder source. Children come along.
+    func test_apply_moveAsRename_renamesDirectoryWithContents() throws {
+        let folder = makeDir("oldname")
+        FileManager.default.createFile(
+            atPath: folder.appendingPathComponent("inside.txt").path,
+            contents: Data("hi".utf8)
+        )
+        let renamed = folder.deletingLastPathComponent().appendingPathComponent("newname")
+        let service = FileOperationsService()
+
+        _ = try service.apply(.move(
+            items: [FileOperationItem(source: folder, destination: renamed)],
+            origin: origin()
+        ))
+
+        XCTAssertFalse(fileExists(folder))
+        XCTAssertTrue(fileExists(renamed))
+        XCTAssertTrue(fileExists(renamed.appendingPathComponent("inside.txt")))
+    }
+
     // MARK: - Helpers
 
     private func origin(tabId: String? = "tab-1") -> FileOperationOrigin {

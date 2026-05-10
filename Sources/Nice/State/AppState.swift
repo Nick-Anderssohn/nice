@@ -129,7 +129,12 @@ final class AppState {
         self.fileExplorerOrchestrator = FileExplorerOrchestrator(
             fileExplorer: fileExplorer ?? services?.fileExplorer,
             tweaks: services?.tweaks,
-            editorDetector: services?.editorDetector
+            editorDetector: services?.editorDetector,
+            // Real `services` means we're running in the app (not a
+            // test/preview); install the AppKit confirmer so a CWD-
+            // invalidating rename surfaces an alert. Headless test
+            // builds leave it nil and rely on stub injection.
+            renameConfirmer: services != nil ? NSAlertRenameConfirmer() : nil
         )
         self.fileExplorerOrchestrator.tabs = tabs
         self.fileExplorerOrchestrator.sessions = sessions

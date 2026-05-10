@@ -300,8 +300,10 @@ final class FileOperationsService {
 
     /// Split `"archive.tar.gz"` into `("archive.tar", "gz")`. We
     /// only treat the last extension as the extension; that matches
-    /// Finder's behavior when it auto-renames.
-    static func splitNameAndExtension(_ name: String) -> (base: String, ext: String) {
+    /// Finder's behavior when it auto-renames. `nonisolated` so the
+    /// rename validator (and any future pure-string consumer) can
+    /// reuse it without inheriting the class's `@MainActor`.
+    nonisolated static func splitNameAndExtension(_ name: String) -> (base: String, ext: String) {
         // Names that *start* with a dot (`.zshrc`) are treated as
         // having no extension — the leading dot is part of the base
         // name, not a separator.

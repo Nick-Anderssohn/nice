@@ -17,6 +17,14 @@ struct FileExplorerServices {
     let pasteboard: FilePasteboardAdapter
     let history: FileOperationHistory
     let openWithProvider: OpenWithProvider
+    /// Weak handle to the process-wide window registry. Read by the
+    /// rename pre-flight to walk every open window's panes for CWD
+    /// invalidation. Held weak because the registry outlives the
+    /// services bundle (both are owned by `NiceServices`), but the
+    /// references shouldn't be retain cycles. `nil` in unit tests
+    /// that don't need cross-window scanning — the orchestrator
+    /// treats `nil` as "no panes to invalidate".
+    weak var registry: WindowRegistry? = nil
 
     /// Pure FS worker used for the orchestration's copy/cut/trash
     /// calls. Shared with `history.service` so a fake `FileManager`

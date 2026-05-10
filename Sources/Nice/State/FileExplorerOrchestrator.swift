@@ -47,14 +47,34 @@ final class FileExplorerOrchestrator: FileExplorerActions {
     /// Auto-detected terminal editors for `editorPaneEntries`.
     let editorDetector: EditorDetector?
 
+    /// Confirmation hook for the CWD-invalidation pre-flight on
+    /// rename. Production wires this to `NSAlertRenameConfirmer`
+    /// (defined below); unit tests inject a stub returning a canned
+    /// answer so `rename(from:to:)` is testable without `runModal`.
+    /// `nil` is treated as "no confirmer available" → the rename
+    /// proceeds without prompting (acceptable for previews/tests
+    /// that don't care).
+    @ObservationIgnored
+    var renameConfirmer: RenameImpactConfirmer?
+
+    /// Notification channel for the right-click "Rename" menu item.
+    /// The menu calls `beginRename(path:tabId:)`, which sets this
+    /// property; each `FileTreeRow` observes it via SwiftUI and
+    /// flips into edit mode iff its own path matches, then clears
+    /// the property. Loose coupling — the menu needs no row
+    /// reference, and only one row can possibly match.
+    var pendingRenamePath: String?
+
     init(
         fileExplorer: FileExplorerServices?,
         tweaks: Tweaks?,
-        editorDetector: EditorDetector?
+        editorDetector: EditorDetector?,
+        renameConfirmer: RenameImpactConfirmer? = nil
     ) {
         self.fileExplorer = fileExplorer
         self.tweaks = tweaks
         self.editorDetector = editorDetector
+        self.renameConfirmer = renameConfirmer
     }
 
     // MARK: - Pasteboard write
@@ -368,6 +388,158 @@ final class FileExplorerOrchestrator: FileExplorerActions {
 
     func redoFileOperation() {
         fileExplorer?.history.redo()
+    }
+
+    // MARK: - Rename
+
+    /// Test seam — incremented every time `focusActiveTerminal()` is
+    /// called. Exposed so unit tests can verify the post-rename focus
+    /// hand-off fires without having to stand up an `NSWindow` to
+    /// observe `makeFirstResponder`. Tests reset to 0 as needed; in
+    /// production it's a harmless counter that never reaches anything
+    /// observable.
+    @ObservationIgnored
+    private(set) var focusActiveTerminalCallCount: Int = 0
+
+    /// Hand AppKit first-responder status back to the active pane's
+    /// terminal after the rename field is torn down. SwiftUI doesn't
+    /// restore focus to an embedded `NSView` when a TextField goes
+    /// away, so without this the user can't type into the terminal
+    /// (or click it back into focus reliably) after a rename. Same
+    /// fix the sidebar tab and pane pill renames use. Safe no-op if
+    /// `sessions` is nil (previews, tests).
+    func focusActiveTerminal() {
+        focusActiveTerminalCallCount += 1
+        sessions?.focusActiveTerminal()
+    }
+
+    func beginRename(path: String, tabId: String?) {
+        // Defense-in-depth: the menu-side gate already hides
+        // "Rename" for `/`. Re-checking here means a rogue caller
+        // (or a future Return-key handler) can't bypass the gate.
+        guard FileBrowserRenameValidator.canRename(URL(fileURLWithPath: path)) else {
+            return
+        }
+        pendingRenamePath = path
+    }
+
+    func rename(from oldPath: String, to newName: String, originatingTabId: String?) {
+        // The row tears down the rename field before calling us, so
+        // the responder chain has lost its first responder. SwiftUI
+        // doesn't restore focus to embedded NSViews — same fix the
+        // pane pill rename uses. Defer so EVERY exit path (success,
+        // CWD-impact cancel, collision drift, format-guard early
+        // return) restores focus; impossible to forget when adding a
+        // new branch.
+        defer { focusActiveTerminal() }
+        guard let fileExplorer else { return }
+        let oldURL = URL(fileURLWithPath: oldPath)
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The row's `commitRename` should have validated already, but
+        // we mirror the format checks here so a rogue caller can't
+        // smuggle in an empty or slash-bearing name.
+        guard !trimmed.isEmpty, !trimmed.contains("/"), !trimmed.contains(":") else {
+            return
+        }
+        let newURL = oldURL.deletingLastPathComponent().appendingPathComponent(trimmed)
+
+        // CWD-invalidation pre-flight. Only directories can host a
+        // shell, but we run the scan unconditionally — a file rename
+        // is never going to match, so the cost is one wasted walk.
+        if let registry = fileExplorer.registry {
+            let snapshot = FileBrowserCWDImpactCheck.snapshot(from: registry)
+            let affected = FileBrowserCWDImpactCheck.affectedBy(
+                rename: oldPath, snapshot: snapshot
+            )
+            if !affected.isEmpty {
+                let proceed = renameConfirmer?.confirmRenameDespiteCWDImpact(
+                    affected: affected,
+                    oldPath: oldPath
+                ) ?? true  // No confirmer wired — proceed.
+                guard proceed else { return }
+            }
+        }
+
+        let origin = FileOperationOrigin(
+            windowSessionId: windowSession?.windowSessionId ?? "",
+            tabId: originatingTabId ?? tabs?.activeTabId
+        )
+        let pair = FileOperationItem(source: oldURL, destination: newURL)
+
+        do {
+            // Use `apply(.move:)` rather than `move(items:into:)` so
+            // the Finder-style auto-suffix in `nextAvailableName` is
+            // bypassed — for rename we want collisions to surface as
+            // a drift error, not silently land at "foo copy.txt".
+            let op = try fileExplorer.service.apply(
+                .move(items: [pair], origin: origin)
+            )
+            fileExplorer.history.push(op)
+        } catch let FileOperationError.sourceMissing(url) {
+            fileExplorer.history.lastDriftMessage =
+                "Couldn't rename: '\(url.lastPathComponent)' is no longer there."
+        } catch let FileOperationError.underlying(message) {
+            fileExplorer.history.lastDriftMessage =
+                Self.renameDriftMessage(forUnderlying: message, newName: trimmed)
+        } catch {
+            fileExplorer.history.lastDriftMessage =
+                "Rename failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Pattern-match the Foundation collision message so the user
+    /// sees a stable string regardless of macOS version. Falls back
+    /// to the raw underlying message for anything unrecognized.
+    /// Pure — exposed so tests can pin the exact phrasing without
+    /// running a real `apply(.move)` against a colliding path.
+    static func renameDriftMessage(forUnderlying message: String, newName: String) -> String {
+        // `NSCocoaErrorDomain` `NSFileWriteFileExistsError` (516) is
+        // surfaced as "...File ... couldn't be written because a
+        // file with the same name already exists." across recent
+        // macOS versions. Match on the stable substring.
+        if message.contains("already exists") {
+            return "Couldn't rename: '\(newName)' already exists."
+        }
+        return "Rename failed: \(message)"
+    }
+}
+
+// MARK: - Rename impact confirmer
+
+/// Decision protocol consulted before applying a rename that would
+/// invalidate one or more open terminal CWDs. Production conformance
+/// shows an `NSAlert.runModal`; tests inject a stub.
+@MainActor
+protocol RenameImpactConfirmer: AnyObject {
+    /// Return `true` if the user wants to proceed despite the
+    /// invalidation. Implementations are expected to be synchronous
+    /// (modal); the orchestrator stalls the rename on the response.
+    func confirmRenameDespiteCWDImpact(
+        affected: [PaneCWDRef],
+        oldPath: String
+    ) -> Bool
+}
+
+/// Production confirmer. Lives next to the orchestrator because
+/// it's the only caller. The view layer wires one of these onto
+/// `FileExplorerOrchestrator.renameConfirmer` after both AppKit and
+/// the AppState are fully constructed.
+@MainActor
+final class NSAlertRenameConfirmer: RenameImpactConfirmer {
+    func confirmRenameDespiteCWDImpact(
+        affected: [PaneCWDRef],
+        oldPath: String
+    ) -> Bool {
+        let count = affected.count
+        let alert = NSAlert()
+        alert.messageText = "Rename will affect \(count) open terminal\(count == 1 ? "" : "s")"
+        let folder = (oldPath as NSString).lastPathComponent
+        alert.informativeText = "Renaming '\(folder)' will break the working directory of \(count) open terminal\(count == 1 ? "" : "s"). The terminal\(count == 1 ? "" : "s") will keep running but `pwd` will report a path that no longer exists. Rename anyway?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        let renameButton = alert.addButton(withTitle: "Rename Anyway")
+        renameButton.hasDestructiveAction = true
+        return alert.runModal() == .alertSecondButtonReturn
     }
 }
 

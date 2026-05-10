@@ -53,6 +53,18 @@ protocol FileExplorerActions: AnyObject {
     func openWithEntries(for url: URL) -> [OpenWithEntry]
     func editorPaneEntries() -> EditorPaneEntries
     func openInEditorPane(url: URL, editorId: UUID)
+    /// Notify the file-tree row at `path` that it should flip into
+    /// inline-edit mode. The orchestrator publishes the request via
+    /// an observable property the row watches; this loose coupling
+    /// avoids the menu needing a row reference.
+    func beginRename(path: String, tabId: String?)
+    /// Commit a rename: move the file/folder at `oldPath` to a sibling
+    /// with `newName` in the same parent. Performs the CWD-impact
+    /// pre-flight (which may show an alert and short-circuit), then
+    /// records an undoable `.move` op via the shared history. Drift
+    /// errors (collision, source missing) surface via
+    /// `history.lastDriftMessage`.
+    func rename(from oldPath: String, to newName: String, originatingTabId: String?)
 }
 
 // MARK: - Pure model
@@ -67,6 +79,7 @@ struct FileBrowserContextMenuModel: Equatable {
         case openInEditorPane
         case revealInFinder
         case dividerOpen
+        case rename
         case copy
         case copyPath
         case cut
@@ -76,10 +89,18 @@ struct FileBrowserContextMenuModel: Equatable {
 
     let items: [Item]
 
+    /// `canRename` is the runtime gate: false when the row is part of
+    /// a multi-selection (rename is single-target only) or the row is
+    /// the filesystem root `/` (which has no parent and can't be
+    /// renamed). The file-browser root row (a project's CWD) is
+    /// renameable — only `/` itself is the special case. The caller
+    /// computes this via `FileBrowserRenameValidator.canRename` AND
+    /// the selection-count check, then passes the bool here.
     static func build(
         isDirectory: Bool,
         isRoot: Bool,
-        canPaste: Bool
+        canPaste: Bool,
+        canRename: Bool = true
     ) -> FileBrowserContextMenuModel {
         var out: [Item] = []
         if !isDirectory {
@@ -89,6 +110,9 @@ struct FileBrowserContextMenuModel: Equatable {
         }
         out.append(.revealInFinder)
         out.append(.dividerOpen)
+        if canRename {
+            out.append(.rename)
+        }
         if !isRoot {
             out.append(.copy)
         }
@@ -147,7 +171,13 @@ struct FileBrowserContextMenu: View {
         let model = FileBrowserContextMenuModel.build(
             isDirectory: isDirectory,
             isRoot: isRoot,
-            canPaste: actions.canPaste()
+            canPaste: actions.canPaste(),
+            // Hide Rename when this is a multi-selection (rename is
+            // single-target only) or the row is the filesystem root.
+            canRename: actionPaths.count <= 1
+                && FileBrowserRenameValidator.canRename(
+                    URL(fileURLWithPath: clickedPath)
+                )
         )
         ForEach(Array(model.items.enumerated()), id: \.offset) { _, item in
             row(for: item)
@@ -173,6 +203,12 @@ struct FileBrowserContextMenu: View {
             }
         case .dividerOpen:
             Divider()
+        case .rename:
+            Button("Rename") {
+                onWillAct()
+                actions.beginRename(path: clickedPath, tabId: tabId)
+            }
+            .accessibilityIdentifier("fileBrowser.row.\(clickedPath).rename")
         case .copy:
             Button("Copy") {
                 onWillAct()

@@ -66,9 +66,10 @@ final class FileBrowserContextMenuModelTests: XCTestCase {
 
     /// File rows show the menu in the documented order:
     /// Open / Open With / Open in Editor Pane / Reveal in Finder /
-    /// divider / Copy / Copy Path / Cut / Paste (when canPaste) /
-    /// Trash. The trailing divider is intentionally absent — the user
-    /// asked for Copy Path to sit directly under Copy.
+    /// divider / Rename / Copy / Copy Path / Cut / Paste (when
+    /// canPaste) / Trash. The trailing divider is intentionally
+    /// absent — the user asked for Copy Path to sit directly under
+    /// Copy.
     func test_menuItems_orderMatchesSpec_fileRow_canPaste() {
         let model = FileBrowserContextMenuModel.build(
             isDirectory: false, isRoot: false, canPaste: true
@@ -76,7 +77,7 @@ final class FileBrowserContextMenuModelTests: XCTestCase {
         XCTAssertEqual(model.items, [
             .open, .openWith, .openInEditorPane, .revealInFinder,
             .dividerOpen,
-            .copy, .copyPath, .cut, .paste, .trash
+            .rename, .copy, .copyPath, .cut, .paste, .trash
         ])
     }
 
@@ -87,19 +88,65 @@ final class FileBrowserContextMenuModelTests: XCTestCase {
         XCTAssertEqual(model.items, [
             .revealInFinder,
             .dividerOpen,
-            .copy, .copyPath, .cut, .trash
+            .rename, .copy, .copyPath, .cut, .trash
         ])
     }
 
     func test_menuItems_orderMatchesSpec_rootRow_canPaste() {
         // On root: no Open (it's a directory), no Cut/Copy/Trash.
+        // Project root IS renameable — only the filesystem root `/`
+        // is special-cased (handled by canRename: false in the
+        // separate test below).
         let model = FileBrowserContextMenuModel.build(
             isDirectory: true, isRoot: true, canPaste: true
         )
         XCTAssertEqual(model.items, [
             .revealInFinder,
             .dividerOpen,
-            .copyPath, .paste
+            .rename, .copyPath, .paste
         ])
+    }
+
+    // MARK: - Rename visibility
+
+    func test_menuItems_rename_visible_whenCanRenameTrue() {
+        let model = FileBrowserContextMenuModel.build(
+            isDirectory: false, isRoot: false, canPaste: false,
+            canRename: true
+        )
+        XCTAssertTrue(model.items.contains(.rename))
+    }
+
+    func test_menuItems_rename_hidden_whenCanRenameFalse() {
+        // Caller passes `canRename: false` for multi-select rows or
+        // for the filesystem root `/`.
+        let model = FileBrowserContextMenuModel.build(
+            isDirectory: false, isRoot: false, canPaste: false,
+            canRename: false
+        )
+        XCTAssertFalse(model.items.contains(.rename))
+    }
+
+    func test_menuItems_rename_visible_onProjectRoot() {
+        // The file-browser root row (project CWD) is renameable.
+        let model = FileBrowserContextMenuModel.build(
+            isDirectory: true, isRoot: true, canPaste: false,
+            canRename: true
+        )
+        XCTAssertTrue(model.items.contains(.rename))
+    }
+
+    func test_menuItems_rename_positionedBetweenDividerAndCopy() {
+        let model = FileBrowserContextMenuModel.build(
+            isDirectory: false, isRoot: false, canPaste: false,
+            canRename: true
+        )
+        guard let dividerIdx = model.items.firstIndex(of: .dividerOpen),
+              let renameIdx = model.items.firstIndex(of: .rename),
+              let copyIdx = model.items.firstIndex(of: .copy) else {
+            XCTFail("expected divider, rename, copy all present"); return
+        }
+        XCTAssertLessThan(dividerIdx, renameIdx)
+        XCTAssertLessThan(renameIdx, copyIdx)
     }
 }

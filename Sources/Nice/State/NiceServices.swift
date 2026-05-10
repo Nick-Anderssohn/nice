@@ -92,7 +92,8 @@ final class NiceServices {
         self.fileExplorer = FileExplorerServices(
             pasteboard: FilePasteboardAdapter(),
             history: history,
-            openWithProvider: OpenWithProvider()
+            openWithProvider: OpenWithProvider(),
+            registry: self.registry
         )
     }
 
