@@ -15,13 +15,15 @@
 //
 //  2. Accepts file drops (any file URL from Finder or the in-app
 //     File Explorer, plus raw image data from browsers / Messages /
-//     Preview) and types the resulting path into the pty. When the
-//     hosted app has bracketed paste enabled (DEC 2004 — Claude
-//     Code's TUI does), the path is wrapped in `ESC [200~ … ESC
-//     [201~` so Claude treats the drop as a paste — and for image
-//     paths, substitutes `[Image #N]` instead of echoing the raw
-//     characters. With bracketed paste off it falls back to a
-//     single-quoted path so spaces survive at a plain zsh prompt.
+//     Preview) and types the resulting path into the pty. The path
+//     is backslash-escaped (POSIX-shell style — same encoding
+//     Terminal.app, iTerm2, Ghostty, and Warp use for drag-drop),
+//     so spaces and shell metacharacters survive zsh parsing. When
+//     the hosted app has bracketed paste enabled (DEC 2004 —
+//     Claude Code's TUI does), the escaped path is additionally
+//     wrapped in `ESC [200~ … ESC [201~` so Claude treats the drop
+//     as a single pasted token and can substitute `[Image #N]` for
+//     image paths.
 //
 
 import AppKit
@@ -328,23 +330,27 @@ final class NiceTerminalView: LocalProcessTerminalView {
             .filter(Self.isSafePath)
         guard !paths.isEmpty else { return super.performDragOperation(sender) }
 
+        // POSIX-shell-style backslash escaping in both branches —
+        // matches what Terminal.app, iTerm2, Ghostty, and Warp emit
+        // for drag-drop. Spaces, parens, quotes, etc. survive zsh
+        // parsing as a single token, and paste-aware TUIs (Claude
+        // Code, fzf) that already accept drag-drop from those
+        // terminals see the same encoding here.
+        let escaped = paths.map { shellBackslashEscape($0) }
+            .joined(separator: " ")
         let bytes: [UInt8]
         if getTerminal().bracketedPasteMode {
-            // Unquoted, wrapped in bracketed-paste markers — Claude
-            // Code (and other paste-aware TUIs) treat this as a single
-            // pasted path and can swap it for `[Image #N]` (or other
-            // attachment indicators). Adding quotes here would defeat
-            // the filepath detection.
+            // Wrap in bracketed-paste markers so paste-aware TUIs
+            // treat the run as one pasted token.
             var buf = Self.bracketedPasteStart
-            buf.append(contentsOf: Array(paths.joined(separator: " ").utf8))
+            buf.append(contentsOf: escaped.utf8)
             buf.append(contentsOf: Self.bracketedPasteEnd)
             bytes = buf
         } else {
-            // Shell prompt with bracketed paste off — quote the path so
-            // spaces survive, and pad with spaces so it separates from
-            // surrounding text. No newline: drop must not auto-submit.
-            let quoted = paths.map { shellSingleQuote($0) }.joined(separator: " ")
-            bytes = Array((" " + quoted + " ").utf8)
+            // Plain prompt — pad with spaces so the path separates
+            // from surrounding text. No newline: drop must not
+            // auto-submit.
+            bytes = Array((" " + escaped + " ").utf8)
         }
         send(data: ArraySlice(bytes))
         return true
