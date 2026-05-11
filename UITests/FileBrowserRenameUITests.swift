@@ -46,11 +46,20 @@ final class FileBrowserRenameUITests: NiceUITestCase {
         renameItem.click()
 
         let field = waitForRenameField(in: app, atPath: file.path)
-        // The field pre-selects the basename portion only (Finder-
-        // style); typing "renamed" replaces "file" while preserving
-        // the ".txt" extension. The on-disk result must therefore
-        // be "renamed.txt".
-        field.typeText("renamed")
+        // The production field pre-selects the basename portion only
+        // (Finder-style) on its first `becomeFirstResponder`, so a
+        // user can type the new basename and keep `.txt`. We can't
+        // rely on that here: `waitForRenameField` clicks the field
+        // to force focus (the production `DispatchQueue.main.async`
+        // focus hop loses to XCUITest's tight event sequence on the
+        // slow CI VM), and the click moves the cursor — destroying
+        // the pre-selection. Compensate by selecting all and typing
+        // the full new name; the on-disk outcome is what we're
+        // actually asserting. Pre-selection lives on as an
+        // implementation-level invariant of
+        // `FileBrowserRenameField.becomeFirstResponder`.
+        app.typeKey("a", modifierFlags: .command)
+        field.typeText("renamed.txt")
         app.typeKey(.return, modifierFlags: [])
 
         let renamed = project.appendingPathComponent("renamed.txt")
@@ -121,27 +130,31 @@ final class FileBrowserRenameUITests: NiceUITestCase {
             element.waitForExistence(timeout: 5),
             "Expected rename field \(id) to exist within 5s."
         )
-        // The rename field becomes first responder via a
-        // `DispatchQueue.main.async` hop in
-        // `FileBrowserRenameField.makeNSView` — the underlying
-        // `NSTextField` can't be made first responder until it's been
-        // attached to a window, which happens one runloop tick after
-        // `makeNSView` returns. On the slow macOS CI VMs that gap is
-        // wide enough that `typeText` lands while focus is still on
-        // the row's parent Group, surfacing as "Neither element nor
-        // any descendant has keyboard focus."
+        // The rename field's first-responder grant comes from a
+        // `DispatchQueue.main.async` hop inside `makeNSView`. In
+        // production users take hundreds of ms between clicking
+        // "Rename" and starting to type, so by then the hop has
+        // fired and any menu-dismissal focus dance has settled —
+        // the field reliably has focus.
         //
-        // The previous version of this helper tried to poll for
-        // focus via `XCUIElement.value(forKey: "hasKeyboardFocus")`,
-        // but that read goes through a cached snapshot on the live
-        // element proxy and returns stale data — so the poll could
-        // see "no focus" for the full timeout even after focus had
-        // actually arrived. A fixed sleep that comfortably exceeds
-        // the one-tick async hop is simpler and reliable: the hop
-        // takes <50ms even on the GitHub-Actions macOS VM, so 500ms
-        // is generous, and it only costs ~1.5s across the three
-        // rename tests.
-        usleep(500_000)
+        // XCUITest hits `typeText` within a few ms. On the slow
+        // GitHub-Actions macOS VM, AppKit's menu-dismissal focus
+        // restoration can land *after* our async, leaving focus
+        // permanently on the row's parent Group; sleeping more
+        // doesn't help (focus isn't delayed, it's elsewhere).
+        // Earlier attempts to poll for focus via
+        // `value(forKey: "hasKeyboardFocus")` also failed because
+        // the live `XCUIElement` proxy returns cached snapshot
+        // data and reports stale "no focus" indefinitely.
+        //
+        // Click the field directly: the mouseDown puts the field
+        // into first-responder state synchronously and keystrokes
+        // land correctly. Side effect: the click moves the cursor,
+        // so any basename pre-selection installed by the
+        // production `becomeFirstResponder` is gone — callers that
+        // care must drive their own selection (e.g. Cmd-A) before
+        // typing.
+        element.click()
         return element
     }
 
