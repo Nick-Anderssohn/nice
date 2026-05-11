@@ -129,21 +129,19 @@ final class FileBrowserRenameUITests: NiceUITestCase {
         // `makeNSView` returns. On the slow macOS CI VMs that gap is
         // wide enough that `typeText` lands while focus is still on
         // the row's parent Group, surfacing as "Neither element nor
-        // any descendant has keyboard focus." Poll for focus here so
-        // callers can `typeText` without racing the focus hop.
+        // any descendant has keyboard focus."
         //
-        // macOS XCUIElement doesn't expose `hasKeyboardFocus` as a
-        // property — read it from the accessibility snapshot via
-        // KVC. The key is documented in `XCUIElementAttributes`
-        // and is the same value AX reports.
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            if (element.value(forKey: "hasKeyboardFocus") as? Bool) == true {
-                return element
-            }
-            usleep(50_000)
-        }
-        XCTFail("Rename field \(id) did not receive keyboard focus within 5s.")
+        // The previous version of this helper tried to poll for
+        // focus via `XCUIElement.value(forKey: "hasKeyboardFocus")`,
+        // but that read goes through a cached snapshot on the live
+        // element proxy and returns stale data — so the poll could
+        // see "no focus" for the full timeout even after focus had
+        // actually arrived. A fixed sleep that comfortably exceeds
+        // the one-tick async hop is simpler and reliable: the hop
+        // takes <50ms even on the GitHub-Actions macOS VM, so 500ms
+        // is generous, and it only costs ~1.5s across the three
+        // rename tests.
+        usleep(500_000)
         return element
     }
 
