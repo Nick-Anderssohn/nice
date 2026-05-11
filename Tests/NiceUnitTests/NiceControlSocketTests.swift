@@ -419,6 +419,7 @@ final class NiceControlSocketTests: XCTestCase {
         let clientFd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard clientFd >= 0 else { return }
         defer { close(clientFd) }
+        suppressSIGPIPE(on: clientFd)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -452,6 +453,7 @@ final class NiceControlSocketTests: XCTestCase {
         let clientFd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard clientFd >= 0 else { return nil }
         defer { close(clientFd) }
+        suppressSIGPIPE(on: clientFd)
 
         var tv = timeval(
             tv_sec: Int(timeout),
@@ -506,6 +508,23 @@ final class NiceControlSocketTests: XCTestCase {
             buffer = buffer.subdata(in: buffer.startIndex..<nl)
         }
         return String(data: buffer, encoding: .utf8)
+    }
+
+    /// Set `SO_NOSIGPIPE` on a client fd so `write()` to a peer that
+    /// closed mid-handshake returns `EPIPE` instead of killing the
+    /// whole test binary with SIGPIPE. Matters for
+    /// `test_restartsAfterAcceptSourceCancel` specifically: the
+    /// forced cancel + rebuild window lets the server close an
+    /// accepted client fd before our `write()` lands, and on slow CI
+    /// VMs that race is just wide enough to fire. Production clients
+    /// shell out to `nc -U`, so they don't share this exposure — only
+    /// the in-process test helpers do.
+    private func suppressSIGPIPE(on fd: Int32) {
+        var one: Int32 = 1
+        _ = setsockopt(
+            fd, SOL_SOCKET, SO_NOSIGPIPE,
+            &one, socklen_t(MemoryLayout<Int32>.size)
+        )
     }
 
     /// Poll `condition` every 20ms up to `timeout`. Beats fixed sleeps
