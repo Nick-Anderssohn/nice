@@ -4,8 +4,9 @@
 //
 //  Captures upsert / prune / flush calls so `WindowSession` tests can
 //  exercise the persistence-side branches (save-gate,
-//  restoreSavedWindow, tearDown's claimedWindowIds invariant) without
-//  reading or writing `~/Library/Application Support/Nice/sessions.json`.
+//  restoreSavedWindow, tearDown's `WindowClaimLedger` invariant)
+//  without reading or writing
+//  `~/Library/Application Support/Nice/sessions.json`.
 //
 //  Mirrors the in-memory shape of the real `SessionStore`: `upsert`
 //  replaces by id, `pruneEmptyWindows` drops empties except the kept

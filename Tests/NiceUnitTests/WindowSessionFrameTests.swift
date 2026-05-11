@@ -26,14 +26,15 @@ final class WindowSessionFrameTests: XCTestCase {
     private var tabs: TabModel!
     private var sessions: SessionsModel!
     private var sidebar: SidebarModel!
+    private var ledger: WindowClaimLedger!
 
     override func setUp() {
         super.setUp()
-        WindowSession._testing_resetClaimedWindowIds()
         fake = FakeSessionStore()
         tabs = TabModel(initialMainCwd: "/tmp/nice-frame-tests")
         sessions = SessionsModel(tabs: tabs)
         sidebar = SidebarModel(initialCollapsed: false, initialMode: .tabs)
+        ledger = WindowClaimLedger()
     }
 
     override func tearDown() {
@@ -42,7 +43,7 @@ final class WindowSessionFrameTests: XCTestCase {
         tabs = nil
         sidebar = nil
         fake = nil
-        WindowSession._testing_resetClaimedWindowIds()
+        ledger = nil
         super.tearDown()
     }
 
@@ -198,7 +199,8 @@ final class WindowSessionFrameTests: XCTestCase {
             sidebar: sidebar,
             windowSessionId: windowSessionId,
             persistenceEnabled: true,
-            store: fake
+            store: fake,
+            claimLedger: ledger
         )
         ws.markInitializationComplete()
         return ws

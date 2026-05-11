@@ -3,8 +3,8 @@
 //  Nice
 //
 //  Per-window identity and disk-state. Carved out of `AppState` so
-//  the persistence concern (this window's `windowSessionId`, the
-//  process-wide `claimedWindowIds` set, the debounced
+//  the persistence concern (this window's `windowSessionId`, its
+//  claim on the injected `WindowClaimLedger`, the debounced
 //  `scheduleSessionSave`, the snapshot/restore round-trip) can live
 //  apart from the composition root and be reasoned about on its own.
 //
@@ -32,15 +32,6 @@ import Observation
 @MainActor
 @Observable
 final class WindowSession {
-    /// Set of `windowSessionId`s already claimed by live AppStates in
-    /// this process. Populated by `restoreSavedWindow` after it picks
-    /// a slot. `restoreSavedWindow` consults this to decide whether a
-    /// miss-on-match should adopt an unclaimed saved entry (legitimate
-    /// first-launch migration) or stay fresh (⌘N opened a second
-    /// window; adopting the first window's slot would duplicate pane
-    /// ids and defeat per-window isolation).
-    private static var claimedWindowIds: Set<String> = []
-
     /// Stable identifier for this window's entry in `sessions.json`.
     /// Pulled in from `@SceneStorage("windowSessionId")` on
     /// `AppShellView`; survives quits via standard SwiftUI scene
@@ -90,13 +81,22 @@ final class WindowSession {
     @ObservationIgnored
     private let store: SessionStorePersisting
 
+    /// Shared ledger of `windowSessionId`s already adopted by live
+    /// AppStates in this process. Replaces the prior process-wide
+    /// `static var claimedWindowIds` — tests construct a fresh ledger
+    /// per test, production threads a single instance via
+    /// `NiceServices` so every window sees the same claims.
+    @ObservationIgnored
+    private let claimLedger: WindowClaimLedger
+
     init(
         tabs: TabModel,
         sessions: SessionsModel,
         sidebar: SidebarModel,
         windowSessionId: String,
         persistenceEnabled: Bool,
-        store: SessionStorePersisting = SessionStore.shared
+        store: SessionStorePersisting = SessionStore.shared,
+        claimLedger: WindowClaimLedger
     ) {
         // Brand-new scenes come in with an empty SceneStorage value;
         // mint a UUID here so the scene has a stable id for save/
@@ -111,6 +111,7 @@ final class WindowSession {
         self.sessions = sessions
         self.sidebar = sidebar
         self.store = store
+        self.claimLedger = claimLedger
     }
 
     /// AppState calls this at the end of `start()` after
@@ -118,23 +119,6 @@ final class WindowSession {
     /// save-gate so subsequent mutations persist normally.
     func markInitializationComplete() {
         isInitializing = false
-    }
-
-    /// Test-only escape hatch: reset the process-wide
-    /// `claimedWindowIds` set so a unit test that constructs multiple
-    /// `WindowSession` instances starts each test from a clean slate.
-    /// Production never calls this — the only legitimate remover is
-    /// `tearDown()` releasing its own id. Internal (visible only via
-    /// `@testable import Nice`) so production code can't reach it.
-    static func _testing_resetClaimedWindowIds() {
-        claimedWindowIds.removeAll()
-    }
-
-    /// Test-only readback for the claim set. Used by tests that
-    /// assert "second window can adopt the slot after first tears
-    /// down" without exposing the storage as a writable seam.
-    static func _testing_isClaimed(_ id: String) -> Bool {
-        claimedWindowIds.contains(id)
     }
 
     /// Number of saved windows that no live AppState in this process
@@ -147,10 +131,11 @@ final class WindowSession {
     /// auto-seeded empty Terminals section still reopens as its own
     /// window (the user may have saved that state intentionally).
     static func unclaimedSavedWindowCount(
+        ledger: WindowClaimLedger,
         store: SessionStorePersisting = SessionStore.shared
     ) -> Int {
         store.load().windows.filter {
-            !$0.projects.isEmpty && !claimedWindowIds.contains($0.id)
+            !$0.projects.isEmpty && !ledger.contains($0.id)
         }.count
     }
 
@@ -270,9 +255,8 @@ final class WindowSession {
         // and the saved state predates it — adopt an unclaimed saved
         // slot as migration, or (b) ⌘N just opened a second window on
         // top of an already-running process — start fresh. Distinguish
-        // via the process-wide `claimedWindowIds` set: if some other
-        // live AppState already claimed every saved slot we could
-        // adopt, we're case (b).
+        // via the `claimLedger`: if some other live AppState already
+        // claimed every saved slot we could adopt, we're case (b).
         let matched = state.windows.first(where: { $0.id == windowSessionId })
         let adopted: PersistedWindow?
         if let m = matched, !m.projects.isEmpty {
@@ -281,21 +265,21 @@ final class WindowSession {
             // Matched slot exists but is empty — likely a crashed
             // mid-restore. Adopt the first non-empty unclaimed slot.
             adopted = state.windows.first(where: {
-                !$0.projects.isEmpty && !Self.claimedWindowIds.contains($0.id)
+                !$0.projects.isEmpty && !claimLedger.contains($0.id)
             })
         } else {
             // No matched slot. Adopt an unclaimed non-empty slot on
             // first-launch migration; stay fresh if every non-empty
             // slot is already owned by another window in this process.
             adopted = state.windows.first(where: {
-                !$0.projects.isEmpty && !Self.claimedWindowIds.contains($0.id)
+                !$0.projects.isEmpty && !claimLedger.contains($0.id)
             })
         }
 
         defer {
             // Claim our slot (either adopted one or our own minted id)
             // so sibling windows spawned next know not to adopt it.
-            Self.claimedWindowIds.insert(windowSessionId)
+            claimLedger.insert(windowSessionId)
             ensureTerminalsProjectSeededAndSpawn()
         }
 
@@ -755,12 +739,12 @@ final class WindowSession {
     }
 
     /// Finalize this window's persistence and release its claim on
-    /// `claimedWindowIds`. Called from `AppState.tearDown(reason:)`
-    /// before the pty subsystem comes down, so the final model
-    /// state (including auto-titles that arrived mid-session) makes
-    /// it to disk on the `.appTerminating` path. Skipped in
-    /// preview/test mode so tests can't pollute the real
-    /// sessions.json.
+    /// the shared `WindowClaimLedger`. Called from
+    /// `AppState.tearDown(reason:)` before the pty subsystem comes
+    /// down, so the final model state (including auto-titles that
+    /// arrived mid-session) makes it to disk on the
+    /// `.appTerminating` path. Skipped in preview/test mode so tests
+    /// can't pollute the real sessions.json.
     func tearDown(reason: TearDownReason) {
         if persistenceEnabled {
             switch reason {
@@ -775,8 +759,7 @@ final class WindowSession {
         // neither path should leave a stale id pinning future
         // windows in this process out of the slot. (For
         // .userClosedWindow the slot is also gone from disk, but
-        // that's the store's concern, not the in-process claim
-        // set's.)
-        Self.claimedWindowIds.remove(windowSessionId)
+        // that's the store's concern, not the ledger's.)
+        claimLedger.remove(windowSessionId)
     }
 }

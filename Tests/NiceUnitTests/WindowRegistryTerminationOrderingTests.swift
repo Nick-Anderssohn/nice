@@ -26,15 +26,8 @@ import XCTest
 @MainActor
 final class WindowRegistryTerminationOrderingTests: XCTestCase {
 
-    override func setUp() {
-        super.setUp()
-        WindowSession._testing_resetClaimedWindowIds()
-    }
-
-    override func tearDown() {
-        WindowSession._testing_resetClaimedWindowIds()
-        super.tearDown()
-    }
+    // Each AppState constructed below gets its own fresh
+    // `WindowClaimLedger` by default — no process-wide reset needed.
 
     /// THE regression test. Drives the full ⌘Q sequence: post
     /// `willTerminate` (which is what `NiceServices` listens for),

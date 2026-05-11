@@ -12,7 +12,7 @@
 //  important branch and the deferred path requires a real pty.
 //
 //  Each test reseeds `FakeSessionStore.state`, resets the static
-//  `claimedWindowIds` claim set, and drives `restoreSavedWindow`
+//  `WindowClaimLedger` claim set, and drives `restoreSavedWindow`
 //  directly. Snapshots use Claude-only tabs so `addRestoredTabModel`'s
 //  Claude branch returns spawn info instead of calling
 //  `sessions.makeSession` — no real pty work happens during the
@@ -30,14 +30,19 @@ final class WindowSessionRestoreTests: XCTestCase {
     private var tabs: TabModel!
     private var sessions: SessionsModel!
     private var sidebar: SidebarModel!
+    private var ledger: WindowClaimLedger!
 
     override func setUp() {
         super.setUp()
-        WindowSession._testing_resetClaimedWindowIds()
         fake = FakeSessionStore()
         tabs = TabModel(initialMainCwd: "/tmp/nice-restore-tests")
         sessions = SessionsModel(tabs: tabs)
         sidebar = SidebarModel(initialCollapsed: false, initialMode: .tabs)
+        // Per-test ledger replaces the prior static-set reset.
+        // Any second WindowSession this test constructs must share
+        // this instance (and does, via the helper below) so
+        // cross-window adoption logic is exercised.
+        ledger = WindowClaimLedger()
     }
 
     override func tearDown() {
@@ -46,7 +51,7 @@ final class WindowSessionRestoreTests: XCTestCase {
         tabs = nil
         sidebar = nil
         fake = nil
-        WindowSession._testing_resetClaimedWindowIds()
+        ledger = nil
         super.tearDown()
     }
 
@@ -67,8 +72,8 @@ final class WindowSessionRestoreTests: XCTestCase {
 
         XCTAssertEqual(ws.windowSessionId, "win-1",
                        "Matched adoption should not rotate the window id.")
-        XCTAssertTrue(WindowSession._testing_isClaimed("win-1"),
-                      "Adopted slot must land in claimedWindowIds so siblings won't poach it.")
+        XCTAssertTrue(ledger.contains("win-1"),
+                      "Adopted slot must land in the claim ledger so siblings won't poach it.")
         XCTAssertEqual(tabs.projects.map(\.id),
                        [TabModel.terminalsProjectId, "proj-alpha"],
                        "Snapshot project order must round-trip with Terminals at index 0.")
@@ -103,7 +108,7 @@ final class WindowSessionRestoreTests: XCTestCase {
 
         XCTAssertEqual(ws.windowSessionId, "win-recovery",
                        "Falling back to a different slot must rotate windowSessionId so subsequent saves target it.")
-        XCTAssertTrue(WindowSession._testing_isClaimed("win-recovery"))
+        XCTAssertTrue(ledger.contains("win-recovery"))
         XCTAssertNotNil(tabs.tab(for: "t-recover"),
                         "Recovered tab from the non-empty slot must be in the rebuilt tree.")
     }
@@ -131,7 +136,7 @@ final class WindowSessionRestoreTests: XCTestCase {
 
         XCTAssertEqual(ws.windowSessionId, "orphan",
                        "Unmatched first-launch adoption must rotate to the orphan id.")
-        XCTAssertTrue(WindowSession._testing_isClaimed("orphan"))
+        XCTAssertTrue(ledger.contains("orphan"))
         XCTAssertNotNil(tabs.tab(for: "t-orphan"))
     }
 
@@ -167,13 +172,14 @@ final class WindowSessionRestoreTests: XCTestCase {
             tabs: tabs2, sessions: sessions2, sidebar: sidebar2,
             windowSessionId: "win-B",
             persistenceEnabled: true,
-            store: fake
+            store: fake,
+            claimLedger: ledger
         )
         ws2.restoreSavedWindow()
 
         XCTAssertEqual(ws2.windowSessionId, "win-B",
                        "Second window must not adopt an already-claimed slot.")
-        XCTAssertTrue(WindowSession._testing_isClaimed("win-B"))
+        XCTAssertTrue(ledger.contains("win-B"))
         XCTAssertEqual(tabs2.projects.map(\.id), [TabModel.terminalsProjectId],
                        "Stay-fresh window must keep the seed-only tree shape.")
 
@@ -197,7 +203,7 @@ final class WindowSessionRestoreTests: XCTestCase {
 
         XCTAssertEqual(ws.windowSessionId, "win-empty",
                        "Empty state must not rotate the minted window id.")
-        XCTAssertTrue(WindowSession._testing_isClaimed("win-empty"),
+        XCTAssertTrue(ledger.contains("win-empty"),
                       "Even with no adoption, defer must still claim the window's own id.")
         XCTAssertEqual(tabs.projects.map(\.id), [TabModel.terminalsProjectId],
                        "Seed tree must survive restore unchanged.")
@@ -244,7 +250,7 @@ final class WindowSessionRestoreTests: XCTestCase {
         // No saved state → nothing for the launch-time fan-out to do.
         fake.state = .empty
         XCTAssertEqual(
-            WindowSession.unclaimedSavedWindowCount(store: fake), 0,
+            WindowSession.unclaimedSavedWindowCount(ledger: ledger, store: fake), 0,
             "Empty state has no saved windows to restore."
         )
     }
@@ -261,7 +267,7 @@ final class WindowSessionRestoreTests: XCTestCase {
             version: PersistedState.currentVersion, windows: [terminalsOnly]
         )
         XCTAssertEqual(
-            WindowSession.unclaimedSavedWindowCount(store: fake), 1,
+            WindowSession.unclaimedSavedWindowCount(ledger: ledger, store: fake), 1,
             "A Terminals-only saved window must still count toward the fan-out."
         )
     }
@@ -275,14 +281,14 @@ final class WindowSessionRestoreTests: XCTestCase {
             version: PersistedState.currentVersion, windows: [ghost]
         )
         XCTAssertEqual(
-            WindowSession.unclaimedSavedWindowCount(store: fake), 0,
+            WindowSession.unclaimedSavedWindowCount(ledger: ledger, store: fake), 0,
             "Ghost entries with no projects must not be counted."
         )
     }
 
     func test_unclaimedCount_dropsAfterAdoption() {
         // Two non-empty saved windows. After one is adopted by a
-        // WindowSession (claimedWindowIds gains its id), the count
+        // WindowSession (the ledger gains its id), the count
         // drops from 2 to 1 — that's the contract the spawn loop
         // depends on to know how many sibling windows to open.
         let claudeA = makePersistedClaudeTab(id: "tA", sessionId: "sA")
@@ -304,13 +310,13 @@ final class WindowSessionRestoreTests: XCTestCase {
         fake.state = PersistedState(
             version: PersistedState.currentVersion, windows: [winA, winB]
         )
-        XCTAssertEqual(WindowSession.unclaimedSavedWindowCount(store: fake), 2,
+        XCTAssertEqual(WindowSession.unclaimedSavedWindowCount(ledger: ledger, store: fake), 2,
                        "Both saved non-empty windows are unclaimed at start.")
 
         let ws = makeWindowSession(windowSessionId: "win-A")
         ws.restoreSavedWindow()
 
-        XCTAssertEqual(WindowSession.unclaimedSavedWindowCount(store: fake), 1,
+        XCTAssertEqual(WindowSession.unclaimedSavedWindowCount(ledger: ledger, store: fake), 1,
                        "After one window adopts a slot, only the other remains unclaimed.")
     }
 
@@ -333,7 +339,7 @@ final class WindowSessionRestoreTests: XCTestCase {
         ws.restoreSavedWindow()  // adopts "the-only" via the unmatched branch
 
         XCTAssertEqual(
-            WindowSession.unclaimedSavedWindowCount(store: fake), 0,
+            WindowSession.unclaimedSavedWindowCount(ledger: ledger, store: fake), 0,
             "Every non-empty slot claimed → fan-out count must be zero."
         )
     }
@@ -1023,8 +1029,8 @@ final class WindowSessionRestoreTests: XCTestCase {
     /// Wrap a single PersistedTab in a fresh PersistedState so the
     /// fake store has something to hand back from `load()`. The
     /// persisted window id is generic — `restoreSavedWindow`'s
-    /// unmatched-adoption path picks it up because
-    /// `claimedWindowIds` is reset in `setUp`. Any non-matching
+    /// unmatched-adoption path picks it up because the per-test
+    /// `ledger` is freshly empty. Any non-matching
     /// `makeWindowSession` id will route through the unmatched
     /// fallback and adopt it.
     private func makeState(tab: PersistedTab) -> PersistedState {
@@ -1047,7 +1053,8 @@ final class WindowSessionRestoreTests: XCTestCase {
             sidebar: sidebar,
             windowSessionId: windowSessionId,
             persistenceEnabled: true,
-            store: fake
+            store: fake,
+            claimLedger: ledger
         )
     }
 

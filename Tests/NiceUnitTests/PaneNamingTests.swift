@@ -265,7 +265,8 @@ final class PaneNamingTests: XCTestCase {
             tabs: tabs, sessions: sessions, sidebar: sidebar,
             windowSessionId: "w1",
             persistenceEnabled: false,
-            store: fake
+            store: fake,
+            claimLedger: WindowClaimLedger()
         )
 
         let pi = tabs.ensureProject(
@@ -295,7 +296,8 @@ final class PaneNamingTests: XCTestCase {
             tabs: tabs, sessions: sessions, sidebar: sidebar,
             windowSessionId: "w2",
             persistenceEnabled: false,
-            store: fake
+            store: fake,
+            claimLedger: WindowClaimLedger()
         )
 
         let pi = tabs.ensureProject(
@@ -325,7 +327,8 @@ final class PaneNamingTests: XCTestCase {
             tabs: tabs, sessions: sessions, sidebar: sidebar,
             windowSessionId: "w3",
             persistenceEnabled: false,
-            store: fake
+            store: fake,
+            claimLedger: WindowClaimLedger()
         )
 
         let pi = tabs.ensureProject(

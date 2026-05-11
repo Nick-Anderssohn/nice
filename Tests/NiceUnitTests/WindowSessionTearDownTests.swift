@@ -7,8 +7,8 @@
 //  so relaunch reopens the window, while `.userClosedWindow`
 //  removes the entry so a window the user explicitly closed is
 //  gone for good. Persistence-disabled callers (preview/test mode)
-//  go silent on either reason. Claim release on
-//  `claimedWindowIds` is unconditional so a future window can
+//  go silent on either reason. Claim release on the shared
+//  `WindowClaimLedger` is unconditional so a future window can
 //  reuse the slot regardless of close path.
 //
 
@@ -23,14 +23,15 @@ final class WindowSessionTearDownTests: XCTestCase {
     private var tabs: TabModel!
     private var sessions: SessionsModel!
     private var sidebar: SidebarModel!
+    private var ledger: WindowClaimLedger!
 
     override func setUp() {
         super.setUp()
-        WindowSession._testing_resetClaimedWindowIds()
         fake = FakeSessionStore()
         tabs = TabModel(initialMainCwd: "/tmp/nice-teardown-tests")
         sessions = SessionsModel(tabs: tabs)
         sidebar = SidebarModel(initialCollapsed: false, initialMode: .tabs)
+        ledger = WindowClaimLedger()
     }
 
     override func tearDown() {
@@ -39,7 +40,7 @@ final class WindowSessionTearDownTests: XCTestCase {
         tabs = nil
         sidebar = nil
         fake = nil
-        WindowSession._testing_resetClaimedWindowIds()
+        ledger = nil
         super.tearDown()
     }
 
@@ -49,23 +50,23 @@ final class WindowSessionTearDownTests: XCTestCase {
         let ws = makeWindowSession(persistenceEnabled: false, id: "win-release-app")
         // Simulate a successful prior restore by claiming the id.
         ws.restoreSavedWindow()
-        XCTAssertTrue(WindowSession._testing_isClaimed("win-release-app"),
+        XCTAssertTrue(ledger.contains("win-release-app"),
                       "Pre-condition: restore must have claimed the id.")
 
         ws.tearDown(reason: .appTerminating)
 
-        XCTAssertFalse(WindowSession._testing_isClaimed("win-release-app"),
+        XCTAssertFalse(ledger.contains("win-release-app"),
                        "tearDown must release the id so a future window can adopt the slot.")
     }
 
     func test_tearDown_userClosedWindow_releasesClaimedWindowId() {
         let ws = makeWindowSession(persistenceEnabled: false, id: "win-release-user")
         ws.restoreSavedWindow()
-        XCTAssertTrue(WindowSession._testing_isClaimed("win-release-user"))
+        XCTAssertTrue(ledger.contains("win-release-user"))
 
         ws.tearDown(reason: .userClosedWindow)
 
-        XCTAssertFalse(WindowSession._testing_isClaimed("win-release-user"),
+        XCTAssertFalse(ledger.contains("win-release-user"),
                        "Claim release must run unconditionally — applies to both reasons.")
     }
 
@@ -153,7 +154,7 @@ final class WindowSessionTearDownTests: XCTestCase {
         XCTAssertTrue(fake.upsertCalls.isEmpty)
         XCTAssertTrue(fake.removeCalls.isEmpty)
         XCTAssertEqual(fake.flushCount, 0)
-        XCTAssertFalse(WindowSession._testing_isClaimed("win-no-persist-app"))
+        XCTAssertFalse(ledger.contains("win-no-persist-app"))
     }
 
     func test_tearDown_persistenceDisabled_doesNothing_userClosedWindow() {
@@ -166,7 +167,7 @@ final class WindowSessionTearDownTests: XCTestCase {
         XCTAssertTrue(fake.removeCalls.isEmpty,
                       "persistenceEnabled == false must skip remove too — the test/preview path is silent.")
         XCTAssertEqual(fake.flushCount, 0)
-        XCTAssertFalse(WindowSession._testing_isClaimed("win-no-persist-user"))
+        XCTAssertFalse(ledger.contains("win-no-persist-user"))
     }
 
     func test_secondWindow_canAdoptSlotAfterFirstTearsDown() {
@@ -205,7 +206,7 @@ final class WindowSessionTearDownTests: XCTestCase {
         // second window can re-adopt it. (.userClosedWindow would
         // delete the slot — that's what its dedicated test pins.)
         ws1.tearDown(reason: .appTerminating)
-        XCTAssertFalse(WindowSession._testing_isClaimed("slot"),
+        XCTAssertFalse(ledger.contains("slot"),
                        "tearDown must release the slot regardless of reason.")
 
         // Second window — fresh models, fresh id. Without the slot
@@ -218,7 +219,8 @@ final class WindowSessionTearDownTests: XCTestCase {
             tabs: tabs2, sessions: sessions2, sidebar: sidebar2,
             windowSessionId: "win-second",
             persistenceEnabled: true,
-            store: fake
+            store: fake,
+            claimLedger: ledger
         )
         ws2.restoreSavedWindow()
 
@@ -239,7 +241,8 @@ final class WindowSessionTearDownTests: XCTestCase {
             sidebar: sidebar,
             windowSessionId: id,
             persistenceEnabled: persistenceEnabled,
-            store: fake
+            store: fake,
+            claimLedger: ledger
         )
     }
 

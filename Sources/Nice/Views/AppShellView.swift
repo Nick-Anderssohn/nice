@@ -248,7 +248,9 @@ private struct AppShellHost: View {
             // siblings we open here, future ⌘N windows, and anything
             // AppKit may auto-restore all skip this branch.
             if services.consumeMultiWindowRestoreSlot() {
-                let toSpawn = WindowSession.unclaimedSavedWindowCount()
+                let toSpawn = WindowSession.unclaimedSavedWindowCount(
+                    ledger: services.claimLedger
+                )
                 for _ in 0..<toSpawn {
                     openWindow(id: "main")
                 }

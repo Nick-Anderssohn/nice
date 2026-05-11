@@ -24,14 +24,15 @@ final class WindowSessionSaveGateTests: XCTestCase {
     private var tabs: TabModel!
     private var sessions: SessionsModel!
     private var sidebar: SidebarModel!
+    private var ledger: WindowClaimLedger!
 
     override func setUp() {
         super.setUp()
-        WindowSession._testing_resetClaimedWindowIds()
         fake = FakeSessionStore()
         tabs = TabModel(initialMainCwd: "/tmp/nice-save-gate-tests")
         sessions = SessionsModel(tabs: tabs)
         sidebar = SidebarModel(initialCollapsed: false, initialMode: .tabs)
+        ledger = WindowClaimLedger()
     }
 
     override func tearDown() {
@@ -40,7 +41,7 @@ final class WindowSessionSaveGateTests: XCTestCase {
         tabs = nil
         sidebar = nil
         fake = nil
-        WindowSession._testing_resetClaimedWindowIds()
+        ledger = nil
         super.tearDown()
     }
 
@@ -98,7 +99,8 @@ final class WindowSessionSaveGateTests: XCTestCase {
             sidebar: sidebar,
             windowSessionId: "win-save-gate",
             persistenceEnabled: persistenceEnabled,
-            store: fake
+            store: fake,
+            claimLedger: ledger
         )
     }
 }

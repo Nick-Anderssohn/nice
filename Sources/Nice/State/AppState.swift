@@ -115,7 +115,8 @@ final class AppState {
         initialMainCwd: String?,
         windowSessionId: String,
         fileExplorer: FileExplorerServices? = nil,
-        store: SessionStorePersisting? = nil
+        store: SessionStorePersisting? = nil,
+        claimLedger: WindowClaimLedger? = nil
     ) {
         self.sidebar = SidebarModel(
             initialCollapsed: initialSidebarCollapsed,
@@ -135,13 +136,17 @@ final class AppState {
         // can pin the per-window-close → flush chain end-to-end
         // without spinning up real NiceServices). When `store` is
         // nil, WindowSession picks up `SessionStore.shared`.
+        // Ledger precedence: caller-supplied > services > a fresh
+        // per-AppState ledger (lone unit tests / previews that don't
+        // care about cross-window adoption).
         self.windowSession = WindowSession(
             tabs: tabs,
             sessions: sessions,
             sidebar: sidebar,
             windowSessionId: windowSessionId,
             persistenceEnabled: services != nil || store != nil,
-            store: store ?? SessionStore.shared
+            store: store ?? SessionStore.shared,
+            claimLedger: claimLedger ?? services?.claimLedger ?? WindowClaimLedger()
         )
         self.fileExplorerOrchestrator = FileExplorerOrchestrator(
             fileExplorer: fileExplorer ?? services?.fileExplorer,

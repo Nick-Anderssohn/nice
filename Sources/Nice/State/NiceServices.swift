@@ -70,6 +70,22 @@ final class NiceServices {
     @ObservationIgnored
     private var terminateObserver: NSObjectProtocol?
 
+    /// Owns the close/quit lifecycle for every window in the process.
+    /// `WindowRegistry` shares this same instance so the per-window
+    /// close path and the app-terminate cascade resolve through one
+    /// object — see `SessionLifecycleController`.
+    @ObservationIgnored
+    let lifecycleController: SessionLifecycleController
+
+    /// Shared `windowSessionId` claim set. Every `AppState` this
+    /// process spawns gets the same instance, so
+    /// `WindowSession.restoreSavedWindow`'s adoption logic sees a
+    /// process-wide view of which saved slots are already held.
+    /// Threaded through `AppState.init`; the launch-time fan-out
+    /// reads it directly via `WindowSession.unclaimedSavedWindowCount`.
+    @ObservationIgnored
+    let claimLedger: WindowClaimLedger
+
     /// One-shot guard for the launch-time multi-window fan-out. The
     /// first-mounted `AppShellHost.task` calls
     /// `consumeMultiWindowRestoreSlot` after `appState.start()` returns;
@@ -93,7 +109,13 @@ final class NiceServices {
         self.shortcuts = KeyboardShortcuts()
         self.fontSettings = FontSettings()
         self.fileBrowserSortSettings = FileBrowserSortSettings()
-        self.registry = WindowRegistry()
+        let lifecycleController = SessionLifecycleController()
+        self.lifecycleController = lifecycleController
+        // Hand the registry the same controller instance so per-window
+        // close routing and the willTerminate cascade resolve through
+        // one object.
+        self.registry = WindowRegistry(lifecycleController: lifecycleController)
+        self.claimLedger = WindowClaimLedger()
         self.terminalThemeCatalog = TerminalThemeCatalog(
             supportDirectory: TerminalThemeCatalog.defaultSupportDirectory()
         )
@@ -216,25 +238,18 @@ final class NiceServices {
             guard let self else { return }
             MainActor.assumeIsolated {
                 self.releaseChecker.stop()
-                // Stop listening to per-window close notifications
-                // BEFORE the tearDown loop runs. SwiftUI's
-                // `WindowGroup` posts `willCloseNotification` for
-                // every live window during process termination,
-                // and we don't want that cascade to retroactively
-                // re-route through `WindowRegistry.handleClose`
-                // (which routes by the `userInitiatedClose` flag,
-                // but defense in depth: no observer fire ⇒ no
-                // possible double-teardown).
-                self.registry.detachAllCloseObservers()
-                for state in self.registry.allAppStates {
-                    // App is terminating with this window still
-                    // open — preserve its saved state so relaunch
-                    // brings it back. (User-closed windows already
-                    // took the `willCloseNotification` path
-                    // through `WindowRegistry` before this and
-                    // were removed from the store there.)
-                    state.tearDown(reason: .appTerminating)
-                }
+                // Window-lifecycle work — detach close observers (so
+                // SwiftUI's scene-teardown burst can't retroactively
+                // re-enter `WindowRegistry.handleClose`) then tear
+                // every registered window down with
+                // `.appTerminating` — lives on the controller. See
+                // `SessionLifecycleController.handleAppWillTerminate`
+                // for the ordering rationale.
+                let registry = self.registry
+                self.lifecycleController.handleAppWillTerminate(
+                    allAppStates: registry.allAppStates,
+                    detachObservers: { registry.detachAllCloseObservers() }
+                )
                 if let zdotdirPath = self.zdotdirPath {
                     try? FileManager.default.removeItem(atPath: zdotdirPath)
                 }

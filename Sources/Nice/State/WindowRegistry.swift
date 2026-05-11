@@ -45,6 +45,18 @@ final class WindowRegistry {
     private var entries: [ObjectIdentifier: Entry] = [:]
     private weak var lastActiveAppState: AppState?
 
+    /// Per-window-close reason routing and the willTerminate cascade
+    /// live on the controller so the "willTerminate then willClose"
+    /// sequence is unit-testable on a single object. Default value
+    /// lets existing tests construct a `WindowRegistry()` without
+    /// supplying one; production wires the same instance that
+    /// `NiceServices`'s willTerminate observer drives.
+    private let lifecycleController: SessionLifecycleController
+
+    init(lifecycleController: SessionLifecycleController = SessionLifecycleController()) {
+        self.lifecycleController = lifecycleController
+    }
+
     func register(appState: AppState, window: NSWindow) {
         let id = ObjectIdentifier(window)
         if entries[id] != nil { return }
@@ -169,24 +181,11 @@ final class WindowRegistry {
         guard let entry = entries.removeValue(forKey: id) else { return }
         NotificationCenter.default.removeObserver(entry.closeObserver)
         NotificationCenter.default.removeObserver(entry.becomeKeyObserver)
-        // The reason routes persistence: drop the entry from
-        // `sessions.json` if the user explicitly closed this window
-        // (via red traffic light / ⌘W — `CloseConfirmationDelegate`
-        // flips `userInitiatedClose` when it returns true); preserve
-        // it if SwiftUI/AppKit happens to close the NSWindow during
-        // process termination so the next launch still reopens it.
-        //
-        // Inferring intent from the notification source was the
-        // original (broken) plan — SwiftUI's `WindowGroup` posts
-        // `willCloseNotification` for every live window during
-        // `app.terminate(_:)` too. The flag carries the intent
-        // through the only AppKit surface that fires uniquely on
-        // user-driven close.
-        let reason: WindowSession.TearDownReason =
-            (entry.appState?.userInitiatedClose ?? false)
-                ? .userClosedWindow
-                : .appTerminating
-        entry.appState?.tearDown(reason: reason)
+        // Reason routing + tearDown live on `SessionLifecycleController`
+        // — same surface that owns the willTerminate cascade — so the
+        // "willTerminate then willClose" sequence can be exercised on a
+        // single object in unit tests.
+        lifecycleController.handleWindowWillClose(appState: entry.appState)
         if lastActiveAppState == nil || entry.appState === lastActiveAppState {
             lastActiveAppState = entries.values.lazy.compactMap { $0.appState }.first
         }
