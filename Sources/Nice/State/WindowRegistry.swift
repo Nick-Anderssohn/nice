@@ -149,6 +149,19 @@ final class WindowRegistry {
         entries[ObjectIdentifier(window)] == nil
     }
 
+    /// Detach every registered window's `willCloseNotification`
+    /// observer without otherwise teardown-ing the AppStates. Used by
+    /// `NiceServices`'s `willTerminate` handler as belt-and-braces:
+    /// even though `userInitiatedClose` correctly routes the reason,
+    /// stopping notification delivery before the per-window teardown
+    /// loop runs means a regression in the flag logic can't silently
+    /// re-introduce the wipe-on-quit bug.
+    func detachAllCloseObservers() {
+        for entry in entries.values {
+            NotificationCenter.default.removeObserver(entry.closeObserver)
+        }
+    }
+
     // MARK: - Cleanup
 
     private func handleClose(window: NSWindow) {
@@ -156,7 +169,24 @@ final class WindowRegistry {
         guard let entry = entries.removeValue(forKey: id) else { return }
         NotificationCenter.default.removeObserver(entry.closeObserver)
         NotificationCenter.default.removeObserver(entry.becomeKeyObserver)
-        entry.appState?.tearDown()
+        // The reason routes persistence: drop the entry from
+        // `sessions.json` if the user explicitly closed this window
+        // (via red traffic light / ⌘W — `CloseConfirmationDelegate`
+        // flips `userInitiatedClose` when it returns true); preserve
+        // it if SwiftUI/AppKit happens to close the NSWindow during
+        // process termination so the next launch still reopens it.
+        //
+        // Inferring intent from the notification source was the
+        // original (broken) plan — SwiftUI's `WindowGroup` posts
+        // `willCloseNotification` for every live window during
+        // `app.terminate(_:)` too. The flag carries the intent
+        // through the only AppKit surface that fires uniquely on
+        // user-driven close.
+        let reason: WindowSession.TearDownReason =
+            (entry.appState?.userInitiatedClose ?? false)
+                ? .userClosedWindow
+                : .appTerminating
+        entry.appState?.tearDown(reason: reason)
         if lastActiveAppState == nil || entry.appState === lastActiveAppState {
             lastActiveAppState = entries.values.lazy.compactMap { $0.appState }.first
         }

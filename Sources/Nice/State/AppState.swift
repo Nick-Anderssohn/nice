@@ -80,6 +80,23 @@ final class AppState {
     @ObservationIgnored
     private var started = false
 
+    /// True when the user has explicitly OK'd closing this window
+    /// via the red traffic light / ⌘W path. Set by
+    /// `CloseConfirmationDelegate.windowShouldClose` when it returns
+    /// `true`; read by `WindowRegistry.handleClose` to decide which
+    /// `TearDownReason` to dispatch.
+    ///
+    /// Why a flag (rather than inferring from the notification
+    /// source): SwiftUI's `WindowGroup` posts
+    /// `NSWindow.willCloseNotification` for every live window
+    /// during process termination too, so observing the notification
+    /// alone can't tell "user clicked red" apart from "app is
+    /// quitting." AppKit only delivers `windowShouldClose` for
+    /// genuine user-initiated closes (never during
+    /// `app.terminate(_:)`), so flipping the flag there carries the
+    /// intent unambiguously to wherever it's needed.
+    var userInitiatedClose: Bool = false
+
     /// Convenience init for previews and tests.
     convenience init() {
         self.init(
@@ -264,11 +281,16 @@ final class AppState {
     }
 
     /// Stop every resource this window owns. Called from
-    /// `WindowRegistry` on close and `NiceServices` on app terminate.
-    /// Safe to call more than once. Persists *before* killing ptys
-    /// so mid-session auto-titles make it to disk.
-    func tearDown() {
-        windowSession.tearDown()
+    /// `WindowRegistry` on close (with `.userClosedWindow`) and
+    /// `NiceServices` on app terminate (with `.appTerminating`).
+    /// Safe to call more than once. The reason routes
+    /// `windowSession`'s persistence between "remove from
+    /// sessions.json" and "upsert latest snapshot"; pty cleanup is
+    /// the same regardless. Persists *before* killing ptys so
+    /// mid-session auto-titles make it to disk on the terminating
+    /// path.
+    func tearDown(reason: WindowSession.TearDownReason) {
+        windowSession.tearDown(reason: reason)
         sessions.tearDown()
     }
 

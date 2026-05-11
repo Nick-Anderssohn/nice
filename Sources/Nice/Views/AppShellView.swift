@@ -66,6 +66,11 @@ private struct AppShellHost: View {
     @Environment(KeyboardShortcuts.self) private var shortcuts
     @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
+    /// Used by the launch-time fan-out: the first-mounted window calls
+    /// `openWindow(id: "main")` once per saved entry that no live
+    /// `AppState` has claimed yet, so every window in `sessions.json`
+    /// reopens on relaunch.
+    @Environment(\.openWindow) private var openWindow
 
     @State private var appState: AppState
     let services: NiceServices
@@ -176,6 +181,11 @@ private struct AppShellHost: View {
             // (which sits at y=26pt from the window top in both the
             // expanded sidebar and the collapsed cap).
             WindowAccessor { window in
+                // Wire the NSWindow into WindowSession before anything
+                // else so the first save (which can fire as early as a
+                // tab mutation triggered during start()) captures the
+                // real frame instead of persisting `frame: nil`.
+                appState.windowSession.window = window
                 TrafficLightNudger.nudge(window: window, dx: 8, dy: -10)
                 TitleBarZoomMonitor.install()
                 services.registry.register(appState: appState, window: window)
@@ -230,6 +240,19 @@ private struct AppShellHost: View {
             // edges (e.g. window restoration).
             services.bootstrap()
             appState.start()
+            // First-mounted window opens the rest. Runs after
+            // `start()` so `restoreSavedWindow` has already claimed
+            // this window's slot — `unclaimedSavedWindowCount` then
+            // sees an accurate "still needs a home" count.
+            // `consumeMultiWindowRestoreSlot` is a one-shot, so
+            // siblings we open here, future ⌘N windows, and anything
+            // AppKit may auto-restore all skip this branch.
+            if services.consumeMultiWindowRestoreSlot() {
+                let toSpawn = WindowSession.unclaimedSavedWindowCount()
+                for _ in 0..<toSpawn {
+                    openWindow(id: "main")
+                }
+            }
         }
         .onAppear {
             // Brand-new scene: write the id WindowSession minted back

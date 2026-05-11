@@ -238,6 +238,106 @@ final class WindowSessionRestoreTests: XCTestCase {
                        "Empty ghost windows must be pruned from the persisted state.")
     }
 
+    // MARK: - unclaimedSavedWindowCount
+
+    func test_unclaimedCount_emptyState_isZero() {
+        // No saved state → nothing for the launch-time fan-out to do.
+        fake.state = .empty
+        XCTAssertEqual(
+            WindowSession.unclaimedSavedWindowCount(store: fake), 0,
+            "Empty state has no saved windows to restore."
+        )
+    }
+
+    func test_unclaimedCount_includesTerminalsOnlyWindows() {
+        // A saved window whose only project is the empty Terminals
+        // section is still its own restorable window — the user may
+        // have intentionally kept it around. Count must include it.
+        let terminalsOnly = makePersistedWindow(
+            id: "win-terminals-only",
+            projects: [makeEmptyTerminalsProject()]
+        )
+        fake.state = PersistedState(
+            version: PersistedState.currentVersion, windows: [terminalsOnly]
+        )
+        XCTAssertEqual(
+            WindowSession.unclaimedSavedWindowCount(store: fake), 1,
+            "A Terminals-only saved window must still count toward the fan-out."
+        )
+    }
+
+    func test_unclaimedCount_skipsTrulyEmptyWindows() {
+        // A `projects == []` entry is a ghost from a crashed mid-init
+        // — the existing adoption filter (`!projects.isEmpty`) skips
+        // it, and so must the fan-out count.
+        let ghost = makePersistedWindow(id: "ghost", projects: [])
+        fake.state = PersistedState(
+            version: PersistedState.currentVersion, windows: [ghost]
+        )
+        XCTAssertEqual(
+            WindowSession.unclaimedSavedWindowCount(store: fake), 0,
+            "Ghost entries with no projects must not be counted."
+        )
+    }
+
+    func test_unclaimedCount_dropsAfterAdoption() {
+        // Two non-empty saved windows. After one is adopted by a
+        // WindowSession (claimedWindowIds gains its id), the count
+        // drops from 2 to 1 — that's the contract the spawn loop
+        // depends on to know how many sibling windows to open.
+        let claudeA = makePersistedClaudeTab(id: "tA", sessionId: "sA")
+        let claudeB = makePersistedClaudeTab(id: "tB", sessionId: "sB")
+        let winA = makePersistedWindow(
+            id: "win-A",
+            projects: [
+                makeEmptyTerminalsProject(),
+                makePersistedProject(id: "pA", tabs: [claudeA]),
+            ]
+        )
+        let winB = makePersistedWindow(
+            id: "win-B",
+            projects: [
+                makeEmptyTerminalsProject(),
+                makePersistedProject(id: "pB", tabs: [claudeB]),
+            ]
+        )
+        fake.state = PersistedState(
+            version: PersistedState.currentVersion, windows: [winA, winB]
+        )
+        XCTAssertEqual(WindowSession.unclaimedSavedWindowCount(store: fake), 2,
+                       "Both saved non-empty windows are unclaimed at start.")
+
+        let ws = makeWindowSession(windowSessionId: "win-A")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(WindowSession.unclaimedSavedWindowCount(store: fake), 1,
+                       "After one window adopts a slot, only the other remains unclaimed.")
+    }
+
+    func test_unclaimedCount_allClaimed_isZero() {
+        // Once the only saved non-empty window is adopted, the fan-out
+        // count must read zero so the spawn loop opens nothing extra.
+        let claude = makePersistedClaudeTab(id: "t", sessionId: "s")
+        let only = makePersistedWindow(
+            id: "the-only",
+            projects: [
+                makeEmptyTerminalsProject(),
+                makePersistedProject(id: "p", tabs: [claude]),
+            ]
+        )
+        fake.state = PersistedState(
+            version: PersistedState.currentVersion, windows: [only]
+        )
+
+        let ws = makeWindowSession(windowSessionId: "win-fresh")
+        ws.restoreSavedWindow()  // adopts "the-only" via the unmatched branch
+
+        XCTAssertEqual(
+            WindowSession.unclaimedSavedWindowCount(store: fake), 0,
+            "Every non-empty slot claimed → fan-out count must be zero."
+        )
+    }
+
     // MARK: - /branch lineage round-trip
 
     func test_restore_preserves_branchLineage_parentTabIds() {

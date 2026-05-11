@@ -26,6 +26,7 @@ final class FakeSessionStore: SessionStorePersisting {
     var state: PersistedState = .empty
 
     private(set) var upsertCalls: [PersistedWindow] = []
+    private(set) var removeCalls: [String] = []
     private(set) var pruneKeepingCalls: [String] = []
     private(set) var flushCount = 0
 
@@ -40,6 +41,18 @@ final class FakeSessionStore: SessionStorePersisting {
         var windows = state.windows.filter { $0.id != window.id }
         windows.append(window)
         state = PersistedState(version: PersistedState.currentVersion, windows: windows)
+    }
+
+    /// Mirrors `SessionStore.remove(windowId:)`: drops the entry by
+    /// id, leaving everything else untouched. Test-recorded into
+    /// `removeCalls` so `WindowSessionTearDownTests` can assert the
+    /// `.userClosedWindow` reason actually reached the store.
+    func remove(windowId: String) {
+        removeCalls.append(windowId)
+        state = PersistedState(
+            version: PersistedState.currentVersion,
+            windows: state.windows.filter { $0.id != windowId }
+        )
     }
 
     func pruneEmptyWindows(keeping: String) {

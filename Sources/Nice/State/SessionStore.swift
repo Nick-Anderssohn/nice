@@ -121,11 +121,42 @@ struct PersistedProject: Codable, Hashable, Sendable {
     let tabs: [PersistedTab]
 }
 
+/// On-screen frame captured at last save, used to restore each window
+/// to its previous size and position on relaunch. Stored as raw
+/// `Double`s (not a `CGRect`) so the JSON shape stays stable and
+/// human-readable. Coordinates are AppKit-window coordinates (origin
+/// at the bottom-left of the primary screen) to match
+/// `NSWindow.frame` directly.
+struct PersistedFrame: Codable, Hashable, Sendable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
 struct PersistedWindow: Codable, Hashable, Sendable {
     let id: String
     let activeTabId: String?
     let sidebarCollapsed: Bool
     let projects: [PersistedProject]
+    /// On-screen frame at last save. Optional so v3 session files
+    /// written before frame persistence existed still decode — those
+    /// windows fall back to SwiftUI's default placement on restore.
+    let frame: PersistedFrame?
+
+    init(
+        id: String,
+        activeTabId: String?,
+        sidebarCollapsed: Bool,
+        projects: [PersistedProject],
+        frame: PersistedFrame? = nil
+    ) {
+        self.id = id
+        self.activeTabId = activeTabId
+        self.sidebarCollapsed = sidebarCollapsed
+        self.projects = projects
+        self.frame = frame
+    }
 }
 
 extension PersistedWindow {
@@ -160,6 +191,12 @@ struct PersistedState: Codable, Hashable, Sendable {
 protocol SessionStorePersisting: AnyObject {
     func load() -> PersistedState
     func upsert(window: PersistedWindow)
+    /// Drop the entry whose id matches. No-op if the id isn't
+    /// present. Called from
+    /// `WindowSession.tearDown(reason: .userClosedWindow)` so a
+    /// window the user explicitly closes (red traffic light or ⌘W)
+    /// doesn't reappear on next launch.
+    func remove(windowId: String)
     func pruneEmptyWindows(keeping: String)
     /// Cancel any pending debounced write and persist the current
     /// state. Conformers must block until the write completes so
@@ -302,6 +339,22 @@ final class SessionStore: SessionStorePersisting {
             windows.append(window)
         }
         cached = PersistedState(version: PersistedState.currentVersion, windows: windows)
+        scheduleWrite()
+    }
+
+    /// Drop the entry whose id matches. No-op if the id isn't
+    /// present. Called from
+    /// `WindowSession.tearDown(reason: .userClosedWindow)` so
+    /// windows the user closes via the red traffic light (or ⌘W on
+    /// the window) don't survive to the next launch. Mirrors
+    /// `pruneEmptyWindows`'s shape — filter the cache, early-out
+    /// if unchanged, schedule a debounced write. The caller's
+    /// immediately-following `flush()` makes the change synchronous
+    /// before tearDown returns.
+    func remove(windowId: String) {
+        let filtered = cached.windows.filter { $0.id != windowId }
+        guard filtered.count != cached.windows.count else { return }
+        cached = PersistedState(version: PersistedState.currentVersion, windows: filtered)
         scheduleWrite()
     }
 

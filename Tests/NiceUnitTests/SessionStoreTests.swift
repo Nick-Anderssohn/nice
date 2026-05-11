@@ -337,6 +337,71 @@ final class SessionStoreTests: XCTestCase {
                        "pruning when all windows are non-empty must not write.")
     }
 
+    // MARK: - remove(windowId:)
+
+    func test_remove_dropsEntryById() {
+        // Two saved windows; remove drops the named one and leaves
+        // the other untouched. A fresh SessionStore reads the same
+        // surviving set from disk, pinning the on-disk write.
+        let store = SessionStore()
+        store.upsert(window: makeWindow(id: "w1", tabs: [makePersistedTab(id: "t1")]))
+        store.upsert(window: makeWindow(id: "w2", tabs: [makePersistedTab(id: "t2")]))
+        store.flush()
+
+        store.remove(windowId: "w1")
+        store.flush()
+
+        let ids = store.load().windows.map(\.id).sorted()
+        XCTAssertEqual(ids, ["w2"],
+                       "remove must drop just the named window from the cache.")
+
+        let fresh = SessionStore()
+        XCTAssertEqual(fresh.load().windows.map(\.id), ["w2"],
+                       "remove must persist to disk so a relaunch sees the same survivors.")
+    }
+
+    func test_remove_isNoOpWhenIdMissing() {
+        // remove for a non-existent id must not schedule a write —
+        // the cache is unchanged, so the I/O layer should never
+        // hear about it. Use a recording IO so we can count writes
+        // without depending on debounce timing.
+        let recorder = RecordingSessionStoreIO()
+        let store = SessionStore(io: recorder)
+        store.upsert(window: makeWindow(id: "w1", tabs: [makePersistedTab(id: "t1")]))
+        store.flush()
+        let writesBefore = recorder.writes.count
+
+        store.remove(windowId: "ghost")
+        // Spin past the debounce so any (incorrectly) scheduled
+        // write would land in the recorder before we assert.
+        let elapsed = XCTestExpectation(description: "debounce window elapsed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { elapsed.fulfill() }
+        wait(for: [elapsed], timeout: 2.0)
+
+        XCTAssertEqual(recorder.writes.count, writesBefore,
+                       "remove for a missing id must not trigger an extra write.")
+    }
+
+    func test_remove_schedulesWrite() {
+        // remove uses the same scheduleWrite path as upsert, so the
+        // file ends up reflecting the removal even without an
+        // explicit flush — once the debounce window elapses.
+        let store = SessionStore()
+        store.upsert(window: makeWindow(id: "w1", tabs: [makePersistedTab(id: "t1")]))
+        store.upsert(window: makeWindow(id: "w2", tabs: [makePersistedTab(id: "t2")]))
+        store.flush()
+
+        store.remove(windowId: "w1")
+        // No flush; just wait for the debounce + IO to land.
+        let elapsed = XCTestExpectation(description: "debounce + write")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { elapsed.fulfill() }
+        wait(for: [elapsed], timeout: 2.0)
+
+        let fresh = SessionStore()
+        XCTAssertEqual(fresh.load().windows.map(\.id), ["w2"],
+                       "remove must schedule a debounced write so the change reaches disk without an explicit flush.")
+    }
+
     // MARK: - round-trip
 
     func test_roundTrip_preservesEveryField() throws {
@@ -514,6 +579,75 @@ final class SessionStoreTests: XCTestCase {
         let pane = decoded.windows.first?.projects.first?.tabs.first?.panes.first
         XCTAssertEqual(pane?.id, "p1")
         XCTAssertNil(pane?.cwd, "Missing cwd field must decode as nil, not crash.")
+    }
+
+    // MARK: - PersistedFrame round-trip
+
+    func test_persistedWindow_roundTrip_withFrame() throws {
+        // Frame fields must survive encode → decode verbatim so a
+        // relaunched window lands at the user's chosen size and
+        // position. Doubles preserve sub-pixel coordinates that
+        // `NSWindow.frame` produces on Retina displays.
+        let panes = [PersistedPane(id: "p1", title: "Claude", kind: .claude)]
+        let tab = PersistedTab(
+            id: "t1", title: "Tab", cwd: "/tmp", branch: nil,
+            claudeSessionId: "sid", activePaneId: "p1", panes: panes
+        )
+        let project = PersistedProject(id: "p", name: "P", path: "/tmp", tabs: [tab])
+        let window = PersistedWindow(
+            id: "w1", activeTabId: "t1", sidebarCollapsed: false,
+            projects: [project],
+            frame: PersistedFrame(x: 17.5, y: 33.25, width: 1280.5, height: 800.75)
+        )
+
+        do {
+            let store = SessionStore()
+            store.upsert(window: window)
+            store.flush()
+        }
+
+        let restored = SessionStore().load().windows.first
+        XCTAssertEqual(restored, window,
+                       "PersistedFrame must round-trip through encode/decode unchanged.")
+    }
+
+    func test_persistedWindow_decodesWithoutFrameField_backwardsCompat() throws {
+        // Sessions written by Nice builds before frame persistence
+        // existed don't have a `frame` key on each window. The
+        // decoder must tolerate that — restored windows fall back
+        // to SwiftUI's default placement, which is the same
+        // behavior users got before this feature shipped.
+        let json = #"""
+        {
+            "version": 3,
+            "windows": [{
+                "id": "w1",
+                "activeTabId": "t1",
+                "sidebarCollapsed": false,
+                "projects": [{
+                    "id": "terminals",
+                    "name": "Terminals",
+                    "path": "/tmp",
+                    "tabs": [{
+                        "id": "t1",
+                        "title": "Main",
+                        "cwd": "/Users/nick",
+                        "branch": null,
+                        "claudeSessionId": null,
+                        "activePaneId": "p1",
+                        "panes": [
+                            {"id": "p1", "title": "zsh", "kind": "terminal"}
+                        ]
+                    }]
+                }]
+            }]
+        }
+        """#
+        let data = Data(json.utf8)
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: data)
+        let window = try XCTUnwrap(decoded.windows.first)
+        XCTAssertNil(window.frame,
+                     "Missing frame field must decode as nil so older sessions still load.")
     }
 
     // MARK: - helpers

@@ -69,13 +69,27 @@ final class CloseConfirmationDelegate: NSObject, NSWindowDelegate {
         guard delegateAllows else { return false }
         guard let state = appState else { return true }
         let counts = state.tabs.livePaneCounts
-        guard counts.claude + counts.terminal > 0 else { return true }
-        return QuitConfirmation.run(
+        if counts.claude + counts.terminal == 0 {
+            // No live panes — close is unconditional. Mark this as
+            // user-initiated so `WindowRegistry.handleClose` drops
+            // the entry from `sessions.json` instead of preserving
+            // it as if the app were quitting.
+            state.userInitiatedClose = true
+            return true
+        }
+        let confirmed = QuitConfirmation.run(
             messageText: "Close this window?",
             claude: counts.claude,
             terminal: counts.terminal,
             confirmTitle: "Close"
         )
+        // Only flip the flag on confirm — Cancel must leave it
+        // false so the window stays open and isn't later treated
+        // as user-closed by some downstream observer.
+        if confirmed {
+            state.userInitiatedClose = true
+        }
+        return confirmed
     }
 
     // Objective-C message forwarding: anything we don't implement goes

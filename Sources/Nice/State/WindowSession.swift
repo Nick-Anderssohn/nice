@@ -75,6 +75,15 @@ final class WindowSession {
     @ObservationIgnored
     private weak var sidebar: SidebarModel?
 
+    /// Live `NSWindow` for this scene, set by `AppShellHost`'s
+    /// `WindowAccessor` once AppKit hands SwiftUI a real window.
+    /// `snapshotPersistedWindow` reads `.frame` from this so each save
+    /// captures the current size/position; `restoreSavedWindow`
+    /// applies the saved frame after the tab tree is rebuilt. Weak so
+    /// teardown doesn't pin the window past its natural lifetime.
+    @ObservationIgnored
+    weak var window: NSWindow?
+
     /// Persistence backend. Defaults to `SessionStore.shared` in
     /// production; tests inject a `FakeSessionStore` so they can
     /// assert upsert / prune / flush calls without touching disk.
@@ -126,6 +135,23 @@ final class WindowSession {
     /// down" without exposing the storage as a writable seam.
     static func _testing_isClaimed(_ id: String) -> Bool {
         claimedWindowIds.contains(id)
+    }
+
+    /// Number of saved windows that no live AppState in this process
+    /// has claimed yet. The first-mounted window's `AppShellHost.task`
+    /// reads this immediately after `appState.start()` to decide how
+    /// many sibling windows to spawn via `openWindow(id: "main")` so
+    /// every saved entry in `sessions.json` gets a home on relaunch.
+    /// "Non-empty" matches `restoreSavedWindow`'s adoption filter
+    /// (`!projects.isEmpty`) — a window whose only project is the
+    /// auto-seeded empty Terminals section still reopens as its own
+    /// window (the user may have saved that state intentionally).
+    static func unclaimedSavedWindowCount(
+        store: SessionStorePersisting = SessionStore.shared
+    ) -> Int {
+        store.load().windows.filter {
+            !$0.projects.isEmpty && !claimedWindowIds.contains($0.id)
+        }.count
     }
 
     /// Walk projects for every Claude tab with a `claudeSessionId`,
@@ -190,11 +216,24 @@ final class WindowSession {
                 tabs: persistedTabs
             ))
         }
+        // Capture the live window's frame so relaunch can restore the
+        // user's chosen size/position. nil before the WindowAccessor
+        // has fired (very early in scene-graph init) — those rare
+        // saves persist with `frame: nil` and the restored window
+        // falls back to SwiftUI's default placement.
+        let persistedFrame: PersistedFrame? = window.map {
+            let f = $0.frame
+            return PersistedFrame(
+                x: f.origin.x, y: f.origin.y,
+                width: f.size.width, height: f.size.height
+            )
+        }
         return PersistedWindow(
             id: windowSessionId,
             activeTabId: tabs?.activeTabId,
             sidebarCollapsed: sidebar?.sidebarCollapsed ?? false,
-            projects: persistedProjects
+            projects: persistedProjects,
+            frame: persistedFrame
         )
     }
 
@@ -273,6 +312,22 @@ final class WindowSession {
         // launches that failed mid-restore. Keep our newly-adopted
         // slot so scheduleSessionSave has something to upsert into.
         store.pruneEmptyWindows(keeping: snapshot.id)
+
+        // Apply the saved frame before the tab tree is rebuilt so the
+        // window lands at its previous size/position before SwiftUI's
+        // first layout pass — no visible "open small, then resize"
+        // flash. `setFrame` constrains off-screen rects into the
+        // current visible screen automatically (handles the
+        // disconnected-external-monitor case without us doing the
+        // math). nil frame means an older session file without frame
+        // persistence; fall back to SwiftUI's default placement.
+        if let savedFrame = snapshot.frame, let window = self.window {
+            let rect = NSRect(
+                x: savedFrame.x, y: savedFrame.y,
+                width: savedFrame.width, height: savedFrame.height
+            )
+            window.setFrame(rect, display: true)
+        }
 
         // Drop any in-init seed from the plain constructor — we want
         // the restored Terminals project (with its own tabs and cwd)
@@ -662,20 +717,66 @@ final class WindowSession {
         return nil
     }
 
-    /// Persist the current tab list synchronously and release this
-    /// window's claim on `claimedWindowIds`. Called from
-    /// `AppState.tearDown()` before it tears down the pty subsystem,
-    /// so the final model state (including auto-titles that arrived
-    /// mid-session) makes it to disk. Skipped in preview/test mode so
-    /// tests can't pollute the real sessions.json.
-    func tearDown() {
+    /// Why this window is going away. The two close paths must
+    /// diverge on disk: a window the user explicitly closed should
+    /// not reappear on next launch, while a window that happened to
+    /// be open at quit time should.
+    ///
+    /// Caller routing — both signals exist and must be wired
+    /// correctly:
+    ///
+    /// - `WindowRegistry.handleClose` (the `willCloseNotification`
+    ///   path) dispatches `.userClosedWindow` only when
+    ///   `AppState.userInitiatedClose` is true. AppKit only flips
+    ///   that flag via `windowShouldClose` (red traffic light /
+    ///   ⌘W), so it's an unambiguous "user wants this gone."
+    ///
+    /// - `NiceServices`'s `willTerminate` observer dispatches
+    ///   `.appTerminating` for every still-registered AppState.
+    ///   This observer also calls
+    ///   `WindowRegistry.detachAllCloseObservers()` first so the
+    ///   subsequent SwiftUI scene-teardown burst (which posts
+    ///   `willCloseNotification` for every live window during
+    ///   `app.terminate(_:)`) cannot retroactively reach
+    ///   `handleClose`. Belt-and-suspenders against an earlier
+    ///   regression where this very class assumed (wrongly) that
+    ///   `willCloseNotification` doesn't fire during terminate.
+    enum TearDownReason {
+        /// User explicitly closed the window via the red traffic
+        /// light / ⌘W. Drop the entry from `sessions.json` so it
+        /// doesn't reopen.
+        case userClosedWindow
+        /// App is terminating with this window still open (or the
+        /// user-close path completed without setting the intent
+        /// flag — defaults to preserving the snapshot, which is
+        /// the safer failure mode). Persist the latest snapshot so
+        /// relaunch reopens it.
+        case appTerminating
+    }
+
+    /// Finalize this window's persistence and release its claim on
+    /// `claimedWindowIds`. Called from `AppState.tearDown(reason:)`
+    /// before the pty subsystem comes down, so the final model
+    /// state (including auto-titles that arrived mid-session) makes
+    /// it to disk on the `.appTerminating` path. Skipped in
+    /// preview/test mode so tests can't pollute the real
+    /// sessions.json.
+    func tearDown(reason: TearDownReason) {
         if persistenceEnabled {
-            store.upsert(window: snapshotPersistedWindow())
+            switch reason {
+            case .userClosedWindow:
+                store.remove(windowId: windowSessionId)
+            case .appTerminating:
+                store.upsert(window: snapshotPersistedWindow())
+            }
             store.flush()
         }
-        // Release the session-id claim so a future window in this
-        // process isn't prevented from adopting this (now-closed)
-        // slot if the user wants to "reopen" it.
+        // Release the session-id claim regardless of reason —
+        // neither path should leave a stale id pinning future
+        // windows in this process out of the slot. (For
+        // .userClosedWindow the slot is also gone from disk, but
+        // that's the store's concern, not the in-process claim
+        // set's.)
         Self.claimedWindowIds.remove(windowSessionId)
     }
 }

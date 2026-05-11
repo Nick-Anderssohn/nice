@@ -70,6 +70,24 @@ final class NiceServices {
     @ObservationIgnored
     private var terminateObserver: NSObjectProtocol?
 
+    /// One-shot guard for the launch-time multi-window fan-out. The
+    /// first-mounted `AppShellHost.task` calls
+    /// `consumeMultiWindowRestoreSlot` after `appState.start()` returns;
+    /// only the call that flips this from false to true does the
+    /// `openWindow(id: "main")` loop. Subsequent windows (sibling
+    /// windows we spawn here, future ⌘N opens, anything AppKit may
+    /// auto-restore) skip the fan-out so we don't double-spawn.
+    @ObservationIgnored
+    private var multiWindowRestoreFired = false
+
+    /// Returns `true` on the FIRST call, `false` thereafter. MainActor
+    /// isolation makes the read-modify-write atomic without a lock.
+    func consumeMultiWindowRestoreSlot() -> Bool {
+        guard !multiWindowRestoreFired else { return false }
+        multiWindowRestoreFired = true
+        return true
+    }
+
     init() {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
@@ -109,6 +127,17 @@ final class NiceServices {
     func bootstrap() {
         guard !booted else { return }
         booted = true
+
+        // Replace AppKit's window restoration with our own. With
+        // `NSQuitAlwaysKeepsWindows = YES` (driven by macOS's "Close
+        // windows when quitting an application" toggle in System
+        // Settings → Desktop & Dock), AppKit auto-restores extra
+        // windows in parallel with our fan-out spawn loop, double-
+        // counting saved slots. We drive multi-window restore entirely
+        // from `sessions.json` instead — see
+        // `WindowSession.unclaimedSavedWindowCount` and the spawn
+        // loop in `AppShellHost.task`.
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
 
         // Sweep `$TMPDIR` debris from prior crashed runs *before*
         // writing this run's zdotdir — otherwise the cleanup would
@@ -187,8 +216,24 @@ final class NiceServices {
             guard let self else { return }
             MainActor.assumeIsolated {
                 self.releaseChecker.stop()
+                // Stop listening to per-window close notifications
+                // BEFORE the tearDown loop runs. SwiftUI's
+                // `WindowGroup` posts `willCloseNotification` for
+                // every live window during process termination,
+                // and we don't want that cascade to retroactively
+                // re-route through `WindowRegistry.handleClose`
+                // (which routes by the `userInitiatedClose` flag,
+                // but defense in depth: no observer fire ⇒ no
+                // possible double-teardown).
+                self.registry.detachAllCloseObservers()
                 for state in self.registry.allAppStates {
-                    state.tearDown()
+                    // App is terminating with this window still
+                    // open — preserve its saved state so relaunch
+                    // brings it back. (User-closed windows already
+                    // took the `willCloseNotification` path
+                    // through `WindowRegistry` before this and
+                    // were removed from the store there.)
+                    state.tearDown(reason: .appTerminating)
                 }
                 if let zdotdirPath = self.zdotdirPath {
                     try? FileManager.default.removeItem(atPath: zdotdirPath)

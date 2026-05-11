@@ -73,7 +73,13 @@ struct NiceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        // The explicit `id: "main"` lets the launch-time fan-out call
+        // `openWindow(id: "main")` once per saved window beyond the
+        // first — see `AppShellHost.task` and
+        // `WindowSession.unclaimedSavedWindowCount`. Each call spawns
+        // a fresh instance (canonical `WindowGroup` semantics), which
+        // then adopts the next unclaimed slot from `sessions.json`.
+        WindowGroup(id: "main") {
             AppShellView()
                 .environment(services)
                 .environment(services.tweaks)

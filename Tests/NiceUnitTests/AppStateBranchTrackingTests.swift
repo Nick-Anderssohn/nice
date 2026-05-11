@@ -375,7 +375,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "pA", tabId: "tA", sessionId: "A0")
 
         let stateB = AppState()
-        defer { stateB.tearDown() }
+        defer { stateB.tearDown(reason: .appTerminating) }
         TabModelFixtures.seedClaudeTab(
             into: stateB.tabs,
             projectId: "pB", tabId: "tB", sessionId: "B0"
