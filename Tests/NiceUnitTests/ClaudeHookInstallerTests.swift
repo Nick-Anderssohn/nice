@@ -256,6 +256,196 @@ final class ClaudeHookInstallerTests: XCTestCase {
         }
     }
 
+    // MARK: - Cwd forwarding
+    //
+    // The SessionStart payload's `cwd` field is what
+    // SessionsModel.handleClaudeSessionUpdate needs to keep `tab.cwd`
+    // aligned with Claude's working directory when bare `claude -w`
+    // (auto-named worktree the parser can't predict) or `/worktree`
+    // moves the session mid-flight. The script extracts it the same
+    // way it extracts session_id / source — sed against the JSON
+    // text — and splices the captured bytes verbatim into the
+    // outgoing payload. Because the sed capture class is `[^"]*`,
+    // the byte run is guaranteed quote-free, and JSON's "splice an
+    // already-encoded substring back into another JSON envelope"
+    // round-trips without re-escaping. (A path with an embedded
+    // `"` in JSON-encoded form is truncated at the first `"` — same
+    // limitation as `source` — and heal-on-restore is the safety
+    // net for that edge case.)
+
+    func test_script_forwardsCwd_simplePath() throws {
+        let line = try runScriptAndCaptureLine(payload: payloadWith(
+            sessionId: UUID().uuidString.lowercased(),
+            cwd: "/Users/nick/Projects/notes"
+        ))
+        XCTAssertTrue(line.contains(#""cwd":"/Users/nick/Projects/notes""#),
+                      "forwarded payload must carry the verbatim cwd: \(line)")
+    }
+
+    func test_script_forwardsCwd_pathWithSpace() throws {
+        // macOS paths can contain spaces (Application Support,
+        // user-named directories). The sed pipeline is space-tolerant
+        // because the match class is `[^"]*` (anything until the
+        // closing quote), so a space inside the value rides through
+        // unchanged.
+        let line = try runScriptAndCaptureLine(payload: payloadWith(
+            sessionId: UUID().uuidString.lowercased(),
+            cwd: "/Users/nick/Library/Application Support/something"
+        ))
+        XCTAssertTrue(
+            line.contains(
+                #""cwd":"/Users/nick/Library/Application Support/something""#
+            ),
+            "path with embedded space must round-trip verbatim: \(line)"
+        )
+    }
+
+    func test_script_forwardsCwd_pathWithBackslash() throws {
+        // Claude already JSON-encodes the cwd value, so an input
+        // payload containing `\\` (the JSON-encoded form of a literal
+        // `\`) shows up to sed as two literal `\` bytes. The script
+        // splices those bytes back into the outgoing JSON envelope
+        // verbatim — same pattern source uses — so the encoded form
+        // round-trips. Re-escaping at the script layer would double
+        // the backslashes and the receiver's JSONSerialization would
+        // decode `\\` as two backslashes instead of one.
+        let line = try runScriptAndCaptureLine(payload: #"""
+        {"hook_event_name":"SessionStart","source":"clear","session_id":"\#(UUID().uuidString.lowercased())","cwd":"/private/tmp/back\\slash","transcript_path":"/x.jsonl"}
+        """#)
+        XCTAssertTrue(
+            line.contains(#""cwd":"/private/tmp/back\\slash""#),
+            "JSON-encoded backslash must round-trip unchanged through the splice: \(line)"
+        )
+    }
+
+    func test_script_forwardsCwd_pathWithDollarSign() throws {
+        // Contract pin: the script splices `$CWD` into the outgoing
+        // JSON via `printf '...' "$CWD"`. Bash (and zsh) do NOT
+        // re-lex variable VALUES looking for `$X` expansions when you
+        // substitute `"$VAR"` — POSIX requires this, and the shebang
+        // pins us to bash. The cwd must therefore survive a literal
+        // `$USER` (or any other variable name) without expansion. If
+        // a future refactor introduces `eval`, `bash -c "$CWD"`, or
+        // unquotes the splice, this test trips before the unit-test
+        // grid lights up downstream.
+        let sid = UUID().uuidString.lowercased()
+        let line = try runScriptAndCaptureLine(payload: payloadWith(
+            sessionId: sid,
+            cwd: "/tmp/$USER/scratch"
+        ))
+        XCTAssertTrue(
+            line.contains("\"cwd\":\"/tmp/$USER/scratch\""),
+            "$VAR inside cwd must be preserved as literal bytes — no shell re-expansion: \(line)"
+        )
+    }
+
+    func test_script_forwardsCwd_pathWithBacktick() throws {
+        // Companion to the dollar-sign test: backticks in a cwd value
+        // are the other common shell-meta vector. Same contract —
+        // bash doesn't re-lex variable values — and the same gate
+        // against an `eval`-shaped refactor.
+        let sid = UUID().uuidString.lowercased()
+        let line = try runScriptAndCaptureLine(payload: payloadWith(
+            sessionId: sid,
+            cwd: "/tmp/`pwd`/scratch"
+        ))
+        XCTAssertTrue(
+            line.contains("\"cwd\":\"/tmp/`pwd`/scratch\""),
+            "backtick inside cwd must be preserved as literal bytes — no command substitution: \(line)"
+        )
+    }
+
+    func test_script_forwardsCwd_omitted_serializesEmptyString() throws {
+        // Old hook payloads (pre-cwd Claude versions, or theoretical
+        // future payloads that drop it) must not break the script.
+        // The sed regex falls through and CWD is empty; the outgoing
+        // JSON carries `"cwd":""`, which the socket parser normalizes
+        // to nil so the downstream handler treats it as a no-op.
+        let line = try runScriptAndCaptureLine(payload: #"""
+        {"hook_event_name":"SessionStart","source":"clear","session_id":"\#(UUID().uuidString.lowercased())"}
+        """#)
+        XCTAssertTrue(line.contains("\"cwd\":\"\""),
+                      "missing cwd must serialize as empty string for the parser to normalize: \(line)")
+    }
+
+    func test_script_forwardsCwd_evenWhenTranscriptPathAppearsFirst() throws {
+        // Regression gate: a future tightening of the sed regex (e.g.
+        // to anchor on a key boundary) must not start matching the
+        // path *inside* `transcript_path`'s value just because it
+        // happens to come earlier in the JSON. The current regex
+        // anchors on the literal `"cwd":` key, so this passes today;
+        // the test guards against an over-clever future edit.
+        let sid = UUID().uuidString.lowercased()
+        let line = try runScriptAndCaptureLine(payload: #"""
+        {"hook_event_name":"SessionStart","source":"clear","transcript_path":"/Users/x.jsonl","session_id":"\#(sid)","cwd":"/Users/nick/Projects/notes"}
+        """#)
+        XCTAssertTrue(
+            line.contains(#""cwd":"/Users/nick/Projects/notes""#),
+            "cwd anchor must hit the cwd key, not transcript_path's value: \(line)"
+        )
+    }
+
+    func test_script_forwardsCwd_whenSourceAbsent() throws {
+        // Defensive composition: a payload with cwd but no source
+        // (older Claude variants that ship cwd before source was
+        // added, or a future event that drops source) must still
+        // forward both fields cleanly. Mirrors
+        // `test_script_forwardsEmptySource_whenPayloadOmitsField`'s
+        // shape, exercised here with cwd present.
+        let sid = UUID().uuidString.lowercased()
+        let line = try runScriptAndCaptureLine(payload: #"""
+        {"hook_event_name":"SessionStart","session_id":"\#(sid)","cwd":"/private/tmp/scratch"}
+        """#)
+        XCTAssertTrue(line.contains("\"source\":\"\""),
+                      "missing source still serializes as empty: \(line)")
+        XCTAssertTrue(line.contains("\"cwd\":\"/private/tmp/scratch\""),
+                      "cwd survives even when source is absent: \(line)")
+    }
+
+    // MARK: - Cwd test helpers
+
+    /// Build a SessionStart payload with a caller-supplied cwd. The
+    /// other fields match the realistic-shape body used by
+    /// `sessionStartPayload`. Test helper kept separate from the
+    /// production-shape helper so the cwd-specific tests can reach
+    /// for it without bloating the canonical fixture.
+    private func payloadWith(sessionId: String, cwd: String) -> String {
+        return #"""
+        {"hook_event_name":"SessionStart","source":"clear","session_id":"\#(sessionId)","cwd":"\#(cwd)","transcript_path":"/x.jsonl"}
+        """#
+    }
+
+    /// Install the script, bring up a one-shot socket listener, run
+    /// the script against `payload`, and return the first line the
+    /// script wrote — or fail the test if nothing arrived. Bundles
+    /// the boilerplate the cwd-cases share so each test reads as a
+    /// single assertion.
+    private func runScriptAndCaptureLine(payload: String) throws -> String {
+        ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
+        let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")
+
+        let socketPath = "/tmp/nice-hook-test-\(UUID().uuidString.prefix(8)).sock"
+        let listener = try TestSocketListener(path: socketPath)
+        defer { listener.cleanup() }
+
+        let captured = captureFirstLine(
+            listener: listener,
+            runScript: {
+                let (exit, _) = self.runScript(
+                    at: scriptURL.path,
+                    env: [
+                        "NICE_SOCKET": socketPath,
+                        "NICE_PANE_ID": "pane-cwd",
+                    ],
+                    stdin: payload
+                )
+                XCTAssertEqual(exit, 0)
+            },
+            timeout: 1.5
+        )
+        return try XCTUnwrap(captured, "script must forward a session_update")
+    }
+
     func test_install_scriptNoOpsOutsideNice() throws {
         ClaudeHookInstaller.install(scriptDir: scriptDir, settingsURL: settingsURL)
         let scriptURL = scriptDir.appendingPathComponent("nice-claude-hook.sh")

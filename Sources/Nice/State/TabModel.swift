@@ -834,6 +834,44 @@ final class TabModel {
         return resolvedSpawnCwd(for: tab)
     }
 
+    /// Update `tab.cwd` to `newCwd` and pull along any pane whose
+    /// `pane.cwd` was still tracking the old `tab.cwd` (or has never
+    /// been set). Preserves the cwd of a pane that has already
+    /// diverged via OSC 7 — that means the user has `cd`'d the
+    /// terminal companion somewhere of their own, and snapping it
+    /// back into the Claude pane's new worktree would destroy that
+    /// context.
+    ///
+    /// Returns `true` when anything actually changed (so callers can
+    /// fire the right save/notify side effect), or `false` for any
+    /// no-op shape: tab not found, `newCwd` equals the current
+    /// `tab.cwd`. The change-detection short-circuit is what makes
+    /// "every prompt sends a SessionStart-with-cwd hook" cheap —
+    /// most rotations don't move the cwd and this returns false
+    /// fast.
+    ///
+    /// Centralizes the pane-follow policy so the rotation handler
+    /// (`SessionsModel.updateTabCwd`) and the restore-time heal pass
+    /// (`WindowSession.addRestoredTabModel`) can't drift on what
+    /// "follow the tab" means.
+    @discardableResult
+    func adoptTabCwd(forTabId tabId: String, newCwd: String) -> Bool {
+        var changed = false
+        mutateTab(id: tabId) { tab in
+            let oldCwd = tab.cwd
+            guard oldCwd != newCwd else { return }
+            tab.cwd = newCwd
+            for i in tab.panes.indices {
+                let paneCwd = tab.panes[i].cwd
+                if paneCwd == nil || paneCwd == oldCwd {
+                    tab.panes[i].cwd = newCwd
+                }
+            }
+            changed = true
+        }
+        return changed
+    }
+
     // MARK: - Static helpers
 
     static func expandTilde(_ path: String) -> String {

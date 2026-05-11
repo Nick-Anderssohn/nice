@@ -68,7 +68,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         )
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW", source: "resume"
+            paneId: "t1-claude", sessionId: "NEW", source: "resume", cwd: nil
         )
 
         let project = projectById("p")
@@ -127,7 +127,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "OLD")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW", source: "clear"
+            paneId: "t1-claude", sessionId: "NEW", source: "clear", cwd: nil
         )
 
         let project = projectById("p")
@@ -151,7 +151,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "OLD")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW", source: nil
+            paneId: "t1-claude", sessionId: "NEW", source: nil, cwd: nil
         )
 
         let project = projectById("p")
@@ -171,7 +171,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "SAME")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "SAME", source: "resume"
+            paneId: "t1-claude", sessionId: "SAME", source: "resume", cwd: nil
         )
 
         let project = projectById("p")
@@ -188,7 +188,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S0")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S1", source: "resume"
+            paneId: "t1-claude", sessionId: "S1", source: "resume", cwd: nil
         )
 
         let project = projectById("p")
@@ -211,12 +211,12 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "S0")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S1", source: "resume"
+            paneId: "t1-claude", sessionId: "S1", source: "resume", cwd: nil
         )
         let rootId = projectById("p").tabs[0].id
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S2", source: "resume"
+            paneId: "t1-claude", sessionId: "S2", source: "resume", cwd: nil
         )
 
         let after = projectById("p")
@@ -257,7 +257,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
 
         for (i, newSession) in ["S1", "S2", "S3"].enumerated() {
             appState.sessions.handleClaudeSessionUpdate(
-                paneId: "t1-claude", sessionId: newSession, source: "resume"
+                paneId: "t1-claude", sessionId: newSession, source: "resume", cwd: nil
             )
             let project = projectById("p")
             // i+2 because each iteration adds one parent and the
@@ -293,7 +293,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "OLD")
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW", source: "resume"
+            paneId: "t1-claude", sessionId: "NEW", source: "resume", cwd: nil
         )
         let parent = projectById("p").tabs[0]
         XCTAssertEqual(
@@ -333,7 +333,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         // itself just because its companion child went away.
         seedClaudeTab(projectId: "p", tabId: "t1", sessionId: "OLD")
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW", source: "resume"
+            paneId: "t1-claude", sessionId: "NEW", source: "resume", cwd: nil
         )
         let parent = projectById("p").tabs[0]
         let child = projectById("p").tabs[1]
@@ -384,7 +384,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         // Cross-window send into A — must be a no-op on both windows
         // because A doesn't own paneId "tB-claude".
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "tB-claude", sessionId: "B-LEAKED", source: "resume"
+            paneId: "tB-claude", sessionId: "B-LEAKED", source: "resume", cwd: nil
         )
 
         XCTAssertEqual(
@@ -407,7 +407,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         // B's own handler does materialize a parent — confirms the
         // scoping wasn't a "/branch never works" false negative.
         stateB.sessions.handleClaudeSessionUpdate(
-            paneId: "tB-claude", sessionId: "B1", source: "resume"
+            paneId: "tB-claude", sessionId: "B1", source: "resume", cwd: nil
         )
 
         XCTAssertEqual(
@@ -437,14 +437,14 @@ final class AppStateBranchTrackingTests: XCTestCase {
         // First /branch establishes the lineage:
         // tRoot (S0) at root; t1 (S1) child of tRoot.
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S1", source: "resume"
+            paneId: "t1-claude", sessionId: "S1", source: "resume", cwd: nil
         )
         let oldRoot = projectById("p").tabs[0]
         XCTAssertNil(oldRoot.parentTabId, "precondition: oldRoot is the root")
 
         // Second /branch on t1 adds a sibling parent under oldRoot.
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "S2", source: "resume"
+            paneId: "t1-claude", sessionId: "S2", source: "resume", cwd: nil
         )
         let secondParentId = projectById("p").tabs.first(where: {
             $0.id != oldRoot.id && $0.id != "t1"
@@ -467,7 +467,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         appState.sessions.handleClaudeSessionUpdate(
             paneId: oldRootClaudePaneId!,
             sessionId: "S0-PRIME",
-            source: "resume"
+            source: "resume", cwd: nil
         )
 
         let after = projectById("p")
@@ -533,7 +533,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         ))
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: claudePaneId, sessionId: "FIRST", source: "resume"
+            paneId: claudePaneId, sessionId: "FIRST", source: "resume", cwd: nil
         )
 
         let project = projectById(projectId)
@@ -563,7 +563,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         }
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: mainPaneId, sessionId: "FRESH", source: "resume"
+            paneId: mainPaneId, sessionId: "FRESH", source: "resume", cwd: nil
         )
 
         XCTAssertEqual(
@@ -638,7 +638,7 @@ final class AppStateBranchTrackingTests: XCTestCase {
         )
 
         appState.sessions.handleClaudeSessionUpdate(
-            paneId: "t1-claude", sessionId: "NEW", source: "resume"
+            paneId: "t1-claude", sessionId: "NEW", source: "resume", cwd: nil
         )
 
         let parent = projectById("p").tabs[0]

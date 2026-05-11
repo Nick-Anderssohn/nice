@@ -241,9 +241,12 @@ final class SessionsModel {
                             tabId: tabId, paneId: paneId,
                             reply: reply
                         )
-                    case let .sessionUpdate(paneId, sessionId, source):
+                    case let .sessionUpdate(paneId, sessionId, source, cwd):
                         self.handleClaudeSessionUpdate(
-                            paneId: paneId, sessionId: sessionId, source: source
+                            paneId: paneId,
+                            sessionId: sessionId,
+                            source: source,
+                            cwd: cwd
                         )
                     }
                 }
@@ -865,17 +868,34 @@ final class SessionsModel {
     /// version that drops the field) is treated as a plain id update
     /// — we'd rather miss a /branch occasionally than spawn a phantom
     /// parent tab from a /clear we mis-classified.
+    ///
+    /// `cwd` carries the absolute path Claude is currently running in
+    /// (from the SessionStart payload). Used to keep `tab.cwd` in sync
+    /// when Claude moves into a worktree mid-session — bare `claude
+    /// -w` (auto-named worktree the parser can't predict), `/worktree`
+    /// slash command, or anything else that swaps Claude's working
+    /// directory without restarting the process. Ordering matters: the
+    /// branch-parent materialization step runs **before** the cwd
+    /// update so the newly-spawned sibling parent inherits the
+    /// pre-rotation cwd (its old-session-id transcript lives in the
+    /// pre-rotation bucket).
     func handleClaudeSessionUpdate(
-        paneId: String, sessionId: String, source: String?
+        paneId: String,
+        sessionId: String,
+        source: String?,
+        cwd: String?
     ) {
         guard let tabs, let tabId = tabs.tabIdOwning(paneId: paneId) else { return }
         let oldId = tabs.tab(for: tabId)?.claudeSessionId
         updateClaudeSessionId(tabId: tabId, sessionId: sessionId)
-        guard source == "resume",
-              let oldId,
-              oldId != sessionId
-        else { return }
-        materializeBranchParent(forTabId: tabId, oldSessionId: oldId)
+        if source == "resume", let oldId, oldId != sessionId {
+            materializeBranchParent(forTabId: tabId, oldSessionId: oldId)
+        }
+        // Apply cwd to the *originating* tab only — runs after branch
+        // materialization so the sibling parent keeps the pre-rotation
+        // cwd by virtue of having forked from `originating.cwd` while
+        // it still held the old value.
+        updateTabCwd(tabId: tabId, newCwd: cwd)
     }
 
     /// Update `tab.claudeSessionId` when claude rotates its session
@@ -895,6 +915,31 @@ final class SessionsModel {
             }
         }
         if changed {
+            onSessionMutation?()
+        }
+    }
+
+    /// Update `tab.cwd` to reflect Claude's actual working directory,
+    /// reported via the SessionStart hook. The hook fires whenever
+    /// Claude swaps directories mid-process (bare `claude -w` lands
+    /// in an auto-named worktree the arg parser can't predict;
+    /// `/worktree` slash command does the same after the fact). The
+    /// recorded cwd is what `claude --resume` keys off on the next
+    /// restart, so keeping `tab.cwd` aligned with it is what makes
+    /// resume work across quits.
+    ///
+    /// Pane policy and the actual mutation live on
+    /// `TabModel.adoptTabCwd` so the rotation handler and the
+    /// restore-time heal pass share one definition of "follow the
+    /// tab." This shim filters out the no-op shapes (nil / empty)
+    /// before calling through and fires the persistence hook on real
+    /// change.
+    private func updateTabCwd(tabId: String, newCwd: String?) {
+        guard let tabs,
+              let newCwd,
+              !newCwd.isEmpty
+        else { return }
+        if tabs.adoptTabCwd(forTabId: tabId, newCwd: newCwd) {
             onSessionMutation?()
         }
     }
@@ -935,6 +980,15 @@ final class SessionsModel {
             oldSessionId: oldSessionId
         ) else { return }
 
+        // Read `parent.cwd` here, before the caller's `updateTabCwd`
+        // moves the originating tab into the post-rotation worktree.
+        // `insertBranchParent` copies `originating.cwd` at the moment
+        // of insertion, so `parent.cwd` is the pre-rotation cwd —
+        // which is what the sibling's `claude --resume <oldId>` needs
+        // because the old-id transcript was bucketed under the
+        // pre-rotation path. A future refactor that delays this read
+        // (e.g. fetches `parent` again from `tabs` later) would
+        // silently break the branch-cwd ordering contract.
         _ = makeSession(
             for: newId,
             cwd: parent.cwd,

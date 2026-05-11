@@ -316,6 +316,433 @@ final class WindowSessionRestoreTests: XCTestCase {
         )
     }
 
+    // MARK: - Heal-on-restore by transcript lookup
+    //
+    // Pre-fix builds — and any code path that wrote a stale `tab.cwd`
+    // (notably bare `claude -w` with no name, where Claude
+    // auto-generates the worktree directory and the args parser
+    // can't predict it) — leave a Claude tab pointing at the project
+    // root while the real transcript lives in a sibling
+    // `~/.claude/projects/<encoded-worktree>` bucket. The heal scan
+    // locates the transcript by session id, recovers the real cwd
+    // from its content, and adopts it for both the deferred-shell
+    // spawn and the persisted `tab.cwd` (via mutateTab + a deferred
+    // scheduleSessionSave the post-init flush picks up).
+    //
+    // Tests sandbox `$HOME` via `TestHomeSandbox`, plant a
+    // `~/.claude/projects/<bucket>/<sid>.jsonl` of the desired
+    // shape, and pre-create the recovered cwd on disk where the
+    // heal's existence-check requires it.
+
+    func test_heal_bucketMatch_noChange() throws {
+        // Steady state: the persisted `tab.cwd` is already correct.
+        // The expected transcript path exists, so the heal scan
+        // returns nil without ever enumerating sibling buckets.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let cwd = "/tmp/nice-heal-tests-match-\(UUID().uuidString)"
+        try plantDirectory(at: cwd)
+        try plantTranscript(
+            sessionId: "sid-match", bucketCwd: cwd, withMessageCwd: cwd
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-match", sessionId: "sid-match", cwd: cwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-match")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-match")?.cwd, cwd,
+            "matching bucket must leave tab.cwd untouched"
+        )
+    }
+
+    func test_heal_mismatchedBucket_recoversFromCwdField() throws {
+        // The classic bug shape: persisted `tab.cwd` is the project
+        // root, but Claude bucketed under the worktree path. The
+        // first regular-message record in the transcript carries a
+        // top-level `cwd` field pointing at the worktree — heal
+        // adopts it.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-tests-mismatch-\(UUID().uuidString)"
+        let worktreeCwd = "\(projectCwd)/.claude/worktrees/auto-name"
+        try plantDirectory(at: projectCwd)
+        try plantDirectory(at: worktreeCwd)
+        try plantTranscript(
+            sessionId: "sid-mismatch",
+            bucketCwd: worktreeCwd,
+            withMessageCwd: worktreeCwd
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-mismatch", sessionId: "sid-mismatch", cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-mismatch")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-mismatch")?.cwd, worktreeCwd,
+            "heal must overwrite tab.cwd with the worktree path it recovered from the transcript"
+        )
+        let claudePane = tabs.tab(for: "t-mismatch")?
+            .panes.first(where: { $0.kind == .claude })
+        XCTAssertEqual(
+            claudePane?.cwd, worktreeCwd,
+            "Claude pane.cwd (nil from PersistedPane) must follow the corrected tab.cwd"
+        )
+    }
+
+    func test_heal_mismatchedBucket_recoversFromWorktreeStateRecord() throws {
+        // First few messages don't carry a top-level `cwd` — only a
+        // `worktree-state` record describing the session's
+        // `worktreePath`. The fallback in `readCwdFromTranscript`
+        // must pick that up.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-tests-wts-\(UUID().uuidString)"
+        let worktreeCwd = "\(projectCwd)/.claude/worktrees/auto-name"
+        try plantDirectory(at: projectCwd)
+        try plantDirectory(at: worktreeCwd)
+        try plantTranscript(
+            sessionId: "sid-wts",
+            bucketCwd: worktreeCwd,
+            // Transcript head: permission-mode + worktree-state +
+            // file-history-snapshot, none with a top-level cwd.
+            // worktreePath is the only signal.
+            lines: [
+                #"{"type":"permission-mode","permissionMode":"auto","sessionId":"sid-wts"}"#,
+                #"""
+                {"type":"worktree-state","worktreeSession":{"originalCwd":"\#(projectCwd)","worktreePath":"\#(worktreeCwd)","worktreeName":"auto-name","sessionId":"sid-wts"},"sessionId":"sid-wts"}
+                """#,
+                #"{"type":"file-history-snapshot","isSnapshotUpdate":false}"#,
+            ]
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-wts", sessionId: "sid-wts", cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-wts")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-wts")?.cwd, worktreeCwd,
+            "worktree-state record's worktreePath must serve as the heal fallback when no per-message cwd is present yet"
+        )
+    }
+
+    func test_heal_noMatchingBucket_fallsBack() throws {
+        // No transcript anywhere under `~/.claude/projects/` carries
+        // the session id. Heal returns nil; tab.cwd stays as
+        // persisted; the existing `resolvedSpawnCwd` fallback path
+        // remains in effect.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let cwd = "/tmp/nice-heal-tests-orphan-\(UUID().uuidString)"
+        try plantDirectory(at: cwd)
+        // Deliberately don't plant a transcript file. Even the
+        // expected bucket directory is missing.
+
+        let tab = makePersistedClaudeTab(
+            id: "t-orphan", sessionId: "sid-orphan", cwd: cwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-orphan")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-orphan")?.cwd, cwd,
+            "no recoverable bucket must leave tab.cwd untouched"
+        )
+    }
+
+    func test_heal_multipleMatches_picksMostRecent() throws {
+        // Defensive tie-break: if two buckets somehow carry the same
+        // session id (UUIDs make this nominally impossible, but
+        // hand-edited or test-corrupted state can produce it), the
+        // heal picks the most-recently-modified file.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-tests-multi-\(UUID().uuidString)"
+        let staleCwd = "\(projectCwd)/.claude/worktrees/stale"
+        let freshCwd = "\(projectCwd)/.claude/worktrees/fresh"
+        try plantDirectory(at: projectCwd)
+        try plantDirectory(at: staleCwd)
+        try plantDirectory(at: freshCwd)
+
+        try plantTranscript(
+            sessionId: "sid-multi",
+            bucketCwd: staleCwd,
+            withMessageCwd: staleCwd
+        )
+        // Force-stale the first file's mtime so the second is
+        // unambiguously newer when the heal picks.
+        let staleTranscript = transcriptPath(
+            sessionId: "sid-multi", bucketCwd: staleCwd
+        )
+        let oldDate = Date(timeIntervalSince1970: 1_000_000)
+        try FileManager.default.setAttributes(
+            [.modificationDate: oldDate], ofItemAtPath: staleTranscript
+        )
+
+        try plantTranscript(
+            sessionId: "sid-multi",
+            bucketCwd: freshCwd,
+            withMessageCwd: freshCwd
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-multi", sessionId: "sid-multi", cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-multi")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-multi")?.cwd, freshCwd,
+            "tie-break must pick the most-recently-modified transcript"
+        )
+    }
+
+    func test_heal_unreadableTranscript_fallsBack() throws {
+        // First 30 lines are non-JSON garbage: every parse attempt
+        // fails, neither `cwd` nor `worktreePath` is recovered, and
+        // the heal returns nil. tab.cwd stays as persisted.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-tests-garbage-\(UUID().uuidString)"
+        let worktreeCwd = "\(projectCwd)/.claude/worktrees/garbage"
+        try plantDirectory(at: projectCwd)
+        try plantDirectory(at: worktreeCwd)
+        try plantTranscript(
+            sessionId: "sid-garbage",
+            bucketCwd: worktreeCwd,
+            // 30+ lines of non-JSON so the parser exhausts its
+            // head-scan budget without finding a cwd anywhere.
+            lines: Array(repeating: "not json at all", count: 35)
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-garbage", sessionId: "sid-garbage", cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-garbage")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-garbage")?.cwd, projectCwd,
+            "unparseable transcript must surface as no heal — tab.cwd unchanged"
+        )
+    }
+
+    func test_heal_recoveredCwdMissingOnDisk_skipsHeal() throws {
+        // The transcript references a worktree that has since been
+        // deleted from disk. The heal abandons the rewrite — there's
+        // no point pointing `tab.cwd` at a phantom path; the resume
+        // is unrecoverable either way, and `resolvedSpawnCwd`'s
+        // existing fallback drops the user back into the project
+        // root via the same code path it always has.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-tests-missing-\(UUID().uuidString)"
+        let deletedWorktreeCwd = "\(projectCwd)/.claude/worktrees/deleted"
+        try plantDirectory(at: projectCwd)
+        // Deliberately don't plant the worktree directory itself.
+        try plantTranscript(
+            sessionId: "sid-missing",
+            bucketCwd: deletedWorktreeCwd,
+            withMessageCwd: deletedWorktreeCwd
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-missing", sessionId: "sid-missing", cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-missing")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-missing")?.cwd, projectCwd,
+            "phantom recovered path must NOT overwrite tab.cwd — leave the existing fallback to handle it"
+        )
+    }
+
+    func test_heal_terminalOnlyTab_skipsScan() throws {
+        // Terminal-only tabs (no claudeSessionId) carry no session id
+        // to look up. The early-out check skips the projects-dir
+        // enumeration entirely. Verifying via the public behavior:
+        // restoring such a tab leaves it untouched even when a
+        // transcript on disk happens to share the same path.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let cwd = "/tmp/nice-heal-tests-terminal-\(UUID().uuidString)"
+        try plantDirectory(at: cwd)
+        // Plant something the heal *could* pick up if it ran — but
+        // it shouldn't, because the tab has no session id.
+        try plantTranscript(
+            sessionId: "should-not-be-looked-up",
+            bucketCwd: cwd,
+            withMessageCwd: "/elsewhere"
+        )
+
+        let terminalTab = PersistedTab(
+            id: "t-terminal",
+            title: "Terminal tab",
+            cwd: cwd,
+            branch: nil,
+            claudeSessionId: nil,   // <-- no Claude session
+            activePaneId: "t-terminal-t1",
+            panes: [
+                PersistedPane(
+                    id: "t-terminal-t1", title: "Terminal 1", kind: .terminal
+                ),
+            ],
+            titleManuallySet: nil
+        )
+        fake.state = makeState(tab: terminalTab)
+
+        let ws = makeWindowSession(windowSessionId: "win-terminal")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-terminal")?.cwd, cwd,
+            "terminal-only tab must not consult the heal path at all"
+        )
+    }
+
+    func test_heal_snapshotRoundTrip_locksCorrectedCwd() throws {
+        // After heal mutates `tab.cwd` in-place, `snapshotPersistedWindow()`
+        // must serialize the corrected value — that's what the
+        // post-init save flush picks up.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-tests-roundtrip-\(UUID().uuidString)"
+        let worktreeCwd = "\(projectCwd)/.claude/worktrees/auto-name"
+        try plantDirectory(at: projectCwd)
+        try plantDirectory(at: worktreeCwd)
+        try plantTranscript(
+            sessionId: "sid-roundtrip",
+            bucketCwd: worktreeCwd,
+            withMessageCwd: worktreeCwd
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-roundtrip", sessionId: "sid-roundtrip", cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-roundtrip")
+        ws.restoreSavedWindow()
+
+        let snapshot = ws.snapshotPersistedWindow()
+        let snapshotTab = snapshot.projects
+            .flatMap(\.tabs)
+            .first(where: { $0.id == "t-roundtrip" })
+        XCTAssertEqual(
+            snapshotTab?.cwd, worktreeCwd,
+            "snapshot must serialize the post-heal cwd so the next save persists the correction"
+        )
+    }
+
+    // MARK: - Heal test helpers
+
+    /// Mirror of Claude's bucket-encoding convention (every `/` and
+    /// `.` becomes `-`). Production lives in
+    /// `WindowSession.encodeClaudeBucket`; duplicated here so the test
+    /// is independent of the SUT's implementation.
+    private func encodeBucket(_ path: String) -> String {
+        var out = ""
+        out.reserveCapacity(path.count)
+        for ch in path {
+            out.append(ch == "/" || ch == "." ? "-" : ch)
+        }
+        return out
+    }
+
+    private func transcriptPath(sessionId: String, bucketCwd: String) -> String {
+        let projectsRoot = NSHomeDirectory() + "/.claude/projects"
+        return "\(projectsRoot)/\(encodeBucket(bucketCwd))/\(sessionId).jsonl"
+    }
+
+    /// Create an empty directory at `path`, making intermediate
+    /// directories. Used to plant both the worktree (so heal's
+    /// existence check passes) and the project root (so the
+    /// `resolvedSpawnCwd` fallback wouldn't accidentally pass before
+    /// heal even ran).
+    private func plantDirectory(at path: String) throws {
+        try FileManager.default.createDirectory(
+            atPath: path, withIntermediateDirectories: true
+        )
+    }
+
+    /// Plant a Claude transcript at the bucket implied by
+    /// `bucketCwd`. The default content is a single message-shape
+    /// line carrying `withMessageCwd` as its `cwd` field —
+    /// `readCwdFromTranscript`'s per-message branch. Pass `lines`
+    /// for custom transcript bodies (worktree-state-only, garbage,
+    /// etc.).
+    private func plantTranscript(
+        sessionId: String,
+        bucketCwd: String,
+        withMessageCwd: String? = nil,
+        lines: [String]? = nil
+    ) throws {
+        let path = transcriptPath(sessionId: sessionId, bucketCwd: bucketCwd)
+        let bucketDir = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(
+            atPath: bucketDir, withIntermediateDirectories: true
+        )
+        let body: String
+        if let lines {
+            body = lines.joined(separator: "\n") + "\n"
+        } else if let withMessageCwd {
+            body = #"""
+            {"type":"user","cwd":"\#(withMessageCwd)","sessionId":"\#(sessionId)"}
+            """# + "\n"
+        } else {
+            body = ""
+        }
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// Wrap a single PersistedTab in a fresh PersistedState so the
+    /// fake store has something to hand back from `load()`. The
+    /// persisted window id is generic — `restoreSavedWindow`'s
+    /// unmatched-adoption path picks it up because
+    /// `claimedWindowIds` is reset in `setUp`. Any non-matching
+    /// `makeWindowSession` id will route through the unmatched
+    /// fallback and adopt it.
+    private func makeState(tab: PersistedTab) -> PersistedState {
+        let project = makePersistedProject(id: "proj-heal", tabs: [tab])
+        let window = makePersistedWindow(
+            id: "heal-test-window",
+            projects: [makeEmptyTerminalsProject(), project]
+        )
+        return PersistedState(
+            version: PersistedState.currentVersion, windows: [window]
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeWindowSession(windowSessionId: String) -> WindowSession {
@@ -344,13 +771,14 @@ final class WindowSessionRestoreTests: XCTestCase {
     private func makePersistedClaudeTab(
         id: String,
         sessionId: String,
-        parentTabId: String? = nil
+        parentTabId: String? = nil,
+        cwd: String = "/tmp/nice-restore-tests"
     ) -> PersistedTab {
         let claudePaneId = "\(id)-claude"
         return PersistedTab(
             id: id,
             title: "Claude tab",
-            cwd: "/tmp/nice-restore-tests",
+            cwd: cwd,
             branch: nil,
             claudeSessionId: sessionId,
             activePaneId: claudePaneId,

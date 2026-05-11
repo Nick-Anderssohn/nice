@@ -207,6 +207,124 @@ final class NiceControlSocketTests: XCTestCase {
                        "non-string paneId/sessionId must not dispatch")
     }
 
+    // MARK: - Cwd parsing
+    //
+    // The cwd field arrived in session_update payloads when the
+    // SessionStart hook started forwarding Claude's actual working
+    // directory — covers the bare `claude -w` (auto-named worktree)
+    // path that `extractWorktreeName` can't predict, plus future
+    // `/worktree` rotations. Parser contract mirrors the `source`
+    // normalization: absent / empty / non-string → nil so the
+    // downstream cwd-update short-circuit catches every "don't know"
+    // variant without branching.
+
+    func test_sessionUpdate_parsesCwdField() throws {
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1","cwd":"/Users/nick/Projects/notes/.claude/worktrees/foo"}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertEqual(
+            got?.cwd,
+            "/Users/nick/Projects/notes/.claude/worktrees/foo",
+            "cwd field must arrive verbatim so SessionsModel can keep tab.cwd aligned"
+        )
+    }
+
+    func test_sessionUpdate_missingCwd_isNil() throws {
+        // The pre-cwd hook script (still on disk during an upgrade
+        // window) omits the field entirely. Must surface as nil so
+        // downstream comparisons can skip the cwd-update path cleanly.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1"}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertNil(got?.cwd, "missing cwd key must arrive as nil")
+    }
+
+    func test_sessionUpdate_emptyCwdNormalizesToNil() throws {
+        // The hook script emits cwd="" when Claude's payload omits the
+        // field (sed regex falls through to empty). Parser collapses
+        // the empty case to nil so the updateTabCwd helper can keep
+        // its "nil → no-op" rule and not also have to special-case
+        // empty strings.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1","cwd":""}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertNil(got?.cwd, "empty cwd string must collapse to nil")
+    }
+
+    func test_sessionUpdate_nullCwdIsNil() throws {
+        // Defensive: a hand-rolled hook (or a future Claude variant)
+        // could ship `"cwd": null`. The `as? String` cast yields nil,
+        // and the optional-chain plus emptiness guard keep that case
+        // from crashing or dispatching a phantom update.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1","cwd":null}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertNil(got?.cwd)
+    }
+
+    func test_sessionUpdate_nonStringCwdIsNil() throws {
+        // Same defensive contract as `null` — a number or array in the
+        // cwd slot fails the String cast and surfaces as nil. The
+        // session_update itself still dispatches because paneId /
+        // sessionId remain valid; only the cwd plumbing degrades.
+        let captured = CapturedSessionUpdates()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendRaw(
+            to: socket.path,
+            payload: #"{"action":"session_update","paneId":"P1","sessionId":"S1","cwd":42}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertEqual(got?.paneId, "P1",
+                       "non-string cwd must not block the session_update dispatch")
+        XCTAssertNil(got?.cwd, "non-string cwd value must surface as nil")
+    }
+
     func test_unknownAction_dropsSilently() throws {
         // Default branch in `readClient`'s switch — covered here
         // because it's the same parser surface as the new
@@ -250,6 +368,7 @@ final class NiceControlSocketTests: XCTestCase {
             let paneId: String
             let sessionId: String
             let source: String?
+            let cwd: String?
         }
         private let lock = NSLock()
         private var updates: [Update] = []
@@ -258,9 +377,12 @@ final class NiceControlSocketTests: XCTestCase {
         var handler: NiceControlSocket.Handler {
             { [weak self] message in
                 switch message {
-                case let .sessionUpdate(paneId, sessionId, source):
+                case let .sessionUpdate(paneId, sessionId, source, cwd):
                     self?.append(.init(
-                        paneId: paneId, sessionId: sessionId, source: source
+                        paneId: paneId,
+                        sessionId: sessionId,
+                        source: source,
+                        cwd: cwd
                     ))
                 case let .claude(_, _, _, _, reply):
                     // Tests don't exercise .claude here, but the handler

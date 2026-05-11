@@ -91,8 +91,8 @@ enum ClaudeHookInstaller {
     // MARK: - Script
 
     /// Shell script that Claude invokes on every SessionStart. Extracts
-    /// `session_id` and `source` from claude's stdin JSON (no jq
-    /// dependency — `sed` handles both patterns reliably) and posts a
+    /// `session_id`, `source`, and `cwd` from claude's stdin JSON (no
+    /// jq dependency — `sed` handles each pattern reliably) and posts a
     /// `session_update` socket payload. Forwards on every source
     /// (`clear`, `compact`, `resume`, `startup`, `branch`, anything
     /// Claude introduces later) — the receiver's `if newId !=
@@ -114,12 +114,13 @@ enum ClaudeHookInstaller {
     /// the hook under claude's hook timeout even if the socket is
     /// unresponsive.
     static let hookScript = #"""
-    #!/bin/bash
-    # nice-claude-hook.sh — relays the SessionStart hook's session_id
-    # and source to Nice's control socket so each tab's stored
+    #!/usr/bin/env bash
+    # nice-claude-hook.sh — relays the SessionStart hook's session_id,
+    # source, and cwd to Nice's control socket so each tab's stored
     # claudeSessionId tracks /clear, /compact, and /branch rotations
-    # across relaunches, and so /branch can spawn a sibling parent tab
-    # holding the pre-rotation session.
+    # across relaunches, and so Nice's tab.cwd follows Claude into a
+    # worktree when `/worktree` or bare `claude -w` (auto-named)
+    # moves the session's working directory mid-flight.
     # Installed automatically by Nice on startup; safe to delete.
     set -u
     if [ -z "${NICE_SOCKET:-}" ] || [ -z "${NICE_PANE_ID:-}" ]; then
@@ -138,7 +139,30 @@ enum ClaudeHookInstaller {
     # spaced sources (e.g. "branch.auto" → "branch"); the receiver's
     # source-classification gate would then mis-label rotations.
     SRC=$(printf '%s' "$INPUT" | /usr/bin/sed -nE 's/.*"source"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | /usr/bin/head -1)
-    PAYLOAD=$(printf '{"action":"session_update","paneId":"%s","sessionId":"%s","source":"%s"}' "$NICE_PANE_ID" "$SID" "$SRC")
+    # Cwd value: top-level "cwd" field from the SessionStart payload —
+    # the absolute path Claude is running in. Anchors on the literal
+    # `"cwd":` key so `transcript_path`'s inner segments can't bleed
+    # in, and uses `[^"]*` (same shape as the source class) so the
+    # captured byte run is guaranteed quote-free. That guarantee is
+    # what lets us splice the raw bytes straight back into the
+    # outgoing JSON without re-escaping: Claude already JSON-encoded
+    # the value, so its `\` runs are already `\\` in the byte stream,
+    # and an additional escape pass would double them.
+    #
+    # Known limitation: a cwd whose JSON-encoded form contains `\"`
+    # (a literal `"` byte in the path) is truncated at the first `"`
+    # byte the regex sees. The splice that follows produces a
+    # malformed outgoing JSON that the socket parser will drop. We
+    # accept the silent-drop because (a) macOS paths essentially
+    # never carry an embedded `"` and (b) on the next restart,
+    # `WindowSession.healSpawnCwd` finds the transcript by session id
+    # and recovers the real cwd from the transcript file's content
+    # — so the forward-path drop is covered by the heal safety net.
+    #
+    # The receiver normalizes an empty string to nil, so a missing
+    # cwd surfaces as a no-op there rather than churning a save.
+    CWD=$(printf '%s' "$INPUT" | /usr/bin/sed -nE 's/.*"cwd"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | /usr/bin/head -1)
+    PAYLOAD=$(printf '{"action":"session_update","paneId":"%s","sessionId":"%s","source":"%s","cwd":"%s"}' "$NICE_PANE_ID" "$SID" "$SRC" "$CWD")
     printf '%s\n' "$PAYLOAD" | /usr/bin/nc -U -w 1 "$NICE_SOCKET" >/dev/null 2>&1 || true
     exit 0
     """#

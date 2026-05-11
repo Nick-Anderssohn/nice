@@ -370,6 +370,185 @@ final class WindowSession {
         }
     }
 
+    // MARK: - Heal-on-restore helpers
+
+    /// Path of Claude Code's per-cwd bucketing root, relative to the
+    /// user's home directory. Resolved against `NSHomeDirectory()` at
+    /// production call sites so a sandboxed `$HOME` (used by
+    /// `TestHomeSandbox` and by Claude itself when running under a
+    /// per-launch HOME override) routes the heal scan into the
+    /// matching bucket tree rather than the developer's real one.
+    static let claudeProjectsDirRelative = "/.claude/projects"
+
+    /// Filename suffix Claude Code uses for per-session transcripts
+    /// (one JSON-lines record per message). Centralized so the heal
+    /// scan and any future indexer touch one constant if Claude
+    /// changes the suffix.
+    static let transcriptExtension = ".jsonl"
+
+    /// How many transcript lines `readCwdFromTranscript` will scan
+    /// before giving up. Sized to cover Claude's transcript head —
+    /// permission-mode + (worktree-state) + file-history-snapshot +
+    /// the first user/attachment/assistant records — without
+    /// ballooning the per-restore I/O cost for sessions whose head
+    /// records have no cwd field for some reason. Internal so the
+    /// pure-helper tests can pin the boundary instead of hard-coding
+    /// the number.
+    static let transcriptHeadScanLines = 30
+
+    /// Locate a Claude session's actual on-disk bucket when the
+    /// persisted `tab.cwd` doesn't match what Claude bucketed under.
+    /// Returns the recovered cwd (suitable for both `tab.cwd`
+    /// persistence and as the deferred-shell spawn directory) or nil
+    /// when no heal is necessary (transcript already present at the
+    /// expected path) or no heal is possible (session id absent from
+    /// every bucket, transcript unreadable, recovered path no longer
+    /// exists on disk).
+    ///
+    /// How the bug shape arises (history): bare `claude -w` (no name)
+    /// auto-generates a worktree name Nice can't predict at the args
+    /// layer, so `createTabFromMainTerminal`'s
+    /// `extractWorktreeName`-based detection misses and `tab.cwd`
+    /// records the pre-worktree project path. The SessionStart hook
+    /// now forwards Claude's real cwd back so new sessions stay in
+    /// sync, but existing on-disk state from before that fix can only
+    /// recover via this restore-time scan.
+    ///
+    /// `projectsRoot` defaults to the production-shape path under
+    /// `$HOME`; tests pass a temp-dir override so direct unit tests
+    /// of the heal helpers don't need `TestHomeSandbox`. Static so it
+    /// can be called from `addRestoredTabModel` without allocating.
+    static func healSpawnCwd(
+        sessionId: String,
+        persistedCwd: String,
+        projectsRoot: String = defaultClaudeProjectsRoot()
+    ) -> String? {
+        let expectedBucket = encodeClaudeBucket(
+            TabModel.expandTilde(persistedCwd)
+        )
+        let expectedTranscript =
+            "\(projectsRoot)/\(expectedBucket)/\(sessionId)\(transcriptExtension)"
+        if FileManager.default.fileExists(atPath: expectedTranscript) {
+            return nil
+        }
+
+        // Enumerate every sibling bucket for `<sessionId>.jsonl`.
+        // contentsOfDirectory returns an empty array (not throws) on
+        // a missing or unreadable projects dir on macOS, but `try?`
+        // covers the throw-path defensively.
+        guard let buckets = try? FileManager.default.contentsOfDirectory(
+            atPath: projectsRoot
+        ), !buckets.isEmpty else { return nil }
+
+        var matches: [(path: String, mtime: Date)] = []
+        for bucket in buckets {
+            let candidate =
+                "\(projectsRoot)/\(bucket)/\(sessionId)\(transcriptExtension)"
+            guard let attrs = try? FileManager.default.attributesOfItem(
+                atPath: candidate
+            ) else { continue }
+            let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
+            matches.append((candidate, mtime))
+        }
+        guard let chosen = matches
+            .sorted(by: { $0.mtime > $1.mtime })
+            .first?.path
+        else {
+            // No diagnostic log here: this branch fires whenever a
+            // restored Claude tab's transcript isn't recoverable from
+            // any bucket — common in tests that don't plant
+            // transcripts, and indistinguishable in production from
+            // legitimately-deleted sessions. The downstream "Claude
+            // couldn't find session X" error in the deferred-resume
+            // pane is the user-facing signal; an NSLog here would
+            // just spam stderr on every launch where any tab's
+            // session was cleaned up server-side.
+            return nil
+        }
+
+        guard let recovered = readCwdFromTranscript(at: chosen) else {
+            NSLog("WindowSession.healSpawnCwd: transcript at \(chosen) yielded no cwd in the first \(transcriptHeadScanLines) lines")
+            return nil
+        }
+        // The recovered cwd is what Claude expects on resume, but
+        // there's no point rewriting `tab.cwd` to a phantom path —
+        // if the worktree was deleted between sessions, the resume is
+        // unrecoverable either way, and `resolvedSpawnCwd`'s existing
+        // fallback will still drop the user into the project root.
+        let expanded = TabModel.expandTilde(recovered)
+        guard FileManager.default.fileExists(atPath: expanded) else {
+            NSLog("WindowSession.healSpawnCwd: recovered cwd \(recovered) for session \(sessionId) does not exist on disk; abandoning heal")
+            return nil
+        }
+        return recovered
+    }
+
+    /// Production-shape projects root: Claude Code's bucketing tree
+    /// under the current user's home. Factored so tests have a single
+    /// well-named constant to override and the default-argument
+    /// expression on `healSpawnCwd` stays one identifier wide.
+    static func defaultClaudeProjectsRoot() -> String {
+        NSHomeDirectory() + claudeProjectsDirRelative
+    }
+
+    /// Mirror of Claude Code's bucket-name convention: replace every
+    /// `/` and `.` in the absolute path with `-`. Observed in
+    /// `~/.claude/projects/` (e.g. `/Users/nick/Projects/notes/.claude/worktrees/foo`
+    /// → `-Users-nick-Projects-notes--claude-worktrees-foo`).
+    /// The encoding is lossy in general (two distinct paths can map to
+    /// the same bucket), which is precisely why
+    /// `readCwdFromTranscript` pulls the real path out of the file
+    /// content rather than trying to decode the bucket name.
+    static func encodeClaudeBucket(_ cwd: String) -> String {
+        var result = ""
+        result.reserveCapacity(cwd.count)
+        for ch in cwd {
+            if ch == "/" || ch == "." {
+                result.append("-")
+            } else {
+                result.append(ch)
+            }
+        }
+        return result
+    }
+
+    /// Read the first `transcriptHeadScanLines` newline-delimited
+    /// JSON records of a Claude transcript and return the first cwd
+    /// value found. Per-message records carry a top-level `"cwd"`
+    /// field; worktree sessions also emit a `{"type":"worktree-state",
+    /// "worktreeSession": {"worktreePath": "..."}}` record near the
+    /// top, used as a fallback for transcripts whose head doesn't yet
+    /// include a regular message with `cwd`. Returns nil if the file
+    /// is missing, unreadable, non-UTF-8, or the scanned head
+    /// contains neither field — caller falls back to the existing
+    /// `resolvedSpawnCwd` behavior in that case.
+    static func readCwdFromTranscript(at path: String) -> String? {
+        guard let content = try? String(
+            contentsOfFile: path, encoding: .utf8
+        ) else {
+            NSLog("WindowSession.readCwdFromTranscript: unable to read \(path)")
+            return nil
+        }
+        for line in content.split(
+            separator: "\n", omittingEmptySubsequences: true
+        ).prefix(transcriptHeadScanLines) {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data)
+                  as? [String: Any]
+            else { continue }
+            if let cwd = obj["cwd"] as? String, !cwd.isEmpty {
+                return cwd
+            }
+            if let nested = obj["worktreeSession"] as? [String: Any],
+               let worktreePath = nested["worktreePath"] as? String,
+               !worktreePath.isEmpty
+            {
+                return worktreePath
+            }
+        }
+        return nil
+    }
+
     /// Append one restored tab's model to `tabs.projects[projectIndex]`.
     /// Claude tabs (tabs with a `claudeSessionId`) return info so the
     /// caller can defer the pty spawn to `claude --resume`. Terminal-
@@ -424,7 +603,29 @@ final class WindowSession {
         // new project context. Falls back to the project path if the
         // persisted cwd (e.g. a worktree directory) has been deleted
         // since the last launch.
-        let spawnCwd = tabs.resolvedSpawnCwd(for: tab)
+        var spawnCwd = tabs.resolvedSpawnCwd(for: tab)
+
+        // Heal-on-restore: pre-hook-cwd-forwarding builds (or any
+        // earlier code path that wrote a stale `tab.cwd`) can leave a
+        // Claude tab pointing at the project root while the real
+        // transcript lives in `~/.claude/projects/<encoded-worktree>/`.
+        // Resume from the wrong bucket fails with "No conversation
+        // found", so before returning the spawn cwd, check whether the
+        // expected transcript actually exists. If it doesn't, locate
+        // the transcript by session id across every projects bucket,
+        // recover the real cwd from the file's content, and adopt it
+        // — both for this spawn and for the persisted tab so the
+        // correction lands on disk via the upcoming save flush.
+        if let sid = persisted.claudeSessionId,
+           let healed = Self.healSpawnCwd(
+            sessionId: sid, persistedCwd: spawnCwd
+           )
+        {
+            if tabs.adoptTabCwd(forTabId: tab.id, newCwd: healed) {
+                scheduleSessionSave()
+            }
+            spawnCwd = healed
+        }
 
         if let sid = persisted.claudeSessionId {
             let claudePaneId = panes.first(where: { $0.kind == .claude })?.id

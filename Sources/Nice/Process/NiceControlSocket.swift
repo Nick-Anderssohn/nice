@@ -67,7 +67,22 @@ enum SocketMessage: Sendable {
     /// receiver uses `source == "resume"` plus an actual id-change to
     /// distinguish `/branch` (and `--fork-session`) from `/clear`,
     /// `/compact`, and the no-op resume cases.
-    case sessionUpdate(paneId: String, sessionId: String, source: String?)
+    ///
+    /// `cwd` is the absolute path Claude is currently running in,
+    /// pulled from the SessionStart payload's `cwd` field. The receiver
+    /// uses it to keep `tab.cwd` in sync when Claude moves into a
+    /// worktree mid-session (`/worktree`, bare `claude -w` with the
+    /// auto-generated name, etc.) so the next restart's `claude
+    /// --resume` lands in the right bucket directory. Optional and
+    /// empty-string-normalized to `nil`: older hook scripts predating
+    /// this field surface as `nil` and the receiver no-ops, preserving
+    /// the rotation-only behavior of pre-cwd builds.
+    case sessionUpdate(
+        paneId: String,
+        sessionId: String,
+        source: String?,
+        cwd: String?
+    )
 }
 
 final class NiceControlSocket: @unchecked Sendable {
@@ -366,12 +381,22 @@ final class NiceControlSocket: @unchecked Sendable {
             // to nil so downstream comparisons stay simple.
             let rawSource = obj["source"] as? String
             let source = (rawSource?.isEmpty == false) ? rawSource : nil
+            // Cwd follows the same normalization contract as `source`:
+            // absent key, non-string value (null, number), and empty
+            // string all collapse to nil so the receiver's no-op
+            // short-circuit catches every "we don't know" variant
+            // without separate branches.
+            let rawCwd = obj["cwd"] as? String
+            let cwd = (rawCwd?.isEmpty == false) ? rawCwd : nil
             // Hook is fire-and-forget: close before dispatch so the
             // helper script's `nc` returns promptly even if the
             // MainActor handler is backed up.
             close(client)
             handler(.sessionUpdate(
-                paneId: paneId, sessionId: sessionId, source: source
+                paneId: paneId,
+                sessionId: sessionId,
+                source: source,
+                cwd: cwd
             ))
         default:
             // Unknown action — log and drop, matching the silent-drop
