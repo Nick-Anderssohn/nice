@@ -121,6 +121,29 @@ final class FileBrowserRenameUITests: NiceUITestCase {
             element.waitForExistence(timeout: 5),
             "Expected rename field \(id) to exist within 5s."
         )
+        // The rename field becomes first responder via a
+        // `DispatchQueue.main.async` hop in
+        // `FileBrowserRenameField.makeNSView` — the underlying
+        // `NSTextField` can't be made first responder until it's been
+        // attached to a window, which happens one runloop tick after
+        // `makeNSView` returns. On the slow macOS CI VMs that gap is
+        // wide enough that `typeText` lands while focus is still on
+        // the row's parent Group, surfacing as "Neither element nor
+        // any descendant has keyboard focus." Poll for focus here so
+        // callers can `typeText` without racing the focus hop.
+        //
+        // macOS XCUIElement doesn't expose `hasKeyboardFocus` as a
+        // property — read it from the accessibility snapshot via
+        // KVC. The key is documented in `XCUIElementAttributes`
+        // and is the same value AX reports.
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if (element.value(forKey: "hasKeyboardFocus") as? Bool) == true {
+                return element
+            }
+            usleep(50_000)
+        }
+        XCTFail("Rename field \(id) did not receive keyboard focus within 5s.")
         return element
     }
 
