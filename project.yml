@@ -93,6 +93,19 @@ packages:
     #     `TerminalOptions.textCompositionStrategy = .appleApprox`;
     #     iOS defaults to .identity. Color emoji are intentionally
     #     unaffected.
+    #   - filter trackpad rubber-band events out of `scrollWheel`.
+    #     A pure gesture state machine latches the user-driven
+    #     direction at gesture start and drops momentum-phase
+    #     deltas whose sign opposes the latch — that's the
+    #     reverse-direction snap-back macOS emits at scroll
+    #     boundaries. Without this, scrolling up to the top of
+    #     scrollback in a pager (e.g. `git log` → `less`) bounced
+    #     the viewport back down a few pixels at gesture end.
+    #     Also adds a `scrollingDeltaY` accumulator to the
+    #     alternate-screen arrow-key emitter so precise-delta
+    #     trackpad input no longer fires one arrow per OS event
+    #     (≈120 Hz) but instead one per cell of travel. Mouse
+    #     wheels (empty phase) pass through untouched.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is opt-in
@@ -106,7 +119,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 3c19c2e91ecbe6d2ad4d24bbab084fa276930920
+    revision: a00dafb693857b23eb47fe24169e1d46ccded260
 
 targets:
   Nice:
