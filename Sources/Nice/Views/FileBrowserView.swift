@@ -140,9 +140,9 @@ private struct FileBrowserContent: View {
     /// Install a `.keyDown` local monitor scoped to this window. We
     /// intercept Return to start an inline rename, but only when:
     ///   • Our window is the event target.
-    ///   • No text-input view holds first responder (the terminal
-    ///     and any open rename field are NSText / NSTextField, so
-    ///     they swallow Return through this guard).
+    ///   • No text-receiving view holds first responder (rename
+    ///     field, settings text field, terminal pane running a shell
+    ///     or editor — see the `NSTextInputClient` guard below).
     ///   • Exactly one row is in the selection.
     /// Anything else returns the event unchanged so other handlers
     /// (terminal, menu, default key processing) keep working.
@@ -154,12 +154,19 @@ private struct FileBrowserContent: View {
             // which varies with input source.
             guard event.keyCode == 36 else { return event }
             guard event.window?.windowNumber == windowNumber else { return event }
-            // If a text view / text field is first responder, the
-            // user is editing text — pass Return through. This also
-            // covers our own rename field (NSTextField), so the
-            // commit path runs through the field's coordinator.
+            // If a text-receiving view is first responder, Return
+            // belongs to it — not to us. `NSTextInputClient` is the
+            // AppKit protocol every such view conforms to: the field
+            // editor (NSTextView) backing NSTextField/NSSecureTextField
+            // AND SwiftTerm's `TerminalView` (so vim / a shell running
+            // inside a pane swallow Return correctly). NSTextField
+            // itself isn't an NSTextInputClient — it forwards through
+            // its field editor — but it can be firstResponder briefly
+            // while focus is being handed to the editor, so keep the
+            // explicit class check as belt-and-suspenders for our
+            // inline rename field's mount window.
             if let responder = event.window?.firstResponder,
-               responder is NSText || responder is NSTextField
+               responder is any NSTextInputClient || responder is NSTextField
             {
                 return event
             }
@@ -419,6 +426,14 @@ private struct FileTreeRow: View {
     /// "outside the field" is.
     @State private var renameFieldFrame: NSRect = .zero
     @State private var renameWindowNumber: Int = 0
+    /// Deferred slow-second-click rename. The first click of a
+    /// would-be double-click satisfies the rename gate, so we hold
+    /// the rename in a work item and only let it fire after one
+    /// `doubleClickWindow` has elapsed without a follow-up click.
+    /// A fast second click cancels it and runs `doubleClick()` —
+    /// otherwise opening a selected file would also drop the row
+    /// into rename mode.
+    @State private var pendingRenameWork: DispatchWorkItem?
 
     /// macOS's stock double-click window is ~500ms but feels long
     /// for a file tree; 280ms gives crisp feedback while still
@@ -461,7 +476,13 @@ private struct FileTreeRow: View {
                 startWatching()
             }
         }
-        .onDisappear { watcher.stop() }
+        .onDisappear {
+            watcher.stop()
+            // Row went away mid-window (scrolled off, tab switched,
+            // file removed externally) — don't let a queued rename
+            // fire on a vanished row.
+            cancelPendingRename()
+        }
         .onChange(of: isExpanded) { _, newValue in
             if newValue {
                 // Always reload on expand. While the row was
@@ -518,6 +539,11 @@ private struct FileTreeRow: View {
         .onChange(of: selection.contains(path)) { _, isSelected in
             if !isSelected {
                 activatedAt = nil
+                // If a slow-second-click rename was queued and this
+                // row just lost selection (e.g. the user clicked a
+                // different row mid-window), the rename is no
+                // longer wanted — drop it before it fires.
+                cancelPendingRename()
                 // Selection lost while editing → commit. Same
                 // rationale as the pane pill's `onChange(isActive)`.
                 if isEditing { commitRename() }
@@ -745,6 +771,10 @@ private struct FileTreeRow: View {
         let now = Date()
         let isDouble = now.timeIntervalSince(lastTapTime) < Self.doubleClickWindow
         if isDouble {
+            // The first click of this pair may have scheduled a
+            // slow-second-click rename; cancel it before opening so
+            // the file doesn't open INTO rename mode.
+            cancelPendingRename()
             doubleClick()
             lastTapTime = .distantPast
             return
@@ -755,6 +785,13 @@ private struct FileTreeRow: View {
         // we're trying to detect doesn't reset `activatedAt`.
         // Same gate (`NSEvent.doubleClickInterval`) the pane pill
         // and sidebar tab use.
+        //
+        // Unlike the pane pill / tab row, this row also responds to
+        // double-click (open file / re-root folder). We can't yet
+        // know whether a second click is coming, so defer the
+        // rename by one `doubleClickWindow`. A fast follow-up click
+        // takes the `isDouble` branch above and cancels this work
+        // item; otherwise it fires and the field opens.
         if selection.contains(path),
            InlineRenameClickGate.canBeginEdit(
             activatedAt: activatedAt,
@@ -762,7 +799,13 @@ private struct FileTreeRow: View {
             doubleClickInterval: NSEvent.doubleClickInterval
            )
         {
-            beginRename()
+            cancelPendingRename()
+            let work = DispatchWorkItem { beginRename() }
+            pendingRenameWork = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Self.doubleClickWindow,
+                execute: work
+            )
             lastTapTime = now
             return
         }
@@ -901,8 +944,19 @@ private struct FileTreeRow: View {
         // gate (the menu and Return-key paths already block).
         guard FileBrowserRenameValidator.canRename(url) else { return }
         guard !isEditing else { return }
+        // Any deferred slow-second-click rename has now been
+        // superseded (either by itself firing, or by an
+        // external trigger arriving first). Drop the work item.
+        cancelPendingRename()
         draftName = url.lastPathComponent
         isEditing = true
+    }
+
+    /// Drop any deferred slow-second-click rename. Safe to call when
+    /// no work is pending — the optional handles that.
+    private func cancelPendingRename() {
+        pendingRenameWork?.cancel()
+        pendingRenameWork = nil
     }
 
     /// Commit the draft. Validates first; cancels for empty /
