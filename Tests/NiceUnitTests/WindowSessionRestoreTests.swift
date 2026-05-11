@@ -629,6 +629,201 @@ final class WindowSessionRestoreTests: XCTestCase {
         )
     }
 
+    // MARK: - Tilde expansion in heal
+    //
+    // `healSpawnCwd` invokes `TabModel.expandTilde` in two distinct
+    // sites that both have to honor `$HOME`. Every other heal test
+    // uses absolute `/tmp/...` paths, which would let either site
+    // silently regress (the bucket lookup would key off `~/scratch`
+    // verbatim instead of the expanded path; the existence check
+    // would `fileExists(atPath: "~/recovered")` and always fail).
+    // Sandbox `$HOME` via `TestHomeSandbox` so both sites route
+    // against the redirected root.
+
+    func test_heal_persistedCwdWithTilde_expandsBeforeBucketLookup() throws {
+        // The persisted `tab.cwd` is the un-expanded form `~/scratch`.
+        // Heal must expand it before computing the bucket — otherwise
+        // the expected-transcript existence check would key off
+        // `encodeClaudeBucket("~/scratch")` and miss the real bucket
+        // (under the expanded form). With the planted transcript at
+        // the expanded bucket, the steady-state branch fires and heal
+        // returns nil — leaving `tab.cwd` as the un-expanded value
+        // the user persisted.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let scratchDir = NSHomeDirectory() + "/scratch"
+        try plantDirectory(at: scratchDir)
+        // Bucket-encode the *expanded* path — the contract under test.
+        try plantTranscript(
+            sessionId: "sid-tilde-persisted",
+            bucketCwd: scratchDir,
+            withMessageCwd: scratchDir
+        )
+        addTeardownBlock {
+            try? FileManager.default.removeItem(atPath: scratchDir)
+        }
+
+        let tab = makePersistedClaudeTab(
+            id: "t-tilde-persisted",
+            sessionId: "sid-tilde-persisted",
+            cwd: "~/scratch"
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-tilde-persisted")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-tilde-persisted")?.cwd, "~/scratch",
+            "expanded persisted cwd must hit the expected bucket — no heal needed, tab.cwd untouched"
+        )
+    }
+
+    func test_heal_recoveredCwdWithTilde_storesUnexpandedValue() throws {
+        // The transcript records its `cwd` as `~/recovered-worktree`
+        // (an un-expanded path — Claude itself may write either form
+        // depending on how it was launched). The recovered directory
+        // exists at the expanded path under the sandbox HOME, so the
+        // heal's existence check must expand before checking. The
+        // value stored back into `tab.cwd` is the un-expanded string
+        // exactly as it appeared in the transcript — heal does not
+        // canonicalize.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        // Persisted project root — bucket-encodes to a key that won't
+        // hold the transcript, so the steady-state branch misses and
+        // the cross-bucket scan kicks in.
+        let projectCwd = "/tmp/nice-heal-tests-tilde-recovered-\(UUID().uuidString)"
+        let recoveredExpanded = NSHomeDirectory() + "/recovered-worktree"
+        try plantDirectory(at: projectCwd)
+        try plantDirectory(at: recoveredExpanded)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(atPath: projectCwd)
+            try? FileManager.default.removeItem(atPath: recoveredExpanded)
+        }
+        // Bucket is keyed off the expanded path (that's where Claude
+        // would have written), but the recorded `cwd` field carries
+        // the un-expanded form.
+        try plantTranscript(
+            sessionId: "sid-tilde-recovered",
+            bucketCwd: recoveredExpanded,
+            withMessageCwd: "~/recovered-worktree"
+        )
+
+        let tab = makePersistedClaudeTab(
+            id: "t-tilde-recovered",
+            sessionId: "sid-tilde-recovered",
+            cwd: projectCwd
+        )
+        fake.state = makeState(tab: tab)
+
+        let ws = makeWindowSession(windowSessionId: "win-tilde-recovered")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-tilde-recovered")?.cwd,
+            "~/recovered-worktree",
+            "heal must store the un-expanded value verbatim — expansion is only for the existence check"
+        )
+    }
+
+    // MARK: - Multi-tab heal isolation
+
+    func test_heal_multipleClaudeTabs_onlyMismatchedHealed() throws {
+        // One window, one project, two Claude tabs. Tab A is in
+        // steady state (transcript at the bucket derived from its
+        // persisted `tab.cwd`). Tab B is the classic bug shape
+        // (`tab.cwd` is the project root, transcript actually lives
+        // under a `.claude/worktrees/foo` sibling bucket). After
+        // restore, A's cwd must be untouched and B's must adopt the
+        // recovered worktree path. The persisted snapshot must
+        // reflect both: A still at its original path, B carrying the
+        // corrected one.
+        //
+        // Heal currently runs per `addRestoredTabModel` call, so a
+        // future refactor that batches the bucket scan ("walk all
+        // tabs, scan once") could quietly break the isolation here
+        // without lighting up the single-tab cases.
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+
+        let projectCwd = "/tmp/nice-heal-multitab-\(UUID().uuidString)"
+        let steadyCwd = "\(projectCwd)/steady"
+        let bugCwd = "\(projectCwd)/.claude/worktrees/foo"
+        try plantDirectory(at: steadyCwd)
+        try plantDirectory(at: bugCwd)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(atPath: projectCwd)
+        }
+
+        // Steady tab: transcript at the bucket derived from its
+        // persisted cwd. Heal sees it at the expected path and
+        // returns nil immediately.
+        try plantTranscript(
+            sessionId: "sid-steady",
+            bucketCwd: steadyCwd,
+            withMessageCwd: steadyCwd
+        )
+        // Bug tab: persisted cwd is the project root, transcript
+        // bucketed under the worktree. Heal must scan, find it,
+        // recover the worktree path, and adopt it.
+        try plantTranscript(
+            sessionId: "sid-bug",
+            bucketCwd: bugCwd,
+            withMessageCwd: bugCwd
+        )
+
+        let steadyTab = makePersistedClaudeTab(
+            id: "t-steady", sessionId: "sid-steady", cwd: steadyCwd
+        )
+        let bugTab = makePersistedClaudeTab(
+            id: "t-bug", sessionId: "sid-bug", cwd: projectCwd
+        )
+        let project = makePersistedProject(
+            id: "proj-multitab", tabs: [steadyTab, bugTab]
+        )
+        let window = makePersistedWindow(
+            id: "heal-multitab-window",
+            projects: [makeEmptyTerminalsProject(), project]
+        )
+        fake.state = PersistedState(
+            version: PersistedState.currentVersion, windows: [window]
+        )
+
+        let ws = makeWindowSession(windowSessionId: "win-multitab")
+        ws.restoreSavedWindow()
+
+        XCTAssertEqual(
+            tabs.tab(for: "t-steady")?.cwd, steadyCwd,
+            "steady-state tab must not be touched by the heal pass"
+        )
+        XCTAssertEqual(
+            tabs.tab(for: "t-bug")?.cwd, bugCwd,
+            "mismatched sibling tab must adopt the recovered worktree cwd"
+        )
+
+        // Snapshot round-trip: the post-init save flush picks up
+        // both values from `snapshotPersistedWindow()`. Future saves
+        // must reflect the steady-state cwd verbatim AND the healed
+        // correction — pin both in the same assertion so a regression
+        // that batches the snapshot (e.g. "use the project's cwd for
+        // every tab") trips here.
+        let snapshot = ws.snapshotPersistedWindow()
+        let snapshotTabs = snapshot.projects.flatMap(\.tabs)
+        XCTAssertEqual(
+            snapshotTabs.first(where: { $0.id == "t-steady" })?.cwd,
+            steadyCwd,
+            "snapshot must carry the steady tab's original cwd"
+        )
+        XCTAssertEqual(
+            snapshotTabs.first(where: { $0.id == "t-bug" })?.cwd,
+            bugCwd,
+            "snapshot must carry the healed cwd for the bug-shape tab"
+        )
+    }
+
     func test_heal_snapshotRoundTrip_locksCorrectedCwd() throws {
         // After heal mutates `tab.cwd` in-place, `snapshotPersistedWindow()`
         // must serialize the corrected value — that's what the
