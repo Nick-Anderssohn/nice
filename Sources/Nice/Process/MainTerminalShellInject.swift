@@ -2,13 +2,13 @@
 //  MainTerminalShellInject.swift
 //  Nice
 //
-//  Phase 7: writes a per-launch `ZDOTDIR` directory the Main Terminal's
-//  zsh picks up. The directory contains stub `.zshenv` / `.zprofile` /
-//  `.zlogin` / `.zshrc` that chain back to the user's real startup
-//  files (resolved from `$NICE_USER_ZDOTDIR` if set, else by sourcing
-//  `~/.zshenv` to discover the user's intended `ZDOTDIR`), then (in
-//  `.zshrc`) restore `ZDOTDIR` to that intended value and define a
-//  `claude()` function that intercepts *interactive* invocations and
+//  Writes a `ZDOTDIR` directory the Main Terminal's zsh picks up. The
+//  directory contains stub `.zshenv` / `.zprofile` / `.zlogin` /
+//  `.zshrc` that chain back to the user's real startup files (resolved
+//  from `$NICE_USER_ZDOTDIR` if set, else by sourcing `~/.zshenv` to
+//  discover the user's intended `ZDOTDIR`), then (in `.zshrc`) restore
+//  `ZDOTDIR` to that intended value and define a `claude()` function
+//  that intercepts *interactive* invocations and
 //  forwards them to Nice's control socket so a new tab opens instead
 //  of the shell exec'ing claude in place. Every interactive `claude`
 //  — whether typed in the built-in Terminals tab or in a companion
@@ -40,18 +40,33 @@
 //  and setting `ZDOTDIR` system-wide is non-idiomatic; documented
 //  rather than fixed.
 //
+//  Storage location: the stubs live in a fixed, per-variant directory
+//  under Application Support (`…/<CFBundleName>/zdotdir`) — NOT
+//  `$TMPDIR`. macOS's `com.apple.bsd.dirhelper` sweeps `$TMPDIR` files
+//  older than 3 days; when Nice ran longer than that, the sweep
+//  deleted the stubs out from under the live process and every new
+//  pane's zsh then sourced nothing (no oh-my-zsh, no PATH) until the
+//  app was relaunched. Application Support is never swept. Because the
+//  stub contents are static, one shared directory serves every window
+//  and every process of a variant; `Nice` and `Nice Dev` stay isolated
+//  via `CFBundleName`. `make()` rewrites the stubs on every launch, so
+//  the directory self-heals if anything ever removes a file.
+//
 
 import Foundation
 
 enum MainTerminalShellInject {
-    /// Write the ZDOTDIR contents for this launch and return its path.
+    /// Write the ZDOTDIR stubs and return the directory holding them.
     /// The `$NICE_SOCKET` env var the `claude()` function reads is
     /// injected separately — the script just references it.
-    static func make() throws -> URL {
-        let dir = URL(
-            fileURLWithPath: NSTemporaryDirectory(),
-            isDirectory: true
-        ).appendingPathComponent("nice-zdotdir-\(getpid())", isDirectory: true)
+    ///
+    /// `location` defaults to `defaultLocation()` (the stable
+    /// per-variant Application Support directory). Tests pass a
+    /// throwaway directory to stay off the real shared location. The
+    /// stubs are (over)written every call, so the directory self-heals
+    /// if a file was ever removed.
+    static func make(at location: URL? = nil) throws -> URL {
+        let dir = location ?? defaultLocation()
 
         try FileManager.default.createDirectory(
             at: dir, withIntermediateDirectories: true, attributes: nil
@@ -75,6 +90,34 @@ enum MainTerminalShellInject {
         )
 
         return dir
+    }
+
+    /// The fixed, per-variant ZDOTDIR location:
+    /// `~/Library/Application Support/<CFBundleName>/zdotdir`. Honors
+    /// `NICE_APPLICATION_SUPPORT_ROOT` (tests redirect it into a
+    /// sandbox; production leaves it unset). The folder name tracks
+    /// `CFBundleName` so `Nice` and `Nice Dev` get separate directories
+    /// — mirrors `SessionStore` / `TerminalThemeCatalog`. Unlike
+    /// `$TMPDIR`, this path is never swept by macOS's temp cleanup.
+    static func defaultLocation() -> URL {
+        let fm = FileManager.default
+        let root: URL
+        if let override = ProcessInfo.processInfo.environment["NICE_APPLICATION_SUPPORT_ROOT"],
+           !override.isEmpty {
+            root = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            root = (try? fm.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )) ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        }
+        let folder = (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "Nice"
+        return root
+            .appendingPathComponent(folder, isDirectory: true)
+            .appendingPathComponent("zdotdir", isDirectory: true)
     }
 
     // MARK: - File bodies

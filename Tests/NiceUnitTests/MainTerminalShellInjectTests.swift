@@ -15,13 +15,20 @@ import XCTest
 
 final class MainTerminalShellInjectTests: XCTestCase {
 
+    /// Write the stubs into a throwaway directory (auto-removed in
+    /// teardown) so tests never read, write, or delete the real shared
+    /// Application Support ZDOTDIR of a running Nice / Nice Dev.
+    private func makeIsolated() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nice-zdotdir-test-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return try MainTerminalShellInject.make(at: dir)
+    }
+
     // MARK: - File layout
 
     func test_make_createsAllFourStubs() throws {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: dir)
-        }
+        let dir = try makeIsolated()
 
         let fm = FileManager.default
         for name in [".zshenv", ".zprofile", ".zlogin", ".zshrc"] {
@@ -31,13 +38,26 @@ final class MainTerminalShellInjectTests: XCTestCase {
         }
     }
 
-    func test_make_usesPidInPath() throws {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+    /// The ZDOTDIR must live under Application Support, NOT `$TMPDIR`.
+    /// macOS's `com.apple.bsd.dirhelper` sweeps `$TMPDIR` files older
+    /// than 3 days; when it did, it stripped the stubs out from under a
+    /// long-running Nice and every new pane sourced nothing (no
+    /// oh-my-zsh, no PATH). The location must also be stable across
+    /// calls so the dir is reused, not re-namespaced per launch.
+    func test_defaultLocation_isUnderAppSupportNotTemp() {
+        let dir = MainTerminalShellInject.defaultLocation()
 
-        let expectedSuffix = "nice-zdotdir-\(getpid())"
-        XCTAssertEqual(dir.lastPathComponent, expectedSuffix,
-                       "ZDOTDIR path should be namespaced by pid to avoid cross-process collisions.")
+        XCTAssertEqual(dir.lastPathComponent, "zdotdir",
+                       "ZDOTDIR directory should be named `zdotdir`.")
+        XCTAssertFalse(
+            dir.path.hasPrefix(NSTemporaryDirectory()),
+            "ZDOTDIR must not live in $TMPDIR — macOS dirhelper sweeps it after 3 days. Got: \(dir.path)")
+        XCTAssertTrue(
+            dir.deletingLastPathComponent().path.contains("Application Support"),
+            "ZDOTDIR should live under Application Support. Got: \(dir.path)")
+        XCTAssertEqual(
+            dir.path, MainTerminalShellInject.defaultLocation().path,
+            "ZDOTDIR location must be stable across calls (one shared, reused dir).")
     }
 
     // MARK: - Chain-back stubs
@@ -50,8 +70,7 @@ final class MainTerminalShellInjectTests: XCTestCase {
     /// zsh layouts (e.g. `~/.config/zsh`) work and what stops shell
     /// tools (p10k, oh-my-zsh, nvm…) from scribbling on our temp dir.
     func test_chainBacks_sourceFromUserZDotDir() throws {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let dir = try makeIsolated()
 
         // .zprofile and .zlogin source through $NICE_USER_ZDOTDIR
         // (still set when those stubs run). .zshrc is special — it
@@ -78,8 +97,7 @@ final class MainTerminalShellInjectTests: XCTestCase {
     /// back to sourcing `~/.zshenv` ourselves), then restores `$ZDOTDIR`
     /// to our temp dir so zsh keeps reading our other stubs.
     func test_zshenv_discoversUserZDotDir() throws {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let dir = try makeIsolated()
 
         let body = try String(
             contentsOf: dir.appendingPathComponent(".zshenv"), encoding: .utf8
@@ -138,8 +156,7 @@ final class MainTerminalShellInjectTests: XCTestCase {
     // MARK: - .zshrc shell wrapper contract
 
     private func readZshrc() throws -> String {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let dir = try makeIsolated()
         return try String(
             contentsOf: dir.appendingPathComponent(".zshrc"), encoding: .utf8
         )
@@ -321,8 +338,7 @@ final class MainTerminalShellInjectTests: XCTestCase {
     /// suspenders for the case where someone refactors the script and
     /// changes the substitution form.
     func test_zshrc_emitterProducesCleanOsc7AtRuntime() throws {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let dir = try makeIsolated()
 
         // Run inside a sandbox cwd we control so the captured payload
         // is predictable. Use a no-percent, no-space path so the
@@ -421,8 +437,7 @@ final class MainTerminalShellInjectTests: XCTestCase {
         commands: String,
         loginShell: Bool = false
     ) throws -> String {
-        let dir = try MainTerminalShellInject.make()
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let dir = try makeIsolated()
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")

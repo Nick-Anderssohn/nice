@@ -53,9 +53,10 @@ final class NiceServices {
     /// control socket. Owned here (not per-AppState) so multi-window
     /// scenarios share one dir and a closing window can't yank it out
     /// from under another window's still-spawning shells. Written by
-    /// `bootstrap()` *after* `cleanupStaleTempFiles` so the cleanup
-    /// never wipes the dir we just wrote. Deleted by the
-    /// `willTerminate` observer.
+    /// `bootstrap()` to a fixed, per-variant Application Support
+    /// location (see `MainTerminalShellInject.defaultLocation`) that
+    /// macOS's temp cleanup never sweeps, and reused across launches —
+    /// so it is intentionally *not* deleted on terminate.
     private(set) var zdotdirPath: String?
 
     /// The `ZDOTDIR` value Nice inherited from its launch environment
@@ -161,10 +162,11 @@ final class NiceServices {
         // loop in `AppShellHost.task`.
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
 
-        // Sweep `$TMPDIR` debris from prior crashed runs *before*
-        // writing this run's zdotdir — otherwise the cleanup would
-        // race the freshly-written dir and delete it, causing every
-        // companion shell spawned after onAppear to source nothing.
+        // Sweep `$TMPDIR` debris from prior crashed runs: stale
+        // `nice-*.sock` control sockets, plus legacy `nice-zdotdir-*`
+        // dirs left by builds that predate moving the ZDOTDIR into
+        // Application Support. Our own zdotdir no longer lives in
+        // `$TMPDIR`, so this sweep can't race it.
         Self.cleanupStaleTempFiles()
 
         // Reap zsh processes orphaned by prior crashes / SIGKILLs
@@ -250,9 +252,11 @@ final class NiceServices {
                     allAppStates: registry.allAppStates,
                     detachObservers: { registry.detachAllCloseObservers() }
                 )
-                if let zdotdirPath = self.zdotdirPath {
-                    try? FileManager.default.removeItem(atPath: zdotdirPath)
-                }
+                // The ZDOTDIR now lives in a stable Application Support
+                // location, shared across this variant's windows and
+                // reused on the next launch — so it is deliberately not
+                // removed here. Deleting it would also break a second
+                // running instance of the same variant mid-session.
             }
         }
     }
