@@ -84,27 +84,32 @@ enum TrafficLightNudger {
 
         applyOffset(to: window, dx: dx, dy: dy)
 
-        // AppKit relays out the buttons on focus and resize. Re-apply
-        // the offset in both cases to keep it sticky.
+        // AppKit relays out the buttons on focus, resize, and on every
+        // full-screen transition (it resets them to their default
+        // positions when the title-bar band changes). Re-apply the
+        // offset on each so it stays sticky. The will/did pair for
+        // full screen is intentional: macOS reorganizes the buttons
+        // both as the animation starts and after it lands, so re-applying
+        // only on one edge leaves them briefly (or persistently) misplaced.
         let center = NotificationCenter.default
-        center.addObserver(
-            forName: NSWindow.didBecomeKeyNotification,
-            object: window,
-            queue: .main
-        ) { [weak window] _ in
-            guard let window else { return }
-            MainActor.assumeIsolated {
-                applyOffset(to: window, dx: dx, dy: dy)
-            }
-        }
-        center.addObserver(
-            forName: NSWindow.didResizeNotification,
-            object: window,
-            queue: .main
-        ) { [weak window] _ in
-            guard let window else { return }
-            MainActor.assumeIsolated {
-                applyOffset(to: window, dx: dx, dy: dy)
+        let reapplyOn: [NSNotification.Name] = [
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResizeNotification,
+            NSWindow.willEnterFullScreenNotification,
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.willExitFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+        ]
+        for name in reapplyOn {
+            center.addObserver(
+                forName: name,
+                object: window,
+                queue: .main
+            ) { [weak window] _ in
+                guard let window else { return }
+                MainActor.assumeIsolated {
+                    applyOffset(to: window, dx: dx, dy: dy)
+                }
             }
         }
     }

@@ -64,8 +64,48 @@ private final class TestHostStubDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {}
 }
 
+/// Tracks whether the current key window is in native full screen, so
+/// the View-menu command can show "Enter" vs "Exit Full Screen". Nice
+/// declares no `.commands` otherwise, which is why the standard
+/// full-screen menu item (and its ⌃⌘F shortcut) was absent entirely —
+/// the green traffic-light button was the only way in.
+@MainActor
+@Observable
+final class FullScreenTracker {
+    var keyWindowIsFullScreen: Bool = false
+
+    @ObservationIgnored
+    private var observers: [NSObjectProtocol] = []
+
+    init() {
+        let center = NotificationCenter.default
+        // `object: nil` → observe every window; we recompute from
+        // whichever window is key, so the title follows the frontmost
+        // window across enter/exit transitions and key-window changes.
+        let names: [NSNotification.Name] = [
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResignKeyNotification,
+        ]
+        for name in names {
+            observers.append(
+                center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.recompute() }
+                }
+            )
+        }
+    }
+
+    private func recompute() {
+        keyWindowIsFullScreen =
+            NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
+    }
+}
+
 struct NiceApp: App {
     @State private var services = NiceServices()
+    @State private var fullScreen = FullScreenTracker()
     // Owns `applicationShouldTerminate` so ⌘Q / Quit-menu goes through
     // the "you have live panes" confirmation before willTerminate fires.
     // The adaptor instantiates the delegate before SwiftUI builds the
@@ -99,6 +139,24 @@ struct NiceApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
+        .commands {
+            // Restore the standard full-screen menu item + ⌃⌘F. It's in
+            // the View menu (where macOS conventionally puts it) via the
+            // `.sidebar` placement. `toggleFullScreen` works because the
+            // window already advertises `.fullScreenPrimary` (the green
+            // button enters full screen); only the menu binding was
+            // missing.
+            CommandGroup(after: .sidebar) {
+                Button(
+                    fullScreen.keyWindowIsFullScreen
+                        ? "Exit Full Screen"
+                        : "Enter Full Screen"
+                ) {
+                    NSApp.keyWindow?.toggleFullScreen(nil)
+                }
+                .keyboardShortcut("f", modifiers: [.control, .command])
+            }
+        }
 
         // ⌘, binds to this scene automatically on macOS. SettingsView
         // declares its own min / ideal / max frame; mirroring it here

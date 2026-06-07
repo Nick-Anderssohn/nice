@@ -186,7 +186,11 @@ private struct AppShellHost: View {
                 // tab mutation triggered during start()) captures the
                 // real frame instead of persisting `frame: nil`.
                 appState.windowSession.window = window
-                TrafficLightNudger.nudge(window: window, dx: 8, dy: -10)
+                TrafficLightNudger.nudge(
+                    window: window,
+                    dx: WindowChrome.trafficLightNudgeX,
+                    dy: WindowChrome.trafficLightNudgeY
+                )
                 TitleBarZoomMonitor.install()
                 services.registry.register(appState: appState, window: window)
             }
@@ -387,7 +391,7 @@ private struct AppShellHost: View {
                 // its vertical band matches the collapsed cap's
                 // restore button.
                 WindowDragRegion()
-                    .frame(height: 52)
+                    .frame(height: WindowChrome.topBarHeight)
                     .overlay(alignment: .topTrailing) {
                         // Mode toggles + collapse all live as a single
                         // trailing row. Collapse stays rightmost so its
@@ -533,20 +537,21 @@ private struct AppShellHost: View {
     }
 
     /// Floating card that lives in the top bar's upper-left corner when
-    /// the sidebar is collapsed. The leading 82pt reserves space for the
-    /// three native traffic lights (nudged to x≈28 with 14pt diameter
-    /// and 6pt spacing, last edge ≈82); the restore button sits just
-    /// past them. Vertical padding centers it within the 52pt top bar
-    /// row so it reads as a distinct card rather than blending into
-    /// either the chrome above or the content below.
+    /// the sidebar is collapsed. The leading reserve
+    /// (`WindowChrome.trafficLightReservedWidth`) hosts the three native
+    /// traffic lights — derived from the same nudge `TrafficLightNudger`
+    /// applies, so the cap and the buttons can't drift apart; the restore
+    /// button sits just past them. Vertical padding centers it within the
+    /// 52pt top bar row so it reads as a distinct card rather than
+    /// blending into either the chrome above or the content below.
     private var collapsedCap: some View {
         SidebarBackground(palette: palette, scheme: scheme) {
             HStack(spacing: 0) {
-                // Leading 82pt hosts the traffic lights; the drag region
-                // underneath makes that strip (and any empty space past
-                // the restore button) behave like a title bar for
+                // Leading reserve hosts the traffic lights; the drag
+                // region underneath makes that strip (and any empty space
+                // past the restore button) behave like a title bar for
                 // drag + double-click zoom.
-                WindowDragRegion().frame(width: 82)
+                WindowDragRegion().frame(width: WindowChrome.trafficLightReservedWidth)
                 SidebarToggleButton(
                     help: "Expand sidebar",
                     accessibilityId: "sidebar.expand"
@@ -556,7 +561,9 @@ private struct AppShellHost: View {
                 WindowDragRegion()
             }
         }
-        .frame(width: 124, height: 40)
+        // Total = traffic-light reserve + room for the restore button and
+        // a small trailing drag strip, so the cap grows with the reserve.
+        .frame(width: WindowChrome.trafficLightReservedWidth + 42, height: 40)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -605,7 +612,7 @@ private struct AppShellHost: View {
                     .fill(Color.niceLine(scheme, palette))
                     .frame(height: 1)
             }
-            .frame(height: 52)
+            .frame(height: WindowChrome.topBarHeight)
 
             terminalBackgroundColor
         }

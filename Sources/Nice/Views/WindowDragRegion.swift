@@ -58,8 +58,41 @@ struct WindowDragRegion: NSViewRepresentable {
     }
 }
 
+/// The action macOS performs when the user double-clicks a window's
+/// title bar, read live from `NSGlobalDomain`'s
+/// `AppleActionOnDoubleClick`. Our custom band has to honor this itself
+/// because we draw our own chrome instead of using a native title bar.
+enum DoubleClickTitleBarAction: Equatable {
+    case zoom
+    case minimize
+    case none
+
+    /// Pure mapping from the raw `AppleActionOnDoubleClick` string to an
+    /// action. Absent or unrecognized ⇒ `.zoom` (the macOS default).
+    /// Split out from `current` so the mapping is unit-testable without
+    /// touching the global `UserDefaults`.
+    init(rawSetting: String?) {
+        switch rawSetting {
+        case "Minimize": self = .minimize
+        case "None":     self = .none
+        case "Maximize": self = .zoom
+        default:         self = .zoom
+        }
+    }
+
+    /// Current setting. Read fresh on each double-click so a change in
+    /// System Settings → Desktop & Dock takes effect without relaunch.
+    @MainActor
+    static var current: DoubleClickTitleBarAction {
+        DoubleClickTitleBarAction(
+            rawSetting: UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick")
+        )
+    }
+}
+
 /// Installs a single process-wide local `NSEvent` monitor that turns
-/// double-clicks on any `WindowDragRegion` into `performZoom(_:)`. Safe
+/// double-clicks on any `WindowDragRegion` into the user's configured
+/// title-bar double-click action (`AppleActionOnDoubleClick`). Safe
 /// to call repeatedly — only the first call installs the monitor.
 @MainActor
 enum TitleBarZoomMonitor {
@@ -74,6 +107,13 @@ enum TitleBarZoomMonitor {
             guard let window = event.window else { return event }
             guard let contentView = window.contentView else { return event }
 
+            // No title-bar semantics in full screen: there's no native
+            // title bar, the traffic lights are hidden in the menu-bar
+            // overlay, and the custom band's zoom action is meaningless
+            // (the window already fills the screen). Let the event pass
+            // through untouched.
+            guard !window.styleMask.contains(.fullScreen) else { return event }
+
             // Gate on the top 52pt chrome strip. Several AppKit views
             // lower in the window (NSVisualEffectView in the sidebar,
             // SwiftTerm's terminal view, etc.) report
@@ -82,10 +122,12 @@ enum TitleBarZoomMonitor {
             // on double-clicks in the sidebar body or terminal pane.
             // Restricting the monitor to the visual chrome row (which
             // spans both the sidebar card's top strip and the toolbar,
-            // edge-to-edge at window y=0..52) matches the native title-
-            // bar's own footprint.
+            // edge-to-edge at window y=0..topBarHeight) matches the
+            // native title-bar's own footprint. Sourced from the shared
+            // constant so the gate can't desync from the band height the
+            // rest of the chrome lays out against.
             let yFromTop = contentView.bounds.height - event.locationInWindow.y
-            guard yFromTop <= 52 else { return event }
+            guard yFromTop <= WindowChrome.topBarHeight else { return event }
 
             guard let hit = contentView.hitTest(event.locationInWindow) else {
                 return event
@@ -96,7 +138,16 @@ enum TitleBarZoomMonitor {
             var cursor: NSView? = hit
             while let v = cursor {
                 if v.mouseDownCanMoveWindow && !(v is NSVisualEffectView) {
-                    window.performZoom(nil)
+                    // Honor the user's title-bar double-click preference
+                    // instead of always zooming. We've already confirmed
+                    // this is a double-click in our title-bar band, so
+                    // consume the event in every case (including .none —
+                    // there's nothing below the chrome to receive it).
+                    switch DoubleClickTitleBarAction.current {
+                    case .zoom:     window.performZoom(nil)
+                    case .minimize: window.performMiniaturize(nil)
+                    case .none:     break
+                    }
                     return nil
                 }
                 cursor = v.superview

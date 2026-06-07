@@ -54,7 +54,7 @@ struct WindowToolbarView: View {
         }
         .padding(.leading, 14)
         .padding(.trailing, 20)
-        .frame(height: 52)
+        .frame(height: WindowChrome.topBarHeight)
         .frame(maxWidth: .infinity)
         .background {
             ZStack {
