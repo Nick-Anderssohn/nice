@@ -126,6 +126,11 @@ struct PaneDragSession: Equatable {
 @Observable
 final class PaneStripDragState {
     var session: PaneDragSession?
+    /// Insertion target painted for a drag that originated in ANOTHER
+    /// window (a cross-window move). This window has no local `session`
+    /// for such a drag, so the foreign target lives here. `tabId`-scoped
+    /// just like `session.target` so only the hovered strip paints.
+    var foreignTarget: PaneDropTarget?
 }
 
 // MARK: - Inline pane strip
@@ -166,6 +171,8 @@ private struct InlinePaneStrip: View {
     @Environment(TabModel.self) private var tabs
     @Environment(SessionsModel.self) private var sessions
     @Environment(CloseRequestCoordinator.self) private var closer
+    @Environment(AppState.self) private var appState
+    @Environment(NiceServices.self) private var services
     @Environment(\.colorScheme) private var scheme
 
     /// Tracks which pill (if any) the mouse is currently over, keyed by
@@ -360,7 +367,9 @@ private struct InlinePaneStrip: View {
                     paneFramesProvider: { paneFrames },
                     paneOrderProvider: { tab.panes.map(\.id) },
                     tabs: tabs,
-                    dragState: dragState
+                    dragState: dragState,
+                    appState: appState,
+                    services: services
                 )
             )
             .background(
@@ -435,9 +444,15 @@ private struct InlinePaneStrip: View {
     /// multi-strip drag can't paint a line in the wrong strip (sidebar
     /// parity — `myIndicator` there filters by `projectId`).
     private func myIndicator(for tabId: String) -> PaneDropIndicator? {
-        guard let target = dragState.session?.target, target.tabId == tabId
-        else { return nil }
-        return target.indicator
+        // Local reorder target wins; otherwise a cross-window (foreign)
+        // drag hovering this strip paints from `foreignTarget`.
+        if let target = dragState.session?.target, target.tabId == tabId {
+            return target.indicator
+        }
+        if let foreign = dragState.foreignTarget, foreign.tabId == tabId {
+            return foreign.indicator
+        }
+        return nil
     }
 
     /// X-position (in the strip's coordinate space) at which to paint the
@@ -477,6 +492,12 @@ private struct PaneStripDropDelegate: DropDelegate {
     let paneOrderProvider: () -> [String]
     let tabs: TabModel
     let dragState: PaneStripDragState
+    /// This strip's own window state — the migration TARGET for a
+    /// cross-window drop, and the source of this window's id.
+    let appState: AppState
+    let services: NiceServices
+
+    private var myWindowId: String { appState.windowSession.windowSessionId }
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(to: [.text])
@@ -492,48 +513,107 @@ private struct PaneStripDropDelegate: DropDelegate {
     }
 
     func dropExited(info: DropInfo) {
-        if ownsCurrentIndicator {
+        if dragState.session?.target?.tabId == tabId {
             dragState.session?.target = nil
+        }
+        if dragState.foreignTarget?.tabId == tabId {
+            dragState.foreignTarget = nil
         }
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        let outcome = dragState.session.flatMap {
-            resolve(draggedPaneId: $0.origin.paneId, info: info)
+        // Local drag (this window is the source): the existing intra-
+        // window reorder path. Read the slot, clear the local session,
+        // and drop the published live-pane handle (an intra-window
+        // reorder never migrates the live pty).
+        if let session = dragState.session {
+            let outcome = resolve(draggedPaneId: session.origin.paneId, info: info)
+            dragState.session = nil
+            services.livePaneRegistry.withdraw(paneId: session.origin.paneId)
+            guard let outcome, case let .slot(targetId, placeAfter) = outcome.destination
+            else { return false }
+            // Defer — an inline mutation here wedges AppKit's drag tracker.
+            DispatchQueue.main.async { [tabs, tabId] in
+                tabs.movePane(outcome.draggedId, inTab: tabId,
+                              relativeTo: targetId, placeAfter: placeAfter)
+            }
+            return true
         }
-        // Clear the session BEFORE deferring so no stale state survives
-        // a failed/no-op drop (sidebar parity).
-        dragState.session = nil
-        guard let outcome, case let .slot(targetId, placeAfter) = outcome.destination
-        else { return false }
-        // Defer the mutation — see the type-level doc on why an inline
-        // `movePane` here wedges AppKit's drag tracker.
-        DispatchQueue.main.async { [tabs, tabId] in
-            tabs.movePane(
-                outcome.draggedId,
-                inTab: tabId,
-                relativeTo: targetId,
-                placeAfter: placeAfter
+
+        // Foreign drag (originated in another window): commit a cross-
+        // window move into this strip's tab. Terminal panes resolve a
+        // slot; Claude panes ignore it (they become a new tab). Deferred
+        // for the same drag-tracker reason — and because re-hosting the
+        // migrated NSView mid-drop is exactly what wedges it.
+        guard foreignDrag != nil else { return false }
+        let slot = PaneStripDropResolver.paneTarget(
+            x: info.location.x,
+            paneOrder: paneOrderProvider(),
+            paneFrames: paneFramesProvider()
+        )
+        dragState.foreignTarget = nil
+        let targetTabId = tabId
+        // The coordinator re-reads the in-flight handle from the registry
+        // (which still holds it until claimed), so nothing to capture here
+        // beyond the slot.
+        DispatchQueue.main.async { [services, appState] in
+            PaneMigrationCoordinator(services: services).commitCrossWindowMove(
+                into: appState,
+                targetTabId: targetTabId,
+                relativeToPaneId: slot?.targetId,
+                placeAfter: slot?.placeAfter ?? false
             )
         }
         return true
     }
 
     private func updateIndicator(for info: DropInfo) {
-        let outcome = dragState.session.flatMap {
-            resolve(draggedPaneId: $0.origin.paneId, info: info)
-        }
-        guard let outcome, let indicator = outcome.indicator else {
-            if ownsCurrentIndicator {
+        // Local reorder indicator.
+        if let session = dragState.session {
+            if let outcome = resolve(draggedPaneId: session.origin.paneId, info: info),
+               let indicator = outcome.indicator {
+                dragState.session?.target = PaneDropTarget(tabId: tabId, indicator: indicator)
+            } else if dragState.session?.target?.tabId == tabId {
                 dragState.session?.target = nil
             }
             return
         }
-        dragState.session?.target = PaneDropTarget(tabId: tabId, indicator: indicator)
+        // Foreign (cross-window) indicator: only terminal panes land in
+        // the strip, so only they paint an insertion line. A Claude pane
+        // becomes a new tab — accept the drop but show no slot line.
+        guard let drag = foreignDrag, drag.kind == .terminal,
+              let slot = PaneStripDropResolver.paneTarget(
+                x: info.location.x,
+                paneOrder: paneOrderProvider(),
+                paneFrames: paneFramesProvider()
+              )
+        else {
+            if dragState.foreignTarget?.tabId == tabId { dragState.foreignTarget = nil }
+            return
+        }
+        let indicator: PaneDropIndicator = slot.placeAfter
+            ? .paneAfter(slot.targetId) : .paneBefore(slot.targetId)
+        dragState.foreignTarget = PaneDropTarget(tabId: tabId, indicator: indicator)
     }
 
     private var ownsCurrentIndicator: Bool {
         dragState.session?.target?.tabId == tabId
+            || dragState.foreignTarget?.tabId == tabId
+            || (dragState.session == nil && foreignDrag != nil)
+    }
+
+    /// The in-flight cross-window drag targeting this window, with the
+    /// dragged pane's kind resolved from its source window — or nil when
+    /// there's no foreign drag (no in-flight handle, or it originated in
+    /// this same window, i.e. an intra-window reorder).
+    private var foreignDrag: (handle: LivePaneRegistry.Handle, kind: PaneKind)? {
+        guard let handle = services.livePaneRegistry.currentDrag,
+              handle.sourceWindowSessionId != myWindowId,
+              let source = services.registry.appState(forSessionId: handle.sourceWindowSessionId),
+              let kind = source.tabs.tab(for: handle.sourceTabId)?
+                .panes.first(where: { $0.id == handle.paneId })?.kind
+        else { return nil }
+        return (handle, kind)
     }
 
     private func resolve(draggedPaneId: String, info: DropInfo) -> PaneStripDropResolver.Outcome? {
@@ -585,6 +665,8 @@ private struct InlinePanePill: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(TabModel.self) private var tabs
     @Environment(SessionsModel.self) private var sessions
+    @Environment(NiceServices.self) private var services
+    @Environment(WindowSession.self) private var windowSession
     @Environment(PaneStripDragState.self) private var dragState
 
     let tabId: String
@@ -703,19 +785,50 @@ private struct InlinePanePill: View {
         // a pill press claim the drag so the toolbar's window-drag gesture
         // (a lower-priority `.gesture`) yields — dragging a pill reorders
         // it without moving the window. (Drop handling wired below.)
+        //
+        // ⚠️ INVARIANT — this `.onDrag` is load-bearing for window-drag
+        // selectivity. It is what makes a pill press CLAIM the drag so the
+        // toolbar's lower-priority `windowDragGesture` yields. Do NOT
+        // replace it with an AppKit drag source / a background NSView
+        // (hitTest→nil + event monitors do NOT participate in SwiftUI's
+        // gesture-priority arbitration) without ALSO re-solving the
+        // `windowDragGesture` yield (gate it so it never fires on a press
+        // that began over a pill). Any change to this drag mechanism MUST
+        // keep `NiceUITests/WindowDragUITests` and
+        // `NiceUITests/PaneReorderUITests` green — they assert "dragging a
+        // pill does NOT move the window." See Sources/Nice/Views/CLAUDE.md.
         .onDrag {
             // Stash the full origin for synchronous access during hover
             // (the pasteboard only yields the payload at drop time), then
             // hand the id to the pasteboard. Beyond reordering, claiming
             // the drag here is what makes the toolbar's lower-priority
             // window-drag `.gesture` yield (pill drag ⇒ no window move).
+            let windowId = windowSession.windowSessionId
             dragState.session = PaneDragSession(
                 origin: PaneDragOrigin(
                     paneId: pane.id,
                     sourceTabId: tabId,
-                    sourceIndex: index
+                    sourceIndex: index,
+                    sourceWindowSessionId: windowId
                 ),
                 target: nil
+            )
+            // Publish a live-pane handle so a DROP in another window can
+            // claim this pane's running pty + view via the process-wide
+            // registry — the pasteboard only carries the id string. The
+            // claim closure detaches the live entry from THIS window's
+            // session on first call. An intra-window reorder never claims
+            // (it goes through the local `dragState` path) and withdraws
+            // the handle on drop.
+            services.livePaneRegistry.publish(
+                LivePaneRegistry.Handle(
+                    paneId: pane.id,
+                    sourceWindowSessionId: windowId,
+                    sourceTabId: tabId,
+                    claim: { [weak sessions] in
+                        sessions?.detachLivePane(tabId: tabId, paneId: pane.id)
+                    }
+                )
             )
             return NSItemProvider(object: pane.id as NSString)
         }
@@ -1081,6 +1194,8 @@ private struct NewTabBtn: View {
         .environment(appState.tabs)
         .environment(appState.sessions)
         .environment(appState.closer)
+        .environment(appState.windowSession)
+        .environment(NiceServices())
         .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.light)
@@ -1093,6 +1208,8 @@ private struct NewTabBtn: View {
         .environment(appState.tabs)
         .environment(appState.sessions)
         .environment(appState.closer)
+        .environment(appState.windowSession)
+        .environment(NiceServices())
         .environment(Tweaks())
         .frame(width: 1180)
         .preferredColorScheme(.dark)

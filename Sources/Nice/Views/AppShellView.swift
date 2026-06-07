@@ -295,6 +295,42 @@ private struct AppShellHost: View {
                     openWindow(id: "main")
                 }
             }
+            // Tear-off seed: a pane was dragged off a window and its
+            // `PaneTearOffController` opened THIS window to receive it.
+            // Pop the seed from the FIFO queue (nil when this window was
+            // opened for any other reason — normal launch, ⌘N, restore).
+            // The seed carries the live pty entry plus the project
+            // identity needed to reconstruct the sidebar tree; we adopt
+            // it here, AFTER `start()` has brought the socket and
+            // sessions subsystem online, so `adoptPane` can re-point
+            // the entry's delegate at this window's `SessionsModel`.
+            if let seed = services.consumeTearOffSeed() {
+                switch seed.kind {
+                case .claude:
+                    appState.sessions.adoptClaudePaneAsNewTab(
+                        entry: seed.entry,
+                        paneId: seed.paneId,
+                        title: seed.title,
+                        claudeSessionId: seed.claudeSessionId,
+                        projectId: seed.projectId,
+                        projectName: seed.projectName,
+                        projectPath: seed.projectPath
+                    )
+                case .terminal:
+                    appState.sessions.adoptTerminalPaneAsNewTab(
+                        entry: seed.entry,
+                        paneId: seed.paneId,
+                        title: seed.title,
+                        projectId: seed.projectId,
+                        projectName: seed.projectName,
+                        projectPath: seed.projectPath
+                    )
+                }
+                // Position the new window at the drag-release point so it
+                // "pops out" at the cursor. Best-effort: `window` may be
+                // nil on a headless build; skip silently in that case.
+                appState.windowSession.window?.setFrameOrigin(seed.screenPoint)
+            }
         }
         .onAppear {
             // Brand-new scene: write the id WindowSession minted back

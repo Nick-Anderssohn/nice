@@ -522,6 +522,52 @@ final class TabPtySession: TabPtySessionThemeable {
         entries.removeValue(forKey: id)
     }
 
+    // MARK: - Live migration (move a pane between windows)
+
+    /// Detach a live pane's entry from this session WITHOUT terminating
+    /// its pty, returning it so a sibling window's session can adopt it.
+    /// The running process and SwiftTerm scrollback survive because both
+    /// are owned by the returned `PaneEntry.view` (a `NiceTerminalView`),
+    /// not by this session. Mirror of `removePane`, but hands the entry
+    /// back instead of dropping it. Returns nil when no entry exists for
+    /// `id`.
+    ///
+    /// Caller contract: only the model-level pane removal (`TabModel
+    /// .extractPane`) and the destination `adoptPane` may follow — do
+    /// NOT route this through `terminatePane`/`removePane`, which would
+    /// kill or orphan the pty.
+    func detachPane(id: String) -> PaneEntry? {
+        entries.removeValue(forKey: id)
+    }
+
+    /// Adopt a live `PaneEntry` previously detached from another session
+    /// (a cross-window move / tear-off). The pty inside `entry.view` is
+    /// already running, so this does NOT re-arm a deferred spawn; it
+    /// rebuilds the termination delegate so future exit / title / cwd
+    /// callbacks route to THIS session's tab (the original delegate
+    /// captured the source session and tab id), re-points the view's
+    /// `processDelegate`, and re-applies this session's current theme +
+    /// font so the migrated pane matches its new window. The migrated
+    /// view's held / intentional-terminate flags are preserved.
+    func adoptPane(id: String, entry: PaneEntry) {
+        let delegate = makePaneDelegate(paneId: id)
+        entry.view.processDelegate = delegate
+        var adopted = PaneEntry(view: entry.view, kind: entry.kind, delegate: delegate)
+        adopted.isHeld = entry.isHeld
+        adopted.heldExitCode = entry.heldExitCode
+        adopted.intentionalTerminate = entry.intentionalTerminate
+        entries[id] = adopted
+        applyTerminalTheme(currentTerminalTheme, to: entry.view)
+        entry.view.font = Self.terminalFont(
+            named: currentTerminalFontFamily, size: currentTerminalFontSize
+        )
+        // Re-arm the focus latch so the migrated pane claims first
+        // responder when SwiftUI re-hosts it in the destination window.
+        // `claimFocusIfRequested` inside `viewDidMoveToWindow` will
+        // consume this flag once the view is live in the new window.
+        entry.view.wantsFocusOnAttach = true
+    }
+
     /// Wire up the "Launching…" placeholder for a newly-spawned pane.
     /// Calls `onPaneLaunched` so AppState starts the grace timer and
     /// sets `view.onFirstData` so the overlay lifts on first pty byte.

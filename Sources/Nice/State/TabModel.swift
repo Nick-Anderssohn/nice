@@ -494,6 +494,92 @@ final class TabModel {
         if moved { onTreeMutation?() }
     }
 
+    /// Which pane id should receive focus after the pane at `idx` is
+    /// removed from `panes` (the post-removal array): prefer the pane
+    /// that slid into the freed slot, else the new last pane, else nil
+    /// (the tab is now empty). Shared by `extractPane` (cross-window
+    /// move) and `SessionsModel.paneExited` (process exit) so a moved
+    /// pane and an exited pane re-focus the same neighbor. Pure.
+    static func neighborActivePaneId(afterRemovingIndex idx: Int, from panes: [Pane]) -> String? {
+        if idx < panes.count { return panes[idx].id }
+        if idx > 0 { return panes[idx - 1].id }
+        return nil
+    }
+
+    /// Remove `paneId` from tab `tabId` and return the removed `Pane`
+    /// model so a destination window can re-insert it (cross-window
+    /// move / tear-off). When the removed pane was the tab's active
+    /// pane, focus re-points to a neighbor via `neighborActivePaneId`
+    /// — the same rule a process exit uses. Fires `onTreeMutation` on a
+    /// real removal. Returns nil (no mutation, no callback) when the
+    /// tab or pane isn't found.
+    ///
+    /// Model-only: the caller is responsible for detaching the live pty
+    /// entry (`SessionsModel.detachLivePane`) and for any tab-dissolve
+    /// when this empties the tab.
+    @discardableResult
+    func extractPane(_ paneId: String, fromTab tabId: String) -> Pane? {
+        var removed: Pane?
+        mutateTab(id: tabId) { tab in
+            guard let idx = tab.panes.firstIndex(where: { $0.id == paneId })
+            else { return }
+            let wasActive = (tab.activePaneId == paneId)
+            removed = tab.panes.remove(at: idx)
+            if wasActive {
+                tab.activePaneId = Self.neighborActivePaneId(
+                    afterRemovingIndex: idx, from: tab.panes
+                )
+            }
+        }
+        if removed != nil { onTreeMutation?() }
+        return removed
+    }
+
+    /// Insert an externally-sourced `pane` into tab `tabId` relative to
+    /// `targetPaneId`: just before it (`placeAfter == false`) or just
+    /// after it. A nil/unknown `targetPaneId` appends. The pane-pill
+    /// analog of dropping a foreign pane into a strip; the source pane
+    /// has already been removed from its origin tab (`extractPane`), so
+    /// unlike `movePane` there's no remove-shift adjustment. No-op (no
+    /// callback) when the tab is unknown or already contains a pane with
+    /// this id. Does NOT change `activePaneId` — the caller decides
+    /// whether the migrated pane takes focus.
+    func insertPane(_ pane: Pane, inTab tabId: String, relativeTo targetPaneId: String?, placeAfter: Bool) {
+        var inserted = false
+        mutateTab(id: tabId) { tab in
+            guard !tab.panes.contains(where: { $0.id == pane.id }) else { return }
+            let insertIndex: Int
+            if let targetPaneId,
+               let ti = tab.panes.firstIndex(where: { $0.id == targetPaneId }) {
+                insertIndex = placeAfter ? ti + 1 : ti
+            } else {
+                insertIndex = tab.panes.count
+            }
+            tab.panes.insert(pane, at: insertIndex)
+            inserted = true
+        }
+        if inserted { onTreeMutation?() }
+    }
+
+    /// Find a non-Terminals project whose path matches `path`; if none,
+    /// append a fresh project carrying the supplied `id`/`name`/`path`
+    /// (copied verbatim so a torn-off / moved Claude pane lands under a
+    /// project with the same identity as its origin window). Returns the
+    /// project index. Distinct from `ensureProject`, which matches by
+    /// id; cross-window placement matches by filesystem path because the
+    /// same repo open in two windows shares a path but may carry
+    /// different project ids.
+    func ensureProjectByPath(id: String, name: String, path: String) -> Int {
+        let expanded = Self.expandTilde(path)
+        if let idx = projects.firstIndex(where: {
+            $0.id != Self.terminalsProjectId && Self.expandTilde($0.path) == expanded
+        }) {
+            return idx
+        }
+        projects.append(Project(id: id, name: name, path: path, tabs: []))
+        return projects.count - 1
+    }
+
     /// Mirrors `movePane` without mutating — true iff the drop would
     /// actually reorder. The pane-strip drop indicator uses this to
     /// suppress the insertion line for no-op drops.

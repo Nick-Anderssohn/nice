@@ -283,13 +283,12 @@ final class SessionsModel {
             }
             tab.panes.remove(at: idx)
             if tab.activePaneId == paneId {
-                if idx < tab.panes.count {
-                    tab.activePaneId = tab.panes[idx].id
-                } else if idx > 0 {
-                    tab.activePaneId = tab.panes[idx - 1].id
-                } else {
-                    tab.activePaneId = nil
-                }
+                // Same neighbor rule a cross-window move uses
+                // (`TabModel.extractPane`), shared so a moved pane and
+                // an exited pane re-focus identically.
+                tab.activePaneId = TabModel.neighborActivePaneId(
+                    afterRemovingIndex: idx, from: tab.panes
+                )
             }
         }
 
@@ -1039,13 +1038,38 @@ final class SessionsModel {
             }
         }
 
+        return instantiateSession(
+            for: tabId,
+            cwd: resolvedCwd,
+            extraClaudeArgs: extraClaudeArgs,
+            initialClaudePaneId: claudePaneId,
+            initialTerminalPaneId: terminalPaneId,
+            claudeSessionMode: claudeSessionMode
+        )
+    }
+
+    /// Construct, theme, cache, and return a `TabPtySession` spawning
+    /// exactly the panes named by `initialClaudePaneId` /
+    /// `initialTerminalPaneId` — no model inference. Shared by
+    /// `makeSession` (which infers the ids first) and the live-migration
+    /// adopt paths (which spawn no Claude pane because the migrated one
+    /// is already running). `cwd` is expected pre-expanded.
+    private func instantiateSession(
+        for tabId: String,
+        cwd: String,
+        extraClaudeArgs: [String],
+        initialClaudePaneId: String?,
+        initialTerminalPaneId: String?,
+        claudeSessionMode: TabPtySession.ClaudeSessionMode
+    ) -> TabPtySession {
+        let resolvedCwd = cwd
         let session = TabPtySession(
             tabId: tabId,
             cwd: resolvedCwd,
             claudeBinary: resolvedClaudePath,
             extraClaudeArgs: extraClaudeArgs,
-            initialClaudePaneId: claudePaneId,
-            initialTerminalPaneId: terminalPaneId,
+            initialClaudePaneId: initialClaudePaneId,
+            initialTerminalPaneId: initialTerminalPaneId,
             socketPath: controlSocket?.path,
             zdotdirPath: zdotdirPath,
             userZDotDir: userZDotDir,
@@ -1072,6 +1096,164 @@ final class SessionsModel {
         themeCache.applyAll(to: session)
         ptySessions[tabId] = session
         return session
+    }
+
+    // MARK: - Live pane migration (move a pane between windows)
+
+    /// Detach the live entry for `paneId` from `tabId`'s pty session
+    /// WITHOUT killing its pty, returning it so another window's
+    /// `SessionsModel` can `adoptLivePane` it. The running process and
+    /// scrollback survive (owned by the entry's view). Clears any
+    /// pending launch-overlay state for the pane so a migrated-but-
+    /// still-launching pane doesn't leave an orphan "Launching…" entry
+    /// behind in the source window. Returns nil when the tab has no
+    /// session or the pane isn't hosted.
+    ///
+    /// Model-only removal of the `Pane` from the source tab is the
+    /// caller's job (`TabModel.extractPane`); this touches the pty
+    /// layer only.
+    func detachLivePane(tabId: String, paneId: String) -> TabPtySession.PaneEntry? {
+        clearPaneLaunch(paneId: paneId)
+        return ptySessions[tabId]?.detachPane(id: paneId)
+    }
+
+    /// Adopt a live `entry` previously detached from another window into
+    /// `tabId`'s session (creating an empty session for the tab when one
+    /// doesn't exist yet, e.g. a target tab whose pty was never spawned).
+    /// Re-points the entry's delegate at this window via
+    /// `TabPtySession.adoptPane`. Inserting the `Pane` model into the
+    /// target tab is the caller's job (`TabModel.insertPane`).
+    func adoptLivePane(tabId: String, paneId: String, entry: TabPtySession.PaneEntry) {
+        let session: TabPtySession
+        if let existing = ptySessions[tabId] {
+            session = existing
+        } else {
+            let cwd = tabs?.tab(for: tabId).map { TabModel.expandTilde($0.cwd) }
+                ?? NSHomeDirectory()
+            session = instantiateSession(
+                for: tabId, cwd: cwd, extraClaudeArgs: [],
+                initialClaudePaneId: nil, initialTerminalPaneId: nil,
+                claudeSessionMode: .none
+            )
+        }
+        session.adoptPane(id: paneId, entry: entry)
+    }
+
+    /// Adopt a live Claude pane (migrated from another window) as a
+    /// brand-new sidebar tab. A Claude pane can't join an existing tab's
+    /// pane set — a tab holds at most one alive Claude pane — so a
+    /// cross-window move / tear-off of a Claude pane lands as its own
+    /// tab under the project matching `projectPath` (recreated from the
+    /// supplied identity when the destination window lacks it). The new
+    /// tab takes the canonical `[Claude, companion terminal]` shape with
+    /// the Claude pane focused and `claudeSessionId` carried across; the
+    /// companion terminal is a fresh deferred spawn (started on first
+    /// focus, exactly like `createTabFromMainTerminal`), and the live
+    /// Claude entry is adopted without re-spawning. Returns the new tab
+    /// id, or nil when `tabs` is gone.
+    @discardableResult
+    func adoptClaudePaneAsNewTab(
+        entry: TabPtySession.PaneEntry,
+        paneId: String,
+        title: String,
+        claudeSessionId: String?,
+        projectId: String,
+        projectName: String,
+        projectPath: String
+    ) -> String? {
+        guard let tabs else { return nil }
+        let newTabId = mintTabId("t")
+        let companionId = "\(newTabId)-t1"
+        var claudePane = Pane(id: paneId, title: title, kind: .claude)
+        // The migrated pane was a live Claude; keep the runtime flag so
+        // `paneTitleChanged`'s OSC gate stays open and status flows.
+        claudePane.isClaudeRunning = true
+        var tab = Tab(
+            id: newTabId,
+            title: title,
+            cwd: projectPath,
+            branch: nil,
+            panes: [
+                claudePane,
+                Pane(id: companionId, title: "Terminal 1", kind: .terminal),
+            ],
+            activePaneId: paneId,
+            claudeSessionId: claudeSessionId
+        )
+        tab.nextTerminalIndex = 2
+        let pi = tabs.ensureProjectByPath(
+            id: projectId, name: projectName, path: projectPath
+        )
+        tabs.projects[pi].tabs.append(tab)
+        tabs.activeTabId = newTabId
+        // Spawn nothing here: the companion terminal is deferred (like
+        // the canonical Claude tab), and the Claude pane is adopted live
+        // below rather than spawned fresh.
+        let session = instantiateSession(
+            for: newTabId, cwd: TabModel.expandTilde(projectPath),
+            extraClaudeArgs: [],
+            initialClaudePaneId: nil, initialTerminalPaneId: nil,
+            claudeSessionMode: .none
+        )
+        session.adoptPane(id: paneId, entry: entry)
+        onSessionMutation?()
+        return newTabId
+    }
+
+    /// Adopt a live terminal pane (migrated from another window) as a
+    /// brand-new sidebar tab. This is the terminal-only sibling to
+    /// `adoptClaudePaneAsNewTab` — used exclusively by the tear-off
+    /// path when a lone terminal pane is dragged off a window and must
+    /// land in a fresh tab rather than an existing strip.
+    ///
+    /// A new tab is created under the project matching `projectPath`
+    /// (recreated from the supplied identity when the destination window
+    /// lacks it, via `tabs.ensureProjectByPath`), with a single pane of
+    /// kind `.terminal` whose id is `paneId` and whose title is `title`.
+    /// `activePaneId` is set to `paneId`. No pty is spawned during
+    /// instantiation — the live entry from the detached source session is
+    /// adopted immediately via `session.adoptPane`. Sets `tabs.activeTabId`
+    /// to the new tab. Fires `onSessionMutation`. Returns the new tab id,
+    /// or nil when `tabs` is gone.
+    @discardableResult
+    func adoptTerminalPaneAsNewTab(
+        entry: TabPtySession.PaneEntry,
+        paneId: String,
+        title: String,
+        projectId: String,
+        projectName: String,
+        projectPath: String
+    ) -> String? {
+        guard let tabs else { return nil }
+        let newTabId = mintTabId("t")
+        let terminalPane = Pane(id: paneId, title: title, kind: .terminal)
+        var tab = Tab(
+            id: newTabId,
+            title: title,
+            cwd: projectPath,
+            branch: nil,
+            panes: [terminalPane],
+            activePaneId: paneId,
+            claudeSessionId: nil
+        )
+        tab.nextTerminalIndex = 2
+        let pi = tabs.ensureProjectByPath(
+            id: projectId, name: projectName, path: projectPath
+        )
+        tabs.projects[pi].tabs.append(tab)
+        tabs.activeTabId = newTabId
+        // Spawn nothing: the live entry is adopted below directly.
+        // `instantiateSession` with nil/nil creates an empty session shell
+        // that the `adoptPane` call below populates.
+        let session = instantiateSession(
+            for: newTabId, cwd: TabModel.expandTilde(projectPath),
+            extraClaudeArgs: [],
+            initialClaudePaneId: nil, initialTerminalPaneId: nil,
+            claudeSessionMode: .none
+        )
+        session.adoptPane(id: paneId, entry: entry)
+        onSessionMutation?()
+        return newTabId
     }
 
     // MARK: - Helpers exposed to the close-request coordinator on AppState

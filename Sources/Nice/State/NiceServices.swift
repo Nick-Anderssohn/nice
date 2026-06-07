@@ -31,6 +31,12 @@ final class NiceServices {
     let releaseChecker: ReleaseChecker
     let editorDetector: EditorDetector
 
+    /// Process-wide side channel for handing a live pane (running pty +
+    /// `NiceTerminalView`) between windows during a cross-window move or
+    /// tear-off. The pasteboard only carries the pane id; the live entry
+    /// rides this registry instead. See `LivePaneRegistry`.
+    let livePaneRegistry: LivePaneRegistry
+
     /// Process-wide bundle of file-browser context-menu services:
     /// pasteboard adapter, undo history, OpenWith provider, and the
     /// shared FS worker. Lives here (not on AppState) so multiple
@@ -105,6 +111,59 @@ final class NiceServices {
         return true
     }
 
+    // MARK: - Tear-off seed queue
+
+    /// A live pane entry queued to be adopted into the next new window
+    /// opened by a tear-off gesture. The entry holds a running pty, so
+    /// it must be `@ObservationIgnored` (non-Observable payload). Only
+    /// one tear-off fires per `openWindow` call, so a FIFO queue is
+    /// the natural model; in practice at most one entry is outstanding
+    /// at a time.
+    struct PendingTearOff {
+        /// The live pty entry detached from the source window.
+        let entry: TabPtySession.PaneEntry
+        /// Stable id of the pane being torn off.
+        let paneId: String
+        /// Display title of the pane (pill label).
+        let title: String
+        /// Kind of the pane being torn off (.terminal or .claude).
+        let kind: PaneKind
+        /// Claude session id if `kind == .claude`; nil for terminals.
+        let claudeSessionId: String?
+        /// Project identity to recreate in the destination window when
+        /// the project is absent (id / name / path triple).
+        let projectId: String
+        let projectName: String
+        let projectPath: String
+        /// Screen-coordinate origin where the new window should appear,
+        /// matching the drag release point so the window "pops out" at
+        /// the cursor.
+        let screenPoint: NSPoint
+    }
+
+    /// Pending tear-off seeds waiting to be consumed by a newly-opened
+    /// window. `@ObservationIgnored` because `PendingTearOff` carries a
+    /// live `TabPtySession.PaneEntry` (not a value type suitable for
+    /// `@Observable` diffing).
+    @ObservationIgnored
+    private var pendingTearOffs: [PendingTearOff] = []
+
+    /// Enqueue a tear-off seed. Called by `PaneTearOffController` just
+    /// before it triggers `openWindow()`. The next `consumeTearOffSeed`
+    /// call (from the new window's `.task`) pops and returns it.
+    func enqueueTearOff(_ seed: PendingTearOff) {
+        pendingTearOffs.append(seed)
+    }
+
+    /// Pop and return the oldest pending tear-off seed, or nil when the
+    /// queue is empty. MainActor isolation makes the pop atomic without
+    /// a lock. Called from `AppShellHost.task` in the new window so the
+    /// seed is consumed exactly once.
+    func consumeTearOffSeed() -> PendingTearOff? {
+        guard !pendingTearOffs.isEmpty else { return nil }
+        return pendingTearOffs.removeFirst()
+    }
+
     init() {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
@@ -122,6 +181,7 @@ final class NiceServices {
         )
         self.releaseChecker = ReleaseChecker()
         self.editorDetector = EditorDetector()
+        self.livePaneRegistry = LivePaneRegistry()
         // Build the file-explorer service bundle. The history shares
         // its `service` with the orchestration layer so a fake
         // `FileManager` or `Trasher` injected for tests reaches

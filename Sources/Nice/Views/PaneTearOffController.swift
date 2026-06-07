@@ -1,0 +1,133 @@
+//
+//  PaneTearOffController.swift
+//  Nice
+//
+//  Orchestrates tearing a live pane out of its source window and
+//  opening it in a brand-new window. This is the model/lifecycle
+//  counterpart to the AppKit drag trigger in `WindowToolbarView` —
+//  the drag code calls `tearOff(…)` once the gesture ends over
+//  empty desktop and the controller handles everything from there.
+//
+//  Structure mirrors `PaneMigrationCoordinator.commitCrossWindowMove`:
+//    1. Resolve the source `AppState` through `WindowRegistry`.
+//    2. Snapshot the pane's kind, title, and project identity BEFORE
+//       any mutation (extractPane may shift focus; snapshot first).
+//    3. `claim(paneId:)` — detaches the live pty entry one-shot.
+//    4. `extractPane` — removes the pane model from the source tab.
+//    5. Enqueue a `PendingTearOff` seed on `NiceServices` so the new
+//       window's `.task` can adopt the entry.
+//    6. Call `openWindow()` — the SwiftUI scene action, passed in as a
+//       closure because a struct can't read `@Environment` directly.
+//    7. `dissolveTabIfEmpty` — dissolve the source tab if it's now
+//       empty (multi-window-safe; won't terminate while another window
+//       exists).
+//
+//  Owned by whoever drives the tear-off gesture (e.g. the pill drag
+//  handler in `WindowToolbarView`). Constructed on demand from the
+//  app-global `NiceServices`.
+//
+
+import AppKit
+
+@MainActor
+struct PaneTearOffController {
+    let services: NiceServices
+
+    /// Execute the tear-off: detach the live pane from its source
+    /// window, enqueue a seed for the new window, open it, then
+    /// dissolve the now-possibly-empty source tab.
+    ///
+    /// - Parameters:
+    ///   - paneId: The id of the pane being torn off.
+    ///   - sourceWindowSessionId: `windowSessionId` of the window the
+    ///     pane is leaving.
+    ///   - screenPoint: The screen coordinate where the new window's
+    ///     origin should be placed (the drag-release point).
+    ///   - openWindow: The SwiftUI `openWindow(id:)` action wrapped in
+    ///     a plain closure. Callers pass
+    ///     `{ openWindow(id: "main") }` — this lets the struct invoke
+    ///     the action without needing `@Environment` access.
+    func tearOff(
+        paneId: String,
+        sourceWindowSessionId: String,
+        at screenPoint: NSPoint,
+        openWindow: () -> Void
+    ) {
+        let live = services.livePaneRegistry
+
+        // Resolve the source AppState. If the window is already gone
+        // (e.g. closed mid-drag), discard the handle and bail.
+        guard let source = services.registry.appState(
+            forSessionId: sourceWindowSessionId
+        ) else {
+            live.withdraw(paneId: paneId)
+            return
+        }
+
+        // Read the sourceTabId from the registry handle BEFORE calling
+        // `claim` — claim removes the handle. `handle(forPaneId:)` is
+        // the non-destructive lookup.
+        guard let handle = live.handle(forPaneId: paneId) else { return }
+        let sourceTabId = handle.sourceTabId
+
+        // Snapshot the source context BEFORE mutating the source tree.
+        // `extractPane` can shift focus and may dissolve neighbors; all
+        // the values we need for the seed must be read from the
+        // current (pre-mutation) model.
+        guard let sourcePane = source.tabs.tab(for: sourceTabId)?
+            .panes.first(where: { $0.id == paneId })
+        else {
+            live.withdraw(paneId: paneId)
+            return
+        }
+
+        let claudeSessionId = source.tabs.tab(for: sourceTabId)?.claudeSessionId
+        let sourceProject: (id: String, name: String, path: String)? = {
+            guard let (pi, _) = source.tabs.projectTabIndex(for: sourceTabId)
+            else { return nil }
+            let p = source.tabs.projects[pi]
+            return (p.id, p.name, p.path)
+        }()
+        // Fall back to a home-directory identity when the source
+        // project can't be resolved (defensive; shouldn't happen in
+        // practice since the pane came from a real project tab).
+        let proj: (id: String, name: String, path: String) = sourceProject ?? {
+            let home = NSHomeDirectory()
+            return (
+                "p-\(UUID().uuidString.prefix(8).lowercased())",
+                (home as NSString).lastPathComponent.uppercased(),
+                home
+            )
+        }()
+
+        // One-shot claim: detaches the live pty entry from the source
+        // session without killing the process. `claim` also removes the
+        // handle from the registry (clearing `currentDrag`).
+        guard let (_, entry) = live.claim(paneId: paneId) else { return }
+
+        // Remove the pane model from the source tab.
+        _ = source.tabs.extractPane(paneId, fromTab: sourceTabId)
+
+        // Enqueue the seed so the new window's `.task` can consume it.
+        services.enqueueTearOff(NiceServices.PendingTearOff(
+            entry: entry,
+            paneId: paneId,
+            title: sourcePane.title,
+            kind: sourcePane.kind,
+            claudeSessionId: claudeSessionId,
+            projectId: proj.id,
+            projectName: proj.name,
+            projectPath: proj.path,
+            screenPoint: screenPoint
+        ))
+
+        // Open the new window. SwiftUI will create a fresh `AppShellHost`
+        // whose `.task` will call `consumeTearOffSeed()` and adopt the entry.
+        openWindow()
+
+        // Dissolve the source tab if tearing off the last pane left it
+        // empty. Multi-window-safe: won't terminate the app while
+        // another window (the one we just opened) is alive.
+        source.dissolveTabIfEmpty(tabId: sourceTabId)
+    }
+}

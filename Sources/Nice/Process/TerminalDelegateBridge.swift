@@ -24,6 +24,16 @@ final class ProcessTerminationDelegate: NSObject, LocalProcessTerminalViewDelega
     }
 
     private let role: Role
+
+    /// The `(tabId, paneId)` this delegate routes exit/title/cwd
+    /// callbacks to. Exposed so live-migration tests can confirm that
+    /// `TabPtySession.adoptPane` re-pointed a migrated pane's delegate
+    /// at the destination tab. Read-only projection of the private
+    /// `role`.
+    var routedPane: (tabId: String, paneId: String)? {
+        if case let .pane(tabId, paneId) = role { return (tabId, paneId) }
+        return nil
+    }
     private let onExit: @MainActor (Role, Int32?) -> Void
     private let onTitleChange: (@MainActor (Role, String) -> Void)?
     private let onCwdChange: (@MainActor (Role, String) -> Void)?

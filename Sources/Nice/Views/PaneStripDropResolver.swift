@@ -16,22 +16,35 @@ enum PaneDropIndicator: Equatable {
     case paneAfter(String)
 }
 
-/// The dragged pane's identity AND where it came from. Forward-compat:
-/// a future cross-window / tear-off drag needs the source context, not
-/// just an array index.
+/// The dragged pane's identity AND where it came from. The source
+/// window id lets a cross-window / tear-off drop find the origin window
+/// (via `WindowRegistry`) to detach the live pane from it.
 struct PaneDragOrigin: Equatable {
     let paneId: String
     let sourceTabId: String
     let sourceIndex: Int
-    // Future extension point: let sourceWindowId: String  (cross-window)
+    /// `windowSessionId` of the window the drag started in. The drop
+    /// side compares it against its own window id to tell an intra-
+    /// window reorder from a cross-window move.
+    let sourceWindowSessionId: String
 }
 
-/// Resolved drop destination. Today only `.slot` (intra-strip reorder)
-/// exists; modeling it as an enum now means future destinations
-/// (new window, another window's strip, the sidebar) are added cases,
-/// not a resolver-signature change.
+/// Resolved drop destination. `.slot` is the intra-strip reorder;
+/// `.otherWindowStrip` / `.otherWindowNewTab` / `.newWindow` are the
+/// cross-window-move and tear-off destinations. Modeling these as enum
+/// cases (rather than resolver-signature changes) keeps the slot math
+/// pure and the cross-window branching at the call site.
 enum PaneDropDestination: Equatable {
+    /// Reorder within the current strip, before/after `targetId`.
     case slot(targetId: String, placeAfter: Bool)
+    /// Move a terminal pane into another window's tab strip at a slot.
+    case otherWindowStrip(windowSessionId: String, tabId: String,
+                          targetId: String?, placeAfter: Bool)
+    /// Move a Claude pane into another window as a new sidebar tab under
+    /// the project matching `projectPath`.
+    case otherWindowNewTab(windowSessionId: String, projectPath: String)
+    /// Tear off into a brand-new window (kind decides the seeded shape).
+    case newWindow
 }
 
 /// Pure, side-effect-free slot math for reordering pane pills within a

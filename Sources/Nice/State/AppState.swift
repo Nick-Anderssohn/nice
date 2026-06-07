@@ -350,7 +350,32 @@ final class AppState {
         windowSession.scheduleSessionSave()
 
         if tabs.projects.allSatisfy({ $0.tabs.isEmpty }) {
-            NSApp.terminate(nil)
+            // The window has no content left. With a single window this
+            // means the app is done — terminate. But a cross-window
+            // move / tear-off can empty a *source* window while other
+            // windows are still live; terminating the whole app then
+            // would be data loss. When another window exists, close just
+            // this window instead.
+            if let registry = trackedServices?.registry,
+               registry.allAppStates.contains(where: { $0 !== self }) {
+                windowSession.window?.close()
+            } else {
+                NSApp.terminate(nil)
+            }
         }
+    }
+
+    /// Dissolve `tabId` if a cross-window move / tear-off left it with no
+    /// panes, running the same cascade a last-pane exit would
+    /// (`finalizeDissolvedTab`: tree removal, file-browser cleanup,
+    /// project pending-removal, save, multi-window-safe close). No-op
+    /// when the tab still has panes or doesn't exist. This is the
+    /// dissolve entry point for `extractPane`, which (unlike
+    /// `paneExited`) bypasses the `onTabBecameEmpty` callback.
+    func dissolveTabIfEmpty(tabId: String) {
+        guard let (pi, ti) = tabs.projectTabIndex(for: tabId),
+              tabs.projects[pi].tabs[ti].panes.isEmpty
+        else { return }
+        finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
     }
 }

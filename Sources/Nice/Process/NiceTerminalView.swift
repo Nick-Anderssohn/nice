@@ -112,16 +112,51 @@ final class NiceTerminalView: LocalProcessTerminalView {
         getTerminal().ansi256PaletteStrategy = .xterm
     }
 
+    /// Weak reference to the last window this view was attached to.
+    /// Used in `viewDidMoveToWindow` to detect when the view moves to
+    /// a genuinely *different* window (a reparent / cross-window
+    /// migration) so the Metal layer can be rebound to the new
+    /// `CAMetalLayer`. Without the rebind, SwiftTerm's MTKView would
+    /// continue compositing into the old window's layer after the view
+    /// hierarchy moves — rendering would silently drop or appear in
+    /// the wrong window.
+    private weak var lastWindow: NSWindow?
+
+    /// Incremented each time the Metal-rebind path is taken in
+    /// `viewDidMoveToWindow`. Internal (not private) so
+    /// `@testable import Nice` can assert the rebind fires exactly
+    /// once on a cross-window move and is NOT taken on first attach.
+    private(set) var metalRebindCount: Int = 0
+
+    /// Whether the Metal renderer was successfully enabled on this view.
+    /// Tracked so `viewDidMoveToWindow` knows whether a rebind is
+    /// needed when the view migrates to a different window.
+    private var isMetalEnabled: Bool = false
+
     /// Enables SwiftTerm's Metal renderer. No-op when the view isn't
     /// yet in a window — `viewDidMoveToWindow` calls this once
-    /// attachment happens. Idempotent: SwiftTerm's `setUseMetal`
-    /// short-circuits when the renderer is already in the requested
-    /// state. Falls back silently to CoreGraphics on devices where
-    /// Metal isn't available (VMs, some CI runners).
-    private func enableGpuRendering() {
+    /// attachment happens. Falls back silently to CoreGraphics on
+    /// devices where Metal isn't available (VMs, some CI runners).
+    ///
+    /// On a cross-window migration the renderer's MTKView is already
+    /// bound to the old window's `CAMetalLayer`. SwiftTerm's
+    /// `setUseMetal` short-circuits when already enabled, so a plain
+    /// re-call won't rebind. Instead we toggle: disable first (which
+    /// tears down the MTKView) then re-enable so SwiftTerm installs a
+    /// fresh MTKView under the new window's layer hierarchy. The
+    /// caller is responsible for passing `rebind: true` when this is
+    /// a window-change rather than a first attach.
+    private func enableGpuRendering(rebind: Bool = false) {
         guard window != nil else { return }
         do {
+            if rebind && isMetalEnabled {
+                // Tear down the old MTKView so the re-enable below
+                // installs a fresh one under the new window's layer.
+                try? setUseMetal(false)
+                metalRebindCount += 1
+            }
             try setUseMetal(true)
+            isMetalEnabled = true
             // Disable Apple's `setShouldSmoothFonts` stem-darkening.
             // SwiftTerm's atlas-based GPU renderer applies the dilation
             // once at rasterization and then composites the cached
@@ -141,7 +176,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        enableGpuRendering()
+        // Detect a cross-window reparent: the view is moving to a
+        // non-nil window that is different from the one it was last
+        // attached to. On first attach `lastWindow` is nil, so that
+        // path is excluded. On reparent we need to rebind the Metal
+        // layer to the new window's CAMetalLayer hierarchy.
+        let isWindowChange = window != nil && window !== lastWindow && lastWindow != nil
+        enableGpuRendering(rebind: isWindowChange)
+        lastWindow = window
         smoothScrollingEnabled = true
         claimFocusIfRequested()
         // Belt-and-suspenders: in the (rare) ordering where AppKit
