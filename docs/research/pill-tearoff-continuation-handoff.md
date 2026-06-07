@@ -54,6 +54,23 @@ scripts/worktree-lock.sh release
 
 ### 1. Tear-off UI trigger (the only missing feature) — GESTURE-CRITICAL
 
+> **✅ DONE (implemented + UITest-verified).** Built as
+> `Sources/Nice/Views/PaneDragSource.swift` (AppKit `NSDraggingSource`
+> wrapping each pill, with a `WindowDragGate` that re-solves the
+> `windowDragGesture` yield per rule 2). The pill's SwiftUI `.onDrag` was
+> removed; the same pane-id string rides the pasteboard so reorder +
+> cross-window move keep working. The drag-end decision is factored into
+> the pure, unit-tested `PaneDragEnd.outcome(...)`
+> (`Tests/NiceUnitTests/PaneDragEndTests.swift`). Real-gesture tear-off is
+> UITest-verified (`UITests/PaneTearOffUITests.swift`) — XCUITest's
+> synthesized drag CAN drive the ended-outside path, so no test-only
+> accessibility action was needed. Regression net stays green
+> (`WindowDragUITests`, `PaneReorderUITests`). Item 2 below
+> (`CrossWindowMoveUITests`) was added but the cross-window DROP isn't
+> drivable by synthesized XCUITest drags, so it verifies the two-window
+> setup and skips the drop (move logic stays unit-covered). Item 3 (review
+> pass) was run and its findings addressed.
+
 Decision (from the user): **finish the AppKit drag source correctly.** Pure
 SwiftUI `.onDrag` cannot detect "dropped off the window" (SwiftUI owns the
 drag session and exposes no end callback), so drag-to-desktop tear-off

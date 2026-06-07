@@ -171,10 +171,41 @@ final class WindowDragUITests: NiceUITestCase {
         )
     }
 
-    // Pill non-draggability is deliberately *not* asserted here —
-    // pane pills are out of Phase A's scope. They'll be addressed in
-    // Phase B (draggable-panes-v2) where the pill's own `mouseDown`
-    // handler disambiguates pill-press → drag-start from
-    // pill-press → window-drag, matching the audit's recommended
-    // pattern for layered drag sources.
+    /// Dragging an EMPTY pixel in the sidebar's 52pt top strip moves the
+    /// window — the sidebar analog of `testEmptyToolbarDragMovesWindow`.
+    /// `WindowDragRegion`'s `mouseDownCanMoveWindow` is inert under
+    /// `isMovable = false`, so the strip needs the explicit
+    /// `windowDraggable` gesture; this guards that it stays wired (it
+    /// regressed once when `isMovable = false` landed without it).
+    func testSidebarTopStripDragMovesWindow() throws {
+        let app = launchApp(windowFrame: CGRect(x: 120, y: 120, width: 1100, height: 720))
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5))
+
+        // The leftmost sidebar header control; the empty drag strip sits
+        // to its left, still within the 52pt top row. It's an
+        // `Image().onTapGesture` (not a `Button`), so query by identifier
+        // across any element type rather than `app.buttons`.
+        let modeButton = app.descendants(matching: .any)["sidebar.mode.tabs"]
+        XCTAssertTrue(modeButton.waitForExistence(timeout: 5), "sidebar header not mounted")
+
+        let initial = window.frame
+        // 60pt left of the mode button, at its vertical center → empty top
+        // strip, clear of both the header buttons (to the right) and the
+        // traffic lights (far to the left).
+        let start = modeButton
+            .coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5))
+            .withOffset(CGVector(dx: -60, dy: 0))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 60, dy: 60)))
+
+        let moved = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in window.frame.origin != initial.origin }),
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [moved], timeout: 2), .completed,
+            "Dragging the sidebar's top strip must move the window (origin stayed \(initial.origin))"
+        )
+        XCTAssertEqual(window.frame.size, initial.size, "size must not change during a drag")
+    }
 }

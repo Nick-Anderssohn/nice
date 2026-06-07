@@ -27,6 +27,13 @@ struct WindowToolbarView: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
+    /// One-bit veto shared with the pane pills' AppKit drag source. A
+    /// pill press flips this true so `windowDragGesture` won't move the
+    /// window for a drag that began on a pill — the explicit replacement
+    /// for the gesture-priority arbitration the pill's old SwiftUI
+    /// `.onDrag` provided. See `PaneDragSource` / `WindowDragGate`.
+    @State private var dragGate = WindowDragGate()
+
     var body: some View {
         HStack(spacing: 10) {
             // Brand block.
@@ -72,26 +79,19 @@ struct WindowToolbarView: View {
                 .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
-        // Restore empty-chrome window drag now that `window.isMovable ==
-        // false` killed the native title-bar drag. A SwiftUI DragGesture
-        // hands the live mouse event to `performDrag`, which moves the
-        // window even when isMovable is false (and, unlike a view
-        // `mouseDown` or an `NSEvent` monitor, IS driven by XCUITest's
-        // synthesized drag — so it's regression-testable). This is a plain
-        // `.gesture` (not `.simultaneousGesture`) so it yields to any
-        // higher-priority child gesture: a drag that starts on a pill is
-        // claimed by the pill's reorder `.onDrag`, leaving only empty
-        // chrome to move the window.
-        .gesture(windowDragGesture)
-    }
-
-    private var windowDragGesture: some Gesture {
-        DragGesture(minimumDistance: 2, coordinateSpace: .global)
-            .onChanged { _ in
-                guard let window = NSApp.keyWindow,
-                      let event = NSApp.currentEvent else { return }
-                window.performDrag(with: event)
-            }
+        // Empty-chrome window drag (the window sets `isMovable = false`,
+        // which kills native title-bar drag — see `windowDraggable`).
+        // `windowDraggable` yields to higher-priority child gestures, but
+        // the pill no longer uses SwiftUI `.onDrag` (it owns an AppKit
+        // `PaneDragSource` for the drag-ended-outside tear-off callback),
+        // and an AppKit view consuming `mouseDown` does NOT make this
+        // ancestor gesture yield. So the yield is re-solved explicitly: a
+        // pill press flips `dragGate.pillPressInProgress`, and the drag is
+        // vetoed (per drag event) while it's set. See `PaneDragSource` /
+        // `WindowDragGate`.
+        .windowDraggable(isBlocked: { dragGate.pillPressInProgress })
+        // Inject the veto flag so the pills' `PaneDragSource` can set it.
+        .environment(dragGate)
     }
 }
 
@@ -120,8 +120,8 @@ struct PaneDragSession: Equatable {
 /// via `@State` and propagated to its pills via `.environment(_:)` —
 /// kept off the persistent model, exactly like `SidebarDragState`. The
 /// SwiftUI drop API exposes the cursor location but not the payload
-/// until the drop commits, so the pill's `.onDrag` stashes the origin
-/// here for synchronous access during hover.
+/// until the drop commits, so the pill's `PaneDragSource` coordinator
+/// stashes the origin here for synchronous access during hover.
 @MainActor
 @Observable
 final class PaneStripDragState {
@@ -173,6 +173,8 @@ private struct InlinePaneStrip: View {
     @Environment(CloseRequestCoordinator.self) private var closer
     @Environment(AppState.self) private var appState
     @Environment(NiceServices.self) private var services
+    @Environment(WindowDragGate.self) private var dragGate
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.colorScheme) private var scheme
 
     /// Tracks which pill (if any) the mouse is currently over, keyed by
@@ -201,8 +203,9 @@ private struct InlinePaneStrip: View {
     @State private var availableWidth: CGFloat = 0
 
     /// Ephemeral pane-reorder drag state, propagated to the pills via
-    /// `.environment` so each pill's `.onDrag` can stash its origin and
-    /// the drop delegate / insertion line can read the live target.
+    /// `.environment` so each pill's `PaneDragSource` coordinator can
+    /// stash its origin and the drop delegate / insertion line can read
+    /// the live target.
     /// Sidebar parity (`SidebarView` owns `SidebarDragState` the same
     /// way).
     @State private var dragState = PaneStripDragState()
@@ -284,8 +287,8 @@ private struct InlinePaneStrip: View {
                     }
             }
         )
-        // Propagate the drag state to every pill so `.onDrag` can stash
-        // its origin (sidebar parity).
+        // Propagate the drag state to every pill so `PaneDragSource` can
+        // stash its origin at drag start (sidebar parity).
         .environment(dragState)
     }
 
@@ -302,47 +305,29 @@ private struct InlinePaneStrip: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
                     ForEach(Array(tab.panes.enumerated()), id: \.element.id) { index, pane in
-                        InlinePanePill(
-                            tabId: tab.id,
-                            index: index,
-                            pane: pane,
-                            isActive: tab.activePaneId == pane.id,
-                            isHovered: hoveredPaneId == pane.id,
-                            onHoverChange: { hovering in
-                                if hovering {
-                                    hoveredPaneId = pane.id
-                                } else if hoveredPaneId == pane.id {
-                                    hoveredPaneId = nil
-                                }
-                            },
-                            onSelect: {
-                                sessions.setActivePane(
-                                    tabId: tab.id,
-                                    paneId: pane.id
-                                )
-                            },
-                            onClose: {
-                                closer.requestClosePane(
-                                    tabId: tab.id,
-                                    paneId: pane.id
-                                )
-                            }
-                        )
-                        .id(pane.id)
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear.preference(
-                                    key: PaneFramePreferenceKey.self,
-                                    value: [
-                                        pane.id: geo.frame(
-                                            in: .named(
-                                                paneStripCoordinateSpace
+                        pillCell(tab: tab, index: index, pane: pane)
+                            .id(pane.id)
+                            // Measure the pill's frame in the OUTER SwiftUI
+                            // tree. This `.background` sits outside the
+                            // `PaneDragSource` host on purpose: SwiftUI
+                            // preferences (and the named coordinate space)
+                            // do not cross an `NSHostingView` boundary, so
+                            // a GeometryReader inside the hosted pill could
+                            // not report into `paneStripCoordinateSpace`.
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: PaneFramePreferenceKey.self,
+                                        value: [
+                                            pane.id: geo.frame(
+                                                in: .named(
+                                                    paneStripCoordinateSpace
+                                                )
                                             )
-                                        )
-                                    ]
-                                )
-                            }
-                        )
+                                        ]
+                                    )
+                                }
+                            )
                     }
                 }
             }
@@ -424,6 +409,50 @@ private struct InlinePaneStrip: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One pill, wrapped in its AppKit `PaneDragSource`. The host owns
+    /// the press → tap-vs-drag decision and acts as the
+    /// `NSDraggingSource` for reorder / cross-window move / tear-off; the
+    /// inner `InlinePanePill` renders the pill and keeps all its SwiftUI
+    /// interactions (select / rename / close / hover) via forwarded taps.
+    /// `.frame(...).fixedSize()` pins the host to the pill's natural size
+    /// so the strip lays pills out left-to-right exactly as before.
+    @ViewBuilder
+    private func pillCell(tab: Tab, index: Int, pane: Pane) -> some View {
+        PaneDragSource(
+            paneId: pane.id,
+            sourceTabId: tab.id,
+            sourceIndex: index,
+            sourceWindowSessionId: appState.windowSession.windowSessionId,
+            services: services,
+            sessions: sessions,
+            dragState: dragState,
+            dragGate: dragGate,
+            openWindow: { openWindow(id: "main") }
+        ) {
+            InlinePanePill(
+                tabId: tab.id,
+                pane: pane,
+                isActive: tab.activePaneId == pane.id,
+                isHovered: hoveredPaneId == pane.id,
+                onHoverChange: { hovering in
+                    if hovering {
+                        hoveredPaneId = pane.id
+                    } else if hoveredPaneId == pane.id {
+                        hoveredPaneId = nil
+                    }
+                },
+                onSelect: {
+                    sessions.setActivePane(tabId: tab.id, paneId: pane.id)
+                },
+                onClose: {
+                    closer.requestClosePane(tabId: tab.id, paneId: pane.id)
+                }
+            )
+        }
+        .frame(maxWidth: 220, maxHeight: 28)
+        .fixedSize()
     }
 
     private func edgeFade(trailing: Bool) -> some View {
@@ -665,12 +694,8 @@ private struct InlinePanePill: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(TabModel.self) private var tabs
     @Environment(SessionsModel.self) private var sessions
-    @Environment(NiceServices.self) private var services
-    @Environment(WindowSession.self) private var windowSession
-    @Environment(PaneStripDragState.self) private var dragState
 
     let tabId: String
-    let index: Int
     let pane: Pane
     let isActive: Bool
     let isHovered: Bool
@@ -781,57 +806,14 @@ private struct InlinePanePill: View {
             y: 1
         )
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        // Reorder drag source. Beyond reordering, this is also what makes
-        // a pill press claim the drag so the toolbar's window-drag gesture
-        // (a lower-priority `.gesture`) yields — dragging a pill reorders
-        // it without moving the window. (Drop handling wired below.)
-        //
-        // ⚠️ INVARIANT — this `.onDrag` is load-bearing for window-drag
-        // selectivity. It is what makes a pill press CLAIM the drag so the
-        // toolbar's lower-priority `windowDragGesture` yields. Do NOT
-        // replace it with an AppKit drag source / a background NSView
-        // (hitTest→nil + event monitors do NOT participate in SwiftUI's
-        // gesture-priority arbitration) without ALSO re-solving the
-        // `windowDragGesture` yield (gate it so it never fires on a press
-        // that began over a pill). Any change to this drag mechanism MUST
-        // keep `NiceUITests/WindowDragUITests` and
-        // `NiceUITests/PaneReorderUITests` green — they assert "dragging a
-        // pill does NOT move the window." See Sources/Nice/Views/CLAUDE.md.
-        .onDrag {
-            // Stash the full origin for synchronous access during hover
-            // (the pasteboard only yields the payload at drop time), then
-            // hand the id to the pasteboard. Beyond reordering, claiming
-            // the drag here is what makes the toolbar's lower-priority
-            // window-drag `.gesture` yield (pill drag ⇒ no window move).
-            let windowId = windowSession.windowSessionId
-            dragState.session = PaneDragSession(
-                origin: PaneDragOrigin(
-                    paneId: pane.id,
-                    sourceTabId: tabId,
-                    sourceIndex: index,
-                    sourceWindowSessionId: windowId
-                ),
-                target: nil
-            )
-            // Publish a live-pane handle so a DROP in another window can
-            // claim this pane's running pty + view via the process-wide
-            // registry — the pasteboard only carries the id string. The
-            // claim closure detaches the live entry from THIS window's
-            // session on first call. An intra-window reorder never claims
-            // (it goes through the local `dragState` path) and withdraws
-            // the handle on drop.
-            services.livePaneRegistry.publish(
-                LivePaneRegistry.Handle(
-                    paneId: pane.id,
-                    sourceWindowSessionId: windowId,
-                    sourceTabId: tabId,
-                    claim: { [weak sessions] in
-                        sessions?.detachLivePane(tabId: tabId, paneId: pane.id)
-                    }
-                )
-            )
-            return NSItemProvider(object: pane.id as NSString)
-        }
+        // NOTE: the pill's drag is owned by the AppKit `PaneDragSource`
+        // host that wraps this view (see `InlinePaneStrip.pillCell`), not
+        // a SwiftUI `.onDrag`. The host needs an `NSDraggingSource`'s
+        // drag-ended-outside callback to drive desktop tear-off, which
+        // pure SwiftUI cannot deliver. The host sets `dragState.session`
+        // and publishes the live-pane handle at drag start, and gates the
+        // toolbar's `windowDragGesture` so a pill drag never moves the
+        // window. See `PaneDragSource` / `WindowDragGate`.
         .onTapGesture {
             // Title taps are handled by `titleView`'s own gesture; this
             // catches taps on the icon, padding, or empty pill area.

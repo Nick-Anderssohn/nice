@@ -217,8 +217,11 @@ private struct AppShellHost: View {
                 // event). This disables ALL native window dragging, so
                 // empty-chrome drag is restored explicitly by the
                 // `windowDragGesture` in `WindowToolbarView` (a SwiftUI
-                // `DragGesture` → `performDrag`), and the pane pill's
-                // `.onDrag` claims pill drags so that gesture yields.
+                // `DragGesture` → `performDrag`). The pane pills own an
+                // AppKit `PaneDragSource` (for the drag-ended-outside
+                // tear-off callback SwiftUI can't give); a pill press
+                // flips `WindowDragGate.pillPressInProgress` so
+                // `windowDragGesture` yields rather than moving the window.
                 // Programmatic frame save/restore (`WindowSession`) is
                 // unaffected — isMovable gates user drags, not `setFrame`.
                 window.isMovable = false
@@ -503,6 +506,13 @@ private struct AppShellHost: View {
                         .padding(.top, 8)
                         .padding(.trailing, 10)
                     }
+                    // Make the sidebar's 52pt top strip a window-drag
+                    // surface (like the toolbar). `WindowDragRegion`'s
+                    // `mouseDownCanMoveWindow` is inert under
+                    // `isMovable = false`, so without this the strip can't
+                    // move the window. The trailing mode/collapse buttons
+                    // are higher-priority children and keep their clicks.
+                    .windowDraggable()
                 SidebarView()
             }
         }
@@ -636,6 +646,9 @@ private struct AppShellHost: View {
         // Total = traffic-light reserve + room for the restore button and
         // a small trailing drag strip, so the cap grows with the reserve.
         .frame(width: WindowChrome.trafficLightReservedWidth + 42, height: 40)
+        // Drag the cap to move the window (the expand button keeps its
+        // own click) — same reason as the expanded sidebar's top strip.
+        .windowDraggable()
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)

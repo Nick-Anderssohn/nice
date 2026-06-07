@@ -69,6 +69,49 @@ struct WindowDragRegion: NSViewRepresentable {
     }
 }
 
+/// Makes a view an empty-chrome **window-drag surface** that works even
+/// when `window.isMovable == false` (which Nice sets to disable native
+/// title-bar drag so pane-pill drags don't move the window). A SwiftUI
+/// `DragGesture` hands the live mouse event to `window.performDrag`, which
+/// moves the window despite `isMovable == false` — and, unlike a view
+/// `mouseDown` or `mouseDownCanMoveWindow`, IS driven by XCUITest's
+/// synthesized drag, so it's regression-testable.
+///
+/// Attached as a **plain** `.gesture` (not `.simultaneousGesture`) so it
+/// yields to any higher-priority child gesture: buttons and pane pills
+/// claim their own presses, leaving only empty chrome to move the window.
+///
+/// `isBlocked` is evaluated per drag event so a caller can veto the drag
+/// at fire time — the toolbar passes the pane-pill veto
+/// (`WindowDragGate.pillPressInProgress`) so a pill drag never moves the
+/// window; the sidebar's top strip has no pills and uses the default.
+private struct WindowDraggableModifier: ViewModifier {
+    let isBlocked: () -> Bool
+
+    func body(content: Content) -> some View {
+        content.gesture(
+            DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                .onChanged { _ in
+                    guard !isBlocked() else { return }
+                    guard let window = NSApp.keyWindow,
+                          let event = NSApp.currentEvent else { return }
+                    window.performDrag(with: event)
+                }
+        )
+    }
+}
+
+extension View {
+    /// Attach the empty-chrome window-drag gesture. See
+    /// `WindowDraggableModifier`. Scope it to the title-bar-height strip
+    /// you want draggable (not the whole window). `isBlocked` (evaluated
+    /// per drag event) lets the caller veto the drag — the toolbar vetoes
+    /// while a pane-pill press is in flight.
+    func windowDraggable(isBlocked: @escaping () -> Bool = { false }) -> some View {
+        modifier(WindowDraggableModifier(isBlocked: isBlocked))
+    }
+}
+
 /// The action macOS performs when the user double-clicks a window's
 /// title bar, read live from `NSGlobalDomain`'s
 /// `AppleActionOnDoubleClick`. Our custom band has to honor this itself
