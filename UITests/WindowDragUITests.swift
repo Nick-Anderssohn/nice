@@ -47,13 +47,19 @@ final class WindowDragUITests: NiceUITestCase {
         return url.path
     }
 
-    private func launchApp() -> XCUIApplication {
+    private func launchApp(windowFrame: CGRect? = nil) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         let home = fakeHomePath()
         app.launchEnvironment["HOME"] = home
         app.launchEnvironment["NICE_APPLICATION_SUPPORT_ROOT"] =
             (home as NSString).appendingPathComponent("Library/Application Support")
+        // Pin a deterministic, sub-screen starting frame so the zoom test
+        // always begins un-zoomed (see AppShellView's matching env hook).
+        if let f = windowFrame {
+            app.launchEnvironment["NICE_UITEST_WINDOW_FRAME"] =
+                "\(f.origin.x),\(f.origin.y),\(f.width),\(f.height)"
+        }
         let hostEnv = ProcessInfo.processInfo.environment
         if let user = hostEnv["USER"]    { app.launchEnvironment["USER"]    = user    }
         if let logname = hostEnv["LOGNAME"] { app.launchEnvironment["LOGNAME"] = logname }
@@ -118,18 +124,20 @@ final class WindowDragUITests: NiceUITestCase {
         )
     }
 
-    /// Double-click an empty pixel in the top bar — assert the
-    /// window's size changes (zoom toggles between user-size and the
-    /// largest screen-fitting size, so any size change confirms zoom
-    /// fired). The previous implementation handled this with a
-    /// process-wide `NSEvent` monitor (`TitleBarZoomMonitor`); the
-    /// refactor moves it to `WindowDragRegion.DragView.mouseDown`'s
-    /// `clickCount >= 2` branch. This test would have caught the
-    /// regression where double-click did nothing because
-    /// `performDrag` was being called on the first click and
-    /// swallowing the second.
+    /// Double-click an empty pixel in the top bar → the window zooms to
+    /// fill the screen, so it grows. `TitleBarZoomMonitor` handles this
+    /// (AppKit's title-bar hit-test doesn't reliably cross into the
+    /// SwiftUI-embedded `WindowDragRegion`, so a `mouseDown`/`performDrag`
+    /// path can't observe the second click — see WindowDragRegion.swift).
+    ///
+    /// The window is launched at a deterministic sub-screen frame
+    /// (`NICE_UITEST_WINDOW_FRAME`) so it always starts un-zoomed. Without
+    /// that, a prior run's saved window state can relaunch the window
+    /// already maximized; a window opened directly at its zoom frame has
+    /// no distinct "user" frame, so `performZoom` is a no-op and the size
+    /// never changes — the test's old intermittent failure on re-runs.
     func testEmptyToolbarDoubleClickZoomsWindow() throws {
-        let app = launchApp()
+        let app = launchApp(windowFrame: CGRect(x: 120, y: 120, width: 1100, height: 720))
         let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 5))
 
@@ -147,17 +155,19 @@ final class WindowDragUITests: NiceUITestCase {
 
         target.doubleClick()
 
+        // Zoom enlarges the window to the largest screen-fitting frame, so
+        // it grows in both dimensions from the sub-screen start.
         let zoomed = XCTNSPredicateExpectation(
             predicate: NSPredicate(block: { _, _ in
                 let f = window.frame
-                return f.size != initial.size
+                return f.width > initial.width && f.height > initial.height
             }),
             object: nil
         )
         XCTAssertEqual(
             XCTWaiter.wait(for: [zoomed], timeout: 2),
             .completed,
-            "Window did not change size after double-clicking an empty top-bar pixel — zoom should have fired"
+            "Window did not grow after double-clicking an empty top-bar pixel — zoom should have fired (initial \(initial.size), now \(window.frame.size))"
         )
     }
 

@@ -186,6 +186,27 @@ private struct AppShellHost: View {
                 // tab mutation triggered during start()) captures the
                 // real frame instead of persisting `frame: nil`.
                 appState.windowSession.window = window
+                // Test hook: pin the window to a deterministic, sub-screen
+                // frame so UITests that toggle zoom
+                // (`WindowDragUITests.testEmptyToolbarDoubleClickZoomsWindow`)
+                // get a known un-zoomed starting geometry. Without it,
+                // AppKit's saved window state can relaunch the window
+                // already maximized — and a window opened directly at its
+                // zoom frame has no distinct "user" frame, so `performZoom`
+                // is a no-op and the size never changes (the test's
+                // intermittent failure on a second run). Only the tests set
+                // this env var; production launches are untouched. Applied
+                // before `WindowSession` restores any saved frame, but for a
+                // sandboxed test home there is none, so this frame wins.
+                if let spec = ProcessInfo.processInfo.environment["NICE_UITEST_WINDOW_FRAME"] {
+                    let parts = spec.split(separator: ",").compactMap { Double($0) }
+                    if parts.count == 4 {
+                        window.setFrame(
+                            NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3]),
+                            display: true
+                        )
+                    }
+                }
                 // Disable AppKit's native title-bar drag for the whole
                 // window. Under `.hiddenTitleBar` the entire 52pt top band
                 // is the native title bar, so a press-drag anywhere in it

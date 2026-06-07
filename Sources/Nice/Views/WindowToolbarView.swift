@@ -21,6 +21,7 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct WindowToolbarView: View {
     @Environment(\.colorScheme) private var scheme
@@ -94,6 +95,39 @@ struct WindowToolbarView: View {
     }
 }
 
+// MARK: - Pane drag state
+
+/// Which strip is currently painting an insertion line, and where. The
+/// horizontal analog of `SidebarDropTarget`. `tabId` scopes the line to
+/// one strip so a future multi-strip drag can't leave a stale line in
+/// another tab's strip.
+struct PaneDropTarget: Equatable {
+    let tabId: String
+    let indicator: PaneDropIndicator
+}
+
+/// One active pane-pill drag, start to finish. Bundles the dragged
+/// pane's full origin (identity + source context, for forward-compat
+/// cross-tab/window drags) with the current insertion-line target, so
+/// clearing the session (`dragState.session = nil`) wipes both at once.
+/// Mirrors `SidebarDragSession`.
+struct PaneDragSession: Equatable {
+    let origin: PaneDragOrigin
+    var target: PaneDropTarget?
+}
+
+/// Ephemeral, view-layer pane-drag state. Owned by `InlinePaneStrip`
+/// via `@State` and propagated to its pills via `.environment(_:)` —
+/// kept off the persistent model, exactly like `SidebarDragState`. The
+/// SwiftUI drop API exposes the cursor location but not the payload
+/// until the drop commits, so the pill's `.onDrag` stashes the origin
+/// here for synchronous access during hover.
+@MainActor
+@Observable
+final class PaneStripDragState {
+    var session: PaneDragSession?
+}
+
 // MARK: - Inline pane strip
 
 /// Animation duration shared by all pill / chrome state transitions in
@@ -158,6 +192,13 @@ private struct InlinePaneStrip: View {
     /// originates from inside the ScrollView's content (which SwiftUI
     /// silently virtualizes for off-screen pills).
     @State private var availableWidth: CGFloat = 0
+
+    /// Ephemeral pane-reorder drag state, propagated to the pills via
+    /// `.environment` so each pill's `.onDrag` can stash its origin and
+    /// the drop delegate / insertion line can read the live target.
+    /// Sidebar parity (`SidebarView` owns `SidebarDragState` the same
+    /// way).
+    @State private var dragState = PaneStripDragState()
 
     private var activeTab: Tab? {
         guard let id = tabs.activeTabId else { return nil }
@@ -236,6 +277,9 @@ private struct InlinePaneStrip: View {
                     }
             }
         )
+        // Propagate the drag state to every pill so `.onDrag` can stash
+        // its origin (sidebar parity).
+        .environment(dragState)
     }
 
     @ViewBuilder
@@ -250,9 +294,10 @@ private struct InlinePaneStrip: View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
-                    ForEach(tab.panes) { pane in
+                    ForEach(Array(tab.panes.enumerated()), id: \.element.id) { index, pane in
                         InlinePanePill(
                             tabId: tab.id,
+                            index: index,
                             pane: pane,
                             isActive: tab.activePaneId == pane.id,
                             isHovered: hoveredPaneId == pane.id,
@@ -295,6 +340,29 @@ private struct InlinePaneStrip: View {
                 }
             }
             .coordinateSpace(name: paneStripCoordinateSpace)
+            // Insertion line painted at the resolved drop slot. Lives in
+            // the named coordinate space so `indicatorX` (derived from
+            // `paneFrames`, which are viewport-relative in that same
+            // space) lines up with the rendered pills. Horizontal analog
+            // of the sidebar's insertion line.
+            .overlay(alignment: .leading) {
+                if let x = indicatorX(for: tab.id) {
+                    insertionLine.offset(x: x - 1)
+                }
+            }
+            // Drop side of the reorder. Attached to the ScrollView (same
+            // view that owns `paneStripCoordinateSpace`) so
+            // `DropInfo.location` shares coordinates with `paneFrames`.
+            .onDrop(
+                of: [.text],
+                delegate: PaneStripDropDelegate(
+                    tabId: tab.id,
+                    paneFramesProvider: { paneFrames },
+                    paneOrderProvider: { tab.panes.map(\.id) },
+                    tabs: tabs,
+                    dragState: dragState
+                )
+            )
             .background(
                 GeometryReader { geo in
                     Color.clear.preference(
@@ -361,6 +429,124 @@ private struct InlinePaneStrip: View {
         .frame(width: 16)
         .allowsHitTesting(false)
     }
+
+    /// The drop indicator for `tabId`'s strip, if the live drag session
+    /// is currently targeting it. Filtered by `tabId` so a future
+    /// multi-strip drag can't paint a line in the wrong strip (sidebar
+    /// parity — `myIndicator` there filters by `projectId`).
+    private func myIndicator(for tabId: String) -> PaneDropIndicator? {
+        guard let target = dragState.session?.target, target.tabId == tabId
+        else { return nil }
+        return target.indicator
+    }
+
+    /// X-position (in the strip's coordinate space) at which to paint the
+    /// insertion line: the leading edge of the target pill for a
+    /// `.paneBefore`, its trailing edge for a `.paneAfter`.
+    private func indicatorX(for tabId: String) -> CGFloat? {
+        switch myIndicator(for: tabId) {
+        case let .paneBefore(id): return paneFrames[id]?.minX
+        case let .paneAfter(id):  return paneFrames[id]?.maxX
+        case nil:                 return nil
+        }
+    }
+
+    /// 2pt vertical accent-colored insertion line — the horizontal
+    /// analog of the sidebar's 2pt horizontal line. Never hit-tests, so
+    /// it can't interfere with the live drop.
+    private var insertionLine: some View {
+        Rectangle()
+            .fill(Color.niceAccent)
+            .frame(width: 2)
+            .frame(height: 28)
+            .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Pane strip drop delegate
+
+/// Drop delegate attached to the pane strip's ScrollView. Picks the slot
+/// the cursor points at via `PaneStripDropResolver` (kept separate so it
+/// stays unit-testable without a live drag) and commits the resulting
+/// `movePane` on the next runloop tick — mutating `tab.panes` inline
+/// from `performDrop` leaves AppKit's drag tracker stuck on the old
+/// view hierarchy, exactly as documented for `ProjectGroupDropDelegate`.
+private struct PaneStripDropDelegate: DropDelegate {
+    let tabId: String
+    let paneFramesProvider: () -> [String: CGRect]
+    let paneOrderProvider: () -> [String]
+    let tabs: TabModel
+    let dragState: PaneStripDragState
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.text])
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateIndicator(for: info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateIndicator(for: info)
+        return DropProposal(operation: ownsCurrentIndicator ? .move : .forbidden)
+    }
+
+    func dropExited(info: DropInfo) {
+        if ownsCurrentIndicator {
+            dragState.session?.target = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let outcome = dragState.session.flatMap {
+            resolve(draggedPaneId: $0.origin.paneId, info: info)
+        }
+        // Clear the session BEFORE deferring so no stale state survives
+        // a failed/no-op drop (sidebar parity).
+        dragState.session = nil
+        guard let outcome, case let .slot(targetId, placeAfter) = outcome.destination
+        else { return false }
+        // Defer the mutation — see the type-level doc on why an inline
+        // `movePane` here wedges AppKit's drag tracker.
+        DispatchQueue.main.async { [tabs, tabId] in
+            tabs.movePane(
+                outcome.draggedId,
+                inTab: tabId,
+                relativeTo: targetId,
+                placeAfter: placeAfter
+            )
+        }
+        return true
+    }
+
+    private func updateIndicator(for info: DropInfo) {
+        let outcome = dragState.session.flatMap {
+            resolve(draggedPaneId: $0.origin.paneId, info: info)
+        }
+        guard let outcome, let indicator = outcome.indicator else {
+            if ownsCurrentIndicator {
+                dragState.session?.target = nil
+            }
+            return
+        }
+        dragState.session?.target = PaneDropTarget(tabId: tabId, indicator: indicator)
+    }
+
+    private var ownsCurrentIndicator: Bool {
+        dragState.session?.target?.tabId == tabId
+    }
+
+    private func resolve(draggedPaneId: String, info: DropInfo) -> PaneStripDropResolver.Outcome? {
+        PaneStripDropResolver.resolve(
+            draggedPaneId: draggedPaneId,
+            location: info.location,
+            paneOrder: paneOrderProvider(),
+            paneFrames: paneFramesProvider(),
+            wouldMovePane: { dragged, target, after in
+                tabs.wouldMovePane(dragged, inTab: tabId, relativeTo: target, placeAfter: after)
+            }
+        )
+    }
 }
 
 /// Coordinate-space identifier used by `InlinePaneStrip` so each pill can
@@ -399,8 +585,10 @@ private struct InlinePanePill: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(TabModel.self) private var tabs
     @Environment(SessionsModel.self) private var sessions
+    @Environment(PaneStripDragState.self) private var dragState
 
     let tabId: String
+    let index: Int
     let pane: Pane
     let isActive: Bool
     let isHovered: Bool
@@ -516,7 +704,20 @@ private struct InlinePanePill: View {
         // (a lower-priority `.gesture`) yields — dragging a pill reorders
         // it without moving the window. (Drop handling wired below.)
         .onDrag {
-            NSItemProvider(object: pane.id as NSString)
+            // Stash the full origin for synchronous access during hover
+            // (the pasteboard only yields the payload at drop time), then
+            // hand the id to the pasteboard. Beyond reordering, claiming
+            // the drag here is what makes the toolbar's lower-priority
+            // window-drag `.gesture` yield (pill drag ⇒ no window move).
+            dragState.session = PaneDragSession(
+                origin: PaneDragOrigin(
+                    paneId: pane.id,
+                    sourceTabId: tabId,
+                    sourceIndex: index
+                ),
+                target: nil
+            )
+            return NSItemProvider(object: pane.id as NSString)
         }
         .onTapGesture {
             // Title taps are handled by `titleView`'s own gesture; this
