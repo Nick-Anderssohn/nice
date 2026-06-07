@@ -1,0 +1,14 @@
+SPIKE QUANTITATIVE RESULTS (windowed, themed=Catppuccin Mocha)
+Three sizing setups tried (constraint / intrinsic / explicit-frame), bandHeight requested 52 AND 80:
+
+  layout=.top    → accessoryHeight = 32.0pt (same for 52 and 80 requests)
+  layout=.bottom → accessoryHeight = 36.0pt (same for 52 and 80 requests)
+
+Traffic-light button frames (window base coords), all setups:
+  .top    close=(9,174) min=(32,174) zoom=(55,174)   ← default x, title row
+  .bottom close=(9,210) min=(32,210) zoom=(55,210)   ← default x, title row
+
+CONCLUSION Q1: accessory height is CAPPED by the titlebar (~32 top / ~36 bottom),
+invariant to requested content height → CANNOT host a 52pt unified band. BLOCKER.
+CONCLUSION Q2 (implied): traffic lights remain at default title-row position,
+not inline with the band → two-tier. (Pending visual confirmation.)
