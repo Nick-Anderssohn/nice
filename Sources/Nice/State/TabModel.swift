@@ -462,6 +462,52 @@ final class TabModel {
         return insertIndex != srcIndex
     }
 
+    /// Move `paneId` to a new slot within tab `tabId`'s pane list,
+    /// relative to `targetPaneId`: just before it (`placeAfter == false`)
+    /// or just after it. The pane-pill analog of `moveTab`. No-op when
+    /// the tab is unknown, either pane id isn't in that tab, or the move
+    /// wouldn't change order. Reordering doesn't touch `activePaneId`
+    /// (it's keyed by id, not index), so the focused pane is preserved.
+    ///
+    /// `tabId` is explicit (rather than assuming the active tab) so a
+    /// future cross-tab / cross-window pane drag can target a non-active
+    /// tab without a signature change.
+    func movePane(_ paneId: String, inTab tabId: String, relativeTo targetPaneId: String, placeAfter: Bool) {
+        guard paneId != targetPaneId else { return }
+        var moved = false
+        mutateTab(id: tabId) { tab in
+            guard let srcIndex = tab.panes.firstIndex(where: { $0.id == paneId }),
+                  let dstIndex = tab.panes.firstIndex(where: { $0.id == targetPaneId })
+            else { return }
+            // `placeAfter` picks the slot just past the target; then
+            // account for the fact that removing the source first shifts
+            // everything after it down by one. (Same math as `moveTab`.)
+            var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
+            if srcIndex < insertIndex { insertIndex -= 1 }
+            guard insertIndex != srcIndex else { return }
+            let pane = tab.panes.remove(at: srcIndex)
+            tab.panes.insert(pane, at: insertIndex)
+            moved = true
+        }
+        // Fire persistence only on a real reorder — the early returns
+        // above (no-op / unknown ids) leave the model untouched.
+        if moved { onTreeMutation?() }
+    }
+
+    /// Mirrors `movePane` without mutating — true iff the drop would
+    /// actually reorder. The pane-strip drop indicator uses this to
+    /// suppress the insertion line for no-op drops.
+    func wouldMovePane(_ paneId: String, inTab tabId: String, relativeTo targetPaneId: String, placeAfter: Bool) -> Bool {
+        guard paneId != targetPaneId,
+              let tab = tab(for: tabId),
+              let srcIndex = tab.panes.firstIndex(where: { $0.id == paneId }),
+              let dstIndex = tab.panes.firstIndex(where: { $0.id == targetPaneId })
+        else { return false }
+        var insertIndex = placeAfter ? dstIndex + 1 : dstIndex
+        if srcIndex < insertIndex { insertIndex -= 1 }
+        return insertIndex != srcIndex
+    }
+
     // MARK: - Title application
 
     /// Default display title for a pane of `kind`. Terminal panes use
