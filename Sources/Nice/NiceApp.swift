@@ -95,15 +95,10 @@ struct NiceApp: App {
                     AppDelegate.registryProvider = { [weak services] in
                         services?.registry
                     }
-                    // ⚠️ THROWAWAY: native title-bar spike (see TitlebarSpike.swift).
-                    // Opt-in via NICE_TITLEBAR_SPIKE env var; remove with the spike.
-                    TitlebarSpike.autoOpenIfRequested()
                 }
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
-        // ⚠️ THROWAWAY: native title-bar spike debug menu. Remove with TitlebarSpike.swift.
-        .commands { TitlebarSpikeMenu() }
 
         // ⌘, binds to this scene automatically on macOS. SettingsView
         // declares its own min / ideal / max frame; mirroring it here
