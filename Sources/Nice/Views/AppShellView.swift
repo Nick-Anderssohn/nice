@@ -186,6 +186,21 @@ private struct AppShellHost: View {
                 // tab mutation triggered during start()) captures the
                 // real frame instead of persisting `frame: nil`.
                 appState.windowSession.window = window
+                // Disable AppKit's native title-bar drag for the whole
+                // window. Under `.hiddenTitleBar` the entire 52pt top band
+                // is the native title bar, so a press-drag anywhere in it
+                // (including on a pane pill) moves the window — the exact
+                // blocker for drag-to-reorder. `isMovable = false` is the
+                // one lever that stops that below the synthesized-event
+                // layer (it's a window property, not an interceptable
+                // event). This disables ALL native window dragging, so
+                // empty-chrome drag is restored explicitly by the
+                // `windowDragGesture` in `WindowToolbarView` (a SwiftUI
+                // `DragGesture` → `performDrag`), and the pane pill's
+                // `.onDrag` claims pill drags so that gesture yields.
+                // Programmatic frame save/restore (`WindowSession`) is
+                // unaffected — isMovable gates user drags, not `setFrame`.
+                window.isMovable = false
                 TrafficLightNudger.nudge(
                     window: window,
                     dx: WindowChrome.trafficLightNudgeX,

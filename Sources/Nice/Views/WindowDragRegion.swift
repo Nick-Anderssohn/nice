@@ -54,6 +54,17 @@ struct WindowDragRegion: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     final class DragView: NSView {
+        // NOTE: this flag no longer drives the window drag. The window
+        // sets `isMovable = false` (AppShellView) to stop pane pills from
+        // riding the native title-bar drag, and that also disables the
+        // `mouseDownCanMoveWindow` drag path entirely — so empty-chrome
+        // dragging is now handled by a SwiftUI `DragGesture` →
+        // `performDrag` in `WindowToolbarView`. We keep the flag `true`
+        // only because `TitleBarZoomMonitor` walks for a
+        // `mouseDownCanMoveWindow == true` view (excluding
+        // `NSVisualEffectView`) to recognise empty chrome for
+        // double-click-to-zoom. Removing this view would break that
+        // detection; it is otherwise inert.
         override var mouseDownCanMoveWindow: Bool { true }
     }
 }

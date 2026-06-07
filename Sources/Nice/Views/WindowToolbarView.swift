@@ -71,6 +71,26 @@ struct WindowToolbarView: View {
                 .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
+        // Restore empty-chrome window drag now that `window.isMovable ==
+        // false` killed the native title-bar drag. A SwiftUI DragGesture
+        // hands the live mouse event to `performDrag`, which moves the
+        // window even when isMovable is false (and, unlike a view
+        // `mouseDown` or an `NSEvent` monitor, IS driven by XCUITest's
+        // synthesized drag — so it's regression-testable). This is a plain
+        // `.gesture` (not `.simultaneousGesture`) so it yields to any
+        // higher-priority child gesture: a drag that starts on a pill is
+        // claimed by the pill's reorder `.onDrag`, leaving only empty
+        // chrome to move the window.
+        .gesture(windowDragGesture)
+    }
+
+    private var windowDragGesture: some Gesture {
+        DragGesture(minimumDistance: 2, coordinateSpace: .global)
+            .onChanged { _ in
+                guard let window = NSApp.keyWindow,
+                      let event = NSApp.currentEvent else { return }
+                window.performDrag(with: event)
+            }
     }
 }
 
@@ -491,6 +511,13 @@ private struct InlinePanePill: View {
             y: 1
         )
         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        // Reorder drag source. Beyond reordering, this is also what makes
+        // a pill press claim the drag so the toolbar's window-drag gesture
+        // (a lower-priority `.gesture`) yields — dragging a pill reorders
+        // it without moving the window. (Drop handling wired below.)
+        .onDrag {
+            NSItemProvider(object: pane.id as NSString)
+        }
         .onTapGesture {
             // Title taps are handled by `titleView`'s own gesture; this
             // catches taps on the icon, padding, or empty pill area.

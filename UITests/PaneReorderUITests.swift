@@ -115,13 +115,17 @@ final class PaneReorderUITests: NiceUITestCase {
     /// what the reorder wiring must do. Once `.onDrag` reorder lands, this
     /// also gains a reorder assertion (see the integration test below).
     func testDragOnPillDoesNotMoveWindow() throws {
-        // UNRESOLVED — see docs/research/pill-drag-window-move-decision.md.
-        // The pill's press-drag is handled by the native title bar of the
-        // `.hiddenTitleBar` window; no app-level fix tried so far stops it,
-        // and XCUITest's synthesized drag can't be intercepted by an
-        // NSEvent monitor anyway. Skipped at this checkpoint so the suite
-        // stays green while we pick an approach (see the doc).
-        try XCTSkipIf(true, "Pill-vs-window drag unresolved; see decision doc.")
+        // Approach under test: keep `.hiddenTitleBar` but set
+        // `window.isMovable = false` (AppShellView), which disables the
+        // native title-bar drag for the whole band — so a press-drag on a
+        // pill can't move the window. The pill's own `.onDrag` claims the
+        // drag, so the toolbar's window-drag gesture yields. (Empty-chrome
+        // drag is restored separately by `windowDragGesture` in
+        // WindowToolbarView — a SwiftUI `DragGesture` → `performDrag`.)
+        // This test asserts the pill case: a press-drag started on a pill
+        // must NOT move the window. Its differential partner,
+        // WindowDragUITests.testEmptyToolbarDragMovesWindow, proves empty
+        // chrome still drags — so a passing pair isn't vacuous.
         let app = launchApp()
         let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 5))

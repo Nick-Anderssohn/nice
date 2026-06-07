@@ -1,5 +1,14 @@
 # Handoff: finish draggable pane pills via the `.windowStyle(.plain)` approach
 
+> **⚠️ SUPERSEDED (2026-06-06).** The `.plain` approach was tried and
+> rejected — it strips all native window chrome (traffic lights, rounded
+> corners, shadow). The window-drag blocker was instead solved with
+> `window.isMovable = false` + a SwiftUI-gesture `performDrag` + a pill
+> `.onDrag` for selectivity, keeping native chrome intact. **Use
+> `docs/research/pill-reorder-continuation-handoff.md` as the current
+> brief**, and see `pill-drag-window-move-decision.md` UPDATE 2 / UPDATE 3
+> for why `.plain` was dropped. This file is kept for history only.
+
 **Paste this whole file into the new conversation as the brief.**
 
 You are continuing work on **drag-to-reorder for the pane "pills" in the
