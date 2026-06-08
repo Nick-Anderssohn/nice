@@ -647,12 +647,16 @@ final class SidebarTabMultiSelectUITests: NiceUITestCase {
         socketPath: String,
         cwd: String
     ) throws -> String {
+        // Snapshot existing tab rows *before* sending, so a fast
+        // socket-spawned row can't appear in the window between the
+        // send and the snapshot and thus hide itself from the diff
+        // (a time-of-check race that flaked this wait). The new
+        // socket-spawned row is whichever id appears that wasn't
+        // there before.
+        let before = Set(currentTabRowIds(in: app))
         let json = #"{"action":"claude","cwd":"\#(cwd)","args":[],"tabId":"","paneId":""}"#
         try sendSocketLine(json, to: socketPath)
 
-        // Snapshot existing tab rows; the new socket-spawned row is
-        // whichever id appears that wasn't there before.
-        let before = Set(currentTabRowIds(in: app))
         let appeared = XCTNSPredicateExpectation(
             predicate: NSPredicate(block: { _, _ in
                 !Set(self.currentTabRowIds(in: app)).subtracting(before).isEmpty
