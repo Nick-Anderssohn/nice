@@ -105,6 +105,24 @@ final class NiceServices {
         return true
     }
 
+    /// One-shot guard for the first-launch "Install the Nice Handoff
+    /// skill?" prompt. `AppShellHost.task` calls this after the
+    /// multi-window fan-out; only the first call (from the first-mounted
+    /// window on the first launch after the prompt becomes eligible)
+    /// returns true and triggers the alert. All later calls — sibling
+    /// windows, future relaunches — return false so the prompt fires
+    /// exactly once per process.
+    @ObservationIgnored
+    private var handoffSkillPromptFired = false
+
+    /// Returns `true` on the FIRST call, `false` thereafter. MainActor
+    /// isolation makes the read-modify-write atomic without a lock.
+    func consumeHandoffSkillPromptSlot() -> Bool {
+        guard !handoffSkillPromptFired else { return false }
+        handoffSkillPromptFired = true
+        return true
+    }
+
     init() {
         self.tweaks = Tweaks()
         self.shortcuts = KeyboardShortcuts()
@@ -222,6 +240,12 @@ final class NiceServices {
         // pre-minted UUID otherwise misses these in-process rotations.
         // Idempotent and safe to run on every launch.
         ClaudeHookInstaller.install()
+
+        // Install or remove the `/nice-handoff` skill and its companion
+        // shell helper depending on the user's preference. Idempotent:
+        // both the install and uninstall paths are no-ops when the
+        // on-disk state already matches the flag.
+        SkillInstaller.sync(enabled: tweaks.installHandoffSkill)
 
         KeyboardShortcutMonitor.install(
             registry: registry,

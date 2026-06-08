@@ -2,9 +2,16 @@
 //  NiceControlSocket.swift
 //  Nice
 //
-//  Phase 7: a tiny Unix-domain-socket listener that lets the Main
-//  Terminal's shadowed `claude` zsh function ask the app to open a new
-//  tab. One newline-delimited JSON message per client, then close.
+//  Phase 7: a tiny Unix-domain-socket listener that lets Nice's shell
+//  helpers and Claude Code skills talk to the app. One newline-delimited
+//  JSON message per client, then close. Supported actions:
+//    • `claude`         — the shadowed `claude` zsh function asking Nice
+//                         to open a new tab or promote a pane in place.
+//    • `session_update` — the SessionStart hook relaying session-id /
+//                         cwd rotations.
+//    • `handoff`        — the `/nice-handoff` skill's helper
+//                         (`nice-handoff.sh`) asking Nice to open a
+//                         nested handoff tab.
 //
 //  Raw POSIX (`socket`/`bind`/`listen`/`accept` + `DispatchSource`) is
 //  used rather than `NWListener` with `NWEndpoint.unix(path:)` because
@@ -18,7 +25,7 @@
 //  `self` in the handler trips Swift 6's actor-isolation assertions.
 //  Instead, the handler type is `@Sendable` and the caller is
 //  responsible for hopping to MainActor if it wants to touch app state
-//  — see the `AppState.init()` call site.
+//  — see the `SessionsModel.startSocketListener` call site.
 //
 //  Self-healing: the listener rebuilds itself if the accept
 //  DispatchSource cancels unexpectedly (fd error, OOM) or the socket
@@ -31,8 +38,8 @@ import Darwin
 import Foundation
 
 /// Discriminated payload carried on the control socket. Produced by the
-/// parser in `readClient`, consumed by `AppState.init`'s handler, which
-/// dispatches each case to the appropriate MainActor method.
+/// parser in `readClient`, consumed by `SessionsModel.startSocketListener`'s
+/// handler, which dispatches each case to the appropriate MainActor method.
 enum SocketMessage: Sendable {
     /// `claude` shadow asking Nice whether to open a new sidebar tab
     /// (the default) or promote the sending pane in place. `tabId` /
@@ -83,13 +90,55 @@ enum SocketMessage: Sendable {
         source: String?,
         cwd: String?
     )
+
+    /// The `/nice-handoff` skill asking Nice to open a fresh Claude
+    /// session in a new tab nested under the originating tab in the
+    /// sidebar. The skill writes a handoff notes file, then shells out
+    /// to a helper that posts this message; the new session is seeded
+    /// with an initial prompt that points Claude at the notes file and
+    /// (optionally) describes how to proceed.
+    ///
+    /// `cwd` is the absolute path the handoff fired from — used only as
+    /// a fallback spawn directory when the originating tab can't be
+    /// resolved (e.g. a handoff from the Main Terminal). When the
+    /// originating tab is found, its own `cwd` wins so the child lands
+    /// in the same place as its parent.
+    ///
+    /// `handoffFile` is the absolute path of the notes file the skill
+    /// wrote; it's interpolated into the seeded prompt. Both `cwd` and
+    /// `handoffFile` are required — a payload missing either is dropped
+    /// (the connection is closed without a reply).
+    ///
+    /// `instructions` carries optional custom continuation text from the
+    /// skill. Normalized to "" when absent/empty (the type is a
+    /// non-optional String, mirroring the empty-string-normalization
+    /// the other cases apply to optional fields); the receiver
+    /// substitutes a default directive when it's blank.
+    ///
+    /// `tabId` / `paneId` identify the sending pty so the receiver can
+    /// resolve the originating tab and nest the new tab under it — both
+    /// are empty strings for the Main Terminals tab (which yields a
+    /// top-level handoff tab). The handler calls `reply` exactly once
+    /// with one of:
+    ///   - "ok"          — the handoff tab was opened
+    ///   - "error: ..."  — the request couldn't be satisfied
+    /// The reply closure owns closing the client fd.
+    case handoff(
+        cwd: String,
+        handoffFile: String,
+        instructions: String,
+        tabId: String,
+        paneId: String,
+        reply: @Sendable (String) -> Void
+    )
 }
 
 final class NiceControlSocket: @unchecked Sendable {
     typealias Handler = @Sendable (SocketMessage) -> Void
 
     /// Path of the bound socket file. Exported via `NICE_SOCKET` into
-    /// the Main Terminal so the shadowed `claude()` zsh function can
+    /// every pty Nice spawns so the shadowed `claude()` zsh function and
+    /// the shell helpers (`nice-claude-hook.sh`, `nice-handoff.sh`) can
     /// `nc -U "$NICE_SOCKET"` into it.
     let path: String
 
@@ -397,6 +446,43 @@ final class NiceControlSocket: @unchecked Sendable {
                 sessionId: sessionId,
                 source: source,
                 cwd: cwd
+            ))
+        case "handoff":
+            // `cwd` and `handoffFile` are both required — without the
+            // notes path there's nothing to seed the new session with,
+            // and without a fallback cwd we'd have nowhere to spawn a
+            // top-level handoff. Drop the connection if either is
+            // missing or empty.
+            guard let cwd = obj["cwd"] as? String, !cwd.isEmpty,
+                  let handoffFile = obj["handoffFile"] as? String, !handoffFile.isEmpty
+            else {
+                close(client)
+                return
+            }
+            // tabId/paneId default to "" when absent — same as the
+            // "claude" case; an empty tabId routes to a top-level tab.
+            let tabId = (obj["tabId"] as? String) ?? ""
+            let paneId = (obj["paneId"] as? String) ?? ""
+            // Instructions are optional. Absent key, non-string value,
+            // and empty string all collapse to "" — same idea as the
+            // "session_update" source/cwd normalization, but to "" not
+            // nil since the message type carries a non-optional String.
+            let rawInstructions = obj["instructions"] as? String
+            let instructions = (rawInstructions?.isEmpty == false) ? rawInstructions! : ""
+            let reply: @Sendable (String) -> Void = { line in
+                let payload = line + "\n"
+                payload.withCString { p in
+                    _ = write(client, p, strlen(p))
+                }
+                close(client)
+            }
+            handler(.handoff(
+                cwd: cwd,
+                handoffFile: handoffFile,
+                instructions: instructions,
+                tabId: tabId,
+                paneId: paneId,
+                reply: reply
             ))
         default:
             // Unknown action — log and drop, matching the silent-drop

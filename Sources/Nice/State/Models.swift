@@ -144,13 +144,17 @@ struct Tab: Identifiable, Hashable, Sendable, Codable {
     /// for terminal-only tabs (including everything in the Terminals
     /// group).
     var claudeSessionId: String? = nil
-    /// ID of a sibling tab in the same project that holds an earlier
-    /// pre-/branch session of this tab — created automatically by
-    /// `SessionsModel.materializeBranchParent` (which delegates the
-    /// tree mutation to `TabModel.insertBranchParent`) when the
-    /// SessionStart hook reports a `/branch` (or `--fork-session`)
-    /// rotation. `nil` for tabs that have never been part of a
-    /// /branch lineage.
+    /// ID of a parent tab in the same project that this tab nests one
+    /// indent under. Set via two paths, both using the same depth-1
+    /// lineage rule:
+    ///   • **/branch**: `SessionsModel.materializeBranchParent` (→
+    ///     `TabModel.insertBranchParent`) when the SessionStart hook
+    ///     reports a `/branch` (or `--fork-session`) rotation; the new
+    ///     sibling holds the earlier pre-/branch session.
+    ///   • **handoff**: `TabModel.insertHandoffChild` when the
+    ///     `/nice-handoff` skill opens a "[HANDOFF] …" tab, nesting it
+    ///     under the originating tab (or that tab's own root).
+    /// `nil` for tabs that neither path has placed into a lineage.
     ///
     /// Within-project constraint: this id always references a tab in
     /// the same project as the holder. The sidebar renders children

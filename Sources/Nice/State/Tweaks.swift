@@ -208,8 +208,10 @@ final class Tweaks {
     static let terminalThemeLightKey = "terminalThemeLightId"
     static let terminalThemeDarkKey  = "terminalThemeDarkId"
     static let terminalFontFamilyKey = "terminalFontFamily"
-    static let editorCommandsKey       = "editorCommands"
-    static let extensionEditorMapKey   = "extensionEditorMap"
+    static let editorCommandsKey         = "editorCommands"
+    static let extensionEditorMapKey     = "extensionEditorMap"
+    static let installHandoffSkillKey    = "installHandoffSkill"
+    static let handoffSkillPromptSeenKey = "handoffSkillPromptSeen"
 
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
@@ -344,6 +346,36 @@ final class Tweaks {
         didSet { persistExtensionEditorMap() }
     }
 
+    /// Whether the `/nice-handoff` Claude Code skill and its companion
+    /// shell helper (`~/.nice/nice-handoff.sh`) are installed globally.
+    /// Defaults to false; flipped by the first-launch prompt or the
+    /// Settings toggle.
+    ///
+    /// This setter only *persists* the flag — it deliberately does NOT
+    /// call `SkillInstaller.sync(enabled:)`. Keeping `Tweaks` free of
+    /// filesystem IO is what lets it be constructed in unit tests
+    /// without writing into the developer's real `~/.claude/`/`~/.nice/`.
+    /// Reconciling the on-disk files with this flag is the caller's job:
+    /// `NiceServices.bootstrap()` syncs once at launch, and each mutation
+    /// site (the Settings toggle's `onChange` and the first-launch alert
+    /// buttons) calls `SkillInstaller.sync(enabled:)` alongside the set.
+    var installHandoffSkill: Bool {
+        didSet {
+            defaults.set(installHandoffSkill, forKey: Self.installHandoffSkillKey)
+        }
+    }
+
+    /// True once the user has responded to the first-launch "Install the
+    /// Nice Handoff skill?" prompt — either "Install" or "Not Now". The
+    /// prompt is shown exactly once per install; this flag prevents it from
+    /// re-appearing on subsequent launches even if `installHandoffSkill`
+    /// is later toggled off in Settings.
+    var handoffSkillPromptSeen: Bool {
+        didSet {
+            defaults.set(handoffSkillPromptSeen, forKey: Self.handoffSkillPromptSeenKey)
+        }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
@@ -392,6 +424,13 @@ final class Tweaks {
         self.terminalFontFamily = fontFamily
         self.editorCommands = editors
         self.extensionEditorMap = extMap
+        // `object(forKey:)` returns nil for a key that has never been set,
+        // letting us distinguish "user has never chosen" (nil → default false)
+        // from "user explicitly set false". Both flags default to false so
+        // a fresh install starts with the skill uninstalled and the prompt
+        // unseen.
+        self.installHandoffSkill = defaults.object(forKey: Self.installHandoffSkillKey) as? Bool ?? false
+        self.handoffSkillPromptSeen = defaults.object(forKey: Self.handoffSkillPromptSeenKey) as? Bool ?? false
 
         NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
 
