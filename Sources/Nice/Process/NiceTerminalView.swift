@@ -31,6 +31,16 @@ import SwiftTerm
 
 @MainActor
 final class NiceTerminalView: LocalProcessTerminalView {
+    /// Called by `TabPtySession` to provide the hardware-acceleration
+    /// preference at the time of window attachment. Returns `true` (on)
+    /// when unset — safe default for views that haven't been wired yet.
+    var hardwareAccelerationPreference: (() -> Bool)?
+
+    /// Called by `TabPtySession` to provide the smooth-scrolling
+    /// preference at the time of window attachment. Returns `true` (on)
+    /// when unset.
+    var smoothScrollPreference: (() -> Bool)?
+
     /// Latch set by `TerminalHost.makeNSView` when this pane is the one
     /// SwiftUI is about to mount as the active pane. Consumed on the
     /// next `viewDidMoveToWindow` / `viewDidMoveToSuperview` so focus
@@ -112,37 +122,47 @@ final class NiceTerminalView: LocalProcessTerminalView {
         getTerminal().ansi256PaletteStrategy = .xterm
     }
 
-    /// Enables SwiftTerm's Metal renderer. No-op when the view isn't
-    /// yet in a window — `viewDidMoveToWindow` calls this once
-    /// attachment happens. Idempotent: SwiftTerm's `setUseMetal`
-    /// short-circuits when the renderer is already in the requested
-    /// state. Falls back silently to CoreGraphics on devices where
-    /// Metal isn't available (VMs, some CI runners).
-    private func enableGpuRendering() {
+    /// Apply the hardware-acceleration preference. No-op when the view
+    /// isn't in a window — called from `viewDidMoveToWindow` and by
+    /// `TabPtySession.applyHardwareAcceleration` when the setting changes
+    /// while panes are live. Idempotent: SwiftTerm's `setUseMetal`
+    /// short-circuits when the renderer is already in the requested state.
+    /// Falls back silently to CoreGraphics on devices where Metal isn't
+    /// available (VMs, some CI runners).
+    func applyHardwareAccelerationPreference() {
         guard window != nil else { return }
+        let desired = hardwareAccelerationPreference?() ?? true
         do {
-            try setUseMetal(true)
-            // Disable Apple's `setShouldSmoothFonts` stem-darkening.
-            // SwiftTerm's atlas-based GPU renderer applies the dilation
-            // once at rasterization and then composites the cached
-            // mask, which empirically over-thickens glyphs vs.
-            // Apple Terminal's per-draw CG path. Turning smoothing
-            // off makes Nice's strokes read closer to Terminal.app
-            // (whose own per-draw CG dilation is in fact lighter than
-            // SwiftTerm's atlas-baked version), at the cost of
-            // matching Ghostty/Alacritty's thin aesthetic on glyphs
-            // that depend on dilation for body. The Metal rasterizer
-            // reads this flag each frame.
-            fontSmoothing = false
+            try setUseMetal(desired)
         } catch {
             NSLog("NiceTerminalView: Metal renderer unavailable, falling back to CoreGraphics: \(error)")
         }
     }
 
+    /// Apply the smooth-scrolling preference. Safe to call at any time;
+    /// SwiftTerm's smooth path also gates on `isUsingMetalRenderer` at
+    /// runtime, so toggling this while hardware acceleration is off is a
+    /// no-op in practice.
+    func applySmoothScrollPreference() {
+        // Default OFF when no preference is wired (smooth scrolling is opt-in).
+        smoothScrollingEnabled = smoothScrollPreference?() ?? false
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        enableGpuRendering()
-        smoothScrollingEnabled = true
+        applyHardwareAccelerationPreference()
+        applySmoothScrollPreference()
+        // Disable Apple's `setShouldSmoothFonts` stem-darkening unconditionally,
+        // regardless of whether Metal or CoreGraphics is active.
+        // SwiftTerm's atlas-based GPU renderer applies the dilation once at
+        // rasterization and then composites the cached mask, which empirically
+        // over-thickens glyphs vs. Apple Terminal's per-draw CG path. Turning
+        // smoothing off makes Nice's strokes read closer to Terminal.app (whose
+        // own per-draw CG dilation is in fact lighter than SwiftTerm's atlas-
+        // baked version), at the cost of matching Ghostty/Alacritty's thin
+        // aesthetic on glyphs that depend on dilation for body. The Metal
+        // rasterizer reads this flag each frame; the CG path reads it per-draw.
+        fontSmoothing = false
         claimFocusIfRequested()
         // Belt-and-suspenders: in the (rare) ordering where AppKit
         // assigns the real frame before window attachment, our

@@ -34,6 +34,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case shortcuts   = "Shortcuts"
     case font        = "Font"
     case claude      = "Claude"
+    case advanced    = "Advanced"
     case about       = "About"
 
     var id: String { rawValue }
@@ -50,6 +51,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .shortcuts:  return "shortcuts"
         case .font:       return "font"
         case .claude:     return "claude"
+        case .advanced:   return "advanced"
         case .about:      return "about"
         }
     }
@@ -148,6 +150,7 @@ struct SettingsView: View {
                 case .editors:    SettingsEditorsPane()
                 case .font:       FontPane()
                 case .claude:     ClaudePane()
+                case .advanced:   AdvancedPane()
                 case .about:      AboutPane()
                 }
             }
@@ -565,6 +568,43 @@ private struct AccentSwatch: View {
             .help(preset.label)
             .accessibilityLabel(preset.label)
             .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// MARK: - Advanced pane
+
+private struct AdvancedPane: View {
+    @Environment(Tweaks.self) private var tweaks
+
+    var body: some View {
+        @Bindable var tweaks = tweaks
+        SettingTitle("Advanced")
+
+        SettingRow(
+            label: "Hardware acceleration",
+            hint: "Uses the Metal/GPU renderer for terminal drawing. Falls back to CPU (CoreGraphics) automatically if Metal is unavailable."
+        ) {
+            Toggle("", isOn: $tweaks.hardwareAcceleration)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.advanced.hardwareAcceleration")
+        }
+
+        SettingRow(
+            label: "Smooth scrolling",
+            hint: "Animates terminal scrolling. Requires hardware acceleration — disabled automatically when Metal is off."
+        ) {
+            Toggle("", isOn: $tweaks.smoothScrolling)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(!tweaks.hardwareAcceleration)
+                .help(tweaks.hardwareAcceleration
+                    ? ""
+                    : "Smooth scrolling requires hardware acceleration to be enabled.")
+                .accessibilityIdentifier("settings.advanced.smoothScrolling")
+        }
     }
 }
 

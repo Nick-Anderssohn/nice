@@ -212,6 +212,10 @@ final class Tweaks {
     static let extensionEditorMapKey     = "extensionEditorMap"
     static let installHandoffSkillKey    = "installHandoffSkill"
     static let handoffSkillPromptSeenKey = "handoffSkillPromptSeen"
+    /// Legacy UserDefaults key strings preserved for backward compatibility
+    /// — anyone who had set these before their removal keeps their value.
+    static let hardwareAccelerationKey = "gpuRendering"
+    static let smoothScrollingKey      = "smoothScrolling"
 
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
@@ -318,6 +322,28 @@ final class Tweaks {
         }
     }
 
+    /// Whether terminal panes use SwiftTerm's Metal renderer. Defaults ON;
+    /// an explicit OFF persists across relaunch (see init). When OFF,
+    /// SwiftTerm falls back to its CoreGraphics path — smooth scrolling
+    /// has no effect on that path, so the smooth-scrolling control is
+    /// disabled in the UI while this is OFF.
+    var hardwareAcceleration: Bool {
+        didSet {
+            defaults.set(hardwareAcceleration, forKey: Self.hardwareAccelerationKey)
+        }
+    }
+
+    /// Whether terminal panes use SwiftTerm's smooth-scrolling path.
+    /// Only takes visible effect when `hardwareAcceleration` is ON
+    /// (SwiftTerm's smooth path gates on `isUsingMetalRenderer`).
+    /// Opt-in: defaults OFF when the key is absent. An explicit value the
+    /// user set (including a legacy ON) persists across relaunch.
+    var smoothScrolling: Bool {
+        didSet {
+            defaults.set(smoothScrolling, forKey: Self.smoothScrollingKey)
+        }
+    }
+
     /// User-configured terminal editors that can open files from the
     /// File Explorer in a new pane. Each entry has a stable UUID so
     /// extension mappings survive renames.
@@ -412,6 +438,18 @@ final class Tweaks {
         let editors = Self.loadEditorCommands(defaults: defaults)
         let extMap  = Self.loadExtensionEditorMap(defaults: defaults)
 
+        // "Distinguish absent key from explicit false" so the default is ON
+        // but an explicit OFF the user set before a relaunch survives.
+        let hwAccel = defaults.object(forKey: Self.hardwareAccelerationKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.hardwareAccelerationKey)
+        // Smooth scrolling is opt-in: default OFF when the user has no saved
+        // preference. An explicit value (including a legacy ON from the old
+        // toggle) is still honored.
+        let smoothScroll = defaults.object(forKey: Self.smoothScrollingKey) == nil
+            ? false
+            : defaults.bool(forKey: Self.smoothScrollingKey)
+
         let migrated = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
         self.scheme = migrated.scheme
@@ -422,6 +460,8 @@ final class Tweaks {
         self.terminalThemeLightId = terminalLight
         self.terminalThemeDarkId = terminalDark
         self.terminalFontFamily = fontFamily
+        self.hardwareAcceleration = hwAccel
+        self.smoothScrolling = smoothScroll
         self.editorCommands = editors
         self.extensionEditorMap = extMap
         // `object(forKey:)` returns nil for a key that has never been set,

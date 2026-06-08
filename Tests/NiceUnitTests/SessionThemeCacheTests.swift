@@ -141,6 +141,59 @@ final class SessionThemeCacheTests: XCTestCase {
         XCTAssertNil(cache.terminalFontFamily)
     }
 
+    // MARK: - updateHardwareAcceleration
+
+    func test_updateHardwareAcceleration_fansToEveryReceiver() {
+        let a = FakeTabPtySession()
+        let b = FakeTabPtySession()
+        receivers = [a, b]
+
+        cache.updateHardwareAcceleration(false)
+
+        XCTAssertEqual(a.applyHardwareAccelerationCalls, [false])
+        XCTAssertEqual(b.applyHardwareAccelerationCalls, [false])
+        XCTAssertEqual(cache.hardwareAcceleration, false)
+    }
+
+    func test_updateHardwareAcceleration_withNoReceivers_doesNotCrash() {
+        XCTAssertNoThrow(
+            cache.updateHardwareAcceleration(false)
+        )
+        XCTAssertEqual(cache.hardwareAcceleration, false,
+                       "Cache must update even with no receivers.")
+    }
+
+    // MARK: - updateSmoothScrolling
+
+    func test_updateSmoothScrolling_fansToEveryReceiver() {
+        let a = FakeTabPtySession()
+        let b = FakeTabPtySession()
+        receivers = [a, b]
+
+        cache.updateSmoothScrolling(false)
+
+        XCTAssertEqual(a.applySmoothScrollingCalls, [false])
+        XCTAssertEqual(b.applySmoothScrollingCalls, [false])
+        XCTAssertEqual(cache.smoothScrolling, false)
+    }
+
+    func test_updateSmoothScrolling_withNoReceivers_doesNotCrash() {
+        XCTAssertNoThrow(
+            cache.updateSmoothScrolling(false)
+        )
+        XCTAssertEqual(cache.smoothScrolling, false,
+                       "Cache must update even with no receivers.")
+    }
+
+    func test_initialDefaults_smoothScrollingOff_hardwareAccelerationOn() {
+        // The cache seeds before `Tweaks` syncs; a stale `true` here would briefly
+        // enable smooth scrolling on sessions seeded before the first fan-out.
+        XCTAssertFalse(cache.smoothScrolling,
+                       "SessionThemeCache must seed smoothScrolling OFF to match the Tweaks default")
+        XCTAssertTrue(cache.hardwareAcceleration,
+                      "Hardware acceleration still seeds ON")
+    }
+
     // MARK: - Receiver list resolution
 
     func test_receiversClosureReResolvedOnEachUpdate() {
@@ -189,6 +242,19 @@ final class SessionThemeCacheTests: XCTestCase {
         XCTAssertEqual(fresh.applyTerminalFontSizeCalls, [15])
     }
 
+    func test_applyAll_seedsReceiverWithHardwareAccelerationAndSmoothScrolling() {
+        // Non-default (false) values must reach a fresh receiver via applyAll,
+        // confirming the cache fields are included in the seed call.
+        cache.updateHardwareAcceleration(false)
+        cache.updateSmoothScrolling(false)
+
+        let fresh = FakeTabPtySession()
+        cache.applyAll(to: fresh)
+
+        XCTAssertEqual(fresh.applyHardwareAccelerationCalls, [false])
+        XCTAssertEqual(fresh.applySmoothScrollingCalls, [false])
+    }
+
     func test_applyAll_preservesThemeBeforeTerminalThemeOrder() {
         // Order matters: applyTheme must run before
         // applyTerminalTheme so the chrome-coupled bg/fg paths in
@@ -224,6 +290,12 @@ final class SessionThemeCacheTests: XCTestCase {
         }
         func applyTerminalFontFamily(_ name: String?) {
             callOrder.append("applyTerminalFontFamily")
+        }
+        func applyHardwareAcceleration(_ enabled: Bool) {
+            callOrder.append("applyHardwareAcceleration")
+        }
+        func applySmoothScrolling(_ enabled: Bool) {
+            callOrder.append("applySmoothScrolling")
         }
     }
 }
