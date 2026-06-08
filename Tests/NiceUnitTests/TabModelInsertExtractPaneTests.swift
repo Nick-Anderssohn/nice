@@ -187,4 +187,24 @@ final class TabModelInsertExtractPaneTests: XCTestCase {
         XCTAssertNotEqual(idx, 0)
         XCTAssertEqual(appState.tabs.projects[idx].id, "p-x")
     }
+
+    func test_ensureProjectByPath_neverDuplicatesTerminalsProject() {
+        // Bug 1 hardening: asking for the reserved Terminals id must
+        // resolve to the existing pinned project at index 0 — never append
+        // a SECOND project carrying `id == terminalsProjectId` (the root
+        // cause of the duplicate "TERMINALS" sidebar section).
+        let countBefore = appState.tabs.projects.count
+        let idx = appState.tabs.ensureProjectByPath(
+            id: TabModel.terminalsProjectId,
+            name: "Terminals",
+            path: "/some/other/path"
+        )
+        XCTAssertEqual(idx, 0)
+        XCTAssertEqual(appState.tabs.projects.count, countBefore,
+                       "Must not append a duplicate terminals project")
+        XCTAssertEqual(
+            appState.tabs.projects.filter { $0.id == TabModel.terminalsProjectId }.count,
+            1, "Exactly one project may carry the terminals id"
+        )
+    }
 }

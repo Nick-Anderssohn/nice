@@ -570,6 +570,17 @@ final class TabModel {
     /// same repo open in two windows shares a path but may carry
     /// different project ids.
     func ensureProjectByPath(id: String, name: String, path: String) -> Int {
+        // Defensive: the pinned Terminals project is unique and lives at
+        // index 0. Never append a SECOND project carrying its reserved id
+        // — that produces a duplicate "TERMINALS" sidebar section. Callers
+        // routing a Terminals-section pane should use
+        // `adoptTerminalPaneAsMainTerminal` instead; this guard ensures
+        // even a stray call here can't duplicate the section.
+        if id == Self.terminalsProjectId {
+            if let idx = projects.firstIndex(where: { $0.id == Self.terminalsProjectId }) {
+                return idx
+            }
+        }
         let expanded = Self.expandTilde(path)
         if let idx = projects.firstIndex(where: {
             $0.id != Self.terminalsProjectId && Self.expandTilde($0.path) == expanded

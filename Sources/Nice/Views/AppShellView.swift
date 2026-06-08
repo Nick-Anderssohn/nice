@@ -169,8 +169,27 @@ private struct AppShellHost: View {
             : "These are still running: \(list)."
     }
 
+    /// Launch-arg gate for the UITest-only tear-off hook. When present,
+    /// `body` renders a hidden zero-size button
+    /// (`accessibilityIdentifier == "test.tearOffActivePane"`) that
+    /// performs a REAL programmatic tear-off of the active tab's active
+    /// pane — XCUITest can't synthesize the cross-window "drag onto empty
+    /// desktop" gesture, so this is how UITests get a genuine second
+    /// window. Absent in production: the button isn't even built.
+    private static let tearOffHookEnabled =
+        ProcessInfo.processInfo.arguments.contains("--uitest-tearoff-hook")
+
     var body: some View {
         shell
+        .overlay(alignment: .bottomTrailing) {
+            // Zero-impact in production: the whole overlay is elided when
+            // the launch arg is absent (the button is never built, so it
+            // can't disturb layout or other tests). Bottom-trailing keeps
+            // it clear of the traffic lights / sidebar / toolbar chrome.
+            if Self.tearOffHookEnabled {
+                testTearOffHook
+            }
+        }
         .ignoresSafeArea(edges: .top)
         .background(
             // Host-window reach-through: once the shell is mounted,
@@ -225,6 +244,22 @@ private struct AppShellHost: View {
                 // Programmatic frame save/restore (`WindowSession`) is
                 // unaffected — isMovable gates user drags, not `setFrame`.
                 window.isMovable = false
+                // A window born during a live drag session (a tear-off
+                // window opened from inside the pill's `NSDraggingSession`
+                // end-callback) can have AppKit re-finalize its window
+                // properties AFTER this first assignment — restoring the
+                // default `isMovable = true`. That re-enables the native
+                // title-bar drag, so a pill press in the 52pt band drags the
+                // WHOLE window (it bypasses the `WindowDragGate` veto, which
+                // only governs the SwiftUI `windowDraggable` path) — the
+                // tear-off-window "pill drag moves the window" bug. Re-assert
+                // on the next runloop ticks so our value wins regardless of
+                // when AppKit settles. Idempotent.
+                for delay in [0.0, 0.05, 0.2] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak window] in
+                        window?.isMovable = false
+                    }
+                }
                 TrafficLightNudger.nudge(
                     window: window,
                     dx: WindowChrome.trafficLightNudgeX,
@@ -320,14 +355,27 @@ private struct AppShellHost: View {
                         projectPath: seed.projectPath
                     )
                 case .terminal:
-                    appState.sessions.adoptTerminalPaneAsNewTab(
-                        entry: seed.entry,
-                        paneId: seed.paneId,
-                        title: seed.title,
-                        projectId: seed.projectId,
-                        projectName: seed.projectName,
-                        projectPath: seed.projectPath
-                    )
+                    // A terminal torn off the TERMINALS section REPLACES
+                    // this new window's pristine auto-seeded Main terminal
+                    // (exactly one TERMINALS section; the torn-off pane IS
+                    // the Main). A companion terminal torn off a Claude
+                    // project keeps the per-project-section behavior.
+                    if seed.projectId == TabModel.terminalsProjectId {
+                        appState.sessions.adoptTerminalPaneAsMainTerminal(
+                            entry: seed.entry,
+                            paneId: seed.paneId,
+                            title: seed.title
+                        )
+                    } else {
+                        appState.sessions.adoptTerminalPaneAsNewTab(
+                            entry: seed.entry,
+                            paneId: seed.paneId,
+                            title: seed.title,
+                            projectId: seed.projectId,
+                            projectName: seed.projectName,
+                            projectPath: seed.projectPath
+                        )
+                    }
                 }
                 // Position the new window at the drag-release point so it
                 // "pops out" at the cursor. Best-effort: `window` may be
@@ -368,6 +416,18 @@ private struct AppShellHost: View {
         }
         .onChange(of: fontSettings.terminalFontSize) { _, newSize in
             appState.sessions.updateTerminalFontSize(newSize)
+        }
+        .onChange(of: appState.tabs.activeTabId) { _, newTabId in
+            // Bug 3 (single choke-point): switching to a tab whose active
+            // pane is a deferred terminal that was never spawned (e.g. a
+            // terminal-only tab selected for the first time via the
+            // sidebar / keyboard, where the selection path only syncs the
+            // id) would render blank. Spawn it on every active-tab change
+            // so `mainContent` always has a hosted view. No-op when the
+            // active pane is already spawned / is a Claude pane / has no
+            // session yet.
+            guard let newTabId else { return }
+            appState.sessions.ensureActivePaneSpawned(tabId: newTabId)
         }
         .onChange(of: tweaks.terminalThemeLightId) { _, _ in
             // Only applies if the active scheme is light — otherwise the
@@ -423,6 +483,56 @@ private struct AppShellHost: View {
         } else {
             expandedShell
         }
+    }
+
+    /// UITest-only: a hidden button that tears off the active tab's
+    /// active pane via `PaneTearOffController.tearOff` directly (bypassing
+    /// `PaneDragEnd.outcome`, so it always tears off and always opens a
+    /// real second window). Lives here because this view has `openWindow`,
+    /// `appState`, and `services` all in scope. Built only when
+    /// `--uitest-tearoff-hook` is passed.
+    private var testTearOffHook: some View {
+        Button {
+            guard let tabId = appState.tabs.activeTabId,
+                  let paneId = appState.tabs.tab(for: tabId)?.activePaneId
+            else { return }
+            // `tearOff` consumes the in-flight live-pane handle that a real
+            // drag would have published on drag-start (`PaneDragSource`).
+            // The hook skips the drag, so publish the same handle here
+            // first — otherwise `tearOff` bails (no handle to claim).
+            services.livePaneRegistry.publish(
+                LivePaneRegistry.Handle(
+                    paneId: paneId,
+                    sourceWindowSessionId: appState.windowSession.windowSessionId,
+                    sourceTabId: tabId,
+                    claim: { [weak sessions = appState.sessions] in
+                        sessions?.detachLivePane(tabId: tabId, paneId: paneId)
+                    }
+                )
+            )
+            // A fixed point well inside the main screen's visible frame so
+            // the torn-off window lands on-screen for the assertions.
+            let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let point = NSPoint(x: frame.minX + 80, y: frame.maxY - 200)
+            PaneTearOffController(services: services).tearOff(
+                paneId: paneId,
+                sourceWindowSessionId: appState.windowSession.windowSessionId,
+                at: point,
+                openWindow: { openWindow(id: "main") }
+            )
+        } label: {
+            // A small but real, hittable hit area. Transparent so it's
+            // invisible; `contentShape` makes the whole rect clickable for
+            // XCUITest. Pinned to the bottom-trailing corner where there
+            // is no interactive chrome to occlude it.
+            Color.clear
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("test.tearOffActivePane")
+        .frame(width: 24, height: 24)
+        .zIndex(999)
     }
 
     /// Floor-to-ceiling floating sidebar card on the left, toolbar + main
@@ -748,6 +858,20 @@ private struct AppShellHost: View {
             .padding(.top, 12)
             .padding(.leading, 20)
             .background(terminalBackgroundColor)
+            // Present ONLY when a pty view is actually hosted for the
+            // active pane — the blank `else` branch below renders nothing
+            // with this id. UITests assert this exists to prove the active
+            // pane renders a terminal rather than a blank background
+            // (bug 3). A dedicated leaf element (rather than a container
+            // identifier, which SwiftUI may not surface to XCUITest)
+            // keyed to the pane id. Zero-size + clear → no visual effect.
+            .overlay(alignment: .topLeading) {
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityElement()
+                    .accessibilityIdentifier("mainContent.hostedPane")
+                    .accessibilityValue(paneId)
+            }
         } else {
             // Transient: no pane currently hosted (e.g. every tab in
             // every project just dissolved — the app is about to

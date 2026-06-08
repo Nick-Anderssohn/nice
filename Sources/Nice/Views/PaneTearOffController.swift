@@ -129,5 +129,16 @@ struct PaneTearOffController {
         // empty. Multi-window-safe: won't terminate the app while
         // another window (the one we just opened) is alive.
         source.dissolveTabIfEmpty(tabId: sourceTabId)
+
+        // Bug 3: `extractPane` shifts `activePaneId` to a neighbor (and a
+        // dissolve may switch focus to a different tab) WITHOUT spawning
+        // it — a deferred companion terminal that becomes active would
+        // otherwise render blank. Spawn whichever tab is active now (the
+        // in-tab neighbor, or the post-dissolve tab). No-op when the
+        // active pane is already spawned / is a Claude pane / has no
+        // session.
+        if let activeTabId = source.tabs.activeTabId {
+            source.sessions.ensureActivePaneSpawned(tabId: activeTabId)
+        }
     }
 }

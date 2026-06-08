@@ -84,17 +84,38 @@ enum TrafficLightNudger {
 
         applyOffset(to: window, dx: dx, dy: dy)
 
-        // AppKit relays out the buttons on focus, resize, and on every
-        // full-screen transition (it resets them to their default
+        // A freshly-created window (notably a tear-off / `openWindow`
+        // window born during a live drag session) finishes laying out its
+        // standard buttons AFTER this first synchronous nudge: AppKit
+        // re-runs the title-bar button layout on the next runloop ticks and
+        // clobbers our offset back to the default position — and for a
+        // window that opens already-key and is never resized, none of the
+        // notification re-applies below ever fire to fix it (the bug behind
+        // the misaligned traffic lights in a torn-off window). Re-apply on
+        // the next couple of ticks so our offset wins the race regardless
+        // of when AppKit's own layout settles. Idempotent: `applyOffset`
+        // reuses the captured canonical origin, so these never compound.
+        for delay in [0.0, 0.05, 0.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak window] in
+                guard let window else { return }
+                applyOffset(to: window, dx: dx, dy: dy)
+            }
+        }
+
+        // AppKit relays out the buttons on focus, resize, move, and on
+        // every full-screen transition (it resets them to their default
         // positions when the title-bar band changes). Re-apply the
         // offset on each so it stays sticky. The will/did pair for
         // full screen is intentional: macOS reorganizes the buttons
         // both as the animation starts and after it lands, so re-applying
         // only on one edge leaves them briefly (or persistently) misplaced.
+        // `didMove` covers the tear-off window's post-open `setFrameOrigin`
+        // reposition, which can also nudge the buttons back to default.
         let center = NotificationCenter.default
         let reapplyOn: [NSNotification.Name] = [
             NSWindow.didBecomeKeyNotification,
             NSWindow.didResizeNotification,
+            NSWindow.didMoveNotification,
             NSWindow.willEnterFullScreenNotification,
             NSWindow.didEnterFullScreenNotification,
             NSWindow.willExitFullScreenNotification,

@@ -226,4 +226,48 @@ final class PaneTearOffControllerTests: XCTestCase {
         // Consume the seed so the queue is clean.
         _ = services.consumeTearOffSeed()
     }
+
+    // MARK: - Bug 3: source's new active pane is spawned after tear-off
+
+    func test_tearOff_spawnsSourceTabsNewActiveTerminal() {
+        // winA has a Claude tab: [Claude (active), companion terminal].
+        // The companion terminal is modelled but its pty is DEFERRED
+        // (not spawned). Tearing off the Claude pane shifts focus to the
+        // companion — which must now be spawned so it doesn't render blank.
+        var claudePane = Pane(id: "cA", title: "Claude", kind: .claude)
+        claudePane.isClaudeRunning = true
+        let companionId = "cA-t1"
+        let srcTab = Tab(id: "a-claude", title: "Repo", cwd: "/tmp/repo",
+                         panes: [claudePane,
+                                 Pane(id: companionId, title: "Terminal 1", kind: .terminal)],
+                         activePaneId: "cA", claudeSessionId: "sess-1")
+        winA.tabs.projects = [
+            winA.tabs.projects[0],
+            Project(id: "p-repo", name: "REPO", path: "/tmp/repo", tabs: [srcTab])
+        ]
+        // The Claude tab is the active tab when its Claude pane is torn
+        // off (matches production: you tear off the pane you're looking at).
+        winA.tabs.activeTabId = "a-claude"
+        // Spawn only the Claude pane — companion stays deferred (mirrors
+        // production: companion terminals spawn on first focus).
+        _ = winA.sessions.makeSession(for: "a-claude", cwd: "/tmp/repo",
+                                       initialClaudePaneId: "cA")
+        XCTAssertEqual(winA.sessions.ptySessions["a-claude"]?.hasPane(companionId), false,
+                       "Precondition: companion terminal is not yet spawned")
+        publishDrag(from: winA, tabId: "a-claude", paneId: "cA")
+
+        PaneTearOffController(services: services).tearOff(
+            paneId: "cA",
+            sourceWindowSessionId: "win-A",
+            at: NSPoint(x: 0, y: 0),
+            openWindow: {}
+        )
+
+        // Focus shifted to the companion terminal AND it was spawned.
+        XCTAssertEqual(winA.tabs.tab(for: "a-claude")?.activePaneId, companionId)
+        XCTAssertEqual(winA.sessions.ptySessions["a-claude"]?.hasPane(companionId), true,
+                       "Source tab's new active terminal must be spawned (bug 3)")
+
+        _ = services.consumeTearOffSeed()
+    }
 }

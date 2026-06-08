@@ -1256,6 +1256,69 @@ final class SessionsModel {
         return newTabId
     }
 
+    /// Adopt a live terminal pane (torn off from another window's
+    /// TERMINALS section) as THIS window's Main terminal — REPLACING the
+    /// pristine auto-seeded Main pane rather than adding a second
+    /// TERMINALS section. This is the terminal-from-Terminals-section
+    /// sibling to `adoptTerminalPaneAsNewTab` (which is used for a
+    /// companion terminal torn off a Claude project).
+    ///
+    /// The new window seeds a fresh "Main" terminal tab in `start()`
+    /// (`TabModel.init` / `ensureTerminalsProjectSeeded`); its single pane
+    /// is deferred-armed (no real child yet). We:
+    ///   1. Tear that seeded pane down (`terminatePane` handles the
+    ///      armed-deferred / spawned / unspawned cases without leaking).
+    ///   2. Replace the Main tab's pane list with the single torn-off
+    ///      `Pane(id: paneId, …)` and focus it.
+    ///   3. Select the Main tab.
+    ///   4. Adopt the live entry into the Main tab's existing session via
+    ///      `session.adoptPane` (same mechanism `adoptTerminalPaneAsNewTab`
+    ///      uses) — the Main tab's session already exists because
+    ///      `AppState.start()` called `makeSession` for it.
+    /// Keeps the Main tab's id and title ("Main"). Fires
+    /// `onSessionMutation`. Returns the Main tab id, or nil when `tabs`
+    /// is gone or the Main tab can't be found.
+    @discardableResult
+    func adoptTerminalPaneAsMainTerminal(
+        entry: TabPtySession.PaneEntry,
+        paneId: String,
+        title: String
+    ) -> String? {
+        guard let tabs else { return nil }
+        let mainTabId = TabModel.mainTerminalTabId
+        guard let mainTab = tabs.tab(for: mainTabId) else { return nil }
+
+        // Snapshot the pristine seeded pane ids before mutating the tree.
+        let seededPaneIds = mainTab.panes.map(\.id)
+
+        // 1. Replace the Main tab's panes with the single torn-off pane
+        //    and focus it. Keep id/title "Main".
+        tabs.mutateTab(id: mainTabId) { tab in
+            tab.panes = [Pane(id: paneId, title: title, kind: .terminal)]
+            tab.activePaneId = paneId
+        }
+        tabs.activeTabId = mainTabId
+
+        // 2. Adopt the live entry into the Main tab's session BEFORE
+        //    retiring the seeded pty. The session exists (start() made
+        //    it); fall back to creating one if not. Adopting first means
+        //    the session already hosts `paneId`, so the `ensureActivePane
+        //    Spawned` that `paneExited` runs in step 3 sees the active
+        //    pane as spawned and won't double-spawn it.
+        adoptLivePane(tabId: mainTabId, paneId: paneId, entry: entry)
+
+        // 3. Retire the seeded pty entries. The model no longer references
+        //    them, so the `paneExited` they fire is a no-op on the
+        //    (already-replaced) tab — it only removes the stale pty entry.
+        //    Skip the torn-off id defensively.
+        for seededId in seededPaneIds where seededId != paneId {
+            terminatePane(tabId: mainTabId, paneId: seededId)
+        }
+
+        onSessionMutation?()
+        return mainTabId
+    }
+
     // MARK: - Helpers exposed to the close-request coordinator on AppState
 
     /// Ask the pty session whether the named terminal pane currently

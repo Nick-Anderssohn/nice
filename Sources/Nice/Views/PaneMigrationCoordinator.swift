@@ -104,6 +104,15 @@ struct PaneMigrationCoordinator {
         // Dissolve the source tab if the move emptied it (existing
         // last-pane rules, multi-window-safe).
         source.dissolveTabIfEmpty(tabId: handle.sourceTabId)
+
+        // Bug 3 (shared gap): `extractPane` shifts the source's active
+        // pane to a deferred neighbor without spawning it, and a dissolve
+        // may switch focus to a different tab. Spawn whichever tab is
+        // active on the source now so it doesn't render blank. No-op when
+        // already spawned / Claude / no session.
+        if let activeTabId = source.tabs.activeTabId {
+            source.sessions.ensureActivePaneSpawned(tabId: activeTabId)
+        }
         return true
     }
 
