@@ -100,12 +100,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
         super.init(frame: frame)
         registerForDraggedTypes(Self.acceptedDragTypes)
         useStandardAnsi256Palette()
+        useSteadyCursor()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerForDraggedTypes(Self.acceptedDragTypes)
         useStandardAnsi256Palette()
+        useSteadyCursor()
     }
 
     /// Override SwiftTerm's `.base16Lab` default for the 256-color
@@ -120,6 +122,20 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// terminals all converge on.
     private func useStandardAnsi256Palette() {
         getTerminal().ansi256PaletteStrategy = .xterm
+    }
+
+    /// Force a non-blinking block cursor. SwiftTerm defaults to
+    /// `.blinkBlock`, and nothing in a normal shell / vim / Claude
+    /// session emits a cursor-style escape sequence, so they all inherit
+    /// that blinking default. A steady cursor keeps the caret position
+    /// readable while holding motion keys (vim `w`/`e`/`b`) instead of
+    /// fading in and out. Both render paths (CoreGraphics caret + Metal
+    /// renderer) read `options.cursorStyle` live, so this one call covers
+    /// both. A program that actively emits a *blinking* DECSCUSR sequence
+    /// could still override it — if that turns out to happen, the fix
+    /// moves into the SwiftTerm fork (coerce blink→steady centrally).
+    private func useSteadyCursor() {
+        getTerminal().setCursorStyle(.steadyBlock)
     }
 
     /// Apply the hardware-acceleration preference. No-op when the view
