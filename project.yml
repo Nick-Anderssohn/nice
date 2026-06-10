@@ -119,6 +119,15 @@ packages:
     #     Metal path has no throttle), so it's the cap that applies
     #     when Nice's "Hardware acceleration" toggle is disabled.
     #     `queueMetalDisplay` (the Metal path) is unchanged.
+    #   - forward Command-modified keys under the kitty keyboard
+    #     protocol. `keyDown` only routed Control / Option-as-Meta
+    #     into the kitty encoder, so Cmd+key combos fell through to
+    #     AppKit and were dropped — apps that enable the protocol
+    #     (Claude Code's fullscreen) never received Cmd+C. Command
+    #     keys now encode as CSI-u (Cmd+C → ESC[99;9u); the default
+    #     Edit menu still claims Cmd+V and Cmd+C-with-selection
+    #     before keyDown, so native paste / selection-copy are
+    #     unaffected.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is plumbed
@@ -134,7 +143,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: 8e4b0cce2a46d0ce8059874eaba1c9c02cf7ca86
+    revision: cceae86f523b4682bb34f2f05ca8fb9349a6f9b2
 
 targets:
   Nice:
