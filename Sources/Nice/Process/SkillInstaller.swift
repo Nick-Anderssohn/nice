@@ -217,9 +217,11 @@ enum SkillInstaller {
 
     The second argument lets the user customise what the new session does
     after reading the handoff file. When it is empty the new session will
-    simply continue the work from the next steps listed in the file. When
-    the user passes a custom instruction (e.g. `/nice-handoff focus only on
-    the UI layer`) that string becomes the opening prompt in the new session.
+    read the handoff file and then wait for the user to say how to proceed —
+    it does not start working on its own. When the user passes a custom
+    instruction (e.g. `/nice-handoff keep going` or `/nice-handoff focus only
+    on the UI layer`) that string tells the new session what to do after
+    reading the file, so it can continue the work right away.
 
     ## 3. Report back
 

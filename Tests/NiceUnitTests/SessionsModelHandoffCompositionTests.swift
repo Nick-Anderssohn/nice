@@ -26,8 +26,8 @@ final class SessionsModelHandoffCompositionTests: XCTestCase {
 
         XCTAssertTrue(result.contains(file),
                       "prompt must reference the handoff file path")
-        XCTAssertTrue(result.hasSuffix("Then continue the work described there."),
-                      "empty instructions must fall back to the default directive")
+        XCTAssertTrue(result.hasSuffix("Do not start working yet — once you have read it, wait for the user to tell you how to proceed."),
+                      "empty instructions must fall back to the default wait-for-user directive")
     }
 
     func test_handoffPrompt_nonEmptyInstructions_containsCustomText_andNotDefaultDirective() {
@@ -40,7 +40,7 @@ final class SessionsModelHandoffCompositionTests: XCTestCase {
 
         XCTAssertTrue(result.contains(customInstructions),
                       "non-empty instructions must appear verbatim in the prompt")
-        XCTAssertFalse(result.contains("Then continue the work described there."),
+        XCTAssertFalse(result.contains("wait for the user to tell you how to proceed"),
                        "custom instructions must replace, not join, the default directive")
     }
 
@@ -54,7 +54,7 @@ final class SessionsModelHandoffCompositionTests: XCTestCase {
             instructions: "   \n\t "
         )
 
-        XCTAssertTrue(result.hasSuffix("Then continue the work described there."),
+        XCTAssertTrue(result.hasSuffix("Do not start working yet — once you have read it, wait for the user to tell you how to proceed."),
                       "whitespace-only instructions must fall back to the default directive")
         XCTAssertFalse(result.contains("   \n\t "),
                        "whitespace-only instructions must not appear in the prompt")

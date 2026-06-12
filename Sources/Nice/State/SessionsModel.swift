@@ -1130,12 +1130,16 @@ final class SessionsModel {
     ///
     /// Always points Claude at the notes file; the continuation is the
     /// skill's custom `instructions` when non-blank (direct `/nice-handoff
-    /// <args>` invocations), otherwise a generic "continue the work"
-    /// directive (model-triggered / no-arg invocations).
+    /// <args>` invocations), otherwise a default "wait for the user"
+    /// directive (model-triggered / no-arg invocations). The default
+    /// deliberately does NOT auto-resume the work — a no-arg handoff lands
+    /// the fresh session in a read-and-await state so the user stays in
+    /// control of when (and how) it picks up. Passing custom instructions
+    /// (e.g. `/nice-handoff keep going`) overrides this to continue.
     nonisolated static func handoffPrompt(handoffFile: String, instructions: String) -> String {
         let trimmed = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
         let directive = trimmed.isEmpty
-            ? "Then continue the work described there."
+            ? "Do not start working yet — once you have read it, wait for the user to tell you how to proceed."
             : trimmed
         return "Read the handoff notes at \(handoffFile). " + directive
     }
