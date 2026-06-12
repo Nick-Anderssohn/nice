@@ -186,11 +186,6 @@ final class SessionsModel {
         themeCache.updateTerminalFontFamily(name)
     }
 
-    /// Forward to `themeCache.updateHardwareAcceleration`.
-    func updateHardwareAcceleration(_ enabled: Bool) {
-        themeCache.updateHardwareAcceleration(enabled)
-    }
-
     /// Forward to `themeCache.updateSmoothScrolling`.
     func updateSmoothScrolling(_ enabled: Bool) {
         themeCache.updateSmoothScrolling(enabled)

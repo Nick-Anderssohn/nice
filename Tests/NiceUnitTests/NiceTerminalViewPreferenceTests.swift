@@ -6,10 +6,10 @@
 //  reads the `smoothScrollPreference` closure and writes the result to
 //  `smoothScrollingEnabled`.
 //
-//  Note: `applyHardwareAccelerationPreference()` is not tested here
-//  because it guards on `window != nil` and Metal is unavailable in a
-//  headless test host. `applySmoothScrollPreference()` has no such gate
-//  and is safe to exercise against a zero-frame, detached view.
+//  Note: `enableHardwareAcceleration()` is not tested here because it
+//  guards on `window != nil` and Metal is unavailable in a headless test
+//  host. `applySmoothScrollPreference()` has no such gate and is safe to
+//  exercise against a zero-frame, detached view.
 //
 
 import AppKit

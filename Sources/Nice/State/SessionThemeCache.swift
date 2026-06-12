@@ -62,10 +62,6 @@ final class SessionThemeCache {
     /// (SF Mono → JetBrains Mono NL → system monospaced).
     private(set) var terminalFontFamily: String? = nil
 
-    /// Whether terminal panes use SwiftTerm's Metal renderer. Defaults ON;
-    /// `updateHardwareAcceleration` fans changes to every live receiver.
-    private(set) var hardwareAcceleration: Bool = true
-
     /// Whether terminal panes use smooth scrolling. Placeholder seed (OFF — the
     /// product default) until `updateSmoothScrolling` syncs the real value from
     /// `Tweaks`; thereafter it fans changes to every live receiver.
@@ -128,16 +124,6 @@ final class SessionThemeCache {
         }
     }
 
-    /// Fan out a hardware-acceleration change (Metal on/off) to every
-    /// live receiver. Called by `SessionsModel.updateHardwareAcceleration`
-    /// when the user toggles the setting in the Advanced pane.
-    func updateHardwareAcceleration(_ enabled: Bool) {
-        hardwareAcceleration = enabled
-        for receiver in receivers() {
-            receiver.applyHardwareAcceleration(enabled)
-        }
-    }
-
     /// Fan out a smooth-scrolling change to every live receiver. Called
     /// by `SessionsModel.updateSmoothScrolling` when the user toggles
     /// the setting in the Advanced pane.
@@ -164,7 +150,6 @@ final class SessionThemeCache {
         receiver.applyTheme(scheme, palette: palette, accent: accent)
         receiver.applyTerminalTheme(terminalTheme)
         receiver.applyTerminalFont(size: terminalFontSize)
-        receiver.applyHardwareAcceleration(hardwareAcceleration)
         receiver.applySmoothScrolling(smoothScrolling)
     }
 }

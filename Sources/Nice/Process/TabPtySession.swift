@@ -33,7 +33,6 @@ protocol TabPtySessionThemeable: AnyObject {
     func applyTerminalFont(size: CGFloat)
     func applyTerminalTheme(_ theme: TerminalTheme)
     func applyTerminalFontFamily(_ name: String?)
-    func applyHardwareAcceleration(_ enabled: Bool)
     func applySmoothScrolling(_ enabled: Bool)
 }
 
@@ -150,11 +149,6 @@ final class TabPtySession: TabPtySessionThemeable {
     /// actual current theme immediately, so this only matters if
     /// something creates a `TabPtySession` directly (tests, previews).
     private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
-
-    /// Cached hardware-acceleration flag (SwiftTerm Metal renderer ON/OFF).
-    /// Panes spawned after a settings change pick this up at construction
-    /// via `view.hardwareAccelerationPreference`. Defaults ON.
-    private var currentHardwareAcceleration: Bool = true
 
     /// Cached smooth-scrolling flag. Panes spawned after a settings change
     /// pick this up at construction via `view.smoothScrollPreference`.
@@ -274,7 +268,6 @@ final class TabPtySession: TabPtySessionThemeable {
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
-        view.hardwareAccelerationPreference = { [weak self] in self?.currentHardwareAcceleration ?? true }
         view.smoothScrollPreference = { [weak self] in self?.currentSmoothScrolling ?? false }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
@@ -358,7 +351,6 @@ final class TabPtySession: TabPtySessionThemeable {
     ) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
-        view.hardwareAccelerationPreference = { [weak self] in self?.currentHardwareAcceleration ?? true }
         view.smoothScrollPreference = { [weak self] in self?.currentSmoothScrolling ?? false }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
@@ -898,16 +890,6 @@ final class TabPtySession: TabPtySessionThemeable {
         let font = Self.terminalFont(named: currentTerminalFontFamily, size: size)
         for entry in entries.values {
             entry.view.font = font
-        }
-    }
-
-    /// Switch the Metal renderer on or off for every live pane.
-    /// Caches the value so panes spawned after this call pick it up
-    /// at construction via `view.hardwareAccelerationPreference`.
-    func applyHardwareAcceleration(_ enabled: Bool) {
-        currentHardwareAcceleration = enabled
-        for entry in entries.values {
-            entry.view.applyHardwareAccelerationPreference()
         }
     }
 

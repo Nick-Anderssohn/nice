@@ -2238,11 +2238,10 @@ final class NiceUITests: NiceUITestCase {
         return app.descendants(matching: .any)[id]
     }
 
-    /// Advanced pane exposes the Hardware acceleration and Smooth scrolling
-    /// toggles. Smooth scrolling is disabled (but not forced off) when
-    /// Hardware acceleration is OFF — the coupling reflects SwiftTerm's
-    /// `smoothScrollingEnabled && isUsingMetalRenderer` gate.
-    func testSettingsAdvanced_togglesAndCoupling() throws {
+    /// Advanced pane exposes the Smooth scrolling toggle. Hardware
+    /// acceleration is always on (no longer user-configurable), so smooth
+    /// scrolling is always interactive.
+    func testSettingsAdvanced_smoothScrollingToggle() throws {
         let app = launchApp()
         XCTAssertTrue(
             app.descendants(matching: .any)["sidebar.terminals"]
@@ -2251,39 +2250,22 @@ final class NiceUITests: NiceUITestCase {
 
         openAdvancedPane(app)
 
-        let hwToggle = advancedToggle(app, "settings.advanced.hardwareAcceleration")
         let ssToggle = advancedToggle(app, "settings.advanced.smoothScrolling")
 
-        XCTAssertTrue(hwToggle.exists,
-                      "Hardware acceleration toggle must exist in the Advanced pane")
         XCTAssertTrue(ssToggle.exists,
                       "Smooth scrolling toggle must exist in the Advanced pane")
 
-        // Hardware acceleration defaults ON; smooth scrolling is opt-in and
-        // defaults OFF.
-        XCTAssertTrue(toggleIsOn(hwToggle),
-                      "Hardware acceleration must default ON")
+        // Smooth scrolling is opt-in and defaults OFF; the control is always
+        // interactive now that hardware acceleration is always on.
         XCTAssertFalse(toggleIsOn(ssToggle),
                        "Smooth scrolling must default OFF (opt-in)")
         XCTAssertTrue(ssToggle.isEnabled,
-                      "Smooth scrolling must be enabled while hardware acceleration is ON")
+                      "Smooth scrolling must always be enabled")
 
-        // Turn hardware acceleration OFF — smooth scrolling must become disabled.
-        hwToggle.click()
-        XCTAssertFalse(toggleIsOn(hwToggle),
-                       "Hardware acceleration toggle must now be OFF")
-        XCTAssertFalse(ssToggle.isEnabled,
-                       "Smooth scrolling control must be disabled when hardware acceleration is OFF")
-        // The smooth scrolling value must remain unchanged (just non-interactive).
-        XCTAssertFalse(toggleIsOn(ssToggle),
-                       "Smooth scrolling value must stay unchanged when its control is disabled")
-
-        // Turn hardware acceleration back ON — smooth scrolling must re-enable.
-        hwToggle.click()
-        XCTAssertTrue(toggleIsOn(hwToggle),
-                      "Hardware acceleration must be ON again")
-        XCTAssertTrue(ssToggle.isEnabled,
-                      "Smooth scrolling must be re-enabled when hardware acceleration is turned back ON")
+        // Toggling it ON must stick.
+        ssToggle.click()
+        XCTAssertTrue(toggleIsOn(ssToggle),
+                      "Smooth scrolling must turn ON when clicked")
     }
 
     /// Read a toggle's on/off state tolerantly. macOS surfaces an

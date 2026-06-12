@@ -27,7 +27,6 @@ final class FakeTabPtySession: TabPtySessionThemeable {
     private(set) var applyTerminalFontSizeCalls: [CGFloat] = []
     private(set) var applyTerminalThemeCalls: [TerminalTheme] = []
     private(set) var applyTerminalFontFamilyCalls: [String?] = []
-    private(set) var applyHardwareAccelerationCalls: [Bool] = []
     private(set) var applySmoothScrollingCalls: [Bool] = []
 
     func applyTheme(_ scheme: ColorScheme, palette: Palette, accent: NSColor) {
@@ -44,10 +43,6 @@ final class FakeTabPtySession: TabPtySessionThemeable {
 
     func applyTerminalFontFamily(_ name: String?) {
         applyTerminalFontFamilyCalls.append(name)
-    }
-
-    func applyHardwareAcceleration(_ enabled: Bool) {
-        applyHardwareAccelerationCalls.append(enabled)
     }
 
     func applySmoothScrolling(_ enabled: Bool) {

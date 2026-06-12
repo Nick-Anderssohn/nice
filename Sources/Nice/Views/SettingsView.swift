@@ -581,28 +581,13 @@ private struct AdvancedPane: View {
         SettingTitle("Advanced")
 
         SettingRow(
-            label: "Hardware acceleration",
-            hint: "Uses the Metal/GPU renderer for terminal drawing. Falls back to CPU (CoreGraphics) automatically if Metal is unavailable."
-        ) {
-            Toggle("", isOn: $tweaks.hardwareAcceleration)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .accessibilityIdentifier("settings.advanced.hardwareAcceleration")
-        }
-
-        SettingRow(
             label: "Smooth scrolling",
-            hint: "Animates terminal scrolling. Requires hardware acceleration — disabled automatically when Metal is off."
+            hint: "Animates terminal scrolling."
         ) {
             Toggle("", isOn: $tweaks.smoothScrolling)
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .disabled(!tweaks.hardwareAcceleration)
-                .help(tweaks.hardwareAcceleration
-                    ? ""
-                    : "Smooth scrolling requires hardware acceleration to be enabled.")
                 .accessibilityIdentifier("settings.advanced.smoothScrolling")
         }
     }

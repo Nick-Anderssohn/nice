@@ -31,11 +31,6 @@ import SwiftTerm
 
 @MainActor
 final class NiceTerminalView: LocalProcessTerminalView {
-    /// Called by `TabPtySession` to provide the hardware-acceleration
-    /// preference at the time of window attachment. Returns `true` (on)
-    /// when unset — safe default for views that haven't been wired yet.
-    var hardwareAccelerationPreference: (() -> Bool)?
-
     /// Called by `TabPtySession` to provide the smooth-scrolling
     /// preference at the time of window attachment. Returns `true` (on)
     /// when unset.
@@ -138,18 +133,15 @@ final class NiceTerminalView: LocalProcessTerminalView {
         getTerminal().setCursorStyle(.steadyBlock)
     }
 
-    /// Apply the hardware-acceleration preference. No-op when the view
-    /// isn't in a window — called from `viewDidMoveToWindow` and by
-    /// `TabPtySession.applyHardwareAcceleration` when the setting changes
-    /// while panes are live. Idempotent: SwiftTerm's `setUseMetal`
-    /// short-circuits when the renderer is already in the requested state.
-    /// Falls back silently to CoreGraphics on devices where Metal isn't
-    /// available (VMs, some CI runners).
-    func applyHardwareAccelerationPreference() {
+    /// Turn on SwiftTerm's Metal renderer. Hardware acceleration is always
+    /// on; this is a no-op when the view isn't in a window — Metal requires
+    /// window attachment for its `CAMetalLayer`, so it's called from
+    /// `viewDidMoveToWindow`. Falls back silently to CoreGraphics on devices
+    /// where Metal isn't available (VMs, some CI runners).
+    func enableHardwareAcceleration() {
         guard window != nil else { return }
-        let desired = hardwareAccelerationPreference?() ?? true
         do {
-            try setUseMetal(desired)
+            try setUseMetal(true)
         } catch {
             NSLog("NiceTerminalView: Metal renderer unavailable, falling back to CoreGraphics: \(error)")
         }
@@ -166,7 +158,7 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        applyHardwareAccelerationPreference()
+        enableHardwareAcceleration()
         applySmoothScrollPreference()
         // Disable Apple's `setShouldSmoothFonts` stem-darkening unconditionally,
         // regardless of whether Metal or CoreGraphics is active.

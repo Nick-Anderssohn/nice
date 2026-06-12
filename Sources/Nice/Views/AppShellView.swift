@@ -349,7 +349,6 @@ private struct AppShellHost: View {
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
             appState.sessions.updateTerminalFontSize(fontSettings.terminalFontSize)
-            appState.sessions.updateHardwareAcceleration(tweaks.hardwareAcceleration)
             appState.sessions.updateSmoothScrolling(tweaks.smoothScrolling)
         }
         .onChange(of: scheme) { _, newScheme in
@@ -384,9 +383,6 @@ private struct AppShellHost: View {
         }
         .onChange(of: tweaks.terminalFontFamily) { _, newValue in
             appState.sessions.updateTerminalFontFamily(newValue)
-        }
-        .onChange(of: tweaks.hardwareAcceleration) { _, newValue in
-            appState.sessions.updateHardwareAcceleration(newValue)
         }
         .onChange(of: tweaks.smoothScrolling) { _, newValue in
             appState.sessions.updateSmoothScrolling(newValue)
