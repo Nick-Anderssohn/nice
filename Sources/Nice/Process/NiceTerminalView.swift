@@ -149,8 +149,8 @@ final class NiceTerminalView: LocalProcessTerminalView {
 
     /// Apply the smooth-scrolling preference. Safe to call at any time;
     /// SwiftTerm's smooth path also gates on `isUsingMetalRenderer` at
-    /// runtime, so toggling this while hardware acceleration is off is a
-    /// no-op in practice.
+    /// runtime, so toggling this while the view falls back to
+    /// CoreGraphics is a no-op in practice.
     func applySmoothScrollPreference() {
         // Default OFF when no preference is wired (smooth scrolling is opt-in).
         smoothScrollingEnabled = smoothScrollPreference?() ?? false

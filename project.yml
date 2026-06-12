@@ -96,7 +96,8 @@ packages:
     #   - reproduce that same composition curve on the CoreGraphics
     #     (software) draw path via an offscreen coverage pass
     #     (`TextCompositionCurve` / `TextCompositionCompositor`), so
-    #     glyph weight matches when Hardware acceleration is OFF. The
+    #     glyph weight matches when the Metal renderer is unavailable
+    #     and the view falls back to CoreGraphics. The
     #     curve params are now sourced from one place
     #     (`TextCompositionCurve.params`) shared by both renderers;
     #     color/emoji glyphs are skipped via `ColorFontDetector`.
@@ -117,7 +118,8 @@ packages:
     #     to 120 Hz in `queuePendingDisplay` (delay 16670000 →
     #     8335000 ns). This path only runs when Metal is off (the
     #     Metal path has no throttle), so it's the cap that applies
-    #     when Nice's "Hardware acceleration" toggle is disabled.
+    #     when the Metal renderer is unavailable and the view falls
+    #     back to CoreGraphics.
     #     `queueMetalDisplay` (the Metal path) is unchanged.
     #   - forward Command-modified keys under the kitty keyboard
     #     protocol. `keyDown` only routed Control / Option-as-Meta
@@ -133,8 +135,9 @@ packages:
     # regression the throttle was masking. Smooth scrolling is plumbed
     # through `Tweaks.smoothScrolling` — a user toggle in Settings →
     # Advanced (default off; opt-in) — and only takes effect on the Metal path:
-    # the control is disabled when Hardware acceleration is off, matching
-    # SwiftTerm's `smoothScrollingEnabled && isUsingMetalRenderer` gate.
+    # it no-ops when the Metal renderer is unavailable and the view falls back
+    # to CoreGraphics, matching SwiftTerm's
+    # `smoothScrollingEnabled && isUsingMetalRenderer` gate.
     # These patches all live on the fork's `main` branch now; no
     # feature branches needed. To pick up an upstream bump, rebase
     # the fork onto the new revision and update the pin here.
