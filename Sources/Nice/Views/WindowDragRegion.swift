@@ -22,6 +22,16 @@
 //     that class — otherwise double-clicks anywhere in the vibrancy-
 //     tinted sidebar would zoom.
 //
+//     The same monitor also OWNS the `isMovable = false` policy: on
+//     every leftMouseDown in a full-size-content window it forces
+//     `isMovable = false` before AppKit's title-bar tracker reads the
+//     flag. Because a local monitor runs before NSApplication dispatch,
+//     the tracker can never see `isMovable == true` on a press — so a
+//     window born mid-drag (whose properties AppKit re-finalizes back to
+//     `true`) can't let a pill press ride the native title-bar drag
+//     (BUG C). This replaced the open-loop `isMovable` re-assert timers
+//     that previously lived in `AppShellView`.
+//
 //  Phase A of the title-bar refactor tried to fold (2) into a
 //  `mouseDown(_:)` override on `DragView` that calls `performZoom`
 //  for `clickCount >= 2` — eliminating the process-wide event hook.
@@ -54,12 +64,17 @@ struct WindowDragRegion: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     final class DragView: NSView {
-        // NOTE: this flag no longer drives the window drag. The window
-        // sets `isMovable = false` (AppShellView) to stop pane pills from
-        // riding the native title-bar drag, and that also disables the
+        // NOTE: this flag no longer drives the window drag. The window's
+        // `isMovable = false` policy stops pane pills from riding the
+        // native title-bar drag, and that also disables the
         // `mouseDownCanMoveWindow` drag path entirely — so empty-chrome
         // dragging is now handled by a SwiftUI `DragGesture` →
-        // `performDrag` in `WindowToolbarView`. We keep the flag `true`
+        // `performDrag` in `WindowToolbarView`. `isMovable = false` is now
+        // OWNED by the per-press event-time invariant in
+        // `TitleBarZoomMonitor`'s local monitor (asserted on every
+        // leftMouseDown before AppKit's title-bar tracker reads it);
+        // `AppShellView` keeps only the harmless initial assignment at
+        // window attach. We keep the flag `true`
         // only because `TitleBarZoomMonitor` walks for a
         // `mouseDownCanMoveWindow == true` view (excluding
         // `NSVisualEffectView`) to recognise empty chrome for
@@ -157,6 +172,28 @@ enum TitleBarZoomMonitor {
         installed = true
 
         NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            // BUG C event-time invariant: on EVERY left mouse-down in a
+            // full-size-content window, force `isMovable = false` before
+            // anything else. Local monitors run BEFORE NSApplication
+            // dispatches the event to AppKit's title-bar tracker, so the
+            // tracker can never observe `isMovable == true` on a press —
+            // even for a window born mid-drag whose properties AppKit
+            // re-finalized back to the default `true` after the
+            // synchronous `WindowAccessor` pass. This is the event-driven
+            // replacement for the deleted 0/0.05/0.2s `AppShellView`
+            // timer loop (which lost the race when re-finalization landed
+            // after the last tick); it is exactly Design 2's
+            // ChromeEventFunnel `isMovable` policy shipped early. Runs for
+            // any leftMouseDown in any styleMask but only flips
+            // full-size-content windows (so the Settings window with
+            // standard chrome is untouched). Falls through to the
+            // double-click logic below unchanged.
+            if let w = event.window,
+               w.styleMask.contains(.fullSizeContentView),
+               w.isMovable {
+                w.isMovable = false
+            }
+
             guard event.clickCount == 2 else { return event }
             guard let window = event.window else { return event }
             guard let contentView = window.contentView else { return event }

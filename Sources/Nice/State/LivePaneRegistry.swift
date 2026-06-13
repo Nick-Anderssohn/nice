@@ -13,18 +13,47 @@
 //  from the source window.
 //
 //  Lifecycle: the drag source `publish`es a `Handle` at drag start whose
-//  `claim` closure detaches the entry from its source `SessionsModel`
-//  on first call. The destination (cross-window drop or tear-off
-//  controller) calls `claim(paneId:)` exactly once to take ownership.
+//  `claim` closure resolves the source pane to a `PaneClaim` on first
+//  call — `.live(entry)` (the pty was running; the entry is detached
+//  one-shot), `.notSpawned(cwd:)` (modelled but spawn deferred; the
+//  destination spawns it fresh), or `.gone`. The destination
+//  (cross-window drop or tear-off controller) calls `claim(paneId:)`
+//  exactly once to take ownership and switches over the tri-state.
 //  Any drag that ends without a cross-window destination (an intra-
 //  window reorder, or a cancelled drag) calls `withdraw` so the handle
-//  is dropped without ever detaching — the pane stays put.
+//  is dropped without ever resolving — the pane stays put.
 //
 //  Owned by `NiceServices` (one instance per process) so every window's
 //  pill and drop delegate reach the same channel.
 //
 
 import Foundation
+
+/// The outcome of taking ownership of a dragged pane from its source
+/// window. A CLOSED tri-state so every consumer (tear-off, migration)
+/// must handle the unspawned case explicitly — the compiler refuses a
+/// non-exhaustive switch, which is exactly the silent-nil trap (BUG A)
+/// this type replaces:
+///
+///   - `.live(entry)`     — the pane had a running pty; the live
+///     `PaneEntry` was detached one-shot and is handed over to migrate.
+///   - `.notSpawned(cwd:)` — the pane is MODELLED in the source tab but
+///     its pty spawn was still deferred (e.g. a terminal restored at
+///     startup, never focused). There is nothing to migrate live; the
+///     destination must spawn it fresh, in `cwd` (resolved from the
+///     SOURCE model at claim time so a restored pane tears off into the
+///     right directory).
+///   - `.gone`            — the pane is neither live nor modelled
+///     (already exited / withdrawn). Consumers abort.
+enum PaneClaim {
+    /// A live pty entry detached from the source session.
+    case live(TabPtySession.PaneEntry)
+    /// The pane exists in the model but was never spawned; carry the
+    /// resolved spawn cwd so the destination can start it in place.
+    case notSpawned(cwd: String)
+    /// The pane is gone — no live entry and no model. Abort.
+    case gone
+}
 
 @MainActor
 @Observable
@@ -39,11 +68,15 @@ final class LivePaneRegistry {
         let sourceWindowSessionId: String
         /// Tab the pane currently lives in, in the source window.
         let sourceTabId: String
-        /// Detach the live entry from its source on the FIRST call and
-        /// return it; later calls (or a pane that already exited) return
-        /// nil. Supplied by the drag source so this type stays unaware
-        /// of `SessionsModel`.
-        let claim: () -> TabPtySession.PaneEntry?
+        /// Resolve the source pane to a `PaneClaim` on the FIRST call:
+        /// `.live(entry)` when the pty was running (the entry is
+        /// detached one-shot), `.notSpawned(cwd:)` when the pane is
+        /// modelled but its spawn was deferred, or `.gone` when neither
+        /// holds. Supplied by the drag source so this type stays unaware
+        /// of `SessionsModel`. The tri-state is what lets the tear-off /
+        /// migration consumers spawn-and-proceed for a deferred pane
+        /// instead of silently no-op'ing on it.
+        let claim: () -> PaneClaim
     }
 
     /// Active drag handles keyed by pane id. At most one drag is in
@@ -76,16 +109,24 @@ final class LivePaneRegistry {
         handles[id]
     }
 
-    /// Take ownership of the live entry for `paneId`. One-shot: the
-    /// handle is removed whether or not the detach succeeds, so a stray
-    /// second drop can't double-migrate the same pane. Returns the
-    /// handle (for its source context) plus the detached live entry, or
-    /// nil when no handle is registered or the pane has already exited.
-    func claim(paneId id: String) -> (handle: Handle, entry: TabPtySession.PaneEntry)? {
+    /// Take ownership of the pane for `paneId`. One-shot: the handle is
+    /// removed whether the claim is `.live`, `.notSpawned`, or `.gone`,
+    /// so a stray second drop can't double-claim the same pane. Returns
+    /// the handle (for its source context) paired with the resolved
+    /// `PaneClaim`.
+    ///
+    /// Returns nil ONLY when no handle is registered for `id` — the
+    /// "already withdrawn / never published" case. When a handle IS
+    /// registered the tuple is ALWAYS returned, even for `.gone`, so
+    /// removal stays one-shot and the caller can distinguish
+    /// `.notSpawned` (spawn-and-proceed) from `.gone` (abort). This is
+    /// the structural fix for BUG A: the old API folded "not spawned
+    /// yet" and "already dead" into a single nil that the consumers'
+    /// `guard let` swallowed, silently dropping the tear-off / migration.
+    func claim(paneId id: String) -> (handle: Handle, claim: PaneClaim)? {
         if currentDrag?.paneId == id { currentDrag = nil }
         guard let handle = handles.removeValue(forKey: id) else { return nil }
-        guard let entry = handle.claim() else { return nil }
-        return (handle, entry)
+        return (handle, handle.claim())
     }
 
     /// Drop the handle for `paneId` without detaching. Called when a

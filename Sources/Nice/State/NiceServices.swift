@@ -120,8 +120,11 @@ final class NiceServices {
     /// the natural model; in practice at most one entry is outstanding
     /// at a time.
     struct PendingTearOff {
-        /// The live pty entry detached from the source window.
-        let entry: TabPtySession.PaneEntry
+        /// The live pty entry detached from the source window, or nil
+        /// when the torn-off pane was modelled-but-deferred in the source
+        /// (never spawned). A nil entry means the destination must spawn
+        /// the pane fresh — using `cwd` — rather than adopt a live one.
+        let entry: TabPtySession.PaneEntry?
         /// Stable id of the pane being torn off.
         let paneId: String
         /// Display title of the pane (pill label).
@@ -135,6 +138,12 @@ final class NiceServices {
         let projectId: String
         let projectName: String
         let projectPath: String
+        /// Resolved spawn cwd for the torn-off pane, carried from the
+        /// SOURCE model at claim time so a deferred (nil-`entry`) pane
+        /// spawns in the right directory in the destination window. Set
+        /// for both the `.live` and `.notSpawned` claims; nil only as a
+        /// defensive fallback. (Graft 0 — cwd-carrying claim.)
+        let cwd: String?
         /// Screen-coordinate origin where the new window should appear,
         /// matching the drag release point so the window "pops out" at
         /// the cursor.

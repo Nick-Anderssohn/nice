@@ -243,23 +243,18 @@ private struct AppShellHost: View {
                 // `windowDragGesture` yields rather than moving the window.
                 // Programmatic frame save/restore (`WindowSession`) is
                 // unaffected — isMovable gates user drags, not `setFrame`.
+                // Harmless initial assignment. The per-press event-time
+                // invariant in `TitleBarZoomMonitor` (a local `NSEvent`
+                // monitor that flips `isMovable` to false on every
+                // leftMouseDown in a full-size-content window, BEFORE
+                // AppKit's title-bar tracker consults the flag) now owns
+                // the `isMovable` policy — so a window born mid-drag whose
+                // properties AppKit re-finalizes back to `isMovable = true`
+                // can never let a pill press ride the native title-bar
+                // drag. That replaces the old 0/0.05/0.2s re-assert timer
+                // loop, which lost the race when re-finalization landed
+                // after the last tick (BUG C).
                 window.isMovable = false
-                // A window born during a live drag session (a tear-off
-                // window opened from inside the pill's `NSDraggingSession`
-                // end-callback) can have AppKit re-finalize its window
-                // properties AFTER this first assignment — restoring the
-                // default `isMovable = true`. That re-enables the native
-                // title-bar drag, so a pill press in the 52pt band drags the
-                // WHOLE window (it bypasses the `WindowDragGate` veto, which
-                // only governs the SwiftUI `windowDraggable` path) — the
-                // tear-off-window "pill drag moves the window" bug. Re-assert
-                // on the next runloop ticks so our value wins regardless of
-                // when AppKit settles. Idempotent.
-                for delay in [0.0, 0.05, 0.2] {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak window] in
-                        window?.isMovable = false
-                    }
-                }
                 TrafficLightNudger.nudge(
                     window: window,
                     dx: WindowChrome.trafficLightNudgeX,
@@ -361,10 +356,14 @@ private struct AppShellHost: View {
                     // the Main). A companion terminal torn off a Claude
                     // project keeps the per-project-section behavior.
                     if seed.projectId == TabModel.terminalsProjectId {
+                        // `seed.entry` is optional: an unspawned torn-off
+                        // pane (nil entry) spawns fresh in `seed.cwd` so
+                        // it opens in the right directory (BUG A / graft 0).
                         appState.sessions.adoptTerminalPaneAsMainTerminal(
                             entry: seed.entry,
                             paneId: seed.paneId,
-                            title: seed.title
+                            title: seed.title,
+                            spawnCwd: seed.cwd
                         )
                     } else {
                         appState.sessions.adoptTerminalPaneAsNewTab(
@@ -373,7 +372,8 @@ private struct AppShellHost: View {
                             title: seed.title,
                             projectId: seed.projectId,
                             projectName: seed.projectName,
-                            projectPath: seed.projectPath
+                            projectPath: seed.projectPath,
+                            spawnCwd: seed.cwd
                         )
                     }
                 }
@@ -506,7 +506,7 @@ private struct AppShellHost: View {
                     sourceWindowSessionId: appState.windowSession.windowSessionId,
                     sourceTabId: tabId,
                     claim: { [weak sessions = appState.sessions] in
-                        sessions?.detachLivePane(tabId: tabId, paneId: paneId)
+                        sessions?.claimPaneForTransfer(tabId: tabId, paneId: paneId) ?? .gone
                     }
                 )
             )

@@ -28,6 +28,15 @@
 //
 
 import AppKit
+import os
+
+/// File-scoped logger for tear-off aborts. Every early-return in
+/// `tearOff` routes through this so a no-op is always greppable (graft
+/// 1: no silent no-ops). Shares the "tearoff" category with the adopt
+/// paths in `SessionsModel`.
+private let tearOffLog = Logger(
+    subsystem: "dev.nickanderssohn.nice", category: "tearoff"
+)
 
 @MainActor
 struct PaneTearOffController {
@@ -61,13 +70,17 @@ struct PaneTearOffController {
             forSessionId: sourceWindowSessionId
         ) else {
             live.withdraw(paneId: paneId)
+            tearOffLog.error("tearOff aborted: source window \(sourceWindowSessionId, privacy: .public) not found in registry (closed mid-drag?) for pane \(paneId, privacy: .public)")
             return
         }
 
         // Read the sourceTabId from the registry handle BEFORE calling
         // `claim` — claim removes the handle. `handle(forPaneId:)` is
         // the non-destructive lookup.
-        guard let handle = live.handle(forPaneId: paneId) else { return }
+        guard let handle = live.handle(forPaneId: paneId) else {
+            tearOffLog.error("tearOff aborted: no live handle registered for pane \(paneId, privacy: .public) (already withdrawn / never published)")
+            return
+        }
         let sourceTabId = handle.sourceTabId
 
         // Snapshot the source context BEFORE mutating the source tree.
@@ -78,6 +91,7 @@ struct PaneTearOffController {
             .panes.first(where: { $0.id == paneId })
         else {
             live.withdraw(paneId: paneId)
+            tearOffLog.error("tearOff aborted: pane \(paneId, privacy: .public) not found in source tab \(sourceTabId, privacy: .public)")
             return
         }
 
@@ -100,17 +114,43 @@ struct PaneTearOffController {
             )
         }()
 
-        // One-shot claim: detaches the live pty entry from the source
-        // session without killing the process. `claim` also removes the
-        // handle from the registry (clearing `currentDrag`).
-        guard let (_, entry) = live.claim(paneId: paneId) else { return }
+        // One-shot claim: resolves the source pane to a `PaneClaim` and
+        // removes the handle from the registry (clearing `currentDrag`).
+        // `seedEntry` is the live entry for the `.live` case and nil for
+        // the `.notSpawned` case (the destination spawns it fresh). The
+        // seed always carries a usable `cwd` (graft 0): the carried cwd
+        // for `.notSpawned`, the source pane's resolved cwd for `.live`,
+        // so a deferred pane tears off into the right directory.
+        let seedEntry: TabPtySession.PaneEntry?
+        let seedCwd: String
+        switch live.claim(paneId: paneId) {
+        case nil, .some((_, .gone)):
+            // No handle registered, or the pane is neither live nor
+            // modelled (already exited). Withdraw defensively (claim with
+            // a registered handle already removed it; nil leaves nothing
+            // to withdraw) and abort BEFORE any source mutation.
+            live.withdraw(paneId: paneId)
+            tearOffLog.error("tearOff aborted: claim for pane \(paneId, privacy: .public) returned .gone / no handle — pane already exited")
+            return
+        case .some((_, .live(let entry))):
+            seedEntry = entry
+            // The source tab still exists here (extractPane runs below);
+            // resolve the live pane's cwd so the seed carries a usable
+            // directory even though the destination adopts a live entry.
+            seedCwd = source.tabs.tab(for: sourceTabId).map {
+                source.tabs.resolvedSpawnCwd(for: $0, pane: sourcePane)
+            } ?? proj.path
+        case .some((_, .notSpawned(let cwd))):
+            seedEntry = nil
+            seedCwd = cwd
+        }
 
         // Remove the pane model from the source tab.
         _ = source.tabs.extractPane(paneId, fromTab: sourceTabId)
 
         // Enqueue the seed so the new window's `.task` can consume it.
         services.enqueueTearOff(NiceServices.PendingTearOff(
-            entry: entry,
+            entry: seedEntry,
             paneId: paneId,
             title: sourcePane.title,
             kind: sourcePane.kind,
@@ -118,6 +158,7 @@ struct PaneTearOffController {
             projectId: proj.id,
             projectName: proj.name,
             projectPath: proj.path,
+            cwd: seedCwd,
             screenPoint: screenPoint
         ))
 

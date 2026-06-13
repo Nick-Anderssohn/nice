@@ -31,11 +31,19 @@
 import AppKit
 import Foundation
 import Observation
+import os
 import SwiftUI
 
 @MainActor
 @Observable
 final class SessionsModel {
+    /// Logger for the cross-window pane-transfer adopt paths. Shares the
+    /// "tearoff" category with `PaneTearOffController` so a tear-off /
+    /// migration that hits an unexpected branch (e.g. a deferred Claude
+    /// pane with no session id) is greppable as one stream.
+    static let tearOffLog = Logger(
+        subsystem: "dev.nickanderssohn.nice", category: "tearoff"
+    )
     /// Tab-keyed pty-session cache. Each entry owns its tab's
     /// `TabPtySession`, which in turn owns one or more pane subprocesses.
     private(set) var ptySessions: [String: TabPtySession] = [:]
@@ -1117,13 +1125,106 @@ final class SessionsModel {
         return ptySessions[tabId]?.detachPane(id: paneId)
     }
 
-    /// Adopt a live `entry` previously detached from another window into
+    /// Resolve `paneId` on `tabId` to a `PaneClaim` for a cross-window
+    /// transfer (tear-off or migration), one-shot. This is the model-
+    /// layer half of the tri-state that replaces the old silent-nil
+    /// claim (BUG A):
+    ///
+    ///   - The pane has a live pty (`hasPane`) → detach it and return
+    ///     `.live(entry)`. The detach is a SAFE `if let`, never a force-
+    ///     unwrap: a force-unwrap at the exact site whose silent-nil
+    ///     history motivated the tri-state would be the inverse failure
+    ///     mode. If `detachLivePane` unexpectedly returns nil, fall
+    ///     through to the model check rather than trapping.
+    ///   - Otherwise the pane is MODELLED in the tab but its spawn was
+    ///     deferred → return `.notSpawned(cwd:)` with the cwd resolved
+    ///     from the SOURCE model (so the destination spawns it in the
+    ///     right directory).
+    ///   - Neither holds → `.gone`.
+    func claimPaneForTransfer(tabId: String, paneId: String) -> PaneClaim {
+        if ptySessions[tabId]?.hasPane(paneId) == true {
+            if let entry = detachLivePane(tabId: tabId, paneId: paneId) {
+                return .live(entry)
+            }
+            // Unexpected: `hasPane` said yes but detach returned nil.
+            // Don't trap — fall through to the model resolution below.
+        }
+        if let tabs,
+           let tab = tabs.tab(for: tabId),
+           let pane = tab.panes.first(where: { $0.id == paneId }) {
+            return .notSpawned(cwd: tabs.resolvedSpawnCwd(for: tab, pane: pane))
+        }
+        return .gone
+    }
+
+    /// Spawn `paneId` on `tabId` in the DESTINATION window when a torn-
+    /// off / migrated pane arrived `.notSpawned` (no live entry to
+    /// adopt). Unlike `ensureActivePaneSpawned` — which hard-guards on an
+    /// already-existing session and only spawns the ACTIVE pane — this is
+    /// SESSION-CREATING: it stands up an empty session shell for the tab
+    /// when one doesn't exist yet (mirroring `adoptLivePane`'s create-if-
+    /// missing branch), then spawns `paneId` as a fresh terminal in
+    /// `cwd`. That makes a drop into a session-less target tab spawn the
+    /// pane instead of silently no-op'ing.
+    ///
+    /// `cwd` is the resolved spawn cwd carried in the claim; the pane
+    /// spawns there with this destination window's own socket / ZDOTDIR /
+    /// tab env. Claude panes are spawned by their adopt path
+    /// (`.resumeDeferred`), not here; this handles `.terminal` only.
+    func ensurePaneSpawned(tabId: String, paneId: String, cwd: String) {
+        let session: TabPtySession
+        if let existing = ptySessions[tabId] {
+            session = existing
+        } else {
+            // Mirror adoptLivePane's create-if-missing branch: an empty
+            // session shell in the resolved cwd (claim cwd preferred,
+            // else the tab's own cwd) that the spawn below populates.
+            let sessionCwd = TabModel.expandTilde(cwd)
+            session = instantiateSession(
+                for: tabId, cwd: sessionCwd, extraClaudeArgs: [],
+                initialClaudePaneId: nil, initialTerminalPaneId: nil,
+                claudeSessionMode: .none
+            )
+        }
+        // Only terminal panes spawn here, and only when not already live.
+        guard let tabs,
+              let tab = tabs.tab(for: tabId),
+              let pane = tab.panes.first(where: { $0.id == paneId }),
+              pane.kind == .terminal,
+              !session.hasPane(paneId)
+        else { return }
+        _ = session.addTerminalPane(id: paneId, cwd: cwd)
+    }
+
+    /// Adopt a pane previously detached from another window into
     /// `tabId`'s session (creating an empty session for the tab when one
     /// doesn't exist yet, e.g. a target tab whose pty was never spawned).
-    /// Re-points the entry's delegate at this window via
-    /// `TabPtySession.adoptPane`. Inserting the `Pane` model into the
-    /// target tab is the caller's job (`TabModel.insertPane`).
-    func adoptLivePane(tabId: String, paneId: String, entry: TabPtySession.PaneEntry) {
+    ///
+    /// `entry` is OPTIONAL so this also serves the `.notSpawned` claim
+    /// path (BUG A): when non-nil, the live entry's delegate is re-pointed
+    /// at this window via `TabPtySession.adoptPane`; when nil, the pane
+    /// was modelled-but-deferred in the source and is spawned FRESH in
+    /// the destination via `ensurePaneSpawned` (resolving the cwd from
+    /// the tab so it opens in the right directory). Inserting the `Pane`
+    /// model into the target tab is the caller's job
+    /// (`TabModel.insertPane`).
+    func adoptLivePane(
+        tabId: String, paneId: String, entry: TabPtySession.PaneEntry?
+    ) {
+        guard let entry else {
+            // No live entry: spawn the deferred pane fresh in the
+            // destination. `ensurePaneSpawned` creates the session shell
+            // if absent (it mirrors this method's create-if-missing
+            // branch) and spawns in the tab's resolved cwd.
+            let cwd: String
+            if let tabs, let tab = tabs.tab(for: tabId) {
+                cwd = tabs.resolvedSpawnCwd(for: tab)
+            } else {
+                cwd = NSHomeDirectory()
+            }
+            ensurePaneSpawned(tabId: tabId, paneId: paneId, cwd: cwd)
+            return
+        }
         let session: TabPtySession
         if let existing = ptySessions[tabId] {
             session = existing
@@ -1139,21 +1240,35 @@ final class SessionsModel {
         session.adoptPane(id: paneId, entry: entry)
     }
 
-    /// Adopt a live Claude pane (migrated from another window) as a
-    /// brand-new sidebar tab. A Claude pane can't join an existing tab's
-    /// pane set — a tab holds at most one alive Claude pane — so a
-    /// cross-window move / tear-off of a Claude pane lands as its own
-    /// tab under the project matching `projectPath` (recreated from the
-    /// supplied identity when the destination window lacks it). The new
-    /// tab takes the canonical `[Claude, companion terminal]` shape with
-    /// the Claude pane focused and `claudeSessionId` carried across; the
-    /// companion terminal is a fresh deferred spawn (started on first
-    /// focus, exactly like `createTabFromMainTerminal`), and the live
-    /// Claude entry is adopted without re-spawning. Returns the new tab
-    /// id, or nil when `tabs` is gone.
+    /// Adopt a Claude pane (migrated from another window) as a brand-new
+    /// sidebar tab. A Claude pane can't join an existing tab's pane set —
+    /// a tab holds at most one alive Claude pane — so a cross-window move
+    /// / tear-off of a Claude pane lands as its own tab under the project
+    /// matching `projectPath` (recreated from the supplied identity when
+    /// the destination window lacks it). The new tab takes the canonical
+    /// `[Claude, companion terminal]` shape with the Claude pane focused
+    /// and `claudeSessionId` carried across; the companion terminal is a
+    /// fresh deferred spawn (started on first focus, exactly like
+    /// `createTabFromMainTerminal`).
+    ///
+    /// `entry` is OPTIONAL (BUG A):
+    ///   - non-nil → the migrated pane was a LIVE Claude; instantiate a
+    ///     `.none`-mode session and adopt the entry without re-spawning.
+    ///   - nil → the Claude pane was modelled-but-deferred in the source
+    ///     (a restored tab never focused). Instantiate with the Claude
+    ///     pane id as `initialClaudePaneId` AND `.resumeDeferred(id:)`
+    ///     mode and DO NOT adopt — the deferred claude spawns on first
+    ///     focus, mirroring restore (`WindowSession.restoreSavedWindow`)
+    ///     and `createTabFromMainTerminal`. A nil `claudeSessionId` on
+    ///     this branch should be near-impossible (an unspawned Claude
+    ///     pane always carries the session it would resume); we log a
+    ///     loud error and still create the tab as a best-effort fresh
+    ///     `.resumeDeferred` with an empty id rather than dropping it.
+    ///
+    /// Returns the new tab id, or nil when `tabs` is gone.
     @discardableResult
     func adoptClaudePaneAsNewTab(
-        entry: TabPtySession.PaneEntry,
+        entry: TabPtySession.PaneEntry?,
         paneId: String,
         title: String,
         claudeSessionId: String?,
@@ -1166,7 +1281,9 @@ final class SessionsModel {
         let companionId = "\(newTabId)-t1"
         var claudePane = Pane(id: paneId, title: title, kind: .claude)
         // The migrated pane was a live Claude; keep the runtime flag so
-        // `paneTitleChanged`'s OSC gate stays open and status flows.
+        // `paneTitleChanged`'s OSC gate stays open and status flows. For
+        // the deferred (nil-entry) path the flag is harmless — the OSC
+        // gate simply stays armed until the resume actually starts.
         claudePane.isClaudeRunning = true
         var tab = Tab(
             id: newTabId,
@@ -1186,16 +1303,33 @@ final class SessionsModel {
         )
         tabs.projects[pi].tabs.append(tab)
         tabs.activeTabId = newTabId
-        // Spawn nothing here: the companion terminal is deferred (like
-        // the canonical Claude tab), and the Claude pane is adopted live
-        // below rather than spawned fresh.
-        let session = instantiateSession(
-            for: newTabId, cwd: TabModel.expandTilde(projectPath),
-            extraClaudeArgs: [],
-            initialClaudePaneId: nil, initialTerminalPaneId: nil,
-            claudeSessionMode: .none
-        )
-        session.adoptPane(id: paneId, entry: entry)
+
+        if let entry {
+            // Live Claude: spawn nothing (companion stays deferred), then
+            // adopt the live entry rather than re-spawning it.
+            let session = instantiateSession(
+                for: newTabId, cwd: TabModel.expandTilde(projectPath),
+                extraClaudeArgs: [],
+                initialClaudePaneId: nil, initialTerminalPaneId: nil,
+                claudeSessionMode: .none
+            )
+            session.adoptPane(id: paneId, entry: entry)
+        } else {
+            // Deferred Claude: instantiate in resume-deferred mode with
+            // the Claude pane as the initial pane and DO NOT adopt — the
+            // resume spawns on first focus, exactly like restore.
+            if claudeSessionId == nil {
+                Self.tearOffLog.error(
+                    "adoptClaudePaneAsNewTab: nil entry AND nil claudeSessionId for pane \(paneId, privacy: .public) — creating a best-effort resumeDeferred tab with an empty session id"
+                )
+            }
+            _ = instantiateSession(
+                for: newTabId, cwd: TabModel.expandTilde(projectPath),
+                extraClaudeArgs: [],
+                initialClaudePaneId: paneId, initialTerminalPaneId: nil,
+                claudeSessionMode: .resumeDeferred(id: claudeSessionId ?? "")
+            )
+        }
         onSessionMutation?()
         return newTabId
     }
@@ -1210,19 +1344,25 @@ final class SessionsModel {
     /// (recreated from the supplied identity when the destination window
     /// lacks it, via `tabs.ensureProjectByPath`), with a single pane of
     /// kind `.terminal` whose id is `paneId` and whose title is `title`.
-    /// `activePaneId` is set to `paneId`. No pty is spawned during
-    /// instantiation — the live entry from the detached source session is
-    /// adopted immediately via `session.adoptPane`. Sets `tabs.activeTabId`
-    /// to the new tab. Fires `onSessionMutation`. Returns the new tab id,
-    /// or nil when `tabs` is gone.
+    /// `activePaneId` is set to `paneId`. Sets `tabs.activeTabId` to the
+    /// new tab. Fires `onSessionMutation`. Returns the new tab id, or nil
+    /// when `tabs` is gone.
+    ///
+    /// `entry` is OPTIONAL (BUG A): non-nil → an empty session shell is
+    /// instantiated and the live entry adopted into it via
+    /// `session.adoptPane`; nil → the pane was modelled-but-deferred in
+    /// the source and is spawned FRESH via `ensurePaneSpawned` in
+    /// `spawnCwd` (the cwd carried in the claim) — falling back to
+    /// `projectPath` when no spawn cwd was supplied.
     @discardableResult
     func adoptTerminalPaneAsNewTab(
-        entry: TabPtySession.PaneEntry,
+        entry: TabPtySession.PaneEntry?,
         paneId: String,
         title: String,
         projectId: String,
         projectName: String,
-        projectPath: String
+        projectPath: String,
+        spawnCwd: String? = nil
     ) -> String? {
         guard let tabs else { return nil }
         let newTabId = mintTabId("t")
@@ -1242,16 +1382,24 @@ final class SessionsModel {
         )
         tabs.projects[pi].tabs.append(tab)
         tabs.activeTabId = newTabId
-        // Spawn nothing: the live entry is adopted below directly.
-        // `instantiateSession` with nil/nil creates an empty session shell
-        // that the `adoptPane` call below populates.
-        let session = instantiateSession(
-            for: newTabId, cwd: TabModel.expandTilde(projectPath),
-            extraClaudeArgs: [],
-            initialClaudePaneId: nil, initialTerminalPaneId: nil,
-            claudeSessionMode: .none
-        )
-        session.adoptPane(id: paneId, entry: entry)
+
+        if let entry {
+            // Live entry: instantiate an empty session shell and adopt
+            // into it directly (no fresh spawn).
+            let session = instantiateSession(
+                for: newTabId, cwd: TabModel.expandTilde(projectPath),
+                extraClaudeArgs: [],
+                initialClaudePaneId: nil, initialTerminalPaneId: nil,
+                claudeSessionMode: .none
+            )
+            session.adoptPane(id: paneId, entry: entry)
+        } else {
+            // Deferred pane: spawn it fresh in the destination.
+            // `ensurePaneSpawned` creates the session shell if absent.
+            ensurePaneSpawned(
+                tabId: newTabId, paneId: paneId, cwd: spawnCwd ?? projectPath
+            )
+        }
         onSessionMutation?()
         return newTabId
     }
@@ -1271,18 +1419,27 @@ final class SessionsModel {
     ///   2. Replace the Main tab's pane list with the single torn-off
     ///      `Pane(id: paneId, …)` and focus it.
     ///   3. Select the Main tab.
-    ///   4. Adopt the live entry into the Main tab's existing session via
-    ///      `session.adoptPane` (same mechanism `adoptTerminalPaneAsNewTab`
-    ///      uses) — the Main tab's session already exists because
-    ///      `AppState.start()` called `makeSession` for it.
+    ///   4. Adopt the pane into the Main tab's existing session — via
+    ///      `session.adoptPane` for a live entry (same mechanism
+    ///      `adoptTerminalPaneAsNewTab` uses), or a fresh
+    ///      `ensurePaneSpawned` for a deferred (nil-entry) pane. The Main
+    ///      tab's session already exists because `AppState.start()`
+    ///      called `makeSession` for it.
     /// Keeps the Main tab's id and title ("Main"). Fires
     /// `onSessionMutation`. Returns the Main tab id, or nil when `tabs`
     /// is gone or the Main tab can't be found.
+    ///
+    /// `entry` is OPTIONAL (BUG A): when nil the torn-off pane was
+    /// modelled-but-deferred in the source, so the Main tab spawns it
+    /// FRESH — in `spawnCwd` when provided (the cwd carried in the claim)
+    /// so it opens in the right directory rather than the new window's
+    /// pristine Main cwd.
     @discardableResult
     func adoptTerminalPaneAsMainTerminal(
-        entry: TabPtySession.PaneEntry,
+        entry: TabPtySession.PaneEntry?,
         paneId: String,
-        title: String
+        title: String,
+        spawnCwd: String? = nil
     ) -> String? {
         guard let tabs else { return nil }
         let mainTabId = TabModel.mainTerminalTabId
@@ -1299,13 +1456,20 @@ final class SessionsModel {
         }
         tabs.activeTabId = mainTabId
 
-        // 2. Adopt the live entry into the Main tab's session BEFORE
-        //    retiring the seeded pty. The session exists (start() made
-        //    it); fall back to creating one if not. Adopting first means
-        //    the session already hosts `paneId`, so the `ensureActivePane
-        //    Spawned` that `paneExited` runs in step 3 sees the active
-        //    pane as spawned and won't double-spawn it.
-        adoptLivePane(tabId: mainTabId, paneId: paneId, entry: entry)
+        // 2. Adopt the pane into the Main tab's session BEFORE retiring
+        //    the seeded pty. The session exists (start() made it). For a
+        //    live entry, pass it straight through to `adoptLivePane`. For
+        //    a deferred pane, spawn it fresh in the claim's `spawnCwd`
+        //    (falling back to `adoptLivePane`'s tab-resolved cwd when no
+        //    spawn cwd was carried). Either way the session ends up
+        //    hosting `paneId`, so the `ensureActivePaneSpawned` that
+        //    `paneExited` runs in step 3 sees the active pane as spawned
+        //    and won't double-spawn it.
+        if entry == nil, let spawnCwd {
+            ensurePaneSpawned(tabId: mainTabId, paneId: paneId, cwd: spawnCwd)
+        } else {
+            adoptLivePane(tabId: mainTabId, paneId: paneId, entry: entry)
+        }
 
         // 3. Retire the seeded pty entries. The model no longer references
         //    them, so the `paneExited` they fire is a no-op on the

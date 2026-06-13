@@ -18,6 +18,14 @@
 //
 
 import AppKit
+import os
+
+/// File-scoped logger for migration aborts. Every early-return after the
+/// claim routes through this so a no-op is always greppable (graft 1).
+/// Shares the "tearoff" category with the tear-off / adopt paths.
+private let migrationLog = Logger(
+    subsystem: "dev.nickanderssohn.nice", category: "tearoff"
+)
 
 @MainActor
 struct PaneMigrationCoordinator {
@@ -49,6 +57,7 @@ struct PaneMigrationCoordinator {
             forSessionId: handle.sourceWindowSessionId
         ) else {
             live.withdraw(paneId: handle.paneId)
+            migrationLog.error("commitCrossWindowMove aborted: source window \(handle.sourceWindowSessionId, privacy: .public) not found in registry (closed mid-drag?) for pane \(handle.paneId, privacy: .public)")
             return false
         }
 
@@ -59,6 +68,7 @@ struct PaneMigrationCoordinator {
         guard let sourcePane = source.tabs.tab(for: handle.sourceTabId)?
             .panes.first(where: { $0.id == handle.paneId }) else {
             live.withdraw(paneId: handle.paneId)
+            migrationLog.error("commitCrossWindowMove aborted: pane \(handle.paneId, privacy: .public) not found in source tab \(handle.sourceTabId, privacy: .public)")
             return false
         }
         let claudeSessionId = source.tabs.tab(for: handle.sourceTabId)?.claudeSessionId
@@ -69,36 +79,85 @@ struct PaneMigrationCoordinator {
             return (p.id, p.name, p.path)
         }()
 
-        // Claim the live pty entry (this detaches it from the source
-        // session without killing the process), then remove the pane
-        // model from the source tab.
-        guard let (_, entry) = live.claim(paneId: handle.paneId) else { return false }
-        _ = source.tabs.extractPane(handle.paneId, fromTab: handle.sourceTabId)
+        // Claim the source pane to a `PaneClaim` (one-shot; detaches the
+        // live entry for `.live`, or reports `.notSpawned(cwd:)` for a
+        // deferred pane). The tri-state forces us to handle the unspawned
+        // case explicitly instead of silently no-op'ing (BUG A).
+        switch live.claim(paneId: handle.paneId) {
+        case nil, .some((_, .gone)):
+            // No handle, or the pane is neither live nor modelled. Abort
+            // BEFORE any source mutation — extractPane has not run yet.
+            live.withdraw(paneId: handle.paneId)
+            migrationLog.error("commitCrossWindowMove aborted: claim for pane \(handle.paneId, privacy: .public) returned .gone / no handle — pane already exited")
+            return false
 
-        switch sourcePane.kind {
-        case .terminal:
-            target.tabs.insertPane(
-                sourcePane, inTab: targetTabId,
-                relativeTo: relativeToPaneId, placeAfter: placeAfter
-            )
-            target.sessions.adoptLivePane(
-                tabId: targetTabId, paneId: handle.paneId, entry: entry
-            )
-            target.tabs.activeTabId = targetTabId
-            target.sessions.setActivePane(tabId: targetTabId, paneId: handle.paneId)
+        case .some((_, .live(let entry))):
+            // Live pane: extract from the source, then adopt the live
+            // entry on the far side exactly as before.
+            _ = source.tabs.extractPane(handle.paneId, fromTab: handle.sourceTabId)
+            switch sourcePane.kind {
+            case .terminal:
+                target.tabs.insertPane(
+                    sourcePane, inTab: targetTabId,
+                    relativeTo: relativeToPaneId, placeAfter: placeAfter
+                )
+                target.sessions.adoptLivePane(
+                    tabId: targetTabId, paneId: handle.paneId, entry: entry
+                )
+                target.tabs.activeTabId = targetTabId
+                target.sessions.setActivePane(tabId: targetTabId, paneId: handle.paneId)
 
-        case .claude:
-            // A Claude pane can't join an existing strip (one Claude per
-            // tab). Land it as a new tab under the matching project; if
-            // the source project identity is somehow unavailable, fall
-            // back to the target tab's own project path so the pane still
-            // has a home.
-            let proj = sourceProject ?? fallbackProject(for: target, tabId: targetTabId)
-            target.sessions.adoptClaudePaneAsNewTab(
-                entry: entry, paneId: handle.paneId, title: sourcePane.title,
-                claudeSessionId: claudeSessionId,
-                projectId: proj.id, projectName: proj.name, projectPath: proj.path
-            )
+            case .claude:
+                // A Claude pane can't join an existing strip (one Claude
+                // per tab). Land it as a new tab under the matching
+                // project; if the source project identity is somehow
+                // unavailable, fall back to the target tab's own project
+                // path so the pane still has a home.
+                let proj = sourceProject ?? fallbackProject(for: target, tabId: targetTabId)
+                target.sessions.adoptClaudePaneAsNewTab(
+                    entry: entry, paneId: handle.paneId, title: sourcePane.title,
+                    claudeSessionId: claudeSessionId,
+                    projectId: proj.id, projectName: proj.name, projectPath: proj.path
+                )
+            }
+
+        case .some((_, .notSpawned(let cwd))):
+            // Deferred pane: extract from the source, then SPAWN it fresh
+            // in the destination instead of adopting a (non-existent)
+            // live entry. The terminal path uses the SESSION-CREATING
+            // `ensurePaneSpawned` (not `ensureActivePaneSpawned`) so a
+            // drop into a session-less target tab spawns the pane rather
+            // than silently no-op'ing.
+            _ = source.tabs.extractPane(handle.paneId, fromTab: handle.sourceTabId)
+            switch sourcePane.kind {
+            case .terminal:
+                target.tabs.insertPane(
+                    sourcePane, inTab: targetTabId,
+                    relativeTo: relativeToPaneId, placeAfter: placeAfter
+                )
+                target.tabs.activeTabId = targetTabId
+                // Spawn with the CARRIED cwd BEFORE focusing: `setActivePane`
+                // would otherwise run `ensureActivePaneSpawned`, which spawns
+                // the now-active pane with the TARGET-resolved cwd, losing the
+                // source pane's directory. Spawning first means the pane is
+                // already live when `setActivePane`'s spawn guard runs, so it
+                // no-ops and the claim cwd wins (graft 0).
+                target.sessions.ensurePaneSpawned(
+                    tabId: targetTabId, paneId: handle.paneId, cwd: cwd
+                )
+                target.sessions.setActivePane(tabId: targetTabId, paneId: handle.paneId)
+
+            case .claude:
+                // A deferred Claude pane lands as a new tab in
+                // `.resumeDeferred` mode (entry: nil); without this it
+                // would be dropped AFTER extractPane — worse than today.
+                let proj = sourceProject ?? fallbackProject(for: target, tabId: targetTabId)
+                target.sessions.adoptClaudePaneAsNewTab(
+                    entry: nil, paneId: handle.paneId, title: sourcePane.title,
+                    claudeSessionId: claudeSessionId,
+                    projectId: proj.id, projectName: proj.name, projectPath: proj.path
+                )
+            }
         }
 
         // Dissolve the source tab if the move emptied it (existing

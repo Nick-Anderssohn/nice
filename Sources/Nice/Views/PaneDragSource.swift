@@ -324,7 +324,12 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
                     sourceWindowSessionId: c.sourceWindowSessionId,
                     sourceTabId: c.sourceTabId,
                     claim: { [weak sessions = c.sessions, tabId = c.sourceTabId, paneId = c.paneId] in
-                        sessions?.detachLivePane(tabId: tabId, paneId: paneId)
+                        // Resolve to a `PaneClaim` tri-state so a deferred
+                        // (never-spawned) pane tears off / migrates by
+                        // spawning fresh in the destination instead of
+                        // silently no-op'ing (BUG A). A dead `sessions` is
+                        // treated as `.gone`.
+                        sessions?.claimPaneForTransfer(tabId: tabId, paneId: paneId) ?? .gone
                     }
                 )
             )

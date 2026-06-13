@@ -62,13 +62,15 @@ final class AdoptTerminalPaneAsMainTerminalTests: XCTestCase {
     }
 
     /// Publish a live-pane handle so `PaneTearOffController` can claim it.
+    /// The claim closure returns a `PaneClaim` tri-state via
+    /// `claimPaneForTransfer` (matching production).
     private func publishDrag(from source: AppState, tabId: String, paneId: String) {
         services.livePaneRegistry.publish(.init(
             paneId: paneId,
             sourceWindowSessionId: source.windowSession.windowSessionId,
             sourceTabId: tabId,
             claim: { [weak source] in
-                source?.sessions.detachLivePane(tabId: tabId, paneId: paneId)
+                source?.sessions.claimPaneForTransfer(tabId: tabId, paneId: paneId) ?? .gone
             }
         ))
     }
