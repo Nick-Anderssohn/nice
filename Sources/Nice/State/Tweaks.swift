@@ -208,8 +208,11 @@ final class Tweaks {
     static let terminalThemeLightKey = "terminalThemeLightId"
     static let terminalThemeDarkKey  = "terminalThemeDarkId"
     static let terminalFontFamilyKey = "terminalFontFamily"
-    static let editorCommandsKey       = "editorCommands"
-    static let extensionEditorMapKey   = "extensionEditorMap"
+    static let editorCommandsKey         = "editorCommands"
+    static let extensionEditorMapKey     = "extensionEditorMap"
+    static let installHandoffSkillKey    = "installHandoffSkill"
+    static let handoffSkillPromptSeenKey = "handoffSkillPromptSeen"
+    static let smoothScrollingKey      = "smoothScrolling"
 
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
@@ -316,6 +319,15 @@ final class Tweaks {
         }
     }
 
+    /// Whether terminal panes use SwiftTerm's smooth-scrolling path.
+    /// Opt-in: defaults OFF when the key is absent. An explicit value the
+    /// user set (including a legacy ON) persists across relaunch.
+    var smoothScrolling: Bool {
+        didSet {
+            defaults.set(smoothScrolling, forKey: Self.smoothScrollingKey)
+        }
+    }
+
     /// User-configured terminal editors that can open files from the
     /// File Explorer in a new pane. Each entry has a stable UUID so
     /// extension mappings survive renames.
@@ -342,6 +354,36 @@ final class Tweaks {
     /// then can't find.
     private(set) var extensionEditorMap: [String: UUID] {
         didSet { persistExtensionEditorMap() }
+    }
+
+    /// Whether the `/nice-handoff` Claude Code skill and its companion
+    /// shell helper (`~/.nice/nice-handoff.sh`) are installed globally.
+    /// Defaults to false; flipped by the first-launch prompt or the
+    /// Settings toggle.
+    ///
+    /// This setter only *persists* the flag — it deliberately does NOT
+    /// call `SkillInstaller.sync(enabled:)`. Keeping `Tweaks` free of
+    /// filesystem IO is what lets it be constructed in unit tests
+    /// without writing into the developer's real `~/.claude/`/`~/.nice/`.
+    /// Reconciling the on-disk files with this flag is the caller's job:
+    /// `NiceServices.bootstrap()` syncs once at launch, and each mutation
+    /// site (the Settings toggle's `onChange` and the first-launch alert
+    /// buttons) calls `SkillInstaller.sync(enabled:)` alongside the set.
+    var installHandoffSkill: Bool {
+        didSet {
+            defaults.set(installHandoffSkill, forKey: Self.installHandoffSkillKey)
+        }
+    }
+
+    /// True once the user has responded to the first-launch "Install the
+    /// Nice Handoff skill?" prompt — either "Install" or "Not Now". The
+    /// prompt is shown exactly once per install; this flag prevents it from
+    /// re-appearing on subsequent launches even if `installHandoffSkill`
+    /// is later toggled off in Settings.
+    var handoffSkillPromptSeen: Bool {
+        didSet {
+            defaults.set(handoffSkillPromptSeen, forKey: Self.handoffSkillPromptSeenKey)
+        }
     }
 
     /// Injectable OS scheme source — real builds read
@@ -380,6 +422,13 @@ final class Tweaks {
         let editors = Self.loadEditorCommands(defaults: defaults)
         let extMap  = Self.loadExtensionEditorMap(defaults: defaults)
 
+        // Smooth scrolling is opt-in: default OFF when the user has no saved
+        // preference. An explicit value (including a legacy ON from the old
+        // toggle) is still honored.
+        let smoothScroll = defaults.object(forKey: Self.smoothScrollingKey) == nil
+            ? false
+            : defaults.bool(forKey: Self.smoothScrollingKey)
+
         let migrated = Self.loadOrMigrate(defaults: defaults, osScheme: osSchemeProvider())
 
         self.scheme = migrated.scheme
@@ -390,8 +439,16 @@ final class Tweaks {
         self.terminalThemeLightId = terminalLight
         self.terminalThemeDarkId = terminalDark
         self.terminalFontFamily = fontFamily
+        self.smoothScrolling = smoothScroll
         self.editorCommands = editors
         self.extensionEditorMap = extMap
+        // `object(forKey:)` returns nil for a key that has never been set,
+        // letting us distinguish "user has never chosen" (nil → default false)
+        // from "user explicitly set false". Both flags default to false so
+        // a fresh install starts with the skill uninstalled and the prompt
+        // unseen.
+        self.installHandoffSkill = defaults.object(forKey: Self.installHandoffSkillKey) as? Bool ?? false
+        self.handoffSkillPromptSeen = defaults.object(forKey: Self.handoffSkillPromptSeenKey) as? Bool ?? false
 
         NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
 

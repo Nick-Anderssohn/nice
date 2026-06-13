@@ -98,6 +98,30 @@ private struct AppShellHost: View {
     /// so the user can click a tab without holding any keys.
     @State private var peekMousePinned: Bool = false
 
+    /// Controls the first-launch "Install the Nice Handoff skill?" alert.
+    /// Set to true once by `consumeHandoffSkillPromptSlot` when the user
+    /// hasn't yet been asked. The alert fires at most once per process
+    /// (the one-shot guard in NiceServices prevents re-entry), and the
+    /// `handoffSkillPromptSeen` flag in Tweaks prevents it from appearing
+    /// on future launches after the user responds.
+    @State private var showHandoffSkillPrompt = false
+
+    /// Whether to skip the first-launch handoff-skill prompt because we're
+    /// running under the UITest harness. The suite launches the app with
+    /// `NICE_APPLICATION_SUPPORT_ROOT` set (the same ephemeral-environment
+    /// seam `SessionStore` / `MainTerminalShellInject` key off — never set
+    /// in production); without this, the alert would appear on every
+    /// UITest launch and cover the UI under test, because the shared
+    /// dev-bundle UserDefaults never persists "seen" (tests don't tap the
+    /// buttons). The dedicated handoff-prompt UITest opts back in by also
+    /// setting `NICE_FORCE_FIRST_LAUNCH_PROMPT`.
+    private static var shouldSuppressFirstLaunchPrompt: Bool {
+        let env = ProcessInfo.processInfo.environment
+        let inTestEnv = env["NICE_APPLICATION_SUPPORT_ROOT"] != nil
+        let forced = env["NICE_FORCE_FIRST_LAUNCH_PROMPT"] != nil
+        return inTestEnv && !forced
+    }
+
     /// Current docked-sidebar width, in points. Per-window and in-memory:
     /// resets to the 240pt default on every launch by design. Only read
     /// by `floatingSidebarCard(resizable:)` in its expanded (docked)
@@ -336,6 +360,34 @@ private struct AppShellHost: View {
         } message: { request in
             Text(pendingCloseMessage(request))
         }
+        // First-launch prompt for the Nice Handoff skill. Shown at most
+        // once per install — `handoffSkillPromptSeen` gates future
+        // launches and `consumeHandoffSkillPromptSlot` gates siblings
+        // within the same process. Both paths mark the prompt seen so
+        // it never re-appears regardless of which button is tapped.
+        .alert(
+            "Install the Nice Handoff skill?",
+            isPresented: $showHandoffSkillPrompt
+        ) {
+            // "Install" — enable the skill, write it to disk, mark seen.
+            Button("Install") {
+                tweaks.installHandoffSkill = true
+                SkillInstaller.sync(enabled: true)
+                tweaks.handoffSkillPromptSeen = true
+            }
+            .accessibilityIdentifier("handoffPrompt.install")
+            // "Not Now" — leave the skill uninstalled, mark seen so the
+            // prompt doesn't reappear. The user can always enable it
+            // later via Settings → Claude.
+            Button("Not Now", role: .cancel) {
+                tweaks.installHandoffSkill = false
+                SkillInstaller.sync(enabled: false)
+                tweaks.handoffSkillPromptSeen = true
+            }
+            .accessibilityIdentifier("handoffPrompt.notNow")
+        } message: {
+            Text("The /nice-handoff skill lets Claude hand off the current work to a fresh session in a new tab. You can change this anytime in Settings.")
+        }
         .task {
             // Order matters: `services.bootstrap()` writes the
             // process-wide ZDOTDIR and seeds `resolvedClaudePath`
@@ -428,6 +480,25 @@ private struct AppShellHost: View {
                 // nil on a headless build; skip silently in that case.
                 appState.windowSession.window?.setFrameOrigin(seed.screenPoint)
             }
+            // Show the one-time handoff-skill prompt on first launch.
+            // Runs after the multi-window fan-out so the extra windows
+            // are already open before the alert appears. Three guards
+            // must pass:
+            //   • `handoffSkillPromptSeen` — prevents the alert from
+            //     re-appearing after the user has already responded.
+            //   • `consumeHandoffSkillPromptSlot` — prevents sibling
+            //     windows from each raising their own copy within the
+            //     same process lifetime.
+            //   • not running under the UITest harness — otherwise the
+            //     alert would pop on every UITest launch (the shared
+            //     dev-bundle UserDefaults never persists "seen" because
+            //     tests don't tap the buttons) and cover the UI under
+            //     test. See `shouldSuppressFirstLaunchPrompt`.
+            if !Self.shouldSuppressFirstLaunchPrompt
+                && !tweaks.handoffSkillPromptSeen
+                && services.consumeHandoffSkillPromptSlot() {
+                showHandoffSkillPrompt = true
+            }
         }
         .onAppear {
             // Brand-new scene: write the id WindowSession minted back
@@ -447,6 +518,7 @@ private struct AppShellHost: View {
                 tweaks.effectiveTerminalTheme(for: scheme, catalog: services.terminalThemeCatalog)
             )
             appState.sessions.updateTerminalFontSize(fontSettings.terminalFontSize)
+            appState.sessions.updateSmoothScrolling(tweaks.smoothScrolling)
         }
         .onChange(of: scheme) { _, newScheme in
             appState.sessions.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
@@ -492,6 +564,9 @@ private struct AppShellHost: View {
         }
         .onChange(of: tweaks.terminalFontFamily) { _, newValue in
             appState.sessions.updateTerminalFontFamily(newValue)
+        }
+        .onChange(of: tweaks.smoothScrolling) { _, newValue in
+            appState.sessions.updateSmoothScrolling(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar state across relaunch. Also clear any

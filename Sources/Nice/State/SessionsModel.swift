@@ -194,6 +194,11 @@ final class SessionsModel {
         themeCache.updateTerminalFontFamily(name)
     }
 
+    /// Forward to `themeCache.updateSmoothScrolling`.
+    func updateSmoothScrolling(_ enabled: Bool) {
+        themeCache.updateSmoothScrolling(enabled)
+    }
+
     /// Update the resolved `claude` binary path. Called by AppState
     /// from its `armClaudePathTracking` handler when `services.resolvedClaudePath`
     /// flips, and at init/start time to seed the cache.
@@ -255,6 +260,15 @@ final class SessionsModel {
                             sessionId: sessionId,
                             source: source,
                             cwd: cwd
+                        )
+                    case let .handoff(cwd, handoffFile, instructions, tabId, paneId, reply):
+                        self.handleHandoffRequest(
+                            cwd: cwd,
+                            handoffFile: handoffFile,
+                            instructions: instructions,
+                            tabId: tabId,
+                            paneId: paneId,
+                            reply: reply
                         )
                     }
                 }
@@ -1003,6 +1017,207 @@ final class SessionsModel {
             initialClaudePaneId: claudePaneId,
             initialTerminalPaneId: nil,
             claudeSessionMode: .resumeDeferred(id: oldSessionId)
+        )
+        onSessionMutation?()
+    }
+
+    // MARK: - Handoff
+
+    /// Handle a `handoff` socket message from the `/nice-handoff` skill.
+    /// Opens a fresh Claude tab nested under the originating tab in the
+    /// sidebar, titled "[HANDOFF] <originating title>", running a brand-
+    /// new Claude session seeded with a prompt that points Claude at the
+    /// notes file the skill wrote.
+    ///
+    /// `internal` (not `private`) so unit tests can drive the dispatch
+    /// path directly without standing up a real socket — matches the
+    /// access level of `handleClaudeSocketRequest` and `paneExited` for
+    /// the same reason.
+    ///
+    /// Originating-tab resolution mirrors the "claude" socket request:
+    /// the request must name a non-empty `tabId` that isn't in the
+    /// pinned Terminals group, resolves to a real tab, and owns the
+    /// sending `paneId`. Unlike the promote-in-place path, a failed
+    /// resolution is NOT an error — a handoff fired from the Main
+    /// Terminal (or any unowned/stale pane) still opens a *top-level*
+    /// handoff tab. Resolution only controls (a) which tab the new tab
+    /// nests under and (b) where it spawns; it never blocks the handoff.
+    ///
+    /// Spawn cwd prefers the originating tab's own `cwd` so the child
+    /// lands wherever its parent is (possibly a worktree Claude moved
+    /// into mid-session), falling back to the payload's `cwd` when there
+    /// is no originating tab.
+    ///
+    /// Title: the originating tab's title with any leading "[HANDOFF] "
+    /// stripped first (so a handoff *from* a handoff tab doesn't stack
+    /// the prefix), defaulting to "Session" when there's no usable
+    /// title, then re-prefixed with "[HANDOFF] ".
+    ///
+    /// Prompt: always instructs Claude to read the notes file, then
+    /// appends either the skill's custom `instructions` (when non-blank)
+    /// or a default "continue the work described there" directive.
+    func handleHandoffRequest(
+        cwd: String,
+        handoffFile: String,
+        instructions: String,
+        tabId: String,
+        paneId: String,
+        reply: @Sendable (String) -> Void
+    ) {
+        guard let tabs else {
+            reply("error: no window")
+            return
+        }
+
+        // Resolve the originating tab the same way the "claude" request
+        // does — non-empty id, not in the Terminals group, present in
+        // the model, and actually owning the sending pane. A miss here
+        // is a top-level fallback, not an error: a handoff from the
+        // Main Terminal should still open a tab.
+        let originating: Tab? = {
+            guard !tabId.isEmpty,
+                  !tabs.isTerminalsProjectTab(tabId),
+                  let tab = tabs.tab(for: tabId),
+                  tab.panes.contains(where: { $0.id == paneId })
+            else { return nil }
+            return tab
+        }()
+
+        let spawnCwd = originating?.cwd ?? cwd
+
+        // Nest under the *resolved* originating tab, not the raw payload
+        // `tabId`. When resolution failed (empty/Terminals/unknown id, or
+        // a stale `paneId` the tab no longer owns) we pass "" so
+        // `insertHandoffChild` rejects it and the tab opens top-level —
+        // keeping nesting coherent with the title/cwd, which already key
+        // off `originating`. (In production `originating?.id == tabId`
+        // whenever resolution succeeds, since the helper sends the pane's
+        // own NICE_TAB_ID/NICE_PANE_ID.)
+        createHandoffTab(
+            underTabId: originating?.id ?? "",
+            cwd: spawnCwd,
+            title: Self.handoffTitle(forOriginatingTitle: originating?.title),
+            prompt: Self.handoffPrompt(handoffFile: handoffFile, instructions: instructions)
+        )
+        reply("ok")
+    }
+
+    /// Prefix used on handoff-tab titles. Exposed so tests and the
+    /// title builder share one literal. `nonisolated` so the pure
+    /// `handoffTitle` helper (also nonisolated) can reference it.
+    nonisolated static let handoffTitlePrefix = "[HANDOFF] "
+
+    /// Build the locked "[HANDOFF] …" title for a handoff tab from the
+    /// originating tab's current title. Pure (no actor state) so it can
+    /// be unit-tested directly — mirrors `TabPtySession.buildClaudeExecCommand`.
+    ///
+    /// Strips a single existing "[HANDOFF] " prefix first so a handoff
+    /// fired *from* a handoff tab reads "[HANDOFF] Foo" rather than
+    /// stacking into "[HANDOFF] [HANDOFF] Foo". Falls back to "Session"
+    /// when the originating title is nil or blank — including
+    /// whitespace-only titles, which would otherwise yield a ragged
+    /// "[HANDOFF]    ".
+    nonisolated static func handoffTitle(forOriginatingTitle originatingTitle: String?) -> String {
+        let raw = originatingTitle ?? ""
+        let stripped = raw.hasPrefix(handoffTitlePrefix)
+            ? String(raw.dropFirst(handoffTitlePrefix.count))
+            : raw
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "Session" : trimmed
+        return handoffTitlePrefix + base
+    }
+
+    /// Build the initial prompt seeded into a handoff session. Pure (no
+    /// actor state) so it can be unit-tested directly.
+    ///
+    /// Always points Claude at the notes file; the continuation is the
+    /// skill's custom `instructions` when non-blank (direct `/nice-handoff
+    /// <args>` invocations), otherwise a default "wait for the user"
+    /// directive (model-triggered / no-arg invocations). The default
+    /// deliberately does NOT auto-resume the work — a no-arg handoff lands
+    /// the fresh session in a read-and-await state so the user stays in
+    /// control of when (and how) it picks up. Passing custom instructions
+    /// (e.g. `/nice-handoff keep going`) overrides this to continue.
+    nonisolated static func handoffPrompt(handoffFile: String, instructions: String) -> String {
+        let trimmed = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        let directive = trimmed.isEmpty
+            ? "Do not start working yet — once you have read it, wait for the user to tell you how to proceed."
+            : trimmed
+        return "Read the handoff notes at \(handoffFile). " + directive
+    }
+
+    /// Mint and spawn the handoff tab. Modelled closely on
+    /// `createTabFromMainTerminal`: a Claude pane (marked running) plus
+    /// a deferred-spawn companion terminal, a pre-minted session UUID
+    /// passed as `--session-id` so the transcript lands under a known
+    /// id, and `activeTabId` flipped to the new tab.
+    ///
+    /// Differences from `createTabFromMainTerminal`:
+    ///   • The title is fixed up front and `titleManuallySet` is flipped
+    ///     so Claude's OSC-driven auto-title can't overwrite the
+    ///     "[HANDOFF] …" label.
+    ///   • Insertion goes through `tabs.insertHandoffChild` so the new
+    ///     tab nests one indent deep under the originating tab (depth-1
+    ///     lineage, same invariant `/branch` uses). When there's no
+    ///     valid parent (top-level handoff from the Main Terminal, or a
+    ///     stale originating id) it falls back to `addTabToProjects` so
+    ///     the tab still opens at top level — same bucketing
+    ///     `createTabFromMainTerminal` uses.
+    ///   • The seeded `prompt` is passed as a single positional Claude
+    ///     arg, which becomes `claude --session-id <id> "<prompt>"` and
+    ///     auto-runs the prompt on launch.
+    private func createHandoffTab(
+        underTabId: String,
+        cwd: String,
+        title: String,
+        prompt: String
+    ) {
+        guard let tabs else { return }
+        let newId = mintTabId("t")
+        let claudePaneId = "\(newId)-claude"
+        let terminalPaneId = "\(newId)-t1"
+        // Pre-mint the session UUID so we can pass --session-id to
+        // claude and persist the same id for later --resume.
+        let sessionId = UUID().uuidString.lowercased()
+        var claudePane = Pane(id: claudePaneId, title: "Claude", kind: .claude)
+        claudePane.isClaudeRunning = true
+
+        var tab = Tab(
+            id: newId,
+            title: title,
+            cwd: cwd,
+            branch: nil,
+            panes: [
+                claudePane,
+                Pane(id: terminalPaneId, title: "Terminal 1", kind: .terminal),
+            ],
+            activePaneId: claudePaneId,
+            claudeSessionId: sessionId
+        )
+        // Lock the title: the handoff label is meaningful and Claude's
+        // OSC auto-title would otherwise replace it once the new session
+        // names itself.
+        tab.titleManuallySet = true
+        tab.nextTerminalIndex = 2
+
+        // Nest under the originating tab when possible; otherwise bucket
+        // by cwd at top level so a Main-Terminal handoff still opens.
+        if !tabs.insertHandoffChild(tab, underTabId: underTabId) {
+            tabs.addTabToProjects(tab, cwd: cwd)
+        }
+        tabs.activeTabId = newId
+
+        // Passing the prompt as a single positional arg makes the
+        // launch line `claude --session-id <id> "<prompt>"`, which
+        // auto-runs the prompt. The companion terminal's pty is deferred
+        // until first focus, same as createTabFromMainTerminal.
+        _ = makeSession(
+            for: newId,
+            cwd: cwd,
+            extraClaudeArgs: [prompt],
+            initialClaudePaneId: claudePaneId,
+            initialTerminalPaneId: nil,
+            claudeSessionMode: .new(id: sessionId)
         )
         onSessionMutation?()
     }

@@ -353,6 +353,10 @@ final class NiceControlSocketTests: XCTestCase {
         switch message {
         case let .claude(_, _, _, _, reply):
             reply("newtab")
+        case let .handoff(_, _, _, _, _, reply):
+            // Not exercised by these tests; reply to honor the
+            // client-fd ownership contract (`reply` closes the fd).
+            reply("ok")
         case .sessionUpdate:
             // Fire-and-forget; not exercised by these tests.
             break
@@ -389,6 +393,9 @@ final class NiceControlSocketTests: XCTestCase {
                     // must close the client fd via `reply` to match
                     // production's contract.
                     reply("newtab")
+                case let .handoff(_, _, _, _, _, reply):
+                    // Likewise unexercised here; reply to close the fd.
+                    reply("ok")
                 }
             }
         }

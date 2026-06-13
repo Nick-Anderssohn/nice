@@ -31,6 +31,11 @@ import SwiftTerm
 
 @MainActor
 final class NiceTerminalView: LocalProcessTerminalView {
+    /// Called by `TabPtySession` to provide the smooth-scrolling
+    /// preference at the time of window attachment. Returns `true` (on)
+    /// when unset.
+    var smoothScrollPreference: (() -> Bool)?
+
     /// Latch set by `TerminalHost.makeNSView` when this pane is the one
     /// SwiftUI is about to mount as the active pane. Consumed on the
     /// next `viewDidMoveToWindow` / `viewDidMoveToSuperview` so focus
@@ -90,12 +95,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
         super.init(frame: frame)
         registerForDraggedTypes(Self.acceptedDragTypes)
         useStandardAnsi256Palette()
+        useSteadyCursor()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerForDraggedTypes(Self.acceptedDragTypes)
         useStandardAnsi256Palette()
+        useSteadyCursor()
     }
 
     /// Override SwiftTerm's `.base16Lab` default for the 256-color
@@ -110,6 +117,20 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// terminals all converge on.
     private func useStandardAnsi256Palette() {
         getTerminal().ansi256PaletteStrategy = .xterm
+    }
+
+    /// Force a non-blinking block cursor. SwiftTerm defaults to
+    /// `.blinkBlock`, and nothing in a normal shell / vim / Claude
+    /// session emits a cursor-style escape sequence, so they all inherit
+    /// that blinking default. A steady cursor keeps the caret position
+    /// readable while holding motion keys (vim `w`/`e`/`b`) instead of
+    /// fading in and out. Both render paths (CoreGraphics caret + Metal
+    /// renderer) read `options.cursorStyle` live, so this one call covers
+    /// both. A program that actively emits a *blinking* DECSCUSR sequence
+    /// could still override it — if that turns out to happen, the fix
+    /// moves into the SwiftTerm fork (coerce blink→steady centrally).
+    private func useSteadyCursor() {
+        getTerminal().setCursorStyle(.steadyBlock)
     }
 
     /// Weak reference to the last window this view was attached to.
@@ -157,21 +178,18 @@ final class NiceTerminalView: LocalProcessTerminalView {
             }
             try setUseMetal(true)
             isMetalEnabled = true
-            // Disable Apple's `setShouldSmoothFonts` stem-darkening.
-            // SwiftTerm's atlas-based GPU renderer applies the dilation
-            // once at rasterization and then composites the cached
-            // mask, which empirically over-thickens glyphs vs.
-            // Apple Terminal's per-draw CG path. Turning smoothing
-            // off makes Nice's strokes read closer to Terminal.app
-            // (whose own per-draw CG dilation is in fact lighter than
-            // SwiftTerm's atlas-baked version), at the cost of
-            // matching Ghostty/Alacritty's thin aesthetic on glyphs
-            // that depend on dilation for body. The Metal rasterizer
-            // reads this flag each frame.
-            fontSmoothing = false
         } catch {
             NSLog("NiceTerminalView: Metal renderer unavailable, falling back to CoreGraphics: \(error)")
         }
+    }
+
+    /// Apply the smooth-scrolling preference. Safe to call at any time;
+    /// SwiftTerm's smooth path also gates on `isUsingMetalRenderer` at
+    /// runtime, so toggling this while the view falls back to
+    /// CoreGraphics is a no-op in practice.
+    func applySmoothScrollPreference() {
+        // Default OFF when no preference is wired (smooth scrolling is opt-in).
+        smoothScrollingEnabled = smoothScrollPreference?() ?? false
     }
 
     override func viewDidMoveToWindow() {
@@ -184,7 +202,18 @@ final class NiceTerminalView: LocalProcessTerminalView {
         let isWindowChange = window != nil && window !== lastWindow && lastWindow != nil
         enableGpuRendering(rebind: isWindowChange)
         lastWindow = window
-        smoothScrollingEnabled = true
+        applySmoothScrollPreference()
+        // Disable Apple's `setShouldSmoothFonts` stem-darkening unconditionally,
+        // regardless of whether Metal or CoreGraphics is active.
+        // SwiftTerm's atlas-based GPU renderer applies the dilation once at
+        // rasterization and then composites the cached mask, which empirically
+        // over-thickens glyphs vs. Apple Terminal's per-draw CG path. Turning
+        // smoothing off makes Nice's strokes read closer to Terminal.app (whose
+        // own per-draw CG dilation is in fact lighter than SwiftTerm's atlas-
+        // baked version), at the cost of matching Ghostty/Alacritty's thin
+        // aesthetic on glyphs that depend on dilation for body. The Metal
+        // rasterizer reads this flag each frame; the CG path reads it per-draw.
+        fontSmoothing = false
         claimFocusIfRequested()
         // Belt-and-suspenders: in the (rare) ordering where AppKit
         // assigns the real frame before window attachment, our

@@ -93,6 +93,14 @@ packages:
     #     `TerminalOptions.textCompositionStrategy = .appleApprox`;
     #     iOS defaults to .identity. Color emoji are intentionally
     #     unaffected.
+    #   - reproduce that same composition curve on the CoreGraphics
+    #     (software) draw path via an offscreen coverage pass
+    #     (`TextCompositionCurve` / `TextCompositionCompositor`), so
+    #     glyph weight matches when the Metal renderer is unavailable
+    #     and the view falls back to CoreGraphics. The
+    #     curve params are now sourced from one place
+    #     (`TextCompositionCurve.params`) shared by both renderers;
+    #     color/emoji glyphs are skipped via `ColorFontDetector`.
     #   - filter trackpad rubber-band events out of `scrollWheel`.
     #     A pure gesture state machine latches the user-driven
     #     direction at gesture start and drops momentum-phase
@@ -106,11 +114,30 @@ packages:
     #     trackpad input no longer fires one arrow per OS event
     #     (≈120 Hz) but instead one per cell of travel. Mouse
     #     wheels (empty phase) pass through untouched.
+    #   - raise the CoreGraphics-path display refresh cap from 60 Hz
+    #     to 120 Hz in `queuePendingDisplay` (delay 16670000 →
+    #     8335000 ns). This path only runs when Metal is off (the
+    #     Metal path has no throttle), so it's the cap that applies
+    #     when the Metal renderer is unavailable and the view falls
+    #     back to CoreGraphics.
+    #     `queueMetalDisplay` (the Metal path) is unchanged.
+    #   - forward Command-modified keys under the kitty keyboard
+    #     protocol. `keyDown` only routed Control / Option-as-Meta
+    #     into the kitty encoder, so Cmd+key combos fell through to
+    #     AppKit and were dropped — apps that enable the protocol
+    #     (Claude Code's fullscreen) never received Cmd+C. Command
+    #     keys now encode as CSI-u (Cmd+C → ESC[99;9u); the default
+    #     Edit menu still claims Cmd+V and Cmd+C-with-selection
+    #     before keyDown, so native paste / selection-copy are
+    #     unaffected.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
-    # regression the throttle was masking. Smooth scrolling is opt-in
-    # via `MacTerminalView.smoothScrollingEnabled` (Nice plumbs it
-    # through `Tweaks.smoothScrolling`, default on).
+    # regression the throttle was masking. Smooth scrolling is plumbed
+    # through `Tweaks.smoothScrolling` — a user toggle in Settings →
+    # Advanced (default off; opt-in) — and only takes effect on the Metal path:
+    # it no-ops when the Metal renderer is unavailable and the view falls back
+    # to CoreGraphics, matching SwiftTerm's
+    # `smoothScrollingEnabled && isUsingMetalRenderer` gate.
     # These patches all live on the fork's `main` branch now; no
     # feature branches needed. To pick up an upstream bump, rebase
     # the fork onto the new revision and update the pin here.
@@ -119,7 +146,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: a00dafb693857b23eb47fe24169e1d46ccded260
+    revision: cceae86f523b4682bb34f2f05ca8fb9349a6f9b2
 
 targets:
   Nice:
@@ -148,7 +175,7 @@ targets:
         # scripts/install.sh for the override flow.
         CFBundleName: $(PRODUCT_NAME)
         CFBundleDisplayName: $(PRODUCT_NAME)
-        CFBundleShortVersionString: "0.23.0"
+        CFBundleShortVersionString: "0.26.0"
         CFBundleVersion: "1"
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
         CFBundlePackageType: APPL
@@ -163,7 +190,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.nickanderssohn.nice
         PRODUCT_NAME: Nice
-        MARKETING_VERSION: "0.23.0"
+        MARKETING_VERSION: "0.26.0"
         CURRENT_PROJECT_VERSION: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

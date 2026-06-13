@@ -33,6 +33,7 @@ protocol TabPtySessionThemeable: AnyObject {
     func applyTerminalFont(size: CGFloat)
     func applyTerminalTheme(_ theme: TerminalTheme)
     func applyTerminalFontFamily(_ name: String?)
+    func applySmoothScrolling(_ enabled: Bool)
 }
 
 @MainActor
@@ -149,6 +150,11 @@ final class TabPtySession: TabPtySessionThemeable {
     /// something creates a `TabPtySession` directly (tests, previews).
     private var currentTerminalTheme: TerminalTheme = BuiltInTerminalThemes.niceDefaultDark
 
+    /// Cached smooth-scrolling flag. Panes spawned after a settings change
+    /// pick this up at construction via `view.smoothScrollPreference`.
+    /// Defaults OFF (smooth scrolling is opt-in).
+    private var currentSmoothScrolling: Bool = false
+
     /// Unix-domain-socket path injected into panes as `NICE_SOCKET`.
     private let socketPath: String?
     /// ZDOTDIR directory injected into terminal panes so the shadowed
@@ -262,6 +268,7 @@ final class TabPtySession: TabPtySessionThemeable {
     private func spawnClaudePane(id: String, cwd: String) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
+        view.smoothScrollPreference = { [weak self] in self?.currentSmoothScrolling ?? false }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         entries[id] = PaneEntry(view: view, kind: .claude, delegate: delegate)
@@ -344,6 +351,7 @@ final class TabPtySession: TabPtySessionThemeable {
     ) -> LocalProcessTerminalView {
         let view = NiceTerminalView(frame: .zero)
         view.font = Self.terminalFont(named: currentTerminalFontFamily, size: currentTerminalFontSize)
+        view.smoothScrollPreference = { [weak self] in self?.currentSmoothScrolling ?? false }
         let delegate = makePaneDelegate(paneId: id)
         view.processDelegate = delegate
         entries[id] = PaneEntry(view: view, kind: .terminal, delegate: delegate)
@@ -928,6 +936,16 @@ final class TabPtySession: TabPtySessionThemeable {
         let font = Self.terminalFont(named: currentTerminalFontFamily, size: size)
         for entry in entries.values {
             entry.view.font = font
+        }
+    }
+
+    /// Switch smooth scrolling on or off for every live pane.
+    /// Caches the value so panes spawned after this call pick it up
+    /// at construction via `view.smoothScrollPreference`.
+    func applySmoothScrolling(_ enabled: Bool) {
+        currentSmoothScrolling = enabled
+        for entry in entries.values {
+            entry.view.applySmoothScrollPreference()
         }
     }
 

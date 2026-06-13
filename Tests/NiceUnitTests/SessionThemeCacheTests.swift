@@ -141,6 +141,35 @@ final class SessionThemeCacheTests: XCTestCase {
         XCTAssertNil(cache.terminalFontFamily)
     }
 
+    // MARK: - updateSmoothScrolling
+
+    func test_updateSmoothScrolling_fansToEveryReceiver() {
+        let a = FakeTabPtySession()
+        let b = FakeTabPtySession()
+        receivers = [a, b]
+
+        cache.updateSmoothScrolling(false)
+
+        XCTAssertEqual(a.applySmoothScrollingCalls, [false])
+        XCTAssertEqual(b.applySmoothScrollingCalls, [false])
+        XCTAssertEqual(cache.smoothScrolling, false)
+    }
+
+    func test_updateSmoothScrolling_withNoReceivers_doesNotCrash() {
+        XCTAssertNoThrow(
+            cache.updateSmoothScrolling(false)
+        )
+        XCTAssertEqual(cache.smoothScrolling, false,
+                       "Cache must update even with no receivers.")
+    }
+
+    func test_initialDefaults_smoothScrollingOff() {
+        // The cache seeds before `Tweaks` syncs; a stale `true` here would briefly
+        // enable smooth scrolling on sessions seeded before the first fan-out.
+        XCTAssertFalse(cache.smoothScrolling,
+                       "SessionThemeCache must seed smoothScrolling OFF to match the Tweaks default")
+    }
+
     // MARK: - Receiver list resolution
 
     func test_receiversClosureReResolvedOnEachUpdate() {
@@ -189,6 +218,17 @@ final class SessionThemeCacheTests: XCTestCase {
         XCTAssertEqual(fresh.applyTerminalFontSizeCalls, [15])
     }
 
+    func test_applyAll_seedsReceiverWithSmoothScrolling() {
+        // A non-default (false) value must reach a fresh receiver via applyAll,
+        // confirming the cache field is included in the seed call.
+        cache.updateSmoothScrolling(false)
+
+        let fresh = FakeTabPtySession()
+        cache.applyAll(to: fresh)
+
+        XCTAssertEqual(fresh.applySmoothScrollingCalls, [false])
+    }
+
     func test_applyAll_preservesThemeBeforeTerminalThemeOrder() {
         // Order matters: applyTheme must run before
         // applyTerminalTheme so the chrome-coupled bg/fg paths in
@@ -224,6 +264,9 @@ final class SessionThemeCacheTests: XCTestCase {
         }
         func applyTerminalFontFamily(_ name: String?) {
             callOrder.append("applyTerminalFontFamily")
+        }
+        func applySmoothScrolling(_ enabled: Bool) {
+            callOrder.append("applySmoothScrolling")
         }
     }
 }

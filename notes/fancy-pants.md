@@ -12,7 +12,7 @@ Two layered changes, both gated on a new `Tweaks.terminalTranslucency: Bool` (de
 
 2. **Inside the terminal**: when applying the terminal theme in `TabPtySession.applyTerminalTheme(_:to:)`, reduce `nativeBackgroundColor`'s alpha to ~0.75 so SwiftTerm's own layer composites over the VisualEffectView behind it. Off ⇒ alpha 1.0 (current behavior).
 
-The toggle plumbs the standard Tweaks → AppState → TabPtySession → NiceTerminalView path already used by `gpuRendering` and `smoothScrolling` (same caching, same `viewDidMoveToWindow` re-apply, same fan-out on change). Fresh-install default is `false` — translucency is a taste toggle, not everyone wants wallpaper bleeding through their terminal.
+The toggle plumbs the standard Tweaks → AppState → TabPtySession → NiceTerminalView path already used by `smoothScrolling` (same caching, same `viewDidMoveToWindow` re-apply, same fan-out on change). Fresh-install default is `false` — translucency is a taste toggle, not everyone wants wallpaper bleeding through their terminal.
 
 ## SwiftTerm compatibility check
 
@@ -107,7 +107,7 @@ Reuse the existing `VisualEffectView` at `Sources/Nice/Views/VisualEffectView.sw
 
 ### 5. `Sources/Nice/Process/NiceTerminalView.swift` (optional)
 
-For `gpuRendering` and `smoothScrolling` we plumb a preference provider through so the view can re-check on `viewDidMoveToWindow`. For translucency we don't need this — the alpha is applied via `nativeBackgroundColor`, which is already set by `TabPtySession` on attach and on every theme fan-out. Skip this file.
+For `smoothScrolling` we plumb a preference provider through so the view can re-check on `viewDidMoveToWindow`. For translucency we don't need this — the alpha is applied via `nativeBackgroundColor`, which is already set by `TabPtySession` on attach and on every theme fan-out. Skip this file.
 
 ### 6. `Sources/Nice/Views/SettingsView.swift` (after line 268)
 

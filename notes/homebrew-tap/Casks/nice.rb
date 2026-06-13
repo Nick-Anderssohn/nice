@@ -23,7 +23,7 @@ cask "nice" do
   desc "Native macOS GUI for Claude Code"
   homepage "https://github.com/Nick-Anderssohn/nice"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Nice.app"
 

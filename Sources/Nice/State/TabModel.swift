@@ -364,6 +364,57 @@ final class TabModel {
         return parentTab
     }
 
+    /// Nest an already-constructed `tab` one indent deep under the tab
+    /// identified by `underTabId`, applying the same depth-1 lineage
+    /// rule `insertBranchParent` uses. Used by the Nice Handoff feature
+    /// to attach a freshly-spawned "[HANDOFF] …" tab beneath the tab it
+    /// was handed off from.
+    ///
+    /// Unlike `insertBranchParent`, the tab is supplied fully-formed by
+    /// the caller (`SessionsModel.createHandoffTab` already minted its
+    /// ids, panes, title, and session id); this method only owns the
+    /// tree placement — choosing the parent pointer and the insertion
+    /// slot.
+    ///
+    /// Lineage layout — depth-1 tree, mirroring `insertBranchParent` but
+    /// from the child's perspective (the new tab is the leaf, the
+    /// originating tab is the anchor):
+    ///   • If the originating tab already has a `parentTabId`, the new
+    ///     tab inherits it — both become depth-1 children of the same
+    ///     root, never depth-2.
+    ///   • Otherwise the originating tab BECOMES the root and the new
+    ///     tab points at it. (We don't re-parent the originating tab's
+    ///     own former children here the way `insertBranchParent` does on
+    ///     first-branch root promotion: the originating tab keeps being
+    ///     the root, so any existing depth-1 children of it stay valid.)
+    ///
+    /// The new tab is inserted immediately AFTER the originating tab so
+    /// the visual order reads [originating, …, handoff child].
+    ///
+    /// Returns `false` (and mutates nothing) when `underTabId` is
+    /// unknown or lives in the pinned Terminals group — the caller then
+    /// falls back to a top-level insert via `addTabToProjects`. Like
+    /// `insertBranchParent`, this method fires no mutation hook itself;
+    /// the caller fires `onSessionMutation` after spawning the pty so
+    /// persistence behaves identically to `createTabFromMainTerminal`.
+    @discardableResult
+    func insertHandoffChild(_ tab: Tab, underTabId: String) -> Bool {
+        guard let (pi, ti) = projectTabIndex(for: underTabId),
+              !isTerminalsProjectTab(underTabId)
+        else { return false }
+        let originating = projects[pi].tabs[ti]
+
+        // Depth-1 rule: if the anchor is already a child, nest under its
+        // root; otherwise the anchor itself becomes the root.
+        var child = tab
+        child.parentTabId = originating.parentTabId ?? underTabId
+
+        // Insert immediately below the originating tab so the visual
+        // order reads [originating, child].
+        projects[pi].tabs.insert(child, at: ti + 1)
+        return true
+    }
+
     /// Sweep every `parentTabId` against the set of currently-present
     /// tab ids and clear any that point at a tab that doesn't exist.
     /// Called from `WindowSession.restoreSavedWindow` after the full

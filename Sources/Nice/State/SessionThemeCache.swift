@@ -62,6 +62,11 @@ final class SessionThemeCache {
     /// (SF Mono → JetBrains Mono NL → system monospaced).
     private(set) var terminalFontFamily: String? = nil
 
+    /// Whether terminal panes use smooth scrolling. Placeholder seed (OFF — the
+    /// product default) until `updateSmoothScrolling` syncs the real value from
+    /// `Tweaks`; thereafter it fans changes to every live receiver.
+    private(set) var smoothScrolling: Bool = false
+
     /// Returns the current fan-out targets. Called on every
     /// `updateX`. `SessionsModel` wires this to `ptySessions.values`
     /// (its live `TabPtySession`s); tests pass a closure that
@@ -119,6 +124,16 @@ final class SessionThemeCache {
         }
     }
 
+    /// Fan out a smooth-scrolling change to every live receiver. Called
+    /// by `SessionsModel.updateSmoothScrolling` when the user toggles
+    /// the setting in the Advanced pane.
+    func updateSmoothScrolling(_ enabled: Bool) {
+        smoothScrolling = enabled
+        for receiver in receivers() {
+            receiver.applySmoothScrolling(enabled)
+        }
+    }
+
     /// Apply the full cached state to a brand-new receiver. Called
     /// from `SessionsModel.makeSession` after creating a new
     /// `TabPtySession` so it joins the population painted with the
@@ -135,5 +150,6 @@ final class SessionThemeCache {
         receiver.applyTheme(scheme, palette: palette, accent: accent)
         receiver.applyTerminalTheme(terminalTheme)
         receiver.applyTerminalFont(size: terminalFontSize)
+        receiver.applySmoothScrolling(smoothScrolling)
     }
 }

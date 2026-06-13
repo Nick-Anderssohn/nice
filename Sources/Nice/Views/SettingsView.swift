@@ -33,6 +33,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case editors     = "Editors"
     case shortcuts   = "Shortcuts"
     case font        = "Font"
+    case claude      = "Claude"
+    case advanced    = "Advanced"
     case about       = "About"
 
     var id: String { rawValue }
@@ -48,6 +50,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .editors:    return "editors"
         case .shortcuts:  return "shortcuts"
         case .font:       return "font"
+        case .claude:     return "claude"
+        case .advanced:   return "advanced"
         case .about:      return "about"
         }
     }
@@ -159,6 +163,8 @@ struct SettingsView: View {
                 case .appearance: AppearancePane()
                 case .editors:    SettingsEditorsPane()
                 case .font:       FontPane()
+                case .claude:     ClaudePane()
+                case .advanced:   AdvancedPane()
                 case .about:      AboutPane()
                 }
             }
@@ -222,6 +228,37 @@ private struct ShortcutsPane: View {
             SettingRow(label: action.label) {
                 KeyRecorderField(action: action)
             }
+        }
+    }
+}
+
+// MARK: - Claude pane
+
+/// Settings for Claude Code integration features. Currently exposes the
+/// handoff-skill toggle; future Claude-specific preferences (hook
+/// configuration, default flags, …) should land here rather than in
+/// Appearance or the top-level pane list.
+private struct ClaudePane: View {
+    @Environment(Tweaks.self) private var tweaks
+
+    var body: some View {
+        @Bindable var tweaks = tweaks
+        SettingTitle("Claude")
+
+        SettingRow(
+            label: "Install the Nice Handoff skill",
+            hint: "Adds the global /nice-handoff Claude Code skill and installs ~/.nice/nice-handoff.sh. When run inside a Claude pane, the skill writes a handoff file capturing the current work and opens a new tab so a fresh session can continue from where this one left off."
+        ) {
+            Toggle("", isOn: $tweaks.installHandoffSkill)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.claude.installHandoffSkill")
+                .onChange(of: tweaks.installHandoffSkill) { _, newValue in
+                    // Keep on-disk skill files in sync with the toggle
+                    // immediately — don't wait for the next launch.
+                    SkillInstaller.sync(enabled: newValue)
+                }
         }
     }
 }
@@ -545,6 +582,28 @@ private struct AccentSwatch: View {
             .help(preset.label)
             .accessibilityLabel(preset.label)
             .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// MARK: - Advanced pane
+
+private struct AdvancedPane: View {
+    @Environment(Tweaks.self) private var tweaks
+
+    var body: some View {
+        @Bindable var tweaks = tweaks
+        SettingTitle("Advanced")
+
+        SettingRow(
+            label: "Smooth scrolling",
+            hint: "Animates terminal scrolling."
+        ) {
+            Toggle("", isOn: $tweaks.smoothScrolling)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.advanced.smoothScrolling")
+        }
     }
 }
 

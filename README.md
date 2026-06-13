@@ -20,7 +20,7 @@ Type `claude <args>` in any shell, from any project directory — a new tab open
 
 ## The themes are lit 🔥
 
-Twelve built-in terminal themes — Catppuccin (all four), Dracula, Nord, Gruvbox, Tokyo Night, Solarized, Atom One, and more — plus five native-chrome accents (Terracotta, Ocean, Fern, Iris, Graphite). Switch live from Settings; the whole window repaints instantly. OS Theme Sync is supported.
+Twelve built-in terminal themes — Catppuccin (Latte & Mocha), Dracula, Nord, Gruvbox, Tokyo Night, Solarized, Atom One, and more — plus five native-chrome accents (Terracotta, Ocean, Fern, Iris, Graphite). Switch live from Settings; the whole window repaints instantly. OS Theme Sync is supported.
 
 Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty's theme file format directly. Drop it in and it's a one-click swap.
 

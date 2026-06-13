@@ -2207,4 +2207,79 @@ final class NiceUITests: NiceUITestCase {
         )
     }
 
+    // MARK: - Settings advanced pane
+
+    /// Opens the Settings window and navigates to the Advanced pane.
+    private func openAdvancedPane(_ app: XCUIApplication) {
+        let gear = app.descendants(matching: .any)["sidebar.settings"]
+        XCTAssertTrue(gear.waitForExistence(timeout: 5))
+        gear.click()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["settings.root"]
+                .waitForExistence(timeout: 5),
+            "Settings window must open before navigating panes"
+        )
+        let row = app.descendants(matching: .any)["settings.section.advanced"]
+        XCTAssertTrue(row.waitForExistence(timeout: 3))
+        row.click()
+    }
+
+    /// Resolve a SwiftUI `Toggle(.switch)` to the underlying control that
+    /// actually carries the "1"/"0" value and the enabled state. A bare
+    /// `descendants(.any)[id]` lookup can resolve to a wrapping group whose
+    /// `.value` is nil, so prefer the checkbox/switch element type (macOS
+    /// surfaces the switch as one or the other depending on OS version)
+    /// before falling back to the generic descendant.
+    private func advancedToggle(_ app: XCUIApplication, _ id: String) -> XCUIElement {
+        let checkBox = app.checkBoxes[id]
+        if checkBox.waitForExistence(timeout: 3) { return checkBox }
+        let toggle = app.switches[id]
+        if toggle.exists { return toggle }
+        return app.descendants(matching: .any)[id]
+    }
+
+    /// Advanced pane exposes the Smooth scrolling toggle. Hardware
+    /// acceleration is always on (no longer user-configurable), so smooth
+    /// scrolling is always interactive.
+    func testSettingsAdvanced_smoothScrollingToggle() throws {
+        let app = launchApp()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["sidebar.terminals"]
+                .waitForExistence(timeout: 5)
+        )
+
+        openAdvancedPane(app)
+
+        let ssToggle = advancedToggle(app, "settings.advanced.smoothScrolling")
+
+        XCTAssertTrue(ssToggle.exists,
+                      "Smooth scrolling toggle must exist in the Advanced pane")
+
+        // Smooth scrolling is opt-in and defaults OFF; the control is always
+        // interactive now that hardware acceleration is always on.
+        XCTAssertFalse(toggleIsOn(ssToggle),
+                       "Smooth scrolling must default OFF (opt-in)")
+        XCTAssertTrue(ssToggle.isEnabled,
+                      "Smooth scrolling must always be enabled")
+
+        // Toggling it ON must stick.
+        ssToggle.click()
+        XCTAssertTrue(toggleIsOn(ssToggle),
+                      "Smooth scrolling must turn ON when clicked")
+    }
+
+    /// Read a toggle's on/off state tolerantly. macOS surfaces an
+    /// `NSButton` checkbox value as an `Int`/`NSNumber` (1/0), whereas
+    /// iOS-style switches use the `"1"`/`"0"` strings — accept any of
+    /// these so the assertion doesn't hinge on the platform's encoding.
+    private func toggleIsOn(_ element: XCUIElement) -> Bool {
+        switch element.value {
+        case let s as String:   return s == "1"
+        case let n as NSNumber: return n.boolValue
+        case let b as Bool:     return b
+        case let i as Int:      return i == 1
+        default:                return false
+        }
+    }
+
 }
