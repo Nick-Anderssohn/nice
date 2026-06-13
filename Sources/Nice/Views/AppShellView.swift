@@ -34,6 +34,13 @@ import SwiftUI
 
 struct AppShellView: View {
     @Environment(NiceServices.self) private var services
+    /// Tear-off pairing token handed down by the value-presenting
+    /// `WindowGroup(id: "main", for: String.self)` in `NiceApp`. nil for
+    /// plain ⌘N / AppKit auto-restore; a fresh UUID for a tear-off or a
+    /// launch fan-out window. `AppShellHost.task` consumes the seed
+    /// deposited under this token (if any). Defaults to nil so the two
+    /// `#Preview` `AppShellView()` call sites still compile.
+    var tearOffToken: String? = nil
     @SceneStorage("sidebarCollapsed") private var storedSidebarCollapsed: Bool = false
     /// Per-window persisted sidebar content mode. Default is `.tabs`
     /// so existing users get exactly the same first-launch experience
@@ -47,6 +54,7 @@ struct AppShellView: View {
     var body: some View {
         AppShellHost(
             services: services,
+            tearOffToken: tearOffToken,
             initialSidebarCollapsed: storedSidebarCollapsed,
             initialSidebarMode: storedSidebarMode,
             windowSessionId: storedWindowSessionId,
@@ -67,13 +75,20 @@ private struct AppShellHost: View {
     @Environment(FontSettings.self) private var fontSettings
     @Environment(\.colorScheme) private var scheme
     /// Used by the launch-time fan-out: the first-mounted window calls
-    /// `openWindow(id: "main")` once per saved entry that no live
+    /// `openWindow(id: "main", value:)` once per saved entry that no live
     /// `AppState` has claimed yet, so every window in `sessions.json`
-    /// reopens on relaunch.
+    /// reopens on relaunch. A fresh token is minted per call (see the
+    /// `.task` fan-out) so the value-presenting `WindowGroup` opens a
+    /// distinct new window each time rather than de-duping on nil.
     @Environment(\.openWindow) private var openWindow
 
     @State private var appState: AppState
     let services: NiceServices
+    /// Tear-off pairing token for this window (see `AppShellView`). nil
+    /// for ⌘N / auto-restore; the `.task` only consumes a seed when this
+    /// is non-nil AND a seed was deposited under it (a fan-out token has
+    /// no deposited seed, so the window starts normally).
+    let tearOffToken: String?
     @Binding var sidebarCollapsedBinding: Bool
     @Binding var sidebarModeBinding: SidebarMode
     @Binding var windowSessionIdBinding: String
@@ -97,6 +112,7 @@ private struct AppShellHost: View {
 
     init(
         services: NiceServices,
+        tearOffToken: String?,
         initialSidebarCollapsed: Bool,
         initialSidebarMode: SidebarMode,
         windowSessionId: String,
@@ -105,6 +121,7 @@ private struct AppShellHost: View {
         windowSessionIdBinding: Binding<String>
     ) {
         self.services = services
+        self.tearOffToken = tearOffToken
         // `NICE_MAIN_CWD` lets UI tests pin the Main Terminal tab's
         // CWD to a sandboxed test directory. Production launches
         // don't set it; AppState falls through to NSHomeDirectory().
@@ -324,20 +341,34 @@ private struct AppShellHost: View {
                 let toSpawn = WindowSession.unclaimedSavedWindowCount(
                     ledger: services.claimLedger
                 )
+                // Mint a FRESH token per spawned window. The value-
+                // presenting `WindowGroup(id: "main", for: String.self)`
+                // keys window uniqueness on the presented value, and a
+                // plain nil value can de-dup to the existing (nil-token)
+                // first window — collapsing the whole fan-out to one
+                // window. A distinct UUID per call forces a NEW window
+                // each time. These fan-out tokens have NO deposited seed,
+                // so each new window's `consumeTearOffSeed(token:)`
+                // returns nil and it starts normally (adopting its
+                // unclaimed `sessions.json` slot, not a tear-off).
                 for _ in 0..<toSpawn {
-                    openWindow(id: "main")
+                    openWindow(id: "main", value: UUID().uuidString)
                 }
             }
             // Tear-off seed: a pane was dragged off a window and its
-            // `PaneTearOffController` opened THIS window to receive it.
-            // Pop the seed from the FIFO queue (nil when this window was
-            // opened for any other reason — normal launch, ⌘N, restore).
-            // The seed carries the live pty entry plus the project
-            // identity needed to reconstruct the sidebar tree; we adopt
-            // it here, AFTER `start()` has brought the socket and
-            // sessions subsystem online, so `adoptPane` can re-point
-            // the entry's delegate at this window's `SessionsModel`.
-            if let seed = services.consumeTearOffSeed() {
+            // `PaneTearOffController` opened THIS window — paired by an
+            // explicit token — to receive it. Consume the seed deposited
+            // under THIS window's token; nil when this window carries no
+            // token (⌘N / auto-restore) or a token with no deposited seed
+            // (a launch fan-out window) — either case skips this block and
+            // the window starts normally. The seed carries the live pty
+            // entry plus the project identity needed to reconstruct the
+            // sidebar tree; we adopt it here, AFTER `start()` has brought
+            // the socket and sessions subsystem online, so `adoptPane`
+            // can re-point the entry's delegate at this window's
+            // `SessionsModel`.
+            if let token = tearOffToken,
+               let seed = services.consumeTearOffSeed(token: token) {
                 switch seed.kind {
                 case .claude:
                     appState.sessions.adoptClaudePaneAsNewTab(
@@ -518,7 +549,7 @@ private struct AppShellHost: View {
                 paneId: paneId,
                 sourceWindowSessionId: appState.windowSession.windowSessionId,
                 at: point,
-                openWindow: { openWindow(id: "main") }
+                openWindow: { token in openWindow(id: "main", value: token) }
             )
         } label: {
             // A small but real, hittable hit area. Transparent so it's

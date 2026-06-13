@@ -18,6 +18,7 @@
 
 import AppKit
 import Foundation
+import os
 
 @MainActor
 @Observable
@@ -111,14 +112,15 @@ final class NiceServices {
         return true
     }
 
-    // MARK: - Tear-off seed queue
+    // MARK: - Tear-off seed pairing
 
-    /// A live pane entry queued to be adopted into the next new window
-    /// opened by a tear-off gesture. The entry holds a running pty, so
-    /// it must be `@ObservationIgnored` (non-Observable payload). Only
-    /// one tear-off fires per `openWindow` call, so a FIFO queue is
-    /// the natural model; in practice at most one entry is outstanding
-    /// at a time.
+    /// A live pane entry queued to be adopted into the new window a
+    /// tear-off gesture opens. The entry holds a running pty, so it must
+    /// be `@ObservationIgnored` (non-Observable payload). Each seed is
+    /// paired to its window by an explicit UUID token (see
+    /// `pendingTearOffs`) rather than by "the next window to mount", so a
+    /// ⌘N / restore window that happens to mount first can never steal a
+    /// tear-off's seed.
     struct PendingTearOff {
         /// The live pty entry detached from the source window, or nil
         /// when the torn-off pane was modelled-but-deferred in the source
@@ -150,27 +152,75 @@ final class NiceServices {
         let screenPoint: NSPoint
     }
 
-    /// Pending tear-off seeds waiting to be consumed by a newly-opened
-    /// window. `@ObservationIgnored` because `PendingTearOff` carries a
-    /// live `TabPtySession.PaneEntry` (not a value type suitable for
-    /// `@Observable` diffing).
+    /// Pending tear-off seeds keyed by the UUID token minted for the
+    /// window that will adopt them. `@ObservationIgnored` because
+    /// `PendingTearOff` carries a live `TabPtySession.PaneEntry` (not a
+    /// value type suitable for `@Observable` diffing).
+    ///
+    /// Token pairing replaces the old temporal FIFO: a window only
+    /// consumes the seed deposited under ITS token (`WindowGroup(for:)`
+    /// hands the token straight to the matching window), so a ⌘N /
+    /// restore window opened concurrently — which carries no token —
+    /// can never pop a seed that belonged to a tear-off.
     @ObservationIgnored
-    private var pendingTearOffs: [PendingTearOff] = []
+    private var pendingTearOffs: [String: PendingTearOff] = [:]
 
-    /// Enqueue a tear-off seed. Called by `PaneTearOffController` just
-    /// before it triggers `openWindow()`. The next `consumeTearOffSeed`
-    /// call (from the new window's `.task`) pops and returns it.
-    func enqueueTearOff(_ seed: PendingTearOff) {
-        pendingTearOffs.append(seed)
+    /// Insertion order of `pendingTearOffs` keys, used for bounded
+    /// eviction only. A deposited window that never opens (the tear-off
+    /// `openWindow` failed, or the app quit before SwiftUI mounted the
+    /// new window) would otherwise leak its seed forever; capping the
+    /// outstanding count and evicting the oldest bounds that leak.
+    @ObservationIgnored
+    private var pendingTearOffOrder: [String] = []
+
+    /// Largest number of un-consumed seeds we keep before evicting the
+    /// oldest. In practice at most one tear-off is ever outstanding, so
+    /// this only trips when seeds orphan (window never opened) — a small
+    /// cap is plenty and keeps the orphan-seed leak bounded. (Static, so
+    /// outside the `@Observable` instance machinery — no
+    /// `@ObservationIgnored` needed.)
+    private static let pendingTearOffCap = 8
+
+    private static let tearOffSeedLog = Logger(
+        subsystem: "dev.nickanderssohn.nice", category: "tearoff"
+    )
+
+    /// Enqueue a tear-off seed under `token`. Called by
+    /// `PaneTearOffController` just before it triggers
+    /// `openWindow(id: "main", value: token)`. The window SwiftUI opens
+    /// for that token consumes it via `consumeTearOffSeed(token:)` from
+    /// its `.task`. If the outstanding count exceeds the cap (an orphan
+    /// leak — a deposited window never opened), the oldest token is
+    /// evicted from both the map and the order list.
+    func enqueueTearOff(_ seed: PendingTearOff, token: String) {
+        pendingTearOffs[token] = seed
+        // Production mints a fresh UUID per call so a token is never
+        // re-deposited, but guard the invariant anyway: a duplicate order
+        // entry would let one consume leave a stale key behind and could
+        // mis-trip the cap-eviction count. Drop any prior occurrence so
+        // the order list stays a faithful 1:1 with the map's keys.
+        pendingTearOffOrder.removeAll { $0 == token }
+        pendingTearOffOrder.append(token)
+        if pendingTearOffOrder.count > Self.pendingTearOffCap {
+            let oldest = pendingTearOffOrder.removeFirst()
+            pendingTearOffs.removeValue(forKey: oldest)
+            Self.tearOffSeedLog.warning(
+                "evicted orphan tear-off seed for token \(oldest, privacy: .public): outstanding count exceeded cap \(Self.pendingTearOffCap, privacy: .public) (a deposited window never opened?)"
+            )
+        }
     }
 
-    /// Pop and return the oldest pending tear-off seed, or nil when the
-    /// queue is empty. MainActor isolation makes the pop atomic without
-    /// a lock. Called from `AppShellHost.task` in the new window so the
-    /// seed is consumed exactly once.
-    func consumeTearOffSeed() -> PendingTearOff? {
-        guard !pendingTearOffs.isEmpty else { return nil }
-        return pendingTearOffs.removeFirst()
+    /// Remove and return the tear-off seed deposited under `token`, or
+    /// nil when none was (a ⌘N / restore window with no token, or a
+    /// fan-out window whose token had no seed). One-shot and MainActor-
+    /// atomic. Called from `AppShellHost.task` in the new window so the
+    /// seed is consumed exactly once, by the window it was paired to.
+    func consumeTearOffSeed(token: String) -> PendingTearOff? {
+        guard let seed = pendingTearOffs.removeValue(forKey: token) else {
+            return nil
+        }
+        pendingTearOffOrder.removeAll { $0 == token }
+        return seed
     }
 
     init() {

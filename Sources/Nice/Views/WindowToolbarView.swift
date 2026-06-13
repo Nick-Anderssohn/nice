@@ -429,7 +429,7 @@ private struct InlinePaneStrip: View {
             sessions: sessions,
             dragState: dragState,
             dragGate: dragGate,
-            openWindow: { openWindow(id: "main") }
+            openWindow: { token in openWindow(id: "main", value: token) }
         ) {
             InlinePanePill(
                 tabId: tab.id,

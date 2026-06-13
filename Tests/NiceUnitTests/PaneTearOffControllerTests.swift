@@ -8,8 +8,15 @@
 //
 //  Two windows (each an AppState) are registered in a shared
 //  NiceServices.registry. A live-pane handle is published and the
-//  controller is called with a stub `openWindow: {}` closure, mirroring
-//  the test pattern in `CrossWindowMoveTests`.
+//  controller is called with a stub `openWindow: { _ in }` closure that
+//  captures the pairing token the controller minted, mirroring the test
+//  pattern in `CrossWindowMoveTests`.
+//
+//  NOTE: `tearOff` now DEFERS its `openWindow` call one runloop turn (so
+//  a new window is never born mid-`NSDraggingSession`). The seed enqueue
+//  + source-tab dissolve + respawn epilogue are still SYNCHRONOUS, but
+//  the `openWindow` token capture is not — tests that read the token (to
+//  consume the seed by token) pump the main runloop first.
 //
 //  Covers:
 //    • Terminal pane tear-off — pane leaves source, seed is enqueued
@@ -98,24 +105,48 @@ final class PaneTearOffControllerTests: XCTestCase {
         ))
     }
 
+    /// Run a tear-off and return the pairing token the controller minted,
+    /// captured from the (deferred) `openWindow` closure. Pumps the main
+    /// runloop so the `DispatchQueue.main.async` open fires. nil if the
+    /// controller aborted before opening (the closure never ran).
+    @discardableResult
+    private func tearOffCapturingToken(
+        paneId: String,
+        from sourceSessionId: String,
+        at point: NSPoint = NSPoint(x: 0, y: 0)
+    ) -> String? {
+        var capturedToken: String?
+        let opened = expectation(description: "openWindow called")
+        PaneTearOffController(services: services).tearOff(
+            paneId: paneId,
+            sourceWindowSessionId: sourceSessionId,
+            at: point,
+            openWindow: { token in
+                capturedToken = token
+                opened.fulfill()
+            }
+        )
+        wait(for: [opened], timeout: 1.0)
+        return capturedToken
+    }
+
     // MARK: - Terminal pane tear-off
 
     func test_terminalPane_tearOff_seedEnqueuedWithCorrectFields() {
         seedTerminalTab(into: winA, projectId: "a", tabId: "a-tab", paneIds: ["pA"])
         publishDrag(from: winA, tabId: "a-tab", paneId: "pA")
 
-        var openWindowCalled = false
         let releasePoint = NSPoint(x: 200, y: 300)
-        PaneTearOffController(services: services).tearOff(
-            paneId: "pA",
-            sourceWindowSessionId: "win-A",
-            at: releasePoint,
-            openWindow: { openWindowCalled = true }
+        let token = tearOffCapturingToken(
+            paneId: "pA", from: "win-A", at: releasePoint
         )
 
-        // The openWindow closure must have been called to trigger the
-        // new window.
-        XCTAssertTrue(openWindowCalled)
+        // The openWindow closure must have been called (deferred) with a
+        // non-nil pairing token to trigger the new window.
+        guard let token else {
+            XCTFail("Expected openWindow to fire with a pairing token")
+            return
+        }
 
         // The in-flight handle must be consumed (drag is no longer live).
         XCTAssertNil(services.livePaneRegistry.currentDrag)
@@ -129,9 +160,9 @@ final class PaneTearOffControllerTests: XCTestCase {
         XCTAssertTrue(winA.sessions.ptySessions["a-tab"]?.hasPane("pA") != true,
                       "Live entry should no longer be in the source session")
 
-        // A seed must be enqueued and consumable.
-        guard let seed = services.consumeTearOffSeed() else {
-            XCTFail("Expected a PendingTearOff seed to be enqueued")
+        // A seed must be enqueued under the minted token and consumable.
+        guard let seed = services.consumeTearOffSeed(token: token) else {
+            XCTFail("Expected a PendingTearOff seed enqueued under the token")
             return
         }
         XCTAssertEqual(seed.paneId, "pA")
@@ -142,8 +173,8 @@ final class PaneTearOffControllerTests: XCTestCase {
         XCTAssertEqual(seed.projectPath, "/tmp/a")
         XCTAssertEqual(seed.screenPoint, releasePoint)
 
-        // No second seed should be lurking.
-        XCTAssertNil(services.consumeTearOffSeed())
+        // One-shot: the seed is gone after the first consume.
+        XCTAssertNil(services.consumeTearOffSeed(token: token))
     }
 
     // MARK: - Claude pane tear-off
@@ -164,16 +195,14 @@ final class PaneTearOffControllerTests: XCTestCase {
                                        initialClaudePaneId: "cA")
         publishDrag(from: winA, tabId: "a-claude", paneId: "cA")
 
-        var openWindowCalled = false
         let releasePoint = NSPoint(x: 500, y: 400)
-        PaneTearOffController(services: services).tearOff(
-            paneId: "cA",
-            sourceWindowSessionId: "win-A",
-            at: releasePoint,
-            openWindow: { openWindowCalled = true }
+        let token = tearOffCapturingToken(
+            paneId: "cA", from: "win-A", at: releasePoint
         )
-
-        XCTAssertTrue(openWindowCalled)
+        guard let token else {
+            XCTFail("Expected openWindow to fire with a pairing token")
+            return
+        }
         XCTAssertNil(services.livePaneRegistry.currentDrag)
 
         // Pane removed from source tab (still has companion terminal).
@@ -182,7 +211,7 @@ final class PaneTearOffControllerTests: XCTestCase {
         XCTAssertEqual(winA.sessions.ptySessions["a-claude"]?.hasPane("cA"), false)
 
         // Seed fields.
-        guard let seed = services.consumeTearOffSeed() else {
+        guard let seed = services.consumeTearOffSeed(token: token) else {
             XCTFail("Expected a PendingTearOff seed for the Claude pane")
             return
         }
@@ -194,7 +223,7 @@ final class PaneTearOffControllerTests: XCTestCase {
         XCTAssertEqual(seed.projectPath, "/tmp/repo")
         XCTAssertEqual(seed.screenPoint, releasePoint)
 
-        XCTAssertNil(services.consumeTearOffSeed())
+        XCTAssertNil(services.consumeTearOffSeed(token: token))
     }
 
     // MARK: - Last-pane dissolve
@@ -207,12 +236,10 @@ final class PaneTearOffControllerTests: XCTestCase {
         // winB already registered; nothing extra to seed there.
         publishDrag(from: winA, tabId: "a-tab", paneId: "pA")
 
-        PaneTearOffController(services: services).tearOff(
-            paneId: "pA",
-            sourceWindowSessionId: "win-A",
-            at: NSPoint(x: 0, y: 0),
-            openWindow: {}
-        )
+        // The dissolve epilogue is SYNCHRONOUS (runs before the deferred
+        // openWindow), so it's asserted immediately after the call. The
+        // token capture pumps the runloop and cleans up the seed.
+        let token = tearOffCapturingToken(paneId: "pA", from: "win-A")
 
         // The project tab must have dissolved (pane was the last one).
         XCTAssertNil(winA.tabs.tab(for: "a-tab"),
@@ -226,8 +253,8 @@ final class PaneTearOffControllerTests: XCTestCase {
         XCTAssertFalse(terminalsProject?.tabs.isEmpty ?? true,
                        "Terminals project Main tab must survive the dissolve")
 
-        // Consume the seed so the queue is clean.
-        _ = services.consumeTearOffSeed()
+        // Consume the seed so the map is clean.
+        if let token { _ = services.consumeTearOffSeed(token: token) }
     }
 
     // MARK: - Bug 3: source's new active pane is spawned after tear-off
@@ -259,18 +286,15 @@ final class PaneTearOffControllerTests: XCTestCase {
                        "Precondition: companion terminal is not yet spawned")
         publishDrag(from: winA, tabId: "a-claude", paneId: "cA")
 
-        PaneTearOffController(services: services).tearOff(
-            paneId: "cA",
-            sourceWindowSessionId: "win-A",
-            at: NSPoint(x: 0, y: 0),
-            openWindow: {}
-        )
+        let token = tearOffCapturingToken(paneId: "cA", from: "win-A")
 
         // Focus shifted to the companion terminal AND it was spawned.
+        // (The respawn epilogue is synchronous — it runs before the
+        // deferred openWindow the helper waits on.)
         XCTAssertEqual(winA.tabs.tab(for: "a-claude")?.activePaneId, companionId)
         XCTAssertEqual(winA.sessions.ptySessions["a-claude"]?.hasPane(companionId), true,
                        "Source tab's new active terminal must be spawned (bug 3)")
 
-        _ = services.consumeTearOffSeed()
+        if let token { _ = services.consumeTearOffSeed(token: token) }
     }
 }

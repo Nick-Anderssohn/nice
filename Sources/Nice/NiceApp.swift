@@ -113,14 +113,23 @@ struct NiceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        // The explicit `id: "main"` lets the launch-time fan-out call
-        // `openWindow(id: "main")` once per saved window beyond the
-        // first — see `AppShellHost.task` and
-        // `WindowSession.unclaimedSavedWindowCount`. Each call spawns
-        // a fresh instance (canonical `WindowGroup` semantics), which
-        // then adopts the next unclaimed slot from `sessions.json`.
-        WindowGroup(id: "main") {
-            AppShellView()
+        // Value-presenting window group: the presented value is a
+        // tear-off pairing token (`String?`). `$tearOffToken` is the
+        // value SwiftUI hands to the window it opens —
+        //   • nil      — plain ⌘N and AppKit auto-restore (no token).
+        //   • a UUID    — a tear-off (`PaneTearOffController`) or a
+        //                 launch fan-out `openWindow`, each minting a
+        //                 fresh token per call.
+        // `AppShellHost.task` consumes the seed deposited under its
+        // token (if any) via `services.consumeTearOffSeed(token:)`, so a
+        // seed is paired to ITS window explicitly rather than to "the
+        // next window to mount" — killing the seed-steal class the old
+        // FIFO had. The fan-out mints a distinct token per call so each
+        // `openWindow(id: "main", value:)` is forced to open a NEW
+        // window: a plain nil value can de-dup to the existing nil-value
+        // window, which would collapse multi-window restore to one.
+        WindowGroup(id: "main", for: String.self) { $tearOffToken in
+            AppShellView(tearOffToken: tearOffToken)
                 .environment(services)
                 .environment(services.tweaks)
                 .environment(services.shortcuts)
@@ -140,6 +149,25 @@ struct NiceApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
         .commands {
+            // Replace SwiftUI's auto File ▸ New Window item. The default
+            // item opens the value-presenting `WindowGroup(id: "main",
+            // for: String.self)` with a NIL value, and SwiftUI can de-dup
+            // a nil-value window to the existing nil-value (launch) window
+            // — focusing it instead of opening a new one. That collapses
+            // ⌘N to a no-op and regresses multi-window isolation.
+            //
+            // Every OTHER open path already mints a fresh UUID token (the
+            // launch fan-out at AppShellView, and tear-off via
+            // PaneTearOffController), forcing a distinct presented value
+            // so the group is obliged to open a NEW window. ⌘N was the one
+            // path still presenting nil. We mint a token here too: the
+            // token has NO deposited tear-off seed, so the new window's
+            // `consumeTearOffSeed(token:)` returns nil and it starts
+            // normally — behaviourally identical to a plain ⌘N, but never
+            // focus-existing.
+            CommandGroup(replacing: .newItem) {
+                NewWindowButton()
+            }
             // Restore the standard full-screen menu item + ⌃⌘F. It's in
             // the View menu (where macOS conventionally puts it) via the
             // `.sidebar` placement. `toggleFullScreen` works because the
@@ -180,5 +208,30 @@ struct NiceApp: App {
                 .tint(services.tweaks.accent.color)
         }
         .windowResizability(.contentMinSize)
+    }
+}
+
+/// The File ▸ New Window menu item (⌘N), wired to mint a fresh tear-off
+/// pairing token per invocation.
+///
+/// Lives in its own `View` rather than calling `openWindow` from the
+/// `App` body so it can hold `@Environment(\.openWindow)` — the action is
+/// reliably populated in a `View` rendered inside a `CommandGroup`, and
+/// reading it from the `App`/`Scene` level is brittle.
+///
+/// Why a token at all: the scene is `WindowGroup(id: "main", for:
+/// String.self)`. A nil presented value can de-dup to the existing
+/// nil-value (launch) window, so plain ⌘N may focus-existing instead of
+/// opening a new window. A fresh `UUID().uuidString` is a distinct value,
+/// forcing a NEW window. The token has no deposited seed, so the new
+/// window consumes nothing and starts as a pristine ⌘N window would.
+private struct NewWindowButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("New Window") {
+            openWindow(id: "main", value: UUID().uuidString)
+        }
+        .keyboardShortcut("n", modifiers: .command)
     }
 }

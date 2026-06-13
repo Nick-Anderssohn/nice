@@ -14,10 +14,13 @@
 //       any mutation (extractPane may shift focus; snapshot first).
 //    3. `claim(paneId:)` — detaches the live pty entry one-shot.
 //    4. `extractPane` — removes the pane model from the source tab.
-//    5. Enqueue a `PendingTearOff` seed on `NiceServices` so the new
-//       window's `.task` can adopt the entry.
-//    6. Call `openWindow()` — the SwiftUI scene action, passed in as a
-//       closure because a struct can't read `@Environment` directly.
+//    5. Enqueue a `PendingTearOff` seed on `NiceServices` under a
+//       freshly-minted UUID token so the window opened for that token
+//       (and only that window) can adopt the entry.
+//    6. Call `openWindow(token)` — the SwiftUI scene action, passed in
+//       as a closure because a struct can't read `@Environment`
+//       directly. Deferred one runloop turn (see below) so a new window
+//       is never born mid-`NSDraggingSession`.
 //    7. `dissolveTabIfEmpty` — dissolve the source tab if it's now
 //       empty (multi-window-safe; won't terminate while another window
 //       exists).
@@ -52,15 +55,17 @@ struct PaneTearOffController {
     ///     pane is leaving.
     ///   - screenPoint: The screen coordinate where the new window's
     ///     origin should be placed (the drag-release point).
-    ///   - openWindow: The SwiftUI `openWindow(id:)` action wrapped in
-    ///     a plain closure. Callers pass
-    ///     `{ openWindow(id: "main") }` — this lets the struct invoke
-    ///     the action without needing `@Environment` access.
+    ///   - openWindow: The SwiftUI `openWindow(id:value:)` action wrapped
+    ///     in a closure taking the pairing token. Callers pass
+    ///     `{ token in openWindow(id: "main", value: token) }` — this
+    ///     lets the struct invoke the action without needing
+    ///     `@Environment` access, while pairing the new window to the
+    ///     seed deposited under `token`.
     func tearOff(
         paneId: String,
         sourceWindowSessionId: String,
         at screenPoint: NSPoint,
-        openWindow: () -> Void
+        openWindow: @escaping (String) -> Void
     ) {
         let live = services.livePaneRegistry
 
@@ -148,7 +153,11 @@ struct PaneTearOffController {
         // Remove the pane model from the source tab.
         _ = source.tabs.extractPane(paneId, fromTab: sourceTabId)
 
-        // Enqueue the seed so the new window's `.task` can consume it.
+        // Mint a fresh pairing token and enqueue the seed under it. Only
+        // the window SwiftUI opens for THIS token will find the seed
+        // (`consumeTearOffSeed(token:)`), so a ⌘N / restore window opened
+        // concurrently can never steal it.
+        let tearOffToken = UUID().uuidString
         services.enqueueTearOff(NiceServices.PendingTearOff(
             entry: seedEntry,
             paneId: paneId,
@@ -160,11 +169,19 @@ struct PaneTearOffController {
             projectPath: proj.path,
             cwd: seedCwd,
             screenPoint: screenPoint
-        ))
+        ), token: tearOffToken)
 
-        // Open the new window. SwiftUI will create a fresh `AppShellHost`
-        // whose `.task` will call `consumeTearOffSeed()` and adopt the entry.
-        openWindow()
+        // Open the new window, DEFERRED one runloop turn so it is never
+        // born mid-`NSDraggingSession` (graft 2/3 — AppKit re-finalizing
+        // a window's properties while a drag session is unwinding is the
+        // BUG C race). The seed is already deposited synchronously above,
+        // so by the time SwiftUI builds the new `AppShellHost` and its
+        // `.task` calls `consumeTearOffSeed(token:)`, the paired seed is
+        // waiting. The dissolve + respawn epilogue below stays
+        // synchronous — it runs before this deferred open.
+        DispatchQueue.main.async { [openWindow, tearOffToken] in
+            openWindow(tearOffToken)
+        }
 
         // Dissolve the source tab if tearing off the last pane left it
         // empty. Multi-window-safe: won't terminate the app while

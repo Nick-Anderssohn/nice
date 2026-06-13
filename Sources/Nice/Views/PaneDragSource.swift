@@ -131,9 +131,11 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
     let dragState: PaneStripDragState
     /// The window-drag veto flag (see `WindowDragGate`).
     let dragGate: WindowDragGate
-    /// `openWindow(id: "main")` wrapped in a closure so the tear-off
-    /// controller (a struct) can open a window without `@Environment`.
-    let openWindow: () -> Void
+    /// `openWindow(id: "main", value:)` wrapped in a closure taking the
+    /// tear-off pairing token, so the tear-off controller (a struct) can
+    /// open the paired window without `@Environment`. The controller
+    /// mints the token and passes it in.
+    let openWindow: (String) -> Void
 
     @ViewBuilder let content: () -> Content
 
@@ -288,7 +290,7 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
             let services: NiceServices
             let sessions: SessionsModel
             let dragState: PaneStripDragState
-            let openWindow: () -> Void
+            let openWindow: (String) -> Void
         }
 
         var config: Config?

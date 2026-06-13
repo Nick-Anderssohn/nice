@@ -75,6 +75,27 @@ final class AdoptTerminalPaneAsMainTerminalTests: XCTestCase {
         ))
     }
 
+    /// Run a tear-off and return the pairing token the controller minted
+    /// (captured from the deferred `openWindow` closure). Pumps the main
+    /// runloop so the `DispatchQueue.main.async` open fires; consume the
+    /// seed by the returned token.
+    @discardableResult
+    private func tearOffCapturingToken(
+        paneId: String,
+        from sourceSessionId: String,
+        at point: NSPoint = NSPoint(x: 100, y: 100)
+    ) -> String? {
+        var capturedToken: String?
+        let opened = expectation(description: "openWindow called")
+        PaneTearOffController(services: services).tearOff(
+            paneId: paneId, sourceWindowSessionId: sourceSessionId,
+            at: point,
+            openWindow: { token in capturedToken = token; opened.fulfill() }
+        )
+        wait(for: [opened], timeout: 1.0)
+        return capturedToken
+    }
+
     // MARK: - Tests
 
     func test_terminalsSectionTearOff_replacesMainTerminal_singleSection() {
@@ -101,13 +122,10 @@ final class AdoptTerminalPaneAsMainTerminalTests: XCTestCase {
         let winBSeededPaneId = winB.tabs.projects[0].tabs[0].activePaneId
 
         // Tear off — enqueues a seed carrying the Terminals project id.
-        PaneTearOffController(services: services).tearOff(
-            paneId: tornId,
-            sourceWindowSessionId: "win-A",
-            at: NSPoint(x: 100, y: 100),
-            openWindow: {}
-        )
-        guard let seed = services.consumeTearOffSeed() else {
+        guard let token = tearOffCapturingToken(paneId: tornId, from: "win-A") else {
+            return XCTFail("Expected openWindow to fire with a pairing token")
+        }
+        guard let seed = services.consumeTearOffSeed(token: token) else {
             return XCTFail("Expected a tear-off seed")
         }
         XCTAssertEqual(seed.projectId, TabModel.terminalsProjectId,

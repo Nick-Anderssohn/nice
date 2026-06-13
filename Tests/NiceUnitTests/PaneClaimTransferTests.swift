@@ -96,6 +96,27 @@ final class PaneClaimTransferTests: XCTestCase {
         ))
     }
 
+    /// Run a tear-off and return the pairing token the controller minted
+    /// (captured from the deferred `openWindow` closure). Pumps the main
+    /// runloop so the `DispatchQueue.main.async` open fires; consume the
+    /// seed by the returned token.
+    @discardableResult
+    private func tearOffCapturingToken(
+        paneId: String,
+        from sourceSessionId: String,
+        at point: NSPoint = NSPoint(x: 100, y: 100)
+    ) -> String? {
+        var capturedToken: String?
+        let opened = expectation(description: "openWindow called")
+        PaneTearOffController(services: services).tearOff(
+            paneId: paneId, sourceWindowSessionId: sourceSessionId,
+            at: point,
+            openWindow: { token in capturedToken = token; opened.fulfill() }
+        )
+        wait(for: [opened], timeout: 1.0)
+        return capturedToken
+    }
+
     // MARK: - claimPaneForTransfer tri-state
 
     func test_claimPaneForTransfer_live_forSpawnedPane() {
@@ -162,12 +183,11 @@ final class PaneClaimTransferTests: XCTestCase {
                      "Precondition: source pane is unspawned (no session).")
         publishDrag(from: winA, tabId: "a-tab", paneId: "pA")
 
-        PaneTearOffController(services: services).tearOff(
-            paneId: "pA", sourceWindowSessionId: "win-A",
-            at: NSPoint(x: 100, y: 100), openWindow: {}
-        )
+        guard let token = tearOffCapturingToken(paneId: "pA", from: "win-A") else {
+            return XCTFail("Expected openWindow to fire with a pairing token.")
+        }
 
-        guard let seed = services.consumeTearOffSeed() else {
+        guard let seed = services.consumeTearOffSeed(token: token) else {
             return XCTFail("Expected a tear-off seed.")
         }
         XCTAssertNil(seed.entry, "An unspawned pane seeds a nil entry.")
@@ -203,11 +223,12 @@ final class PaneClaimTransferTests: XCTestCase {
         XCTAssertEqual(winA.sessions.ptySessions[mainTabId]?.hasPane(deferredId), nil)
         publishDrag(from: winA, tabId: mainTabId, paneId: deferredId)
 
-        PaneTearOffController(services: services).tearOff(
-            paneId: deferredId, sourceWindowSessionId: "win-A",
-            at: NSPoint(x: 100, y: 100), openWindow: {}
-        )
-        guard let seed = services.consumeTearOffSeed() else {
+        guard let token = tearOffCapturingToken(
+            paneId: deferredId, from: "win-A"
+        ) else {
+            return XCTFail("Expected openWindow to fire with a pairing token.")
+        }
+        guard let seed = services.consumeTearOffSeed(token: token) else {
             return XCTFail("Expected a tear-off seed.")
         }
         XCTAssertNil(seed.entry)
