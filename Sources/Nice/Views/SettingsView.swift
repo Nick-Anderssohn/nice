@@ -77,11 +77,25 @@ struct SettingsView: View {
             // SwiftUI's `Settings` scene historically renders its window
             // without `.resizable` in its styleMask, ignoring
             // `.windowResizability(.contentMinSize)` on the scene. Reach
-            // into AppKit and OR the bit in once the window is live so
-            // the user can drag any edge / corner like a normal window.
-            WindowAccessor { window in
-                if !window.styleMask.contains(.resizable) {
-                    window.styleMask.insert(.resizable)
+            // into AppKit and OR the bit in so the user can drag any edge /
+            // corner like a normal window.
+            //
+            // `WindowBridge` fires synchronously at attach, but the
+            // `.resizable` insert is DEFERRED one runloop: SwiftUI's
+            // subsequent Settings-window styleMask configuration can clobber
+            // an attach-time insert, regressing resizable Settings. The
+            // deferred hop lands after that finalization, matching the old
+            // `WindowAccessor` timing.
+            //
+            // We deliberately do NOT adopt the chrome controller here —
+            // Settings keeps standard chrome. (Even if we did, the
+            // controller's `.fullSizeContentView` guards would skip it.)
+            WindowBridge { window in
+                DispatchQueue.main.async { [weak window] in
+                    guard let window else { return }
+                    if !window.styleMask.contains(.resizable) {
+                        window.styleMask.insert(.resizable)
+                    }
                 }
             }
         )

@@ -4,7 +4,7 @@
 //
 //  Coverage for window-frame persistence: `snapshotPersistedWindow`
 //  reads `window.frame` when an `NSWindow` has been wired in by the
-//  view layer's `WindowAccessor`, and `restoreSavedWindow` calls
+//  view layer's `WindowBridge`, and `restoreSavedWindow` calls
 //  `setFrame` on that same window when the adopted snapshot carries
 //  a frame.
 //
@@ -51,7 +51,7 @@ final class WindowSessionFrameTests: XCTestCase {
 
     func test_snapshot_includesFrame_whenWindowIsSet() {
         // Wire a real NSWindow with a known frame; the snapshot must
-        // capture it verbatim. AppShellHost's WindowAccessor sets
+        // capture it verbatim. AppShellHost's WindowBridge sets
         // `windowSession.window` once AppKit hands SwiftUI an
         // NSWindow — this test pins down the read-side contract.
         let frame = NSRect(x: 120, y: 240, width: 800, height: 600)
@@ -69,7 +69,7 @@ final class WindowSessionFrameTests: XCTestCase {
     }
 
     func test_snapshot_frameNil_whenWindowMissing() {
-        // Saves can fire before WindowAccessor wires up the NSWindow
+        // Saves can fire before WindowBridge wires up the NSWindow
         // (very early in scene-graph init). Those rare snapshots
         // must persist `frame: nil`, not crash, not synthesize a
         // bogus value. The restored window then falls back to

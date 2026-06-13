@@ -7,7 +7,7 @@
 //  app termination) can route work to the focused window without the
 //  views themselves holding a reference to a single shared AppState.
 //
-//  Each `AppShellView` registers on mount via `WindowAccessor`. The
+//  Each `AppShellView` registers on mount via `WindowBridge`. The
 //  registry observes `willCloseNotification` so it can tear down the
 //  window's AppState (terminate ptys, stop control socket) without each
 //  view needing its own `.onDisappear` plumbing.

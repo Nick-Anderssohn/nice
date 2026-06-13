@@ -179,7 +179,7 @@ enum TitleBarZoomMonitor {
             // tracker can never observe `isMovable == true` on a press —
             // even for a window born mid-drag whose properties AppKit
             // re-finalized back to the default `true` after the
-            // synchronous `WindowAccessor` pass. This is the event-driven
+            // synchronous `WindowBridge` pass. This is the event-driven
             // replacement for the deleted 0/0.05/0.2s `AppShellView`
             // timer loop (which lost the race when re-finalization landed
             // after the last tick); it is exactly Design 2's

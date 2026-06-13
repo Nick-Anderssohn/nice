@@ -67,7 +67,7 @@ final class WindowSession {
     private weak var sidebar: SidebarModel?
 
     /// Live `NSWindow` for this scene, set by `AppShellHost`'s
-    /// `WindowAccessor` once AppKit hands SwiftUI a real window.
+    /// `WindowBridge` once AppKit hands SwiftUI a real window.
     /// `snapshotPersistedWindow` reads `.frame` from this so each save
     /// captures the current size/position; `restoreSavedWindow`
     /// applies the saved frame after the tab tree is rebuilt. Weak so
@@ -202,7 +202,7 @@ final class WindowSession {
             ))
         }
         // Capture the live window's frame so relaunch can restore the
-        // user's chosen size/position. nil before the WindowAccessor
+        // user's chosen size/position. nil before the WindowBridge
         // has fired (very early in scene-graph init) — those rare
         // saves persist with `frame: nil` and the restored window
         // falls back to SwiftUI's default placement.

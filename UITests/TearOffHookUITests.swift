@@ -191,11 +191,14 @@ final class TearOffHookUITests: NiceUITestCase {
 
     /// Tear off a pane via the hook and assert the NEW window's
     /// traffic-light (close) button sits at the SAME window-relative
-    /// position as the original window's — i.e. the `TrafficLightNudger`
-    /// inset applied to the torn-off window just like a normal window.
-    /// Bug 2 left the torn-off window's buttons at the default macOS
-    /// position (flush to the corner) because AppKit re-laid them out
-    /// after the nudge and nothing re-applied it.
+    /// position as the original window's — i.e. `TrafficLightPlacer`
+    /// (owned by each window's `WindowChromeController`) insets the
+    /// torn-off window's buttons just like a normal window. Bug 2 left
+    /// the torn-off window's buttons at the default macOS position
+    /// (flush to the corner) because AppKit re-laid them out after the
+    /// nudge and nothing re-applied it. The assertion is deliberately
+    /// RELATIVE (torn-off matches original) so it never bakes in an
+    /// OS-specific absolute position.
     func testTornOffWindowTrafficLightsMatchOriginalOffset() throws {
         let app = launchApp(windowFrame: CGRect(x: 150, y: 180, width: 900, height: 640))
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 5))
@@ -214,8 +217,11 @@ final class TearOffHookUITests: NiceUITestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [opened], timeout: 8), .completed,
                        "Tear-off hook should open a second window")
 
-        // Give the new window's chrome time to settle (the nudge fix
-        // re-applies on a short deferred schedule + on window move).
+        // Give the new window's chrome time to settle. `TrafficLightPlacer`
+        // re-resolves + re-applies on the buttons' own frame events and on
+        // window focus / resize / move (`didMove` specifically covers the
+        // tear-off's post-open reposition) — no timer, but the XCUITest
+        // round-trip still needs a beat for those events to land.
         Thread.sleep(forTimeInterval: 1.0)
 
         guard let newWindow = newlyOpenedWindow(in: app, originalOriginX: 150) else {

@@ -209,76 +209,85 @@ private struct AppShellHost: View {
         }
         .ignoresSafeArea(edges: .top)
         .background(
-            // Host-window reach-through: once the shell is mounted,
-            // register the window so shortcuts and termination route to
-            // this AppState, and nudge the native traffic lights into
-            // the sidebar card. dy:-10 places their visual centers at
-            // the same window-y as the sidebar collapse/expand icon
-            // (which sits at y=26pt from the window top in both the
-            // expanded sidebar and the collapsed cap).
-            WindowAccessor { window in
-                // Wire the NSWindow into WindowSession before anything
-                // else so the first save (which can fire as early as a
-                // tab mutation triggered during start()) captures the
-                // real frame instead of persisting `frame: nil`.
+            // Host-window reach-through. `WindowBridge` fires SYNCHRONOUSLY
+            // at view-attach (before first draw), unlike the old
+            // `WindowAccessor` which deferred one runloop. Ownership after
+            // this redesign:
+            //   • `WindowChromeController` owns the chrome AppKit state —
+            //     the `isMovable = false` policy (with a KVO re-assert for
+            //     the server-side drag-init path) and the traffic lights
+            //     (positioned absolutely to Nice's window-y 26 top-bar row,
+            //     OS-version-robust, by `TrafficLightPlacer`). `adopt()`
+            //     registers UNCONDITIONALLY and self-heals via its own
+            //     focus / frame observers once the `.hiddenTitleBar` mask
+            //     lands, so it's safe to call this early at attach.
+            //   • `TitleBarZoomMonitor` still owns double-click-zoom AND the
+            //     event-time `isMovable` invariant until Phase D's router
+            //     absorbs them — the controller's policy is a complementary
+            //     second defense (both set isMovable false; no conflict).
+            //
+            // TIMING — two writes are DEFERRED one runloop because they only
+            // stick when run AFTER SwiftUI finalizes the window (the same
+            // reason the old `WindowAccessor` deferred everything):
+            //   • the `NICE_UITEST_WINDOW_FRAME` pin — SwiftUI's initial
+            //     sizing pass under `.windowResizability(.contentSize)` can
+            //     override an attach-time `setFrame`, resurrecting the zoom
+            //     flake the pin kills.
+            //   • `registry.register` — it wraps `window.delegate` in
+            //     `CloseConfirmationDelegate`; at synchronous attach SwiftUI
+            //     may not have installed its scene delegate yet and would
+            //     later replace our confirmer, silently losing busy-pane
+            //     close confirmation.
+            WindowBridge { window in
+                // SYNCHRONOUS at attach: wire the NSWindow into
+                // WindowSession before anything else so the first save
+                // (which can fire as early as a tab mutation triggered
+                // during start()) captures the real frame instead of
+                // persisting `frame: nil` — the whole reason the bridge is
+                // synchronous.
                 appState.windowSession.window = window
-                // Test hook: pin the window to a deterministic, sub-screen
-                // frame so UITests that toggle zoom
-                // (`WindowDragUITests.testEmptyToolbarDoubleClickZoomsWindow`)
-                // get a known un-zoomed starting geometry. Without it,
-                // AppKit's saved window state can relaunch the window
-                // already maximized — and a window opened directly at its
-                // zoom frame has no distinct "user" frame, so `performZoom`
-                // is a no-op and the size never changes (the test's
-                // intermittent failure on a second run). Only the tests set
-                // this env var; production launches are untouched. Applied
-                // before `WindowSession` restores any saved frame, but for a
-                // sandboxed test home there is none, so this frame wins.
-                if let spec = ProcessInfo.processInfo.environment["NICE_UITEST_WINDOW_FRAME"] {
-                    let parts = spec.split(separator: ",").compactMap { Double($0) }
-                    if parts.count == 4 {
-                        window.setFrame(
-                            NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3]),
-                            display: true
-                        )
+                // SYNCHRONOUS at attach: register the chrome controller.
+                // Unconditional registration + self-healing observers mean
+                // the placer and the isMovable policy go live early without
+                // waiting for the styleMask; the controller is idempotent.
+                WindowChromeController.adopt(window)
+
+                // DEFERRED one runloop — these must land after SwiftUI's
+                // window finalization (see the comment above).
+                DispatchQueue.main.async { [weak window] in
+                    guard let window else { return }
+
+                    // Pin the window to a deterministic, sub-screen frame so
+                    // UITests that toggle zoom
+                    // (`WindowDragUITests.testEmptyToolbarDoubleClickZoomsWindow`)
+                    // get a known un-zoomed starting geometry. Without it,
+                    // AppKit's saved window state can relaunch the window
+                    // already maximized — and a window opened directly at
+                    // its zoom frame has no distinct "user" frame, so
+                    // `performZoom` is a no-op and the size never changes
+                    // (the test's intermittent failure on a second run).
+                    // Only the tests set this env var; production launches
+                    // are untouched.
+                    if let spec = ProcessInfo.processInfo.environment["NICE_UITEST_WINDOW_FRAME"] {
+                        let parts = spec.split(separator: ",").compactMap { Double($0) }
+                        if parts.count == 4 {
+                            window.setFrame(
+                                NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3]),
+                                display: true
+                            )
+                        }
                     }
+
+                    // Register the window so shortcuts and termination route
+                    // to this AppState, and install the close-confirmation
+                    // delegate wrapper around whatever SwiftUI set.
+                    services.registry.register(appState: appState, window: window)
                 }
-                // Disable AppKit's native title-bar drag for the whole
-                // window. Under `.hiddenTitleBar` the entire 52pt top band
-                // is the native title bar, so a press-drag anywhere in it
-                // (including on a pane pill) moves the window — the exact
-                // blocker for drag-to-reorder. `isMovable = false` is the
-                // one lever that stops that below the synthesized-event
-                // layer (it's a window property, not an interceptable
-                // event). This disables ALL native window dragging, so
-                // empty-chrome drag is restored explicitly by the
-                // `windowDragGesture` in `WindowToolbarView` (a SwiftUI
-                // `DragGesture` → `performDrag`). The pane pills own an
-                // AppKit `PaneDragSource` (for the drag-ended-outside
-                // tear-off callback SwiftUI can't give); a pill press
-                // flips `WindowDragGate.pillPressInProgress` so
-                // `windowDragGesture` yields rather than moving the window.
-                // Programmatic frame save/restore (`WindowSession`) is
-                // unaffected — isMovable gates user drags, not `setFrame`.
-                // Harmless initial assignment. The per-press event-time
-                // invariant in `TitleBarZoomMonitor` (a local `NSEvent`
-                // monitor that flips `isMovable` to false on every
-                // leftMouseDown in a full-size-content window, BEFORE
-                // AppKit's title-bar tracker consults the flag) now owns
-                // the `isMovable` policy — so a window born mid-drag whose
-                // properties AppKit re-finalizes back to `isMovable = true`
-                // can never let a pill press ride the native title-bar
-                // drag. That replaces the old 0/0.05/0.2s re-assert timer
-                // loop, which lost the race when re-finalization landed
-                // after the last tick (BUG C).
-                window.isMovable = false
-                TrafficLightNudger.nudge(
-                    window: window,
-                    dx: WindowChrome.trafficLightNudgeX,
-                    dy: WindowChrome.trafficLightNudgeY
-                )
+
+                // Phase D removes this (the ChromeEventRouter absorbs it);
+                // until then it owns double-click-zoom and the per-press
+                // event-time `isMovable` invariant.
                 TitleBarZoomMonitor.install()
-                services.registry.register(appState: appState, window: window)
             }
         )
         .background(windowBackground.ignoresSafeArea())
@@ -762,7 +771,7 @@ private struct AppShellHost: View {
     /// Floating card that lives in the top bar's upper-left corner when
     /// the sidebar is collapsed. The leading reserve
     /// (`WindowChrome.trafficLightReservedWidth`) hosts the three native
-    /// traffic lights — derived from the same nudge `TrafficLightNudger`
+    /// traffic lights — derived from the same nudge `TrafficLightPlacer`
     /// applies, so the cap and the buttons can't drift apart; the restore
     /// button sits just past them. Vertical padding centers it within the
     /// 52pt top bar row so it reads as a distinct card rather than
