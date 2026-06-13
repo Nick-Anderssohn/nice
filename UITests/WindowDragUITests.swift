@@ -2,21 +2,26 @@
 //  WindowDragUITests.swift
 //  NiceUITests
 //
-//  Regression net for the title-bar refactor (Phase A): asserts that
-//  empty top-bar pixels still drag the window. The previous architecture
-//  used `WindowDragRegion` (mouseDownCanMoveWindow=true) under the
-//  toolbar; the refactor moves the toolbar into an
-//  `NSTitlebarAccessoryViewController` so AppKit's title-bar drag tracker
-//  computes the drag region for us. Either way, the user-visible
-//  invariant is the same: drag from a non-widget pixel in the top 52pt
-//  → window moves; drag from a widget → button activates and the window
-//  doesn't move.
+//  Regression net for the window-chrome refactor: asserts that empty
+//  top-bar pixels still drag (and double-click-zoom) the window.
+//  Native title-bar drag is OFF on every Nice window (`isMovable =
+//  false`), so the behaviour now comes entirely from `ChromeEventRouter`
+//  — one process-wide local `NSEvent` monitor that classifies each press,
+//  resolves an empty-chrome press to a `ChromeDragStripView` marker, and
+//  drives `performDrag` / the double-click action itself. The
+//  user-visible invariant is unchanged: drag from a non-widget pixel in
+//  the top 52pt → window moves; drag from a widget (pill / button) →
+//  the widget activates and the window doesn't move.
 //
-//  Lives at the UITest layer because cooperative window drag is an
-//  AppKit-internal mechanism (NSWindow.performDrag, the drag-region
-//  tracker). A unit test against `mouseDownCanMoveWindow` flags only
-//  certifies that *one* layer of the contract is intact; this test
-//  certifies the actual behaviour.
+//  Lives at the UITest layer because the router's live side
+//  (per-press hit-test class-walk, `NSWindow.performDrag`, `performZoom`)
+//  needs a real window + real events. The pure routing table is unit-
+//  tested in `ChromeEventRouterTests`; the `mouseDownCanMoveWindow ==
+//  false` marker contract in `WindowToolbarDragRegionTests`. This suite
+//  certifies the actual end-to-end behaviour those two can't reach — and
+//  is the make-or-break gate for ISSUE 5 (the class-walk being narrower
+//  than the deleted attribute-walk): if an empty-chrome press ever fails
+//  to resolve to the strip, one of these tests goes red.
 //
 
 import XCTest
@@ -125,10 +130,11 @@ final class WindowDragUITests: NiceUITestCase {
     }
 
     /// Double-click an empty pixel in the top bar → the window zooms to
-    /// fill the screen, so it grows. `TitleBarZoomMonitor` handles this
-    /// (AppKit's title-bar hit-test doesn't reliably cross into the
-    /// SwiftUI-embedded `WindowDragRegion`, so a `mouseDown`/`performDrag`
-    /// path can't observe the second click — see WindowDragRegion.swift).
+    /// fill the screen, so it grows. `ChromeEventRouter` handles this: its
+    /// process-wide local monitor classifies the press as the empty-chrome
+    /// strip and runs `DoubleClickTitleBarAction` on `clickCount == 2`
+    /// (AppKit's own title-bar hit-test doesn't reliably cross into the
+    /// SwiftUI-embedded `ChromeDragStripView` — see ChromeEventRouter.swift).
     ///
     /// The window is launched at a deterministic sub-screen frame
     /// (`NICE_UITEST_WINDOW_FRAME`) so it always starts un-zoomed. Without
@@ -173,10 +179,11 @@ final class WindowDragUITests: NiceUITestCase {
 
     /// Dragging an EMPTY pixel in the sidebar's 52pt top strip moves the
     /// window — the sidebar analog of `testEmptyToolbarDragMovesWindow`.
-    /// `WindowDragRegion`'s `mouseDownCanMoveWindow` is inert under
-    /// `isMovable = false`, so the strip needs the explicit
-    /// `windowDraggable` gesture; this guards that it stays wired (it
-    /// regressed once when `isMovable = false` landed without it).
+    /// Native title-bar drag is off (`isMovable = false`), so the move comes
+    /// from `ChromeEventRouter`: the press hit-tests to the strip's
+    /// `ChromeDragStripView` marker and the router `performDrag`s the window.
+    /// This guards that the sidebar strip stays wired (it regressed once when
+    /// `isMovable = false` landed without a replacement drag path).
     func testSidebarTopStripDragMovesWindow() throws {
         let app = launchApp(windowFrame: CGRect(x: 120, y: 120, width: 1100, height: 720))
         let window = app.windows.firstMatch

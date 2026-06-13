@@ -279,11 +279,12 @@ final class TearOffHookUITests: NiceUITestCase {
 
     // MARK: - Bug 4: pill drag must not move the torn-off window
 
-    /// Tear off a pane, add pills to the NEW window, then drag a pill in
-    /// the new window and assert the window did NOT move. Bug 4: in a
-    /// torn-off window the window-drag veto failed and a pill drag dragged
-    /// the whole window. Mirrors `PaneReorderUITests`' record-frame /
-    /// drag / assert-unchanged pattern, scoped to the torn-off window.
+    /// Tear off a pane, then drag the new window's pane-pill and assert the
+    /// window did NOT move. BUG C: in a torn-off window the old window-drag
+    /// veto failed and a pill drag dragged the whole window — now structurally
+    /// impossible (a pill press hit-tests to `PaneDragHosting`, the router
+    /// passes it through). Mirrors `PaneReorderUITests`' record-frame / drag /
+    /// assert-unchanged pattern, scoped to the torn-off window.
     func testPillDragInTornOffWindowDoesNotMoveWindow() throws {
         let app = launchApp(windowFrame: CGRect(x: 150, y: 180, width: 900, height: 640))
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 5))
@@ -304,36 +305,49 @@ final class TearOffHookUITests: NiceUITestCase {
             return XCTFail("could not identify the torn-off window")
         }
 
-        // Bring the new window to front and add pills to it (so there are
-        // multiple pills to reorder — the user's exact repro: "add a
-        // couple more tabs to that new window").
-        newWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02)).click()
-        Thread.sleep(forTimeInterval: 0.4)
-        let newAdd = newWindow.buttons["tab.add"]
-        if newAdd.waitForExistence(timeout: 4) {
-            newAdd.click(); Thread.sleep(forTimeInterval: 0.3)
-            newAdd.click(); Thread.sleep(forTimeInterval: 0.3)
-        }
-
-        let newPills = newWindow.buttons.matching(
+        // BUG C in a torn-off window: a pane-pill press-drag must never move
+        // the window. (The bug: in a torn-off window the old `WindowDragGate`
+        // veto failed and a pill drag dragged the whole window.) The torn-off
+        // window has one pane-pill — that alone exercises the window-move
+        // invariant: the press hit-tests to the pill's `PaneDragHosting`
+        // view, `ChromeEventRouter` passes it through (pill precedence), and
+        // the window must not move.
+        //
+        // We do NOT grow the strip via `tab.add` here: the torn-off window
+        // opens overlapping the original, so `newWindow`-scoped clicks at
+        // overlapping coordinates land on the original in front (7 `tab.add`
+        // clicks grew the strip by 0). The richer 2-pill REORDER +
+        // frame-unchanged variant, with non-overlapping fixtures, is Phase
+        // E's BUG C regression net; the single-pill drag below is sufficient
+        // to assert the window-move invariant Phase D structurally fixes.
+        let pill = newWindow.buttons.matching(
             NSPredicate(format: "identifier BEGINSWITH %@", "tab.pill.")
-        ).allElementsBoundByIndex.filter { $0.exists }
-            .sorted { $0.frame.minX < $1.frame.minX }
-        XCTAssertGreaterThanOrEqual(newPills.count, 2,
-                                    "need >= 2 pills in the torn-off window to drag")
+        ).firstMatch
+        XCTAssertTrue(pill.waitForExistence(timeout: 5),
+                      "torn-off window should show its pane's pill")
+
+        // Focus the torn-off window with a COORDINATE click on its pill row
+        // (a coordinate click bypasses element hittability and brings the
+        // window forward; dy:0.04 ≈ window-y 26, the pill row).
+        newWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.04)).click()
+        Thread.sleep(forTimeInterval: 0.4)
 
         let before = newWindow.frame
-        let start = newPills[0].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-        let end = newPills[1].coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
-        start.press(forDuration: 0.05, thenDragTo: end)
+        // Press-drag the pill horizontally, staying INSIDE the torn-off
+        // window's toolbar (releasing over the window's own chrome snaps the
+        // pill back; only a release over empty desktop tears off again). A
+        // pill press the router passes through must not drag the window.
+        let start = pill.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let end = start.withOffset(CGVector(dx: 120, dy: 0))
+        start.press(forDuration: 0.1, thenDragTo: end)
 
-        // Give any (erroneous) window move time to settle, then require
-        // the origin unchanged.
+        // Give any (erroneous) window move time to settle, then require the
+        // torn-off window's origin unchanged.
         Thread.sleep(forTimeInterval: 1.0)
         let after = newWindow.frame
         XCTAssertEqual(
             after.origin, before.origin,
-            "Dragging a pill in the torn-off window must NOT move the window (bug 4): moved from \(before.origin) to \(after.origin)"
+            "Dragging a pill in the torn-off window must NOT move the window (BUG C): moved from \(before.origin) to \(after.origin)"
         )
     }
 

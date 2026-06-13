@@ -2,11 +2,12 @@
 //  WindowToolbarDragRegionTests.swift
 //  NiceUnitTests
 //
-//  Asserts the contract `WindowDragRegion.DragView` exposes to
-//  AppKit's title-bar drag tracker: `mouseDownCanMoveWindow` returns
-//  `true`, opting the empty-chrome regions into the cooperative
-//  drag path. Without this flag, AppKit's tracker doesn't fire and
-//  the user can't drag the window from the toolbar.
+//  Asserts the contract `ChromeDragStripView` exposes to AppKit:
+//  `mouseDownCanMoveWindow` returns `false`. The view is now a PURE
+//  MARKER for `ChromeEventRouter`'s per-press hit-test — it opts OUT of
+//  AppKit's native title-bar drag (which is off anyway via
+//  `isMovable = false`), and the router, not this flag, owns empty-chrome
+//  drag and double-click-zoom.
 //
 //  The actual end-to-end drag and double-click-to-zoom behaviours
 //  are covered by `WindowDragUITests`.
@@ -20,11 +21,11 @@ import XCTest
 @MainActor
 final class WindowToolbarDragRegionTests: XCTestCase {
 
-    func testDragViewOptsIntoCooperativeDrag() {
-        let view = WindowDragRegion.DragView()
-        XCTAssertTrue(
+    func testDragStripOptsOutOfNativeDrag() {
+        let view = ChromeDragStripView()
+        XCTAssertFalse(
             view.mouseDownCanMoveWindow,
-            "DragView must opt in to AppKit's cooperative title-bar drag tracker"
+            "ChromeDragStripView is a marker for the router's hit-test; native title-bar drag must stay OFF"
         )
     }
 }

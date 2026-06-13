@@ -27,13 +27,6 @@ struct WindowToolbarView: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.palette) private var palette
 
-    /// One-bit veto shared with the pane pills' AppKit drag source. A
-    /// pill press flips this true so `windowDragGesture` won't move the
-    /// window for a drag that began on a pill — the explicit replacement
-    /// for the gesture-priority arbitration the pill's old SwiftUI
-    /// `.onDrag` provided. See `PaneDragSource` / `WindowDragGate`.
-    @State private var dragGate = WindowDragGate()
-
     var body: some View {
         HStack(spacing: 10) {
             // Brand block.
@@ -67,10 +60,11 @@ struct WindowToolbarView: View {
         .background {
             ZStack {
                 Color.niceChrome(scheme, palette)
-                // Sits on top of the chrome fill but behind the toolbar's
-                // interactive children — pills/buttons still receive
-                // their own clicks while empty chrome behaves like a
-                // title bar (drag to move, double-click to zoom).
+                // The frontmost view of the chrome background. It vends a
+                // `ChromeDragStripView` marker that `ChromeEventRouter`
+                // hit-tests per-press: empty-chrome presses resolve to it and
+                // the router owns drag-to-move + double-click-zoom, while
+                // pills/buttons hit-test to themselves and are passed through.
                 WindowDragRegion()
             }
         }
@@ -79,19 +73,12 @@ struct WindowToolbarView: View {
                 .fill(Color.niceLine(scheme, palette))
                 .frame(height: 1)
         }
-        // Empty-chrome window drag (the window sets `isMovable = false`,
-        // which kills native title-bar drag — see `windowDraggable`).
-        // `windowDraggable` yields to higher-priority child gestures, but
-        // the pill no longer uses SwiftUI `.onDrag` (it owns an AppKit
-        // `PaneDragSource` for the drag-ended-outside tear-off callback),
-        // and an AppKit view consuming `mouseDown` does NOT make this
-        // ancestor gesture yield. So the yield is re-solved explicitly: a
-        // pill press flips `dragGate.pillPressInProgress`, and the drag is
-        // vetoed (per drag event) while it's set. See `PaneDragSource` /
-        // `WindowDragGate`.
-        .windowDraggable(isBlocked: { dragGate.pillPressInProgress })
-        // Inject the veto flag so the pills' `PaneDragSource` can set it.
-        .environment(dragGate)
+        // Empty-chrome drag + double-click-zoom are owned by
+        // `ChromeEventRouter`. There is no SwiftUI drag gesture and no
+        // window-drag veto flag any more: the router's per-press hit-test IS
+        // the arbitration. A pill press hit-tests to a `PaneDragHosting`
+        // view, so the router passes it through and never arms a window drag
+        // — selectivity by construction, not by a flag that can stick.
     }
 }
 
@@ -173,7 +160,6 @@ private struct InlinePaneStrip: View {
     @Environment(CloseRequestCoordinator.self) private var closer
     @Environment(AppState.self) private var appState
     @Environment(NiceServices.self) private var services
-    @Environment(WindowDragGate.self) private var dragGate
     @Environment(\.openWindow) private var openWindow
     @Environment(\.colorScheme) private var scheme
 
@@ -428,7 +414,6 @@ private struct InlinePaneStrip: View {
             services: services,
             sessions: sessions,
             dragState: dragState,
-            dragGate: dragGate,
             openWindow: { token in openWindow(id: "main", value: token) }
         ) {
             InlinePanePill(
@@ -811,9 +796,10 @@ private struct InlinePanePill: View {
         // a SwiftUI `.onDrag`. The host needs an `NSDraggingSource`'s
         // drag-ended-outside callback to drive desktop tear-off, which
         // pure SwiftUI cannot deliver. The host sets `dragState.session`
-        // and publishes the live-pane handle at drag start, and gates the
-        // toolbar's `windowDragGesture` so a pill drag never moves the
-        // window. See `PaneDragSource` / `WindowDragGate`.
+        // and publishes the live-pane handle at drag start. A pill press
+        // never moves the window because the host hit-tests to itself (a
+        // `PaneDragHosting` view): `ChromeEventRouter` sees the pill in the
+        // ancestor chain and passes the press through. See `PaneDragSource`.
         .onTapGesture {
             // Title taps are handled by `titleView`'s own gesture; this
             // catches taps on the icon, padding, or empty pill area.

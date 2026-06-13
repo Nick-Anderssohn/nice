@@ -22,45 +22,29 @@
 //  end callback, so it cannot drive tear-off.
 //
 //  ⚠️ WINDOW-DRAG SELECTIVITY — load-bearing, behavioral invariant.
-//  Swapping the pill's SwiftUI `.onDrag` for this AppKit source removes
-//  the higher-priority child gesture that made the toolbar's
-//  `windowDragGesture` yield. An AppKit view consuming `mouseDown` does
-//  NOT make an ancestor SwiftUI `DragGesture` yield (gesture recognizers
-//  see events independently of subview `mouseDown`). So this source ALSO
-//  re-solves the yield explicitly: it flips `WindowDragGate
-//  .pillPressInProgress` true on `mouseDown` and `windowDragGesture`
-//  refuses to move the window while that flag is set. The flag is cleared
-//  on `mouseUp` (tap) or `draggingSession(_:endedAt:)` (drag). The
-//  `WindowDragUITests` / `PaneReorderUITests` regression net is the only
-//  real check that this stays correct — keep it green.
+//  A drag that began on a pill must NEVER move the window. This is no
+//  longer enforced by a flag: it is enforced by `ChromeEventRouter`'s
+//  per-press hit-test. The host (`PaneDragHostingView`) claims its whole
+//  bounds in `hitTest(_:)` and conforms to the `PaneDragHosting` marker
+//  protocol, so a press on a pill hit-tests to it; the router finds
+//  `PaneDragHosting` in the ancestor chain (with precedence over the
+//  empty-chrome strip), passes the event through, and never arms a window
+//  drag. The veto is therefore structural — there is no `WindowDragGate`
+//  bit to set, clear, or accidentally leave stuck. The `WindowDragUITests`
+//  / `PaneReorderUITests` regression net is the only real check that this
+//  stays correct — keep it green.
 //
 
 import AppKit
 import SwiftUI
 
-/// Shared one-bit channel that lets a pane-pill press veto the toolbar's
-/// empty-chrome window-drag gesture. Owned by `WindowToolbarView` (as
-/// `@State`) and injected into the pill subtree via `.environment` so the
-/// AppKit drag source (`PaneDragSource.PaneDragHostingView`) can set it and
-/// `windowDragGesture` can read it.
-///
-/// This is the explicit replacement for the gesture-priority arbitration
-/// that the pill's old SwiftUI `.onDrag` provided for free. See the file
-/// header for the full invariant.
-@MainActor
-@Observable
-final class WindowDragGate {
-    /// True between a `mouseDown` that landed on a pill and the end of
-    /// that press (its `mouseUp`, or the end of the drag session it
-    /// spawned). While true, `windowDragGesture` must not `performDrag`.
-    ///
-    /// Read IMPERATIVELY from `windowDragGesture`'s `.onChanged` closure
-    /// at event time — no view's `body` depends on it, so the
-    /// `@Observable` conformance here exists only to satisfy
-    /// `@Environment(WindowDragGate.self)` injection, not to drive any
-    /// reactive re-render. Don't add a `body`-level read expecting one.
-    var pillPressInProgress = false
-}
+/// Marker protocol the chrome event router uses to classify a pill press
+/// without referencing the generic-nested hosting type. The router walks a
+/// press's ancestor chain and treats any `PaneDragHosting` view as "a pill
+/// owns this press" — so it passes the event through and never arms a
+/// window drag. This is the structural replacement for the old
+/// `WindowDragGate` veto flag (see the file header).
+protocol PaneDragHosting: AnyObject {}
 
 /// Pure classification of how a pane-pill drag ended, factored out of the
 /// `NSDraggingSource` callback so the load-bearing decision (does this
@@ -129,8 +113,6 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
     /// `.session` at drag start so the reorder insertion line is live
     /// from the first hover frame, and clears it when the drag ends.
     let dragState: PaneStripDragState
-    /// The window-drag veto flag (see `WindowDragGate`).
-    let dragGate: WindowDragGate
     /// `openWindow(id: "main", value:)` wrapped in a closure taking the
     /// tear-off pairing token, so the tear-off controller (a struct) can
     /// open the paired window without `@Environment`. The controller
@@ -147,14 +129,12 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
         hosting.translatesAutoresizingMaskIntoConstraints = false
         hosting.coordinator = coordinator
         coordinator.hostView = hosting
-        coordinator.dragGate = dragGate
         apply(to: coordinator)
         return hosting
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         let coordinator = context.coordinator
-        coordinator.dragGate = dragGate
         apply(to: coordinator)
         if let hosting = nsView as? PaneDragHostingView {
             hosting.rootView = AnyView(content())
@@ -163,8 +143,8 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
 
     /// SwiftUI tears the representable down (pane closed, tab dissolved,
     /// row diffed out). If a drag was still in flight, unwind its
-    /// published registry handle + the window-drag gate here so neither
-    /// leaks past the pill's lifetime.
+    /// published registry handle here so it doesn't leak past the pill's
+    /// lifetime.
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.cancelInFlightDrag()
     }
@@ -188,17 +168,19 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
     /// `NSHostingView` subclass that owns the press disambiguation. Two
     /// responsibilities:
     ///
-    /// 1. Keep AppKit's title-bar drag tracker out of the picture by
-    ///    returning `false` from `mouseDownCanMoveWindow` and claiming
-    ///    `self` for every in-bounds point in `hitTest(_:)`. SwiftUI's
-    ///    hosting machinery sprinkles transparent descendants that report
-    ///    `mouseDownCanMoveWindow == true`; without the hit-test override
-    ///    AppKit's drag-region walk could land on one of those.
+    /// 1. Be the pill's recognisable presence in the window-drag router's
+    ///    hit-test: it conforms to `PaneDragHosting` and claims `self` for
+    ///    every in-bounds point in `hitTest(_:)`, so a press on a pill
+    ///    resolves to this view. `ChromeEventRouter` finds `PaneDragHosting`
+    ///    in the ancestor chain (with precedence over the empty-chrome strip)
+    ///    and passes the press through — a pill drag can never move the
+    ///    window. `mouseDownCanMoveWindow` is `false` for the same reason
+    ///    (native title-bar drag is off via `isMovable = false` anyway).
     /// 2. Override `mouseDown` / `mouseDragged` / `mouseUp` to drive the
     ///    tap-vs-drag decision. SwiftUI's gesture router still runs inside
     ///    the host once `super.mouseDown` is forwarded, so taps / hovers /
     ///    the close button keep working for presses that never drag.
-    final class PaneDragHostingView: NSHostingView<AnyView> {
+    final class PaneDragHostingView: NSHostingView<AnyView>, PaneDragHosting {
         weak var coordinator: Coordinator?
 
         /// Total motion (pt) required before we commit to a drag. Slightly
@@ -225,14 +207,11 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
             pressEvent = event
             pressLocationInWindow = event.locationInWindow
             didDecideDrag = false
-            // Veto the toolbar's window-drag gesture for the lifetime of
-            // this press: a drag that began on a pill must never move the
-            // window. Set BEFORE any movement so `windowDragGesture`'s
-            // `.onChanged` (which only fires after the 2pt minimum) always
-            // sees the flag.
-            coordinator?.dragGate?.pillPressInProgress = true
-            // Forward so SwiftUI's gesture router sees the press; a tap
-            // (no drag) then completes normally on `mouseUp`.
+            // No window-drag veto to set: a press on this view hit-tests to
+            // `self` (a `PaneDragHosting` view), so `ChromeEventRouter`
+            // passes it through and never arms a window drag. Forward so
+            // SwiftUI's gesture router sees the press; a tap (no drag) then
+            // completes normally on `mouseUp`.
             super.mouseDown(with: event)
         }
 
@@ -251,9 +230,9 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
                 return
             }
             // Any drag past the threshold is a pane drag — pill presses
-            // never move the window (that's the empty-chrome gesture's
-            // job). Stop forwarding motion to SwiftUI now that the AppKit
-            // drag session is taking over.
+            // never move the window (the router passed the press through).
+            // Stop forwarding motion to SwiftUI now that the AppKit drag
+            // session is taking over.
             didDecideDrag = true
             coordinator?.beginPaneDragSession(initialEvent: press)
         }
@@ -262,10 +241,6 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
             pressEvent = nil
             pressLocationInWindow = nil
             didDecideDrag = false
-            // Tap path: clear the window-drag veto here (the drag path
-            // clears it in `draggingSession(_:endedAt:)` instead, since a
-            // drag session swallows this `mouseUp`).
-            coordinator?.dragGate?.pillPressInProgress = false
             super.mouseUp(with: event)
         }
 
@@ -294,13 +269,12 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
         }
 
         var config: Config?
-        weak var dragGate: WindowDragGate?
         weak var hostView: NSView?
 
         /// True from `beginDraggingSession` until `draggingSession(_:
         /// endedAt:)` (or a teardown). Lets `cancelInFlightDrag` know
-        /// whether there's published registry state + a raised window-drag
-        /// gate to unwind if the pill is removed mid-drag.
+        /// whether there's published registry state to unwind if the pill
+        /// is removed mid-drag.
         private var isDragInFlight = false
 
         func beginPaneDragSession(initialEvent event: NSEvent) {
@@ -354,8 +328,7 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
         /// `draggingSession(_:endedAt:)`, but if the host view is removed
         /// from its window the end callback isn't guaranteed — without
         /// this the published `LivePaneRegistry` handle would stay
-        /// `currentDrag` (blocking future drags) and `pillPressInProgress`
-        /// could stay raised (freezing empty-chrome window dragging).
+        /// `currentDrag` (blocking future drags).
         func cancelInFlightDrag() {
             guard isDragInFlight else { return }
             isDragInFlight = false
@@ -363,7 +336,6 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
                 c.services.livePaneRegistry.withdraw(paneId: c.paneId)
                 c.dragState.session = nil
             }
-            dragGate?.pillPressInProgress = false
         }
 
         private static func snapshot(view: NSView) -> NSImage {
@@ -402,10 +374,7 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
             operation: NSDragOperation
         ) {
             isDragInFlight = false
-            guard let c = config else {
-                dragGate?.pillPressInProgress = false
-                return
-            }
+            guard let c = config else { return }
 
             // Classify the end via the pure helper (unit-tested in
             // `PaneDragEndTests`): `.tearOff` (empty desktop), `.withdraw`
@@ -430,11 +399,9 @@ struct PaneDragSource<Content: View>: NSViewRepresentable {
                 break
             }
 
-            // Always clear the ephemeral drag state and the window-drag
-            // veto so the source pill un-sticks even if a drop delegate
-            // forgot to (defensive).
+            // Always clear the ephemeral drag state so the source pill
+            // un-sticks even if a drop delegate forgot to (defensive).
             c.dragState.session = nil
-            dragGate?.pillPressInProgress = false
         }
 
         /// Frames of the app's real CONTENT windows in global Cocoa screen

@@ -29,11 +29,13 @@
 //      mask lands. The Settings window (standard chrome, never adopted)
 //      is filtered by those guards too.
 //
-//  This is Phase C of the WindowChromeController redesign. Phase D adds a
-//  process-wide `ChromeEventRouter` that classifies windows via
-//  `controller(for:)` (the positive-identity seam added here but not yet
-//  called) and absorbs the title-bar drag / double-click-zoom handling
-//  that `TitleBarZoomMonitor` still owns until then.
+//  Phase D's process-wide `ChromeEventRouter` is installed from `start()`
+//  and classifies the window an event landed in via `controller(for:)`
+//  (the positive-identity seam below). The router owns title-bar drag,
+//  double-click-zoom, and the per-press event-time `isMovable` invariant;
+//  this controller's `isMovable` policy is the complementary focus / KVO
+//  re-assert that covers the non-`sendEvent` server-side drag-init path
+//  the per-press monitor never sees.
 //
 
 import AppKit
@@ -103,7 +105,7 @@ final class WindowChromeController {
     /// KVO on `isMovable`. Catches the server-side / non-`sendEvent`
     /// window-move-init path (a busy-main-thread drag the WindowServer can
     /// start without dispatching through `NSApp`), which the event-time
-    /// monitor in `TitleBarZoomMonitor` never sees. Event-driven, no timer.
+    /// monitor in `ChromeEventRouter` never sees. Event-driven, no timer.
     private var isMovableObservation: NSKeyValueObservation?
 
     private init(window: NSWindow) {
@@ -119,6 +121,10 @@ final class WindowChromeController {
     private func start() {
         applyPolicy()
         trafficLights.start()
+        // Install the process-wide chrome event router once. Owned here so
+        // the single arbitration point goes live the first time any Nice
+        // window is adopted; idempotent on every later adopt.
+        ChromeEventRouter.installIfNeeded()
 
         guard let window else { return }
         let center = NotificationCenter.default

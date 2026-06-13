@@ -221,10 +221,11 @@ private struct AppShellHost: View {
             //     registers UNCONDITIONALLY and self-heals via its own
             //     focus / frame observers once the `.hiddenTitleBar` mask
             //     lands, so it's safe to call this early at attach.
-            //   • `TitleBarZoomMonitor` still owns double-click-zoom AND the
-            //     event-time `isMovable` invariant until Phase D's router
-            //     absorbs them — the controller's policy is a complementary
-            //     second defense (both set isMovable false; no conflict).
+            //   • `ChromeEventRouter` (installed by `adopt` below) owns
+            //     double-click-zoom, empty-chrome drag, AND the per-press
+            //     event-time `isMovable` invariant — the controller's policy
+            //     is a complementary focus / KVO defense (both set isMovable
+            //     false; no conflict).
             //
             // TIMING — two writes are DEFERRED one runloop because they only
             // stick when run AFTER SwiftUI finalizes the window (the same
@@ -256,7 +257,6 @@ private struct AppShellHost: View {
                 // window finalization (see the comment above).
                 DispatchQueue.main.async { [weak window] in
                     guard let window else { return }
-
                     // Pin the window to a deterministic, sub-screen frame so
                     // UITests that toggle zoom
                     // (`WindowDragUITests.testEmptyToolbarDoubleClickZoomsWindow`)
@@ -283,11 +283,10 @@ private struct AppShellHost: View {
                     // delegate wrapper around whatever SwiftUI set.
                     services.registry.register(appState: appState, window: window)
                 }
-
-                // Phase D removes this (the ChromeEventRouter absorbs it);
-                // until then it owns double-click-zoom and the per-press
-                // event-time `isMovable` invariant.
-                TitleBarZoomMonitor.install()
+                // The chrome event router (double-click-zoom + empty-chrome
+                // drag + the per-press event-time `isMovable` invariant) is
+                // installed by `WindowChromeController.adopt` above — once,
+                // process-wide — so there is nothing to install here.
             }
         )
         .background(windowBackground.ignoresSafeArea())
@@ -656,13 +655,12 @@ private struct AppShellHost: View {
                         .padding(.top, 8)
                         .padding(.trailing, 10)
                     }
-                    // Make the sidebar's 52pt top strip a window-drag
-                    // surface (like the toolbar). `WindowDragRegion`'s
-                    // `mouseDownCanMoveWindow` is inert under
-                    // `isMovable = false`, so without this the strip can't
-                    // move the window. The trailing mode/collapse buttons
-                    // are higher-priority children and keep their clicks.
-                    .windowDraggable()
+                // The `WindowDragRegion` above vends a `ChromeDragStripView`
+                // marker; `ChromeEventRouter` hit-tests it per-press and owns
+                // this strip's empty-chrome drag + double-click-zoom. The
+                // trailing mode/collapse buttons claim their own presses
+                // (they hit-test to themselves, not the strip), so the router
+                // passes those through.
                 SidebarView()
             }
         }
@@ -796,9 +794,10 @@ private struct AppShellHost: View {
         // Total = traffic-light reserve + room for the restore button and
         // a small trailing drag strip, so the cap grows with the reserve.
         .frame(width: WindowChrome.trafficLightReservedWidth + 42, height: 40)
-        // Drag the cap to move the window (the expand button keeps its
-        // own click) — same reason as the expanded sidebar's top strip.
-        .windowDraggable()
+        // The `WindowDragRegion`s inside vend `ChromeDragStripView` markers;
+        // `ChromeEventRouter` owns the cap's empty-chrome drag + double-click
+        // zoom per-press (the expand button hit-tests to itself and is passed
+        // through) — same model as the expanded sidebar's top strip.
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)

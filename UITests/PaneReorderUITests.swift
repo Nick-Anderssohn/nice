@@ -5,8 +5,10 @@
 //  Phase B (draggable-panes-v2): drag-to-reorder pane pills in the top
 //  toolbar. The headline invariant — the one that sank the first attempt —
 //  is that dragging a pill reorders it WITHOUT moving the window, even
-//  though the toolbar band is otherwise window-draggable
-//  (WindowDragRegion.DragView.mouseDownCanMoveWindow == true).
+//  though the toolbar band is otherwise window-draggable (a press on empty
+//  chrome hit-tests to `ChromeDragStripView` and `ChromeEventRouter` moves
+//  the window; a press on a pill hit-tests to a `PaneDragHosting` view and
+//  the router passes it through, so the pill drag reorders instead).
 //
 //  `testDragOnPillReordersAndDoesNotMoveWindow` is the deliberate
 //  differential partner of WindowDragUITests.testEmptyToolbarDragMovesWindow:
