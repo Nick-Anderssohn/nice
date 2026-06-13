@@ -24,6 +24,22 @@ import Foundation
 final class ReleaseChecker {
     nonisolated static let lastKnownLatestVersionKey = "releaseChecker.lastKnownLatestVersion"
 
+    /// A sandboxed UI-test run sets `NICE_APPLICATION_SUPPORT_ROOT` to
+    /// redirect Application Support to a temp dir. Such a run must never
+    /// perform a live GitHub release check or surface the "Update
+    /// available" pill: the pill renders at the trailing edge of the
+    /// toolbar, and its presence shifts the chrome layout the drag /
+    /// reorder / tear-off UITests assert against (an empty-chrome drag
+    /// point ~120pt from the right edge would land on the pill instead
+    /// of a window-drag surface). A sandboxed test also has no business
+    /// hitting the network. Gates BOTH the cache-seed in `init` (so a
+    /// version persisted by a prior real run can't flip the flag) and
+    /// the timer in `start()`, keeping `updateAvailable == false` so the
+    /// toolbar is layout-identical to a fresh build.
+    nonisolated static var isSandboxedTestRun: Bool {
+        ProcessInfo.processInfo.environment["NICE_APPLICATION_SUPPORT_ROOT"] != nil
+    }
+
     /// Default delay before the first check after `start()`. Keeps the
     /// launch quiet — the toolbar has other work in the first few
     /// seconds and network latency shouldn't compete with it.
@@ -67,8 +83,12 @@ final class ReleaseChecker {
         self.initialDelay = initialDelay
         self.interval = interval
         // Seed from cache so the pill can appear on the first frame
-        // after relaunch if we already knew about an update.
-        if let cached = defaults.string(forKey: Self.lastKnownLatestVersionKey) {
+        // after relaunch if we already knew about an update. Skipped
+        // under a sandboxed UI-test run so a version persisted by a
+        // prior real launch can't surface the pill mid-test (see
+        // `isSandboxedTestRun`).
+        if !Self.isSandboxedTestRun,
+           let cached = defaults.string(forKey: Self.lastKnownLatestVersionKey) {
             applyLatest(cached)
         }
     }
@@ -77,6 +97,11 @@ final class ReleaseChecker {
     /// repeated calls after the first are no-ops, matching the
     /// `NiceServices.bootstrap()` pattern.
     func start() {
+        // Never run the live release check under a sandboxed UI-test
+        // run — keeps `updateAvailable` false so the toolbar stays
+        // layout-stable for the chrome/drag UITests (see
+        // `isSandboxedTestRun`).
+        guard !Self.isSandboxedTestRun else { return }
         guard !started else { return }
         started = true
         let timer = DispatchSource.makeTimerSource(queue: .main)
