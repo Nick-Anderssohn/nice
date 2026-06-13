@@ -186,13 +186,15 @@ private struct AppShellHost: View {
             : "These are still running: \(list)."
     }
 
-    /// Launch-arg gate for the UITest-only tear-off hook. When present,
-    /// `body` renders a hidden zero-size button
-    /// (`accessibilityIdentifier == "test.tearOffActivePane"`) that
-    /// performs a REAL programmatic tear-off of the active tab's active
-    /// pane — XCUITest can't synthesize the cross-window "drag onto empty
-    /// desktop" gesture, so this is how UITests get a genuine second
-    /// window. Absent in production: the button isn't even built.
+    /// Launch-arg gate for the UITest-only tear-off hooks. When present,
+    /// `body` renders two hidden zero-size buttons —
+    /// `accessibilityIdentifier == "test.tearOffActivePane"` and
+    /// `"test.tearOffInactivePane"` — that perform a REAL programmatic
+    /// tear-off of, respectively, the active tab's ACTIVE pane and its
+    /// first NON-ACTIVE pane. XCUITest can't synthesize the cross-window
+    /// "drag onto empty desktop" gesture, so this is how UITests get a
+    /// genuine second window. Absent in production: the buttons aren't
+    /// even built.
     private static let tearOffHookEnabled =
         ProcessInfo.processInfo.arguments.contains("--uitest-tearoff-hook")
 
@@ -200,11 +202,16 @@ private struct AppShellHost: View {
         shell
         .overlay(alignment: .bottomTrailing) {
             // Zero-impact in production: the whole overlay is elided when
-            // the launch arg is absent (the button is never built, so it
-            // can't disturb layout or other tests). Bottom-trailing keeps
-            // it clear of the traffic lights / sidebar / toolbar chrome.
+            // the launch arg is absent (the buttons are never built, so
+            // they can't disturb layout or other tests). Bottom-trailing
+            // keeps them clear of the traffic lights / sidebar / toolbar
+            // chrome. The two hooks are stacked vertically (each 24x24)
+            // so they never occlude each other for XCUITest hit-testing.
             if Self.tearOffHookEnabled {
-                testTearOffHook
+                VStack(spacing: 8) {
+                    testTearOffHook
+                    testTearOffInactiveHook
+                }
             }
         }
         .ignoresSafeArea(edges: .top)
@@ -570,6 +577,68 @@ private struct AppShellHost: View {
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("test.tearOffActivePane")
+        .frame(width: 24, height: 24)
+        .zIndex(999)
+    }
+
+    /// UITest-only: a sibling of `testTearOffHook` that tears off the
+    /// active tab's FIRST NON-ACTIVE pane instead of the active one.
+    /// This exists to exercise the BUG A unspawned-pane path that the
+    /// active-pane hook structurally cannot reach: the active pane is
+    /// always spawned (`ensureActivePaneSpawned` / restore brings it up),
+    /// whereas a restored-but-never-focused non-active terminal pane has
+    /// its pty spawn DEFERRED — it is `.notSpawned` until first focus
+    /// (see `WindowSession.swift`'s terminal-spawn branch). Tearing that
+    /// pane off must SPAWN it in the destination window (Phase A's
+    /// `PaneClaim.notSpawned` path) rather than silently no-op'ing, which
+    /// is exactly the BUG A regression `TearOffHookUITests` pins.
+    /// Built only when `--uitest-tearoff-hook` is passed; everything else
+    /// mirrors `testTearOffHook` (same handle publish + `tearOff` call) —
+    /// only the pane selection differs.
+    private var testTearOffInactiveHook: some View {
+        Button {
+            guard let tabId = appState.tabs.activeTabId,
+                  let tab = appState.tabs.tab(for: tabId),
+                  let inactive = tab.panes.first(where: { $0.id != tab.activePaneId })
+            else { return }
+            let paneId = inactive.id
+            // `tearOff` consumes the in-flight live-pane handle that a real
+            // drag would have published on drag-start (`PaneDragSource`).
+            // The hook skips the drag, so publish the same handle here
+            // first — otherwise `tearOff` bails (no handle to claim). The
+            // claim closure routes through `claimPaneForTransfer`, which
+            // returns `.notSpawned(cwd:)` for this never-focused pane.
+            services.livePaneRegistry.publish(
+                LivePaneRegistry.Handle(
+                    paneId: paneId,
+                    sourceWindowSessionId: appState.windowSession.windowSessionId,
+                    sourceTabId: tabId,
+                    claim: { [weak sessions = appState.sessions] in
+                        sessions?.claimPaneForTransfer(tabId: tabId, paneId: paneId) ?? .gone
+                    }
+                )
+            )
+            // A fixed point well inside the main screen's visible frame so
+            // the torn-off window lands on-screen for the assertions.
+            let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let point = NSPoint(x: frame.minX + 80, y: frame.maxY - 200)
+            PaneTearOffController(services: services).tearOff(
+                paneId: paneId,
+                sourceWindowSessionId: appState.windowSession.windowSessionId,
+                at: point,
+                openWindow: { token in openWindow(id: "main", value: token) }
+            )
+        } label: {
+            // A small but real, hittable hit area. Transparent so it's
+            // invisible; `contentShape` makes the whole rect clickable for
+            // XCUITest. Stacked above `testTearOffHook` in the bottom-
+            // trailing corner where there is no interactive chrome.
+            Color.clear
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("test.tearOffInactivePane")
         .frame(width: 24, height: 24)
         .zIndex(999)
     }
