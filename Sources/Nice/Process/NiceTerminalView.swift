@@ -511,3 +511,23 @@ final class NiceTerminalView: LocalProcessTerminalView {
         }
     }
 }
+
+extension LocalProcessTerminalView {
+    /// Height of one terminal cell in points, as currently laid out by
+    /// SwiftTerm for the active font. Returns `0` only in the degenerate
+    /// case of zero rows (never after normal setup, where `rows` defaults
+    /// to a positive value).
+    ///
+    /// Derived from SwiftTerm's public surface rather than its internal
+    /// `cellDimension` (which is package-private): `getOptimalFrameSize`
+    /// returns `cellDimension.height * rows`, so dividing by `rows` recovers
+    /// the per-cell height exactly. `TerminalHost`'s container uses this to
+    /// size the grid to a whole number of rows and bottom-anchor it, so the
+    /// sub-row remainder lands at the top (under the chrome) instead of as a
+    /// wandering gap below the prompt.
+    var cellHeight: CGFloat {
+        let rows = getTerminal().rows
+        guard rows > 0 else { return 0 }
+        return getOptimalFrameSize().height / CGFloat(rows)
+    }
+}

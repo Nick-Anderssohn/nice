@@ -792,6 +792,33 @@ final class TabPtySession: TabPtySessionThemeable {
         let font = Self.terminalFont(named: name, size: currentTerminalFontSize)
         for entry in entries.values {
             entry.view.font = font
+            relayoutHostContainer(for: entry.view)
+        }
+    }
+
+    /// Re-lay-out a pane's bottom-anchoring host container after a font
+    /// change. A new font changes the cell height, so the container in
+    /// `TerminalHost` must re-quantize the grid to the new row size and
+    /// re-pin it to the bottom; without this the grid keeps the old row
+    /// count (and a stale bottom anchor) until the next window resize.
+    ///
+    /// The relayout is forced synchronously (`layoutSubtreeIfNeeded`) so
+    /// it's ordered right after the font apply rather than waiting for the
+    /// next layout pass — a font change doesn't move the container's frame,
+    /// so nothing else would dirty its geometry. Walks ancestors rather
+    /// than assuming the container is the immediate superview, so an
+    /// interposed host view can't silently break the link. No-op for panes
+    /// that aren't currently mounted — a remount lays the container out
+    /// from scratch against the current cell height.
+    private func relayoutHostContainer(for view: LocalProcessTerminalView) {
+        var ancestor = view.superview
+        while let current = ancestor {
+            if let container = current as? TerminalContainerView {
+                container.needsLayout = true
+                container.layoutSubtreeIfNeeded()
+                return
+            }
+            ancestor = current.superview
         }
     }
 
@@ -960,6 +987,7 @@ final class TabPtySession: TabPtySessionThemeable {
         let font = Self.terminalFont(named: currentTerminalFontFamily, size: size)
         for entry in entries.values {
             entry.view.font = font
+            relayoutHostContainer(for: entry.view)
         }
     }
 

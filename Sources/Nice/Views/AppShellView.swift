@@ -1052,6 +1052,14 @@ private struct AppShellHost: View {
             .animation(.easeOut(duration: 0.12), value: appState.sessions.paneLaunchStates[paneId])
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.top, 12)
+            // Constant gap from the window's bottom edge, a touch below the
+            // floating sidebar card's bottom (its `.padding(.bottom, 6)`).
+            // `TerminalHost` bottom-anchors the row-quantized grid within
+            // this area, so the sub-row remainder is parked at the top
+            // (under the chrome) rather than wandering below the prompt as
+            // the window resizes. Applied before `.background` so the gap is
+            // painted in the terminal color.
+            .padding(.bottom, 9)
             .padding(.leading, 20)
             .background(terminalBackgroundColor)
             // Present ONLY when a pty view is actually hosted for the
