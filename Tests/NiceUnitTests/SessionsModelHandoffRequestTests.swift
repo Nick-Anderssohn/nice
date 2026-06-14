@@ -16,6 +16,12 @@
 //      reply("ok") called.
 //    • Non-empty instructions → prompt contains the custom text.
 //    • Empty instructions → prompt contains the default continue directive.
+//    • model/effort present → handoff still creates a tab and replies ok
+//      (guards the handler from dropping/short-circuiting on the new
+//      fields). The actual --model/--effort arg construction is pinned by
+//      SessionsModelHandoffCompositionTests.handoffExtraArgs — the spawned
+//      arg list isn't observable here (makeSession runs under the
+//      NICE_CLAUDE_OVERRIDE test seam, which suppresses extraClaudeArgs).
 //      (NOTE: prompt is not directly observable outside the production
 //       path; we infer it indirectly by checking the title/nesting
 //       properties that are always produced alongside the prompt. The
@@ -68,6 +74,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/p",
                 handoffFile: "/tmp/p/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "t1",
                 paneId: "t1-claude",
                 reply: reply
@@ -134,6 +142,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/p",
                 handoffFile: "/tmp/p/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "t1",
                 paneId: "t1-claude",
                 reply: reply
@@ -162,6 +172,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/scratch",
                 handoffFile: "/tmp/scratch/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "",
                 paneId: "",
                 reply: reply
@@ -183,6 +195,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/scratch",
                 handoffFile: "/tmp/scratch/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "does-not-exist",
                 paneId: "does-not-exist-pane",
                 reply: reply
@@ -209,6 +223,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/p",
                 handoffFile: "/tmp/p/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "t1",
                 paneId: "stale-pane-id-not-owned-by-t1",
                 reply: reply
@@ -243,6 +259,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/p",
                 handoffFile: "/tmp/p/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "t1",
                 paneId: "t1-claude",
                 reply: reply
@@ -288,6 +306,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/p",
                 handoffFile: "/tmp/p/.claude/handoff/h.md",
                 instructions: "Focus only on the UI layer",
+                model: "",
+                effort: "",
                 tabId: "t1",
                 paneId: "t1-claude",
                 reply: reply
@@ -309,6 +329,8 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
                 cwd: "/tmp/p",
                 handoffFile: "/tmp/p/.claude/handoff/h.md",
                 instructions: "",
+                model: "",
+                effort: "",
                 tabId: "t1",
                 paneId: "t1-claude",
                 reply: reply
@@ -318,6 +340,36 @@ final class SessionsModelHandoffRequestTests: XCTestCase {
         XCTAssertEqual(reply, "ok")
         XCTAssertEqual(projectById("p").tabs.count, 2,
                        "empty instructions must still produce a handoff tab")
+    }
+
+    // MARK: - model / effort forwarding
+
+    func test_modelAndEffortPresent_tabCreated_repliesOk() {
+        // A handoff carrying a model + effort must thread through the
+        // handler without dropping the request. The flags themselves are
+        // pinned by the handoffExtraArgs unit tests; here we guard that the
+        // handler doesn't short-circuit on the new fields.
+        TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1"
+        )
+        appState.tabs.mutateTab(id: "t1") { $0.title = "my task" }
+
+        let reply = captureReply { reply in
+            appState.sessions.handleHandoffRequest(
+                cwd: "/tmp/p",
+                handoffFile: "/tmp/p/.claude/handoff/h.md",
+                instructions: "",
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                tabId: "t1",
+                paneId: "t1-claude",
+                reply: reply
+            )
+        }
+
+        XCTAssertEqual(reply, "ok")
+        XCTAssertEqual(projectById("p").tabs.count, 2,
+                       "a handoff with model+effort must still produce a handoff tab")
     }
 
     // MARK: - Helpers

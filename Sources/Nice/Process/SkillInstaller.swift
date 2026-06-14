@@ -200,19 +200,26 @@ enum SkillInstaller {
 
     ## 2. Open the handoff tab
 
-    Run the helper, passing the **absolute path** to the handoff file you
-    just wrote as the first argument, and forwarding any arguments the user
-    provided to this skill verbatim as the second argument:
+    Run the helper, passing three arguments:
+
+    1. The **absolute path** to the handoff file you just wrote.
+    2. Any arguments the user provided to this skill, forwarded verbatim
+       (or an empty string `""` when the user provided none).
+    3. Your **exact current model id** — the precise `claude-…` identifier
+       you are running as right now (e.g. `claude-opus-4-8`), so the fresh
+       session continues on the same model. If you are not certain of your
+       exact model id, pass an empty string `""` rather than guessing; the
+       new session then falls back to the default model.
 
     ```
-    ~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "$ARGUMENTS"
+    ~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "$ARGUMENTS" "<your exact model id>"
     ```
 
     If the user provided no arguments to this skill, pass an empty string
     for the second argument:
 
     ```
-    ~/.nice/nice-handoff.sh "<absolute path to the handoff file>" ""
+    ~/.nice/nice-handoff.sh "<absolute path to the handoff file>" "" "<your exact model id>"
     ```
 
     The second argument lets the user customise what the new session does
@@ -222,6 +229,10 @@ enum SkillInstaller {
     instruction (e.g. `/nice-handoff keep going` or `/nice-handoff focus only
     on the UI layer`) that string tells the new session what to do after
     reading the file, so it can continue the work right away.
+
+    The third argument carries your model id so the new tab launches on the
+    same model. Your effort level is forwarded automatically by the helper
+    (it reads `CLAUDE_EFFORT` from the environment), so you do not pass it.
 
     ## 3. Report back
 
@@ -246,8 +257,9 @@ enum SkillInstaller {
     ///
     /// JSON-escape approach: three sed passes — backslash first (so the
     /// later escapes don't double-escape it), then double-quote, then
-    /// tab. Embedded newlines (possible in `$INSTRUCTIONS`) are handled
-    /// by a fourth sed pass using BSD sed's hold-space join idiom.
+    /// tab. Embedded newlines (possible in `$INSTRUCTIONS`; the model and
+    /// effort fields run through the same escaper) are handled by a fourth
+    /// sed pass using BSD sed's hold-space join idiom.
     /// Carriage-return is intentionally not escaped: macOS file paths
     /// never carry CR, and Claude's skill arguments are shell-expanded
     /// strings that don't produce CR in practice. This mirrors the
@@ -258,6 +270,17 @@ enum SkillInstaller {
     # so a fresh Claude session can continue the current work. Posts a JSON
     # `handoff` message to Nice's control socket.
     # Installed automatically by Nice; safe to delete.
+    #
+    # Args: $1 = absolute path to handoff file (required)
+    #       $2 = continuation instructions (optional)
+    #       $3 = model id to launch the new session with (optional)
+    # The effort level is NOT an argument: it is read from the CLAUDE_EFFORT
+    # environment variable Claude Code exports into the pane, so the new
+    # session inherits the current effort tier automatically. CLAUDE_EFFORT
+    # already holds the literal `claude --effort` token (low/medium/high/
+    # xhigh/max) — Nice forwards it verbatim and does NOT translate it.
+    # Both model and effort are forwarded empty-when-unknown; Nice omits the
+    # matching launch flag for any empty value.
     set -u
 
     if [ -z "${NICE_SOCKET:-}" ] || [ -z "${NICE_PANE_ID:-}" ]; then
@@ -267,11 +290,16 @@ enum SkillInstaller {
 
     HANDOFF_FILE="${1:-}"
     if [ -z "$HANDOFF_FILE" ]; then
-      printf 'usage: nice-handoff.sh <absolute-path-to-handoff-file> [instructions]\n' >&2
+      printf 'usage: nice-handoff.sh <absolute-path-to-handoff-file> [instructions] [model]\n' >&2
       exit 1
     fi
 
     INSTRUCTIONS="${2:-}"
+    MODEL="${3:-}"
+    # Effort tier is read from the environment, not passed as an argument:
+    # Claude Code exports CLAUDE_EFFORT (e.g. "xhigh") into the pane. Empty
+    # when the user is at the implicit default — Nice then omits --effort.
+    EFFORT="${CLAUDE_EFFORT:-}"
 
     # JSON-escape a single string value (without surrounding quotes).
     # Passes in order:
@@ -298,9 +326,11 @@ enum SkillInstaller {
     CWD_ESC=$(_nice_esc "$PWD")
     TAB_ID_ESC=$(_nice_esc "${NICE_TAB_ID:-}")
     PANE_ID_ESC=$(_nice_esc "$NICE_PANE_ID")
+    MODEL_ESC=$(_nice_esc "$MODEL")
+    EFFORT_ESC=$(_nice_esc "$EFFORT")
 
-    PAYLOAD=$(printf '{"action":"handoff","cwd":"%s","handoffFile":"%s","tabId":"%s","paneId":"%s","instructions":"%s"}' \
-      "$CWD_ESC" "$HANDOFF_ESC" "$TAB_ID_ESC" "$PANE_ID_ESC" "$INSTRUCTIONS_ESC")
+    PAYLOAD=$(printf '{"action":"handoff","cwd":"%s","handoffFile":"%s","tabId":"%s","paneId":"%s","instructions":"%s","model":"%s","effort":"%s"}' \
+      "$CWD_ESC" "$HANDOFF_ESC" "$TAB_ID_ESC" "$PANE_ID_ESC" "$INSTRUCTIONS_ESC" "$MODEL_ESC" "$EFFORT_ESC")
 
     REPLY=$(printf '%s\n' "$PAYLOAD" | /usr/bin/nc -U -w 2 "$NICE_SOCKET")
 

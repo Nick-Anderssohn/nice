@@ -115,6 +115,14 @@ enum SocketMessage: Sendable {
     /// the other cases apply to optional fields); the receiver
     /// substitutes a default directive when it's blank.
     ///
+    /// `model` / `effort` carry the originating session's model id and
+    /// effort tier so the fresh session launches matched to the current
+    /// one. Both are optional and normalized to "" when absent/empty
+    /// (same convention as `instructions`); the receiver omits the
+    /// corresponding `claude` launch flag for any empty value. `effort`
+    /// originates from the helper reading `CLAUDE_EFFORT`; `model` from
+    /// the skill passing Claude's exact model id.
+    ///
     /// `tabId` / `paneId` identify the sending pty so the receiver can
     /// resolve the originating tab and nest the new tab under it — both
     /// are empty strings for the Main Terminals tab (which yields a
@@ -127,6 +135,8 @@ enum SocketMessage: Sendable {
         cwd: String,
         handoffFile: String,
         instructions: String,
+        model: String,
+        effort: String,
         tabId: String,
         paneId: String,
         reply: @Sendable (String) -> Void
@@ -463,12 +473,17 @@ final class NiceControlSocket: @unchecked Sendable {
             // "claude" case; an empty tabId routes to a top-level tab.
             let tabId = (obj["tabId"] as? String) ?? ""
             let paneId = (obj["paneId"] as? String) ?? ""
-            // Instructions are optional. Absent key, non-string value,
-            // and empty string all collapse to "" — same idea as the
-            // "session_update" source/cwd normalization, but to "" not
-            // nil since the message type carries a non-optional String.
-            let rawInstructions = obj["instructions"] as? String
-            let instructions = (rawInstructions?.isEmpty == false) ? rawInstructions! : ""
+            // instructions/model/effort are all optional and normalized
+            // the same way: an absent key or non-string value collapses to
+            // "" (an explicit empty string is already ""). The message type
+            // carries non-optional Strings, so "" — not nil — is the "not
+            // provided" sentinel the receiver acts on. Missing model/effort
+            // must NOT drop the request: an older installed helper
+            // (pre-model/effort) omits them entirely, and the new session
+            // simply launches without the corresponding flag.
+            let instructions = (obj["instructions"] as? String) ?? ""
+            let model = (obj["model"] as? String) ?? ""
+            let effort = (obj["effort"] as? String) ?? ""
             let reply: @Sendable (String) -> Void = { line in
                 let payload = line + "\n"
                 payload.withCString { p in
@@ -480,6 +495,8 @@ final class NiceControlSocket: @unchecked Sendable {
                 cwd: cwd,
                 handoffFile: handoffFile,
                 instructions: instructions,
+                model: model,
+                effort: effort,
                 tabId: tabId,
                 paneId: paneId,
                 reply: reply

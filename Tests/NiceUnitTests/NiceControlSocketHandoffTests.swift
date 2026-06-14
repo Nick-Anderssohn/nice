@@ -8,8 +8,11 @@
 //      fields (`cwd` and `handoffFile`) are present.
 //    • drop the connection without dispatching when either required field
 //      is missing or empty (same silent-drop contract as the other cases).
-//    • normalize absent / empty `instructions`, `tabId`, and `paneId` to
-//      `""` so the handler never sees nil for the non-optional String fields.
+//    • normalize absent / empty `instructions`, `tabId`, `paneId`, `model`,
+//      and `effort` to `""` so the handler never sees nil for the
+//      non-optional String fields. `model`/`effort` are additionally a
+//      back-compat surface: an older installed helper omits them, and the
+//      request must still dispatch (not drop).
 //
 //  Test style mirrors NiceControlSocketTests: raw POSIX AF_UNIX connects,
 //  a thread-safe collector for dispatched messages, and the same
@@ -38,7 +41,7 @@ final class NiceControlSocketHandoffTests: XCTestCase {
         sendHandoff(
             to: socket.path,
             payload: #"""
-            {"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"tab1","paneId":"pane1","instructions":"Focus only on the UI layer"}
+            {"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"tab1","paneId":"pane1","instructions":"Focus only on the UI layer","model":"claude-opus-4-8","effort":"xhigh"}
             """#
         )
 
@@ -49,6 +52,8 @@ final class NiceControlSocketHandoffTests: XCTestCase {
         XCTAssertEqual(got?.instructions, "Focus only on the UI layer")
         XCTAssertEqual(got?.tabId, "tab1")
         XCTAssertEqual(got?.paneId, "pane1")
+        XCTAssertEqual(got?.model, "claude-opus-4-8")
+        XCTAssertEqual(got?.effort, "xhigh")
     }
 
     func test_handoff_validPayload_replyIsOk() throws {
@@ -59,7 +64,7 @@ final class NiceControlSocketHandoffTests: XCTestCase {
             healthCheckInterval: 60, initialRestartDelay: 0.02
         )
         try socket.start(handler: { message in
-            if case let .handoff(_, _, _, _, _, reply) = message {
+            if case let .handoff(_, _, _, _, _, _, _, reply) = message {
                 reply("ok")
             }
         })
@@ -224,6 +229,68 @@ final class NiceControlSocketHandoffTests: XCTestCase {
                        "absent paneId must normalize to \"\"")
     }
 
+    // MARK: - model / effort parsing
+
+    func test_handoff_modelAndEffortPresent_surfaceVerbatim() throws {
+        let captured = CapturedHandoffs()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendHandoff(
+            to: socket.path,
+            payload: #"{"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"t1","paneId":"p1","model":"claude-sonnet-4-6","effort":"max"}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertEqual(got?.model, "claude-sonnet-4-6")
+        XCTAssertEqual(got?.effort, "max")
+    }
+
+    func test_handoff_absentModelAndEffort_dispatchesWithEmptyStrings() throws {
+        // Back-compat: an older installed nice-handoff.sh omits both fields.
+        // The request must still dispatch (cwd/handoffFile are the only
+        // required fields), with model/effort normalized to "".
+        let captured = CapturedHandoffs()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendHandoff(
+            to: socket.path,
+            payload: #"{"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"t1","paneId":"p1"}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertNotNil(got, "a payload without model/effort must still dispatch")
+        XCTAssertEqual(got?.model, "", "absent model must normalize to \"\"")
+        XCTAssertEqual(got?.effort, "", "absent effort must normalize to \"\"")
+    }
+
+    func test_handoff_emptyModelAndEffort_normalizeToEmptyStrings() throws {
+        // The helper sends explicit empty strings when the model is unknown
+        // and CLAUDE_EFFORT is unset — same surface as absent.
+        let captured = CapturedHandoffs()
+        let socket = NiceControlSocket(
+            healthCheckInterval: 60, initialRestartDelay: 0.02
+        )
+        try socket.start(handler: captured.handler)
+        defer { socket.stop() }
+
+        sendHandoff(
+            to: socket.path,
+            payload: #"{"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"t1","paneId":"p1","model":"","effort":""}"#
+        )
+
+        let got = captured.waitForOne(timeout: 1.0)
+        XCTAssertEqual(got?.model, "")
+        XCTAssertEqual(got?.effort, "")
+    }
+
     // MARK: - Thread-safe collector
 
     /// Thread-safe collector for `.handoff` payloads dispatched to the
@@ -234,6 +301,8 @@ final class NiceControlSocketHandoffTests: XCTestCase {
             let cwd: String
             let handoffFile: String
             let instructions: String
+            let model: String
+            let effort: String
             let tabId: String
             let paneId: String
         }
@@ -244,12 +313,14 @@ final class NiceControlSocketHandoffTests: XCTestCase {
         var handler: NiceControlSocket.Handler {
             { [weak self] message in
                 switch message {
-                case let .handoff(cwd, handoffFile, instructions, tabId, paneId, reply):
+                case let .handoff(cwd, handoffFile, instructions, model, effort, tabId, paneId, reply):
                     reply("ok")
                     self?.append(.init(
                         cwd: cwd,
                         handoffFile: handoffFile,
                         instructions: instructions,
+                        model: model,
+                        effort: effort,
                         tabId: tabId,
                         paneId: paneId
                     ))

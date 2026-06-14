@@ -278,11 +278,13 @@ final class SessionsModel {
                             source: source,
                             cwd: cwd
                         )
-                    case let .handoff(cwd, handoffFile, instructions, tabId, paneId, reply):
+                    case let .handoff(cwd, handoffFile, instructions, model, effort, tabId, paneId, reply):
                         self.handleHandoffRequest(
                             cwd: cwd,
                             handoffFile: handoffFile,
                             instructions: instructions,
+                            model: model,
+                            effort: effort,
                             tabId: tabId,
                             paneId: paneId,
                             reply: reply
@@ -1096,11 +1098,19 @@ final class SessionsModel {
     ///
     /// Prompt: always instructs Claude to read the notes file, then
     /// appends either the skill's custom `instructions` (when non-blank)
-    /// or a default "continue the work described there" directive.
+    /// or a default read-and-wait directive (do not auto-resume) — see
+    /// `handoffPrompt`.
+    ///
+    /// Model/effort: the originating session's model id and effort tier,
+    /// forwarded verbatim to `createHandoffTab`, where each becomes an
+    /// optional `--model` / `--effort` launch flag (omitted when empty) so
+    /// the fresh session starts matched to the current one.
     func handleHandoffRequest(
         cwd: String,
         handoffFile: String,
         instructions: String,
+        model: String,
+        effort: String,
         tabId: String,
         paneId: String,
         reply: @Sendable (String) -> Void
@@ -1138,7 +1148,9 @@ final class SessionsModel {
             underTabId: originating?.id ?? "",
             cwd: spawnCwd,
             title: Self.handoffTitle(forOriginatingTitle: originating?.title),
-            prompt: Self.handoffPrompt(handoffFile: handoffFile, instructions: instructions)
+            prompt: Self.handoffPrompt(handoffFile: handoffFile, instructions: instructions),
+            model: model,
+            effort: effort
         )
         reply("ok")
     }
@@ -1187,6 +1199,27 @@ final class SessionsModel {
         return "Read the handoff notes at \(handoffFile). " + directive
     }
 
+    /// Build the `extraClaudeArgs` for a handoff session so the fresh
+    /// session launches matched to the originating one. Pure (no actor
+    /// state) so it can be unit-tested directly, like `handoffPrompt`.
+    ///
+    /// `model` and `effort` map to the `claude --model <id>` /
+    /// `claude --effort <tier>` launch flags; each is omitted when empty
+    /// (unknown model, or no `CLAUDE_EFFORT` in the originating env), in
+    /// which case the new session falls back to its own default. The
+    /// `prompt` MUST stay the final element: it's the single positional
+    /// arg `claude` auto-runs, and flags must precede it. Combined with
+    /// `TabPtySession.buildClaudeExecCommand` (which emits `--session-id
+    /// <id>` then these args verbatim), the launch line becomes
+    /// `claude --session-id <id> --model <m> --effort <e> '<prompt>'`.
+    nonisolated static func handoffExtraArgs(model: String, effort: String, prompt: String) -> [String] {
+        var args: [String] = []
+        if !model.isEmpty { args += ["--model", model] }
+        if !effort.isEmpty { args += ["--effort", effort] }
+        args.append(prompt)
+        return args
+    }
+
     /// Mint and spawn the handoff tab. Modelled closely on
     /// `createTabFromMainTerminal`: a Claude pane (marked running) plus
     /// a deferred-spawn companion terminal, a pre-minted session UUID
@@ -1204,14 +1237,19 @@ final class SessionsModel {
     ///     stale originating id) it falls back to `addTabToProjects` so
     ///     the tab still opens at top level — same bucketing
     ///     `createTabFromMainTerminal` uses.
-    ///   • The seeded `prompt` is passed as a single positional Claude
-    ///     arg, which becomes `claude --session-id <id> "<prompt>"` and
-    ///     auto-runs the prompt on launch.
+    ///   • The seeded `prompt` is passed as the final positional Claude
+    ///     arg, preceded by optional `--model`/`--effort` flags (see
+    ///     `handoffExtraArgs`), which becomes
+    ///     `claude --session-id <id> [--model <m>] [--effort <e>] '<prompt>'`
+    ///     and auto-runs the prompt on launch matched to the originating
+    ///     session's model and effort.
     private func createHandoffTab(
         underTabId: String,
         cwd: String,
         title: String,
-        prompt: String
+        prompt: String,
+        model: String,
+        effort: String
     ) {
         guard let tabs else { return }
         let newId = mintTabId("t")
@@ -1248,14 +1286,15 @@ final class SessionsModel {
         }
         tabs.activeTabId = newId
 
-        // Passing the prompt as a single positional arg makes the
-        // launch line `claude --session-id <id> "<prompt>"`, which
-        // auto-runs the prompt. The companion terminal's pty is deferred
-        // until first focus, same as createTabFromMainTerminal.
+        // Prepend any --model/--effort flags, then the prompt as the final
+        // positional arg, making the launch line
+        // `claude --session-id <id> [--model <m>] [--effort <e>] "<prompt>"`,
+        // which auto-runs the prompt. The companion terminal's pty is
+        // deferred until first focus, same as createTabFromMainTerminal.
         _ = makeSession(
             for: newId,
             cwd: cwd,
-            extraClaudeArgs: [prompt],
+            extraClaudeArgs: Self.handoffExtraArgs(model: model, effort: effort, prompt: prompt),
             initialClaudePaneId: claudePaneId,
             initialTerminalPaneId: nil,
             claudeSessionMode: .new(id: sessionId)

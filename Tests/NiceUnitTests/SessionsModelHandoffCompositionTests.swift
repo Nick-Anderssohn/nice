@@ -2,9 +2,10 @@
 //  SessionsModelHandoffCompositionTests.swift
 //  NiceUnitTests
 //
-//  Pins the two pure helpers introduced alongside the handoff feature:
+//  Pins the pure helpers introduced alongside the handoff feature:
 //    • `SessionsModel.handoffTitle(forOriginatingTitle:)`
 //    • `SessionsModel.handoffPrompt(handoffFile:instructions:)`
+//    • `SessionsModel.handoffExtraArgs(model:effort:prompt:)`
 //
 //  Both are `nonisolated static`, so these tests need no AppState or
 //  SessionsModel instance — they can call the helpers directly without any
@@ -104,6 +105,103 @@ final class SessionsModelHandoffCompositionTests: XCTestCase {
             SessionsModel.handoffTitle(forOriginatingTitle: "[HANDOFF]    "),
             "[HANDOFF] Session",
             "\"[HANDOFF]\" + whitespace must fall back to \"[HANDOFF] Session\""
+        )
+    }
+
+    // MARK: - handoffExtraArgs
+
+    private let samplePrompt = "Read the handoff notes at /tmp/h.md. Wait."
+
+    func test_handoffExtraArgs_bothPresent_emitsFlagsThenPromptInOrder() {
+        // Order matters: flags must precede the positional prompt, and
+        // --model must precede --effort to match the documented launch line
+        // `claude --session-id <id> --model <m> --effort <e> "<prompt>"`.
+        XCTAssertEqual(
+            SessionsModel.handoffExtraArgs(
+                model: "claude-opus-4-8",
+                effort: "xhigh",
+                prompt: samplePrompt
+            ),
+            ["--model", "claude-opus-4-8", "--effort", "xhigh", samplePrompt]
+        )
+    }
+
+    func test_handoffExtraArgs_emptyModel_omitsModelFlag() {
+        XCTAssertEqual(
+            SessionsModel.handoffExtraArgs(model: "", effort: "xhigh", prompt: samplePrompt),
+            ["--effort", "xhigh", samplePrompt],
+            "an empty model must omit --model entirely (no empty-string arg)"
+        )
+    }
+
+    func test_handoffExtraArgs_emptyEffort_omitsEffortFlag() {
+        XCTAssertEqual(
+            SessionsModel.handoffExtraArgs(model: "claude-opus-4-8", effort: "", prompt: samplePrompt),
+            ["--model", "claude-opus-4-8", samplePrompt],
+            "an empty effort must omit --effort entirely (no empty-string arg)"
+        )
+    }
+
+    func test_handoffExtraArgs_bothEmpty_isJustThePrompt() {
+        // The pre-feature behavior: a handoff with neither value known
+        // launches exactly as before — `claude --session-id <id> "<prompt>"`.
+        XCTAssertEqual(
+            SessionsModel.handoffExtraArgs(model: "", effort: "", prompt: samplePrompt),
+            [samplePrompt],
+            "both empty must reproduce the original single-positional-arg launch"
+        )
+    }
+
+    func test_handoffExtraArgs_promptIsAlwaysLast() {
+        // Guards the invariant the launch path depends on: claude auto-runs
+        // the trailing positional arg, so the prompt must never be reordered
+        // ahead of a flag.
+        for (model, effort) in [("opus", "max"), ("", "high"), ("sonnet", ""), ("", "")] {
+            let args = SessionsModel.handoffExtraArgs(model: model, effort: effort, prompt: samplePrompt)
+            XCTAssertEqual(args.last, samplePrompt,
+                           "prompt must be the final element for model=\(model) effort=\(effort)")
+        }
+    }
+
+    // MARK: - handoffExtraArgs composed into the real launch command
+    //
+    // handoffExtraArgs only matters because of the command line it produces
+    // once TabPtySession.buildClaudeExecCommand splices it after
+    // `--session-id`. Both are pure `nonisolated static`, so the composed
+    // line is observable here (only the runtime pty spawn isn't). These pin
+    // the end-to-end ordering + per-arg single-quoting the feature depends
+    // on — a reorder of the flags relative to --session-id, or a quoting
+    // regression, would slip past the per-helper tests.
+
+    func test_composedLaunchCommand_modelAndEffort_afterSessionId_promptLast() {
+        let args = SessionsModel.handoffExtraArgs(
+            model: "claude-opus-4-8", effort: "xhigh", prompt: samplePrompt
+        )
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/usr/local/bin/claude",
+            mode: .new(id: "sess-1"),
+            extraClaudeArgs: args,
+            isOverride: false
+        )
+        XCTAssertEqual(
+            cmd,
+            "exec '/usr/local/bin/claude' --session-id 'sess-1' '--model' 'claude-opus-4-8' '--effort' 'xhigh' '\(samplePrompt)'"
+        )
+    }
+
+    func test_composedLaunchCommand_neitherFlag_matchesPreFeatureLine() {
+        // Back-compat: no model/effort ⇒ byte-for-byte the original
+        // single-positional launch line (`claude --session-id <id> '<prompt>'`).
+        let args = SessionsModel.handoffExtraArgs(model: "", effort: "", prompt: samplePrompt)
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/usr/local/bin/claude",
+            mode: .new(id: "sess-1"),
+            extraClaudeArgs: args,
+            isOverride: false
+        )
+        XCTAssertEqual(
+            cmd,
+            "exec '/usr/local/bin/claude' --session-id 'sess-1' '\(samplePrompt)'"
         )
     }
 }

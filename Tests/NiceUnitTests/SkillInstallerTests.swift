@@ -17,6 +17,9 @@
 //      already absent.
 //    • `sync(enabled:true)` routes to install; `sync(enabled:false)`
 //      routes to uninstall.
+//    • model/effort plumbing: the helper reads a 3rd positional `model`
+//      arg + `CLAUDE_EFFORT` and emits them in the payload; SKILL.md tells
+//      Claude to pass its model id.
 //
 
 import Darwin
@@ -122,6 +125,32 @@ final class SkillInstallerTests: XCTestCase {
         proc.waitUntilExit()
         XCTAssertEqual(proc.terminationStatus, 0,
                        "nice-handoff.sh must pass bash -n syntax check")
+    }
+
+    // MARK: - model / effort plumbing
+
+    func test_helperScript_readsModelArgAndEffortEnv() {
+        let script = SkillInstaller.helperScript
+        XCTAssertTrue(script.contains("${3:-}"),
+                      "helper must read the model from the 3rd positional arg")
+        XCTAssertTrue(script.contains("CLAUDE_EFFORT"),
+                      "helper must read the effort tier from the CLAUDE_EFFORT env var")
+        XCTAssertTrue(script.contains(#""model":"%s","effort":"%s""#),
+                      "helper payload must carry the model and effort fields")
+    }
+
+    func test_skillMarkdown_documentsPassingModelId() {
+        let md = SkillInstaller.skillMarkdown
+        XCTAssertTrue(md.contains("model id"),
+                      "SKILL.md must instruct Claude to pass its exact model id")
+        // Pin the model id specifically as the THIRD positional arg in the
+        // helper invocation — a weak `contains(\"model id\")` would still
+        // pass if a regression reordered or dropped the arg, but the whole
+        // feature depends on the model landing in slot 3 ($3).
+        XCTAssertTrue(
+            md.contains(#""$ARGUMENTS" "<your exact model id>""#),
+            "SKILL.md must show the model id as the third positional arg in the helper call"
+        )
     }
 
     // MARK: - Idempotency
