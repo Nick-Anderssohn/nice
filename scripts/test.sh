@@ -112,9 +112,14 @@ xcodegen generate >/dev/null
 # A handful of tear-off / window-chrome UITests need a REAL window
 # server with a real display: they open a second window the headless
 # GitHub Actions runner can't place where XCUITest can find it, read the
-# native traffic-light cluster geometry, zoom the window, or hit chrome
-# near the screen edge. They PASS locally (and are valuable there), so we
-# only skip them in CI — they are NOT disabled for local development.
+# native traffic-light cluster geometry, zoom the window, hit chrome
+# near the screen edge, or drive an AppKit pane-drag `NSDraggingSession`
+# (a synthesized drag through that path wedges the headless runner's drag
+# tracker, so a follow-on window move never fires). They PASS locally
+# (and are valuable there), so we only skip them in CI — they are NOT
+# disabled for local development. NB: a plain window-chrome *drag-move*
+# (`WindowDragUITests`) DOES work headlessly and stays unskipped; only
+# the AppKit-drag-session tests in this list are display-bound that way.
 #
 # This gate lives HERE, in the job shell, on purpose: xcodebuild does not
 # forward the shell environment to the macOS UITest *runner* process, so a
@@ -124,6 +129,7 @@ xcodegen generate >/dev/null
 # before tagging precisely because CI doesn't.
 CI_SKIP_TESTS=(
     NiceUITests/PaneTearOffUITests/testDragPillToEmptyDesktopOpensNewWindow
+    NiceUITests/PaneTearOffUITests/testPillDragReleasedInWindowDoesNotTearOffAndLeavesWindowDraggable
     NiceUITests/TearOffHookUITests/testTearOffFromTerminalsSection_singleSection_andNoBlankPane
     NiceUITests/TearOffHookUITests/testTearOffUnspawnedPane_spawnsInNewWindow
     NiceUITests/TearOffHookUITests/testTornOffWindowTrafficLightsMatchOriginalOffset
