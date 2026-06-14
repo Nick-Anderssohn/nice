@@ -360,6 +360,19 @@ final class NiceServices {
         // Idempotent and safe to run on every launch.
         ClaudeHookInstaller.install()
 
+        // Mirror Nice's active terminal theme into Claude Code so the first
+        // Claude pane spawned this launch already matches, and the
+        // per-session `--settings` pointer file exists before any spawn.
+        // Idempotent + only-if-changed; gated on the toggle. Live changes
+        // thereafter flow through `SessionThemeCache`. See `ClaudeThemeSync`.
+        if tweaks.syncClaudeTheme {
+            ClaudeThemeSync.write(
+                theme: tweaks.effectiveTerminalTheme(for: tweaks.scheme, catalog: terminalThemeCatalog),
+                scheme: tweaks.scheme,
+                accent: tweaks.accent.nsColor
+            )
+        }
+
         // Install or remove the `/nice-handoff` skill and its companion
         // shell helper depending on the user's preference. Idempotent:
         // both the install and uninstall paths are no-ops when the

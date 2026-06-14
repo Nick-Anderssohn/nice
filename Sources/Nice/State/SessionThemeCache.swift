@@ -67,6 +67,20 @@ final class SessionThemeCache {
     /// `Tweaks`; thereafter it fans changes to every live receiver.
     private(set) var smoothScrolling: Bool = false
 
+    /// Whether Nice mirrors the active terminal theme into Claude Code
+    /// (`~/.claude/themes/nice.json`) so Claude sessions Nice launches
+    /// re-theme to match — live. Placeholder seed OFF (like
+    /// `smoothScrolling`) so the cache never writes the theme file before
+    /// it's reconciled from the persisted `Tweaks.syncClaudeTheme` at
+    /// window setup (`AppShellHost.onAppear` → `updateSyncClaudeTheme`,
+    /// after the scheme/theme seed) and on every toggle change
+    /// (`AppShellHost.onChange`). Were it seeded ON, the onAppear
+    /// scheme/theme seed would write `nice.json` for an opted-out user
+    /// before the reconcile flips it off. Read in
+    /// `SessionsModel.makeSession` to decide whether a spawned Claude pane
+    /// gets the `--settings` theme pointer.
+    private(set) var syncClaudeTheme: Bool = false
+
     /// Returns the current fan-out targets. Called on every
     /// `updateX`. `SessionsModel` wires this to `ptySessions.values`
     /// (its live `TabPtySession`s); tests pass a closure that
@@ -75,6 +89,14 @@ final class SessionThemeCache {
     /// before `self` is fully formed and then bind a `[weak self]`
     /// closure to it once initialization is complete.
     var receivers: () -> [any TabPtySessionThemeable]
+
+    /// Persists the active terminal theme into Claude Code's custom-theme
+    /// file whenever the displayed colors change. Injected so unit tests
+    /// stay hermetic — the default is a no-op, and `SessionsModel` wires it
+    /// to `ClaudeThemeSync.write`. Takes the resolved scheme/accent/theme
+    /// rather than reading globals so it's trivially stubbable and
+    /// assertable.
+    var claudeThemeWriter: @MainActor (TerminalTheme, ColorScheme, NSColor) -> Void = { _, _, _ in }
 
     init(receivers: @escaping () -> [any TabPtySessionThemeable] = { [] }) {
         self.receivers = receivers
@@ -90,6 +112,7 @@ final class SessionThemeCache {
         for receiver in receivers() {
             receiver.applyTheme(scheme, palette: palette, accent: accent)
         }
+        writeClaudeThemeIfEnabled()
     }
 
     /// Fan a new terminal font size out to every live receiver.
@@ -112,6 +135,7 @@ final class SessionThemeCache {
         for receiver in receivers() {
             receiver.applyTerminalTheme(theme)
         }
+        writeClaudeThemeIfEnabled()
     }
 
     /// Fan out a terminal-font-family change. `nil` resets to the
@@ -132,6 +156,28 @@ final class SessionThemeCache {
         for receiver in receivers() {
             receiver.applySmoothScrolling(enabled)
         }
+    }
+
+    /// Enable/disable mirroring Nice's theme into Claude. On enable, write
+    /// the current theme immediately so the next spawn (and any session
+    /// already pointed at `custom:nice`) matches. On disable, leave the
+    /// existing `nice.json` in place — deleting it would make Claude's
+    /// resolver fall back to a dark base for sessions still pointed at
+    /// `custom:nice` (the pointer is read once at startup); newly spawned
+    /// panes simply won't be handed the `--settings` flag.
+    func updateSyncClaudeTheme(_ enabled: Bool) {
+        syncClaudeTheme = enabled
+        if enabled { writeClaudeThemeIfEnabled() }
+    }
+
+    /// Rewrite `~/.claude/themes/nice.json` from the cached scheme +
+    /// accent + terminal theme when sync is on. Atomic + only-if-changed,
+    /// so the scheme-flip pair (`updateScheme` then `updateTerminalTheme`,
+    /// fired together) collapses to at most one real disk write — a Claude
+    /// file-watcher therefore sees at most one content change.
+    private func writeClaudeThemeIfEnabled() {
+        guard syncClaudeTheme else { return }
+        claudeThemeWriter(terminalTheme, scheme, accent)
     }
 
     /// Apply the full cached state to a brand-new receiver. Called

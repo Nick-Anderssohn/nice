@@ -519,6 +519,13 @@ private struct AppShellHost: View {
             )
             appState.sessions.updateTerminalFontSize(fontSettings.terminalFontSize)
             appState.sessions.updateSmoothScrolling(tweaks.smoothScrolling)
+            // Reconcile the per-window cache with the persisted toggle.
+            // Load-bearing that this runs AFTER updateScheme/updateTerminalTheme:
+            // the cache seeds sync OFF, so those calls don't write the theme
+            // file; this line then enables (if persisted ON) and performs the
+            // single write with the correct colors already cached — and an
+            // opted-out user never writes at all. Mirrors the smoothScrolling seed.
+            appState.sessions.updateSyncClaudeTheme(tweaks.syncClaudeTheme)
         }
         .onChange(of: scheme) { _, newScheme in
             appState.sessions.updateScheme(newScheme, palette: palette, accent: tweaks.accent.nsColor)
@@ -567,6 +574,12 @@ private struct AppShellHost: View {
         }
         .onChange(of: tweaks.smoothScrolling) { _, newValue in
             appState.sessions.updateSmoothScrolling(newValue)
+        }
+        .onChange(of: tweaks.syncClaudeTheme) { _, newValue in
+            // Every open window observes the shared Tweaks, so this fans the
+            // toggle out to each window's cache — newly spawned panes pick up
+            // / drop the --settings pointer, and enabling rewrites nice.json.
+            appState.sessions.updateSyncClaudeTheme(newValue)
         }
         // Per-window SceneStorage bridges: persist this window's
         // collapsed-sidebar state across relaunch. Also clear any

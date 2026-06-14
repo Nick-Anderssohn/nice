@@ -260,6 +260,21 @@ private struct ClaudePane: View {
                     SkillInstaller.sync(enabled: newValue)
                 }
         }
+
+        SettingRow(
+            label: "Sync Claude Code theme",
+            hint: "Match Claude Code's colors to Nice's current terminal theme, and update them live when you switch theme or light/dark. Applies only to Claude sessions launched inside Nice — your global Claude theme (e.g. Claude run in another terminal) is left untouched."
+        ) {
+            Toggle("", isOn: $tweaks.syncClaudeTheme)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityIdentifier("settings.claude.syncClaudeTheme")
+            // Reconciliation lives in AppShellHost's
+            // `.onChange(of: tweaks.syncClaudeTheme)` (every open window
+            // observes the shared Tweaks), mirroring the smoothScrolling
+            // toggle — so this row just binds the persisted value.
+        }
     }
 }
 

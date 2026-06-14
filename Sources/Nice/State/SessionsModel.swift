@@ -157,6 +157,15 @@ final class SessionsModel {
             guard let self else { return [] }
             return Array(self.ptySessions.values)
         }
+        // Production wiring for the Claude theme mirror. Hermeticity holds
+        // two ways: SessionThemeCacheTests construct the cache directly and
+        // keep the no-op default; SessionsModel/AppState tests run under
+        // TestHomeSandbox, whose $HOME redirect ClaudeThemeSync.homeBase()
+        // honors, so any write lands in the sandbox, never the real
+        // ~/.claude. See `SessionThemeCache.claudeThemeWriter` / `ClaudeThemeSync`.
+        self.themeCache.claudeThemeWriter = { theme, scheme, accent in
+            ClaudeThemeSync.write(theme: theme, scheme: scheme, accent: accent)
+        }
     }
 
     /// Production minter used by `init`'s default. Format:
@@ -197,6 +206,14 @@ final class SessionsModel {
     /// Forward to `themeCache.updateSmoothScrolling`.
     func updateSmoothScrolling(_ enabled: Bool) {
         themeCache.updateSmoothScrolling(enabled)
+    }
+
+    /// Forward to `themeCache.updateSyncClaudeTheme`. Called when the user
+    /// toggles "Sync Claude Code theme" so this window's cache stops/starts
+    /// handing the `--settings` pointer to newly spawned panes (and writes
+    /// the theme file on enable).
+    func updateSyncClaudeTheme(_ enabled: Bool) {
+        themeCache.updateSyncClaudeTheme(enabled)
     }
 
     /// Update the resolved `claude` binary path. Called by AppState
@@ -791,6 +808,12 @@ final class SessionsModel {
     /// - "inplace <uuid>": same promotion, but mint a new session id
     ///   so we can later resume it. The wrapper prepends
     ///   `--session-id <uuid>`.
+    /// - A trailing pointer path ("inplace <uuid|-> <settingsPath>") is
+    ///   appended when theme sync is on; the wrapper splices it as
+    ///   `--settings <path>` so the in-place Claude matches the Nice
+    ///   theme. A "-" sid placeholder lets the path follow when the
+    ///   user's own args already carry the session. Sync off omits the
+    ///   field, leaving the two replies above byte-identical.
     ///
     /// `internal` so unit tests can drive the dispatch path directly
     /// without standing up a real socket — matches `paneExited` and
@@ -860,7 +883,25 @@ final class SessionsModel {
         }
         onSessionMutation?()
 
-        if parsedId != nil {
+        // Hand the wrapper the theme pointer when sync is on, so an
+        // in-place promotion matches the Nice theme exactly like a
+        // from-scratch Nice Claude pane. The wrapper splices it as the
+        // `--settings <path>` 3rd reply field; sync off omits it so the
+        // reply stays byte-identical to the pre-theming protocol.
+        // Skip it when the args already carry `--settings` (e.g. a
+        // restored deferred pane re-dispatching its pre-typed `claude
+        // --settings … --resume …` through this socket) so we never emit
+        // a doubled flag. Mirrors `makeSession`'s gate — see `ClaudeThemeSync`.
+        let settingsPath = themeCache.syncClaudeTheme && !args.contains("--settings")
+            ? ClaudeThemeSync.settingsFlagPath()
+            : nil
+        if let settingsPath {
+            // "-" sid placeholder when the user's args already carry the
+            // session, so the pointer can follow as the 3rd field; else
+            // the freshly minted id.
+            let sidField = parsedId != nil ? "-" : sessionId
+            reply("inplace \(sidField) \(settingsPath)")
+        } else if parsedId != nil {
             reply("inplace")
         } else {
             reply("inplace \(sessionId)")
@@ -1261,13 +1302,25 @@ final class SessionsModel {
             }
         }
 
+        // Hand Claude the Nice-managed theme pointer only when sync is on.
+        // `settingsFlagPath()` ensures the file exists and returns its path;
+        // nil (sync off, or write failed) omits `--settings` so Claude uses
+        // the user's own theme. Computed here — not in `instantiateSession`
+        // — so the migration/adopt callers (which re-home an existing pane
+        // rather than spawn a fresh Claude) neither trigger the write nor
+        // bake `--settings` into a migrated pane's prefill. Those panes
+        // still get themed on resume via the socket reply. See `ClaudeThemeSync`.
+        let claudeSettingsPath = themeCache.syncClaudeTheme
+            ? ClaudeThemeSync.settingsFlagPath()
+            : nil
         return instantiateSession(
             for: tabId,
             cwd: resolvedCwd,
             extraClaudeArgs: extraClaudeArgs,
             initialClaudePaneId: claudePaneId,
             initialTerminalPaneId: terminalPaneId,
-            claudeSessionMode: claudeSessionMode
+            claudeSessionMode: claudeSessionMode,
+            claudeSettingsPath: claudeSettingsPath
         )
     }
 
@@ -1283,9 +1336,11 @@ final class SessionsModel {
         extraClaudeArgs: [String],
         initialClaudePaneId: String?,
         initialTerminalPaneId: String?,
-        claudeSessionMode: TabPtySession.ClaudeSessionMode
+        claudeSessionMode: TabPtySession.ClaudeSessionMode,
+        claudeSettingsPath: String? = nil
     ) -> TabPtySession {
         let resolvedCwd = cwd
+
         let session = TabPtySession(
             tabId: tabId,
             cwd: resolvedCwd,
@@ -1297,6 +1352,7 @@ final class SessionsModel {
             zdotdirPath: zdotdirPath,
             userZDotDir: userZDotDir,
             claudeSessionMode: claudeSessionMode,
+            claudeSettingsPath: claudeSettingsPath,
             onPaneExit: { [weak self] paneId, code in
                 self?.paneExited(tabId: tabId, paneId: paneId, exitCode: code)
             },

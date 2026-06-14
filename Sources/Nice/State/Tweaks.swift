@@ -213,6 +213,7 @@ final class Tweaks {
     static let installHandoffSkillKey    = "installHandoffSkill"
     static let handoffSkillPromptSeenKey = "handoffSkillPromptSeen"
     static let smoothScrollingKey      = "smoothScrolling"
+    static let syncClaudeThemeKey      = "syncClaudeTheme"
 
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
@@ -386,6 +387,20 @@ final class Tweaks {
         }
     }
 
+    /// Whether Nice mirrors its active terminal theme into Claude Code so
+    /// Claude sessions Nice launches re-theme to match — live. Default ON.
+    ///
+    /// Like `installHandoffSkill`, this setter ONLY persists. Reconciling
+    /// the on-disk theme files and live windows is the caller's job:
+    /// `NiceServices.bootstrap()` writes the file once at launch, and the
+    /// Settings toggle's `onChange` writes + fans the value out to every
+    /// window's `SessionThemeCache`. See `ClaudeThemeSync`.
+    var syncClaudeTheme: Bool {
+        didSet {
+            defaults.set(syncClaudeTheme, forKey: Self.syncClaudeThemeKey)
+        }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
@@ -449,6 +464,8 @@ final class Tweaks {
         // unseen.
         self.installHandoffSkill = defaults.object(forKey: Self.installHandoffSkillKey) as? Bool ?? false
         self.handoffSkillPromptSeen = defaults.object(forKey: Self.handoffSkillPromptSeenKey) as? Bool ?? false
+        // Default ON: a fresh install syncs Claude's theme out of the box.
+        self.syncClaudeTheme = defaults.object(forKey: Self.syncClaudeThemeKey) as? Bool ?? true
 
         NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
 
@@ -774,10 +791,12 @@ final class Tweaks {
         let extensionEditorMap: [String: UUID]
 
         static func decode() -> TestSeed? {
-            // `ProcessInfo.processInfo.environment` is documented as
-            // immutable for the process lifetime — `setenv` from a
-            // unit test wouldn't show up. Read via `getenv` so the
-            // unit test for this hook can flip the var at runtime.
+            // Read via `getenv` so the unit test for this hook can flip
+            // the var at runtime with `setenv`. (Belt-and-suspenders:
+            // `ProcessInfo.processInfo.environment` also re-reads `environ`
+            // and would observe a runtime `setenv` too —
+            // `ClaudeThemeSync.homeBase()` deliberately relies on exactly
+            // that — so the two are consistent, not contradictory.)
             guard let cstr = getenv("NICE_TEST_EDITOR_SEED") else { return nil }
             let raw = String(cString: cstr)
             guard !raw.isEmpty, let data = raw.data(using: .utf8) else { return nil }

@@ -192,4 +192,96 @@ final class TabPtySessionClaudeArgsTests: XCTestCase {
         )
         XCTAssertEqual(cmd, "exec '/usr/local/bin/claude' --resume 'abc-123'")
     }
+
+    // MARK: - Theme-sync --settings flag
+    //
+    // When theme sync is on, Nice hands Claude a `--settings <file>`
+    // pointing at the per-session `{"theme":"custom:nice"}` pointer. It's
+    // a global flag with its own value, so it must precede the
+    // `--session-id` / `--resume` flags (never sit between one and its
+    // UUID), and the override branch must suppress it like every other
+    // injected flag.
+
+    func test_settingsPath_emittedBeforeSessionId() {
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/c",
+            mode: .new(id: "abc-123"),
+            extraClaudeArgs: ["--model", "opus"],
+            isOverride: false,
+            settingsPath: "/Users/x/.nice/claude-theme-settings.json"
+        )
+        XCTAssertEqual(
+            cmd,
+            "exec '/c' --settings '/Users/x/.nice/claude-theme-settings.json' --session-id 'abc-123' '--model' 'opus'"
+        )
+    }
+
+    func test_settingsPath_emittedBeforeResume() {
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/c",
+            mode: .resume(id: "abc-123"),
+            extraClaudeArgs: [],
+            isOverride: false,
+            settingsPath: "/s.json"
+        )
+        XCTAssertEqual(cmd, "exec '/c' --settings '/s.json' --resume 'abc-123'")
+    }
+
+    func test_settingsPath_nil_omitsFlag() {
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/c",
+            mode: .new(id: "abc-123"),
+            extraClaudeArgs: [],
+            isOverride: false,
+            settingsPath: nil
+        )
+        XCTAssertEqual(cmd, "exec '/c' --session-id 'abc-123'")
+    }
+
+    func test_settingsPath_suppressedByOverride() {
+        // NICE_CLAUDE_OVERRIDE owns the full argv — no injected flags,
+        // including --settings.
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/c",
+            mode: .new(id: "abc-123"),
+            extraClaudeArgs: [],
+            isOverride: true,
+            settingsPath: "/s.json"
+        )
+        XCTAssertEqual(cmd, "exec '/c'")
+    }
+
+    func test_settingsPath_quotedWhenContainsSpace() {
+        let cmd = TabPtySession.buildClaudeExecCommand(
+            claude: "/c",
+            mode: .none,
+            extraClaudeArgs: [],
+            isOverride: false,
+            settingsPath: "/Users/dev user/.nice/s.json"
+        )
+        XCTAssertEqual(cmd, "exec '/c' --settings '/Users/dev user/.nice/s.json'")
+    }
+
+    func test_resumeDeferred_prefill_includesSettingsWhenPresent() {
+        // Deferred resume pre-types the resume command instead of execing.
+        // The --settings flag must ride along so the resumed session is
+        // themed too, single-quoted for the interactive shell line.
+        let env = TabPtySession.buildClaudeExtraEnv(
+            mode: .resumeDeferred(id: "abc-123"),
+            tabId: "t", paneId: "p",
+            socketPath: nil, zdotdirPath: nil, userZDotDir: nil,
+            settingsPath: "/s.json"
+        )
+        XCTAssertEqual(env["NICE_PREFILL_COMMAND"], "claude --settings '/s.json' --resume abc-123")
+    }
+
+    func test_resumeDeferred_prefill_omitsSettingsWhenNil() {
+        let env = TabPtySession.buildClaudeExtraEnv(
+            mode: .resumeDeferred(id: "abc-123"),
+            tabId: "t", paneId: "p",
+            socketPath: nil, zdotdirPath: nil, userZDotDir: nil,
+            settingsPath: nil
+        )
+        XCTAssertEqual(env["NICE_PREFILL_COMMAND"], "claude --resume abc-123")
+    }
 }

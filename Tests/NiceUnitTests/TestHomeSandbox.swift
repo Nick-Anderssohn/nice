@@ -34,6 +34,7 @@ final class TestHomeSandbox {
     private let tempHome: URL
     private let originalHome: String?
     private let originalAppSupportRoot: String?
+    private let originalClaudeConfigDir: String?
 
     init() {
         self.tempHome = FileManager.default.temporaryDirectory
@@ -47,10 +48,18 @@ final class TestHomeSandbox {
         self.originalHome = ProcessInfo.processInfo.environment["HOME"]
         self.originalAppSupportRoot =
             ProcessInfo.processInfo.environment["NICE_APPLICATION_SUPPORT_ROOT"]
+        self.originalClaudeConfigDir =
+            ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
         setenv("HOME", tempHome.path, 1)
         let appSupport = tempHome
             .appendingPathComponent("Library/Application Support", isDirectory: true)
         setenv("NICE_APPLICATION_SUPPORT_ROOT", appSupport.path, 1)
+        // Clear CLAUDE_CONFIG_DIR for the test lifetime: it's the one
+        // theme-sync path that bypasses the `$HOME` seam —
+        // `ClaudeThemeSync.defaultThemesDir()` reads it straight from the
+        // process env. A developer who exports it would otherwise have the
+        // sync write escape this sandbox into their real Claude config dir.
+        unsetenv("CLAUDE_CONFIG_DIR")
     }
 
     /// Restore the prior `$HOME` and remove the temp directory. Safe to
@@ -65,6 +74,11 @@ final class TestHomeSandbox {
             setenv("NICE_APPLICATION_SUPPORT_ROOT", originalAppSupportRoot, 1)
         } else {
             unsetenv("NICE_APPLICATION_SUPPORT_ROOT")
+        }
+        if let originalClaudeConfigDir {
+            setenv("CLAUDE_CONFIG_DIR", originalClaudeConfigDir, 1)
+        } else {
+            unsetenv("CLAUDE_CONFIG_DIR")
         }
         try? FileManager.default.removeItem(at: tempHome)
     }

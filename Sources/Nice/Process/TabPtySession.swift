@@ -170,6 +170,11 @@ final class TabPtySession: TabPtySessionThemeable {
     private let claudeBinary: String?
     private let extraClaudeArgs: [String]
     private let claudeSessionMode: ClaudeSessionMode
+    /// Path to the per-session settings file (`{"theme":"custom:nice"}`)
+    /// passed to Claude as `--settings <path>` so it adopts Nice's mirrored
+    /// theme. `nil` when theme sync is off — the flag is then omitted and
+    /// Claude uses the user's own theme. See `ClaudeThemeSync`.
+    private let claudeSettingsPath: String?
 
     /// How to attach this tab to the Claude CLI's session layer.
     enum ClaudeSessionMode: Sendable, Equatable {
@@ -202,6 +207,7 @@ final class TabPtySession: TabPtySessionThemeable {
         zdotdirPath: String? = nil,
         userZDotDir: String? = nil,
         claudeSessionMode: ClaudeSessionMode = .none,
+        claudeSettingsPath: String? = nil,
         onPaneExit: @escaping @MainActor (String, Int32?) -> Void,
         onPaneTitleChange: @escaping @MainActor (String, String) -> Void,
         onPaneCwdChange: (@MainActor (String, String) -> Void)? = nil,
@@ -223,6 +229,7 @@ final class TabPtySession: TabPtySessionThemeable {
         self.claudeBinary = claudeBinary
         self.extraClaudeArgs = extraClaudeArgs
         self.claudeSessionMode = claudeSessionMode
+        self.claudeSettingsPath = claudeSettingsPath
 
         if let claudeId = initialClaudePaneId {
             _ = spawnClaudePane(id: claudeId, cwd: cwd)
@@ -287,7 +294,8 @@ final class TabPtySession: TabPtySessionThemeable {
             paneId: id,
             socketPath: socketPath,
             zdotdirPath: zdotdirPath,
-            userZDotDir: userZDotDir
+            userZDotDir: userZDotDir,
+            settingsPath: claudeSettingsPath
         )
 
         if case .resumeDeferred = claudeSessionMode {
@@ -307,7 +315,8 @@ final class TabPtySession: TabPtySessionThemeable {
                 claude: claude,
                 mode: claudeSessionMode,
                 extraClaudeArgs: extraClaudeArgs,
-                isOverride: isOverride
+                isOverride: isOverride,
+                settingsPath: claudeSettingsPath
             )
             view.armDeferredSpawn(
                 executable: "/bin/zsh",
@@ -829,25 +838,6 @@ final class TabPtySession: TabPtySessionThemeable {
 
     // MARK: - Helpers
 
-    /// Assemble the `exec <claude> ...` command line for the inner
-    /// `zsh -ilc` invocation. Pure — factored out so unit tests can
-    /// lock down the flag ordering contract without spawning a pty.
-    ///
-    /// Flag-order rule: `--session-id` / `--resume` and their UUID
-    /// arguments must precede `extraClaudeArgs` so the UUID isn't
-    /// consumed as the value of the trailing flag.
-    ///
-    /// `isOverride == true` (set when `NICE_CLAUDE_OVERRIDE` is in the
-    /// environment) suppresses every Nice-injected flag — the caller
-    /// is responsible for the full argv via their override wrapper.
-    /// `.resumeDeferred` is handled outside this helper (it spawns a
-    /// plain shell, not `exec claude`) and passing it here returns
-    /// just `exec <claude>` defensively.
-    ///
-    /// `nonisolated` because the function is pure — it touches no
-    /// instance or static state — so tests can call it from their
-    /// default nonisolated `XCTestCase.test*` methods without hopping
-    /// onto the main actor.
     /// Build the extra-env dictionary for a Claude pane. Pure helper so
     /// per-mode contracts (every mode injects `NICE_SOCKET` so the
     /// SessionStart hook can reach Nice; only `.resumeDeferred`
@@ -861,7 +851,8 @@ final class TabPtySession: TabPtySessionThemeable {
         paneId: String,
         socketPath: String?,
         zdotdirPath: String?,
-        userZDotDir: String?
+        userZDotDir: String?,
+        settingsPath: String? = nil
     ) -> [String: String] {
         var env: [String: String] = ["TERM_PROGRAM": "ghostty"]
         env["NICE_TAB_ID"] = tabId
@@ -873,7 +864,12 @@ final class TabPtySession: TabPtySessionThemeable {
             // depends on it to resolve the user's intended layout
             // before our injection unwinds.
             env["NICE_USER_ZDOTDIR"] = userZDotDir ?? ""
-            env["NICE_PREFILL_COMMAND"] = "claude --resume \(sessionId)"
+            // Pre-type the resume command the user runs with Enter. Splice
+            // `--settings <path>` in (when theme sync is on) so the
+            // deferred-resumed session adopts Nice's theme too. The path
+            // is single-quoted for the interactive shell line.
+            let settingsArg = settingsPath.map { " --settings \(shellSingleQuote($0))" } ?? ""
+            env["NICE_PREFILL_COMMAND"] = "claude\(settingsArg) --resume \(sessionId)"
         }
         return env
     }
@@ -893,14 +889,42 @@ final class TabPtySession: TabPtySessionThemeable {
         return ["-il"]
     }
 
+    /// Assemble the `exec <claude> ...` command line for the inner
+    /// `zsh -ilc` invocation. Pure — factored out so unit tests can
+    /// lock down the flag ordering contract without spawning a pty.
+    ///
+    /// Flag-order rule: `--session-id` / `--resume` and their UUID
+    /// arguments must precede `extraClaudeArgs` so the UUID isn't
+    /// consumed as the value of the trailing flag.
+    ///
+    /// `isOverride == true` (set when `NICE_CLAUDE_OVERRIDE` is in the
+    /// environment) suppresses every Nice-injected flag — the caller
+    /// is responsible for the full argv via their override wrapper.
+    /// `.resumeDeferred` is handled outside this helper (it spawns a
+    /// plain shell, not `exec claude`) and passing it here returns
+    /// just `exec <claude>` defensively.
+    ///
+    /// `nonisolated` because the function is pure — it touches no
+    /// instance or static state — so tests can call it from their
+    /// default nonisolated `XCTestCase.test*` methods without hopping
+    /// onto the main actor.
     nonisolated static func buildClaudeExecCommand(
         claude: String,
         mode: ClaudeSessionMode,
         extraClaudeArgs: [String],
-        isOverride: Bool
+        isOverride: Bool,
+        settingsPath: String? = nil
     ) -> String {
         var parts = ["exec", shellSingleQuote(claude)]
         if !isOverride {
+            // Nice-managed theme pointer (`{"theme":"custom:nice"}`). A
+            // global flag with its own value; emit it before the
+            // session flags so it never sits between `--session-id` /
+            // `--resume` and their UUID.
+            if let settingsPath {
+                parts.append("--settings")
+                parts.append(shellSingleQuote(settingsPath))
+            }
             switch mode {
             case .none:
                 parts.append(contentsOf: extraClaudeArgs.map(shellSingleQuote))

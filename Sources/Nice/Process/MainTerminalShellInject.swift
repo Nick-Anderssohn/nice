@@ -281,20 +281,29 @@ enum MainTerminalShellInject {
             exec command claude "$@"
         fi
 
-        local mode sid
-        read -r mode sid <<< "$response"
+        local mode sid settings
+        read -r mode sid settings <<< "$response"
         case "$mode" in
             newtab)
                 # Nice is opening a new sidebar tab; nothing to do here.
                 return 0
                 ;;
             inplace)
-                # Nice promoted this pane to Claude. If it minted a
-                # session id for us, prepend --session-id so it can
-                # resume the session later; otherwise the user's own
-                # args (e.g. --resume <uuid>) already identify it.
-                if [[ -n "$sid" ]]; then
-                    exec command claude --session-id "$sid" "$@"
+                # Nice promoted this pane to Claude. Build the exec line:
+                #   --settings <path>  when Nice's theme sync is on (the
+                #     3rd reply field), so this in-place Claude matches
+                #     the Nice theme like a from-scratch Nice Claude pane;
+                #   --session-id <sid> when Nice minted an id so it can
+                #     resume later. A sid of "-" (or empty) means the
+                #     user's own args (e.g. --resume <uuid>) already
+                #     identify the session, so no --session-id is added.
+                local -a pre=()
+                [[ -n "$settings" ]] && pre+=(--settings "$settings")
+                [[ -n "$sid" && "$sid" != "-" ]] && pre+=(--session-id "$sid")
+                # Guard the expansion so an empty `pre` never trips the
+                # user's `setopt nounset` (and never injects an empty arg).
+                if (( ${#pre} )); then
+                    exec command claude "${pre[@]}" "$@"
                 else
                     exec command claude "$@"
                 fi

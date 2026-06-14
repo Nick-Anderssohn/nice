@@ -249,6 +249,97 @@ final class SessionThemeCacheTests: XCTestCase {
                           "applyTheme must precede applyTerminalTheme — chrome-coupled bg/fg depends on it.")
     }
 
+    // MARK: - Claude theme writer
+    //
+    // The cache mirrors the active theme into Claude Code via an injected
+    // `claudeThemeWriter`. The default is a no-op (keeps unit tests
+    // hermetic — no writes to the real ~/.claude); SessionsModel wires the
+    // real `ClaudeThemeSync.write`. These pin the gating + the trio passed.
+
+    func test_updateScheme_invokesWriter_whenSyncOn() {
+        cache.updateSyncClaudeTheme(true)   // enable first — cache seeds OFF
+        var schemes: [ColorScheme] = []
+        cache.claudeThemeWriter = { _, scheme, _ in schemes.append(scheme) }
+        cache.updateScheme(.dark, palette: .nice, accent: .systemTeal)
+        XCTAssertEqual(schemes, [.dark],
+                       "a scheme change must mirror to Claude while sync is on")
+    }
+
+    func test_updateTerminalTheme_invokesWriter_whenSyncOn() {
+        cache.updateSyncClaudeTheme(true)
+        var writes = 0
+        cache.claudeThemeWriter = { _, _, _ in writes += 1 }
+        cache.updateTerminalTheme(BuiltInTerminalThemes.niceDefaultLight)
+        XCTAssertEqual(writes, 1)
+    }
+
+    func test_writerReceivesCurrentTrio() {
+        cache.updateSyncClaudeTheme(true)
+        var captured: (theme: TerminalTheme, scheme: ColorScheme, accent: NSColor)?
+        cache.claudeThemeWriter = { captured = (theme: $0, scheme: $1, accent: $2) }
+        cache.updateScheme(.light, palette: .nice, accent: .systemPink)
+        cache.updateTerminalTheme(BuiltInTerminalThemes.niceDefaultLight)
+        // The last write reflects the freshly-set theme plus the
+        // scheme/accent already cached by the preceding updateScheme.
+        XCTAssertEqual(captured?.theme, BuiltInTerminalThemes.niceDefaultLight)
+        XCTAssertEqual(captured?.scheme, .light)
+        XCTAssertEqual(captured?.accent, NSColor.systemPink)
+    }
+
+    func test_seedsOff_soNoWriteBeforeReconcile() {
+        // The cache seeds sync OFF (placeholder); updateScheme/updateTerminalTheme
+        // must NOT write until the persisted value is reconciled in. This is what
+        // stops an opted-out user's nice.json from being rewritten on window appear.
+        var writes = 0
+        cache.claudeThemeWriter = { _, _, _ in writes += 1 }
+        cache.updateScheme(.dark, palette: .nice, accent: .systemTeal)
+        cache.updateTerminalTheme(BuiltInTerminalThemes.niceDefaultDark)
+        XCTAssertEqual(writes, 0, "a freshly-seeded cache must not write before reconciliation")
+    }
+
+    func test_syncOff_suppressesWriter() {
+        var writes = 0
+        cache.claudeThemeWriter = { _, _, _ in writes += 1 }
+        cache.updateSyncClaudeTheme(false)   // turning off must not itself write
+        cache.updateScheme(.dark, palette: .nice, accent: .systemTeal)
+        cache.updateTerminalTheme(BuiltInTerminalThemes.niceDefaultDark)
+        XCTAssertEqual(writes, 0, "no mirror writes while sync is off")
+    }
+
+    func test_enablingSync_writesImmediately() {
+        var writes = 0
+        cache.claudeThemeWriter = { _, _, _ in writes += 1 }
+        cache.updateSyncClaudeTheme(false)
+        XCTAssertEqual(writes, 0)
+        cache.updateSyncClaudeTheme(true)
+        XCTAssertEqual(writes, 1,
+                       "re-enabling must push the current theme so running panes match")
+    }
+
+    func test_defaultWriterIsNoOp_keepsTestsHermetic() throws {
+        // Even with sync enabled, a directly-constructed cache must not touch
+        // the filesystem — a regression that defaulted the writer to
+        // ClaudeThemeSync.write would scribble ~/.claude/themes/nice.json on
+        // any scheme flip. Prove it: under a redirected HOME, enable sync and
+        // flip the theme, then assert nothing landed there. (no-write, not
+        // just no-throw — the prior version passed even if a real write ran,
+        // because ClaudeThemeSync.write swallows its errors.)
+        let sandbox = TestHomeSandbox()
+        defer { sandbox.teardown() }
+        let home = try XCTUnwrap(ProcessInfo.processInfo.environment["HOME"])
+        let niceJSON = URL(fileURLWithPath: home)
+            .appendingPathComponent(".claude/themes/nice.json")
+
+        cache.updateSyncClaudeTheme(true)
+        cache.updateScheme(.dark, palette: .nice, accent: .systemTeal)
+        cache.updateTerminalTheme(BuiltInTerminalThemes.niceDefaultDark)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: niceJSON.path),
+            "The default writer must be the no-op; a regression defaulting it to ClaudeThemeSync.write would write nice.json under the sandbox HOME and fail here."
+        )
+    }
+
     // MARK: - Local helpers
 
     private final class OrderRecordingThemeable: TabPtySessionThemeable {

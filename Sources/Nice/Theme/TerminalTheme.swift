@@ -58,6 +58,13 @@ struct ThemeColor: Hashable, Sendable {
         )
     }
 
+    /// Lowercase `#rrggbb`. The form Claude Code's custom-theme parser
+    /// accepts for an override value (`ClaudeThemeSync`). Round-trips
+    /// with `init?(hex:)`.
+    var hexString: String {
+        String(format: "#%02x%02x%02x", red, green, blue)
+    }
+
     /// SwiftTerm's `Color` initializer takes 16-bit per channel.
     /// Widen via `v * 257` (== `(v << 8) | v`), matching the helper
     /// `NiceANSIPalette.c` uses.

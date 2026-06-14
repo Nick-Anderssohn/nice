@@ -227,6 +227,116 @@ final class SessionsModelClaudeSocketRequestTests: XCTestCase {
         XCTAssertEqual(pane.title, "Claude")
     }
 
+    // MARK: - inplace promotion · theme sync on
+
+    func test_inplaceWithSessionId_syncOn_appendsSettingsPointer() {
+        // Sync on: the reply must carry the --settings pointer so an
+        // in-place promotion is themed like a from-scratch Nice pane.
+        // The user's --resume already names the session, so the sid
+        // field is the "-" placeholder and the pointer follows third.
+        appState.sessions.updateSyncClaudeTheme(true)
+        let seed = TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            sessionId: "OLD",
+            isClaudeRunning: false
+        )
+
+        let reply = captureReply { reply in
+            appState.sessions.handleClaudeSocketRequest(
+                cwd: "/tmp/p",
+                args: ["--resume", "abc-123"],
+                tabId: seed.tabId,
+                paneId: seed.claudePaneId,
+                reply: reply
+            )
+        }
+
+        let pointer = ClaudeThemeSync.settingsFlagPath()
+        XCTAssertNotNil(pointer, "settingsFlagPath must materialize the pointer under the sandbox.")
+        XCTAssertEqual(reply, "inplace - \(pointer!)",
+                       "Sync on + user-supplied session id → 'inplace - <pointer>' (sid placeholder, then the --settings path the wrapper splices).")
+    }
+
+    func test_inplaceWithoutSessionId_syncOn_appendsSettingsPointerAfterMintedId() {
+        // Sync on, mint-new path: reply is 'inplace <uuid> <pointer>' —
+        // the wrapper prepends both --settings and --session-id.
+        appState.sessions.updateSyncClaudeTheme(true)
+        let seed = TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            sessionId: "OLD",
+            isClaudeRunning: false
+        )
+
+        let reply = captureReply { reply in
+            appState.sessions.handleClaudeSocketRequest(
+                cwd: "/tmp/p",
+                args: [],
+                tabId: seed.tabId,
+                paneId: seed.terminalPaneId,
+                reply: reply
+            )
+        }
+
+        let pointer = ClaudeThemeSync.settingsFlagPath()
+        XCTAssertNotNil(pointer)
+        let parts = reply.split(separator: " ").map(String.init)
+        XCTAssertEqual(parts.count, 3, "Reply must be 'inplace <uuid> <pointer>' when sync is on.")
+        XCTAssertEqual(parts[0], "inplace")
+        XCTAssertNotEqual(parts[1], "-", "mint-new path uses the real minted id, not the '-' placeholder.")
+        XCTAssertEqual(parts[2], pointer!, "third field is the --settings pointer.")
+        XCTAssertEqual(appState.tabs.tab(for: seed.tabId)?.claudeSessionId, parts[1],
+                       "minted id in the reply must match the persisted tab session id.")
+    }
+
+    func test_inplace_syncOff_repliesByteIdentical() {
+        // Sync off (the cache's default): reply must be unchanged from
+        // the pre-theming protocol — no pointer field appended.
+        let seed = TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            sessionId: "OLD",
+            isClaudeRunning: false
+        )
+
+        let reply = captureReply { reply in
+            appState.sessions.handleClaudeSocketRequest(
+                cwd: "/tmp/p",
+                args: ["--resume", "abc-123"],
+                tabId: seed.tabId,
+                paneId: seed.claudePaneId,
+                reply: reply
+            )
+        }
+        XCTAssertEqual(reply, "inplace",
+                       "Sync off must leave the reply byte-identical (no --settings pointer).")
+    }
+
+    func test_inplace_syncOn_argsAlreadyHaveSettings_doesNotDouble() {
+        // A restored deferred pane re-dispatches its pre-typed
+        // `claude --settings <path> --resume <id>` through this socket on
+        // Enter. The reply must NOT append a second --settings (the wrapper
+        // would emit a doubled flag) — it falls back to plain 'inplace' and
+        // the wrapper runs the user's args as-is.
+        appState.sessions.updateSyncClaudeTheme(true)
+        let pointer = try! XCTUnwrap(ClaudeThemeSync.settingsFlagPath())
+        let seed = TabModelFixtures.seedClaudeTab(
+            into: appState.tabs, projectId: "p", tabId: "t1",
+            sessionId: "OLD",
+            isClaudeRunning: false
+        )
+
+        let reply = captureReply { reply in
+            appState.sessions.handleClaudeSocketRequest(
+                cwd: "/tmp/p",
+                args: ["--settings", pointer, "--resume", "abc-123"],
+                tabId: seed.tabId,
+                paneId: seed.claudePaneId,
+                reply: reply
+            )
+        }
+        XCTAssertEqual(reply, "inplace",
+                       "Args already carry --settings → reply must not append a second pointer.")
+    }
+
     // MARK: - Helpers
 
     /// Drive `handleClaudeSocketRequest` and return the single string

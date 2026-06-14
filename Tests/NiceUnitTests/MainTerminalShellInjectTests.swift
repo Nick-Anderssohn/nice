@@ -209,8 +209,10 @@ final class MainTerminalShellInjectTests: XCTestCase {
                       "wrapper must handle the `newtab` mode — Nice opened a sidebar tab, shell returns.")
         XCTAssertTrue(body.contains("inplace)"),
                       "wrapper must handle the `inplace` mode — Nice promoted this pane to Claude.")
-        XCTAssertTrue(body.contains(#"exec command claude --session-id "$sid""#),
-                      "inplace with a minted session id must exec claude --session-id so Nice can resume it later.")
+        XCTAssertTrue(body.contains(#"pre+=(--session-id "$sid")"#),
+                      "inplace with a minted session id must splice --session-id so Nice can resume it later.")
+        XCTAssertTrue(body.contains(#"pre+=(--settings "$settings")"#),
+                      "inplace must splice --settings when Nice's theme sync passes a pointer path (3rd reply field).")
     }
 
     func test_zshrc_socketUnreachableFallsBackToCommand() throws {

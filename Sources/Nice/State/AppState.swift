@@ -183,6 +183,13 @@ final class AppState {
                     )
                 )
             }
+            // Reconcile Claude-theme sync from the persisted toggle BEFORE
+            // start()/restore spawns panes — otherwise restored Claude panes
+            // (created in start()) read the cache's OFF placeholder and miss
+            // the --settings pointer. Runs AFTER the scheme/theme seed above
+            // so the enabling write uses the correct colors; an opted-out user
+            // writes nothing. See SessionThemeCache.syncClaudeTheme.
+            sessions.updateSyncClaudeTheme(tweaks.syncClaudeTheme)
         }
         if let fontSize = services?.fontSettings.terminalFontSize {
             sessions.updateTerminalFontSize(fontSize)
