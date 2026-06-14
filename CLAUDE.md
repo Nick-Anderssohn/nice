@@ -47,12 +47,17 @@ killing the app that's hosting your live Claude Code session.
 
 ## Before killing a running Nice
 
-Even with the two-variant split, `pgrep` the exact variant before
-killing anything:
+Even with the two-variant split, confirm which variant is running
+before killing anything. **Do NOT use `pgrep`** — on macOS a GUI app's
+`comm` is the full exec path truncated to 16 chars (`/Applications/Ni`),
+so `pgrep`/`pgrep -f` silently MISS a running prod Nice and report a
+false "not running". Use the `nice-process-check` skill
+(`~/.claude/skills/nice-process-check/check.sh`), or `ps` directly:
 
 ```sh
-pgrep -f '/Applications/Nice.app/Contents/MacOS/Nice'           # prod
-pgrep -f '/Applications/Nice Dev.app/Contents/MacOS/Nice Dev'   # dev
+snap="$(ps -Aww -o pid=,args=)"
+printf '%s\n' "$snap" | grep -E '/Applications/Nice\.app/Contents/MacOS/Nice( |$)'  # prod
+printf '%s\n' "$snap" | grep -E 'Nice Dev\.app/Contents/MacOS/Nice Dev( |$)'        # dev (incl. build-dir)
 ```
 
 Killing prod `Nice` **requires explicit permission every time** — it
