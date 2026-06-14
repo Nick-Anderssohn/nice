@@ -108,6 +108,37 @@ log "patching project.yml → dev.nickanderssohn.nice-dev"
 log "generating Xcode project via xcodegen"
 xcodegen generate >/dev/null
 
+# ── skip display-bound UITests on headless CI ────────────────────────
+# A handful of tear-off / window-chrome UITests need a REAL window
+# server with a real display: they open a second window the headless
+# GitHub Actions runner can't place where XCUITest can find it, read the
+# native traffic-light cluster geometry, zoom the window, or hit chrome
+# near the screen edge. They PASS locally (and are valuable there), so we
+# only skip them in CI — they are NOT disabled for local development.
+#
+# This gate lives HERE, in the job shell, on purpose: xcodebuild does not
+# forward the shell environment to the macOS UITest *runner* process, so a
+# `$CI` / `$GITHUB_ACTIONS` check inside a test (XCTSkipIf) never fires in
+# CI. The shell, by contrast, definitely sees those vars. Keep this list
+# in sync with the display-bound tests; `/nice-release` runs them locally
+# before tagging precisely because CI doesn't.
+CI_SKIP_TESTS=(
+    NiceUITests/PaneTearOffUITests/testDragPillToEmptyDesktopOpensNewWindow
+    NiceUITests/TearOffHookUITests/testTearOffFromTerminalsSection_singleSection_andNoBlankPane
+    NiceUITests/TearOffHookUITests/testTearOffUnspawnedPane_spawnsInNewWindow
+    NiceUITests/TearOffHookUITests/testTornOffWindowTrafficLightsMatchOriginalOffset
+    NiceUITests/TearOffHookUITests/testTrafficLightsAreMonotonicAndEqualPitch
+    NiceUITests/TearOffHookUITests/testPillDragInTornOffWindowDoesNotMoveWindow
+    NiceUITests/WindowDragUITests/testEmptyToolbarDoubleClickZoomsWindow
+)
+CI_SKIP_ARGS=()
+if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+    for t in "${CI_SKIP_TESTS[@]}"; do
+        CI_SKIP_ARGS+=("-skip-testing:$t")
+    done
+    log "headless CI detected — skipping ${#CI_SKIP_TESTS[@]} display-bound UITests (they run locally)"
+fi
+
 log "running tests against dev.nickanderssohn.nice-dev"
 xcodebuild test \
     -project Nice.xcodeproj \
@@ -116,4 +147,5 @@ xcodebuild test \
     -destination 'platform=macOS' \
     -derivedDataPath "$REPO_ROOT/build-dev" \
     CODE_SIGN_IDENTITY='-' \
+    ${CI_SKIP_ARGS[@]+"${CI_SKIP_ARGS[@]}"} \
     "$@"

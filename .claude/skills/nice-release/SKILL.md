@@ -57,6 +57,45 @@ grep -E '(CFBundleShortVersionString|MARKETING_VERSION):' project.yml
 git log "$(git tag --sort=-v:refname | head -1)..HEAD" --oneline
 ```
 
+## Run the CI-skipped tests locally first
+
+CI is the normal safety net (the `test` workflow runs unit + UI tests on
+every push to `main`), but a handful of UITests are **deliberately
+skipped on CI** because they need a real window server / display that the
+headless GitHub Actions runner doesn't have — tear-off-to-second-window,
+native traffic-light geometry, window zoom, edge-of-screen chrome hits.
+`scripts/test.sh` skips exactly these when `$CI` / `$GITHUB_ACTIONS` is
+set (the canonical list is `CI_SKIP_TESTS` in `scripts/test.sh`). That
+means **CI never exercises them**, so a regression there sails through
+green CI and only shows up after release.
+
+So before bumping, run that CI-skipped set **locally** (where they DO
+run — no `$CI` var) and confirm green. Acquire the worktree lock first
+(see the `worktree-lock` skill / CLAUDE.md). The command mirrors the
+`CI_SKIP_TESTS` list in `scripts/test.sh` — if that list changes, update
+this one to match:
+
+```sh
+scripts/worktree-lock.sh acquire nice-release-pretest
+scripts/test.sh \
+  -only-testing:NiceUITests/PaneTearOffUITests/testDragPillToEmptyDesktopOpensNewWindow \
+  -only-testing:NiceUITests/TearOffHookUITests/testTearOffFromTerminalsSection_singleSection_andNoBlankPane \
+  -only-testing:NiceUITests/TearOffHookUITests/testTearOffUnspawnedPane_spawnsInNewWindow \
+  -only-testing:NiceUITests/TearOffHookUITests/testTornOffWindowTrafficLightsMatchOriginalOffset \
+  -only-testing:NiceUITests/TearOffHookUITests/testTrafficLightsAreMonotonicAndEqualPitch \
+  -only-testing:NiceUITests/TearOffHookUITests/testPillDragInTornOffWindowDoesNotMoveWindow \
+  -only-testing:NiceUITests/WindowDragUITests/testEmptyToolbarDoubleClickZoomsWindow
+scripts/worktree-lock.sh release
+```
+
+These drive real windows, so they'll steal focus for ~80s while they
+run — fine on the dev build, but announce it first (a demo or manual
+test may be in progress). If any **fail**, stop and fix before
+releasing; that's the whole point of running them here. (To keep the
+list authoritative in one place, derive it from `scripts/test.sh` rather
+than re-typing — e.g. grep `CI_SKIP_TESTS` and build the
+`-only-testing:` args from it.)
+
 ## Picking the next version
 
 Default to a **minor** bump (`0.16.0` → `0.17.0`). Nice has stayed on
