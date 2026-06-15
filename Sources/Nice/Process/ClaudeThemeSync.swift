@@ -69,6 +69,15 @@ enum ClaudeThemeSync {
     /// only ever overwrite our own file.
     static let managedMarker = "_niceManaged"
 
+    /// WCAG 2.1 AA contrast floor for normal-size body text (4.5:1). The
+    /// secondary-text tokens (`subtle`, `inactive`) must clear this.
+    static let minTextContrast = 4.5
+
+    /// WCAG 2.1 AA contrast floor for UI component boundaries (3:1). The
+    /// prompt border is decorative chrome, not text, so it may stay
+    /// fainter than body text while remaining perceptible.
+    static let minChromeContrast = 3.0
+
     // MARK: - Public entry points
 
     /// Write/refresh `~/.claude/themes/nice.json` from the given theme and
@@ -206,12 +215,22 @@ enum ClaudeThemeSync {
         o["claudeBlue_FOR_SYSTEM_SPINNER"] = a[4].hexString
         o["claudeBlueShimmer_FOR_SYSTEM_SPINNER"] = a[12].hexString
 
-        // Muted / chrome
-        o["promptBorder"] = a[8].hexString
+        // Muted / chrome. `subtle` and `inactive` carry secondary TEXT —
+        // the model line, cwd path, tool-use summaries, "Baked for…", the
+        // bottom status row — so they must stay readable. ANSI bright-
+        // black (a[8]) is a deliberately faint gray, and on several dark
+        // themes it collapses into the background: Catppuccin Mocha lands
+        // at 2.5:1, Nord ~1.9:1, Tokyo Night ~2.3:1, and Solarized Dark
+        // sets bright-black EQUAL to its background (1:1 — the text would
+        // be invisible). `legibleMute` keeps the theme's own dim hue where
+        // it already clears the floor and only lifts it toward the
+        // foreground when it doesn't. `promptBorder` is a UI boundary, not
+        // text, so it rides the lower 3:1 graphics floor and stays faint.
+        o["promptBorder"] = legibleMute(fg: fg, bg: bg, dim: a[8], minContrast: minChromeContrast).hexString
         o["promptBorderShimmer"] = a[15].hexString
-        o["inactive"] = a[8].hexString
+        o["inactive"] = legibleMute(fg: fg, bg: bg, dim: a[8], minContrast: minTextContrast).hexString
         o["inactiveShimmer"] = a[15].hexString
-        o["subtle"] = a[8].hexString
+        o["subtle"] = legibleMute(fg: fg, bg: bg, dim: a[8], minContrast: minTextContrast).hexString
         o["rate_limit_fill"] = a[4].hexString
         o["rate_limit_empty"] = blend(a[8], over: bg, alpha: 0.5).hexString
 
@@ -272,6 +291,43 @@ enum ClaudeThemeSync {
     /// sibling).
     static func lighten(_ c: ThemeColor, amount: Double) -> ThemeColor {
         blend(ThemeColor(255, 255, 255), over: c, alpha: amount)
+    }
+
+    /// WCAG 2.1 relative luminance of an 8-bit sRGB color (0…1).
+    static func luminance(_ c: ThemeColor) -> Double {
+        func channel(_ v: UInt8) -> Double {
+            let s = Double(v) / 255.0
+            return s <= 0.03928 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channel(c.red) + 0.7152 * channel(c.green) + 0.0722 * channel(c.blue)
+    }
+
+    /// WCAG 2.1 contrast ratio between two colors (1…21, order-independent).
+    static func contrastRatio(_ x: ThemeColor, _ y: ThemeColor) -> Double {
+        let a = luminance(x), b = luminance(y)
+        return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+    }
+
+    /// A muted text/chrome color guaranteed to clear `minContrast` against
+    /// `bg`. Prefers the theme's own dim color (`dim`, normally ANSI
+    /// bright-black) so each theme keeps its character; but when `dim` is
+    /// too faint against the background it is composited toward `fg` — the
+    /// smallest lift that clears the floor — preserving the dim hue while
+    /// rescuing legibility. Falls back to `fg` if even that can't (a
+    /// pathologically low-contrast theme). Compositing toward `fg` moves
+    /// monotonically away from `bg` in luminance, so the first clearing
+    /// step is also the most muted one.
+    static func legibleMute(
+        fg: ThemeColor, bg: ThemeColor, dim: ThemeColor, minContrast: Double
+    ) -> ThemeColor {
+        if contrastRatio(dim, bg) >= minContrast { return dim }
+        var alpha = 0.1
+        while alpha < 1.0 {
+            let lifted = blend(fg, over: dim, alpha: alpha)
+            if contrastRatio(lifted, bg) >= minContrast { return lifted }
+            alpha += 0.05
+        }
+        return fg
     }
 
     /// `NSColor` → 8-bit sRGB `ThemeColor`. Used to fold the accent (a

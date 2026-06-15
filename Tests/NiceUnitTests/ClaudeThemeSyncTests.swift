@@ -103,7 +103,8 @@ final class ClaudeThemeSyncTests: XCTestCase {
         XCTAssertEqual(o["permission"], t.ansi[4].hexString)
         XCTAssertEqual(o["planMode"], t.ansi[6].hexString)
         XCTAssertEqual(o["bashBorder"], t.ansi[5].hexString)
-        XCTAssertEqual(o["inactive"], t.ansi[8].hexString)
+        // `inactive`/`subtle`/`promptBorder` are contrast-corrected, not a
+        // raw ANSI passthrough — see the muted-token tests below.
     }
 
     func test_usesBrightAnsiVariants() {
@@ -173,6 +174,126 @@ final class ClaudeThemeSyncTests: XCTestCase {
             XCTAssertNotNil(hex?.firstMatch(in: value, range: range),
                             "token \(token) emitted non-hex value \(value)")
         }
+    }
+
+    // MARK: - muted tokens (contrast)
+
+    // A theme with an explicit background, foreground, and bright-black
+    // (a[8]) so muted-token contrast can be exercised directly.
+    private func makeTheme(bg: ThemeColor, fg: ThemeColor, brightBlack: ThemeColor) -> TerminalTheme {
+        var ansi = (0..<16).map { ThemeColor(UInt8($0), 0, 0) }
+        ansi[8] = brightBlack
+        return TerminalTheme(
+            id: "muted", displayName: "Muted", scope: .dark,
+            background: bg, foreground: fg, cursor: nil, selection: nil,
+            ansi: ansi, source: .builtIn
+        )
+    }
+
+    func test_mutedText_keepsLegibleDimHueUntouched() {
+        // a[8] that already clears 4.5:1 against the bg is passed through
+        // verbatim, so a theme's intended dim hue is preserved.
+        let bg = ThemeColor(0, 0, 0)
+        let dim = ThemeColor(0x88, 0x88, 0x88) // ~5.9:1 on black
+        let t = makeTheme(bg: bg, fg: ThemeColor(255, 255, 255), brightBlack: dim)
+        let o = overrides(ClaudeThemeSync.makeThemeJSON(theme: t, scheme: .dark, accent: ThemeColor(1, 2, 3)))
+        XCTAssertEqual(o["subtle"], dim.hexString)
+        XCTAssertEqual(o["inactive"], dim.hexString)
+        XCTAssertEqual(o["promptBorder"], dim.hexString)
+    }
+
+    func test_mutedText_rescuedWhenDimCollapsesIntoBackground() {
+        // Solarized Dark's failure mode: bright-black == background. The
+        // secondary-text tokens must be lifted to a readable color, never
+        // left to vanish.
+        let bg = ThemeColor(0x00, 0x2b, 0x36)
+        let t = makeTheme(bg: bg, fg: ThemeColor(0x83, 0x94, 0x96), brightBlack: bg)
+        let o = overrides(ClaudeThemeSync.makeThemeJSON(theme: t, scheme: .dark, accent: ThemeColor(1, 2, 3)))
+
+        let subtle = try! XCTUnwrap(parseHex(o["subtle"]))
+        XCTAssertNotEqual(o["subtle"], bg.hexString, "subtle must not equal the background")
+        XCTAssertGreaterThanOrEqual(
+            ClaudeThemeSync.contrastRatio(subtle, bg), ClaudeThemeSync.minTextContrast,
+            "subtle text must clear the AA body floor"
+        )
+    }
+
+    func test_mocha_subtleClearsBodyContrastFloor() {
+        // Regression for the reported bug: Catppuccin Mocha's bright-black
+        // (#585b70) on its #1e1e2e background is only ~2.5:1, which made
+        // the model line, paths, and status row hard to read.
+        let mocha = BuiltInTerminalThemes.catppuccinMocha
+        let o = overrides(ClaudeThemeSync.makeThemeJSON(theme: mocha, scheme: .dark, accent: ThemeColor(0x3b, 0x82, 0xf6)))
+        let subtle = try! XCTUnwrap(parseHex(o["subtle"]))
+        XCTAssertGreaterThanOrEqual(
+            ClaudeThemeSync.contrastRatio(subtle, mocha.background),
+            ClaudeThemeSync.minTextContrast
+        )
+    }
+
+    func test_everyBundledDarkTheme_subtleIsReadable() {
+        // No bundled dark theme may ship secondary text below the AA floor.
+        for theme in BuiltInTerminalThemes.all where theme.scope == .dark {
+            let o = overrides(ClaudeThemeSync.makeThemeJSON(theme: theme, scheme: .dark, accent: ThemeColor(1, 2, 3)))
+            let subtle = try! XCTUnwrap(parseHex(o["subtle"]), "\(theme.displayName) emitted no subtle")
+            XCTAssertGreaterThanOrEqual(
+                ClaudeThemeSync.contrastRatio(subtle, theme.background),
+                ClaudeThemeSync.minTextContrast,
+                "\(theme.displayName) subtle text is below the AA floor"
+            )
+        }
+    }
+
+    func test_promptBorder_ridesLowerChromeFloor() {
+        // The border is decorative chrome: it only needs the 3:1 graphics
+        // floor, so on a theme where a[8] sits between the two floors it
+        // stays at a[8] while the text tokens get lifted higher.
+        let bg = ThemeColor(0, 0, 0)
+        let dim = ThemeColor(0x66, 0x66, 0x66) // ~3.7:1 on black: clears 3.0, not 4.5
+        let t = makeTheme(bg: bg, fg: ThemeColor(255, 255, 255), brightBlack: dim)
+        let o = overrides(ClaudeThemeSync.makeThemeJSON(theme: t, scheme: .dark, accent: ThemeColor(1, 2, 3)))
+        XCTAssertEqual(o["promptBorder"], dim.hexString, "border keeps the faint dim at the 3:1 floor")
+        XCTAssertNotEqual(o["subtle"], dim.hexString, "text is lifted past the 4.5:1 floor")
+    }
+
+    // MARK: - contrast helpers
+
+    func test_luminance_endpoints() {
+        XCTAssertEqual(ClaudeThemeSync.luminance(ThemeColor(0, 0, 0)), 0, accuracy: 1e-9)
+        XCTAssertEqual(ClaudeThemeSync.luminance(ThemeColor(255, 255, 255)), 1, accuracy: 1e-9)
+    }
+
+    func test_contrastRatio_isSymmetricAndBounded() {
+        let black = ThemeColor(0, 0, 0), white = ThemeColor(255, 255, 255)
+        XCTAssertEqual(ClaudeThemeSync.contrastRatio(black, white), 21, accuracy: 1e-6)
+        XCTAssertEqual(ClaudeThemeSync.contrastRatio(white, black), 21, accuracy: 1e-6,
+                       "contrast is order-independent")
+        XCTAssertEqual(ClaudeThemeSync.contrastRatio(white, white), 1, accuracy: 1e-9)
+    }
+
+    func test_legibleMute_returnsDimWhenAlreadyLegible() {
+        let bg = ThemeColor(0, 0, 0)
+        let dim = ThemeColor(0xcc, 0xcc, 0xcc)
+        XCTAssertEqual(
+            ClaudeThemeSync.legibleMute(fg: ThemeColor(255, 255, 255), bg: bg, dim: dim, minContrast: 4.5),
+            dim
+        )
+    }
+
+    func test_legibleMute_liftsWhenDimTooFaint() {
+        let bg = ThemeColor(0, 0, 0)
+        let dim = ThemeColor(0x10, 0x10, 0x10) // ~1.1:1 on black
+        let result = ClaudeThemeSync.legibleMute(
+            fg: ThemeColor(255, 255, 255), bg: bg, dim: dim, minContrast: 4.5)
+        XCTAssertNotEqual(result, dim)
+        XCTAssertGreaterThanOrEqual(ClaudeThemeSync.contrastRatio(result, bg), 4.5)
+    }
+
+    /// Parse a `#rrggbb` override value back into a `ThemeColor` for
+    /// contrast assertions.
+    private func parseHex(_ s: String?) -> ThemeColor? {
+        guard let s else { return nil }
+        return ThemeColor(hex: s)
     }
 
     // MARK: - color math
