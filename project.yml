@@ -130,6 +130,16 @@ packages:
     #     Edit menu still claims Cmd+V and Cmd+C-with-selection
     #     before keyDown, so native paste / selection-copy are
     #     unaffected.
+    #   - fix an unbounded memory leak in `LocalProcess.childProcessRead`:
+    #     it re-issued the DispatchIO `io.read()` on every callback,
+    #     including the intermediate `done == false` chunk callbacks. A
+    #     single `io.read(length:)` invokes the handler once per chunk and
+    #     then a final `done == true`, so re-issuing per chunk enqueued a
+    #     fresh read operation (each retaining its ioHandler block) for
+    #     every chunk read. Under a constantly-redrawing TUI (Claude
+    #     `/tui fullscreen`) those dispatch operations + blocks piled up
+    #     without bound — the ~27 MB/hr growth in nick-anderssohn/nice#3.
+    #     Now re-arms only on `done`, keeping one read in flight.
     # The throttle/draw work cut ~16-33ms off typing latency
     # (visibly smoother held backspace) without the missing-output
     # regression the throttle was masking. Smooth scrolling is plumbed
@@ -146,7 +156,7 @@ packages:
     #   path: ../SwiftTerm
     # and revert before committing.
     url: https://github.com/Nick-Anderssohn/SwiftTerm.git
-    revision: cceae86f523b4682bb34f2f05ca8fb9349a6f9b2
+    revision: 5f07dc65b1e2d0306cc5b35410bded3cd613d1e0
 
 targets:
   Nice:
