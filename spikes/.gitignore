@@ -1,0 +1,5 @@
+# These are throwaway PoC spikes — rebuild artifacts are not tracked.
+target/
+**/target/
+*.dylib
+*.o

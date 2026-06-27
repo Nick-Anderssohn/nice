@@ -1,0 +1,33 @@
+[package]
+name = "altui_vibrancy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "altui_vibrancy"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+raw-window-handle = "0.6"
+objc2 = "0.6"
+
+[dependencies.objc2-foundation]
+version = "0.3"
+features = ["NSGeometry", "NSString", "NSObjCRuntime"]
+
+[dependencies.objc2-app-kit]
+version = "0.3"
+features = [
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSApplication",
+    "NSVisualEffectView",
+    "NSColor",
+    "NSGraphics",
+    "NSScreen",
+]
+
+[profile.dev]
+opt-level = 0

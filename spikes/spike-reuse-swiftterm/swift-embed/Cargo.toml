@@ -1,0 +1,20 @@
+[package]
+name = "swift_embed"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "swiftembed"
+path = "src/main.rs"
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSGraphics",
+] }

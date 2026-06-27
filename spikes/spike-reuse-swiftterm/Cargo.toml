@@ -1,0 +1,30 @@
+[package]
+name = "spike_reuse_swiftterm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSGeometry",
+    "NSString",
+    "NSThread",
+    "NSObjCRuntime",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSVisualEffectView",
+    "NSResponder",
+    "NSEvent",
+    "NSColor",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSText",
+    "NSRunningApplication",
+] }

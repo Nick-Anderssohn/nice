@@ -1,0 +1,3 @@
+EFFECT_ATTACHED=1 (NSVisualEffectView material=HUDWindow, cornerRadius=18)
+GLASS_PRESENT=1 (NSGlassEffectView found; instantiated + cornerRadius=28)
+WINDOW_NUMBER=12130
