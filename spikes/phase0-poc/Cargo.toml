@@ -11,7 +11,18 @@ publish = false
 name = "phase0-poc"
 path = "src/main.rs"
 
+# Phase-0 PoC #2 — the SINGLE-STACK GPUI-native terminal (Path B live spike):
+# alacritty_terminal VT core rendered through GPUI's public paint API, no
+# SwiftTerm, no second Metal layer. Reuses harness.rs. See src/gpui_term.rs.
+[[bin]]
+name = "gpui-term"
+path = "src/gpui_term.rs"
+
 [dependencies]
+# Path-B VT core: headless grid/scrollback/parser, ships NO renderer (we draw
+# it on GPUI's public primitives). Same version spike-rust-term already proved.
+alacritty_terminal = "0.26.0"
+
 # GPUI chrome host. 0.2.2 re-exports raw-window-handle 0.6 — pin to the SAME
 # major so the RawWindowHandle enum matches across the gpui<->objc2 seam.
 gpui = "0.2.2"

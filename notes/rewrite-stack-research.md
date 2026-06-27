@@ -437,6 +437,27 @@ Its defining premise ("single GPUI drawable + proven renderer + **no** fork") is
 
 **Net:** the architecture decision is **de‑risked from "feasibility unknown" to "favored, pending live measurement."** Items 1–4 are one focused build‑and‑measure session on the existing `spikes/phase0-poc/` harness; item 8 is the parallel "could‑dominate‑both" probe.
 
+### ✅ LIVE MEASUREMENT — the single‑stack GPUI‑native terminal locks 60 fps (2026‑06‑27)
+
+**Built and measured remaining‑item #1 (the headline live unknown).** New runnable PoC `spikes/phase0-poc` binary **`gpui-term`** (`src/gpui_term.rs`, ~470 LOC): a **single‑stack, GPUI‑native terminal** — an `alacritty_terminal` VT core rendered through GPUI's **public** paint API (`window.text_system().shape_line(...).paint()` for glyphs + `paint_quad` for cell backgrounds), inside GPUI's own **one** `CAMetalLayer`. **No SwiftTerm, no objc2 embed, no second Metal layer** — literally the Path‑B architecture. It **reuses `harness.rs` verbatim** (same mach clock, FPS reducer, memory sampler, and synthetic Claude‑stream workload as the Path‑A PoC), so the numbers are apples‑to‑apples with §10. Same clean 60 Hz panel, debug build, 18 s continuous max‑rate stream into a 120×40 grid, plus an animated sub‑pixel vertical offset (the **sub‑line smooth‑scroll** path). Reproduced across 3 runs:
+
+| Run | Frame interval p50 / p95 / p99 (ms) | Frames / 18 s | Steady mem (MiB) |
+|---|---|---|---|
+| 1 | **16.66 / 16.83 / 17.57** | 1078 (59.9 fps) | 148.7 |
+| 2 | **16.66 / 17.10 / 17.57** | 1079 (59.9 fps) | 147.6 |
+| 3 | **16.67 / 16.81 / 17.67** | 1078 (59.9 fps) | 147.6 |
+| **§10 ref — single‑stack baseline** | ~16.7 / 17.1 | — | ~111 / 114 |
+| **§10 ref — Path A dual‑stack `txn`** | 18.3 / **31.2** (~54 fps) | — | peak ~155 |
+| **§10 ref — Path A dual‑stack `sync`** | 33.3 / 42.6 (~30 fps) | — | — |
+
+**Verdict — Path B locks refresh; the dual‑stack tail is gone.** The single GPUI stack holds the terminal at **p50 16.66 ms / p95 ~16.8 ms (~60 fps) under continuous burst load** — it reaches the single‑stack baseline and, crucially, its **p95 has essentially no tail** (≈16.8 ms) where Path A's best result (`txn`) still collapsed to **p95 31 ms**. The structural prediction in §11/§12 — *one `CAMetalLayer` ⇒ no shared‑commit contention ⇒ locked refresh* — is now **measured, not asserted.** (The harness's raw `cliffs>16.6ms ≈ 1019` count is the same 120 Hz‑calibrated over‑count §10 warned about — on a 60 Hz panel a ~16.66 ms median trivially trips a 16.6 ms threshold; read p95/p99.) This holds even though the prototype is the *worst case* for the renderer: a **debug build** that **re‑shapes every row every frame** with **no damage tracking / line caching** — a production renderer would only be cheaper.
+
+**Honest caveats (what this run does and does NOT settle):**
+- **Memory is not yet a clean win.** Steady ~**148 MiB** (debug + full‑reshape‑per‑frame) sits *between* the Nice baseline (~111–114) and Path A `txn` (~155) — native and far from Electron, but the §11 "Path B inherits ~baseline memory" claim needs a **release build + damage‑tracked renderer** re‑measure to actually test. (The "idle 13.7 MiB" the harness prints is a frame‑1, pre‑Metal‑allocation artifact, not a real idle baseline.)
+- **Still owed (unchanged):** keystroke‑to‑glyph **latency** (needs real key injection / TCC; item 2); the **AA/gamma/subpixel pixel comparison** vs SwiftTerm (item 3) — now the **single most important remaining gate**, because it is the *only* path that could expose a bespoke‑shader need and flip the call toward Path A; **kitty/sixel image‑cell atlas pressure** at refresh (item 4); and the **single‑drawable additive‑fork** probe (item 8).
+
+**Updated stance.** The decisive performance unknown — *can one GPUI stack hold the terminal at refresh under burst load?* — is **resolved YES**, and Path B's structural FPS advantage over Path A is now a measured fact. The A‑vs‑B call rests on a single remaining could‑flip item (the AA/gamma pixel comparison); everything else points to **Path B**.
+
 ---
 
 # Addendum — backfilled candidate (failed in workflow)
