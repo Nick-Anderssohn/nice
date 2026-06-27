@@ -458,6 +458,30 @@ Its defining premise ("single GPUI drawable + proven renderer + **no** fork") is
 
 **Updated stance.** The decisive performance unknown — *can one GPUI stack hold the terminal at refresh under burst load?* — is **resolved YES**, and Path B's structural FPS advantage over Path A is now a measured fact. The A‑vs‑B call rests on a single remaining could‑flip item (the AA/gamma pixel comparison); everything else points to **Path B**.
 
+### ✅ AA/gamma comparison vs SwiftTerm — the lone could‑flip gate, resolved (2026‑06‑27)
+
+**Method.** Rather than eyeball screenshots (confounded by font/size/scaling), this compares the **actual glyph‑blend source on both sides**: GPUI's `monochrome_sprite_fragment` + sprite pipeline blend state (`gpui-0.2.2/src/platform/mac/shaders.metal:645‑660`, `metal_renderer.rs:1244‑1247`) vs SwiftTerm's text shaders + pipeline + rasterizer + atlas (`SwiftTerm/Sources/SwiftTerm/Apple/Metal/{Shaders.metal, MetalTerminalRenderer.swift, CoreTextGlyphRasterizer.swift, GlyphAtlas.swift}` + `TextCompositionCurve.swift`).
+
+**Finding — the fundamental text stack is identical; one optional curve is the only divergence.**
+- **Rasterization:** both rasterize glyphs via **CoreText into an A8 grayscale atlas** (color/emoji into a separate BGRA atlas) — the *same* model. (`CoreTextGlyphRasterizer.swift:35‑63`, `GlyphAtlas.swift:20‑41` ↔ GPUI's mono‑A8 + polychrome‑RGBA.)
+- **Blend:** both use **premultiplied "over"** — GPUI `color.a *= sample.a; return color` with `src=SourceAlpha/One, dst=OneMinusSourceAlpha`; SwiftTerm `src=.one (premultiplied), dst=.oneMinusSourceAlpha` (`MetalTerminalRenderer.swift:2828‑2834`). **SwiftTerm uses NO LCD subpixel and NO dual‑source blending** — so GPUI's plain coverage path already matches it, and GPUI's **4× subpixel‑X position variants exceed** SwiftTerm's integer‑snapped single‑bitmap glyphs (`MetalTerminalRenderer.swift:15‑19`).
+- **The one bespoke element:** SwiftTerm's default‑on‑macOS grayscale shader `terminal_text_fragment_gray` (`Shaders.metal:100‑113`) applies a **per‑cell, luminance‑aware gamma + contrast remap of coverage** — `mix(coverage, pow(coverage, 1/1.7), mixFactor) * 1.30`, keyed on **both** fg luminance **and** per‑cell bg luminance (Kitty's `text_composition_strategy 1.7 30` ≈ Apple‑Terminal stem‑darkening). Because the same atlas texel is reused across cells with different fg/bg, it **cannot be baked into the atlas**, and GPUI exposes **no public hook** to inject `pow`/`mix`/contrast or per‑cell luminance — so GPUI's fixed primitive set **cannot reproduce it**.
+
+**Verdict — does NOT hard‑flip to Path A; it isolates a bounded product decision.** Per the §11 decision rule (Path A only if matching fidelity forces a fork of GPUI's **text/atlas core**), this stays **Path B**: the core text stack matches with **zero** fork, and the lone gap is a single **optional, ~14‑line fragment‑shader tone curve** that (a) is **tunable to `.identity`**, where it reduces to plain coverage **byte‑identical to GPUI**, and (b) if wanted, is the **additive‑shader‑patch class** (add one curve to `monochrome_sprite_fragment`), **not** a fork of `text_system`/`open_type`/`metal_atlas` — exactly the cheap additive fork §12's single‑drawable analysis flagged, and current GPUI `main` already evolves this shader set (it added `SubpixelSprite`). So the gate resolves to a **product question**: *do we require SwiftTerm's exact default‑macOS stem‑darkened dark‑on‑light look?* — **Yes** → a small additive GPUI shader patch (or Path A); **No / plain CoreText coverage acceptable** (what GPUI, Zed, and most terminals ship) → **Path B is safe with no fork.** Either way it is **not** the deep, decision‑flipping "fork GPUI's hardest subsystem" risk the adversary feared.
+
+### Live‑gate scorecard (after this session's builds + source comparison)
+
+| §12 live item | Status |
+|---|---|
+| 1. Sustained burst FPS / present pacing (single GPUI stack) | ✅ **PASS** — locks ~60 fps, p95 ~16.8 ms, no tail (beats Path A's p95 31 ms) |
+| 3. AA/gamma/subpixel vs SwiftTerm — *the lone could‑flip gate* | ✅ **Resolved → Path B safe** — identical core text stack; only an optional, tunable, additive‑patch tone curve diverges (not a core fork) |
+| 2. Keystroke‑to‑glyph latency | ⏳ owed (needs real key injection / TCC) |
+| 4. kitty/sixel image‑cell atlas pressure at refresh | ⏳ owed (confirmatory; capability already source‑proven) |
+| 8. Single‑drawable additive‑fork probe (could dominate A *and* B) | ⏳ owed (parallel "stronger‑option" probe) |
+| Memory ~baseline claim | ⏳ owed (release + damage‑tracked re‑measure; debug+naive ~148 MiB) |
+
+**Bottom line:** both gates that could have flipped the call — sustained‑at‑refresh FPS and SwiftTerm‑parity text fidelity — are now **retired in Path B's favor** (one measured, one source‑proven). The remaining items are **confirmatory or optimization**, none decision‑flipping. **Path B is the recommendation under the re‑weighted criteria, no longer provisional on a feasibility unknown** — only on confirmatory polish + the optional single‑drawable upside probe.
+
 ---
 
 # Addendum — backfilled candidate (failed in workflow)
