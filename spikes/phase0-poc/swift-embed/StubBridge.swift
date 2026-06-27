@@ -171,6 +171,10 @@ public func st_present_async(_ h: UnsafeMutableRawPointer) {
     NiceHarness.onPresent?(mach_absolute_time())
 }
 
+/// Stub: no CAMetalLayer to configure — report -1 (no MTKView).
+@_cdecl("st_set_display_sync")
+public func st_set_display_sync(_ h: UnsafeMutableRawPointer, _ enabled: Int32) -> Int32 { -1 }
+
 // MARK: - Font / colors / selection -----------------------------------------
 
 @_cdecl("st_set_font")

@@ -181,10 +181,6 @@ mod gui {
     static STOP: AtomicBool = AtomicBool::new(false); // set by SIGINT/SIGTERM
     static FINISHED: AtomicBool = AtomicBool::new(false); // print-once guard
     static METAL_ACTIVE: AtomicBool = AtomicBool::new(false);
-    /// Which present scheme the run actually used (true once the decoupled
-    /// CADisplayLink loop is live; false = synchronous per-GPUI-frame present).
-    /// Recorded into the report so the captured numbers are self-describing.
-    static DECOUPLED: AtomicBool = AtomicBool::new(false);
     static SEED: AtomicU64 = AtomicU64::new(0);
     static BPS: AtomicU64 = AtomicU64::new(0);
     static WINDOW_NUMBER: AtomicI64 = AtomicI64::new(0);
@@ -192,11 +188,18 @@ mod gui {
     /// a hot-plugged monitor mid-run is flagged, not silently averaged in).
     static DISPLAY_INFO: Mutex<String> = Mutex::new(String::new());
     static DISPLAY_FPS: AtomicI64 = AtomicI64::new(0);
+    /// Human label of the present scheme (NICE_POC_PRESENT), recorded so the
+    /// report header self-documents which of link/sync/async/copace/none ran.
+    static SCHEME_LABEL: Mutex<String> = Mutex::new(String::new());
     // memory (MiB stored as f64 bits)
     static IDLE_PHYS: AtomicU64 = AtomicU64::new(0);
     static IDLE_RSS: AtomicU64 = AtomicU64::new(0);
     static PEAK_PHYS: AtomicU64 = AtomicU64::new(0);
     static LOAD_SAMPLES: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    /// Wall time (ms) of each synchronous terminal present_now() FFI call — the
+    /// direct stall probe: ~a vsync (~16 ms) means mtk.draw()/currentDrawable is
+    /// blocking the main thread; <1 ms means it returns immediately.
+    static PRESENT_DUR: Mutex<Vec<f64>> = Mutex::new(Vec::new());
     // proof outcomes: 0 = UNPROVEN, 1 = PASS, 2 = FAIL
     static RES_KEY: AtomicU8 = AtomicU8::new(0);
     static RES_MOUSE: AtomicU8 = AtomicU8::new(0);
@@ -333,11 +336,7 @@ mod gui {
             proofs: live_proof_gates(),
         };
 
-        let scheme = if DECOUPLED.load(Ordering::SeqCst) {
-            "decoupled CADisplayLink present loop (terminal presents at refresh on its own run-loop source)"
-        } else {
-            "synchronous per-GPUI-frame present (naive: two vsync-locked presents per cycle)"
-        };
+        let scheme = SCHEME_LABEL.lock().unwrap().clone();
         println!("<!-- present scheme: {scheme} -->");
         println!(
             "<!-- display: {} (max {} Hz) — present interval below pace to THIS display's vsync -->",
@@ -351,6 +350,15 @@ mod gui {
                 Err(e) => eprintln!("[phase0-poc] CSV write failed: {e}"),
             }
         }
+        let mut pd = PRESENT_DUR.lock().unwrap().clone();
+        let pd_p50 = median(&mut pd);
+        let pd_max = pd.last().copied().unwrap_or(0.0);
+        eprintln!(
+            "[diag] terminal present_now() wall p50={pd_p50:.2} ms max={pd_max:.2} ms (n={}) \
+             — >~10 ms ⇒ main-thread stall on currentDrawable; <1 ms ⇒ no stall",
+            pd.len()
+        );
+
         use std::io::Write;
         let _ = std::io::stdout().flush();
         eprintln!("\n[phase0-poc] LIVE run complete ({reason}); exiting cleanly.");
@@ -374,9 +382,10 @@ mod gui {
         per_frame_budget: usize,
         frame: u64,
         metal_ok: bool,
-        // present scheme (NICE_POC_PRESENT: link=default, sync, async, none)
+        // present scheme (NICE_POC_PRESENT: link=default, sync, async, copace, none)
         decouple_present: bool,    // link mode: drive terminal present off a CADisplayLink
         async_present: bool,       // async mode: coalesced DispatchQueue.main.async present
+        copace: bool,              // copace mode: sync clock + terminal displaySyncEnabled=false
         present_terminal: bool,    // false only in `none` mode (GPUI-compositor-alone baseline)
         present_link_active: bool, // the CADisplayLink loop actually started
         // driver
@@ -394,6 +403,7 @@ mod gui {
             deadline_secs: f64,
             decouple_present: bool,
             async_present: bool,
+            copace: bool,
             present_terminal: bool,
         ) -> Self {
             let prof = WorkloadProfile::default();
@@ -408,6 +418,7 @@ mod gui {
                 metal_ok: false,
                 decouple_present,
                 async_present,
+                copace,
                 present_terminal,
                 present_link_active: false,
                 deadline_secs,
@@ -440,6 +451,18 @@ mod gui {
             // Real Metal terminal (or stub) created on the main thread.
             let term = Terminal::new(0.0, 0.0, 900.0, 560.0);
             self.metal_ok = term.set_use_metal(true); // 0 with the stub
+            // copace lever: drop the terminal layer's vsync back-pressure so its
+            // per-frame present stops blocking the shared main thread on
+            // currentDrawable (the sync-mode 30/30 stall). Terminal keeps the
+            // single GPUI clock (present_now per render frame); only the layer's
+            // displaySyncEnabled changes.
+            if self.copace && self.metal_ok {
+                let st = term.set_display_sync(false);
+                eprintln!(
+                    "[copace] set_display_sync(false) -> status {st} \
+                     (1=applied&stuck, 0=didn't stick, -1=no MTKView, -2=not CAMetalLayer)"
+                );
+            }
             term.set_loopback(true); // seam-latency profile (§C.3)
             term.register_callbacks(
                 std::ptr::null_mut(),
@@ -490,7 +513,6 @@ mod gui {
                 && self.decouple_present
                 && self.metal_ok
                 && term.start_present_link();
-            DECOUPLED.store(self.present_link_active, Ordering::SeqCst);
 
             // IDLE dual-stack baseline BEFORE any byte is streamed, then clear the
             // warm-up frames so the report's UNDER-LOAD percentiles are clean.
@@ -547,11 +569,14 @@ mod gui {
             // DispatchQueue.main.async present (the fork's production path). In
             // `none` mode never present — isolates GPUI's standalone rate.
             if self.present_terminal && !self.present_link_active {
+                let t0 = harness::clock::now();
                 if self.async_present {
                     term.present_async();
                 } else {
                     term.present_now();
                 }
+                let dt = harness::clock::ms_between(t0, harness::clock::now());
+                PRESENT_DUR.lock().unwrap().push(dt);
             }
 
             // Periodic reflow stressor (§E.2): every ~3 s @120 Hz nudge cols.
@@ -812,17 +837,21 @@ mod gui {
         // Present scheme (NICE_POC_PRESENT): default `link` = decoupled CADisplayLink
         // loop; `sync` = naive per-GPUI-frame present (the A/B baseline); `async` =
         // coalesced DispatchQueue.main.async present (the fork's production path,
-        // paired with GPUI's RAF); `none` = never present the terminal, isolating
-        // GPUI's standalone compositor rate.
+        // paired with GPUI's RAF); `copace` = sync clock + terminal layer
+        // displaySyncEnabled=false (the co-paced single-clock present); `none` =
+        // never present the terminal, isolating GPUI's standalone compositor rate.
         let present_env = std::env::var("NICE_POC_PRESENT").unwrap_or_default();
+        let copace = present_env == "copace";
         // (decouple_present, async_present, present_terminal, label)
         let (decouple_present, async_present, present_terminal, scheme_label) =
             match present_env.as_str() {
                 "sync" | "synchronous" | "0" => (false, false, true, "synchronous-per-frame"),
                 "async" => (false, true, true, "async-coalesced (production path)"),
+                "copace" => (false, false, true, "copace (single clock + terminal displaySyncEnabled=false)"),
                 "none" | "off" => (false, false, false, "none (GPUI compositor alone)"),
                 _ => (true, false, true, "decoupled-CADisplayLink"),
             };
+        *SCHEME_LABEL.lock().unwrap() = scheme_label.to_string();
         eprintln!(
             "[phase0-poc] LIVE run: streaming ~{deadline:.0}s then auto-exit with a populated \
              Results table. present={scheme_label} (NICE_POC_PRESENT=link|sync|async|none). \
@@ -861,7 +890,13 @@ mod gui {
                 },
                 |_window, cx| {
                     cx.new(|_cx| {
-                        ChromeRoot::new(deadline, decouple_present, async_present, present_terminal)
+                        ChromeRoot::new(
+                            deadline,
+                            decouple_present,
+                            async_present,
+                            copace,
+                            present_terminal,
+                        )
                     })
                 },
             )

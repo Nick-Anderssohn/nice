@@ -272,6 +272,24 @@ public func st_present_async(_ h: UnsafeMutableRawPointer) {
     }
 }
 
+/// Toggle `displaySyncEnabled` on the terminal MTKView's backing `CAMetalLayer`.
+/// With it FALSE the presented drawable is released immediately instead of being
+/// held by CoreAnimation until vsync — so `view.currentDrawable` stops draining
+/// the 3-deep pool and blocking the shared main thread. This is the "copace"
+/// lever: it lets the terminal present once per GPUI frame WITHOUT stealing
+/// GPUI's vsync slot (the `sync`-mode 30/30 stall). Tradeoff: the terminal may
+/// tear under heavy scroll. Main thread.
+/// Returns status: 1 = applied and read back as requested; 0 = layer found but
+/// the value did NOT stick; -1 = no MTKView; -2 = layer is not a CAMetalLayer.
+@_cdecl("st_set_display_sync")
+public func st_set_display_sync(_ h: UnsafeMutableRawPointer, _ enabled: Int32) -> Int32 {
+    guard let mtk = box(h).view.subviews.compactMap({ $0 as? MTKView }).first else { return -1 }
+    guard let layer = mtk.layer as? CAMetalLayer else { return -2 }
+    let want = (enabled != 0)
+    layer.displaySyncEnabled = want
+    return layer.displaySyncEnabled == want ? 1 : 0
+}
+
 // MARK: - Font / colors ------------------------------------------------------
 
 @_cdecl("st_set_font")

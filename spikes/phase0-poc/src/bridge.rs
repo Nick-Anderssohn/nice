@@ -43,6 +43,7 @@ extern "C" {
     pub fn st_set_frame(h: StHandle, x: f64, y: f64, w: f64, d: f64);
     pub fn st_present_now(h: StHandle) -> i32; // forces 1 synchronous frame; FPS hook
     pub fn st_present_async(h: StHandle); // coalesced async present (fork's production path)
+    pub fn st_set_display_sync(h: StHandle, enabled: i32) -> i32; // 1 applied, 0 didn't stick, -1 no MTKView, -2 not CAMetalLayer
     pub fn st_start_present_link(h: StHandle) -> i32; // decoupled CADisplayLink present loop (1 ok, 0 stub)
     pub fn st_stop_present_link(h: StHandle);
 
@@ -133,6 +134,14 @@ impl Terminal {
     /// path). Returns immediately; the present runs on a later run-loop turn.
     pub fn present_async(&self) {
         unsafe { st_present_async(self.handle) }
+    }
+
+    /// Set `displaySyncEnabled` on the terminal's `CAMetalLayer` (the `copace`
+    /// lever — false releases the presented drawable immediately so the terminal
+    /// present stops blocking the shared main thread on `currentDrawable`).
+    /// Returns status: 1 applied, 0 didn't stick, -1 no MTKView, -2 not CAMetalLayer.
+    pub fn set_display_sync(&self, enabled: bool) -> i32 {
+        unsafe { st_set_display_sync(self.handle, enabled as i32) }
     }
 
     /// Start the decoupled CADisplayLink present loop (terminal presents at the
