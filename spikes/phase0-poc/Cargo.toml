@@ -1,0 +1,42 @@
+[package]
+name = "phase0-poc"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+publish = false
+
+# One throwaway binary: a GPUI window hosting the REAL SwiftTerm Metal NSView
+# (or the headless stub) under GPUI chrome, plus the measurement harness.
+[[bin]]
+name = "phase0-poc"
+path = "src/main.rs"
+
+[dependencies]
+# GPUI chrome host. 0.2.2 re-exports raw-window-handle 0.6 — pin to the SAME
+# major so the RawWindowHandle enum matches across the gpui<->objc2 seam.
+gpui = "0.2.2"
+raw-window-handle = "0.6"
+
+# objc2 0.6 / 0.3 — all foreign AppKit manipulation (subview insertion, first
+# responder, synthetic NSEvents, event monitor) is done here, exactly like the
+# committed spikes (spike-reuse-swiftterm).
+objc2 = "0.6"
+block2 = "0.6"          # NSEvent local-monitor handler block (PoC item 7)
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSRunningApplication", # NSApplicationActivationPolicy (setActivationPolicy)
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSEvent",
+    "NSGraphics",        # NSWindowOrderingMode + addSubview:positioned:relativeTo:
+    "NSText",
+    "NSVisualEffectView",
+    "block2",            # addLocalMonitorForEventsMatchingMask:handler:
+] }
+
+# Harness: mach clock + (partial) task FFI; task_vm_info_data_t is hand-declared
+# in harness.rs because mach2 0.4 does not ship it.
+mach2 = "0.4"
+libc = "0.2"

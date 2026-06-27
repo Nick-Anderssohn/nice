@@ -213,6 +213,16 @@ The deep Claude integration — `claude` shell shadow + ZDOTDIR injection + per�
 
 **Build a GPUI window that hosts the *real* SwiftTerm Metal NSView (not the stub) as a subview, drive it through a *live key window*, and *measure* — do not assume — the numbers that decide the architecture.**
 
+### ✅ BUILT & MEASURED (2026-06-26) — runnable PoC at `spikes/phase0-poc/`
+
+This PoC was built (a GPUI window hosting the **real** SwiftTerm Metal `NSView` via objc2, plus an FPS/latency/memory harness) and run on the actual machine (debug **and** release). Results:
+
+- **All four proofs (4–7) PASS on the real renderer** — including **(5) the mouse hit-test seam**, the Path-A-vs-objc2-hybrid decider: a `class_addMethod` `hitTest:` override on GPUI's `GPUIView` routes terminal-region points to the terminal and chrome points to GPUI, and a synthetic drag produced a real terminal selection. Keyboard/IME routing, transparent-over-terminal compositing (also visually confirmed), and same-window Metal rebind all PASS.
+- **Memory: native and flat** — idle ~37–53 MiB, under-load **143.6 / 145.9 MiB** steady/peak, no growth over the run. (Electron-class terminals run 300 MB–1 GB+.)
+- **Frame rate: the one open item — but it is *pacing*, not throughput.** Term/GPUI present p50 ≈ **33 ms (~30 fps)**, **identical in debug and release** (so *not* a debug artifact) — yet `draw-attempt p50 = 0.01 ms` (the real per-frame Metal encode is ~free). The 30 fps is therefore the PoC's **naive present scheme** (a synchronous `present_now()` once per GPUI frame ⇒ two vsync-locked presents per cycle ≈ half of 60 Hz), **not** a dual-stack compute tax. The stack has large headroom; hitting refresh needs a **decoupled present loop** (e.g. drive the terminal off a `CVDisplayLink` instead of synchronously per GPUI frame) — a bounded follow-up.
+
+**Net:** the dual-stack architecture is **validated** (every correctness/seam unknown cleared; memory native) and the provisional §5 `5†` efficiency mark is **substantially de-risked**. Remaining work: (a) a non-naive present scheme to prove sustained at-refresh FPS, and (b) the Nice Dev baseline for the comparison columns. **Leaning Path A.** Re-run: `cd spikes/phase0-poc && NICE_POC_REAL_BRIDGE=1 NICE_POC_RUN=1 cargo run` (see its README). The original methodology/decision-tree below stands.
+
 **Measure (against the current Nice baseline on this same machine):**
 1. **Sustained burst FPS** under a synthetic Claude‑streaming workload — does the embedded Metal view hold smooth GPU scroll while GPUI composites chrome over/around it? Compare to baseline.
 2. **Keystroke latency** end‑to‑end through the GPUI↔AppKit seam.
