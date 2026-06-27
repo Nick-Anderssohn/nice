@@ -650,6 +650,30 @@ mod gui {
             let chrome_stays = hit_chrome != term; // chrome must NOT go to the terminal
             let routing_ok = routes_term && chrome_stays;
 
+            // Deterministic content fill so the synthetic drag is GUARANTEED to
+            // land on printable glyphs rather than incidental blanks. The drag
+            // targets a FIXED middle-row geometry; whether those cells held
+            // glyphs vs spaces previously depended on run-to-run frame pacing,
+            // so `selection().trim()` was sometimes empty -> spurious UNPROVEN.
+            // Clear the screen and paint every visible row with a long run of
+            // 'X' using ABSOLUTE cursor positioning (ESC[r;1H) and NO newlines,
+            // so the grid never scrolls (grid-row == buffer-row) and the
+            // selected text is stable regardless of pacing. feed_bytes is
+            // synchronous (SwiftTerm parses inline), so the buffer holds the
+            // glyphs before the drag below reads the selection back.
+            if let Some(t) = &self.terminal {
+                let mut fill: Vec<u8> = Vec::with_capacity(64 * 230);
+                fill.extend_from_slice(b"\x1b[2J\x1b[H"); // clear screen + cursor home
+                // Cover well past the 24 visible rows AND the >=200 cols needed
+                // to span the 80<->90 col resize stressor; absolute positioning
+                // (never newlines) keeps the view from scrolling.
+                for row in 1..=60 {
+                    fill.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+                    fill.extend(std::iter::repeat(b'X').take(220));
+                }
+                t.feed_bytes(&fill);
+            }
+
             // Real synthetic drag through the responder chain over the terminal.
             let mtm = MainThreadMarker::new().unwrap();
             let app = NSApplication::sharedApplication(mtm);
@@ -662,18 +686,28 @@ mod gui {
                 .as_ref()
                 .and_then(|t| t.selection())
                 .filter(|s| !s.trim().is_empty());
+            // Corroborate via the selection RANGE itself (start != end) too, so
+            // PASS does not hinge on the incidental selected text. Either the
+            // non-empty filled text OR an active range proves the drag formed a
+            // selection end-to-end.
+            let has_range = self
+                .terminal
+                .as_ref()
+                .map(|t| t.selection_has_range())
+                .unwrap_or(false);
             let (hits_term, hits_chrome) = crate::input::hittest_counts();
 
             eprintln!(
                 "[§5 mouse] swizzle installed; routing: term_pt->terminal={routes_term}, \
                  chrome_pt->gpui(not terminal)={chrome_stays}; hit-test counts term={hits_term} \
-                 chrome={hits_chrome}; gpui_ptr={gpui_ptr:?} hit_chrome={hit_chrome:?}; selection={sel:?}"
+                 chrome={hits_chrome}; gpui_ptr={gpui_ptr:?} hit_chrome={hit_chrome:?}; \
+                 selection={sel:?} has_range={has_range}"
             );
 
             let code = if !routing_ok {
                 2 // FAIL -> objc2-hybrid
-            } else if sel.is_some() {
-                1 // PASS -> Path A
+            } else if sel.is_some() || has_range {
+                1 // PASS -> Path A (filled text OR an active selection range)
             } else {
                 0 // routing proven but selection not corroborated synthetically
             };

@@ -353,6 +353,16 @@ public func st_get_selection(_ h: UnsafeMutableRawPointer) -> UnsafeMutablePoint
 @_cdecl("st_string_free")
 public func st_string_free(_ p: UnsafeMutablePointer<CChar>?) { free(p) }
 
+/// 1 if the terminal currently has an ACTIVE selection range, 0 otherwise.
+/// Backed by SwiftTerm's public `TerminalView.selectionActive` (selection
+/// start != end). Lets the §5 mouse-seam proof corroborate the RANGE the
+/// synthetic drag formed, independent of whether the selected cells hold
+/// printable glyphs. Main thread.
+@_cdecl("st_selection_has_range")
+public func st_selection_has_range(_ h: UnsafeMutableRawPointer) -> Int32 {
+    return box(h).view.selectionActive ? 1 : 0
+}
+
 // MARK: - Callback registration (reverse-FFI) --------------------------------
 
 @_cdecl("st_register_callbacks")

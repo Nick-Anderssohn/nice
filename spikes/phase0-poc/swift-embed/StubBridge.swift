@@ -196,6 +196,11 @@ public func st_get_selection(_ h: UnsafeMutableRawPointer) -> UnsafeMutablePoint
 @_cdecl("st_string_free")
 public func st_string_free(_ p: UnsafeMutablePointer<CChar>?) { free(p) }
 
+/// Stub has no real selection model — report 0 (no active range). The headless
+/// link still resolves the symbol; the real range proof runs only on a display.
+@_cdecl("st_selection_has_range")
+public func st_selection_has_range(_ h: UnsafeMutableRawPointer) -> Int32 { 0 }
+
 // MARK: - Callback registration ----------------------------------------------
 
 @_cdecl("st_register_callbacks")

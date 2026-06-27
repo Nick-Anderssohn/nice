@@ -55,6 +55,7 @@ extern "C" {
     // selection (free returned ptr with st_string_free)
     pub fn st_get_selection(h: StHandle) -> *mut c_char;
     pub fn st_string_free(p: *mut c_char);
+    pub fn st_selection_has_range(h: StHandle) -> i32; // 1 if an active selection range (start != end)
 
     // reverse-FFI registration
     pub fn st_register_callbacks(
@@ -194,6 +195,15 @@ impl Terminal {
             st_string_free(p);
             Some(s)
         }
+    }
+
+    /// True when the terminal currently has an ACTIVE selection RANGE
+    /// (SwiftTerm `selectionActive`, i.e. selection start != end). Lets the §5
+    /// mouse-seam proof assert the range the synthetic drag formed independent
+    /// of whether the selected cells happen to hold printable text. Always
+    /// false with the headless stub (no selection model).
+    pub fn selection_has_range(&self) -> bool {
+        unsafe { st_selection_has_range(self.handle) == 1 }
     }
 
     /// Register reverse-FFI callbacks. `userdata` is passed back to each.
