@@ -175,6 +175,10 @@ public func st_present_async(_ h: UnsafeMutableRawPointer) {
 @_cdecl("st_set_display_sync")
 public func st_set_display_sync(_ h: UnsafeMutableRawPointer, _ enabled: Int32) -> Int32 { -1 }
 
+/// Stub: no Metal renderer to opt into transactional present — report 0.
+@_cdecl("st_set_presents_with_transaction")
+public func st_set_presents_with_transaction(_ h: UnsafeMutableRawPointer, _ enabled: Int32) -> Int32 { 0 }
+
 // MARK: - Font / colors / selection -----------------------------------------
 
 @_cdecl("st_set_font")

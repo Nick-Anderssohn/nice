@@ -382,10 +382,11 @@ mod gui {
         per_frame_budget: usize,
         frame: u64,
         metal_ok: bool,
-        // present scheme (NICE_POC_PRESENT: link=default, sync, async, copace, none)
+        // present scheme (NICE_POC_PRESENT: link=default, sync, async, copace, txn, none)
         decouple_present: bool,    // link mode: drive terminal present off a CADisplayLink
         async_present: bool,       // async mode: coalesced DispatchQueue.main.async present
         copace: bool,              // copace mode: sync clock + terminal displaySyncEnabled=false
+        transactional: bool,       // txn mode: renderer presents inside the CA transaction (co-commit)
         present_terminal: bool,    // false only in `none` mode (GPUI-compositor-alone baseline)
         present_link_active: bool, // the CADisplayLink loop actually started
         // driver
@@ -404,6 +405,7 @@ mod gui {
             decouple_present: bool,
             async_present: bool,
             copace: bool,
+            transactional: bool,
             present_terminal: bool,
         ) -> Self {
             let prof = WorkloadProfile::default();
@@ -419,6 +421,7 @@ mod gui {
                 decouple_present,
                 async_present,
                 copace,
+                transactional,
                 present_terminal,
                 present_link_active: false,
                 deadline_secs,
@@ -461,6 +464,20 @@ mod gui {
                 eprintln!(
                     "[copace] set_display_sync(false) -> status {st} \
                      (1=applied&stuck, 0=didn't stick, -1=no MTKView, -2=not CAMetalLayer)"
+                );
+            }
+            // txn lever: opt the renderer into transactional present
+            // (commit -> waitUntilScheduled -> drawable.present() INSIDE the CA
+            // transaction) so the terminal co-commits with GPUI's per-vsync
+            // composite instead of issuing an independent vsync-gated flush that
+            // contends for the shared one-commit-per-vsync budget. Unlike copace
+            // (a layer flag that left the nextDrawable block in place) this
+            // changes the present call sequence — the textbook 60/60 fix.
+            if self.transactional && self.metal_ok {
+                let ok = term.set_presents_with_transaction(true);
+                eprintln!(
+                    "[txn] set_presents_with_transaction(true) -> {ok} \
+                     (renderer commit->waitUntilScheduled->drawable.present() inside the CA transaction)"
                 );
             }
             term.set_loopback(true); // seam-latency profile (§C.3)
@@ -838,23 +855,27 @@ mod gui {
         // loop; `sync` = naive per-GPUI-frame present (the A/B baseline); `async` =
         // coalesced DispatchQueue.main.async present (the fork's production path,
         // paired with GPUI's RAF); `copace` = sync clock + terminal layer
-        // displaySyncEnabled=false (the co-paced single-clock present); `none` =
+        // displaySyncEnabled=false (the co-paced single-clock present); `txn` =
+        // renderer presents inside the CA transaction (presentsWithTransaction —
+        // co-commits with GPUI per vsync, the textbook 60/60 fix); `none` =
         // never present the terminal, isolating GPUI's standalone compositor rate.
         let present_env = std::env::var("NICE_POC_PRESENT").unwrap_or_default();
         let copace = present_env == "copace";
+        let transactional = present_env == "txn";
         // (decouple_present, async_present, present_terminal, label)
         let (decouple_present, async_present, present_terminal, scheme_label) =
             match present_env.as_str() {
                 "sync" | "synchronous" | "0" => (false, false, true, "synchronous-per-frame"),
                 "async" => (false, true, true, "async-coalesced (production path)"),
                 "copace" => (false, false, true, "copace (single clock + terminal displaySyncEnabled=false)"),
+                "txn" => (false, false, true, "txn (transactional present — co-committed with GPUI per vsync)"),
                 "none" | "off" => (false, false, false, "none (GPUI compositor alone)"),
                 _ => (true, false, true, "decoupled-CADisplayLink"),
             };
         *SCHEME_LABEL.lock().unwrap() = scheme_label.to_string();
         eprintln!(
             "[phase0-poc] LIVE run: streaming ~{deadline:.0}s then auto-exit with a populated \
-             Results table. present={scheme_label} (NICE_POC_PRESENT=link|sync|async|none). \
+             Results table. present={scheme_label} (NICE_POC_PRESENT=link|sync|async|copace|txn|none). \
              Ctrl-C exits early + reports. (NICE_POC_SECS overrides the window.)"
         );
 
@@ -895,6 +916,7 @@ mod gui {
                             decouple_present,
                             async_present,
                             copace,
+                            transactional,
                             present_terminal,
                         )
                     })

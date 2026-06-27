@@ -44,6 +44,7 @@ extern "C" {
     pub fn st_present_now(h: StHandle) -> i32; // forces 1 synchronous frame; FPS hook
     pub fn st_present_async(h: StHandle); // coalesced async present (fork's production path)
     pub fn st_set_display_sync(h: StHandle, enabled: i32) -> i32; // 1 applied, 0 didn't stick, -1 no MTKView, -2 not CAMetalLayer
+    pub fn st_set_presents_with_transaction(h: StHandle, enabled: i32) -> i32; // 1 applied, 0 no metal renderer (stub) — txn co-paced present
     pub fn st_start_present_link(h: StHandle) -> i32; // decoupled CADisplayLink present loop (1 ok, 0 stub)
     pub fn st_stop_present_link(h: StHandle);
 
@@ -142,6 +143,17 @@ impl Terminal {
     /// Returns status: 1 applied, 0 didn't stick, -1 no MTKView, -2 not CAMetalLayer.
     pub fn set_display_sync(&self, enabled: bool) -> i32 {
         unsafe { st_set_display_sync(self.handle, enabled as i32) }
+    }
+
+    /// Opt the terminal's Metal renderer into TRANSACTIONAL present (the fork's
+    /// `setMetalPresentsWithTransaction`): commit -> waitUntilScheduled ->
+    /// `drawable.present()` inside the current CoreAnimation transaction, so the
+    /// terminal co-commits with GPUI's per-vsync composite instead of issuing an
+    /// independent vsync-gated flush that contends for the shared commit budget
+    /// (the `sync`/`async` 30/30 stall). The `txn` co-paced lever. Returns true
+    /// if applied (real Metal renderer), false with the stub.
+    pub fn set_presents_with_transaction(&self, enabled: bool) -> bool {
+        unsafe { st_set_presents_with_transaction(self.handle, enabled as i32) == 1 }
     }
 
     /// Start the decoupled CADisplayLink present loop (terminal presents at the

@@ -290,6 +290,24 @@ public func st_set_display_sync(_ h: UnsafeMutableRawPointer, _ enabled: Int32) 
     return layer.displaySyncEnabled == want ? 1 : 0
 }
 
+/// Opt the terminal's Metal renderer into TRANSACTIONAL present (the fork's new
+/// `MacTerminalView.setMetalPresentsWithTransaction`): instead of the async
+/// `commandBuffer.present(drawable); commit()` path (which schedules an
+/// independent vsync-gated surface flush that contends with GPUI's present for
+/// the one-commit-per-vsync budget — the `sync`/`async` 30/30 stall), the
+/// renderer commits, `waitUntilScheduled()`s, then `drawable.present()`s INSIDE
+/// the current CoreAnimation transaction. The terminal's present then
+/// co-commits with GPUI's per-vsync composite instead of fighting it — the
+/// "txn" co-paced lever this experiment measures. This is the textbook
+/// presentsWithTransaction fix; unlike `copace` (a layer flag that did NOT
+/// remove the nextDrawable block) it changes the present *call sequence*.
+/// Returns 1 if the Metal renderer was active and the mode applied; 0 if the
+/// terminal is not currently Metal-backed (stub bridge returns 0). Main thread.
+@_cdecl("st_set_presents_with_transaction")
+public func st_set_presents_with_transaction(_ h: UnsafeMutableRawPointer, _ enabled: Int32) -> Int32 {
+    return box(h).view.setMetalPresentsWithTransaction(enabled != 0) ? 1 : 0
+}
+
 // MARK: - Font / colors ------------------------------------------------------
 
 @_cdecl("st_set_font")
