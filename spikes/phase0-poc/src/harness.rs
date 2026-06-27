@@ -540,7 +540,7 @@ impl Results {
         s.push_str("| Metric | Baseline (Nice Dev) | PoC (dual-stack) | Gate |\n");
         s.push_str("|---|---|---|---|\n");
         s.push_str(&format!(
-            "| Term present FPS p50/p95 (ms) | TODO | {:.2}/{:.2} (cliffs {}) | ≤ baseline p95 ×1.15, no cliff cluster |\n",
+            "| Term present FPS p50/p95 (ms) | ~16.7/17.1† | {:.2}/{:.2} (cliffs {}) | ≤ baseline p95 ×1.15, no cliff cluster |\n",
             self.term.p50_ms, self.term.p95_ms, self.term.cliffs
         ));
         s.push_str(&format!(
@@ -560,13 +560,23 @@ impl Results {
             self.latency_pty.0, self.latency_pty.1, self.latency_pty.2
         ));
         s.push_str(&format!(
-            "| phys_footprint idle (MiB) | TODO | {:.1} | ≤ baseline ×1.2 |\n",
+            "| phys_footprint idle (MiB) | ~69† | {:.1} | ≤ baseline ×1.2 |\n",
             self.mem_idle_phys_mib
         ));
         s.push_str(&format!(
-            "| phys_footprint under-load steady/peak (MiB) | TODO | {:.1}/{:.1} | ≤ baseline ×1.2, no growth |\n",
+            "| phys_footprint under-load steady/peak (MiB) | ~111/114† | {:.1}/{:.1} | ≤ baseline ×1.2, no growth |\n",
             self.mem_load_phys_mib, self.mem_peak_phys_mib
         ));
+        s.push_str(
+            "\n> † Baseline = current Nice (Nice Dev), single Metal terminal layer + AppKit/SwiftUI \
+             chrome, 60 Hz panel. Memory: phys_footprint of Nice Dev 0.29.0 under the same fixture, \
+             Metal active (1 pane). Term FPS: the single-Metal-layer-at-refresh rate established by \
+             this PoC's own single-stack controls on the identical SwiftTerm Metal renderer/display/ \
+             workload (`link` terminal-alone 16.68/17.13, `none` GPUI-alone 16.70/19.18) — a fresh \
+             signpost-emitting Nice Dev build is blocked by the missing Xcode Metal Toolchain \
+             component and 0.29.0 predates the SWIFTTERM_PROFILE signpost. Keystroke-latency pty-echo \
+             baseline deferred (needs Accessibility TCC for Nice Dev). See report §10.\n",
+        );
         s.push_str("\n### Proof gates (PoC items 4–7)\n\n");
         for p in &self.proofs {
             let val = match p.pass {
