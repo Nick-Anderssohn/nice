@@ -140,16 +140,16 @@ Env knobs:
 
 ### `NICE_POC_PRESENT` — terminal present scheme (the present-loop A/B/C/D)
 
-> ⚠️ The numbers below are from a sweep **contaminated by a mid-run monitor hot-plug** (display/refresh not recorded at the time). The harness now prints the window's display + `maximumFramesPerSecond` and flags a mid-run change — re-run on a single stable display (and on ProMotion) before trusting these. The "60 Hz" is inferred from the 16.7 ms interval, not measured.
+> Numbers below are the **verified** clean sweep: single stable display **"Built-in Retina Display [1470×956], max 60 Hz"** (recorded per run, zero mid-run-change flags), 18 s continuous load, real bridge; CSV-cross-checked by adversarial review. The harness now prints the window's display + `maximumFramesPerSecond` and flags a mid-run change as CONTAMINATED.
 
-| Scheme | What it does | Measured (display **unverified**, continuous load) |
+| Scheme | What it does | Measured (60 Hz panel, continuous load) — term / GPUI p50 |
 |---|---|---|
-| `link` *(default)* | terminal present driven off its own **`CADisplayLink`** (`st_start_present_link`), decoupled from GPUI | **term ~60 fps**, but **GPUI starved to ~1.4 fps** |
-| `sync` | terminal `present_now()` **synchronously inside each GPUI render frame** (the original naive scheme) | term ~30 / GPUI ~30 |
-| `async` | terminal present via coalesced **`DispatchQueue.main.async`** (the SwiftTerm fork's *production* path) + GPUI RAF | term ~30 / GPUI ~30 |
-| `none` | terminal **never** presents (feed only) — isolates GPUI's standalone compositor rate | GPUI ~60 fps |
+| `link` *(default)* | terminal present driven off its own **`CADisplayLink`** (`st_start_present_link`), decoupled from GPUI | **term 16.68 ms (~60 fps)**, **GPUI 700 ms (~1.4 fps — starved)** |
+| `sync` | terminal `present_now()` **synchronously inside each GPUI render frame** (the original naive scheme) | 33.4 / 33.4 ms (~30 / 30) |
+| `async` | terminal present via coalesced **`DispatchQueue.main.async`** (the SwiftTerm fork's *production* path) + GPUI RAF | 33.3 / 33.4 ms (~30 / 30) |
+| `none` | terminal **never** presents (feed only) — isolates GPUI's standalone compositor rate | — / 16.70 ms (~60) |
 
-**Finding (see report §10 "RE-MEASURED 2026-06-27"):** each stack *alone* reaches refresh (terminal in `link`, GPUI in `none`), but **no scheme drives both at refresh at once** — two `CAMetalLayer`s in one `NSWindow` share a ~one-commit-per-vsync main-thread budget. `draw-attempt` p50 stays ~0.01 ms in every scheme, so this is a **compositing/scheduling** ceiling, not a compute tax. Memory stays native + flat (~37–51 idle / ~137–146 under load) across all four. The open follow-up is a *co-paced single-clock* present (present both layers within one vsync) and a re-measure on a 120 Hz ProMotion panel.
+**Finding (see report §10 "RE-MEASURED & VERIFIED 2026-06-27"):** each stack *alone* reaches the panel's 60 Hz refresh (terminal in `link`, GPUI in `none`), but **none of the three schemes tested drives both at refresh at once** — two `CAMetalLayer`s in one `NSWindow` share a ~one-commit-per-vsync main-thread budget; the schemes only redistribute it. `draw-attempt` p50 ≈ 0.02 ms (in `link` it is vsync-bound by design), so this is a **compositing/scheduling** ceiling, not a compute tax. Memory is native (peaks ≤ 151 MiB, no growth). **Not** claimed: that *no* scheme can — a **co-paced single-clock** present (both layers off one vsync, or one shared layer) was not built; and 120 Hz ProMotion is untested (this machine's built-in is hard 60 Hz). Those, plus closing proof 5 end-to-end, are the open follow-ups.
 
 Generate the baseline replay fixture once with:
 ```sh
@@ -252,13 +252,14 @@ does not modify the fork.** Instead:
   `org.tirania.SwiftTerm`, category `MetalProfile`). Use the **same** source on
   the baseline side for like-for-like (`baseline/NOTES.md`).
 
-### 3. Two-`CAMetalLayer`-in-one-window present contention (the §10 yellow flag — provisional)
-The decoupling re-measure (2026-06-27) *suggested* the terminal's `CAMetalLayer`
-and GPUI's `CAMetalLayer` **contend for one main-thread, ~one-commit-per-vsync
-budget** — see the `NICE_POC_PRESENT` table above and report §10. **That sweep
-was contaminated by a mid-run monitor hot-plug; the harness now records the
-display + refresh rate, and a controlled re-run is pending before this flag is
-load-bearing.** The renderer's
+### 3. Two-`CAMetalLayer`-in-one-window present contention (the §10 yellow flag — verified)
+The decoupling re-measure (2026-06-27, clean single 60 Hz display, CSV-verified)
+established that the terminal's `CAMetalLayer` and GPUI's `CAMetalLayer`
+**contend for one main-thread, ~one-commit-per-vsync budget** — see the
+`NICE_POC_PRESENT` table above and report §10. Proven for the three naive
+schemes (`sync`/`async`/`link`); a **co-paced single-clock present** (both layers
+off one vsync, or one shared layer) and a **120 Hz ProMotion** re-measure remain
+the open experiments before the A-vs-B decision. The renderer's
 present is `view.currentDrawable` (vsync-gated) + non-blocking `frameSemaphore` +
 async `present(drawable)`, so the cost is the per-present main-thread stall, not
 encode (`draw-attempt` p50 ≈ 0.01 ms). Reaching 60/60 needs a **co-paced
