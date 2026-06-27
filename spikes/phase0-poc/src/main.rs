@@ -188,6 +188,10 @@ mod gui {
     static SEED: AtomicU64 = AtomicU64::new(0);
     static BPS: AtomicU64 = AtomicU64::new(0);
     static WINDOW_NUMBER: AtomicI64 = AtomicI64::new(0);
+    /// Display the window paced to, captured at embed (and re-checked at exit so
+    /// a hot-plugged monitor mid-run is flagged, not silently averaged in).
+    static DISPLAY_INFO: Mutex<String> = Mutex::new(String::new());
+    static DISPLAY_FPS: AtomicI64 = AtomicI64::new(0);
     // memory (MiB stored as f64 bits)
     static IDLE_PHYS: AtomicU64 = AtomicU64::new(0);
     static IDLE_RSS: AtomicU64 = AtomicU64::new(0);
@@ -335,6 +339,11 @@ mod gui {
             "synchronous per-GPUI-frame present (naive: two vsync-locked presents per cycle)"
         };
         println!("<!-- present scheme: {scheme} -->");
+        println!(
+            "<!-- display: {} (max {} Hz) — present interval below pace to THIS display's vsync -->",
+            DISPLAY_INFO.lock().unwrap(),
+            DISPLAY_FPS.load(Ordering::SeqCst)
+        );
         println!("{}", results.markdown());
         if let Ok(p) = std::env::var("NICE_POC_CSV") {
             match results.write_csv(Path::new(&p), &streams) {
@@ -462,6 +471,13 @@ mod gui {
             self.swallow_monitor = token;
 
             METAL_ACTIVE.store(self.metal_ok, Ordering::SeqCst);
+
+            // Record which display (+ refresh rate) the window paced to, so the
+            // numbers self-document the monitor and a hot-plug is detectable.
+            let (dfps, dname) = embed::screen_info(&handles);
+            DISPLAY_FPS.store(dfps, Ordering::SeqCst);
+            *DISPLAY_INFO.lock().unwrap() = dname.clone();
+            eprintln!("[phase0-poc] window on display: {dname} (max {dfps} Hz)");
 
             // Decoupled present loop: drive the terminal's Metal present off its
             // own CADisplayLink (a vsync-paced run-loop source) instead of
@@ -657,6 +673,23 @@ mod gui {
         fn finalize_and_exit(&mut self, reason: &str) -> ! {
             if self.embedded && !self.seam_done {
                 self.seam_done = true;
+                // Detect a hot-plugged / changed display mid-run — it silently
+                // re-paces the present loop to a different vsync and would
+                // corrupt the numbers. Flag loudly rather than average it in.
+                if let Some(h) = &self.handles {
+                    let (now_fps, now_name) = embed::screen_info(h);
+                    let embed_name = DISPLAY_INFO.lock().unwrap().clone();
+                    if now_name != embed_name || now_fps != DISPLAY_FPS.load(Ordering::SeqCst) {
+                        eprintln!(
+                            "[phase0-poc] ⚠️ DISPLAY CHANGED MID-RUN: embed='{embed_name}' \
+                             ({} Hz) -> exit='{now_name}' ({now_fps} Hz). Numbers are \
+                             CONTAMINATED — re-run on a single stable display.",
+                            DISPLAY_FPS.load(Ordering::SeqCst)
+                        );
+                        *DISPLAY_INFO.lock().unwrap() =
+                            format!("{embed_name} -> {now_name} (CHANGED MID-RUN — CONTAMINATED)");
+                    }
+                }
                 // Stop the decoupled present loop first so the end-of-window
                 // probes (mouse seam + §6 metal rebind) drive present_now()
                 // deterministically — no CADisplayLink presents racing the

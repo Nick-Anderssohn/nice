@@ -169,3 +169,33 @@ pub fn full_bounds(h: &NativeHandles) -> NSRect {
 pub fn rect(x: f64, y: f64, w: f64, ht: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, ht))
 }
+
+/// (max refresh fps, human label) for the display the window is CURRENTLY on.
+///
+/// Captured so every measurement self-documents the monitor + refresh rate it
+/// paced to: `NSView.displayLink`/CoreAnimation pace the present loop to the
+/// screen the window sits on, so a hot-plugged display silently changes the
+/// vsync and can corrupt a cross-run comparison. `maximumFramesPerSecond` is
+/// the display's nominal max (e.g. 120 on ProMotion, 60 on a typical external);
+/// pair it with the measured present interval to tell every-vsync from
+/// every-other-vsync. Returns `(0, "<no screen>")` if the window is off-screen.
+pub fn screen_info(h: &NativeHandles) -> (i64, String) {
+    match h.window.screen() {
+        Some(screen) => {
+            let fps = screen.maximumFramesPerSecond() as i64;
+            let name = screen.localizedName().to_string();
+            let f = screen.frame();
+            (
+                fps,
+                format!(
+                    "{name} [{}x{} @ {},{}]",
+                    f.size.width as i64,
+                    f.size.height as i64,
+                    f.origin.x as i64,
+                    f.origin.y as i64
+                ),
+            )
+        }
+        None => (0, "<no screen>".to_string()),
+    }
+}
