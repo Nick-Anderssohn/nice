@@ -136,6 +136,18 @@ Env knobs:
 | `NICE_POC_REAL_BRIDGE=1` | unset (stub) | link the real SwiftTerm Metal bridge (required for real numbers) |
 | `NICE_POC_SECS=<n>` | `25` | measurement window in seconds before auto-exit |
 | `NICE_POC_CSV=<path>` | unset | also write the raw per-sample CSV (Harness §H.1) |
+| `NICE_POC_PRESENT=<scheme>` | `link` | terminal present scheme (see below) |
+
+### `NICE_POC_PRESENT` — terminal present scheme (the present-loop A/B/C/D)
+
+| Scheme | What it does | Measured (60 Hz panel, continuous load) |
+|---|---|---|
+| `link` *(default)* | terminal present driven off its own **`CADisplayLink`** (`st_start_present_link`), decoupled from GPUI | **term ~60 fps**, but **GPUI starved to ~1.4 fps** |
+| `sync` | terminal `present_now()` **synchronously inside each GPUI render frame** (the original naive scheme) | term ~30 / GPUI ~30 |
+| `async` | terminal present via coalesced **`DispatchQueue.main.async`** (the SwiftTerm fork's *production* path) + GPUI RAF | term ~30 / GPUI ~30 |
+| `none` | terminal **never** presents (feed only) — isolates GPUI's standalone compositor rate | GPUI ~60 fps |
+
+**Finding (see report §10 "RE-MEASURED 2026-06-27"):** each stack *alone* reaches refresh (terminal in `link`, GPUI in `none`), but **no scheme drives both at refresh at once** — two `CAMetalLayer`s in one `NSWindow` share a ~one-commit-per-vsync main-thread budget. `draw-attempt` p50 stays ~0.01 ms in every scheme, so this is a **compositing/scheduling** ceiling, not a compute tax. Memory stays native + flat (~37–51 idle / ~137–146 under load) across all four. The open follow-up is a *co-paced single-clock* present (present both layers within one vsync) and a re-measure on a 120 Hz ProMotion panel.
 
 Generate the baseline replay fixture once with:
 ```sh
@@ -229,11 +241,25 @@ The original harness spec patches `MetalTerminalRenderer.draw(in:)` with a
 does not modify the fork.** Instead:
 - `st_present_now` fires the present hook **after** `mtkView.draw()` returns — a
   CPU *frame-submitted* timestamp (`draw(in:)` ran synchronously). Good for
-  cadence + the deterministic latency loop, **not** GPU-complete.
+  cadence + the deterministic latency loop, **not** GPU-complete. The same hook
+  also fires from `st_start_present_link`'s `CADisplayLink` tick and from
+  `st_present_async`, so the cadence stream reflects whichever present scheme
+  (`NICE_POC_PRESENT`) is active.
 - For true GPU-complete timing, run with `SWIFTTERM_PROFILE=1` and stream the
   fork's existing `OSSignposter` "Metal.Draw" interval (subsystem
   `org.tirania.SwiftTerm`, category `MetalProfile`). Use the **same** source on
   the baseline side for like-for-like (`baseline/NOTES.md`).
+
+### 3. Two-`CAMetalLayer`-in-one-window present contention (the §10 yellow flag)
+The decoupling re-measure (2026-06-27) found the terminal's `CAMetalLayer` and
+GPUI's `CAMetalLayer` **contend for one main-thread, ~one-commit-per-vsync
+budget** — see the `NICE_POC_PRESENT` table above and report §10. The renderer's
+present is `view.currentDrawable` (vsync-gated) + non-blocking `frameSemaphore` +
+async `present(drawable)`, so the cost is the per-present main-thread stall, not
+encode (`draw-attempt` p50 ≈ 0.01 ms). Reaching 60/60 needs a **co-paced
+single-clock present** (drive both layers from one frame tick) or an
+off-main-thread/non-blocking terminal present — not built here; it needs real
+GPUI-internals work. Re-measure on a 120 Hz ProMotion panel too (this was 60 Hz).
 
 ---
 

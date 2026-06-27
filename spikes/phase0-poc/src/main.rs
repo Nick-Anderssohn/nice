@@ -181,6 +181,10 @@ mod gui {
     static STOP: AtomicBool = AtomicBool::new(false); // set by SIGINT/SIGTERM
     static FINISHED: AtomicBool = AtomicBool::new(false); // print-once guard
     static METAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+    /// Which present scheme the run actually used (true once the decoupled
+    /// CADisplayLink loop is live; false = synchronous per-GPUI-frame present).
+    /// Recorded into the report so the captured numbers are self-describing.
+    static DECOUPLED: AtomicBool = AtomicBool::new(false);
     static SEED: AtomicU64 = AtomicU64::new(0);
     static BPS: AtomicU64 = AtomicU64::new(0);
     static WINDOW_NUMBER: AtomicI64 = AtomicI64::new(0);
@@ -325,6 +329,12 @@ mod gui {
             proofs: live_proof_gates(),
         };
 
+        let scheme = if DECOUPLED.load(Ordering::SeqCst) {
+            "decoupled CADisplayLink present loop (terminal presents at refresh on its own run-loop source)"
+        } else {
+            "synchronous per-GPUI-frame present (naive: two vsync-locked presents per cycle)"
+        };
+        println!("<!-- present scheme: {scheme} -->");
         println!("{}", results.markdown());
         if let Ok(p) = std::env::var("NICE_POC_CSV") {
             match results.write_csv(Path::new(&p), &streams) {
@@ -355,6 +365,11 @@ mod gui {
         per_frame_budget: usize,
         frame: u64,
         metal_ok: bool,
+        // present scheme (NICE_POC_PRESENT: link=default, sync, async, none)
+        decouple_present: bool,    // link mode: drive terminal present off a CADisplayLink
+        async_present: bool,       // async mode: coalesced DispatchQueue.main.async present
+        present_terminal: bool,    // false only in `none` mode (GPUI-compositor-alone baseline)
+        present_link_active: bool, // the CADisplayLink loop actually started
         // driver
         deadline_secs: f64,
         start_tick: u64, // mach ticks at first streaming frame; 0 until embedded
@@ -366,7 +381,12 @@ mod gui {
     }
 
     impl ChromeRoot {
-        fn new(deadline_secs: f64) -> Self {
+        fn new(
+            deadline_secs: f64,
+            decouple_present: bool,
+            async_present: bool,
+            present_terminal: bool,
+        ) -> Self {
             let prof = WorkloadProfile::default();
             ChromeRoot {
                 embedded: false,
@@ -377,6 +397,10 @@ mod gui {
                 per_frame_budget: prof.bytes_per_sec / 120, // assume ProMotion 120 Hz
                 frame: 0,
                 metal_ok: false,
+                decouple_present,
+                async_present,
+                present_terminal,
+                present_link_active: false,
                 deadline_secs,
                 start_tick: 0,
                 last_mem_frame: 0,
@@ -439,6 +463,19 @@ mod gui {
 
             METAL_ACTIVE.store(self.metal_ok, Ordering::SeqCst);
 
+            // Decoupled present loop: drive the terminal's Metal present off its
+            // own CADisplayLink (a vsync-paced run-loop source) instead of
+            // calling present_now() synchronously inside each GPUI render frame.
+            // The naive scheme serialized two vsync-locked presents per cycle
+            // (~half refresh); this lets the terminal repaint at refresh
+            // independently of GPUI's compositor. Falls back to the synchronous
+            // present if NICE_POC_PRESENT=sync or the link can't start (stub).
+            self.present_link_active = self.present_terminal
+                && self.decouple_present
+                && self.metal_ok
+                && term.start_present_link();
+            DECOUPLED.store(self.present_link_active, Ordering::SeqCst);
+
             // IDLE dual-stack baseline BEFORE any byte is streamed, then clear the
             // warm-up frames so the report's UNDER-LOAD percentiles are clean.
             let (phys, rss) = harness::mem::sample();
@@ -452,9 +489,11 @@ mod gui {
             self.terminal = Some(term);
             self.embedded = true;
             eprintln!(
-                "[phase0-poc] embedded terminal (metal={}); streaming + measuring for {:.0}s. \
-                 Mouse hit-test seam probed at the deadline.",
-                self.metal_ok, self.deadline_secs
+                "[phase0-poc] embedded terminal (metal={}, present={}); streaming + measuring \
+                 for {:.0}s. Mouse hit-test seam probed at the deadline.",
+                self.metal_ok,
+                if self.present_link_active { "decoupled CADisplayLink" } else { "synchronous per-frame" },
+                self.deadline_secs
             );
         }
 
@@ -485,7 +524,19 @@ mod gui {
                 term.feed_bytes(&chunk);
                 fed += chunk.len();
             }
-            term.present_now(); // fires the present hook -> FPS_TERM + latency close
+            // With the decoupled present loop the CADisplayLink drives the
+            // terminal present at refresh (and closes the keystroke-latency
+            // loop); feed only here. In sync mode present synchronously per
+            // frame (the naive scheme); in async mode queue a coalesced
+            // DispatchQueue.main.async present (the fork's production path). In
+            // `none` mode never present — isolates GPUI's standalone rate.
+            if self.present_terminal && !self.present_link_active {
+                if self.async_present {
+                    term.present_async();
+                } else {
+                    term.present_now();
+                }
+            }
 
             // Periodic reflow stressor (§E.2): every ~3 s @120 Hz nudge cols.
             if self.frame % 360 == 0 {
@@ -606,6 +657,16 @@ mod gui {
         fn finalize_and_exit(&mut self, reason: &str) -> ! {
             if self.embedded && !self.seam_done {
                 self.seam_done = true;
+                // Stop the decoupled present loop first so the end-of-window
+                // probes (mouse seam + §6 metal rebind) drive present_now()
+                // deterministically — no CADisplayLink presents racing the
+                // before/after counters or the metal-off teardown window.
+                if self.present_link_active {
+                    if let Some(t) = &self.terminal {
+                        t.stop_present_link();
+                    }
+                    self.present_link_active = false;
+                }
                 // Proof 4 verdict: keystrokes were injected every tick; if none
                 // ever echoed back through the terminal, routing is broken.
                 let echoes = KEY_ECHO.load(Ordering::Relaxed);
@@ -714,9 +775,25 @@ mod gui {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
             .unwrap_or(25.0);
+
+        // Present scheme (NICE_POC_PRESENT): default `link` = decoupled CADisplayLink
+        // loop; `sync` = naive per-GPUI-frame present (the A/B baseline); `async` =
+        // coalesced DispatchQueue.main.async present (the fork's production path,
+        // paired with GPUI's RAF); `none` = never present the terminal, isolating
+        // GPUI's standalone compositor rate.
+        let present_env = std::env::var("NICE_POC_PRESENT").unwrap_or_default();
+        // (decouple_present, async_present, present_terminal, label)
+        let (decouple_present, async_present, present_terminal, scheme_label) =
+            match present_env.as_str() {
+                "sync" | "synchronous" | "0" => (false, false, true, "synchronous-per-frame"),
+                "async" => (false, true, true, "async-coalesced (production path)"),
+                "none" | "off" => (false, false, false, "none (GPUI compositor alone)"),
+                _ => (true, false, true, "decoupled-CADisplayLink"),
+            };
         eprintln!(
             "[phase0-poc] LIVE run: streaming ~{deadline:.0}s then auto-exit with a populated \
-             Results table. Ctrl-C exits early + reports. (NICE_POC_SECS overrides the window.)"
+             Results table. present={scheme_label} (NICE_POC_PRESENT=link|sync|async|none). \
+             Ctrl-C exits early + reports. (NICE_POC_SECS overrides the window.)"
         );
 
         Application::new().run(move |cx: &mut App| {
@@ -749,7 +826,11 @@ mod gui {
                     is_resizable: true,
                     ..Default::default()
                 },
-                |_window, cx| cx.new(|_cx| ChromeRoot::new(deadline)),
+                |_window, cx| {
+                    cx.new(|_cx| {
+                        ChromeRoot::new(deadline, decouple_present, async_present, present_terminal)
+                    })
+                },
             )
             .unwrap();
         });

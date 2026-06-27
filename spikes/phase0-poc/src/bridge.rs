@@ -42,6 +42,9 @@ extern "C" {
     pub fn st_resize(h: StHandle, cols: i32, rows: i32);
     pub fn st_set_frame(h: StHandle, x: f64, y: f64, w: f64, d: f64);
     pub fn st_present_now(h: StHandle) -> i32; // forces 1 synchronous frame; FPS hook
+    pub fn st_present_async(h: StHandle); // coalesced async present (fork's production path)
+    pub fn st_start_present_link(h: StHandle) -> i32; // decoupled CADisplayLink present loop (1 ok, 0 stub)
+    pub fn st_stop_present_link(h: StHandle);
 
     // font / colors  (0x00RRGGBB; palette16 = ptr to 16 u32 or null)
     pub fn st_set_font(h: StHandle, name: *const c_char, size: f64);
@@ -124,6 +127,25 @@ impl Terminal {
     /// Force one synchronous frame; returns true if a frame was issued.
     pub fn present_now(&self) -> bool {
         unsafe { st_present_now(self.handle) == 1 }
+    }
+
+    /// Queue ONE coalesced async present on the main queue (the fork's production
+    /// path). Returns immediately; the present runs on a later run-loop turn.
+    pub fn present_async(&self) {
+        unsafe { st_present_async(self.handle) }
+    }
+
+    /// Start the decoupled CADisplayLink present loop (terminal presents at the
+    /// display refresh on its own run-loop source). Returns true if scheduled
+    /// (real bridge); false with the headless stub — caller then keeps issuing
+    /// `present_now()` synchronously per GPUI frame.
+    pub fn start_present_link(&self) -> bool {
+        unsafe { st_start_present_link(self.handle) == 1 }
+    }
+
+    /// Stop the decoupled present loop. Idempotent.
+    pub fn stop_present_link(&self) {
+        unsafe { st_stop_present_link(self.handle) }
     }
 
     pub fn set_font(&self, name: Option<&str>, size: f64) {

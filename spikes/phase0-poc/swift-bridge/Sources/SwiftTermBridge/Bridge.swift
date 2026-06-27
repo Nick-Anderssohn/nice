@@ -20,6 +20,7 @@
 
 import AppKit
 import MetalKit
+import QuartzCore       // CADisplayLink for the decoupled present loop
 import Darwin           // mach_absolute_time for the harness clock (same clock as Rust)
 import SwiftTerm
 
@@ -111,7 +112,39 @@ final class BridgeDelegate: NSObject, TerminalViewDelegate {
 final class STHandle {
     let view: TerminalView
     let delegate = BridgeDelegate()
+    // Decoupled present loop (st_start_present_link). Held here so the box keeps
+    // the link + its target alive for the whole run; torn down in st_destroy.
+    var presentDriver: PresentDriver?
+    var presentLink: CADisplayLink?
+    // Coalescing flag for st_present_async (at most one queued present at a time).
+    var asyncPresentQueued = false
     init(view: TerminalView) { self.view = view }
+}
+
+// MARK: - Decoupled present loop (CADisplayLink) -----------------------------
+//
+// The naive PoC scheme called st_present_now() synchronously inside every GPUI
+// render frame, so each main-thread tick issued TWO vsync-locked presents (the
+// terminal's CAMetalLayer + GPUI's) back-to-back ≈ half the display refresh.
+//
+// PresentDriver instead drives ONE terminal Metal present per display-refresh
+// tick off the view's own CADisplayLink — an independent, vsync-paced run-loop
+// source — so the terminal repaints at refresh INDEPENDENTLY of GPUI's
+// compositor. The fork creates the MTKView paused (isPaused=true,
+// enableSetNeedsDisplay=true), so this is the SOLE driver of its draw(in:): no
+// double-presenting with an internal MTKView loop. Fires the same harness hooks
+// as st_present_now so FPS_TERM / the keystroke-latency loop close on it.
+final class PresentDriver: NSObject {
+    weak var view: TerminalView?
+    init(view: TerminalView) { self.view = view; super.init() }
+
+    @objc func step(_ link: CADisplayLink) {
+        guard let view = view,
+              let mtk = view.subviews.compactMap({ $0 as? MTKView }).first else { return }
+        NiceHarness.onDrawAttempt?(mach_absolute_time())
+        mtk.draw()                                   // synchronous draw(in:)
+        NiceHarness.onPresent?(mach_absolute_time()) // CPU frame-submitted (see NiceHarness note)
+    }
 }
 
 @inline(__always) private func box(_ h: UnsafeMutableRawPointer) -> STHandle {
@@ -136,6 +169,9 @@ public func st_nsview(_ h: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer {
 @_cdecl("st_destroy")
 public func st_destroy(_ h: UnsafeMutableRawPointer) {
     let handle = box(h)
+    handle.presentLink?.invalidate()
+    handle.presentLink = nil
+    handle.presentDriver = nil
     handle.view.removeFromSuperview()
     Unmanaged<STHandle>.fromOpaque(h).release()
 }
@@ -187,6 +223,53 @@ public func st_present_now(_ h: UnsafeMutableRawPointer) -> Int32 {
     mtk.draw()                                   // public, synchronous -> draw(in:)
     NiceHarness.onPresent?(mach_absolute_time()) // CPU frame-submitted (see NiceHarness note)
     return 1
+}
+
+/// Start the DECOUPLED present loop (PresentDriver above). After this, the
+/// terminal presents once per display-refresh tick on its own CADisplayLink and
+/// the caller should STOP issuing st_present_now() per GPUI frame. Returns 1 if
+/// the link was created + scheduled (1 too if already running), 0 otherwise (the
+/// caller then falls back to synchronous per-frame st_present_now). Main thread.
+@_cdecl("st_start_present_link")
+public func st_start_present_link(_ h: UnsafeMutableRawPointer) -> Int32 {
+    let handle = box(h)
+    if handle.presentLink != nil { return 1 } // idempotent
+    let driver = PresentDriver(view: handle.view)
+    let link = handle.view.displayLink(target: driver, selector: #selector(PresentDriver.step(_:)))
+    link.add(to: .main, forMode: .common)
+    handle.presentDriver = driver
+    handle.presentLink = link
+    return 1
+}
+
+/// Stop + tear down the decoupled present loop. Idempotent. Main thread.
+@_cdecl("st_stop_present_link")
+public func st_stop_present_link(_ h: UnsafeMutableRawPointer) {
+    let handle = box(h)
+    handle.presentLink?.invalidate()
+    handle.presentLink = nil
+    handle.presentDriver = nil
+}
+
+/// Present ASYNCHRONOUSLY on the main queue — mirrors the fork's PRODUCTION
+/// present path (queuePendingDisplay -> requestMetalDisplay ->
+/// DispatchQueue.main.async -> metalView.draw()). Coalesced via
+/// `asyncPresentQueued` so back-to-back calls queue at most one present. Unlike
+/// st_present_now (synchronous, blocks the caller's main-thread tick), this lets
+/// GPUI's render+present complete first and the terminal present run on a later
+/// run-loop turn — the realistic Path-A co-pacing configuration. Main thread.
+@_cdecl("st_present_async")
+public func st_present_async(_ h: UnsafeMutableRawPointer) {
+    let handle = box(h)
+    if handle.asyncPresentQueued { return }
+    handle.asyncPresentQueued = true
+    DispatchQueue.main.async {
+        handle.asyncPresentQueued = false
+        guard let mtk = handle.view.subviews.compactMap({ $0 as? MTKView }).first else { return }
+        NiceHarness.onDrawAttempt?(mach_absolute_time())
+        mtk.draw()
+        NiceHarness.onPresent?(mach_absolute_time())
+    }
 }
 
 // MARK: - Font / colors ------------------------------------------------------

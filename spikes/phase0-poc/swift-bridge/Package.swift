@@ -22,7 +22,9 @@ import PackageDescription
 
 let package = Package(
     name: "SwiftTermBridge",
-    platforms: [ .macOS(.v11) ],
+    // .v14 for NSView.displayLink(target:selector:) — the decoupled present loop
+    // (st_start_present_link). SwiftTerm depends at .v13, so this is compatible.
+    platforms: [ .macOS(.v14) ],
     products: [
         .library(name: "SwiftTermBridge", type: .dynamic, targets: ["SwiftTermBridge"]),
     ],

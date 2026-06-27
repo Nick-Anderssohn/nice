@@ -155,6 +155,22 @@ public func st_present_now(_ h: UnsafeMutableRawPointer) -> Int32 {
     return 1
 }
 
+/// Stub has no Metal present loop: report 0 so the Rust driver keeps its
+/// synchronous per-frame st_present_now() fallback (preserving prior behavior).
+@_cdecl("st_start_present_link")
+public func st_start_present_link(_ h: UnsafeMutableRawPointer) -> Int32 { 0 }
+
+@_cdecl("st_stop_present_link")
+public func st_stop_present_link(_ h: UnsafeMutableRawPointer) {}
+
+/// Stub: fire the harness hooks synchronously (no real Metal to defer).
+@_cdecl("st_present_async")
+public func st_present_async(_ h: UnsafeMutableRawPointer) {
+    NiceHarness.onDrawAttempt?(mach_absolute_time())
+    box(h).view.needsDisplay = true
+    NiceHarness.onPresent?(mach_absolute_time())
+}
+
 // MARK: - Font / colors / selection -----------------------------------------
 
 @_cdecl("st_set_font")
