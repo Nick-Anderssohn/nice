@@ -42,3 +42,25 @@ original spike parsed the pty inside `render()` on the main thread.
 ## Evidence
 
 Raw CSV: `spikes/phase0-poc/gpui-term-multi-7w3s.csv`.
+
+---
+
+## Correction (2026-07-02): bg-window "demand frames" counted scene rebuilds, not presents
+
+A gpui-0.2.2 finding from the spike-4b/5 keystroke run
+(`baseline/RESULTS-keylat-20260701.md`) invalidates one counter above:
+`cx.notify()` alone never reaches `MetalRenderer::draw` while a window's
+CVDisplayLink is stopped — a demand-driven present needs an explicit layer
+kick. The background windows' "demand frames" counters (173/19) counted
+**scene rebuilds** (element renders), not Metal presents. Given that
+finding, the background windows very likely never presented during these
+runs (visually frozen; scene rebuilt and dropped).
+
+- **Stands UNCHANGED** (for what it actually measured): the headline
+  streaming-window frame pacing is RAF-driven — a real present path — and
+  the parse-off-main scaling conclusion (all 7 sessions at 500 KB/s, p95
+  21.42) is about main-thread load, which is unaffected.
+- **RETRACTED** until re-run with the present kick: "background windows
+  redraw on demand at notify cadence." The kick now exists (interactive
+  mode, `NICE_POC_INTERACTIVE=1`) but has not been wired into the
+  multi-window background path.
