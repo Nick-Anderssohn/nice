@@ -1,7 +1,7 @@
 ---
 title: Claude chrome-tractability A/B — SwiftUI/AppKit-on-Nice vs GPUI-on-PoC — protocol v2
-date: 2026-07-02 (v2, same-day revision; v1 in git history)
-status: DESIGN v2 — awaiting Nick's approval; no runs executed
+date: 2026-07-02 (v2.2; v1/v2/v2.1 in git history)
+status: APPROVED (Nick, 2026-07-02 — asks 1–4 including the C0 control, plus the v2.1 Xcode exclusion and the v2.2 model choice). Runs NOT yet executed.
 closes: rewrite-stack-research.md §13 gap #3 / audit G3
 supersedes: v1 of this file — v1 mis-aimed the premise at the language axis and chose seam-free tasks
 ---
@@ -47,6 +47,21 @@ Two consequences:
 he will not use Xcode's agent integration, period. Claude Code CLI is the
 real workflow both arms are measured in; no replication is owed under any
 outcome.
+
+**v2.2 note (same day, approved):** implementer agents run
+**claude-opus-4-8**, both arms — deliberately NOT the frontier model.
+Rationale: (1) construct validity — Opus is Nick's practiced workflow (and
+his dev-cycle orchestration's default implementer), so it is the model
+whose velocity the decision is actually about; (2) instrument sensitivity —
+a frontier model could ceiling both arms and mask the seam differential the
+daily workflow experiences; (3) evidence-base match — the chrome-pain
+record was accumulated by Opus-class sessions. **Judges stay
+claude-fable-5** (a stronger grader than doer is measurement hygiene, and
+it is symmetric across arms). **Pre-registered sensitivity option:** if the
+Opus result is surprising in either direction, ONE additional Fable
+implementer pair on T1 (~+0.8–1M tokens) may be run — decided only after
+the Opus data is in — to distinguish a model-tier-dependent gap (would
+dissolve with model progress) from a structural one.
 
 ## 1. The question, sharply
 
@@ -178,10 +193,18 @@ differs):*
 
 ### C0 (OPTIONAL CONTROL) — v1's stream-activity badge, seam-free
 
-v1's frozen T1 brief (activity badge: throughput label, active/idle
-dimming, click-to-toggle presentation, persisted), retained unchanged as a
-**seam-free control**: pure state→view + interaction + persistence, no
-window-drag arbitration, no native-chrome geometry. Purpose: calibrate the
+v1's frozen T1 brief, retained verbatim as a **seam-free control** (pure
+state→view + interaction + persistence — no window-drag arbitration, no
+native-chrome geometry):
+
+> Add a small **activity badge** to the window chrome, adjacent to the
+> existing top-bar content: a dot plus a `NN KB/s` label showing terminal
+> output throughput over a rolling ~1 s window. While bytes are arriving the
+> badge renders in the active/accent style; after ~2 s of silence it dims to
+> the idle style. **Clicking** the badge toggles between the full (dot +
+> label) and compact (dot-only) presentation, and the chosen presentation
+> **persists across app relaunch**. Match the surrounding chrome's visual
+> style (colors, typography, spacing). Do not regress existing behavior. Purpose: calibrate the
 instrument. Per the corrected premise the expectation is **both arms pass
 comfortably**. If the Swift arm struggles even on C0, the impedance framing
 (or the harness) is wrong and the seam results can't be read at face value;
@@ -213,7 +236,10 @@ Carried from v1 verbatim unless noted:
   built under `Sources/Nice/`" / "the interactive window is built in
   `spikes/phase0-poc/src/gpui_term.rs`, `run_interactive()`"); and the
   standard build/run command (`scripts/install.sh` + launch Nice Dev under
-  the worktree lock / `NICE_POC_INTERACTIVE=1 cargo run --bin gpui-term`).
+  the worktree lock / `NICE_POC_RUN=1 NICE_POC_INTERACTIVE=1 cargo run
+  --bin gpui-term` — both vars; `NICE_POC_INTERACTIVE=1` alone is the
+  headless self-test, a prep-time correction that would otherwise have
+  been a broken brief).
   Equal-specificity infrastructure pointers, not solution hints (the Swift
   block does NOT name `ChromeEventRouter` or the drag machinery; finding
   the house arbitration pattern is part of the measured work, exactly as
@@ -240,10 +266,11 @@ Carried from v1 verbatim unless noted:
   simultaneously an asset (pattern to extend) and a hazard (invariants to
   regress); the PoC's blank slate is simultaneously freedom and missing
   infrastructure. Both directions are the two real jobs being compared.
-- **Same model, effort, budget** (unchanged): same frontier model
-  (claude-fable-5 as of this design), same reasoning effort, 100
-  tool-call-turn / 3 h caps, isolated worktrees, web access denied
-  symmetrically.
+- **Same implementer model, effort, budget (v2.2):** both arms
+  **claude-opus-4-8** — deliberately not the frontier model; Opus is the
+  practiced workflow whose velocity the decision is about (§0 v2.2 note).
+  Same reasoning effort, 100 tool-call-turn / 3 h caps, isolated worktrees,
+  web access denied symmetrically.
 - **Same definition of done, told to both agents** (unchanged in shape):
   compiles clean; feature works per the brief incl. its stated invariants
   (agent self-verifies by running the app); existing behavior unregressed
@@ -305,8 +332,10 @@ conformance (judged). Same anchors as v1.
 
 ### Judge protocol (unchanged)
 
-3 independent judges per judged artifact (T1/T2 only: 6 artifacts → 18
-short sessions; C0 is objective-gate-only). Input: frozen brief, final
+3 independent **claude-fable-5** judges per judged artifact (a stronger
+grader than the doer is measurement hygiene, and it is symmetric across
+arms; T1/T2 only: 6 artifacts → 18 short sessions; C0 is
+objective-gate-only). Input: frozen brief, final
 diff, build log, tool-call sequence, objective-gate results. Judges score
 against anchors, no head-to-head; blind to the decision framing.
 Per-dimension median across judges, mean across dimensions = the run's
@@ -318,9 +347,10 @@ Results land in `spikes/phase0-poc/RESULTS-spike11p3-<date>.md` (raw
 scores, checklists, judge rationales, transcript locations); the report
 gets a §12-scorecard row ("Claude chrome-tractability A/B — spike 11.3")
 and an annotation on the impedance-driver claims it touches: **"measured
-YYYY-MM-DD, claude-fable-5, gpui 0.2.2-vendored (prod would pin zed main),
-n=6(+2) sessions"**. (v1's "date-stamp the D1 scores" language is
-superseded: what gets stamped is the impedance-axis evidence.)
+YYYY-MM-DD, implementers claude-opus-4-8, judges claude-fable-5, gpui
+0.2.2-vendored (prod would pin zed main), n=8 sessions"**. (v1's
+"date-stamp the D1 scores" language is superseded: what gets stamped is
+the impedance-axis evidence, at the practiced model tier.)
 
 ---
 
@@ -330,11 +360,27 @@ Roles, prep, caps unchanged from v1 (main session orchestrates only;
 worktrees pre-warmed; Swift runs serialize on the worktree lock, Rust runs
 parallel to them).
 
-Sessions: **T1×2/arm + T2×1/arm = 6 implementer sessions** (+ C0×1/arm = 8
-if the control is approved). Judged artifacts 6 → 18 judge sessions.
+**Prep completed 2026-07-02:** arm worktrees at
+`.claude/worktrees/ab-swift` (branch `ab-swift-arm`) and
+`.claude/worktrees/ab-rust` (branch `ab-rust-arm`), both off
+`worktree-rewrite` @ `8f0dd7f`. Rust arm vendored (`vendor-gpui.sh`) +
+`gpui-term` built + interactive window launch-verified
+(`NICE_POC_RUN=1 NICE_POC_INTERACTIVE=1`). Swift arm built + Nice Dev
+0.30.0 installed under the worktree lock + launch/quit-verified (note:
+`open -a "Nice Dev"` may resolve to the ab-swift build-products copy via
+LaunchServices — same build; use `open "/Applications/Nice Dev.app"` to be
+explicit). Between runs in the same arm: `git reset --hard` + drop
+untracked SOURCE files only — keep `build-dev/`, `target/`, and `vendor/`
+so the warm caches carry.
 
-**Token budget:** implementers ≤3.0M (+~0.6–1.0M for C0); judges ≤2.0M;
-orchestration + write-up ≈0.5M → **≈4–5.5M tokens (≈5–6.5M with C0)**.
+Sessions: **T1×2/arm + T2×1/arm + C0×1/arm = 8 implementer sessions** (C0
+approved). Judged artifacts 6 → 18 judge sessions (C0 unjudged). Optional
+post-hoc: the §0 v2.2 Fable sensitivity pair on T1 (+2 sessions), only if
+the Opus result is surprising.
+
+**Token budget:** implementers ≤3.0M + C0 ≈0.6–1.0M; judges ≤2.0M;
+orchestration + write-up ≈0.5M → **≈5–6.5M tokens approved** (+0.8–1M only
+if the Fable sensitivity pair fires).
 Wall-clock ~1 active day; Nick's time ≈1–1.5 h (verification + approval;
 T1's double-click-preference check and T2's full-screen/focus cycling are
 GUI-manual, ~10 min/run).
@@ -359,16 +405,22 @@ stop, report partial, decide with Nick.
 | T8 | **gpui 0.2.2 vs production zed-main pin.** | Unchanged: known-sign bias *for* Rust; Rust-loses is conclusive; narrow Rust win labeled an upper bound + optional pinned-main sensitivity re-run. |
 | T9 | **Verification asymmetry** (XCUITest suites vs none). | Unchanged: DoD uses manual functional checklists both arms; each side's native cheap regression mechanism only. Note: XCUITest's documented event-synthesis gaps are exactly why the checklists are executed manually/by driving the real app. |
 | T10 | **Task selection bias (NEW)** — tasks chosen from Swift's own failure record could overfit the experiment against Swift. | Named openly: the documented failure distribution *is* the distribution the rewrite decision is about — sampling anywhere else measures the wrong thing (v1's mistake, inverted). Mitigations: C0 seam-free control bounds the instrument; T3 spare targets a GPUI-weak surface (platform drag-out); T1/T2 also engage GPUI's genuinely thin surfaces (window-drag behavior, titlebar geometry, timers/animation), so the tasks are not one-sided-by-construction; and branch 1 of the decision rule gives Swift full credit for winning on its home turf. |
+| T11 | **Model-tier generalization (NEW, v2.2)** — the result is measured at the Opus tier and may differ at other tiers. | Deliberate: Opus is the tier that would actually do the work (Nick's practice + his dev-cycle default), so it is the decision-relevant measurement. The date-stamp names the tier; the pre-registered Fable sensitivity pair (§0 v2.2) exists to test tier-dependence if the Opus result surprises. |
 
 ---
 
-## Approval asks (Nick)
+## Approvals (recorded)
 
-1. Approve the **re-aimed premise** (§0/§1): the impedance axis is what's
-   tested; raw-Swift competence is conceded, not measured.
-2. Approve tasks: **T1 bottom status bar (n=2/arm) primary, T2
-   traffic-light-row widget (n=1/arm) replication**, T3 spare. And: run the
-   **C0 control** (+2 sessions, ≈+1M tokens) — yes/no?
-3. Approve the §1 decision rule as binding before data.
-4. Approve budget: ~4–5.5M tokens (~5–6.5M with C0), ~1 active day, ~1–1.5 h
-   of your time.
+All approved by Nick, 2026-07-02, in-session:
+
+1. Re-aimed premise (§0/§1) — the impedance axis; raw-Swift competence
+   conceded, not measured. ✅
+2. Tasks — T1 bottom status bar (n=2/arm) primary, T2 traffic-light-row
+   widget (n=1/arm) replication, T3 spare, **C0 control funded** (n=1/arm,
+   objective-gate-only). ✅
+3. §1 decision rule binding before data. ✅
+4. Budget ≈5–6.5M tokens, ~1 active day, ~1–1.5 h of Nick's time. ✅
+5. (v2.1) Xcode agent integration excluded outright — not part of any
+   workflow being compared. ✅
+6. (v2.2) Implementers claude-opus-4-8 both arms; judges claude-fable-5;
+   optional post-hoc Fable sensitivity pair on T1. ✅
