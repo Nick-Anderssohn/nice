@@ -12,6 +12,12 @@
 //    • double-click empty chrome to run the user's `AppleActionOnDoubleClick`,
 //    • never let a pane-pill press ride either path (BUG C).
 //
+//  "Empty chrome" spans TWO bands: the 52pt top bar and the 28pt bottom
+//  status bar (`WindowStatusBarView`). The status bar's widgets (cwd /
+//  clock) are recognised via the `ChromeWidgetHosting` marker and get the
+//  same pass-through treatment as pills — a widget press can never move
+//  the window or run the double-click action.
+//
 //  This replaces THREE older mechanisms that used to cooperate (and could
 //  conflict) for these behaviours:
 //
@@ -81,7 +87,9 @@ enum ChromeEventRouter {
     // MARK: - Pure decision (unit-tested)
 
     /// What the hit view's ancestor chain classified as, frontmost first.
-    enum HitKind { case pill, strip, other }
+    /// `.widget` is a status-bar widget (`ChromeWidgetHosting`) — it owns
+    /// its press exactly like a pill does.
+    enum HitKind { case pill, widget, strip, other }
 
     /// The routing decision for a `.leftMouseDown`.
     enum Routing: Equatable {
@@ -98,10 +106,10 @@ enum ChromeEventRouter {
     }
 
     /// Pure classification, extracted so the decision table is unit-testable
-    /// without a live window. A pill press wins over the strip (pill
-    /// precedence) and never zooms; the strip arms a drag on a single click
-    /// and runs the double-click action on two; everything out-of-band or in
-    /// full screen passes through.
+    /// without a live window. A pill or status-bar widget press wins over
+    /// the strip (widget precedence) and never zooms; the strip arms a drag
+    /// on a single click and runs the double-click action on two; everything
+    /// out-of-band or in full screen passes through.
     static func decision(
         hitChain: [HitKind],
         clickCount: Int,
@@ -109,9 +117,12 @@ enum ChromeEventRouter {
         isFullScreen: Bool
     ) -> Routing {
         guard inBand && !isFullScreen else { return .passThrough }
-        // Pill owns its press — precedence over the strip even when both are
-        // in the chain (a pill drawn on top of the strip background).
-        if hitChain.contains(.pill) { return .passThrough }
+        // A pill / widget owns its press — precedence over the strip even
+        // when both are in the chain (a pill or widget drawn on top of the
+        // strip background). Neither may ever move the window or zoom.
+        if hitChain.contains(.pill) || hitChain.contains(.widget) {
+            return .passThrough
+        }
         if hitChain.contains(.strip) {
             return clickCount >= 2 ? .doubleClickAction : .armDrag
         }
@@ -172,18 +183,21 @@ enum ChromeEventRouter {
         guard let contentView = window.contentView else { return event }
 
         let isFullScreen = window.styleMask.contains(.fullScreen)
-        // Gate on the top chrome strip. `locationInWindow` has origin
+        // Gate on the two chrome bands. `locationInWindow` has origin
         // bottom-left, so `bounds.height - y` is the distance from the top
-        // edge. Sourced from the shared constant so the band can't desync
-        // from the chrome the rest of the layout draws.
+        // edge and `y` itself the distance from the bottom. Sourced from
+        // the shared constants so the bands can't desync from the chrome
+        // the rest of the layout draws (the 52pt top bar and the 28pt
+        // bottom status bar — `WindowStatusBarView`).
         let yFromTop = contentView.bounds.height - event.locationInWindow.y
-        let inBand = yFromTop <= WindowChrome.topBarHeight
+        let inTopBand = yFromTop <= WindowChrome.topBarHeight
+        let inBottomBand = event.locationInWindow.y <= WindowChrome.bottomBarHeight
         let chain = hitChain(in: contentView, at: event.locationInWindow)
 
         switch decision(
             hitChain: chain,
             clickCount: event.clickCount,
-            inBand: inBand,
+            inBand: inTopBand || inBottomBand,
             isFullScreen: isFullScreen
         ) {
         case .passThrough:
@@ -232,8 +246,9 @@ enum ChromeEventRouter {
 
     /// Hit-tests once at `point`, then walks the ancestor chain (frontmost
     /// first) classifying each view: `PaneDragHosting` → `.pill`,
-    /// `ChromeDragStripView` → `.strip`. Returns the chain so the pure
-    /// `decision` can apply pill precedence.
+    /// `ChromeWidgetHosting` → `.widget`, `ChromeDragStripView` → `.strip`.
+    /// Returns the chain so the pure `decision` can apply pill / widget
+    /// precedence.
     private static func hitChain(in contentView: NSView, at point: NSPoint) -> [HitKind] {
         guard let hit = contentView.hitTest(point) else { return [] }
         var chain: [HitKind] = []
@@ -241,6 +256,13 @@ enum ChromeEventRouter {
         while let v = cursor {
             if v is PaneDragHosting {
                 chain.append(.pill)
+            } else if v is ChromeWidgetHosting {
+                // Status-bar widget (cwd / clock) — owns its press just like
+                // a pill, so it can never move the window or trigger the
+                // double-click action. Its hosting view claims its whole
+                // bounds and reports `mouseDownCanMoveWindow == false`, so
+                // the attribute-walk below can't also classify it `.strip`.
+                chain.append(.widget)
             } else if v is ChromeDragStripView {
                 chain.append(.strip)
             } else if v.mouseDownCanMoveWindow && !(v is NSVisualEffectView) {

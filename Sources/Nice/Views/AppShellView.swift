@@ -223,7 +223,14 @@ private struct AppShellHost: View {
         ProcessInfo.processInfo.arguments.contains("--uitest-tearoff-hook")
 
     var body: some View {
-        shell
+        VStack(spacing: 0) {
+            shell
+            // Bottom chrome band: cwd + clock widgets, empty pixels drag /
+            // double-click like the title bar (via `ChromeEventRouter`'s
+            // bottom band). Outside `shell` so both the expanded and
+            // collapsed layouts get the same full-width bar.
+            WindowStatusBarView()
+        }
         .overlay(alignment: .bottomTrailing) {
             // Zero-impact in production: the whole overlay is elided when
             // the launch arg is absent (the buttons are never built, so
@@ -231,11 +238,14 @@ private struct AppShellHost: View {
             // keeps them clear of the traffic lights / sidebar / toolbar
             // chrome. The two hooks are stacked vertically (each 24x24)
             // so they never occlude each other for XCUITest hit-testing.
+            // Lifted above the status bar so they can't cover its clock
+            // widget (whose AppKit host would swallow the hooks' taps).
             if Self.tearOffHookEnabled {
                 VStack(spacing: 8) {
                     testTearOffHook
                     testTearOffInactiveHook
                 }
+                .padding(.bottom, WindowChrome.bottomBarHeight)
             }
         }
         .ignoresSafeArea(edges: .top)
@@ -322,9 +332,12 @@ private struct AppShellHost: View {
         )
         .background(windowBackground.ignoresSafeArea())
         // Bottom-anchored banner for cross-window undo / drift
-        // notifications from the shared file-operation history.
+        // notifications from the shared file-operation history. Floats
+        // above the status bar (not over it) so its dismiss button stays
+        // clear of the bar's drag band.
         .overlay(alignment: .bottom) {
             FileOperationDriftBanner(history: services.fileExplorer.history)
+                .padding(.bottom, WindowChrome.bottomBarHeight)
                 .animation(.easeInOut(duration: 0.18), value: services.fileExplorer.history.lastDriftMessage)
         }
         .environment(\.palette, palette)

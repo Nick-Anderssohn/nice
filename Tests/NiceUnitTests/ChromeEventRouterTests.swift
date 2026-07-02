@@ -121,4 +121,46 @@ final class ChromeEventRouterTests: XCTestCase {
             .passThrough
         )
     }
+
+    // MARK: - Status-bar widget: always pass through, never drags/zooms
+
+    func test_widget_singleClick_passesThrough() {
+        XCTAssertEqual(
+            ChromeEventRouter.decision(
+                hitChain: [.widget], clickCount: 1, inBand: true, isFullScreen: false
+            ),
+            .passThrough
+        )
+    }
+
+    func test_widget_doubleClick_passesThrough_noAction() {
+        // A double-click on a widget must NOT run the title-bar action —
+        // the widget owns its press, exactly like a pill.
+        XCTAssertEqual(
+            ChromeEventRouter.decision(
+                hitChain: [.widget], clickCount: 2, inBand: true, isFullScreen: false
+            ),
+            .passThrough
+        )
+    }
+
+    func test_widgetOverStrip_singleClick_passesThrough() {
+        // A widget drawn on top of the status bar's strip background: the
+        // widget must win, so a press-drag on it never moves the window.
+        XCTAssertEqual(
+            ChromeEventRouter.decision(
+                hitChain: [.widget, .strip], clickCount: 1, inBand: true, isFullScreen: false
+            ),
+            .passThrough
+        )
+    }
+
+    func test_widgetOverStrip_doubleClick_passesThrough() {
+        XCTAssertEqual(
+            ChromeEventRouter.decision(
+                hitChain: [.widget, .strip], clickCount: 2, inBand: true, isFullScreen: false
+            ),
+            .passThrough
+        )
+    }
 }
