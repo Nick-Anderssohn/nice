@@ -4,6 +4,10 @@ The from-scratch GPUI-native terminal `InputHandler` from `IMPLEMENTATION-PLAN.m
 built and wired to a minimal live terminal-ish view. Build + headless verification are
 DONE (below); the composition checklist needs a display and a human at the keyboard.
 
+**RUN 2026-07-02: FULL PASS — gate G1 CLOSED, no gpui fork.** All five gating items
+pass live on the pin; results + item-8 diagnosis: `RESULTS-spike2-20260702.md`. Two
+runbook expectations are corrected inline below (items 2 and 4).
+
 **Code:**
 - `spikes/phase0-poc/aa-gamma/gpui-term-main/src/bin/ime-spike/main.rs` — the live spike
   bin: platform `InputHandler` impl, key-down policy, preedit overlay, alacritty
@@ -85,12 +89,18 @@ for every item (pty writes in hex, swallow flag, anchor rect).
    Expect the HUD `insertText(...) → COMMIT; swallow armed` and either NO enter key
    event or `key enter SWALLOWED`; **no `0d 0a` pty write**. Then a bare Enter → new
    prompt line (`pty ← "\r\n"`). Tab-commit variant: same, swallow message for `tab`.
+   *(Run correction 2026-07-02: "confirm a candidate with Enter" is the Japanese Romaji
+   flow — with Pinyin, Enter commits the RAW preedit (`nihao`) and Space selects the
+   candidate, matching system-wide behavior. The gating assertion — no `0d 0a` while
+   composing, bare Enter afterwards sends CR — is unchanged, and held.)*
 3. **Preedit editing** (matrix #3): while composing press ←/→/Backspace. Expect
    `setMarkedText` updates only (preedit/sel change), no pty writes, grid cursor
    does not move.
 4. **Dead keys** (matrix #4): ABC source, ⌥e then e → `pty ← "é"`, with the `´`
-   stage visible as a preedit. Re-run with `--option-as-meta`: ⌥e →
-   `pty ← "\x1be"` (ESC e), no composition.
+   stage visible as a preedit. Re-run with `--option-as-meta`: ⌥e → ESC e with no
+   composition — logged in the pty-write section as `pty ← "\u{1b}e" [1b 65]`
+   (Rust-debug escape; this runbook previously said `"\x1be"`, corrected 2026-07-02),
+   with the event line `key ⌥e → ESC e (option-as-meta ON; IME bypassed)`.
 5. **Press-and-hold** (matrix #5): hold `e`. Expect key-repeat (`pty ← "e"` many
    times), no accent popover, nothing stuck.
 6. **Candidate anchor** (matrix #6, zed#46055): move the cursor with arrows and
@@ -108,6 +118,11 @@ for every item (pty writes in hex, swallow flag, anchor rect).
 **Gate (plan):** 1-3, 6, 7 must PASS to close audit G1 with "no gpui fork". If a
 routing case fails app-side, the contingency is the ~10-30 LOC `gpui_macos`
 `handle_key_event` predicate patch (SCOPE §5) — record it as a maintained-fork cost.
+
+**Outcome (2026-07-02): 5/5 gating items PASS — G1 CLOSED; contingency retired
+unused.** Items 4/5/9 also pass; item 8 splits (commit path PASS via Character Viewer,
+summoning FAIL in the bare bin only — works in Zed ⇒ app/bundle-side). See
+`RESULTS-spike2-20260702.md`.
 
 ---
 
