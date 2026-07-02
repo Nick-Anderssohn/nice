@@ -1,0 +1,114 @@
+NICE Phase-0 §13 spike 11 — zed-main-patched ADDITIVE hook (headline harness).
+Applied on top of rev 10b07951838e422722e34641f4a9c0bfec9037ff + the
+bg-luminance patch (../bg-luminance-applied.patch). Touches ONE file that the
+bg-luminance patch does NOT touch (crates/gpui_macos/src/metal_renderer.rs):
+  * one guard line at the top of MetalRenderer::draw (scene submission), and
+  * an appended pub mod nice_draw_metrics (draw count, per-draw CPU ns, and
+    registrable begin/end callbacks the headline bin points at its os_signpost
+    C shim). No new deps, no required extern symbols — all other consumers of
+    the checkout build unchanged.
+Apply from zed-main-patched/ with: patch -p1 < ../gpui-term-main/zed-main-headline-hook.patch
+
+--- a/crates/gpui_macos/src/metal_renderer.rs
++++ b/crates/gpui_macos/src/metal_renderer.rs
+@@ -444,6 +444,10 @@
+     }
+ 
+     pub fn draw(&mut self, scene: &Scene) {
++        // NICE Phase-0 §13 spike 11 (additive hook, see nice_draw_metrics at
++        // the bottom of this file): count + time every scene submission and
++        // bracket it with the harness-registered os_signpost interval.
++        let _nice_draw_guard = nice_draw_metrics::DrawGuard::begin();
+         let layer = match &self.layer {
+             Some(l) => l.clone(),
+             None => {
+@@ -1795,5 +1799,89 @@
+ 
+     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+         self.renderer.sprite_atlas().clone()
++    }
++}
++
++/// NICE Phase-0 §13 spike 11 — ADDITIVE measurement hook (not upstream code).
++///
++/// `MetalRenderer::draw` is where a GPUI window's scene submission happens on
++/// current main (`Window::present()` -> `PlatformWindow::draw` -> here): one
++/// call = one CPU-side present submission (drawable acquire -> encode ->
++/// command-buffer commit [-> waitUntilScheduled -> drawable.present() in
++/// transactional mode]). The Phase-0 headline harness
++/// (spikes/phase0-poc/aa-gamma/gpui-term-main, bin `headline`) needs, per
++/// draw: an in-process CPU duration (summary percentiles) and an os_signpost
++/// interval ("Draw", subsystem dev.nickanderssohn.gpui-term-main, category
++/// present) comparable to the 0.2.2 vendored-gpui numbers and to Nice's
++/// SwiftTerm "Metal.Draw".
++///
++/// Self-contained on purpose: no new deps, no extern symbols required at
++/// link time, so every other consumer of this checkout builds unchanged.
++/// The signpost emission itself lives in the HARNESS binary (a C shim using
++/// the real os_signpost macros); it registers begin/end callbacks here at
++/// startup. Unregistered (every other binary): one atomic increment + one
++/// `Instant` read + a Vec push per draw, no signpost.
++pub mod nice_draw_metrics {
++    use std::sync::Mutex;
++    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++    use std::time::Instant;
++
++    /// Count of `MetalRenderer::draw` entries — real present submissions
++    /// (incremented whether or not hooks are registered).
++    pub static DRAW_COUNT: AtomicU64 = AtomicU64::new(0);
++    /// Per-draw CPU durations in nanoseconds (capped at 2^20 samples; the
++    /// harness drains/clears at measurement start and reduces at exit).
++    pub static DRAW_DUR_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
++
++    /// Returns an opaque token (e.g. an os_signpost id) passed to `EndFn`.
++    pub type BeginFn = extern "C" fn() -> u64;
++    pub type EndFn = extern "C" fn(u64);
++
++    static BEGIN_HOOK: AtomicUsize = AtomicUsize::new(0);
++    static END_HOOK: AtomicUsize = AtomicUsize::new(0);
++
++    /// Register the optional begin/end callbacks invoked around every draw.
++    /// Call once at process startup, before any window opens.
++    pub fn set_hooks(begin: BeginFn, end: EndFn) {
++        BEGIN_HOOK.store(begin as usize, Ordering::Release);
++        END_HOOK.store(end as usize, Ordering::Release);
+     }
++
++    pub(crate) struct DrawGuard {
++        token: u64,
++        started: Instant,
++    }
++
++    impl DrawGuard {
++        pub(crate) fn begin() -> Self {
++            DRAW_COUNT.fetch_add(1, Ordering::Relaxed);
++            let begin = BEGIN_HOOK.load(Ordering::Acquire);
++            let token = if begin != 0 {
++                let f: BeginFn = unsafe { std::mem::transmute::<usize, BeginFn>(begin) };
++                f()
++            } else {
++                0
++            };
++            DrawGuard {
++                token,
++                started: Instant::now(),
++            }
++        }
++    }
++
++    impl Drop for DrawGuard {
++        fn drop(&mut self) {
++            let dur_ns = self.started.elapsed().as_nanos() as u64;
++            if let Ok(mut durations) = DRAW_DUR_NS.lock() {
++                if durations.len() < (1 << 20) {
++                    durations.push(dur_ns);
++                }
++            }
++            let end = END_HOOK.load(Ordering::Acquire);
++            if end != 0 {
++                let f: EndFn = unsafe { std::mem::transmute::<usize, EndFn>(end) };
++                f(self.token);
++            }
++        }
++    }
+ }

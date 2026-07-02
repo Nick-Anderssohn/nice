@@ -37,6 +37,22 @@ path = "src/main.rs"
 name = "ime-spike"
 path = "src/bin/ime-spike/main.rs"
 
+# Phase-0 §13 spike 11 (part 1): re-run the HEADLINE measurements (streaming
+# FPS + per-draw CPU cost + interactive keystroke-latency) on the pinned
+# zed-main production-candidate stack, so they can be compared 1:1 against the
+# crates.io gpui 0.2.2 numbers (spikes/phase0-poc, bin gpui-term). Reuses the
+# parent crate's harness.rs verbatim via #[path] — identical clock, workload
+# generator, percentile reducer, memory sampler, and watchdog.
+#   headless self-tests: cargo run --bin headline            (workload path)
+#                        NICE_MAIN_INTERACTIVE=1 cargo run --bin headline
+#   live (display):      NICE_MAIN_RUN=1 cargo run --release --bin headline
+#                        NICE_MAIN_RUN=1 NICE_MAIN_INTERACTIVE=1 ... (pty/cat)
+# Per-draw CPU + "Draw" signpost need zed-main-headline-hook.patch (already
+# applied to ../zed-main-patched; recorded in this directory).
+[[bin]]
+name = "headline"
+path = "src/bin/headline/main.rs"
+
 [dependencies]
 # Patched local copy of the pinned rev (10b07951838e422722e34641f4a9c0bfec9037ff),
 # rsync'd from ~/.cargo/git/checkouts/zed-a70e2ad075855582/10b0795/ (minus .git)
@@ -45,6 +61,12 @@ path = "src/bin/ime-spike/main.rs"
 # Switch back to the git deps below to build the UNPATCHED baseline.
 gpui = { path = "../zed-main-patched/crates/gpui", features = ["test-support"] }
 gpui_platform = { path = "../zed-main-patched/crates/gpui_platform", features = ["test-support", "font-kit"] }
+# Direct dep for the headline bin only: reach the additive draw hook
+# (gpui_macos::metal_renderer::nice_draw_metrics — zed-main-headline-hook.patch)
+# to register the os_signpost shim + read per-draw CPU durations. Same path/
+# version cargo already builds transitively via gpui_platform, so this adds
+# no second build of the crate.
+gpui_macos = { path = "../zed-main-patched/crates/gpui_macos" }
 # gpui = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support"] }
 # gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support", "font-kit"] }
 
@@ -57,6 +79,28 @@ core-foundation-sys = "0.8"
 
 # PNG encoding (gpui's `image` re-export may not enable the png codec).
 png = "0.17"
+
+# ---- headline bin (spike 11) ------------------------------------------------
+# harness.rs (#[path]-included verbatim from spikes/phase0-poc/src) needs the
+# mach clock/task FFI; zed-main already pins mach2 0.5 so we match it.
+mach2 = "0.5"
+# pty fd O_NONBLOCK clearing (interactive mode), as in the 0.2.2 crate.
+libc = "0.2"
+# Echo-wakeup channel (pty reader thread -> foreground notify), as in 0.2.2.
+futures = "0.3"
+# NSView/CAMetalLayer present kick + screen info (hot-plug guard) — the same
+# objc2 stack zed-main itself links, so no new native seams.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSScreen",
+] }
+# gpui's Window implements raw_window_handle::HasWindowHandle on main (0.6,
+# matching the 0.2.2 crate's pin) — used to capture the NSView pointer.
+raw-window-handle = "0.6"
 
 [profile.dev]
 opt-level = 0
