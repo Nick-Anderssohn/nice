@@ -29,6 +29,14 @@ publish = false
 name = "gpui-term-main"
 path = "src/main.rs"
 
+# IME live spike (Phase-0 §13 spike 2, live half): the from-scratch
+# InputHandler on the same pinned zed-main-patched checkout. Pure marked-text
+# state machine + unit tests in src/bin/ime-spike/ime_state.rs; live window
+# gated on NICE_IME_SPIKE_RUN=1. Runbook: ../../ime-spike/RUN-IME.md.
+[[bin]]
+name = "ime-spike"
+path = "src/bin/ime-spike/main.rs"
+
 [dependencies]
 # Patched local copy of the pinned rev (10b07951838e422722e34641f4a9c0bfec9037ff),
 # rsync'd from ~/.cargo/git/checkouts/zed-a70e2ad075855582/10b0795/ (minus .git)
