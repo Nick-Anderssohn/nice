@@ -1,0 +1,20 @@
+{
+  "side": "swiftterm-fork",
+  "fork_rev": "583551f (phase0-txn-present; Nice pin 5f07dc6 + docs + off-by-default txn present)",
+  "theme": "dark",
+  "curve": "appleApprox",
+  "fontSmoothing": false,
+  "font_ps": "SFMono-Regular",
+  "font_px": 13.0,
+  "cell_w_pt": 8.5,
+  "cell_h_pt": 16.0,
+  "advance_w_pt": 8.0361328125,
+  "cols": 60,
+  "rows": 16,
+  "scale_factor": 2.0,
+  "drawable_w": 1020,
+  "drawable_h": 512,
+  "drawables_seen": 3,
+  "bg": "#090705",
+  "fg": "#f4f0ef"
+}

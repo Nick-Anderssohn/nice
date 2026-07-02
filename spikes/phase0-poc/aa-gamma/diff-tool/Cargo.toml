@@ -1,0 +1,22 @@
+# AA/gamma spike — pixel diff tool (aa-diff).
+#
+# Rust instead of python/PIL because this machine has no numpy/Pillow and no
+# uv; cargo is already the spike toolchain. Pure-Rust deps only.
+[package]
+name = "aa-diff"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate — do not join any enclosing workspace.
+[workspace]
+
+[[bin]]
+name = "aa-diff"
+path = "src/main.rs"
+
+[dependencies]
+png = "0.17"
+
+[profile.dev]
+opt-level = 2

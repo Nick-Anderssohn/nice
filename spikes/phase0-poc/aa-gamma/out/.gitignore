@@ -1,0 +1,6 @@
+# Regenerable pixel artifacts (RUNBOOK.md rebuilds them from the binaries + scene).
+# Keep only the decisive evidence: diff heatmaps, report.json numbers, and metas.
+*.png
+diff/*-ref.png
+diff/*-img.png
+!diff/*-heatmap.png

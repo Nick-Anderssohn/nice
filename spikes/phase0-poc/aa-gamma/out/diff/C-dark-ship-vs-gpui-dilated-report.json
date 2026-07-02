@@ -1,0 +1,30 @@
+{
+  "ref": "aa-gamma/out/swiftterm-dark-appleApprox.png",
+  "img": "aa-gamma/out/gpui-main-dark-smoothing-on.png",
+  "shift": [-20, -21],
+  "correlation": 0.887824,
+  "intersection": [1020, 512],
+  "max_delta": [246, 248, 250],
+  "mean_delta": [6.4015, 6.4206, 6.5442],
+  "rmse": [29.3904, 28.7220, 29.5718],
+  "threshold": 8,
+  "pct_over_threshold": 10.4741,
+  "per_row": [
+    {"row": 0, "mean": 9.2532, "max": 235, "pct_over": 8.6091},
+    {"row": 1, "mean": 6.3211, "max": 168, "pct_over": 10.9130},
+    {"row": 2, "mean": 7.6063, "max": 193, "pct_over": 12.5429},
+    {"row": 3, "mean": 4.1554, "max": 235, "pct_over": 6.9210},
+    {"row": 4, "mean": 12.8394, "max": 235, "pct_over": 12.3009},
+    {"row": 5, "mean": 4.8124, "max": 235, "pct_over": 5.4044},
+    {"row": 6, "mean": 8.5739, "max": 235, "pct_over": 9.3199},
+    {"row": 7, "mean": 4.8218, "max": 250, "pct_over": 8.0055},
+    {"row": 8, "mean": 6.9763, "max": 250, "pct_over": 10.1838},
+    {"row": 9, "mean": 1.9434, "max": 107, "pct_over": 5.2482},
+    {"row": 10, "mean": 7.5339, "max": 220, "pct_over": 8.7806},
+    {"row": 11, "mean": 6.1695, "max": 235, "pct_over": 7.9902},
+    {"row": 12, "mean": 9.3173, "max": 245, "pct_over": 39.2494},
+    {"row": 13, "mean": 4.6869, "max": 203, "pct_over": 7.3499},
+    {"row": 14, "mean": 11.2201, "max": 235, "pct_over": 10.0337},
+    {"row": 15, "mean": 4.8296, "max": 235, "pct_over": 4.7335}
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "ref": "aa-gamma/out/swiftterm-light-appleApprox.png",
+  "img": "aa-gamma/out/swiftterm-light-identity.png",
+  "shift": [0, 0],
+  "correlation": 0.968369,
+  "intersection": [1020, 512],
+  "max_delta": [93, 93, 93],
+  "mean_delta": [3.2333, 3.2196, 3.2849],
+  "rmse": [14.2729, 14.2432, 14.5589],
+  "threshold": 8,
+  "pct_over_threshold": 6.3881,
+  "per_row": [
+    {"row": 0, "mean": 2.9838, "max": 85, "pct_over": 4.9540},
+    {"row": 1, "mean": 6.4872, "max": 85, "pct_over": 10.7996},
+    {"row": 2, "mean": 7.5936, "max": 85, "pct_over": 12.4632},
+    {"row": 3, "mean": 3.4315, "max": 85, "pct_over": 6.3695},
+    {"row": 4, "mean": 7.2667, "max": 84, "pct_over": 10.0000},
+    {"row": 5, "mean": 1.0005, "max": 85, "pct_over": 1.7004},
+    {"row": 6, "mean": 0.4922, "max": 27, "pct_over": 2.3162},
+    {"row": 7, "mean": 0.6539, "max": 32, "pct_over": 2.5123},
+    {"row": 8, "mean": 3.6653, "max": 93, "pct_over": 7.2304},
+    {"row": 9, "mean": 3.5454, "max": 77, "pct_over": 6.7586},
+    {"row": 10, "mean": 3.5548, "max": 72, "pct_over": 7.4571},
+    {"row": 11, "mean": 1.6975, "max": 45, "pct_over": 6.3542},
+    {"row": 12, "mean": 2.9781, "max": 85, "pct_over": 6.4614},
+    {"row": 13, "mean": 4.2834, "max": 85, "pct_over": 7.2089},
+    {"row": 14, "mean": 4.1470, "max": 85, "pct_over": 6.7678},
+    {"row": 15, "mean": 1.6347, "max": 85, "pct_over": 2.8554}
+  ]
+}

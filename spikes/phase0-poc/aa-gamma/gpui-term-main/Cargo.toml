@@ -1,0 +1,50 @@
+# AA/gamma spike (rank-1): GPUI-native terminal scene renderer on CURRENT GPUI
+# main (pinned zed git rev), with first-party Metal readback -> PNG.
+#
+# Why git main and not crates.io gpui 0.2.2: main added default-on fg-luminance
+# smoothing dilation to the mac glyph rasterizer and removed vertical subpixel
+# positioning (zed PR #54728) — 0.2.2 would test the wrong renderer. crates.io
+# gpui is dormant (gpui_platform 404s there), so we pin the zed workspace rev
+# via git — the "gpui-component pattern". The 0.2.2 build path stays intact in
+# the parent crate (spikes/phase0-poc, bin gpui-term).
+#
+# Pinned rev (zed-industries/zed main as of 2026-07-01):
+#   10b07951838e422722e34641f4a9c0bfec9037ff
+#
+# Readback: gpui's "test-support" feature exposes VisualTestAppContext +
+# Window::render_to_image — the SAME draw_primitives/shaders as the shipping
+# renderer, drawn into the layer's next drawable (framebuffer_only=false under
+# test-support) and read back with get_bytes. This is zed's own visual-test
+# harness (crates/zed/src/visual_test_runner.rs uses the identical recipe).
+[package]
+name = "gpui-term-main"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone crate — do not join any enclosing workspace.
+[workspace]
+
+[[bin]]
+name = "gpui-term-main"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support", "font-kit"] }
+
+# Same VT core as the FPS spike (spikes/phase0-poc).
+alacritty_terminal = "0.26.0"
+
+# AppleFontSmoothing app-domain pref (GPUI main's dilation gate reads it once).
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+# PNG encoding (gpui's `image` re-export may not enable the png codec).
+png = "0.17"
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2

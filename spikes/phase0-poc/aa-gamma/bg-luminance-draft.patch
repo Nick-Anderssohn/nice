@@ -1,0 +1,183 @@
+# DRAFT — bg-luminance-aware text composition curve for GPUI's mac monochrome
+# text path (kitty text_composition_strategy "1.7 30" ≡ SwiftTerm .appleApprox).
+#
+# Target: zed-industries/zed @ 10b07951838e422722e34641f4a9c0bfec9037ff
+# Status: drafted from source reading for SIZING (spike-1 deliverable 6).
+#         NOT applied, NOT compiled. Hunk line numbers are approximate; apply
+#         by context. See bg-luminance-patch-plan.md for the full analysis.
+#
+# Semantics: MonochromeSprite.bg_luminance < 0 (default everywhere except
+# callers that opt in via TextRun.background_color) => curve disabled =>
+# byte-identical output for all existing GPUI users (upstreamable as opt-in).
+
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ pub struct MonochromeSprite {
+     pub order: DrawOrder,
+     pub pad: u32,
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
+     pub color: Hsla,
+     pub tile: AtlasTile,
+     pub transformation: TransformationMatrix,
++    /// Rec-709 luminance (display-gamma) of the cell background behind this
++    /// glyph, or a negative sentinel to disable the composition curve.
++    /// Drives the kitty-style bg-aware coverage remap in the mac fragment
++    /// shader (text_composition_strategy "1.7 30").
++    pub bg_luminance: f32,
++    pub pad2: u32,
+ }
+
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ impl Window {
+     pub fn paint_glyph(
+         &mut self,
+         origin: Point<Pixels>,
+         font_id: FontId,
+         glyph_id: GlyphId,
+         font_size: Pixels,
+         color: Hsla,
++        background: Option<Hsla>,
+     ) -> Result<()> {
+@@
++        // Display-gamma Rec-709 luminance, matching SwiftTerm's
++        // TextCompositionCurve.luminance(of:) so the two stacks' mixFactor
++        // agree. Negative = curve disabled.
++        let bg_luminance = background
++            .map(|bg| {
++                let rgba: Rgba = bg.into();
++                0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b
++            })
++            .unwrap_or(-1.0);
+@@ if subpixel_rendering { ... } else {
+                 self.next_frame.scene.insert_primitive(MonochromeSprite {
+                     order: 0,
+                     pad: 0,
+                     bounds,
+                     content_mask,
+                     color: color.opacity(element_opacity),
+                     tile,
+                     transformation: TransformationMatrix::unit(),
++                    bg_luminance,
++                    pad2: 0,
+                 });
+@@ paint_svg (the other MonochromeSprite site, ~:4057)
+         self.next_frame.scene.insert_primitive(MonochromeSprite {
+             order: 0,
+             pad: 0,
+             bounds: final_bounds,
+             content_mask,
+             color: color.opacity(element_opacity),
+             tile,
+             transformation,
++            bg_luminance: -1.0,
++            pad2: 0,
+         });
+
+--- a/crates/gpui/src/text_system/line.rs
++++ b/crates/gpui/src/text_system/line.rs
+@@ fn paint_line(...)
+         let mut run_end = 0;
+         let mut color = black();
++        let mut background: Option<Hsla> = None;
+@@ (decoration-run advance)
+                         run_end += style_run.len as usize;
+                         color = style_run.color;
++                        background = style_run.background_color;
+                     } else {
+                         run_end = layout.len;
++                        background = None;
+@@ (glyph paint)
+                         window.paint_glyph(
+                             glyph_origin + baseline_offset + vertical_offset,
+                             run.font_id,
+                             glyph.id,
+                             layout.font_size,
+                             color,
++                            background,
+                         )?;
+
+--- a/crates/gpui_macos/src/shaders.metal
++++ b/crates/gpui_macos/src/shaders.metal
+@@
++// Kitty text_composition_strategy "1.7 30" (SwiftTerm .appleApprox).
++// Spike: baked constants; product lane may hoist these into a uniform.
++constant float TEXT_COMPOSITION_GAMMA_INV = 1.0 / 1.7;
++constant float TEXT_COMPOSITION_CONTRAST = 1.30;
++
+ struct MonochromeSpriteVertexOutput {
+   float4 position [[position]];
+   float2 tile_position;
+   float4 color [[flat]];
++  float mix_factor [[flat]];
+   float4 clip_distance;
+ };
+
+ struct MonochromeSpriteFragmentInput {
+   float4 position [[position]];
+   float2 tile_position;
+   float4 color [[flat]];
++  float mix_factor [[flat]];
+   float4 clip_distance;
+ };
+
+@@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(...)
+   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+   float4 color = hsla_to_rgba(sprite.color);
++  // mixFactor = clamp((1 - L_fg + L_bg) * 0.5, 0, 1); negative bg_luminance
++  // disables the curve (sentinel -1 propagated to the fragment stage).
++  float mix_factor = -1.0;
++  if (sprite.bg_luminance >= 0.0) {
++    float fg_luminance =
++        dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
++    mix_factor =
++        clamp((1.0 - fg_luminance + sprite.bg_luminance) * 0.5, 0.0, 1.0);
++  }
+   return MonochromeSpriteVertexOutput{
+       device_position,
+       tile_position,
+       color,
++      mix_factor,
+       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+ }
+
+@@ fragment float4 monochrome_sprite_fragment(...)
+   float4 sample =
+       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+   float4 color = input.color;
+-  color.a *= sample.a;
++  float coverage = sample.a;
++  if (input.mix_factor >= 0.0) {
++    // clamp(mix(cov, pow(cov, 1/gamma), mixFactor) * contrast, 0, 1) —
++    // SwiftTerm Shaders.metal:terminal_text_fragment_gray, applied to the
++    // straight-alpha coverage instead of premultiplying (same math over
++    // GPUI's SourceAlpha/OneMinusSourceAlpha blend).
++    float curved = mix(coverage, pow(coverage, TEXT_COMPOSITION_GAMMA_INV),
++                       input.mix_factor);
++    coverage = clamp(curved * TEXT_COMPOSITION_CONTRAST, 0.0, 1.0);
++  }
++  color.a *= coverage;
+   return color;
+
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ struct MonochromeSprite {
+     color: Hsla,
+     tile: AtlasTile,
+     transformation: TransformationMatrix,
++    // Layout mirror of gpui::MonochromeSprite (curve is mac-only for now).
++    bg_luminance: f32,
++    pad2: u32,
+ }
+
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ struct MonochromeSprite {
+     Hsla color;
+     AtlasTile tile;
+     TransformationMatrix transformation;
++    // Layout mirror of gpui::MonochromeSprite (curve is mac-only for now).
++    float bg_luminance;
++    uint pad2;
+ };
