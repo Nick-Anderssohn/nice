@@ -51,3 +51,16 @@ objc2-app-kit = { version = "0.3", features = [
 # in harness.rs because mach2 0.4 does not ship it.
 mach2 = "0.4"
 libc = "0.2"
+
+# Interactive keystroke-latency mode (spikes 4b/5): pty-echo wakeups cross from
+# the reader thread to the GPUI main thread over an unbounded channel. Same
+# futures 0.3 gpui already links (no new transitive deps).
+futures = "0.3"
+
+# Vendored gpui 0.2.2 with the Nice Phase-0 patch applied (spike 3 GPUI-side
+# transactional-present toggle via NICE_POC_GPUI_TXN=1 + the "Draw" os_signpost
+# on subsystem dev.nickanderssohn.gpui-term). vendor/ is gitignored; recreate it
+# with ./vendor-gpui.sh (copies the pristine crates.io extraction and applies
+# gpui-0.2.2-nice.patch). See README §"Vendored gpui (spike 3 + signpost)".
+[patch.crates-io]
+gpui = { path = "vendor/gpui-0.2.2" }

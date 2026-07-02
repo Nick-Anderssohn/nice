@@ -1,0 +1,4 @@
+# Vendored gpui-0.2.2 (crates.io extraction + the Nice Phase-0 patch).
+# NOT committed (8 MB / ~185 files). Reproduce with ./vendor-gpui.sh, which
+# copies the pristine registry source and applies gpui-0.2.2-nice.patch.
+vendor/

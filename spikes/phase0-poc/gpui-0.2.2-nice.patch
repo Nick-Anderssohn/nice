@@ -1,0 +1,290 @@
+diff --color=never -ruN a/build.rs b/build.rs
+--- a/build.rs	2026-07-01 23:02:19
++++ b/build.rs	2026-07-01 23:53:34
+@@ -65,6 +65,7 @@
+ 
+     pub(super) fn build() {
+         generate_dispatch_bindings();
++        compile_nice_signpost_shim();
+         #[cfg(not(feature = "macos-blade"))]
+         {
+             let header_path = generate_shader_bindings();
+@@ -74,6 +75,42 @@
+             #[cfg(not(feature = "runtime_shaders"))]
+             compile_metal_shaders(&header_path);
+         }
++    }
++
++    /// NICE PHASE-0 PATCH: compile the os_signpost "Draw" shim
++    /// (src/platform/mac/nice_signpost.c) into a static lib and link it.
++    /// See the comment header in that file for the signpost name contract.
++    fn compile_nice_signpost_shim() {
++        use std::process::Command;
++
++        let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
++        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
++        let src = manifest.join("src/platform/mac/nice_signpost.c");
++        let obj = out_dir.join("nice_signpost.o");
++        let lib = out_dir.join("libnice_signpost.a");
++
++        println!("cargo:rerun-if-changed={}", src.display());
++
++        let status = Command::new("cc")
++            .arg("-O2")
++            .arg("-c")
++            .arg(&src)
++            .arg("-o")
++            .arg(&obj)
++            .status()
++            .expect("failed to spawn `cc` for the nice_signpost shim");
++        assert!(status.success(), "cc failed on nice_signpost.c");
++
++        let status = Command::new("ar")
++            .arg("rcs")
++            .arg(&lib)
++            .arg(&obj)
++            .status()
++            .expect("failed to spawn `ar` for the nice_signpost shim");
++        assert!(status.success(), "ar failed for libnice_signpost.a");
++
++        println!("cargo:rustc-link-search=native={}", out_dir.display());
++        println!("cargo:rustc-link-lib=static=nice_signpost");
+     }
+ 
+     fn generate_dispatch_bindings() {
+diff --color=never -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
+--- a/src/platform/mac/metal_renderer.rs	2026-07-01 23:02:19
++++ b/src/platform/mac/metal_renderer.rs	2026-07-01 23:53:34
+@@ -153,6 +153,11 @@
+                     | AutoresizingMask::HEIGHT_SIZABLE
+             ];
+         }
++        // NICE PHASE-0 PATCH (spike 3): optionally force transactional present
++        // for the whole run via env NICE_POC_GPUI_TXN=1 (see nice_poc module).
++        if nice_poc::forced_txn() {
++            layer.set_presents_with_transaction(true);
++        }
+         #[cfg(feature = "runtime_shaders")]
+         let library = device
+             .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
+@@ -257,7 +262,9 @@
+         Self {
+             device,
+             layer,
+-            presents_with_transaction: false,
++            // NICE PHASE-0 PATCH (spike 3): default stays `false` unless the
++            // NICE_POC_GPUI_TXN env override is active.
++            presents_with_transaction: nice_poc::forced_txn(),
+             command_queue,
+             paths_rasterization_pipeline_state,
+             path_sprites_pipeline_state,
+@@ -290,6 +297,12 @@
+     }
+ 
+     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
++        // NICE PHASE-0 PATCH (spike 3): with NICE_POC_GPUI_TXN=1, transactional
++        // present is forced ON for the whole run — the periodic `false` resets
++        // from window.rs (display_layer / windowDidBecomeKey) become no-ops, so
++        // the ordinary CVDisplayLink `step` frames also co-commit with the CA
++        // transaction. Default (env unset) is byte-identical to stock 0.2.2.
++        let presents_with_transaction = presents_with_transaction || nice_poc::forced_txn();
+         self.presents_with_transaction = presents_with_transaction;
+         self.layer
+             .set_presents_with_transaction(presents_with_transaction);
+@@ -351,6 +364,14 @@
+     }
+ 
+     pub fn draw(&mut self, scene: &Scene) {
++        // NICE PHASE-0 PATCH (spikes 5/6/8): os_signpost interval "Draw"
++        // (subsystem "dev.nickanderssohn.gpui-term", category "present") around
++        // the whole present path: next_drawable acquire -> encode -> commit
++        // (-> waitUntilScheduled -> drawable.present() when transactional).
++        // Symmetric to SwiftTerm's `Metal.Draw` interval (a CPU-side draw
++        // submission interval, NOT GPU-complete). The guard's Drop covers every
++        // return path. No-op (id 0) unless a signpost recorder is attached.
++        let _nice_draw_signpost = nice_poc::DrawSignpost::begin();
+         let layer = self.layer.clone();
+         let viewport_size = layer.drawable_size();
+         let viewport_size: Size<DevicePixels> = size(
+@@ -1352,4 +1373,66 @@
+ pub struct SurfaceBounds {
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
++}
++
++// ===========================================================================
++// NICE PHASE-0 PATCH — spike instrumentation for the Nice rewrite Phase-0
++// program (spikes/phase0-poc; see its README §"Vendored gpui"). Two pieces,
++// both inert by default:
++//
++//  1. `forced_txn()` — env `NICE_POC_GPUI_TXN=1` (also accepts "true"/"txn")
++//     forces GPUI's own Metal present into `presents_with_transaction` mode
++//     for the entire run (§13 spike 3: does Path A's 31 ms tail collapse when
++//     the GPUI side ALSO co-commits with the CA transaction?). gpui 0.2.2
++//     already ships the machinery (metal_renderer.rs draw(); window.rs
++//     display_layer/windowDidBecomeKey toggle it transiently); this override
++//     simply pins it on. Env unset => byte-identical stock behavior.
++//
++//  2. `DrawSignpost` — an os_signpost interval named "Draw" on subsystem
++//     "dev.nickanderssohn.gpui-term", category "present", spanning
++//     `MetalRenderer::draw` (drawable acquire -> encode -> commit ->
++//     [present when transactional]). Emitted via a tiny C shim
++//     (src/platform/mac/nice_signpost.c, compiled by this crate's build.rs)
++//     that uses the real <os/signpost.h> macros, so `xctrace record
++//     --template Logging` sees it exactly like SwiftTerm's `Metal.Draw`
++//     (subsystem org.tirania.SwiftTerm, category MetalProfile). Zero-cost
++//     when no recorder is attached (os_signpost_enabled gate).
++// ===========================================================================
++mod nice_poc {
++    use std::sync::OnceLock;
++
++    /// True iff env `NICE_POC_GPUI_TXN` is "1" | "true" | "txn" (read once).
++    pub(super) fn forced_txn() -> bool {
++        static FORCED: OnceLock<bool> = OnceLock::new();
++        *FORCED.get_or_init(|| {
++            matches!(
++                std::env::var("NICE_POC_GPUI_TXN").as_deref(),
++                Ok("1") | Ok("true") | Ok("txn")
++            )
++        })
++    }
++
++    unsafe extern "C" {
++        /// Returns a live os_signpost interval id (0 when not recording).
++        fn nice_signpost_draw_begin() -> u64;
++        /// Ends the interval opened by `nice_signpost_draw_begin` (0 = no-op).
++        fn nice_signpost_draw_end(id: u64);
++    }
++
++    /// RAII guard for one "Draw" signpost interval; Drop covers all exits.
++    pub(super) struct DrawSignpost(u64);
++
++    impl DrawSignpost {
++        #[inline]
++        pub(super) fn begin() -> Self {
++            DrawSignpost(unsafe { nice_signpost_draw_begin() })
++        }
++    }
++
++    impl Drop for DrawSignpost {
++        #[inline]
++        fn drop(&mut self) {
++            unsafe { nice_signpost_draw_end(self.0) }
++        }
++    }
+ }
+diff --color=never -ruN a/src/platform/mac/nice_signpost.c b/src/platform/mac/nice_signpost.c
+--- a/src/platform/mac/nice_signpost.c	1969-12-31 16:00:00
++++ b/src/platform/mac/nice_signpost.c	2026-07-01 23:53:34
+@@ -0,0 +1,72 @@
++// NICE PHASE-0 PATCH — os_signpost "Draw" interval shim.
++//
++// Why C and not Rust FFI: the os_signpost macros place the name/format
++// strings in the special __TEXT sections the signpost runtime expects and
++// pass the correct dso handle, so intervals are guaranteed visible to
++// `xctrace record --template Logging`. Hand-rolled Rust calls into
++// `_os_signpost_emit_with_name_impl` can silently emit nothing if either
++// detail is off — this spike cannot afford a silent failure discovered only
++// at live-run time.
++//
++// Contract (the keystroke-latency injection/reduction harness keys on these
++// exact strings — keep in sync with spikes/phase0-poc/README.md):
++//   subsystem: "dev.nickanderssohn.gpui-term"
++//   category : "present"
++//   name     : "Draw"
++//
++// Semantics: one interval per MetalRenderer::draw — CPU-side draw submission
++// (drawable acquire -> encode -> commandBuffer commit [-> waitUntilScheduled
++// -> drawable.present() in transactional mode]). NOT GPU-complete. Symmetric
++// to SwiftTerm's "Metal.Draw" (subsystem org.tirania.SwiftTerm, category
++// MetalProfile), which spans its draw(in:) the same way.
++//
++// Zero overhead when no recorder is attached: os_signpost_enabled() gates
++// begin; a 0 id makes end a no-op.
++
++#include <dispatch/dispatch.h>
++#include <os/log.h>
++#include <os/signpost.h>
++#include <stdatomic.h>
++#include <stdint.h>
++
++// Process-wide count of MetalRenderer::draw invocations (= actual Metal
++// draw/present submissions), counted regardless of whether a signpost
++// recorder is attached. The interactive keystroke-latency mode reports this
++// so its summary counts REAL renderer draws, not just GPUI scene rebuilds
++// (which happen on cx.notify() even when nothing is ever presented).
++static _Atomic uint64_t nice_draw_count;
++
++uint64_t nice_signpost_draw_count(void) {
++    return atomic_load_explicit(&nice_draw_count, memory_order_relaxed);
++}
++
++static os_log_t nice_poc_log(void) {
++    static os_log_t log;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        log = os_log_create("dev.nickanderssohn.gpui-term", "present");
++    });
++    return log;
++}
++
++uint64_t nice_signpost_draw_begin(void) {
++    atomic_fetch_add_explicit(&nice_draw_count, 1, memory_order_relaxed);
++    os_log_t log = nice_poc_log();
++    if (!os_signpost_enabled(log)) {
++        return (uint64_t)OS_SIGNPOST_ID_NULL;
++    }
++    os_signpost_id_t spid = os_signpost_id_generate(log);
++    if (spid == OS_SIGNPOST_ID_NULL || spid == OS_SIGNPOST_ID_INVALID) {
++        return (uint64_t)OS_SIGNPOST_ID_NULL;
++    }
++    os_signpost_interval_begin(log, spid, "Draw");
++    return (uint64_t)spid;
++}
++
++void nice_signpost_draw_end(uint64_t spid) {
++    if (spid == (uint64_t)OS_SIGNPOST_ID_NULL ||
++        spid == (uint64_t)OS_SIGNPOST_ID_INVALID) {
++        return;
++    }
++    os_signpost_interval_end(nice_poc_log(), (os_signpost_id_t)spid, "Draw");
++}
+diff --color=never -ruN a/src/window.rs b/src/window.rs
+--- a/src/window.rs	2026-07-01 23:02:19
++++ b/src/window.rs	2026-07-01 23:53:34
+@@ -1036,9 +1036,17 @@
+ 
+                 // Keep presenting the current scene for 1 extra second since the
+                 // last input to prevent the display from underclocking the refresh rate.
++                //
++                // NICE PHASE-0 PATCH (interactive keystroke-latency mode): with env
++                // NICE_POC_DAMAGE_ONLY=1 this keepalive is DISABLED so presents are
++                // purely damage-driven (needs_present / dirty) — otherwise a running
++                // CVDisplayLink presents the unchanged scene at refresh rate for 1 s
++                // after every keystroke, and the "Draw" signpost samples frame phase
++                // instead of echo latency. Env unset => stock behavior.
+                 let needs_present = request_frame_options.require_presentation
+                     || needs_present.get()
+-                    || (active.get()
++                    || (!nice_poc_damage_only()
++                        && active.get()
+                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+ 
+                 if invalidator.is_dirty() || request_frame_options.force_render {
+@@ -5100,4 +5108,16 @@
+         border_color: border_color.into(),
+         border_style,
+     }
++}
++
++/// NICE PHASE-0 PATCH: true iff env `NICE_POC_DAMAGE_ONLY` is "1" | "true"
++/// (read once). See the request-frame keepalive above.
++fn nice_poc_damage_only() -> bool {
++    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *V.get_or_init(|| {
++        matches!(
++            std::env::var("NICE_POC_DAMAGE_ONLY").as_deref(),
++            Ok("1") | Ok("true")
++        )
++    })
+ }

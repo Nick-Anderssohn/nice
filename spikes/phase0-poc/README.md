@@ -328,6 +328,253 @@ ticking). It self-terminates and prints a populated report.
 
 ## Provenance
 - SwiftTerm fork: `/Users/nick/Projects/SwiftTerm` @ `2f2a0b727feaa0d51659a9aaa21d47d752a16e0b` (read-only).
-- gpui `0.2.2` (crates.io), objc2 `0.6`, objc2-app-kit/foundation `0.3`, raw-window-handle `0.6`.
+- gpui `0.2.2` (crates.io — since 2026-07-01 **vendored + patched**, see below), objc2 `0.6`,
+  objc2-app-kit/foundation `0.3`, raw-window-handle `0.6`.
 - Extends: `../spike-gpui-glass/glassdemo` (window/vibrancy/traffic-lights),
   `../spike-reuse-swiftterm` (objc2 NSView host + @_cdecl C-ABI dylib pattern).
+
+---
+
+# 2026-07-01 spike prep — vendored gpui, spike 3 txn toggle, present signpost, spike 8 multi-session
+
+Build-only prep for §13 spikes 3 and 8 plus the keystroke-latency present
+signpost. Everything below compiles headless; every live run stays
+display-gated behind `NICE_POC_RUN=1`.
+
+## Vendored gpui (required to build since 2026-07-01)
+
+`Cargo.toml` patches `gpui` to a repo-local copy:
+
+```toml
+[patch.crates-io]
+gpui = { path = "vendor/gpui-0.2.2" }
+```
+
+`vendor/` is **gitignored** (~8 MB / ~185 files). The committed source of truth is:
+
+- `gpui-0.2.2-nice.patch` — the full diff vs the pristine crates.io 0.2.2
+  extraction (3 files: `build.rs`, `src/platform/mac/metal_renderer.rs`, new
+  `src/platform/mac/nice_signpost.c`);
+- `vendor-gpui.sh` — copies the pristine extraction out of
+  `~/.cargo/registry/src/*/gpui-0.2.2` (or the `.crate` tarball in
+  `registry/cache`) into `vendor/gpui-0.2.2` and applies the patch.
+
+Fresh checkout ⇒ run `./vendor-gpui.sh` once, then `cargo build` as usual.
+With the env vars below unset, the patched gpui is **behavior-identical** to
+stock 0.2.2 (the txn override reads as `false`; the signpost is gated on
+`os_signpost_enabled` and emits nothing unless a recorder is attached).
+
+## Spike 3 — GPUI-side transactional present (`NICE_POC_GPUI_TXN`)
+
+gpui 0.2.2 already ships the transactional-present machinery
+(`metal_renderer.rs` draw path; `window.rs` toggles it transiently around
+`display_layer`/`windowDidBecomeKey`). The patch adds a runtime override —
+env **`NICE_POC_GPUI_TXN=1`** (also accepts `true`/`txn`) — that pins
+`presents_with_transaction` ON for the whole run, so the ordinary
+CVDisplayLink `step` frames also co-commit inside the CA transaction
+(`commit → waitUntilScheduled → drawable.present()`).
+
+> **Deliberate deviation from the tasking:** the GPUI-side switch is a
+> **separate** env var, *not* overloading `NICE_POC_PRESENT=txn`. Reason:
+> `NICE_POC_PRESENT=txn` already selects the **SwiftTerm-side** transactional
+> present in the Path-A bin, and spike 3's A/B needs the two sides
+> independently switchable (re-running "terminal txn alone" fresh is arm A).
+> Defaults preserve every previously measured mode bit-for-bit.
+
+Live A/B (user, with a display; SwiftTerm fork branch `phase0-txn-present`
+checked out for the `txn` terminal mode, as before):
+
+```sh
+cd spikes/phase0-poc
+# Arm A — terminal txn only (replicates the §10 measurement: p50 18.3 / p95 31 ms)
+NICE_POC_REAL_BRIDGE=1 NICE_POC_RUN=1 NICE_POC_PRESENT=txn cargo run --bin phase0-poc
+# Arm B — terminal txn + GPUI txn (the audit's untested "~1-line GPUI-side fix")
+NICE_POC_REAL_BRIDGE=1 NICE_POC_RUN=1 NICE_POC_PRESENT=txn NICE_POC_GPUI_TXN=1 cargo run --bin phase0-poc
+# Optional Path-B control — does forced txn change the single-stack cadence?
+NICE_POC_RUN=1 cargo run --bin gpui-term
+NICE_POC_RUN=1 NICE_POC_GPUI_TXN=1 cargo run --bin gpui-term
+```
+
+Read: if arm B's p95 tail collapses toward the ~17 ms single-stack line, the
+only measured A-vs-B quality differentiator collapses with it (§13 spike 3).
+
+## Present signpost (keystroke-latency harness contract)
+
+The vendored gpui emits an os_signpost **interval** around every GPUI Metal
+draw/present (`MetalRenderer::draw`), via a C shim using the real
+`<os/signpost.h>` macros. **Exact names** (the injection/reduction harness
+keys on these):
+
+| Field | Value |
+|---|---|
+| subsystem | `dev.nickanderssohn.gpui-term` |
+| category | `present` |
+| signpost name | `Draw` |
+| type | interval (`os_signpost_interval_begin`/`_end`, one per draw) |
+
+Nice/SwiftTerm counterpart (for the symmetric reduction): subsystem
+`org.tirania.SwiftTerm`, category `MetalProfile`, name `Metal.Draw`, gated on
+`SWIFTTERM_PROFILE=1`.
+
+Placement + semantics:
+
+- Spans `MetalRenderer::draw` entry → return: `next_drawable()` acquire (can
+  block on drawable availability/vsync) → instance-buffer acquire → encode →
+  `commandBuffer.commit()` (→ `waitUntilScheduled` → `drawable.present()` in
+  transactional mode). This is a **CPU-side draw-submission interval, NOT
+  GPU-complete** — the same semantics as SwiftTerm's `Metal.Draw` (which spans
+  its `draw(in:)` the same way, incl. the `currentDrawable` wait).
+- **One semantic difference:** SwiftTerm's `Metal.Draw` includes
+  `BuildDrawData` (terminal grid → vertex data) inside the interval; GPUI
+  builds its `Scene` earlier (element layout/paint in `render()`), so the GPUI
+  `Draw` covers encode+submit of a prebuilt scene. For keystroke→present
+  latency use the interval **END** as the present stamp on both sides — those
+  anchors are equivalent (post-encode commit, present scheduled/inline).
+- Emitted by **both bins** (it is inside gpui): in `gpui-term` (single stack)
+  the GPUI draw **is** the terminal present; in `phase0-poc` (Path A) it is
+  the GPUI **chrome** composite only — the terminal side keeps SwiftTerm's own
+  `Metal.Draw`.
+- Multi-window runs interleave `Draw` intervals from all windows on the main
+  thread (serialized, never nested); per-interval ids are generated, but the
+  stream does not tag which window — single out w0 by cadence or run K=1 for
+  per-window latency.
+- No env var needed: gated on `os_signpost_enabled()`, zero-cost unless a
+  recorder is attached. Capture with
+  `xctrace record --template Logging --attach <pid>` (or `--launch`), then
+  reduce the `os_signpost` table filtered on the subsystem above.
+
+## Interactive keystroke-latency mode (spikes 4b/5 — the Path-B half)
+
+The `Draw` signpost above is only a usable latency anchor if draws are
+**damage-gated** (the harness caveat in `baseline/keystroke-harness/RUN.md`
+§4: a per-RAF-frame Draw samples frame phase, not latency). This mode makes
+that true by construction:
+
+```sh
+cd spikes/phase0-poc
+# LIVE (display-gated; release build for real numbers):
+NICE_POC_RUN=1 NICE_POC_INTERACTIVE=1 cargo run --release --bin gpui-term
+# optional: NICE_POC_SECS=<n> (default 120) — auto-exit + one-line summary
+# HEADLESS self-test (safe anywhere; no window):
+NICE_POC_INTERACTIVE=1 cargo run --bin gpui-term
+```
+
+What it does (all in `src/gpui_term.rs`):
+
+- **One window, NO synthetic workload, NO RAF loop** — `render()` never calls
+  `request_animation_frame`. The multi-session flags are ignored in this mode.
+- **Real pty:** `alacritty_terminal::tty` spawns **`/bin/cat`** behind an
+  `openpty` pair (`PtySession`). Canonical mode + ECHO stay at kernel
+  defaults, so every typed byte is echoed by the tty line discipline
+  immediately (and cat re-emits the whole line after Return) — the closest
+  analog to the Nice Dev baseline's zsh+`cat` loopback. (Fallback if cat ever
+  misbehaves: `/bin/zsh -c 'exec cat'`.)
+- **Key path:** GPUI `on_key_down` on a focused div → `keystroke_bytes()`
+  (plain printables via `Keystroke.key_char`, plus enter→`\r`, tab, space,
+  backspace→0x7f; **no kitty/CSI-u encoder**; modified keys ignored) → raw
+  `write` to the pty master. The window is activated (`cx.activate(true)`)
+  and the div focused at open, so externally-activated typing (harness:
+  activate the app, then `CGEventPostToPid` keycode 0 + unicode 'a') lands
+  without a click.
+- **Echo path (present-kick fix, 2026-07-01, after the first live run):**
+  blocking pty reader thread → parse into `FairMutex<Term>` → byte counter +
+  dirty flag → unbounded-channel wakeup → foreground task does `cx.notify()`
+  **plus a platform present kick**. The kick is load-bearing: in gpui 0.2.2
+  `cx.notify()` only rebuilds the scene (app-side `Window::draw`, which sets
+  `needs_present`) — the Metal present runs *only* from the platform
+  request-frame path (CVDisplayLink `step` / `displayLayer:`), and gpui
+  **stops the display link for occluded windows** — so notify alone produced
+  505 scene rebuilds and **zero** Metal draws in the first live run. The kick
+  (`kick_platform_display`) marks the GPUI NSView **and its backing
+  CAMetalLayer** (`setNeedsDisplay`) so the next CA commit fires
+  `displayLayer:` → gpui's request-frame → `Window::present()` →
+  `MetalRenderer::draw` → **one `Draw` signpost per echo**, independent of
+  the display-link state. (That path presents transactionally — gpui's own
+  `displayLayer:` behavior.) A channel, not a poller, so the wakeup adds no
+  quantization to the measured latency.
+- **Keepalive present disabled** (`NICE_POC_DAMAGE_ONLY=1`, auto-set by this
+  mode; a vendored-gpui knob in core `window.rs`): stock gpui keeps
+  presenting the *unchanged* scene at refresh rate for **1 s after every
+  input** ("prevent the display from underclocking") whenever the display
+  link runs — during continuous typing that is a 60 Hz `Draw` spray that
+  samples frame phase, not latency. With the knob set, presents happen only
+  on damage (`needs_present`/dirty). Env unset ⇒ stock behavior (all other
+  modes unaffected).
+- **Occlusion (for arranging the live run):** stock gpui stops its
+  CVDisplayLink when the window is **fully occluded**
+  (`windowDidChangeOcclusionState`) — consistent with the first run's zero
+  presents if the window sat behind others. The kick does **not** depend on
+  the display link and fires even for an occluded window (CA commits still
+  run app-side). Residual caveat: a fully-occluded `CAMetalLayer` *may*
+  recycle drawables lazily (pool of 3, `allowsNextDrawableTimeout=NO` ⇒
+  `next_drawable` blocks rather than drops) — safest is the window at least
+  partially visible; the summary's `metal draws` count will immediately show
+  if occlusion still gated anything.
+- **Cursor/blink:** this bin renders **no cursor at all** (grid text + cell
+  backgrounds only) and owns **no timers** — zero timer-driven draws exist.
+  Remaining non-echo draw sources are OS-initiated only (window open, resize,
+  occlusion/appearance change, activation) — and **mouse movement over the
+  window** can trigger extra renders via GPUI's hitbox tracking, so keep the
+  pointer parked outside the window during a measurement run.
+- **Exit:** after `NICE_POC_SECS` (a timer, not a render-path check — a
+  demand-driven window may not render for long stretches), prints one line:
+  **metal draws** (real `MetalRenderer::draw` count from the C shim — the
+  honest present number), scene rebuilds (Element renders), pty bytes echoed,
+  keys sent. Healthy run: `metal draws ≈ keys + a few` (window-open/
+  activation presents). `scene rebuilds` high while `metal draws` ~0 is the
+  failed pattern.
+
+Headless verification (`NICE_POC_INTERACTIVE=1` without `NICE_POC_RUN`):
+spawns the same pty, writes `hello\r`, asserts ≥12 bytes came back (kernel
+echo + cat's line), the dirty flag was set, and the parsed grid contains
+"hello" twice. Verified PASS in debug and release (bytes_echoed=14). The
+present kick itself is display-gated — verify live via the summary counts
+and xctrace (`Draw` rows ≈ key count).
+
+## Spike 8 — multi-session gpui-term (pump off the render path)
+
+Restructure (in `src/gpui_term.rs`): the old `render()`-inline
+`pump()` (workload generate + `Processor::advance` **on the main thread**,
+old lines 286–289) is gone. Each session now owns a **feeder thread**
+(`Session::spawn`) that parses the deterministic workload into a shared
+`FairMutex<Term>` paced by wall clock (5 ms ticks at the profile byte rate —
+same ~500 KB/s aggregate as before); `render()` only takes a short lock to
+snapshot. Idle windows redraw on demand via a dirty-flag → `cx.notify()`
+poller (~10 Hz) instead of RAF; streaming windows keep the RAF loop as the
+measurement clock, unchanged.
+
+Live-run flags (all optional; defaults = the original single-window run):
+
+| Var | Default | Effect |
+|---|---|---|
+| `NICE_POC_WINDOWS=K` | `1` | open K windows (clamped 1..=16), cascaded |
+| `NICE_POC_STREAMING=M` | `K` | first M windows stream the full workload + RAF-render; w0 is always streaming (it is the coordinator: deadline, memory, report) |
+| `NICE_POC_BG_BPS=N` | `0` | byte rate of the K−M background sessions; `0` = idle-with-live-session (1 heartbeat line/s, demand-driven redraw) |
+
+Per-window seeds are `seed + window_index` (deterministic, distinct streams;
+w0 keeps the original stream). Every session = its own feeder thread, so
+K−M background sessions are literally "background parsers off the main
+thread" (§13 spike 8).
+
+```sh
+cd spikes/phase0-poc
+# Spike 8 target scenario: 3 streaming + 4 idle-with-live-session = 7 windows
+NICE_POC_RUN=1 NICE_POC_WINDOWS=7 NICE_POC_STREAMING=3 cargo run --bin gpui-term
+# Harder variant: the 4 background parsers churn at FULL workload rate off-main
+NICE_POC_RUN=1 NICE_POC_WINDOWS=7 NICE_POC_STREAMING=3 NICE_POC_BG_BPS=500000 cargo run --bin gpui-term
+# Spike 6 pairing — release build (already built): add --release to any of the above
+NICE_POC_RUN=1 NICE_POC_WINDOWS=7 NICE_POC_STREAMING=3 cargo run --release --bin gpui-term
+```
+
+Output: the single-window summary/CSV are unchanged when `K=1`
+(`gpui-term-gpui-native-single-stack.csv`). With `K>1` the report adds a
+`-- per-window cadence (spike 8) --` block (per-window p50/p95/p99/cliffs +
+bytes fed) and writes `gpui-term-multi-<K>w<M>s.csv` with the window index in
+the `stack` column (`gpui-native-w<N>-stream` / `gpui-native-w<N>-bg`).
+Memory numbers are process-wide (all sessions live in one process).
+
+Known limits (spike-grade, by design): the measurement start is w0's first
+frame (other windows' warm-up frames are cleared then, but their streams may
+start a frame or two apart); background-window frame intervals track the
+heartbeat/notify cadence, not fps; a background window's dirty flag can be
+consumed by its own render racing the poller (at most one delayed redraw).
