@@ -42,6 +42,12 @@ Two consequences:
    rewrite. v2's tasks are drawn from the catalog's documented pain
    mechanisms (v1's badge survives as an optional seam-free *control*).
 
+**v2.1 note (same day):** the Xcode 26.3 agent-integration contingency
+(v1's decision-rule branch 4) is removed entirely. Nick has ruled it out —
+he will not use Xcode's agent integration, period. Claude Code CLI is the
+real workflow both arms are measured in; no replication is owed under any
+outcome.
+
 ## 1. The question, sharply
 
 The rewrite's velocity driver, correctly stated: **Claude's effectiveness
@@ -51,9 +57,10 @@ internals opaque to hit-testing, drag-session lifecycles split across two
 frameworks, native chrome re-synthesized by hand — **and a single-framework
 GPUI chrome removes that cap** (one owner for window, event routing, and
 view tree). That claim gates the rewrite; it has never been measured
-head-to-head. The audit's secondary note stands: Xcode 26.3's agent
-integration erodes the Swift side's *tooling* handicap, which §3/branch 4
-handles.
+head-to-head. (The audit's side note about Xcode 26.3's agent integration
+is moot: Nick has ruled it out of his workflow entirely, so Claude Code
+CLI is the real environment on both sides and no tooling correction
+applies.)
 
 **What is actually measurable.** As in v1: no task isolates "the seam" from
 framework corpus or codebase shape; every session exercises the composite.
@@ -83,12 +90,8 @@ anchored dimensions in §4, median across judges, then across runs.
 3. **Rust ≫ Swift** (Swift DNFs the objective gate — including failing a
    differential invariant — where Rust passes on the same task, or a graded
    gap ≥ 1.0 replicated on both tasks): premise **supported**. Date-stamp
-   the measured values into the report and proceed.
-4. **Xcode contingency (asymmetric on purpose, unchanged from v1):** both
-   arms run in Claude Code CLI, the Swift arm's weaker real-world tooling.
-   A Swift win is conclusive as-is (it won handicapped); any Rust-favoring
-   outcome cited in a commitment memo first requires **one Swift
-   replication inside Xcode 26.3's agent integration**.
+   the measured values into the report and proceed. No tooling replication
+   is owed (v1's branch 4 is deleted — see §0 v2.1 note).
 
 **Power honesty (unchanged).** n=2/arm on the primary is a screen for a
 claimed *decisive* gap, not a measurement of small effects. A gap too
@@ -247,8 +250,12 @@ Carried from v1 verbatim unless noted:
   (Swift: targeted `scripts/test.sh` suites green; Rust: existing
   `gpui-term` headless modes still build and run); code matches the style
   of the files it touches.
-- **Xcode 26.3 Agent-SDK tooling: OUT of the main run, IN as contingency**
-  (unchanged; decision-rule branch 4).
+- **Xcode 26.3 Agent-SDK tooling: excluded outright (Nick, 2026-07-02).**
+  Not a contingency: Nick will not use Xcode's agent integration, so it is
+  not part of any real workflow being compared. Both arms run in Claude
+  Code CLI — the environment Nice work actually happens in on either stack
+  — so results generalize to the workflow that would really be practiced.
+  v1's "handicapped Swift arm" framing is retired with it.
 - **Hypothesis blinding** (unchanged): briefs are routine feature requests;
   no mention of experiment, comparison, or rewrite; `notes/` scoped out;
   residual inference risk accepted (§6-T6); judges blind to the decision
@@ -348,7 +355,7 @@ stop, report partial, decide with Nick.
 | T4 | **Judge bias.** | Unchanged: blind framing, anchored + counted dimensions, objective gate supreme, 3 judges + tie-break, rationales published. |
 | T5 | **One-shot variance.** | Unchanged: n=2 primary, replication required for the strong branches, branch 2 absorbs noisy small gaps. |
 | T6 | **Demand effects.** | Unchanged: routine-feature-request briefs, `notes/` scoped out, residual accepted (symmetric). |
-| T7 | **Harness confound vs real Swift workflow** (no Xcode agent). | Unchanged: known-sign bias against Swift; branch 4 obligates the Xcode replication before any Rust-favoring commitment citation. |
+| T7 | **Harness under-represents hypothetical Swift tooling** (Xcode 26.3's agent integration exists in the wild but is unused here). | Dissolved by decision, not mitigation: Nick has ruled Xcode's agent integration out of his workflow permanently, so Claude Code CLI *is* the real Swift workflow the decision is about. No replication owed. Recorded so a future audit sees the exclusion was deliberate, not an oversight. |
 | T8 | **gpui 0.2.2 vs production zed-main pin.** | Unchanged: known-sign bias *for* Rust; Rust-loses is conclusive; narrow Rust win labeled an upper bound + optional pinned-main sensitivity re-run. |
 | T9 | **Verification asymmetry** (XCUITest suites vs none). | Unchanged: DoD uses manual functional checklists both arms; each side's native cheap regression mechanism only. Note: XCUITest's documented event-synthesis gaps are exactly why the checklists are executed manually/by driving the real app. |
 | T10 | **Task selection bias (NEW)** — tasks chosen from Swift's own failure record could overfit the experiment against Swift. | Named openly: the documented failure distribution *is* the distribution the rewrite decision is about — sampling anywhere else measures the wrong thing (v1's mistake, inverted). Mitigations: C0 seam-free control bounds the instrument; T3 spare targets a GPUI-weak surface (platform drag-out); T1/T2 also engage GPUI's genuinely thin surfaces (window-drag behavior, titlebar geometry, timers/animation), so the tasks are not one-sided-by-construction; and branch 1 of the decision rule gives Swift full credit for winning on its home turf. |
@@ -365,5 +372,3 @@ stop, report partial, decide with Nick.
 3. Approve the §1 decision rule as binding before data.
 4. Approve budget: ~4–5.5M tokens (~5–6.5M with C0), ~1 active day, ~1–1.5 h
    of your time.
-5. Confirm Xcode 26.3 handling (CLI-only main run + contingent Xcode
-   replication on any Rust-favoring outcome) — unchanged from v1.
