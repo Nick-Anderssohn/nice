@@ -44,3 +44,14 @@ A's ceiling (the GPUI-side `presents_with_transaction` ~1-line fix was never
 tested)" is now closed: the fix WAS tested, and the tail did not move. Path A's
 measured ceiling on this panel stands at p50 ~18.3 / p95 ~31 ms under
 continuous load, vs Path B single-stack p50 16.67 / p95 ~16.8 ms.
+
+## Extension (2026-07-02, spike 7 real-bridge trace replay)
+
+The tail is also **byte-rate independent**, not just present-mode
+independent: replaying a real claude-session trace averaging ~145 B/s
+(~3,400x lighter than this spike's 500 KB/s synthetic load) through the
+same real-bridge txn configuration gives term 18.00/30.75 p50/p95 —
+numerically identical to the synthetic 18.34/31.07 above. The RAF-driven
+co-present pays the coordination cost per frame, not per byte, so the
+"under continuous load" qualifier can be dropped: even a mostly-idle
+real session pays the tail. See `RESULTS-spike7-20260702.md`.

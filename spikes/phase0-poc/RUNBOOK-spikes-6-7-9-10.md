@@ -61,10 +61,16 @@ NICE_POC_REAL_BRIDGE=1 NICE_POC_RUN=1 NICE_POC_PRESENT=txn NICE_POC_TRACE=/tmp/c
 NICE_POC_RUN=1 NICE_POC_WINDOWS=7 NICE_POC_STREAMING=3 NICE_POC_TRACE=/tmp/claude-session.nicetrace NICE_POC_TRACE_LOOP=1 NICE_POC_SECS=30 cargo run --release --bin gpui-term
 ```
 
-RESULT (fill in): paced p50/p95/p99 vs synthetic ____ ; drain wall ____ ms
-for ____ bytes, max frame interval ____ ms; Path A vs B drain delta ____ .
-Validate the synthetic mix: does the trace's paced run pace/land near the
-synthetic numbers (workload realism, §13 measurement blind spot)?
+RESULT (2026-07-02, RUN; A-arm re-run same day on the REAL bridge): paced
+B t2 16.66/17.63/17.68 vs synthetic 16.67/17.35/17.61 — clean 60 fps;
+paced A t2 (real bridge, banner-verified) **18.00/30.75** — the ~31 ms
+tail is PRESENT at real pacing, identical to synthetic 18.34/31.07 ⇒
+byte-rate independent; the differential does not soften. Drain wall ~0 ms
+for 27,799 B (t2) and 98,563 B (t1), >100 MB/s both bins. Realism
+validated: real bytes ~3 orders of magnitude lighter than synthetic ⇒
+synthetic numbers are conservative upper bounds. (First A attempt
+silently ran the stub bridge — build-time flag + prebuilt binary; always
+check the bridge banner.) Full write-up: `RESULTS-spike7-20260702.md`.
 
 ---
 
@@ -106,9 +112,12 @@ summary's rusage energy line (`ri_billed_energy`).
 120 Hz answer without ProMotion: per-frame total cost (draw CPU + GPU time +
 busy-cost) < 8.3 ms ⇒ 120 Hz headroom exists; scale energy by 2x draw rate.
 
-RESULT (fill in): idle CPU ____%/60s, dot CPU ____%, streaming CPU ____%;
-draw CPU p50 ____ ms (Nice 1.19); GPU p50 ____ ms; shape hit rate ____%;
-energy idle/dot/stream ____/____/____ mW.
+RESULT (2026-07-02, RUN): idle CPU 0.6%/60s, dot 5.6%, streaming 14.8%;
+draw CPU p50 0.076 ms (honest analog to Nice's 1.19 is paint-closure 1.54);
+GPU p50 0.871 ms; shape hit 39.9%; per-frame total ~2.5 ms ⇒ 120 Hz
+headroom. rusage mJ column is inconsistent — use CPU%/wakeups; the sudo
+powermetrics pass stays parked for Nick. Full write-up:
+`RESULTS-spike6-20260702.md`.
 
 ---
 
@@ -143,9 +152,11 @@ live-resize by dragging the window edge (both need real input; the
 programmatic versions above cover the VT-core + relayout cost — note the
 distinction in the results).
 
-RESULT (fill in): reflow stall p50/p95/max ____ under streaming (kill-signal
->200 ms?); frame p50/p95 during scroll churn ____ ; selection evicted-frames
-____ ; memory steady/peak at 1k/10k/100k ____ .
+RESULT (2026-07-02, RUN, PASS): reflow stall p50/p95/max 6.25/7.85/9.00 ms
+@10k (kill-signal absent by ~20×; all-three worst 11.87 ms); scroll churn
+16.67/17.15; selection 68 re-anchors, resolves to None on eviction sanely;
+memory steady 119.7/137.2/434.0 MiB at 1k/10k/100k — linear in the limit,
+closes the spike-8 memory flag. Full write-up: `RESULTS-spike9-20260702.md`.
 
 ---
 
@@ -171,9 +182,13 @@ whole-texture granularity) and GROW LINEARLY in run 2. `upload MiB` ≈ 1 MiB ×
 30 fps × 60 s ≈ 1.8 GiB in both. Watch the frame-interval block for
 upload-driven drops (cliffs>1.5×p50).
 
-RESULT (fill in): run-1 poly live tex/MiB start→end ____ ; run-2 growth
-____ MiB/min; frame p95 under pressure ____ vs plain ____ ; sweep mono atlas
-growth ____ tex / ____ MiB, shape-cache hit rate ____%.
+RESULT (2026-07-02, RUN, PASS): run-1 poly +423/−419 tex, live plateau
+4 tex = 16 MiB (remove() reclaims, whole-texture granularity — as
+predicted); run-2 growth ~1.7 GiB/min (424 tex = 1696 MiB, process
+~3.5 GiB); frame p95 under pressure 18.34 vs plain 17.35, auto-cliffs 1
+(no upload-driven drops at 1682 MiB/60s); sweep mono atlas +368 tex =
+368 MiB never evicted (0.2.2 mono atlas has NO eviction — hygiene item,
+not a blocker), hit rate 4.0%. Full write-up: `RESULTS-spike10-20260702.md`.
 
 ---
 

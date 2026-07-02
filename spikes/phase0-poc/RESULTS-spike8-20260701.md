@@ -64,3 +64,21 @@ runs (visually frozen; scene rebuilt and dropped).
   redraw on demand at notify cadence." The kick now exists (interactive
   mode, `NICE_POC_INTERACTIVE=1`) but has not been wired into the
   multi-window background path.
+
+---
+
+## Addendum (2026-07-02, spike-6 live run): bg-present claim UN-RETRACTED
+
+The kick got wired into the multi-window background path (see the runbook's
+"Notes for whoever folds results"), and the spike-6 7w3s + GPU-timestamps
+run (release, 30 s) verifies it live via draw arithmetic: **5560 total
+`MetalRenderer::draw` invocations vs 3 × 1795 streaming RAF frames = 5385**,
+leaving **~175 non-streaming Metal presents** — the 4 background windows
+presenting at ≈heartbeat cadence (their scene-rebuild counters read 31–32
+each, plus 7 window-open presents and a handful of AppKit-driven ones).
+Unlike the counters this correction retracted, `MetalRenderer::draw` is a
+real present-submission path — background windows now demonstrably redraw
+on demand. The spike-7 real-trace 7w3s loop shows the same signature (5566
+draws vs 3×~1796). Evidence: `gpui-term-multi-7w3s-gputs.csv` (committed
+386863b) + `RESULTS-spike6-20260702.md`; per-window frame stamps unchanged,
+so the original headline numbers above need no revision.
