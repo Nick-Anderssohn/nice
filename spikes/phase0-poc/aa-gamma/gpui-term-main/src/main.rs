@@ -22,7 +22,27 @@
 //!                             (gpui_macos/src/text_system.rs:218-253).
 //!                             off = Nice parity (Nice ships fontSmoothing=false);
 //!                             on  = GPUI-main out-of-the-box default.
+//!   --curve appleApprox|identity
+//!                             PATCHED-BUILD axis (this binary now builds against
+//!                             ../zed-main-patched, the pinned rev + the
+//!                             bg-luminance curve patch). appleApprox sets
+//!                             TextRun.background_color on every glyph run
+//!                             (activating the shader curve) and applies the
+//!                             same curve CPU-side to procedural block-element
+//!                             fills; identity passes background_color: None
+//!                             (sentinel -1 => curve off => byte-identical to
+//!                             the unpatched glyph path).
 //!   --scene PATH --out DIR    scene bytes in, PNGs out
+//!
+//! Non-curve paint fixes (both curves; spike-1 residuals, RESULTS-spike1):
+//!   * inverse video resolves default colors the SwiftTerm way: after the
+//!     fg/bg swap, a default color in the fg slot becomes the component-wise
+//!     inverse of the native foreground, and in the bg slot the inverse of
+//!     the native background (AppleTerminalView.getAttributes +
+//!     mapColor(.defaultInvertedColor)) — NOT the swapped native color.
+//!   * block elements U+2580-259F paint as procedural pixel-aligned quads
+//!     (SwiftTerm BlockElementRenderer parity: eighth-cell rects, shades =
+//!     full-cell fill at alpha .25/.5/.75) instead of font glyphs.
 //!
 //! Font: both sides of the A/B load the SAME font file —
 //! /System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/
@@ -161,6 +181,22 @@ fn color_rgb(c: Color, pal: &Palette, is_fg: bool) -> u32 {
     }
 }
 
+/// Component-wise inverse, matching the fork's `NSColor.inverseColor()`
+/// (1 - c per sRGB channel; exact in u8 as 255 - c).
+fn invert_rgb(c: u32) -> u32 {
+    0xffffff ^ c
+}
+
+/// Is this attribute slot holding a terminal default color? (alacritty keeps
+/// Named(Foreground)/Named(Background) distinct; SwiftTerm collapses both to
+/// `.defaultColor` per slot, which is what its inverse-video rule keys on.)
+fn is_default_color(c: Color) -> bool {
+    matches!(
+        c,
+        Color::Named(NamedColor::Foreground) | Color::Named(NamedColor::Background)
+    )
+}
+
 fn snapshot(term: &Term<EventProxy>, pal: &Palette) -> Vec<Vec<CellSnap>> {
     let rows = term.screen_lines();
     let cols = term.columns();
@@ -169,11 +205,29 @@ fn snapshot(term: &Term<EventProxy>, pal: &Palette) -> Vec<Vec<CellSnap>> {
         let mut row = Vec::with_capacity(cols);
         for col in 0..cols {
             let cell = &term.grid()[TermPoint::new(Line(line as i32), Column(col))];
-            let mut fg = color_rgb(cell.fg, pal, true);
-            let mut bg = color_rgb(cell.bg, pal, false);
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
+            // Inverse video, the SwiftTerm way (AppleTerminalView.getAttributes):
+            // swap the attribute slots, then a default color in the fg slot
+            // resolves to inverse(native fg) and in the bg slot to
+            // inverse(native bg) (mapColor(.defaultInvertedColor)). Plain
+            // `CSI 7m` over default colors therefore paints an
+            // inverse(bg)-colored bar with inverse(fg)-colored text — not a
+            // straight fg/bg swap (spike-1 row-12 residual).
+            let inverse = cell.flags.contains(Flags::INVERSE);
+            let (fg_attr, bg_attr) = if inverse {
+                (cell.bg, cell.fg)
+            } else {
+                (cell.fg, cell.bg)
+            };
+            let fg = if inverse && is_default_color(fg_attr) {
+                invert_rgb(pal.fg)
+            } else {
+                color_rgb(fg_attr, pal, true)
+            };
+            let bg = if inverse && is_default_color(bg_attr) {
+                invert_rgb(pal.bg)
+            } else {
+                color_rgb(bg_attr, pal, false)
+            };
             let ch = if cell.c == '\0' { ' ' } else { cell.c };
             row.push(CellSnap {
                 ch,
@@ -222,6 +276,7 @@ struct Args {
     out: PathBuf,
     theme: String,     // "light" | "dark"
     smoothing: String, // "off" | "on"
+    curve: String,     // "appleApprox" | "identity"
     font_family: String,
     font_px: f32,
     cell_w: f32,
@@ -236,6 +291,7 @@ fn parse_args() -> Args {
         out: PathBuf::new(),
         theme: "light".into(),
         smoothing: "off".into(),
+        curve: "appleApprox".into(),
         font_family: "SF Mono".into(),
         font_px: 13.0,
         cell_w: 8.5,
@@ -251,6 +307,7 @@ fn parse_args() -> Args {
             "--out" => a.out = PathBuf::from(val()),
             "--theme" => a.theme = val(),
             "--smoothing" => a.smoothing = val(),
+            "--curve" => a.curve = val(),
             "--font-family" => a.font_family = val(),
             "--font-px" => a.font_px = val().parse().unwrap(),
             "--cell-w" => a.cell_w = val().parse().unwrap(),
@@ -262,14 +319,150 @@ fn parse_args() -> Args {
     }
     assert!(
         !a.scene.as_os_str().is_empty() && !a.out.as_os_str().is_empty(),
-        "usage: gpui-term-main --scene scene.bin --out DIR --theme light|dark [--smoothing off|on]"
+        "usage: gpui-term-main --scene scene.bin --out DIR --theme light|dark [--smoothing off|on] [--curve appleApprox|identity]"
     );
     assert!(a.theme == "light" || a.theme == "dark", "--theme light|dark");
     assert!(
         a.smoothing == "off" || a.smoothing == "on",
         "--smoothing off|on"
     );
+    assert!(
+        a.curve == "appleApprox" || a.curve == "identity",
+        "--curve appleApprox|identity"
+    );
     a
+}
+
+// ---- block elements (U+2580-259F), SwiftTerm BlockElementRenderer parity ----
+// Port of the fork's BlockElementMapping (SwiftTerm is MIT; our own fork):
+// rects in cell-EIGHTHS, (x0, x1, y0, y1) with y measured from the CELL TOP,
+// alpha = fill coverage (.light/.medium/.dark shades = .25/.5/.75, else 1.0).
+// SwiftTerm rasterizes these ALIASED into its atlas with pixelAlignedRect
+// (min edges floor, max edges ceil, device px) and runs the result through the
+// same bg-luminance composition curve as glyph coverage — mirrored here as
+// pixel-aligned paint_quad fills with the curve applied CPU-side (coverage is
+// uniform per rect, so per-fragment and CPU application are identical).
+
+#[derive(Clone, Copy)]
+struct BlockRect {
+    x0: u8,
+    x1: u8,
+    y0: u8,
+    y1: u8,
+    alpha: f32,
+}
+
+const fn br(x0: u8, x1: u8, y0: u8, y1: u8, alpha: f32) -> BlockRect {
+    BlockRect { x0, x1, y0, y1, alpha }
+}
+
+const FULL: BlockRect = br(0, 8, 0, 8, 1.0);
+const QUAD_UL: BlockRect = br(0, 4, 0, 4, 1.0);
+const QUAD_UR: BlockRect = br(4, 8, 0, 4, 1.0);
+const QUAD_LL: BlockRect = br(0, 4, 4, 8, 1.0);
+const QUAD_LR: BlockRect = br(4, 8, 4, 8, 1.0);
+
+const fn upper_block(n: u8) -> BlockRect {
+    br(0, 8, 0, n, 1.0)
+}
+const fn lower_block(n: u8) -> BlockRect {
+    br(0, 8, 8 - n, 8, 1.0)
+}
+const fn left_block(n: u8) -> BlockRect {
+    br(0, n, 0, 8, 1.0)
+}
+const fn right_block(n: u8) -> BlockRect {
+    br(8 - n, 8, 0, 8, 1.0)
+}
+
+fn block_rects(cp: u32) -> Option<&'static [BlockRect]> {
+    const B2580: [BlockRect; 1] = [upper_block(4)];
+    const B2581: [BlockRect; 1] = [lower_block(1)];
+    const B2582: [BlockRect; 1] = [lower_block(2)];
+    const B2583: [BlockRect; 1] = [lower_block(3)];
+    const B2584: [BlockRect; 1] = [lower_block(4)];
+    const B2585: [BlockRect; 1] = [lower_block(5)];
+    const B2586: [BlockRect; 1] = [lower_block(6)];
+    const B2587: [BlockRect; 1] = [lower_block(7)];
+    const B2588: [BlockRect; 1] = [FULL];
+    const B2589: [BlockRect; 1] = [left_block(7)];
+    const B258A: [BlockRect; 1] = [left_block(6)];
+    const B258B: [BlockRect; 1] = [left_block(5)];
+    const B258C: [BlockRect; 1] = [left_block(4)];
+    const B258D: [BlockRect; 1] = [left_block(3)];
+    const B258E: [BlockRect; 1] = [left_block(2)];
+    const B258F: [BlockRect; 1] = [left_block(1)];
+    const B2590: [BlockRect; 1] = [right_block(4)];
+    const B2591: [BlockRect; 1] = [br(0, 8, 0, 8, 0.25)];
+    const B2592: [BlockRect; 1] = [br(0, 8, 0, 8, 0.5)];
+    const B2593: [BlockRect; 1] = [br(0, 8, 0, 8, 0.75)];
+    const B2594: [BlockRect; 1] = [upper_block(1)];
+    const B2595: [BlockRect; 1] = [right_block(1)];
+    const B2596: [BlockRect; 1] = [QUAD_LL];
+    const B2597: [BlockRect; 1] = [QUAD_LR];
+    const B2598: [BlockRect; 1] = [QUAD_UL];
+    const B2599: [BlockRect; 3] = [QUAD_UL, QUAD_LL, QUAD_LR];
+    const B259A: [BlockRect; 2] = [QUAD_UL, QUAD_LR];
+    const B259B: [BlockRect; 3] = [QUAD_UL, QUAD_UR, QUAD_LL];
+    const B259C: [BlockRect; 3] = [QUAD_UL, QUAD_UR, QUAD_LR];
+    const B259D: [BlockRect; 1] = [QUAD_UR];
+    const B259E: [BlockRect; 2] = [QUAD_UR, QUAD_LL];
+    const B259F: [BlockRect; 3] = [QUAD_UR, QUAD_LL, QUAD_LR];
+    Some(match cp {
+        0x2580 => &B2580,
+        0x2581 => &B2581,
+        0x2582 => &B2582,
+        0x2583 => &B2583,
+        0x2584 => &B2584,
+        0x2585 => &B2585,
+        0x2586 => &B2586,
+        0x2587 => &B2587,
+        0x2588 => &B2588,
+        0x2589 => &B2589,
+        0x258A => &B258A,
+        0x258B => &B258B,
+        0x258C => &B258C,
+        0x258D => &B258D,
+        0x258E => &B258E,
+        0x258F => &B258F,
+        0x2590 => &B2590,
+        0x2591 => &B2591,
+        0x2592 => &B2592,
+        0x2593 => &B2593,
+        0x2594 => &B2594,
+        0x2595 => &B2595,
+        0x2596 => &B2596,
+        0x2597 => &B2597,
+        0x2598 => &B2598,
+        0x2599 => &B2599,
+        0x259A => &B259A,
+        0x259B => &B259B,
+        0x259C => &B259C,
+        0x259D => &B259D,
+        0x259E => &B259E,
+        0x259F => &B259F,
+        _ => return None,
+    })
+}
+
+/// Display-gamma Rec-709 luminance of a 0xRRGGBB color (u8 channels / 255),
+/// matching the fork's `MetalTerminalRenderer.luminance(colorToSIMD(_:))`.
+fn luminance_rgb(c: u32) -> f32 {
+    let r = ((c >> 16) & 0xff) as f32 / 255.0;
+    let g = ((c >> 8) & 0xff) as f32 / 255.0;
+    let b = (c & 0xff) as f32 / 255.0;
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// SwiftTerm `terminal_text_fragment_gray` composition curve, `.appleApprox`
+/// params (kitty text_composition_strategy "1.7 30"), applied CPU-side to a
+/// uniform block-fill coverage:
+/// clamp(mix(cov, pow(cov, 1/1.7), mixFactor) * 1.30, 0, 1),
+/// mixFactor = clamp((1 - L_fg + L_bg) * 0.5, 0, 1).
+fn apple_approx_coverage(cov: f32, fg: u32, bg: u32) -> f32 {
+    let mix_factor = ((1.0 - luminance_rgb(fg) + luminance_rgb(bg)) * 0.5).clamp(0.0, 1.0);
+    let curved = cov + (cov.powf(1.0 / 1.7) - cov) * mix_factor;
+    (curved * 1.30).clamp(0.0, 1.0)
 }
 
 // ---- GPUI scene view ---------------------------------------------------------
@@ -293,6 +486,9 @@ struct SceneView {
     font_px: f32,
     cell_w: f32,
     cell_h: f32,
+    /// true = .appleApprox composition curve (TextRun.background_color feeds
+    /// the patched shader; block fills curved CPU-side); false = identity.
+    apple_approx: bool,
 }
 
 fn scene_font(family: SharedString, bold: bool) -> Font {
@@ -317,6 +513,7 @@ impl Render for SceneView {
         let font_px = self.font_px;
         let cell_w = self.cell_w;
         let cell_h = self.cell_h;
+        let apple_approx = self.apple_approx;
 
         canvas(
             move |_bounds, _window, _cx| {},
@@ -374,18 +571,84 @@ impl Render for SceneView {
                     // cell origin — mirrors SwiftTerm's per-cell quad placement
                     // at its snapped cell pitch (fractional advances do NOT
                     // accumulate on either side).
+                    let scale: f32 = window.scale_factor();
                     for (c, cell) in row.iter().enumerate() {
                         if cell.ch == ' ' && !cell.underline {
                             continue;
                         }
+
+                        // Block elements: procedural pixel-aligned quads in
+                        // place of font glyphs (SwiftTerm BlockElementRenderer
+                        // parity; spike-1 row-0/4/15 residual). Mirrors the
+                        // fork's ALIASED atlas path: integer-px cell box
+                        // (round(lineOriginPx) + col*round(cellW*scale)),
+                        // eighth-rect edges floored (min) / ceiled (max) to
+                        // device pixels, coverage run through the composition
+                        // curve exactly like glyph coverage.
+                        if let Some(rects) = block_rects(cell.ch as u32) {
+                            let cw_px = (cell_w * scale).round();
+                            let ch_px = (cell_h * scale).round();
+                            let ox_f: f32 = ox.into();
+                            let oy_f: f32 = oy.into();
+                            let cell_x_px = (ox_f * scale).round() + c as f32 * cw_px;
+                            let cell_y_px = ((oy_f + r as f32 * cell_h) * scale).round();
+                            let effective_bg = cell.bg.unwrap_or(bg);
+                            for rect in rects {
+                                let x0 = (rect.x0 as f32 * cw_px / 8.0).floor();
+                                let x1 = (rect.x1 as f32 * cw_px / 8.0).ceil();
+                                // The fork pixel-aligns in CG's bottom-origin
+                                // frame: bottom edge floors, top edge ceils.
+                                // Flip back to top-origin afterwards.
+                                let cg_top = ((8 - rect.y0) as f32 * ch_px / 8.0).ceil();
+                                let cg_bot = ((8 - rect.y1) as f32 * ch_px / 8.0).floor();
+                                let y_top = ch_px - cg_top;
+                                let y_bot = ch_px - cg_bot;
+                                if x1 <= x0 || y_bot <= y_top {
+                                    continue;
+                                }
+                                // The fork's coverage lives in an 8-bit atlas
+                                // (CG stores alpha .25 as 64/255) — quantize
+                                // BEFORE the curve to match its input exactly.
+                                let cov8 = (rect.alpha * 255.0).round() / 255.0;
+                                let coverage = if apple_approx {
+                                    apple_approx_coverage(cov8, cell.fg, effective_bg)
+                                } else {
+                                    cov8
+                                };
+                                let fg_hsla: gpui::Hsla = rgb(cell.fg).into();
+                                window.paint_quad(fill(
+                                    Bounds {
+                                        origin: point(
+                                            px((cell_x_px + x0) / scale),
+                                            px((cell_y_px + y_top) / scale),
+                                        ),
+                                        size: size(
+                                            px((x1 - x0) / scale),
+                                            px((y_bot - y_top) / scale),
+                                        ),
+                                    },
+                                    fg_hsla.opacity(coverage),
+                                ));
+                            }
+                            continue;
+                        }
+
                         let mut buf = [0u8; 4];
                         let s: &str = cell.ch.encode_utf8(&mut buf);
                         let text: SharedString = SharedString::new(s.to_string());
+                        // Per-cell background behind the glyph: activates the
+                        // patched bg-luminance shader curve (appleApprox).
+                        // None = sentinel -1 = curve off = unpatched output.
+                        let run_background: Option<gpui::Hsla> = if apple_approx {
+                            Some(rgb(cell.bg.unwrap_or(bg)).into())
+                        } else {
+                            None
+                        };
                         let run = TextRun {
                             len: s.len(),
                             font: scene_font(family.clone(), cell.bold),
                             color: rgb(cell.fg).into(),
-                            background_color: None,
+                            background_color: run_background,
                             underline: if cell.underline {
                                 Some(gpui::UnderlineStyle {
                                     thickness: px(1.0),
@@ -469,6 +732,7 @@ fn main() {
     let grid_for_view = grid.clone();
     let family: SharedString = SharedString::new(args.font_family.clone());
     let (bg, font_px, cell_w, cell_h) = (pal.bg, args.font_px, args.cell_w, args.cell_h);
+    let apple_approx = args.curve == "appleApprox";
 
     let window = cx
         .update(|cx| {
@@ -490,6 +754,7 @@ fn main() {
                         font_px,
                         cell_w,
                         cell_h,
+                        apple_approx,
                     })
                 },
             )
@@ -516,13 +781,17 @@ fn main() {
         args.font_family, args.font_px, advance_w
     );
 
-    let label = format!("gpui-main-{}-smoothing-{}", args.theme, args.smoothing);
+    let label = format!(
+        "gpui-main-patched-{}-{}-smoothing-{}",
+        args.theme, args.curve, args.smoothing
+    );
     let png_path = args.out.join(format!("{label}.png"));
     write_png(&png_path, img.width(), img.height(), img.as_raw());
 
     let meta_path = args.out.join(format!("{label}.meta.json"));
     let meta = format!(
-        "{{\n  \"side\": \"gpui-main\",\n  \"zed_rev\": \"10b07951838e422722e34641f4a9c0bfec9037ff\",\n  \"theme\": \"{}\",\n  \"smoothing\": \"{}\",\n  \"font_family\": \"{}\",\n  \"font_px\": {},\n  \"cell_w_pt\": {},\n  \"cell_h_pt\": {},\n  \"cols\": {},\n  \"rows\": {},\n  \"inset_pt\": {},\n  \"scale_factor\": {},\n  \"advance_w_px\": {:.4},\n  \"image_w\": {},\n  \"image_h\": {},\n  \"bg\": \"#{:06x}\",\n  \"fg\": \"#{:06x}\"\n}}\n",
+        "{{\n  \"side\": \"gpui-main-patched\",\n  \"zed_rev\": \"10b07951838e422722e34641f4a9c0bfec9037ff\",\n  \"bg_luminance_patch\": true,\n  \"gpui_src\": \"../zed-main-patched (pinned rev + bg-luminance-applied.patch)\",\n  \"curve\": \"{}\",\n  \"theme\": \"{}\",\n  \"smoothing\": \"{}\",\n  \"font_family\": \"{}\",\n  \"font_px\": {},\n  \"cell_w_pt\": {},\n  \"cell_h_pt\": {},\n  \"cols\": {},\n  \"rows\": {},\n  \"inset_pt\": {},\n  \"scale_factor\": {},\n  \"advance_w_px\": {:.4},\n  \"image_w\": {},\n  \"image_h\": {},\n  \"bg\": \"#{:06x}\",\n  \"fg\": \"#{:06x}\"\n}}\n",
+        args.curve,
         args.theme,
         args.smoothing,
         args.font_family,

@@ -1,0 +1,22 @@
+{
+  "side": "gpui-main-patched",
+  "zed_rev": "10b07951838e422722e34641f4a9c0bfec9037ff",
+  "bg_luminance_patch": true,
+  "gpui_src": "../zed-main-patched (pinned rev + bg-luminance-applied.patch)",
+  "curve": "identity",
+  "theme": "dark",
+  "smoothing": "off",
+  "font_family": "SF Mono",
+  "font_px": 13,
+  "cell_w_pt": 8.5,
+  "cell_h_pt": 16,
+  "cols": 60,
+  "rows": 16,
+  "inset_pt": 10,
+  "scale_factor": 2,
+  "advance_w_px": 8.0361,
+  "image_w": 1060,
+  "image_h": 632,
+  "bg": "#090705",
+  "fg": "#f4f0ef"
+}

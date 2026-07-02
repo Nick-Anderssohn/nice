@@ -1,0 +1,30 @@
+{
+  "ref": "aa-gamma/out/swiftterm-dark-identity.png",
+  "img": "aa-gamma/out/patched/gpui-main-patched-dark-identity-smoothing-off.png",
+  "shift": [-20, -21],
+  "correlation": 0.951656,
+  "intersection": [1020, 512],
+  "max_delta": [246, 248, 250],
+  "mean_delta": [2.3815, 2.2595, 2.3981],
+  "rmse": [22.5121, 21.6579, 22.7694],
+  "threshold": 8,
+  "pct_over_threshold": 1.4055,
+  "per_row": [
+    {"row": 0, "mean": 0.9792, "max": 235, "pct_over": 0.4167},
+    {"row": 1, "mean": 0.0000, "max": 0, "pct_over": 0.0000},
+    {"row": 2, "mean": 0.0000, "max": 0, "pct_over": 0.0000},
+    {"row": 3, "mean": 0.6570, "max": 235, "pct_over": 0.4381},
+    {"row": 4, "mean": 4.8241, "max": 235, "pct_over": 2.9626},
+    {"row": 5, "mean": 4.5511, "max": 235, "pct_over": 3.4344},
+    {"row": 6, "mean": 4.8039, "max": 235, "pct_over": 2.1967},
+    {"row": 7, "mean": 2.7495, "max": 250, "pct_over": 2.1354},
+    {"row": 8, "mean": 2.6979, "max": 250, "pct_over": 2.0833},
+    {"row": 9, "mean": 0.0000, "max": 0, "pct_over": 0.0000},
+    {"row": 10, "mean": 4.1359, "max": 220, "pct_over": 2.0312},
+    {"row": 11, "mean": 4.0828, "max": 245, "pct_over": 2.0833},
+    {"row": 12, "mean": 2.8073, "max": 245, "pct_over": 1.1458},
+    {"row": 13, "mean": 0.0000, "max": 0, "pct_over": 0.0000},
+    {"row": 14, "mean": 7.8365, "max": 235, "pct_over": 3.3517},
+    {"row": 15, "mean": 0.4896, "max": 235, "pct_over": 0.2083}
+  ]
+}

@@ -71,3 +71,56 @@ Rank-1 gate resolves **for Path B**: SwiftTerm-class text fidelity is reachable 
 GPUI's public paint API with a small additive bg-luminance patch and minor
 paint-fill fixes — **no fork of the GPU text/atlas core.** The lone could-flip
 item the report hung on (a bespoke blend/shader need) did **not** materialize.
+
+---
+
+## Closure run (2026-07-01, live) — patch applied + VERIFIED on rendered pixels
+
+Same evening, same machine/procedure (RUNBOOK §3, scale 2, SF Mono advance
+8.0361 px). The "owed" items above are done: the drafted bg-luminance patch was
+applied, built, and verified, plus the two paint-fill residuals fixed.
+
+### What was applied
+
+- **Zed-side patch: 65+/7− across exactly 6 files** — `scene.rs` (bg_luminance
+  on `MonochromeSprite`), `window.rs` (`paint_glyph` background param + Rec-709
+  luminance), `text_system/line.rs` (background threaded through decoration
+  runs), `gpui_macos` `shaders.metal` (mix_factor vertex+fragment curve:
+  `pow(coverage, 1/1.7)`, ×1.30 clamp), wgsl/hlsl passive layout mirrors.
+  Local checkout at `zed-main-patched/` (pinned rev `10b0795` + patch;
+  gitignored); the as-applied diff is committed as `bg-luminance-applied.patch`.
+  `gpui-term-main` switched to path deps.
+- **Two residual fixes in `gpui-term-main` (+287/−17), renderer-side, no fork:**
+  (a) inverse-video colors = exact per-channel inverse (255−c), replicating
+  SwiftTerm's `defaultInvertedColor` mapping — NOT a fg/bg swap; (b) full
+  32-entry U+2580–259F block-element port as procedural `paint_quad` fills
+  (pixel-aligned, aliased, coverage quantized to 8-bit then curved CPU-side),
+  matching SwiftTerm's `BlockElementRenderer`.
+
+### Verification (% pixels any-channel >8 / correlation)
+
+| Cut | light | dark |
+|---|---|---|
+| **A′** ship-SwiftTerm(appleApprox) vs patched-GPUI(appleApprox) | **1.3258% / 0.9448** | **1.3092% / 0.9550** |
+| **B′** identity vs identity | 1.3704% | 1.4055% |
+
+- **Success bar was A′ ≤ old-B (4.5% >thr) — beaten 3×.**
+- Old worst row 12 (inverse video, 36.67% >thr) → **now 1.146%**.
+- **A′ ≈ B′ row-for-row ⇒ the luminance-curve gap is FULLY CLOSED** — all
+  remaining delta is curve-independent.
+
+### Remaining known residual (by design, out of scope)
+
+Rows 4/5/14 (~2.4–5.4% >thr, means 4.4–9.3) = box-drawing LINE glyphs
+U+2500–257F, font-rendered in GPUI vs procedural strokes in SwiftTerm.
+Paint-level fix (paint_quad/path strokes) if ever wanted; NOT a
+text-system/atlas issue.
+
+### Evidence
+`out/patched/*.png` + `.meta.json`; `out/patched/diff/{Ap,Bp}-*-heatmap.png` +
+`-report.json`.
+
+### Gate verdict
+**AA/gamma gate → CLOSED & VERIFIED** (was RESOLVED-by-diagnosis). No fork of
+`text_system`/`open_type`/`metal_atlas` needed; total closure cost ~65 LOC
+zed-side + the renderer-side residual ports.

@@ -4,3 +4,4 @@
 diff/*-ref.png
 diff/*-img.png
 !diff/*-heatmap.png
+!patched/diff/*-heatmap.png

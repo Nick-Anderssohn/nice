@@ -30,6 +30,18 @@ cd spikes/phase0-poc/aa-gamma/scene && python3 gen_scene.py scene.bin
 ```
 
 All three were verified green on 2026-07-01 (rustc 1.96.0, Swift 6.x).
+
+> **PATCHED BUILD (since 2026-07-01, spike-1 closure):** `gpui-term-main`
+> now builds against `../zed-main-patched/` — a local copy of the pinned rev
+> (rsync of `~/.cargo/git/checkouts/zed-a70e2ad075855582/10b0795/`, minus
+> `.git`) with the bg-luminance curve patch applied
+> (`bg-luminance-applied.patch`; plan in `bg-luminance-patch-plan.md`). The
+> binary also grew a `--curve appleApprox|identity` axis and two always-on
+> paint fixes (inverse-video default-color inversion, procedural block
+> elements) and writes `gpui-main-patched-*` filenames — the §1 matrix below
+> documents the ORIGINAL baseline names; to reproduce those exactly, flip
+> `gpui-term-main/Cargo.toml` back to the commented git deps and rebuild.
+> The patched re-run lives in §3.
 The SwiftTerm fixture depends on `/Users/nick/Projects/SwiftTerm` by absolute
 path — READ-ONLY checkout, must stay on `phase0-txn-present @ 583551f`
 (= Nice's project.yml pin `5f07dc6` + a docs commit + the OFF-by-default
@@ -135,7 +147,79 @@ Each run prints the metric table and writes
   quantization, not AA — judge it visually in the aligned crops and note it
   separately in the report.
 
-## 3. Cleanup / gotchas
+## 3. Patched re-run — closing the curve (display required, main session only)
+
+Turns spike 1's "the gap IS the curve" into "the curve is closed". The
+`gpui-term-main` binary is now the PATCHED build (see the §0 note): pinned
+zed rev + `bg-luminance-applied.patch`, plus the two non-curve paint fixes
+from `RESULTS-spike1-20260701.md` (inverse-video bar color, block elements
+U+2580-259F as procedural pixel-aligned quads). Outputs are kept separate
+from the originals: new filenames (`gpui-main-patched-…-{curve}-…`) AND a
+separate out dir (`out/patched/`).
+
+The SwiftTerm fixture PNGs in `out/` are REUSED as the reference — do not
+re-run the fixture unless the display/scale changed since they were captured
+(metas must still say `scale_factor: 2` on the display you use now; if the
+machine/display differs, re-run the §1 fixture matrix first).
+
+```sh
+cd spikes/phase0-poc
+OUT=aa-gamma/out
+POUT=aa-gamma/out/patched && mkdir -p "$POUT"
+SCENE=aa-gamma/scene/scene.bin
+GPUI=aa-gamma/gpui-term-main/target/debug/gpui-term-main
+
+# Patched matrix: theme x curve, smoothing off (= Nice parity) throughout.
+"$GPUI" --scene "$SCENE" --out "$POUT" --theme light --smoothing off --curve appleApprox
+"$GPUI" --scene "$SCENE" --out "$POUT" --theme dark  --smoothing off --curve appleApprox
+"$GPUI" --scene "$SCENE" --out "$POUT" --theme light --smoothing off --curve identity
+"$GPUI" --scene "$SCENE" --out "$POUT" --theme dark  --smoothing off --curve identity
+```
+
+Expected outputs in `aa-gamma/out/patched/`:
+
+```
+gpui-main-patched-{light,dark}-{appleApprox,identity}-smoothing-off.png + .meta.json
+```
+
+Sanity: each meta must have `"bg_luminance_patch": true`, the right
+`"curve"`, `"scale_factor": 2`, `advance_w_px ≈ 8.036`.
+
+```sh
+DIFF=aa-gamma/diff-tool/target/debug/aa-diff
+PD=aa-gamma/out/patched/diff && mkdir -p "$PD"
+
+# (A') THE CLOSURE — Nice's shipping look vs PATCHED GPUI, curve on:
+"$DIFF" --ref "$OUT"/swiftterm-light-appleApprox.png --img "$POUT"/gpui-main-patched-light-appleApprox-smoothing-off.png --out "$PD"/Ap-light-ship-vs-gpui-patched
+"$DIFF" --ref "$OUT"/swiftterm-dark-appleApprox.png  --img "$POUT"/gpui-main-patched-dark-appleApprox-smoothing-off.png  --out "$PD"/Ap-dark-ship-vs-gpui-patched
+
+# (B') residual-fix check — identity vs identity (curve off on both sides;
+# isolates the two paint fixes + proves the sentinel keeps identity intact):
+"$DIFF" --ref "$OUT"/swiftterm-light-identity.png --img "$POUT"/gpui-main-patched-light-identity-smoothing-off.png --out "$PD"/Bp-light-identity-vs-gpui-patched
+"$DIFF" --ref "$OUT"/swiftterm-dark-identity.png  --img "$POUT"/gpui-main-patched-dark-identity-smoothing-off.png  --out "$PD"/Bp-dark-identity-vs-gpui-patched
+```
+
+### Reading the patched results (baselines = spike-1 numbers)
+
+* **A′ vs old A (6.97/5.64 mean, 9.9% >thr):** success = A′ collapses to at
+  most old-B territory (3.98/3.51 mean, 4.5% >thr) and visibly below it,
+  since the paint fixes also remove old B's rows-0/4/12/15 residuals. The
+  A-heatmap's "every glyph lights up" signature must be GONE.
+* **B′ vs old B:** rows 12 (inverse video, was 36.67% >thr) and 0/15 (full
+  blocks) → ≈0; row 4 (was 13.2%) → only the box-drawing LINE glyphs'
+  remainder (┌─╔═ etc. stay font-rendered on the GPUI side vs the fork's
+  procedural strokes — out of scope of the two fixes, judge separately).
+  Everywhere else B′ must match B (±placement noise) — if B′ is WORSE than B
+  on any text row, the −1 sentinel regressed the identity path: stop and
+  debug before trusting A′.
+* **If A′ ≈ A:** the shader curve isn't engaging — check the meta says
+  `curve: appleApprox` and that the run went through the patched binary
+  (`bg_luminance_patch: true`), then suspect the TextRun.background_color →
+  paint_glyph plumbing.
+* Row 13 (bold) stays excluded (font-selection axis). Rows 3/6/7/8 remain
+  the money rows for curve parity.
+
+## 4. Cleanup / gotchas
 
 * The gpui binary writes the AppleFontSmoothing pref into its own app domain:
   `~/Library/Preferences/gpui-term-main.plist`. Remove with
@@ -159,9 +243,13 @@ Each run prints the metric table and writes
   scheduling with the TestDispatcher can be racy on a cold start); if it
   persists, insert a second `window.refresh()` + `run_until_parked()` round.
 
-## 4. What was deliberately NOT run by the authoring agent
+## 5. What was deliberately NOT run by the authoring agents
 
-Per the hard constraint, no GUI was launched: the scene matrix, the 8 PNGs,
-and the aa-diff numbers do not exist yet. Builds of all three targets and the
-aa-diff self-test (synthetic offset images, headless CoreGraphics) are the
-only executed verification.
+Per the hard constraint, the original authoring agent launched no GUI: builds
+of all three targets and the aa-diff self-test (synthetic offset images,
+headless CoreGraphics) were its only executed verification. The §1/§2 matrix
+was then run live from the main session on 2026-07-01
+(`RESULTS-spike1-20260701.md`). The patched-build agent (§3) likewise ran
+build-only: the patched binary compiles (metallib validated the new shader at
+build time) but the §3 matrix + diffs have NOT been run — that is the main
+session's remaining step.

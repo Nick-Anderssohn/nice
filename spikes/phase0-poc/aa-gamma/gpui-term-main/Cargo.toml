@@ -30,8 +30,15 @@ name = "gpui-term-main"
 path = "src/main.rs"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support", "font-kit"] }
+# Patched local copy of the pinned rev (10b07951838e422722e34641f4a9c0bfec9037ff),
+# rsync'd from ~/.cargo/git/checkouts/zed-a70e2ad075855582/10b0795/ (minus .git)
+# into ../zed-main-patched with the bg-luminance curve patch applied
+# (../bg-luminance-applied.patch; plan in ../bg-luminance-patch-plan.md).
+# Switch back to the git deps below to build the UNPATCHED baseline.
+gpui = { path = "../zed-main-patched/crates/gpui", features = ["test-support"] }
+gpui_platform = { path = "../zed-main-patched/crates/gpui_platform", features = ["test-support", "font-kit"] }
+# gpui = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support"] }
+# gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "10b07951838e422722e34641f4a9c0bfec9037ff", features = ["test-support", "font-kit"] }
 
 # Same VT core as the FPS spike (spikes/phase0-poc).
 alacritty_terminal = "0.26.0"
