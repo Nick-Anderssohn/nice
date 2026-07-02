@@ -1,0 +1,6 @@
+# gpui-term run metadata (parse rows below; lines starting '#' are comments)
+# display=Built-in Retina Display [1470x956 @ 0,0] (max 60 Hz)
+# build=release seed=42 bytes_per_sec=500000 windows=1 streaming=1 bg_bps=0
+# mode=energy-idle scrollback=10000 gpui_txn=0 damage_only=0 trace=-
+metric,stack,phase,build,idx,value,unit
+frame_interval,gpui-native,load,poc,0,59983.259375,ms

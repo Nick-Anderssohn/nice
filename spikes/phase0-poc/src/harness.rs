@@ -43,6 +43,15 @@ pub mod clock {
         (b.wrapping_sub(a) as f64) * (n as f64) / (d as f64)
     }
 
+    /// Convert a mach-absolute-time TICK COUNT (a duration, not an instant)
+    /// to nanoseconds. Used for `rusage_info_v4` CPU times, which are
+    /// reported in mach ticks.
+    #[inline]
+    pub fn ticks_to_ns(ticks: u64) -> f64 {
+        let (n, d) = timebase();
+        (ticks as f64) * (n as f64) / (d as f64)
+    }
+
     #[inline]
     pub fn ms_between(a: u64, b: u64) -> f64 {
         ns_between(a, b) / 1.0e6
@@ -133,20 +142,36 @@ pub struct FrameStreams {
 
 /// p50/p95/p99 of frame INTERVALS (ms) from a timestamp stream, plus a count of
 /// "cliff" intervals exceeding `cliff_ms` (Harness §B.3 dropped-frame cliffs).
+///
+/// §13 harness fix: also reports `max_ms` and a SELF-CALIBRATED cliff count
+/// (`cliffs_auto` over threshold `cliff_auto_ms` = 1.5 × the run's own median
+/// interval) — the audit flagged the fixed 16.6 ms threshold as inoperative
+/// on a 60 Hz panel (it counts nearly every frame). The fixed-threshold count
+/// is retained for continuity with previously published numbers.
 pub fn interval_stats(timestamps: &[u64], cliff_ms: f64) -> IntervalStats {
     let mut intervals: Vec<f64> = timestamps
         .windows(2)
         .map(|w| clock::ms_between(w[0], w[1]))
         .collect();
     let cliffs = intervals.iter().filter(|&&v| v > cliff_ms).count();
+    let max_ms = intervals.iter().cloned().fold(0.0_f64, f64::max);
     let (p50, p95, p99) = percentiles(&mut intervals);
+    let cliff_auto_ms = 1.5 * p50;
+    let cliffs_auto = if p50 > 0.0 {
+        intervals.iter().filter(|&&v| v > cliff_auto_ms).count()
+    } else {
+        0
+    };
     IntervalStats {
         samples: timestamps.len(),
         p50_ms: p50,
         p95_ms: p95,
         p99_ms: p99,
+        max_ms,
         fps_p50: if p50 > 0.0 { 1000.0 / p50 } else { 0.0 },
         cliffs,
+        cliff_auto_ms,
+        cliffs_auto,
     }
 }
 
@@ -156,8 +181,13 @@ pub struct IntervalStats {
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
+    pub max_ms: f64,
     pub fps_p50: f64,
     pub cliffs: usize,
+    /// Self-calibrated cliff threshold: 1.5 × this run's median interval.
+    pub cliff_auto_ms: f64,
+    /// Intervals exceeding `cliff_auto_ms`.
+    pub cliffs_auto: usize,
 }
 
 /// Percentiles of an arbitrary f64 sample set (sorts in place). Capture raw,
@@ -261,6 +291,397 @@ pub mod mem {
     #[inline]
     pub fn mib(bytes: u64) -> f64 {
         bytes as f64 / (1024.0 * 1024.0)
+    }
+}
+
+// ===========================================================================
+// §D2. CPU / energy proxy — proc_pid_rusage(RUSAGE_INFO_V4) (spike 6).
+// No sudo required. `ri_user_time`/`ri_system_time` are in mach ticks;
+// `ri_billed_energy` is in nanojoules (0 on machines/kernels that don't
+// account it — report it only when non-zero). The struct is hand-declared
+// (libc ships the call but not the v4 struct), same approach as TaskVmInfo.
+// ===========================================================================
+
+pub mod cpu {
+    use std::ffi::c_int;
+
+    const RUSAGE_INFO_V4: c_int = 4;
+
+    /// `struct rusage_info_v4` from <sys/resource.h>, laid out exactly.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RusageInfoV4 {
+        ri_uuid: [u8; 16],
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+        ri_child_user_time: u64,
+        ri_child_system_time: u64,
+        ri_child_pkg_idle_wkups: u64,
+        ri_child_interrupt_wkups: u64,
+        ri_child_pageins: u64,
+        ri_child_elapsed_abstime: u64,
+        ri_diskio_bytesread: u64,
+        ri_diskio_byteswritten: u64,
+        ri_cpu_time_qos_default: u64,
+        ri_cpu_time_qos_maintenance: u64,
+        ri_cpu_time_qos_background: u64,
+        ri_cpu_time_qos_utility: u64,
+        ri_cpu_time_qos_legacy: u64,
+        ri_cpu_time_qos_user_initiated: u64,
+        ri_cpu_time_qos_user_interactive: u64,
+        ri_billed_system_time: u64,
+        ri_serviced_system_time: u64,
+        ri_logical_writes: u64,
+        ri_lifetime_max_phys_footprint: u64,
+        ri_instructions: u64,
+        ri_cycles: u64,
+        ri_billed_energy: u64,
+        ri_serviced_energy: u64,
+        ri_interval_max_phys_footprint: u64,
+        ri_runnable_time: u64,
+    }
+
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut RusageInfoV4) -> c_int;
+    }
+
+    /// One point-in-time CPU/energy sample of THIS process.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct CpuSample {
+        pub user_ns: f64,
+        pub system_ns: f64,
+        pub pkg_idle_wakeups: u64,
+        pub interrupt_wakeups: u64,
+        /// Nanojoules billed to the process (0 when the kernel doesn't account it).
+        pub billed_energy_nj: u64,
+        pub instructions: u64,
+        pub cycles: u64,
+    }
+
+    pub fn sample() -> Option<CpuSample> {
+        let mut info = RusageInfoV4::default();
+        let pid = std::process::id() as c_int;
+        let kr = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V4, &mut info) };
+        if kr != 0 {
+            return None;
+        }
+        Some(CpuSample {
+            user_ns: super::clock::ticks_to_ns(info.ri_user_time),
+            system_ns: super::clock::ticks_to_ns(info.ri_system_time),
+            pkg_idle_wakeups: info.ri_pkg_idle_wkups,
+            interrupt_wakeups: info.ri_interrupt_wkups,
+            billed_energy_nj: info.ri_billed_energy,
+            instructions: info.ri_instructions,
+            cycles: info.ri_cycles,
+        })
+    }
+
+    /// Human summary of the delta between two samples over `wall_s` seconds:
+    /// CPU time + average core utilization, wakeup rate, and the no-sudo
+    /// energy proxy (average mW from billed nanojoules) when available.
+    pub fn delta_summary(t0: &CpuSample, t1: &CpuSample, wall_s: f64) -> String {
+        let cpu_ms = (t1.user_ns - t0.user_ns + t1.system_ns - t0.system_ns) / 1.0e6;
+        let user_ms = (t1.user_ns - t0.user_ns) / 1.0e6;
+        let sys_ms = (t1.system_ns - t0.system_ns) / 1.0e6;
+        let pct = if wall_s > 0.0 {
+            cpu_ms / (wall_s * 1000.0) * 100.0
+        } else {
+            0.0
+        };
+        let wk = t1.pkg_idle_wakeups.saturating_sub(t0.pkg_idle_wakeups);
+        let iwk = t1.interrupt_wakeups.saturating_sub(t0.interrupt_wakeups);
+        let energy = t1.billed_energy_nj.saturating_sub(t0.billed_energy_nj);
+        let mut s = format!(
+            "cpu {cpu_ms:.0} ms ({pct:.1}% of one core; user {user_ms:.0} / sys {sys_ms:.0}) | \
+             wakeups pkg-idle {wk} ({:.1}/s) intr {iwk}",
+            if wall_s > 0.0 { wk as f64 / wall_s } else { 0.0 }
+        );
+        if energy > 0 {
+            let mj = energy as f64 / 1.0e6;
+            let mw = if wall_s > 0.0 { mj / wall_s } else { 0.0 };
+            s.push_str(&format!(" | energy {mj:.1} mJ (~{mw:.1} mW avg, proc_pid_rusage)"));
+        } else {
+            s.push_str(" | energy n/a (ri_billed_energy=0; use sudo powermetrics)");
+        }
+        let instr = t1.instructions.saturating_sub(t0.instructions);
+        let cyc = t1.cycles.saturating_sub(t0.cycles);
+        if instr > 0 {
+            s.push_str(&format!(
+                " | {:.2}G instr / {:.2}G cycles",
+                instr as f64 / 1.0e9,
+                cyc as f64 / 1.0e9
+            ));
+        }
+        s
+    }
+}
+
+// ===========================================================================
+// §D3. Deadline watchdog (spike 6 hang fix, 2026-07-02) — a GUARANTEED-FIRE
+// auto-exit for demand-driven windows.
+//
+// Why it exists: the energy `idle` live run hung forever on the previous
+// mechanism (gpui BackgroundExecutor::timer -> foreground entity update).
+// That path is dispatch_after on a global queue + a repoll dispatched to the
+// main queue — mechanically runloop-independent, but a fully idle app (no
+// draws, no events, display link stopped, window occluded) is exactly what
+// macOS App Nap targets: its timers get coalesced/deferred, and the observed
+// live behavior was a 60 s deadline not firing within 8 minutes. The
+// interactive mode's identical timer only ever fired in runs kept un-napped
+// by real input.
+//
+// This mechanism cannot starve under any of those conditions:
+//   * a dedicated OS thread sleeps to the deadline in drift-corrected 500 ms
+//     slices (nanosleep wakeups are scheduler-level, NOT coalescable timers);
+//   * at the deadline it enqueues the registered main-thread callback onto
+//     the libdispatch MAIN queue (dispatch_async_f — an enqueue + runloop
+//     port wakeup, not a timer) AND force-wakes the main CFRunLoop
+//     (CFRunLoopWakeUp), retrying every 500 ms;
+//   * if the main thread still hasn't serviced it after 20 s, the watchdog
+//     prints a diagnostic and hard-exits(3) so a run can never wedge.
+//
+// One watchdog per process. `arm()` must be called on the MAIN thread and
+// the callback runs on the MAIN thread (it may safely touch gpui entities
+// via WeakEntity::update + AsyncApp).
+// ===========================================================================
+
+pub mod watchdog {
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[repr(C)]
+    struct DispatchQueueS {
+        _private: [u8; 0],
+    }
+
+    unsafe extern "C" {
+        /// libdispatch's main queue object (what dispatch_get_main_queue()
+        /// expands to). Always linked (libSystem).
+        static _dispatch_main_q: DispatchQueueS;
+        fn dispatch_async_f(
+            queue: *const DispatchQueueS,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        /// CoreFoundation (linked via gpui/AppKit): force the main runloop
+        /// out of its wait so the just-enqueued main-queue block runs NOW —
+        /// immune to timer coalescing/App Nap.
+        fn CFRunLoopGetMain() -> *mut c_void;
+        fn CFRunLoopWakeUp(rl: *mut c_void);
+    }
+
+    /// Main-thread-only callback smuggled through a global. Safety: the
+    /// watchdog thread never touches the contents — only the main-queue
+    /// trampoline (which runs on the main thread) takes and calls it.
+    struct ForceSend<T>(T);
+    unsafe impl<T> Send for ForceSend<T> {}
+
+    type Cb = Box<dyn FnMut() + 'static>;
+    static CB: Mutex<Option<ForceSend<Cb>>> = Mutex::new(None);
+    static SERVICED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn trampoline(_ctx: *mut c_void) {
+        // MAIN thread (dispatched to the main queue).
+        SERVICED.store(true, Ordering::SeqCst);
+        let cb = CB.lock().unwrap().take();
+        if let Some(ForceSend(mut cb)) = cb {
+            cb(); // expected to finalize + process::exit
+        }
+    }
+
+    /// Arm the process-wide deadline watchdog (call on the MAIN thread).
+    /// `on_deadline` runs on the main thread at ~`deadline` and is expected
+    /// to print the summary and exit the process. Streaming modes' render-
+    /// path deadline usually exits first — the watchdog is the backstop that
+    /// makes auto-exit unconditional for demand-driven/occluded windows.
+    pub fn arm(deadline: Duration, label: &'static str, on_deadline: impl FnMut() + 'static) {
+        *CB.lock().unwrap() = Some(ForceSend(Box::new(on_deadline)));
+        std::thread::Builder::new()
+            .name("poc-deadline-watchdog".into())
+            .spawn(move || {
+                let t0 = Instant::now();
+                // Drift-corrected sleep to the deadline in short slices.
+                while let Some(rest) = deadline.checked_sub(t0.elapsed()) {
+                    if rest.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(rest.min(Duration::from_millis(500)));
+                }
+                // Fire: enqueue on the main queue + force the runloop awake.
+                for _ in 0..40 {
+                    if SERVICED.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    unsafe {
+                        dispatch_async_f(&_dispatch_main_q, std::ptr::null_mut(), trampoline);
+                        CFRunLoopWakeUp(CFRunLoopGetMain());
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                if !SERVICED.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "[watchdog] {label}: main thread did not service the deadline within \
+                         20 s of forced wakeups — hard exit(3); partial results lost."
+                    );
+                    std::process::exit(3);
+                }
+            })
+            .expect("failed to spawn deadline watchdog thread");
+    }
+}
+
+// ===========================================================================
+// §E2. Real-trace workload (spike 7) — record/replay a REAL pty byte stream
+// with timing.
+//
+// FORMAT ("nicetrace v1", little-endian):
+//   magic   8 bytes  b"NICEPTY1"
+//   start   u64      unix epoch millis at capture start (metadata only)
+//   records repeated until EOF:
+//     off_ns u64     monotonic offset from capture start (nanoseconds)
+//     len    u32     chunk byte length
+//     data   len bytes  raw pty OUTPUT bytes (child -> master)
+// A truncated trailing record (crash mid-write) is tolerated on load.
+// ===========================================================================
+
+pub mod trace {
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter, Read, Write};
+    use std::path::Path;
+    use std::time::Instant;
+
+    pub const MAGIC: &[u8; 8] = b"NICEPTY1";
+
+    pub struct TraceRecord {
+        pub offset_ns: u64,
+        pub data: Vec<u8>,
+    }
+
+    pub struct Trace {
+        pub start_unix_ms: u64,
+        pub records: Vec<TraceRecord>,
+        pub total_bytes: u64,
+        pub duration_ns: u64,
+    }
+
+    impl Trace {
+        pub fn load(path: &Path) -> std::io::Result<Trace> {
+            let f = File::open(path)?;
+            let mut r = BufReader::new(f);
+            let mut magic = [0u8; 8];
+            r.read_exact(&mut magic)?;
+            if &magic != MAGIC {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "not a nicetrace file (magic {:02x?}; want {MAGIC:02x?})",
+                        magic
+                    ),
+                ));
+            }
+            let mut u64buf = [0u8; 8];
+            r.read_exact(&mut u64buf)?;
+            let start_unix_ms = u64::from_le_bytes(u64buf);
+            let mut records = Vec::new();
+            let mut total_bytes = 0u64;
+            let mut duration_ns = 0u64;
+            loop {
+                match r.read_exact(&mut u64buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+                let offset_ns = u64::from_le_bytes(u64buf);
+                let mut u32buf = [0u8; 4];
+                if r.read_exact(&mut u32buf).is_err() {
+                    break; // truncated tail — keep what we have
+                }
+                let len = u32::from_le_bytes(u32buf) as usize;
+                let mut data = vec![0u8; len];
+                if r.read_exact(&mut data).is_err() {
+                    break; // truncated tail
+                }
+                total_bytes += len as u64;
+                duration_ns = duration_ns.max(offset_ns);
+                records.push(TraceRecord { offset_ns, data });
+            }
+            Ok(Trace {
+                start_unix_ms,
+                records,
+                total_bytes,
+                duration_ns,
+            })
+        }
+
+        pub fn duration_secs(&self) -> f64 {
+            self.duration_ns as f64 / 1.0e9
+        }
+    }
+
+    /// Streaming writer used by the `pty-capture` bin (and self-tests).
+    pub struct TraceWriter {
+        out: BufWriter<File>,
+        t0: Instant,
+        last_flush: Instant,
+        pub records: u64,
+        pub bytes: u64,
+    }
+
+    impl TraceWriter {
+        pub fn create(path: &Path) -> std::io::Result<TraceWriter> {
+            let f = File::create(path)?;
+            let mut out = BufWriter::new(f);
+            out.write_all(MAGIC)?;
+            let start_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            out.write_all(&start_unix_ms.to_le_bytes())?;
+            let now = Instant::now();
+            Ok(TraceWriter {
+                out,
+                t0: now,
+                last_flush: now,
+                records: 0,
+                bytes: 0,
+            })
+        }
+
+        /// Append one output chunk stamped with "now" (offset from create()).
+        pub fn record(&mut self, data: &[u8]) -> std::io::Result<()> {
+            self.record_at(self.t0.elapsed().as_nanos() as u64, data)
+        }
+
+        /// Append one output chunk at an explicit offset (converter path).
+        pub fn record_at(&mut self, offset_ns: u64, data: &[u8]) -> std::io::Result<()> {
+            self.out.write_all(&offset_ns.to_le_bytes())?;
+            self.out.write_all(&(data.len() as u32).to_le_bytes())?;
+            self.out.write_all(data)?;
+            self.records += 1;
+            self.bytes += data.len() as u64;
+            // Bound data loss on an abrupt kill without per-record fsync.
+            if self.last_flush.elapsed().as_millis() > 500 {
+                self.out.flush()?;
+                self.last_flush = Instant::now();
+            }
+            Ok(())
+        }
+
+        /// Flush + return (records, bytes, capture wall seconds).
+        pub fn finish(mut self) -> std::io::Result<(u64, u64, f64)> {
+            self.out.flush()?;
+            Ok((self.records, self.bytes, self.t0.elapsed().as_secs_f64()))
+        }
     }
 }
 

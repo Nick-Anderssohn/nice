@@ -155,6 +155,7 @@ fn run_headless() {
 // ===========================================================================
 mod gui {
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
     use std::sync::Mutex;
 
@@ -210,6 +211,15 @@ mod gui {
     /// delegate.send). This is the real proof-4 routing signal, vs the latency
     /// loop which closes on every present regardless of who handled the key.
     static KEY_ECHO: AtomicU64 = AtomicU64::new(0);
+    /// Spike 6: CPU/energy baseline (proc_pid_rusage) captured at embed; the
+    /// delta is reported by finish_and_exit.
+    static CPU0: Mutex<Option<harness::cpu::CpuSample>> = Mutex::new(None);
+    /// mach tick of measurement start (mirrors ChromeRoot.start_tick for the
+    /// free-function report path).
+    static START_TICK_G: AtomicU64 = AtomicU64::new(0);
+    /// Spike 7: mach tick when the trace feed finished (0 = not finished /
+    /// no trace).
+    static TRACE_DONE_AT: AtomicU64 = AtomicU64::new(0);
 
     /// SIGINT/SIGTERM handler — async-signal-safe (only flips an atomic). The
     /// Cocoa NSApplication.run loop swallows the default SIGINT, so without this
@@ -359,6 +369,42 @@ mod gui {
             pd.len()
         );
 
+        // ---- spike 6 diagnostics (vendored-gpui metrics + CPU/energy) -----
+        {
+            let mut draw_ms: Vec<f64> = gpui::nice_poc_metrics::DRAW_DUR_NS
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&ns| ns as f64 / 1.0e6)
+                .collect();
+            let n = draw_ms.len();
+            let (p50, p95, p99) = harness::percentiles(&mut draw_ms);
+            eprintln!(
+                "[diag] GPUI chrome MetalRenderer::draw CPU: n={n} p50={p50:.3} ms \
+                 p95={p95:.3} p99={p99:.3} (whole-process; SwiftTerm side has its own \
+                 Metal.Draw signpost)"
+            );
+            let (c, p, m) = gpui::nice_poc_metrics::shape_cache_stats();
+            eprintln!(
+                "[diag] GPUI shape cache: hit-current={c} hit-prev={p} miss={m}"
+            );
+        }
+        {
+            let start = START_TICK_G.load(Ordering::SeqCst);
+            let wall_s = if start != 0 {
+                harness::clock::ms_between(start, harness::clock::now()) / 1000.0
+            } else {
+                0.0
+            };
+            let c0 = *CPU0.lock().unwrap();
+            if let (Some(c0), Some(c1)) = (c0, harness::cpu::sample()) {
+                eprintln!(
+                    "[energy] {} (whole process over the {wall_s:.1}s measurement window)",
+                    harness::cpu::delta_summary(&c0, &c1, wall_s)
+                );
+            }
+        }
+
         use std::io::Write;
         let _ = std::io::stdout().flush();
         eprintln!("\n[phase0-poc] LIVE run complete ({reason}); exiting cleanly.");
@@ -373,12 +419,27 @@ mod gui {
         KEY_ECHO.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Spike 7: replay state for a captured real pty trace (NICE_POC_TRACE).
+    /// Replaces the synthetic workload as the byte source; the present scheme
+    /// and the rest of the driver are untouched.
+    pub struct TraceReplay {
+        trace: Arc<harness::trace::Trace>,
+        next: usize,
+        drain: bool,
+        speed: f64,
+        done: bool,
+    }
+
     pub struct ChromeRoot {
         embedded: bool,
         handles: Option<NativeHandles>,
         terminal: Option<Terminal>,
         term_nsview: *mut NSView,
         workload: Workload,
+        /// Spike 7: when set, pump_workload feeds from the trace instead of
+        /// the synthetic generator (paced by the trace's own timestamps, or
+        /// max-rate in drain mode).
+        trace: Option<TraceReplay>,
         per_frame_budget: usize,
         frame: u64,
         metal_ok: bool,
@@ -415,6 +476,7 @@ mod gui {
                 terminal: None,
                 term_nsview: std::ptr::null_mut(),
                 workload: Workload::new(prof),
+                trace: None,
                 per_frame_budget: prof.bytes_per_sec / 120, // assume ProMotion 120 Hz
                 frame: 0,
                 metal_ok: false,
@@ -539,6 +601,9 @@ mod gui {
             store_f64(&PEAK_PHYS, harness::mem::mib(phys));
             harness::reset_frame_streams();
             self.start_tick = harness::clock::now();
+            // Spike 6: CPU/energy baseline over the measurement window.
+            START_TICK_G.store(self.start_tick, Ordering::SeqCst);
+            *CPU0.lock().unwrap() = harness::cpu::sample();
 
             self.handles = Some(handles);
             self.terminal = Some(term);
@@ -570,14 +635,52 @@ mod gui {
 
         /// Stream one frame's byte budget into the terminal and force a present
         /// (the burst-FPS driver, Harness §B/§E). The present also closes the
-        /// armed keystroke's latency loop.
+        /// armed keystroke's latency loop. With NICE_POC_TRACE set (spike 7)
+        /// the byte source is the captured real pty trace instead: paced by
+        /// its own timestamps (scaled by NICE_POC_TRACE_SPEED), or max-rate
+        /// at ~1 MiB/frame in drain mode.
         fn pump_workload(&mut self) {
             let Some(term) = &self.terminal else { return };
-            let mut fed = 0usize;
-            while fed < self.per_frame_budget {
-                let chunk = self.workload.next_chunk();
-                term.feed_bytes(&chunk);
-                fed += chunk.len();
+            if let Some(tr) = &mut self.trace {
+                let records = &tr.trace.records;
+                if tr.drain {
+                    let mut fed = 0usize;
+                    while tr.next < records.len() && fed < (1 << 20) {
+                        let rec = &records[tr.next];
+                        term.feed_bytes(&rec.data);
+                        fed += rec.data.len();
+                        tr.next += 1;
+                    }
+                } else {
+                    let elapsed_ns = harness::clock::ms_between(
+                        self.start_tick,
+                        harness::clock::now(),
+                    ) * 1.0e6
+                        * tr.speed;
+                    while tr.next < records.len()
+                        && (records[tr.next].offset_ns as f64) <= elapsed_ns
+                    {
+                        term.feed_bytes(&records[tr.next].data);
+                        tr.next += 1;
+                    }
+                }
+                if tr.next >= records.len() && !tr.done {
+                    tr.done = true;
+                    TRACE_DONE_AT.store(harness::clock::now(), Ordering::SeqCst);
+                    eprintln!(
+                        "[phase0-poc] trace feed complete ({} records, {} bytes) — \
+                         finalizing ~1s after quiescent",
+                        records.len(),
+                        tr.trace.total_bytes
+                    );
+                }
+            } else {
+                let mut fed = 0usize;
+                while fed < self.per_frame_budget {
+                    let chunk = self.workload.next_chunk();
+                    term.feed_bytes(&chunk);
+                    fed += chunk.len();
+                }
             }
             // With the decoupled present loop the CADisplayLink drives the
             // terminal present at refresh (and closes the keystroke-latency
@@ -826,6 +929,15 @@ mod gui {
             if self.embedded && self.elapsed_secs() >= self.deadline_secs {
                 self.finalize_and_exit("measurement window elapsed");
             }
+            // Spike 7: a finite trace feed finalizes ~1 s after the last byte
+            // ("quiescent"), before the deadline.
+            let trace_done = TRACE_DONE_AT.load(Ordering::SeqCst);
+            if self.embedded
+                && trace_done != 0
+                && harness::clock::ms_between(trace_done, harness::clock::now()) > 1000.0
+            {
+                self.finalize_and_exit("trace complete (quiescent +1s)");
+            }
 
             // Keep compositing continuously so the GPUI (blade/metal) stack does
             // REAL work over the live terminal — the dual-stack story. This is the
@@ -879,11 +991,49 @@ mod gui {
         SEED.store(prof.seed, Ordering::SeqCst);
         BPS.store(prof.bytes_per_sec as u64, Ordering::SeqCst);
 
+        // Spike 7: optional real-trace workload (NICE_POC_TRACE=<file>,
+        // NICE_POC_TRACE_SPEED=<f>, NICE_POC_TRACE_MODE=drain).
+        let trace_speed = std::env::var("NICE_POC_TRACE_SPEED")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(1.0);
+        let trace_drain = matches!(
+            std::env::var("NICE_POC_TRACE_MODE").as_deref(),
+            Ok("drain") | Ok("max")
+        );
+        let trace: Option<Arc<harness::trace::Trace>> = match std::env::var("NICE_POC_TRACE") {
+            Ok(p) if !p.is_empty() => match harness::trace::Trace::load(Path::new(&p)) {
+                Ok(t) => {
+                    eprintln!(
+                        "[phase0-poc] trace loaded: {p} — {} records, {} bytes, {:.1}s \
+                         native duration (speed x{trace_speed}, mode={})",
+                        t.records.len(),
+                        t.total_bytes,
+                        t.duration_secs(),
+                        if trace_drain { "DRAIN" } else { "timing-faithful" }
+                    );
+                    Some(Arc::new(t))
+                }
+                Err(e) => {
+                    eprintln!("[phase0-poc] FATAL: NICE_POC_TRACE={p}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            _ => None,
+        };
+
         let deadline = std::env::var("NICE_POC_SECS")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
-            .unwrap_or(25.0);
+            .unwrap_or_else(|| match &trace {
+                // A finite trace replay sizes its own window (+3 s tail; the
+                // run finalizes ~1 s after the feed completes anyway).
+                Some(t) if !trace_drain => t.duration_secs() / trace_speed + 3.0,
+                Some(_) => 60.0,
+                None => 25.0,
+            });
 
         // Present scheme (NICE_POC_PRESENT): default `link` = decoupled CADisplayLink
         // loop; `sync` = naive per-GPUI-frame present (the A/B baseline); `async` =
@@ -921,6 +1071,22 @@ mod gui {
             unsafe { crate::input::activate_front(&app) };
             cx.activate(true);
 
+            // Guaranteed auto-exit backstop (2026-07-02, shared with gpui-term
+            // — see harness::watchdog): the ordinary deadline lives on the
+            // render path (RAF), which stops if the window is fully occluded
+            // or the runloop starves after a finite trace quiesces. The
+            // watchdog fires the free-function report (the end-of-run
+            // mouse-seam/rebind probes are SKIPPED — their gates stay
+            // UNPROVEN, the correct degradation for a starved run). +5 s
+            // grace so the embed-anchored render-path deadline normally wins.
+            harness::watchdog::arm(
+                std::time::Duration::from_secs_f64(deadline + 5.0),
+                "phase0-poc",
+                move || {
+                    finish_and_exit("deadline (watchdog — render path starved; probes skipped)")
+                },
+            );
+
             // Window-close / Cmd-Q -> emit the report and exit cleanly.
             cx.on_window_closed(|_cx| finish_and_exit("window closed / Cmd-Q"))
                 .detach();
@@ -943,16 +1109,24 @@ mod gui {
                     is_resizable: true,
                     ..Default::default()
                 },
-                |_window, cx| {
-                    cx.new(|_cx| {
-                        ChromeRoot::new(
+                move |_window, cx| {
+                    cx.new(move |_cx| {
+                        let mut root = ChromeRoot::new(
                             deadline,
                             decouple_present,
                             async_present,
                             copace,
                             transactional,
                             present_terminal,
-                        )
+                        );
+                        root.trace = trace.map(|t| TraceReplay {
+                            trace: t,
+                            next: 0,
+                            drain: trace_drain,
+                            speed: trace_speed,
+                            done: false,
+                        });
+                        root
                     })
                 },
             )

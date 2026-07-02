@@ -1,6 +1,6 @@
 diff --color=never -ruN a/build.rs b/build.rs
---- a/build.rs	2026-07-01 23:02:19
-+++ b/build.rs	2026-07-01 23:53:34
+--- a/build.rs	2026-07-02 00:42:06
++++ b/build.rs	2026-07-02 00:42:07
 @@ -65,6 +65,7 @@
  
      pub(super) fn build() {
@@ -52,9 +52,255 @@ diff --color=never -ruN a/build.rs b/build.rs
      }
  
      fn generate_dispatch_bindings() {
+diff --color=never -ruN a/src/gpui.rs b/src/gpui.rs
+--- a/src/gpui.rs	2026-07-02 00:42:07
++++ b/src/gpui.rs	2026-07-02 00:42:07
+@@ -27,6 +27,9 @@
+ mod interactive;
+ mod key_dispatch;
+ mod keymap;
++/// NICE PHASE-0 PATCH: passive spike metrics (per-draw CPU/GPU durations,
++/// shape-cache hit counters, atlas pressure counters). See the module docs.
++pub mod nice_poc_metrics;
+ mod path_builder;
+ mod platform;
+ pub mod prelude;
+diff --color=never -ruN a/src/nice_poc_metrics.rs b/src/nice_poc_metrics.rs
+--- a/src/nice_poc_metrics.rs	1969-12-31 16:00:00
++++ b/src/nice_poc_metrics.rs	2026-07-02 00:42:07
+@@ -0,0 +1,145 @@
++//! NICE PHASE-0 PATCH — process-wide spike metrics for the Nice rewrite
++//! Phase-0 program (spikes/phase0-poc; see its README §"Vendored gpui").
++//!
++//! Everything here is passive bookkeeping read by the spike bins through
++//! `gpui::nice_poc_metrics::…` (the crate is path-patched, so the module is
++//! directly importable). Nothing in this module changes rendering behavior;
++//! the only optional behavior switch (`NICE_POC_GPU_TS`) adds a read of the
++//! command buffer's GPU timestamps inside the *already existing* completed
++//! handler.
++//!
++//! Recorders wired by the patch:
++//!  * `DRAW_DUR_NS` — CPU wall duration of every `MetalRenderer::draw`
++//!    (drawable acquire -> encode -> commit [-> waitUntilScheduled ->
++//!    present]) pushed by the `DrawSignpost` guard's Drop (spike 6: per-draw
++//!    CPU cost — the number comparable to Nice's `Metal.Draw` 1.2 ms p50).
++//!  * `GPU_DUR_NS` — `GPUEndTime - GPUStartTime` of each command buffer,
++//!    read in the completed handler ONLY when env `NICE_POC_GPU_TS=1`
++//!    (spike 6: GPU-side per-frame cost).
++//!  * `SHAPE_*` — LineLayoutCache::layout_line outcome counters (spike 6:
++//!    shape-cache hit rate; current-frame hit / previous-frame hit / miss =
++//!    fresh CoreText shape).
++//!  * `ATLAS_MONO` / `ATLAS_POLY` — MetalAtlas texture/tile/upload counters
++//!    (spike 10: atlas pressure; what `remove()` actually reclaims).
++
++use std::sync::Mutex;
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++/// Safety cap so an unattended run cannot grow the duration vectors
++/// unboundedly (1M samples = 8 MB; a 60 Hz run emits ~216k/h).
++const DUR_CAP: usize = 1 << 20;
++
++/// Per-draw CPU durations (ns) of `MetalRenderer::draw`, in call order,
++/// across ALL windows (draws are serialized on the main thread).
++pub static DRAW_DUR_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
++
++/// Per-command-buffer GPU durations (ns), recorded by the completed handler
++/// when `NICE_POC_GPU_TS=1`. Completion order (still monotone per buffer).
++pub static GPU_DUR_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
++
++/// Record one `MetalRenderer::draw` CPU duration (called by the Draw guard).
++pub fn record_draw_dur_ns(ns: u64) {
++    let mut v = DRAW_DUR_NS.lock().unwrap();
++    if v.len() < DUR_CAP {
++        v.push(ns);
++    }
++}
++
++/// Record one command buffer's GPU execution duration (completed handler).
++pub fn record_gpu_dur_ns(ns: u64) {
++    let mut v = GPU_DUR_NS.lock().unwrap();
++    if v.len() < DUR_CAP {
++        v.push(ns);
++    }
++}
++
++/// True iff env `NICE_POC_GPU_TS` is "1" | "true" (read once). Gates the
++/// GPUStartTime/GPUEndTime read in the metal_renderer completed handler.
++pub fn gpu_ts_enabled() -> bool {
++    static V: OnceLock<bool> = OnceLock::new();
++    *V.get_or_init(|| {
++        matches!(
++            std::env::var("NICE_POC_GPU_TS").as_deref(),
++            Ok("1") | Ok("true")
++        )
++    })
++}
++
++// ---------------------------------------------------------------------------
++// Shape cache (LineLayoutCache::layout_line) outcome counters — spike 6.
++// ---------------------------------------------------------------------------
++
++/// Hit in the CURRENT frame's cache (same line shaped again this frame).
++pub static SHAPE_HIT_CURRENT: AtomicU64 = AtomicU64::new(0);
++/// Hit carried over from the PREVIOUS frame (unchanged line across frames).
++pub static SHAPE_HIT_PREVIOUS: AtomicU64 = AtomicU64::new(0);
++/// Miss — a fresh platform (CoreText) shaping call.
++pub static SHAPE_MISS: AtomicU64 = AtomicU64::new(0);
++
++/// (hit_current, hit_previous, miss) snapshot.
++pub fn shape_cache_stats() -> (u64, u64, u64) {
++    (
++        SHAPE_HIT_CURRENT.load(Ordering::Relaxed),
++        SHAPE_HIT_PREVIOUS.load(Ordering::Relaxed),
++        SHAPE_MISS.load(Ordering::Relaxed),
++    )
++}
++
++// ---------------------------------------------------------------------------
++// Atlas counters — spike 10. One bank per texture kind, cumulative over the
++// process lifetime and across every window's atlas (aggregate).
++// ---------------------------------------------------------------------------
++
++/// Cumulative counters for one atlas texture kind (monochrome/polychrome).
++pub struct AtlasBank {
++    /// Atlas textures created (each is a real MTLTexture allocation).
++    pub tex_allocated: AtomicU64,
++    /// Atlas textures actually FREED (storage reclaimed): gpui 0.2.2 frees a
++    /// texture only when its live-tile refcount reaches zero — individual
++    /// tile rectangles are never returned to the allocator.
++    pub tex_freed: AtomicU64,
++    /// Bytes of texture storage allocated (w*h*bytes-per-pixel).
++    pub tex_bytes_allocated: AtomicU64,
++    /// Bytes of texture storage freed (whole-texture reclaim only).
++    pub tex_bytes_freed: AtomicU64,
++    /// Tiles inserted (`get_or_insert_with` build path).
++    pub tiles_inserted: AtomicU64,
++    /// Tiles removed (`remove`; storage is NOT reclaimed per tile).
++    pub tiles_removed: AtomicU64,
++    /// Bytes uploaded through `replace_region` (tile upload traffic).
++    pub upload_bytes: AtomicU64,
++}
++
++impl AtlasBank {
++    const fn new() -> Self {
++        AtlasBank {
++            tex_allocated: AtomicU64::new(0),
++            tex_freed: AtomicU64::new(0),
++            tex_bytes_allocated: AtomicU64::new(0),
++            tex_bytes_freed: AtomicU64::new(0),
++            tiles_inserted: AtomicU64::new(0),
++            tiles_removed: AtomicU64::new(0),
++            upload_bytes: AtomicU64::new(0),
++        }
++    }
++
++    /// Plain-u64 snapshot: (tex_alloc, tex_freed, bytes_alloc, bytes_freed,
++    /// tiles_inserted, tiles_removed, upload_bytes).
++    pub fn snapshot(&self) -> [u64; 7] {
++        [
++            self.tex_allocated.load(Ordering::Relaxed),
++            self.tex_freed.load(Ordering::Relaxed),
++            self.tex_bytes_allocated.load(Ordering::Relaxed),
++            self.tex_bytes_freed.load(Ordering::Relaxed),
++            self.tiles_inserted.load(Ordering::Relaxed),
++            self.tiles_removed.load(Ordering::Relaxed),
++            self.upload_bytes.load(Ordering::Relaxed),
++        ]
++    }
++}
++
++/// Monochrome atlas (A8 — glyph masks).
++pub static ATLAS_MONO: AtlasBank = AtlasBank::new();
++/// Polychrome atlas (BGRA8 — images/emoji/`paint_image`).
++pub static ATLAS_POLY: AtlasBank = AtlasBank::new();
+diff --color=never -ruN a/src/platform/mac/metal_atlas.rs b/src/platform/mac/metal_atlas.rs
+--- a/src/platform/mac/metal_atlas.rs	2026-07-02 00:42:07
++++ b/src/platform/mac/metal_atlas.rs	2026-07-02 00:42:07
+@@ -10,6 +10,23 @@
+ use parking_lot::Mutex;
+ use std::borrow::Cow;
+ 
++/// NICE PHASE-0 PATCH (spike 10): counter bank for one atlas texture kind.
++fn nice_poc_bank(kind: AtlasTextureKind) -> &'static crate::nice_poc_metrics::AtlasBank {
++    match kind {
++        AtlasTextureKind::Monochrome => &crate::nice_poc_metrics::ATLAS_MONO,
++        AtlasTextureKind::Polychrome => &crate::nice_poc_metrics::ATLAS_POLY,
++    }
++}
++
++/// NICE PHASE-0 PATCH (spike 10): bytes-per-pixel by texture kind (matches
++/// the descriptor pixel formats chosen in `push_texture`).
++fn nice_poc_bpp(kind: AtlasTextureKind) -> u64 {
++    match kind {
++        AtlasTextureKind::Monochrome => 1, // A8Unorm
++        AtlasTextureKind::Polychrome => 4, // BGRA8Unorm
++    }
++}
++
+ pub(crate) struct MetalAtlas(Mutex<MetalAtlasState>);
+ 
+ impl MetalAtlas {
+@@ -53,6 +70,14 @@
+             let texture = lock.texture(tile.texture_id);
+             texture.upload(tile.bounds, &bytes);
+             lock.tiles_by_key.insert(key.clone(), tile.clone());
++            // NICE PHASE-0 PATCH (spike 10): tile insert + upload traffic.
++            {
++                use std::sync::atomic::Ordering;
++                let bank = nice_poc_bank(key.texture_kind());
++                bank.tiles_inserted.fetch_add(1, Ordering::Relaxed);
++                bank.upload_bytes
++                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
++            }
+             Ok(Some(tile))
+         }
+     }
+@@ -79,6 +104,22 @@
+         if let Some(mut texture) = texture_slot.take() {
+             texture.decrement_ref_count();
+ 
++            // NICE PHASE-0 PATCH (spike 10): count the tile removal, and —
++            // when the WHOLE texture becomes unreferenced (the only case
++            // where gpui 0.2.2 reclaims storage) — the freed texture bytes.
++            {
++                use std::sync::atomic::Ordering;
++                let bank = nice_poc_bank(id.kind);
++                bank.tiles_removed.fetch_add(1, Ordering::Relaxed);
++                if texture.is_unreferenced() {
++                    let bytes = texture.metal_texture.width() as u64
++                        * texture.metal_texture.height() as u64
++                        * nice_poc_bpp(id.kind);
++                    bank.tex_freed.fetch_add(1, Ordering::Relaxed);
++                    bank.tex_bytes_freed.fetch_add(bytes, Ordering::Relaxed);
++                }
++            }
++
+             if texture.is_unreferenced() {
+                 textures.free_list.push(id.index as usize);
+                 lock.tiles_by_key.remove(key);
+@@ -147,6 +188,18 @@
+         texture_descriptor.set_pixel_format(pixel_format);
+         texture_descriptor.set_usage(usage);
+         let metal_texture = self.device.new_texture(&texture_descriptor);
++
++        // NICE PHASE-0 PATCH (spike 10): texture allocation counters.
++        {
++            use std::sync::atomic::Ordering;
++            let bank = nice_poc_bank(kind);
++            bank.tex_allocated.fetch_add(1, Ordering::Relaxed);
++            bank.tex_bytes_allocated.fetch_add(
++                u64::from(size.width.0 as u32) * u64::from(size.height.0 as u32)
++                    * nice_poc_bpp(kind),
++                Ordering::Relaxed,
++            );
++        }
+ 
+         let texture_list = match kind {
+             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
 diff --color=never -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
---- a/src/platform/mac/metal_renderer.rs	2026-07-01 23:02:19
-+++ b/src/platform/mac/metal_renderer.rs	2026-07-01 23:53:34
+--- a/src/platform/mac/metal_renderer.rs	2026-07-02 00:42:07
++++ b/src/platform/mac/metal_renderer.rs	2026-07-02 00:42:07
 @@ -153,6 +153,11 @@
                      | AutoresizingMask::HEIGHT_SIZABLE
              ];
@@ -106,7 +352,32 @@ diff --color=never -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/
          let layer = self.layer.clone();
          let viewport_size = layer.drawable_size();
          let viewport_size: Size<DevicePixels> = size(
-@@ -1352,4 +1373,66 @@
+@@ -377,10 +398,23 @@
+                 Ok(command_buffer) => {
+                     let instance_buffer_pool = self.instance_buffer_pool.clone();
+                     let instance_buffer = Cell::new(Some(instance_buffer));
+-                    let block = ConcreteBlock::new(move |_| {
++                    let block = ConcreteBlock::new(move |cb: &metal::CommandBufferRef| {
+                         if let Some(instance_buffer) = instance_buffer.take() {
+                             instance_buffer_pool.lock().release(instance_buffer);
+                         }
++                        // NICE PHASE-0 PATCH (spike 6): with NICE_POC_GPU_TS=1
++                        // record the buffer's GPU execution time (GPUEndTime -
++                        // GPUStartTime, CFTimeInterval seconds) in the ALREADY
++                        // existing completed handler. Env unset => no reads.
++                        if crate::nice_poc_metrics::gpu_ts_enabled() {
++                            let start: f64 = unsafe { msg_send![cb, GPUStartTime] };
++                            let end: f64 = unsafe { msg_send![cb, GPUEndTime] };
++                            if end > start {
++                                crate::nice_poc_metrics::record_gpu_dur_ns(
++                                    ((end - start) * 1.0e9) as u64,
++                                );
++                            }
++                        }
+                     });
+                     let block = block.copy();
+                     command_buffer.add_completed_handler(&block);
+@@ -1352,4 +1386,77 @@
  pub struct SurfaceBounds {
      pub bounds: Bounds<ScaledPixels>,
      pub content_mask: ContentMask<ScaledPixels>,
@@ -157,25 +428,36 @@ diff --color=never -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/
 +    }
 +
 +    /// RAII guard for one "Draw" signpost interval; Drop covers all exits.
-+    pub(super) struct DrawSignpost(u64);
++    /// Also times the draw (spike 6): the guard's lifetime IS the CPU-side
++    /// draw-submission interval, so Drop records `t0.elapsed()` into
++    /// `nice_poc_metrics::DRAW_DUR_NS` — recorded ALWAYS (independent of
++    /// whether a signpost recorder is attached; a Vec push per draw).
++    pub(super) struct DrawSignpost {
++        id: u64,
++        t0: std::time::Instant,
++    }
 +
 +    impl DrawSignpost {
 +        #[inline]
 +        pub(super) fn begin() -> Self {
-+            DrawSignpost(unsafe { nice_signpost_draw_begin() })
++            DrawSignpost {
++                id: unsafe { nice_signpost_draw_begin() },
++                t0: std::time::Instant::now(),
++            }
 +        }
 +    }
 +
 +    impl Drop for DrawSignpost {
 +        #[inline]
 +        fn drop(&mut self) {
-+            unsafe { nice_signpost_draw_end(self.0) }
++            crate::nice_poc_metrics::record_draw_dur_ns(self.t0.elapsed().as_nanos() as u64);
++            unsafe { nice_signpost_draw_end(self.id) }
 +        }
 +    }
  }
 diff --color=never -ruN a/src/platform/mac/nice_signpost.c b/src/platform/mac/nice_signpost.c
 --- a/src/platform/mac/nice_signpost.c	1969-12-31 16:00:00
-+++ b/src/platform/mac/nice_signpost.c	2026-07-01 23:53:34
++++ b/src/platform/mac/nice_signpost.c	2026-07-02 00:42:07
 @@ -0,0 +1,72 @@
 +// NICE PHASE-0 PATCH — os_signpost "Draw" interval shim.
 +//
@@ -249,9 +531,37 @@ diff --color=never -ruN a/src/platform/mac/nice_signpost.c b/src/platform/mac/ni
 +    }
 +    os_signpost_interval_end(nice_poc_log(), (os_signpost_id_t)spid, "Draw");
 +}
+diff --color=never -ruN a/src/text_system/line_layout.rs b/src/text_system/line_layout.rs
+--- a/src/text_system/line_layout.rs	2026-07-02 00:42:07
++++ b/src/text_system/line_layout.rs	2026-07-02 00:42:07
+@@ -551,15 +551,24 @@
+ 
+         let current_frame = self.current_frame.upgradable_read();
+         if let Some(layout) = current_frame.lines.get(key) {
++            // NICE PHASE-0 PATCH (spike 6): shape-cache hit (current frame).
++            crate::nice_poc_metrics::SHAPE_HIT_CURRENT
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             return layout.clone();
+         }
+ 
+         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+         if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
++            // NICE PHASE-0 PATCH (spike 6): shape-cache hit (previous frame).
++            crate::nice_poc_metrics::SHAPE_HIT_PREVIOUS
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             current_frame.lines.insert(key.clone(), layout.clone());
+             current_frame.used_lines.push(key);
+             layout
+         } else {
++            // NICE PHASE-0 PATCH (spike 6): miss — fresh platform shaping.
++            crate::nice_poc_metrics::SHAPE_MISS
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             let text = SharedString::from(text);
+             let mut layout = self
+                 .platform_text_system
 diff --color=never -ruN a/src/window.rs b/src/window.rs
---- a/src/window.rs	2026-07-01 23:02:19
-+++ b/src/window.rs	2026-07-01 23:53:34
+--- a/src/window.rs	2026-07-02 00:42:07
++++ b/src/window.rs	2026-07-02 00:42:07
 @@ -1036,9 +1036,17 @@
  
                  // Keep presenting the current scene for 1 extra second since the

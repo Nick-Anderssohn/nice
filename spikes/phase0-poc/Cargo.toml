@@ -18,6 +18,14 @@ path = "src/main.rs"
 name = "gpui-term"
 path = "src/gpui_term.rs"
 
+# §13 spike 7 — capture a REAL pty session (e.g. a live `claude` CLI run) to a
+# timestamped byte trace (harness::trace "nicetrace v1" format), replayable
+# via NICE_POC_TRACE=<file> in both measurement bins. Also converts macOS
+# `script -r` recordings (best-effort). See src/pty_capture.rs.
+[[bin]]
+name = "pty-capture"
+path = "src/pty_capture.rs"
+
 [dependencies]
 # Path-B VT core: headless grid/scrollback/parser, ships NO renderer (we draw
 # it on GPUI's public primitives). Same version spike-rust-term already proved.
@@ -56,6 +64,11 @@ libc = "0.2"
 # the reader thread to the GPUI main thread over an unbounded channel. Same
 # futures 0.3 gpui already links (no new transitive deps).
 futures = "0.3"
+
+# Spike 10 (atlas pressure): construct gpui::RenderImage frames for
+# paint_image. SAME version gpui 0.2.2 depends on (cargo unifies; no new
+# transitive dep tree).
+image = "0.25.1"
 
 # Vendored gpui 0.2.2 with the Nice Phase-0 patch applied (spike 3 GPUI-side
 # transactional-present toggle via NICE_POC_GPUI_TXN=1 + the "Draw" os_signpost

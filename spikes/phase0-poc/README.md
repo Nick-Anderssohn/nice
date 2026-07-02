@@ -578,3 +578,209 @@ frame (other windows' warm-up frames are cleared then, but their streams may
 start a frame or two apart); background-window frame intervals track the
 heartbeat/notify cadence, not fps; a background window's dirty flag can be
 consumed by its own render racing the poller (at most one delayed redraw).
+
+> **Fixed 2026-07-02:** background windows previously rebuilt scenes on
+> notify but never actually PRESENTED while their display link was stopped
+> (the same gpui-0.2.2 behavior the interactive mode's present kick works
+> around). The bg notify poller now also fires `kick_view_display`
+> (setNeedsDisplay on the view + backing CAMetalLayer), so demand-driven
+> background windows really present ~1/s.
+
+---
+
+# 2026-07-02 spike prep — §13 spikes 6, 7, 9, 10 (build-only)
+
+Everything below compiles headless and defaults OFF (unset env ⇒ the audited
+behavior, bit-for-bit — verified by the unchanged headless self-tests). Every
+live mode stays display-gated behind `NICE_POC_RUN=1`. The exact live-run
+command sequences live in `RUNBOOK-spikes-6-7-9-10.md`.
+
+## Vendored-gpui metrics (`gpui::nice_poc_metrics`, new patch hunks)
+
+The vendored gpui now also records (passively — no behavior change):
+
+| Metric | Where | Notes |
+|---|---|---|
+| `DRAW_DUR_NS` | `MetalRenderer::draw` guard | CPU wall per draw (drawable acquire→encode→commit[→present]); always on; the number comparable to Nice's `Metal.Draw` 1.19/2.41 ms p50/p95 |
+| `GPU_DUR_NS` | command-buffer completed handler | `GPUEndTime−GPUStartTime`; **only with `NICE_POC_GPU_TS=1`** |
+| `SHAPE_HIT_CURRENT/PREVIOUS/MISS` | `LineLayoutCache::layout_line` | shape-cache hit rate (miss = fresh CoreText shape) |
+| `ATLAS_MONO` / `ATLAS_POLY` banks | `MetalAtlas` | textures/bytes allocated+freed, tiles inserted/removed, upload bytes — verifies what `remove()` actually reclaims (gpui 0.2.2 frees storage only when a whole texture unreferences) |
+
+Both bins print these in their summaries. Patch regenerated + round-trip
+verified (`vendor-gpui.sh` → identical tree).
+
+## Spike 6 — release per-frame cost + energy
+
+New in the `gpui-term` summary (every live run): render busy-cost percentiles
+(snapshot / render-body / paint-closure), per-draw CPU cost, optional GPU
+time, shape-cache hit rate, and a **no-sudo energy proxy** — `proc_pid_rusage`
+(RUSAGE_INFO_V4) deltas over the measurement window: CPU ms + avg core %,
+pkg-idle wakeups/s, `ri_billed_energy` mJ/mW when the kernel accounts it,
+instructions/cycles. The Path A bin prints `[diag]`/`[energy]` equivalents.
+
+Energy states for the powermetrics three-state protocol
+(`NICE_POC_ENERGY_STATE`, single window forced):
+
+| State | Meaning |
+|---|---|
+| `idle` | window open, no feed, NO RAF — demand-driven, ~zero draws |
+| `dot` | no feed, one 12px chrome dot animating via RAF — GPUI whole-scene repaint at refresh (the audit's idle-cost risk) |
+| unset | normal streaming |
+
+`sudo powermetrics` variant (HUMAN, optional — the rusage proxy needs no
+sudo): while each state runs for 60 s, in another terminal:
+`sudo powermetrics --samplers cpu_power,gpu_power,tasks -i 1000 -n 55 > pm-<state>.txt`
+then read the average CPU/GPU mW + the per-task row for `gpui-term`.
+
+## Spike 7 — real-trace workload (`NICE_POC_TRACE`)
+
+Capture (MAIN SESSION, inside a real terminal — records pty OUTPUT only, with
+timestamps; input is forwarded but never recorded):
+
+```sh
+cargo run --release --bin pty-capture -- -o /tmp/claude-session.nicetrace -- claude
+# use the session normally (ask it something real); exit claude to finish.
+```
+
+Alternative: record with `script -r /tmp/s.raw claude`, then convert:
+`pty-capture --convert-script /tmp/s.raw -o /tmp/claude-session.nicetrace`
+(best-effort BSD stamp parser — verified against this machine's script(1)).
+
+Format "nicetrace v1" (`harness::trace`): magic `NICEPTY1` + u64 unix-ms +
+records of (u64 LE offset_ns, u32 LE len, bytes). Truncated tails tolerated.
+
+Replay — same FPS harness/CSV as the synthetic runs, in BOTH bins:
+
+| Var | Effect |
+|---|---|
+| `NICE_POC_TRACE=<file>` | replace the synthetic generator with the trace (streaming windows; bg windows keep heartbeat/`NICE_POC_BG_BPS`) |
+| `NICE_POC_TRACE_SPEED=<f>` | time scale (2 = twice as fast; default 1) |
+| `NICE_POC_TRACE_LOOP=1` | loop the trace (endless feed; deadline governs) |
+| `NICE_POC_TRACE_MODE=drain` | max-rate drain test: ignore timestamps, feed as fast as the parser accepts; summary reports wall-clock-to-quiescent + max frame interval |
+
+A finite replay auto-sizes the deadline (native duration + 3 s) and finalizes
+~1 s after the feed goes quiescent. Headless: `NICE_POC_TRACE=<file|selftest>
+cargo run --bin gpui-term` loads + max-rate-drains the trace through the
+parser with no display (the parse half of the drain test).
+
+## Spike 9 — scrollback / resize-reflow / selection under streaming
+
+| Var | Effect |
+|---|---|
+| `NICE_POC_SCROLLBACK=<n>` | alacritty `scrolling_history` (default 10000) — run 1k/10k/100k for the spike-8 memory question |
+| `NICE_POC_SCROLL_CHURN=1` | prefill history, then churn the display offset every frame (±3 lines triangle over full history; snap to Bottom every 900 frames) |
+| `NICE_POC_RESIZE_STORM=1` | every `NICE_POC_RESIZE_MS` (default 400) cycle the Term through 120x40→100x34→80x28→100x34 (full-history reflow, stall TIMED per resize) + resize the real NSWindow to match |
+| `NICE_POC_SELECTION=1` | programmatic selection churn: re-anchor deep in history every ~4 s (streaming EVICTS the anchor), sweep the end across the viewport each frame; rendered inverse (real paint cost); summary counts re-anchors + evicted frames |
+| `NICE_POC_PREFILL_LINES=<n>` | history prefill (defaults to the scrollback limit when scroll/selection churn is on) |
+
+Kill-signal instrument: `Term::resize reflow stall` percentiles in the
+summary (§13: multi-hundred-ms stalls ⇒ the fork's debounce machinery must be
+re-invented). Headless first look (`NICE_POC_SPIKE9=1 cargo run --release
+--bin gpui-term`, measured 2026-07-02 on this machine): max reflow stall
+**4.0 ms** on a full 10k history; memory at history-full: 1k **+3.5 MiB**,
+10k **+28.5 MiB**, 100k **+287 MiB** per session (parser side, no atlas).
+Selection held across eviction rotates sanely (no panic, range stays valid).
+
+Note: input-level selection (real mouse drags through the responder chain) is
+deliberately NOT simulated here — that belongs to the live IME/input spike
+(spike 2). This mode drives the same alacritty `Selection` + grid-rotation VT
+core, which is where §13's perf kill-signal lives.
+
+## Spike 10 — atlas pressure
+
+| Var | Effect |
+|---|---|
+| `NICE_POC_ATLAS=1` | w0 paints a synthetic kitty-style animation (30 fps, 512x512, every frame brand-new bytes ⇒ a new polychrome tile via `paint_image`) + 12 static sixel-stand-in images every frame; stale animation frames are `drop_image()`d (⇒ atlas `remove()`) |
+| `NICE_POC_ATLAS_RETAIN=1` | never drop — demonstrates the unbounded-growth failure mode |
+| `NICE_POC_GLYPH_SWEEP=1` | feeder streams unbounded distinct glyphs (ASCII→Latin-ext→box→blocks→kana→CJK→emoji + rotating SGR bold/italic) to grow the MONOCHROME atlas; auto-enables styles |
+| `NICE_POC_STYLES=1` | map SGR bold/italic to real font variants in paint (default OFF to keep audited numbers reproducible; the synthetic workload emits `[1m`, so styles-on also measures production-fidelity paint) |
+
+Summary prints both atlas banks: textures/bytes allocated vs FREED (gpui
+0.2.2 reclaims storage only when an entire texture unreferences — the §13
+"verify what remove() actually reclaims" question), tiles inserted/removed,
+upload MiB, plus animation emit/drop counts. Kill-signal: live-texture bytes
+growing without bound, or upload-driven frame drops (watch the frame-interval
+block in the same summary).
+
+## Deadline watchdog — the idle-state hang fix (2026-07-02, second pass)
+
+The first live run of `NICE_POC_ENERGY_STATE=idle` HUNG (banner + display
+line, then nothing for 8+ minutes). Root cause shape: the auto-exit deadline
+lived on (a) the render path — which never runs in a demand-driven window
+with no feed — and, for idle, (b) a gpui `BackgroundExecutor::timer`, which
+is `dispatch_after` + a main-queue repoll; mechanically runloop-independent,
+but a fully idle app (no draws, no events, display link stopped, window
+occluded) is exactly what App Nap targets — its timers get coalesced/deferred
+indefinitely. The interactive mode's identical timer only ever fired in runs
+kept un-napped by real input.
+
+Fix: **`harness::watchdog`** — a dedicated OS thread (drift-corrected
+`nanosleep` slices; not a coalescable timer) that at the deadline enqueues
+the finalize callback onto the libdispatch MAIN queue (`dispatch_async_f` —
+an enqueue + port wakeup, not a timer) AND force-wakes the main runloop
+(`CFRunLoopWakeUp`), retrying every 500 ms; if the main thread stays wedged
+for 20 s it prints a diagnostic and hard-exits(3). A run can no longer hang.
+
+Armed in **every live mode of both bins**:
+
+- `gpui-term` run_live w0 (all modes incl. idle/dot/trace/spike-9/10) at
+  deadline **+3 s** — the render-path deadline still exits streaming runs at
+  the exact deadline; the watchdog is the guaranteed backstop. Reason string
+  `deadline (watchdog)` in the summary = the render path had starved.
+- `gpui-term` interactive at the exact deadline (replaces its executor
+  timer — same mechanism everywhere now).
+- `phase0-poc` (Path A) at deadline **+5 s** — fires the free-function report;
+  the end-of-run mouse-seam/rebind probes are skipped (gates print UNPROVEN),
+  the correct degradation for a starved run.
+
+Wakeup audit of the other modes (same failure shape):
+
+- `dot` + every streaming mode (scroll/resize/select/atlas/sweep/trace): RAF
+  is display-link-driven, and gpui STOPS the link for fully occluded windows
+  — so their render-path deadlines can also starve if the window is fully
+  covered. Watchdog now guarantees exit regardless; keep windows at least
+  partially visible for meaningful cadence numbers.
+- finite trace replay/drain: the "quiescent +1 s" early finalize is a
+  render-path check; under occlusion the run now ends at deadline+grace via
+  the watchdog instead of hanging (the drain wall-clock itself is recorded on
+  the feeder thread, so the headline number survives).
+- multi-window bg poller (100 ms executor timers): can be napped too — that
+  degrades bg redraw cadence (measurement quality), never exit. Keep the app
+  frontmost during runs.
+
+Zero-draw summaries (idle's whole point) verified safe: every reducer guards
+empty inputs (fps/hit-rate/wakeup-rate divisions are conditional, percentiles
+return 0 on empty), memory is sampled at finalize, and `metal draws` can
+legitimately print ~1–2 (window-open presents) with 0 composited frames.
+
+Headless proof (no display): `NICE_POC_WATCHDOG_SELFTEST=1 cargo run --bin
+gpui-term` arms a 1 s deadline and parks the main thread in `dispatch_main()`
+(zero sources/events — the exact starvation shape); PASS = fired at ~1.0 s.
+
+## §13 harness fixes (this pass)
+
+- **Self-calibrated cliff threshold**: every interval report now prints
+  `cliffs>16.6ms` (legacy, kept for continuity) AND `cliffs>1.5×p50` with the
+  computed threshold, plus `max` interval.
+- **CSV metadata**: gpui-term CSVs now start with `#` comment lines (display
+  + max Hz, build profile debug/release, seed, byte rate, windows/streaming,
+  mode flags, scrollback, trace path) — reducers should skip `#` lines.
+- **Per-sample memory in CSV**: `mem_phys` rows (~4 Hz series) appended after
+  the frame intervals; elapsed seconds ride in the `phase` column.
+- **Hot-plug guard ported from main.rs**: display recorded at measurement
+  start, re-checked at finalize; a mid-run change prints CONTAMINATED and
+  poisons the CSV `display=` comment.
+- **CSV naming**: special modes write `gpui-term-<tag>[-KwMs].csv` (e.g.
+  `gpui-term-trace-drain.csv`, `gpui-term-scroll+select.csv`) so the audited
+  default CSVs are never clobbered by spike runs.
+
+## New headless self-tests (safe anywhere; used as build proof)
+
+```sh
+cargo run --bin gpui-term                       # workload self-test (unchanged)
+NICE_POC_INTERACTIVE=1 cargo run --bin gpui-term  # pty echo self-test (unchanged)
+NICE_POC_SPIKE9=1 cargo run --release --bin gpui-term   # reflow/scroll/selection + memory@3 limits
+NICE_POC_TRACE=selftest cargo run --bin gpui-term        # trace format + drain + pacing
+NICE_POC_ATLAS=1 cargo run --bin gpui-term               # image gen + glyph sweep
+NICE_POC_WATCHDOG_SELFTEST=1 cargo run --bin gpui-term   # guaranteed-exit deadline (~1s, self-bounded)
+```

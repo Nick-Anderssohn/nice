@@ -60,21 +60,74 @@
 //!     presents_with_transaction mode (spike 3, works for this bin too);
 //!   * an os_signpost interval "Draw" (subsystem dev.nickanderssohn.gpui-term,
 //!     category "present") around every GPUI Metal draw/present — in THIS bin
-//!     (single stack) that IS the terminal present (spike 5 latency).
+//!     (single stack) that IS the terminal present (spike 5 latency);
+//!   * gpui::nice_poc_metrics — per-draw CPU durations (always), GPU command-
+//!     buffer durations (NICE_POC_GPU_TS=1), shape-cache hit counters, and
+//!     atlas texture/tile/upload counters (spikes 6 + 10).
+//!
+//! §13 spikes 6/7/9/10 prep (2026-07-02) — all live modes stay display-gated
+//! behind NICE_POC_RUN=1; every new env defaults OFF (previous modes are
+//! bit-identical with the flags unset):
+//!   * Spike 6 (release per-frame cost + energy):
+//!       - render busy-time stamps (snapshot / render-body / paint closure)
+//!         + per-draw CPU cost + optional GPU time + shape-cache hit rate +
+//!         proc_pid_rusage CPU/wakeup/energy deltas, all in the summary.
+//!       - NICE_POC_ENERGY_STATE=idle|dot — the powermetrics three-state
+//!         protocol: `idle` = window open, no feed, no RAF (demand-driven,
+//!         ~zero draws); `dot` = no feed but ONE animating 12px chrome dot
+//!         (RAF at refresh — GPUI's whole-scene repaint idle cost).
+//!   * Spike 7 (real-trace workload):
+//!       - NICE_POC_TRACE=<file.nicetrace> — replay a captured real pty byte
+//!         trace timing-faithfully instead of the synthetic generator
+//!         (format + capture procedure: harness::trace + the pty-capture bin).
+//!       - NICE_POC_TRACE_SPEED=<f> (default 1.0), NICE_POC_TRACE_LOOP=1,
+//!         NICE_POC_TRACE_MODE=drain (max-rate drain test: wall-clock to
+//!         quiescent + max frame interval).
+//!   * Spike 9 (scrollback / resize-reflow / selection under streaming):
+//!       - NICE_POC_SCROLLBACK=<n> (alacritty scrolling_history, default 10000)
+//!       - NICE_POC_SCROLL_CHURN=1 (history prefill + per-frame display-offset
+//!         churn), NICE_POC_RESIZE_STORM=1 (+NICE_POC_RESIZE_MS, default 400:
+//!         periodic Term reflow-resize + real NSWindow setFrame), and
+//!         NICE_POC_SELECTION=1 (programmatic selection drag/re-anchor each
+//!         frame, held across scrollback eviction; rendered as inverse cells)
+//!       - NICE_POC_PREFILL_LINES=<n> — history prefill line count (defaults
+//!         to the scrollback limit when scroll/selection churn is on)
+//!       - kill-signal instrument: per-resize reflow stall ms in the summary.
+//!       - headless: NICE_POC_SPIKE9=1 cargo run --bin gpui-term — no-display
+//!         reflow/scroll/selection self-test incl. memory at 3 scrollback
+//!         limits (the spike-8 open question).
+//!   * Spike 10 (atlas pressure):
+//!       - NICE_POC_ATLAS=1 — synthetic kitty-style animation (30 fps 512x512
+//!         distinct frames via paint_image) + 12 static sixel-stand-in images
+//!         painted every frame; stale animation frames are drop_image()d
+//!         (NICE_POC_ATLAS_RETAIN=1 to never drop = growth failure demo).
+//!       - NICE_POC_GLYPH_SWEEP=1 — feeder streams an unbounded distinct-glyph
+//!         sweep (unicode ranges + bold/italic SGR) to grow the GLYPH atlas.
+//!       - NICE_POC_STYLES=1 — map SGR bold/italic to real font variants in
+//!         paint (auto-on under the sweep; off by default to keep the audited
+//!         numbers reproducible).
+//!       - summary prints gpui::nice_poc_metrics atlas counters (textures/
+//!         bytes allocated+freed, tiles inserted/removed, upload traffic).
+//!   * §13 harness fixes: cliff threshold self-calibrated at 1.5 x median
+//!     (printed next to the legacy 16.6ms count), display/build/seed/flags
+//!     persisted as CSV `#` comments, per-sample memory rows in the CSV, and
+//!     the main.rs hot-plug guard ported (display re-checked at finalize).
 
 #![allow(dead_code)]
 
 #[path = "harness.rs"]
 mod harness;
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point as TermPoint};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
@@ -183,32 +236,50 @@ struct BgRun {
 
 struct RowSnap {
     text: String,
-    /// (utf8-byte-len, fg-rgb) per cell, in column order.
-    cells: Vec<(usize, u32)>,
+    /// (utf8-byte-len, fg-rgb, style-bits) per cell, in column order.
+    /// style-bits: 1 = bold, 2 = italic — always 0 unless `styles` was
+    /// requested (NICE_POC_STYLES / glyph sweep), so the default paint path
+    /// is byte-identical to the audited rev.
+    cells: Vec<(usize, u32, u8)>,
     bgs: Vec<BgRun>,
 }
 
-fn snapshot(term: &Term<EventProxy>) -> Vec<RowSnap> {
+/// Snapshot the VISIBLE viewport (honoring the grid's display offset — the
+/// scrollback scroll position) plus the active selection (rendered inverse).
+/// With offset 0, no selection, and `styles == false` this is behaviorally
+/// identical to the audited snapshot.
+fn snapshot(term: &Term<EventProxy>, styles: bool) -> Vec<RowSnap> {
     let rows = term.screen_lines();
     let cols = term.columns();
+    let display_offset = term.grid().display_offset() as i32;
+    let sel_range = term.selection.as_ref().and_then(|s| s.to_range(term));
     let mut out = Vec::with_capacity(rows);
     for line in 0..rows {
+        let buffer_line = Line(line as i32 - display_offset);
         let mut text = String::with_capacity(cols);
         let mut cells = Vec::with_capacity(cols);
         let mut bgs: Vec<BgRun> = Vec::new();
         for col in 0..cols {
-            let cell = &term.grid()[TermPoint::new(Line(line as i32), Column(col))];
-            let inverse = cell.flags.contains(Flags::INVERSE);
+            let point = TermPoint::new(buffer_line, Column(col));
+            let cell = &term.grid()[point];
+            let selected = sel_range.map_or(false, |r| r.contains(point));
+            let inverse = cell.flags.contains(Flags::INVERSE) ^ selected;
             let mut fg = color_rgb(cell.fg, DEFAULT_FG);
             let mut bg = color_rgb(cell.bg, DEFAULT_BG);
             if inverse {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            let style_bits = if styles {
+                (cell.flags.contains(Flags::BOLD) as u8)
+                    | ((cell.flags.contains(Flags::ITALIC) as u8) << 1)
+            } else {
+                0
+            };
             let ch = if cell.c == '\0' { ' ' } else { cell.c };
             let mut buf = [0u8; 4];
             let s = ch.encode_utf8(&mut buf);
             text.push_str(s);
-            cells.push((s.len(), fg));
+            cells.push((s.len(), fg, style_bits));
             if bg != DEFAULT_BG {
                 if let Some(last) = bgs.last_mut() {
                     if last.rgb == bg && last.col + last.len == col {
@@ -222,6 +293,151 @@ fn snapshot(term: &Term<EventProxy>) -> Vec<RowSnap> {
         out.push(RowSnap { text, cells, bgs });
     }
     out
+}
+
+// =========================================================================
+// Spike 10 — distinct-glyph sweep + synthetic image ("kitty"/"sixel") frames.
+// =========================================================================
+
+/// Unicode ranges swept for ever-new distinct glyphs (Latin/punct, Latin-ext,
+/// box drawing, block elements, kana, a broad CJK slab, emoji). The CJK +
+/// emoji ranges alone are tens of thousands of codepoints, so a run at the
+/// default byte rate keeps minting NEW atlas tiles for its whole duration.
+const SWEEP_RANGES: &[(u32, u32)] = &[
+    (0x0021, 0x007E),   // ASCII printable
+    (0x00A1, 0x017F),   // Latin-1 supplement + Latin extended-A
+    (0x2500, 0x257F),   // box drawing
+    (0x2580, 0x259F),   // block elements
+    (0x3041, 0x30FF),   // hiragana + katakana
+    (0x4E00, 0x9FFF),   // CJK unified ideographs (~21k glyphs)
+    (0x1F300, 0x1F64F), // emoji (polychrome path where supported)
+];
+
+/// Deterministic distinct-glyph sweep chunk (~`target` bytes): consecutive
+/// codepoints from the ranges above, wrapped in rotating SGR bold/italic
+/// (real style variants multiply atlas keys when NICE_POC_STYLES is on).
+/// `counter` persists across calls so glyphs keep advancing, not repeating.
+fn sweep_chunk(counter: &mut u64, target: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(target + 64);
+    while out.len() < target {
+        let style = match *counter % 4 {
+            0 => &b"\x1b[0m"[..],
+            1 => &b"\x1b[1m"[..],
+            2 => &b"\x1b[3m"[..],
+            _ => &b"\x1b[1;3m"[..],
+        };
+        out.extend_from_slice(style);
+        // One line of ~32 consecutive codepoints from a rotating range.
+        let (lo, hi) = SWEEP_RANGES[(*counter as usize / 7) % SWEEP_RANGES.len()];
+        let span = (hi - lo + 1) as u64;
+        for i in 0..32u64 {
+            let cp = lo + ((counter.wrapping_mul(31).wrapping_add(i * 3)) % span) as u32;
+            if let Some(ch) = char::from_u32(cp) {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        out.extend_from_slice(b"\x1b[0m\r\n");
+        *counter += 1;
+    }
+    out
+}
+
+/// Procedurally generate one distinct BGRA image (bytes differ per `t`), as
+/// gpui's `RenderImage` expects (BGRA bytes in an `image::RgbaImage`
+/// container — the same convention gpui's own img loaders use before upload).
+fn gen_image(w: u32, h: u32, t: u64) -> std::sync::Arc<gpui::RenderImage> {
+    let mut bytes = vec![0u8; (w * h * 4) as usize];
+    let mut rng = harness::Rng::new(t.wrapping_mul(0x9E37_79B9).wrapping_add(w as u64) | 1);
+    let speckle = (rng.next_u64() & 0xFF) as u32;
+    for y in 0..h {
+        let row = &mut bytes[(y * w * 4) as usize..((y + 1) * w * 4) as usize];
+        for x in 0..w {
+            let i = (x * 4) as usize;
+            // Moving gradient + per-frame phase so every frame's bytes differ.
+            let phase = (t as u32).wrapping_mul(7);
+            row[i] = ((x + phase) & 0xFF) as u8; // B
+            row[i + 1] = ((y + phase / 2) & 0xFF) as u8; // G
+            row[i + 2] = ((x ^ y ^ speckle) & 0xFF) as u8; // R
+            row[i + 3] = 0xFF; // A
+        }
+    }
+    let buffer = image::RgbaImage::from_raw(w, h, bytes).expect("image buffer");
+    std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
+/// Spike 10 image-pressure state: a 30 fps 512x512 "kitty animation" (every
+/// frame is a brand-new image = a brand-new polychrome atlas tile) plus 12
+/// static "sixel" stand-ins painted every frame. Stale animation frames are
+/// released with `window.drop_image` (=> atlas `remove()`) unless `retain`.
+struct ImgPressure {
+    statics: Vec<std::sync::Arc<gpui::RenderImage>>,
+    anim: VecDeque<std::sync::Arc<gpui::RenderImage>>,
+    /// NICE_POC_ATLAS_RETAIN=1: never drop — demonstrates unbounded growth.
+    retained: Vec<std::sync::Arc<gpui::RenderImage>>,
+    retain: bool,
+    last_emit: Option<Instant>,
+    pub emitted: u64,
+    pub dropped: u64,
+}
+
+const ANIM_SIZE: u32 = 512;
+const ANIM_KEEP: usize = 2;
+const STATIC_SIZES: [u32; 12] = [64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288];
+
+impl ImgPressure {
+    fn new(retain: bool) -> Self {
+        let statics = STATIC_SIZES
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| gen_image(s, s, 0x5EED_0000 + i as u64))
+            .collect();
+        ImgPressure {
+            statics,
+            anim: VecDeque::new(),
+            retained: Vec::new(),
+            retain,
+            last_emit: None,
+            emitted: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Advance the animation clock (30 fps) and return (images to paint,
+    /// images to drop_image this frame). Paint order: statics then the
+    /// newest animation frame.
+    #[allow(clippy::type_complexity)]
+    fn tick(
+        &mut self,
+    ) -> (
+        Vec<std::sync::Arc<gpui::RenderImage>>,
+        Option<std::sync::Arc<gpui::RenderImage>>,
+        Vec<std::sync::Arc<gpui::RenderImage>>,
+    ) {
+        let due = self
+            .last_emit
+            .map_or(true, |t| t.elapsed() >= Duration::from_millis(33));
+        if due {
+            self.last_emit = Some(Instant::now());
+            self.emitted += 1;
+            self.anim.push_back(gen_image(ANIM_SIZE, ANIM_SIZE, self.emitted));
+        }
+        let mut drops = Vec::new();
+        while self.anim.len() > ANIM_KEEP {
+            let old = self.anim.pop_front().unwrap();
+            if self.retain {
+                self.retained.push(old);
+            } else {
+                self.dropped += 1;
+                drops.push(old);
+            }
+        }
+        (
+            self.statics.clone(),
+            self.anim.back().cloned(),
+            drops,
+        )
+    }
 }
 
 // =========================================================================
@@ -262,6 +478,147 @@ impl MultiCfg {
     }
 }
 
+fn env_flag(key: &str) -> bool {
+    matches!(std::env::var(key).as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Spike 6 powermetrics/energy states (NICE_POC_ENERGY_STATE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnergyState {
+    /// Window open, no feed, NO RAF — demand-driven, ~zero draws.
+    Idle,
+    /// No feed, but one 12px chrome dot animates via RAF at refresh — GPUI's
+    /// whole-scene repaint model with a single animating chrome element (the
+    /// audit's named idle-cost risk for a laptop app).
+    Dot,
+}
+
+/// §13 spikes 6/7/9/10 run configuration (all default OFF = the audited
+/// behavior, bit-for-bit).
+#[derive(Clone)]
+struct SpikeCfg {
+    // -- spike 7: real-trace workload ------------------------------------
+    trace_path: Option<String>,
+    trace: Option<Arc<harness::trace::Trace>>,
+    trace_speed: f64,
+    trace_drain: bool,
+    trace_loop: bool,
+    // -- spike 6: energy states -------------------------------------------
+    energy_state: Option<EnergyState>,
+    // -- spike 9: scrollback / resize-reflow / selection -------------------
+    scrollback: usize,
+    scroll_churn: bool,
+    resize_storm: bool,
+    resize_ms: u64,
+    selection_churn: bool,
+    prefill_lines: usize,
+    // -- spike 10: atlas pressure ------------------------------------------
+    atlas: bool,
+    atlas_retain: bool,
+    glyph_sweep: bool,
+    /// Map SGR bold/italic to real font variants in paint (auto-on under the
+    /// glyph sweep; default off so the audited numbers stay reproducible).
+    styles: bool,
+}
+
+impl SpikeCfg {
+    fn from_env() -> Self {
+        let trace_path = std::env::var("NICE_POC_TRACE").ok().filter(|s| !s.is_empty());
+        let glyph_sweep = env_flag("NICE_POC_GLYPH_SWEEP");
+        let scroll_churn = env_flag("NICE_POC_SCROLL_CHURN");
+        let selection_churn = env_flag("NICE_POC_SELECTION");
+        let scrollback = env_usize("NICE_POC_SCROLLBACK").unwrap_or(10_000);
+        SpikeCfg {
+            trace_path,
+            trace: None, // loaded lazily by the live/headless entry points
+            trace_speed: std::env::var("NICE_POC_TRACE_SPEED")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(1.0),
+            trace_drain: matches!(
+                std::env::var("NICE_POC_TRACE_MODE").as_deref(),
+                Ok("drain") | Ok("max")
+            ),
+            trace_loop: env_flag("NICE_POC_TRACE_LOOP"),
+            energy_state: match std::env::var("NICE_POC_ENERGY_STATE").as_deref() {
+                Ok("idle") => Some(EnergyState::Idle),
+                Ok("dot") => Some(EnergyState::Dot),
+                _ => None,
+            },
+            scrollback,
+            scroll_churn,
+            resize_storm: env_flag("NICE_POC_RESIZE_STORM"),
+            resize_ms: env_usize("NICE_POC_RESIZE_MS").unwrap_or(400).max(50) as u64,
+            selection_churn,
+            prefill_lines: env_usize("NICE_POC_PREFILL_LINES").unwrap_or(
+                if scroll_churn || selection_churn {
+                    scrollback
+                } else {
+                    0
+                },
+            ),
+            atlas: env_flag("NICE_POC_ATLAS"),
+            atlas_retain: env_flag("NICE_POC_ATLAS_RETAIN"),
+            glyph_sweep,
+            styles: env_flag("NICE_POC_STYLES") || glyph_sweep,
+        }
+    }
+
+    fn load_trace(&mut self) -> Result<(), String> {
+        if let Some(p) = &self.trace_path {
+            let t = harness::trace::Trace::load(Path::new(p))
+                .map_err(|e| format!("NICE_POC_TRACE={p}: {e}"))?;
+            eprintln!(
+                "[gpui-term] trace loaded: {p} — {} records, {} bytes, {:.1}s native duration",
+                t.records.len(),
+                t.total_bytes,
+                t.duration_secs()
+            );
+            self.trace = Some(Arc::new(t));
+        }
+        Ok(())
+    }
+
+    /// Short tag describing the active special modes (CSV naming + summary);
+    /// None = the plain audited workload.
+    fn tag(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.trace.is_some() || self.trace_path.is_some() {
+            parts.push(if self.trace_drain {
+                "trace-drain".into()
+            } else {
+                "trace".into()
+            });
+        }
+        match self.energy_state {
+            Some(EnergyState::Idle) => parts.push("energy-idle".into()),
+            Some(EnergyState::Dot) => parts.push("energy-dot".into()),
+            None => {}
+        }
+        if self.scroll_churn {
+            parts.push("scroll".into());
+        }
+        if self.resize_storm {
+            parts.push("resize".into());
+        }
+        if self.selection_churn {
+            parts.push("select".into());
+        }
+        if self.atlas {
+            parts.push("atlas".into());
+        }
+        if self.glyph_sweep {
+            parts.push("sweep".into());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("+"))
+        }
+    }
+}
+
 /// Per-window bookkeeping the window-0 coordinator reads at finalize time.
 /// Slots are created (all at once) BEFORE any window opens.
 struct WinSlot {
@@ -269,6 +626,13 @@ struct WinSlot {
     bps: usize,
     bytes_fed: Arc<AtomicU64>,
     frames: Mutex<Vec<u64>>,
+    /// mach tick when this session's finite feed (trace replay/drain)
+    /// completed; 0 while still feeding. Always 0 for endless feeds.
+    feed_done: Arc<AtomicU64>,
+    /// Whether this session's feed is finite (trace, non-loop) — the
+    /// coordinator waits on exactly these before the early "quiescent"
+    /// finalize in trace/drain runs.
+    expect_done: bool,
 }
 
 static WIN_SLOTS: OnceLock<Vec<WinSlot>> = OnceLock::new();
@@ -303,77 +667,279 @@ fn clear_window_frames() {
 /// aggregate rate (~500 KB/s default) with a finer, render-independent clock.
 const FEED_TICK_MS: u64 = 5;
 
+/// What a session's feeder thread streams (spikes 6/7/10 additions; the
+/// original behaviors map to `Heartbeat` (old bps==0) and `Synthetic`).
+enum FeedSpec {
+    /// NOTHING is ever fed (spike 6 energy states) — the feeder parks.
+    Idle,
+    /// One short heartbeat line per second (idle-with-live-session).
+    Heartbeat,
+    /// The deterministic synthetic workload at `bps` bytes/s (the audited
+    /// default when `bps == WorkloadProfile::default().bytes_per_sec`).
+    Synthetic { bps: usize },
+    /// Spike 10: unbounded distinct-glyph sweep at `bps` bytes/s.
+    Sweep { bps: usize },
+    /// Spike 7: replay a captured real pty trace. `speed` scales time
+    /// (2.0 = twice as fast); `drain` ignores timestamps and feeds at max
+    /// rate; `loop_replay` restarts the trace when it ends (endless feed).
+    Trace {
+        trace: Arc<harness::trace::Trace>,
+        speed: f64,
+        drain: bool,
+        loop_replay: bool,
+    },
+}
+
 struct Session {
     term: Arc<FairMutex<Term<EventProxy>>>,
     /// Set by the feeder after each parse; consumed by the notify poller.
     dirty: Arc<AtomicBool>,
     bytes_fed: Arc<AtomicU64>,
+    /// mach tick when a FINITE feed (trace, non-loop) completed; 0 otherwise.
+    feed_done: Arc<AtomicU64>,
+    /// Wall ms the feeder spent in the max-rate drain (f64 bits; 0 = n/a).
+    drain_ms: Arc<AtomicU64>,
+    /// Wall ms spent prefilling scrollback history (f64 bits; 0 = none).
+    prefill_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     feeder: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
-    /// `bytes_per_sec == 0` => idle-with-live-session: the feeder stays alive
-    /// and emits one short heartbeat line per second (a quiet prompt),
-    /// exercising the parse -> dirty -> notify -> render wakeup path with
-    /// negligible load.
+    /// Original entry point (kept so K=1/multi synthetic runs read the same):
+    /// `bytes_per_sec == 0` => heartbeat, else synthetic at that rate.
     fn spawn(index: usize, seed: u64, bytes_per_sec: usize) -> Self {
+        let spec = if bytes_per_sec == 0 {
+            FeedSpec::Heartbeat
+        } else {
+            FeedSpec::Synthetic {
+                bps: bytes_per_sec,
+            }
+        };
+        Self::spawn_spec(index, seed, spec, 10_000, 0)
+    }
+
+    /// Spawn with an explicit feed spec + scrollback limit + history prefill
+    /// (spikes 6/7/9/10). `scrolling_history` is the alacritty Config
+    /// scrollback limit; `prefill_lines` > 0 fills that many history lines at
+    /// max rate BEFORE the paced feed starts (spike 9 scroll/selection runs).
+    fn spawn_spec(
+        index: usize,
+        seed: u64,
+        spec: FeedSpec,
+        scrolling_history: usize,
+        prefill_lines: usize,
+    ) -> Self {
         let size = Size {
             rows: ROWS,
             cols: COLS,
         };
-        let term = Arc::new(FairMutex::new(Term::new(
-            Config::default(),
-            &size,
-            EventProxy,
-        )));
+        let config = Config {
+            scrolling_history,
+            ..Config::default()
+        };
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, EventProxy)));
         let dirty = Arc::new(AtomicBool::new(false));
         let bytes_fed = Arc::new(AtomicU64::new(0));
+        let feed_done = Arc::new(AtomicU64::new(0));
+        let drain_ms = Arc::new(AtomicU64::new(0));
+        let prefill_ms = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
         let feeder = {
             let term = Arc::clone(&term);
             let dirty = Arc::clone(&dirty);
             let bytes_fed = Arc::clone(&bytes_fed);
+            let feed_done = Arc::clone(&feed_done);
+            let drain_ms = Arc::clone(&drain_ms);
+            let prefill_ms_out = Arc::clone(&prefill_ms);
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name(format!("poc-feeder-{index}"))
                 .spawn(move || {
                     let mut parser: Processor = Processor::new();
-                    if bytes_per_sec == 0 {
-                        let mut beat = 0u64;
-                        while !stop.load(Ordering::Relaxed) {
-                            beat += 1;
-                            let line = format!("\r\x1b[2K[idle w{index}] heartbeat {beat}");
+
+                    // ---- optional scrollback prefill (spike 9) -----------
+                    if prefill_lines > 0 {
+                        let t0 = Instant::now();
+                        let mut fed_lines = 0usize;
+                        let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
+                        while fed_lines < prefill_lines && !stop.load(Ordering::Relaxed) {
+                            chunk.clear();
+                            let batch = (prefill_lines - fed_lines).min(512);
+                            for i in 0..batch {
+                                let n = fed_lines + i;
+                                chunk.extend_from_slice(
+                                    format!(
+                                        "prefill {n:06} \
+                                         abcdefghijklmnopqrstuvwxyz0123456789 \
+                                         the quick brown fox jumps over the lazy dog\r\n"
+                                    )
+                                    .as_bytes(),
+                                );
+                            }
                             {
                                 let mut t = term.lock();
-                                parser.advance(&mut *t, line.as_bytes());
+                                parser.advance(&mut *t, &chunk);
                             }
-                            bytes_fed.fetch_add(line.len() as u64, Ordering::Relaxed);
-                            dirty.store(true, Ordering::Release);
-                            std::thread::sleep(Duration::from_secs(1));
+                            bytes_fed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                            fed_lines += batch;
                         }
-                        return;
-                    }
-                    let mut wl = Workload::new(WorkloadProfile {
-                        seed,
-                        ..WorkloadProfile::default()
-                    });
-                    let per_tick = ((bytes_per_sec * FEED_TICK_MS as usize) / 1000).max(64);
-                    while !stop.load(Ordering::Relaxed) {
-                        let t0 = std::time::Instant::now();
-                        // Generate OUTSIDE the lock; hold it only to parse.
-                        let chunk = wl.stream(per_tick);
-                        {
-                            let mut t = term.lock();
-                            parser.advance(&mut *t, &chunk);
-                        }
-                        bytes_fed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         dirty.store(true, Ordering::Release);
-                        if let Some(rest) =
-                            Duration::from_millis(FEED_TICK_MS).checked_sub(t0.elapsed())
-                        {
-                            std::thread::sleep(rest);
+                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        prefill_ms_out.store(ms.to_bits(), Ordering::Relaxed);
+                        eprintln!(
+                            "[gpui-term] w{index} prefilled {fed_lines} history lines in {ms:.0} ms"
+                        );
+                    }
+
+                    match spec {
+                        FeedSpec::Idle => {
+                            while !stop.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                        }
+                        FeedSpec::Heartbeat => {
+                            let mut beat = 0u64;
+                            while !stop.load(Ordering::Relaxed) {
+                                beat += 1;
+                                let line =
+                                    format!("\r\x1b[2K[idle w{index}] heartbeat {beat}");
+                                {
+                                    let mut t = term.lock();
+                                    parser.advance(&mut *t, line.as_bytes());
+                                }
+                                bytes_fed.fetch_add(line.len() as u64, Ordering::Relaxed);
+                                dirty.store(true, Ordering::Release);
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                        FeedSpec::Synthetic { bps } => {
+                            let mut wl = Workload::new(WorkloadProfile {
+                                seed,
+                                ..WorkloadProfile::default()
+                            });
+                            let per_tick =
+                                ((bps * FEED_TICK_MS as usize) / 1000).max(64);
+                            while !stop.load(Ordering::Relaxed) {
+                                let t0 = Instant::now();
+                                // Generate OUTSIDE the lock; hold it only to parse.
+                                let chunk = wl.stream(per_tick);
+                                {
+                                    let mut t = term.lock();
+                                    parser.advance(&mut *t, &chunk);
+                                }
+                                bytes_fed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                                dirty.store(true, Ordering::Release);
+                                if let Some(rest) = Duration::from_millis(FEED_TICK_MS)
+                                    .checked_sub(t0.elapsed())
+                                {
+                                    std::thread::sleep(rest);
+                                }
+                            }
+                        }
+                        FeedSpec::Sweep { bps } => {
+                            let mut counter = seed;
+                            let per_tick =
+                                ((bps * FEED_TICK_MS as usize) / 1000).max(64);
+                            while !stop.load(Ordering::Relaxed) {
+                                let t0 = Instant::now();
+                                let chunk = sweep_chunk(&mut counter, per_tick);
+                                {
+                                    let mut t = term.lock();
+                                    parser.advance(&mut *t, &chunk);
+                                }
+                                bytes_fed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                                dirty.store(true, Ordering::Release);
+                                if let Some(rest) = Duration::from_millis(FEED_TICK_MS)
+                                    .checked_sub(t0.elapsed())
+                                {
+                                    std::thread::sleep(rest);
+                                }
+                            }
+                        }
+                        FeedSpec::Trace {
+                            trace,
+                            speed,
+                            drain,
+                            loop_replay,
+                        } => {
+                            if drain {
+                                // Max-rate drain: ignore timestamps, feed as
+                                // fast as the parser accepts (per-record
+                                // locking keeps the render loop schedulable —
+                                // FairMutex hands the lock over fairly).
+                                let t0 = Instant::now();
+                                'drain: for rec in &trace.records {
+                                    if stop.load(Ordering::Relaxed) {
+                                        break 'drain;
+                                    }
+                                    {
+                                        let mut t = term.lock();
+                                        parser.advance(&mut *t, &rec.data);
+                                    }
+                                    bytes_fed
+                                        .fetch_add(rec.data.len() as u64, Ordering::Relaxed);
+                                    dirty.store(true, Ordering::Release);
+                                }
+                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                drain_ms.store(ms.to_bits(), Ordering::Relaxed);
+                                feed_done.store(harness::clock::now(), Ordering::Release);
+                                eprintln!(
+                                    "[gpui-term] w{index} trace DRAIN complete: {} bytes in \
+                                     {ms:.0} ms ({:.1} MB/s parse throughput)",
+                                    trace.total_bytes,
+                                    trace.total_bytes as f64 / 1.0e6 / (ms / 1000.0)
+                                );
+                            } else {
+                                // Timing-faithful replay (speed-scaled).
+                                let t0 = Instant::now();
+                                let mut base_ns = 0u64;
+                                'replay: loop {
+                                    for rec in &trace.records {
+                                        if stop.load(Ordering::Relaxed) {
+                                            break 'replay;
+                                        }
+                                        let target_ns = base_ns
+                                            + (rec.offset_ns as f64 / speed) as u64;
+                                        loop {
+                                            let el = t0.elapsed().as_nanos() as u64;
+                                            if el >= target_ns
+                                                || stop.load(Ordering::Relaxed)
+                                            {
+                                                break;
+                                            }
+                                            let rem_ns = target_ns - el;
+                                            std::thread::sleep(Duration::from_nanos(
+                                                rem_ns.min(5_000_000),
+                                            ));
+                                        }
+                                        {
+                                            let mut t = term.lock();
+                                            parser.advance(&mut *t, &rec.data);
+                                        }
+                                        bytes_fed.fetch_add(
+                                            rec.data.len() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        dirty.store(true, Ordering::Release);
+                                    }
+                                    if !loop_replay {
+                                        break 'replay;
+                                    }
+                                    // Seamless rebase for the next pass.
+                                    base_ns = t0.elapsed().as_nanos() as u64;
+                                }
+                                if !loop_replay {
+                                    feed_done
+                                        .store(harness::clock::now(), Ordering::Release);
+                                    eprintln!(
+                                        "[gpui-term] w{index} trace replay complete \
+                                         ({:.1}s wall)",
+                                        t0.elapsed().as_secs_f64()
+                                    );
+                                }
+                            }
                         }
                     }
                 })
@@ -384,6 +950,9 @@ impl Session {
             term,
             dirty,
             bytes_fed,
+            feed_done,
+            drain_ms,
+            prefill_ms,
             stop,
             feeder: Some(feeder),
         }
@@ -536,7 +1105,7 @@ fn run_headless() {
         let chunk = wl.stream((prof.bytes_per_sec / 60).max(64));
         parser.advance(&mut term, &chunk);
     }
-    let snap = snapshot(&term);
+    let snap = snapshot(&term, false);
     for r in &snap {
         let t = r.text.trim_end();
         if !t.is_empty() {
@@ -597,7 +1166,7 @@ fn run_headless_interactive() {
 
     let bytes = ps.bytes_echoed.load(Ordering::Relaxed);
     let dirty = ps.dirty.load(Ordering::Acquire);
-    let snap = snapshot(&ps.term.lock());
+    let snap = snapshot(&ps.term.lock(), false);
     let hello_rows = snap.iter().filter(|r| r.text.contains("hello")).count();
 
     eprintln!(
@@ -616,6 +1185,330 @@ fn run_headless_interactive() {
     std::process::exit(if ok { 0 } else { 1 });
 }
 
+/// HEADLESS spike 9 self-test (`NICE_POC_SPIKE9=1`, no display): the VT-core
+/// half of scrollback / resize-reflow / selection — memory at 3 scrollback
+/// limits (the spike-8 open question), the full-history reflow stall
+/// (§13 kill-signal: multi-hundred-ms), scroll-position churn, and a
+/// selection held across scrollback eviction. The live run adds frame pacing
+/// + the real NSWindow resize on top of this machinery.
+fn run_headless_spike9() {
+    eprintln!("{}", harness::banner());
+    eprintln!("[gpui-term] HEADLESS spike 9 self-test (scrollback/reflow/selection; no display).");
+
+    fn fill_lines(term: &mut Term<EventProxy>, parser: &mut Processor, n: usize) {
+        let mut chunk: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut fed = 0usize;
+        while fed < n {
+            chunk.clear();
+            let batch = (n - fed).min(512);
+            for i in 0..batch {
+                chunk.extend_from_slice(
+                    format!(
+                        "prefill {:06} abcdefghijklmnopqrstuvwxyz0123456789 \
+                         the quick brown fox jumps over the lazy dog\r\n",
+                        fed + i
+                    )
+                    .as_bytes(),
+                );
+            }
+            parser.advance(term, &chunk);
+            fed += batch;
+        }
+    }
+
+    let size = Size { rows: ROWS, cols: COLS };
+
+    // ---- memory at 3 scrollback limits (spike 8 open question) ----------
+    eprintln!("-- memory vs scrollback limit (history full; parser-side only, no atlas) --");
+    for limit in [1_000usize, 10_000, 100_000] {
+        let (before, _) = harness::mem::sample();
+        let t0 = Instant::now();
+        {
+            let mut term = Term::new(
+                Config { scrolling_history: limit, ..Config::default() },
+                &size,
+                EventProxy,
+            );
+            let mut parser: Processor = Processor::new();
+            fill_lines(&mut term, &mut parser, limit + ROWS);
+            let (after, _) = harness::mem::sample();
+            eprintln!(
+                "  scrollback {limit:>6}: fill {} lines in {:>5.0} ms | phys_footprint \
+                 {:>7.1} -> {:>7.1} MiB (delta {:+.1})",
+                limit + ROWS,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                harness::mem::mib(before),
+                harness::mem::mib(after),
+                harness::mem::mib(after) - harness::mem::mib(before),
+            );
+            assert_eq!(term.grid().history_size(), limit, "history not at limit");
+        } // term dropped before the next limit's baseline sample
+    }
+
+    // ---- reflow stall (10k history — the §13 kill-signal number) --------
+    let mut term = Term::new(
+        Config { scrolling_history: 10_000, ..Config::default() },
+        &size,
+        EventProxy,
+    );
+    let mut parser: Processor = Processor::new();
+    fill_lines(&mut term, &mut parser, 10_000 + ROWS);
+    eprintln!("-- Term::resize reflow stall (full 10k-line history rewrap per resize) --");
+    let mut stalls: Vec<f64> = Vec::new();
+    for _ in 0..2 {
+        for (cols, rows) in [(100usize, 34usize), (80, 28), (120, 40)] {
+            let t0 = Instant::now();
+            term.resize(Size { rows, cols });
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  resize -> {cols}x{rows}: {ms:.1} ms");
+            stalls.push(ms);
+        }
+    }
+    let max_stall = stalls.iter().cloned().fold(0.0f64, f64::max);
+    eprintln!(
+        "  max reflow stall {max_stall:.1} ms  [KILL-SIGNAL threshold: multi-hundred-ms]"
+    );
+
+    // ---- scroll churn ----------------------------------------------------
+    let t0 = Instant::now();
+    term.scroll_display(Scroll::Top);
+    let top_off = term.grid().display_offset();
+    for i in 0..1000 {
+        term.scroll_display(Scroll::Delta(if i % 2 == 0 { -7 } else { 5 }));
+    }
+    term.scroll_display(Scroll::Bottom);
+    eprintln!(
+        "-- scroll churn: Top (offset {top_off}) + 1000 Delta ops + Bottom in {:.1} ms --",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // ---- selection across eviction ---------------------------------------
+    let top = term.grid().topmost_line();
+    let anchor = TermPoint::new(Line(top.0 + 2), Column(0));
+    term.selection = Some(Selection::new(SelectionType::Simple, anchor, Side::Left));
+    if let Some(sel) = &mut term.selection {
+        sel.update(TermPoint::new(Line(0), Column(20)), Side::Right);
+    }
+    let before = term.selection.as_ref().and_then(|s| s.to_range(&term));
+    assert!(before.is_some(), "fresh selection must resolve to a range");
+    // Stream PAST the anchor: 2k more lines rotate the anchor line out of the
+    // (full) history. Selection must stay SANE (rotated or cleared, no panic).
+    fill_lines(&mut term, &mut parser, 2_000);
+    let after = term.selection.as_ref().and_then(|s| s.to_range(&term));
+    eprintln!(
+        "-- selection across eviction: before={:?} -> after 2k more lines={:?} (both \
+           non-panicking outcomes are sane; alacritty rotates/clamps) --",
+        before.map(|r| (r.start.line.0, r.end.line.0)),
+        after.map(|r| (r.start.line.0, r.end.line.0)),
+    );
+
+    let snap = snapshot(&term, false);
+    let nonempty = snap.iter().filter(|r| !r.text.trim_end().is_empty()).count();
+    let ok = nonempty > 0 && !stalls.is_empty();
+    eprintln!(
+        "RESULT: {}",
+        if ok {
+            "PASS (spike 9 VT-core machinery live; see stall numbers above)"
+        } else {
+            "FAIL"
+        }
+    );
+    std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// HEADLESS spike 7 self-test / drain measurement (`NICE_POC_TRACE=<file>`
+/// without `NICE_POC_RUN`): load a nicetrace, max-rate drain it through the
+/// alacritty parser (the parse half of the §13 "cat a 10 MB trace" test), and
+/// spot-check the timing-faithful replay pacing. `NICE_POC_TRACE=selftest`
+/// synthesizes a small deterministic trace first (no capture needed).
+fn run_headless_trace() {
+    eprintln!("{}", harness::banner());
+    let arg = std::env::var("NICE_POC_TRACE").unwrap_or_default();
+    let path = if arg == "selftest" {
+        let p = std::env::temp_dir().join("nice-poc-trace-selftest.nicetrace");
+        let mut w = harness::trace::TraceWriter::create(&p).expect("create selftest trace");
+        let mut wl = Workload::new(WorkloadProfile::default());
+        for i in 0..100u64 {
+            let chunk = wl.stream(4096);
+            w.record_at(i * 5_000_000, &chunk).expect("write record"); // 5 ms apart
+        }
+        let (recs, bytes, _) = w.finish().expect("finish selftest trace");
+        eprintln!("[gpui-term] synthesized selftest trace: {recs} records / {bytes} bytes -> {}", p.display());
+        p
+    } else {
+        std::path::PathBuf::from(&arg)
+    };
+
+    let trace = match harness::trace::Trace::load(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("RESULT: FAIL (trace load: {e})");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[gpui-term] trace: {} — {} records / {} bytes / {:.2}s native duration",
+        path.display(),
+        trace.records.len(),
+        trace.total_bytes,
+        trace.duration_secs()
+    );
+
+    // Max-rate drain through the parser (no display, no render).
+    let size = Size { rows: ROWS, cols: COLS };
+    let mut term = Term::new(
+        Config { scrolling_history: 10_000, ..Config::default() },
+        &size,
+        EventProxy,
+    );
+    let mut parser: Processor = Processor::new();
+    let t0 = Instant::now();
+    for rec in &trace.records {
+        parser.advance(&mut term, &rec.data);
+    }
+    let drain_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "-- max-rate drain (parse half): {} bytes in {drain_ms:.1} ms ({:.1} MB/s) --",
+        trace.total_bytes,
+        trace.total_bytes as f64 / 1.0e6 / (drain_ms / 1000.0)
+    );
+
+    // Pacing spot-check on short traces only (a real session would replay in
+    // real time — the LIVE run does that; here we just prove the mechanism).
+    if trace.duration_secs() <= 3.0 && !trace.records.is_empty() {
+        let speed = 2.0;
+        let t0 = Instant::now();
+        for rec in &trace.records {
+            let target = Duration::from_nanos((rec.offset_ns as f64 / speed) as u64);
+            if let Some(rest) = target.checked_sub(t0.elapsed()) {
+                std::thread::sleep(rest);
+            }
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        let expect = trace.duration_secs() / speed;
+        eprintln!(
+            "-- paced replay spot-check (x{speed}): wall {wall:.2}s vs native/speed \
+             {expect:.2}s --"
+        );
+    }
+
+    let snap = snapshot(&term, false);
+    let nonempty = snap.iter().filter(|r| !r.text.trim_end().is_empty()).count();
+    let ok = !trace.records.is_empty() && trace.total_bytes > 0 && nonempty > 0;
+    eprintln!(
+        "RESULT: {}",
+        if ok {
+            "PASS (trace load -> parse -> grid path live; drain number above)"
+        } else {
+            "FAIL"
+        }
+    );
+    std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// HEADLESS spike 10 self-test (`NICE_POC_ATLAS=1` or `NICE_POC_GLYPH_SWEEP=1`
+/// without `NICE_POC_RUN`): proves the image-generation + sweep paths with no
+/// display. The atlas counters themselves only move in the LIVE run (a Metal
+/// atlas needs a window).
+fn run_headless_atlas() {
+    eprintln!("{}", harness::banner());
+    eprintln!("[gpui-term] HEADLESS spike 10 self-test (image gen + glyph sweep; no display).");
+
+    // Image pressure state: 12 statics + a few 30fps animation ticks.
+    let mut img = ImgPressure::new(false);
+    assert_eq!(img.statics.len(), 12, "want 12 static images");
+    let s0 = img.statics[0].size(0);
+    assert_eq!(s0.width.0 as u32, STATIC_SIZES[0], "static size mismatch");
+    let mut drops_total = 0usize;
+    for _ in 0..4 {
+        let (statics, anim, drops) = img.tick();
+        assert_eq!(statics.len(), 12);
+        assert!(anim.is_some(), "animation frame present");
+        drops_total += drops.len();
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let anim_size = 512 * 512 * 4;
+    eprintln!(
+        "  images: {} statics + {} anim frames emitted ({} bytes/frame), {} dropped \
+         after keep={ANIM_KEEP}",
+        img.statics.len(),
+        img.emitted,
+        anim_size,
+        drops_total
+    );
+    assert!(img.emitted >= 3, "30fps clock should emit >=3 frames in 4 ticks/160ms");
+    assert!(drops_total >= 1, "stale frames should be dropped");
+
+    // Glyph sweep: distinct-codepoint growth through the parser.
+    let mut counter = 42u64;
+    let size = Size { rows: ROWS, cols: COLS };
+    let mut term = Term::new(Config::default(), &size, EventProxy);
+    let mut parser: Processor = Processor::new();
+    let mut distinct: std::collections::HashSet<char> = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let chunk = sweep_chunk(&mut counter, 512);
+        distinct.extend(
+            String::from_utf8_lossy(&chunk)
+                .chars()
+                .filter(|c| !c.is_control() && *c != '[' && !c.is_ascii_digit()),
+        );
+        parser.advance(&mut term, &chunk);
+    }
+    let snap = snapshot(&term, true);
+    let nonempty = snap.iter().filter(|r| !r.text.trim_end().is_empty()).count();
+    eprintln!(
+        "  sweep: {} distinct codepoints across 50 chunks; grid non-empty rows {nonempty}",
+        distinct.len()
+    );
+    let ok = distinct.len() > 200 && nonempty > 0;
+    eprintln!(
+        "RESULT: {}",
+        if ok {
+            "PASS (image gen + sweep paths live; atlas counters need the live run)"
+        } else {
+            "FAIL"
+        }
+    );
+    std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// HEADLESS watchdog self-test (`NICE_POC_WATCHDOG_SELFTEST=1`, no display):
+/// proves the guaranteed-fire deadline end-to-end with the main thread parked
+/// in `dispatch_main()` — a main thread that services ONLY the libdispatch
+/// main queue, with zero windows/events/timers (the exact starvation shape
+/// that hung the idle energy state live). PASS = the watchdog thread's
+/// dispatch_async_f enqueue reached the main thread and ran the callback.
+/// If the mechanism is broken, the watchdog's own hard-exit(3) fires ~21 s
+/// later, so this test can never hang.
+fn run_headless_watchdog() {
+    eprintln!("{}", harness::banner());
+    eprintln!(
+        "[gpui-term] HEADLESS watchdog self-test: arming a 1s deadline, then parking the \
+         main thread in dispatch_main() (no runloop sources, no events)."
+    );
+    unsafe extern "C" {
+        fn dispatch_main() -> !;
+    }
+    let armed = Instant::now();
+    harness::watchdog::arm(Duration::from_secs(1), "watchdog-selftest", move || {
+        eprintln!(
+            "[gpui-term] watchdog fired on the main thread {:.2}s after arm (want ~1s)",
+            armed.elapsed().as_secs_f64()
+        );
+        let ok = armed.elapsed() < Duration::from_secs(10);
+        eprintln!(
+            "RESULT: {}",
+            if ok {
+                "PASS (deadline watchdog: thread -> main-queue enqueue -> main-thread callback)"
+            } else {
+                "FAIL (fired but far past the deadline)"
+            }
+        );
+        std::process::exit(if ok { 0 } else { 1 });
+    });
+    unsafe { dispatch_main() }
+}
+
 // =========================================================================
 // LIVE GPUI run.
 // =========================================================================
@@ -624,13 +1517,15 @@ mod gui {
     use super::*;
     use gpui::{
         canvas, div, fill, font, point, prelude::*, px, rgb, size, App, Application, Bounds,
-        Context, FocusHandle, Font, Hsla, AppContext, IntoElement, KeyDownEvent, Keystroke,
-        Pixels, Render, SharedString, Styled, TextRun, TitlebarOptions, Window,
-        WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+        Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla, AppContext,
+        IntoElement, KeyDownEvent, Keystroke, Pixels, Render, RenderImage, SharedString, Styled,
+        TextRun, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
+        WindowOptions,
     };
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
     use objc2_app_kit::NSView;
+    use objc2_foundation::{NSRect, NSSize};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     extern "C" {
@@ -644,6 +1539,144 @@ mod gui {
         unsafe { nice_signpost_draw_count() }
     }
 
+    // ---- spike 6/9 per-run metric stores (w0 only records into these) ----
+
+    /// Grid snapshot cost per w0 render (lock + copy), ms.
+    static SNAPSHOT_MS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    /// Whole `render()` body cost per w0 render (element build incl. snapshot
+    /// + spike drivers), ms. The canvas paint runs later in the frame.
+    static BUILD_MS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    /// Canvas paint-closure cost per w0 frame (shape_line + paint_quad +
+    /// glyph paint + images), ms.
+    static PAINT_MS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    /// Spike 9: wall ms of each `Term::resize` (history reflow stall).
+    static RESIZE_STALL_MS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    /// Spike 9 counters.
+    static SCROLL_OPS: AtomicU64 = AtomicU64::new(0);
+    static SEL_REANCHORS: AtomicU64 = AtomicU64::new(0);
+    static SEL_EVICTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+    fn push_ms(store: &Mutex<Vec<f64>>, ms: f64) {
+        let mut v = store.lock().unwrap();
+        if v.len() < (1 << 20) {
+            v.push(ms);
+        }
+    }
+
+    fn stats_line(name: &str, store: &Mutex<Vec<f64>>) -> String {
+        let mut v = store.lock().unwrap().clone();
+        let n = v.len();
+        let (p50, p95, p99) = harness::percentiles(&mut v);
+        let max = v.last().copied().unwrap_or(0.0);
+        format!("{name}: n={n} p50 {p50:.3} ms | p95 {p95:.3} | p99 {p99:.3} | max {max:.3}")
+    }
+
+    /// The four style variants of the grid font (NICE_POC_STYLES / sweep).
+    #[derive(Clone)]
+    struct FontSet {
+        base: Font,
+        bold: Font,
+        italic: Font,
+        bold_italic: Font,
+    }
+
+    impl FontSet {
+        fn new(family: &'static str) -> Self {
+            let base = font(family);
+            let mut bold = base.clone();
+            bold.weight = FontWeight::BOLD;
+            let mut italic = base.clone();
+            italic.style = FontStyle::Italic;
+            let mut bold_italic = bold.clone();
+            bold_italic.style = FontStyle::Italic;
+            FontSet {
+                base,
+                bold,
+                italic,
+                bold_italic,
+            }
+        }
+
+        fn pick(&self, bits: u8) -> &Font {
+            match bits & 3 {
+                1 => &self.bold,
+                2 => &self.italic,
+                3 => &self.bold_italic,
+                _ => &self.base,
+            }
+        }
+    }
+
+    /// Mark an NSView + its backing CAMetalLayer as needing display so the
+    /// next CA commit fires `displayLayer:` -> gpui request-frame ->
+    /// `Window::present()` -> `MetalRenderer::draw`, independent of the
+    /// display-link state. (The interactive mode's load-bearing present kick,
+    /// shared here so BACKGROUND multi-session windows actually present their
+    /// demand-driven redraws too — before this fix they rebuilt scenes on
+    /// notify but never presented when their display link was stopped.)
+    fn kick_view_display(ns_view: *mut NSView) {
+        if ns_view.is_null() {
+            return;
+        }
+        unsafe {
+            let view: &NSView = &*ns_view;
+            view.setNeedsDisplay(true);
+            let layer: *mut AnyObject = msg_send![view, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setNeedsDisplay];
+            }
+        }
+    }
+
+    /// Display + max refresh of the screen hosting `ns_view`'s window (the
+    /// main.rs hot-plug guard, ported — §13 harness fix).
+    fn screen_info_of_view(ns_view: *mut NSView) -> (i64, String) {
+        if ns_view.is_null() {
+            return (0, "<no view>".to_string());
+        }
+        unsafe {
+            let view: &NSView = &*ns_view;
+            let Some(window) = view.window() else {
+                return (0, "<no window>".to_string());
+            };
+            match window.screen() {
+                Some(screen) => {
+                    let fps = screen.maximumFramesPerSecond() as i64;
+                    let name = screen.localizedName().to_string();
+                    let f = screen.frame();
+                    (
+                        fps,
+                        format!(
+                            "{name} [{}x{} @ {},{}]",
+                            f.size.width as i64,
+                            f.size.height as i64,
+                            f.origin.x as i64,
+                            f.origin.y as i64
+                        ),
+                    )
+                }
+                None => (0, "<no screen>".to_string()),
+            }
+        }
+    }
+
+    /// Resize the NSWindow hosting `ns_view` (spike 9 resize storm — a real
+    /// window-frame change so GPUI relayouts and the drawable resizes).
+    fn set_window_size(ns_view: *mut NSView, w: f64, h: f64) {
+        if ns_view.is_null() {
+            return;
+        }
+        unsafe {
+            let view: &NSView = &*ns_view;
+            let Some(window) = view.window() else { return };
+            let mut frame: NSRect = window.frame();
+            // Keep the top-left corner fixed (AppKit origin is bottom-left).
+            frame.origin.y += frame.size.height - h;
+            frame.size = NSSize::new(w, h);
+            window.setFrame_display(frame, true);
+        }
+    }
+
     struct TermView {
         /// Window index (0 = the measurement coordinator).
         index: usize,
@@ -651,10 +1684,11 @@ mod gui {
         /// demand-driven (dirty-flag notify poller).
         streaming: bool,
         cfg: MultiCfg,
+        spike: SpikeCfg,
         /// The session's Term + feeder thread (parsing happens there, NOT in
         /// render — spike 8 restructure).
         session: Session,
-        base_font: Font,
+        fonts: FontSet,
         frame: u64,
         start_tick: u64,
         deadline_secs: f64,
@@ -663,24 +1697,45 @@ mod gui {
         mem_peak_mib: f64,
         seed: u64,
         bps: usize,
+        /// GPUI's NSView (raw-window-handle), captured on first render —
+        /// used for the bg present kick, screen info, and the resize storm.
+        ns_view: *mut NSView,
+        // -- spike 6 baselines (captured at measurement start, w0 only) ----
+        cpu0: Option<harness::cpu::CpuSample>,
+        shape0: (u64, u64, u64),
+        atlas0_mono: [u64; 7],
+        atlas0_poly: [u64; 7],
+        screen0: Option<(i64, String)>,
+        /// (elapsed_s, phys MiB) series persisted into the CSV (§13 fix).
+        mem_series: Vec<(f64, f64)>,
+        // -- spike 9 drivers ------------------------------------------------
+        scroll_dir: i32,
+        last_resize: Option<Instant>,
+        resize_phase: usize,
+        // -- spike 10 -------------------------------------------------------
+        img: Option<ImgPressure>,
     }
 
     impl TermView {
+        #[allow(clippy::too_many_arguments)]
         fn new(
             index: usize,
             streaming: bool,
             cfg: MultiCfg,
+            spike: SpikeCfg,
             session: Session,
             deadline_secs: f64,
             seed: u64,
             bps: usize,
         ) -> Self {
+            let img = (index == 0 && spike.atlas).then(|| ImgPressure::new(spike.atlas_retain));
             Self {
                 index,
                 streaming,
                 cfg,
+                spike,
                 session,
-                base_font: font("Menlo"),
+                fonts: FontSet::new("Menlo"),
                 frame: 0,
                 start_tick: 0,
                 deadline_secs,
@@ -689,6 +1744,17 @@ mod gui {
                 mem_peak_mib: 0.0,
                 seed,
                 bps,
+                ns_view: std::ptr::null_mut(),
+                cpu0: None,
+                shape0: (0, 0, 0),
+                atlas0_mono: [0; 7],
+                atlas0_poly: [0; 7],
+                screen0: None,
+                mem_series: Vec::new(),
+                scroll_dir: 1,
+                last_resize: None,
+                resize_phase: 0,
+                img,
             }
         }
 
@@ -709,31 +1775,213 @@ mod gui {
             }
         }
 
-        fn finalize_and_exit(&self, reason: &str) -> ! {
+        fn kick_platform_display(&self) {
+            kick_view_display(self.ns_view);
+        }
+
+        /// Spike 9: per-frame scrollback scroll-position churn — a triangle
+        /// wave over the full history depth (±3 lines/frame) with a periodic
+        /// snap back to Bottom (the sticky-bottom jump).
+        fn drive_scroll(&mut self) {
+            let mut t = self.session.term.lock();
+            if self.frame % 900 == 0 {
+                t.scroll_display(Scroll::Bottom);
+                self.scroll_dir = 1;
+            } else {
+                let hist = t.grid().history_size();
+                let off = t.grid().display_offset();
+                if self.scroll_dir > 0 && off + 3 >= hist {
+                    self.scroll_dir = -1;
+                } else if self.scroll_dir < 0 && off <= 3 {
+                    self.scroll_dir = 1;
+                }
+                t.scroll_display(Scroll::Delta(self.scroll_dir * 3));
+            }
+            SCROLL_OPS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Spike 9: programmatic selection churn under streaming — re-anchor
+        /// deep in history every ~4s (so ongoing streaming EVICTS the anchor
+        /// line), otherwise sweep the selection end across the viewport (the
+        /// drag analog). Rendered inverse by `snapshot`, so it has real paint
+        /// cost. NOTE: input-level drags (real NSEvent mouse) are the IME/
+        /// input spike's turf; this drives the same alacritty `Selection` +
+        /// grid-rotation code the fork's hardest patches live in.
+        fn drive_selection(&mut self) {
+            let mut t = self.session.term.lock();
+            let cols = t.columns();
+            if self.frame % 240 == 1 || t.selection.is_none() {
+                let top = t.grid().topmost_line();
+                let anchor = TermPoint::new(Line(top.0 + 2), Column(0));
+                t.selection = Some(Selection::new(SelectionType::Simple, anchor, Side::Left));
+                SEL_REANCHORS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let line = Line((self.frame % ROWS as u64) as i32);
+                let col = Column((self.frame as usize * 7) % cols);
+                if let Some(sel) = &mut t.selection {
+                    sel.update(TermPoint::new(line, col), Side::Right);
+                }
+            }
+            // Count frames where the held selection no longer resolves to a
+            // range (anchor evicted from history / cleared by grid rotation).
+            let gone = t
+                .selection
+                .as_ref()
+                .and_then(|s| s.to_range(&t))
+                .is_none();
+            if gone {
+                SEL_EVICTED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Spike 9: resize storm — every NICE_POC_RESIZE_MS cycle the Term
+        /// through 4 sizes (a full-history reflow each time; the stall is
+        /// timed) and resize the real NSWindow to match (GPUI relayout +
+        /// drawable resize).
+        fn drive_resize(&mut self) {
+            const SIZES: [(usize, usize); 4] = [(120, 40), (100, 34), (80, 28), (100, 34)];
+            let due = self
+                .last_resize
+                .map_or(self.frame > 30, |t| {
+                    t.elapsed() >= Duration::from_millis(self.spike.resize_ms)
+                });
+            if !due {
+                return;
+            }
+            self.last_resize = Some(Instant::now());
+            self.resize_phase = (self.resize_phase + 1) % SIZES.len();
+            let (cols, rows) = SIZES[self.resize_phase];
+            let t0 = Instant::now();
+            {
+                let mut t = self.session.term.lock();
+                t.resize(Size { rows, cols });
+            }
+            push_ms(&RESIZE_STALL_MS, t0.elapsed().as_secs_f64() * 1000.0);
+            set_window_size(
+                self.ns_view,
+                cols as f64 * (FONT_PX * 0.62) as f64,
+                rows as f64 * LINE_PX as f64 + 40.0,
+            );
+        }
+
+        fn finalize_and_exit(&mut self, reason: &str) -> ! {
+            // Final memory sample first — idle/demand-driven runs may not have
+            // rendered (and therefore sampled) for long stretches.
+            self.sample_mem();
+            if self.mem_idle_mib == 0.0 {
+                self.mem_idle_mib = self.mem_steady_mib;
+            }
+
             let streams = harness::drain_frame_streams();
             // Single stack: GPUI's composite IS the terminal present. One vsync
             // on this panel = 16.67 ms (60 Hz); cliff threshold matches §10.
             let g = harness::interval_stats(&streams.gpui_composite, 16.6);
+            let elapsed = self.elapsed_secs();
+
+            // Hot-plug guard (ported from main.rs — §13 harness fix).
+            let screen_now = screen_info_of_view(self.ns_view);
+            let mut display_desc = match &self.screen0 {
+                Some((fps, name)) => format!("{name} (max {fps} Hz)"),
+                None => "<unknown>".to_string(),
+            };
+            if let Some((fps0, name0)) = &self.screen0 {
+                if screen_now.0 != *fps0 || screen_now.1 != *name0 {
+                    eprintln!(
+                        "[gpui-term] ⚠️ DISPLAY CHANGED MID-RUN: start='{name0}' ({fps0} Hz) \
+                         -> exit='{}' ({} Hz). Numbers are CONTAMINATED — re-run on a single \
+                         stable display.",
+                        screen_now.1, screen_now.0
+                    );
+                    display_desc = format!(
+                        "{name0} -> {} (CHANGED MID-RUN — CONTAMINATED)",
+                        screen_now.1
+                    );
+                }
+            }
 
             let multi = self.cfg.windows > 1;
-            let csv = if multi {
-                format!(
+            let tag = self.spike.tag();
+            let csv = match (&tag, multi) {
+                (None, false) => "./gpui-term-gpui-native-single-stack.csv".to_string(),
+                (None, true) => format!(
                     "./gpui-term-multi-{}w{}s.csv",
                     self.cfg.windows, self.cfg.streaming
-                )
-            } else {
-                "./gpui-term-gpui-native-single-stack.csv".to_string()
+                ),
+                (Some(t), false) => format!("./gpui-term-{t}.csv"),
+                (Some(t), true) => format!(
+                    "./gpui-term-{t}-{}w{}s.csv",
+                    self.cfg.windows, self.cfg.streaming
+                ),
+            };
+            let meta = CsvMeta {
+                display: display_desc.clone(),
+                seed: self.seed,
+                bps: self.bps,
+                cfg: self.cfg,
+                tag: tag.clone().unwrap_or_else(|| "none".to_string()),
+                scrollback: self.spike.scrollback,
+                trace: self.spike.trace_path.clone(),
+                mem_series: std::mem::take(&mut self.mem_series),
             };
             let _ = if multi {
-                write_multi_csv(Path::new(&csv))
+                write_multi_csv(Path::new(&csv), &meta)
             } else {
-                write_csv(Path::new(&csv), &streams)
+                write_csv(Path::new(&csv), &streams, &meta)
             };
 
             eprintln!("\n================ gpui-term LIVE RESULT ({reason}) ================");
             eprintln!("architecture : Path B — single GPUI Metal stack, alacritty_terminal VT core,");
             eprintln!("               rendered via public shape_line().paint() + paint_quad()");
-            eprintln!("workload     : synthetic Claude-stream, seed={} ~{} B/s, {}x{} grid", self.seed, self.bps, COLS, ROWS);
+            eprintln!(
+                "build        : {} | display: {display_desc} | gpui_txn={} damage_only={}",
+                if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" },
+                env_flag("NICE_POC_GPUI_TXN") as u8,
+                env_flag("NICE_POC_DAMAGE_ONLY") as u8,
+            );
+            match (&self.spike.trace, self.spike.energy_state) {
+                (Some(t), _) => eprintln!(
+                    "workload     : REAL TRACE {} — {} records / {} bytes / {:.1}s native, \
+                     speed x{}, mode={}{} ({}x{} grid)",
+                    self.spike.trace_path.as_deref().unwrap_or("?"),
+                    t.records.len(),
+                    t.total_bytes,
+                    t.duration_secs(),
+                    self.spike.trace_speed,
+                    if self.spike.trace_drain { "DRAIN (max-rate)" } else { "timing-faithful" },
+                    if self.spike.trace_loop { " loop" } else { "" },
+                    COLS,
+                    ROWS
+                ),
+                (None, Some(state)) => eprintln!(
+                    "workload     : NONE — energy state {:?} ({})",
+                    state,
+                    match state {
+                        EnergyState::Idle => "window open, no feed, no RAF",
+                        EnergyState::Dot => "no feed; one 12px chrome dot animating via RAF",
+                    }
+                ),
+                (None, None) if self.spike.glyph_sweep => eprintln!(
+                    "workload     : distinct-glyph sweep, seed={} ~{} B/s, {}x{} grid (styles=on)",
+                    self.seed, self.bps, COLS, ROWS
+                ),
+                (None, None) => eprintln!(
+                    "workload     : synthetic Claude-stream, seed={} ~{} B/s, {}x{} grid",
+                    self.seed, self.bps, COLS, ROWS
+                ),
+            }
+            eprintln!(
+                "spike flags  : {} | scrollback={}{}",
+                tag.as_deref().unwrap_or("none"),
+                self.spike.scrollback,
+                {
+                    let pf = f64::from_bits(self.session.prefill_ms.load(Ordering::Relaxed));
+                    if self.spike.prefill_lines > 0 {
+                        format!(" prefill={} lines ({pf:.0} ms)", self.spike.prefill_lines)
+                    } else {
+                        String::new()
+                    }
+                }
+            );
             if multi {
                 let bg = self.cfg.windows - self.cfg.streaming;
                 let bg_desc = if self.cfg.bg_bps == 0 {
@@ -747,11 +1995,13 @@ mod gui {
                     self.cfg.windows, self.cfg.streaming, bg
                 );
             }
-            eprintln!("duration     : {:.1} s, {} composited frames", self.elapsed_secs(), g.samples);
+            eprintln!("duration     : {elapsed:.1} s, {} composited frames", g.samples);
             eprintln!("-- frame interval (single stack = terminal present) --");
             eprintln!(
-                "  p50 {:.2} ms ({:.1} fps) | p95 {:.2} ms | p99 {:.2} ms | cliffs>16.6ms {}",
-                g.p50_ms, g.fps_p50, g.p95_ms, g.p99_ms, g.cliffs
+                "  p50 {:.2} ms ({:.1} fps) | p95 {:.2} ms | p99 {:.2} ms | max {:.2} ms | \
+                 cliffs>16.6ms {} | cliffs>{:.1}ms(=1.5xp50) {}",
+                g.p50_ms, g.fps_p50, g.p95_ms, g.p99_ms, g.max_ms, g.cliffs, g.cliff_auto_ms,
+                g.cliffs_auto
             );
             if multi {
                 eprintln!("-- per-window cadence (spike 8) --");
@@ -774,10 +2024,152 @@ mod gui {
                     }
                 }
             }
+
+            // ---- spike 6: per-frame cost decomposition + CPU/energy -------
+            eprintln!("-- render busy-cost (w0; spike 6) --");
+            eprintln!("  {}", stats_line("snapshot(lock+copy)   ", &SNAPSHOT_MS));
+            eprintln!("  {}", stats_line("render-body(build)    ", &BUILD_MS));
+            eprintln!("  {}", stats_line("paint-closure(shape+quads)", &PAINT_MS));
+            {
+                let mut draw_ms: Vec<f64> = gpui::nice_poc_metrics::DRAW_DUR_NS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|&ns| ns as f64 / 1.0e6)
+                    .collect();
+                let n = draw_ms.len();
+                let (p50, p95, p99) = harness::percentiles(&mut draw_ms);
+                let max = draw_ms.last().copied().unwrap_or(0.0);
+                eprintln!(
+                    "  MetalRenderer::draw CPU (all windows): n={n} p50 {p50:.3} ms | p95 \
+                     {p95:.3} | p99 {p99:.3} | max {max:.3} | total draws {} \
+                     [comparable to Nice Metal.Draw 1.19/2.41 ms p50/p95]",
+                    metal_draw_count()
+                );
+                let mut gpu_ms: Vec<f64> = gpui::nice_poc_metrics::GPU_DUR_NS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|&ns| ns as f64 / 1.0e6)
+                    .collect();
+                if gpu_ms.is_empty() {
+                    eprintln!(
+                        "  GPU time: (not recorded — set NICE_POC_GPU_TS=1 for \
+                         MTLCommandBuffer GPUStart/EndTime deltas)"
+                    );
+                } else {
+                    let n = gpu_ms.len();
+                    let (p50, p95, p99) = harness::percentiles(&mut gpu_ms);
+                    let max = gpu_ms.last().copied().unwrap_or(0.0);
+                    eprintln!(
+                        "  GPU time per command buffer: n={n} p50 {p50:.3} ms | p95 {p95:.3} | \
+                         p99 {p99:.3} | max {max:.3}"
+                    );
+                }
+                let (c, p, m) = gpui::nice_poc_metrics::shape_cache_stats();
+                let (dc, dp, dm) = (
+                    c.saturating_sub(self.shape0.0),
+                    p.saturating_sub(self.shape0.1),
+                    m.saturating_sub(self.shape0.2),
+                );
+                let total = dc + dp + dm;
+                eprintln!(
+                    "  shape cache (LineLayoutCache): hit-current {dc} | hit-prev-frame {dp} | \
+                     miss(fresh CoreText) {dm} | hit rate {:.1}%",
+                    if total > 0 {
+                        (dc + dp) as f64 / total as f64 * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+            }
+            eprintln!("-- cpu / energy (proc_pid_rusage deltas over the measurement window) --");
+            match (&self.cpu0, harness::cpu::sample()) {
+                (Some(t0), Some(t1)) => {
+                    eprintln!("  {}", harness::cpu::delta_summary(t0, &t1, elapsed))
+                }
+                _ => eprintln!("  (proc_pid_rusage unavailable)"),
+            }
+
+            // ---- spike 10: atlas pressure ---------------------------------
+            {
+                use gpui::nice_poc_metrics::{ATLAS_MONO, ATLAS_POLY};
+                let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+                let line = |name: &str, s: [u64; 7], b: [u64; 7]| {
+                    let d: Vec<u64> = s.iter().zip(b.iter()).map(|(a, b)| a - b).collect();
+                    eprintln!(
+                        "  {name}: tex +{}/-{} (live {} = {:.1} MiB) | tiles +{}/-{} | \
+                         upload {:.1} MiB   [this run]",
+                        d[0],
+                        d[1],
+                        s[0] as i64 - s[1] as i64,
+                        mib(s[2] - s[3]),
+                        d[4],
+                        d[5],
+                        mib(d[6])
+                    );
+                };
+                eprintln!(
+                    "-- atlas (gpui::nice_poc_metrics; live = process-cumulative alloc-freed) --"
+                );
+                line("mono(A8 glyphs)   ", ATLAS_MONO.snapshot(), self.atlas0_mono);
+                line("poly(BGRA images) ", ATLAS_POLY.snapshot(), self.atlas0_poly);
+                if let Some(img) = &self.img {
+                    eprintln!(
+                        "  image pressure: anim frames emitted {} | drop_image()d {} | \
+                         retain={} | statics {} painted/frame",
+                        img.emitted,
+                        img.dropped,
+                        self.spike.atlas_retain as u8,
+                        img.statics.len()
+                    );
+                }
+            }
+
+            // ---- spike 9 ---------------------------------------------------
+            if self.spike.resize_storm || self.spike.scroll_churn || self.spike.selection_churn {
+                eprintln!("-- scrollback / reflow / selection (spike 9) --");
+                if self.spike.resize_storm {
+                    eprintln!(
+                        "  {}   [KILL-SIGNAL: multi-hundred-ms stalls]",
+                        stats_line("Term::resize reflow stall", &RESIZE_STALL_MS)
+                    );
+                }
+                if self.spike.scroll_churn {
+                    eprintln!(
+                        "  scroll churn: {} scroll_display ops (triangle over {} history \
+                         lines, snap-to-bottom every 900 frames)",
+                        SCROLL_OPS.load(Ordering::Relaxed),
+                        self.spike.scrollback
+                    );
+                }
+                if self.spike.selection_churn {
+                    eprintln!(
+                        "  selection churn: {} re-anchors | {} frames with the held selection \
+                         resolved to None (anchor evicted/cleared)",
+                        SEL_REANCHORS.load(Ordering::Relaxed),
+                        SEL_EVICTED_FRAMES.load(Ordering::Relaxed)
+                    );
+                }
+            }
+
+            // ---- spike 7: drain summary ------------------------------------
+            if self.spike.trace.is_some() {
+                let drain = f64::from_bits(self.session.drain_ms.load(Ordering::Relaxed));
+                if self.spike.trace_drain && drain > 0.0 {
+                    eprintln!("-- max-rate drain (spike 7) --");
+                    eprintln!(
+                        "  w0 parse wall-clock to quiescent: {drain:.0} ms | max frame \
+                         interval during run: {:.2} ms",
+                        g.max_ms
+                    );
+                }
+            }
+
             eprintln!("-- memory (phys_footprint; whole process, incl. every session) --");
             eprintln!(
-                "  idle {:.1} MiB | steady {:.1} MiB | peak {:.1} MiB",
-                self.mem_idle_mib, self.mem_steady_mib, self.mem_peak_mib
+                "  idle {:.1} MiB | steady {:.1} MiB | peak {:.1} MiB (scrollback limit {})",
+                self.mem_idle_mib, self.mem_steady_mib, self.mem_peak_mib, self.spike.scrollback
             );
             eprintln!("-- reference (§10, same harness) --");
             eprintln!("  baseline single-stack  : ~16.7 / 17.1 ms (~60 fps)");
@@ -789,13 +2181,43 @@ mod gui {
         }
     }
 
+    /// If every finite (trace) feed has completed, return the LATEST
+    /// completion tick — the coordinator finalizes ~1 s after it.
+    fn all_finite_feeds_done() -> Option<u64> {
+        let slots = win_slots();
+        let mut latest = 0u64;
+        let mut any = false;
+        for slot in slots {
+            if slot.expect_done {
+                any = true;
+                let t = slot.feed_done.load(Ordering::Acquire);
+                if t == 0 {
+                    return None;
+                }
+                latest = latest.max(t);
+            }
+        }
+        if any { Some(latest) } else { None }
+    }
+
     impl Render for TermView {
         fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let t_render0 = harness::clock::now();
             if self.index == 0 {
                 harness::stamp_gpui_frame();
             }
             stamp_window_frame(self.index);
             self.frame += 1;
+
+            if self.frame == 1 {
+                // Capture gpui's NSView (every window): bg-window present
+                // kick, screen info, resize storm.
+                if let Ok(handle) = HasWindowHandle::window_handle(window) {
+                    if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+                        self.ns_view = appkit.ns_view.as_ptr() as *mut NSView;
+                    }
+                }
+            }
 
             if self.index == 0 && self.frame == 1 {
                 // Capture an idle baseline, then clear the warm-up frame so the
@@ -806,10 +2228,43 @@ mod gui {
                 self.start_tick = harness::clock::now();
                 harness::reset_frame_streams();
                 clear_window_frames();
+                // Spike 6 baselines: CPU/energy + vendored-gpui metric zeroes.
+                self.cpu0 = harness::cpu::sample();
+                gpui::nice_poc_metrics::DRAW_DUR_NS.lock().unwrap().clear();
+                gpui::nice_poc_metrics::GPU_DUR_NS.lock().unwrap().clear();
+                self.shape0 = gpui::nice_poc_metrics::shape_cache_stats();
+                self.atlas0_mono = gpui::nice_poc_metrics::ATLAS_MONO.snapshot();
+                self.atlas0_poly = gpui::nice_poc_metrics::ATLAS_POLY.snapshot();
+                // Display recorded per run (hot-plug guard, ported from main.rs).
+                let (fps, name) = screen_info_of_view(self.ns_view);
+                eprintln!("[gpui-term] window on display: {name} (max {fps} Hz)");
+                self.screen0 = Some((fps, name));
             }
 
             if self.index == 0 {
                 self.sample_mem();
+                if self.frame % 15 == 0 {
+                    self.mem_series.push((self.elapsed_secs(), self.mem_steady_mib));
+                }
+                // Spike 9 drivers (all default off; each holds the FairMutex
+                // briefly on the main thread — contention with the feeder is
+                // part of what's being measured).
+                if self.spike.scroll_churn {
+                    self.drive_scroll();
+                }
+                if self.spike.selection_churn {
+                    self.drive_selection();
+                }
+                if self.spike.resize_storm {
+                    self.drive_resize();
+                }
+                // Spike 7: a finite trace feed finalizes ~1 s after the last
+                // byte parsed ("quiescent"), before the deadline.
+                if let Some(done_at) = all_finite_feeds_done() {
+                    if harness::clock::ms_between(done_at, harness::clock::now()) > 1000.0 {
+                        self.finalize_and_exit("trace complete (quiescent +1s)");
+                    }
+                }
                 if self.elapsed_secs() >= self.deadline_secs {
                     self.finalize_and_exit("measurement window elapsed");
                 }
@@ -819,21 +2274,57 @@ mod gui {
             // on the session's feeder thread now — spike 8 restructure). The
             // snapshot is owned so the 'static paint closure can render it
             // without borrowing `self`.
-            let snap = snapshot(&self.session.term.lock());
-            let base = self.base_font.clone();
+            let t_snap0 = harness::clock::now();
+            let snap = snapshot(&self.session.term.lock(), self.spike.styles);
+            if self.index == 0 {
+                push_ms(
+                    &SNAPSHOT_MS,
+                    harness::clock::ms_between(t_snap0, harness::clock::now()),
+                );
+            }
+            let fonts = self.fonts.clone();
             // Animated sub-pixel vertical offset → exercises fractional glyph
             // placement + full re-paint every frame (the sub-line scroll path).
-            let frac = (self.frame as f32 * 0.7) % LINE_PX;
+            // Static in the energy states (nothing should animate but the dot).
+            let frac = if self.spike.energy_state.is_some() {
+                0.0
+            } else {
+                (self.frame as f32 * 0.7) % LINE_PX
+            };
+
+            // Spike 10 image pressure (w0 only): advance the 30 fps animation,
+            // hand the paint closure the images to paint + the stale frames to
+            // drop_image (=> atlas remove()).
+            let images = self.img.as_mut().map(|img| img.tick());
+            // Spike 6 `dot` energy state: one animating chrome dot.
+            let dot_frame = (self.spike.energy_state == Some(EnergyState::Dot))
+                .then_some(self.frame);
 
             // Streaming windows composite continuously — this RAF is the
             // measurement clock (unchanged from the audited rev). Background
             // windows are demand-driven: the notify poller in run_live turns
-            // the feeder's dirty flag into cx.notify() instead.
+            // the feeder's dirty flag into cx.notify() + a present kick.
             if self.streaming {
                 window.request_animation_frame();
             }
 
-            grid_canvas(snap, base, frac)
+            let el = grid_canvas(
+                snap,
+                fonts,
+                frac,
+                CanvasExtras {
+                    record: self.index == 0,
+                    images,
+                    dot_frame,
+                },
+            );
+            if self.index == 0 {
+                push_ms(
+                    &BUILD_MS,
+                    harness::clock::ms_between(t_render0, harness::clock::now()),
+                );
+            }
+            el
         }
     }
 
@@ -841,12 +2332,44 @@ mod gui {
         rgb(v).into()
     }
 
+    /// Per-frame extras threaded into the paint closure (all None/false for
+    /// the interactive view and the plain audited run).
+    struct CanvasExtras {
+        /// Record the paint-closure duration into PAINT_MS (w0 only).
+        record: bool,
+        /// Spike 10: (static images, newest animation frame, frames to
+        /// drop_image this frame).
+        images: Option<(
+            Vec<std::sync::Arc<RenderImage>>,
+            Option<std::sync::Arc<RenderImage>>,
+            Vec<std::sync::Arc<RenderImage>>,
+        )>,
+        /// Spike 6 `dot` energy state: paint one animating 12px dot.
+        dot_frame: Option<u64>,
+    }
+
+    impl CanvasExtras {
+        fn none() -> Self {
+            CanvasExtras {
+                record: false,
+                images: None,
+                dot_frame: None,
+            }
+        }
+    }
+
     /// Build the paint canvas for one grid snapshot. Shared by the workload
     /// view (`TermView`) and the interactive view (`InteractiveView`).
-    fn grid_canvas(snap: Vec<RowSnap>, base: Font, frac: f32) -> impl IntoElement {
+    fn grid_canvas(
+        snap: Vec<RowSnap>,
+        fonts: FontSet,
+        frac: f32,
+        extras: CanvasExtras,
+    ) -> impl IntoElement {
         canvas(
             move |_bounds, _window, _cx| {},
             move |bounds: Bounds<Pixels>, _state, window: &mut Window, cx: &mut App| {
+                let t_paint0 = harness::clock::now();
                 let line_h = px(LINE_PX);
                 let font_size = px(FONT_PX);
                 let origin_x = bounds.origin.x;
@@ -862,9 +2385,9 @@ mod gui {
                     let runs: Vec<TextRun> = row
                         .cells
                         .iter()
-                        .map(|(len, fg)| TextRun {
+                        .map(|(len, fg, style)| TextRun {
                             len: *len,
-                            font: base.clone(),
+                            font: fonts.pick(*style).clone(),
                             color: rgb_to_hsla(*fg),
                             background_color: None,
                             underline: None,
@@ -879,8 +2402,11 @@ mod gui {
                             .shape_line(text, font_size, &runs, None);
 
                     // Cell advance from the shaped row width (monospace ⇒ even).
-                    let cell_w = if COLS > 0 {
-                        shaped.width / (COLS as f32)
+                    // Divide by THIS row's cell count — the resize storm makes
+                    // the grid narrower than the COLS constant.
+                    let row_cols = row.cells.len();
+                    let cell_w = if row_cols > 0 {
+                        shaped.width / (row_cols as f32)
                     } else {
                         px(FONT_PX * 0.6)
                     };
@@ -897,6 +2423,68 @@ mod gui {
                     }
 
                     let _ = shaped.paint(point(origin_x, y), line_h, window, cx);
+                }
+
+                // ---- spike 10: image pressure over the grid ---------------
+                if let Some((statics, anim, drops)) = &extras.images {
+                    // 12 static "sixels" in a 3-wide grid along the right edge.
+                    let right = bounds.origin.x + bounds.size.width;
+                    for (i, img) in statics.iter().enumerate() {
+                        let side = px(STATIC_SIZES[i % STATIC_SIZES.len()] as f32 / 2.0);
+                        let col = (i % 3) as f32;
+                        let row = (i / 3) as f32;
+                        let rect = Bounds {
+                            origin: point(
+                                right - px(3.0 * 150.0) + px(col * 150.0),
+                                top + px(280.0 + row * 90.0),
+                            ),
+                            size: size(side, side),
+                        };
+                        let _ = window.paint_image(
+                            rect,
+                            Corners::default(),
+                            img.clone(),
+                            0,
+                            false,
+                        );
+                    }
+                    // The 512x512 animation frame, top-right, painted at 256pt
+                    // (1:1 device pixels at 2x scale).
+                    if let Some(img) = anim {
+                        let rect = Bounds {
+                            origin: point(right - px(266.0), top + px(10.0)),
+                            size: size(px(256.0), px(256.0)),
+                        };
+                        let _ = window.paint_image(
+                            rect,
+                            Corners::default(),
+                            img.clone(),
+                            0,
+                            false,
+                        );
+                    }
+                    // Release stale animation frames => atlas remove().
+                    for d in drops {
+                        let _ = window.drop_image(d.clone());
+                    }
+                }
+
+                // ---- spike 6 `dot` energy state: one animating chrome dot --
+                if let Some(f) = extras.dot_frame {
+                    let x = 8.0 + ((f % 120) as f32) * 2.0;
+                    let hue = ((f % 255) as u32) << 16 | 0x0059F5;
+                    let rect = Bounds {
+                        origin: point(origin_x + px(x), top + px(4.0)),
+                        size: size(px(12.0), px(12.0)),
+                    };
+                    window.paint_quad(fill(rect, rgb(hue)));
+                }
+
+                if extras.record {
+                    push_ms(
+                        &PAINT_MS,
+                        harness::clock::ms_between(t_paint0, harness::clock::now()),
+                    );
                 }
             },
         )
@@ -944,7 +2532,7 @@ mod gui {
     struct InteractiveView {
         pty: PtySession,
         focus_handle: FocusHandle,
-        base_font: Font,
+        fonts: FontSet,
         frame: u64,
         keys_sent: u64,
         start_tick: u64,
@@ -977,21 +2565,9 @@ mod gui {
         /// `MetalRenderer::draw` (the "Draw" signpost), independent of the
         /// display-link state. One echo => one commit => one Metal draw.
         fn kick_platform_display(&self) {
-            if self.ns_view.is_null() {
-                return;
-            }
-            unsafe {
-                let view: &NSView = &*self.ns_view;
-                view.setNeedsDisplay(true);
-                // The layer mark is the guaranteed CALayerDelegate
-                // `displayLayer:` trigger (the view is the layer's delegate;
-                // gpui's `makeBackingLayer` returns the renderer's
-                // CAMetalLayer).
-                let layer: *mut AnyObject = msg_send![view, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, setNeedsDisplay];
-                }
-            }
+            // Shared with the multi-session background windows (spike 8 fix):
+            // marks the view + its backing CAMetalLayer as needing display.
+            kick_view_display(self.ns_view);
         }
 
         fn finalize_and_exit(&self, reason: &str) -> ! {
@@ -1031,7 +2607,7 @@ mod gui {
             }
             self.pty.dirty.store(false, Ordering::Release);
 
-            let snap = snapshot(&self.pty.term.lock());
+            let snap = snapshot(&self.pty.term.lock(), false);
             // frac = 0: no sub-pixel scroll animation (that path needs a
             // continuous redraw clock, which this mode deliberately lacks).
             // NOTE: no request_animation_frame anywhere in this render.
@@ -1041,7 +2617,12 @@ mod gui {
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, _cx| {
                     this.on_key(ev);
                 }))
-                .child(grid_canvas(snap, self.base_font.clone(), 0.0))
+                .child(grid_canvas(
+                    snap,
+                    self.fonts.clone(),
+                    0.0,
+                    CanvasExtras::none(),
+                ))
         }
     }
 
@@ -1124,22 +2705,40 @@ mod gui {
                         })
                         .detach();
 
-                        // The deadline is a TIMER, not a render-path check —
-                        // a demand-driven window may not render for long
-                        // stretches, so the exit cannot live in render().
-                        let executor = cx.background_executor().clone();
-                        cx.spawn(async move |this, cx| {
-                            executor.timer(Duration::from_secs_f64(deadline)).await;
-                            let _ = this.update(cx, |view: &mut InteractiveView, _| {
-                                view.finalize_and_exit("deadline")
-                            });
-                        })
-                        .detach();
+                        // The deadline must NOT live in render() (a demand-
+                        // driven window may not render for long stretches) —
+                        // and NOT on a gpui executor timer either: that
+                        // starved live in the idle energy state (App Nap
+                        // timer coalescing in a fully idle app; this mode
+                        // only ever survived because real input kept the app
+                        // un-napped). Shared guaranteed-fire watchdog thread
+                        // instead (harness::watchdog).
+                        let weak = cx.weak_entity();
+                        let mut async_cx = cx.to_async();
+                        harness::watchdog::arm(
+                            Duration::from_secs_f64(deadline),
+                            "gpui-term interactive",
+                            move || {
+                                let done = weak.update(
+                                    &mut async_cx,
+                                    |view: &mut InteractiveView, _| {
+                                        view.finalize_and_exit("deadline (watchdog)")
+                                    },
+                                );
+                                if done.is_err() {
+                                    eprintln!(
+                                        "[gpui-term interactive] watchdog: view entity \
+                                         gone; exiting without a summary"
+                                    );
+                                    std::process::exit(2);
+                                }
+                            },
+                        );
 
                         InteractiveView {
                             pty,
                             focus_handle: cx.focus_handle(),
-                            base_font: font("Menlo"),
+                            fonts: FontSet::new("Menlo"),
                             frame: 0,
                             keys_sent: 0,
                             start_tick: 0,
@@ -1157,26 +2756,79 @@ mod gui {
         });
     }
 
+    /// Run metadata persisted into the CSV as leading `#` comment lines
+    /// (§13 harness fix: screen info / seed / build profile / flags), plus
+    /// the per-sample memory series appended as `mem_phys` rows.
+    struct CsvMeta {
+        display: String,
+        seed: u64,
+        bps: usize,
+        cfg: MultiCfg,
+        tag: String,
+        scrollback: usize,
+        trace: Option<String>,
+        mem_series: Vec<(f64, f64)>,
+    }
+
+    fn write_csv_header(f: &mut impl std::io::Write, meta: &CsvMeta) -> std::io::Result<()> {
+        writeln!(f, "# gpui-term run metadata (parse rows below; lines starting '#' are comments)")?;
+        writeln!(f, "# display={}", meta.display)?;
+        writeln!(
+            f,
+            "# build={} seed={} bytes_per_sec={} windows={} streaming={} bg_bps={}",
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+            meta.seed,
+            meta.bps,
+            meta.cfg.windows,
+            meta.cfg.streaming,
+            meta.cfg.bg_bps
+        )?;
+        writeln!(
+            f,
+            "# mode={} scrollback={} gpui_txn={} damage_only={} trace={}",
+            meta.tag,
+            meta.scrollback,
+            env_flag("NICE_POC_GPUI_TXN") as u8,
+            env_flag("NICE_POC_DAMAGE_ONLY") as u8,
+            meta.trace.as_deref().unwrap_or("-")
+        )?;
+        writeln!(f, "metric,stack,phase,build,idx,value,unit")?;
+        Ok(())
+    }
+
+    fn write_mem_rows(f: &mut impl std::io::Write, meta: &CsvMeta) -> std::io::Result<()> {
+        for (idx, (secs, mib)) in meta.mem_series.iter().enumerate() {
+            // value = phys_footprint MiB; the elapsed seconds ride in `phase`.
+            writeln!(f, "mem_phys,gpui-native,{secs:.1}s,poc,{idx},{mib:.2},MiB")?;
+        }
+        Ok(())
+    }
+
     /// Raw per-sample CSV (single-stack frame intervals + memory), §H.1-shaped.
-    fn write_csv(path: &Path, streams: &harness::FrameStreams) -> std::io::Result<()> {
+    fn write_csv(
+        path: &Path,
+        streams: &harness::FrameStreams,
+        meta: &CsvMeta,
+    ) -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
-        writeln!(f, "metric,stack,phase,build,idx,value,unit")?;
+        write_csv_header(&mut f, meta)?;
         let ts = &streams.gpui_composite;
         for (idx, w) in ts.windows(2).enumerate() {
             let ms = harness::clock::ms_between(w[0], w[1]);
             writeln!(f, "frame_interval,gpui-native,load,poc,{idx},{ms},ms")?;
         }
+        write_mem_rows(&mut f, meta)?;
         Ok(())
     }
 
     /// Multi-window raw CSV (spike 8): per-window frame intervals, same schema
     /// with the window index + role folded into the `stack` column
     /// (`gpui-native-w<N>-stream` / `gpui-native-w<N>-bg`).
-    fn write_multi_csv(path: &Path) -> std::io::Result<()> {
+    fn write_multi_csv(path: &Path, meta: &CsvMeta) -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
-        writeln!(f, "metric,stack,phase,build,idx,value,unit")?;
+        write_csv_header(&mut f, meta)?;
         for (w, slot) in win_slots().iter().enumerate() {
             let ts = slot.frames.lock().unwrap().clone();
             let kind = if slot.streaming { "stream" } else { "bg" };
@@ -1185,27 +2837,54 @@ mod gui {
                 writeln!(f, "frame_interval,gpui-native-w{w}-{kind},load,poc,{idx},{ms},ms")?;
             }
         }
+        write_mem_rows(&mut f, meta)?;
         Ok(())
     }
 
     pub fn run_live() {
+        let mut spike = SpikeCfg::from_env();
+        if let Err(e) = spike.load_trace() {
+            eprintln!("[gpui-term] FATAL: {e}");
+            std::process::exit(1);
+        }
+        let mut cfg = MultiCfg::from_env();
+        if spike.energy_state.is_some() {
+            // Energy states are single-window by definition (the powermetrics
+            // three-state protocol).
+            cfg = MultiCfg {
+                windows: 1,
+                streaming: 1,
+                bg_bps: 0,
+            };
+        }
+        let prof = WorkloadProfile::default();
+
+        // Deadline: explicit NICE_POC_SECS wins; a finite (non-loop) trace
+        // replay defaults to its own native duration (+3 s tail; the run
+        // finalizes ~1 s after quiescent anyway); everything else keeps 18 s.
         let deadline = std::env::var("NICE_POC_SECS")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
-            .unwrap_or(18.0);
-        let cfg = MultiCfg::from_env();
-        let prof = WorkloadProfile::default();
+            .unwrap_or_else(|| match &spike.trace {
+                Some(t) if !spike.trace_loop && !spike.trace_drain => {
+                    t.duration_secs() / spike.trace_speed + 3.0
+                }
+                Some(_) if spike.trace_drain => 60.0,
+                _ => 18.0,
+            });
 
         eprintln!(
             "[gpui-term] LIVE single-stack GPUI-native terminal: {} window(s) \
              ({} streaming, {} background @ {} B/s), ~{deadline:.0}s then auto-exit \
-             with an FPS/memory summary. (NICE_POC_SECS / NICE_POC_WINDOWS / \
-             NICE_POC_STREAMING / NICE_POC_BG_BPS override.)",
+             with an FPS/memory summary. Spike flags: {}. (NICE_POC_SECS / \
+             NICE_POC_WINDOWS / NICE_POC_STREAMING / NICE_POC_BG_BPS override; \
+             spikes 6/7/9/10 env in the README.)",
             cfg.windows,
             cfg.streaming,
             cfg.windows - cfg.streaming,
-            cfg.bg_bps
+            cfg.bg_bps,
+            spike.tag().as_deref().unwrap_or("none"),
         );
 
         Application::new().run(move |cx: &mut App| {
@@ -1222,12 +2901,44 @@ mod gui {
                 let bps = if streaming { prof.bytes_per_sec } else { cfg.bg_bps };
                 // Distinct deterministic stream per window (w0 keeps the
                 // original seed, so K=1 is byte-identical to the audited rev).
-                let session = Session::spawn(i, prof.seed + i as u64, bps);
+                let (spec, expect_done) = if spike.energy_state.is_some() {
+                    (FeedSpec::Idle, false)
+                } else if streaming {
+                    match &spike.trace {
+                        Some(t) => (
+                            FeedSpec::Trace {
+                                trace: Arc::clone(t),
+                                speed: spike.trace_speed,
+                                drain: spike.trace_drain,
+                                loop_replay: spike.trace_loop,
+                            },
+                            !spike.trace_loop,
+                        ),
+                        None if spike.glyph_sweep => {
+                            (FeedSpec::Sweep { bps: prof.bytes_per_sec }, false)
+                        }
+                        None => (FeedSpec::Synthetic { bps: prof.bytes_per_sec }, false),
+                    }
+                } else if cfg.bg_bps == 0 {
+                    (FeedSpec::Heartbeat, false)
+                } else {
+                    (FeedSpec::Synthetic { bps: cfg.bg_bps }, false)
+                };
+                let prefill = if streaming { spike.prefill_lines } else { 0 };
+                let session = Session::spawn_spec(
+                    i,
+                    prof.seed + i as u64,
+                    spec,
+                    spike.scrollback,
+                    prefill,
+                );
                 slots.push(WinSlot {
                     streaming,
                     bps,
                     bytes_fed: Arc::clone(&session.bytes_fed),
                     frames: Mutex::new(Vec::new()),
+                    feed_done: Arc::clone(&session.feed_done),
+                    expect_done,
                 });
                 sessions.push(session);
             }
@@ -1239,8 +2950,15 @@ mod gui {
             );
 
             for (i, session) in sessions.into_iter().enumerate() {
-                let streaming = i < cfg.streaming;
-                let bps = if streaming { prof.bytes_per_sec } else { cfg.bg_bps };
+                // Energy `dot` renders via RAF (that's the point: one
+                // animating chrome element = whole-scene repaint at refresh);
+                // `idle` is fully demand-driven (no RAF, ~no draws).
+                let streaming = match spike.energy_state {
+                    Some(EnergyState::Idle) => false,
+                    Some(EnergyState::Dot) => true,
+                    None => i < cfg.streaming,
+                };
+                let bps = if i < cfg.streaming { prof.bytes_per_sec } else { cfg.bg_bps };
                 let bounds = if cfg.windows == 1 {
                     Bounds::centered(None, win_size, cx)
                 } else {
@@ -1258,6 +2976,8 @@ mod gui {
                         if streaming { "streaming" } else { "background" }
                     )
                 };
+                let spike_i = spike.clone();
+                let deadline_i = deadline;
                 cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1276,15 +2996,22 @@ mod gui {
                             if !streaming {
                                 // Demand-driven redraw for background windows:
                                 // a foreground poller (~10 Hz) turns the
-                                // feeder's dirty flag into cx.notify().
-                                // Streaming windows redraw via RAF instead.
+                                // feeder's dirty flag into cx.notify() + a
+                                // platform present kick (spike 8 fix: notify
+                                // alone rebuilds the scene but never PRESENTS
+                                // when the window's display link is stopped).
                                 let dirty = Arc::clone(&session.dirty);
                                 let executor = cx.background_executor().clone();
                                 cx.spawn(async move |this, cx| {
                                     loop {
                                         executor.timer(Duration::from_millis(100)).await;
                                         if dirty.swap(false, Ordering::AcqRel)
-                                            && this.update(cx, |_, cx| cx.notify()).is_err()
+                                            && this
+                                                .update(cx, |view: &mut TermView, cx| {
+                                                    cx.notify();
+                                                    view.kick_platform_display();
+                                                })
+                                                .is_err()
                                         {
                                             break;
                                         }
@@ -1292,12 +3019,44 @@ mod gui {
                                 })
                                 .detach();
                             }
+                            if i == 0 {
+                                // GUARANTEED auto-exit for EVERY live mode
+                                // (2026-07-02 hang fix): the render-path
+                                // deadline only runs while frames tick, and a
+                                // gpui executor timer starved live in the
+                                // fully idle window (App Nap coalescing — see
+                                // harness::watchdog). The watchdog thread
+                                // cannot starve; streaming runs normally exit
+                                // via the render path first (+3 s grace here).
+                                let weak = cx.weak_entity();
+                                let mut async_cx = cx.to_async();
+                                harness::watchdog::arm(
+                                    Duration::from_secs_f64(deadline_i + 3.0),
+                                    "gpui-term",
+                                    move || {
+                                        let done = weak.update(
+                                            &mut async_cx,
+                                            |view: &mut TermView, _| {
+                                                view.finalize_and_exit("deadline (watchdog)")
+                                            },
+                                        );
+                                        if done.is_err() {
+                                            eprintln!(
+                                                "[gpui-term] watchdog: coordinator entity \
+                                                 gone; exiting without a summary"
+                                            );
+                                            std::process::exit(2);
+                                        }
+                                    },
+                                );
+                            }
                             TermView::new(
                                 i,
                                 streaming,
                                 cfg,
+                                spike_i,
                                 session,
-                                deadline,
+                                deadline_i,
                                 prof.seed + i as u64,
                                 bps,
                             )
@@ -1323,6 +3082,19 @@ fn main() {
         (true, false) => gui::run_live(),
         // Headless pty/echo self-test for the interactive path.
         (false, true) => run_headless_interactive(),
-        (false, false) => run_headless(),
+        (false, false) => {
+            // Headless self-tests for the new spike machinery (no display).
+            if env_flag("NICE_POC_WATCHDOG_SELFTEST") {
+                run_headless_watchdog()
+            } else if env_flag("NICE_POC_SPIKE9") {
+                run_headless_spike9()
+            } else if env_flag("NICE_POC_ATLAS") || env_flag("NICE_POC_GLYPH_SWEEP") {
+                run_headless_atlas()
+            } else if std::env::var("NICE_POC_TRACE").is_ok() {
+                run_headless_trace()
+            } else {
+                run_headless()
+            }
+        }
     }
 }
