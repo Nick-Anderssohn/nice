@@ -211,18 +211,36 @@ xcodebuild \
 # file handles across the rename, and any live Claude Code sessions
 # hosted in that Nice survive the upgrade. The user picks up the new
 # version on their next relaunch.
-RUNNING_PATH="/Applications/$APP_NAME.app/Contents/MacOS/$APP_NAME"
-if [[ "$PROD" -eq 0 ]] && pgrep -f "$RUNNING_PATH" >/dev/null 2>&1; then
-    log "$APP_NAME is running — asking it to quit"
-    osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        pgrep -f "$RUNNING_PATH" >/dev/null 2>&1 || break
+# Dev instances are force-quit with signals rather than AppleScript:
+# the graceful `tell app to quit` path raises Nice's quit-confirmation
+# dialog, which stalls unattended installs until a human dismisses it.
+# Detection uses `ps` args, not pgrep/pkill — on macOS a GUI app's
+# `comm` is the exec path truncated to 16 chars, so pgrep/pkill -f can
+# silently miss a running instance (see CLAUDE.md). The pattern also
+# matches build-dir copies of the dev bundle (same bundle id — they
+# fight over relaunch otherwise); prod `Nice` never matches it.
+if [[ "$PROD" -eq 0 ]]; then
+    dev_pids() {
+        ps -Aww -o pid=,args= \
+            | grep -E "$APP_NAME"'\.app/Contents/MacOS/'"$APP_NAME"'( |$)' \
+            | awk '{print $1}'
+    }
+    pids="$(dev_pids)"
+    if [[ -n "$pids" ]]; then
+        log "$APP_NAME is running (pid(s): $(echo "$pids" | tr '\n' ' ')) — force-quitting"
+        # shellcheck disable=SC2086  # word-splitting the pid list is intended
+        kill $pids 2>/dev/null || true
+        for _ in 1 2 3 4 5 6; do
+            [[ -z "$(dev_pids)" ]] && break
+            sleep 0.5
+        done
+        pids="$(dev_pids)"
+        if [[ -n "$pids" ]]; then
+            log "$APP_NAME survived SIGTERM — sending SIGKILL"
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
         sleep 0.5
-    done
-    if pgrep -f "$RUNNING_PATH" >/dev/null 2>&1; then
-        log "$APP_NAME did not quit cleanly — sending SIGTERM"
-        pkill -f "$RUNNING_PATH" 2>/dev/null || true
-        sleep 1
+        fi
     fi
 fi
 
