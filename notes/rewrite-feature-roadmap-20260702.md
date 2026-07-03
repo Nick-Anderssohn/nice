@@ -241,15 +241,20 @@ decision report or the code makes them obvious.
   behind a setting — GPUI main pixel-snaps; line-stepped first, sub-line as
   the §12 additive follow-up). **GPL rule applies hard here** — reference
   alacritty's Apache frontend and gpui-ghostty only. Size **L**. Deps: R3.
-- **R5. Input: keyboard + IME.** GPUI `InputHandler`/`EntityInputHandler`
-  (~400–500 LOC per §13 scoping): marked text rendered inline,
-  `bounds_for_range` anchored to the cursor cell (never `None` while
-  composing), Enter-commit swallow; kitty keyboard CSI-u encoding (T8) —
-  `termwiz` `KeyboardEncoding::Kitty` or alacritty `keyboard.rs` (Apache) as
-  the encoder reference, keyCode recovery via objc2 side-channel if GPUI's
-  `Keystroke` drops it. **This is the open §13 G1 gate — run the live IME
-  spike as the first task of this item; a ~10–30 LOC gpui_macos patch is the
-  budgeted contingency.** Size **L**. Deps: R4.
+- **R5. Input: keyboard + IME.** GPUI platform `InputHandler` implemented
+  **directly** (~400–500 LOC per §13 scoping; NOT
+  `EntityInputHandler`/`ElementInputHandler` — spike 2 proved that path
+  unusable for terminals: the blanket impl ties
+  `prefers_ime_for_printable_keys` to `accepts_text_input`): marked text
+  rendered inline, `bounds_for_range` anchored to the cursor cell (never
+  `None` while composing), Enter-commit swallow; kitty keyboard CSI-u
+  encoding (T8) — `termwiz` `KeyboardEncoding::Kitty` or alacritty
+  `keyboard.rs` (Apache) as the encoder reference, keyCode recovery via
+  objc2 side-channel (GPUI's `Keystroke` carries no keyCode on the pin).
+  *(Update 2026-07-02: the §13 G1 gate CLOSED fork-free — live checklist
+  FULL PASS on the pin; the gpui_macos contingency patch retired unused.
+  See `spikes/phase0-poc/ime-spike/RESULTS-spike2-20260702.md`.)*
+  Size **L**. Deps: R4.
 - **R6. OSC plumbing.** OSC 0/1/2 titles surfaced to the app layer (T5's
   transport half) and OSC 7 cwd (T6) — vte 0.15 has no OSC 7 arm, so either
   the pty-stream tee or a ~10-line vte ansi patch (per §12); bracketed-paste
