@@ -55,6 +55,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// invoking `dataReceived(slice:)`.
     var onFirstData: (@MainActor () -> Void)?
 
+    /// Fires on every non-empty pty output chunk with the chunk's byte
+    /// count. Feeds the window-chrome activity badge's throughput meter
+    /// (see `ThroughputMeter`). Runs on the main actor for the same
+    /// reason as `onFirstData` — SwiftTerm hops to `DispatchQueue.main`
+    /// before invoking `dataReceived(slice:)`. Left nil in previews /
+    /// tests and any pane whose session has no output sink wired.
+    var onData: (@MainActor (Int) -> Void)?
+
     /// Captured `startProcess` arguments waiting for AppKit to lay this
     /// view out at its real frame. See `armDeferredSpawn(...)` for the
     /// motivation (TL;DR: spawning while `frame == .zero` makes the pty
@@ -381,9 +389,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
     /// pty reads deliver a zero-length chunk on EOF).
     override func dataReceived(slice: ArraySlice<UInt8>) {
         super.dataReceived(slice: slice)
-        guard !slice.isEmpty, let callback = onFirstData else { return }
-        onFirstData = nil
-        callback()
+        // Some pty reads deliver a zero-length chunk on EOF — those are
+        // neither throughput nor a "first byte", so skip them entirely.
+        guard !slice.isEmpty else { return }
+        onData?(slice.count)
+        if let callback = onFirstData {
+            onFirstData = nil
+            callback()
+        }
     }
 
     // MARK: - File drag-and-drop

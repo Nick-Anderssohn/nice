@@ -65,6 +65,11 @@ final class AppState {
     let windowSession: WindowSession
     let fileExplorerOrchestrator: FileExplorerOrchestrator
 
+    /// Rolling terminal-output throughput for this window, aggregated
+    /// across every pane. Fed by `sessions.onPaneOutput` (wired below)
+    /// and read by the chrome activity badge in `WindowToolbarView`.
+    let throughput = ThroughputMeter()
+
     /// Per-window file-browser states keyed by `Tab.id`. Removed in
     /// `finalizeDissolvedTab` when a tab dissolves.
     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
@@ -215,6 +220,9 @@ final class AppState {
         }
         self.sessions.onTabBecameEmpty = { [weak self] tabId, pi, ti in
             self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+        }
+        self.sessions.onPaneOutput = { [weak self] byteCount in
+            self?.throughput.record(byteCount)
         }
         self.closer.onSyncFinalizeDissolve = { [weak self] tabId, pi, ti in
             self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)

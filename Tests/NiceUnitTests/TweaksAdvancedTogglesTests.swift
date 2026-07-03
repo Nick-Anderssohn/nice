@@ -78,6 +78,29 @@ final class TweaksAdvancedTogglesTests: XCTestCase {
         XCTAssertEqual(Tweaks.smoothScrollingKey, "smoothScrolling")
     }
 
+    // MARK: - Activity badge presentation
+
+    func test_activityBadgeCompact_defaultsToFalse_whenKeyAbsent() {
+        let suite = freshSuite()
+        defer { wipeSuite(suite) }
+
+        let tweaks = makeTweaks(defaults: suite)
+        XCTAssertFalse(tweaks.activityBadgeCompact,
+                       "The badge defaults to the full dot + label presentation")
+    }
+
+    func test_activityBadgeCompact_roundTrips_persistsThroughInjectedDefaults() {
+        let suite = freshSuite()
+        defer { wipeSuite(suite) }
+
+        let first = makeTweaks(defaults: suite)
+        first.activityBadgeCompact = true
+
+        let second = makeTweaks(defaults: suite)
+        XCTAssertTrue(second.activityBadgeCompact,
+                      "A compact choice must survive across relaunch")
+    }
+
     // MARK: - helpers
 
     private func makeTweaks(defaults: UserDefaults) -> Tweaks {

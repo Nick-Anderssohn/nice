@@ -128,6 +128,14 @@ final class SessionsModel {
     @ObservationIgnored
     var onTabBecameEmpty: ((_ tabId: String, _ projectIndex: Int, _ tabIndex: Int) -> Void)?
 
+    /// Fired for every non-empty pty output chunk on any pane in any of
+    /// this window's sessions, with the chunk's byte count. AppState
+    /// forwards it into the window's `ThroughputMeter`, which drives the
+    /// chrome activity badge. `nil` (tests / previews) simply drops the
+    /// counts.
+    @ObservationIgnored
+    var onPaneOutput: (@MainActor (Int) -> Void)?
+
     /// Mint a unique id for a freshly-created tab (or pane). The
     /// production default is `<prefix><ms>-<uuid4>` — millisecond
     /// timestamp keeps ids roughly time-sortable (useful for log
@@ -1409,6 +1417,9 @@ final class SessionsModel {
             },
             onPaneHeld: { [weak self] paneId, code in
                 self?.paneHeld(tabId: tabId, paneId: paneId, exitCode: code)
+            },
+            onPaneOutput: { [weak self] byteCount in
+                self?.onPaneOutput?(byteCount)
             }
         )
         themeCache.applyAll(to: session)

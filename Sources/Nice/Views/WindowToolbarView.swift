@@ -20,6 +20,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -47,6 +48,10 @@ struct WindowToolbarView: View {
             // Pill strip fills the remaining width.
             InlinePaneStrip()
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Trailing: live terminal-output throughput. Always present;
+            // clicking toggles the dot-only compact form.
+            ActivityBadge()
 
             // Trailing: update-available nudge. Renders nothing when
             // no update is known, so the toolbar is layout-identical
@@ -79,6 +84,88 @@ struct WindowToolbarView: View {
         // the arbitration. A pill press hit-tests to a `PaneDragHosting`
         // view, so the router passes it through and never arms a window drag
         // — selectivity by construction, not by a flag that can stick.
+    }
+}
+
+// MARK: - Activity badge
+
+/// Small chrome badge showing this window's live terminal-output
+/// throughput: a status dot plus an `NN KB/s` label. While bytes are
+/// arriving it paints in the accent style; after ~2 s of silence the
+/// throughput meter flips `isActive` false and the badge dims to the
+/// idle ink. Clicking toggles between the full (dot + label) and compact
+/// (dot-only) presentation; the choice lives in `Tweaks.activityBadgeCompact`
+/// so it persists across relaunch.
+///
+/// The meter accumulates bytes on the pty read path but only publishes on
+/// demand (see `ThroughputMeter`), so this view drives a steady ~4 Hz
+/// timer to decay the rate and dim to idle even when output stops.
+private struct ActivityBadge: View {
+    @Environment(AppState.self) private var appState
+    @Environment(Tweaks.self) private var tweaks
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.palette) private var palette
+
+    @State private var hovering = false
+
+    /// Display cadence. Refreshing the meter is cheap and only publishes
+    /// when a value actually changes, so a steady 4 Hz tick costs nothing
+    /// while idle but keeps the rate/dim responsive.
+    private let tick = Timer.publish(every: 0.25, on: .main, in: .common)
+        .autoconnect()
+
+    private var meter: ThroughputMeter { appState.throughput }
+
+    private var isActive: Bool { meter.isActive }
+
+    /// Accent when active, dim tertiary ink when idle. Same tint the rest
+    /// of the chrome uses for the user's chosen accent so the badge reads
+    /// as part of the toolbar, not bolted on.
+    private var tintColor: Color {
+        isActive ? tweaks.accent.color : Color.niceInk3(scheme, palette)
+    }
+
+    var body: some View {
+        Button(action: { tweaks.activityBadgeCompact.toggle() }) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(tintColor)
+                    .frame(width: 7, height: 7)
+
+                if !tweaks.activityBadgeCompact {
+                    Text(ThroughputMeter.label(forBytesPerSecond: meter.bytesPerSecond))
+                        .font(.system(size: 11, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(tintColor)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .transition(.opacity.combined(with: .move(edge: .trailing)))
+                }
+            }
+            .padding(.horizontal, tweaks.activityBadgeCompact ? 7 : 10)
+            .frame(height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(hovering ? Color.niceInk(scheme, palette).opacity(0.06) : .clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .onReceive(tick) { _ in meter.refresh() }
+        .animation(.easeInOut(duration: 0.2), value: isActive)
+        .animation(.easeInOut(duration: 0.12), value: hovering)
+        .animation(.easeInOut(duration: 0.18), value: tweaks.activityBadgeCompact)
+        .help(tweaks.activityBadgeCompact
+            ? "Terminal output — click to show the rate"
+            : "Terminal output throughput — click for the compact dot")
+        .accessibilityIdentifier("toolbar.activityBadge")
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        let rate = ThroughputMeter.label(forBytesPerSecond: meter.bytesPerSecond)
+        return isActive ? "Terminal output \(rate)" : "Terminal output idle"
     }
 }
 

@@ -214,6 +214,7 @@ final class Tweaks {
     static let handoffSkillPromptSeenKey = "handoffSkillPromptSeen"
     static let smoothScrollingKey      = "smoothScrolling"
     static let syncClaudeThemeKey      = "syncClaudeTheme"
+    static let activityBadgeCompactKey = "activityBadgeCompact"
 
     /// Default terminal-theme ids. These are the ones in
     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
@@ -401,6 +402,16 @@ final class Tweaks {
         }
     }
 
+    /// Presentation of the window-chrome activity badge: `false` (default)
+    /// shows the dot plus the `NN KB/s` label; `true` collapses it to the
+    /// dot alone. Clicking the badge toggles this, and the setter writes
+    /// through to `UserDefaults` so the choice survives relaunch.
+    var activityBadgeCompact: Bool {
+        didSet {
+            defaults.set(activityBadgeCompact, forKey: Self.activityBadgeCompactKey)
+        }
+    }
+
     /// Injectable OS scheme source — real builds read
     /// `AppleInterfaceStyle`, tests substitute a stub.
     var osSchemeProvider: () -> ColorScheme
@@ -466,6 +477,9 @@ final class Tweaks {
         self.handoffSkillPromptSeen = defaults.object(forKey: Self.handoffSkillPromptSeenKey) as? Bool ?? false
         // Default ON: a fresh install syncs Claude's theme out of the box.
         self.syncClaudeTheme = defaults.object(forKey: Self.syncClaudeThemeKey) as? Bool ?? true
+        // Default full (dot + label). An explicit prior choice — compact
+        // or full — persists across relaunch.
+        self.activityBadgeCompact = defaults.object(forKey: Self.activityBadgeCompactKey) as? Bool ?? false
 
         NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
 

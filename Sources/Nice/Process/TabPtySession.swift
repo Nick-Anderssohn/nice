@@ -118,6 +118,12 @@ final class TabPtySession: TabPtySessionThemeable {
     /// without wiring it.
     private let onPaneHeld: (@MainActor (String, Int32?) -> Void)?
 
+    /// Called for every non-empty pty output chunk on any pane in this
+    /// session, with the chunk's byte count. Feeds the window-chrome
+    /// activity badge's throughput meter (see `ThroughputMeter`). `nil`
+    /// leaves the per-pane `onData` hook uninstalled (tests / previews).
+    private let onPaneOutput: (@MainActor (Int) -> Void)?
+
     /// Cached SwiftUI `ColorScheme` so panes added after init can be
     /// themed at creation without round-tripping through `AppState`.
     private var currentScheme: ColorScheme = .dark
@@ -213,7 +219,8 @@ final class TabPtySession: TabPtySessionThemeable {
         onPaneCwdChange: (@MainActor (String, String) -> Void)? = nil,
         onPaneLaunched: (@MainActor (String, String) -> Void)? = nil,
         onPaneFirstOutput: (@MainActor (String) -> Void)? = nil,
-        onPaneHeld: (@MainActor (String, Int32?) -> Void)? = nil
+        onPaneHeld: (@MainActor (String, Int32?) -> Void)? = nil,
+        onPaneOutput: (@MainActor (Int) -> Void)? = nil
     ) {
         self.tabId = tabId
         self.cwd = cwd
@@ -223,6 +230,7 @@ final class TabPtySession: TabPtySessionThemeable {
         self.onPaneLaunched = onPaneLaunched
         self.onPaneFirstOutput = onPaneFirstOutput
         self.onPaneHeld = onPaneHeld
+        self.onPaneOutput = onPaneOutput
         self.socketPath = socketPath
         self.zdotdirPath = zdotdirPath
         self.userZDotDir = userZDotDir
@@ -280,6 +288,7 @@ final class TabPtySession: TabPtySessionThemeable {
         view.processDelegate = delegate
         entries[id] = PaneEntry(view: view, kind: .claude, delegate: delegate)
         installLaunchOverlayHooks(on: view, paneId: id, kind: .claude)
+        installOutputMeterHook(on: view)
 
         let resolvedCwd = Self.expandTilde(cwd)
         let isOverride = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] != nil
@@ -367,6 +376,7 @@ final class TabPtySession: TabPtySessionThemeable {
         installLaunchOverlayHooks(
             on: view, paneId: id, kind: .terminal, displayCommand: command
         )
+        installOutputMeterHook(on: view)
 
         var extraEnv: [String: String] = [:]
         if let sp = socketPath ?? self.socketPath {
@@ -574,6 +584,10 @@ final class TabPtySession: TabPtySessionThemeable {
         adopted.heldExitCode = entry.heldExitCode
         adopted.intentionalTerminate = entry.intentionalTerminate
         entries[id] = adopted
+        // Re-point the migrated view's output hook at THIS session so its
+        // throughput lands in the destination window's badge, not the
+        // source window's (the closure captured the old session).
+        installOutputMeterHook(on: entry.view)
         applyTerminalTheme(currentTerminalTheme, to: entry.view)
         entry.view.font = Self.terminalFont(
             named: currentTerminalFontFamily, size: currentTerminalFontSize
@@ -583,6 +597,19 @@ final class TabPtySession: TabPtySessionThemeable {
         // `claimFocusIfRequested` inside `viewDidMoveToWindow` will
         // consume this flag once the view is live in the new window.
         entry.view.wantsFocusOnAttach = true
+    }
+
+    /// Point (or re-point) a pane view's per-chunk output hook at this
+    /// session's `onPaneOutput` sink. Always assigns — including nil —
+    /// so a migrated view adopted by a session with no sink has any
+    /// stale hook from its previous session cleared rather than left
+    /// dangling at the old window's meter.
+    private func installOutputMeterHook(on view: NiceTerminalView) {
+        if let onPaneOutput {
+            view.onData = { byteCount in onPaneOutput(byteCount) }
+        } else {
+            view.onData = nil
+        }
     }
 
     /// Wire up the "Launching…" placeholder for a newly-spawned pane.
