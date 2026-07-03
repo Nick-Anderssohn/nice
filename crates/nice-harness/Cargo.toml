@@ -1,0 +1,41 @@
+# nice-harness — the Nice rewrite's measurement + self-test library. Every
+# later cycle reuses it: mach-clock frame stamps, the percentile reducer, the
+# RSS/phys_footprint sampler, os_signpost emission (subsystem
+# `dev.nickanderssohn.nice-rs`), the `NICE_RS_SELFTEST` driver + suite runner,
+# the App-Nap-immune watchdog, and (feature-gated) screenshot capture.
+#
+# Layering rule for the rewrite: crates mirroring today's pure-Swift model code
+# must NOT depend on gpui. This harness is not one of those — it is inherently a
+# gpui/measurement crate — but the rule governs future model crates.
+#
+# gpui `test-support` is DELIBERATELY optional (behind the `capture` feature),
+# NOT unconditional: `Window::render_to_image()` (the capture path) is gated
+# `#[cfg(any(test, feature = "test-support"))]`, and enabling test-support flips
+# `CAMetalLayer.framebufferOnly = false` PROCESS-WIDE (gpui_macos
+# metal_renderer.rs). Shipped builds must keep the live layer framebuffer-only,
+# so the app crate only turns this on via its own `selftest` feature.
+[package]
+name = "nice-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# gpui without test-support by default — the scenario driver, reducer, watchdog,
+# clock and signpost never need it. `capture` turns test-support on.
+gpui = { path = "../../vendor/zed/crates/gpui" }
+# anyhow: gpui's own `Result` alias is `anyhow::Result`; the scenario openers
+# and capture path surface it.
+anyhow = "1"
+# mach clock (mach_absolute_time / mach_timebase_info) + memory FFI (task_info /
+# TASK_VM_INFO). mach2 0.4 does not ship `task_vm_info`, so mem.rs hand-declares
+# it — same approach the phase-0 spike used.
+mach2 = "0.4"
+# PNG encode for screenshot capture — only pulled in under `capture`.
+image = { version = "0.25.1", features = ["png"], optional = true }
+
+[features]
+# Screenshot capture via `Window::render_to_image()`. Enables gpui's
+# `test-support` (framebuffer-only OFF process-wide) + the image PNG encoder.
+# The app crate's `selftest` feature forwards to this; shipped builds omit it.
+capture = ["gpui/test-support", "dep:image"]

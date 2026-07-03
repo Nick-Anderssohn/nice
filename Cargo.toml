@@ -1,0 +1,31 @@
+# Nice rewrite — Rust + GPUI cargo workspace (Path B, all-Rust single Metal
+# stack). Coexists with the Swift project at the repo root; nothing Swift moves.
+#
+# GPUI is vendored (not a member): `scripts/vendor-zed.sh` produces
+# `vendor/zed/` — a pinned zed checkout (rev
+# 10b07951838e422722e34641f4a9c0bfec9037ff) with the bg-luminance patch
+# (`patches/zed-bg-luminance.patch`) applied. The crates below path-depend into
+# `vendor/zed/crates/gpui{,_platform,_macos}`.
+#
+# `exclude = ["vendor"]` is load-bearing: `vendor/zed` is itself a cargo
+# workspace, and without the exclude cargo would try to auto-attach it as a
+# member of THIS workspace. It stays a path-dependency source, never a member.
+[workspace]
+resolver = "2"
+members = [
+    "crates/nice",
+    "crates/nice-harness",
+]
+exclude = ["vendor"]
+
+# Build ergonomics carried over from the phase-0 spike
+# (spikes/phase0-poc/aa-gamma/gpui-term-main/Cargo.toml): build our own code
+# unoptimized for fast iteration, but compile the heavy dependency graph
+# (the gpui stack) at opt-level 2 so dev builds and self-tests aren't crippled.
+# Workspace profiles must live in the root manifest; members' profile tables
+# are ignored by cargo.
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2

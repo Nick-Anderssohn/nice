@@ -38,5 +38,15 @@ scripts/.env.release
 # never meant to be committed.
 .claude/scheduled_tasks.lock
 
+# Rust rewrite (Path B)
+# Vendored pinned zed/GPUI checkout (~1 GB) — reproduced by
+# scripts/vendor-zed.sh from patches/zed-bg-luminance.patch, never committed.
+/vendor/
+# Cargo build output.
+/target/
+# scripts/rust-bundle.sh output (the assembled "Nice RS Dev.app" bundle,
+# staged before scripts/rust-install.sh copies it to /Applications).
+/build-rs/
+
 # macOS
 .DS_Store

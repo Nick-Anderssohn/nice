@@ -1,0 +1,44 @@
+# nice — the Nice rewrite's GPUI application crate. Binary/process name
+# `nice-rs` (deliberately distinct from the Swift `Nice` / `Nice Dev` builds).
+#
+# Path-dep wiring mirrors the phase-0 spike
+# (spikes/phase0-poc/aa-gamma/gpui-term-main/Cargo.toml): gpui plus its macOS
+# platform backend, with gpui_platform's `font-kit` feature on. The deps point
+# into the vendored, pinned + bg-luminance-patched zed checkout produced by
+# `scripts/vendor-zed.sh` (run that before the first build).
+[package]
+name = "nice"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "nice-rs"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { path = "../../vendor/zed/crates/gpui" }
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = ["font-kit"] }
+gpui_macos = { path = "../../vendor/zed/crates/gpui_macos" }
+nice-harness = { path = "../nice-harness" }
+anyhow = "1"
+# Foreign AppKit access lives behind the one `platform` module (all-Rust rule):
+# the demand-present kick uses objc2 msg_send + raw-window-handle to reach the
+# window's NSView. objc2/raw-window-handle 0.6 match what gpui_macos links.
+objc2 = "0.6"
+raw-window-handle = "0.6"
+
+[features]
+# Screenshot capture (Window::render_to_image), gated so it stays OUT of the
+# shipped bundle: enabling it turns on test-support, which flips
+# CAMetalLayer.framebufferOnly = false PROCESS-WIDE. The scenario driver itself
+# is always compiled (env-gated, harmless); only capture needs this.
+#
+# Two features are load-bearing and BOTH required:
+#   * `nice-harness/capture` -> `gpui/test-support` — compiles the outer
+#     `gpui::Window::render_to_image()` method + the image PNG encoder.
+#   * `gpui_platform/test-support` -> `gpui_macos/test-support` — compiles the
+#     macOS `MacWindow::render_to_image` OVERRIDE (which reads the drawable
+#     texture back). Without it the default trait impl bails
+#     ("render_to_image not implemented for this platform").
+selftest = ["nice-harness/capture", "gpui_platform/test-support"]
