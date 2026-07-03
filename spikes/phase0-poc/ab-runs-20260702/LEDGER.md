@@ -52,9 +52,9 @@ misremembered arg order on real API = half-weight.)
 - [x] 8 implementer runs complete, artifacts preserved (branches ab/*)
 - [x] Objective gates executed — verifier agents ground-truthed every item incl. GUI; Nick batch list EMPTY (nothing left UNVERIFIED)
 - [x] 18 judge sessions + medians computed (all unanimous; zero tie-breaks needed)
-- [ ] Decision rule applied mechanically (§1)
-- [ ] RESULTS-spike11p3 written; report §12 folded; memory updated; pushed
-- [ ] Reported to Nick (incl. sensitivity-pair offer if surprising)
+- [x] Decision rule applied mechanically (§1) → branch 3, premise SUPPORTED (see RESULTS)
+- [x] RESULTS-spike11p3 written; report §12 folded; memory updated; pushed (cadf592)
+- [x] Reported to Nick (sensitivity pair offered, unspent; batch GUI list empty — all items verifier-ground-truthed)
 
 ## Harness fixes (logged per §3 — symmetric fixes for harness breakage only)
 
