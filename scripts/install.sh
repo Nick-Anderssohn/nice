@@ -221,9 +221,12 @@ xcodebuild \
 # fight over relaunch otherwise); prod `Nice` never matches it.
 if [[ "$PROD" -eq 0 ]]; then
     dev_pids() {
+        # `|| true`: grep exits 1 when no instance is running; under
+        # `set -euo pipefail` that would abort the whole install at the
+        # `pids="$(dev_pids)"` assignment (bug caught 2026-07-02).
         ps -Aww -o pid=,args= \
             | grep -E "$APP_NAME"'\.app/Contents/MacOS/'"$APP_NAME"'( |$)' \
-            | awk '{print $1}'
+            | awk '{print $1}' || true
     }
     pids="$(dev_pids)"
     if [[ -n "$pids" ]]; then
