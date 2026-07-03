@@ -1517,7 +1517,7 @@ mod gui {
     use super::*;
     use gpui::{
         canvas, div, fill, font, point, prelude::*, px, rgb, size, App, Application, Bounds,
-        Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla, AppContext,
+        ClickEvent, Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla, AppContext,
         IntoElement, KeyDownEvent, Keystroke, Pixels, Render, RenderImage, SharedString, Styled,
         TextRun, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
         WindowOptions,
@@ -2519,6 +2519,32 @@ mod gui {
         }
     }
 
+    // ---- interactive-window chrome strip + pin-toggle geometry -----------
+    //
+    // The interactive window uses a client-drawn (transparent) titlebar: gpui
+    // repositions the NATIVE traffic lights into this strip via
+    // `traffic_light_position` (kept in lockstep on resize / focus / fullscreen
+    // by gpui's own `move_traffic_light`), and the pin toggle is drawn
+    // immediately to their right at the SAME diameter + vertical center. Both
+    // the traffic lights and the pin are anchored to the window's top-left
+    // corner, so the whole control row holds its placement across those events.
+
+    /// Height of the client-drawn titlebar strip (pt).
+    const CHROME_STRIP_H: f32 = 28.0;
+    /// Traffic-light / pin-button diameter (pt) — matches the native buttons.
+    const TL_DIAMETER: f32 = 14.0;
+    /// Left inset of the first (close) traffic light — the macOS default.
+    const TL_LEFT: f32 = 9.0;
+    /// Top inset of the control row, centering the buttons in the strip.
+    const TL_TOP: f32 = (CHROME_STRIP_H - TL_DIAMETER) / 2.0;
+    /// Left origin of the pin toggle: clear of the widest native 3-button
+    /// layout (close/min/zoom at 9/32/55 @ 23pt pitch on macOS 26, so the zoom
+    /// button ends near 69pt) with a small, consistent gap to its right.
+    const PIN_LEFT: f32 = 78.0;
+    /// Strip background — a hair lighter than the terminal body so the chrome
+    /// row reads as a distinct bar.
+    const CHROME_BG: u32 = 0x0016_1616;
+
     /// Interactive keystroke-latency view: NO synthetic workload, NO RAF —
     /// this view renders ONLY when the pty reader pings the wake channel
     /// (echo arrived) or the OS itself asks for a frame (open/resize/
@@ -2536,6 +2562,10 @@ mod gui {
         frame: u64,
         keys_sent: u64,
         start_tick: u64,
+        /// Pin-toggle state: flipped by clicking the pin button in the chrome
+        /// strip; drives the button's active/inactive fill (chrome only — it
+        /// does not affect the pty / measurement path).
+        pinned: bool,
         /// GPUI's NSView (from raw-window-handle), captured on first render.
         /// Used to kick AppKit's damage path per echo — see
         /// `kick_platform_display`. Main-thread only (gpui entities are).
@@ -2568,6 +2598,50 @@ mod gui {
             // Shared with the multi-session background windows (spike 8 fix):
             // marks the view + its backing CAMetalLayer as needing display.
             kick_view_display(self.ns_view);
+        }
+
+        /// The client-drawn titlebar strip: an opaque bar the height of the
+        /// native titlebar (so the terminal grid starts below it, not under the
+        /// traffic lights), carrying the pin toggle immediately to the right of
+        /// the native close/min/zoom buttons. The pin is absolutely positioned
+        /// at a fixed offset from the strip's top-left — which is the window's
+        /// top-left — so it holds its placement through resize, focus changes,
+        /// and fullscreen exactly as gpui's repositioned traffic lights do.
+        fn chrome_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            let pinned = self.pinned;
+            // Active = filled amber ("pinned"); inactive = hollow dark disc.
+            let (bg, border, hover_bg) = if pinned {
+                (0x00E0_A22B, 0x00F5_C766, 0x00F0_B84B)
+            } else {
+                (0x0033_3333, 0x0055_5555, 0x0044_4444)
+            };
+            div()
+                .relative()
+                .flex_shrink_0()
+                .w_full()
+                .h(px(CHROME_STRIP_H))
+                .bg(rgb(CHROME_BG))
+                .child(
+                    div()
+                        .id("pin-toggle")
+                        .absolute()
+                        .left(px(PIN_LEFT))
+                        .top(px(TL_TOP))
+                        .size(px(TL_DIAMETER))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(border))
+                        .bg(rgb(bg))
+                        .hover(|s| s.bg(rgb(hover_bg)))
+                        .on_click(cx.listener(|this, _ev: &ClickEvent, _window, cx| {
+                            this.pinned = !this.pinned;
+                            cx.notify();
+                            // Demand-driven window: force the CA commit that
+                            // actually PRESENTS the toggled state (notify alone
+                            // may not reach MetalRenderer::draw here).
+                            this.kick_platform_display();
+                        })),
+                )
         }
 
         fn finalize_and_exit(&self, reason: &str) -> ! {
@@ -2613,16 +2687,19 @@ mod gui {
             // NOTE: no request_animation_frame anywhere in this render.
             div()
                 .size_full()
+                .flex()
+                .flex_col()
                 .track_focus(&self.focus_handle)
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, _cx| {
                     this.on_key(ev);
                 }))
-                .child(grid_canvas(
+                .child(self.chrome_strip(cx))
+                .child(div().flex_1().child(grid_canvas(
                     snap,
                     self.fonts.clone(),
                     0.0,
                     CanvasExtras::none(),
-                ))
+                )))
         }
     }
 
@@ -2674,8 +2751,12 @@ mod gui {
                         title: Some(
                             "Nice Phase-0 — gpui-term INTERACTIVE (pty: /bin/cat)".into(),
                         ),
-                        appears_transparent: false,
-                        traffic_light_position: None,
+                        // Client-drawn titlebar: full-size content view (so the
+                        // chrome strip + pin can be drawn beside the traffic
+                        // lights) with the native buttons repositioned into the
+                        // strip and centered on the pin's row.
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(TL_LEFT), px(TL_TOP))),
                     }),
                     kind: WindowKind::Normal,
                     is_resizable: true,
@@ -2742,6 +2823,7 @@ mod gui {
                             frame: 0,
                             keys_sent: 0,
                             start_tick: 0,
+                            pinned: false,
                             ns_view: std::ptr::null_mut(),
                         }
                     });
