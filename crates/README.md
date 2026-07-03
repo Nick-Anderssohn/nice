@@ -21,6 +21,10 @@ crates/
   nice-harness   — measurement + self-test library. No app logic lives here.
   nice-theme     — design tokens as pure data (palettes, accents, typography,
                    chrome geometry). No gpui dependency.
+  nice-term-core — headless terminal core: pty spawn semantics + the
+                   alacritty_terminal VT (grid/scrollback/damage) + the pane
+                   session state machine (deferred spawn, events, held panes).
+                   No gpui dependency.
 ```
 
 ### `crates/nice` (bin `nice-rs`)
@@ -128,6 +132,65 @@ future token in this crate follows:
   documentary (R9 must still read each button's live default), and this is the
   only place a citation points somewhere other than a Swift source line.
 
+### `crates/nice-term-core` (lib)
+
+The headless heart of the terminal (R3): Nice's exact spawn semantics plus the
+`alacritty_terminal` VT core, all UI-free and testable under plain `cargo test`
+(no window). **No `gpui` dependency** — the renderer (R4) consumes it through a
+narrow API. Modules, bottom-up:
+
+- `quoting` — `shell_single_quote` / `shell_backslash_escape`, ported
+  test-for-test from `Sources/Nice/Process/ShellQuoting.swift`.
+- `spawn` — the `SpawnSpec` (shell-only vs command, cwd, env pairs, rows/cols)
+  and the pure projections of the PROTECTED spawn contract: `build_argv`
+  (`None → ["-il"]`; `Some(cmd) → ["-ilc", "exec <cmd>"]`), cwd tilde-expansion
+  (the command is never tilde-expanded), and the curated base env (SwiftTerm's
+  set; PATH deliberately not forwarded so the login shell rebuilds it).
+- `pty` — `PtyProcess`: real pty spawn (`openpty` + `fork` + `login_tty` +
+  `execve`) honouring that contract, plus write-input, resize (SIGWINCH),
+  child-exit reaping (a dedicated `waitpid` reaper thread → `ExitStatus`), and
+  process-group SIGHUP-then-SIGKILL teardown so no orphaned zsh survives.
+- `vt` — the `alacritty_terminal` glue: `SharedTerm =
+  Arc<FairMutex<Term<EventProxy>>>` (the lock the R4 renderer holds only to
+  read cells for one frame), the `EventProxy` that forwards `PtyWrite` replies
+  (DA/DSR) back to the child, the `DEFAULT_SCROLLBACK_LINES = 500` parity knob,
+  and the owned `GridSnapshot` read helpers (lock briefly, copy, unlock — never
+  held across a paint).
+- `session` — `TermSession`: one *eager, already-live* session owning the
+  `PtyProcess` + `SharedTerm` + the per-session feeder thread.
+- `deferred` — `Session`: the value-owning pane session the renderer (R4) and
+  the session manager (R13) consume, wrapping `TermSession` into the deferred
+  spawn state machine, the outward event stream, and held-pane classification
+  (below).
+
+#### Threading model
+
+Each live session runs its VT work **off the render thread**, the shape proven
+in the phase-0 spike (`spikes/phase0-poc`, RESULTS-spike8):
+
+- a **feeder** thread is the sole reader of the pty master; it blocking-reads
+  bytes and parses them into the `Term` under a *brief* lock, then — **after
+  releasing the lock** — fires the damage-wake so the UI grabs the lock and
+  paints. The wake is a signal only (async/non-blocking, never under the lock,
+  never re-entering the UI framework) — R4's session-host owns the receiving end;
+- a **reaper** thread is the sole `waitpid` caller, recording the child's
+  `ExitStatus` (no zombies, no double-reap);
+- an **exit-watcher** thread blocks on the reaped status and pushes the outward
+  `Exited` event, so the caller learns of an exit even though it produces no
+  pty output.
+
+The renderer never parses; it locks the shared `Term` only to copy the cells it
+paints. `Session` layers the pane lifecycle on top of that: an explicit deferred
+spawn state machine — `NotSpawned{spec} → Spawning → Live → Exited{status,
+held}` — so a not-yet-focused pane is a real, matchable state, never a nil pty a
+caller force-reads (the fix for BUG A in `docs/window-chrome-architecture.md`); a
+typed, `#[non_exhaustive]` outward event stream (`OutputStarted`, `Exited{status,
+held}`; `Title`/`Cwd` reserved for R6); and held-pane classification
+(`should_hold_on_exit`, ported from `TabPtySession.shouldHoldOnExit`): a
+non-zero or signalled exit the user didn't ask for is *held* — the `Term` and
+its scrollback are kept alive so the failed output stays readable — while a
+clean `exit 0` or an explicit user close is dropped.
+
 ## Layering rule
 
 **Crates that mirror today's pure-Swift model code must not depend on
@@ -137,10 +200,13 @@ means to keep it. `nice-harness` is not one of those crates — it is
 inherently a gpui/measurement library (it drives and inspects real gpui
 windows) — so it depends on `gpui` directly. `nice-theme` **is** one of those
 crates — the first — and carries no `gpui` dependency (its color→gpui adapter
-lives downstream in `crates/nice`). When a later cycle adds another model crate
-(parsing, session state, config, anything that doesn't paint pixels), it must
-likewise NOT gain a `gpui` dependency; if it needs to talk to the UI layer,
-that's a sign the boundary belongs in `crates/nice` instead.
+lives downstream in `crates/nice`). `nice-term-core` (R3) is the second — the
+terminal session state + VT parsing carry no `gpui` dependency either; the
+renderer (R4) consumes it through a narrow API and the damage-wake callback.
+When a later cycle adds another model crate (parsing, session state, config,
+anything that doesn't paint pixels), it must likewise NOT gain a `gpui`
+dependency; if it needs to talk to the UI layer, that's a sign the boundary
+belongs in `crates/nice` instead.
 
 ## All-Rust rule
 

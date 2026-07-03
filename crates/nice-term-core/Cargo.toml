@@ -1,0 +1,36 @@
+# nice-term-core — the headless heart of the terminal: pty session management
+# and (in later R3 slices) the alacritty_terminal VT core. UI-free and testable
+# without a window.
+#
+# Layering rule (crates/README.md "Layering rule"): this crate mirrors Nice's
+# pure-process/model code and MUST NOT depend on the GPUI UI framework. The
+# renderer (R4) consumes it through a narrow API; no view, theme, or window
+# types leak in. There is intentionally no UI-framework dependency below, and
+# the workspace keeps this crate free of one so its logic stays window-less and
+# testable under plain `cargo test`.
+[package]
+name = "nice-term-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Direct pty spawn honoring the PROTECTED spawn contract needs precise control
+# over openpty / login_tty / setsid / TIOCSWINSZ / killpg / waitpid — more than
+# a higher-level pty wrapper exposes for the process-group teardown + exit
+# reaping this crate owns. libc is already in the workspace lock; no new fetch.
+libc = "0.2"
+# The VT core: vanilla alacritty_terminal 0.26 (grid + scrollback + damage +
+# vte parser via `alacritty_terminal::vte`). Parity default scrollback is set
+# per-session (SwiftTerm's 500), overriding this crate's Config default of
+# 10_000. No fork — §12 confirmed selection survives scrollback eviction and
+# memory is linear in the scrollback limit in vanilla 0.26. This crate uses
+# alacritty's Term/Grid/parser ONLY; the pty is our own libc `PtyProcess` (the
+# feeder reads its master fd), NOT `alacritty_terminal::tty`.
+alacritty_terminal = "0.26"
+
+[dev-dependencies]
+# The pty integration tests poll/read the master fd and probe child liveness
+# with kill(pid, 0) directly. Integration tests are separate crates and do not
+# inherit the library's normal dependencies, so libc is declared again here.
+libc = "0.2"
