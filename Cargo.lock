@@ -3124,10 +3124,14 @@ name = "nice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.0",
+ "core-foundation-sys",
  "gpui",
  "gpui_macos",
  "gpui_platform",
  "nice-harness",
+ "nice-term-core",
+ "nice-term-view",
  "nice-theme",
  "objc2 0.6.4",
  "raw-window-handle",
@@ -3149,6 +3153,17 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "libc",
+]
+
+[[package]]
+name = "nice-term-view"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "gpui",
+ "nice-term-core",
+ "nice-theme",
 ]
 
 [[package]]

@@ -1,0 +1,38 @@
+# nice-term-view — the GPUI-native terminal renderer (R4). A gpui element/view
+# wrapping a `nice-term-core` `Session`: it paints the VT grid through gpui's
+# PUBLIC paint API (per-cell `paint_quad` backgrounds + `shape_line().paint()`
+# foreground runs) inside gpui's single Metal stack, and owns the core->GPUI
+# adapter entity (`TerminalSessionHandle`) that drains a session's event stream
+# and re-emits it as typed gpui events.
+#
+# Layering: this is a UI crate (like `nice-harness`), so a `gpui` dependency is
+# expected here — it is NOT one of the pure-model crates the "Layering rule"
+# (crates/README.md) keeps gpui-free. It consumes the headless `nice-term-core`
+# through its narrow API and reads the shared `alacritty_terminal` grid to paint.
+#
+# All-Rust rule: no `objc2` lives here. The one sanctioned AppKit crossing the
+# renderer needs (the demand-present kick for occluded windows) is injected from
+# `crates/nice/src/platform` in a later slice; this crate stays objc2-free.
+[package]
+name = "nice-term-view"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The UI framework. Vendored + pinned + bg-luminance-patched (see the root
+# Cargo.toml / crates/README.md "Vendoring GPUI"). The renderer paints through
+# gpui's public element API only.
+gpui = { path = "../../vendor/zed/crates/gpui" }
+# The headless terminal core (R3): the `Session` this renderer drives and the
+# `SharedTerm` it locks briefly to read cells. No gpui leaks the other way.
+nice-term-core = { path = "../nice-term-core" }
+# Design tokens (R2): the accent `Srgba` the caret is painted in. Pure data.
+nice-theme = { path = "../nice-theme" }
+# The VT core, same pin as nice-term-core (workspace-locked, no new fetch): the
+# renderer reads `Term`/`Grid`/`Cell` cells and resolves `vte::ansi::Color`
+# (named / 256-indexed / truecolor) to concrete sRGB while painting.
+alacritty_terminal = "0.26"
+# gpui's own `Result` alias is `anyhow::Result`; the session-host constructor
+# surfaces the pty-spawn error through it.
+anyhow = "1"

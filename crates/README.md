@@ -25,16 +25,23 @@ crates/
                    alacritty_terminal VT (grid/scrollback/damage) + the pane
                    session state machine (deferred spawn, events, held panes).
                    No gpui dependency.
+  nice-term-view — the GPUI-native terminal renderer (R4): the core->GPUI
+                   adapter entity (TerminalSessionHandle), the terminal-theme
+                   value type, and the TerminalView/TerminalElement cell
+                   painter. A UI crate — depends on gpui.
 ```
 
 ### `crates/nice` (bin `nice-rs`)
 
 The GPUI application. Structure (grows over later cycles):
 
-- `app` — owns window creation and the root view: the shipped window (one
-  static "Nice RS Dev" window, solid background + version line) and the
-  self-test scenario windows (animated root view, registered in
-  `selftest_scenarios()`).
+- `app` — owns window creation and the two root paths: the shipped window
+  (`run` → `open_live_terminal`) now hosts a single live terminal pane — the
+  login shell (`zsh -il`) by default, or a one-off `NICE_RS_COMMAND` command —
+  in a `TerminalView` wired to the demand-present kick; and the self-test
+  scenario windows (registered in `selftest_scenarios()`). `RootView` (the
+  solid-background + version-line animated view) is now just the `smoke`
+  scenario's root, no longer the shipped window.
 - `platform` — the single home for foreign AppKit / `objc2` access (see
   "All-Rust rule" below). R1 holds exactly one thing here: the demand-present
   kick (`present_kick`) plus the two present-timing facts that motivate it
@@ -72,6 +79,13 @@ The measurement + self-test library every later cycle reuses. Modules:
   `capture` cargo feature (see "Screenshot capture" below).
 - `selftest` — the `NICE_RS_SELFTEST` driver + `all` suite runner, and the
   `Scenario` registry later cycles extend (see "Self-test scenarios" below).
+  Each scenario declares a `Gate`: `Cadence` (the default — the driver measures
+  a fixed window and asserts jitter sanity) or `SelfReported` (the scenario runs
+  its own long measurement + gate and posts the verdict; the driver just waits).
+  `term-perf` uses `SelfReported` for its absolute frame-time + memory budget.
+- `workload` — the deterministic synthetic "Claude-streaming" stressor (seeded
+  xorshift + a weighted SGR/reflow/long-line/unicode/plain content mix, ported
+  from the phase-0 spike) that `term-perf` floods a pane with.
 
 ### `crates/nice-theme` (lib)
 
@@ -191,6 +205,44 @@ non-zero or signalled exit the user didn't ask for is *held* — the `Term` and
 its scrollback are kept alive so the failed output stays readable — while a
 clean `exit 0` or an explicit user close is dropped.
 
+### `crates/nice-term-view` (lib)
+
+The GPUI-native terminal renderer (R4): it paints a `nice-term-core` `Session`'s
+grid through gpui's **public** paint API inside gpui's single Metal stack. A UI
+crate (it drives real gpui windows), so — like `nice-harness` — it depends on
+`gpui`; there is deliberately **no AppKit bridging** here (the terminal is an
+ordinary element in gpui's own tree, so the `NSViewRepresentable` dance today's
+`TerminalHost.swift` needs does not exist). Modules:
+
+- `theme` — `TerminalTheme` / `TerminalColor`, the render-half theme value (16
+  ANSI + bg/fg/cursor/selection) shaped like `TerminalTheme.swift`. The two
+  Nice built-in defaults are ported here; the catalog / import UI is R22.
+- `color` — the full color-model resolver: 16 themed ANSI (through the theme),
+  256-color indexed (computed xterm cube + grayscale ramp), and 24-bit
+  truecolor, from an `alacritty_terminal` `vte::ansi::Color`.
+- `session_handle` — `TerminalSessionHandle`, the core→GPUI adapter **entity**.
+  It owns the `Session` and one task that drains the session's event stream +
+  damage-wake, re-emitting typed gpui `TerminalEvent`s (`EventEmitter`) +
+  `cx.notify()`. View-independent (title / cwd / exit events flow with no view
+  attached — R6 / R7 ride this entity). Damage drives `cx.notify()` plus the
+  injected demand-present kick (`set_present_kick`, whose `setNeedsDisplay` body
+  lives in `crates/nice/src/platform`) on a short poll; replacing the poll with
+  an event-driven wake is a later optimization.
+- `element` / `view` — `TerminalElement` (the per-frame paint element: whole-bg
+  fill + coalesced per-cell background quads + per-cell foreground glyph runs
+  carrying `background_color` so the bg-luminance curve engages + a block
+  cursor) and `TerminalView` (owns a `FocusHandle`; the caret's solid/hollow
+  state is **computed** from `is_focused && window active`, never a stored flag).
+
+R4 is now complete: the full color model, text attributes, selection,
+box-drawing / block elements, wide glyphs, the row-quantized bottom-anchored
+layout (T4), line-stepped scrollback scroll, and damage-driven present (the
+injected `setNeedsDisplay` kick) all live here, and `crates/nice`'s shipped
+window hosts a live zsh pane over this crate. The `term-perf` self-test gates
+streaming frame time + memory under the synthetic workload. Out of R4's scope
+(later cycles): keyboard/IME/mouse input (R5), OSC title/cwd (R6), fonts/zoom/
+overlay (R7), and sub-line smooth scroll (deferred).
+
 ## Layering rule
 
 **Crates that mirror today's pure-Swift model code must not depend on
@@ -203,7 +255,10 @@ crates — the first — and carries no `gpui` dependency (its color→gpui adap
 lives downstream in `crates/nice`). `nice-term-core` (R3) is the second — the
 terminal session state + VT parsing carry no `gpui` dependency either; the
 renderer (R4) consumes it through a narrow API and the damage-wake callback.
-When a later cycle adds another model crate (parsing, session state, config,
+`nice-term-view` (R4) **is** a UI crate — like `nice-harness` it depends on
+`gpui` directly (it is the renderer), so it is not one of the gpui-free model
+crates. When a later cycle adds another model crate (parsing, session state,
+config,
 anything that doesn't paint pixels), it must likewise NOT gain a `gpui`
 dependency; if it needs to talk to the UI layer, that's a sign the boundary
 belongs in `crates/nice` instead.
@@ -297,15 +352,23 @@ the window, and moves to the next scenario.
 |---|---|
 | `smoke` | Opens the window, drives continuous animated repaint via `request_animation_frame`, and asserts frame-cadence sanity (`p95 < 2× median` interval, at least 30 sampled frames). The minimal "the window opens and paints at a sane cadence" gate. |
 | `tokens` | Renders a deterministic swatch grid from the `nice-theme` design tokens (every Nice/Dark palette slot plus the five accents), then reads each swatch centre back through `Window::render_to_image()` and asserts it matches the token's sRGB value within ±8/255 per channel — proving the tokens survive gpui's fill pipeline + Metal compositing, not just unit arithmetic. The pixel read-back needs the `selftest` feature (same `render_to_image` path as `NICE_RS_CAPTURE`); without it the scenario FAILs. The scenario samples pixels and hard-exits nonzero on mismatch itself — the `Scenario` shape and driver are unchanged (no post-capture hook). |
+| `term-render` | Drives the `nice-term-view` renderer (R4) over a fixture-fed `nice_term_core` `Session` (a byte stream piped in via `cat`, with `ZDOTDIR` pointed at an empty dir so no user zsh rc pollutes the grid): a 16-color themed-ANSI swatch row, a 256-color indexed cube/ramp row, a 24-bit truecolor row, a parked block cursor, and two same-glyph cells (dark-on-light / light-on-dark), plus inverse-video, box-drawing / block, wide-glyph / emoji, underline / strikethrough, and a programmatic selection row. It captures and asserts those cell pixels within ±8/255, the cursor center matches the accent, and the **bg-luminance patch ENGAGES** (dark-on-light antialiased coverage exceeds light-on-dark — a check that fails on an unpatched vendor tree). Needs the `selftest` feature (pixel read-back) and a frontmost, focused window. |
+| `term-layout` | The T4 row-quantized, bottom-anchored layout gate: resizes the window shorter than the grid and asserts (via capture) the bottom prompt row stays pinned at the bottom gap while the top rows clip under the chrome. |
+| `term-scroll` | The scrollback scroll + park/snap gate: feeds >1 screen of numbered lines into an echo-off `cat`, then asserts (via the core's display offset + visible snapshot) parked-at-bottom, offset-3 after scroll-up, no auto-snap while scrolled, and snap-to-bottom resuming. |
+| `term-perf` | The streaming frame-time + memory budget gate (Validation §5). Floods a live ~120×40 pane (scrollback 10 000) with 15 s of the deterministic `nice_harness::workload` synthetic stream through a raw-mode `cat` while the RAF-animated `TerminalView` stamps frames; self-activates its window, reduces the frame stream to interval percentiles, samples memory, and gates on **absolute** frame times (p50 ≤ 17.5 ms, p95 ≤ 20 ms) plus the pane's own memory **growth** over its entry baseline (< 120 MiB) — a criterion the cadence-jitter gate can't express. (Growth, not absolute, because inside the `all` suite the process already carries ~140 MiB from the five prior scenarios' retained windows/atlas/readbacks; the absolute < 200 MiB "steady" budget is validated by the dedicated `NICE_RS_SELFTEST=term-perf` run — a fresh process, ≈142 MiB.) Runs up to 3 times, gates on the best run, prints the percentiles + memory in the transcript. Uses `Gate::SelfReported` (it runs its own measurement and posts the verdict). |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
-`crates/nice/src/app.rs`'s `selftest_scenarios()` — the driver, reducer,
-watchdog, and table-printing in `nice-harness` never need to change. Each
-scenario supplies an `open: fn(&mut AsyncApp) -> anyhow::Result<AnyWindowHandle>`
-whose view stamps a frame (`nice_harness::frame::stamp()`) and requests the
-next animation frame on every render, so the harness can measure cadence.
-**Keep this table in sync** — it's the map a future cycle (or a reconciler)
-reads to know what regression coverage already exists before adding more.
+`crates/nice/src/app.rs`'s `selftest_scenarios()`. A `Cadence`-gated scenario
+needs no driver change — its view stamps a frame (`nice_harness::frame::stamp()`)
+and requests the next animation frame every render, and the driver measures a
+fixed window + asserts jitter sanity. A scenario whose pass criterion the jitter
+gate can't express (an absolute frame-time / memory budget, a multi-run best-of)
+declares `Gate::SelfReported { budget }`: it runs its own measurement in its
+`open` task and posts the verdict via `nice_harness::selftest::report_gate`, and
+the driver waits for it (up to `budget`) instead of measuring. `term-perf` is the
+first such scenario. **Keep this table in sync** — it's the map a future cycle
+(or a reconciler) reads to know what regression coverage already exists before
+adding more.
 
 ### Why frontmost & focused
 

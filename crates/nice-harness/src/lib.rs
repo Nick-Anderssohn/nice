@@ -8,6 +8,8 @@
 //! - [`signpost`]  — os_signpost emission on subsystem
 //!                   `dev.nickanderssohn.nice-rs` (C shim in `signpost.c`).
 //! - [`frame`]     — frame-stamp stream, percentile reducer, cadence gate.
+//! - [`workload`]  — deterministic synthetic "Claude-streaming" stressor (the
+//!                   `term-perf` gate's renderer workload; ported from the spike).
 //! - [`watchdog`]  — App-Nap-immune OS-thread deadline (guaranteed auto-exit).
 //! - [`capture`]   — screenshot via `Window::render_to_image()` (feature
 //!                   `capture` only; enables gpui `test-support`).
@@ -25,3 +27,4 @@ pub mod mem;
 pub mod selftest;
 pub mod signpost;
 pub mod watchdog;
+pub mod workload;

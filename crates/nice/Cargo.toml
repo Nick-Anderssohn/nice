@@ -25,12 +25,24 @@ nice-harness = { path = "../nice-harness" }
 # asserts against. Pure data, no gpui — the app owns the token -> gpui::Rgba
 # adapter (see the swatch grid in `app.rs`), per the crates/README Layering rule.
 nice-theme = { path = "../nice-theme" }
+# The terminal renderer (R4) and its headless core: the `term-render` self-test
+# scenario drives a fixture-fed `nice_term_core::Session` through the
+# `nice-term-view` renderer and asserts the painted pixels.
+nice-term-view = { path = "../nice-term-view" }
+nice-term-core = { path = "../nice-term-core" }
 anyhow = "1"
 # Foreign AppKit access lives behind the one `platform` module (all-Rust rule):
 # the demand-present kick uses objc2 msg_send + raw-window-handle to reach the
 # window's NSView. objc2/raw-window-handle 0.6 match what gpui_macos links.
 objc2 = "0.6"
 raw-window-handle = "0.6"
+# AppleFontSmoothing parity: Nice ships fontSmoothing=false, and GPUI-main's
+# CoreGraphics glyph-dilation is default-on (gpui_macos text_system.rs) and
+# fights the bg-luminance curve. `platform::disable_font_smoothing` sets the
+# pref to 0 before the first glyph rasterizes, matching Nice and gpui_macos's
+# own reader (same `core_foundation` versions it links — no new fetch).
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 
 [features]
 # Screenshot capture (Window::render_to_image), gated so it stays OUT of the

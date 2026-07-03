@@ -16,6 +16,7 @@ members = [
     "crates/nice",
     "crates/nice-harness",
     "crates/nice-term-core",
+    "crates/nice-term-view",
     "crates/nice-theme",
 ]
 exclude = ["vendor"]

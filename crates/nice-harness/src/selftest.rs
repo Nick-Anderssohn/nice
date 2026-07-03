@@ -20,10 +20,12 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{AnyWindowHandle, App, AsyncApp};
 
+use crate::frame::CadenceReport;
 use crate::{frame, watchdog};
 
 /// A registered self-test scenario.
@@ -36,6 +38,52 @@ pub struct Scenario {
     /// on a frontmost, focused window. Returns the handle so the driver can
     /// capture + close it.
     pub open: fn(&mut AsyncApp) -> anyhow::Result<AnyWindowHandle>,
+    /// How the driver measures + gates this scenario (see [`Gate`]). Most
+    /// scenarios use [`Gate::Cadence`]; a scenario with an absolute frame-time or
+    /// memory budget uses [`Gate::SelfReported`].
+    pub gate: Gate,
+}
+
+/// How the driver measures and gates a scenario.
+#[derive(Clone, Copy)]
+pub enum Gate {
+    /// Standard: warm up, measure `measure_secs`, assert cadence-jitter sanity
+    /// (`p95 < ratio × p50`, at least [`MIN_FRAMES`] frames). The default for a
+    /// scenario whose pass criterion is "the window paints at a sane, steady
+    /// cadence."
+    Cadence,
+    /// The scenario runs its OWN measurement + gate inside its `open` task
+    /// (self-activating, multi-run, absolute frame-time thresholds, memory) and
+    /// reports the verdict via [`report_gate`]. The driver keeps the window open
+    /// until that verdict arrives (bounded by `budget`) and imposes no cadence
+    /// gate of its own.
+    ///
+    /// `term-perf` uses this: its absolute p50/p95 + memory gate is a criterion
+    /// the jitter check cannot express — a 31 ms tail atop a 16 ms median passes
+    /// the jitter ratio yet is exactly the Path-A regression this gate exists to
+    /// catch.
+    SelfReported {
+        /// Upper bound on how long the scenario's task may take to report. The
+        /// process watchdog is the hard backstop above this.
+        budget: Duration,
+    },
+}
+
+/// A [`Gate::SelfReported`] scenario posts its own gate verdict here; the driver
+/// awaits it instead of running the standard cadence measurement. Process-global
+/// (one scenario runs at a time, exactly like the `frame` module's global stamp
+/// stream).
+static GATE_REPORT: Mutex<Option<CadenceReport>> = Mutex::new(None);
+
+/// Post a self-reported scenario's gate verdict for the driver to collect. The
+/// scenario's `open` task calls this once, after its own measurement + gate.
+pub fn report_gate(report: CadenceReport) {
+    *GATE_REPORT.lock().unwrap() = Some(report);
+}
+
+/// Take (and clear) a pending self-reported verdict, if one has arrived.
+fn take_gate_report() -> Option<CadenceReport> {
+    GATE_REPORT.lock().unwrap().take()
 }
 
 /// Warm-up window discarded before each measurement (startup frames are
@@ -89,12 +137,21 @@ pub fn drive(cx: &mut App, selector: &str, scenarios: Vec<Scenario>) {
     // Hard backstop: a real-OS-thread deadline across ALL scenarios + grace.
     // App Nap can defer the async orchestrator's timers on an occluded/idle
     // run; the watchdog cannot starve, so the self-test can never hang. On fire
-    // it prints the FAIL marker and hard-exits.
-    let n = selected.len().max(1) as f64;
-    let budget = n * (WARMUP_SECS + measure_secs + 4.0) + 5.0;
+    // it prints the FAIL marker and hard-exits. The budget sums each scenario's
+    // own worst-case duration — a `SelfReported` scenario (term-perf) can run for
+    // its whole reporting budget, far longer than a cadence scenario's fixed
+    // warm-up + measure window, so a flat `n × measure` cap would fire mid-run.
+    let mut budget_secs = 5.0; // grace
+    for sc in &selected {
+        budget_secs += match sc.gate {
+            Gate::Cadence => WARMUP_SECS + measure_secs + 4.0,
+            Gate::SelfReported { budget } => budget.as_secs_f64() + 4.0,
+        };
+    }
+    let budget = Duration::from_secs_f64(budget_secs);
     let selector_for_watchdog = selector.to_string();
     watchdog::arm(
-        Duration::from_secs_f64(budget),
+        budget,
         "nice-rs selftest",
         move || {
             eprintln!(
@@ -139,6 +196,9 @@ async fn run_scenarios(
     for sc in &scenarios {
         eprintln!("[selftest] scenario '{}': opening window", sc.name);
         frame::reset();
+        // Drop any stale verdict a previous scenario's task posted after its
+        // budget elapsed, so a `SelfReported` scenario never reads the wrong one.
+        let _ = take_gate_report();
 
         let handle = match (sc.open)(cx) {
             Ok(h) => h,
@@ -150,14 +210,20 @@ async fn run_scenarios(
             }
         };
 
-        // Warm up (discard startup frames), then measure a clean window.
-        let t = cx.background_executor().timer(warmup);
-        t.await;
-        frame::reset();
-        let t = cx.background_executor().timer(measure);
-        t.await;
-
-        let mut report = frame::assess_cadence(MIN_FRAMES, CADENCE_RATIO);
+        let mut report = match sc.gate {
+            Gate::Cadence => {
+                // Warm up (discard startup frames), then measure a clean window.
+                let t = cx.background_executor().timer(warmup);
+                t.await;
+                frame::reset();
+                let t = cx.background_executor().timer(measure);
+                t.await;
+                frame::assess_cadence(MIN_FRAMES, CADENCE_RATIO)
+            }
+            // The scenario's own task self-activates, measures, and posts its
+            // verdict; the window stays open (painting) while we wait for it.
+            Gate::SelfReported { budget } => await_self_reported(cx, sc.name, budget).await,
+        };
 
         if let Some(path) = &capture_path {
             match crate::capture::capture_window_png(handle, cx, Path::new(path)) {
@@ -185,6 +251,29 @@ async fn run_scenarios(
     }
 
     finish(results, is_suite, &selector);
+}
+
+/// Poll for a [`Gate::SelfReported`] scenario's verdict, up to `budget`. The
+/// scenario's task self-activates, measures, and posts via [`report_gate`]; this
+/// only waits (the window stays open and painting meanwhile). Falls back to an
+/// error report if the task never reports — the process watchdog is the harder
+/// backstop above this.
+async fn await_self_reported(cx: &mut AsyncApp, name: &str, budget: Duration) -> CadenceReport {
+    const POLL: Duration = Duration::from_millis(150);
+    let ticks = (budget.as_secs_f64() / POLL.as_secs_f64()).ceil() as u64;
+    for _ in 0..ticks.max(1) {
+        if let Some(r) = take_gate_report() {
+            return r;
+        }
+        cx.background_executor().timer(POLL).await;
+    }
+    // A last check after the final sleep, then give up into an error report.
+    take_gate_report().unwrap_or_else(|| {
+        CadenceReport::error(format!(
+            "self-reported scenario '{name}' did not post a verdict within {:.0}s",
+            budget.as_secs_f64()
+        ))
+    })
 }
 
 fn finish(results: Vec<(&'static str, frame::CadenceReport)>, is_suite: bool, selector: &str) -> ! {
@@ -269,5 +358,26 @@ mod tests {
         std::env::set_var(key, "-1.0");
         assert_eq!(env_secs(key, 2.5), 2.5);
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn gate_report_round_trips_and_clears() {
+        use super::{report_gate, take_gate_report};
+        use crate::frame::{CadenceReport, IntervalStats};
+
+        // Start from a clean slot (no other test touches GATE_REPORT).
+        let _ = take_gate_report();
+        assert!(take_gate_report().is_none());
+
+        report_gate(CadenceReport {
+            passed: true,
+            stats: IntervalStats::default(),
+            detail: "verdict".to_string(),
+        });
+        let r = take_gate_report().expect("verdict is present after report_gate");
+        assert!(r.passed);
+        assert_eq!(r.detail, "verdict");
+        // A second take sees the slot cleared.
+        assert!(take_gate_report().is_none(), "take clears the slot");
     }
 }

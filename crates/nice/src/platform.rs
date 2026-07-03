@@ -34,9 +34,51 @@ use objc2::msg_send;
 use objc2::runtime::AnyObject;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+/// Disable CoreGraphics font-smoothing glyph dilation for this process, matching
+/// Nice's shipping `fontSmoothing=false`.
+///
+/// GPUI-main thickens glyph strokes by an amount that depends on the foreground
+/// color's luminance whenever the `AppleFontSmoothing` pref is not an explicit
+/// `0` (`gpui_macos::text_system::glyph_dilation_for_color` /
+/// `font_smoothing_allowed_by_user`, read once via `OnceLock`). That dilation
+/// is a *different* effect from the bg-luminance composition curve the renderer
+/// relies on to match SwiftTerm, and with it enabled a light-on-dark glyph is
+/// dilated far more than a dark-on-light one — swamping the curve. Nice never
+/// wanted CoreGraphics smoothing (it ships `fontSmoothing=false`), so we set the
+/// pref to `0` before the first glyph rasterizes; gpui then reads `0` and skips
+/// the dilation, leaving the bg-luminance curve as the sole antialiasing shaping.
+///
+/// This writes the `AppleFontSmoothing` key into this app's own preferences
+/// domain (`nice-rs`), exactly the domain + API gpui_macos's reader uses
+/// (`CFPreferencesCopyAppValue(_, kCFPreferencesCurrentApplication)`), so the
+/// same-process read sees it. Mirrors the phase-0 aa-gamma spike's
+/// `set_apple_font_smoothing(false)`. Call once, before `Application::run`.
+pub fn disable_font_smoothing() {
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesAppSynchronize, CFPreferencesSetAppValue,
+    };
+
+    let key = CFString::new("AppleFontSmoothing");
+    let value = CFNumber::from(0i64);
+    // SAFETY: `key`/`value` are live CF objects for the duration of the calls;
+    // `kCFPreferencesCurrentApplication` is a valid constant domain. The set is
+    // in-memory (+ synchronize flushes it) so gpui's later `OnceLock` read sees
+    // it. No aliasing — we own both CF objects until they drop after this scope.
+    unsafe {
+        CFPreferencesSetAppValue(
+            key.as_concrete_TypeRef(),
+            value.as_CFTypeRef(),
+            kCFPreferencesCurrentApplication,
+        );
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    }
+}
+
 /// The backing `NSView` pointer for a gpui window, via raw-window-handle.
 /// Null if the window has no AppKit handle yet (not on screen).
-#[allow(dead_code)]
 pub fn ns_view_of(window: &Window) -> *mut c_void {
     // UFCS: gpui's `Window` has an inherent `window_handle()` returning
     // `gpui::AnyWindowHandle` that shadows the raw-window-handle trait method;
@@ -57,7 +99,6 @@ pub fn ns_view_of(window: &Window) -> *mut c_void {
 ///
 /// # Safety
 /// `ns_view` must be a valid `NSView*` (e.g. from [`ns_view_of`]) or null.
-#[allow(dead_code)]
 pub unsafe fn present_kick(ns_view: *mut c_void) {
     if ns_view.is_null() {
         return;
