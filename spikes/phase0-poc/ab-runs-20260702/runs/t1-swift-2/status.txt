@@ -1,0 +1,7 @@
+ M Sources/Nice/Views/AppShellView.swift
+ M Sources/Nice/Views/Chrome/ChromeEventRouter.swift
+ M Sources/Nice/Views/WindowChrome.swift
+ M Tests/NiceUnitTests/ChromeEventRouterTests.swift
+ M Tests/NiceUnitTests/WindowChromeTests.swift
+ M Tests/NiceUnitTests/WindowToolbarDragRegionTests.swift
+?? Sources/Nice/Views/BottomStatusBarView.swift

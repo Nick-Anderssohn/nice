@@ -1,0 +1,662 @@
+diff --git a/Sources/Nice/Process/NiceTerminalView.swift b/Sources/Nice/Process/NiceTerminalView.swift
+index 4aa64d4..34906fe 100644
+--- a/Sources/Nice/Process/NiceTerminalView.swift
++++ b/Sources/Nice/Process/NiceTerminalView.swift
+@@ -55,6 +55,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
+     /// invoking `dataReceived(slice:)`.
+     var onFirstData: (@MainActor () -> Void)?
+ 
++    /// Fires on every non-empty pty output chunk with the chunk's byte
++    /// count. Feeds the window-chrome activity badge's throughput meter
++    /// (see `ThroughputMeter`). Runs on the main actor for the same
++    /// reason as `onFirstData` — SwiftTerm hops to `DispatchQueue.main`
++    /// before invoking `dataReceived(slice:)`. Left nil in previews /
++    /// tests and any pane whose session has no output sink wired.
++    var onData: (@MainActor (Int) -> Void)?
++
+     /// Captured `startProcess` arguments waiting for AppKit to lay this
+     /// view out at its real frame. See `armDeferredSpawn(...)` for the
+     /// motivation (TL;DR: spawning while `frame == .zero` makes the pty
+@@ -381,9 +389,14 @@ final class NiceTerminalView: LocalProcessTerminalView {
+     /// pty reads deliver a zero-length chunk on EOF).
+     override func dataReceived(slice: ArraySlice<UInt8>) {
+         super.dataReceived(slice: slice)
+-        guard !slice.isEmpty, let callback = onFirstData else { return }
+-        onFirstData = nil
+-        callback()
++        // Some pty reads deliver a zero-length chunk on EOF — those are
++        // neither throughput nor a "first byte", so skip them entirely.
++        guard !slice.isEmpty else { return }
++        onData?(slice.count)
++        if let callback = onFirstData {
++            onFirstData = nil
++            callback()
++        }
+     }
+ 
+     // MARK: - File drag-and-drop
+diff --git a/Sources/Nice/Process/TabPtySession.swift b/Sources/Nice/Process/TabPtySession.swift
+index 313f9c3..835f66a 100644
+--- a/Sources/Nice/Process/TabPtySession.swift
++++ b/Sources/Nice/Process/TabPtySession.swift
+@@ -118,6 +118,12 @@ final class TabPtySession: TabPtySessionThemeable {
+     /// without wiring it.
+     private let onPaneHeld: (@MainActor (String, Int32?) -> Void)?
+ 
++    /// Called for every non-empty pty output chunk on any pane in this
++    /// session, with the chunk's byte count. Feeds the window-chrome
++    /// activity badge's throughput meter (see `ThroughputMeter`). `nil`
++    /// leaves the per-pane `onData` hook uninstalled (tests / previews).
++    private let onPaneOutput: (@MainActor (Int) -> Void)?
++
+     /// Cached SwiftUI `ColorScheme` so panes added after init can be
+     /// themed at creation without round-tripping through `AppState`.
+     private var currentScheme: ColorScheme = .dark
+@@ -213,7 +219,8 @@ final class TabPtySession: TabPtySessionThemeable {
+         onPaneCwdChange: (@MainActor (String, String) -> Void)? = nil,
+         onPaneLaunched: (@MainActor (String, String) -> Void)? = nil,
+         onPaneFirstOutput: (@MainActor (String) -> Void)? = nil,
+-        onPaneHeld: (@MainActor (String, Int32?) -> Void)? = nil
++        onPaneHeld: (@MainActor (String, Int32?) -> Void)? = nil,
++        onPaneOutput: (@MainActor (Int) -> Void)? = nil
+     ) {
+         self.tabId = tabId
+         self.cwd = cwd
+@@ -223,6 +230,7 @@ final class TabPtySession: TabPtySessionThemeable {
+         self.onPaneLaunched = onPaneLaunched
+         self.onPaneFirstOutput = onPaneFirstOutput
+         self.onPaneHeld = onPaneHeld
++        self.onPaneOutput = onPaneOutput
+         self.socketPath = socketPath
+         self.zdotdirPath = zdotdirPath
+         self.userZDotDir = userZDotDir
+@@ -280,6 +288,7 @@ final class TabPtySession: TabPtySessionThemeable {
+         view.processDelegate = delegate
+         entries[id] = PaneEntry(view: view, kind: .claude, delegate: delegate)
+         installLaunchOverlayHooks(on: view, paneId: id, kind: .claude)
++        installOutputMeterHook(on: view)
+ 
+         let resolvedCwd = Self.expandTilde(cwd)
+         let isOverride = ProcessInfo.processInfo.environment["NICE_CLAUDE_OVERRIDE"] != nil
+@@ -367,6 +376,7 @@ final class TabPtySession: TabPtySessionThemeable {
+         installLaunchOverlayHooks(
+             on: view, paneId: id, kind: .terminal, displayCommand: command
+         )
++        installOutputMeterHook(on: view)
+ 
+         var extraEnv: [String: String] = [:]
+         if let sp = socketPath ?? self.socketPath {
+@@ -574,6 +584,10 @@ final class TabPtySession: TabPtySessionThemeable {
+         adopted.heldExitCode = entry.heldExitCode
+         adopted.intentionalTerminate = entry.intentionalTerminate
+         entries[id] = adopted
++        // Re-point the migrated view's output hook at THIS session so its
++        // throughput lands in the destination window's badge, not the
++        // source window's (the closure captured the old session).
++        installOutputMeterHook(on: entry.view)
+         applyTerminalTheme(currentTerminalTheme, to: entry.view)
+         entry.view.font = Self.terminalFont(
+             named: currentTerminalFontFamily, size: currentTerminalFontSize
+@@ -585,6 +599,19 @@ final class TabPtySession: TabPtySessionThemeable {
+         entry.view.wantsFocusOnAttach = true
+     }
+ 
++    /// Point (or re-point) a pane view's per-chunk output hook at this
++    /// session's `onPaneOutput` sink. Always assigns — including nil —
++    /// so a migrated view adopted by a session with no sink has any
++    /// stale hook from its previous session cleared rather than left
++    /// dangling at the old window's meter.
++    private func installOutputMeterHook(on view: NiceTerminalView) {
++        if let onPaneOutput {
++            view.onData = { byteCount in onPaneOutput(byteCount) }
++        } else {
++            view.onData = nil
++        }
++    }
++
+     /// Wire up the "Launching…" placeholder for a newly-spawned pane.
+     /// Calls `onPaneLaunched` so AppState starts the grace timer and
+     /// sets `view.onFirstData` so the overlay lifts on first pty byte.
+diff --git a/Sources/Nice/State/AppState.swift b/Sources/Nice/State/AppState.swift
+index a7be55e..f587974 100644
+--- a/Sources/Nice/State/AppState.swift
++++ b/Sources/Nice/State/AppState.swift
+@@ -65,6 +65,11 @@ final class AppState {
+     let windowSession: WindowSession
+     let fileExplorerOrchestrator: FileExplorerOrchestrator
+ 
++    /// Rolling terminal-output throughput for this window, aggregated
++    /// across every pane. Fed by `sessions.onPaneOutput` (wired below)
++    /// and read by the chrome activity badge in `WindowToolbarView`.
++    let throughput = ThroughputMeter()
++
+     /// Per-window file-browser states keyed by `Tab.id`. Removed in
+     /// `finalizeDissolvedTab` when a tab dissolves.
+     let fileBrowserStore: FileBrowserStore = FileBrowserStore()
+@@ -216,6 +221,9 @@ final class AppState {
+         self.sessions.onTabBecameEmpty = { [weak self] tabId, pi, ti in
+             self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+         }
++        self.sessions.onPaneOutput = { [weak self] byteCount in
++            self?.throughput.record(byteCount)
++        }
+         self.closer.onSyncFinalizeDissolve = { [weak self] tabId, pi, ti in
+             self?.finalizeDissolvedTab(projectIndex: pi, tabIndex: ti, tabId: tabId)
+         }
+diff --git a/Sources/Nice/State/SessionsModel.swift b/Sources/Nice/State/SessionsModel.swift
+index e660076..484e73f 100644
+--- a/Sources/Nice/State/SessionsModel.swift
++++ b/Sources/Nice/State/SessionsModel.swift
+@@ -128,6 +128,14 @@ final class SessionsModel {
+     @ObservationIgnored
+     var onTabBecameEmpty: ((_ tabId: String, _ projectIndex: Int, _ tabIndex: Int) -> Void)?
+ 
++    /// Fired for every non-empty pty output chunk on any pane in any of
++    /// this window's sessions, with the chunk's byte count. AppState
++    /// forwards it into the window's `ThroughputMeter`, which drives the
++    /// chrome activity badge. `nil` (tests / previews) simply drops the
++    /// counts.
++    @ObservationIgnored
++    var onPaneOutput: (@MainActor (Int) -> Void)?
++
+     /// Mint a unique id for a freshly-created tab (or pane). The
+     /// production default is `<prefix><ms>-<uuid4>` — millisecond
+     /// timestamp keeps ids roughly time-sortable (useful for log
+@@ -1409,6 +1417,9 @@ final class SessionsModel {
+             },
+             onPaneHeld: { [weak self] paneId, code in
+                 self?.paneHeld(tabId: tabId, paneId: paneId, exitCode: code)
++            },
++            onPaneOutput: { [weak self] byteCount in
++                self?.onPaneOutput?(byteCount)
+             }
+         )
+         themeCache.applyAll(to: session)
+diff --git a/Sources/Nice/State/ThroughputMeter.swift b/Sources/Nice/State/ThroughputMeter.swift
+new file mode 100644
+index 0000000..2833ae9
+--- /dev/null
++++ b/Sources/Nice/State/ThroughputMeter.swift
+@@ -0,0 +1,155 @@
++//
++//  ThroughputMeter.swift
++//  Nice
++//
++//  Rolling-window byte-rate meter for the window-chrome activity badge.
++//  Every pane's `NiceTerminalView` reports the size of each pty output
++//  chunk here (via the `onPaneOutput` callback chain: NiceTerminalView →
++//  TabPtySession → SessionsModel → AppState → this meter). The meter keeps
++//  a short ring of per-bucket byte counts spanning `windowDuration`
++//  (~1 s) and reports the summed rate as `bytesPerSecond`.
++//
++//  Two-phase design so a `cat bigfile` burst can't storm SwiftUI with
++//  view invalidations:
++//    • `record(_:)` is called on every output chunk. It only accumulates
++//      into `@ObservationIgnored` state — no observed property changes,
++//      so it never invalidates the badge no matter how fast bytes arrive.
++//    • `refresh()` recomputes and publishes `bytesPerSecond` / `isActive`.
++//      The badge calls it on a fixed ~4 Hz display timer, so the badge
++//      repaints at most a handful of times a second and the rate decays
++//      (and the badge dims to idle after `idleThreshold`) even when no new
++//      bytes arrive. Published setters are equality-gated so a steady
++//      value doesn't notify.
++//
++//  The clock is injectable so the ring/idle logic is unit-testable
++//  without wall-clock sleeps; production uses the monotonic
++//  `ProcessInfo.systemUptime`.
++//
++
++import Foundation
++import Observation
++
++@MainActor
++@Observable
++final class ThroughputMeter {
++    /// Terminal output rate over the last `windowDuration`, in bytes per
++    /// second. Refreshed by `refresh()`; drives the badge's `NN KB/s`
++    /// label.
++    private(set) var bytesPerSecond: Double = 0
++
++    /// True while output has arrived within `idleThreshold`. Drives the
++    /// badge's active (accent) vs. idle (dim) styling. Flips to false on
++    /// the first `refresh()` that observes `idleThreshold` of silence.
++    private(set) var isActive: Bool = false
++
++    // MARK: - Configuration
++
++    @ObservationIgnored private let windowDuration: TimeInterval
++    @ObservationIgnored private let bucketDuration: TimeInterval
++    @ObservationIgnored private let idleThreshold: TimeInterval
++    @ObservationIgnored private let clock: () -> TimeInterval
++
++    // MARK: - Rolling-window state
++
++    /// Number of buckets in the ring — `windowDuration / bucketDuration`,
++    /// rounded. The ring holds exactly one window's worth of counts once
++    /// `advance(to:)` has zeroed anything that scrolled out.
++    @ObservationIgnored private let bucketCount: Int
++    @ObservationIgnored private var buckets: [Int]
++    /// Absolute index (time / bucketDuration) of the most recently
++    /// touched bucket, or -1 before the first sample.
++    @ObservationIgnored private var latestBucket: Int = -1
++    /// Clock time of the most recent non-empty `record`, or nil if no
++    /// bytes have ever arrived.
++    @ObservationIgnored private var lastActivity: TimeInterval?
++
++    init(
++        windowDuration: TimeInterval = 1.0,
++        bucketDuration: TimeInterval = 0.1,
++        idleThreshold: TimeInterval = 2.0,
++        clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
++    ) {
++        precondition(
++            bucketDuration > 0 && windowDuration >= bucketDuration,
++            "windowDuration must be a positive multiple of bucketDuration"
++        )
++        self.windowDuration = windowDuration
++        self.bucketDuration = bucketDuration
++        self.idleThreshold = idleThreshold
++        self.clock = clock
++        self.bucketCount = max(1, Int((windowDuration / bucketDuration).rounded()))
++        self.buckets = Array(repeating: 0, count: bucketCount)
++    }
++
++    // MARK: - Recording (hot path — no observed mutation)
++
++    /// Add `byteCount` bytes of terminal output arriving now. Cheap and
++    /// safe to call on every pty chunk: it only writes to
++    /// `@ObservationIgnored` fields, so it never invalidates the badge.
++    /// The badge's display timer picks the accumulated bytes up on its
++    /// next `refresh()`.
++    func record(_ byteCount: Int) {
++        guard byteCount > 0 else { return }
++        let now = clock()
++        advance(to: now)
++        buckets[latestBucket % bucketCount] += byteCount
++        lastActivity = now
++    }
++
++    // MARK: - Publishing (display cadence)
++
++    /// Recompute `bytesPerSecond` / `isActive` against the current clock
++    /// and publish any change. Call on a steady display-rate timer so the
++    /// rate decays and the badge dims to idle even when no bytes arrive.
++    func refresh() {
++        let now = clock()
++        advance(to: now)
++
++        let sum = buckets.reduce(0, +)
++        let bps = Double(sum) / windowDuration
++        let active: Bool
++        if let last = lastActivity {
++            active = (now - last) < idleThreshold
++        } else {
++            active = false
++        }
++
++        // Equality-gate so a steady value (e.g. sitting at 0 while idle)
++        // doesn't notify observers every tick.
++        if bytesPerSecond != bps { bytesPerSecond = bps }
++        if isActive != active { isActive = active }
++    }
++
++    // MARK: - Ring maintenance
++
++    /// Roll the ring forward to the bucket containing `now`, zeroing every
++    /// bucket we skip over so counts older than `windowDuration` fall out.
++    private func advance(to now: TimeInterval) {
++        let idx = Int((now / bucketDuration).rounded(.down))
++        if latestBucket < 0 {
++            latestBucket = idx
++            return
++        }
++        guard idx > latestBucket else { return }
++        let steps = idx - latestBucket
++        if steps >= bucketCount {
++            // The whole window elapsed since the last touch — clear it all.
++            for i in 0..<bucketCount { buckets[i] = 0 }
++        } else {
++            // Clear only the buckets we're scrolling into.
++            for s in 1...steps {
++                buckets[(latestBucket + s) % bucketCount] = 0
++            }
++        }
++        latestBucket = idx
++    }
++
++    // MARK: - Formatting
++
++    /// The badge's `NN KB/s` label for a given rate. Rounds to whole
++    /// KB/s; a negative input (never produced here) clamps to 0.
++    nonisolated static func label(forBytesPerSecond bps: Double) -> String {
++        let kb = max(0, bps) / 1024.0
++        return "\(Int(kb.rounded())) KB/s"
++    }
++}
+diff --git a/Sources/Nice/State/Tweaks.swift b/Sources/Nice/State/Tweaks.swift
+index c84e2ab..a59bcbe 100644
+--- a/Sources/Nice/State/Tweaks.swift
++++ b/Sources/Nice/State/Tweaks.swift
+@@ -214,6 +214,7 @@ final class Tweaks {
+     static let handoffSkillPromptSeenKey = "handoffSkillPromptSeen"
+     static let smoothScrollingKey      = "smoothScrolling"
+     static let syncClaudeThemeKey      = "syncClaudeTheme"
++    static let activityBadgeCompactKey = "activityBadgeCompact"
+ 
+     /// Default terminal-theme ids. These are the ones in
+     /// `BuiltInTerminalThemes`; keep in sync or fresh installs will fall
+@@ -401,6 +402,16 @@ final class Tweaks {
+         }
+     }
+ 
++    /// Presentation of the window-chrome activity badge: `false` (default)
++    /// shows the dot plus the `NN KB/s` label; `true` collapses it to the
++    /// dot alone. Clicking the badge toggles this, and the setter writes
++    /// through to `UserDefaults` so the choice survives relaunch.
++    var activityBadgeCompact: Bool {
++        didSet {
++            defaults.set(activityBadgeCompact, forKey: Self.activityBadgeCompactKey)
++        }
++    }
++
+     /// Injectable OS scheme source — real builds read
+     /// `AppleInterfaceStyle`, tests substitute a stub.
+     var osSchemeProvider: () -> ColorScheme
+@@ -466,6 +477,9 @@ final class Tweaks {
+         self.handoffSkillPromptSeen = defaults.object(forKey: Self.handoffSkillPromptSeenKey) as? Bool ?? false
+         // Default ON: a fresh install syncs Claude's theme out of the box.
+         self.syncClaudeTheme = defaults.object(forKey: Self.syncClaudeThemeKey) as? Bool ?? true
++        // Default full (dot + label). An explicit prior choice — compact
++        // or full — persists across relaunch.
++        self.activityBadgeCompact = defaults.object(forKey: Self.activityBadgeCompactKey) as? Bool ?? false
+ 
+         NSApp?.appearance = Self.nsAppearance(for: migrated.scheme)
+ 
+diff --git a/Sources/Nice/Views/WindowToolbarView.swift b/Sources/Nice/Views/WindowToolbarView.swift
+index 0ad18f7..0c63715 100644
+--- a/Sources/Nice/Views/WindowToolbarView.swift
++++ b/Sources/Nice/Views/WindowToolbarView.swift
+@@ -20,6 +20,7 @@
+ //
+ 
+ import AppKit
++import Combine
+ import SwiftUI
+ import UniformTypeIdentifiers
+ 
+@@ -48,6 +49,10 @@ struct WindowToolbarView: View {
+             InlinePaneStrip()
+                 .frame(maxWidth: .infinity, alignment: .leading)
+ 
++            // Trailing: live terminal-output throughput. Always present;
++            // clicking toggles the dot-only compact form.
++            ActivityBadge()
++
+             // Trailing: update-available nudge. Renders nothing when
+             // no update is known, so the toolbar is layout-identical
+             // to before this feature in the common case.
+@@ -82,6 +87,88 @@ struct WindowToolbarView: View {
+     }
+ }
+ 
++// MARK: - Activity badge
++
++/// Small chrome badge showing this window's live terminal-output
++/// throughput: a status dot plus an `NN KB/s` label. While bytes are
++/// arriving it paints in the accent style; after ~2 s of silence the
++/// throughput meter flips `isActive` false and the badge dims to the
++/// idle ink. Clicking toggles between the full (dot + label) and compact
++/// (dot-only) presentation; the choice lives in `Tweaks.activityBadgeCompact`
++/// so it persists across relaunch.
++///
++/// The meter accumulates bytes on the pty read path but only publishes on
++/// demand (see `ThroughputMeter`), so this view drives a steady ~4 Hz
++/// timer to decay the rate and dim to idle even when output stops.
++private struct ActivityBadge: View {
++    @Environment(AppState.self) private var appState
++    @Environment(Tweaks.self) private var tweaks
++    @Environment(\.colorScheme) private var scheme
++    @Environment(\.palette) private var palette
++
++    @State private var hovering = false
++
++    /// Display cadence. Refreshing the meter is cheap and only publishes
++    /// when a value actually changes, so a steady 4 Hz tick costs nothing
++    /// while idle but keeps the rate/dim responsive.
++    private let tick = Timer.publish(every: 0.25, on: .main, in: .common)
++        .autoconnect()
++
++    private var meter: ThroughputMeter { appState.throughput }
++
++    private var isActive: Bool { meter.isActive }
++
++    /// Accent when active, dim tertiary ink when idle. Same tint the rest
++    /// of the chrome uses for the user's chosen accent so the badge reads
++    /// as part of the toolbar, not bolted on.
++    private var tintColor: Color {
++        isActive ? tweaks.accent.color : Color.niceInk3(scheme, palette)
++    }
++
++    var body: some View {
++        Button(action: { tweaks.activityBadgeCompact.toggle() }) {
++            HStack(spacing: 6) {
++                Circle()
++                    .fill(tintColor)
++                    .frame(width: 7, height: 7)
++
++                if !tweaks.activityBadgeCompact {
++                    Text(ThroughputMeter.label(forBytesPerSecond: meter.bytesPerSecond))
++                        .font(.system(size: 11, weight: .medium))
++                        .monospacedDigit()
++                        .foregroundStyle(tintColor)
++                        .lineLimit(1)
++                        .fixedSize()
++                        .transition(.opacity.combined(with: .move(edge: .trailing)))
++                }
++            }
++            .padding(.horizontal, tweaks.activityBadgeCompact ? 7 : 10)
++            .frame(height: 28)
++            .background(
++                RoundedRectangle(cornerRadius: 7, style: .continuous)
++                    .fill(hovering ? Color.niceInk(scheme, palette).opacity(0.06) : .clear)
++            )
++            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
++        }
++        .buttonStyle(.plain)
++        .onHover { hovering = $0 }
++        .onReceive(tick) { _ in meter.refresh() }
++        .animation(.easeInOut(duration: 0.2), value: isActive)
++        .animation(.easeInOut(duration: 0.12), value: hovering)
++        .animation(.easeInOut(duration: 0.18), value: tweaks.activityBadgeCompact)
++        .help(tweaks.activityBadgeCompact
++            ? "Terminal output — click to show the rate"
++            : "Terminal output throughput — click for the compact dot")
++        .accessibilityIdentifier("toolbar.activityBadge")
++        .accessibilityLabel(accessibilityLabel)
++    }
++
++    private var accessibilityLabel: String {
++        let rate = ThroughputMeter.label(forBytesPerSecond: meter.bytesPerSecond)
++        return isActive ? "Terminal output \(rate)" : "Terminal output idle"
++    }
++}
++
+ // MARK: - Pane drag state
+ 
+ /// Which strip is currently painting an insertion line, and where. The
+diff --git a/Tests/NiceUnitTests/ThroughputMeterTests.swift b/Tests/NiceUnitTests/ThroughputMeterTests.swift
+new file mode 100644
+index 0000000..5ba70d0
+--- /dev/null
++++ b/Tests/NiceUnitTests/ThroughputMeterTests.swift
+@@ -0,0 +1,136 @@
++//
++//  ThroughputMeterTests.swift
++//  NiceUnitTests
++//
++//  Coverage for `ThroughputMeter`, the rolling-window byte-rate meter
++//  behind the chrome activity badge. All tests drive an injected clock so
++//  the ring/idle logic is exercised deterministically without wall-clock
++//  sleeps.
++//
++
++import Foundation
++import XCTest
++@testable import Nice
++
++@MainActor
++final class ThroughputMeterTests: XCTestCase {
++
++    /// Meter with a 1 s window / 0.1 s buckets / 2 s idle threshold and a
++    /// caller-controlled clock. The returned setter advances virtual time.
++    private func makeMeter(
++        start: TimeInterval = 1000
++    ) -> (meter: ThroughputMeter, setNow: (TimeInterval) -> Void) {
++        var now = start
++        let meter = ThroughputMeter(
++            windowDuration: 1.0,
++            bucketDuration: 0.1,
++            idleThreshold: 2.0,
++            clock: { now }
++        )
++        return (meter, { now = $0 })
++    }
++
++    // MARK: - Rate
++
++    func test_startsIdleAtZero() {
++        let (meter, _) = makeMeter()
++        meter.refresh()
++        XCTAssertEqual(meter.bytesPerSecond, 0)
++        XCTAssertFalse(meter.isActive, "No bytes have ever arrived → idle")
++    }
++
++    func test_recordedBytesReportAsRateOverWindow() {
++        let (meter, _) = makeMeter()
++        // 2048 bytes within the 1 s window → 2048 B/s.
++        meter.record(2048)
++        meter.refresh()
++        XCTAssertEqual(meter.bytesPerSecond, 2048, accuracy: 0.001)
++        XCTAssertTrue(meter.isActive, "Bytes just arrived → active")
++    }
++
++    func test_bytesAcrossBucketsSumWithinWindow() {
++        let (meter, setNow) = makeMeter(start: 1000)
++        meter.record(1000)          // bucket at t=1000.0
++        setNow(1000.5)
++        meter.record(1000)          // bucket at t=1000.5, still in window
++        meter.refresh()
++        XCTAssertEqual(meter.bytesPerSecond, 2000, accuracy: 0.001,
++                       "Two 1000-byte chunks inside the 1 s window sum to 2000 B/s")
++    }
++
++    func test_rateDecaysAsBytesLeaveWindow() {
++        let (meter, setNow) = makeMeter(start: 1000)
++        meter.record(4096)          // at t=1000
++        setNow(1000.5)
++        meter.refresh()
++        XCTAssertEqual(meter.bytesPerSecond, 4096, accuracy: 0.001,
++                       "Still inside the window half a second later")
++
++        // Advance past the full window: the 4096 bytes have scrolled out.
++        setNow(1001.2)
++        meter.refresh()
++        XCTAssertEqual(meter.bytesPerSecond, 0, accuracy: 0.001,
++                       "After the 1 s window elapses the old bytes fall out")
++    }
++
++    // MARK: - Idle / active transition
++
++    func test_staysActiveUntilIdleThreshold() {
++        let (meter, setNow) = makeMeter(start: 1000)
++        meter.record(1024)
++        // 1.9 s later — past the rate window but inside the 2 s idle
++        // threshold: dimmed number, but still the active style.
++        setNow(1001.9)
++        meter.refresh()
++        XCTAssertTrue(meter.isActive,
++                      "Within the idle threshold the badge stays active")
++        XCTAssertEqual(meter.bytesPerSecond, 0, accuracy: 0.001,
++                       "…even though the rate has already decayed to 0")
++    }
++
++    func test_dimsToIdleAfterThreshold() {
++        let (meter, setNow) = makeMeter(start: 1000)
++        meter.record(1024)
++        setNow(1002.5)              // 2.5 s of silence > 2 s threshold
++        meter.refresh()
++        XCTAssertFalse(meter.isActive, "Past the idle threshold → idle")
++        XCTAssertEqual(meter.bytesPerSecond, 0, accuracy: 0.001)
++    }
++
++    func test_reactivatesWhenBytesResume() {
++        let (meter, setNow) = makeMeter(start: 1000)
++        meter.record(1024)
++        setNow(1005)                // long silence → idle
++        meter.refresh()
++        XCTAssertFalse(meter.isActive)
++
++        meter.record(512)           // new output at t=1005
++        meter.refresh()
++        XCTAssertTrue(meter.isActive, "Fresh bytes re-activate the badge")
++        XCTAssertEqual(meter.bytesPerSecond, 512, accuracy: 0.001,
++                       "Ring was cleared on the long jump; only the new chunk counts")
++    }
++
++    // MARK: - Hot-path hygiene
++
++    func test_zeroAndNegativeChunksIgnored() {
++        let (meter, _) = makeMeter()
++        meter.record(0)
++        meter.record(-10)
++        meter.refresh()
++        XCTAssertEqual(meter.bytesPerSecond, 0)
++        XCTAssertFalse(meter.isActive, "An empty chunk must not count as activity")
++    }
++
++    // MARK: - Label formatting
++
++    func test_labelFormatsWholeKilobytesPerSecond() {
++        XCTAssertEqual(ThroughputMeter.label(forBytesPerSecond: 0), "0 KB/s")
++        XCTAssertEqual(ThroughputMeter.label(forBytesPerSecond: 1024), "1 KB/s")
++        XCTAssertEqual(ThroughputMeter.label(forBytesPerSecond: 1536), "2 KB/s",
++                       "1.5 KB/s rounds to nearest whole KB/s")
++        XCTAssertEqual(ThroughputMeter.label(forBytesPerSecond: 20480), "20 KB/s")
++        XCTAssertEqual(ThroughputMeter.label(forBytesPerSecond: -5), "0 KB/s",
++                       "Negative input clamps to 0")
++    }
++}
+diff --git a/Tests/NiceUnitTests/TweaksAdvancedTogglesTests.swift b/Tests/NiceUnitTests/TweaksAdvancedTogglesTests.swift
+index c7b4c87..5fa310d 100644
+--- a/Tests/NiceUnitTests/TweaksAdvancedTogglesTests.swift
++++ b/Tests/NiceUnitTests/TweaksAdvancedTogglesTests.swift
+@@ -78,6 +78,29 @@ final class TweaksAdvancedTogglesTests: XCTestCase {
+         XCTAssertEqual(Tweaks.smoothScrollingKey, "smoothScrolling")
+     }
+ 
++    // MARK: - Activity badge presentation
++
++    func test_activityBadgeCompact_defaultsToFalse_whenKeyAbsent() {
++        let suite = freshSuite()
++        defer { wipeSuite(suite) }
++
++        let tweaks = makeTweaks(defaults: suite)
++        XCTAssertFalse(tweaks.activityBadgeCompact,
++                       "The badge defaults to the full dot + label presentation")
++    }
++
++    func test_activityBadgeCompact_roundTrips_persistsThroughInjectedDefaults() {
++        let suite = freshSuite()
++        defer { wipeSuite(suite) }
++
++        let first = makeTweaks(defaults: suite)
++        first.activityBadgeCompact = true
++
++        let second = makeTweaks(defaults: suite)
++        XCTAssertTrue(second.activityBadgeCompact,
++                      "A compact choice must survive across relaunch")
++    }
++
+     // MARK: - helpers
+ 
+     private func makeTweaks(defaults: UserDefaults) -> Tweaks {

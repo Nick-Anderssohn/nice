@@ -1,0 +1,345 @@
+diff --git a/Sources/Nice/Views/Chrome/ChromePinButton.swift b/Sources/Nice/Views/Chrome/ChromePinButton.swift
+new file mode 100644
+index 0000000..eaf42dd
+--- /dev/null
++++ b/Sources/Nice/Views/Chrome/ChromePinButton.swift
+@@ -0,0 +1,123 @@
++//
++//  ChromePinButton.swift
++//  Nice
++//
++//  The custom "pin" toggle that `TrafficLightPlacer` lays out inline with
++//  the three standard window buttons (close / miniaturize / zoom),
++//  immediately to the zoom button's right. It shares the lights' superview
++//  and coordinate space, so the placer can size + position it exactly like
++//  a fourth light (same visual diameter, same window-y 26 top-bar row,
++//  one native inter-button pitch to the right of zoom).
++//
++//  It is an `NSButton` rather than a bare `NSView` on purpose: AppKit's
++//  button tracking loop CONSUMES the press (mouseDown → drag → up), so a
++//  click on the pin can never leak into the title-bar's window-move drag
++//  the way a press on an inert title-bar subview could. Click handling and
++//  accessibility come for free.
++//
++//  All visuals are custom-drawn in `draw(_:)` (the cell never draws): a
++//  filled accent disc + white pin glyph when active, a faint ringed disc +
++//  dim glyph when inactive — a clearly-visible two-state toggle that still
++//  reads as part of the traffic-light cluster.
++//
++
++import AppKit
++
++@MainActor
++final class ChromePinButton: NSButton {
++
++    /// The toggle state. Flipped on each click; drives the active/inactive
++    /// rendering. `private(set)` so only a click (or a test's
++    /// `performClick`) can change it.
++    private(set) var isActive = false
++
++    init() {
++        super.init(frame: .zero)
++        wantsLayer = true
++        isBordered = false
++        bezelStyle = .regularSquare
++        setButtonType(.momentaryChange)
++        title = ""
++        imagePosition = .noImage
++        focusRingType = .none
++        // Fire our own toggle on click; AppKit's tracking loop consumes the
++        // press so it never turns into a window-move drag.
++        target = self
++        action = #selector(handleClick)
++
++        setAccessibilityRole(.checkBox)
++        setAccessibilityLabel("Pin window")
++        setAccessibilityIdentifier("chrome.pinToggle")
++        toolTip = "Pin window"
++        refreshAccessibilityValue()
++    }
++
++    @available(*, unavailable)
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    @objc private func handleClick() {
++        isActive.toggle()
++        needsDisplay = true
++        refreshAccessibilityValue()
++    }
++
++    private func refreshAccessibilityValue() {
++        setAccessibilityValue(NSNumber(value: isActive))
++    }
++
++    // MARK: - Drawing
++
++    override func draw(_ dirtyRect: NSRect) {
++        // Match a traffic light: a disc filling the shorter dimension,
++        // centered, inset ~0.5pt so the ring doesn't clip.
++        let diameter = min(bounds.width, bounds.height)
++        let discRect = NSRect(
++            x: (bounds.width - diameter) / 2,
++            y: (bounds.height - diameter) / 2,
++            width: diameter,
++            height: diameter
++        ).insetBy(dx: 0.5, dy: 0.5)
++        let disc = NSBezierPath(ovalIn: discRect)
++
++        if isActive {
++            NSColor.controlAccentColor.setFill()
++            disc.fill()
++        } else {
++            NSColor.tertiaryLabelColor.withAlphaComponent(0.16).setFill()
++            disc.fill()
++            NSColor.tertiaryLabelColor.setStroke()
++            disc.lineWidth = 1
++            disc.stroke()
++        }
++
++        let glyphColor: NSColor = isActive ? .white : .secondaryLabelColor
++        if let glyph = Self.pinGlyph(diameter: diameter, color: glyphColor) {
++            let size = glyph.size
++            let origin = NSPoint(
++                x: (bounds.width - size.width) / 2,
++                y: (bounds.height - size.height) / 2
++            )
++            glyph.draw(at: origin, from: .zero, operation: .sourceOver, fraction: 1)
++        }
++    }
++
++    /// A `pin.fill` SF Symbol rendered at roughly half the disc diameter and
++    /// tinted to `color`. Template-tinted via a `.sourceAtop` fill so it
++    /// paints solid in the requested color regardless of appearance.
++    private static func pinGlyph(diameter: CGFloat, color: NSColor) -> NSImage? {
++        guard let base = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: nil) else {
++            return nil
++        }
++        let config = NSImage.SymbolConfiguration(pointSize: diameter * 0.5, weight: .bold)
++        let sized = base.withSymbolConfiguration(config) ?? base
++        let size = sized.size
++        return NSImage(size: size, flipped: false) { rect in
++            sized.draw(in: rect)
++            color.set()
++            rect.fill(using: .sourceAtop)
++            return true
++        }
++    }
++}
+diff --git a/Sources/Nice/Views/Chrome/TrafficLightPlacer.swift b/Sources/Nice/Views/Chrome/TrafficLightPlacer.swift
+index 4457563..a9b9397 100644
+--- a/Sources/Nice/Views/Chrome/TrafficLightPlacer.swift
++++ b/Sources/Nice/Views/Chrome/TrafficLightPlacer.swift
+@@ -7,6 +7,12 @@
+ //  card, aligned to Nice's own top-bar row instead of macOS's default
+ //  ~16pt-from-top cluster. Owned by `WindowChromeController`.
+ //
++//  Also lays out `pinButton` (a `ChromePinButton`) as a fourth "light"
++//  immediately to zoom's right — same size, same window-y 26 row, one
++//  native inter-button pitch across. It rides the same absolute-target
++//  apply()/observer machinery, so it holds its spot through resize, focus
++//  changes, and the full-screen transition just like the lights do.
++//
+ //  GEOMETRY (the why behind the two pure functions below):
+ //
+ //    • y is ABSOLUTE and OS-independent. Every Nice top-bar element
+@@ -65,6 +71,12 @@ final class TrafficLightPlacer {
+     /// from its own captured default, so the cluster keeps the OS pitch.
+     private let kinds: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+ 
++    /// The custom pin toggle, laid out as a fourth "light" one native pitch
++    /// to the right of zoom. Owned here (created once) and re-parented into
++    /// the lights' superview inside `apply()`; removed in `stop()`. Exposed
++    /// `internal` so tests can assert its placement + state.
++    let pinButton = ChromePinButton()
++
+     /// Per-kind `frameDidChange` observer tokens, so we can drop the stale
+     /// one when a button instance is replaced.
+     private var frameTokens: [NSWindow.ButtonType: NSObjectProtocol] = [:]
+@@ -158,7 +170,15 @@ final class TrafficLightPlacer {
+             object: window,
+             queue: .main
+         ) { [weak self] _ in
+-            MainActor.assumeIsolated { self?.suspended = true }
++            MainActor.assumeIsolated {
++                guard let self else { return }
++                self.suspended = true
++                // Hide the pin for the duration of full screen — the whole
++                // custom top-bar row goes away, so a pin floating at window-y
++                // 26 would be stranded. `apply()` on did-exit re-shows +
++                // re-positions it at exactly its windowed spot.
++                self.pinButton.isHidden = true
++            }
+         }
+         windowTokens.append(willEnter)
+ 
+@@ -226,6 +246,11 @@ final class TrafficLightPlacer {
+ 
+         let windowHeight = contentView.bounds.height
+ 
++        // Captured while we walk the three lights, so the pin can be laid
++        // out relative to zoom afterwards (one native pitch to its right).
++        var miniDefaultX: CGFloat?
++        var zoomContext: (button: NSView, superview: NSView, defaultX: CGFloat)?
++
+         for kind in kinds {
+             // Lazy re-resolve: read the button + superview fresh every
+             // apply so a swapped instance is handled even without a
+@@ -265,7 +290,56 @@ final class TrafficLightPlacer {
+             if abs(cur.x - desiredSuper.x) > 0.5 || abs(cur.y - desiredSuper.y) > 0.5 {
+                 button.setFrameOrigin(desiredSuper)
+             }
++
++            switch kind {
++            case .miniaturizeButton: miniDefaultX = defaultX
++            case .zoomButton: zoomContext = (button, superview, defaultX)
++            default: break
++            }
++        }
++
++        placePin(after: zoomContext, miniDefaultX: miniDefaultX, windowHeight: windowHeight)
++    }
++
++    /// Size + position the pin as a fourth light. Its size matches zoom's;
++    /// its leading x sits ONE native inter-button pitch to zoom's right
++    /// (`pitch = zoomDefaultX - miniDefaultX`, the same gap the three lights
++    /// preserve); its center shares the absolute window-y 26 top-bar row.
++    /// The math is ABSOLUTE (default-relative x + absolute y), so — like the
++    /// lights — re-applying converges and never compounds.
++    private func placePin(
++        after zoomContext: (button: NSView, superview: NSView, defaultX: CGFloat)?,
++        miniDefaultX: CGFloat?,
++        windowHeight: CGFloat
++    ) {
++        // Need both zoom (anchor) and miniaturize (to derive the OS pitch).
++        // On any real window all three lights exist; if not, leave the pin
++        // untouched rather than guess a pitch.
++        guard let zoom = zoomContext, let miniX = miniDefaultX else { return }
++
++        let pitch = zoom.defaultX - miniX
++        let leadingX = Self.desiredOriginX(nativeDefaultX: zoom.defaultX) + pitch
++        let size = zoom.button.frame.size
++        let originY = Self.desiredOriginY(windowHeight: windowHeight, buttonHeight: size.height)
++
++        // Keep the pin in the SAME superview as the lights so it shares their
++        // coordinate space + z-layer; re-parent if AppKit swapped the
++        // container (e.g. across a full-screen reparent).
++        if pinButton.superview !== zoom.superview {
++            pinButton.removeFromSuperview()
++            zoom.superview.addSubview(pinButton)
++        }
++
++        let originSuper = zoom.superview.convert(CGPoint(x: leadingX, y: originY), from: nil)
++        let desired = CGRect(origin: originSuper, size: size)
++        let cur = pinButton.frame
++        if abs(cur.origin.x - desired.origin.x) > 0.5
++            || abs(cur.origin.y - desired.origin.y) > 0.5
++            || abs(cur.width - desired.width) > 0.5
++            || abs(cur.height - desired.height) > 0.5 {
++            pinButton.frame = desired
+         }
++        pinButton.isHidden = false
+     }
+ 
+     // MARK: - Teardown
+@@ -280,5 +354,6 @@ final class TrafficLightPlacer {
+         windowTokens = []
+         observedButtons = [:]
+         defaultOriginX = [:]
++        pinButton.removeFromSuperview()
+     }
+ }
+diff --git a/Tests/NiceUnitTests/TrafficLightPlacerTests.swift b/Tests/NiceUnitTests/TrafficLightPlacerTests.swift
+index ffbd12e..2168483 100644
+--- a/Tests/NiceUnitTests/TrafficLightPlacerTests.swift
++++ b/Tests/NiceUnitTests/TrafficLightPlacerTests.swift
+@@ -206,4 +206,88 @@ final class TrafficLightPlacerTests: XCTestCase {
+                        "settled y must not drift on a redundant frame event")
+         placer.stop()
+     }
++
++    // MARK: - (f) Pin toggle: inline placement + state
++
++    func testPinSitsOnePitchRightOfZoomOnSharedRow() throws {
++        let window = makeHiddenTitleBarWindow()
++        let placer = TrafficLightPlacer(window: window)
++        placer.start()
++        spinRunLoop()
++
++        let miniButton = try XCTUnwrap(window.standardWindowButton(.miniaturizeButton))
++        let zoomButton = try XCTUnwrap(window.standardWindowButton(.zoomButton))
++        let mini = try windowX(of: miniButton)
++        let zoom = try windowX(of: zoomButton)
++        let pitch = zoom - mini
++
++        // Parented into the lights' superview so it shares their space.
++        let pin = placer.pinButton
++        XCTAssertNotNil(pin.superview, "pin should be parented into the chrome")
++        XCTAssertFalse(pin.isHidden, "pin should be visible in windowed mode")
++
++        // One native pitch to zoom's right — the same gap the lights keep.
++        XCTAssertEqual(try windowX(of: pin), zoom + pitch, accuracy: 0.5,
++                       "pin should sit one native inter-button pitch right of zoom")
++        // Shares the absolute 26pt-from-top top-bar row.
++        XCTAssertEqual(try centerFromTop(of: pin, in: window),
++                       WindowChrome.trafficLightCenterFromTop, accuracy: 0.5,
++                       "pin should share the 26pt-from-top row with the lights")
++        // Matches zoom's size (a fourth light).
++        XCTAssertEqual(pin.frame.width, zoomButton.frame.width, accuracy: 0.5,
++                       "pin width should match the zoom button")
++        XCTAssertEqual(pin.frame.height, zoomButton.frame.height, accuracy: 0.5,
++                       "pin height should match the zoom button")
++        placer.stop()
++    }
++
++    func testPinHoldsPlacementAcrossResizeAndRefocus() throws {
++        let window = makeHiddenTitleBarWindow()
++        let placer = TrafficLightPlacer(window: window)
++        placer.start()
++        spinRunLoop()
++
++        let zoomButton = try XCTUnwrap(window.standardWindowButton(.zoomButton))
++        let miniButton = try XCTUnwrap(window.standardWindowButton(.miniaturizeButton))
++        let expectedPitch = try windowX(of: zoomButton) - (try windowX(of: miniButton))
++
++        // Resize taller: the absolute y target keeps the pin on the 26pt row.
++        window.setContentSize(NSSize(width: 900, height: 720))
++        NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
++        spinRunLoop()
++        XCTAssertEqual(try centerFromTop(of: placer.pinButton, in: window),
++                       WindowChrome.trafficLightCenterFromTop, accuracy: 0.5,
++                       "pin should stay on the 26pt row after a resize")
++        XCTAssertEqual(try windowX(of: placer.pinButton),
++                       (try windowX(of: zoomButton)) + expectedPitch, accuracy: 0.5,
++                       "pin should stay one pitch right of zoom after a resize")
++
++        // Refocus (didBecomeKey) re-resolves + re-applies; the pin holds.
++        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
++        spinRunLoop()
++        XCTAssertEqual(try windowX(of: placer.pinButton),
++                       (try windowX(of: zoomButton)) + expectedPitch, accuracy: 0.5,
++                       "pin should stay one pitch right of zoom after refocus")
++        placer.stop()
++    }
++
++    func testPinToggleFlipsActiveState() {
++        let pin = ChromePinButton()
++        XCTAssertFalse(pin.isActive, "pin starts inactive")
++        pin.performClick(nil)
++        XCTAssertTrue(pin.isActive, "click activates the pin")
++        pin.performClick(nil)
++        XCTAssertFalse(pin.isActive, "second click deactivates the pin")
++    }
++
++    func testStopRemovesPinFromChrome() throws {
++        let window = makeHiddenTitleBarWindow()
++        let placer = TrafficLightPlacer(window: window)
++        placer.start()
++        spinRunLoop()
++        XCTAssertNotNil(placer.pinButton.superview, "precondition: pin is parented")
++
++        placer.stop()
++        XCTAssertNil(placer.pinButton.superview, "stop() must remove the pin from the chrome")
++    }
+ }

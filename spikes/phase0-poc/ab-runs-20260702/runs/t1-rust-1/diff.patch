@@ -1,0 +1,322 @@
+diff --git a/spikes/phase0-poc/src/gpui_term.rs b/spikes/phase0-poc/src/gpui_term.rs
+index 638596c..880cf24 100644
+--- a/spikes/phase0-poc/src/gpui_term.rs
++++ b/spikes/phase0-poc/src/gpui_term.rs
+@@ -1516,11 +1516,11 @@ fn run_headless_watchdog() {
+ mod gui {
+     use super::*;
+     use gpui::{
+-        canvas, div, fill, font, point, prelude::*, px, rgb, size, App, Application, Bounds,
+-        Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla, AppContext,
+-        IntoElement, KeyDownEvent, Keystroke, Pixels, Render, RenderImage, SharedString, Styled,
+-        TextRun, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
+-        WindowOptions,
++        canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size, App, Application,
++        Bounds, ClipboardItem, Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla,
++        AppContext, IntoElement, KeyDownEvent, Keystroke, MouseButton, Pixels, Render,
++        RenderImage, SharedString, Styled, TextRun, TitlebarOptions, Window,
++        WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+     };
+     use objc2::msg_send;
+     use objc2::runtime::AnyObject;
+@@ -1628,6 +1628,36 @@ mod gui {
+         }
+     }
+ 
++    /// Hand the in-flight left-mouse press to the window server as a window-
++    /// move drag — `performWindowDragWithEvent:` is the same mechanism the
++    /// native title bar uses, so snapping / space-switching / release behave
++    /// identically to a title-bar drag. Must be called from inside GPUI's
++    /// mouse-down dispatch: gpui's `handle_view_event` runs the app callback
++    /// synchronously inside the view's `mouseDown:`, so the NSWindow's
++    /// `currentEvent` IS the pressing mouse-down NSEvent.
++    fn start_window_drag(window: &Window) {
++        let Ok(handle) = HasWindowHandle::window_handle(window) else {
++            return;
++        };
++        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
++            return;
++        };
++        let ns_view = appkit.ns_view.as_ptr() as *mut NSView;
++        if ns_view.is_null() {
++            return;
++        }
++        unsafe {
++            let view: &NSView = &*ns_view;
++            let Some(ns_window) = view.window() else {
++                return;
++            };
++            let Some(event) = ns_window.currentEvent() else {
++                return;
++            };
++            ns_window.performWindowDragWithEvent(&event);
++        }
++    }
++
+     /// Display + max refresh of the screen hosting `ns_view`'s window (the
+     /// main.rs hot-plug guard, ported — §13 harness fix).
+     fn screen_info_of_view(ns_view: *mut NSView) -> (i64, String) {
+@@ -2519,6 +2549,43 @@ mod gui {
+         }
+     }
+ 
++    // ---- bottom status bar (interactive window chrome) -------------------
++
++    /// Status-bar height, pt (matches the ~28pt Path-A chrome pill scale).
++    const STATUS_BAR_PX: f32 = 28.0;
++    /// How long the "Copied" confirmation stays visible after a cwd click.
++    const COPY_FLASH: Duration = Duration::from_millis(1500);
++
++    /// The interactive session's working directory. The pty child inherits
++    /// this process's cwd (`PtySession` spawns `/bin/cat` with
++    /// `working_directory: None`), so `current_dir` is the honest answer.
++    fn session_cwd() -> SharedString {
++        std::env::current_dir()
++            .map(|p| p.display().to_string())
++            .unwrap_or_else(|_| "~".to_string())
++            .into()
++    }
++
++    /// Local wall-clock "HH:MM" via libc (no new chrono dependency).
++    fn clock_hhmm() -> SharedString {
++        unsafe {
++            let mut t: libc::time_t = 0;
++            libc::time(&mut t);
++            let mut tm: libc::tm = std::mem::zeroed();
++            libc::localtime_r(&t, &mut tm);
++            format!("{:02}:{:02}", tm.tm_hour, tm.tm_min).into()
++        }
++    }
++
++    /// Ms until just past the next wall-clock minute boundary (clock ticker).
++    fn ms_to_next_minute() -> u64 {
++        let ms = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_millis() as u64)
++            .unwrap_or(0);
++        60_000 - (ms % 60_000) + 150
++    }
++
+     /// Interactive keystroke-latency view: NO synthetic workload, NO RAF —
+     /// this view renders ONLY when the pty reader pings the wake channel
+     /// (echo arrived) or the OS itself asks for a frame (open/resize/
+@@ -2540,6 +2607,12 @@ mod gui {
+         /// Used to kick AppKit's damage path per echo — see
+         /// `kick_platform_display`. Main-thread only (gpui entities are).
+         ns_view: *mut NSView,
++        /// Status bar: the session's working directory (shown left; the
++        /// clipboard payload of a click).
++        cwd: SharedString,
++        /// Status bar: when the cwd was last copied — a recent stamp renders
++        /// the brief "Copied" confirmation in the cwd widget.
++        copied_at: Option<Instant>,
+     }
+ 
+     impl InteractiveView {
+@@ -2570,6 +2643,115 @@ mod gui {
+             kick_view_display(self.ns_view);
+         }
+ 
++        /// Status-bar cwd click: copy the path, flash "Copied" for
++        /// `COPY_FLASH`, and schedule the un-flash re-render. Every visual
++        /// change needs notify + the platform present kick — this window is
++        /// demand-driven (no RAF), and notify alone never presents.
++        fn copy_cwd(&mut self, cx: &mut Context<Self>) {
++            cx.write_to_clipboard(ClipboardItem::new_string(self.cwd.to_string()));
++            self.copied_at = Some(Instant::now());
++            cx.notify();
++            self.kick_platform_display();
++            let executor = cx.background_executor().clone();
++            cx.spawn(async move |this, cx| {
++                executor.timer(COPY_FLASH + Duration::from_millis(100)).await;
++                let _ = this.update(cx, |view: &mut InteractiveView, cx| {
++                    cx.notify();
++                    view.kick_platform_display();
++                });
++            })
++            .detach();
++        }
++
++        /// Bottom status bar: full window width, `STATUS_BAR_PX` tall, styled
++        /// to the Path-A chrome strip palette (0x10141C + 0xFFFFFF22 hairline)
++        /// with the grid's Menlo typography. Left: the session cwd (click =
++        /// copy + confirmation). Right: an HH:MM clock (minute ticker in
++        /// `run_interactive`). Empty bar area behaves exactly like the title
++        /// bar — press-drag hands off to a native window move, double-click
++        /// runs the user's AppleActionOnDoubleClick titlebar action. Both
++        /// widgets swallow their left mouse-downs (`stop_propagation`), so
++        /// pressing / dragging / clicking a widget can never move the window.
++        fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
++            let copied = self.copied_at.is_some_and(|t| t.elapsed() < COPY_FLASH);
++            div()
++                .h(px(STATUS_BAR_PX))
++                .w_full()
++                .flex_none()
++                .flex()
++                .items_center()
++                .justify_between()
++                .gap(px(12.0))
++                .px(px(12.0))
++                .bg(rgb(0x10141C))
++                .border_t_1()
++                .border_color(rgba(0xFFFFFF22))
++                .font_family("Menlo")
++                .text_size(px(11.0))
++                .text_color(rgb(0xC8C8C8))
++                .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
++                    // Only empty-bar presses reach here (the widgets stop
++                    // propagation on mouse-down). Double-click = the titlebar
++                    // action (honors AppleActionOnDoubleClick); any other
++                    // press starts a native window-move drag immediately —
++                    // the same press-then-drag feel as the title bar.
++                    if ev.click_count == 2 {
++                        window.titlebar_double_click();
++                    } else {
++                        start_window_drag(window);
++                    }
++                })
++                .child(
++                    // Left: cwd widget (click-to-copy with confirmation).
++                    // The path stays laid out (transparent) while "Copied"
++                    // overlays it, so the widget's geometry NEVER changes —
++                    // the second press of a double-click on the widget must
++                    // still land on the widget, not on suddenly-bared bar
++                    // (which would start a window move / titlebar action).
++                    div()
++                        .id("status-cwd")
++                        .flex_none()
++                        .relative()
++                        .px(px(6.0))
++                        .py(px(2.0))
++                        .rounded(px(4.0))
++                        .bg(rgba(0xFFFFFF0A))
++                        .hover(|s| s.bg(rgba(0xFFFFFF1F)))
++                        .cursor_pointer()
++                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
++                        .on_click(cx.listener(|this, _ev, _window, cx| this.copy_cwd(cx)))
++                        .child(
++                            div()
++                                .when(copied, |el| el.text_color(rgba(0x00000000)))
++                                .child(self.cwd.clone()),
++                        )
++                        .when(copied, |el| {
++                            el.child(
++                                div()
++                                    .absolute()
++                                    .top_0()
++                                    .bottom_0()
++                                    .left_0()
++                                    .right_0()
++                                    .flex()
++                                    .items_center()
++                                    .justify_center()
++                                    .text_color(rgb(0x8AE234))
++                                    .child("Copied"),
++                            )
++                        }),
++                )
++                .child(
++                    // Right: HH:MM clock. Inert, but still swallows presses —
++                    // a widget must never start a window move.
++                    div()
++                        .id("status-clock")
++                        .flex_none()
++                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
++                        .child(clock_hhmm()),
++                )
++        }
++
+         fn finalize_and_exit(&self, reason: &str) -> ! {
+             let secs = if self.start_tick == 0 {
+                 0.0
+@@ -2608,21 +2790,30 @@ mod gui {
+             self.pty.dirty.store(false, Ordering::Release);
+ 
+             let snap = snapshot(&self.pty.term.lock(), false);
++            let status_bar = self.status_bar(cx);
+             // frac = 0: no sub-pixel scroll animation (that path needs a
+             // continuous redraw clock, which this mode deliberately lacks).
+             // NOTE: no request_animation_frame anywhere in this render.
+             div()
+                 .size_full()
++                .flex()
++                .flex_col()
+                 .track_focus(&self.focus_handle)
+                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, _cx| {
+                     this.on_key(ev);
+                 }))
+-                .child(grid_canvas(
+-                    snap,
+-                    self.fonts.clone(),
+-                    0.0,
+-                    CanvasExtras::none(),
+-                ))
++                .child(
++                    // Terminal grid — everything above the status bar. (The
++                    // bar paints after this child, so its opaque background
++                    // also masks any canvas overdraw at the seam.)
++                    div().flex_1().child(grid_canvas(
++                        snap,
++                        self.fonts.clone(),
++                        0.0,
++                        CanvasExtras::none(),
++                    )),
++                )
++                .child(status_bar)
+         }
+     }
+ 
+@@ -2663,7 +2854,11 @@ mod gui {
+ 
+             let bounds = Bounds::centered(
+                 None,
+-                size(px(COLS as f32 * FONT_PX * 0.62), px(ROWS as f32 * LINE_PX + 40.0)),
++                size(
++                    px(COLS as f32 * FONT_PX * 0.62),
++                    // + the status bar, so the 40-row grid stays fully visible.
++                    px(ROWS as f32 * LINE_PX + 40.0 + STATUS_BAR_PX),
++                ),
+                 cx,
+             );
+             cx.open_window(
+@@ -2735,6 +2930,31 @@ mod gui {
+                             },
+                         );
+ 
++                        // Status-bar clock: re-render just past each wall-
++                        // clock minute boundary. Notify + present kick, like
++                        // every other visual change in this demand-driven
++                        // window (notify alone never presents). App Nap can
++                        // defer the tick in a fully idle app — the clock
++                        // catches up on the next wakeup; fine for a spike.
++                        let executor = cx.background_executor().clone();
++                        cx.spawn(async move |this, cx| {
++                            loop {
++                                executor
++                                    .timer(Duration::from_millis(ms_to_next_minute()))
++                                    .await;
++                                if this
++                                    .update(cx, |view: &mut InteractiveView, cx| {
++                                        cx.notify();
++                                        view.kick_platform_display();
++                                    })
++                                    .is_err()
++                                {
++                                    break;
++                                }
++                            }
++                        })
++                        .detach();
++
+                         InteractiveView {
+                             pty,
+                             focus_handle: cx.focus_handle(),
+@@ -2743,6 +2963,8 @@ mod gui {
+                             keys_sent: 0,
+                             start_tick: 0,
+                             ns_view: std::ptr::null_mut(),
++                            cwd: session_cwd(),
++                            copied_at: None,
+                         }
+                     });
+                     // Make the grid div the focus target immediately so keys

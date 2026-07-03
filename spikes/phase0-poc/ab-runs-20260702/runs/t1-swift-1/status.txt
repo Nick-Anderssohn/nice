@@ -1,0 +1,6 @@
+ M Sources/Nice/Views/AppShellView.swift
+ M Sources/Nice/Views/Chrome/ChromeEventRouter.swift
+ M Sources/Nice/Views/WindowChrome.swift
+ M Tests/NiceUnitTests/ChromeEventRouterTests.swift
+?? Sources/Nice/Views/WindowStatusBarView.swift
+?? Tests/NiceUnitTests/WindowStatusBarTests.swift

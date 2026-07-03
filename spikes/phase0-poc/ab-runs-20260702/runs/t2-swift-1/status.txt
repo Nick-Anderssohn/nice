@@ -1,0 +1,3 @@
+ M Sources/Nice/Views/Chrome/TrafficLightPlacer.swift
+ M Tests/NiceUnitTests/TrafficLightPlacerTests.swift
+?? Sources/Nice/Views/Chrome/ChromePinButton.swift

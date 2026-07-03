@@ -1,0 +1,460 @@
+diff --git a/spikes/phase0-poc/src/gpui_term.rs b/spikes/phase0-poc/src/gpui_term.rs
+index 638596c..80ab50c 100644
+--- a/spikes/phase0-poc/src/gpui_term.rs
++++ b/spikes/phase0-poc/src/gpui_term.rs
+@@ -119,7 +119,7 @@
+ mod harness;
+ 
+ use std::collections::VecDeque;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock};
+ use std::time::{Duration, Instant};
+@@ -1517,7 +1517,7 @@ mod gui {
+     use super::*;
+     use gpui::{
+         canvas, div, fill, font, point, prelude::*, px, rgb, size, App, Application, Bounds,
+-        Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla, AppContext,
++        ClickEvent, Context, Corners, FocusHandle, Font, FontStyle, FontWeight, Hsla, AppContext,
+         IntoElement, KeyDownEvent, Keystroke, Pixels, Render, RenderImage, SharedString, Styled,
+         TextRun, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
+         WindowOptions,
+@@ -2519,13 +2519,179 @@ mod gui {
+         }
+     }
+ 
+-    /// Interactive keystroke-latency view: NO synthetic workload, NO RAF —
+-    /// this view renders ONLY when the pty reader pings the wake channel
++    // =====================================================================
++    // Activity badge — a dot + `NN KB/s` throughput label in the window
++    // chrome. Renders in the accent style while terminal output is arriving
++    // and dims to the idle style after ~2 s of silence; clicking it toggles
++    // between the full (dot + label) and compact (dot-only) presentation,
++    // which persists across relaunch.
++    // =====================================================================
++
++    /// Chrome-bar height (px) reserved above the grid for the top bar that
++    /// hosts the session label + activity badge.
++    const CHROME_BAR_PX: f32 = 28.0;
++
++    /// Rolling window (ms) the throughput rate is averaged over (~1 s).
++    const BADGE_WINDOW_MS: f64 = 1000.0;
++    /// Silence (ms since the last byte) after which the badge dims to idle.
++    const BADGE_IDLE_MS: f64 = 2000.0;
++    /// While within this many ms of the last byte the view keeps requesting
++    /// animation frames, so the KB/s figure decays and the badge crosses the
++    /// idle threshold even with no further echoes; past it the interactive
++    /// view falls back to fully demand-driven (no RAF), as before.
++    const BADGE_TICK_MS: f64 = 2200.0;
++
++    // Chrome colors, chosen to sit with the dark terminal palette above.
++    const CHROME_BAR_BG: u32 = 0x0016_1616; // a hair lighter than DEFAULT_BG
++    const CHROME_BAR_BORDER: u32 = 0x0028_2828;
++    const CHROME_LABEL: u32 = 0x0080_8080; // muted top-bar label
++    const BADGE_ACCENT: u32 = 0x008A_E234; // palette bright-green (active dot)
++    const BADGE_ACCENT_TEXT: u32 = DEFAULT_FG; // active label = terminal fg
++    const BADGE_IDLE_DOT: u32 = 0x0055_5753; // palette bright-black (dim dot)
++    const BADGE_IDLE_TEXT: u32 = 0x0060_6060;
++
++    /// Full (dot + label) vs compact (dot-only) badge presentation. Persisted
++    /// across relaunch so the user's chosen density survives a restart.
++    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++    enum BadgePresentation {
++        Full,
++        Compact,
++    }
++
++    impl BadgePresentation {
++        fn toggled(self) -> Self {
++            match self {
++                BadgePresentation::Full => BadgePresentation::Compact,
++                BadgePresentation::Compact => BadgePresentation::Full,
++            }
++        }
++
++        fn as_str(self) -> &'static str {
++            match self {
++                BadgePresentation::Full => "full",
++                BadgePresentation::Compact => "compact",
++            }
++        }
++
++        fn parse(s: &str) -> Option<Self> {
++            match s.trim() {
++                "full" => Some(BadgePresentation::Full),
++                "compact" => Some(BadgePresentation::Compact),
++                _ => None,
++            }
++        }
++    }
++
++    /// Directory the badge presentation is persisted in (under Application
++    /// Support, keyed to the PoC bundle id — never touches prod Nice state).
++    fn badge_state_dir() -> Option<PathBuf> {
++        let home = std::env::var_os("HOME")?;
++        let mut p = PathBuf::from(home);
++        p.push("Library/Application Support/dev.nickanderssohn.nice-poc");
++        Some(p)
++    }
++
++    fn load_badge_presentation_from(dir: &Path) -> BadgePresentation {
++        std::fs::read_to_string(dir.join("badge-presentation"))
++            .ok()
++            .and_then(|s| BadgePresentation::parse(&s))
++            .unwrap_or(BadgePresentation::Full)
++    }
++
++    fn save_badge_presentation_to(dir: &Path, p: BadgePresentation) {
++        let _ = std::fs::create_dir_all(dir);
++        let _ = std::fs::write(dir.join("badge-presentation"), p.as_str());
++    }
++
++    fn load_badge_presentation() -> BadgePresentation {
++        badge_state_dir()
++            .map(|d| load_badge_presentation_from(&d))
++            .unwrap_or(BadgePresentation::Full)
++    }
++
++    fn save_badge_presentation(p: BadgePresentation) {
++        if let Some(dir) = badge_state_dir() {
++            save_badge_presentation_to(&dir, p);
++        }
++    }
++
++    /// Rolling terminal-output throughput tracker. Samples a cumulative byte
++    /// counter over a ~1 s window (mach-tick timestamps, consistent with the
++    /// rest of the harness) and reports the rate + whether output is currently
++    /// arriving (for the active/idle style).
++    struct ThroughputMeter {
++        /// (mach tick, cumulative bytes) within the rolling window.
++        samples: VecDeque<(u64, u64)>,
++        /// Last cumulative byte count seen (to detect fresh output).
++        last_bytes: u64,
++        /// mach tick of the most recent byte increase; 0 = nothing yet.
++        last_activity: u64,
++        /// True once at least one sample has been taken.
++        primed: bool,
++    }
++
++    impl ThroughputMeter {
++        fn new() -> Self {
++            ThroughputMeter {
++                samples: VecDeque::new(),
++                last_bytes: 0,
++                last_activity: 0,
++                primed: false,
++            }
++        }
++
++        /// Record the cumulative byte counter at `now`, evicting samples that
++        /// have aged out of the rolling window.
++        fn sample(&mut self, now: u64, cumulative: u64) {
++            if self.primed && cumulative > self.last_bytes {
++                self.last_activity = now;
++            }
++            self.last_bytes = cumulative;
++            self.primed = true;
++            self.samples.push_back((now, cumulative));
++            while self.samples.len() > 1 {
++                let front = self.samples.front().unwrap().0;
++                if harness::clock::ms_between(front, now) > BADGE_WINDOW_MS {
++                    self.samples.pop_front();
++                } else {
++                    break;
++                }
++            }
++        }
++
++        /// Throughput in KB/s over the retained window (0 with < 2 samples or
++        /// no byte delta).
++        fn kb_per_sec(&self) -> f64 {
++            if self.samples.len() < 2 {
++                return 0.0;
++            }
++            let (t0, b0) = *self.samples.front().unwrap();
++            let (t1, b1) = *self.samples.back().unwrap();
++            let dt_s = harness::clock::ms_between(t0, t1) / 1000.0;
++            if dt_s <= 0.0 {
++                return 0.0;
++            }
++            (b1.saturating_sub(b0) as f64 / dt_s) / 1024.0
++        }
++
++        /// Output is "arriving" if the last byte increase was within `ms`.
++        fn active_within(&self, now: u64, ms: f64) -> bool {
++            self.last_activity != 0 && harness::clock::ms_between(self.last_activity, now) < ms
++        }
++    }
++
++    /// Interactive keystroke-latency view: NO synthetic workload, NO RAF while
++    /// idle — this view renders when the pty reader pings the wake channel
+     /// (echo arrived) or the OS itself asks for a frame (open/resize/
+     /// occlusion/activation). So the vendored-gpui "Draw" signpost is
+     /// inherently damage-gated: one echo batch => one cx.notify() => one
+     /// render => one Draw interval.
+     ///
++    /// The activity badge adds a bounded exception: for up to ~2.2 s after the
++    /// last byte the render requests animation frames so the throughput figure
++    /// decays and the badge dims; once silent it stops requesting frames and
++    /// the view is fully demand-driven again (no timers when idle).
++    ///
+     /// Cursor/blink: this bin renders NO cursor at all (the snapshot paints
+     /// only cell text + backgrounds) and owns NO timers — there are zero
+     /// timer-driven redraws in this mode by construction.
+@@ -2540,6 +2706,10 @@ mod gui {
+         /// Used to kick AppKit's damage path per echo — see
+         /// `kick_platform_display`. Main-thread only (gpui entities are).
+         ns_view: *mut NSView,
++        /// Rolling terminal-output throughput for the activity badge.
++        throughput: ThroughputMeter,
++        /// Full (dot + label) vs compact (dot-only) badge; persisted.
++        badge: BadgePresentation,
+     }
+ 
+     impl InteractiveView {
+@@ -2570,6 +2740,80 @@ mod gui {
+             kick_view_display(self.ns_view);
+         }
+ 
++        /// Flip the badge between full and compact, persist the choice, and
++        /// repaint. Wired to the badge's click handler.
++        fn toggle_badge(&mut self, cx: &mut Context<Self>) {
++            self.badge = self.badge.toggled();
++            save_badge_presentation(self.badge);
++            cx.notify();
++            self.kick_platform_display();
++        }
++
++        /// Build the top chrome bar: a session label on the left and the
++        /// activity badge on the right, styled to match the terminal below.
++        fn chrome_bar(&self, now: u64, cx: &mut Context<Self>) -> impl IntoElement {
++            let active = self.throughput.active_within(now, BADGE_IDLE_MS);
++            let kbps = self.throughput.kb_per_sec().round() as u64;
++            let dot_color = if active { BADGE_ACCENT } else { BADGE_IDLE_DOT };
++            let text_color = if active {
++                BADGE_ACCENT_TEXT
++            } else {
++                BADGE_IDLE_TEXT
++            };
++
++            let dot = div()
++                .size(px(8.0))
++                .rounded_full()
++                .bg(rgb(dot_color));
++
++            let mut badge = div()
++                .id("activity-badge")
++                .flex()
++                .flex_row()
++                .items_center()
++                .gap(px(6.0))
++                .px(px(6.0))
++                .py(px(2.0))
++                .rounded_md()
++                .cursor_pointer()
++                .on_click(cx.listener(|this, _ev: &ClickEvent, _window, cx| {
++                    this.toggle_badge(cx);
++                }))
++                .child(dot);
++            if self.badge == BadgePresentation::Full {
++                badge = badge.child(
++                    div()
++                        .font_family("Menlo")
++                        .text_size(px(11.0))
++                        .text_color(rgb(text_color))
++                        .whitespace_nowrap()
++                        .child(SharedString::from(format!("{kbps} KB/s"))),
++                );
++            }
++
++            div()
++                .flex()
++                .flex_row()
++                .items_center()
++                .justify_between()
++                .h(px(CHROME_BAR_PX))
++                .w_full()
++                .flex_none()
++                .px(px(10.0))
++                .bg(rgb(CHROME_BAR_BG))
++                .border_b_1()
++                .border_color(rgb(CHROME_BAR_BORDER))
++                .child(
++                    div()
++                        .font_family("Menlo")
++                        .text_size(px(11.0))
++                        .text_color(rgb(CHROME_LABEL))
++                        .whitespace_nowrap()
++                        .child(SharedString::from("pty: /bin/cat")),
++                )
++                .child(badge)
++        }
++
+         fn finalize_and_exit(&self, reason: &str) -> ! {
+             let secs = if self.start_tick == 0 {
+                 0.0
+@@ -2607,22 +2851,39 @@ mod gui {
+             }
+             self.pty.dirty.store(false, Ordering::Release);
+ 
++            // Sample terminal-output throughput (cumulative pty echo bytes)
++            // for the activity badge.
++            let now = harness::clock::now();
++            self.throughput
++                .sample(now, self.pty.bytes_echoed.load(Ordering::Relaxed));
++
++            // While output is recent, keep requesting frames so the KB/s
++            // figure decays and the badge crosses the idle threshold even
++            // without further echoes. Past that window the view is fully
++            // demand-driven again (no RAF, no timers) — the mode's invariant.
++            if self.throughput.active_within(now, BADGE_TICK_MS) {
++                window.request_animation_frame();
++            }
++
++            let chrome = self.chrome_bar(now, cx);
+             let snap = snapshot(&self.pty.term.lock(), false);
+             // frac = 0: no sub-pixel scroll animation (that path needs a
+             // continuous redraw clock, which this mode deliberately lacks).
+-            // NOTE: no request_animation_frame anywhere in this render.
+             div()
+                 .size_full()
++                .flex()
++                .flex_col()
+                 .track_focus(&self.focus_handle)
+                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, _cx| {
+                     this.on_key(ev);
+                 }))
+-                .child(grid_canvas(
++                .child(chrome)
++                .child(div().flex_1().child(grid_canvas(
+                     snap,
+                     self.fonts.clone(),
+                     0.0,
+                     CanvasExtras::none(),
+-                ))
++                )))
+         }
+     }
+ 
+@@ -2663,7 +2924,12 @@ mod gui {
+ 
+             let bounds = Bounds::centered(
+                 None,
+-                size(px(COLS as f32 * FONT_PX * 0.62), px(ROWS as f32 * LINE_PX + 40.0)),
++                size(
++                    px(COLS as f32 * FONT_PX * 0.62),
++                    // Grow the window by the chrome-bar height so the badge bar
++                    // does not steal any grid rows.
++                    px(ROWS as f32 * LINE_PX + 40.0 + CHROME_BAR_PX),
++                ),
+                 cx,
+             );
+             cx.open_window(
+@@ -2743,6 +3009,9 @@ mod gui {
+                             keys_sent: 0,
+                             start_tick: 0,
+                             ns_view: std::ptr::null_mut(),
++                            throughput: ThroughputMeter::new(),
++                            // Restore the persisted density (full vs compact).
++                            badge: load_badge_presentation(),
+                         }
+                     });
+                     // Make the grid div the focus target immediately so keys
+@@ -2756,6 +3025,85 @@ mod gui {
+         });
+     }
+ 
++    /// HEADLESS self-test for the activity-badge logic (no display): the
++    /// full/compact toggle + persistence round trip, the throughput math, and
++    /// the active/idle transition. Mirrors the file's other `run_headless_*`
++    /// self-tests; wired to `NICE_POC_BADGE_SELFTEST`.
++    pub fn run_badge_selftest() -> ! {
++        eprintln!("{}", harness::banner());
++        eprintln!("[gpui-term] HEADLESS activity-badge self-test (no display).");
++
++        let mut ok = true;
++        macro_rules! check {
++            ($cond:expr, $msg:expr) => {{
++                let c = $cond;
++                eprintln!("  [{}] {}", if c { "PASS" } else { "FAIL" }, $msg);
++                ok &= c;
++            }};
++        }
++
++        // -- presentation toggle + string round trip --------------------------
++        check!(
++            BadgePresentation::Full.toggled() == BadgePresentation::Compact
++                && BadgePresentation::Compact.toggled() == BadgePresentation::Full,
++            "toggle flips full <-> compact"
++        );
++        check!(
++            BadgePresentation::parse(BadgePresentation::Full.as_str())
++                == Some(BadgePresentation::Full)
++                && BadgePresentation::parse(BadgePresentation::Compact.as_str())
++                    == Some(BadgePresentation::Compact),
++            "as_str/parse round trip"
++        );
++        check!(BadgePresentation::parse("garbage").is_none(), "parse rejects garbage");
++
++        // -- persistence round trip (temp dir; never the real state file) -----
++        let dir = std::env::temp_dir().join(format!("nice-poc-badge-selftest-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        check!(
++            load_badge_presentation_from(&dir) == BadgePresentation::Full,
++            "missing state file defaults to full"
++        );
++        save_badge_presentation_to(&dir, BadgePresentation::Compact);
++        check!(
++            load_badge_presentation_from(&dir) == BadgePresentation::Compact,
++            "compact persists + reloads (survives relaunch)"
++        );
++        save_badge_presentation_to(&dir, BadgePresentation::Full);
++        check!(
++            load_badge_presentation_from(&dir) == BadgePresentation::Full,
++            "toggled-back full persists + reloads"
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++
++        // -- throughput meter -------------------------------------------------
++        let mut m = ThroughputMeter::new();
++        let t0 = harness::clock::now();
++        m.sample(t0, 0);
++        check!(m.kb_per_sec() == 0.0, "single sample => 0 KB/s");
++        check!(!m.active_within(t0, BADGE_IDLE_MS), "no bytes => idle");
++        std::thread::sleep(Duration::from_millis(50));
++        let t1 = harness::clock::now();
++        m.sample(t1, 100 * 1024); // ~100 KiB over ~50 ms
++        let kbps = m.kb_per_sec();
++        check!(kbps > 0.0, "byte increase => positive KB/s");
++        check!(m.active_within(t1, BADGE_IDLE_MS), "fresh bytes => active");
++        // Activity is time-since-last-increase: a tiny threshold reads idle
++        // while a generous one still reads active (the 2 s dim in miniature).
++        std::thread::sleep(Duration::from_millis(30));
++        let t2 = harness::clock::now();
++        m.sample(t2, 100 * 1024); // same cumulative => no fresh output
++        check!(!m.active_within(t2, 10.0), "silence beyond threshold => idle");
++        check!(m.active_within(t2, 60_000.0), "still active within a generous window");
++        eprintln!("  (measured burst throughput ~{kbps:.0} KB/s over the sampled window)");
++
++        eprintln!(
++            "RESULT: {}",
++            if ok { "PASS (activity-badge logic)" } else { "FAIL" }
++        );
++        std::process::exit(if ok { 0 } else { 1 });
++    }
++
+     /// Run metadata persisted into the CSV as leading `#` comment lines
+     /// (§13 harness fix: screen info / seed / build profile / flags), plus
+     /// the per-sample memory series appended as `mem_phys` rows.
+@@ -3084,7 +3432,9 @@ fn main() {
+         (false, true) => run_headless_interactive(),
+         (false, false) => {
+             // Headless self-tests for the new spike machinery (no display).
+-            if env_flag("NICE_POC_WATCHDOG_SELFTEST") {
++            if env_flag("NICE_POC_BADGE_SELFTEST") {
++                gui::run_badge_selftest()
++            } else if env_flag("NICE_POC_WATCHDOG_SELFTEST") {
+                 run_headless_watchdog()
+             } else if env_flag("NICE_POC_SPIKE9") {
+                 run_headless_spike9()

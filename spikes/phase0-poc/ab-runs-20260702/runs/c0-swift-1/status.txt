@@ -1,0 +1,9 @@
+ M Sources/Nice/Process/NiceTerminalView.swift
+ M Sources/Nice/Process/TabPtySession.swift
+ M Sources/Nice/State/AppState.swift
+ M Sources/Nice/State/SessionsModel.swift
+ M Sources/Nice/State/Tweaks.swift
+ M Sources/Nice/Views/WindowToolbarView.swift
+ M Tests/NiceUnitTests/TweaksAdvancedTogglesTests.swift
+?? Sources/Nice/State/ThroughputMeter.swift
+?? Tests/NiceUnitTests/ThroughputMeterTests.swift

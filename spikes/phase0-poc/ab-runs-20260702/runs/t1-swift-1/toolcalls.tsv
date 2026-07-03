@@ -1,0 +1,153 @@
+1	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && git status && echo "---BRANCH---" && git branch --show-current && echo "---STRUCTURE---" && ls -la Sources/Nice/Views/ && echo "---NICE ROOT-
+2	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowToolbarView.swift
+3	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowChrome.swift
+4	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowDragRegion.swift
+5	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && ls -la Sources/Nice/Views/Chrome/ && echo "---THEME---" && ls -la Sources/Nice/Theme/
+6	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift
+7	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/WindowChromeController.swift
+8	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Theme/Typography.swift
+9	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "PaneDragHosting\\|mouseDownCanMoveWindow\\|class .*NSView" Sources/Nice/Views/PaneDragSource.swift
+10	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "WindowToolbarView\\|topBarHeight\\|bottomBar\\|VStack\\|WindowChrome\\|niceChrome\\|niceWindow\\|safeAreaInset\\|overlay(alignment: 
+11	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/PaneDragSource.swift
+12	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+13	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "var shell\\|private var shell\\|var body\\|HSplitView\\|NavigationSplit\\|SidebarView()\\|contentColumn\\|func contentColumn\\|var c
+14	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+15	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+16	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+17	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+18	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "static func niceChrome\\|static func niceInk\\|static func niceInk2\\|static func niceInk3\\|static func niceLine\\|static func nice
+19	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && find . -path ./build-dev -prune -o -name "*.swift" -print | xargs grep -l "ChromeEventRouter\\|WindowDragUITests\\|decision(hitChain" 2>/dev/
+20	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && ls Tests 2>/dev/null; echo "---"; find . -path ./build-dev -prune -o -type d -name "*Tests*" -print 2>/dev/null; echo "---UITESTS---"; ls UIT
+21	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Tests/NiceUnitTests/ChromeEventRouterTests.swift
+22	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/UITests/WindowDragUITests.swift
+23	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Tests/NiceUnitTests/WindowToolbarDragRegionTests.swift
+24	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+25	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/PaneDragSource.swift
+26	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -rn "cwd\\|workingDirectory\\|workingDir\\|currentDirectory\\|OSC 7\\|osc7\\|\\.pwd" Sources/Nice/ --include="*.swift" | grep -iv "test"
+27	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -rn "var cwd\\|let cwd\\|cwd:" Sources/Nice/State/TabModel.swift Sources/Nice/State/Tab.swift 2>/dev/null | head; echo "---find Tab/Pane
+28	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "struct Pane\\|struct Tab\\|var cwd\\|let cwd\\|class\\|title\\|kind" Sources/Nice/State/Models.swift | head -50
+29	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -rn "\\.cwd = \\|updateCwd\\|setCwd\\|osc7\\|OSC 7\\|hostCurrentDirectory" Sources/Nice/State/*.swift Sources/Nice/Process/*.swift 2>/de
+30	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && sed -n '1000,1070p' Sources/Nice/State/TabModel.swift
+31	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/FileOperationDriftBanner.swift
+32	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/UpdateAvailablePill.swift
+33	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "sources\\|path\\|Tests" project.yml | head -30
+34	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && sed -n '1,60p' scripts/install.sh && echo "=====TEST=====" && sed -n '1,80p' scripts/test.sh
+35	Bash	cd /Users/nick/Projects/nice/.claude/worktrees/ab-swift && grep -n "enum Palette\\|struct Palette\\|var palette\\|extension EnvironmentValues" Sources/Nice/Theme/Palette.swift | head; echo "---"; sed 
+36	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowChrome.swift [edit]
+37	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowChrome.swift
+38	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowChrome.swift [edit]
+39	Bash	cd /Users/nick/Projects/nice && git worktree list
+40	EnterWorktree	{"path":"/Users/nick/Projects/nice/.claude/worktrees/ab-swift"}
+41	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowChrome.swift [edit]
+42	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+43	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift
+44	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+45	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+46	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+47	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+48	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+49	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/Chrome/ChromeEventRouter.swift [edit]
+50	Write	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowStatusBarView.swift [write]
+51	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift
+52	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift [edit]
+53	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/AppShellView.swift [edit]
+54	Read	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Tests/NiceUnitTests/ChromeEventRouterTests.swift
+55	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Tests/NiceUnitTests/ChromeEventRouterTests.swift [edit]
+56	Write	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Tests/NiceUnitTests/WindowStatusBarTests.swift [write]
+57	Bash	grep -n "SWIFT_VERSION\\|StrictConcurrency\\|SWIFT_STRICT\\|settings:" project.yml | head; echo "---existing static DateFormatter precedent---"; grep -rn "DateFormatter\\|ISO8601" Sources/Nice --inclu
+58	Edit	/Users/nick/Projects/nice/.claude/worktrees/ab-swift/Sources/Nice/Views/WindowStatusBarView.swift [edit]
+59	Bash	scripts/worktree-lock.sh acquire install && scripts/install.sh 2>&1 | tail -40; status=$?; scripts/worktree-lock.sh release; exit $status
+60	Bash	grep -rn "maxY\\|dy: 1\\.0\\|dy: 0\\.9[5-9]\\|bottomTrailing\\|driftBanner" UITests/*.swift | grep -v "^Binary" | head -20
+61	Read	/private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/b7vnt07ho.output
+62	Bash	scripts/worktree-lock.sh status 2>&1; scripts/worktree-lock.sh release 2>&1; scripts/worktree-lock.sh status 2>&1
+63	Bash	open "/Applications/Nice Dev.app" && sleep 4 && ~/.claude/skills/nice-process-check/check.sh 2>/dev/null || ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$)' | grep -v grep
+64	Bash	osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1'
+65	Bash	mkdir -p /tmp/nice-statusbar && screencapture -x -R141,242,900,450 /tmp/nice-statusbar/full.png && screencapture -x -R141,642,900,50 /tmp/nice-statusbar/bottom.png && ls -la /tmp/nice-statusbar/
+66	Read	/tmp/nice-statusbar/full.png
+67	Bash	osascript -e 'tell application "Nice Dev" to activate' && sleep 1 && screencapture -x -R141,242,900,450 /tmp/nice-statusbar/full2.png && screencapture -x -R141,652,900,40 /tmp/nice-statusbar/bottom2.p
+68	Read	/tmp/nice-statusbar/full2.png
+69	Write	/tmp/nice-statusbar/mouse.swift [write]
+70	Bash	cd /tmp/nice-statusbar && swiftc -O mouse.swift -o mouse 2>&1 | head -5; ls -la mouse; defaults read -g AppleActionOnDoubleClick 2>&1
+71	Bash	cd /tmp/nice-statusbar && before=$(osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1') && echo "before: $before" && ./mouse drag 591 678 671
+72	Bash	cd /tmp/nice-statusbar && before=$(osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1') && echo "before: $before" && ./mouse drag 249 623 329
+73	Bash	cd /tmp/nice-statusbar && echo -n "sentinel" | pbcopy && ./mouse click 249 623 && screencapture -x -R214,597,450,40 copied.png && sleep 0.3 && echo "pasteboard: [$(pbpaste)]"
+74	Read	/tmp/nice-statusbar/copied.png
+75	Bash	cd /tmp/nice-statusbar && before=$(osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1') && echo "before: $before" && ./mouse dblclick 664 623
+76	Bash	cd /tmp/nice-statusbar && ./mouse dblclick 700 942 && sleep 1 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1'
+77	Bash	cd /tmp/nice-statusbar && ./mouse dblclick 1077 623 && sleep 1 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1' && ./mouse drag 1077 62
+78	Bash	cd /tmp/nice-statusbar && ./mouse drag 994 213 934 273 && sleep 0.5 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position, size} of window 1'
+79	Bash	cd /tmp/nice-statusbar && screencapture -x -R214,187,900,60 topbar.png
+80	Read	/tmp/nice-statusbar/topbar.png
+81	Bash	osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' && osascript -e 'tell application "Nice Dev" to activate' && sleep 1 && osascript -e 'tell applicat
+82	Bash	cd /tmp/nice-statusbar && echo "== clock dblclick ==" && ./mouse dblclick 1077 623 && sleep 0.8 && osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 
+83	Bash	osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'; cd /tmp/nice-statusbar && echo "== clock drag ==" && ./mouse drag 1077 623 1030 580 && sleep 0.5 &
+84	Bash	osascript -e 'tell application "System Events" to tell process "gpui-term" to get {position, size} of every window' ; osascript -e 'tell application "System Events" to get name of every process whose 
+85	Bash	for i in 1 2 3 4 5 6; do osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'; sleep 1; done; ps -Aww -o pid=,pcpu=,args= | grep -i "gpui-term" | grep -
+86	Bash	for i in $(seq 1 48); do if ! ps -Aww -o args= | grep -E '^target/debug/gpui-term' >/dev/null && ! ps -Aww -o args= | grep -E 'target/debug/gpui-term$' >/dev/null; then echo "gpui-term exited after ~$
+87	Bash	scripts/worktree-lock.sh acquire test && { scripts/test.sh -only-testing:NiceUnitTests 2>&1 | tail -30; rc=$?; scripts/worktree-lock.sh release; exit $rc; }
+88	Bash	head -3 /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/bvsijx26g.output; osascript -e 'tell application "Nice 
+89	Bash	cd /tmp/nice-statusbar && echo "== clock dblclick (expect NO zoom) ==" && ./mouse dblclick 1077 623 && sleep 0.8 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {po
+90	Bash	cd /tmp/nice-statusbar && echo "== clock press-drag (expect NO move) ==" && ./mouse drag 1077 623 1030 580 && sleep 0.5 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to 
+91	Bash	cd /tmp/nice-statusbar && echo "== top-bar empty drag (expect move) ==" && ./mouse drag 994 213 934 273 && sleep 0.5 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get
+92	Bash	cd /tmp/nice-statusbar && echo "== pill click (window must not move; pane selected) ==" && ./mouse click 514 268 && sleep 0.5 && osascript -e 'tell application "System Events" to tell process "Nice De
+93	Read	/tmp/nice-statusbar/after-typing.png
+94	Bash	tail -20 /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/bhac3frb3.output
+95	Bash	grep -E "WindowStatusBarTests|widget_" /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/bhac3frb3.output | grep 
+96	Bash	grep -E "Abbreviate|widgetOverStrip|widget_singleClick|widget_doubleClick" /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4
+97	Bash	grep -cE "Test Case.*passed" /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/bhac3frb3.output; grep -E "ChromeE
+98	Bash	scripts/worktree-lock.sh acquire test && { scripts/test.sh -only-testing:NiceUITests/WindowDragUITests -only-testing:NiceUITests/TearOffHookUITests -only-testing:NiceUITests/PaneReorderUITests 2>&1 | 
+99	Bash	git status --short && git diff --stat
+100	Bash	git diff project.yml
+101	Bash	sleep 90; tail -5 /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/btea67nc8.output 2>/dev/null; echo "---"; ps 
+102	Bash	git diff Sources/Nice/Views/Chrome/ChromeEventRouter.swift Sources/Nice/Views/AppShellView.swift
+103	Bash	until ! kill -0 $(cat /dev/null; echo 0) 2>/dev/null || [ -n "$(tail -1 /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc
+104	Bash	grep -E "Test Case.*(passed|failed)|Test Suite.*(passed|failed)|TEST (SUCCEEDED|FAILED)|Executed" /private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd
+105	Read	/private/tmp/claude-501/-Users-nick-Projects-nice--claude-worktrees-rewrite-spikes-phase0-poc/94102acd-7c6d-49ee-a00a-3c3d9c4bfc4e/tasks/btea67nc8.output
+106	Bash	osascript -e 'tell application "Nice Dev" to quit' 2>/dev/null; sleep 2; ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$)' | grep -v grep; echo "quit done"
+107	Bash	ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$)' | grep -v grep; echo "---"; scripts/worktree-lock.sh status
+108	Bash	osascript -e 'tell application "Nice Dev" to quit'; ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$)' | grep -v grep || echo "Nice Dev not running"
+109	Bash	osascript <<'EOF'\ntell application "System Events"\n    tell process "Nice Dev"\n        set frontmost to true\n        delay 0.5\n        if (count of windows) > 0 then\n            repeat with w in
+110	Bash	osascript <<'EOF'\ntell application "System Events"\n    tell process "Nice Dev"\n        set out to ""\n        repeat with w in windows\n            set out to out & "WINDOW: " & (name of w as text)
+111	Bash	osascript <<'EOF'\ntell application "System Events"\n    tell process "Nice Dev"\n        repeat with w in windows\n            if (subrole of w as text) is "AXDialog" then\n                set out to
+112	Bash	osascript <<'EOF'\ntell application "System Events"\n    tell process "Nice Dev"\n        repeat with w in windows\n            if (subrole of w as text) is "AXDialog" then\n                repeat wit
+113	Bash	scripts/worktree-lock.sh acquire test && scripts/test.sh -only-testing:NiceUITests/WindowDragUITests -only-testing:NiceUITests/TearOffHookUITests -only-testing:NiceUITests/PaneReorderUITests > /tmp/ni
+114	Bash	until grep -qE "TEST (SUCCEEDED|FAILED)" /tmp/nice-statusbar/uitest2.log 2>/dev/null; do sleep 15; done; grep -E "Test Case.*(passed|failed)" /tmp/nice-statusbar/uitest2.log | sed 's/^Test Case .-.Nic
+115	Bash	grep -E "Failed to initialize|automation mode|Test Case|Testing failed" /tmp/nice-statusbar/uitest2.log | head -10
+116	Bash	ps -Aww -o pid=,args= | grep -iE "testmanagerd|UITests-Runner|XCTRunner" | grep -v grep
+117	Bash	kill 41909 2>/dev/null; sleep 1; ps -Aww -o pid=,args= | grep testmanagerd | grep -v grep || echo "testmanagerd stopped (will relaunch on demand)"
+118	Bash	kill -9 41909 2>/dev/null; sleep 2; ps -Aww -o pid=,args= | grep testmanagerd | grep -v grep || echo "testmanagerd gone"; launchctl print system/com.apple.testmanagerd 2>/dev/null | head -5
+119	Bash	scripts/worktree-lock.sh acquire test && scripts/test.sh -only-testing:NiceUITests/WindowDragUITests -only-testing:NiceUITests/TearOffHookUITests -only-testing:NiceUITests/PaneReorderUITests > /tmp/ni
+120	Bash	until grep -qE "TEST (SUCCEEDED|FAILED)" /tmp/nice-statusbar/uitest3.log 2>/dev/null; do sleep 15; done; echo "=== test cases ==="; grep -E "Test Case.*(passed|failed)" /tmp/nice-statusbar/uitest3.log
+121	Bash	DevToolsSecurity -status 2>&1; echo "---"; screencapture -x /tmp/nice-statusbar/screen.png && sips -g pixelWidth -g pixelHeight /tmp/nice-statusbar/screen.png | tail -2
+122	Read	/tmp/nice-statusbar/screen.png
+123	Bash	osascript <<'EOF'\ntell application "System Events"\n    repeat with p in (every process whose name contains "SecurityAgent" or name contains "coreautha" or name contains "LocalAuthentication")\n     
+124	Bash	ps -Aww -o pid=,args= | grep -E "gpui-term" | grep -v grep || echo "gpui-term not running"; open -a "Nice Dev" --args --uitest-tearoff-hook && sleep 4 && osascript -e 'tell application "System Events"
+125	Bash	cd /tmp/nice-statusbar && echo "windows before:" && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get count of windows' && ./mouse click 3096 861 && sleep 3 && echo "win
+126	Bash	osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position of window 1, size of window 1}' && osascript -e 'tell application "System Events" to tell process "Nice Dev" 
+127	Bash	screencapture -x -R2208,483,1470,923 /tmp/nice-statusbar/win1.png && screencapture -x -R2179,454,900,450 /tmp/nice-statusbar/win2.png && echo captured
+128	Read	/tmp/nice-statusbar/win1.png
+129	Read	/tmp/nice-statusbar/win2.png
+130	Bash	osascript <<'EOF'\ntell application "System Events"\n    tell process "Nice Dev"\n        set out to (count of windows) as text\n        repeat with i from 1 to (count of windows)\n            set out
+131	Bash	osascript -e 'tell application "System Events" to tell process "Nice Dev" to set position of window 1 to {1480, 40}' && sleep 0.5 && screencapture -x -R2179,454,900,470 /tmp/nice-statusbar/win2b.png &
+132	Read	/tmp/nice-statusbar/win2b.png
+133	Bash	osascript -e 'tell application "Nice Dev" to quit' 2>/dev/null; sleep 1\nosascript <<'EOF' 2>/dev/null\ntell application "System Events"\n    tell process "Nice Dev"\n        repeat with w in windows\
+134	Bash	rm -rf /tmp/nice-fakehome && mkdir -p "/tmp/nice-fakehome/Library/Application Support" && cd /tmp/nice-statusbar && HOME=/tmp/nice-fakehome NICE_APPLICATION_SUPPORT_ROOT="/tmp/nice-fakehome/Library/Ap
+135	Bash	sleep 4; osascript -e 'tell application "System Events" to tell process "Nice Dev" to get count of windows'; osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position 
+136	Bash	ps -Aww -o pid=,args= | grep -E 'Nice Dev' | grep -v grep; osascript -e 'tell application "Nice Dev" to activate' 2>&1; sleep 2; osascript -e 'tell application "System Events" to tell process "Nice De
+137	Bash	tail -30 /tmp/nice-statusbar/app.log; screencapture -x /tmp/nice-statusbar/screen2.png && sips -Z 1400 /tmp/nice-statusbar/screen2.png --out /tmp/nice-statusbar/screen2-small.png >/dev/null && echo ok
+138	Read	/tmp/nice-statusbar/screen2-small.png
+139	Bash	kill 17062 && sleep 1; ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$)' | grep -v grep || echo "no Nice Dev running"; open -a "Nice Dev" && sleep 4 && osascript -e 'tell a
+140	Bash	cd /tmp/nice-statusbar && echo "== top-bar dblclick (expect zoom) ==" && ./mouse dblclick 2959 480 && sleep 1.2 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {pos
+141	Bash	cd /tmp/nice-statusbar && ./mouse dblclick 4710 56 && sleep 1.2 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position of window 1, size of window 1}' && echo "=
+142	Bash	cd /tmp/nice-statusbar && ./mouse click 2974 535 && sleep 1.5 && screencapture -x -R2105,509,900,60 toolbar2.png && echo ok
+143	Read	/tmp/nice-statusbar/toolbar2.png
+144	Bash	cd /tmp/nice-statusbar && ./mouse drag 2785 535 2455 535 && sleep 1.5 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {position of window 1, size of window 1}' && s
+145	Read	/tmp/nice-statusbar/toolbar3.png
+146	Write	/tmp/nice-statusbar/slowdrag.swift [write]
+147	Bash	cd /tmp/nice-statusbar && swiftc -O slowdrag.swift -o slowdrag && ./slowdrag 2785 535 2470 535 && sleep 1.5 && osascript -e 'tell application "System Events" to tell process "Nice Dev" to get {positio
+148	Read	/tmp/nice-statusbar/toolbar4.png
+149	Bash	osascript -e 'tell application "Nice Dev" to quit' 2>/dev/null; sleep 1\nosascript <<'EOF' 2>/dev/null\ntell application "System Events"\n    tell process "Nice Dev"\n        repeat with w in windows\
+150	Bash	ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$)' | grep -v grep || echo "Nice Dev not running"
+151	Bash	osascript -e 'tell application "System Events" to tell process "Nice Dev" to get subrole of every window' 2>&1
+152	Bash	osascript -e 'tell application "System Events" to tell process "Nice Dev" to click button "Quit" of window 1' 2>&1; sleep 2; ps -Aww -o pid=,args= | grep -E 'Nice Dev\\.app/Contents/MacOS/Nice Dev( |$
+153	Bash	git status --short; echo "---lock---"; scripts/worktree-lock.sh status; echo "---swift files compile stamp---"; git diff --stat | tail -3
