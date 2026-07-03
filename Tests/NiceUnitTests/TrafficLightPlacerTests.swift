@@ -206,4 +206,88 @@ final class TrafficLightPlacerTests: XCTestCase {
                        "settled y must not drift on a redundant frame event")
         placer.stop()
     }
+
+    // MARK: - (f) Pin toggle: inline placement + state
+
+    func testPinSitsOnePitchRightOfZoomOnSharedRow() throws {
+        let window = makeHiddenTitleBarWindow()
+        let placer = TrafficLightPlacer(window: window)
+        placer.start()
+        spinRunLoop()
+
+        let miniButton = try XCTUnwrap(window.standardWindowButton(.miniaturizeButton))
+        let zoomButton = try XCTUnwrap(window.standardWindowButton(.zoomButton))
+        let mini = try windowX(of: miniButton)
+        let zoom = try windowX(of: zoomButton)
+        let pitch = zoom - mini
+
+        // Parented into the lights' superview so it shares their space.
+        let pin = placer.pinButton
+        XCTAssertNotNil(pin.superview, "pin should be parented into the chrome")
+        XCTAssertFalse(pin.isHidden, "pin should be visible in windowed mode")
+
+        // One native pitch to zoom's right — the same gap the lights keep.
+        XCTAssertEqual(try windowX(of: pin), zoom + pitch, accuracy: 0.5,
+                       "pin should sit one native inter-button pitch right of zoom")
+        // Shares the absolute 26pt-from-top top-bar row.
+        XCTAssertEqual(try centerFromTop(of: pin, in: window),
+                       WindowChrome.trafficLightCenterFromTop, accuracy: 0.5,
+                       "pin should share the 26pt-from-top row with the lights")
+        // Matches zoom's size (a fourth light).
+        XCTAssertEqual(pin.frame.width, zoomButton.frame.width, accuracy: 0.5,
+                       "pin width should match the zoom button")
+        XCTAssertEqual(pin.frame.height, zoomButton.frame.height, accuracy: 0.5,
+                       "pin height should match the zoom button")
+        placer.stop()
+    }
+
+    func testPinHoldsPlacementAcrossResizeAndRefocus() throws {
+        let window = makeHiddenTitleBarWindow()
+        let placer = TrafficLightPlacer(window: window)
+        placer.start()
+        spinRunLoop()
+
+        let zoomButton = try XCTUnwrap(window.standardWindowButton(.zoomButton))
+        let miniButton = try XCTUnwrap(window.standardWindowButton(.miniaturizeButton))
+        let expectedPitch = try windowX(of: zoomButton) - (try windowX(of: miniButton))
+
+        // Resize taller: the absolute y target keeps the pin on the 26pt row.
+        window.setContentSize(NSSize(width: 900, height: 720))
+        NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
+        spinRunLoop()
+        XCTAssertEqual(try centerFromTop(of: placer.pinButton, in: window),
+                       WindowChrome.trafficLightCenterFromTop, accuracy: 0.5,
+                       "pin should stay on the 26pt row after a resize")
+        XCTAssertEqual(try windowX(of: placer.pinButton),
+                       (try windowX(of: zoomButton)) + expectedPitch, accuracy: 0.5,
+                       "pin should stay one pitch right of zoom after a resize")
+
+        // Refocus (didBecomeKey) re-resolves + re-applies; the pin holds.
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        spinRunLoop()
+        XCTAssertEqual(try windowX(of: placer.pinButton),
+                       (try windowX(of: zoomButton)) + expectedPitch, accuracy: 0.5,
+                       "pin should stay one pitch right of zoom after refocus")
+        placer.stop()
+    }
+
+    func testPinToggleFlipsActiveState() {
+        let pin = ChromePinButton()
+        XCTAssertFalse(pin.isActive, "pin starts inactive")
+        pin.performClick(nil)
+        XCTAssertTrue(pin.isActive, "click activates the pin")
+        pin.performClick(nil)
+        XCTAssertFalse(pin.isActive, "second click deactivates the pin")
+    }
+
+    func testStopRemovesPinFromChrome() throws {
+        let window = makeHiddenTitleBarWindow()
+        let placer = TrafficLightPlacer(window: window)
+        placer.start()
+        spinRunLoop()
+        XCTAssertNotNil(placer.pinButton.superview, "precondition: pin is parented")
+
+        placer.stop()
+        XCTAssertNil(placer.pinButton.superview, "stop() must remove the pin from the chrome")
+    }
 }
