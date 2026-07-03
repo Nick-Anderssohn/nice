@@ -15,6 +15,7 @@ resolver = "2"
 members = [
     "crates/nice",
     "crates/nice-harness",
+    "crates/nice-theme",
 ]
 exclude = ["vendor"]
 

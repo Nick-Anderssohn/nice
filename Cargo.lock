@@ -3085,6 +3085,7 @@ dependencies = [
  "gpui_macos",
  "gpui_platform",
  "nice-harness",
+ "nice-theme",
  "objc2 0.6.4",
  "raw-window-handle",
 ]
@@ -3098,6 +3099,10 @@ dependencies = [
  "image",
  "mach2 0.4.3",
 ]
+
+[[package]]
+name = "nice-theme"
+version = "0.1.0"
 
 [[package]]
 name = "no_std_io2"

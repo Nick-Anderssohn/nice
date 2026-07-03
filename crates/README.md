@@ -19,6 +19,8 @@ stale.
 crates/
   nice           — the app binary (GPUI). Process name `nice-rs`.
   nice-harness   — measurement + self-test library. No app logic lives here.
+  nice-theme     — design tokens as pure data (palettes, accents, typography,
+                   chrome geometry). No gpui dependency.
 ```
 
 ### `crates/nice` (bin `nice-rs`)
@@ -67,6 +69,65 @@ The measurement + self-test library every later cycle reuses. Modules:
 - `selftest` — the `NICE_RS_SELFTEST` driver + `all` suite runner, and the
   `Scenario` registry later cycles extend (see "Self-test scenarios" below).
 
+### `crates/nice-theme` (lib)
+
+Nice's design system ported to **pure Rust data** — no behavior, no UI, and
+**no `gpui` dependency** (it mirrors today's pure-Swift design code; see the
+"Layering rule" below). Everything is ported verbatim from the Swift sources
+and pinned by literal-equality tests that cite their Swift provenance (see
+"Fixture-provenance convention" below). Modules:
+
+- `color` — `Srgba`, the plain gamma-encoded sRGB value type the palette
+  tables use (`f32` channels, same representation gpui's `Rgba` uses so the R9
+  adapter converts losslessly).
+- `palette` — the chrome palettes from `Sources/Nice/Theme/Palette.swift`.
+  Structured exactly as today's model has them (no invented variants): `Nice`
+  and `MacOs` accept either scheme; `CatppuccinLatte` is light-only and
+  `CatppuccinMocha` dark-only (`Palette.matches(scheme:)`). Slot names mirror
+  `Palette.swift`'s slots (`background`, `ink`, `line`, …), not SwiftUI view
+  names. Nice/Catppuccin slots carry precomputed sRGB literals; the `MacOs`
+  table carries `SystemColor` NSColor roles that resolve dynamically against
+  the pinned `NSApp.appearance` at paint time (so it has one scheme-independent
+  literal table). `slots(palette, scheme)` returns the table for a valid pair
+  or `None` for the two off-scheme Catppuccin combos.
+- `accent` — `AccentPreset` (terracotta / ocean / fern / iris / graphite) from
+  `Sources/Nice/State/Tweaks.swift`. The `#rrggbb` hex is the source of record;
+  `.color()` derives sRGB from it the way Swift's `Color(hex:)` does. Also the
+  selection-tint alpha ratios (14% light / 22% dark).
+- `typography` — the three font *aliases* (`niceUI`, `niceMono`,
+  `niceMonoSmall`) from `Sources/Nice/Theme/Typography.swift` as
+  `(text-style, design)` data. Font *resolution* (family chain, point size) is
+  R7's job, not recorded here.
+- `chrome_geometry` — every chrome magic number the R9–R11 plans need, named
+  once: top-bar height (52), sidebar default 240 + resize clamp 160–480,
+  traffic-light offsets, card corner radii / inset / shadow, from
+  `WindowChrome.swift` and `AppShellView.swift`.
+
+The tiny adapter from these plain types into gpui color types lives downstream
+(`crates/nice`, R9), NOT here — that is what keeps this crate gpui-free and
+unit-testable by plain arithmetic.
+
+#### Fixture-provenance convention
+
+`nice-theme` is a **verbatim port** of the Swift design system, so every ported
+literal must stay traceable to its source. The convention every current and
+future token in this crate follows:
+
+- **Every ported literal cites its Swift source line** in a trailing comment,
+  e.g. `Srgba::rgb(0.080, 0.066, 0.055), // Palette.swift:81`.
+- **Tests are literal equality against fixtures, and each fixture repeats the
+  Swift citation.** The expected value in a test is an *independent*
+  transcription from the cited Swift line (double-entry bookkeeping): a
+  fat-fingered literal in either the token table or the fixture fails the
+  build. To audit, open the cited Swift line and confirm the value matches.
+- **One documented exception:** the macOS-26 native traffic-light defaults
+  (`MACOS26_TRAFFIC_LIGHT_LEADINGS` / `_PITCH` in `chrome_geometry`) are
+  OS-owned *runtime* values the Swift code deliberately does not hardcode, so
+  they cite the project-memory note
+  `reference_traffic_light_geometry_macos26` instead of a Swift line. They are
+  documentary (R9 must still read each button's live default), and this is the
+  only place a citation points somewhere other than a Swift source line.
+
 ## Layering rule
 
 **Crates that mirror today's pure-Swift model code must not depend on
@@ -74,9 +135,11 @@ The measurement + self-test library every later cycle reuses. Modules:
 reason about (`../notes/chrome-pain-catalog-20260702.md` §2), and the rewrite
 means to keep it. `nice-harness` is not one of those crates — it is
 inherently a gpui/measurement library (it drives and inspects real gpui
-windows) — so it depends on `gpui` directly. When a later cycle adds a model
-crate (parsing, session state, config, anything that doesn't paint pixels),
-it must NOT gain a `gpui` dependency; if it needs to talk to the UI layer,
+windows) — so it depends on `gpui` directly. `nice-theme` **is** one of those
+crates — the first — and carries no `gpui` dependency (its color→gpui adapter
+lives downstream in `crates/nice`). When a later cycle adds another model crate
+(parsing, session state, config, anything that doesn't paint pixels), it must
+likewise NOT gain a `gpui` dependency; if it needs to talk to the UI layer,
 that's a sign the boundary belongs in `crates/nice` instead.
 
 ## All-Rust rule
@@ -150,7 +213,7 @@ sixel-image/sixel-tokenizer).
 | Env var | Effect |
 |---|---|
 | `NICE_RS_SELFTEST=<scenario>` | Run one named scenario. Prints exactly `SELFTEST PASS <scenario>` and exits 0 on success, or `SELFTEST FAIL <scenario>` (+ a detail line on stderr) and exits nonzero on failure. |
-| `NICE_RS_SELFTEST=all` | Run every registered scenario sequentially. Prints a PASS/FAIL table, exits nonzero if any scenario failed. This is the standing UI regression gate — every later plan's validation re-runs it, so a later cycle cannot silently break an earlier scenario. |
+| `NICE_RS_SELFTEST=all` | Run every registered scenario sequentially. Prints a PASS/FAIL table, exits nonzero if any scenario failed. This is the standing UI regression gate — every later plan's validation re-runs it, so a later cycle cannot silently break an earlier scenario. **Requires building with `--features selftest`:** at least one registered scenario (`tokens`) reads pixels back through `Window::render_to_image()`, which is gated behind that feature, so without it the suite FAILs (see "Screenshot capture" below). |
 | `NICE_RS_SELFTEST_SECS=<f64>` | Override the per-scenario measurement window (default 2.5s). Applies after a fixed 0.5s warm-up that's always discarded. |
 | `NICE_RS_CAPTURE=<path>` | Additionally write a PNG of each scenario's window to `<path>`. Requires building `crates/nice` with `--features selftest` (see "Screenshot capture" below) — without it, capture is a hard error, not a silent no-op. |
 
@@ -167,6 +230,7 @@ the window, and moves to the next scenario.
 | Name | What it exercises |
 |---|---|
 | `smoke` | Opens the window, drives continuous animated repaint via `request_animation_frame`, and asserts frame-cadence sanity (`p95 < 2× median` interval, at least 30 sampled frames). The minimal "the window opens and paints at a sane cadence" gate. |
+| `tokens` | Renders a deterministic swatch grid from the `nice-theme` design tokens (every Nice/Dark palette slot plus the five accents), then reads each swatch centre back through `Window::render_to_image()` and asserts it matches the token's sRGB value within ±8/255 per channel — proving the tokens survive gpui's fill pipeline + Metal compositing, not just unit arithmetic. The pixel read-back needs the `selftest` feature (same `render_to_image` path as `NICE_RS_CAPTURE`); without it the scenario FAILs. The scenario samples pixels and hard-exits nonzero on mismatch itself — the `Scenario` shape and driver are unchanged (no post-capture hook). |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
 `crates/nice/src/app.rs`'s `selftest_scenarios()` — the driver, reducer,
@@ -235,11 +299,16 @@ From the repo root, on a Mac with a GUI session (the app window must become
 frontmost — see above):
 
 ```sh
-# one scenario
+# one scenario — smoke needs no feature; a scenario that reads pixels back
+# (e.g. tokens) requires --features selftest, or it FAILs (see the scenario
+# table above)
 NICE_RS_SELFTEST=smoke cargo run -p nice
+NICE_RS_SELFTEST=tokens cargo run -p nice --features selftest
 
-# the full regression suite
-NICE_RS_SELFTEST=all cargo run -p nice
+# the full regression suite — --features selftest is required because at least
+# one registered scenario (tokens) reads pixels back through render_to_image;
+# without it the suite FAILs, exit nonzero
+NICE_RS_SELFTEST=all cargo run -p nice --features selftest
 
 # with a screenshot capture (needs the selftest feature)
 NICE_RS_SELFTEST=smoke NICE_RS_CAPTURE=/tmp/nice-rs-smoke.png \

@@ -1,0 +1,15 @@
+# nice-theme — Nice's design tokens ported to pure Rust data: the chrome
+# palettes (precomputed sRGB literals), accent presets, typography aliases, and
+# chrome geometry constants. Pure data — no behavior, no UI.
+#
+# Layering rule (crates/README.md "Layering rule"): this crate mirrors today's
+# pure-Swift design/model code, so it MUST NOT depend on gpui. Downstream crates
+# (crates/nice, R9 chrome) own the tiny adapter from these plain types into gpui
+# color types. Keeping nice-theme gpui-free is what makes the ported literals
+# testable by plain arithmetic, exactly like the Swift Palette/Tweaks they came
+# from. There is intentionally no `[dependencies]` table below.
+[package]
+name = "nice-theme"
+version = "0.1.0"
+edition = "2021"
+publish = false
