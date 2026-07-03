@@ -25,6 +25,16 @@ enum WindowChrome {
     /// and the zoom monitor's hit gate.
     static let topBarHeight: CGFloat = 52
 
+    /// Height in points of the custom BOTTOM status-bar band. The status
+    /// bar mirrors the top bar's role: `ChromeEventRouter` makes empty
+    /// (non-widget) pixels in this band behave like a native title bar
+    /// (drag to move, double-click to run the double-click action). Shared
+    /// so the SwiftUI frame that draws the bar and the router's hit gate
+    /// can't desync — a mismatch would either dead-spot part of the bar's
+    /// drag surface or let the router steal presses from the terminal just
+    /// above it.
+    static let statusBarHeight: CGFloat = 28
+
     // MARK: - Traffic-light geometry
 
     /// Horizontal offset `TrafficLightPlacer` applies to the native window

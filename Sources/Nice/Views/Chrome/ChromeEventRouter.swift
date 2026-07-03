@@ -32,6 +32,7 @@
 //
 //  CLASSIFICATION — class-walk PLUS an attribute-walk fallback. The hit
 //  view's ancestor chain is classified `PaneDragHosting` → `.pill`,
+//  `ChromeWidgetHosting` (a bottom status-bar widget) → `.widget`,
 //  `ChromeDragStripView` → `.strip`. The SIDEBAR strip resolves directly
 //  to its `ChromeDragStripView` marker. The TOOLBAR strip does NOT: it
 //  lives in a `.background` `ZStack` behind the toolbar's HStack, and
@@ -81,7 +82,11 @@ enum ChromeEventRouter {
     // MARK: - Pure decision (unit-tested)
 
     /// What the hit view's ancestor chain classified as, frontmost first.
-    enum HitKind { case pill, strip, other }
+    /// `.widget` is a status-bar widget (the cwd / clock views): like a
+    /// pill it OWNS its press and must never ride a window drag, but unlike
+    /// a pill it has no drag behaviour of its own — it just vetoes the
+    /// empty-chrome strip so a press/drag/click on it leaves the window put.
+    enum HitKind { case pill, widget, strip, other }
 
     /// The routing decision for a `.leftMouseDown`.
     enum Routing: Equatable {
@@ -112,6 +117,11 @@ enum ChromeEventRouter {
         // Pill owns its press — precedence over the strip even when both are
         // in the chain (a pill drawn on top of the strip background).
         if hitChain.contains(.pill) { return .passThrough }
+        // Status-bar widget owns its press the same way: a press/drag/click
+        // on the cwd or clock widget must never move the window, even though
+        // the widget sits on top of the status bar's empty-chrome strip.
+        // Precedence over `.strip`, mirroring the pill.
+        if hitChain.contains(.widget) { return .passThrough }
         if hitChain.contains(.strip) {
             return clickCount >= 2 ? .doubleClickAction : .armDrag
         }
@@ -172,12 +182,17 @@ enum ChromeEventRouter {
         guard let contentView = window.contentView else { return event }
 
         let isFullScreen = window.styleMask.contains(.fullScreen)
-        // Gate on the top chrome strip. `locationInWindow` has origin
-        // bottom-left, so `bounds.height - y` is the distance from the top
-        // edge. Sourced from the shared constant so the band can't desync
-        // from the chrome the rest of the layout draws.
+        // Gate on the two chrome strips — the top bar and the bottom status
+        // bar, each of which behaves like a native title bar (drag to move,
+        // double-click to act). `locationInWindow` has origin bottom-left,
+        // so `bounds.height - y` is the distance from the TOP edge and `y`
+        // itself is the distance from the BOTTOM edge. Both bands are sourced
+        // from the shared constants so a band can't desync from the chrome
+        // the rest of the layout draws.
         let yFromTop = contentView.bounds.height - event.locationInWindow.y
-        let inBand = yFromTop <= WindowChrome.topBarHeight
+        let inTopBand = yFromTop <= WindowChrome.topBarHeight
+        let inBottomBand = event.locationInWindow.y <= WindowChrome.statusBarHeight
+        let inBand = inTopBand || inBottomBand
         let chain = hitChain(in: contentView, at: event.locationInWindow)
 
         switch decision(
@@ -241,6 +256,14 @@ enum ChromeEventRouter {
         while let v = cursor {
             if v is PaneDragHosting {
                 chain.append(.pill)
+            } else if v is ChromeWidgetHosting {
+                // A status-bar widget host (cwd / clock). Classified before
+                // the `mouseDownCanMoveWindow` fallback below so the widget's
+                // own hosting view — which reports `mouseDownCanMoveWindow ==
+                // false` — is recognised as a widget, not missed. `.widget`
+                // has precedence over `.strip` in `decision`, so a press on
+                // the widget passes through and never moves the window.
+                chain.append(.widget)
             } else if v is ChromeDragStripView {
                 chain.append(.strip)
             } else if v.mouseDownCanMoveWindow && !(v is NSVisualEffectView) {

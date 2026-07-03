@@ -28,4 +28,18 @@ final class WindowToolbarDragRegionTests: XCTestCase {
             "ChromeDragStripView is a marker for the router's hit-test; native title-bar drag must stay OFF"
         )
     }
+
+    /// The status-bar widget host is the router's `.widget` marker: it must
+    /// conform to `ChromeWidgetHosting` and report `mouseDownCanMoveWindow ==
+    /// false` so the router's attribute-walk fallback never reclassifies a
+    /// widget press as the draggable empty-chrome strip.
+    func testWidgetHostOptsOutOfNativeDragAndIsMarker() {
+        let host = ChromeWidgetGuard<AnyView>.WidgetHostView(rootView: AnyView(Text("x")))
+        XCTAssertFalse(
+            host.mouseDownCanMoveWindow,
+            "widget host must opt out of native drag so the router treats it as a widget, not chrome"
+        )
+        // Compile-time proof that the host is the router's widget marker.
+        let _: ChromeWidgetHosting = host
+    }
 }

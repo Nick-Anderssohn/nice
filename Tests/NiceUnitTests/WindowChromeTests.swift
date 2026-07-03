@@ -19,6 +19,13 @@ final class WindowChromeTests: XCTestCase {
         XCTAssertEqual(WindowChrome.topBarHeight, 52)
     }
 
+    func test_statusBarHeight_is28() {
+        // The bottom status-bar band. Shared by the SwiftUI frame that draws
+        // the bar and `ChromeEventRouter`'s bottom-band hit gate, so they
+        // can't desync.
+        XCTAssertEqual(WindowChrome.statusBarHeight, 28)
+    }
+
     func test_trafficLightReservedWidth_matchesHistoricalValue() {
         XCTAssertEqual(WindowChrome.trafficLightReservedWidth, 82)
     }

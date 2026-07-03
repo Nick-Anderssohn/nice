@@ -326,6 +326,9 @@ private struct AppShellHost: View {
         .overlay(alignment: .bottom) {
             FileOperationDriftBanner(history: services.fileExplorer.history)
                 .animation(.easeInOut(duration: 0.18), value: services.fileExplorer.history.lastDriftMessage)
+                // Keep the transient banner clear of the bottom status bar
+                // so it floats above the chrome rather than overlapping it.
+                .padding(.bottom, WindowChrome.statusBarHeight)
         }
         .environment(\.palette, palette)
         // Each sub-model is injected separately so views downstream
@@ -612,10 +615,20 @@ private struct AppShellHost: View {
 
     @ViewBuilder
     private var shell: some View {
-        if appState.sidebar.sidebarCollapsed {
-            collapsedShell
-        } else {
-            expandedShell
+        VStack(spacing: 0) {
+            // The sidebar + toolbar + terminal fill the window above the
+            // status bar (mainContent expands with `maxHeight: .infinity`).
+            Group {
+                if appState.sidebar.sidebarCollapsed {
+                    collapsedShell
+                } else {
+                    expandedShell
+                }
+            }
+            // Full-width bottom status bar: cwd (left) + clock (right), with
+            // empty pixels behaving like a title bar (drag / double-click)
+            // via `ChromeEventRouter`'s bottom-band gate.
+            BottomStatusBarView()
         }
     }
 
