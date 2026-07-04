@@ -25,6 +25,12 @@ crates/
                    alacritty_terminal VT (grid/scrollback/damage) + the pane
                    session state machine (deferred spawn, events, held panes).
                    No gpui dependency.
+  nice-term-input— pure input layer (R5): keyboard encoder (kitty CSI-u +
+                   legacy VT fallback), VT mouse (X10/SGR/UTF-8),
+                   bracketed-paste wrap, option-as-meta config, and the IME
+                   marked-text state machine (the five G1 gating behaviours as
+                   pure transitions). Plain key/mouse structs in, bytes out;
+                   byte-exact unit tests. No gpui dependency.
   nice-term-view — the GPUI-native terminal renderer (R4): the core->GPUI
                    adapter entity (TerminalSessionHandle), the terminal-theme
                    value type, and the TerminalView/TerminalElement cell
@@ -42,11 +48,17 @@ The GPUI application. Structure (grows over later cycles):
   scenario windows (registered in `selftest_scenarios()`). `RootView` (the
   solid-background + version-line animated view) is now just the `smoke`
   scenario's root, no longer the shipped window.
-- `platform` — the single home for foreign AppKit / `objc2` access (see
-  "All-Rust rule" below). R1 holds exactly one thing here: the demand-present
-  kick (`present_kick`) plus the two present-timing facts that motivate it
-  (see the doc comment on that module — every later cycle adding
-  demand-driven repaint needs to know them).
+- `platform` — the single home for foreign AppKit / `objc2` / CoreGraphics
+  access (see "All-Rust rule" below): the demand-present kick (`present_kick`)
+  plus the two present-timing facts that motivate it (R1), the macOS keyCode
+  side-channel feeding the R5 keyboard encoder, and (R5) the CGEvent / `AXIsProcessTrusted`
+  / TIS-input-source FFI the live input scenarios drive — synthetic events are
+  posted **only** with `CGEventPostToPid` to nice-rs's own pid, never the global
+  HID tap.
+- `input_live` — the R5 live input self-test scenarios (`input-live` /
+  `input-shell`): real CGEvents posted to our own pid, byte-exact pty receipt,
+  the item-4 candidate anchor, and the IME go/no-go probe (see the scenario
+  table under "Self-test harness").
 - `main.rs` — dispatches on `NICE_RS_SELFTEST`: unset runs the normal app,
   set runs the self-test driver.
 
@@ -273,7 +285,13 @@ crates — the first — and carries no `gpui` dependency (its color→gpui adap
 lives downstream in `crates/nice`). `nice-term-core` (R3) is the second — the
 terminal session state + VT parsing carry no `gpui` dependency either; the
 renderer (R4) consumes it through a narrow API and the damage-wake callback.
-`nice-term-view` (R4) **is** a UI crate — like `nice-harness` it depends on
+`nice-term-input` (R5) is the third gpui-free model crate — the input encoders
+and the IME marked-text state machine are pure logic over plain key/mouse
+structs, deliberately kept out of `nice-term-view` (which links gpui) so the
+byte-exact encoder tests and the G1 IME-transition tests build without the gpui
+stack; the R5 event-edge (`nice-term-view/src/input.rs`) translates gpui events
+into these plain types at the boundary and hosts the platform `InputHandler`. `nice-term-view` (R4) **is** a UI crate —
+like `nice-harness` it depends on
 `gpui` directly (it is the renderer), so it is not one of the gpui-free model
 crates. When a later cycle adds another model crate (parsing, session state,
 config,
@@ -374,6 +392,8 @@ the window, and moves to the next scenario.
 | `term-layout` | The T4 row-quantized, bottom-anchored layout gate: resizes the window shorter than the grid and asserts (via capture) the bottom prompt row stays pinned at the bottom gap while the top rows clip under the chrome. |
 | `term-scroll` | The scrollback scroll + park/snap gate: feeds >1 screen of numbered lines into an echo-off `cat`, then asserts (via the core's display offset + visible snapshot) parked-at-bottom, offset-3 after scroll-up, no auto-snap while scrolled, and snap-to-bottom resuming. |
 | `term-perf` | The streaming frame-time + memory budget gate (Validation §5). Floods a live ~120×40 pane (scrollback 10 000) with 15 s of the deterministic `nice_harness::workload` synthetic stream through a raw-mode `cat` while the RAF-animated `TerminalView` stamps frames; self-activates its window, reduces the frame stream to interval percentiles, samples memory, and gates on **absolute** frame times (p50 ≤ 17.5 ms, p95 ≤ 20 ms) plus the pane's own memory **growth** over its entry baseline (< 120 MiB) — a criterion the cadence-jitter gate can't express. (Growth, not absolute, because inside the `all` suite the process already carries ~140 MiB from the five prior scenarios' retained windows/atlas/readbacks; the absolute < 200 MiB "steady" budget is validated by the dedicated `NICE_RS_SELFTEST=term-perf` run — a fresh process, ≈142 MiB.) Runs up to 3 times, gates on the best run, prints the percentiles + memory in the transcript. Uses `Gate::SelfReported` (it runs its own measurement and posts the verdict). |
+| `input-live` | The R5 live keyboard/paste/IME-anchor gate (Validation §2–§4). Spawns a capture-tee session (`sh -c 'stty raw -echo; exec tee <cap>'`), posts **real CGEvents** to nice-rs's own pid (`crate::platform`, `CGEventPostToPid` — never the global HID tap), and asserts the bytes appended to the capture file match exactly: plain ASCII (rides the IME `insertText` path → pty), ⌘V paste with DECSET 2004 **off** (raw) then **on** (`ESC[200~…ESC[201~`), and arrow keys (`ESC[A/B/C/D`). Then the G1 **item-4 candidate anchor** is asserted programmatically — park the grid cursor mid-grid (CUP), drive a composition through the real `TermInputHandler`, and check `bounds_for_range` returns a rect at the grid-cursor cell (never `None`, the zed#46055 failure mode). Finally the **IME go/no-go probe** (TIS → Pinyin): if synthetic composition engages, items 1–3 + 5 are asserted mechanically; if not (plan-flagged UNPROVEN — and on this machine Pinyin is installed-but-not-enabled, so `TISSelectInputSource` refuses it), it records a **DEFERRED HUMAN PASS** (stderr checklist) rather than fail-looping. The user's keyboard input source is **always** restored (on `Drop`). Preflights `AXIsProcessTrusted()` and FAILs loudly (never silently skips) if the Accessibility grant is missing. `Gate::SelfReported` (byte-exact receipt, not cadence). |
+| `input-shell` | The R5 real-shell CGEvent sanity gate (Validation §5). A real `zsh -il` (user rc suppressed via an empty `ZDOTDIR`): polls the grid until the shell prints its prompt, then types `echo <marker>` + Enter entirely via CGEvents and asserts the marker appears ≥ 2× in the grid (the typed command echo **and** the command output), proving the whole path reaches a real login shell and its output round-trips. `Gate::SelfReported`. |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
 `crates/nice/src/app.rs`'s `selftest_scenarios()`. A `Cadence`-gated scenario
@@ -383,8 +403,10 @@ fixed window + asserts jitter sanity. A scenario whose pass criterion the jitter
 gate can't express (an absolute frame-time / memory budget, a multi-run best-of)
 declares `Gate::SelfReported { budget }`: it runs its own measurement in its
 `open` task and posts the verdict via `nice_harness::selftest::report_gate`, and
-the driver waits for it (up to `budget`) instead of measuring. `term-perf` is the
-first such scenario. **Keep this table in sync** — it's the map a future cycle
+the driver waits for it (up to `budget`) instead of measuring. `term-perf` was the
+first such scenario; the R5 `input-live` / `input-shell` scenarios also self-report
+(their pass criterion is byte-exact pty receipt from posted CGEvents, not cadence).
+**Keep this table in sync** — it's the map a future cycle
 (or a reconciler) reads to know what regression coverage already exists before
 adding more.
 

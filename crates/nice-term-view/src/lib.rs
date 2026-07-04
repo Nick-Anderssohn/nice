@@ -51,6 +51,8 @@
 
 pub mod color;
 pub mod element;
+pub mod input;
+pub mod mouse;
 pub mod session_handle;
 pub mod theme;
 pub mod view;
@@ -61,7 +63,8 @@ pub mod view;
 mod boxdraw;
 
 pub use color::{resolve_color, xterm256};
-pub use element::{TerminalElement, TerminalMetrics, TERMINAL_BOTTOM_GAP};
+pub use element::{grid_top_y, ImeInput, TerminalElement, TerminalMetrics, TERMINAL_BOTTOM_GAP};
+pub use input::{KeyCodeProbe, TermInputHandler};
 pub use session_handle::{PresentKick, TerminalEvent, TerminalSessionHandle};
 pub use theme::{TerminalColor, TerminalTheme};
 pub use view::TerminalView;

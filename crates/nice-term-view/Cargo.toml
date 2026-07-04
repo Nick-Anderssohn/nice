@@ -27,6 +27,11 @@ gpui = { path = "../../vendor/zed/crates/gpui" }
 # The headless terminal core (R3): the `Session` this renderer drives and the
 # `SharedTerm` it locks briefly to read cells. No gpui leaks the other way.
 nice-term-core = { path = "../nice-term-core" }
+# The pure input layer (R5, slice 1): the kitty/legacy key encoder, the IME
+# marked-text state machine, and the option-as-meta config. The R5 event-edge
+# here (`input.rs`) translates gpui `Keystroke`/`KeyDownEvent` + the macOS
+# keyCode side-channel into these plain types and drives the encoder / IME.
+nice-term-input = { path = "../nice-term-input" }
 # Design tokens (R2): the accent `Srgba` the caret is painted in. Pure data.
 nice-theme = { path = "../nice-theme" }
 # The VT core, same pin as nice-term-core (workspace-locked, no new fetch): the

@@ -34,6 +34,9 @@
 //! Scroll offset is read from the core's display offset (line-quantized; the
 //! `TerminalSessionHandle` owns the wheel/trackpad stepping).
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint};
@@ -43,17 +46,38 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 
 use gpui::{
-    canvas, fill, point, prelude::*, px, rgb, size, App, Bounds, Canvas, ContentMask, Font,
-    FontFeatures, FontStyle, FontWeight, Hsla, PathBuilder, Pixels, Rgba, SharedString,
-    StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window,
+    canvas, fill, point, prelude::*, px, rgb, size, App, Bounds, Canvas, ContentMask, Entity,
+    FocusHandle, Font, FontFeatures, FontStyle, FontWeight, Hsla, PathBuilder, Pixels, Rgba,
+    SharedString, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window,
 };
 
 use nice_theme::Srgba;
 
 use crate::boxdraw::{self, apple_approx_coverage, Segment};
 use crate::color::resolve_color;
+use crate::input::TermInputHandler;
 use crate::session_handle::TerminalSessionHandle;
 use crate::theme::TerminalTheme;
+use crate::view::TerminalView;
+
+/// The R5 IME wiring the view hands to the element each frame: the focus handle
+/// + view entity the platform [`TermInputHandler`] is registered against during
+/// paint, plus the current preedit to paint inline at the grid cursor.
+///
+/// Threading this through the element (rather than a separate overlay) keeps the
+/// input-handler registration and the marked-text overlay on the exact grid
+/// geometry the element already computes — the candidate anchor
+/// (`bounds_for_range`) and the painted preedit then agree by construction.
+pub struct ImeInput {
+    /// The view's focus handle — the input handler is active only while it holds
+    /// focus (`window.handle_input`).
+    pub focus_handle: FocusHandle,
+    /// The view whose IME state the handler reads/drives.
+    pub view: Entity<TerminalView>,
+    /// `Some((preedit_text, selected_byte_range))` while composing; drives the
+    /// inline underline overlay + block-cursor suppression at the cursor cell.
+    pub preedit: Option<(SharedString, std::ops::Range<usize>)>,
+}
 
 /// Default selection tint used when the theme carries no `selection` colour
 /// (a neutral mid-grey). Themes ship an explicit value; this only guards the
@@ -121,11 +145,31 @@ struct CursorPaint {
 pub struct TerminalElement {
     rows: Vec<Vec<PaintCell>>,
     default_bg: u32,
+    /// The theme foreground, used as the inline preedit (marked-text) glyph color.
+    foreground: u32,
     cursor: Option<CursorPaint>,
     accent: Rgba,
     font_family: SharedString,
     font_px: f32,
     metrics: TerminalMetrics,
+    /// The R5 IME wiring: input-handler registration + inline preedit paint.
+    ime: ImeInput,
+    /// The cell the view reads for pixel→cell hit-testing in its mouse handlers.
+    /// Paint writes this frame's grid `bounds` into it (the same `bounds` the
+    /// candidate anchor and `grid_top_y` use), so the next mouse event hit-tests
+    /// against exactly what was painted. `Rc<Cell>` (not an entity re-borrow) so
+    /// paint never re-enters the view — see [`crate::view::TerminalView`].
+    paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+/// Y (logical px) of the top of grid row 0 under the bottom-anchored layout (T4)
+/// for element `bounds` holding `rows` grid rows. The grid's bottom edge is
+/// pinned at `bounds.bottom − TERMINAL_BOTTOM_GAP` and the top origin derived, so
+/// the value can be negative (grid taller than the view). Shared with the view's
+/// `bounds_for_range` anchor so the candidate window lands where the row paints.
+pub fn grid_top_y(bounds: Bounds<Pixels>, metrics: TerminalMetrics, rows: usize) -> f32 {
+    let grid_h = rows as f32 * metrics.cell_h;
+    f32::from(bounds.origin.y) + f32::from(bounds.size.height) - TERMINAL_BOTTOM_GAP - grid_h
 }
 
 impl TerminalElement {
@@ -144,8 +188,11 @@ impl TerminalElement {
         font_px: f32,
         metrics: TerminalMetrics,
         caret_solid: bool,
+        ime: ImeInput,
+        paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     ) -> Self {
         let default_bg = theme.background.to_u32();
+        let foreground = theme.foreground.to_u32();
         // Caret color: the theme's cursor override, else the accent token (R2)
         // — exactly `TerminalTheme.swift`'s "nil => caret follows accent".
         let accent_rgba = match theme.cursor {
@@ -174,11 +221,14 @@ impl TerminalElement {
         Self {
             rows,
             default_bg,
+            foreground,
             cursor,
             accent: accent_rgba,
             font_family,
             font_px,
             metrics,
+            ime,
+            paint_bounds,
         }
     }
 
@@ -189,12 +239,42 @@ impl TerminalElement {
         let TerminalElement {
             rows,
             default_bg,
+            foreground,
             cursor,
             accent,
             font_family,
             font_px,
             metrics,
+            ime,
+            paint_bounds,
         } = self;
+
+        // Publish this frame's grid bounds for the view's mouse hit-testing (read
+        // on the next mouse event). Same `bounds` the IME anchor + `grid_top_y`
+        // use, so a click resolves to the cell that was actually painted there.
+        paint_bounds.set(Some(bounds));
+
+        // Register the platform IME input handler for this frame (paint-phase
+        // only, active while our focus handle holds focus) — the ime-spike's
+        // `handle_input` pattern. `element_bounds` is this grid's bounds, so
+        // `bounds_for_range` can anchor the candidate window at the cursor cell.
+        let ImeInput {
+            focus_handle,
+            view,
+            preedit,
+        } = ime;
+        window.handle_input(
+            &focus_handle,
+            TermInputHandler {
+                view: view.clone(),
+                element_bounds: bounds,
+            },
+            cx,
+        );
+        // While composing, the inline preedit overlay stands in for the block
+        // cursor at the cursor cell (matching the ime-spike / Terminal.app).
+        let composing = preedit.is_some();
+
         let cw = metrics.cell_w;
         let ch = metrics.cell_h;
         let ox = bounds.origin.x;
@@ -203,10 +283,7 @@ impl TerminalElement {
         // resize (nothing is remembered). A grid taller than the view gets a
         // negative origin — its top rows fall above the view and the content mask
         // below clips them; a shorter grid leaves the theme-bg remainder on top.
-        let grid_h = rows.len() as f32 * ch;
-        let view_h: f32 = bounds.size.height.into();
-        let origin_y: f32 = bounds.origin.y.into();
-        let oy = px(origin_y + view_h - TERMINAL_BOTTOM_GAP - grid_h);
+        let oy = px(grid_top_y(bounds, metrics, rows.len()));
 
         // Clip to the element bounds so the sub-row remainder / over-tall grid is
         // hidden at the TOP, matching `TerminalContainerView` (Nice's Swift host).
@@ -239,20 +316,23 @@ impl TerminalElement {
                 }
             }
 
-            // Block cursor.
+            // Block cursor — suppressed while composing (the preedit overlay
+            // below stands in for it at the cursor cell).
             if let Some(cur) = &cursor {
-                let x = ox + px(cur.col as f32 * cw);
-                let y = oy + px(cur.row as f32 * ch);
-                if cur.solid {
-                    window.paint_quad(fill(
-                        Bounds {
-                            origin: point(x, y),
-                            size: size(px(cw), px(ch)),
-                        },
-                        accent,
-                    ));
-                } else {
-                    paint_hollow_cursor(window, x, y, cw, ch, accent);
+                if !composing {
+                    let x = ox + px(cur.col as f32 * cw);
+                    let y = oy + px(cur.row as f32 * ch);
+                    if cur.solid {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(x, y),
+                                size: size(px(cw), px(ch)),
+                            },
+                            accent,
+                        ));
+                    } else {
+                        paint_hollow_cursor(window, x, y, cw, ch, accent);
+                    }
                 }
             }
 
@@ -280,9 +360,13 @@ impl TerminalElement {
                     }
                     // A solid cursor covers its cell; skip the glyph so it does not
                     // paint over the block. Inverse-video caret text is a later slice.
-                    if let Some(cur) = &cursor {
-                        if cur.solid && cur.row == r && cur.col == c {
-                            continue;
+                    // (While composing the block is suppressed, so the glyph paints
+                    // and the preedit overlay lands on top.)
+                    if !composing {
+                        if let Some(cur) = &cursor {
+                            if cur.solid && cur.row == r && cur.col == c {
+                                continue;
+                            }
                         }
                     }
 
@@ -342,6 +426,70 @@ impl TerminalElement {
                     let x = ox + px(c as f32 * cw);
                     let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
                 }
+            }
+
+            // Inline preedit (marked text) overlay at the grid cursor cell. The
+            // IME composition never enters the grid model (G1 item 1). The whole
+            // preedit is underlined thin, the IME's selected sub-range underlined
+            // thick, with a composition caret at the selection start — and a
+            // subtle accent strip behind it so it reads as "not committed".
+            if let (Some((preedit_text, sel_bytes)), Some(cur)) = (&preedit, &cursor) {
+                let cur_x = ox + px(cur.col as f32 * cw);
+                let cur_y = oy + px(cur.row as f32 * ch);
+                let fg: Hsla = rgb(foreground).into();
+                let deco: Hsla = accent.into();
+                let underline = |thickness: f32| {
+                    Some(UnderlineStyle {
+                        thickness: px(thickness),
+                        color: Some(deco),
+                        wavy: false,
+                    })
+                };
+                let font = cell_font(font_family.clone(), false, false);
+                let seg = |len: usize, thick: bool| TextRun {
+                    len,
+                    font: font.clone(),
+                    color: fg,
+                    background_color: None,
+                    underline: underline(if thick { 2.0 } else { 1.0 }),
+                    strikethrough: None,
+                };
+                let len = preedit_text.len();
+                let start = sel_bytes.start.min(len);
+                let end = sel_bytes.end.min(len).max(start);
+                let runs: Vec<TextRun> = [
+                    seg(start, false),
+                    seg(end - start, true),
+                    seg(len - end, false),
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect();
+                let runs = if runs.is_empty() {
+                    vec![seg(len, false)]
+                } else {
+                    runs
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(preedit_text.clone(), px(font_px), &runs, None);
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: point(cur_x, cur_y),
+                        size: size(shaped.width, px(ch)),
+                    },
+                    deco.opacity(0.20),
+                ));
+                let _ = shaped.paint(point(cur_x, cur_y), px(ch), TextAlign::Left, None, window, cx);
+                let caret_x = cur_x + shaped.x_for_index(start);
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: point(caret_x, cur_y),
+                        size: size(px(2.0), px(ch)),
+                    },
+                    deco,
+                ));
             }
         });
     }

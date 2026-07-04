@@ -213,6 +213,16 @@ impl TerminalSessionHandle {
         }
     }
 
+    /// The current selection rendered to a `String` (alacritty's
+    /// `selection_to_string`), or `None` if there is no active selection / the
+    /// session has not spawned. This is the ⌘C copy source (R5): the view reads
+    /// it and writes it to the pasteboard via gpui's clipboard API.
+    pub fn selection_text(&self) -> Option<String> {
+        self.session
+            .term()
+            .and_then(|term_arc| term_arc.lock().selection_to_string())
+    }
+
     /// Scroll the viewport through scrollback by `delta_lines` (**positive =
     /// toward history / older output; negative = toward the bottom / newer**).
     ///

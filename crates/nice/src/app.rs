@@ -106,8 +106,9 @@ impl Render for RootView {
 }
 
 /// Fixed, sensible default window geometry + chrome defaults (real chrome is
-/// R9). Shared by the shipped window and every self-test scenario window.
-fn window_options() -> WindowOptions {
+/// R9). Shared by the shipped window and every self-test scenario window
+/// (including the R5 live-input scenarios in [`crate::input_live`]).
+pub(crate) fn window_options() -> WindowOptions {
     let bounds = Bounds {
         origin: point(px(160.0), px(160.0)),
         size: size(px(960.0), px(640.0)),
@@ -186,7 +187,7 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
         let theme = theme.clone();
         move |_window, cx| {
             cx.new(|cx| {
-                TerminalView::new(
+                let mut view = TerminalView::new(
                     handle,
                     theme,
                     accent,
@@ -194,7 +195,15 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
                     LIVE_FONT_PX,
                     TerminalMetrics::new(LIVE_CELL_W, LIVE_CELL_H),
                     cx,
-                )
+                );
+                // Wire the macOS keyCode side-channel so the R5 keyboard encoder
+                // can recover the layout-independent physical key. The sole objc2
+                // crossing for input lives in `crate::platform`, injected here
+                // like the present kick — `nice-term-view` stays objc2-free.
+                view.set_keycode_probe(std::sync::Arc::new(
+                    crate::platform::current_event_keycode,
+                ));
+                view
             })
         }
     })?;
@@ -880,7 +889,7 @@ impl Render for TermRenderView {
 /// CVDisplayLink is stopped — see `platform`). The objc2 lives in
 /// `crate::platform`; `nice-term-view` only receives the closure. R13 re-points
 /// this on a re-parent.
-fn install_present_kick(
+pub(crate) fn install_present_kick(
     handle: &Entity<TerminalSessionHandle>,
     window: AnyWindowHandle,
     cx: &mut impl AppContext,
@@ -1969,9 +1978,13 @@ fn term_perf_report(
 /// gate (R2), `term-render` is the renderer's deterministic color/cursor/
 /// attribute gate, `term-layout` is the T4 bottom-anchored layout gate,
 /// `term-scroll` is the scrollback scroll + park/snap gate, and `term-perf` is
-/// the streaming frame-time + memory budget gate (all R4). Every scenario but
-/// `term-perf` uses the standard cadence-jitter gate; `term-perf` self-reports an
-/// absolute p50/p95 + memory verdict its own way (see [`Gate::SelfReported`]).
+/// the streaming frame-time + memory budget gate (all R4). `input-live` /
+/// `input-shell` are the R5 live input scenarios (real CGEvents → byte-exact pty
+/// receipt + the IME candidate anchor + the IME go/no-go probe). The cadence
+/// scenarios use the standard jitter gate; `term-perf` and the two `input-*`
+/// scenarios self-report their own verdict (see [`Gate::SelfReported`]) — the
+/// input ones because their pass criterion is byte-exact pty receipt, not frame
+/// cadence.
 pub fn selftest_scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -2004,6 +2017,20 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             open: open_term_perf_window,
             gate: Gate::SelfReported {
                 budget: TP_REPORT_BUDGET,
+            },
+        },
+        Scenario {
+            name: "input-live",
+            open: crate::input_live::open_input_live_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(45),
+            },
+        },
+        Scenario {
+            name: "input-shell",
+            open: crate::input_live::open_input_shell_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(25),
             },
         },
     ]

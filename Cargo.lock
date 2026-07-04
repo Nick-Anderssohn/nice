@@ -3156,6 +3156,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nice-term-input"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.0",
+]
+
+[[package]]
 name = "nice-term-view"
 version = "0.1.0"
 dependencies = [
@@ -3163,6 +3170,7 @@ dependencies = [
  "anyhow",
  "gpui",
  "nice-term-core",
+ "nice-term-input",
  "nice-theme",
 ]
 

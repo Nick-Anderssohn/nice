@@ -1,0 +1,25 @@
+# nice-term-input — the pure, gpui-free input-encoding layer for the terminal
+# view (R5, slice 1). Keyboard (kitty CSI-u + legacy VT fallback), VT mouse
+# (X10 / SGR / UTF-8), the bracketed-paste wrap helper, and the option-as-meta
+# config value — every entry taking plain key/modifier structs, never gpui
+# types. The gpui `InputHandler`, the IME state machine, and the event-edge
+# translation live in later R5 slices (in `nice-term-view`) and depend on this
+# crate; nothing here reaches back into gpui.
+#
+# Layering rule (crates/README.md "Layering rule"): this is a pure-model crate
+# like `nice-term-core` and `nice-theme` — it MUST NOT depend on the GPUI UI
+# framework. Keeping the encoders in their own crate (rather than a module in
+# `nice-term-view`, which links gpui) means `cargo test` over the byte-exact
+# encoder matrix compiles none of the gpui stack: encoder tests stay fast and
+# genuinely headless. The lookup-table logic is independent of any window.
+[package]
+name = "nice-term-input"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The flag ladder (`KittyFlags`) and modifier/mouse bit sets are modelled as
+# bitflags, same version already resolved in the workspace lock (via
+# alacritty_terminal) — no new fetch.
+bitflags = "2"
