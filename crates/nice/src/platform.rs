@@ -321,6 +321,14 @@ type CfArrayRef = *const c_void;
 type CfDictionaryRef = *const c_void;
 type CfStringRef = *const c_void;
 type CfIndex = isize;
+/// An `AXUIElement` handle (an accessibility node). Created +1 for the app
+/// element (Create rule → released); child handles are borrowed from their
+/// parent's `AXChildren` array (owned by that array). Used by the `ax-probe`
+/// self-test scenario to walk this process's macOS Accessibility tree.
+type AXUIElementRef = *const c_void;
+/// A generic `CFTypeRef` out-parameter for `AXUIElementCopyAttributeValue`
+/// (a `CFString`, `CFArray`, or `AXUIElement`, depending on the attribute).
+type CfTypeRef = *const c_void;
 
 /// The `CGEventFlags` ⌘ (Command) mask — carried on a synthesized ⌘V. The other
 /// modifier masks (shift `0x20000`, control `0x40000`, alternate `0x80000`) are
@@ -343,6 +351,17 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> u8;
+    /// `AXUIElementRef AXUIElementCreateApplication(pid_t pid)` — a +1 handle to
+    /// the accessibility element of the app with `pid` (`pid_t` is `i32`).
+    fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    /// `AXError AXUIElementCopyAttributeValue(AXUIElementRef, CFStringRef,
+    /// CFTypeRef *value)` — writes a +1 value out-param and returns
+    /// `kAXErrorSuccess` (0) on success.
+    fn AXUIElementCopyAttributeValue(
+        element: AXUIElementRef,
+        attribute: CfStringRef,
+        value: *mut CfTypeRef,
+    ) -> i32;
 }
 
 #[link(name = "Carbon", kind = "framework")]
@@ -382,6 +401,128 @@ extern "C" {
 pub fn accessibility_trusted() -> bool {
     // SAFETY: `AXIsProcessTrusted` takes no arguments and is always safe to call.
     unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// `kAXErrorSuccess`.
+const AX_SUCCESS: i32 = 0;
+
+/// Copy one AX attribute of `element` as a +1 `CFTypeRef`, or null when the
+/// attribute is absent or the query errored. Caller owns the result (release it).
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn ax_copy_attr(element: AXUIElementRef, attr: &str) -> CfTypeRef {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    let key = CFString::new(attr);
+    let mut value: CfTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(
+        element,
+        key.as_concrete_TypeRef() as CfStringRef,
+        &mut value,
+    );
+    if err != AX_SUCCESS {
+        std::ptr::null()
+    } else {
+        value
+    }
+}
+
+/// Read a string-valued AX attribute of `element` as an owned Rust `String`.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`; `attr` must name a string-valued
+/// attribute (e.g. `AXRole`, `AXTitle`).
+unsafe fn ax_copy_string(element: AXUIElementRef, attr: &str) -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    let value = ax_copy_attr(element, attr);
+    if value.is_null() {
+        return None;
+    }
+    // `AXUIElementCopyAttributeValue` returns a +1 value; hand ownership to the
+    // CFString wrapper (releases on drop) and copy it into an owned String.
+    let s = CFString::wrap_under_create_rule(value as core_foundation_sys::string::CFStringRef);
+    Some(s.to_string())
+}
+
+/// Depth-first search of `element`'s AX subtree for the first node whose
+/// `AXTitle` equals `label`; returns that node's `AXRole`. Bounded by `depth`
+/// (levels remaining) and `budget` (total nodes visited) so a malformed tree
+/// can never loop unbounded.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn ax_find_role_by_title(
+    element: AXUIElementRef,
+    label: &str,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<String> {
+    if depth == 0 || *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+
+    // This node: match by the unique title marker, then report its role.
+    if ax_copy_string(element, "AXTitle").as_deref() == Some(label) {
+        return Some(ax_copy_string(element, "AXRole").unwrap_or_default());
+    }
+
+    // Recurse into AXChildren (a +1 CFArray of borrowed child AXUIElementRefs;
+    // the children stay valid while the array is alive, which spans the loop).
+    let children = ax_copy_attr(element, "AXChildren");
+    if children.is_null() {
+        return None;
+    }
+    let count = CFArrayGetCount(children as CfArrayRef);
+    let mut found = None;
+    for i in 0..count {
+        let child = CFArrayGetValueAtIndex(children as CfArrayRef, i) as AXUIElementRef;
+        if child.is_null() {
+            continue;
+        }
+        if let Some(role) = ax_find_role_by_title(child, label, depth - 1, budget) {
+            found = Some(role);
+            break;
+        }
+    }
+    CFRelease(children as *const c_void);
+    found
+}
+
+/// Walk this process's macOS Accessibility tree and return the `AXRole` of the
+/// first element whose `AXTitle` equals `label`. `Err` if no such element is
+/// exposed (the AX tree never surfaced the node) or the AX query failed.
+///
+/// This is the query half of the `ax-probe` self-test scenario: gpui exposes an
+/// element via AccessKit only when it carries both an `.id()` and a `.role()`,
+/// and maps its `aria_label` to the macOS `AXTitle`; the probe sets those on one
+/// stable root element and asserts this walk finds it with the expected role.
+///
+/// # Threading
+/// MUST be called ON the gpui main thread. A *same-process* AX query is
+/// dispatched inline on the calling thread (not marshaled to the main runloop
+/// and awaited), so it does NOT deadlock — but AccessKit's per-view adapter
+/// state is a non-`Sync` `RefCell` that gpui also borrows every frame while
+/// building the tree. Querying from a background thread races that per-frame
+/// borrow and panics `RefCell already borrowed`; running on the main thread
+/// serializes the walk with rendering. The `ax-probe` scenario calls this from
+/// its foreground task.
+pub fn ax_find_titled_role(pid: i32, label: &str) -> Result<String, String> {
+    // SAFETY: `AXUIElementCreateApplication` returns a +1 handle (or null); we
+    // walk its subtree with owned/borrowed CF handles released per the Create/Get
+    // rules inside `ax_find_role_by_title`, then release the +1 app handle.
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Err("AXUIElementCreateApplication returned null".to_string());
+        }
+        let mut budget = 5000usize;
+        let result = ax_find_role_by_title(app, label, 64, &mut budget);
+        CFRelease(app as *const c_void);
+        result.ok_or_else(|| format!("no AX element titled '{label}' found in the tree"))
+    }
 }
 
 /// Post one real key event (down or up) to `pid` via `CGEventPostToPid`.

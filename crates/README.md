@@ -13,6 +13,13 @@ workspace as it exists, and every later cycle that adds a crate or a
 self-test scenario should extend it in place rather than leaving the map
 stale.
 
+**Writing a new test?** Read `../docs/testing.md` first — it's the
+placement rulebook (unit vs. in-process integration vs. live ground truth),
+the differential-pair convention for seam-y interactions, the live-run
+environmental preconditions, and the AX decision record. This file stays
+the crate-map + self-test-scenario reference `testing.md` points back to;
+it doesn't re-derive the layer story itself.
+
 ## Crate map
 
 ```
@@ -39,6 +46,12 @@ crates/
                    adapter entity (TerminalSessionHandle), the terminal-theme
                    value type, and the TerminalView/TerminalElement cell
                    painter. A UI crate — depends on gpui.
+  nice-itests    — dev/test-only in-process gpui integration-test harness
+                   (T2): behavior fixtures on mocked TestAppContext + visual/
+                   pixel fixtures on real-MacPlatform VisualTestAppContext. The
+                   shared bed the Stage-2 chrome/pane cycles write tests on. Not
+                   depended on by the shipped `nice` binary (`publish = false`).
+                   Depends on gpui. See `../docs/testing.md`.
 ```
 
 ### `crates/nice` (bin `nice-rs`)
@@ -66,7 +79,13 @@ The GPUI application. Structure (grows over later cycles):
   builds the **App-Nap-safe** grace-deadline future the T9 launch overlay arms —
   a dedicated OS-thread `nanosleep` that wakes the main runloop (the spike-6
   finding that a coalescable libdispatch timer can be deferred indefinitely on an
-  idle/occluded app), injected via `set_launch_deadline`.
+  idle/occluded app), injected via `set_launch_deadline`. T2 adds one more FFI
+  surface here — the AX-tree walk `ax_find_titled_role`
+  (`AXUIElementCreateApplication` + a depth-/node-bounded `AXChildren` traversal
+  reading `AXTitle`/`AXRole` via `AXUIElementCopyAttributeValue`) that the
+  `ax-probe` self-test scenario calls, on the gpui main thread, to read **this
+  process's own** macOS Accessibility tree and confirm AccessKit still exposes the
+  tagged root (role + label, never identifier).
 - `input_live` — the R5 live input self-test scenarios (`input-live` /
   `input-shell`): real CGEvents posted to our own pid, byte-exact pty receipt,
   the item-4 candidate anchor, and the IME go/no-go probe (see the scenario
@@ -510,6 +529,7 @@ the window, and moves to the next scenario.
 | `niceties-drop` | The R7/T7 file/image drag-drop gate (Validation §3). Drives the view's drop handler through its test seam (`handle_external_paths_drop`) with **constructed** `ExternalPaths` events over a real pty (a real OS drag is impractical headless, and gpui's macOS backend only accepts filename drags) and asserts the exact bytes typed into the child: one escaped, space-padded path (DECSET 2004 off); multiple paths space-joined in drop order; a path with spaces / shell metacharacters backslash-escaped; the **raw-image fallback** (a drop with no file URLs consults the injected image-drop provider — a stub path here); the `ESC[200~ … ESC[201~` frame with 2004 **on**; and never a trailing newline. Reuses the `input-live` capture-tee child; drives the handler directly, so it needs **no** Accessibility grant. `Gate::SelfReported` (byte-exact receipt). |
 | `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent pane** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt pane** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
 | `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
+| `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-rs-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/pane tests on. `Gate::SelfReported`. |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
 `crates/nice/src/app.rs`'s `selftest_scenarios()`. A `Cadence`-gated scenario

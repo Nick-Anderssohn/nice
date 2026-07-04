@@ -1,0 +1,90 @@
+# nice-itests — the in-process gpui integration-test harness for the Nice
+# rewrite. Dev/test-only: it holds the shared fixtures (boot a mocked/real gpui
+# app, mount a view under test, drive a fixture terminal session, simulated
+# keystroke/mouse drivers, screenshot + pixel-assert helpers) and the exemplar
+# harness proofs the later chrome/pane cycles (R9–R13) write their tests on.
+#
+# ## Why this is a separate crate, and how test-support stays out of `nice`
+#
+# The fixtures name gpui's test-only contexts (`TestAppContext`,
+# `VisualTestAppContext`) and read pixels back through
+# `Window::render_to_image()` / `capture_screenshot`. Both are gated
+# `#[cfg(any(test, feature = "test-support"))]` in gpui, and enabling
+# `test-support` flips `CAMetalLayer.framebufferOnly = false` PROCESS-WIDE
+# (gpui_macos) — which must never reach the shipped app (R1 rule). Keeping this
+# machinery in its own crate that the app binary (`nice`) NEVER depends on is
+# what keeps that rule intact:
+#
+#   * `gpui/test-support` is enabled ONLY through this crate's own
+#     `[dev-dependencies]` (for its exemplars) and through the `test-support`
+#     FEATURE (for downstream test crates), never as a plain normal dependency.
+#     So a normal build of this crate's lib (`cargo build`, no feature) does NOT
+#     turn it on, and the v2 feature resolver therefore never propagates it into
+#     `nice`'s graph. Validation §4 asserts exactly this
+#     (`cargo tree -p nice --edges normal` has no test-support).
+#   * `gpui_platform` (real MacPlatform, for the visual exemplar) is
+#     `[dev-dependencies]`-only — the visual `harness = false` binary is the only
+#     thing that constructs `VisualTestAppContext`.
+#
+# ## Two execution models (do not conflate — see TRANCHE-2-NOTES §… / the plan)
+#
+#   * Behavior tests run on the MOCKED `TestAppContext` (TestPlatform,
+#     NoopTextSystem — no Metal, no pixels) as ordinary libtest `#[gpui::test]`
+#     cases; they may parallelize. See `behavior`.
+#   * Visual/pixel tests run on the REAL-MacPlatform `VisualTestAppContext` and
+#     cannot run under libtest (real NSWindows are main-thread-only, libtest uses
+#     worker threads, and no `#[gpui::visual_test]` macro exists at the pin). They
+#     live in `harness = false` integration binaries whose `main` owns the
+#     platform on the main thread and runs cases serially, exiting nonzero on
+#     failure — `cargo test -p nice-itests` still runs them and gates on the exit
+#     code. See `tests/visual_terminal_screenshot.rs`.
+#
+# Neither model may ever assert cadence/perf/wall-clock claims — those live only
+# in the live `NICE_RS_SELFTEST` suite (the simulated clock makes such a claim
+# untrustworthy; a cadence/perf assertion here is a blocking review finding).
+[package]
+name = "nice-itests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# gpui WITHOUT test-support here. The gated fixture helpers (`behavior`) name
+# test-support-only types; test-support is added for this crate's own tests via
+# the dev-dependency below, and for downstream consumers via the `test-support`
+# feature. Keeping it off the normal dependency means a plain build of this lib
+# never enables it, so it cannot leak into `nice`.
+gpui = { path = "../../vendor/zed/crates/gpui" }
+# The view under test + its headless session core + the render-half theme and the
+# fixed cell metrics the pixel geometry keys off. Plain (non-test) deps.
+nice-term-view = { path = "../nice-term-view" }
+nice-term-core = { path = "../nice-term-core" }
+nice-theme = { path = "../nice-theme" }
+anyhow = "1"
+
+[dev-dependencies]
+# test-support for THIS crate's own exemplars only (never a normal dep — see the
+# header). Turns on `TestAppContext`/`VisualTestAppContext` + `render_to_image`.
+gpui = { path = "../../vendor/zed/crates/gpui", features = ["test-support"] }
+# The real MacPlatform the visual exemplar wraps in a `VisualTestAppContext`
+# (`gpui_platform::current_platform(false)`), plus the `test-support` half that
+# compiles the macOS `MacWindow::render_to_image` OVERRIDE (via
+# gpui_platform/test-support -> gpui_macos/test-support); without it the default
+# trait impl bails "render_to_image not implemented for this platform". font-kit
+# matches how `nice` links gpui_platform.
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", features = ["font-kit", "test-support"] }
+
+[features]
+# Downstream (R9–R13) test crates depend on this crate as a dev-dependency with
+# `features = ["test-support"]` so the gated in-process fixture helpers compile
+# for them. It is deliberately NOT a default feature: a plain build stays
+# test-support-free, so nothing pulls test-support into a normal graph.
+test-support = ["gpui/test-support"]
+
+# The visual exemplar: a `harness = false` main-thread binary (real NSWindow,
+# serial). `cargo test -p nice-itests` builds and runs it and gates on its exit
+# code (nonzero = fail), exactly like a libtest case.
+[[test]]
+name = "visual_terminal_screenshot"
+path = "tests/visual_terminal_screenshot.rs"
+harness = false

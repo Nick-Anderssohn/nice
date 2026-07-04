@@ -235,6 +235,117 @@ fn open_selftest_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 }
 
 // ---------------------------------------------------------------------------
+// `ax-probe` self-test scenario — the AccessKit-wired canary (T2 test-infra).
+//
+// gpui exposes an element to the macOS Accessibility tree ONLY when it carries
+// both an `.id()` (a global element id) and a non-generic `.role()`; the
+// element's `aria_label` becomes the node's macOS `AXTitle`. gpui never sets
+// `author_id`, so `accessibilityIdentifier`-based matching is unreachable
+// without a vendor patch (the AX finding of record — see the plan): this
+// scenario matches on role + label only.
+//
+// The probe gives itself a target — one stable root element tagged with the
+// fixed id/role/label below — then its task walks this process's AX tree
+// (`crate::platform::ax_find_titled_role`) and asserts the element is exposed
+// with the expected role, printing `SELFTEST PASS ax-probe`. It is the canary
+// that AccessKit stays wired as gpui evolves, not an a11y test suite.
+// ---------------------------------------------------------------------------
+
+/// The stable element id of the `ax-probe` target root — gives it a global id so
+/// AccessKit reports a node for it.
+const AX_PROBE_ELEMENT_ID: &str = "ax-probe-root";
+/// The target's `aria_label`, surfaced as the node's macOS `AXTitle`: the unique
+/// marker the AX walk matches on.
+const AX_PROBE_LABEL: &str = "nice-rs-ax-probe-root";
+/// The macOS `AXRole` the target's AccessKit role maps to — accesskit_macos maps
+/// `Role::Group` to `NSAccessibilityGroupRole` (`"AXGroup"`).
+const AX_PROBE_EXPECTED_ROLE: &str = "AXGroup";
+/// How long the probe polls the AX tree for its node before failing. AccessKit is
+/// activated lazily by the first AX query and the node then appears a frame
+/// later; this is generous headroom over that ~1-frame latency.
+const AX_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `ax-probe` target view: a solid backdrop whose single root element carries
+/// the fixed id + role + label AccessKit needs to expose a node. Repaints
+/// continuously so the per-frame a11y tree stays fresh once AccessKit activates.
+struct AxProbeView;
+
+impl Render for AxProbeView {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep frames flowing: AccessKit builds its tree on the frame AFTER it is
+        // activated (by the probe's first AX query), so the window must keep
+        // painting for the node to materialize and stay current.
+        window.request_animation_frame();
+        div()
+            .id(AX_PROBE_ELEMENT_ID)
+            .role(gpui::Role::Group)
+            .aria_label(AX_PROBE_LABEL)
+            .size_full()
+            .bg(rgb(0x11141b))
+    }
+}
+
+/// Open the `ax-probe` window and spawn its AX-walk task. Handed to the harness
+/// as a self-reported [`Scenario`] opener.
+fn open_ax_probe_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(window_options(), |_window, cx| cx.new(|_cx| AxProbeView))?;
+    let window: AnyWindowHandle = handle.into();
+
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let report = run_ax_probe(acx).await;
+        eprintln!("[selftest] scenario 'ax-probe': {}", report.detail);
+        nice_harness::selftest::report_gate(report);
+    })
+    .detach();
+
+    Ok(window)
+}
+
+/// Poll this process's AX tree until the probe's target element is exposed with
+/// the expected role + label, or time out. The driver's activation preamble has
+/// already foregrounded the window; the first AX query lazily activates
+/// AccessKit, so the node appears within a frame — hence poll-and-retry.
+async fn run_ax_probe(cx: &mut AsyncApp) -> CadenceReport {
+    let pid = std::process::id() as i32;
+    let deadline = Instant::now() + AX_PROBE_TIMEOUT;
+    let mut last = "AX tree never exposed the probe element".to_string();
+    while Instant::now() < deadline {
+        // The AX query runs ON the main thread (this foreground task). A
+        // same-process AX query is dispatched inline on the calling thread, so
+        // it does not deadlock; but AccessKit's per-view state is a non-Sync
+        // RefCell gpui also borrows each frame, so a background-thread query
+        // would race that borrow and panic. The first query lazily activates
+        // AccessKit; the node then materializes on a later frame — hence retry.
+        let found = crate::platform::ax_find_titled_role(pid, AX_PROBE_LABEL);
+        match found {
+            Ok(role) if role == AX_PROBE_EXPECTED_ROLE => {
+                return CadenceReport {
+                    passed: true,
+                    stats: IntervalStats::default(),
+                    detail: format!(
+                        "AccessKit wired: element '{AX_PROBE_ELEMENT_ID}' exposed with \
+                         role='{role}' label='{AX_PROBE_LABEL}'"
+                    ),
+                };
+            }
+            // Node found but role wrong: a real regression, not a not-yet-ready
+            // state — stop polling and report it.
+            Ok(role) => {
+                return CadenceReport::error(format!(
+                    "ax-probe: element exposed but role mismatch — got '{role}', expected \
+                     '{AX_PROBE_EXPECTED_ROLE}'"
+                ));
+            }
+            Err(e) => last = e,
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(200))
+            .await;
+    }
+    CadenceReport::error(format!("ax-probe: {last}"))
+}
+
+// ---------------------------------------------------------------------------
 // `tokens` self-test scenario — the design-token render gate (R2).
 //
 // Renders a deterministic swatch grid from the nice-theme tokens, then reads
@@ -1995,32 +2106,46 @@ fn term_perf_report(
 /// `ExternalPaths` events and asserts byte-exact escaped-path typing (padded when
 /// DECSET 2004 is off, bracketed-paste-framed when on) — self-reported, and
 /// needs no Accessibility grant (it drives the handler directly, not via CGEvents).
+/// `ax-probe` (T2 test-infra) is the AccessKit canary: it tags one stable root
+/// element with an id/role/label and walks the macOS AX tree to assert the node
+/// is exposed with the expected role + label — also self-reported.
 pub fn selftest_scenarios() -> Vec<Scenario> {
+    // Every windowed scenario opts into the driver's activation preamble
+    // (`activate: true`): the driver drives its window frontmost + key and
+    // asserts it before measuring, so a run on an occupied screen FAILs
+    // actionably instead of measuring a frame-capped, inactive window. The
+    // `SelfReported` scenarios also self-activate inside their own task; the
+    // driver preamble front-loads the same guarantee uniformly.
     vec![
         Scenario {
             name: "smoke",
             open: open_selftest_window,
             gate: Gate::Cadence,
+            activate: true,
         },
         Scenario {
             name: "tokens",
             open: open_tokens_window,
             gate: Gate::Cadence,
+            activate: true,
         },
         Scenario {
             name: "term-render",
             open: open_term_render_window,
             gate: Gate::Cadence,
+            activate: true,
         },
         Scenario {
             name: "term-layout",
             open: open_term_layout_window,
             gate: Gate::Cadence,
+            activate: true,
         },
         Scenario {
             name: "term-scroll",
             open: open_term_scroll_window,
             gate: Gate::Cadence,
+            activate: true,
         },
         Scenario {
             name: "term-perf",
@@ -2028,6 +2153,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: TP_REPORT_BUDGET,
             },
+            activate: true,
         },
         Scenario {
             name: "input-live",
@@ -2035,6 +2161,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(45),
             },
+            activate: true,
         },
         Scenario {
             name: "input-shell",
@@ -2042,6 +2169,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(25),
             },
+            activate: true,
         },
         Scenario {
             name: "niceties-zoom",
@@ -2049,6 +2177,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(30),
             },
+            activate: true,
         },
         Scenario {
             name: "niceties-drop",
@@ -2056,6 +2185,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(30),
             },
+            activate: true,
         },
         Scenario {
             name: "niceties-overlay",
@@ -2063,6 +2193,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(30),
             },
+            activate: true,
         },
         Scenario {
             name: "niceties-held",
@@ -2070,6 +2201,18 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(30),
             },
+            activate: true,
+        },
+        Scenario {
+            name: "ax-probe",
+            open: open_ax_probe_window,
+            gate: Gate::SelfReported {
+                // Exceeds the probe's own AX_PROBE_TIMEOUT (10 s) so the driver
+                // awaits the probe's verdict (or its internal timeout) rather than
+                // cutting it off.
+                budget: Duration::from_secs(15),
+            },
+            activate: true,
         },
     ]
 }

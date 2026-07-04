@@ -3148,6 +3148,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nice-itests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui_platform",
+ "nice-term-core",
+ "nice-term-view",
+ "nice-theme",
+]
+
+[[package]]
 name = "nice-model"
 version = "0.1.0"
 dependencies = [

@@ -10,9 +10,12 @@
 //!     window (requires the app's `selftest` feature — see [`crate::capture`]).
 //!
 //! Scenarios are supplied by the app crate (which owns the concrete gpui views)
-//! and passed to [`drive`] as a `Vec<Scenario>`. Later cycles extend the gate
-//! by adding scenarios to that vec — the driver, reducer, watchdog and table
-//! printing here never change.
+//! and passed to [`drive`] as a `Vec<Scenario>`. Later cycles extend the gate by
+//! adding scenarios to that vec — the reducer, watchdog and table printing here
+//! stay put. Before it measures, the driver runs a per-scenario activation
+//! preamble ([`activate_window`]) that drives the scenario's window frontmost +
+//! key and asserts it: a run on an occupied screen FAILs actionably instead of
+//! measuring an inactive, frame-capped window (see [`Scenario::activate`]).
 //!
 //! The whole run lives inside a SINGLE `Application::run`: [`drive`] is called
 //! from the app's run closure, foregrounds the app, arms the watchdog, and
@@ -42,6 +45,16 @@ pub struct Scenario {
     /// scenarios use [`Gate::Cadence`]; a scenario with an absolute frame-time or
     /// memory budget uses [`Gate::SelfReported`].
     pub gate: Gate,
+    /// Whether the driver runs the activation preamble — foreground the app and
+    /// drive this scenario's window to frontmost + key, *asserted* — before it
+    /// measures. This is the driver's self-activation guarantee: every windowed
+    /// scenario measures on the active window, and a run on an occupied screen
+    /// FAILs with an actionable message ("window could not become frontmost — is
+    /// another app fullscreen?") instead of silently measuring an inactive,
+    /// frame-capped window and reporting a mystifying "0 frames" (zed-main
+    /// frame-caps inactive windows at ~33 ms). `true` for every windowed scenario;
+    /// set `false` only for a deliberately-background scenario (none exist today).
+    pub activate: bool,
 }
 
 /// How the driver measures and gates a scenario.
@@ -97,6 +110,13 @@ const DEFAULT_MEASURE_SECS: f64 = 2.5;
 const MIN_FRAMES: usize = 30;
 /// Cadence gate: p95 interval must be `< CADENCE_RATIO ×` the median interval.
 const CADENCE_RATIO: f64 = 2.0;
+/// How long the activation preamble waits for a scenario's window to become
+/// frontmost + key before giving up with an actionable failure. On a free screen
+/// activation is near-instant (the preamble returns as soon as the window reports
+/// active); this bound only bites on the failure path — another app is fullscreen
+/// or owns the display Space, exactly the case that used to silently yield
+/// "0 frames."
+const ACTIVATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn env_secs(key: &str, default: f64) -> f64 {
     std::env::var(key)
@@ -129,9 +149,12 @@ pub fn drive(cx: &mut App, selector: &str, scenarios: Vec<Scenario>) {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Foreground + activate so the scenario windows become frontmost AND
-    // focused — zed-main frame-caps inactive windows at ~33 ms, so cadence
-    // measurement must run on the active window (see `frame` module docs).
+    // Foreground the app once up front. Per-scenario, the driver additionally
+    // runs the activation preamble ([`activate_window`]) that drives each
+    // window frontmost + key AND asserts it before measuring — that assertion,
+    // not this best-effort kick, is the self-activation guarantee. (zed-main
+    // frame-caps inactive windows at ~33 ms, so measurement must run on the
+    // active window — see the `frame` module docs.)
     cx.activate(true);
 
     // Hard backstop: a real-OS-thread deadline across ALL scenarios + grace.
@@ -143,6 +166,13 @@ pub fn drive(cx: &mut App, selector: &str, scenarios: Vec<Scenario>) {
     // warm-up + measure window, so a flat `n × measure` cap would fire mid-run.
     let mut budget_secs = 5.0; // grace
     for sc in &selected {
+        // The activation preamble runs before measurement for every windowed
+        // scenario; its worst case (a legitimately slow-but-eventual activation)
+        // stacks on top of the gate's own budget, so count it here or the
+        // watchdog could false-fire on a slow-to-foreground run.
+        if sc.activate {
+            budget_secs += ACTIVATE_TIMEOUT.as_secs_f64();
+        }
         budget_secs += match sc.gate {
             Gate::Cadence => WARMUP_SECS + measure_secs + 4.0,
             Gate::SelfReported { budget } => budget.as_secs_f64() + 4.0,
@@ -210,6 +240,19 @@ async fn run_scenarios(
             }
         };
 
+        // Self-activation guarantee: drive the window frontmost + key (asserted)
+        // before measuring, so a run on an occupied screen FAILs actionably here
+        // instead of measuring an inactive, frame-capped window ("0 frames").
+        if sc.activate {
+            if let Err(msg) = activate_window(cx, handle).await {
+                let report = frame::CadenceReport::error(msg);
+                eprintln!("[selftest] scenario '{}': {}", sc.name, report.detail);
+                let _ = handle.update(cx, |_view, window, _app| window.remove_window());
+                results.push((sc.name, report));
+                continue;
+            }
+        }
+
         let mut report = match sc.gate {
             Gate::Cadence => {
                 // Warm up (discard startup frames), then measure a clean window.
@@ -251,6 +294,45 @@ async fn run_scenarios(
     }
 
     finish(results, is_suite, &selector);
+}
+
+/// Foreground the app and drive `handle`'s window to frontmost + key, asserting
+/// it actually became active. Re-issues `activate` each tick — a single activate
+/// can lose the race to the initial paint or a Space switch, and the platform
+/// coalesces repeats — and polls [`gpui::Window::is_window_active`]. Returns
+/// `Ok(())` as soon as the window reports active, or an actionable `Err` if it
+/// never became frontmost within [`ACTIVATE_TIMEOUT`].
+///
+/// This is the driver's self-activation guarantee (see [`Scenario::activate`]):
+/// a run on an occupied screen FAILs with a clear remediation instead of
+/// silently measuring an inactive, frame-capped window and reporting "0 frames."
+async fn activate_window(cx: &mut AsyncApp, handle: AnyWindowHandle) -> Result<(), String> {
+    const POLL: Duration = Duration::from_millis(100);
+    let ticks = (ACTIVATE_TIMEOUT.as_secs_f64() / POLL.as_secs_f64()).ceil() as u64;
+    let is_active = |cx: &mut AsyncApp| {
+        handle
+            .update(cx, |_view, window, _app| window.is_window_active())
+            .unwrap_or(false)
+    };
+    for _ in 0..ticks.max(1) {
+        // Best-effort foreground each tick (idempotent); then check whether the
+        // platform has actually made the window key/active yet.
+        let _ = cx.update(|app| app.activate(true));
+        if is_active(cx) {
+            return Ok(());
+        }
+        cx.background_executor().timer(POLL).await;
+    }
+    // A last check after the final sleep, then give up with remediation.
+    if is_active(cx) {
+        return Ok(());
+    }
+    Err(format!(
+        "window could not become frontmost within {:.0}s — is another app \
+         fullscreen or occupying the display Space? Free the screen (no app \
+         owning the display Space) and re-run.",
+        ACTIVATE_TIMEOUT.as_secs_f64()
+    ))
 }
 
 /// Poll for a [`Gate::SelfReported`] scenario's verdict, up to `budget`. The
