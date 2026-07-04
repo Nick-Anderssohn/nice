@@ -1,0 +1,30 @@
+# nice-model — Nice's per-window document model ported to pure Rust: the
+# projects/tabs/panes value tree and the Claude status model. UI-free and
+# testable without a window.
+#
+# Layering rule (crates/README.md "Layering rule"): this crate mirrors today's
+# pure-Swift model code (`Sources/Nice/State/Models.swift`), so it MUST NOT
+# depend on `gpui` (or any UI framework). Downstream cycles own the tiny
+# adapter that wraps this crate in a gpui Entity (R12/R13); keeping the model
+# gpui-free is what makes its ~180 test-pinned behaviors verifiable under plain
+# `cargo test`, exactly like the Swift value types they came from.
+#
+# The documented asymmetries in this model are DELIBERATE and test-pinned — see
+# the crate docs (`src/lib.rs`) and `../README.md`; "cleaning them up" is a bug.
+[package]
+name = "nice-model"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Value types carry `derive(Serialize, Deserialize)` so R18's persistence layer
+# has a serialization surface; `is_claude_running` is `#[serde(skip)]` (runtime
+# only — restores always come back `false`, mirroring Models.swift's CodingKeys
+# exclusion). Already in the workspace lock; no new fetch.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The `#[serde(skip)]` round-trip test serializes a Pane to JSON to prove the
+# runtime-only field never reaches disk. Already in the workspace lock.
+serde_json = "1"

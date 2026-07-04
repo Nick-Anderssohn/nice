@@ -15,6 +15,7 @@ resolver = "2"
 members = [
     "crates/nice",
     "crates/nice-harness",
+    "crates/nice-model",
     "crates/nice-term-core",
     "crates/nice-term-input",
     "crates/nice-term-view",

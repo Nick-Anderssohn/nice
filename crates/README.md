@@ -19,6 +19,10 @@ stale.
 crates/
   nice           — the app binary (GPUI). Process name `nice-rs`.
   nice-harness   — measurement + self-test library. No app logic lives here.
+  nice-model     — per-window document model as pure data: the projects/tabs/
+                   panes value tree + the Claude status model (R8). The
+                   documented asymmetries are deliberate + test-pinned. No gpui
+                   dependency.
   nice-theme     — design tokens as pure data (palettes, accents, typography,
                    chrome geometry). No gpui dependency.
   nice-term-core — headless terminal core: pty spawn semantics + the
@@ -119,6 +123,70 @@ The measurement + self-test library every later cycle reuses. Modules:
 - `workload` — the deterministic synthetic "Claude-streaming" stressor (seeded
   xorshift + a weighted SGR/reflow/long-line/unicode/plain content mix, ported
   from the phase-0 spike) that `term-perf` floods a pane with.
+
+### `crates/nice-model` (lib)
+
+Nice's per-window document model ported to **pure Rust** — no window, no timer,
+and **no `gpui` dependency** (it mirrors today's pure-Swift model code; see the
+"Layering rule" below). The R8 cycle ports it in two layers, both verbatim.
+
+**The value types + status model** (`Sources/Nice/State/Models.swift`):
+
+- `PaneKind` / `TabStatus` — the pane kind and per-pane Claude status.
+- `Pane` — a toolbar pill: `apply_status_transition` (the waiting-pulse
+  acknowledgment truth table — a same-status re-report is a no-op that
+  preserves acknowledgment), `mark_acknowledged_if_waiting`, `needs_attention`.
+- `Tab` — a session: the derived aggregate `status()` over its live Claude
+  panes (thinking > waiting > idle), `waiting_acknowledged()`,
+  `has_running_claude()` (the promotion-refusal predicate), and the pure
+  `recover_next_terminal_index` hydration helper (`^terminal\s+(\d+)$`,
+  case-insensitive).
+- `Project` — an ordered group of tabs.
+
+**The document** (`Sources/Nice/State/TabModel.swift`):
+
+- `TabModel` — the per-window projects/tabs/panes tree: seeding + the pinned
+  Terminals group, `select_tab` (the single `active_tab_id` writer) +
+  `navigable_sidebar_tab_ids`, tab/pane reorder, pane insert/extract + the
+  shared neighbor-refocus rule, `add_pane`, renames + title locks +
+  `apply_auto_title`, cwd bucketing (`add_tab_to_projects`/`find_git_root`) +
+  `repair_project_structure`, the cwd resolution chain + `adopt_tab_cwd`,
+  depth-1 `/branch` + handoff lineage, single-entry `remove_tab` + the
+  parent-pointer sweep, and the two arg parsers.
+- `FsProbe` — the injected filesystem seam (`exists` / `home`) that keeps the
+  document a pure value-tree; production uses `std::fs`, tests inject a fake so
+  the git-root/repair/bucketing ports stay hermetic (the Swift tests planted
+  real temp dirs). Swift's `onTreeMutation` closure + `@Observable` write-back
+  are consolidated into one explicit did-mutate signal whose observable
+  contract survives verbatim: **a no-op transform produces no mutation event; a
+  real change produces exactly one.**
+
+**The asymmetries are deliberate.** This model contains behaviors that look
+inconsistent and are each intentional + test-pinned (`Models.swift`,
+`TabModel.swift`, and the ~180 ported unit cases are the spec) — a reader
+"cleaning them up" is introducing a bug:
+
+1. "At most one *running* Claude per tab" is a creation-edge rule keyed on
+   `Pane::is_claude_running` (`Tab::has_running_claude`), **not** a struct-level
+   uniqueness invariant, so a running Claude and a deferred-resume Claude
+   coexist transiently and the aggregations tolerate it.
+2. The per-tab "Terminal N" counter (`Tab::next_terminal_index`) is monotonic —
+   never decremented, never reused.
+3. Empty-input rename is asymmetric: `TabModel::rename_tab` with empty input is
+   a no-op, while `TabModel::rename_pane` resets to the per-kind default, clears
+   the lock, and (for terminals) consumes a counter slot.
+4. Two cwd writers, two policies: OSC 7 writes `Pane.cwd` only, while
+   `TabModel::adopt_tab_cwd` moves the tab and pulls along only panes still
+   tracking the old cwd (diverged panes stay — per-pane, not all-or-nothing).
+
+And in the lineage, `insert_branch_parent` re-parents an originating root's
+former children on first-branch promotion, while `insert_handoff_child`
+deliberately does **not** re-parent (the anchor stays root). `is_claude_running`
+is `#[serde(skip)]` (runtime only; restores always come back `false`), mirroring
+`Models.swift`'s `CodingKeys` exclusion.
+
+`Tab.branch` (vestigial, roadmap M5) and `SidebarMode` (window UI state → R10)
+are deliberately **not** ported here.
 
 ### `crates/nice-theme` (lib)
 
@@ -330,7 +398,11 @@ and the IME marked-text state machine are pure logic over plain key/mouse
 structs, deliberately kept out of `nice-term-view` (which links gpui) so the
 byte-exact encoder tests and the G1 IME-transition tests build without the gpui
 stack; the R5 event-edge (`nice-term-view/src/input.rs`) translates gpui events
-into these plain types at the boundary and hosts the platform `InputHandler`. `nice-term-view` (R4) **is** a UI crate —
+into these plain types at the boundary and hosts the platform `InputHandler`.
+`nice-model` (R8) is the fourth gpui-free model crate — the projects/tabs/panes
+value tree + the Claude status model carry no `gpui` dependency; the gpui
+adapter that wraps the document in an Entity lives downstream (R12/R13).
+`nice-term-view` (R4) **is** a UI crate —
 like `nice-harness` it depends on
 `gpui` directly (it is the renderer), so it is not one of the gpui-free model
 crates. When a later cycle adds another model crate (parsing, session state,

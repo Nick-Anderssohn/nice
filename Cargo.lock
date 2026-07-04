@@ -3148,6 +3148,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nice-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nice-term-core"
 version = "0.1.0"
 dependencies = [
