@@ -11,6 +11,7 @@
 //! `alacritty_terminal::tty` — the pty is Nice's own libc [`crate::PtyProcess`].
 
 use std::os::fd::RawFd;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -18,6 +19,8 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
+
+use crate::deferred::SessionEvent;
 
 /// Parity scrollback limit: SwiftTerm's `TerminalOptions` default, which today's
 /// Nice never overrides. `alacritty_terminal`'s own `Config` default is 10_000,
@@ -33,37 +36,67 @@ pub type SharedTerm = Arc<FairMutex<Term<EventProxy>>>;
 
 /// The [`EventListener`] a session's `Term` reports through.
 ///
-/// It carries the pty master fd purely so terminal **replies** — Device
-/// Attributes / cursor-position reports and the like, which alacritty surfaces
-/// as [`Event::PtyWrite`] — are written straight back to the child. Without
-/// that, a login+interactive zsh with a query-happy prompt (the user's
-/// powerlevel10k) stalls waiting for a DA/DSR answer. Every other event
-/// (`Title`/`Bell`/`Wakeup`/`ColorRequest`/clipboard/…) is ignored here:
-/// damage is signalled by the feeder after each parsed chunk (not via
-/// `Wakeup`), OSC title/cwd surfacing is R6, and the typed *outward* event
-/// stream is a later R3 slice.
+/// It carries the pty master fd so terminal **replies** — Device Attributes /
+/// cursor-position reports and the like, which alacritty surfaces as
+/// [`Event::PtyWrite`] — are written straight back to the child. Without that, a
+/// login+interactive zsh with a query-happy prompt (the user's powerlevel10k)
+/// stalls waiting for a DA/DSR answer.
+///
+/// It also carries an optional clone of the owning [`Session`]'s outward event
+/// [`Sender`] so **OSC 0/2 window-title** changes reach the typed stream: an
+/// [`Event::Title`] becomes [`SessionEvent::TitleChanged`] and an
+/// [`Event::ResetTitle`] becomes [`SessionEvent::TitleReset`]. (OSC 1 icon-title
+/// is dropped end-to-end — matching SwiftTerm's handling — so alacritty never
+/// raises a distinct event for it and there is nothing to forward.) When there
+/// is no `Session` (a bare [`crate::session::TermSession`]) the sink is `None`
+/// and titles are dropped. Every remaining event (`Bell`/`Wakeup`/
+/// `ColorRequest`/clipboard/…) is ignored: damage is signalled by the feeder
+/// after each parsed chunk (not via `Wakeup`), and OSC 7 cwd is teed off the raw
+/// byte stream in the feeder (see [`crate::osc7`]), not here.
 ///
 /// `send_event` is called from inside `parser.advance(&mut term, …)` while the
-/// feeder holds the `Term` lock, so it MUST NOT re-lock the `Term`. Writing to
-/// the pty fd does not touch the lock, so there is no re-entrancy.
-#[derive(Clone, Copy)]
+/// feeder holds the `Term` lock, so it MUST NOT re-lock the `Term`. Neither
+/// writing to the pty fd nor sending on the channel touches the lock, so there
+/// is no re-entrancy.
+///
+/// [`Session`]: crate::deferred::Session
 pub struct EventProxy {
     pty_fd: RawFd,
+    /// The `Session`'s outward event sink, if this `Term` belongs to one.
+    events: Option<Sender<SessionEvent>>,
 }
 
 impl EventProxy {
-    /// Wire the proxy to the pty master fd its `Term` should write replies to.
+    /// Wire the proxy to the pty master fd its `Term` writes replies to, and to
+    /// the optional outward event sink title changes are forwarded on.
     /// Crate-internal: only [`crate::session::TermSession`] constructs one, with
-    /// the fd of the `PtyProcess` it owns (kept alive for the proxy's lifetime).
-    pub(crate) fn new(pty_fd: RawFd) -> EventProxy {
-        EventProxy { pty_fd }
+    /// the fd of the `PtyProcess` it owns (kept alive for the proxy's lifetime)
+    /// and — when a [`Session`](crate::deferred::Session) owns it — a clone of
+    /// that session's event `Sender`.
+    pub(crate) fn new(pty_fd: RawFd, events: Option<Sender<SessionEvent>>) -> EventProxy {
+        EventProxy { pty_fd, events }
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            write_all_fd(self.pty_fd, text.as_bytes());
+        match event {
+            Event::PtyWrite(text) => write_all_fd(self.pty_fd, text.as_bytes()),
+            // OSC 0/2 set the window/tab title; the payload is already decoded
+            // UTF-8 (emoji/CJK/braille intact — Stage 3 depends on that
+            // fidelity). Best-effort send: a dropped receiver is not worth
+            // failing the parse over.
+            Event::Title(title) => {
+                if let Some(events) = &self.events {
+                    let _ = events.send(SessionEvent::TitleChanged(title));
+                }
+            }
+            Event::ResetTitle => {
+                if let Some(events) = &self.events {
+                    let _ = events.send(SessionEvent::TitleReset);
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -23,8 +23,24 @@
 //! the typed outward event stream ([`SessionEvent`]), and held-pane
 //! classification ([`should_hold_on_exit`]). That is the API the renderer (R4)
 //! and the session manager (R13) consume — still with **no `gpui` dependency**.
+//!
+//! R6 plumbs the escape-sequence side-channels Nice's app layer runs on onto
+//! that same event stream and query surface: OSC 0/2 window titles
+//! ([`SessionEvent::TitleChanged`] / [`SessionEvent::TitleReset`], via the
+//! `Term`'s [`EventProxy`]), OSC 7 cwd tracking ([`SessionEvent::CwdChanged`],
+//! teed off the raw pty bytes by the self-contained [`crate::osc7`] scanner
+//! without ever altering the bytes the parser sees), and a synchronous
+//! bracketed-paste (DECSET 2004) query ([`Session::bracketed_paste_active`] /
+//! [`TermSession::bracketed_paste_active`]) the paste/drop paths consult. The
+//! consumers (status parsing, cwd persistence, paste framing) come in later
+//! stages; R6 is transport only.
 
 pub mod deferred;
+/// OSC 7 cwd tee (internal): the byte-transparent scanner the feeder runs over
+/// the raw pty stream. Not part of the public surface — its existence and its
+/// "never alters the parser's bytes" property are the contract later stages
+/// (R15 status parsing) build on.
+mod osc7;
 pub mod pty;
 pub mod quoting;
 pub mod session;

@@ -21,12 +21,16 @@
 //!    is modelled explicitly so the machine has no "Live yet pty is nil" state.
 //!
 //! 2. **A typed outward event stream** ([`SessionEvent`], delivered on the
-//!    [`Receiver`] the constructor returns). Two events ship now:
+//!    [`Receiver`] the constructor returns). Lifecycle events:
 //!    [`SessionEvent::OutputStarted`] (the child's first byte — mirrors Nice's
 //!    `onFirstData`, the "dismiss the Launching… overlay" signal) and
 //!    [`SessionEvent::Exited`] (with the raw status and the held classification).
-//!    The enum is `#[non_exhaustive]`: R6 adds `Title` / `Cwd` variants without
-//!    a breaking change — the stream is deliberately not narrowed to today's two.
+//!    R6 added the escape-sequence side-channels on the same stream:
+//!    [`SessionEvent::TitleChanged`] / [`SessionEvent::TitleReset`] (OSC 0/2, via
+//!    the `Term`'s [`EventProxy`](crate::vt::EventProxy)) and
+//!    [`SessionEvent::CwdChanged`] (OSC 7, teed off the raw pty bytes in the
+//!    feeder — see [`crate::osc7`]). The enum is `#[non_exhaustive]`: later
+//!    stages add variants without a breaking change — do not narrow consumers.
 //!
 //! 3. **Held-pane classification** ([`should_hold_on_exit`], a verbatim port of
 //!    `TabPtySession.shouldHoldOnExit`): a non-zero or signalled exit the user
@@ -51,6 +55,7 @@
 //! process group, and joins the watcher, so no thread or zsh is left behind.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
@@ -105,8 +110,8 @@ pub enum Phase {
 }
 
 /// A typed event pushed onto the session's outward stream (the [`Receiver`] the
-/// constructor hands back). `#[non_exhaustive]` so R6 can add `Title`/`Cwd`
-/// without a breaking change — do not narrow consumers to today's two variants.
+/// constructor hands back). `#[non_exhaustive]` so later stages can add more
+/// without a breaking change — do not narrow consumers to today's variants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionEvent {
@@ -116,6 +121,19 @@ pub enum SessionEvent {
     /// The child exited. `status` is the raw exit; `held` is the classification
     /// (see [`should_hold_on_exit`]).
     Exited { status: ExitStatus, held: bool },
+    /// OSC 0 / OSC 2 set the window/tab title (R6). The string is the decoded,
+    /// already-trimmed UTF-8 title (emoji/CJK/braille preserved). Feeds pane
+    /// titles / tab auto-titles / Stage 3 Claude-status parsing. OSC 1
+    /// (icon-title) is intentionally never surfaced — parity with SwiftTerm's
+    /// handling, which drops it.
+    TitleChanged(String),
+    /// The title was reset to the terminal default (alacritty `ResetTitle`,
+    /// reached via the title-stack `CSI 23 t` popping an empty saved title).
+    TitleReset,
+    /// OSC 7 reported a new working directory (R6). The path is percent-decoded
+    /// from `file://<host>/<path>` and validated to be on this host; feeds cwd
+    /// persistence and the file explorer in later stages.
+    CwdChanged(PathBuf),
 }
 
 /// The exit facts, latched once by the watcher thread and read by [`phase`].
@@ -245,7 +263,15 @@ impl Session {
             user_cb();
         });
 
-        let ts = match TermSession::spawn(&self.spec, self.scrollback_lines, wrapped) {
+        // Hand the core a clone of our outward `Sender` so OSC 0/2 titles (via
+        // the `Term`'s `EventProxy`) and OSC 7 cwd (via the feeder's byte tee)
+        // land on the same stream as `OutputStarted`/`Exited`.
+        let ts = match TermSession::spawn_with_events(
+            &self.spec,
+            self.scrollback_lines,
+            wrapped,
+            self.events.clone(),
+        ) {
             Ok(ts) => ts,
             Err(e) => {
                 self.state = State::NotSpawned;
@@ -365,6 +391,16 @@ impl Session {
     /// if not yet spawned. Readable after a held exit.
     pub fn grid_contains(&self, needle: &str) -> bool {
         self.session().is_some_and(|ts| ts.grid_contains(needle))
+    }
+
+    /// Whether bracketed-paste mode (DECSET 2004) is currently enabled in the
+    /// VT — the synchronous query the paste (R5) and drop (R7) paths consult
+    /// before deciding whether to frame pasted text in `ESC[200~`…`ESC[201~`.
+    /// `false` before the session is spawned. Reads alacritty's tracked terminal
+    /// mode under a brief `Term` lock.
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.session()
+            .is_some_and(|ts| ts.bracketed_paste_active())
     }
 
     /// The shared `Term` the renderer (R4) locks to paint, or `None` if not yet

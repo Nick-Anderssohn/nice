@@ -167,11 +167,26 @@ narrow API. Modules, bottom-up:
 - `vt` — the `alacritty_terminal` glue: `SharedTerm =
   Arc<FairMutex<Term<EventProxy>>>` (the lock the R4 renderer holds only to
   read cells for one frame), the `EventProxy` that forwards `PtyWrite` replies
-  (DA/DSR) back to the child, the `DEFAULT_SCROLLBACK_LINES = 500` parity knob,
-  and the owned `GridSnapshot` read helpers (lock briefly, copy, unlock — never
-  held across a paint).
+  (DA/DSR) back to the child **and** relays OSC 0/2 title events
+  (`Event::Title` / `ResetTitle`) onto the owning `Session`'s outward stream
+  (R6), the `DEFAULT_SCROLLBACK_LINES = 500` parity knob, and the owned
+  `GridSnapshot` read helpers (lock briefly, copy, unlock — never held across a
+  paint).
+- `osc7` — the OSC 7 cwd **tee** (R6): a self-contained, byte-transparent
+  scanner the feeder runs over each raw pty read chunk *alongside* (never in
+  place of) the VT parser. vte 0.15 has no OSC 7 arm, so cwd cannot ride the
+  parser's event stream; the tee recognises a complete
+  `ESC ] 7 ; file://<host>/<path> ST|BEL` sequence (tolerant of split reads,
+  matching vte's terminator set — BEL / `ESC \`), percent-decodes the path,
+  validates the host is local, and emits `CwdChanged`. It never alters the bytes
+  handed to the parser — the "never alters bytes" property is the contract R15's
+  status parsing may later extend.
 - `session` — `TermSession`: one *eager, already-live* session owning the
-  `PtyProcess` + `SharedTerm` + the per-session feeder thread.
+  `PtyProcess` + `SharedTerm` + the per-session feeder thread. Owns the two R6
+  escape-sequence side-channels that straddle the VT core — OSC 0/2 titles (via
+  the `EventProxy`) and OSC 7 cwd (via the feeder's `osc7` tee) — and exposes the
+  synchronous `bracketed_paste_active()` DECSET-2004 query the R5 paste / R7 drop
+  paths consult.
 - `deferred` — `Session`: the value-owning pane session the renderer (R4) and
   the session manager (R13) consume, wrapping `TermSession` into the deferred
   spawn state machine, the outward event stream, and held-pane classification
@@ -183,10 +198,11 @@ Each live session runs its VT work **off the render thread**, the shape proven
 in the phase-0 spike (`spikes/phase0-poc`, RESULTS-spike8):
 
 - a **feeder** thread is the sole reader of the pty master; it blocking-reads
-  bytes and parses them into the `Term` under a *brief* lock, then — **after
-  releasing the lock** — fires the damage-wake so the UI grabs the lock and
-  paints. The wake is a signal only (async/non-blocking, never under the lock,
-  never re-entering the UI framework) — R4's session-host owns the receiving end;
+  bytes, runs the OSC 7 cwd tee (`osc7`) over the raw chunk, then parses the
+  **same** bytes into the `Term` under a *brief* lock, then — **after releasing
+  the lock** — fires the damage-wake so the UI grabs the lock and paints. The
+  wake is a signal only (async/non-blocking, never under the lock, never
+  re-entering the UI framework) — R4's session-host owns the receiving end;
 - a **reaper** thread is the sole `waitpid` caller, recording the child's
   `ExitStatus` (no zombies, no double-reap);
 - an **exit-watcher** thread blocks on the reaped status and pushes the outward
@@ -199,7 +215,9 @@ spawn state machine — `NotSpawned{spec} → Spawning → Live → Exited{statu
 held}` — so a not-yet-focused pane is a real, matchable state, never a nil pty a
 caller force-reads (the fix for BUG A in `docs/window-chrome-architecture.md`); a
 typed, `#[non_exhaustive]` outward event stream (`OutputStarted`, `Exited{status,
-held}`; `Title`/`Cwd` reserved for R6); and held-pane classification
+held}`, and — landed in R6 — `TitleChanged`/`TitleReset` from OSC 0/2 via the
+`EventProxy` and `CwdChanged` from OSC 7 via the feeder's tee); and held-pane
+classification
 (`should_hold_on_exit`, ported from `TabPtySession.shouldHoldOnExit`): a
 non-zero or signalled exit the user didn't ask for is *held* — the `Term` and
 its scrollback are kept alive so the failed output stays readable — while a
@@ -240,8 +258,8 @@ layout (T4), line-stepped scrollback scroll, and damage-driven present (the
 injected `setNeedsDisplay` kick) all live here, and `crates/nice`'s shipped
 window hosts a live zsh pane over this crate. The `term-perf` self-test gates
 streaming frame time + memory under the synthetic workload. Out of R4's scope
-(later cycles): keyboard/IME/mouse input (R5), OSC title/cwd (R6), fonts/zoom/
-overlay (R7), and sub-line smooth scroll (deferred).
+(later cycles): keyboard/IME/mouse input (R5), OSC title/cwd (now landed in R6),
+fonts/zoom/overlay (R7), and sub-line smooth scroll (deferred).
 
 ## Layering rule
 

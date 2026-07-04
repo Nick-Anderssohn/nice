@@ -5,23 +5,37 @@
 //! drains on. This is the crate's exported threading shape (parse off-main,
 //! share `Arc<FairMutex<Term>>`, wake via a callback).
 //!
-//! Out of scope here (a later R3 slice owns them, built on top of this value):
-//! the deferred-spawn state machine (`NotSpawned → Spawning → Live → Exited`),
-//! the typed outward event stream, and held-pane classification. `TermSession`
-//! is the eager, already-live session those wrap — it exposes the raw exit
-//! status (via the pty) that classification will consume, but does not classify.
+//! The deferred-spawn state machine (`NotSpawned → Spawning → Live → Exited`)
+//! and held-pane classification live one layer up in [`crate::deferred`], built
+//! on top of this value: `TermSession` is the eager, already-live session those
+//! wrap — it exposes the raw exit status (via the pty) that classification
+//! consumes, but does not classify.
+//!
+//! `TermSession` does own the two R6 escape-sequence side-channels, since both
+//! straddle the VT core it holds: OSC 0/2 **titles** flow through the `Term`'s
+//! [`EventProxy`], and OSC 7 **cwd** is teed off the raw pty bytes in the feeder
+//! (see [`crate::osc7`]). Neither is surfaced when a `TermSession` is used bare
+//! (the outward [`SessionEvent`] `Sender` is `None`); the [`Session`] layer
+//! passes its `Sender` down via [`TermSession::spawn_with_events`] so they reach
+//! the typed stream. The synchronous [`TermSession::bracketed_paste_active`]
+//! query reads the same `Term`'s tracked DECSET 2004 mode.
+//!
+//! [`Session`]: crate::deferred::Session
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
+use crate::deferred::SessionEvent;
+use crate::osc7::Osc7Scanner;
 use crate::pty::{ExitStatus, ExitWaiter, PtyProcess};
 use crate::spawn::SpawnSpec;
 use crate::vt::{self, EventProxy, GridSnapshot, SharedTerm, TermSize, DEFAULT_SCROLLBACK_LINES};
@@ -65,10 +79,69 @@ impl TermSession {
     /// The pty is created first (slice 1's `PtyProcess`, honouring the PROTECTED
     /// spawn contract); the `Term` is sized to `spec`'s initial rows/cols and its
     /// `EventProxy` is wired to the pty so terminal replies reach the child.
+    ///
+    /// Used bare, a `TermSession` has no outward event sink: OSC 0/2 titles and
+    /// OSC 7 cwd are recognised but dropped. The [`Session`](crate::deferred::Session)
+    /// layer uses [`TermSession::spawn_with_events`] to receive them.
     pub fn spawn(
         spec: &SpawnSpec,
         scrollback_lines: usize,
         on_damage: DamageCallback,
+    ) -> io::Result<TermSession> {
+        TermSession::spawn_inner(spec, scrollback_lines, on_damage, true, None)
+    }
+
+    /// [`TermSession::spawn`] with the parity [`DEFAULT_SCROLLBACK_LINES`] knob.
+    pub fn spawn_default_scrollback(
+        spec: &SpawnSpec,
+        on_damage: DamageCallback,
+    ) -> io::Result<TermSession> {
+        TermSession::spawn(spec, DEFAULT_SCROLLBACK_LINES, on_damage)
+    }
+
+    /// Like [`TermSession::spawn`], but the caller supplies the outward event
+    /// [`Sender`] so the R6 side-channels reach the typed stream: OSC 0/2 title
+    /// changes (via the `Term`'s [`EventProxy`]) become
+    /// [`SessionEvent::TitleChanged`] / [`SessionEvent::TitleReset`], and OSC 7
+    /// cwd changes (via the feeder's byte tee) become
+    /// [`SessionEvent::CwdChanged`]. Crate-internal: only the
+    /// [`Session`](crate::deferred::Session) layer wires this, passing a clone of
+    /// its own `Sender`.
+    pub(crate) fn spawn_with_events(
+        spec: &SpawnSpec,
+        scrollback_lines: usize,
+        on_damage: DamageCallback,
+        events: Sender<SessionEvent>,
+    ) -> io::Result<TermSession> {
+        TermSession::spawn_inner(spec, scrollback_lines, on_damage, true, Some(events))
+    }
+
+    /// Like [`TermSession::spawn`], but with the OSC 7 cwd tee **disabled**.
+    ///
+    /// The tee is a pure observer that never alters the bytes handed to the VT
+    /// parser (see [`crate::osc7`]); this hook exists only so the byte-
+    /// transparency test can spawn one session with the tee on and one with it
+    /// off and assert the resulting grids are identical. Not part of the stable
+    /// surface — normal callers use [`spawn`](TermSession::spawn) (tee on) or the
+    /// [`Session`](crate::deferred::Session) layer.
+    #[doc(hidden)]
+    pub fn spawn_teeless(
+        spec: &SpawnSpec,
+        scrollback_lines: usize,
+        on_damage: DamageCallback,
+    ) -> io::Result<TermSession> {
+        TermSession::spawn_inner(spec, scrollback_lines, on_damage, false, None)
+    }
+
+    /// The shared spawn path: build the pty, the `Term` (wiring the `EventProxy`
+    /// to the pty fd and the optional title sink), and the feeder (which runs
+    /// the OSC 7 tee when `osc7_tee` and forwards cwd on `events`).
+    fn spawn_inner(
+        spec: &SpawnSpec,
+        scrollback_lines: usize,
+        on_damage: DamageCallback,
+        osc7_tee: bool,
+        events: Option<Sender<SessionEvent>>,
     ) -> io::Result<TermSession> {
         let pty = PtyProcess::spawn(spec)?;
         let fd = pty.master_fd();
@@ -81,10 +154,13 @@ impl TermSession {
             scrolling_history: scrollback_lines,
             ..Config::default()
         };
-        let term: SharedTerm =
-            Arc::new(FairMutex::new(Term::new(config, &size, EventProxy::new(fd))));
+        let term: SharedTerm = Arc::new(FairMutex::new(Term::new(
+            config,
+            &size,
+            EventProxy::new(fd, events.clone()),
+        )));
 
-        let feeder = spawn_feeder(fd, Arc::clone(&term), on_damage)?;
+        let feeder = spawn_feeder(fd, Arc::clone(&term), on_damage, osc7_tee, events)?;
 
         Ok(TermSession {
             pty,
@@ -92,14 +168,6 @@ impl TermSession {
             feeder: Some(feeder),
             scrollback_lines,
         })
-    }
-
-    /// [`TermSession::spawn`] with the parity [`DEFAULT_SCROLLBACK_LINES`] knob.
-    pub fn spawn_default_scrollback(
-        spec: &SpawnSpec,
-        on_damage: DamageCallback,
-    ) -> io::Result<TermSession> {
-        TermSession::spawn(spec, DEFAULT_SCROLLBACK_LINES, on_damage)
     }
 
     /// The shared `Term` the renderer (R4) locks to paint. The renderer holds
@@ -140,6 +208,14 @@ impl TermSession {
     /// [`TermSession::scrollback_limit`]).
     pub fn history_lines(&self) -> usize {
         self.term.lock().grid().history_size()
+    }
+
+    /// Whether bracketed-paste mode (DECSET 2004) is currently enabled — the
+    /// synchronous query the paste (R5) and drop (R7) paths consult before
+    /// framing pasted text. Reads alacritty's tracked [`TermMode`] under a brief
+    /// lock; the child toggles it with `ESC[?2004h` / `ESC[?2004l`.
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// The configured per-session scrollback limit (lines).
@@ -218,29 +294,52 @@ impl Drop for TermSession {
 }
 
 /// Spawn the per-session feeder thread: the single reader of this pty's master.
-/// It blocking-reads bytes, parses them into the shared `Term` under a brief
-/// lock, then — **after releasing the lock** — fires the damage wake. Ends when
-/// the child's slave side closes (read EOF on Linux, `EIO` on macOS).
+/// It blocking-reads bytes, runs the OSC 7 cwd tee over the raw chunk, parses
+/// the **same** bytes into the shared `Term` under a brief lock, then — **after
+/// releasing the lock** — fires the damage wake. Ends when the child's slave
+/// side closes (read EOF on Linux, `EIO` on macOS).
+///
+/// The tee ([`Osc7Scanner`]) runs when `osc7_tee` is set; it observes the chunk
+/// by shared reference (so the exact same slice reaches the parser — the tee
+/// never eats or reorders a byte) and forwards each decoded cwd on `events` as
+/// [`SessionEvent::CwdChanged`]. With no `events` sink the scan still runs but
+/// its emissions are dropped (used by the byte-transparency test).
 fn spawn_feeder(
     fd: RawFd,
     term: SharedTerm,
     on_damage: DamageCallback,
+    osc7_tee: bool,
+    events: Option<Sender<SessionEvent>>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("nice-term-feeder".to_string())
         .spawn(move || {
             let mut parser: Processor = Processor::new();
             let mut buf = [0u8; 4096];
+            let mut scanner = Osc7Scanner::new();
             loop {
                 let n = unsafe {
                     libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                 };
                 if n > 0 {
+                    let chunk = &buf[..n as usize];
+                    // OSC 7 cwd tee: observe the raw chunk BEFORE parsing. The
+                    // scanner borrows `chunk` immutably and cannot alter it, so
+                    // the byte-identical slice is handed to the parser below —
+                    // the transparency contract holds by construction. Emission
+                    // is best-effort onto the outward stream.
+                    if osc7_tee {
+                        scanner.feed(chunk, |path| {
+                            if let Some(events) = &events {
+                                let _ = events.send(SessionEvent::CwdChanged(path));
+                            }
+                        });
+                    }
                     {
                         // Hold the lock ONLY to parse; the wake below is fired
                         // after this scope drops the guard (damage-wake contract).
                         let mut guard = term.lock();
-                        parser.advance(&mut *guard, &buf[..n as usize]);
+                        parser.advance(&mut *guard, chunk);
                     }
                     on_damage();
                 } else if n == 0 {
