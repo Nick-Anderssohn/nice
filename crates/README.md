@@ -64,7 +64,19 @@ The GPUI application. Structure (grows over later cycles):
   in a `TerminalView` wired to the demand-present kick; and the self-test
   scenario windows (registered in `selftest_scenarios()`). `RootView` (the
   solid-background + version-line animated view) is now just the `smoke`
-  scenario's root, no longer the shipped window.
+  scenario's root, no longer the shipped window. R9 gives the shipped window
+  Nice's **window chrome**: `window_options()` flips to a hidden (transparent)
+  titlebar with the native traffic lights repositioned onto the y-26 row
+  (`traffic_light_position` = the absolute close leading 17 — see the
+  chrome-geometry divergence note above), and the terminal is wrapped in
+  `WindowChromeView` — a 52pt top band (chrome token + 1pt bottom rule) whose
+  mouse handlers ARE the empty-chrome behaviour (drag past ~2pt →
+  `start_window_move`; double-click → `titlebar_double_click`, both gated on
+  `!is_fullscreen()`), plus the `ToggleFullScreen` action (⌃⌘F + a native View
+  menu whose title flips via an `observe_window_bounds` callback). The band's
+  press-arbitration convention — interactive children (R10/R11) consume their
+  own presses with `stop_propagation`, the band acts only on the remainder — is
+  the reusable pattern later chrome cycles build on.
 - `platform` — the single home for foreign AppKit / `objc2` / CoreGraphics
   access (see "All-Rust rule" below): the demand-present kick (`present_kick`)
   plus the two present-timing facts that motivate it (R1), the macOS keyCode
@@ -85,11 +97,25 @@ The GPUI application. Structure (grows over later cycles):
   reading `AXTitle`/`AXRole` via `AXUIElementCopyAttributeValue`) that the
   `ax-probe` self-test scenario calls, on the gpui main thread, to read **this
   process's own** macOS Accessibility tree and confirm AccessKit still exposes the
-  tagged root (role + label, never identifier).
+  tagged root (role + label, never identifier). R9 adds the window-chrome FFI:
+  `standard_window_button_frames` reads the live close/minimize/zoom button frames
+  (in content-view coords, y-from-top) so the `chrome` scenario asserts the REAL
+  rendered traffic-light geometry, and a `chrome`-scenario validation block posts
+  synthetic **mouse** CGEvents (down / drag / up / double-click, one-pid only,
+  same safety invariant as the R5 keyboard block), reads the live NSWindow
+  frame + zoom/miniaturize state, maps a content-view point to CG-global
+  coordinates for the posted events, and reads (never writes)
+  `AppleActionOnDoubleClick`.
 - `input_live` — the R5 live input self-test scenarios (`input-live` /
   `input-shell`): real CGEvents posted to our own pid, byte-exact pty receipt,
   the item-4 candidate anchor, and the IME go/no-go probe (see the scenario
   table under "Self-test harness").
+- `chrome_live` — the R9 live window-chrome self-test scenario (`chrome`): real
+  mouse CGEvents drive the shipped `WindowChromeView` band + repositioned traffic
+  lights + full-screen wiring, judged against AppKit frame/state reads — the
+  traffic-light geometry (baseline + after resize / focus bounce / full-screen
+  exit), the drag differential, the double-click vs `AppleActionOnDoubleClick`,
+  and the full-screen toggle + View-menu title flip (see the scenario table).
 - `niceties_zoom` — the R7/T11 live zoom + pty re-metric self-test
   (`niceties-zoom`): real ⌘+/⌘−/⌘0 CGEvents grow the shared font, the grid
   re-fits, and the pty winsize follows.
@@ -262,9 +288,17 @@ future token in this crate follows:
   (`MACOS26_TRAFFIC_LIGHT_LEADINGS` / `_PITCH` in `chrome_geometry`) are
   OS-owned *runtime* values the Swift code deliberately does not hardcode, so
   they cite the project-memory note
-  `reference_traffic_light_geometry_macos26` instead of a Swift line. They are
-  documentary (R9 must still read each button's live default), and this is the
-  only place a citation points somewhere other than a Swift source line.
+  `reference_traffic_light_geometry_macos26` instead of a Swift line — the only
+  place a citation points somewhere other than a Swift source line. R9 makes
+  `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]` (the close leading) **load-bearing**: GPUI
+  takes an *absolute* close-button origin rather than reading each button's live
+  default and adding a nudge (Swift's captured-default-plus-8), so the shipped
+  close-x is `[0] + TRAFFIC_LIGHT_NUDGE_X` = 17 (`crates/nice`'s
+  `window_options`). The other leadings + the pitch stay documentary
+  sanity-check values (GPUI derives minimize/zoom x and preserves the pitch
+  itself); the `chrome` live scenario asserts the *rendered* geometry from
+  `standard_window_button_frames()`, so a future OS shift surfaces as a token
+  change plus a live-scenario failure, not silent drift.
 
 ### `crates/nice-term-core` (lib)
 
@@ -530,6 +564,7 @@ the window, and moves to the next scenario.
 | `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent pane** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt pane** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
 | `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
 | `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-rs-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/pane tests on. `Gate::SelfReported`. |
+| `chrome` | The R9 live window-chrome gate (Validation §1–§4). Opens the shipped chrome shell (`WindowChromeView` band + repositioned native traffic lights + full-screen wiring) over a silent live pane and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. **§1** — via `platform::standard_window_button_frames`, asserts all three buttons exist, the close button's visual centre sits on the y-26 row and its x-origin at 17, and the three are equally pitched (pitch read from the live frames), **re-asserted after a resize, a focus bounce, and a full-screen enter+exit** (the BUG-B stale-capture guard). **§2** — a CGEvent press-drag on the empty band vs the terminal content area, judged by real NSWindow frame reads (the content drag must leave the window put). **§3** — reads (never writes) `AppleActionOnDoubleClick`, posts a CGEvent double-click on the band, and checks the window state matches the predicted zoom / miniaturize / none, plus a double-click while full screen is a no-op (the band's `!is_fullscreen` gate). **§4** — dispatches `ToggleFullScreen` and asserts `is_fullscreen()` + the View-menu title flip, both ways. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Effects a synthetic CGEvent provably can't drive (a window drag via `performWindowDragWithEvent:` follows the *physical* cursor, which `CGEventPostToPid` doesn't move) are recorded as a **DEFERRED HUMAN PASS**, not fail-looped — the same honest-deferral pattern `input-live` uses for synthetic IME composition. `Gate::SelfReported`. |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
 `crates/nice/src/app.rs`'s `selftest_scenarios()`. A `Cadence`-gated scenario
@@ -541,7 +576,10 @@ declares `Gate::SelfReported { budget }`: it runs its own measurement in its
 `open` task and posts the verdict via `nice_harness::selftest::report_gate`, and
 the driver waits for it (up to `budget`) instead of measuring. `term-perf` was the
 first such scenario; the R5 `input-live` / `input-shell` scenarios also self-report
-(their pass criterion is byte-exact pty receipt from posted CGEvents, not cadence).
+(their pass criterion is byte-exact pty receipt from posted CGEvents, not cadence),
+as does the R9 `chrome` scenario (its criterion is AppKit frame/geometry/menu
+state after posted gestures, not cadence — and it self-activates + preflights the
+Accessibility grant like the other CGEvent scenarios).
 **Keep this table in sync** — it's the map a future cycle
 (or a reconciler) reads to know what regression coverage already exists before
 adding more.

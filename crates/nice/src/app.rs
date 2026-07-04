@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui::{
     div, point, prelude::*, px, rgb, size, AnyWindowHandle, App, AppContext, AsyncApp, Bounds,
-    Context, Entity, IntoElement, Render, Rgba, SharedString, TitlebarOptions, WeakEntity, Window,
+    Context, Entity, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, SharedString, TitlebarOptions,
+    WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 
@@ -37,8 +39,12 @@ use nice_term_view::{
     FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
     TERMINAL_BOTTOM_GAP,
 };
+use nice_theme::chrome_geometry::{
+    MACOS26_TRAFFIC_LIGHT_LEADINGS, TOP_BAR_HEIGHT, TRAFFIC_LIGHT_CENTER_FROM_TOP,
+    TRAFFIC_LIGHT_NUDGE_X,
+};
 use nice_theme::color::Srgba;
-use nice_theme::palette::{slots, ColorScheme, Palette, SlotColor};
+use nice_theme::palette::{slots, ColorScheme, Palette, SlotColor, Slots};
 use nice_theme::AccentPreset;
 
 /// The `smoke` scenario's root view: a solid background with one line of text
@@ -106,28 +112,355 @@ impl Render for RootView {
     }
 }
 
-/// Fixed, sensible default window geometry + chrome defaults (real chrome is
-/// R9). Shared by the shipped window and every self-test scenario window
-/// (including the R5 live-input scenarios in [`crate::input_live`]).
+/// macOS-26 standard window-button (traffic-light) frame height, in points.
+/// Measured live (`standardWindowButton(.closeButton).frame` → 14×14 on macOS
+/// 26; matches `WindowChrome.swift:71`'s "14pt diameter each"). gpui sizes the
+/// titlebar container as `button_height + 2·y` and places the close button's
+/// origin at our `y`, so the button center lands `y + button_height/2` below the
+/// window top; [`window_options`] picks `y` so that equals
+/// [`TRAFFIC_LIGHT_CENTER_FROM_TOP`] (26) — and the derived container height is
+/// exactly [`TOP_BAR_HEIGHT`] (52). The R9 live scenario asserts the RENDERED
+/// center from the real button frame ([`crate::platform::standard_window_button_frames`]),
+/// so a future macOS button-height change surfaces there instead of drifting.
+const TRAFFIC_LIGHT_BUTTON_HEIGHT: f32 = 14.0;
+
+/// Fixed, sensible default window geometry + Nice's window chrome (R9): a hidden
+/// (transparent) titlebar with the native traffic lights repositioned onto the
+/// y-26 row, and `is_movable: false` so the band's own drag handlers own window
+/// movement. Shared by the shipped window and every self-test scenario window
+/// (including the R5 live-input scenarios in [`crate::input_live`]); only the
+/// shipped live window wraps its content in the [`WindowChromeView`] band.
 pub(crate) fn window_options() -> WindowOptions {
     let bounds = Bounds {
         origin: point(px(160.0), px(160.0)),
         size: size(px(960.0), px(640.0)),
     };
+    // Traffic-light target — the DOCUMENTED divergence from Swift's captured-
+    // default-plus-8: gpui takes an ABSOLUTE close-button origin, so x is the
+    // macOS-26 native close leading (9, `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]`) + the
+    // 8pt nudge = 17, making the documentary token load-bearing. y puts the button
+    // center on the y-26 row (see [`TRAFFIC_LIGHT_BUTTON_HEIGHT`]).
+    let traffic_light_position = point(
+        px(MACOS26_TRAFFIC_LIGHT_LEADINGS[0] + TRAFFIC_LIGHT_NUDGE_X),
+        px(TRAFFIC_LIGHT_CENTER_FROM_TOP - TRAFFIC_LIGHT_BUTTON_HEIGHT / 2.0),
+    );
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_background: WindowBackgroundAppearance::Opaque,
         titlebar: Some(TitlebarOptions {
             title: Some("Nice RS Dev".into()),
-            appears_transparent: false,
-            traffic_light_position: None,
+            // Hidden titlebar so the app draws its own chrome band; the native
+            // traffic lights show through and gpui re-applies their position on
+            // resize / focus / full-screen exit.
+            appears_transparent: true,
+            traffic_light_position: Some(traffic_light_position),
         }),
         kind: WindowKind::Normal,
+        // The band implements its own drag (`start_window_move`); the gpui doc
+        // note (`platform.rs:1498-1503`) recommends `false` for custom-drag
+        // titlebars so AppKit does not claim the region and delay clicks.
+        is_movable: false,
         is_resizable: true,
         focus: true,
         show: true,
         ..Default::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Window chrome band (R9) — the shipped live window's root view.
+// ---------------------------------------------------------------------------
+
+/// The empty-chrome window-drag start threshold, in points: a band press must
+/// move at least this far before it becomes a window move. Nice parity — the
+/// ported `DragGesture(minimumDistance: 2)` feel / `ChromeEventRouter.swift:218`.
+const BAND_DRAG_THRESHOLD_PX: f32 = 2.0;
+
+/// Has a press→current displacement `(dx, dy)` (window points) crossed the
+/// [`BAND_DRAG_THRESHOLD_PX`] drag threshold? Compared squared to avoid a sqrt,
+/// exactly like `ChromeEventRouter.swift:218` (`dx*dx + dy*dy >= 4`).
+fn band_drag_threshold_crossed(dx: f32, dy: f32) -> bool {
+    dx * dx + dy * dy >= BAND_DRAG_THRESHOLD_PX * BAND_DRAG_THRESHOLD_PX
+}
+
+/// The Nice / Dark chrome table — the shipped live window's palette/scheme (its
+/// terminal theme is `nice_default_dark`). Both the `chrome` and `line` slots the
+/// band paints are sRGB literals here.
+fn nice_dark_slots() -> Slots {
+    slots(Palette::Nice, ColorScheme::Dark).expect("Nice + Dark is a valid palette/scheme combo")
+}
+
+/// The chrome band's fill — the Nice/Dark `chrome` slot (translucent background),
+/// matching `AppShellView.swift:1001`'s edge-to-edge toolbar band.
+fn band_chrome_color() -> Rgba {
+    slot_rgba(nice_dark_slots().chrome)
+}
+
+/// The band's 1pt bottom rule — the Nice/Dark `line` slot, matching the toolbar's
+/// `niceLine` separator (`AppShellView.swift:1002-1004`).
+fn band_rule_color() -> Rgba {
+    slot_rgba(nice_dark_slots().line)
+}
+
+/// Adapt a nice-theme [`SlotColor`] to a gpui [`Rgba`] (the app owns this token →
+/// gpui adapter, per the crates/README Layering rule). Only the sRGB-literal arm
+/// is reachable for the Nice/Dark chrome + line slots the band paints; a
+/// (currently unreached) system-color slot falls back to opaque so the band can
+/// never silently vanish.
+fn slot_rgba(slot: SlotColor) -> Rgba {
+    match slot {
+        SlotColor::Srgb(c) => Rgba {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        },
+        SlotColor::System { .. } => Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        },
+    }
+}
+
+/// The shipped live window's root view: Nice's window chrome (R9) — a full-width
+/// [`TOP_BAR_HEIGHT`] (52pt) chrome band stacked over the live terminal content
+/// in a column. The native traffic lights are repositioned declaratively by
+/// [`window_options`] (real buttons, not painted here); the band carries the
+/// empty-chrome behavior — drag to move, double-click to run the user's
+/// `AppleActionOnDoubleClick`. The band spans the full window width this cycle;
+/// R10 reshapes it around the sidebar card.
+///
+/// This is the reusable chrome shell later chrome cycles build on. The two
+/// carried-forward principles hold here: chrome state is computed per event —
+/// the only thing remembered is the single in-flight press origin below, never a
+/// cross-element interaction flag (the documented anti-pattern) — and there is
+/// one arbitration point per press (GPUI event propagation: interactive children
+/// R10/R11 add consume their own presses with `stop_propagation`, and the band
+/// acts only on presses that bubble to it unconsumed).
+pub(crate) struct WindowChromeView {
+    /// The content hosted below the band — the live terminal, unchanged.
+    content: Entity<TerminalView>,
+    /// Window position of an in-band left-press not yet resolved into a drag,
+    /// recorded on mouse-down and cleared once it crosses the drag threshold
+    /// (→ `start_window_move`) or the button releases.
+    band_press: Option<Point<Pixels>>,
+}
+
+impl WindowChromeView {
+    /// Wrap `content` in the chrome band. Used by the shipped live window.
+    pub(crate) fn new(content: Entity<TerminalView>) -> Self {
+        Self {
+            content,
+            band_press: None,
+        }
+    }
+
+    /// Left mouse-down on the band. A double-click runs the user's title-bar
+    /// action (zoom / minimize / none, read per-event by gpui from
+    /// `AppleActionOnDoubleClick`) and is consumed in every case — but only
+    /// outside full screen (`ChromeEventRouter.swift:111`). A single press arms a
+    /// potential window drag from this point.
+    fn on_band_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.band_press = None;
+        // In full screen the band passes every press through untouched — the
+        // Swift decision's in-band gate also requires `!isFullScreen`
+        // (`ChromeEventRouter.swift:111`): no double-click action, no consume, no
+        // drag-arm. (Full screen itself is slice 2; this gate is already correct.)
+        if window.is_fullscreen() {
+            return;
+        }
+        if event.click_count >= 2 {
+            // Double-click: run the user's title-bar action (zoom / minimize /
+            // none, read per-event by gpui from `AppleActionOnDoubleClick`) and
+            // consume it in every case (`ChromeEventRouter.swift:191-201`).
+            window.titlebar_double_click();
+            cx.stop_propagation();
+            return;
+        }
+        // Single press: arm a potential window drag from this point.
+        self.band_press = Some(event.position);
+    }
+
+    /// Mouse move while a band press is armed: once the pointer leaves the ~2pt
+    /// threshold, hand the drag to AppKit via `start_window_move` (which moves the
+    /// window even though `is_movable == false`, exactly like Swift's
+    /// `performDrag`). A move without the left button held disarms the press.
+    fn on_band_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = self.band_press else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.band_press = None;
+            return;
+        }
+        let dx = f32::from(event.position.x - origin.x);
+        let dy = f32::from(event.position.y - origin.y);
+        if band_drag_threshold_crossed(dx, dy) {
+            self.band_press = None;
+            window.start_window_move();
+        }
+    }
+
+    /// Left mouse-up: disarm any pending drag (parity with the router clearing
+    /// `pendingDrag` on mouse-up).
+    fn on_band_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.band_press = None;
+    }
+}
+
+impl Render for WindowChromeView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(
+                // The 52pt chrome band, edge-to-edge (R10 reshapes it around the
+                // sidebar card). Painted with the `chrome` token; a 1pt `line`
+                // bottom rule matches the toolbar separator. The repositioned
+                // native traffic lights sit on its y-26 row (drawn by the OS, not
+                // here). Its mouse handlers ARE the empty-chrome drag / double-
+                // click behavior.
+                div()
+                    .relative()
+                    .flex_none()
+                    .w_full()
+                    .h(px(TOP_BAR_HEIGHT))
+                    .bg(band_chrome_color())
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_band_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_band_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .w_full()
+                            .h(px(1.0))
+                            .bg(band_rule_color()),
+                    ),
+            )
+            .child(
+                // The content area below the band — the live terminal, unchanged.
+                // `flex_1` + `min_h_0` fills the remaining height without forcing
+                // the column to overflow.
+                div().flex_1().min_h_0().child(self.content.clone()),
+            )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full screen (R9, slice 2) — the ⌃⌘F action, the native View menu, and its
+// Enter/Exit title flip.
+//
+// One declarative gpui action plus an app menu replace Swift's four-class dance:
+// `FullScreenTracker` (an `@Observable` fed by `NSWindow.didEnter/didExit/
+// didBecome/didResignKey` notifications) and the `CommandGroup(after: .sidebar)`
+// button that recomputed its title from `NSApp.keyWindow?.styleMask`
+// (`NiceApp.swift:74-104, :177-186`). No `NSEvent`/notification monitors here:
+// the menu title follows the window's own bounds observer, and gpui re-applies
+// the traffic-light position on full-screen exit so the y-26 row survives.
+// ---------------------------------------------------------------------------
+
+// R12: temporary scaffolding. R9 needs exactly one action; the app-wide
+// action/keymap table (⌘N, the full menu bar, …) lands in R12 and absorbs this
+// `actions!` block, its ⌃⌘F binding, and the app menu below.
+gpui::actions!(nice, [ToggleFullScreen]);
+
+/// The View-menu full-screen item's title, flipped by the window's current
+/// full-screen state — Swift parity (`NiceApp.swift:180-184`): "Exit Full
+/// Screen" while full screen, "Enter Full Screen" otherwise.
+fn fullscreen_menu_title(is_fullscreen: bool) -> &'static str {
+    if is_fullscreen {
+        "Exit Full Screen"
+    } else {
+        "Enter Full Screen"
+    }
+}
+
+/// The shipped app's menu bar for the given full-screen state. `menus[0]` is the
+/// macOS application menu (AppKit always renders the first menu bold with the
+/// process name, ignoring its title), left empty until R12 owns the app-wide
+/// command table (Quit / ⌘N / …); it precedes the **View** menu so that renders
+/// as "View" rather than being consumed as the app menu. The View menu carries
+/// the full-screen toggle, whose title flips via [`fullscreen_menu_title`]. The
+/// bar is rebuilt (not mutated) on each transition — the gpui menu idiom
+/// (`gpui/examples/set_menus.rs:124-128`).
+fn app_menus(is_fullscreen: bool) -> Vec<Menu> {
+    vec![
+        // The application menu — empty for now (R12 fills it).
+        Menu::new("Nice RS Dev"),
+        Menu::new("View").items([MenuItem::action(
+            fullscreen_menu_title(is_fullscreen),
+            ToggleFullScreen,
+        )]),
+    ]
+}
+
+/// Wire the shipped app's full-screen chrome, once, from [`run`] before the
+/// window opens: the global [`ToggleFullScreen`] handler, its ⌃⌘F key binding,
+/// and the initial (windowed) menu bar. [`install_fullscreen_menu_sync`] then
+/// keeps the View-menu title in step with the live window.
+pub(crate) fn install_fullscreen_command(cx: &mut App) {
+    // The action toggles the key window's native full screen.
+    // `window.toggle_fullscreen()` maps to AppKit's `toggleFullScreen:` — the
+    // same call Swift's menu button made (`NiceApp.swift:184`) — and gpui
+    // re-applies the traffic-light position on exit, so the y-26 row survives
+    // the round trip with no code of ours. A menu click dispatches the action to
+    // the key window; ⌃⌘F does the same via the binding below.
+    cx.on_action(|_: &ToggleFullScreen, cx: &mut App| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_root, window, _cx| window.toggle_fullscreen());
+        }
+    });
+    // ⌃⌘F — Nice's full-screen shortcut (`NiceApp.swift:186`). `None` context =
+    // active in every dispatch context; there is no per-view full-screen state.
+    cx.bind_keys([KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None)]);
+    // Initial bar: the window opens windowed, so the item reads "Enter Full
+    // Screen"; the bounds observer flips it on the first transition.
+    cx.set_menus(app_menus(false));
+}
+
+/// Keep the View-menu full-screen title in sync with `window` (called once as the
+/// shipped window is built, with the live `Window`). The pin has no dedicated
+/// full-screen observer, so key off the window's bounds turning to
+/// [`WindowBounds::Fullscreen`]: entering / exiting full screen resizes the
+/// window, which fires the bounds observer. The rebuild is gated on an actual
+/// full-screen state change, so an ordinary resize — or our own band drag, which
+/// emits a stream of move events — never rebuilds the menu.
+pub(crate) fn install_fullscreen_menu_sync(
+    view: Entity<WindowChromeView>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    view.update(cx, |_view, cx| {
+        let mut was_fullscreen = matches!(window.window_bounds(), WindowBounds::Fullscreen(_));
+        cx.observe_window_bounds(window, move |_view, window, cx| {
+            let is_fullscreen = matches!(window.window_bounds(), WindowBounds::Fullscreen(_));
+            if is_fullscreen != was_fullscreen {
+                was_fullscreen = is_fullscreen;
+                cx.set_menus(app_menus(is_fullscreen));
+            }
+        })
+        .detach();
+    });
 }
 
 /// The shipped window's initial live-terminal grid size. Chosen to fit inside the
@@ -149,6 +482,10 @@ pub fn run() {
     gpui_platform::application().run(|cx: &mut App| {
         cx.activate(true);
         cx.on_window_closed(|cx, _id| cx.quit()).detach();
+        // R9 (slice 2): the ⌃⌘F full-screen action + its key binding + the View
+        // menu (whose title flips once the window transitions in / out of full
+        // screen — see `install_fullscreen_menu_sync` in `open_live_terminal`).
+        install_fullscreen_command(cx);
         if let Err(e) = open_live_terminal(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);
@@ -180,14 +517,14 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
     let window = cx.open_window(window_options(), {
         let handle = handle.clone();
         let theme = theme.clone();
-        move |_window, cx| {
+        move |window, cx| {
             // The app-level shared terminal font state (T11): the SF Mono →
             // JetBrains Mono NL → system-mono chain resolved through GPUI's text
             // system, cell metrics derived from the resolved font. One entity for
             // the app's panes (Stage 2's multiple panes share it), so a ⌘+/⌘−/⌘0
             // zoom fans out to every view.
             let font = cx.new(FontSettings::resolved_default);
-            cx.new(|cx| {
+            let terminal = cx.new(|cx| {
                 let mut view = TerminalView::new(handle, theme, accent, font, cx);
                 // Wire the macOS keyCode side-channel so the R5 keyboard encoder
                 // can recover the layout-independent physical key. The sole objc2
@@ -209,7 +546,16 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
                 // deferred indefinitely by App Nap — spike-6).
                 view.set_launch_deadline(crate::platform::launch_deadline());
                 view
-            })
+            });
+            // R9: wrap the terminal in the chrome band (52pt top bar + traffic
+            // lights on the y-26 row + empty-chrome drag/double-click) — the
+            // shipped window's real chrome. Scenario windows keep their full-bleed
+            // roots; only the live window gets the band.
+            let chrome = cx.new(|_cx| WindowChromeView::new(terminal));
+            // R9 (slice 2): keep the View menu's full-screen title in sync as this
+            // window enters / exits full screen.
+            install_fullscreen_menu_sync(chrome.clone(), window, cx);
+            chrome
         }
     })?;
 
@@ -2214,6 +2560,16 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        Scenario {
+            name: "chrome",
+            open: crate::chrome_live::open_chrome_window,
+            gate: Gate::SelfReported {
+                // Two full-screen transitions (~1s each, animated) + resize / focus
+                // bounce / drag / double-click settles; generous headroom.
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
     ]
 }
 
@@ -2227,4 +2583,75 @@ pub fn run_selftest(selector: String) {
     gpui_platform::application().run(move |cx: &mut App| {
         nice_harness::selftest::drive(cx, &selector, scenarios);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_drag_threshold_is_2pt_radius_squared() {
+        // Below the 2pt radius (dx² + dy² < 4) → no window move. Matches
+        // `ChromeEventRouter.swift:218`'s `dx*dx + dy*dy >= 4`.
+        assert!(!band_drag_threshold_crossed(0.0, 0.0));
+        assert!(!band_drag_threshold_crossed(1.0, 1.0)); // 2.0  < 4
+        assert!(!band_drag_threshold_crossed(1.9, 0.0)); // 3.61 < 4
+        assert!(!band_drag_threshold_crossed(0.0, -1.9));
+        // At / beyond the 2pt radius (>= 4, boundary inclusive) → drag starts,
+        // sign-independent (the squared form ignores drag direction).
+        assert!(band_drag_threshold_crossed(2.0, 0.0)); // 4.0 == 4
+        assert!(band_drag_threshold_crossed(0.0, 2.0));
+        assert!(band_drag_threshold_crossed(-2.0, 0.0));
+        assert!(band_drag_threshold_crossed(1.5, 1.5)); // 4.5 >= 4
+    }
+
+    #[test]
+    fn traffic_light_target_centers_on_the_y26_row() {
+        // gpui centers the close button at `y + button_height/2`; our chosen y
+        // must land that on the y-26 row, and the container gpui derives
+        // (`button_height + 2·y`) must equal the 52pt band.
+        let y = TRAFFIC_LIGHT_CENTER_FROM_TOP - TRAFFIC_LIGHT_BUTTON_HEIGHT / 2.0;
+        assert_eq!(
+            y + TRAFFIC_LIGHT_BUTTON_HEIGHT / 2.0,
+            TRAFFIC_LIGHT_CENTER_FROM_TOP
+        );
+        assert_eq!(TRAFFIC_LIGHT_BUTTON_HEIGHT + 2.0 * y, TOP_BAR_HEIGHT);
+        // x is the absolute macOS-26 close leading + the 8pt nudge = 17 (the
+        // documented divergence from Swift's captured-default-plus-8).
+        assert_eq!(MACOS26_TRAFFIC_LIGHT_LEADINGS[0] + TRAFFIC_LIGHT_NUDGE_X, 17.0);
+    }
+
+    #[test]
+    fn fullscreen_menu_title_flips_on_state() {
+        // Swift parity (`NiceApp.swift:180-184`): the item reads "Enter Full
+        // Screen" windowed and "Exit Full Screen" while full screen.
+        assert_eq!(fullscreen_menu_title(false), "Enter Full Screen");
+        assert_eq!(fullscreen_menu_title(true), "Exit Full Screen");
+    }
+
+    #[test]
+    fn app_menus_carry_a_view_menu_with_the_flipping_toggle() {
+        // The full-screen toggle lives in a menu named "View" (not the app menu
+        // at index 0), and its item title tracks the full-screen state — the
+        // exact structure the R9 live scenario (slice 3) reads back via
+        // `get_menus()` and the title the bounds observer rebuilds.
+        for is_fullscreen in [false, true] {
+            let menus = app_menus(is_fullscreen);
+            let view = menus
+                .iter()
+                .find(|m| m.name.as_ref() == "View")
+                .expect("app_menus has a View menu");
+            assert_ne!(
+                menus[0].name.as_ref(),
+                "View",
+                "menus[0] is the app menu, so View must not be first"
+            );
+            match view.items.as_slice() {
+                [MenuItem::Action { name, .. }] => {
+                    assert_eq!(name.as_ref(), fullscreen_menu_title(is_fullscreen));
+                }
+                _ => panic!("View menu should hold exactly one action item"),
+            }
+        }
+    }
 }

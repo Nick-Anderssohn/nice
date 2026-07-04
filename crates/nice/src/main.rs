@@ -12,6 +12,10 @@
 //!   * [`input_live`] — the R5 live input self-test scenarios (`input-live` /
 //!     `input-shell`): real CGEvents posted to our own pid, byte-exact pty
 //!     receipt, the item-4 candidate anchor, and the IME go/no-go probe.
+//!   * [`chrome_live`] — the R9 live window-chrome self-test scenario
+//!     (`chrome`): real mouse CGEvents drive the shipped band + repositioned
+//!     traffic lights + full-screen wiring, judged against AppKit frame/state
+//!     reads (geometry, drag differential, double-click, full-screen toggle).
 //!   * [`niceties_zoom`] — the R7/T11 live zoom + pty re-metric self-test
 //!     (`niceties-zoom`): real ⌘+/⌘0 CGEvents grow the shared font, and the
 //!     grid re-fits + the pty winsize follows.
@@ -30,6 +34,7 @@
 //! (see `nice_harness::selftest`); otherwise the normal app opens its window.
 
 mod app;
+mod chrome_live;
 mod input_live;
 mod niceties_drop;
 mod niceties_held;

@@ -60,3 +60,9 @@ pub mod behavior;
 // own tests; each states its execution model in its doc comment.
 #[cfg(test)]
 mod behavior_exemplars;
+
+// R9 window-chrome band-press classification differentials — libtest
+// `#[gpui::test]` cases on the mocked context (double-click consumed; a press on
+// an interactive child never reaches the band; the ~2pt drag-threshold split).
+#[cfg(test)]
+mod chrome_band;

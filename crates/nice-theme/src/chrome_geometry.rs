@@ -67,14 +67,30 @@ pub const fn traffic_light_reserved_width() -> f32 {
     TRAFFIC_LIGHT_DEFAULT_LEADING + TRAFFIC_LIGHT_NUDGE_X + TRAFFIC_LIGHT_CLUSTER_WIDTH
 }
 
-// ---- macOS 26 native traffic-light defaults (documentary) -------------------
+// ---- macOS 26 native traffic-light defaults ---------------------------------
 //
 // The live per-button leading origins observed on macOS 26 — 9 / 32 / 55 pt at
-// a 23pt inter-button pitch — recorded for R9's sanity checks. These are
-// OS-owned RUNTIME values, NOT a design token: `TrafficLightPlacer` reads each
-// button's OWN live default at placement time (WindowChrome.swift:60-66) rather
-// than hardcoding them, and R9 must do the same — treat these only as the
-// expected values to sanity-check the live query against.
+// a 23pt inter-button pitch. R9 promoted the FIRST of these from "documentary
+// only" to LOAD-BEARING, and the split now matters:
+//
+//   * `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]` (9, the close leading) is a real input
+//     to placement. Swift's `TrafficLightPlacer` read each button's OWN live
+//     native default and added the 8pt nudge (captured-default-plus-8,
+//     `WindowChrome.swift:60-66`); GPUI instead takes an ABSOLUTE close-button
+//     origin, so R9 sets the close leading to `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]
+//     + TRAFFIC_LIGHT_NUDGE_X` = 17 (`crate::app::window_options` in the `nice`
+//     crate). That is the documented divergence from the Swift approach, and it
+//     makes this token load-bearing for the first time: if a future macOS shifts
+//     its native close leading, THIS value is what changes — the R9 `chrome` live
+//     scenario asserts the RENDERED close-button x from
+//     `standard_window_button_frames()`, so any drift from the shipped geometry
+//     surfaces there rather than silently.
+//   * `MACOS26_TRAFFIC_LIGHT_LEADINGS[1..3]` (32 / 55) and
+//     `MACOS26_TRAFFIC_LIGHT_PITCH` (23) stay DOCUMENTARY sanity-check values.
+//     GPUI derives the minimize/zoom x-positions from the live button widths +
+//     system padding and preserves the OS-native pitch with no code of ours, so
+//     these are only the expected values the live scenario checks the queried
+//     frames against — never inputs to placement.
 //
 // Provenance: project-memory note `reference_traffic_light_geometry_macos26`
 // (there is deliberately NO Swift source line — the Swift code does not
@@ -82,11 +98,14 @@ pub const fn traffic_light_reserved_width() -> f32 {
 // fixture-provenance "cite a Swift line" convention (see crates/README.md).
 
 /// Observed macOS 26 native leading origins (pt) of the close / minimize / zoom
-/// buttons. Documentary only — see the block comment above.
+/// buttons. `[0]` (the close leading) is LOAD-BEARING — R9's absolute close-x is
+/// `[0] + TRAFFIC_LIGHT_NUDGE_X` (see the block comment above); `[1]` / `[2]` are
+/// documentary sanity-check values (GPUI derives the minimize/zoom x from the
+/// live buttons).
 pub const MACOS26_TRAFFIC_LIGHT_LEADINGS: [f32; 3] = [9.0, 32.0, 55.0];
 
-/// Observed macOS 26 native inter-button pitch (pt). Documentary only — see the
-/// block comment above.
+/// Observed macOS 26 native inter-button pitch (pt). Documentary only — GPUI
+/// preserves the OS-native pitch itself; see the block comment above.
 pub const MACOS26_TRAFFIC_LIGHT_PITCH: f32 = 23.0;
 
 // ---- Cards (sidebar / collapsed cap) ----------------------------------------
@@ -165,9 +184,15 @@ mod tests {
 
     #[test]
     fn macos26_native_defaults_recorded() {
-        // Documentary (project-memory note reference_traffic_light_geometry_macos26).
+        // Project-memory note reference_traffic_light_geometry_macos26. `[0]` is
+        // load-bearing (R9's absolute close-x = `[0] + TRAFFIC_LIGHT_NUDGE_X`,
+        // consumed by `crate::app::window_options` in `nice`); `[1]`/`[2]`/pitch
+        // stay documentary. The load-bearing derivation is pinned in `nice`'s own
+        // `traffic_light_target_centers_on_the_y26_row` test.
         assert_eq!(MACOS26_TRAFFIC_LIGHT_LEADINGS, [9.0, 32.0, 55.0]);
         assert_eq!(MACOS26_TRAFFIC_LIGHT_PITCH, 23.0);
+        // The close leading feeds R9's absolute close-button x of 17.
+        assert_eq!(MACOS26_TRAFFIC_LIGHT_LEADINGS[0] + TRAFFIC_LIGHT_NUDGE_X, 17.0);
     }
 
     #[test]

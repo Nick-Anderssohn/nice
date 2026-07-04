@@ -35,6 +35,12 @@ anyhow = "1"
 # the demand-present kick uses objc2 msg_send + raw-window-handle to reach the
 # window's NSView. objc2/raw-window-handle 0.6 match what gpui_macos links.
 objc2 = "0.6"
+# The R9 traffic-light geometry reader (`platform::standard_window_button_frames`)
+# reads live `standardWindowButton` frames; `NSRect` and its `CGFloat` fields come
+# from objc2-foundation's geometry module. Pinned to the exact version gpui_macos
+# already links (`=0.3.2`) with a subset of its features, so the feature set
+# unifies and nothing recompiles.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSGeometry", "objc2-core-foundation"] }
 raw-window-handle = "0.6"
 # AppleFontSmoothing parity: Nice ships fontSmoothing=false, and GPUI-main's
 # CoreGraphics glyph-dilation is default-on (gpui_macos text_system.rs) and

@@ -37,8 +37,9 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use gpui::Window;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// Disable CoreGraphics font-smoothing glyph dilation for this process, matching
@@ -162,6 +163,120 @@ pub unsafe fn present_kick(ns_view: *mut c_void) {
     let layer: *mut AnyObject = msg_send![view, layer];
     if !layer.is_null() {
         let _: () = msg_send![layer, setNeedsDisplay];
+    }
+}
+
+// ===========================================================================
+// R9 window chrome — live standard-window-button (traffic light) geometry.
+//
+// gpui repositions the native close/minimize/zoom buttons declaratively from
+// `TitlebarOptions::traffic_light_position` (see `crate::app::window_options`),
+// re-applying the position itself on resize / focus / full-screen exit. The R9
+// live scenario must assert the REAL rendered geometry rather than trusting the
+// point we passed, so this reader queries AppKit's `standardWindowButton:`
+// frames directly. It is the R9 slice's one new AppKit reach-through (all-Rust
+// rule: every objc2 crossing lives in this module).
+// ===========================================================================
+
+/// One standard window button's frame in the window content view's coordinate
+/// space, with `y_from_top` measured DOWNWARD from the content view's top edge —
+/// so it aligns with gpui's own top-left origin and the R9 traffic-light target
+/// (the close button's [`center_from_top`](Self::center_from_top) is the y-26
+/// row).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)] // R9 slice 3 (the `chrome` scenario + nice-itests) consume this.
+pub struct WindowButtonFrame {
+    /// Leading (left) origin x, content-view points.
+    pub x: f32,
+    /// Top edge distance from the content view's top, points.
+    pub y_from_top: f32,
+    /// Button frame width, points.
+    pub width: f32,
+    /// Button frame height, points.
+    pub height: f32,
+}
+
+#[allow(dead_code)] // R9 slice 3 (the `chrome` scenario + nice-itests) consume this.
+impl WindowButtonFrame {
+    /// The button's visual-center y, measured from the content view's top — the
+    /// value the R9 scenario asserts lands on the y-26 row for the close button.
+    pub fn center_from_top(&self) -> f32 {
+        self.y_from_top + self.height / 2.0
+    }
+}
+
+/// Read the live close / minimize / zoom standard-window-button frames of
+/// `window` (in that order) straight from AppKit (`standardWindowButton:`), so a
+/// test can assert the REAL rendered traffic-light geometry instead of trusting
+/// the point passed to `window_options()`. `None` if the window has no AppKit
+/// handle yet, or any standard button is absent (e.g. a borderless window).
+///
+/// Frames are reported in the window content view's coordinate space with y
+/// measured from the top (see [`WindowButtonFrame`]); the conversion is
+/// flipped-view-aware, so it stays correct whether or not the content view is
+/// flipped (gpui's is not today, but this does not depend on that).
+///
+/// # Threading
+/// Main thread only — a synchronous AppKit view-geometry read, called from the
+/// R9 scenario's foreground task.
+#[allow(dead_code)] // R9 slice 3 (the `chrome` scenario + nice-itests) consume this.
+pub fn standard_window_button_frames(window: &Window) -> Option<[WindowButtonFrame; 3]> {
+    // `NSWindowButton` raw values: close = 0, miniaturize = 1, zoom = 2.
+    const NS_WINDOW_BUTTONS: [u64; 3] = [0, 1, 2];
+
+    let ns_view = ns_view_of(window);
+    if ns_view.is_null() {
+        return None;
+    }
+    // SAFETY: `ns_view` is this gpui window's live content `NSView`. We read the
+    // window, its content view, and the three standard window buttons, converting
+    // each button's bounds rect into content-view coordinates — all main-thread
+    // AppKit accessors with no ownership transfer (get-rule; nothing to release).
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return None;
+        }
+        let content_view: *mut AnyObject = msg_send![ns_window, contentView];
+        if content_view.is_null() {
+            return None;
+        }
+        let content_bounds: NSRect = msg_send![content_view, bounds];
+        let content_height = content_bounds.size.height;
+        let flipped: Bool = msg_send![content_view, isFlipped];
+        let content_flipped = flipped.as_bool();
+
+        let mut out = [WindowButtonFrame {
+            x: 0.0,
+            y_from_top: 0.0,
+            width: 0.0,
+            height: 0.0,
+        }; 3];
+        for (i, &kind) in NS_WINDOW_BUTTONS.iter().enumerate() {
+            let button: *mut AnyObject = msg_send![ns_window, standardWindowButton: kind];
+            if button.is_null() {
+                return None;
+            }
+            let bounds: NSRect = msg_send![button, bounds];
+            // The buttons live in the titlebar container, a sibling of the content
+            // view; AppKit converts the rect across the shared window hierarchy.
+            let frame: NSRect = msg_send![button, convertRect: bounds, toView: content_view];
+            let y_from_top = if content_flipped {
+                // Flipped view: origin is top-left, y already grows downward.
+                frame.origin.y
+            } else {
+                // Non-flipped (AppKit default): y grows up from the bottom edge.
+                content_height - (frame.origin.y + frame.size.height)
+            };
+            out[i] = WindowButtonFrame {
+                x: frame.origin.x as f32,
+                y_from_top: y_from_top as f32,
+                width: frame.size.width as f32,
+                height: frame.size.height as f32,
+            };
+        }
+        Some(out)
     }
 }
 
@@ -771,4 +886,370 @@ pub fn launch_deadline() -> nice_term_view::LaunchDeadline {
             armed: false,
         })
     })
+}
+
+// ===========================================================================
+// R9 chrome live validation — synthetic mouse CGEvents, NSWindow frame/state
+// reads, the content→screen coordinate mapping, and the
+// `AppleActionOnDoubleClick` preference read.
+//
+// This is the foreign side of the `chrome` self-test scenario
+// (`crate::chrome_live`), the R9 sibling of the R5 CGEvent input block above: it
+// posts synthetic LEFT-mouse events (down / dragged / up, with a click-state
+// field so a double-click reaches gpui) to nice-rs's OWN pid via
+// `CGEventPostToPid` — never the global HID tap — so the scenario can assert the
+// real drag / double-click behavior of the chrome band, and reads the live
+// NSWindow frame + zoom/miniaturize state to ground-truth what those gestures
+// did. It has no place in the shipped app (real input arrives through gpui); the
+// all-Rust rule keeps every foreign C crossing in this one module.
+//
+// Coordinate spaces: gpui/content-view points are top-left origin, y down. Cocoa
+// screen points are bottom-left origin, y up. CGEvent "global display" points are
+// top-left origin, y down, relative to the main (menu-bar) display. The helpers
+// convert between them explicitly.
+// ===========================================================================
+
+// CoreGraphics mouse-event types + fields (`CGEventType` / `CGEventField` /
+// `CGMouseButton`). Only the left-button subset the scenario drives.
+const CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+const CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+const CG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+const CG_MOUSE_BUTTON_LEFT: u32 = 0;
+/// `kCGMouseEventClickState` — the field that carries the click count (2 = a
+/// double-click), read back by AppKit as `NSEvent.clickCount`.
+const CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
+
+// The CGEvent cursor location and the AppKit point conversions below both use
+// `NSPoint` (== `CGPoint`, two `CGFloat`/`f64`): it is `repr(C)` for the extern
+// CGEvent call AND implements objc2's `Encode` for the `msg_send!` conversions.
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreateMouseEvent(
+        source: CGEventSourceRef,
+        mouse_type: u32,
+        cursor: NSPoint,
+        button: u32,
+    ) -> CGEventRef;
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+}
+
+/// Post one synthetic left-mouse event of `mouse_type` at CG-global point
+/// `(x, y)` to `pid`, stamping `click_count` (>=1) into the click-state field so
+/// a value of 2 reaches gpui as a double-click. Same one-pid safety invariant as
+/// the R5 keyboard block: `CGEventPostToPid`, never the global HID tap.
+fn post_mouse_event(pid: i32, mouse_type: u32, x: f64, y: f64, click_count: i64) {
+    // SAFETY: `CGEventCreateMouseEvent(nil, …)` returns a +1 event (or null,
+    // guarded); we optionally set its click-state field, post it to one pid, then
+    // release the +1.
+    unsafe {
+        let event = CGEventCreateMouseEvent(
+            std::ptr::null_mut(),
+            mouse_type,
+            NSPoint { x, y },
+            CG_MOUSE_BUTTON_LEFT,
+        );
+        if event.is_null() {
+            return;
+        }
+        if click_count > 1 {
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_count);
+        }
+        CGEventPostToPid(pid, event);
+        CFRelease(event as *const c_void);
+    }
+}
+
+/// Post a synthetic left-mouse-DOWN at CG-global `(x, y)` to `pid`. `click_count`
+/// (clamped to >=1) becomes `NSEvent.clickCount` — pass 2 for a double-click.
+pub fn post_left_mouse_down(pid: i32, x: f64, y: f64, click_count: i64) {
+    post_mouse_event(pid, CG_EVENT_LEFT_MOUSE_DOWN, x, y, click_count.max(1));
+}
+
+/// Post a synthetic left-mouse-DRAGGED at CG-global `(x, y)` to `pid`.
+pub fn post_left_mouse_dragged(pid: i32, x: f64, y: f64) {
+    post_mouse_event(pid, CG_EVENT_LEFT_MOUSE_DRAGGED, x, y, 1);
+}
+
+/// Post a synthetic left-mouse-UP at CG-global `(x, y)` to `pid`.
+pub fn post_left_mouse_up(pid: i32, x: f64, y: f64, click_count: i64) {
+    post_mouse_event(pid, CG_EVENT_LEFT_MOUSE_UP, x, y, click_count.max(1));
+}
+
+/// The window's `frame` in Cocoa screen points (bottom-left origin, y up):
+/// `[x, y, width, height]`. `None` if the window has no AppKit handle yet.
+pub fn window_screen_frame(window: &Window) -> Option<[f64; 4]> {
+    let ns_view = ns_view_of(window);
+    if ns_view.is_null() {
+        return None;
+    }
+    // SAFETY: `ns_view` is this window's live content `NSView`; `-window`/`-frame`
+    // are get-rule reads with no ownership transfer.
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return None;
+        }
+        let frame: NSRect = msg_send![ns_window, frame];
+        Some([
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        ])
+    }
+}
+
+/// Whether the window is currently zoomed (`-[NSWindow isZoomed]`). `None` if the
+/// window has no AppKit handle.
+pub fn window_is_zoomed(window: &Window) -> Option<bool> {
+    let ns_window = ns_window_of(window)?;
+    // SAFETY: `-isZoomed` is a no-arg get-rule `-> BOOL` accessor on the live
+    // NSWindow.
+    unsafe {
+        let value: Bool = msg_send![ns_window, isZoomed];
+        Some(value.as_bool())
+    }
+}
+
+/// Whether the window is currently miniaturized (`-[NSWindow isMiniaturized]`).
+pub fn window_is_miniaturized(window: &Window) -> Option<bool> {
+    let ns_window = ns_window_of(window)?;
+    // SAFETY: `-isMiniaturized` is a no-arg get-rule `-> BOOL` accessor on the
+    // live NSWindow.
+    unsafe {
+        let value: Bool = msg_send![ns_window, isMiniaturized];
+        Some(value.as_bool())
+    }
+}
+
+/// The window's backing `NSWindow` pointer via its content `NSView`, or `None` if
+/// the window has no AppKit handle yet.
+fn ns_window_of(window: &Window) -> Option<*mut AnyObject> {
+    let ns_view = ns_view_of(window);
+    if ns_view.is_null() {
+        return None;
+    }
+    // SAFETY: `ns_view` is this window's live content `NSView`; `-window` is a
+    // get-rule read returning its enclosing NSWindow (or nil, guarded).
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            None
+        } else {
+            Some(ns_window)
+        }
+    }
+}
+
+/// De-miniaturize the window (`-[NSWindow deminiaturize:]`), so the scenario can
+/// recover after a double-click whose `AppleActionOnDoubleClick` is "Minimize".
+pub fn deminiaturize_window(window: &Window) {
+    let ns_view = ns_view_of(window);
+    if ns_view.is_null() {
+        return;
+    }
+    // SAFETY: `-deminiaturize:` on the live NSWindow; `nil` sender is valid.
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let _: () = msg_send![ns_window, deminiaturize: std::ptr::null_mut::<AnyObject>()];
+    }
+}
+
+/// Set the window's `frame` (Cocoa screen points, `[x, y, width, height]`) via
+/// `setFrame:display:` (no animation) — used to RESTORE the window to a known
+/// geometry after a gesture that moved / zoomed / miniaturized it, so later
+/// scenario steps run against a stable frame.
+pub fn set_window_frame(window: &Window, frame: [f64; 4]) {
+    let Some(ns_window) = ns_window_of(window) else {
+        return;
+    };
+    // SAFETY: `setFrame:display:` on the live NSWindow with an owned rect; no
+    // ownership transfer.
+    unsafe {
+        let rect = NSRect {
+            origin: NSPoint {
+                x: frame[0],
+                y: frame[1],
+            },
+            size: NSSize {
+                width: frame[2],
+                height: frame[3],
+            },
+        };
+        let _: () = msg_send![ns_window, setFrame: rect, display: true];
+    }
+}
+
+/// Resize the window's frame by `(dw, dh)` points via AppKit `setFrame:display:`
+/// (no animation), leaving the origin fixed. Used only to FIRE gpui's resize
+/// handler for the BUG-B "traffic lights survive a resize" re-assert; pair with a
+/// restoring call (`-dw, -dh`).
+pub fn resize_window_by(window: &Window, dw: f64, dh: f64) {
+    let ns_view = ns_view_of(window);
+    if ns_view.is_null() {
+        return;
+    }
+    // SAFETY: read the live frame, widen/heighten it, and set it back with no
+    // animation; all main-thread AppKit calls with no ownership transfer.
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let mut frame: NSRect = msg_send![ns_window, frame];
+        frame.size.width += dw;
+        frame.size.height += dh;
+        let _: () = msg_send![ns_window, setFrame: frame, display: true];
+    }
+}
+
+/// Resign this app's active status (`-[NSApplication deactivate]`) so the key
+/// window resigns key. Paired with a later `cx.activate(true)`, this is the
+/// focus BOUNCE the BUG-B re-assert needs (gpui re-applies the traffic-light
+/// position on the key-state change).
+pub fn deactivate_app() {
+    // SAFETY: `NSApplication.sharedApplication` is a live singleton on the main
+    // thread once running; `-deactivate` takes no arguments.
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let _: () = msg_send![app, deactivate];
+    }
+}
+
+/// Map a content-view point `(cx, cy_from_top)` (top-left origin, y down — the
+/// gpui coordinate space `standard_window_button_frames` reports in) to a
+/// CG-global point (top-left of the main display, y down) suitable for
+/// `post_left_mouse_*`. `None` if the window / content view / main screen is
+/// unavailable.
+pub fn content_point_to_cg_global(window: &Window, cx: f64, cy_from_top: f64) -> Option<(f64, f64)> {
+    let ns_view = ns_view_of(window);
+    if ns_view.is_null() {
+        return None;
+    }
+    let main_h = main_screen_height()?;
+    // SAFETY: all AppKit point/geometry conversions on the live window +
+    // content view; get-rule reads, main thread. `convertPoint:toView: nil`
+    // yields window-base coords; `convertPointToScreen:` (10.12+) yields Cocoa
+    // screen coords.
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return None;
+        }
+        let content_view: *mut AnyObject = msg_send![ns_window, contentView];
+        if content_view.is_null() {
+            return None;
+        }
+        let bounds: NSRect = msg_send![content_view, bounds];
+        let flipped: Bool = msg_send![content_view, isFlipped];
+        // Content-view point: if the view is not flipped (gpui's default), y grows
+        // up from the bottom, so mirror the top-down input.
+        let view_y = if flipped.as_bool() {
+            cy_from_top
+        } else {
+            bounds.size.height - cy_from_top
+        };
+        let view_pt = NSPoint { x: cx, y: view_y };
+        let win_pt: NSPoint =
+            msg_send![content_view, convertPoint: view_pt, toView: std::ptr::null_mut::<AnyObject>()];
+        let screen_pt: NSPoint = msg_send![ns_window, convertPointToScreen: win_pt];
+        // Cocoa screen (bottom-left, y up) → CG global (top-left, y down).
+        Some((screen_pt.x, main_h - screen_pt.y))
+    }
+}
+
+/// The main (menu-bar) display's height in points — the flip reference between
+/// Cocoa screen coords and CG-global coords. `NSScreen.screens[0]` is the screen
+/// whose origin is `(0,0)` in Cocoa space.
+fn main_screen_height() -> Option<f64> {
+    // SAFETY: `+[NSScreen screens]` returns an autoreleased array (get-rule); we
+    // read element 0's `-frame` height. Main thread, autorelease pool active.
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![screens, count];
+        if count == 0 {
+            return None;
+        }
+        let screen: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        if screen.is_null() {
+            return None;
+        }
+        let frame: NSRect = msg_send![screen, frame];
+        Some(frame.size.height)
+    }
+}
+
+/// The user's title-bar double-click action, read the SAME way gpui's
+/// `titlebar_double_click` does (`NSGlobalDomain` persistent domain, key
+/// `AppleActionOnDoubleClick`), so the `chrome` scenario can predict the effect
+/// of a double-click. Read-only — the scenario NEVER writes this (it is the
+/// user's real preference).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoubleClickAction {
+    /// "Do Nothing".
+    None,
+    /// "Minimize".
+    Minimize,
+    /// "Maximize" / "Fill" / unset / anything else → gpui zooms (its default arm).
+    Zoom,
+}
+
+/// Read `AppleActionOnDoubleClick` from `NSGlobalDomain`, mapping it exactly like
+/// gpui (`gpui_macos/src/window.rs:1777-1794`): "None" → do nothing, "Minimize" →
+/// miniaturize, everything else (including unset) → zoom.
+pub fn apple_action_on_double_click() -> DoubleClickAction {
+    // SAFETY: `+[NSUserDefaults standardUserDefaults]` is a live get-rule
+    // singleton; `-persistentDomainForName:`/`-objectForKey:`/`-UTF8String` are
+    // get-rule reads. Main thread, autorelease pool active. We NEVER call a setter.
+    unsafe {
+        let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        if defaults.is_null() {
+            return DoubleClickAction::Zoom;
+        }
+        let domain = ns_string("NSGlobalDomain");
+        let key = ns_string("AppleActionOnDoubleClick");
+        let dict: *mut AnyObject = msg_send![defaults, persistentDomainForName: domain];
+        let action: *mut AnyObject = if dict.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![dict, objectForKey: key]
+        };
+        if action.is_null() {
+            return DoubleClickAction::Zoom;
+        }
+        let utf8: *const std::os::raw::c_char = msg_send![action, UTF8String];
+        if utf8.is_null() {
+            return DoubleClickAction::Zoom;
+        }
+        match std::ffi::CStr::from_ptr(utf8).to_string_lossy().as_ref() {
+            "None" => DoubleClickAction::None,
+            "Minimize" => DoubleClickAction::Minimize,
+            _ => DoubleClickAction::Zoom,
+        }
+    }
+}
+
+/// Build an autoreleased `NSString` from a Rust `&str`.
+///
+/// # Safety
+/// Main thread with an active autorelease pool (every scenario read satisfies
+/// this — it runs on the gpui foreground/main runloop).
+unsafe fn ns_string(s: &str) -> *mut AnyObject {
+    let c = std::ffi::CString::new(s).unwrap_or_default();
+    msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
 }
