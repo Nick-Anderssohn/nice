@@ -51,7 +51,7 @@ use gpui::{
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
 use nice_term_view::{
-    grid_top_y, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
+    grid_top_y, FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
     TermInputHandler,
 };
 use nice_theme::AccentPreset;
@@ -126,16 +126,18 @@ fn prepare_dir(tag: &str) -> Result<PathBuf> {
 fn make_view(handle: Entity<TerminalSessionHandle>, cx: &mut AsyncApp) -> Entity<TerminalView> {
     let theme = TerminalTheme::nice_default_dark();
     let accent = AccentPreset::Terracotta.color();
-    cx.new(|cx| {
-        let mut v = TerminalView::new(
-            handle,
-            theme,
-            accent,
+    // Fixed-metrics font state (Menlo/13px/8×16): these scenarios assert byte-exact
+    // pty receipt + the IME anchor geometry at a known pitch, not font resolution
+    // / zoom (which the niceties-zoom scenario covers).
+    let font = cx.new(|_cx| {
+        FontSettings::fixed(
             SharedString::from(FONT_FAMILY),
             FONT_PX,
             TerminalMetrics::new(CELL_W, CELL_H),
-            cx,
-        );
+        )
+    });
+    cx.new(|cx| {
+        let mut v = TerminalView::new(handle, theme, accent, font, cx);
         v.set_keycode_probe(Arc::new(platform::current_event_keycode));
         v
     })

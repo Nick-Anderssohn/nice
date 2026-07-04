@@ -46,7 +46,7 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use anyhow::Result;
-use gpui::{AppContext, AsyncApp, Entity, EventEmitter, Task};
+use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, Task};
 
 use nice_term_core::{DamageCallback, ExitStatus, Session, SessionEvent, SharedTerm, SpawnSpec};
 
@@ -96,6 +96,13 @@ fn to_terminal_event(ev: SessionEvent) -> Option<TerminalEvent> {
 /// the drain task; the view observes it.
 pub struct TerminalSessionHandle {
     session: Session,
+    /// The spec the session was spawned from, kept so the T10 dismiss affordance
+    /// can [`respawn_shell`](Self::respawn_shell) a fresh login shell in the same
+    /// cwd / env after a held pane is dismissed (the original may have been a
+    /// one-off command that already exited).
+    spec: SpawnSpec,
+    /// The per-session scrollback knob, kept for [`respawn_shell`](Self::respawn_shell).
+    scrollback_lines: usize,
     /// Sub-line scroll remainder, in lines. Wheel/trackpad deltas accumulate
     /// here; only whole lines are stepped into the core's line-quantized display
     /// offset, leaving the fractional part parked as the **deferred smooth-scroll
@@ -141,7 +148,7 @@ impl TerminalSessionHandle {
                 damage.fetch_add(1, Ordering::Release);
             })
         };
-        let (session, events) = Session::spawn(spec, scrollback_lines, on_damage)?;
+        let (session, events) = Session::spawn(spec.clone(), scrollback_lines, on_damage)?;
 
         let entity = cx.new(|cx| {
             let drain = cx.spawn(async move |this, cx| {
@@ -149,12 +156,56 @@ impl TerminalSessionHandle {
             });
             TerminalSessionHandle {
                 session,
+                spec,
+                scrollback_lines,
                 scroll_accum: 0.0,
                 present_kick: None,
                 _drain: drain,
             }
         });
         Ok(entity)
+    }
+
+    /// Respawn a **fresh login shell** in place, replacing a held/exited session
+    /// (T10 dismiss). This is the ONLY path that frees the held term: dropping the
+    /// old [`Session`] tears down its (already-dead) child and releases its
+    /// scrollback, and a brand-new `zsh -il` session takes its place — reusing the
+    /// original spec's cwd + env but never its command (the held pane's command
+    /// already exited; a Stage-2 tab-dissolve will own this later). The entity
+    /// identity is preserved, so the view's subscriptions and the app's present
+    /// kick survive; only the drain task is restarted over the fresh event stream.
+    ///
+    /// The fresh pty is sized to the current grid (so the shell comes up filling
+    /// the window); the caller re-fits to the live viewport on its next paint.
+    pub fn respawn_shell(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        let (rows, cols) = self
+            .session
+            .dimensions()
+            .unwrap_or((self.spec.rows, self.spec.cols));
+        let shell_spec = SpawnSpec::shell(self.spec.cwd.clone())
+            .with_env(self.spec.env.clone())
+            .with_size(rows, cols);
+
+        let damage = Arc::new(AtomicU64::new(0));
+        let on_damage: DamageCallback = {
+            let damage = Arc::clone(&damage);
+            Box::new(move || {
+                damage.fetch_add(1, Ordering::Release);
+            })
+        };
+        // Spawn the fresh session FIRST; only swap it in on success so a failed
+        // respawn leaves the held pane intact (its output stays readable) rather
+        // than blanking the view to a dead session.
+        let (session, events) = Session::spawn(shell_spec.clone(), self.scrollback_lines, on_damage)?;
+        self.session = session;
+        // Future dismissals of this pane respawn a shell too (the command spec is
+        // gone once its held pane is dismissed).
+        self.spec = shell_spec;
+        self._drain = cx.spawn(async move |this, cx| {
+            drain_loop(this, cx, events, damage).await;
+        });
+        cx.notify();
+        Ok(())
     }
 
     /// Install the demand-present kick (see [`PresentKick`] + the module docs).

@@ -21,8 +21,21 @@
 //!   cursor).
 //! * [`TerminalTheme`] — the render-half theme value (16 ANSI + bg/fg/cursor/
 //!   selection), shaped like `TerminalTheme.swift`.
+//! * [`FontSettings`] — the app-level terminal font state (T11): the family
+//!   chain + point size + derived cell metrics every [`TerminalView`] observes.
+//!   A ⌘+/⌘−/⌘0 zoom mutates it; each view re-metrics and resizes its pty.
 //! * [`color`] — the full color model resolver (16 themed ANSI, 256 computed
 //!   cube/ramp, 24-bit truecolor).
+//! * [`drop`] — the file / image drag-drop escaped-path typer (T7): the pure
+//!   byte builder ([`drop_bytes`]) behind [`TerminalView`]'s
+//!   `on_drop::<ExternalPaths>` handler, reusing `shell_backslash_escape` +
+//!   the R5 bracketed-paste wrap seam.
+//! * [`overlay`] — the two R7 terminal-niceties state machines (T9/T10): the
+//!   [`LaunchOverlay`] "Launching…" timing machine (silent-pane grace → overlay →
+//!   cleared on first output) and the [`HeldPane`] machine (a non-clean exit keeps
+//!   the pane mounted + readable, writes the dim in-buffer footer, and a
+//!   single-pane-era dismiss respawns a fresh shell). Both are driven off the R3
+//!   [`TerminalEvent`] stream the [`TerminalView`] now subscribes to.
 //!
 //! ## What this crate covers so far
 //!
@@ -50,9 +63,12 @@
 //! to hit the gate.
 
 pub mod color;
+pub mod drop;
 pub mod element;
+pub mod font;
 pub mod input;
 pub mod mouse;
+pub mod overlay;
 pub mod session_handle;
 pub mod theme;
 pub mod view;
@@ -63,8 +79,19 @@ pub mod view;
 mod boxdraw;
 
 pub use color::{resolve_color, xterm256};
-pub use element::{grid_top_y, ImeInput, TerminalElement, TerminalMetrics, TERMINAL_BOTTOM_GAP};
+pub use drop::{drop_bytes, is_safe_path, ImageDropProvider};
+pub use element::{
+    fit_grid, grid_top_y, ImeInput, TerminalElement, TerminalMetrics, TERMINAL_BOTTOM_GAP,
+};
+pub use font::{
+    cell_metrics, clamp_px, default_font_chain, resolve_family, FontSettings, FontZoom,
+    DEFAULT_TERMINAL_FONT_PX, MAX_TERMINAL_FONT_PX, MIN_TERMINAL_FONT_PX,
+};
 pub use input::{KeyCodeProbe, TermInputHandler};
+pub use overlay::{
+    held_exit_footer, HeldPane, LaunchDeadline, LaunchDeadlineFuture, LaunchOverlay,
+    DEFAULT_LAUNCH_OVERLAY_GRACE, HELD_FOOTER_LABEL,
+};
 pub use session_handle::{PresentKick, TerminalEvent, TerminalSessionHandle};
 pub use theme::{TerminalColor, TerminalTheme};
 pub use view::TerminalView;

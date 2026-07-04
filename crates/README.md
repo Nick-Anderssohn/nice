@@ -54,11 +54,32 @@ The GPUI application. Structure (grows over later cycles):
   side-channel feeding the R5 keyboard encoder, and (R5) the CGEvent / `AXIsProcessTrusted`
   / TIS-input-source FFI the live input scenarios drive — synthetic events are
   posted **only** with `CGEventPostToPid` to nice-rs's own pid, never the global
-  HID tap.
+  HID tap. R7 adds two more FFI surfaces here (keeping the view crates objc2-free
+  via the same injection pattern as the present-kick): `read_dropped_image_to_temp`
+  reads the **drag pasteboard** for a raw-image drag (browser / Messages / Preview,
+  no file URL), transcodes it to a temp PNG, and returns that path (the T7 raw-image
+  drop fallback, injected via `set_image_drop_provider`); and `launch_deadline`
+  builds the **App-Nap-safe** grace-deadline future the T9 launch overlay arms —
+  a dedicated OS-thread `nanosleep` that wakes the main runloop (the spike-6
+  finding that a coalescable libdispatch timer can be deferred indefinitely on an
+  idle/occluded app), injected via `set_launch_deadline`.
 - `input_live` — the R5 live input self-test scenarios (`input-live` /
   `input-shell`): real CGEvents posted to our own pid, byte-exact pty receipt,
   the item-4 candidate anchor, and the IME go/no-go probe (see the scenario
   table under "Self-test harness").
+- `niceties_zoom` — the R7/T11 live zoom + pty re-metric self-test
+  (`niceties-zoom`): real ⌘+/⌘−/⌘0 CGEvents grow the shared font, the grid
+  re-fits, and the pty winsize follows.
+- `niceties_drop` — the R7/T7 file/image drag-drop self-test (`niceties-drop`):
+  the drop handler is driven with constructed `ExternalPaths` events, asserting
+  byte-exact escaped-path typing.
+- `niceties_overlay` — the R7/T9 "Launching…" overlay self-test
+  (`niceties-overlay`): a slow silent pane shows the overlay past a short grace
+  window and clears it on first output, while an instant-prompt pane never
+  flashes it.
+- `niceties_held` — the R7/T10 held-pane self-test (`niceties-held`): a non-zero
+  exit stays mounted with the dim in-buffer footer + the dismiss affordance,
+  typing is inert, and dismiss respawns a fresh shell.
 - `main.rs` — dispatches on `NICE_RS_SELFTEST`: unset runs the normal app,
   set runs the self-test driver.
 
@@ -263,6 +284,24 @@ ordinary element in gpui's own tree, so the `NSViewRepresentable` dance today's
   carrying `background_color` so the bg-luminance curve engages + a block
   cursor) and `TerminalView` (owns a `FocusHandle`; the caret's solid/hollow
   state is **computed** from `is_focused && window active`, never a stored flag).
+- `font` (R7/T11) — `FontSettings`, the shared **app-level** terminal-font state
+  (family chain + point size) every view `cx.observe`s so a ⌘+/⌘−/⌘0 zoom fans out
+  to all panes; owns the SF Mono → JetBrains Mono NL → system-mono chain
+  resolution through gpui's text system and the derived cell metrics. The type
+  lives here (Rust's `nice → nice-term-view` graph forces it) but is constructed
+  and owned once at the app root in `crates/nice` — no view creates its own.
+- `drop` (R7/T7) — the pure escaped-path byte builder + path-safety filter behind
+  the drag-drop handler (`NiceTerminalView.performDragOperation` port): dropped
+  POSIX paths are backslash-escaped and space-joined in drop order, framed in
+  `ESC[200~…ESC[201~` when the app enabled DECSET 2004 (else space-padded), never
+  a trailing newline. Table-tested against the Swift semantics.
+- `overlay` (R7/T9+T10) — the two niceties state machines split from paint for
+  windowless unit testing: `LaunchOverlay` (the "Launching…" timing machine —
+  `Pending → Visible` past the grace window, cleared on first output / exit) and
+  `HeldPane` (latches `Exited { held: true }`, keeps the view mounted + scrollback
+  readable, writes the dim in-buffer exit footer, and gates the dismiss respawn).
+  Also the `LaunchDeadline` factory type the App-Nap-safe grace deadline is
+  injected through (its objc2 body lives in `crates/nice/src/platform`).
 
 R4 is now complete: the full color model, text attributes, selection,
 box-drawing / block elements, wide glyphs, the row-quantized bottom-anchored
@@ -271,7 +310,8 @@ injected `setNeedsDisplay` kick) all live here, and `crates/nice`'s shipped
 window hosts a live zsh pane over this crate. The `term-perf` self-test gates
 streaming frame time + memory under the synthetic workload. Out of R4's scope
 (later cycles): keyboard/IME/mouse input (R5), OSC title/cwd (now landed in R6),
-fonts/zoom/overlay (R7), and sub-line smooth scroll (deferred).
+fonts/zoom + drag-drop + the launch overlay + held panes (now landed in R7 — the
+`font`/`drop`/`overlay` modules above), and sub-line smooth scroll (deferred).
 
 ## Layering rule
 
@@ -394,6 +434,10 @@ the window, and moves to the next scenario.
 | `term-perf` | The streaming frame-time + memory budget gate (Validation §5). Floods a live ~120×40 pane (scrollback 10 000) with 15 s of the deterministic `nice_harness::workload` synthetic stream through a raw-mode `cat` while the RAF-animated `TerminalView` stamps frames; self-activates its window, reduces the frame stream to interval percentiles, samples memory, and gates on **absolute** frame times (p50 ≤ 17.5 ms, p95 ≤ 20 ms) plus the pane's own memory **growth** over its entry baseline (< 120 MiB) — a criterion the cadence-jitter gate can't express. (Growth, not absolute, because inside the `all` suite the process already carries ~140 MiB from the five prior scenarios' retained windows/atlas/readbacks; the absolute < 200 MiB "steady" budget is validated by the dedicated `NICE_RS_SELFTEST=term-perf` run — a fresh process, ≈142 MiB.) Runs up to 3 times, gates on the best run, prints the percentiles + memory in the transcript. Uses `Gate::SelfReported` (it runs its own measurement and posts the verdict). |
 | `input-live` | The R5 live keyboard/paste/IME-anchor gate (Validation §2–§4). Spawns a capture-tee session (`sh -c 'stty raw -echo; exec tee <cap>'`), posts **real CGEvents** to nice-rs's own pid (`crate::platform`, `CGEventPostToPid` — never the global HID tap), and asserts the bytes appended to the capture file match exactly: plain ASCII (rides the IME `insertText` path → pty), ⌘V paste with DECSET 2004 **off** (raw) then **on** (`ESC[200~…ESC[201~`), and arrow keys (`ESC[A/B/C/D`). Then the G1 **item-4 candidate anchor** is asserted programmatically — park the grid cursor mid-grid (CUP), drive a composition through the real `TermInputHandler`, and check `bounds_for_range` returns a rect at the grid-cursor cell (never `None`, the zed#46055 failure mode). Finally the **IME go/no-go probe** (TIS → Pinyin): if synthetic composition engages, items 1–3 + 5 are asserted mechanically; if not (plan-flagged UNPROVEN — and on this machine Pinyin is installed-but-not-enabled, so `TISSelectInputSource` refuses it), it records a **DEFERRED HUMAN PASS** (stderr checklist) rather than fail-looping. The user's keyboard input source is **always** restored (on `Drop`). Preflights `AXIsProcessTrusted()` and FAILs loudly (never silently skips) if the Accessibility grant is missing. `Gate::SelfReported` (byte-exact receipt, not cadence). |
 | `input-shell` | The R5 real-shell CGEvent sanity gate (Validation §5). A real `zsh -il` (user rc suppressed via an empty `ZDOTDIR`): polls the grid until the shell prints its prompt, then types `echo <marker>` + Enter entirely via CGEvents and asserts the marker appears ≥ 2× in the grid (the typed command echo **and** the command output), proving the whole path reaches a real login shell and its output round-trips. `Gate::SelfReported`. |
+| `niceties-zoom` | The R7/T11 live zoom + pty re-metric gate (Validation §2). Drives the shipped ⌘+/⌘−/⌘0 zoom keybindings with **real CGEvents** to nice-rs's own pid over a real login shell and asserts the whole T11 chain: after ⌘+ ×3 the shared `FontSettings` reports a larger point size + cell box, the view re-fits the grid and pushes `(rows, cols)` to the pty (asserted both by the core `Term`'s grid dimensions matching an independent `fit_grid` **and** `stty size` in the child echoing them — proving SIGWINCH reached the shell), and ⌘0 restores the baseline exactly. Preflights the Accessibility grant and FAILs loudly if it is missing (a dropped CGEvent would make every zoom a no-op). `Gate::SelfReported` (state assertions, not cadence). |
+| `niceties-drop` | The R7/T7 file/image drag-drop gate (Validation §3). Drives the view's drop handler through its test seam (`handle_external_paths_drop`) with **constructed** `ExternalPaths` events over a real pty (a real OS drag is impractical headless, and gpui's macOS backend only accepts filename drags) and asserts the exact bytes typed into the child: one escaped, space-padded path (DECSET 2004 off); multiple paths space-joined in drop order; a path with spaces / shell metacharacters backslash-escaped; the **raw-image fallback** (a drop with no file URLs consults the injected image-drop provider — a stub path here); the `ESC[200~ … ESC[201~` frame with 2004 **on**; and never a trailing newline. Reuses the `input-live` capture-tee child; drives the handler directly, so it needs **no** Accessibility grant. `Gate::SelfReported` (byte-exact receipt). |
+| `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent pane** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt pane** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
+| `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
 `crates/nice/src/app.rs`'s `selftest_scenarios()`. A `Cadence`-gated scenario

@@ -172,6 +172,21 @@ pub fn grid_top_y(bounds: Bounds<Pixels>, metrics: TerminalMetrics, rows: usize)
     f32::from(bounds.origin.y) + f32::from(bounds.size.height) - TERMINAL_BOTTOM_GAP - grid_h
 }
 
+/// Grid dimensions `(rows, cols)` that fill a content area `content_w × content_h`
+/// (logical px) at cell `metrics`, clamped to at least 1×1. The bottom-anchor gap
+/// ([`TERMINAL_BOTTOM_GAP`]) is reserved from the height. This is the re-metric
+/// fit the view applies to the pty on a font change (T11): when the cell box grows
+/// or shrinks under zoom, the same window holds a different number of cells, and
+/// the new `(rows, cols)` are pushed to the pty via the R3/R4 resize path (which
+/// drives SIGWINCH). The niceties-zoom self-test recomputes with this same
+/// function so its expected-fit assertion cannot drift from the view.
+pub fn fit_grid(content_w: f32, content_h: f32, metrics: TerminalMetrics) -> (u16, u16) {
+    let usable_h = (content_h - TERMINAL_BOTTOM_GAP).max(0.0);
+    let cols = (content_w / metrics.cell_w).floor().max(1.0) as u16;
+    let rows = (usable_h / metrics.cell_h).floor().max(1.0) as u16;
+    (rows, cols)
+}
+
 impl TerminalElement {
     /// Build the frame snapshot from `handle`'s session grid.
     ///

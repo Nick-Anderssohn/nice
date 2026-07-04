@@ -34,7 +34,8 @@ use nice_harness::selftest::{Gate, Scenario};
 use nice_harness::workload;
 use nice_term_core::SpawnSpec;
 use nice_term_view::{
-    TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView, TERMINAL_BOTTOM_GAP,
+    FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
+    TERMINAL_BOTTOM_GAP,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, SlotColor};
@@ -129,18 +130,12 @@ pub(crate) fn window_options() -> WindowOptions {
     }
 }
 
-/// The shipped window's live terminal geometry. Fixed cell metrics (font
-/// resolution / zoom is R7); a grid sized to sit inside `window_options`'s
-/// content area at that pitch. Menlo 13px is a stock monospace family (the exact
-/// SF Mono chain is R7); the cell box matches `term-render` so the renderer's
-/// pitch is consistent across the shipped window and the scenarios.
-const LIVE_FONT_FAMILY: &str = "Menlo";
-const LIVE_FONT_PX: f32 = 13.0;
-const LIVE_CELL_W: f32 = 8.0;
-const LIVE_CELL_H: f32 = 16.0;
-/// Grid size, chosen to fit inside the 960×640 window's content area at 8×16
-/// (≈118×36 fits under the titlebar with a small margin); the pane is
-/// bottom-anchored, so the prompt sits flush at the bottom.
+/// The shipped window's initial live-terminal grid size. Chosen to fit inside the
+/// 960×640 window's content area (≈118×36 at the old 8×16 Menlo box, comfortably
+/// inside the SF Mono box the R7 chain now resolves); the pane is bottom-anchored,
+/// so the prompt sits flush at the bottom. The font family + size + cell metrics
+/// are now the app-level [`FontSettings`] (T11): a ⌘+/⌘−/⌘0 zoom re-metrics from
+/// here and resizes the pty to refill the window.
 const LIVE_ROWS: u16 = 36;
 const LIVE_COLS: u16 = 118;
 
@@ -186,16 +181,14 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
         let handle = handle.clone();
         let theme = theme.clone();
         move |_window, cx| {
+            // The app-level shared terminal font state (T11): the SF Mono →
+            // JetBrains Mono NL → system-mono chain resolved through GPUI's text
+            // system, cell metrics derived from the resolved font. One entity for
+            // the app's panes (Stage 2's multiple panes share it), so a ⌘+/⌘−/⌘0
+            // zoom fans out to every view.
+            let font = cx.new(FontSettings::resolved_default);
             cx.new(|cx| {
-                let mut view = TerminalView::new(
-                    handle,
-                    theme,
-                    accent,
-                    SharedString::from(LIVE_FONT_FAMILY),
-                    LIVE_FONT_PX,
-                    TerminalMetrics::new(LIVE_CELL_W, LIVE_CELL_H),
-                    cx,
-                );
+                let mut view = TerminalView::new(handle, theme, accent, font, cx);
                 // Wire the macOS keyCode side-channel so the R5 keyboard encoder
                 // can recover the layout-independent physical key. The sole objc2
                 // crossing for input lives in `crate::platform`, injected here
@@ -203,6 +196,18 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
                 view.set_keycode_probe(std::sync::Arc::new(
                     crate::platform::current_event_keycode,
                 ));
+                // Raw-image drag fallback (T7): a drop with no file URLs reads the
+                // drag pasteboard for image data and types a temp PNG path. Same
+                // objc2-in-platform injection as the keyCode probe above.
+                view.set_image_drop_provider(std::sync::Arc::new(
+                    crate::platform::read_dropped_image_to_temp,
+                ));
+                // App-Nap-safe "Launching…" overlay grace deadline (T9): the sole
+                // foreign-code home builds it, injected like the probes above so
+                // `nice-term-view` stays CF/objc2-free. Load-bearing for a slow,
+                // silent, possibly-occluded pane (a bare gpui timer could be
+                // deferred indefinitely by App Nap — spike-6).
+                view.set_launch_deadline(crate::platform::launch_deadline());
                 view
             })
         }
@@ -930,17 +935,17 @@ fn open_term_render_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         let handle = handle.clone();
         let theme = theme.clone();
         move |_window, cx| {
-            let terminal = cx.new(|cx| {
-                TerminalView::new(
-                    handle,
-                    theme,
-                    accent,
+            // Fixed-metrics font state: an explicit Menlo/13px/8×16 cell box so the
+            // deterministic pixel assertions key off a known pitch (font resolution
+            // + zoom are exercised by the shipped window + niceties-zoom instead).
+            let font = cx.new(|_cx| {
+                FontSettings::fixed(
                     SharedString::from(TR_FONT_FAMILY),
                     TR_FONT_PX,
                     TerminalMetrics::new(TR_CELL_W, TR_CELL_H),
-                    cx,
                 )
             });
+            let terminal = cx.new(|cx| TerminalView::new(handle, theme, accent, font, cx));
             cx.new(|_cx| TermRenderView { terminal, frame: 0 })
         }
     })?;
@@ -1353,17 +1358,17 @@ fn open_term_layout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         let handle = handle.clone();
         let theme = theme.clone();
         move |_window, cx| {
-            let terminal = cx.new(|cx| {
-                TerminalView::new(
-                    handle,
-                    theme,
-                    accent,
+            // Fixed-metrics font state: an explicit Menlo/13px/8×16 cell box so the
+            // deterministic pixel assertions key off a known pitch (font resolution
+            // + zoom are exercised by the shipped window + niceties-zoom instead).
+            let font = cx.new(|_cx| {
+                FontSettings::fixed(
                     SharedString::from(TR_FONT_FAMILY),
                     TR_FONT_PX,
                     TerminalMetrics::new(TR_CELL_W, TR_CELL_H),
-                    cx,
                 )
             });
+            let terminal = cx.new(|cx| TerminalView::new(handle, theme, accent, font, cx));
             cx.new(|_cx| TermRenderView { terminal, frame: 0 })
         }
     })?;
@@ -1538,17 +1543,17 @@ fn open_term_scroll_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         let handle = handle.clone();
         let theme = theme.clone();
         move |_window, cx| {
-            let terminal = cx.new(|cx| {
-                TerminalView::new(
-                    handle,
-                    theme,
-                    accent,
+            // Fixed-metrics font state: an explicit Menlo/13px/8×16 cell box so the
+            // deterministic pixel assertions key off a known pitch (font resolution
+            // + zoom are exercised by the shipped window + niceties-zoom instead).
+            let font = cx.new(|_cx| {
+                FontSettings::fixed(
                     SharedString::from(TR_FONT_FAMILY),
                     TR_FONT_PX,
                     TerminalMetrics::new(TR_CELL_W, TR_CELL_H),
-                    cx,
                 )
             });
+            let terminal = cx.new(|cx| TerminalView::new(handle, theme, accent, font, cx));
             cx.new(|_cx| TermRenderView { terminal, frame: 0 })
         }
     })?;
@@ -1792,17 +1797,16 @@ fn open_term_perf_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         let handle = handle.clone();
         let theme = theme.clone();
         move |_window, cx| {
-            let terminal = cx.new(|cx| {
-                TerminalView::new(
-                    handle,
-                    theme,
-                    accent,
+            // Fixed-metrics font state (Menlo/13px/8×16): the perf gate measures
+            // the renderer at a known pitch, not font resolution / zoom.
+            let font = cx.new(|_cx| {
+                FontSettings::fixed(
                     SharedString::from(TP_FONT_FAMILY),
                     TP_FONT_PX,
                     TerminalMetrics::new(TP_CELL_W, TP_CELL_H),
-                    cx,
                 )
             });
+            let terminal = cx.new(|cx| TerminalView::new(handle, theme, accent, font, cx));
             cx.new(|_cx| TermRenderView { terminal, frame: 0 })
         }
     })?;
@@ -1984,7 +1988,13 @@ fn term_perf_report(
 /// scenarios use the standard jitter gate; `term-perf` and the two `input-*`
 /// scenarios self-report their own verdict (see [`Gate::SelfReported`]) — the
 /// input ones because their pass criterion is byte-exact pty receipt, not frame
-/// cadence.
+/// cadence. `niceties-zoom` (R7/T11) is the live zoom + pty re-metric gate: real
+/// ⌘+/⌘0 CGEvents grow the shared font, the grid re-fits, and the pty winsize
+/// follows — also self-reported (state assertions, not cadence). `niceties-drop`
+/// (R7/T7) is the drag-drop gate: the drop handler is driven with constructed
+/// `ExternalPaths` events and asserts byte-exact escaped-path typing (padded when
+/// DECSET 2004 is off, bracketed-paste-framed when on) — self-reported, and
+/// needs no Accessibility grant (it drives the handler directly, not via CGEvents).
 pub fn selftest_scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -2031,6 +2041,34 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             open: crate::input_live::open_input_shell_window,
             gate: Gate::SelfReported {
                 budget: Duration::from_secs(25),
+            },
+        },
+        Scenario {
+            name: "niceties-zoom",
+            open: crate::niceties_zoom::open_niceties_zoom_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(30),
+            },
+        },
+        Scenario {
+            name: "niceties-drop",
+            open: crate::niceties_drop::open_niceties_drop_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(30),
+            },
+        },
+        Scenario {
+            name: "niceties-overlay",
+            open: crate::niceties_overlay::open_niceties_overlay_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(30),
+            },
+        },
+        Scenario {
+            name: "niceties-held",
+            open: crate::niceties_held::open_niceties_held_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(30),
             },
         },
     ]

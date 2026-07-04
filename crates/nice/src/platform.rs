@@ -28,6 +28,13 @@
 //!    runbook requires the window be frontmost.
 
 use std::ffi::c_void;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 
 use gpui::Window;
 use objc2::runtime::AnyObject;
@@ -159,6 +166,135 @@ pub unsafe fn present_kick(ns_view: *mut c_void) {
 }
 
 // ===========================================================================
+// R7 drag-drop — raw-image pasteboard fallback.
+//
+// gpui's macOS backend registers only `NSFilenamesPboardType` for drags, so a
+// file drop reaches the view as `ExternalPaths` (file URLs) but a *raw-image*
+// drag (from a browser / Messages / Preview — image data, no file URL) carries
+// no path. The Swift app handles that by transcoding the pasteboard image to a
+// temp PNG and typing that path (`NiceTerminalView.swift:441-512`). This is the
+// objc2 half of that fallback, injected into the view as `set_image_drop_provider`
+// so `nice-term-view` stays objc2-free (like the keyCode side-channel above).
+//
+// NOTE: with today's stock gpui backend a raw-image drag is not delivered to the
+// window at all (it accepts only filename drags), so this provider is wired but
+// dormant until the backend also registers the image drag types; the file-URL
+// drop path (the common case: Finder / the in-app file explorer) is fully live.
+// ===========================================================================
+
+// AppKit pasteboard constants (each is an `NSString *const` global; reading the
+// extern static yields the interned NSString pointer). Hand-declared in the raw-
+// FFI style this module already uses rather than pulling in objc2-app-kit.
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    static NSPasteboardNameDrag: *const AnyObject;
+    static NSPasteboardTypePNG: *const AnyObject;
+    static NSPasteboardTypeTIFF: *const AnyObject;
+}
+
+/// `NSBitmapImageFileType.png` — the file-type selector for
+/// `-representationUsingType:properties:` (AppKit `NSBitmapImageFileTypePNG`).
+const NS_BITMAP_FILE_TYPE_PNG: u64 = 4;
+
+/// Read the current drag pasteboard for image data, transcode it to PNG, write it
+/// to a per-process temp file, and return that path — or `None` when the drag
+/// carried no image (or the write failed). The returned path is all-safe ASCII,
+/// so it passes the drop handler's path filter unchanged.
+///
+/// Prefers a direct PNG payload; otherwise transcodes the canonical TIFF
+/// representation via `NSBitmapImageRep` (browsers usually drop one or the other).
+/// Mirrors Swift's `pngData(from:)` + `writeDroppedImage(_:)`.
+///
+/// Called synchronously on the main thread from the view's drop handler, where an
+/// AppKit autorelease pool is active, so the autoreleased `NSData`/`NSBitmapImageRep`
+/// need no manual release.
+pub fn read_dropped_image_to_temp() -> Option<PathBuf> {
+    let png = unsafe { drag_pasteboard_png_bytes()? };
+    write_dropped_image(&png)
+}
+
+/// The PNG bytes for the image currently on the drag pasteboard, or `None`.
+///
+/// # Safety
+/// Must be called on the main thread with an active autorelease pool (the drop
+/// handler satisfies both).
+unsafe fn drag_pasteboard_png_bytes() -> Option<Vec<u8>> {
+    // [NSPasteboard pasteboardWithName: NSPasteboardNameDrag]
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), pasteboardWithName: NSPasteboardNameDrag];
+    if pb.is_null() {
+        return None;
+    }
+
+    // Direct PNG first (no transcode needed).
+    let png_data: *mut AnyObject = msg_send![pb, dataForType: NSPasteboardTypePNG];
+    if !png_data.is_null() {
+        return ns_data_bytes(png_data);
+    }
+
+    // Otherwise transcode the TIFF representation to PNG via NSBitmapImageRep.
+    let tiff_data: *mut AnyObject = msg_send![pb, dataForType: NSPasteboardTypeTIFF];
+    if tiff_data.is_null() {
+        return None;
+    }
+    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff_data];
+    if rep.is_null() {
+        return None;
+    }
+    let empty_props: *mut AnyObject = msg_send![class!(NSDictionary), dictionary];
+    let png_data: *mut AnyObject = msg_send![
+        rep,
+        representationUsingType: NS_BITMAP_FILE_TYPE_PNG,
+        properties: empty_props
+    ];
+    if png_data.is_null() {
+        return None;
+    }
+    ns_data_bytes(png_data)
+}
+
+/// Copy an `NSData`'s bytes into an owned `Vec<u8>`.
+///
+/// # Safety
+/// `data` must be a valid `NSData*` (or null, guarded).
+unsafe fn ns_data_bytes(data: *mut AnyObject) -> Option<Vec<u8>> {
+    if data.is_null() {
+        return None;
+    }
+    let len: usize = msg_send![data, length];
+    if len == 0 {
+        return None;
+    }
+    let ptr: *const u8 = msg_send![data, bytes];
+    if ptr.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr, len).to_vec())
+}
+
+/// Write PNG `bytes` to a fresh per-process temp file and return its path, or
+/// `None` if the directory / file could not be created. Port of
+/// `writeDroppedImage` (a caches subdir; here the per-user temp dir — same-user
+/// readable, which is all the child shell needs).
+fn write_dropped_image(bytes: &[u8]) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Monotonic tiebreaker so two drops in the same nanosecond never collide.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    let dir = std::env::temp_dir().join("Nice").join("dropped-images");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("drop-{}-{}-{}.png", std::process::id(), nanos, seq));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+// ===========================================================================
 // R5 live input validation — CGEvent posting, Accessibility trust, and the
 // TIS keyboard-input-source switch.
 //
@@ -225,11 +361,18 @@ extern "C" {
 }
 
 // CoreFoundation, hand-declared (the `core_foundation_sys` graph already links
-// it; these are the two array accessors + CFRelease this module uses).
+// it; these are the two array accessors + CFRelease this module uses, plus the
+// two runloop pokes the T9 launch-overlay deadline needs — see `launch_deadline`).
 extern "C" {
     fn CFArrayGetCount(array: CfArrayRef) -> CfIndex;
     fn CFArrayGetValueAtIndex(array: CfArrayRef, idx: CfIndex) -> *const c_void;
     fn CFRelease(cf: *const c_void);
+    /// The main runloop (always the app's; linked via AppKit/CF).
+    fn CFRunLoopGetMain() -> *mut c_void;
+    /// Force the main runloop out of its wait so a just-enqueued wake runs NOW —
+    /// immune to timer coalescing / App Nap (the harness watchdog's belt-and-
+    /// suspenders wake, reused by the launch-overlay deadline).
+    fn CFRunLoopWakeUp(rl: *mut c_void);
 }
 
 /// Whether this process holds the Accessibility (TCC) grant. Without it
@@ -409,4 +552,82 @@ pub fn select_pinyin_input_source() -> Option<String> {
         CFRelease(list);
         chosen
     }
+}
+
+/// A future that resolves after a fixed delay via the **spike-6 App-Nap-safe**
+/// mechanism the T9 launch-overlay grace deadline needs.
+///
+/// Why not `background_executor().timer`: macOS App Nap indefinitely defers
+/// coalescable libdispatch timers on an idle/occluded app (the spike observed a
+/// 60 s deadline not firing within 8 minutes). The overlay-worthy case is a
+/// *silent* pane — no output, no events — which is exactly the idle condition
+/// that lets App Nap kick in, so the deadline cannot ride a coalescable timer.
+///
+/// The mechanism (the harness watchdog pattern): a **dedicated OS thread** sleeps
+/// to the deadline — a `nanosleep` wakeup is scheduler-level, NOT a coalescable
+/// timer — then wakes the awaiting foreground task's `Waker` AND force-wakes the
+/// main CFRunLoop, so gpui's foreground executor polls this future to completion
+/// even under App Nap.
+struct AppNapSafeDelay {
+    delay: Duration,
+    done: Arc<AtomicBool>,
+    /// The timer thread is spawned on the first poll (when a real `Waker` exists),
+    /// then this latches so a re-poll never spawns a second thread.
+    armed: bool,
+}
+
+impl Future for AppNapSafeDelay {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        // `AppNapSafeDelay` is `Unpin` (Duration + Arc + bool), so a plain `&mut`
+        // is sound to take out of the pin.
+        let this = self.get_mut();
+        if this.done.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        if !this.armed {
+            this.armed = true;
+            let done = Arc::clone(&this.done);
+            let waker = cx.waker().clone();
+            let delay = this.delay;
+            // Best-effort: if the thread cannot spawn, the overlay simply never
+            // promotes (no worse than the pre-T9 behaviour). It is a one-shot,
+            // short-lived thread per launch.
+            let _ = std::thread::Builder::new()
+                .name("nice-rs-launch-deadline".into())
+                .spawn(move || {
+                    // Scheduler-level sleep — immune to libdispatch timer coalescing.
+                    std::thread::sleep(delay);
+                    done.store(true, Ordering::Release);
+                    // Wake the awaiting task, then force the main runloop out of its
+                    // wait so the foreground executor re-polls us even if napped.
+                    waker.wake();
+                    // SAFETY: `CFRunLoopGetMain` returns the app's main runloop (or,
+                    // implausibly, null, which `CFRunLoopWakeUp` tolerates as a
+                    // no-op); both take no ownership.
+                    unsafe {
+                        CFRunLoopWakeUp(CFRunLoopGetMain());
+                    }
+                });
+        }
+        Poll::Pending
+    }
+}
+
+/// The App-Nap-safe launch-overlay grace-deadline factory (T9) injected into every
+/// [`TerminalView`](nice_term_view::TerminalView) via `set_launch_deadline`.
+/// Given the grace `Duration`, it hands back a future that resolves after that
+/// delay through [`AppNapSafeDelay`] (dedicated OS-thread sleep + main-runloop
+/// wake). Keeping this the sole foreign-code home lets `nice-term-view` stay free
+/// of CF/objc2 — it only awaits the returned future.
+pub fn launch_deadline() -> nice_term_view::LaunchDeadline {
+    Arc::new(|delay: Duration| -> nice_term_view::LaunchDeadlineFuture {
+        // The concrete future unsize-coerces to the boxed trait object at return.
+        Box::pin(AppNapSafeDelay {
+            delay,
+            done: Arc::new(AtomicBool::new(false)),
+            armed: false,
+        })
+    })
 }
