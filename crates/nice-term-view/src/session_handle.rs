@@ -37,6 +37,7 @@
 //!
 //! [`set_present_kick`]: TerminalSessionHandle::set_present_kick
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -65,9 +66,14 @@ pub type PresentKick = Arc<dyn Fn(&mut AsyncApp)>;
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 /// A typed event re-emitted onto the gpui side, mirroring
-/// [`nice_term_core::SessionEvent`]. `#[non_exhaustive]` so R6 can add
-/// `Title` / `Cwd` variants (which ride this same entity) without a breaking
-/// change — do not narrow consumers to today's two.
+/// [`nice_term_core::SessionEvent`]. `#[non_exhaustive]` so a still-later cycle
+/// can add variants without a breaking change — do not narrow consumers to
+/// today's set.
+///
+/// **Terminal-stack library boundary (R13, TRANCHE-2-NOTES §4):** the OSC
+/// title/cwd variants carry **plain types only** (`String`, `PathBuf`) — no
+/// `nice-model` types, no Nice-specific config. The app adapts these into its
+/// document; the stack never learns about tabs/panes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TerminalEvent {
@@ -77,17 +83,34 @@ pub enum TerminalEvent {
     /// The child exited. `status` is the raw exit; `held` is the held-pane
     /// classification (see [`nice_term_core::should_hold_on_exit`]).
     Exited { status: ExitStatus, held: bool },
+    /// OSC 0 / OSC 2 set the window/tab title (R6). The already-trimmed decoded
+    /// title (mirror of [`nice_term_core::SessionEvent::TitleChanged`]). Rides
+    /// this entity — not the view — so a hidden pane's title still flows to the
+    /// app (R13). Plain `String`; the app maps it onto its pane/tab titles.
+    TitleChanged(String),
+    /// The title was reset to the terminal default (alacritty `ResetTitle`;
+    /// mirror of [`nice_term_core::SessionEvent::TitleReset`]).
+    TitleReset,
+    /// OSC 7 reported a new working directory (R6; mirror of
+    /// [`nice_term_core::SessionEvent::CwdChanged`]). Plain [`PathBuf`]; the app
+    /// stashes it on its per-pane cwd.
+    CwdChanged(PathBuf),
 }
 
-/// Translate a core [`SessionEvent`] to its gpui [`TerminalEvent`]. Returns
-/// `None` for a future `#[non_exhaustive]` variant this slice does not model
-/// yet (it is dropped rather than mis-emitted).
+/// Translate a core [`SessionEvent`] to its gpui [`TerminalEvent`]. Every
+/// current core variant maps (R13 wired the OSC title/cwd variants that
+/// `7500e55` dropped at the `_ => None` hole); `None` is reserved for a
+/// still-later `#[non_exhaustive]` variant this crate hasn't learned to
+/// translate yet (dropped rather than mis-emitted on the render thread).
 fn to_terminal_event(ev: SessionEvent) -> Option<TerminalEvent> {
     match ev {
         SessionEvent::OutputStarted => Some(TerminalEvent::OutputStarted),
         SessionEvent::Exited { status, held } => Some(TerminalEvent::Exited { status, held }),
-        // A variant added by a later cycle (Title/Cwd): ignore until this crate
-        // learns to translate it, rather than panicking on the render thread.
+        SessionEvent::TitleChanged(title) => Some(TerminalEvent::TitleChanged(title)),
+        SessionEvent::TitleReset => Some(TerminalEvent::TitleReset),
+        SessionEvent::CwdChanged(path) => Some(TerminalEvent::CwdChanged(path)),
+        // A variant added by a still-later cycle: ignore until this crate learns
+        // to translate it, rather than panicking on the render thread.
         _ => None,
     }
 }
@@ -404,7 +427,79 @@ async fn drain_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::take_scroll_steps;
+    use super::{take_scroll_steps, to_terminal_event, TerminalEvent};
+    use nice_term_core::{ExitStatus, SessionEvent};
+    use std::path::PathBuf;
+
+    /// A scripted core event stream — every current [`SessionEvent`] variant —
+    /// must surface through the entity's translator instead of being dropped.
+    /// The OSC title/cwd variants used to fall into the `_ => None` hole
+    /// (`session_handle.rs` at `7500e55`); R13 maps them so a hidden pane's
+    /// title/cwd still reach the app on this view-independent entity.
+    #[test]
+    fn scripted_core_stream_maps_every_variant_including_title_and_cwd() {
+        let scripted: Vec<(SessionEvent, Option<TerminalEvent>)> = vec![
+            (
+                SessionEvent::OutputStarted,
+                Some(TerminalEvent::OutputStarted),
+            ),
+            (
+                SessionEvent::TitleChanged("build watcher".into()),
+                Some(TerminalEvent::TitleChanged("build watcher".into())),
+            ),
+            (SessionEvent::TitleReset, Some(TerminalEvent::TitleReset)),
+            (
+                SessionEvent::CwdChanged(PathBuf::from("/tmp/proj")),
+                Some(TerminalEvent::CwdChanged(PathBuf::from("/tmp/proj"))),
+            ),
+            (
+                SessionEvent::Exited {
+                    status: ExitStatus::Exited(0),
+                    held: false,
+                },
+                Some(TerminalEvent::Exited {
+                    status: ExitStatus::Exited(0),
+                    held: false,
+                }),
+            ),
+            (
+                SessionEvent::Exited {
+                    status: ExitStatus::Signaled(9),
+                    held: true,
+                },
+                Some(TerminalEvent::Exited {
+                    status: ExitStatus::Signaled(9),
+                    held: true,
+                }),
+            ),
+        ];
+
+        for (core, want) in scripted {
+            assert_eq!(
+                to_terminal_event(core.clone()),
+                want,
+                "core event {core:?} must translate to {want:?}, not drop"
+            );
+        }
+    }
+
+    #[test]
+    fn title_and_cwd_payloads_survive_translation_verbatim() {
+        // The plain-typed payloads (String / PathBuf) cross the boundary
+        // unchanged — no re-decoding, no app-type coercion in the stack.
+        assert_eq!(
+            to_terminal_event(SessionEvent::TitleChanged("Fix top bar height".into())),
+            Some(TerminalEvent::TitleChanged("Fix top bar height".into()))
+        );
+        assert_eq!(
+            to_terminal_event(SessionEvent::CwdChanged(PathBuf::from(
+                "/Users/nick/Projects/nice"
+            ))),
+            Some(TerminalEvent::CwdChanged(PathBuf::from(
+                "/Users/nick/Projects/nice"
+            )))
+        );
+    }
 
     #[test]
     fn sub_line_ticks_accumulate_then_step_once() {
