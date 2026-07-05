@@ -63,6 +63,12 @@ core-foundation-sys = "0.8"
 # version gpui links (already in the workspace lock) so the types unify; no
 # extra codecs pulled here — gpui enables its own feature set.
 image = { version = "0.25", default-features = false }
+# The R14 control socket parses the frozen NDJSON wire protocol
+# (`crate::control_socket`): one newline-terminated JSON object per client.
+# Promoted from nice-model's dev-only use to a normal dependency here (the app
+# is the sole runtime parser of the shell helpers' messages). Already in the
+# workspace lock; no new fetch.
+serde_json = "1"
 
 [features]
 # Screenshot capture (Window::render_to_image), gated so it stays OUT of the

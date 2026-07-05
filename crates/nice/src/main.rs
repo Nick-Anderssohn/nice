@@ -81,6 +81,21 @@
 //!     window-level (sidebar/pane, through the registry's `active_state`)
 //!     handler split, the process-level `FontSettings` fan-out, and the peek
 //!     modifier-release observer.
+//!   * [`control_socket`] — the R14 per-window Unix control socket: the FROZEN
+//!     NDJSON message enum (`claude`/`session_update`/`handoff` + every
+//!     normalization rule) + parser, the consume-on-use reply object, the
+//!     dedicated-thread bind/accept/self-heal listener, and the waker-based
+//!     `mpsc` → gpui foreground drain bridge (`CFRunLoopWakeUp`, AppNapSafe
+//!     shape). The window routing point lives on [`window_state`]; `app::run`
+//!     bootstrap wiring lands with the R14 env-injection slice.
+//!   * [`shell_inject`] — the R14 synthetic `ZDOTDIR` rc chain: the four FROZEN
+//!     stub bodies (`.zshenv`/`.zprofile`/`.zlogin`/`.zshrc` with the `claude()`
+//!     shadow + OSC 7 emitter + prefill tail), the self-healing stub writer, and
+//!     the per-variant Application Support location + `NICE_APPLICATION_SUPPORT_ROOT`
+//!     override seam (`app::run` bootstrap wiring lands later in R14).
+//!   * [`tmp_sweep`] — the R14 stale-`$TMPDIR` sweep: the pure `tempFileDecision`
+//!     classifier + the `nice-*.sock` / legacy `nice-zdotdir-*` sweep with an
+//!     injected `kill(pid,0)` liveness probe (keeps a live sibling app's debris).
 //!
 //! Entry dispatch: `NICE_RS_SELFTEST=<scenario>` runs the measurement harness
 //! (see `nice_harness::selftest`); otherwise the normal app opens its window.
@@ -90,6 +105,7 @@ mod app_shell;
 mod app_shell_live;
 mod chrome_live;
 mod context_menu;
+mod control_socket;
 mod inline_rename;
 mod input_live;
 mod keymap;
@@ -104,11 +120,14 @@ mod platform;
 mod session_lifecycle;
 mod session_manager;
 mod sf_symbols;
+mod shell_inject;
+mod shell_socket_live;
 mod sidebar_actions;
 mod sidebar_live;
 mod sidebar_shell;
 mod status_dot;
 mod theme;
+mod tmp_sweep;
 mod toolbar;
 mod window_registry;
 mod window_state;

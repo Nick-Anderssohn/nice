@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui::{
     div, point, prelude::*, px, rgb, size, AnyWindowHandle, App, AppContext, AsyncApp, Bounds,
-    Context, Entity, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
+    Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, SharedString, TitlebarOptions,
     WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
@@ -539,11 +539,143 @@ pub fn run() {
         // process-level `FontSettings` every window shares. Must run before the
         // first window opens: `open_managed_window` reads the shared font entity.
         crate::keymap::install_shortcuts(cx);
+        // R14: the process-wide shell-injection bootstrap — app::run ONLY (NEVER
+        // run_selftest, so the regression suite never writes real user files, per
+        // the tranche-3 hermeticity rule). Order (Swift NiceServices.bootstrap):
+        // sweep stale $TMPDIR debris → write the ZDOTDIR stubs (overwrite-always
+        // self-heal; a write failure ⇒ zdotdir None and panes still get
+        // NICE_SOCKET) → capture Nice's own inherited ZDOTDIR before any pty child
+        // sees our override. The captured config becomes an app global so every
+        // window (the first + every ⌘N) threads the same zdotdir / user-zdotdir
+        // into its SessionManager's shell env.
+        install_shell_inject_bootstrap(cx);
         if let Err(e) = open_managed_window(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);
         }
     });
+}
+
+/// Process-wide shell-injection config, captured once by [`run`]'s bootstrap and
+/// read by every [`open_managed_window`] (the first window and every ⌘N). UNSET
+/// under [`run_selftest`] — the launch-time writers never run there (hermeticity),
+/// so a scenario opening through `open_managed_window` gets a socket-only window
+/// env (no real `ZDOTDIR` override; the shells read the user's real rc directly,
+/// exactly as before R14).
+struct ShellInjectConfig {
+    /// The synthetic rc-chain directory (`ZDOTDIR`), or `None` if the stub write
+    /// failed. Threaded into every window's `SessionManager` shell env.
+    zdotdir: Option<String>,
+    /// Nice's own inherited `ZDOTDIR` (the value for `NICE_USER_ZDOTDIR`), captured
+    /// before any pty child sees our override. `None` when Nice inherited none.
+    user_zdotdir: Option<String>,
+}
+
+impl Global for ShellInjectConfig {}
+
+/// The R14 process-wide shell-injection bootstrap (Swift `NiceServices.bootstrap`).
+/// Runs from [`run`] ONLY — never [`run_selftest`], so the regression suite never
+/// writes real user files. See the call site for the ordering rationale.
+fn install_shell_inject_bootstrap(cx: &mut App) {
+    // 1. Sweep stale $TMPDIR debris (crashed-run `nice-*.sock` + legacy
+    //    `nice-zdotdir-*` dirs) whose owning pid is gone. Cross-app safe: a live
+    //    sibling's debris is kept (pid-liveness rule).
+    crate::tmp_sweep::sweep_stale_temp_files();
+    // R15: OrphanShellReaper::reap() slots here — reap orphan zsh from prior
+    // crashes before any new pane spawns (macOS caps kern.tty.ptmx_max at 511).
+    // 2. Write the ZDOTDIR stubs (overwrite-always self-heal). A write failure is
+    //    non-fatal: zdotdir stays None and panes still get NICE_SOCKET.
+    let zdotdir = match crate::shell_inject::write_stubs(&crate::shell_inject::default_location()) {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Err(e) => {
+            eprintln!("nice-rs: ZDOTDIR inject failed: {e} (panes still get NICE_SOCKET)");
+            None
+        }
+    };
+    // 3. Capture Nice's own inherited ZDOTDIR from the process env, BEFORE any pty
+    //    child inherits our override (read straight from the env so this works even
+    //    if the stub write failed — a pane still benefits from NICE_USER_ZDOTDIR).
+    let user_zdotdir = std::env::var("ZDOTDIR").ok();
+    cx.set_global(ShellInjectConfig {
+        zdotdir,
+        user_zdotdir,
+    });
+}
+
+/// Mint + arm this window's control socket and thread its shell-injection env into
+/// the window's [`SessionManager`] — the Rust twin of Swift
+/// `SessionsModel.bootstrapSocket` + `startSocketListener`. Must run BEFORE the
+/// window's Main pane forks (the "env before fork" invariant: the pane inherits
+/// `NICE_SOCKET` / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from launch, or the `claude()`
+/// shadow can't reach us). Shared by [`open_managed_window`] (production) and the
+/// `shell-socket` scenario, so both wire the socket identically.
+///
+/// The socket path is minted first (two-phase, no bind yet) so it can ride pty env
+/// before the listener arms. Bind failure is NON-fatal — logged; `NICE_SOCKET`
+/// still points at the (unbound) path so shells' `nc … -w 2` fails fast and falls
+/// back to direct `command claude` ("user always gets claude"). `health_interval`
+/// is `None` in production (30 s default) and a short value in the scenario's
+/// self-heal step. The foreground drain is **waker-woken** (App-Nap-safe) — never
+/// a coalescable timer. Returns the minted socket path (the `shell-socket`
+/// scenario drives raw `UnixStream` clients + asserts the teardown unlink against
+/// it; `open_managed_window` discards it).
+pub(crate) fn arm_window_control_socket(
+    ws: &mut WindowState,
+    cx: &mut Context<WindowState>,
+    zdotdir: Option<String>,
+    user_zdotdir: Option<String>,
+    health_interval: Option<Duration>,
+) -> String {
+    use crate::control_socket::{socket_channel, NiceControlSocket};
+    use crate::session_manager::WindowShellEnv;
+    use std::sync::mpsc::TryRecvError;
+
+    let socket = match health_interval {
+        Some(h) => NiceControlSocket::with_intervals(h, Duration::from_millis(500)),
+        None => NiceControlSocket::new(),
+    };
+    let socket_path = socket.path().to_string();
+
+    // Set the window's shell-injection env BEFORE the caller forks the Main pane.
+    ws.session.set_window_shell_env(WindowShellEnv {
+        socket_path: Some(socket_path.clone()),
+        zdotdir,
+        user_zdotdir,
+    });
+
+    // Bind + start the accept thread; drain parsed messages onto the foreground.
+    let (tx, rx) = socket_channel();
+    if let Err(e) = socket.start(move |msg| tx.post(msg)) {
+        eprintln!(
+            "nice-rs: control socket failed to bind: {e:#} (shells fall back to direct claude)"
+        );
+    }
+
+    // The waker-woken foreground drain: park on `readable()`, then route every
+    // queued message through the window state. Held (not detached) so teardown /
+    // entity drop cancels it. Exits when the entity is gone or all senders drop.
+    let drain = cx.spawn(async move |this: WeakEntity<WindowState>, acx: &mut AsyncApp| {
+        loop {
+            rx.readable().await;
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        if this
+                            .update(acx, |ws, _cx| ws.route_socket_message(msg))
+                            .is_err()
+                        {
+                            return; // window entity gone
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+        }
+    });
+
+    ws.install_control_socket(socket, drain);
+    socket_path
 }
 
 /// Open a managed Nice window: mint + seed this window's [`WindowState`], spawn
@@ -594,6 +726,20 @@ pub(crate) fn open_managed_window(
             .and_then(|t| t.active_pane_id.clone());
         tab.zip(pane)
     };
+
+    // R14: mint + arm this window's control socket and set its shell-injection env
+    // BEFORE the Main pane forks (env-before-fork). The zdotdir / user-zdotdir come
+    // from the process-wide bootstrap config, which is UNSET under run_selftest —
+    // a scenario opening through here gets a socket-only window env (no real
+    // ZDOTDIR override), so its shells behave exactly as before R14.
+    let (zdotdir, user_zdotdir) = cx
+        .try_global::<ShellInjectConfig>()
+        .map(|c| (c.zdotdir.clone(), c.user_zdotdir.clone()))
+        .unwrap_or((None, None));
+    state.update(cx, |ws, cx| {
+        arm_window_control_socket(ws, cx, zdotdir, user_zdotdir, None);
+    });
+
     if let Some((tab_id, pane_id)) = main {
         state.update(cx, |ws, cx| ws.session.spawn_pane(&tab_id, &pane_id, spec, cx))?;
     }
@@ -2733,6 +2879,28 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // panes, the AX-tree activation poll, and the teardown reap of
                 // several ptys, each on the real pty clock; generous headroom.
                 budget: Duration::from_secs(60),
+            },
+            activate: true,
+        },
+        // R14: the shell-injection + control-socket transport gate — spawns real
+        // login shells through the live spawn path with manager env injection
+        // active (the synthetic ZDOTDIR rc chain + per-pane NICE_SOCKET/ids), then
+        // asserts the TRANSPORT: the USER_RC_RAN chain-back, the `claude --help`
+        // bypass, a `claude` handshake recording the pane's exact ids/cwd + one
+        // reply line, a raw-UnixStream session_update surfacing normalized, the
+        // NICE_PREFILL_COMMAND pre-type, socket self-heal, and teardown unlink.
+        // Headless (its own root, no view assertions); registers no WindowRegistry,
+        // so it stays before the `multiwindow` scenario that installs the
+        // quit-when-empty close observer and must be last.
+        Scenario {
+            name: "shell-socket",
+            open: crate::shell_socket_live::open_shell_socket_window,
+            gate: Gate::SelfReported {
+                // Two real login-shell spawns + grid-readiness polls, a real
+                // `claude()` handshake round-trip, raw-socket drives, the prefill
+                // pane, a socket self-heal poll, and the teardown reap — each on the
+                // real pty / socket clock; generous headroom.
+                budget: Duration::from_secs(90),
             },
             activate: true,
         },

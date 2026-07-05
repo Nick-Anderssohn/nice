@@ -742,6 +742,42 @@ pub fn accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
+/// The running app's `CFBundleName` (e.g. `"Nice RS Dev"` for the shipped
+/// bundle), or `None` when the process is not bundled — a bare `cargo run` or
+/// the test binary has no `Info.plist`. Mirrors Swift's
+/// `Bundle.main.object(forInfoDictionaryKey: "CFBundleName")`: the R14
+/// shell-inject per-variant `ZDOTDIR` path keys off this so `Nice RS Dev` never
+/// shares a self-healing stub directory with the Swift `Nice` / `Nice Dev`
+/// builds (two apps rewriting one dir with drifting stub text would fight).
+pub fn main_bundle_name() -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::base::{CFGetTypeID, CFTypeRef};
+    use core_foundation_sys::bundle::{
+        CFBundleGetMainBundle, CFBundleGetValueForInfoDictionaryKey,
+    };
+    use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
+
+    // SAFETY: every call below is a get-rule read on the process's own main
+    // bundle — thread-safe, requires no run loop, takes no ownership. We confirm
+    // the value is actually a CFString (via its type id) before wrapping it, and
+    // hand the borrowed ref to a get-rule wrapper that does not over-release.
+    unsafe {
+        let bundle = CFBundleGetMainBundle();
+        if bundle.is_null() {
+            return None;
+        }
+        let key = CFString::new("CFBundleName");
+        let value: CFTypeRef =
+            CFBundleGetValueForInfoDictionaryKey(bundle, key.as_concrete_TypeRef());
+        if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
+            return None;
+        }
+        let name = CFString::wrap_under_get_rule(value as CFStringRef);
+        Some(name.to_string())
+    }
+}
+
 /// `kAXErrorSuccess`.
 const AX_SUCCESS: i32 = 0;
 
@@ -1110,6 +1146,22 @@ pub fn launch_deadline() -> nice_term_view::LaunchDeadline {
             armed: false,
         })
     })
+}
+
+/// Force the app's main CFRunLoop out of its wait so a just-enqueued foreground
+/// wake runs *now*, immune to timer coalescing / App Nap — the App-Nap-safe
+/// belt-and-suspenders the R14 control-socket foreground drain
+/// (`crate::control_socket::SocketSender::post`) fires after every enqueue,
+/// mirroring [`AppNapSafeDelay`]. Safe to call from any thread. Production
+/// consumer lands with the R14 env-injection slice's drain wiring, hence the
+/// `dead_code` allow.
+#[allow(dead_code)]
+pub fn wake_main_runloop() {
+    // SAFETY: `CFRunLoopGetMain` returns the app's main runloop (or, implausibly,
+    // null, which `CFRunLoopWakeUp` tolerates as a no-op); neither takes ownership.
+    unsafe {
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
 }
 
 // ===========================================================================

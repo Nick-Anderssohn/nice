@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nice_model::{SidebarMode, SidebarModel, SidebarTabSelection, TabModel};
 
+use crate::control_socket::{NiceControlSocket, Reply, RecordedSocketMessage, SocketMessage};
 use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
 use crate::session_manager::SessionManager;
 use crate::sidebar_actions::{ModelSidebarActions, SidebarActions};
@@ -84,6 +85,24 @@ pub(crate) struct WindowState {
     pub(crate) session: SessionManager,
     /// Stable unique per-window id (the registry's per-session-id lookup key).
     session_id: String,
+    /// R14 control-socket routing record: the parsed / normalized messages this
+    /// window received through [`route_socket_message`](WindowState::route_socket_message).
+    /// Populated only under `cfg(test)` or the `selftest` feature (see
+    /// [`record_socket_message`](WindowState::record_socket_message)) — production
+    /// leaves it empty. The `shell-socket` scenario's raw-socket headless driver
+    /// and the routing unit tests assert against it.
+    recorded_socket_messages: Vec<RecordedSocketMessage>,
+    /// R14 per-window control socket, owned here so [`teardown`](WindowState::teardown)
+    /// can stop it (suppress healing, unlink the socket file) on window close.
+    /// Armed by `crate::app::arm_window_control_socket` before the Main pane forks;
+    /// `None` on scenarios/itests that never bootstrap one. `NiceControlSocket`'s
+    /// own `Drop` also stops it, so a dropped `WindowState` never leaks its thread.
+    control_socket: Option<NiceControlSocket>,
+    /// The gpui foreground task draining parsed socket messages into
+    /// [`route_socket_message`](WindowState::route_socket_message). Held (not
+    /// detached) so dropping it — on teardown or when the window entity drops —
+    /// cancels the drain rather than leaking a parked task.
+    socket_drain: Option<gpui::Task<()>>,
 }
 
 impl WindowState {
@@ -118,7 +137,32 @@ impl WindowState {
             pane_strip_actions: Box::new(ModelPaneStripActions::new()),
             session: SessionManager::new(),
             session_id: mint_session_id(),
+            recorded_socket_messages: Vec::new(),
+            control_socket: None,
+            socket_drain: None,
         }
+    }
+
+    /// Take ownership of this window's armed control socket + its foreground drain
+    /// task (`crate::app::arm_window_control_socket`, called before the Main pane
+    /// forks). Stopping/replacing any prior socket first keeps a re-arm idempotent.
+    pub(crate) fn install_control_socket(
+        &mut self,
+        socket: NiceControlSocket,
+        drain: gpui::Task<()>,
+    ) {
+        if let Some(old) = self.control_socket.take() {
+            old.stop();
+        }
+        self.control_socket = Some(socket);
+        self.socket_drain = Some(drain);
+    }
+
+    /// Test seam: install just the control socket (no gpui drain task, which needs
+    /// a `Context`) so a plain `#[test]` can pin that `teardown` stops + unlinks it.
+    #[cfg(test)]
+    pub(crate) fn set_control_socket_for_test(&mut self, socket: NiceControlSocket) {
+        self.control_socket = Some(socket);
     }
 
     /// This window's stable session id — the registry's per-session-id lookup
@@ -128,16 +172,164 @@ impl WindowState {
         &self.session_id
     }
 
+    /// The R14 control-socket routing point (the Rust mirror of Swift
+    /// `SessionsModel.startSocketListener`'s handler dispatch,
+    /// `SessionsModel.swift:257-309`): each [`SocketMessage`] variant is routed
+    /// to a named window-local handler. The message enum + parser are finished
+    /// business after R14 — R15/R16/R26 replace only the handler BODIES below,
+    /// never this routing shape. Called on the gpui foreground by the socket
+    /// drain task (wired by the R14 env-injection slice's `open_managed_window`).
+    pub(crate) fn route_socket_message(&mut self, msg: SocketMessage) {
+        match msg {
+            SocketMessage::Claude {
+                cwd,
+                args,
+                tab_id,
+                pane_id,
+                reply,
+            } => self.handle_claude_socket_request(cwd, args, tab_id, pane_id, reply),
+            SocketMessage::SessionUpdate {
+                pane_id,
+                session_id,
+                source,
+                cwd,
+            } => self.handle_session_update(pane_id, session_id, source, cwd),
+            SocketMessage::Handoff {
+                cwd,
+                handoff_file,
+                instructions,
+                model,
+                effort,
+                tab_id,
+                pane_id,
+                reply,
+            } => self.handle_handoff(
+                cwd,
+                handoff_file,
+                instructions,
+                model,
+                effort,
+                tab_id,
+                pane_id,
+                reply,
+            ),
+        }
+    }
+
+    /// `claude` action stub. R14 replies the bare `inplace` line: with `sid=""`
+    /// and `settings=""` the frozen wrapper runs `exec command claude "$@"` —
+    /// claude launches in-pane with the user's args, no error, no model mutation.
+    /// (A `newtab` stub would swallow the invocation; a decision requires the
+    /// promotion logic.)
+    ///
+    /// R15 replaces this body with the newtab/inplace promotion + session-id
+    /// minting decision (`SessionsModel.handleClaudeSocketRequest`).
+    fn handle_claude_socket_request(
+        &mut self,
+        cwd: String,
+        args: Vec<String>,
+        tab_id: String,
+        pane_id: String,
+        reply: Reply,
+    ) {
+        self.record_socket_message(RecordedSocketMessage::Claude {
+            cwd,
+            args,
+            tab_id,
+            pane_id,
+        });
+        reply.send("inplace");
+    }
+
+    /// `session_update` action stub — fully parsed, no-op body. R16 fills it with
+    /// the session-id / cwd rotation routing (`SessionsModel.applySessionUpdate`).
+    fn handle_session_update(
+        &mut self,
+        pane_id: String,
+        session_id: String,
+        source: Option<String>,
+        cwd: Option<String>,
+    ) {
+        self.record_socket_message(RecordedSocketMessage::SessionUpdate {
+            pane_id,
+            session_id,
+            source,
+            cwd,
+        });
+        // No-op: the client fd was already closed before dispatch (fire-and-forget).
+    }
+
+    /// `handoff` action stub. R14 replies `error: handoff is not supported yet`;
+    /// the installed helper's `error*` branch handles that gracefully (the user
+    /// gets a clear message instead of a silent hang). R26 fills this body with
+    /// the nested-handoff-tab open + `ok` reply (`SkillInstaller` / handoff
+    /// receiver).
+    #[allow(clippy::too_many_arguments)]
+    fn handle_handoff(
+        &mut self,
+        cwd: String,
+        handoff_file: String,
+        instructions: String,
+        model: String,
+        effort: String,
+        tab_id: String,
+        pane_id: String,
+        reply: Reply,
+    ) {
+        self.record_socket_message(RecordedSocketMessage::Handoff {
+            cwd,
+            handoff_file,
+            instructions,
+            model,
+            effort,
+            tab_id,
+            pane_id,
+        });
+        reply.send("error: handoff is not supported yet");
+    }
+
+    /// Record a routed message for the scenario / routing tests. Compiled to a
+    /// no-op in a production build (no `selftest` feature) so a long-lived
+    /// window never accumulates messages — the accessor is test-only, and R15
+    /// replaces these handler bodies wholesale.
+    fn record_socket_message(&mut self, msg: RecordedSocketMessage) {
+        #[cfg(any(test, feature = "selftest"))]
+        self.recorded_socket_messages.push(msg);
+        #[cfg(not(any(test, feature = "selftest")))]
+        let _ = msg;
+    }
+
+    /// The parsed / normalized messages this window has routed, in arrival order.
+    /// Populated only under `cfg(test)` / the `selftest` feature (see
+    /// [`record_socket_message`](WindowState::record_socket_message)); returns an
+    /// EMPTY slice in a production build (recording is a no-op there, so a
+    /// long-lived window never accumulates). Always compiled — the `shell-socket`
+    /// scenario module is always built (meaningful only under `--features
+    /// selftest`), so it must be able to name this accessor even in a plain
+    /// `cargo run -p nice` build. The scenario asserts a routed `claude` carried
+    /// the pane's exact tabId/paneId/cwd and a raw-`UnixStream` `session_update`
+    /// surfaced normalized.
+    pub(crate) fn recorded_socket_messages(&self) -> &[RecordedSocketMessage] {
+        &self.recorded_socket_messages
+    }
+
     /// Tear the window's owned resources down on close. R12 has nothing to stop
     /// (the shipped live terminal is owned by the view and dies with the window's
     /// entity, exactly as before this cycle); this is the hook
     /// [`crate::window_registry::WindowRegistry`] calls on window close, which
     /// R13 extends to terminate the window's sessions / ptys. Idempotent.
     pub(crate) fn teardown(&mut self) {
+        // R14: stop this window's control socket first — suppress healing, unblock
+        // the accept loop, and unlink the socket file (Swift `SessionsModel.tearDown`'s
+        // `controlSocket?.stop()`). Dropping the held drain task cancels the
+        // foreground drain so no parked task lingers past the window.
+        self.socket_drain = None;
+        if let Some(socket) = self.control_socket.take() {
+            socket.stop();
+        }
         // Terminate this window's ptys: dropping each cached session handle tears
         // its child process group down (SIGHUP→SIGKILL), so no orphan zsh
-        // survives. R14 adds control-socket teardown; R18 flushes the session
-        // snapshot before this runs. Idempotent.
+        // survives. R18 flushes the session snapshot before this runs. Idempotent.
         self.session.teardown();
     }
 }
@@ -145,7 +337,10 @@ impl WindowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_socket::{Reply, RecordedSocketMessage, SocketMessage};
     use nice_model::TabModel;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn new_seeds_default_window_shape() {
@@ -222,5 +417,110 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         state.teardown();
         state.teardown();
+    }
+
+    // ---- R14 control-socket routing point + stub handlers -------------------
+
+    /// The handler writes its line then drops the server end (EOF); read to EOF.
+    fn read_reply(mut client: UnixStream) -> String {
+        let mut buf = String::new();
+        client.read_to_string(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn claude_stub_replies_bare_inplace_and_records_message() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut state = WindowState::new("/home/u");
+        state.route_socket_message(SocketMessage::Claude {
+            cwd: "/tmp/x".into(),
+            args: vec!["--resume".into(), "abc-123".into()],
+            tab_id: "t1".into(),
+            pane_id: "p1".into(),
+            reply: Reply::for_test(server),
+        });
+        // Frozen reply grammar: exactly the bare `inplace` line. The wrapper reads
+        // `read -r mode sid settings` → mode=inplace, sid="", settings="" ⇒
+        // `exec command claude "$@"`. Never a trailing field, never diagnostics.
+        assert_eq!(read_reply(client), "inplace\n");
+
+        let recorded = state.recorded_socket_messages();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            RecordedSocketMessage::Claude {
+                cwd: "/tmp/x".into(),
+                args: vec!["--resume".into(), "abc-123".into()],
+                tab_id: "t1".into(),
+                pane_id: "p1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn handoff_stub_replies_error_and_records_message() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut state = WindowState::new("/home/u");
+        state.route_socket_message(SocketMessage::Handoff {
+            cwd: "/tmp/work".into(),
+            handoff_file: "/tmp/work/.claude/handoff/h.md".into(),
+            instructions: String::new(),
+            model: String::new(),
+            effort: String::new(),
+            tab_id: "t1".into(),
+            pane_id: "p1".into(),
+            reply: Reply::for_test(server),
+        });
+        // R14 stub: the installed helper's `error*` branch degrades gracefully.
+        // R26 replaces the body with a nested-tab open + `ok` reply.
+        assert_eq!(read_reply(client), "error: handoff is not supported yet\n");
+        assert_eq!(state.recorded_socket_messages().len(), 1);
+    }
+
+    #[test]
+    fn teardown_stops_and_unlinks_the_control_socket() {
+        use crate::control_socket::NiceControlSocket;
+        use std::path::Path;
+
+        let mut state = WindowState::new("/home/u");
+        let socket = NiceControlSocket::new();
+        // Bind + start so the socket file exists on disk (a no-op handler is fine —
+        // this test never connects a client; it asserts the unlink-on-teardown).
+        socket.start(|_msg| {}).expect("control socket should bind");
+        let path = socket.path().to_string();
+        assert!(Path::new(&path).exists(), "precondition: the socket file is bound");
+
+        state.set_control_socket_for_test(socket);
+        state.teardown();
+        assert!(
+            !Path::new(&path).exists(),
+            "teardown must stop the control socket and unlink its file"
+        );
+        // Idempotent — a second teardown (app-terminate double-up) must not panic.
+        state.teardown();
+    }
+
+    #[test]
+    fn session_update_stub_records_normalized_message_and_sends_no_reply() {
+        let mut state = WindowState::new("/home/u");
+        // session_update is fire-and-forget — no Reply variant, so the routing
+        // point just records the parsed, normalized message (R16 fills the body).
+        state.route_socket_message(SocketMessage::SessionUpdate {
+            pane_id: "P1".into(),
+            session_id: "S1".into(),
+            source: Some("resume".into()),
+            cwd: None,
+        });
+        let recorded = state.recorded_socket_messages();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            RecordedSocketMessage::SessionUpdate {
+                pane_id: "P1".into(),
+                session_id: "S1".into(),
+                source: Some("resume".into()),
+                cwd: None,
+            }
+        );
     }
 }

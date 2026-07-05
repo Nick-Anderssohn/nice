@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nice_model::{Pane, PaneKind, Project, SidebarTabSelection, Tab, TabModel, TabStatus};
+use nice_term_core::SpawnSpec;
 use nice_term_view::TerminalEvent;
 
 use super::{
-    clip_title, default_mint_id, DissolveTerminus, PaneLaunchStatus, SessionManager,
-    PANE_TITLE_MAX,
+    build_claude_extra_env, clip_title, default_mint_id, merge_env_spec_wins, ClaudeSessionMode,
+    DissolveTerminus, PaneLaunchStatus, SessionManager, WindowShellEnv, PANE_TITLE_MAX,
 };
 
 /// A fresh empty selection for cascade tests that don't seed a multi-selection.
@@ -1331,4 +1332,200 @@ fn probe_d_close_model_only_tab_reaches_cascade_synchronously() {
         "a model-only tab dissolves synchronously on close_tab's return"
     );
     assert_eq!(terminus, DissolveTerminus::None, "other projects remain non-empty");
+}
+
+// ---- R14 env injection: the spec-wins merge + the per-pane matrix -----------
+//
+// The manager's `spawn_pane` merges these pairs into the caller-built spec's env
+// before forking the pty. `spawn_pane` itself needs a gpui `App`, so the pure
+// merge + matrix (`window_pane_env_pairs`, exercised here through a
+// spawn_pane-shaped merge) are unit-tested directly (Validation §3 a/b/c); the
+// full live spawn path is the `shell-socket` scenario.
+
+/// Helper: a manager with a fully-populated window shell env (socket + zdotdir +
+/// an inherited user zdotdir).
+fn manager_with_shell_env(
+    socket: Option<&str>,
+    zdotdir: Option<&str>,
+    user_zdotdir: Option<&str>,
+) -> SessionManager {
+    let mut m = SessionManager::new();
+    m.set_window_shell_env(WindowShellEnv {
+        socket_path: socket.map(str::to_string),
+        zdotdir: zdotdir.map(str::to_string),
+        user_zdotdir: user_zdotdir.map(str::to_string),
+    });
+    m
+}
+
+fn value_of<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// Validation §3(a): a `ZDOTDIR` the caller already set on the spec (the
+/// deliberately-blanked shells) SURVIVES the manager's injection — spec wins.
+#[test]
+fn spec_provided_zdotdir_survives_manager_injection() {
+    let mgr = manager_with_shell_env(Some("/tmp/sock"), Some("/managed/zdotdir"), Some("/user/z"));
+    // A spec that blanks ZDOTDIR to its own cwd, exactly like the ~10 landed
+    // scenarios (`SpawnSpec::with_env(vec![("ZDOTDIR", cwd)])`).
+    let mut spec = SpawnSpec::shell("/work").with_env(vec![("ZDOTDIR".to_string(), "/work".to_string())]);
+    merge_env_spec_wins(&mut spec.env, mgr.window_pane_env_pairs("t1", "p1"));
+
+    assert_eq!(
+        value_of(&spec.env, "ZDOTDIR"),
+        Some("/work"),
+        "the spec's blanked ZDOTDIR must win over the manager's injected value"
+    );
+    // Exactly one ZDOTDIR entry — the merge never duplicates a key.
+    assert_eq!(
+        spec.env.iter().filter(|(k, _)| k == "ZDOTDIR").count(),
+        1,
+        "no duplicate ZDOTDIR key"
+    );
+    // The keys the spec did NOT set are still injected.
+    assert_eq!(value_of(&spec.env, "NICE_SOCKET"), Some("/tmp/sock"));
+    assert_eq!(value_of(&spec.env, "NICE_TAB_ID"), Some("t1"));
+}
+
+/// Validation §3(b): a pane spawned through the manager carries
+/// `NICE_SOCKET` + `NICE_TAB_ID` + `NICE_PANE_ID` (the exact ids handed to
+/// `spawn_pane` — the same ids `ensure_active_pane_spawned` passes through).
+#[test]
+fn injected_pane_env_carries_socket_and_pane_identity() {
+    let mgr = manager_with_shell_env(Some("/tmp/win.sock"), Some("/z"), Some("/user/z"));
+    // A default shell spec (what `ensure_active_pane_spawned` builds), then the
+    // exact merge `spawn_pane` performs.
+    let mut spec = SpawnSpec::shell("/work");
+    merge_env_spec_wins(&mut spec.env, mgr.window_pane_env_pairs("tabX", "paneY"));
+
+    assert_eq!(value_of(&spec.env, "NICE_SOCKET"), Some("/tmp/win.sock"));
+    assert_eq!(value_of(&spec.env, "NICE_TAB_ID"), Some("tabX"));
+    assert_eq!(value_of(&spec.env, "NICE_PANE_ID"), Some("paneY"));
+    assert_eq!(value_of(&spec.env, "ZDOTDIR"), Some("/z"));
+}
+
+/// Validation §3(c): `NICE_USER_ZDOTDIR` is present-but-EMPTY when Nice inherited
+/// no `ZDOTDIR` (the empty/absent distinction the `.zshenv` stub keys off).
+#[test]
+fn user_zdotdir_is_present_but_empty_when_none_inherited() {
+    let mgr = manager_with_shell_env(Some("/tmp/sock"), Some("/z"), None);
+    let pairs = mgr.window_pane_env_pairs("t", "p");
+    assert_eq!(
+        value_of(&pairs, "NICE_USER_ZDOTDIR"),
+        Some(""),
+        "NICE_USER_ZDOTDIR must be SET (empty string), never absent"
+    );
+    assert!(
+        pairs.iter().any(|(k, _)| k == "NICE_USER_ZDOTDIR"),
+        "the key must be present"
+    );
+}
+
+/// A manager with no bootstrapped socket injects NOTHING — the scenarios/itests
+/// that build a `WindowState` directly keep their env untouched.
+#[test]
+fn unbootstrapped_manager_injects_no_env() {
+    let mgr = SessionManager::new();
+    assert!(
+        mgr.window_pane_env_pairs("t", "p").is_empty(),
+        "a manager with no window shell env must inject nothing"
+    );
+}
+
+// ---- R14 build_claude_extra_env: the FROZEN per-mode matrix (R15 wires it) ---
+
+/// EVERY mode sets TERM_PROGRAM + the ids + NICE_SOCKET, and a non-deferred mode
+/// adds NONE of the ZDOTDIR / prefill trio (that is ResumeDeferred's alone).
+#[test]
+fn claude_extra_env_common_columns_for_every_mode() {
+    for mode in [
+        ClaudeSessionMode::None,
+        ClaudeSessionMode::New("id".into()),
+        ClaudeSessionMode::Resume("id".into()),
+    ] {
+        let env = build_claude_extra_env(
+            &mode,
+            "tab1",
+            "pane1",
+            Some("/tmp/s.sock"),
+            Some("/z"),
+            Some("/user/z"),
+            None,
+        );
+        assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
+        assert_eq!(value_of(&env, "NICE_TAB_ID"), Some("tab1"));
+        assert_eq!(value_of(&env, "NICE_PANE_ID"), Some("pane1"));
+        assert_eq!(value_of(&env, "NICE_SOCKET"), Some("/tmp/s.sock"));
+        // The deferred-only trio is absent for non-deferred modes.
+        assert_eq!(value_of(&env, "ZDOTDIR"), None, "{mode:?} must not set ZDOTDIR");
+        assert_eq!(value_of(&env, "NICE_USER_ZDOTDIR"), None);
+        assert_eq!(value_of(&env, "NICE_PREFILL_COMMAND"), None);
+    }
+}
+
+/// No socket ⇒ no NICE_SOCKET (the only conditional common column).
+#[test]
+fn claude_extra_env_omits_socket_when_absent() {
+    let env = build_claude_extra_env(&ClaudeSessionMode::None, "t", "p", None, None, None, None);
+    assert_eq!(value_of(&env, "NICE_SOCKET"), None);
+    assert_eq!(value_of(&env, "TERM_PROGRAM"), Some("ghostty"));
+}
+
+/// ResumeDeferred adds ZDOTDIR + the always-present NICE_USER_ZDOTDIR + the
+/// pinned NICE_PREFILL_COMMAND format (`claude --resume <uuid>`, no settings).
+#[test]
+fn claude_extra_env_resume_deferred_sets_prefill_and_zdotdir() {
+    let env = build_claude_extra_env(
+        &ClaudeSessionMode::ResumeDeferred("SID-123".into()),
+        "t1",
+        "p1",
+        Some("/tmp/s.sock"),
+        Some("/managed/z"),
+        Some("/user/z"),
+        None,
+    );
+    assert_eq!(value_of(&env, "ZDOTDIR"), Some("/managed/z"));
+    assert_eq!(value_of(&env, "NICE_USER_ZDOTDIR"), Some("/user/z"));
+    assert_eq!(
+        value_of(&env, "NICE_PREFILL_COMMAND"),
+        Some("claude --resume SID-123"),
+        "the frozen prefill format is `claude --resume <uuid>`"
+    );
+}
+
+/// ResumeDeferred with no inherited user zdotdir still sets NICE_USER_ZDOTDIR to
+/// the empty string (the .zshenv stub's absent/empty distinction).
+#[test]
+fn claude_extra_env_resume_deferred_user_zdotdir_empty_when_none() {
+    let env = build_claude_extra_env(
+        &ClaudeSessionMode::ResumeDeferred("S".into()),
+        "t",
+        "p",
+        Some("/s"),
+        Some("/z"),
+        None,
+        None,
+    );
+    assert_eq!(value_of(&env, "NICE_USER_ZDOTDIR"), Some(""));
+}
+
+/// A `settings_path` splices a single-quoted `--settings <path>` BEFORE
+/// `--resume` in the prefill line (theme parity), matching the Swift byte-for-byte.
+#[test]
+fn claude_extra_env_settings_path_splices_into_prefill() {
+    let env = build_claude_extra_env(
+        &ClaudeSessionMode::ResumeDeferred("SID".into()),
+        "t",
+        "p",
+        Some("/s"),
+        Some("/z"),
+        Some("/user/z"),
+        Some("/Users/nick/Library/Application Support/settings.json".to_string()),
+    );
+    assert_eq!(
+        value_of(&env, "NICE_PREFILL_COMMAND"),
+        Some("claude --settings '/Users/nick/Library/Application Support/settings.json' --resume SID"),
+        "--settings must precede --resume and be single-quoted"
+    );
 }

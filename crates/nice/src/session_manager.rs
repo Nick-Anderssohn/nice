@@ -203,6 +203,33 @@ struct PaneSession {
 /// `makeSession` ran for that tab — the precondition
 /// [`ensure_active_pane_spawned`](SessionManager::ensure_active_pane_spawned)
 /// checks before lazily spawning a deferred companion pane.
+/// The per-window shell-injection env, set once at window construction by
+/// `crate::app::arm_window_control_socket` (the Rust twin of Swift
+/// `SessionsModel.bootstrapSocket`'s `controlSocketExtraEnv`). Every pty this
+/// window's [`SessionManager`] spawns gets these merged into its env
+/// **spec-wins** (see [`spawn_pane`](SessionManager::spawn_pane)).
+///
+/// `None` on a manager whose window never bootstrapped a control socket (the
+/// ~10 landed scenarios / itests that build a `WindowState` directly and spawn
+/// ZDOTDIR-blanked fixture shells) — those spawn with **no** injection, so the
+/// blanked `ZDOTDIR` they set via `SpawnSpec::with_env` is untouched.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowShellEnv {
+    /// `NICE_SOCKET` — the window's control-socket path (the `claude()` shadow's
+    /// handshake target). Always `Some` in production (the path is minted before
+    /// the socket binds); a bind failure leaves it set so shells' `nc … -w 2`
+    /// fails fast and falls back to direct `command claude`.
+    pub(crate) socket_path: Option<String>,
+    /// `ZDOTDIR` — the synthetic rc-chain directory. `None` when the launch-time
+    /// stub write failed (panes still get `NICE_SOCKET`; they just source the
+    /// user's real rc directly).
+    pub(crate) zdotdir: Option<String>,
+    /// The value for `NICE_USER_ZDOTDIR`. `None` ⇒ the empty string is injected
+    /// (Nice inherited no `ZDOTDIR`); the empty/absent distinction is semantic
+    /// for the `.zshenv` stub's XDG discovery branch, so the var is ALWAYS set.
+    pub(crate) user_zdotdir: Option<String>,
+}
+
 pub(crate) struct SessionManager {
     /// `tab_id -> (pane_id -> live session)`.
     tabs: HashMap<String, HashMap<String, PaneSession>>,
@@ -238,6 +265,11 @@ pub(crate) struct SessionManager {
     /// millisecond from colliding (Swift saw two `/branch`es in one ms collide).
     /// Unit tests inject a deterministic counter and assert by id.
     mint_id: Box<dyn Fn(&str) -> String>,
+    /// R14: the per-window shell-injection env, set once at window construction
+    /// (before the Main pane forks). `None` until a control socket is bootstrapped
+    /// for this window, so managers built directly by scenarios/itests inject
+    /// nothing. See [`WindowShellEnv`].
+    window_shell_env: Option<WindowShellEnv>,
 }
 
 impl SessionManager {
@@ -261,6 +293,7 @@ impl SessionManager {
             synthetic_held: HashSet::new(),
             synthetic_armed: HashSet::new(),
             mint_id,
+            window_shell_env: None,
         }
     }
 
@@ -1015,20 +1048,65 @@ impl SessionManager {
         self.tabs.entry(tab_id.to_string()).or_default();
     }
 
+    /// Set this window's shell-injection env (Swift `SessionsModel.bootstrapSocket`).
+    /// Called once at window construction, BEFORE the Main pane forks, so every
+    /// pty spawned through [`spawn_pane`](Self::spawn_pane) inherits `NICE_SOCKET`
+    /// / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from launch (the "env before fork"
+    /// invariant the shell's `claude()` shadow depends on).
+    pub(crate) fn set_window_shell_env(&mut self, env: WindowShellEnv) {
+        self.window_shell_env = Some(env);
+    }
+
+    /// The per-pane terminal env pairs this window injects into every pty
+    /// (Swift `TabPtySession.addTerminalPane`'s `extraEnv`): `NICE_SOCKET` +
+    /// `ZDOTDIR` (each only when set) + `NICE_USER_ZDOTDIR` (ALWAYS, empty string
+    /// when Nice inherited none — the empty/absent distinction is semantic for the
+    /// `.zshenv` stub) + this pane's `NICE_TAB_ID` / `NICE_PANE_ID` (the handshake
+    /// identity the `claude()` shadow includes in its socket payload). Empty when
+    /// the window bootstrapped no socket. Pure — no `cx`, so the env matrix is
+    /// unit-tested directly (Validation §3 b/c).
+    fn window_pane_env_pairs(&self, tab_id: &str, pane_id: &str) -> Vec<(String, String)> {
+        let Some(env) = &self.window_shell_env else {
+            return Vec::new();
+        };
+        let mut pairs = Vec::new();
+        if let Some(sp) = &env.socket_path {
+            pairs.push(("NICE_SOCKET".to_string(), sp.clone()));
+        }
+        if let Some(zp) = &env.zdotdir {
+            pairs.push(("ZDOTDIR".to_string(), zp.clone()));
+        }
+        pairs.push((
+            "NICE_USER_ZDOTDIR".to_string(),
+            env.user_zdotdir.clone().unwrap_or_default(),
+        ));
+        pairs.push(("NICE_TAB_ID".to_string(), tab_id.to_string()));
+        pairs.push(("NICE_PANE_ID".to_string(), pane_id.to_string()));
+        pairs
+    }
+
     /// Spawn a live terminal session for `(tab_id, pane_id)` from `spec` and
-    /// cache it with a fresh key-focus handle. Idempotent per `(tab, pane)`. The
-    /// spawn-time extra-env hook (R14 injects `NICE_SOCKET` / `NICE_TAB_ID` /
-    /// `NICE_PANE_ID`) rides on the caller-built `spec.env`.
+    /// cache it with a fresh key-focus handle. Idempotent per `(tab, pane)`.
+    ///
+    /// R14: the window's shell-injection env
+    /// ([`window_pane_env_pairs`](Self::window_pane_env_pairs) — `NICE_SOCKET` /
+    /// `ZDOTDIR` / `NICE_USER_ZDOTDIR` / `NICE_TAB_ID` / `NICE_PANE_ID`) is merged
+    /// into `spec.env` **spec-wins** ([`merge_env_spec_wins`]): a key already
+    /// present on the caller-built spec (e.g. a deliberately-blanked `ZDOTDIR`)
+    /// survives the injection. This is the single choke point every pty spawn
+    /// passes through, so it covers the Main pane, `ensure_active_pane_spawned`,
+    /// and every future R15/R18 path for free.
     pub(crate) fn spawn_pane(
         &mut self,
         tab_id: &str,
         pane_id: &str,
-        spec: SpawnSpec,
+        mut spec: SpawnSpec,
         cx: &mut App,
     ) -> Result<()> {
         if self.has_pane(tab_id, pane_id) {
             return Ok(());
         }
+        merge_env_spec_wins(&mut spec.env, self.window_pane_env_pairs(tab_id, pane_id));
         let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
         let focus = cx.focus_handle();
         self.tabs
@@ -1171,6 +1249,100 @@ fn default_mint_id(prefix: &str) -> String {
         .as_millis();
     let c = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}{ms}-{:04x}", c & 0xffff)
+}
+
+/// Merge `injected` env pairs into `spec_env` **spec-wins**: a key already
+/// present on the caller-built spec keeps its value; only keys absent from the
+/// spec are appended. The inverse of `nice_term_core::build_env`'s caller-wins
+/// upsert direction (there the caller wins over the base; here the spec — the
+/// caller — wins over the manager injection). Load-bearing: ~10 landed scenarios
+/// / itests spawn shells with `ZDOTDIR` deliberately blanked via
+/// `SpawnSpec::with_env`; blanket injection would clobber that. Order is stable
+/// (spec pairs first, then the new injected keys in matrix order).
+fn merge_env_spec_wins(spec_env: &mut Vec<(String, String)>, injected: Vec<(String, String)>) {
+    for (k, v) in injected {
+        if !spec_env.iter().any(|(ek, _)| *ek == k) {
+            spec_env.push((k, v));
+        }
+    }
+}
+
+/// How a Claude pane attaches to the Claude CLI's session layer. Ports Swift
+/// `TabPtySession.ClaudeSessionMode` (`TabPtySession.swift:180-197`). The env
+/// matrix ([`build_claude_extra_env`]) branches on the `ResumeDeferred` variant
+/// only. R15 owns the decision logic that selects a mode; R14 ports the enum +
+/// the pure env matrix so the FROZEN prefill format is pinned now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeSessionMode {
+    /// No session id; the CLI picks one.
+    None,
+    /// Fresh session under a caller-provided UUID (`--session-id <uuid>`).
+    New(String),
+    /// Resume a prior session by UUID (`--resume <uuid>`).
+    Resume(String),
+    /// Restore path: don't run claude — spawn a plain `zsh -il` with
+    /// `claude --resume <uuid>` pre-typed at the prompt via the stub's
+    /// `print -z "$NICE_PREFILL_COMMAND"` tail. This is the only mode that needs
+    /// `ZDOTDIR` + `NICE_PREFILL_COMMAND` in the pane env.
+    ResumeDeferred(String),
+}
+
+/// Build the extra-env pairs for a **Claude** pane. Pure port of Swift
+/// `TabPtySession.buildClaudeExtraEnv` (`TabPtySession.swift:875-902`).
+///
+/// The per-mode matrix is R14's FROZEN spec (R15 wires this function and may
+/// extend the signature — never the matrix): EVERY mode sets `TERM_PROGRAM`,
+/// `NICE_TAB_ID`, `NICE_PANE_ID`, and `NICE_SOCKET` (when a socket exists) so the
+/// SessionStart hook can reach Nice; ONLY [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred)
+/// adds `ZDOTDIR` (when set), the always-present `NICE_USER_ZDOTDIR` (empty when
+/// none), and the `NICE_PREFILL_COMMAND` the stub's `print -z` tail pre-types.
+///
+/// **Production-unused until R15** wires it (marked via the module-wide
+/// `dead_code` allow). `settings_path` is threaded now but always `None` until
+/// R17 fills R15's theme-sync provider; when `Some`, it splices a single-quoted
+/// `--settings <path>` before `--resume` in the prefill line (theme parity for a
+/// deferred-resumed session), matching the Swift source byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_claude_extra_env(
+    mode: &ClaudeSessionMode,
+    tab_id: &str,
+    pane_id: &str,
+    socket_path: Option<&str>,
+    zdotdir_path: Option<&str>,
+    user_zdotdir: Option<&str>,
+    settings_path: Option<String>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
+        ("NICE_TAB_ID".to_string(), tab_id.to_string()),
+        ("NICE_PANE_ID".to_string(), pane_id.to_string()),
+    ];
+    if let Some(sp) = socket_path {
+        env.push(("NICE_SOCKET".to_string(), sp.to_string()));
+    }
+    if let ClaudeSessionMode::ResumeDeferred(session_id) = mode {
+        if let Some(zp) = zdotdir_path {
+            env.push(("ZDOTDIR".to_string(), zp.to_string()));
+        }
+        // Pair NICE_USER_ZDOTDIR with ZDOTDIR — the .zshenv stub resolves the
+        // user's intended layout from it before our injection unwinds. Always set
+        // (empty string when Nice inherited none).
+        env.push((
+            "NICE_USER_ZDOTDIR".to_string(),
+            user_zdotdir.unwrap_or("").to_string(),
+        ));
+        // Pre-type the resume command the user runs with Enter. Splice
+        // `--settings <path>` (single-quoted for the interactive shell line) when
+        // theme sync is on, so the deferred-resumed session adopts Nice's theme.
+        let settings_arg = settings_path
+            .map(|p| format!(" --settings {}", nice_term_core::shell_single_quote(&p)))
+            .unwrap_or_default();
+        env.push((
+            "NICE_PREFILL_COMMAND".to_string(),
+            format!("claude{settings_arg} --resume {session_id}"),
+        ));
+    }
+    env
 }
 
 #[cfg(test)]
