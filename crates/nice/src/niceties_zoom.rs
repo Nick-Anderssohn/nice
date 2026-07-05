@@ -96,10 +96,17 @@ pub fn open_niceties_zoom_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let theme = TerminalTheme::nice_default_dark();
     let accent = AccentPreset::Terracotta.color();
 
-    // The shared, RESOLVED font state (real derivation): the shipped SF Mono →
-    // JetBrains Mono NL → system-mono chain, cell metrics derived from the
-    // resolved font, so a zoom exercises the real re-metric path.
-    let font = cx.new(FontSettings::resolved_default);
+    // R12: install the app-wide shortcut keymap and take its process-level,
+    // RESOLVED font entity (the shipped SF Mono → JetBrains Mono NL → system-mono
+    // chain, metrics derived from the resolved font). The ⌘=/⌘0 chords this
+    // scenario posts are now handled by the app's IncreaseFontSize / ResetFontSizes
+    // actions (they mutate this shared entity), NOT the old view-local zoom chord —
+    // so this exercises the migrated end-to-end path (Validation §6). The view
+    // below observes the same entity, so a zoom re-metrics it and resizes the pty.
+    let font = cx.update(|app| {
+        crate::keymap::install_shortcuts(app);
+        crate::keymap::shared_font_settings(app)
+    });
     let terminal = {
         let font = font.clone();
         let handle = handle.clone();

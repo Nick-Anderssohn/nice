@@ -60,6 +60,19 @@
 //!     double-click reset and the top-strip-vs-body drag differential, judged
 //!     against AppKit frame reads, plus the collapse-cap geometry drift guards
 //!     (R9 button-frame re-assert) and the per-state dot colour/pulse checks.
+//!   * [`window_state`] — the R12 per-window composition root (`WindowState`),
+//!     the Rust mirror of Swift's `AppState`: the R8 document + R10 sidebar /
+//!     selection + the R10/R11 action seams + the R13 session slot. Handed to
+//!     each window as a constructor argument by `app::build_window_root`.
+//!   * [`window_registry`] — the R12 process-wide `WindowId → WindowState` map:
+//!     register/deregister on open/close, MRU via `observe_window_activation`,
+//!     the four-consumer lookup contract (`active_state`, id / session-id
+//!     lookup), and the close→teardown hook.
+//!   * [`keymap`] — the R12 shortcut dispatch: the 13 rebindable actions +
+//!     ⌃⌘F generated from `nice_model::shortcuts`, the app-level (font/undo) vs
+//!     window-level (sidebar/pane, through the registry's `active_state`)
+//!     handler split, the process-level `FontSettings` fan-out, and the peek
+//!     modifier-release observer.
 //!
 //! Entry dispatch: `NICE_RS_SELFTEST=<scenario>` runs the measurement harness
 //! (see `nice_harness::selftest`); otherwise the normal app opens its window.
@@ -69,6 +82,8 @@ mod chrome_live;
 mod context_menu;
 mod inline_rename;
 mod input_live;
+mod keymap;
+mod multiwindow;
 mod niceties_drop;
 mod niceties_held;
 mod niceties_overlay;
@@ -82,6 +97,8 @@ mod sidebar_shell;
 mod status_dot;
 mod theme;
 mod toolbar;
+mod window_registry;
+mod window_state;
 
 fn main() {
     match std::env::var("NICE_RS_SELFTEST") {

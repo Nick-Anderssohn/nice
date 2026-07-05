@@ -85,11 +85,22 @@
 //!   auto-center-on-activate offset math (the GPUI-real-layout replacement for
 //!   SwiftUI's `scrollTo(anchor: .center)`), kept here so the R11 view and the
 //!   in-process itests share one arithmetic.
+//!
+//! ## Keyboard-shortcut data (R12 pure port)
+//!
+//! * [`shortcuts`] — [`ShortcutAction`] (the closed 13-action rebindable set) +
+//!   [`default_bindings`] (the default-combo table as data), ported from
+//!   `Sources/Nice/State/KeyboardShortcuts.swift`. Gpui-free: R12's keymap slice
+//!   generates the `actions!` / `bind_keys` wiring from this table, and R24's
+//!   rebinding UI consumes the same data. Matching is character-token based at
+//!   the gpui pin (a documented divergence from Swift's physical-keycode match —
+//!   see the module docs).
 
 mod pane;
 mod project;
 pub mod rename_gate;
 pub mod selection;
+pub mod shortcuts;
 pub mod sidebar;
 pub mod strip_geometry;
 mod tab;
@@ -99,6 +110,7 @@ pub use pane::{Pane, PaneKind, TabStatus};
 pub use project::Project;
 pub use rename_gate::InlineRenameClickGate;
 pub use selection::SidebarTabSelection;
+pub use shortcuts::{default_bindings, default_combo, KeyCombo, Modifiers, ShortcutAction};
 pub use sidebar::{SidebarMode, SidebarModel};
 pub use strip_geometry::{
     center_offset_x, should_show_overflow_chevron, Rect, StripGeometry, EDGE_TOLERANCE,

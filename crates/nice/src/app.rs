@@ -47,10 +47,13 @@ use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, SlotColor, Slots};
 use nice_theme::AccentPreset;
 
+use crate::window_registry::WindowRegistry;
+use crate::window_state::WindowState;
+
 /// The `smoke` scenario's root view: a solid background with one line of text
 /// (the version string) that drives a continuous animated repaint and stamps each
 /// frame for the cadence gate. (The shipped window is a live terminal now — see
-/// [`run`] / [`open_live_terminal`] — so the `animated: false` static variant is
+/// [`run`] / [`open_managed_window`] — so the `animated: false` static variant is
 /// exercised only if a future non-animated view reuses it.)
 struct RootView {
     /// When true, stamp a frame + request the next animation frame on every
@@ -331,6 +334,15 @@ impl Render for WindowChromeView {
             .flex()
             .flex_col()
             .size_full()
+            // R12: the window-level peek clear. A sidebar-tab cycle on a collapsed
+            // sidebar floats the peek overlay (set in the keymap's tab-cycle
+            // handler); this ends it once the shortcut's modifiers are all
+            // released (Swift's flagsChanged monitor). Registered on the root so
+            // it observes modifier changes regardless of which descendant holds
+            // focus; routes through the registry's `active_state` like the trigger.
+            .on_modifiers_changed(|event, _window, cx| {
+                crate::keymap::on_window_modifiers_changed(event, cx)
+            })
             .child(
                 // The 52pt chrome band, edge-to-edge (R10 reshapes it around the
                 // sidebar card). Painted with the `chrome` token; a 1pt `line`
@@ -384,6 +396,12 @@ impl Render for WindowChromeView {
 // `actions!` block, its ⌃⌘F binding, and the app menu below.
 gpui::actions!(nice, [ToggleFullScreen]);
 
+// R12: the New Window accelerator (⌘N) + File ▸ New Window menu item. Unlike the
+// 13 rebindable shortcuts (`nice_model::shortcuts`, wired by R12's keymap slice),
+// `NewWindow` is a fixed window-management action — like `ToggleFullScreen` — so
+// it lives here, not in the rebindable defaults table.
+gpui::actions!(nice, [NewWindow]);
+
 /// The View-menu full-screen item's title, flipped by the window's current
 /// full-screen state — Swift parity (`NiceApp.swift:180-184`): "Exit Full
 /// Screen" while full screen, "Enter Full Screen" otherwise.
@@ -405,8 +423,13 @@ fn fullscreen_menu_title(is_fullscreen: bool) -> &'static str {
 /// (`gpui/examples/set_menus.rs:124-128`).
 fn app_menus(is_fullscreen: bool) -> Vec<Menu> {
     vec![
-        // The application menu — empty for now (R12 fills it).
+        // The application menu — empty for now (R12's keymap slice fills it with
+        // Quit / etc.). Precedes File so AppKit renders it as the bold app menu.
         Menu::new("Nice RS Dev"),
+        // File ▸ New Window (⌘N) — mints a fresh isolated window (plan: every ⌘N
+        // opens a NEW window, nothing de-dups). The accelerator comes from the
+        // `cmd-n` binding in `install_new_window_command`.
+        Menu::new("File").items([MenuItem::action("New Window", NewWindow)]),
         Menu::new("View").items([MenuItem::action(
             fullscreen_menu_title(is_fullscreen),
             ToggleFullScreen,
@@ -415,27 +438,44 @@ fn app_menus(is_fullscreen: bool) -> Vec<Menu> {
 }
 
 /// Wire the shipped app's full-screen chrome, once, from [`run`] before the
-/// window opens: the global [`ToggleFullScreen`] handler, its ⌃⌘F key binding,
-/// and the initial (windowed) menu bar. [`install_fullscreen_menu_sync`] then
-/// keeps the View-menu title in step with the live window.
+/// window opens: the global [`ToggleFullScreen`] handler and the initial
+/// (windowed) menu bar. The ⌃⌘F key binding is folded into the R12 keymap wiring
+/// (`crate::keymap::install_shortcuts`), so this no longer binds it — a menu
+/// click dispatches the same action, and the `chrome` self-test dispatches it
+/// directly. [`install_fullscreen_menu_sync`] keeps the View-menu title in step
+/// with the live window.
 pub(crate) fn install_fullscreen_command(cx: &mut App) {
     // The action toggles the key window's native full screen.
     // `window.toggle_fullscreen()` maps to AppKit's `toggleFullScreen:` — the
     // same call Swift's menu button made (`NiceApp.swift:184`) — and gpui
     // re-applies the traffic-light position on exit, so the y-26 row survives
     // the round trip with no code of ours. A menu click dispatches the action to
-    // the key window; ⌃⌘F does the same via the binding below.
+    // the key window; ⌃⌘F does the same via the keymap binding.
     cx.on_action(|_: &ToggleFullScreen, cx: &mut App| {
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_root, window, _cx| window.toggle_fullscreen());
         }
     });
-    // ⌃⌘F — Nice's full-screen shortcut (`NiceApp.swift:186`). `None` context =
-    // active in every dispatch context; there is no per-view full-screen state.
-    cx.bind_keys([KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None)]);
     // Initial bar: the window opens windowed, so the item reads "Enter Full
     // Screen"; the bounds observer flips it on the first transition.
     cx.set_menus(app_menus(false));
+}
+
+/// Wire the New Window command, once, from [`run`] before the first window opens:
+/// the global [`NewWindow`] handler and its ⌘N key binding. The File ▸ New Window
+/// menu item ([`app_menus`]) dispatches the same action. Every invocation opens a
+/// brand-new isolated window with a fresh default [`WindowState`] — nothing
+/// de-dups (plan). Registered as a *global* action (`cx.on_action`) so ⌘N works
+/// with any window focused ("new window from anywhere").
+pub(crate) fn install_new_window_command(cx: &mut App) {
+    cx.on_action(|_: &NewWindow, cx: &mut App| {
+        if let Err(e) = open_managed_window(cx) {
+            eprintln!("nice-rs: failed to open a new window: {e:#}");
+        }
+    });
+    // ⌘N — a non-rebindable window-management accelerator (like ⌃⌘F). `None`
+    // context = active in every dispatch context.
+    cx.bind_keys([KeyBinding::new("cmd-n", NewWindow, None)]);
 }
 
 /// Keep the View-menu full-screen title in sync with `window` (called once as the
@@ -481,32 +521,49 @@ pub fn run() {
     crate::platform::disable_font_smoothing();
     gpui_platform::application().run(|cx: &mut App| {
         cx.activate(true);
-        cx.on_window_closed(|cx, _id| cx.quit()).detach();
-        // R9 (slice 2): the ⌃⌘F full-screen action + its key binding + the View
-        // menu (whose title flips once the window transitions in / out of full
-        // screen — see `install_fullscreen_menu_sync` in `open_live_terminal`).
+        // R12: the process-wide window registry + its single close observer
+        // (deregister → per-window teardown → quit-when-empty). This REPLACES the
+        // old unconditional `on_window_closed(cx.quit())`: with multiple windows,
+        // closing one of several must not quit the app — only the last close does.
+        WindowRegistry::install(cx);
+        // R9 (slice 2): the ⌃⌘F full-screen action handler + the View menu (whose
+        // title flips once the window transitions in / out of full screen — see
+        // `install_fullscreen_menu_sync` in `build_window_root`). Its ⌃⌘F key
+        // binding is now folded into the R12 keymap wiring below.
         install_fullscreen_command(cx);
-        if let Err(e) = open_live_terminal(cx) {
+        // R12: ⌘N / File ▸ New Window — every invocation opens a fresh isolated
+        // window (see `install_new_window_command` / `open_managed_window`).
+        install_new_window_command(cx);
+        // R12: the app-wide shortcut keymap — the 13 rebindable actions + ⌃⌘F
+        // generated from `nice_model::shortcuts`, their handlers, and the hoisted
+        // process-level `FontSettings` every window shares. Must run before the
+        // first window opens: `open_managed_window` reads the shared font entity.
+        crate::keymap::install_shortcuts(cx);
+        if let Err(e) = open_managed_window(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);
         }
     });
 }
 
-/// Open the shipped live-terminal window: spawn a login-shell (or, if
-/// `NICE_RS_COMMAND` is set, a one-off command) session, host it in a
-/// [`TerminalView`], and wire the demand-present kick.
+/// Open a managed Nice window: spawn a login-shell (or, if `NICE_RS_COMMAND` is
+/// set, a one-off command) session, host it in a [`TerminalView`] wrapped in the
+/// R9 chrome band, mint + register this window's [`WindowState`], and wire the
+/// demand-present kick. Used both for the first window ([`run`]) and every ⌘N
+/// window ([`install_new_window_command`]); each is fully isolated.
 ///
 /// The session is owned solely by the view (via the entity), so closing the
 /// window drops the handle → drops the session → tears down the child process
-/// group (`TabPtySession`-parity SIGHUP/SIGKILL): no orphan zsh survives.
-fn open_live_terminal(cx: &mut App) -> Result<()> {
+/// group (`TabPtySession`-parity SIGHUP/SIGKILL): no orphan zsh survives. Window
+/// close also deregisters the state and runs its teardown hook (the registry's
+/// `on_window_closed` observer).
+fn open_managed_window(cx: &mut App) -> Result<()> {
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let spec = match std::env::var("NICE_RS_COMMAND") {
         // A one-off command pane (the live-smoke path: `ls -la`, colour tests).
-        Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd),
+        Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd.clone()),
         // The default: an interactive login shell (`zsh -il`).
-        _ => SpawnSpec::shell(cwd),
+        _ => SpawnSpec::shell(cwd.clone()),
     }
     .with_size(LIVE_ROWS, LIVE_COLS);
 
@@ -517,13 +574,15 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
     let window = cx.open_window(window_options(), {
         let handle = handle.clone();
         let theme = theme.clone();
+        // `cwd` is moved into the builder as this window's initial document root.
         move |window, cx| {
-            // The app-level shared terminal font state (T11): the SF Mono →
-            // JetBrains Mono NL → system-mono chain resolved through GPUI's text
-            // system, cell metrics derived from the resolved font. One entity for
-            // the app's panes (Stage 2's multiple panes share it), so a ⌘+/⌘−/⌘0
-            // zoom fans out to every view.
-            let font = cx.new(FontSettings::resolved_default);
+            // The process-level shared terminal font state (T11 + R12 hoist): one
+            // `FontSettings` entity for the WHOLE app, minted once in
+            // `keymap::install_shortcuts` and read here, so a ⌘=/⌘−/⌘0 zoom fans
+            // out to every open window's panes — not the per-window entity this
+            // builder used to create. (R12 moved font ownership up to the app so
+            // the zoom action can drive it without a focused-window lookup.)
+            let font = crate::keymap::shared_font_settings(cx);
             let terminal = cx.new(|cx| {
                 let mut view = TerminalView::new(handle, theme, accent, font, cx);
                 // Wire the macOS keyCode side-channel so the R5 keyboard encoder
@@ -547,15 +606,11 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
                 view.set_launch_deadline(crate::platform::launch_deadline());
                 view
             });
-            // R9: wrap the terminal in the chrome band (52pt top bar + traffic
-            // lights on the y-26 row + empty-chrome drag/double-click) — the
-            // shipped window's real chrome. Scenario windows keep their full-bleed
-            // roots; only the live window gets the band.
-            let chrome = cx.new(|_cx| WindowChromeView::new(terminal));
-            // R9 (slice 2): keep the View menu's full-screen title in sync as this
-            // window enters / exits full screen.
-            install_fullscreen_menu_sync(chrome.clone(), window, cx);
-            chrome
+            // R12: hand this window its per-window state as a constructor
+            // argument and build the root (R9 chrome band over the terminal) +
+            // register the state. This is the `build_root(WindowState::new(..))`
+            // seam R18/R25 later thread restored / adopted state through.
+            build_window_root(WindowState::new(cwd), terminal, window, cx)
         }
     })?;
 
@@ -566,6 +621,48 @@ fn open_live_terminal(cx: &mut App) -> Result<()> {
     // re-parent.
     install_present_kick(&handle, window.into(), cx);
     Ok(())
+}
+
+/// Build a managed window's root view from its per-window [`WindowState`] — the
+/// state-as-constructor-argument seam (plan). Wraps the terminal `content` in the
+/// R9 chrome band, mints the state as a gpui entity, registers it in the
+/// [`WindowRegistry`], tracks activation for the registry's MRU (Swift's
+/// `didBecomeKey` role), and keeps the View-menu full-screen title in sync.
+///
+/// Only the live window gets the chrome band; scenario windows keep their
+/// full-bleed roots. R18 will hand this restored state, R25 an adopted pane —
+/// they change what `WindowState::new` produces, not this wiring.
+fn build_window_root(
+    state: WindowState,
+    content: Entity<TerminalView>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<WindowChromeView> {
+    let state = cx.new(|_cx| state);
+    // R9: the chrome band (52pt top bar + traffic lights on the y-26 row +
+    // empty-chrome drag/double-click) — the shipped window's real chrome.
+    let chrome = cx.new(|_cx| WindowChromeView::new(content));
+
+    // Register this window's state, then track activation so the registry's MRU
+    // stays current (the pin's `window_stack()` is only a z-order assist). The
+    // observer fires immediately; we record a window only while it is actually
+    // the key window, so an initial inactive fire is ignored and the
+    // registration-order fallback stands until the window is first keyed.
+    let id = window.window_handle().window_id();
+    WindowRegistry::register(cx, id, state.clone());
+    state.update(cx, |_state, cx| {
+        cx.observe_window_activation(window, |_state, window, cx| {
+            if window.is_window_active() {
+                WindowRegistry::note_active(cx, window.window_handle().window_id());
+            }
+        })
+        .detach();
+    });
+
+    // R9 (slice 2): keep the View menu's full-screen title in sync as this window
+    // enters / exits full screen.
+    install_fullscreen_menu_sync(chrome.clone(), window, cx);
+    chrome
 }
 
 /// Open the self-test scenario window (animated root view). Handed to the
@@ -2589,6 +2686,20 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // an auto-center select, and a chevron click, with their settles —
                 // generous headroom (self-activates + preflights the AX grant).
                 budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
+        // R12: registered LAST — it installs the real WindowRegistry, whose close
+        // observer quits when the registry empties, so the harness closing its
+        // window A (after the scenario) must be the final window close in the run.
+        Scenario {
+            name: "multiwindow",
+            open: crate::multiwindow::open_multiwindow_window,
+            gate: Gate::SelfReported {
+                // ⌘N open + ⌘T routing + font fan-out + pass-through + peek + close
+                // fallback, each with its CGEvent settle; generous headroom
+                // (self-activates + preflights the AX grant).
+                budget: Duration::from_secs(60),
             },
             activate: true,
         },

@@ -43,6 +43,20 @@ pub(crate) trait PaneStripActions {
     /// [`TabModel::add_pane`] (the "Terminal N" monotonic counter). Returns the
     /// new pane id, or `None` if the tab is unknown. R13 spawns the pty.
     fn add_terminal_pane(&mut self, model: &mut TabModel, tab_id: &str) -> Option<String>;
+
+    /// Move focus to the next pane within the active tab, **wrapping**. A no-op
+    /// when the active tab has fewer than two panes (or has no active pane). The
+    /// R12 ⌘⌥→ shortcut drives this; model-only — it moves the active tab's
+    /// `active_pane_id`. R13 re-implements it behind this same name so real focus
+    /// activation + the deferred-spawn acknowledgment ride along without touching
+    /// callers. Ported from `SessionsModel.stepActivePane(by: +1)`.
+    fn select_next_pane(&mut self, model: &mut TabModel);
+
+    /// Move focus to the previous pane within the active tab, **wrapping**. The
+    /// ⌘⌥← counterpart of [`select_next_pane`](Self::select_next_pane); same
+    /// <2-panes no-op and same R13 rewiring contract. Ported from
+    /// `SessionsModel.stepActivePane(by: -1)`.
+    fn select_prev_pane(&mut self, model: &mut TabModel);
 }
 
 /// The R11 model-only [`PaneStripActions`] implementation. Holds a monotonic id
@@ -66,6 +80,34 @@ impl ModelPaneStripActions {
         self.next_id += 1;
         format!("{prefix}-{}", self.next_id)
     }
+
+    /// Wrapping step of the active tab's `active_pane_id` by `offset` panes. A
+    /// no-op when there is no active tab, the active tab has fewer than two panes,
+    /// or its `active_pane_id` is unset / not on the tab (selection can never
+    /// dangle). Mirrors Swift's `SessionsModel.stepActivePane`
+    /// (`((i + off) % n + n) % n`, expressed here with `rem_euclid`).
+    fn step_active_pane(model: &mut TabModel, offset: isize) {
+        let Some(tab_id) = model.active_tab_id().map(str::to_owned) else {
+            return;
+        };
+        let Some((pi, ti)) = model.project_tab_index(&tab_id) else {
+            return;
+        };
+        let tab = &model.projects[pi].tabs[ti];
+        let count = tab.panes.len();
+        if count < 2 {
+            return;
+        }
+        let Some(active) = tab.active_pane_id.clone() else {
+            return;
+        };
+        let Some(cur) = tab.panes.iter().position(|p| p.id == active) else {
+            return;
+        };
+        let next = (cur as isize + offset).rem_euclid(count as isize) as usize;
+        let next_id = tab.panes[next].id.clone();
+        model.projects[pi].tabs[ti].active_pane_id = Some(next_id);
+    }
 }
 
 impl PaneStripActions for ModelPaneStripActions {
@@ -88,6 +130,14 @@ impl PaneStripActions for ModelPaneStripActions {
     fn add_terminal_pane(&mut self, model: &mut TabModel, tab_id: &str) -> Option<String> {
         let pane_id = self.mint("pane");
         model.add_pane(tab_id, pane_id, None)
+    }
+
+    fn select_next_pane(&mut self, model: &mut TabModel) {
+        Self::step_active_pane(model, 1);
+    }
+
+    fn select_prev_pane(&mut self, model: &mut TabModel) {
+        Self::step_active_pane(model, -1);
     }
 }
 
@@ -198,6 +248,72 @@ mod tests {
             tab.active_pane_id.as_deref(),
             Some("c"),
             "active re-points to the pane that slid into the freed slot"
+        );
+    }
+
+    /// Seed a `[a, b, c]` three-pane tab (a active) as the active tab of the
+    /// model, so pane-stepping has something to wrap over.
+    fn seeded_three_pane() -> TabModel {
+        let mut model = seeded();
+        let mut tab = Tab::new("t3", "Three", "/home/u");
+        tab.panes = vec![
+            Pane::new("a", "A", PaneKind::Terminal),
+            Pane::new("b", "B", PaneKind::Terminal),
+            Pane::new("c", "C", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some("a".into());
+        model.projects[0].tabs.insert(0, tab);
+        model.select_tab("t3");
+        model
+    }
+
+    fn active_pane(model: &TabModel) -> Option<String> {
+        model
+            .tab_for("t3")
+            .and_then(|t| t.active_pane_id.clone())
+    }
+
+    #[test]
+    fn select_next_pane_wraps_forward_over_the_active_tab() {
+        let mut model = seeded_three_pane();
+        let mut actions = ModelPaneStripActions::new();
+
+        actions.select_next_pane(&mut model);
+        assert_eq!(active_pane(&model).as_deref(), Some("b"));
+        actions.select_next_pane(&mut model);
+        assert_eq!(active_pane(&model).as_deref(), Some("c"));
+        // Wrap: c → a.
+        actions.select_next_pane(&mut model);
+        assert_eq!(active_pane(&model).as_deref(), Some("a"), "next wraps c→a");
+    }
+
+    #[test]
+    fn select_prev_pane_wraps_backward_over_the_active_tab() {
+        let mut model = seeded_three_pane();
+        let mut actions = ModelPaneStripActions::new();
+
+        // Wrap immediately: a → c.
+        actions.select_prev_pane(&mut model);
+        assert_eq!(active_pane(&model).as_deref(), Some("c"), "prev wraps a→c");
+        actions.select_prev_pane(&mut model);
+        assert_eq!(active_pane(&model).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn select_next_pane_is_a_noop_with_fewer_than_two_panes() {
+        // The seeded Main tab has a single pane; stepping must not move (or panic).
+        let mut model = seeded();
+        model.select_tab(main_tab_id());
+        let before = model.tab_for(main_tab_id()).unwrap().active_pane_id.clone();
+        let mut actions = ModelPaneStripActions::new();
+
+        actions.select_next_pane(&mut model);
+        actions.select_prev_pane(&mut model);
+
+        assert_eq!(
+            model.tab_for(main_tab_id()).unwrap().active_pane_id,
+            before,
+            "a single-pane tab has nowhere to step — active_pane_id is untouched"
         );
     }
 

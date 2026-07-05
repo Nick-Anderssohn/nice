@@ -445,11 +445,13 @@ type AXUIElementRef = *const c_void;
 /// (a `CFString`, `CFArray`, or `AXUIElement`, depending on the attribute).
 type CfTypeRef = *const c_void;
 
-/// The `CGEventFlags` ⌘ (Command) mask — carried on a synthesized ⌘V. The other
-/// modifier masks (shift `0x20000`, control `0x40000`, alternate `0x80000`) are
-/// not needed by the current live scenarios, so they are intentionally omitted
-/// until a chord assertion needs one.
+/// The `CGEventFlags` ⌘ (Command) mask — carried on a synthesized ⌘V / ⌘=.
 pub const FLAG_COMMAND: u64 = 0x0010_0000;
+
+/// The `CGEventFlags` ⌥ (Option / Alternate) mask — carried with ⌘ on the
+/// `multiwindow` scenario's ⌘⌥↓ sidebar-tab chord. (The remaining shift `0x20000`
+/// / control `0x40000` masks stay omitted until a chord assertion needs one.)
+pub const FLAG_OPTION: u64 = 0x0008_0000;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {

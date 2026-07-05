@@ -313,33 +313,11 @@ impl TerminalView {
         }
     }
 
-    /// Zoom the shared font by `delta` points (⌘+ / ⌘−). The mutation notifies
-    /// the entity, so every observing view — including this one — re-metrics.
-    fn zoom_font(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.font.update(cx, |font, fcx| font.zoom_by(delta, fcx));
-    }
-
-    /// Reset the shared font to its default size (⌘0).
-    fn reset_font(&mut self, cx: &mut Context<Self>) {
-        self.font.update(cx, |font, fcx| font.reset(fcx));
-    }
-
-    /// If `key` is a ⌘-zoom chord (`=`/`+` grow, `-` shrink, `0` reset), apply it
-    /// to the shared font and return `true`; otherwise `false` (not a zoom key).
-    /// The caller has already established the ⌘ (no ctrl/alt) modifier state. gpui
-    /// folds ⌘+ (⌘⇧=) to key `"+"` with shift cleared, so both `"="` and `"+"`
-    /// grow. Shared by the live-key path ([`on_key_down`](Self::on_key_down)) and
-    /// the held-pane app-gesture allowance — a held pane can still enlarge its
-    /// final output even though its pty is dead.
-    fn try_zoom_chord(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
-        match key {
-            "=" | "+" => self.zoom_font(1, cx),
-            "-" => self.zoom_font(-1, cx),
-            "0" => self.reset_font(cx),
-            _ => return false,
-        }
-        true
-    }
+    // R12: `zoom_font` / `reset_font` / `try_zoom_chord` were removed here. The
+    // ⌘=/⌘−/⌘0 zoom chords are app-level keyboard shortcuts now (`crate::keymap`
+    // in `crates/nice`), which drive the shared `FontSettings` entity directly;
+    // this view keeps observing that entity (see `on_font_changed`) and re-metrics
+    // on every zoom, but no longer intercepts the chords in its key path.
 
     /// The view's focus handle (R5 drives key input through it; R13 focuses it).
     pub fn focus_handle_ref(&self) -> &FocusHandle {
@@ -598,24 +576,24 @@ impl TerminalView {
         // key is consumed (never reaching the encoder / a closed pty, and never
         // falling through to AppKit's unhandled-key beep). But app gestures that
         // never touch the pty stay live: the whole point of a held pane is reading
-        // its failed output (T10), so ⌘C must still copy a mouse selection and the
-        // ⌘+/⌘−/⌘0 zoom chords must still enlarge it (they mutate the shared
-        // `FontSettings`, which re-metrics every view — the dead pty's resize error
-        // is simply dropped). Without this the output is readable but not copyable
-        // or zoomable, and this app has no menu-bar Edit>Copy fallback (unlike the
-        // Swift app, where copy is app-level and survives a held pane). No kitty
-        // ⌘C-forward gate here (there is no live child to forward `ESC[99;9u` to);
-        // ⌘V is intentionally left inert (nothing to paste into a dead shell).
+        // its failed output (T10), so ⌘C must still copy a mouse selection.
+        // Without this the output is readable but not copyable, and this app has
+        // no menu-bar Edit>Copy fallback (unlike the Swift app, where copy is
+        // app-level and survives a held pane). No kitty ⌘C-forward gate here
+        // (there is no live child to forward `ESC[99;9u` to); ⌘V is intentionally
+        // left inert (nothing to paste into a dead shell).
+        //
+        // R12: the ⌘=/⌘−/⌘0 zoom chords are NO LONGER intercepted here — they are
+        // app-level keyboard shortcuts now (`crate::keymap` in `crates/nice`),
+        // matched by the keymap before this key listener ever runs. A held pane
+        // still enlarges: the app action mutates the shared `FontSettings` this
+        // view observes, which re-metrics it (the dead pty's resize error is just
+        // dropped) without the keystroke reaching this handler at all.
         if self.held.is_held() {
-            if m.platform && !m.control && !m.alt {
-                if keystroke.key == "c" && self.copy_selection(cx) {
-                    cx.stop_propagation();
-                    return;
-                }
-                if self.try_zoom_chord(keystroke.key.as_str(), cx) {
-                    cx.stop_propagation();
-                    return;
-                }
+            if m.platform && !m.control && !m.alt && keystroke.key == "c" && self.copy_selection(cx)
+            {
+                cx.stop_propagation();
+                return;
             }
             // The one non-gesture key a held pane honours: the dismiss affordance —
             // a bare Enter respawns a fresh shell (like clicking the pill), the only
@@ -674,17 +652,15 @@ impl TerminalView {
                 cx.stop_propagation();
                 return;
             }
-            // Zoom: ⌘+ / ⌘− / ⌘0 mutate the shared font state, which every
-            // terminal view observes → re-metrics + resizes its pty. These take
-            // priority over the key encoder (an app gesture, like ⌘V/⌘C above),
-            // so they fire even under full-kitty mode. They are LOCAL view
-            // keybindings for now; R12's app-shortcut system will own them
-            // (together with R10's proportional sidebar scale off the same
-            // FontZoom event) — MIGRATE THEM THERE THEN.
-            if self.try_zoom_chord(keystroke.key.as_str(), cx) {
-                cx.stop_propagation();
-                return;
-            }
+            // R12: ⌘=/⌘−/⌘0 zoom is no longer handled here — it is an app-level
+            // keyboard shortcut (`crate::keymap` in `crates/nice`), matched by the
+            // GPUI keymap before this key listener runs (dispatch order: actions →
+            // key listeners → input handler). The action mutates the shared,
+            // process-level `FontSettings` this view observes, so every open
+            // window re-metrics; the keystroke never reaches this handler, so it
+            // also never encodes to the pty. ⌘V/⌘C above stay LOCAL (they are not
+            // in the rebindable shortcut table and depend on this view's selection
+            // / kitty state).
         }
 
         let event_type = if event.is_held {
