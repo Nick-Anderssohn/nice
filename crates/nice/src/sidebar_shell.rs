@@ -6,17 +6,26 @@
 //! state it drives ships gpui-free in `nice-model` (slice 1): [`SidebarModel`],
 //! [`SidebarTabSelection`], [`InlineRenameClickGate`].
 //!
-//! ## One entity owns the per-window state (the GPUI shape)
+//! ## Shared per-window state + transient view state (the GPUI shape)
 //!
 //! Swift spreads this across `AppShellView`, `SidebarView`, `ProjectGroup`, and
-//! `TabRow` `@State`. GPUI collapses the mutable state into one entity —
-//! [`SidebarShellView`] — that owns the [`TabModel`] (R8), the sidebar
-//! mode/collapse/peek [`SidebarModel`], the [`SidebarTabSelection`], the injected
-//! [`SidebarActions`] seam, and the transient view state (resize width, peek pin,
-//! disclosure-open set, inline-rename draft, the open context menu). The rows and
-//! groups are built by helper methods rather than child entities so their tap
-//! handlers can reach this state through `cx.listener` — no cross-element
-//! interaction flags (the R9 anti-pattern), state is recomputed per event.
+//! `TabRow` `@State`. GPUI splits it in two: the *document* state a whole window
+//! shares — the [`TabModel`] (R8), the sidebar mode/collapse/peek `SidebarModel`,
+//! the `SidebarTabSelection`, and the `SidebarActions` seam — lives in the
+//! per-window [`WindowState`] entity this view holds a handle to and renders
+//! from / mutates (R13.5's "one `TabModel` per window" invariant: no divergent
+//! model copy in any mounted view, every mutation flowing through
+//! `WindowState`'s seams). A sibling holder of that same entity — the keymap's
+//! window-scoped actions, routed through the `WindowRegistry` — mutating it
+//! re-renders this view through the `cx.observe` subscription set in [`new`].
+//! What the view still owns is only the *transient* per-view state (resize
+//! width, peek pin, disclosure-open set, inline-rename draft, the open context
+//! menu). The rows and groups are built by helper methods rather than child
+//! entities so their tap handlers can reach this state through `cx.listener` —
+//! no cross-element interaction flags (the R9 anti-pattern), state is recomputed
+//! per event.
+//!
+//! [`new`]: SidebarShellView::new
 //!
 //! ## DO-NOT-PORT seams (binding decision)
 //!
@@ -55,14 +64,12 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, point, prelude::*, px, App, BoxShadow, Context, CursorStyle, DismissEvent, Entity,
+    div, point, prelude::*, px, AnyView, App, BoxShadow, Context, CursorStyle, DismissEvent, Entity,
     FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, SharedString, Subscription, Window,
 };
 
-use nice_model::{
-    InlineRenameClickGate, SidebarMode, SidebarModel, SidebarTabSelection, TabModel, TabStatus,
-};
+use nice_model::{InlineRenameClickGate, SidebarMode, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
     traffic_light_reserved_width, CARD_BORDER_OPACITY, CARD_BORDER_WIDTH, CARD_CORNER_RADIUS,
     CARD_INSET, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET, COLLAPSED_CAP_HEIGHT,
@@ -73,10 +80,12 @@ use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 use nice_theme::AccentPreset;
 
+use crate::app_shell::SIDEBAR_ROOT_LABEL;
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::window_state::WindowState;
 
 // The Esc key binding is a gpui action (the DO-NOT-PORT replacement for the
 // `NSEvent` Esc monitor). Reuses the `nice` action namespace like R9's
@@ -256,18 +265,30 @@ struct GroupVm {
 // ---- The view ---------------------------------------------------------------
 
 /// The per-window sessions-mode sidebar shell. Construct with
-/// [`SidebarShellView::new`] over a seeded [`TabModel`]; slice 4 opens it in the
-/// `sidebar` self-test window.
+/// [`SidebarShellView::new`] over the window's shared [`WindowState`] entity; it
+/// renders the shared `model` / `sidebar` / `selection` and mutates them through
+/// `WindowState`'s seams.
 pub(crate) struct SidebarShellView {
-    /// The R8 document — the projects/tabs/panes tree the sidebar renders and
-    /// the [`SidebarActions`] seam mutates.
-    model: TabModel,
-    /// Sidebar mode / collapse / peek state (slice-1 pure model).
-    sidebar: SidebarModel,
-    /// The Finder-style multi-selection (slice-1 pure model).
-    selection: SidebarTabSelection,
-    /// The create/close/select seam — R13 swaps this for real sessions.
-    actions: Box<dyn crate::sidebar_actions::SidebarActions>,
+    /// The shared per-window state (the single [`TabModel`], the sidebar
+    /// collapse/mode/peek model, the multi-selection, and the create/close/select
+    /// [`SidebarActions`] seam). This view renders from and mutates it; it never
+    /// keeps a private copy (R13.5's "one `TabModel` per window" invariant).
+    state: Entity<WindowState>,
+    /// Re-render this view whenever the shared state notifies — the seam through
+    /// which the keymap's window-scoped actions (⌘S toggle, tab cycle, …) become
+    /// visible in the shell. Held so the subscription lives as long as the view.
+    _state_sub: Subscription,
+
+    /// R13.5 composition slot: the toolbar band (the R11 `WindowToolbarView`),
+    /// rendered in the 52pt top-bar-accessory position — right of the card in the
+    /// expanded shell, right of the collapsed cap in the collapsed shell
+    /// (mirroring Swift's `AppShellView`). `None` in the isolated `sidebar`
+    /// scenario, which mounts the shell standalone and keeps the placeholder
+    /// content region.
+    main_toolbar: Option<AnyView>,
+    /// R13.5 composition slot: the pane-content host (`PaneHostView`), rendered as
+    /// the shell's fill body below the toolbar. `None` in the isolated scenario.
+    main_body: Option<AnyView>,
 
     /// The user-resizable docked sidebar width (in-memory; resets on relaunch).
     sidebar_width: f32,
@@ -312,17 +333,20 @@ pub(crate) struct SidebarShellView {
 }
 
 impl SidebarShellView {
-    /// A shell over a seeded model: expanded, tabs mode, selection seeded from
-    /// the model's active tab so the invariant holds and the first ⇧-click has an
-    /// anchor. Width 240, Terracotta accent.
-    pub(crate) fn new(model: TabModel, cx: &mut Context<Self>) -> Self {
-        let mut selection = SidebarTabSelection::new();
-        selection.sync_active_tab_id(model.active_tab_id());
+    /// A shell over the window's shared [`WindowState`]: it reads the sidebar
+    /// mode/collapse/peek, the selection, and the tab tree from that entity and
+    /// mutates them through its seams. The `sidebar`/`selection` invariants
+    /// (expanded, tabs mode, selection seeded from the active tab) are established
+    /// by [`WindowState::with_model`] / [`WindowState::new`], not here. Width 240,
+    /// Terracotta accent. Observing the state re-renders the shell when a sibling
+    /// holder (the keymap) mutates it.
+    pub(crate) fn new(state: Entity<WindowState>, cx: &mut Context<Self>) -> Self {
+        let state_sub = cx.observe(&state, |_this, _state, cx| cx.notify());
         Self {
-            model,
-            sidebar: SidebarModel::new(false, SidebarMode::Tabs),
-            selection,
-            actions: Box::new(crate::sidebar_actions::ModelSidebarActions::new()),
+            state,
+            _state_sub: state_sub,
+            main_toolbar: None,
+            main_body: None,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             drag_start_width: None,
             resize_origin_x: None,
@@ -342,11 +366,29 @@ impl SidebarShellView {
         }
     }
 
+    /// The R13.5 composed shell: same shared-state shell as [`new`](Self::new)
+    /// with the toolbar band + pane-content host injected into the content
+    /// region's top-bar-accessory + body slots. `crate::app::build_window_root`
+    /// wires this for the shipped window and every ⌘N window; the isolated
+    /// `sidebar` scenario keeps [`new`](Self::new) (placeholder content).
+    pub(crate) fn new_composed(
+        state: Entity<WindowState>,
+        toolbar: AnyView,
+        body: AnyView,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(state, cx);
+        this.main_toolbar = Some(toolbar);
+        this.main_body = Some(body);
+        this
+    }
+
     // MARK: - Snapshot
 
-    fn snapshot_groups(&self) -> Vec<GroupVm> {
-        let active = self.model.active_tab_id().map(|s| s.to_string());
-        self.model
+    fn snapshot_groups(&self, cx: &mut Context<Self>) -> Vec<GroupVm> {
+        let ws = self.state.read(cx);
+        let active = ws.model.active_tab_id().map(|s| s.to_string());
+        ws.model
             .projects
             .iter()
             .map(|p| {
@@ -362,7 +404,7 @@ impl SidebarShellView {
                             status: t.status(),
                             waiting_ack: t.waiting_acknowledged(),
                             is_active: active.as_deref() == Some(t.id.as_str()),
-                            is_selected: self.selection.contains(&t.id),
+                            is_selected: ws.selection.contains(&t.id),
                             is_editing: self.editing_tab_id.as_deref() == Some(t.id.as_str()),
                         })
                         .collect()
@@ -389,29 +431,32 @@ impl SidebarShellView {
     /// ⇧ extends from the sticky anchor. Resets `activated_at` only when the
     /// active tab actually changes (so a click on the already-active row keeps
     /// the rename gate armed — `SidebarView.swift`'s `onChange(of: isActive)`).
-    fn route_click(&mut self, tab_id: &str, cmd: bool, shift: bool) {
-        let before = self.model.active_tab_id().map(|s| s.to_string());
-        if cmd {
-            if let Some(new_active) = self.selection.toggle(tab_id) {
-                self.actions.select_tab(&mut self.model, &new_active);
+    fn route_click(&mut self, tab_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
+        let changed = self.state.update(cx, |ws, _| {
+            let before = ws.model.active_tab_id().map(|s| s.to_string());
+            if cmd {
+                if let Some(new_active) = ws.selection.toggle(tab_id) {
+                    ws.sidebar_actions.select_tab(&mut ws.model, &new_active);
+                }
+            } else if shift {
+                let order = ws.model.navigable_sidebar_tab_ids();
+                ws.selection.extend(tab_id, &order);
+                ws.sidebar_actions.select_tab(&mut ws.model, tab_id);
+            } else {
+                ws.selection.replace(tab_id);
+                ws.sidebar_actions.select_tab(&mut ws.model, tab_id);
             }
-        } else if shift {
-            let order = self.model.navigable_sidebar_tab_ids();
-            self.selection.extend(tab_id, &order);
-            self.actions.select_tab(&mut self.model, tab_id);
-        } else {
-            self.selection.replace(tab_id);
-            self.actions.select_tab(&mut self.model, tab_id);
-        }
-        let after = self.model.active_tab_id().map(|s| s.to_string());
-        if before != after {
+            let after = ws.model.active_tab_id().map(|s| s.to_string());
+            // Reconcile the selection's active mirror with the model (a no-op on
+            // the tap paths since the mutators already set it; keeps the invariant
+            // if a toggle refused).
+            let active = ws.model.active_tab_id().map(|s| s.to_string());
+            ws.selection.sync_active_tab_id(active.as_deref());
+            before != after
+        });
+        if changed {
             self.activated_at = Some(Instant::now());
         }
-        // Reconcile the selection's active mirror with the model (a no-op on the
-        // tap paths since the mutators already set it; keeps the invariant if a
-        // toggle refused).
-        let active = self.model.active_tab_id().map(|s| s.to_string());
-        self.selection.sync_active_tab_id(active.as_deref());
     }
 
     /// Plain title tap: modified clicks route like a row; on the already-active
@@ -426,10 +471,10 @@ impl SidebarShellView {
         cx: &mut Context<Self>,
     ) {
         if cmd || shift {
-            self.route_click(tab_id, cmd, shift);
+            self.route_click(tab_id, cmd, shift, cx);
             return;
         }
-        let is_active = self.model.active_tab_id() == Some(tab_id);
+        let is_active = self.state.read(cx).model.active_tab_id() == Some(tab_id);
         if is_active {
             if InlineRenameClickGate::can_begin_edit(
                 self.activated_at,
@@ -440,45 +485,58 @@ impl SidebarShellView {
             }
             // else: same-click-as-select window — no-op (no redundant reselect).
         } else {
-            self.route_click(tab_id, false, false);
+            self.route_click(tab_id, false, false, cx);
         }
     }
 
     /// Collapse a multi-selection back to the active tab (Esc / empty-area
     /// click). Drops everything only when the tree has no active tab — a
     /// mid-shutdown edge (`SidebarView.swift:86-92`).
-    fn collapse_selection_to_active(&mut self) {
-        if let Some(active) = self.model.active_tab_id().map(|s| s.to_string()) {
-            self.selection.collapse(&active);
-        } else {
-            self.selection.clear();
-        }
+    fn collapse_selection_to_active(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, _| {
+            if let Some(active) = ws.model.active_tab_id().map(|s| s.to_string()) {
+                ws.selection.collapse(&active);
+            } else {
+                ws.selection.clear();
+            }
+        });
     }
 
     /// Prune + re-sync the selection against the surviving tabs after a close.
-    fn reconcile_selection_after_close(&mut self) {
-        let valid: HashSet<String> = self.model.navigable_sidebar_tab_ids().into_iter().collect();
-        let active = self.model.active_tab_id().map(|s| s.to_string());
-        self.selection.prune(&valid);
-        self.selection.sync_active_tab_id(active.as_deref());
+    fn reconcile_selection_after_close(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, _| {
+            let valid: HashSet<String> =
+                ws.model.navigable_sidebar_tab_ids().into_iter().collect();
+            let active = ws.model.active_tab_id().map(|s| s.to_string());
+            ws.selection.prune(&valid);
+            ws.selection.sync_active_tab_id(active.as_deref());
+        });
     }
 
     /// Re-seed the selection + arm the rename gate after a create/select (the new
     /// tab is already the model's active tab).
-    fn reseed_selection_after_create(&mut self) {
-        let active = self.model.active_tab_id().map(|s| s.to_string());
-        self.selection.sync_active_tab_id(active.as_deref());
+    fn reseed_selection_after_create(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, _| {
+            let active = ws.model.active_tab_id().map(|s| s.to_string());
+            ws.selection.sync_active_tab_id(active.as_deref());
+        });
         self.activated_at = Some(Instant::now());
     }
 
     // MARK: - Inline rename
 
     fn begin_editing(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.model.tab_for(tab_id) else {
+        let Some(title) = self
+            .state
+            .read(cx)
+            .model
+            .tab_for(tab_id)
+            .map(|t| t.title.clone())
+        else {
             return;
         };
         self.editing_tab_id = Some(tab_id.to_string());
-        self.draft_title = tab.title.clone();
+        self.draft_title = title;
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
         // Replacing any prior subscription here drops it OUTSIDE its callback.
@@ -495,7 +553,7 @@ impl SidebarShellView {
             return;
         };
         let draft = std::mem::take(&mut self.draft_title);
-        self.model.rename_tab(&id, &draft);
+        self.state.update(cx, |ws, _| ws.model.rename_tab(&id, &draft));
         cx.notify();
     }
 
@@ -532,31 +590,41 @@ impl SidebarShellView {
 
     // MARK: - Toggles / actions
 
-    fn set_mode(&mut self, mode: SidebarMode) {
-        if self.sidebar.mode() != mode {
-            self.sidebar.toggle_sidebar_mode();
-        }
+    fn set_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, _| {
+            if ws.sidebar.mode() != mode {
+                ws.sidebar.toggle_sidebar_mode();
+            }
+        });
     }
 
     /// Toggle the collapsed flag. Expanding also clears any peek state
     /// (`AppShellView`: expand clears peek).
     fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
-        self.sidebar.toggle_sidebar();
-        if !self.sidebar.collapsed() {
-            self.sidebar.end_sidebar_peek();
+        let now_collapsed = self.state.update(cx, |ws, _| {
+            ws.sidebar.toggle_sidebar();
+            let collapsed = ws.sidebar.collapsed();
+            if !collapsed {
+                ws.sidebar.end_sidebar_peek();
+            }
+            collapsed
+        });
+        if !now_collapsed {
             self.peek_mouse_pinned = false;
         }
         cx.notify();
     }
 
     fn add_tab_in_group(&mut self, group_id: &str, is_terminals: bool, cx: &mut Context<Self>) {
-        if is_terminals {
-            self.actions.create_terminal_tab(&mut self.model);
-        } else {
-            self.actions
-                .create_claude_tab_in_project(&mut self.model, group_id);
-        }
-        self.reseed_selection_after_create();
+        self.state.update(cx, |ws, _| {
+            if is_terminals {
+                ws.sidebar_actions.create_terminal_tab(&mut ws.model);
+            } else {
+                ws.sidebar_actions
+                    .create_claude_tab_in_project(&mut ws.model, group_id);
+            }
+        });
+        self.reseed_selection_after_create(cx);
         cx.notify();
     }
 
@@ -579,8 +647,9 @@ impl SidebarShellView {
             self.cancel_rename(cx);
             return; // consumed
         }
-        if self.selection.selected_tab_ids().len() > 1 {
-            self.collapse_selection_to_active();
+        let multi = self.state.read(cx).selection.selected_tab_ids().len() > 1;
+        if multi {
+            self.collapse_selection_to_active(cx);
             cx.notify(); // consumed
         } else {
             // Nothing to collapse — let Esc reach the focused terminal.
@@ -597,7 +666,11 @@ impl SidebarShellView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let action_ids = self.selection.selection_ids_for_right_click_on(tab_id);
+        let action_ids = self
+            .state
+            .read(cx)
+            .selection
+            .selection_ids_for_right_click_on(tab_id);
         let mut items = Vec::new();
         let weak = cx.weak_entity();
 
@@ -607,9 +680,11 @@ impl SidebarShellView {
             let w = weak.clone();
             items.push(ContextMenuItem::entry("Rename Tab", move |window, app| {
                 let _ = w.update(app, |this, cx| {
-                    this.selection.snap_if_right_click_outside(&tid);
-                    this.actions.select_tab(&mut this.model, &tid);
-                    this.reseed_selection_after_create();
+                    this.state.update(cx, |ws, _| {
+                        ws.selection.snap_if_right_click_outside(&tid);
+                        ws.sidebar_actions.select_tab(&mut ws.model, &tid);
+                    });
+                    this.reseed_selection_after_create(cx);
                     this.begin_editing(&tid, window, cx);
                 });
             }));
@@ -621,13 +696,15 @@ impl SidebarShellView {
         let w = weak.clone();
         items.push(ContextMenuItem::entry(close_label, move |_window, app| {
             let _ = w.update(app, |this, cx| {
-                this.selection.snap_if_right_click_outside(&tid);
-                if ids.len() > 1 {
-                    this.actions.close_tabs(&mut this.model, &ids);
-                } else {
-                    this.actions.close_tab(&mut this.model, &tid);
-                }
-                this.reconcile_selection_after_close();
+                this.state.update(cx, |ws, _| {
+                    ws.selection.snap_if_right_click_outside(&tid);
+                    if ids.len() > 1 {
+                        ws.sidebar_actions.close_tabs(&mut ws.model, &ids);
+                    } else {
+                        ws.sidebar_actions.close_tab(&mut ws.model, &tid);
+                    }
+                });
+                this.reconcile_selection_after_close(cx);
                 cx.notify();
             });
         }));
@@ -653,8 +730,9 @@ impl SidebarShellView {
         let gid = group_id.to_string();
         let items = vec![ContextMenuItem::entry("Close Project", move |_window, app| {
             let _ = weak.update(app, |this, cx| {
-                this.actions.close_project(&mut this.model, &gid);
-                this.reconcile_selection_after_close();
+                this.state
+                    .update(cx, |ws, _| ws.sidebar_actions.close_project(&mut ws.model, &gid));
+                this.reconcile_selection_after_close(cx);
                 cx.notify();
             });
         })];
@@ -773,41 +851,49 @@ impl SidebarShellView {
 
     // MARK: - Rendering
 
-    fn build_expanded_shell(&self, groups: Vec<GroupVm>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn build_expanded_shell(
+        &self,
+        groups: Vec<GroupVm>,
+        mode: SidebarMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_row()
             .size_full()
-            .child(self.build_sidebar_card(&groups, true, false, cx))
-            .child(self.build_content())
+            .child(self.build_sidebar_card(&groups, true, false, mode, cx))
+            .child(self.build_main_column())
     }
 
     fn build_collapsed_shell(
         &self,
         groups: Vec<GroupVm>,
+        mode: SidebarMode,
+        peeking_model: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let s = dark_slots();
-        let peeking = self.sidebar.peeking() || self.peek_mouse_pinned;
-        let peek = peeking.then(|| self.build_peek_overlay(&groups, peeking, cx));
+        let peeking = peeking_model || self.peek_mouse_pinned;
+        let peek = peeking.then(|| self.build_peek_overlay(&groups, peeking, mode, cx));
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
             .child(
-                // Top row: the collapsed cap (traffic lights + restore) plus the
-                // chrome band area (R9/R11 own it); content extends full-width
-                // beneath.
+                // Top row: the collapsed cap (traffic lights + restore) beside the
+                // toolbar band (Swift's `HStack { collapsedCap ; WindowToolbarView }`);
+                // in the isolated scenario the toolbar slot is absent and the R9/R11
+                // chrome filler stands in. The pane content extends full-width beneath.
                 div()
                     .flex()
                     .flex_row()
                     .w_full()
                     .h(px(TOP_BAR_HEIGHT))
                     .child(self.build_collapsed_cap(&s, cx))
-                    .child(div().flex_1().h_full().bg(slot_to_rgba(s.chrome))),
+                    .child(self.build_collapsed_top_accessory(&s)),
             )
-            .child(self.build_content())
+            .child(self.build_main_body())
             .children(peek)
     }
 
@@ -822,6 +908,7 @@ impl SidebarShellView {
         groups: &[GroupVm],
         resizable: bool,
         peeking: bool,
+        mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let s = dark_slots();
@@ -832,6 +919,13 @@ impl SidebarShellView {
         };
         let handle = resizable.then(|| self.build_resize_handle(cx));
         let inner = div()
+            // Exported shipped-surface AX anchor (§6): the sidebar card root, found
+            // by an AX walk on role + label. gpui exposes an element to the macOS
+            // AX tree only with both an `.id()` and a non-generic `.role()`; the
+            // `aria_label` becomes its `AXTitle`.
+            .id(SIDEBAR_ROOT_LABEL)
+            .role(gpui::Role::Group)
+            .aria_label(SIDEBAR_ROOT_LABEL)
             .relative()
             .flex()
             .flex_col()
@@ -842,8 +936,8 @@ impl SidebarShellView {
             .border(px(CARD_BORDER_WIDTH))
             .border_color(card_border_color(&s))
             .shadow(card_shadow())
-            .child(self.build_top_strip(&s, cx))
-            .child(self.build_body(groups, &s, peeking, cx))
+            .child(self.build_top_strip(&s, mode, cx))
+            .child(self.build_body(groups, &s, peeking, mode, cx))
             .child(self.build_footer(&s, cx))
             .children(handle);
         div()
@@ -859,10 +953,10 @@ impl SidebarShellView {
     /// collapse toggles at its trailing edge. The strip is the R9 band (drag to
     /// move, double-click zoom); the buttons consume their own presses so the
     /// band passes them through.
-    fn build_top_strip(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+    fn build_top_strip(&self, s: &Slots, mode: SidebarMode, cx: &mut Context<Self>) -> impl IntoElement {
         let accent = self.accent;
-        let tabs_active = self.sidebar.mode() == SidebarMode::Tabs;
-        let files_active = self.sidebar.mode() == SidebarMode::Files;
+        let tabs_active = mode == SidebarMode::Tabs;
+        let files_active = mode == SidebarMode::Files;
         div()
             .relative()
             .flex_none()
@@ -886,7 +980,7 @@ impl SidebarShellView {
                         accent,
                         s,
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.set_mode(SidebarMode::Tabs);
+                            this.set_mode(SidebarMode::Tabs, cx);
                             cx.notify();
                             cx.stop_propagation();
                         }),
@@ -898,7 +992,7 @@ impl SidebarShellView {
                         accent,
                         s,
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.set_mode(SidebarMode::Files);
+                            this.set_mode(SidebarMode::Files, cx);
                             cx.notify();
                             cx.stop_propagation();
                         }),
@@ -982,9 +1076,10 @@ impl SidebarShellView {
         groups: &[GroupVm],
         s: &Slots,
         peeking: bool,
+        mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let show_tabs = peeking || self.sidebar.mode() == SidebarMode::Tabs;
+        let show_tabs = peeking || mode == SidebarMode::Tabs;
         if show_tabs {
             self.build_tab_list(groups, s, cx).into_any_element()
         } else {
@@ -1018,7 +1113,7 @@ impl SidebarShellView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                    this.collapse_selection_to_active();
+                    this.collapse_selection_to_active(cx);
                     cx.notify();
                 }),
             )
@@ -1272,7 +1367,7 @@ impl SidebarShellView {
                     if this.editing_tab_id.is_some() {
                         this.commit_rename(cx);
                     }
-                    this.route_click(&tid_tap, e.modifiers.platform, e.modifiers.shift);
+                    this.route_click(&tid_tap, e.modifiers.platform, e.modifiers.shift, cx);
                     cx.notify();
                     cx.stop_propagation();
                 }),
@@ -1384,14 +1479,66 @@ impl SidebarShellView {
     }
 
     /// The content column to the right of (expanded) or beneath (collapsed) the
-    /// sidebar. A plain background this cycle — R11's toolbar + R13's terminal
-    /// fill it later.
+    /// sidebar. A plain background when no content is injected (the isolated
+    /// `sidebar` scenario); R13.5's composed shell replaces it with the toolbar
+    /// band + pane-content host via the [`main_toolbar`](Self::main_toolbar) /
+    /// [`main_body`](Self::main_body) slots.
     fn build_content(&self) -> impl IntoElement {
         div()
             .flex_1()
             .min_h_0()
             .size_full()
             .bg(slot_to_rgba(dark_slots().background))
+    }
+
+    /// The expanded shell's right column: the toolbar band stacked over the pane
+    /// body (Swift's `VStack { WindowToolbarView ; mainContent }`). When no
+    /// content is injected this is the placeholder [`build_content`](Self::build_content)
+    /// verbatim, so the isolated `sidebar` scenario's layout is unchanged.
+    fn build_main_column(&self) -> gpui::AnyElement {
+        if self.main_toolbar.is_none() && self.main_body.is_none() {
+            return self.build_content().into_any_element();
+        }
+        let mut col = div().flex().flex_col().flex_1().min_w_0().h_full();
+        if let Some(toolbar) = &self.main_toolbar {
+            col = col.child(toolbar.clone());
+        }
+        col.child(self.build_main_body()).into_any_element()
+    }
+
+    /// The collapsed shell's top-row accessory beside the cap: the toolbar band
+    /// when composed (as a flex-filling wrapper so the toolbar's own `w_full`
+    /// resolves against the remaining row width), else the R9/R11 chrome filler
+    /// the isolated scenario shows.
+    fn build_collapsed_top_accessory(&self, s: &Slots) -> gpui::AnyElement {
+        if let Some(toolbar) = &self.main_toolbar {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(toolbar.clone())
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .h_full()
+                .bg(slot_to_rgba(s.chrome))
+                .into_any_element()
+        }
+    }
+
+    /// The pane content fill below the toolbar / cap row: the injected pane-host
+    /// when composed, else the placeholder [`build_content`](Self::build_content).
+    fn build_main_body(&self) -> gpui::AnyElement {
+        if let Some(body) = &self.main_body {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(body.clone())
+                .into_any_element()
+        } else {
+            self.build_content().into_any_element()
+        }
     }
 
     /// The peek overlay: the full sidebar card floating over the collapsed
@@ -1403,6 +1550,7 @@ impl SidebarShellView {
         &self,
         groups: &[GroupVm],
         peeking: bool,
+        mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -1415,7 +1563,7 @@ impl SidebarShellView {
                 this.peek_mouse_pinned = *hovering;
                 cx.notify();
             }))
-            .child(self.build_sidebar_card(groups, false, peeking, cx))
+            .child(self.build_sidebar_card(groups, false, peeking, mode, cx))
     }
 }
 
@@ -1433,8 +1581,8 @@ impl SidebarShellView {
     }
 
     /// Whether the sidebar is collapsed (drives the cap-vs-column assertion).
-    pub(crate) fn is_collapsed(&self) -> bool {
-        self.sidebar.collapsed()
+    pub(crate) fn is_collapsed(&self, cx: &App) -> bool {
+        self.state.read(cx).sidebar.collapsed()
     }
 
     /// Drive the real collapse toggle (used to bring up / dismiss the collapsed
@@ -1447,8 +1595,10 @@ impl SidebarShellView {
     /// [`StatusDot`] for `tab_id` — the R8 predicates read straight off the model,
     /// never recomputed. `None` if the tab is unknown. The scenario asserts the
     /// dot colour + pulse rule against these.
-    pub(crate) fn tab_dot_inputs(&self, tab_id: &str) -> Option<(TabStatus, bool)> {
-        self.model
+    pub(crate) fn tab_dot_inputs(&self, tab_id: &str, cx: &App) -> Option<(TabStatus, bool)> {
+        self.state
+            .read(cx)
+            .model
             .tab_for(tab_id)
             .map(|t| (t.status(), t.waiting_acknowledged()))
     }
@@ -1456,6 +1606,24 @@ impl SidebarShellView {
     /// The user's accent (thinking-dot colour) — resolved once at construction.
     pub(crate) fn accent(&self) -> Srgba {
         self.accent
+    }
+
+    /// The width the shell sizes its leading column to right now — the docked card
+    /// width (`sidebar_width`) when expanded, the fixed collapsed-cap width when
+    /// collapsed — the exact values [`build_sidebar_card`](Self::build_sidebar_card) /
+    /// [`build_collapsed_cap`](Self::build_collapsed_cap) size their roots to. This is
+    /// the *intended* column width, re-derived from the collapse flag (and the
+    /// `sidebar_width` field), NOT a read of the rendered element's laid-out `Bounds`.
+    /// The `app-shell` scenario samples it across a ⌘B toggle to confirm the intended
+    /// leading-column width tracks the collapse (~240 → ~124pt); because that scenario
+    /// never resizes, the shrink follows from the collapse flag rather than an
+    /// independent layout measurement.
+    pub(crate) fn scenario_leading_column_width(&self, cx: &App) -> f32 {
+        if self.is_collapsed(cx) {
+            collapsed_cap_width()
+        } else {
+            self.sidebar_width
+        }
     }
 }
 
@@ -1467,11 +1635,16 @@ impl Focusable for SidebarShellView {
 
 impl Render for SidebarShellView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = self.snapshot_groups();
-        let shell = if self.sidebar.collapsed() {
-            self.build_collapsed_shell(groups, cx).into_any_element()
+        let (collapsed, mode, peeking_model) = {
+            let ws = self.state.read(cx);
+            (ws.sidebar.collapsed(), ws.sidebar.mode(), ws.sidebar.peeking())
+        };
+        let groups = self.snapshot_groups(cx);
+        let shell = if collapsed {
+            self.build_collapsed_shell(groups, mode, peeking_model, cx)
+                .into_any_element()
         } else {
-            self.build_expanded_shell(groups, cx).into_any_element()
+            self.build_expanded_shell(groups, mode, cx).into_any_element()
         };
         div()
             .size_full()

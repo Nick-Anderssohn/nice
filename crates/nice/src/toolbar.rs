@@ -31,15 +31,21 @@
 //! GeometryReader fallback, and **no drag plumbing** — pill drag / reorder /
 //! tear-off is R25, and the trailing update pill is R27.
 //!
-//! ## One entity owns the per-window state (the GPUI shape)
+//! ## Shared per-window state + transient view state (the GPUI shape)
 //!
-//! Like [`crate::sidebar_shell::SidebarShellView`], one entity
-//! ([`WindowToolbarView`]) owns the [`TabModel`], the injected
-//! [`PaneStripActions`], the scroll handle, and the transient view state (hovered
-//! pill, inline-rename draft, the open context menu). The pills / buttons are
-//! built by helper methods rather than child entities so their handlers reach
-//! this state through `cx.listener` — no cross-element interaction flags (the R9
-//! anti-pattern); state is recomputed per event.
+//! Like [`crate::sidebar_shell::SidebarShellView`], the *document* state — the
+//! [`TabModel`] and the pane-strip select/close/add seam — lives in the shared
+//! per-window [`WindowState`] entity this view holds a handle to and renders
+//! from / mutates (R13.5's "one `TabModel` per window" invariant: no divergent
+//! model copy in any mounted view). What the view still owns is the transient
+//! per-view state (the scroll handle, hovered pill, inline-rename draft, the open
+//! context menu). A sibling holder of that same entity — the keymap's
+//! window-scoped pane actions (⌘T, pane-step) routed through the `WindowRegistry`
+//! — mutating it re-renders this view through the `cx.observe` subscription set
+//! in [`new`](WindowToolbarView::new). The pills / buttons are built by helper
+//! methods rather than child entities so their handlers reach this state through
+//! `cx.listener` — no cross-element interaction flags (the R9 anti-pattern);
+//! state is recomputed per event.
 
 // No in-crate caller wires this view until slice 3 adds the `pane-strip` self-test
 // scenario; it is a deliberately-exported surface (plan "Exported contracts"). The
@@ -58,18 +64,19 @@ use gpui::{
 
 use nice_model::{
     center_offset_x, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry, Tab,
-    TabModel, TabStatus,
+    TabStatus,
 };
 use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 use nice_theme::AccentPreset;
 
+use crate::app_shell::PANE_STRIP_ROOT_LABEL;
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
-use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::window_state::WindowState;
 
 // ---- Geometry / behaviour constants (Swift provenance) ----------------------
 
@@ -273,14 +280,19 @@ struct PaneVm {
 // ---- The view ---------------------------------------------------------------
 
 /// The per-window toolbar (brand block + pane strip). Construct with
-/// [`WindowToolbarView::new`] over a seeded [`TabModel`]; slice 3 opens it in the
-/// `pane-strip` self-test window.
+/// [`WindowToolbarView::new`] over the window's shared [`WindowState`] entity; it
+/// renders the shared `model`'s active-tab panes and mutates them through the
+/// `pane_strip_actions` seam.
 pub(crate) struct WindowToolbarView {
-    /// The R8 document — the strip renders the active tab's panes and the
-    /// [`PaneStripActions`] seam mutates it.
-    model: TabModel,
-    /// The select / close / add seam — R13 swaps this for real sessions.
-    actions: Box<dyn PaneStripActions>,
+    /// The shared per-window state (the single [`TabModel`] plus the pane-strip
+    /// select/close/add seam). This view renders the active tab's panes from it
+    /// and mutates it through the seam; it never keeps a private model copy
+    /// (R13.5's "one `TabModel` per window" invariant).
+    state: Entity<WindowState>,
+    /// Re-render this view whenever the shared state notifies — the seam through
+    /// which the keymap's window-scoped pane actions (⌘T, pane-step) become
+    /// visible in the strip. Held so the subscription lives as long as the view.
+    _state_sub: Subscription,
     /// The user's accent — the Claude dot's thinking colour, the brand mark, and
     /// the attention badge. Terracotta default (palette switching is R21).
     accent: Srgba,
@@ -325,12 +337,14 @@ pub(crate) struct WindowToolbarView {
 }
 
 impl WindowToolbarView {
-    /// A toolbar over a seeded model, Terracotta accent, nothing hovered or
-    /// editing.
-    pub(crate) fn new(model: TabModel, cx: &mut Context<Self>) -> Self {
+    /// A toolbar over the window's shared [`WindowState`], Terracotta accent,
+    /// nothing hovered or editing. Observing the state re-renders the strip when a
+    /// sibling holder (the keymap) mutates the shared model.
+    pub(crate) fn new(state: Entity<WindowState>, cx: &mut Context<Self>) -> Self {
+        let state_sub = cx.observe(&state, |_this, _state, cx| cx.notify());
         Self {
-            model,
-            actions: Box::new(ModelPaneStripActions::new()),
+            state,
+            _state_sub: state_sub,
             accent: AccentPreset::Terracotta.color(),
             hovered_pane_id: None,
             editing_pane: None,
@@ -350,20 +364,23 @@ impl WindowToolbarView {
 
     // MARK: - Model access / snapshot
 
-    /// The active tab — the one whose panes the strip renders.
-    fn active_tab(&self) -> Option<&Tab> {
-        let id = self.model.active_tab_id()?;
-        self.model.tab_for(id)
+    /// The active tab — the one whose panes the strip renders. The returned
+    /// borrow is tied to `cx` (the shared model lives in the [`WindowState`]
+    /// entity), so callers read it and drop the borrow before mutating.
+    fn active_tab<'a>(&self, cx: &'a App) -> Option<&'a Tab> {
+        let ws = self.state.read(cx);
+        let id = ws.model.active_tab_id()?;
+        ws.model.tab_for(id)
     }
 
     /// The active tab's id (owned), if any.
-    fn active_tab_id(&self) -> Option<String> {
-        self.model.active_tab_id().map(|s| s.to_string())
+    fn active_tab_id(&self, cx: &App) -> Option<String> {
+        self.state.read(cx).model.active_tab_id().map(|s| s.to_string())
     }
 
     /// A per-render snapshot of the active tab's pills.
-    fn snapshot_panes(&self) -> Vec<PaneVm> {
-        let Some(tab) = self.active_tab() else {
+    fn snapshot_panes(&self, cx: &App) -> Vec<PaneVm> {
+        let Some(tab) = self.active_tab(cx) else {
             return Vec::new();
         };
         let active = tab.active_pane_id.clone();
@@ -387,13 +404,13 @@ impl WindowToolbarView {
 
     /// The pill row's real geometry: each pane's viewport-relative rect + the
     /// viewport width, fed to [`StripGeometry`] for the fades and offscreen set.
-    fn strip_geometry(&self) -> StripGeometry {
+    fn strip_geometry(&self, cx: &App) -> StripGeometry {
         let viewport = self.scroll.bounds();
         let viewport_left = f32::from(viewport.origin.x);
         let visible_width = f32::from(viewport.size.width);
         let offset_x = f32::from(self.scroll.offset().x);
         let mut frames = HashMap::new();
-        if let Some(tab) = self.active_tab() {
+        if let Some(tab) = self.active_tab(cx) {
             for (ix, pane) in tab.panes.iter().enumerate() {
                 if let Some(b) = self.scroll.bounds_for_item(ix) {
                     frames.insert(
@@ -413,17 +430,17 @@ impl WindowToolbarView {
 
     /// Whether the overflow chevron should render — the `>= 2` panes + reserved
     /// real-overflow rule.
-    fn show_chevron(&self) -> bool {
-        let pane_count = self.active_tab().map(|t| t.panes.len()).unwrap_or(0);
+    fn show_chevron(&self, cx: &App) -> bool {
+        let pane_count = self.active_tab(cx).map(|t| t.panes.len()).unwrap_or(0);
         should_show_overflow_chevron(pane_count, f32::from(self.scroll.max_offset().x))
     }
 
     /// Whether some fully-offscreen pane needs attention — reuses the R8
     /// [`Tab::has_offscreen_attention`] fed this cycle's offscreen set (no second
     /// predicate).
-    fn has_offscreen_attention(&self) -> bool {
-        let offscreen = self.strip_geometry().offscreen_pane_ids();
-        self.active_tab()
+    fn has_offscreen_attention(&self, cx: &App) -> bool {
+        let offscreen = self.strip_geometry(cx).offscreen_pane_ids();
+        self.active_tab(cx)
             .map(|t| t.has_offscreen_attention(&offscreen))
             .unwrap_or(false)
     }
@@ -431,15 +448,15 @@ impl WindowToolbarView {
     /// If the active pane changed since last frame, reset the rename gate and try
     /// to center its pill; retry next frame while `bounds_for_item` is not yet
     /// populated (first layout).
-    fn sync_active_pane(&mut self, window: &mut Window) {
-        let active_now = self.active_tab().and_then(|t| t.active_pane_id.clone());
+    fn sync_active_pane(&mut self, window: &mut Window, cx: &App) {
+        let active_now = self.active_tab(cx).and_then(|t| t.active_pane_id.clone());
         if active_now != self.last_active_pane {
             self.last_active_pane = active_now.clone();
             self.activated_at = Some(Instant::now());
             self.center_pending = active_now.is_some();
         }
         if self.center_pending {
-            if self.try_center_active() {
+            if self.try_center_active(cx) {
                 self.center_pending = false;
             } else {
                 // Layout not ready — repaint so we retry once the pills lay out.
@@ -450,15 +467,20 @@ impl WindowToolbarView {
 
     /// Apply the centering offset for the active pane. Returns `false` (a retry
     /// signal) when the pill hasn't been laid out yet.
-    fn try_center_active(&mut self) -> bool {
-        let Some(tab) = self.active_tab() else {
-            return true; // nothing to center
-        };
-        let Some(active_id) = tab.active_pane_id.clone() else {
-            return true;
-        };
-        let Some(ix) = tab.panes.iter().position(|p| p.id == active_id) else {
-            return true;
+    fn try_center_active(&mut self, cx: &App) -> bool {
+        // Resolve the active pane's row index (dropping the model borrow) before
+        // touching the scroll handle.
+        let ix = {
+            let Some(tab) = self.active_tab(cx) else {
+                return true; // nothing to center
+            };
+            let Some(active_id) = tab.active_pane_id.as_deref() else {
+                return true;
+            };
+            match tab.panes.iter().position(|p| p.id == active_id) {
+                Some(ix) => ix,
+                None => return true,
+            }
         };
         let Some(item) = self.scroll.bounds_for_item(ix) else {
             return false; // not laid out yet
@@ -479,13 +501,17 @@ impl WindowToolbarView {
     // MARK: - Inline rename
 
     fn begin_editing(&mut self, tab_id: &str, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.model.tab_for(tab_id) else {
+        let Some(title) = self
+            .state
+            .read(cx)
+            .model
+            .tab_for(tab_id)
+            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
+            .map(|p| p.title.clone())
+        else {
             return;
         };
-        let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) else {
-            return;
-        };
-        self.draft_title = pane.title.clone();
+        self.draft_title = title;
         self.editing_pane = Some((tab_id.to_string(), pane_id.to_string()));
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
@@ -505,7 +531,8 @@ impl WindowToolbarView {
             return;
         };
         let draft = std::mem::take(&mut self.draft_title);
-        self.model.rename_pane(&tab_id, &pane_id, &draft);
+        self.state
+            .update(cx, |ws, _| ws.model.rename_pane(&tab_id, &pane_id, &draft));
         self.refocus_terminal_after_rename();
         cx.notify();
     }
@@ -559,13 +586,16 @@ impl WindowToolbarView {
     /// A plain (unmodified) press on a pill body: select the pane. Commits any
     /// in-flight rename on another pill first.
     fn select_pane(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id() else {
+        let Some(tab_id) = self.active_tab_id(cx) else {
             return;
         };
         if self.editing_pane.is_some() {
             self.commit_rename(cx);
         }
-        self.actions.select_pane(&mut self.model, &tab_id, pane_id);
+        self.state.update(cx, |ws, _| {
+            ws.pane_strip_actions
+                .select_pane(&mut ws.model, &tab_id, pane_id)
+        });
         cx.notify();
     }
 
@@ -573,11 +603,11 @@ impl WindowToolbarView {
     /// else it's a plain select on a non-active pill
     /// (`WindowToolbarView.swift:883-888`).
     fn handle_title_tap(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id() else {
+        let Some(tab_id) = self.active_tab_id(cx) else {
             return;
         };
         let is_active = self
-            .active_tab()
+            .active_tab(cx)
             .and_then(|t| t.active_pane_id.as_deref())
             == Some(pane_id);
         if is_active {
@@ -593,23 +623,27 @@ impl WindowToolbarView {
     /// Close a pane through the seam, committing any in-flight edit first
     /// (`WindowToolbarView.swift:912-916`).
     fn close_pane(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id() else {
+        let Some(tab_id) = self.active_tab_id(cx) else {
             return;
         };
         if self.editing_pane.is_some() {
             self.commit_rename(cx);
         }
-        self.actions.close_pane(&mut self.model, &tab_id, pane_id);
+        self.state.update(cx, |ws, _| {
+            ws.pane_strip_actions
+                .close_pane(&mut ws.model, &tab_id, pane_id)
+        });
         cx.notify();
     }
 
     /// Add a terminal pane to the active tab through the seam
     /// (`WindowToolbarView.swift:242-244`).
     fn add_terminal_pane(&mut self, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id() else {
+        let Some(tab_id) = self.active_tab_id(cx) else {
             return;
         };
-        self.actions.add_terminal_pane(&mut self.model, &tab_id);
+        self.state
+            .update(cx, |ws, _| ws.pane_strip_actions.add_terminal_pane(&mut ws.model, &tab_id));
         cx.notify();
     }
 
@@ -631,10 +665,13 @@ impl WindowToolbarView {
             let pid = pid.clone();
             ContextMenuItem::entry(rename_menu_label(kind), move |window, app| {
                 let _ = w.update(app, |this, cx| {
-                    let Some(tab_id) = this.active_tab_id() else {
+                    let Some(tab_id) = this.active_tab_id(cx) else {
                         return;
                     };
-                    this.actions.select_pane(&mut this.model, &tab_id, &pid);
+                    this.state.update(cx, |ws, _| {
+                        ws.pane_strip_actions
+                            .select_pane(&mut ws.model, &tab_id, &pid)
+                    });
                     this.begin_editing(&tab_id, &pid, window, cx);
                 });
             })
@@ -652,18 +689,23 @@ impl WindowToolbarView {
     }
 
     fn open_overflow_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else {
-            return;
+        // Snapshot the (pane id, row label) pairs while the model borrow is held,
+        // then build the menu items from owned data.
+        let rows: Vec<(String, String)> = {
+            let Some(tab) = self.active_tab(cx) else {
+                return;
+            };
+            let active = tab.active_pane_id.clone();
+            tab.panes
+                .iter()
+                .map(|pane| (pane.id.clone(), overflow_row_label(pane, active.as_deref())))
+                .collect()
         };
-        let active = tab.active_pane_id.clone();
         let weak = cx.weak_entity();
-        let items: Vec<ContextMenuItem> = tab
-            .panes
-            .iter()
-            .map(|pane| {
-                let label = overflow_row_label(pane, active.as_deref());
+        let items: Vec<ContextMenuItem> = rows
+            .into_iter()
+            .map(|(pid, label)| {
                 let w = weak.clone();
-                let pid = pane.id.clone();
                 ContextMenuItem::entry(label, move |_window, app| {
                     let _ = w.update(app, |this, cx| {
                         this.select_pane(&pid, cx);
@@ -781,9 +823,9 @@ impl WindowToolbarView {
     /// The pill strip: a horizontally-scrolling row of pills (flex-filling), then
     /// the always-reserved chevron slot, then the always-visible `+`.
     fn render_strip(&self, panes: &[PaneVm], s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
-        let geometry = self.strip_geometry();
-        let show_chevron = self.show_chevron();
-        let has_attention = self.has_offscreen_attention();
+        let geometry = self.strip_geometry(cx);
+        let show_chevron = self.show_chevron(cx);
+        let has_attention = self.has_offscreen_attention(cx);
 
         // The tracked scroll viewport (fixed width — the two trailing slots are
         // always reserved) hosting the pill row.
@@ -1156,12 +1198,19 @@ impl Focusable for WindowToolbarView {
 impl Render for WindowToolbarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Reset the rename gate + auto-center when the active pane changed.
-        self.sync_active_pane(window);
+        self.sync_active_pane(window, cx);
 
         let s = dark_slots();
-        let panes = self.snapshot_panes();
+        let panes = self.snapshot_panes(cx);
 
         div()
+            // Exported shipped-surface AX anchor (§6): the pane-strip (toolbar)
+            // root, found by an AX walk on role + label. `.id()` + a non-generic
+            // `.role()` are what expose an element to the macOS AX tree; the
+            // `aria_label` becomes its `AXTitle`.
+            .id(PANE_STRIP_ROOT_LABEL)
+            .role(gpui::Role::Group)
+            .aria_label(PANE_STRIP_ROOT_LABEL)
             .relative()
             .track_focus(&self.focus_handle)
             .key_context("WindowToolbar")
@@ -1202,21 +1251,21 @@ impl Render for WindowToolbarView {
 // exercises the shipped behaviour, not a shortcut.
 impl WindowToolbarView {
     /// The active tab's pane ids, in order.
-    pub(crate) fn pane_ids(&self) -> Vec<String> {
-        self.active_tab()
+    pub(crate) fn pane_ids(&self, cx: &App) -> Vec<String> {
+        self.active_tab(cx)
             .map(|t| t.panes.iter().map(|p| p.id.clone()).collect())
             .unwrap_or_default()
     }
 
     /// The active pane id, if any.
-    pub(crate) fn active_pane_id(&self) -> Option<String> {
-        self.active_tab()
+    pub(crate) fn active_pane_id(&self, cx: &App) -> Option<String> {
+        self.active_tab(cx)
             .and_then(|t| t.active_pane_id.clone())
     }
 
     /// Whether the overflow chevron currently renders.
-    pub(crate) fn scenario_show_chevron(&self) -> bool {
-        self.show_chevron()
+    pub(crate) fn scenario_show_chevron(&self, cx: &App) -> bool {
+        self.show_chevron(cx)
     }
 
     /// Whether the overflow (or a pill) context menu is currently open — the live
@@ -1227,14 +1276,14 @@ impl WindowToolbarView {
     }
 
     /// The fully-offscreen pane ids (drives the fades / badge assertions).
-    pub(crate) fn scenario_offscreen_pane_ids(&self) -> std::collections::HashSet<String> {
-        self.strip_geometry().offscreen_pane_ids()
+    pub(crate) fn scenario_offscreen_pane_ids(&self, cx: &App) -> std::collections::HashSet<String> {
+        self.strip_geometry(cx).offscreen_pane_ids()
     }
 
     /// Whether the attention badge should light (a fully-offscreen pane needs
     /// attention).
-    pub(crate) fn scenario_has_offscreen_attention(&self) -> bool {
-        self.has_offscreen_attention()
+    pub(crate) fn scenario_has_offscreen_attention(&self, cx: &App) -> bool {
+        self.has_offscreen_attention(cx)
     }
 
     /// The current horizontal scroll offset (drives the centering assertion).
@@ -1244,8 +1293,8 @@ impl WindowToolbarView {
 
     /// The pill's window-space bounds, if laid out (drives the ×-slot width
     /// equality + centering assertions).
-    pub(crate) fn scenario_pill_bounds(&self, pane_id: &str) -> Option<Bounds<Pixels>> {
-        let tab = self.active_tab()?;
+    pub(crate) fn scenario_pill_bounds(&self, pane_id: &str, cx: &App) -> Option<Bounds<Pixels>> {
+        let tab = self.active_tab(cx)?;
         let ix = tab.panes.iter().position(|p| p.id == pane_id)?;
         self.scroll.bounds_for_item(ix)
     }
@@ -1274,17 +1323,24 @@ impl WindowToolbarView {
         being_viewed: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tab_id) = self.active_tab_id() {
-            if let Some((pi, ti)) = self.model.project_tab_index(&tab_id) {
-                if let Some(pane) = self.model.projects[pi].tabs[ti]
+        let Some(tab_id) = self.active_tab_id(cx) else {
+            return;
+        };
+        let changed = self.state.update(cx, |ws, _| {
+            if let Some((pi, ti)) = ws.model.project_tab_index(&tab_id) {
+                if let Some(pane) = ws.model.projects[pi].tabs[ti]
                     .panes
                     .iter_mut()
                     .find(|p| p.id == pane_id)
                 {
                     pane.apply_status_transition(status, being_viewed);
-                    cx.notify();
+                    return true;
                 }
             }
+            false
+        });
+        if changed {
+            cx.notify();
         }
     }
 }

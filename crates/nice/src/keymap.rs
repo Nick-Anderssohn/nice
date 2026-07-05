@@ -231,13 +231,26 @@ fn trigger_peek_if_collapsed(state: &mut WindowState) {
     }
 }
 
-/// Route a window-scoped action to the focused window's state. A no-op when no
-/// window is registered (e.g. a self-test that installs the keymap but never
-/// stands up the [`WindowRegistry`]) — `active_state` returns `None` and the
-/// action harmlessly does nothing.
+/// Route a window-scoped action to the focused window's state, then notify the
+/// state entity so every view observing it re-renders. A no-op when no window is
+/// registered (e.g. a self-test that installs the keymap but never stands up the
+/// [`WindowRegistry`]) — `active_state` returns `None` and the action harmlessly
+/// does nothing.
+///
+/// The trailing `cx.notify()` is what makes the window-scoped shortcuts produce
+/// **visible** results in the shipped shell (R13.5): the shell's
+/// `AppShellView` / `SidebarShellView` / `WindowToolbarView` / `PaneHostView`
+/// each observe this `WindowState` entity, so `gpui::Entity::update` — which does
+/// not notify on its own — is followed by an explicit notify. Without it a ⌘T /
+/// ⌘S / pane-step would mutate state that nothing re-renders (the gap this cycle
+/// closes). Harmless where no view observes the state (e.g. the `multiwindow`
+/// scenario asserts the model directly).
 fn with_active_state(cx: &mut App, f: impl FnOnce(&mut WindowState, &mut Context<WindowState>)) {
     if let Some(state) = WindowRegistry::active_state(cx, true) {
-        state.update(cx, f);
+        state.update(cx, |s, cx| {
+            f(s, cx);
+            cx.notify();
+        });
     }
 }
 

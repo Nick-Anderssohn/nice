@@ -60,6 +60,7 @@ use crate::platform::{self, WindowButtonFrame};
 use crate::sidebar_shell::SidebarShellView;
 use crate::status_dot::{status_dot_base_color, status_dot_should_pulse};
 use crate::theme::slot_srgba;
+use crate::window_state::WindowState;
 
 // -- fixed geometry / tolerances --------------------------------------------
 
@@ -111,7 +112,14 @@ const DOT_IDLE: &str = "dot-idle";
 pub fn open_sidebar_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let model = seed_model();
     let whandle: WindowHandle<SidebarShellView> = cx.open_window(app::window_options(), {
-        move |_window, cx| cx.new(|cx| SidebarShellView::new(model, cx))
+        // Seed the shared per-window state around the fixture model, then mount
+        // the SAME refactored shell the managed window uses (R13.5: the isolated
+        // scenario exercises the shipped view over a real `WindowState`, not a
+        // private model copy).
+        move |_window, cx| {
+            let state = cx.new(|_cx| WindowState::with_model(model));
+            cx.new(|cx| SidebarShellView::new(state, cx))
+        }
     })?;
     let any: AnyWindowHandle = whandle.into();
 
@@ -227,7 +235,7 @@ fn read_width(cx: &mut AsyncApp, view: &Entity<SidebarShellView>) -> f32 {
 }
 
 fn read_collapsed(cx: &mut AsyncApp, view: &Entity<SidebarShellView>) -> bool {
-    view.update(cx, |v, _| v.is_collapsed())
+    view.update(cx, |v, cx| v.is_collapsed(cx))
 }
 
 fn drive_collapse(cx: &mut AsyncApp, view: &Entity<SidebarShellView>) {
@@ -623,7 +631,7 @@ fn dot_checks(cx: &mut AsyncApp, view: &Entity<SidebarShellView>, failures: &mut
     ];
 
     for (id, exp_status, exp_color, exp_pulse) in cases {
-        let Some((status, ack)) = view.update(cx, |v, _| v.tab_dot_inputs(id)) else {
+        let Some((status, ack)) = view.update(cx, |v, cx| v.tab_dot_inputs(id, cx)) else {
             failures.push(format!("dot: tab '{id}' missing from the model"));
             continue;
         };

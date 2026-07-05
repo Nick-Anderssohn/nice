@@ -27,7 +27,7 @@ use gpui::{
     Context, Entity, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, SharedString, TitlebarOptions,
     WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
 use nice_harness::frame::{self, CadenceReport, IntervalStats};
@@ -485,8 +485,8 @@ pub(crate) fn install_new_window_command(cx: &mut App) {
 /// window, which fires the bounds observer. The rebuild is gated on an actual
 /// full-screen state change, so an ordinary resize — or our own band drag, which
 /// emits a stream of move events — never rebuilds the menu.
-pub(crate) fn install_fullscreen_menu_sync(
-    view: Entity<WindowChromeView>,
+pub(crate) fn install_fullscreen_menu_sync<V: 'static>(
+    view: Entity<V>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -546,18 +546,30 @@ pub fn run() {
     });
 }
 
-/// Open a managed Nice window: spawn a login-shell (or, if `NICE_RS_COMMAND` is
-/// set, a one-off command) session, host it in a [`TerminalView`] wrapped in the
-/// R9 chrome band, mint + register this window's [`WindowState`], and wire the
-/// demand-present kick. Used both for the first window ([`run`]) and every ⌘N
-/// window ([`install_new_window_command`]); each is fully isolated.
+/// Open a managed Nice window: mint + seed this window's [`WindowState`], spawn
+/// its Main tab's terminal pane into the [`SessionManager`](crate::session_manager::SessionManager)
+/// (a login shell, or a one-off `NICE_RS_COMMAND`), and mount the R13.5 shell —
+/// the pane strip + floating sidebar card + a pane-content host that follows the
+/// active pane. Used both for the first window ([`run`]) and every ⌘N window
+/// ([`install_new_window_command`]); each is fully isolated.
 ///
-/// The session is owned solely by the view (via the entity), so closing the
-/// window drops the handle → drops the session → tears down the child process
-/// group (`TabPtySession`-parity SIGHUP/SIGKILL): no orphan zsh survives. Window
+/// The Main pane is spawned **here** with the full shipped spec (command + the
+/// live grid size) so the initial pane keeps its `NICE_RS_COMMAND` / geometry;
+/// explicitly-added panes spawn a plain login shell through R13's deferred-spawn
+/// path (`ensure_active_pane_spawned`). The session is owned by the window's
+/// `SessionManager`, so closing the window tears its child process groups down
+/// (`WindowState::teardown` → SIGHUP/SIGKILL): no orphan zsh survives. Window
 /// close also deregisters the state and runs its teardown hook (the registry's
-/// `on_window_closed` observer).
-fn open_managed_window(cx: &mut App) -> Result<()> {
+/// `on_window_closed` observer). The demand-present kick is owned by the shell's
+/// pane host, which re-points it to the active pane on every switch.
+///
+/// Returns the shell window handle. `run` / the ⌘N handler discard it; the
+/// `app-shell` self-test scenario (`crate::app_shell_live`) keeps it so its driver
+/// can read the shipped shell it just built — the scenario opens through THIS
+/// builder, not a hand-rolled root, so it can never drift from what `run` mounts.
+pub(crate) fn open_managed_window(
+    cx: &mut App,
+) -> Result<WindowHandle<crate::app_shell::AppShellView>> {
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let spec = match std::env::var("NICE_RS_COMMAND") {
         // A one-off command pane (the live-smoke path: `ls -la`, colour tests).
@@ -567,82 +579,49 @@ fn open_managed_window(cx: &mut App) -> Result<()> {
     }
     .with_size(LIVE_ROWS, LIVE_COLS);
 
-    let handle = TerminalSessionHandle::spawn(cx, spec, nice_term_core::DEFAULT_SCROLLBACK_LINES)?;
-    let theme = TerminalTheme::nice_default_dark();
-    let accent = AccentPreset::Terracotta.color();
+    // Mint the window's shared state (its `TabModel` seeds the pinned Terminals
+    // group + Main tab with one terminal pane), then spawn that Main pane into
+    // the window's `SessionManager` with the full spec — the pane the shell's
+    // `PaneHostView` hosts. Spawning it here (not lazily) preserves its command +
+    // grid size.
+    let state = cx.new(|_cx| WindowState::new(cwd));
+    let main = {
+        let ws = state.read(cx);
+        let tab = ws.model.active_tab_id().map(str::to_owned);
+        let pane = tab
+            .as_deref()
+            .and_then(|t| ws.model.tab_for(t))
+            .and_then(|t| t.active_pane_id.clone());
+        tab.zip(pane)
+    };
+    if let Some((tab_id, pane_id)) = main {
+        state.update(cx, |ws, cx| ws.session.spawn_pane(&tab_id, &pane_id, spec, cx))?;
+    }
 
-    let window = cx.open_window(window_options(), {
-        let handle = handle.clone();
-        let theme = theme.clone();
-        // `cwd` is moved into the builder as this window's initial document root.
-        move |window, cx| {
-            // The process-level shared terminal font state (T11 + R12 hoist): one
-            // `FontSettings` entity for the WHOLE app, minted once in
-            // `keymap::install_shortcuts` and read here, so a ⌘=/⌘−/⌘0 zoom fans
-            // out to every open window's panes — not the per-window entity this
-            // builder used to create. (R12 moved font ownership up to the app so
-            // the zoom action can drive it without a focused-window lookup.)
-            let font = crate::keymap::shared_font_settings(cx);
-            let terminal = cx.new(|cx| {
-                let mut view = TerminalView::new(handle, theme, accent, font, cx);
-                // Wire the macOS keyCode side-channel so the R5 keyboard encoder
-                // can recover the layout-independent physical key. The sole objc2
-                // crossing for input lives in `crate::platform`, injected here
-                // like the present kick — `nice-term-view` stays objc2-free.
-                view.set_keycode_probe(std::sync::Arc::new(
-                    crate::platform::current_event_keycode,
-                ));
-                // Raw-image drag fallback (T7): a drop with no file URLs reads the
-                // drag pasteboard for image data and types a temp PNG path. Same
-                // objc2-in-platform injection as the keyCode probe above.
-                view.set_image_drop_provider(std::sync::Arc::new(
-                    crate::platform::read_dropped_image_to_temp,
-                ));
-                // App-Nap-safe "Launching…" overlay grace deadline (T9): the sole
-                // foreign-code home builds it, injected like the probes above so
-                // `nice-term-view` stays CF/objc2-free. Load-bearing for a slow,
-                // silent, possibly-occluded pane (a bare gpui timer could be
-                // deferred indefinitely by App Nap — spike-6).
-                view.set_launch_deadline(crate::platform::launch_deadline());
-                view
-            });
-            // R12: hand this window its per-window state as a constructor
-            // argument and build the root (R9 chrome band over the terminal) +
-            // register the state. This is the `build_root(WindowState::new(..))`
-            // seam R18/R25 later thread restored / adopted state through.
-            build_window_root(WindowState::new(cwd), terminal, window, cx)
-        }
+    let handle = cx.open_window(window_options(), {
+        let state = state.clone();
+        move |window, cx| build_window_root(state, window, cx)
     })?;
-
-    // Demand-present kick: on damage the drain task notifies + `setNeedsDisplay`s
-    // this window. On the frontmost live window `cx.notify()` already presents
-    // (the CVDisplayLink is running); the kick is the load-bearing path for when
-    // the window is occluded (its link is stopped). R13 re-points it on a
-    // re-parent.
-    install_present_kick(&handle, window.into(), cx);
-    Ok(())
+    Ok(handle)
 }
 
-/// Build a managed window's root view from its per-window [`WindowState`] — the
-/// state-as-constructor-argument seam (plan). Wraps the terminal `content` in the
-/// R9 chrome band, mints the state as a gpui entity, registers it in the
-/// [`WindowRegistry`], tracks activation for the registry's MRU (Swift's
-/// `didBecomeKey` role), and keeps the View-menu full-screen title in sync.
+/// Build a managed window's root view over its per-window [`WindowState`] entity
+/// — the R13.5 shipped shell. Registers the state in the [`WindowRegistry`],
+/// tracks activation for the registry's MRU (Swift's `didBecomeKey` role), mounts
+/// the [`AppShellView`](crate::app_shell::AppShellView) composition (the R11 pane
+/// strip + R10 floating sidebar card + the pane-content host, all over the one
+/// shared state), and keeps the View-menu full-screen title in sync.
 ///
-/// Only the live window gets the chrome band; scenario windows keep their
-/// full-bleed roots. R18 will hand this restored state, R25 an adopted pane —
+/// The R9 chrome-band behaviour (drag / double-click / traffic-light row / press
+/// arbitration) is carried by the toolbar band + the sidebar top strip inside the
+/// shell; [`WindowChromeView`] is unchanged and now mounted only by the `chrome`
+/// self-test scenario. R18 will hand this restored state, R25 an adopted pane —
 /// they change what `WindowState::new` produces, not this wiring.
 fn build_window_root(
-    state: WindowState,
-    content: Entity<TerminalView>,
+    state: Entity<WindowState>,
     window: &mut Window,
     cx: &mut App,
-) -> Entity<WindowChromeView> {
-    let state = cx.new(|_cx| state);
-    // R9: the chrome band (52pt top bar + traffic lights on the y-26 row +
-    // empty-chrome drag/double-click) — the shipped window's real chrome.
-    let chrome = cx.new(|_cx| WindowChromeView::new(content));
-
+) -> Entity<crate::app_shell::AppShellView> {
     // Register this window's state, then track activation so the registry's MRU
     // stays current (the pin's `window_stack()` is only a z-order assist). The
     // observer fires immediately; we record a window only while it is actually
@@ -659,10 +638,34 @@ fn build_window_root(
         .detach();
     });
 
+    // Mount the shipped shell. The sidebar owns the two-mode layout + peek +
+    // resize; the toolbar band and the pane-content host ride its content slots
+    // (Swift's `AppShellView` expanded / collapsed layout). All three surfaces
+    // render from and mutate the ONE shared `WindowState` (the "one TabModel per
+    // window" invariant). The pane host uses the same theme / accent / shared
+    // font as the old single-terminal window and follows the active pane through
+    // `SessionManager::activate_pane`.
+    let font = crate::keymap::shared_font_settings(cx);
+    let theme = TerminalTheme::nice_default_dark();
+    let accent = AccentPreset::Terracotta.color();
+    let pane_host =
+        cx.new(|cx| crate::app_shell::PaneHostView::new(state.clone(), theme, accent, font, cx));
+    let toolbar = cx.new(|cx| crate::toolbar::WindowToolbarView::new(state.clone(), cx));
+    let sidebar = cx.new(|cx| {
+        crate::sidebar_shell::SidebarShellView::new_composed(
+            state.clone(),
+            toolbar.clone().into(),
+            pane_host.into(),
+            cx,
+        )
+    });
+    let shell = cx.new(|cx| crate::app_shell::AppShellView::new(state, sidebar, toolbar, cx));
+
     // R9 (slice 2): keep the View menu's full-screen title in sync as this window
-    // enters / exits full screen.
-    install_fullscreen_menu_sync(chrome.clone(), window, cx);
-    chrome
+    // enters / exits full screen (now hung on the shell root instead of the bare
+    // chrome view — the observer just needs some view entity to own it).
+    install_fullscreen_menu_sync(shell.clone(), window, cx);
+    shell
 }
 
 /// Open the self-test scenario window (animated root view). Handed to the
@@ -2702,6 +2705,28 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // Two readiness polls + two routed exits + the held detour, each on
                 // the real pty clock, plus settles; generous headroom.
                 budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
+        // R13.5: the app-shell composition gate — drives the SHIPPED builder
+        // (`open_managed_window` / `build_window_root`, the exact path `run` uses)
+        // and asserts the mounted shell: the sidebar + pane-strip AX anchors are
+        // exposed, ⌘T adds a visible pill and switches pane content, ⌘B collapses/
+        // expands the card (geometry read), the strip `+` spawns a real pty whose
+        // output renders, closing the extra pane refocuses a neighbor, and teardown
+        // reaps every pty. Registered BEFORE `multiwindow`: it does NOT install the
+        // `WindowRegistry` close observer (its `build_window_root` only `register`s,
+        // via `default_global`), so closing its window never trips the quit-when-
+        // empty terminus that `multiwindow` — which DOES install it — relies on
+        // being last.
+        Scenario {
+            name: "app-shell",
+            open: crate::app_shell_live::open_app_shell_window,
+            gate: Gate::SelfReported {
+                // Login-shell spawns + grid-readiness polls for the ⌘T and strip-+
+                // panes, the AX-tree activation poll, and the teardown reap of
+                // several ptys, each on the real pty clock; generous headroom.
+                budget: Duration::from_secs(60),
             },
             activate: true,
         },

@@ -5,6 +5,10 @@
 //! Structure (grows over later cycles):
 //!   * [`app`] — owns window creation + the root view (shipped window and the
 //!     self-test scenario window).
+//!   * [`app_shell`] — the R13.5 per-window composition root (`AppShellView`):
+//!     mounts the R11 pane strip + R10 floating sidebar card + the pane-content
+//!     host (`PaneHostView`, active pane → session handle → per-pane
+//!     `TerminalView`) that the shipped window and every ⌘N window use.
 //!   * [`platform`] — the single home for foreign AppKit / objc2 / CoreGraphics
 //!     access (all-Rust rule): the demand-present kick + present-timing facts
 //!     (R1), the keyCode side-channel (R5), and the CGEvent/AX/TIS FFI the live
@@ -78,6 +82,8 @@
 //! (see `nice_harness::selftest`); otherwise the normal app opens its window.
 
 mod app;
+mod app_shell;
+mod app_shell_live;
 mod chrome_live;
 mod context_menu;
 mod inline_rename;

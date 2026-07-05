@@ -44,7 +44,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use gpui::{prelude::*, AnyWindowHandle, AsyncApp, Entity, WindowHandle};
+use gpui::{prelude::*, AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_model::{Pane, PaneKind, TabModel};
@@ -53,6 +53,7 @@ use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 use crate::app;
 use crate::platform;
 use crate::toolbar::WindowToolbarView;
+use crate::window_state::WindowState;
 
 // -- fixed geometry / tolerances --------------------------------------------
 
@@ -90,7 +91,14 @@ Verify: swift -e 'import ApplicationServices; print(AXIsProcessTrusted())'";
 pub fn open_pane_strip_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let model = seed_model();
     let whandle: WindowHandle<WindowToolbarView> = cx.open_window(app::window_options(), {
-        move |_window, cx| cx.new(|cx| WindowToolbarView::new(model, cx))
+        // Seed the shared per-window state around the fixture model, then mount
+        // the SAME refactored toolbar the managed window uses (R13.5: the isolated
+        // scenario exercises the shipped view over a real `WindowState`, not a
+        // private model copy).
+        move |_window, cx| {
+            let state = cx.new(|_cx| WindowState::with_model(model));
+            cx.new(|cx| WindowToolbarView::new(state, cx))
+        }
     })?;
     let any: AnyWindowHandle = whandle.into();
 
@@ -298,7 +306,7 @@ async fn overflow_checks(
     settle(cx, 400).await;
 
     // The chevron shows on a REAL on-screen window (real-layout overflow).
-    if read_bool(cx, view, |v| v.scenario_show_chevron()) {
+    if read_bool(cx, view, |v, cx| v.scenario_show_chevron(cx)) {
         eprintln!("[selftest] pane-strip overflow: chevron shows (real-layout overflow with the reserved slots)");
     } else {
         failures.push(format!(
@@ -311,7 +319,8 @@ async fn overflow_checks(
     // Activate-from-elsewhere centers: p0 is at the far leading edge and is
     // offscreen now (the last add centered the trailing pane). Selecting it must
     // make it active (hard) and scroll it back into view (deferred on repaint).
-    let p0_offscreen_before = read_bool(cx, view, |v| v.scenario_offscreen_pane_ids().contains("p0"));
+    let p0_offscreen_before =
+        read_bool(cx, view, |v, cx| v.scenario_offscreen_pane_ids(cx).contains("p0"));
     let _ = view.update(cx, |v, cx| v.drive_select_pane("p0", cx));
     settle(cx, 500).await;
     if read_active(cx, view).as_deref() == Some("p0") {
@@ -319,7 +328,8 @@ async fn overflow_checks(
     } else {
         failures.push("centering: selecting p0 did not make it the active pane".to_string());
     }
-    let p0_offscreen_after = read_bool(cx, view, |v| v.scenario_offscreen_pane_ids().contains("p0"));
+    let p0_offscreen_after =
+        read_bool(cx, view, |v, cx| v.scenario_offscreen_pane_ids(cx).contains("p0"));
     if p0_offscreen_before && !p0_offscreen_after {
         eprintln!("[selftest] pane-strip centering: p0 was offscreen and is now revealed (auto-centered)");
     } else if !p0_offscreen_before {
@@ -341,7 +351,7 @@ async fn overflow_checks(
         platform::post_left_mouse_down(pid, gx, gy, 1);
         platform::post_left_mouse_up(pid, gx, gy, 1);
         settle(cx, 400).await;
-        if read_bool(cx, view, |v| v.scenario_menu_open()) {
+        if read_bool(cx, view, |v, _| v.scenario_menu_open()) {
             eprintln!("[selftest] pane-strip overflow menu: opened via a real click on the chevron");
         } else {
             deferred.push(
@@ -361,18 +371,22 @@ async fn overflow_checks(
 // `WindowHandle::update` returns a `Result` (the window can close), hence `.ok()`.
 
 fn read_active(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>) -> Option<String> {
-    view.update(cx, |v, _| v.active_pane_id())
+    view.update(cx, |v, cx| v.active_pane_id(cx))
 }
 
-fn read_bool(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, f: impl Fn(&WindowToolbarView) -> bool) -> bool {
-    view.update(cx, |v, _| f(v))
+fn read_bool(
+    cx: &mut AsyncApp,
+    view: &Entity<WindowToolbarView>,
+    f: impl Fn(&WindowToolbarView, &App) -> bool,
+) -> bool {
+    view.update(cx, |v, cx| f(v, cx))
 }
 
 /// The on-screen content-view centre of a pill (offset-free bounds + the current
 /// scroll offset), as `(x, y_from_top)` for a CGEvent.
 fn read_pill_center(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, pane_id: &str) -> Option<(f64, f64)> {
-    view.update(cx, |v, _| {
-        let b = v.scenario_pill_bounds(pane_id)?;
+    view.update(cx, |v, cx| {
+        let b = v.scenario_pill_bounds(pane_id, cx)?;
         let off = v.scenario_scroll_offset_x();
         let x = f32::from(b.origin.x) + off + f32::from(b.size.width) / 2.0;
         let y = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
@@ -384,10 +398,10 @@ fn read_pill_center(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, pane_id
 /// of the last pill (plus a margin) yet clear of the trailing chevron / `+`
 /// cluster. Falls back to 60% width if the pill bounds can't be read.
 fn pick_empty_band_x(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, vw: f64) -> f64 {
-    let last_right = view.update(cx, |v, _| {
-        let ids = v.pane_ids();
+    let last_right = view.update(cx, |v, cx| {
+        let ids = v.pane_ids(cx);
         let last = ids.last()?;
-        let b = v.scenario_pill_bounds(last)?;
+        let b = v.scenario_pill_bounds(last, cx)?;
         let off = v.scenario_scroll_offset_x();
         Some((f32::from(b.origin.x) + off + f32::from(b.size.width)) as f64)
     });

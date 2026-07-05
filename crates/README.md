@@ -59,24 +59,63 @@ crates/
 The GPUI application. Structure (grows over later cycles):
 
 - `app` — owns window creation and the two root paths: the shipped window
-  (`run` → `open_live_terminal`) now hosts a single live terminal pane — the
-  login shell (`zsh -il`) by default, or a one-off `NICE_RS_COMMAND` command —
-  in a `TerminalView` wired to the demand-present kick; and the self-test
-  scenario windows (registered in `selftest_scenarios()`). `RootView` (the
-  solid-background + version-line animated view) is now just the `smoke`
-  scenario's root, no longer the shipped window. R9 gives the shipped window
-  Nice's **window chrome**: `window_options()` flips to a hidden (transparent)
-  titlebar with the native traffic lights repositioned onto the y-26 row
-  (`traffic_light_position` = the absolute close leading 17 — see the
-  chrome-geometry divergence note above), and the terminal is wrapped in
-  `WindowChromeView` — a 52pt top band (chrome token + 1pt bottom rule) whose
-  mouse handlers ARE the empty-chrome behaviour (drag past ~2pt →
-  `start_window_move`; double-click → `titlebar_double_click`, both gated on
-  `!is_fullscreen()`), plus the `ToggleFullScreen` action (⌃⌘F + a native View
-  menu whose title flips via an `observe_window_bounds` callback). The band's
-  press-arbitration convention — interactive children (R10/R11) consume their
-  own presses with `stop_propagation`, the band acts only on the remainder — is
-  the reusable pattern later chrome cycles build on.
+  (`run` → `open_managed_window` → `build_window_root`) and the self-test
+  scenario windows (registered in `selftest_scenarios()`). **R13.5** makes the
+  shipped window — and every ⌘N window — mount the full Swift-parity app shell
+  (`AppShellView`, below) over ONE per-window `WindowState`, replacing the bare R9
+  chrome band over a single terminal (the composition gap the launched app exposed).
+  `open_managed_window` mints + seeds the window's `WindowState`, spawns the Main
+  tab's pane into its `SessionManager` up front with the full shipped spec (the
+  login shell `zsh -il` by default, or a one-off `NICE_RS_COMMAND`; later panes get
+  a plain login shell via the R13 deferred-spawn path), opens the window, and hands
+  back the shell `WindowHandle` (`run` / the ⌘N handler discard it — the `app-shell`
+  scenario keeps it). `build_window_root` registers the state in the
+  `WindowRegistry`, tracks activation, mounts the shell, and keeps the View-menu
+  full-screen title in sync. `RootView` (the solid-background + version-line animated
+  view) is the `smoke` scenario's root. R9 still gives the shipped window Nice's
+  **window chrome**: `window_options()` flips to a hidden (transparent) titlebar with
+  the native traffic lights repositioned onto the y-26 row (`traffic_light_position` =
+  the absolute close leading 17 — see the chrome-geometry divergence note above). The
+  R9 band behaviour (drag past ~2pt → `start_window_move`; double-click →
+  `titlebar_double_click`, both gated on `!is_fullscreen()`; the `ToggleFullScreen`
+  action ⌃⌘F + a native View menu whose title flips via an `observe_window_bounds`
+  callback) is now carried **inside the shell** by the toolbar band + the sidebar top
+  strip, each replicating the same press-arbitration + drag-threshold + full-screen
+  gate. **`WindowChromeView` is unchanged** — the R9 single-band chrome view — but is
+  now mounted **only by the `chrome` self-test scenario**; the shipped window no
+  longer wraps a lone terminal in it. The band's press-arbitration convention —
+  interactive children (R10/R11) consume their own presses with `stop_propagation`,
+  the band acts only on the remainder — is the reusable pattern the shell composes
+  with.
+- `app_shell` — the R13.5 **per-window composition root**. `AppShellView` renders the
+  shell subtree (sidebar card + toolbar band + pane content), carries the window-level
+  peek-clear modifier observer (moved off `WindowChromeView`), and observes the shared
+  `WindowState`, the toolbar, and the sidebar — re-rendering the whole subtree on any
+  notify, so a pill/row click (which notifies only its own view) still switches the
+  `PaneHostView` sibling's content. `PaneHostView` is the pane-content host (the
+  PROTECTED activation decision): it maps the active `(tab_id, pane_id)` →
+  `SessionManager::pane_handle` → a per-pane, lazily-created, cached `TerminalView`
+  (shared theme/accent/font + the same platform probe injections `open_managed_window`
+  used), with activation flowing **only** through `SessionManager::activate_pane` (R13
+  deferred-spawn + focus preserved verbatim, no view-side spawn), dropping a departed
+  pane's view and re-pointing the demand-present kick to the active pane on every
+  switch. The layout tree roots in `SidebarShellView` (it owns the collapse/peek/resize
+  geometry) with the toolbar band + pane host threaded into its content slots, mirroring
+  Swift's `AppShellView` expanded/collapsed layout — no ChromeEventRouter /
+  LivePaneRegistry seam ports. **The composition invariant (PROTECTED):**
+  `WindowState.model` is the ONLY `TabModel` a shipped window holds — `AppShellView` /
+  `SidebarShellView` / `WindowToolbarView` / `PaneHostView` all render from and mutate
+  that one shared state, so no mounted view carries a divergent model copy and every
+  mutation flows through the `sidebar_actions` / `pane_strip_actions` / `session` seams.
+  Exports the AX-anchor label constants `nice-rs-sidebar-root` / `nice-rs-pane-strip-root`
+  (the §6 shipped-surface assertion hooks), placed as `.id()` + `.role(Group)` +
+  `.aria_label(..)` on the sidebar-card root (`sidebar_shell`) and the pane-strip root
+  (`toolbar`).
+- `app_shell_live` — the R13.5 live app-shell composition self-test scenario
+  (`app-shell`, see the table below). Opens through the SHIPPED builder
+  (`open_managed_window` / `build_window_root`), not a hand-rolled root, so it can
+  never drift from what `run` mounts; registered **before** `multiwindow` (it does not
+  install the `WindowRegistry` close observer that scenario relies on being last).
 - `platform` — the single home for foreign AppKit / `objc2` / CoreGraphics
   access (see "All-Rust rule" below): the demand-present kick (`present_kick`)
   plus the two present-timing facts that motivate it (R1), the macOS keyCode
@@ -158,16 +197,23 @@ The GPUI application. Structure (grows over later cycles):
     R10 model-only impl (nothing spawns; no busy-pane confirmation — that is
     W5/R18); removal always goes through the single `TabModel::remove_tab` entry
     point so the parent-pointer sweep can't be skipped.
-  - `sidebar_shell` — one `SidebarShellView` entity owning the per-window state
-    (the `TabModel`, the `SidebarModel` mode/collapse/peek, the
-    `SidebarTabSelection`, the boxed seam, resize width, disclosure set, inline
-    rename draft, open menu) and rendering the whole shell (expanded floating
-    card / collapsed cap / peek overlay / resize handle) + card (project groups,
-    tab rows, footer, toggles). The DO-NOT-PORT SwiftUI seams are replaced per
-    the plan: the Esc `NSEvent` monitor → a `CollapseSidebarSelection` gpui key
-    **binding** (dispatched before key listeners; collapses a >1 selection, else
-    `cx.propagate()`s so Esc still reaches the terminal), and the rename
-    click-away monitor → a `cx.on_blur` focus-out subscription.
+  - `sidebar_shell` — the `SidebarShellView` entity. **R13.5 (slice 1)** moved it off
+    its private `TabModel` copy: it now holds the shared `Entity<WindowState>` + a
+    `cx.observe` subscription and reads/mutates the shared model, sidebar
+    (mode/collapse/peek), selection, and seam through it (the "one TabModel per window"
+    invariant); it keeps only its own view-local render state (resize width, disclosure
+    set, inline-rename draft, open menu). Two constructors: `new(state, cx)` (the
+    isolated `sidebar` scenario — placeholder content, layout byte-identical to before)
+    and **`new_composed(state, main_toolbar, main_body, cx)`** (the shell — the toolbar
+    band + pane host injected as `AnyView`s into the top-bar-accessory + body slots of
+    both shell modes, mirroring Swift's expanded/collapsed layout). Renders the whole
+    shell (expanded floating card / collapsed cap / peek overlay / resize handle) + card
+    (project groups, tab rows, footer, toggles), and carries the exported
+    `nice-rs-sidebar-root` AX anchor on the card root. The DO-NOT-PORT SwiftUI seams are
+    replaced per the plan: the Esc `NSEvent` monitor → a `CollapseSidebarSelection` gpui
+    key **binding** (dispatched before key listeners; collapses a >1 selection, else
+    `cx.propagate()`s so Esc still reaches the terminal), and the rename click-away
+    monitor → a `cx.on_blur` focus-out subscription.
   - `sidebar_live` — the R10 live sidebar self-test scenario (`sidebar`, see the
     table below).
 - **Toolbar (R11 pane strip).** The window toolbar's pane strip — the brand
@@ -201,11 +247,15 @@ The GPUI application. Structure (grows over later cycles):
     R11 model-only impl (select moves `active_pane_id`; close routes through the
     single `TabModel::extract_pane`; add through the R8 `add_pane` "Terminal N"
     counter — nothing spawns until R13).
-  - `toolbar` — one `WindowToolbarView` entity owning the per-window state (the
-    `TabModel`, the injected seam, the `ScrollHandle`, hovered pill, rename draft,
-    open menu) and rendering the whole strip. Empty-submit pill rename resets to
-    the per-kind auto-default via the R8 `rename_pane` (the pill reimplements no
-    title policy).
+  - `toolbar` — the `WindowToolbarView` entity. **R13.5 (slice 1)** moved it off its
+    private `TabModel` copy the same way: it now holds the shared `Entity<WindowState>`
+    + a `cx.observe` subscription, renders the shared model's active-tab panes, and
+    routes select/close/add/rename through the shared `pane_strip_actions` seam; it
+    keeps only its own view-local state (the `ScrollHandle`, hovered pill, rename draft,
+    open menu). Constructor `new(state, cx)`. Renders the whole strip and carries the
+    exported `nice-rs-pane-strip-root` AX anchor on the strip root. Empty-submit pill
+    rename resets to the per-kind auto-default via the R8 `rename_pane` (the pill
+    reimplements no title policy).
   - `pane_strip_live` — the R11 live pane-strip self-test scenario (`pane-strip`,
     see the table below). Its in-process real-layout differentials (overflow
     onset, fades, badge, ✕-slot reservation, select/close/rename routing,
@@ -223,11 +273,15 @@ The GPUI application. Structure (grows over later cycles):
     Swift's `AppState`: the R8 `TabModel` document + the R10 `SidebarModel` /
     `SidebarTabSelection` + the R10/R11 `SidebarActions` / `PaneStripActions`
     seams + the R13 `SessionManager` (in the slot R12 reserved) + a unique
-    per-window session id. Minted fresh by `WindowState::new(cwd)` and handed to
-    `app::build_window_root` — the seam R18 threads restored state and R25 an
-    adopted pane through. `teardown` (a no-op in R12) is what the registry calls
-    on close; R13 makes it drop the window's `SessionManager` sessions
-    (SIGHUP→SIGKILL, no orphan zsh).
+    per-window session id. `WindowState::new(cwd)` mints a fresh default window;
+    **R13.5 (slice 1)** factored out **`WindowState::with_model(model)`** — it seeds a
+    window around a pre-built `TabModel` (re-syncing the selection from its active tab
+    so the "selection ⊇ {active tab}" invariant holds), the seam the isolated `sidebar`
+    / `pane-strip` scenarios mount the shipped views over (and R18 restore will reuse);
+    `new` delegates to it. Handed to `app::build_window_root` — the seam R18 threads
+    restored state and R25 an adopted pane through. `teardown` (a no-op in R12) is what
+    the registry calls on close; R13 makes it drop the window's `SessionManager`
+    sessions (SIGHUP→SIGKILL, no orphan zsh).
   - `session_manager` — `SessionManager`, the per-window pty/session subsystem
     (one per `WindowState`), the Rust twin of Swift's `SessionsModel` pane-lifecycle
     half. It wires the R3–R7 terminal stack (`nice_term_view::TerminalSessionHandle`
@@ -790,9 +844,10 @@ the window, and moves to the next scenario.
 | `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent pane** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt pane** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
 | `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
 | `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-rs-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/pane tests on. `Gate::SelfReported`. |
-| `chrome` | The R9 live window-chrome gate (Validation §1–§4). Opens the shipped chrome shell (`WindowChromeView` band + repositioned native traffic lights + full-screen wiring) over a silent live pane and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. **§1** — via `platform::standard_window_button_frames`, asserts all three buttons exist, the close button's visual centre sits on the y-26 row and its x-origin at 17, and the three are equally pitched (pitch read from the live frames), **re-asserted after a resize, a focus bounce, and a full-screen enter+exit** (the BUG-B stale-capture guard). **§2** — a CGEvent press-drag on the empty band vs the terminal content area, judged by real NSWindow frame reads (the content drag must leave the window put). **§3** — reads (never writes) `AppleActionOnDoubleClick`, posts a CGEvent double-click on the band, and checks the window state matches the predicted zoom / miniaturize / none, plus a double-click while full screen is a no-op (the band's `!is_fullscreen` gate). **§4** — dispatches `ToggleFullScreen` and asserts `is_fullscreen()` + the View-menu title flip, both ways. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Effects a synthetic CGEvent provably can't drive (a window drag via `performWindowDragWithEvent:` follows the *physical* cursor, which `CGEventPostToPid` doesn't move) are recorded as a **DEFERRED HUMAN PASS**, not fail-looped — the same honest-deferral pattern `input-live` uses for synthetic IME composition. `Gate::SelfReported`. |
+| `chrome` | The R9 live window-chrome gate (Validation §1–§4). Opens the R9 chrome band (`WindowChromeView`) + repositioned native traffic lights + full-screen wiring over a silent live pane and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. **§1** — via `platform::standard_window_button_frames`, asserts all three buttons exist, the close button's visual centre sits on the y-26 row and its x-origin at 17, and the three are equally pitched (pitch read from the live frames), **re-asserted after a resize, a focus bounce, and a full-screen enter+exit** (the BUG-B stale-capture guard). **§2** — a CGEvent press-drag on the empty band vs the terminal content area, judged by real NSWindow frame reads (the content drag must leave the window put). **§3** — reads (never writes) `AppleActionOnDoubleClick`, posts a CGEvent double-click on the band, and checks the window state matches the predicted zoom / miniaturize / none, plus a double-click while full screen is a no-op (the band's `!is_fullscreen` gate). **§4** — dispatches `ToggleFullScreen` and asserts `is_fullscreen()` + the View-menu title flip, both ways. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Effects a synthetic CGEvent provably can't drive (a window drag via `performWindowDragWithEvent:` follows the *physical* cursor, which `CGEventPostToPid` doesn't move) are recorded as a **DEFERRED HUMAN PASS**, not fail-looped — the same honest-deferral pattern `input-live` uses for synthetic IME composition. `Gate::SelfReported`. |
 | `pane-strip` | The R11 live toolbar pane-strip gate (Validation §3). Mounts the real `WindowToolbarView` over a seeded Main tab and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit frame reads. Asserts the drag differential with pills present — a CGEvent press-drag starting on a pill **selects** the pill AND leaves the NSWindow frame **put** (hard-asserted only when the select confirms the synthetic press LANDED, else DEFERRED — a `CGEventPostToPid` mouse event need not land on a gpui hitbox), while the same drag on the empty toolbar band **moves** the window (DEFERRED — `performWindowDragWithEvent:` tracks the physical cursor `CGEventPostToPid` doesn't move) — plus the reserved-width overflow **showing the chevron** on a real window (hard, real layout), an **activate-from-elsewhere** that makes an offscreen pane active (hard) and auto-centers it into view (DEFERRED on repaint timing), and the **overflow menu opening** on a real chevron click (DEFERRED on a synthetic miss). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing — the same honest-deferral for synthetic mouse gestures `chrome` / `sidebar` use. The in-process overflow-onset / edge-fades / attention-badge / ✕-slot-reservation / select-close-rename / centering **real-layout** differentials live in `nice-itests`' `pane_strip` cases (a simulated event can't move a real frame; real Taffy layout is deterministic in-process). `Gate::SelfReported`. |
 | `session-lifecycle` | The R13 live session-manager gate (Validation §4). Drives the real per-window `SessionManager` on a real `WindowState` over **real ptys**, headless (no `TerminalView` — every assertion is model + session state, which `route_terminal_event` resolves in full; the two gpui-only side effects the pane-exit resolution carries, the deferred-companion spawn on refocus and the every-project-empty terminus, are composed by the live window root, and the scenario is built so the terminus stays `None` and no refocus lands on an unspawned companion). Asserts the six lifecycle behaviours Milestone 2 rests on: **immediate explicit-add spawn** — the `Terminals +` / ⌘T create-and-spawn path and the strip `+` (`add_terminal_to_active_tab`) path each fork their pty **synchronously** (Swift `addPane` semantics — an explicit add is never deferred); **deferred companion spawn on focus** — the project `+` seam builds the `[Claude, Terminal 1]` shape + registers the tab's session container but spawns **neither** pane (Claude = model-only until R15, companion = deferred), and selecting the companion forks its pty on that first focus via `ensure_active_pane_spawned`; **clean-exit neighbor refocus** — a shell `exit 0` (not held) removes the pane and re-points the active pane to the slot neighbor through the live `Exited{held:false}` subscription; **last-pane dissolve + Terminals-order fallback** — exiting the tab's last pane dissolves the tab and the active-tab selection falls back to the first navigable tab (the pinned Terminals group's Main tab); **held detour** — a `sh -c 'echo FINAL; exit 3'` pane exits non-zero, so the `Exited{held:true}` subscription flips it dead-but-mounted (`is_alive == false`, still in the strip) rather than removing it; and **orphan sweep** — `WindowState::teardown` drops every session (SIGHUP→SIGKILL), so no zsh survives (asserted externally by `ps`, the R3 teardown contract). The action-seam rewiring (create-and-spawn / activate / close+dissolve) and the live `cx.subscribe` that feeds `route_terminal_event` from each pane's session entity (via `SessionManager::pane_handle`) are the slice-3 wiring this exercises. Fixture shells poll the grid for a `READY` marker before the driver triggers their exit (never sleep-and-hope, per the ZDOTDIR-blanked-shell rule). Needs **no** Accessibility grant (it drives the manager directly, not via CGEvents). Registered before `multiwindow` (it installs no `WindowRegistry`). `Gate::SelfReported`. |
+| `app-shell` | The R13.5 app-shell composition gate (What-to-build #3). Opens through the **shipped builder** (`crate::app::open_managed_window` / `build_window_root` — the exact path `run` and every ⌘N take, not a hand-rolled root: a scenario mounting its own composition would re-create the blind spot R13.5 closes) and asserts the mounted shell over ONE shared `WindowState`. **The AX anchors are exposed** — an AX-tree walk (`ax_find_titled_role`, the `ax-probe` pattern) finds the sidebar-card root (`nice-rs-sidebar-root`) and the pane-strip root (`nice-rs-pane-strip-root`) each as an `AXGroup`; the poll forces a repaint per tick (a `WindowState` notify) because the shipped shell doesn't RAF, keeping AccessKit's lazily-activated tree current. **⌘T adds a visible pill AND switches pane content** — a real ⌘T CGEvent (`CGEventPostToPid`, own pid) routes through the shipped keymap to the key window: the toolbar gains one *laid-out* pill, the new pane becomes active, and the `PaneHostView` follows the switch and spawns+hosts its pty (proving the slice-2 `cx.notify()` wiring makes a window-scoped chord produce a visible result in the shipped shell). **The strip `+` spawns a real pty whose output renders** — the real toolbar `+` seam adds a terminal pane, the pane host spawns its login shell, and a marker echoed into that pty renders back in the pane's live grid. **Closing the extra pane refocuses a neighbor** — the real pill-× close removes the active extra pane from the model, the active pane refocuses to a surviving neighbor, and the pane host re-hosts it (the departed pane's view is dissolved from the composition). **⌘B collapses/expands the card** — a real ⌘B CGEvent (the R12 table binds *toggle-sidebar* to `cmd-b`; the plan's "⌘S" for this step predates that table) collapses the card and its intended leading-column width shrinks ~240 → ~124pt (`SidebarShellView::scenario_leading_column_width`, re-derived from the collapse flag — not a laid-out `Bounds` read), a second ⌘B restores it. **Teardown releases every session; the closed pane's pty is reaped** — `WindowState::teardown` clears the SessionManager's session map (asserted: every session released), and SIGHUP→SIGKILLs (via `PtyProcess::drop`, which joins the reaper — no zombie) any pane whose handle it held the *last* ref to: the closed pane, whose cached `TerminalView` the pane host already dropped, is reaped here (asserted: `kill(pid, 0)` → ESRCH). The still-*hosted* panes keep a `TerminalView` ref in the mounted `PaneHostView`, so their pty's final reap lands on window close (dropping the shell view tree) — confirmed by the external `ps` sweep, per the R3 teardown contract (reaping a view-hosted pane inside the still-open window is not possible; the assertion says so honestly). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make ⌘T / ⌘B no-ops). Registered **before** `multiwindow`: it does not install the `WindowRegistry` close observer (its `build_window_root` only `register`s, via `default_global`), so closing its window never trips the quit-when-empty terminus `multiwindow` — which DOES install it — relies on being last. `Gate::SelfReported`. |
 | `multiwindow` | The R12 live multi-window + shortcut-dispatch gate (Validation §2–§5). Drives the shipped `WindowRegistry` / `WindowState` / `keymap` on **real `NSWindow`s** with **real CGEvents** to nice-rs's own pid. Opens window A as a capture-tee managed window (the `input-live` pattern) registered in the process-wide registry, then asserts: **⌘N** opens a second, isolated, registry-tracked window (the registry count **and** `App::windows()` both step 1 → 2); **⌘T** posted while window B is key adds a pane to B's `WindowState` model only, leaving A's model signature unchanged (isolation + focused-window routing through `active_state`); **⌘=** grows the one process-level `FontSettings` every window observes (the font fan-out) and leaks **zero** bytes into A's capture-tee pty; the **pass-through differential** — a plain `x` reaches the pty as `x`, while **⌘⌥↓** cycles the sidebar and leaks **zero** capture bytes (a matched chord is consumed, an unmatched key falls through byte-identically); **live peek** — with A's sidebar collapsed, ⌘⌥↓ floats the peek and a modifiers-release clears it via the window-level `on_modifiers_changed` observer; and **close/deregister/fallback** — closing B deregisters it (registry + `NSWindow` count drop) and a window-scoped action then falls back to the surviving window A. Matching is **character-based** at the gpui pin (the documented divergence from Swift's physical-keycode match — see the `keymap` module notes). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make every chord a no-op). The per-pid flagsChanged the peek-clear needs is not synthesizable via `CGEventPostToPid`, so the modifier release is driven as a real `ModifiersChangedEvent` through GPUI's own dispatch (the same `on_modifiers_changed` path). The in-process isolation / routing / all-13-fire / peek **differentials** live in `nice-itests`' `multiwindow` cases. Registered **last** in `selftest_scenarios` (it installs the registry whose close observer quits when the registry empties). `Gate::SelfReported`. |
 | `sidebar` | The R10 live sessions-sidebar gate (Validation §3–§4). Mounts the real `SidebarShellView` (no pty — the shell hosts no terminal this cycle) and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. Asserts the expanded card reports the **240pt** default width; a CGEvent drag on the trailing resize handle **clamps at 160 and 480** and a CGEvent double-click **resets to 240**; **collapse** brings up the cap and its geometry drift guards hold — the cap reserve clears the LIVE zoom button's trailing edge, the restore button's rect has **zero x-overlap** with any traffic light, R9's close-x / y-26 / equal-pitch geometry is **re-asserted** (`standard_window_button_frames`, the BUG-B guard), and the cap width equals the lights reserve + 42; **restore** returns the column; a CGEvent drag on the sidebar top strip moves the window (R9 band pattern) while the **same drag inside the card body leaves the frame put** (hard). **§4 dots** — with the model driven into all four states (thinking / waiting-unacked / waiting-acked / idle), the dot colour per token and the pulse-presence rule are asserted at the state level off the view's own R8 predicates (`SidebarShellView::tab_dot_inputs`; pixel corroboration is best-effort under `capture`). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing; the resize clamps/reset and the strip window-move hard-assert when the synthetic gesture drives the real behaviour, else **DEFER** (the 6pt resize handle a synthetic press may miss; the `performWindowDragWithEvent:` physical-cursor limitation), the same honest-deferral pattern `chrome` uses. The in-process multi-select / rename-gate / Esc / band-arm **classification** differentials live in `nice-itests`' `sidebar_multiselect` cases (a simulated event can't move a real frame). `Gate::SelfReported`. |
 

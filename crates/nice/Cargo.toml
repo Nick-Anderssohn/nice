@@ -46,6 +46,11 @@ objc2 = "0.6"
 # unifies and nothing recompiles.
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSGeometry", "objc2-core-foundation"] }
 raw-window-handle = "0.6"
+# The `app-shell` self-test scenario reaps its ptys via `WindowState::teardown`
+# then asserts each recorded child pid is GONE (`libc::kill(pid, 0)` -> ESRCH) — an
+# OS-level "no orphaned shells" check on top of the SessionManager handle drop.
+# Already in the workspace lock (nice-term-core owns the pty reaping); no new fetch.
+libc = "0.2"
 # AppleFontSmoothing parity: Nice ships fontSmoothing=false, and GPUI-main's
 # CoreGraphics glyph-dilation is default-on (gpui_macos text_system.rs) and
 # fights the bg-luminance curve. `platform::disable_font_smoothing` sets the

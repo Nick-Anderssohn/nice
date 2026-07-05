@@ -94,7 +94,20 @@ impl WindowState {
     /// (`initialSidebarCollapsed: false`, `initialSidebarMode: .tabs`). Every ⌘N
     /// mints one of these; R18 will add a variant that takes restored state.
     pub(crate) fn new(initial_cwd: impl Into<String>) -> Self {
-        let model = TabModel::new(initial_cwd);
+        Self::with_model(TabModel::new(initial_cwd))
+    }
+
+    /// A window seeded around a pre-built [`TabModel`] — the scenario/restore
+    /// seam. The isolated `sidebar` / `pane-strip` self-test windows use it to
+    /// mount the shipped views (`SidebarShellView` / `WindowToolbarView`) over a
+    /// fixture model while still going through the SAME shared-state shape the
+    /// managed window uses (R13.5's "seed a `WindowState` around their seed
+    /// models" decision); R18's restore path will thread persisted state through
+    /// here too. Same defaults as [`new`](WindowState::new) otherwise (expanded
+    /// sidebar, tabs mode, model-only action seams, a fresh [`SessionManager`],
+    /// a unique session id), and it re-seeds the selection from the model's active
+    /// tab so the "selection ⊇ {active tab}" invariant holds from construction.
+    pub(crate) fn with_model(model: TabModel) -> Self {
         let mut selection = SidebarTabSelection::new();
         selection.sync_active_tab_id(model.active_tab_id());
         Self {
