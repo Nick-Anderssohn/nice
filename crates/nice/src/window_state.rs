@@ -26,9 +26,11 @@
 //!   [`pane_strip_actions`](WindowState::pane_strip_actions) — the R10/R11
 //!   create/close/select seams. Model-only today; R13 swaps the implementations
 //!   for real sessions without touching callers.
-//! * [`session`](WindowState::session) — a placeholder [`SessionSlot`]. R13 fills
-//!   it with the per-window session/pty manager; [`teardown`](WindowState::teardown)
-//!   is the close hook R13 extends to tear those down.
+//! * [`session`](WindowState::session) — the per-window
+//!   [`SessionManager`](crate::session_manager::SessionManager) (R13). Owns the
+//!   window's live pane sessions and routes their OSC title/cwd events into
+//!   `model`; [`teardown`](WindowState::teardown) is the close hook that tears
+//!   them down. R12 carried an empty placeholder here.
 //!
 //! `AppState`'s remaining sub-models (`sessions`, `closer`,
 //! `fileExplorerOrchestrator`, `fileBrowserStore`) are deferred: sessions to R13,
@@ -46,6 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nice_model::{SidebarMode, SidebarModel, SidebarTabSelection, TabModel};
 
 use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
+use crate::session_manager::SessionManager;
 use crate::sidebar_actions::{ModelSidebarActions, SidebarActions};
 
 /// Process-wide monotonic source of per-window session ids. Cheap, dependency-
@@ -58,13 +61,6 @@ static NEXT_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 fn mint_session_id() -> String {
     format!("win-{}", NEXT_SESSION_SEQ.fetch_add(1, Ordering::Relaxed))
 }
-
-/// Placeholder for the per-window session/pty manager. R13 fills this slot; R12
-/// carries an empty one so the window builder, registry, and
-/// [`WindowState::teardown`] hook already thread through it (plan: "a
-/// session-manager slot R13 fills" / "close hook — teardown slot R13 extends").
-#[derive(Default)]
-pub(crate) struct SessionSlot;
 
 /// The per-window composition root. One per Nice window, owned by a
 /// `gpui::Entity` and registered in [`crate::window_registry::WindowRegistry`].
@@ -80,8 +76,12 @@ pub(crate) struct WindowState {
     pub(crate) sidebar_actions: Box<dyn SidebarActions>,
     /// R11 pane-strip select/close/add seam (model-only; R13 rewires).
     pub(crate) pane_strip_actions: Box<dyn PaneStripActions>,
-    /// Session-manager slot — R13 fills it.
-    pub(crate) session: SessionSlot,
+    /// The per-window pty/session manager (R13). Owns this window's live pane
+    /// sessions and routes their OSC title/cwd events into `model`. R12 carried
+    /// an empty placeholder here; R13 slice 1 fills it with the real
+    /// [`SessionManager`] (the action seams that drive it are rewired in a later
+    /// R13 slice — this just makes the manager part of the per-window state).
+    pub(crate) session: SessionManager,
     /// Stable unique per-window id (the registry's per-session-id lookup key).
     session_id: String,
 }
@@ -103,7 +103,7 @@ impl WindowState {
             selection,
             sidebar_actions: Box::new(ModelSidebarActions::new()),
             pane_strip_actions: Box::new(ModelPaneStripActions::new()),
-            session: SessionSlot,
+            session: SessionManager::new(),
             session_id: mint_session_id(),
         }
     }
@@ -121,8 +121,11 @@ impl WindowState {
     /// [`crate::window_registry::WindowRegistry`] calls on window close, which
     /// R13 extends to terminate the window's sessions / ptys. Idempotent.
     pub(crate) fn teardown(&mut self) {
-        // R13: self.session.tear_down() — terminate ptys, stop the control
-        // socket, flush the session snapshot. Nothing to do in R12.
+        // Terminate this window's ptys: dropping each cached session handle tears
+        // its child process group down (SIGHUP→SIGKILL), so no orphan zsh
+        // survives. R14 adds control-socket teardown; R18 flushes the session
+        // snapshot before this runs. Idempotent.
+        self.session.teardown();
     }
 }
 
