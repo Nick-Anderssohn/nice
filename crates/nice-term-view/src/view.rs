@@ -100,6 +100,13 @@ use crate::overlay::{
 use crate::session_handle::{TerminalEvent, TerminalSessionHandle};
 use crate::theme::TerminalTheme;
 
+/// Default coalescing window for bounds-driven pty refits. Swift parity: the
+/// SwiftTerm fork ships `resizeDebounceMs = 200` and Nice leaves it at the
+/// default (disabling it only for the one pre-fork bootstrap apply — mirrored
+/// here by applying the FIRST fit synchronously, see
+/// [`TerminalView::schedule_refit`]).
+pub const RESIZE_DEBOUNCE_DEFAULT: Duration = Duration::from_millis(200);
+
 /// A view over one terminal session. Construct with [`TerminalView::new`] from a
 /// session handle + theme value + accent (R2) + cell metrics.
 pub struct TerminalView {
@@ -158,6 +165,20 @@ pub struct TerminalView {
     /// first successful push (and reset on a held-pane respawn, whose fresh
     /// shell spawns at the spec size and must be refit unconditionally).
     last_pty_fit: Option<(u16, u16)>,
+    /// Coalescing window for bounds-driven refits — the Swift-parity resize
+    /// debounce (the SwiftTerm fork's `resizeDebounceMs`, default 200 ms in
+    /// `AppleTerminalView.processSizeChange`): a live-resize burst lands ONE
+    /// `TIOCSWINSZ`/SIGWINCH per window instead of one per row crossing, so the
+    /// child isn't redraw-thrashed mid-drag. Zero applies synchronously.
+    resize_debounce: Duration,
+    /// A bounds change arrived while (or since) the coalescing timer was armed.
+    /// Latest-wins: the fire re-reads `paint_bounds` rather than a size stored
+    /// at arrival, so the apply uses whatever the newest paint published.
+    pending_refit_arrived: bool,
+    /// The coalescing timer is armed. Deliberately NOT re-armed by new arrivals
+    /// (the fork's semantics): a sustained drag lands once per window rather
+    /// than never.
+    pending_refit_scheduled: bool,
     /// An in-progress local selection drag, anchored at the **buffer** cell
     /// `(line, column)` the left button went down on (`line` negative in
     /// scrollback). `Some` between mouse-down and the ending mouse-up; each drag
@@ -272,6 +293,9 @@ impl TerminalView {
             paint_bounds: Rc::new(Cell::new(None)),
             auto_refit: false,
             last_pty_fit: None,
+            resize_debounce: RESIZE_DEBOUNCE_DEFAULT,
+            pending_refit_arrived: false,
+            pending_refit_scheduled: false,
             drag_anchor: None,
             last_report_cell: None,
             wheel_accum: 0.0,
@@ -354,11 +378,63 @@ impl TerminalView {
         }
     }
 
+    /// Coalesced entry point for bounds-driven refits — the port of the Swift
+    /// resize debounce (`AppleTerminalView.processSizeChange` in the SwiftTerm
+    /// fork). Semantics, matching the fork exactly:
+    ///
+    /// - **Bootstrap applies synchronously.** The first fit after a spawn
+    ///   (`last_pty_fit == None`, which a held-pane respawn resets) skips the
+    ///   coalescer, so the shell starts at the real geometry — the same reason
+    ///   Nice's Swift host zeroes `resizeDebounceMs` around its one pre-fork
+    ///   `setFrameSize` apply.
+    /// - **Zero debounce applies synchronously** (test/consumer escape hatch).
+    /// - Otherwise **latest-wins coalescing**: mark an arrival, arm ONE timer
+    ///   per burst (never re-armed by later arrivals, so a sustained drag lands
+    ///   once per window rather than never), and at fire time re-read the live
+    ///   `paint_bounds` instead of any size captured at arrival.
+    pub(crate) fn schedule_refit(&mut self, cx: &mut Context<Self>) {
+        if self.last_pty_fit.is_none() || self.resize_debounce.is_zero() {
+            self.resize_pty_to_fit(cx);
+            return;
+        }
+        self.pending_refit_arrived = true;
+        if self.pending_refit_scheduled {
+            return;
+        }
+        self.pending_refit_scheduled = true;
+        let delay = self.resize_debounce;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |view, cx| view.fire_coalesced_refit(cx));
+        })
+        .detach();
+    }
+
+    /// The coalescing timer fired: apply the pending refit at the LIVE painted
+    /// bounds (latest-wins). A fire with nothing pending no-ops — the arrived
+    /// flag is the cancellation token (the timer itself can't be cancelled).
+    fn fire_coalesced_refit(&mut self, cx: &App) {
+        self.pending_refit_scheduled = false;
+        if !self.pending_refit_arrived {
+            return;
+        }
+        self.pending_refit_arrived = false;
+        self.resize_pty_to_fit(cx);
+    }
+
+    /// Set the coalescing window for bounds-driven refits (0 = synchronous).
+    /// Parity with the SwiftTerm fork's `resizeDebounceMs` knob; the default is
+    /// [`RESIZE_DEBOUNCE_DEFAULT`].
+    pub fn set_resize_debounce_ms(&mut self, ms: u64) {
+        self.resize_debounce = Duration::from_millis(ms);
+    }
+
     /// Opt in to bounds-driven pty refits (M2 Item E): when set, a change in the
-    /// element's painted bounds schedules [`resize_pty_to_fit`](Self::resize_pty_to_fit)
+    /// element's painted bounds schedules [`schedule_refit`](Self::schedule_refit)
     /// via `cx.defer` (outside the paint pass), so the grid tracks a live window
-    /// resize. The shipped pane host sets this; fixed-grid scenario embeddings
-    /// leave it off (their pixel assertions key on the exact spawn grid).
+    /// resize — coalesced behind the Swift-parity resize debounce. The shipped
+    /// pane host sets this; fixed-grid scenario embeddings leave it off (their
+    /// pixel assertions key on the exact spawn grid).
     pub fn set_auto_refit(&mut self, on: bool) {
         self.auto_refit = on;
     }

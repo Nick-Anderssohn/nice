@@ -278,18 +278,21 @@ impl TerminalElement {
 
         // M2 Item E — window resize → pty grid refit. When the painted bounds
         // changed (a live window resize, a layout change, or the first paint),
-        // schedule the view's `resize_pty_to_fit` OUTSIDE this paint pass
+        // schedule the view's `schedule_refit` OUTSIDE this paint pass
         // (`cx.defer`; updating the view entity mid-paint would re-enter it).
-        // The deferred refit reads the freshly-published `paint_bounds`, so it
-        // fits exactly what this frame painted; its `last_pty_fit` guard drops
-        // sub-cell bounds deltas and breaks the resize → SIGWINCH → repaint
-        // feedback loop (an unchanged-bounds repaint never even schedules).
-        // The T4 bottom-anchored `grid_top_y` math is untouched — once the grid
-        // tracks the view, only the sub-row remainder shows at the top.
+        // `schedule_refit` coalesces a live-resize burst behind the Swift-parity
+        // resize debounce (one TIOCSWINSZ/SIGWINCH per window, not one per row
+        // crossing; the bootstrap first fit applies synchronously) and at fire
+        // time reads the freshly-published `paint_bounds`, so it fits what the
+        // newest frame painted; the `last_pty_fit` guard drops sub-cell bounds
+        // deltas and breaks the resize → SIGWINCH → repaint feedback loop (an
+        // unchanged-bounds repaint never even schedules). The T4 bottom-anchored
+        // `grid_top_y` math is untouched — once the grid tracks the view, only
+        // the sub-row remainder shows at the top.
         if auto_refit && prev_bounds != Some(bounds) {
             let view = ime.view.clone();
             cx.defer(move |cx| {
-                view.update(cx, |view, cx| view.resize_pty_to_fit(cx));
+                view.update(cx, |view, cx| view.schedule_refit(cx));
             });
         }
 

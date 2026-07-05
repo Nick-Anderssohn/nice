@@ -100,7 +100,9 @@ const KC_ESC: u16 = 53;
 /// several grid rows at any sane cell height.
 const RESIZE_DY: f64 = -160.0;
 /// Poll cap for the pty grid to refit after a window resize (the paint-driven
-/// defer → `resize_pty_to_fit` → `Session::resize` path, M2 Item E).
+/// defer → `schedule_refit` → `resize_pty_to_fit` → `Session::resize` path,
+/// M2 Item E). The budget (30 × 100 ms) comfortably covers the Swift-parity
+/// 200 ms resize-debounce window the coalescer holds the apply behind.
 const REFIT_POLLS: usize = 30;
 
 /// The macOS `AXRole` a `gpui::Role::Group` maps to (accesskit_macos →
@@ -714,9 +716,10 @@ fn active_terminal_focused(
 /// Shrinks the shipped window 160pt vertically and asserts the ACTIVE pane's
 /// pty grid loses rows (cols hold — the width didn't change), then restores the
 /// frame and asserts the rows come back. This pins the paint-driven refit
-/// wiring (`TerminalElement` bounds delta → deferred `resize_pty_to_fit` →
-/// `Session::resize` → TIOCSWINSZ/SIGWINCH); pre-M2 the grid stayed at its
-/// spawn size forever.
+/// wiring (`TerminalElement` bounds delta → deferred `schedule_refit`, which
+/// coalesces behind the Swift-parity 200 ms resize debounce →
+/// `resize_pty_to_fit` → `Session::resize` → TIOCSWINSZ/SIGWINCH); pre-M2 the
+/// grid stayed at its spawn size forever.
 async fn resize_refit_checks(
     cx: &mut AsyncApp,
     whandle: WindowHandle<AppShellView>,
