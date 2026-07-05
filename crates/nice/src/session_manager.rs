@@ -984,6 +984,27 @@ impl SessionManager {
             .is_some_and(|panes| panes.contains_key(pane_id))
     }
 
+    /// The live session entity for `(tab_id, pane_id)`, if one is cached — the
+    /// **slice-3 subscription seam**. The live wiring clones this out to
+    /// `cx.subscribe` the window's [`crate::window_state::WindowState`] to the
+    /// pane's OSC / exit events (feeding them through
+    /// [`route_terminal_event`](Self::route_terminal_event)), to read its grid for
+    /// a readiness poll, and to write input. Cloning an [`Entity`] is a cheap
+    /// refcount bump that does **not** keep the session alive past the manager's
+    /// own release — a transient clone dropped after subscribing leaves the manager
+    /// the sole owner, so a later [`pane_exited`](Self::pane_exited) /
+    /// [`teardown`](Self::teardown) still tears the child process group down.
+    pub(crate) fn pane_handle(
+        &self,
+        tab_id: &str,
+        pane_id: &str,
+    ) -> Option<Entity<TerminalSessionHandle>> {
+        self.tabs
+            .get(tab_id)
+            .and_then(|panes| panes.get(pane_id))
+            .map(|session| session.handle.clone())
+    }
+
     /// Register an **empty** per-tab session container without spawning any pane
     /// — the claude-tab creation path this cycle, where the claude pane is
     /// model-only (no process until R15) and the companion terminal is deferred.
