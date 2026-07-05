@@ -74,6 +74,7 @@ use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 use nice_theme::AccentPreset;
 
 use crate::context_menu::{ContextMenu, ContextMenuItem};
+use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
@@ -127,7 +128,6 @@ const ICON_MODE_TABS: &str = "\u{2630}"; // ☰ (list.bullet)
 const ICON_MODE_FILES: &str = "\u{25A4}"; // ▤ (folder)
 const ICON_SIDEBAR: &str = "\u{25A8}"; // ▨ (sidebar.left — collapse & expand)
 const ICON_GEAR: &str = "\u{2699}"; // ⚙ (gearshape)
-const RENAME_CARET: &str = "\u{258F}"; // ▏
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 
@@ -509,27 +509,24 @@ impl SidebarShellView {
 
     fn on_rename_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
-        match ks.key.as_str() {
-            "enter" => {
+        // Escape is consumed by the shell Esc action (which cancels rename) before
+        // this bubble-phase listener runs; the shared editor leaves it Ignored.
+        match apply_rename_key(
+            &mut self.draft_title,
+            &ks.key,
+            ks.key_char.as_deref(),
+            ks.modifiers.platform,
+            ks.modifiers.control,
+        ) {
+            RenameKeyOutcome::Commit => {
                 self.commit_rename(cx);
                 cx.stop_propagation();
             }
-            "backspace" => {
-                self.draft_title.pop();
+            RenameKeyOutcome::Edited => {
                 cx.notify();
                 cx.stop_propagation();
             }
-            // Escape is consumed by the shell Esc action (which cancels rename)
-            // before this bubble-phase listener runs.
-            _ => {
-                if !ks.modifiers.platform && !ks.modifiers.control {
-                    if let Some(ch) = &ks.key_char {
-                        self.draft_title.push_str(ch);
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }
-            }
+            RenameKeyOutcome::Ignored => {}
         }
     }
 
@@ -1189,24 +1186,17 @@ impl SidebarShellView {
 
         // Title view: the inline-rename field while editing, else the label.
         let title: gpui::AnyElement = if t.is_editing {
-            div()
-                .track_focus(&self.rename_focus)
-                .key_context("SidebarRename")
-                .flex_1()
-                .px(px(6.0))
-                .py(px(2.0))
-                .rounded(px(INNER_CORNER_RADIUS))
-                .bg(slot_to_rgba(s.background3))
-                .border(px(1.0))
-                .border_color(slot_to_rgba(s.line_strong))
-                .text_size(px(13.0))
-                .text_color(ink)
-                .child(SharedString::from(format!(
-                    "{}{}",
-                    self.draft_title, RENAME_CARET
-                )))
-                .on_key_down(cx.listener(Self::on_rename_key))
-                .into_any_element()
+            rename_field(
+                &self.rename_focus,
+                &self.draft_title,
+                "SidebarRename",
+                slot_to_rgba(s.background3),
+                slot_to_rgba(s.line_strong),
+                ink,
+                13.0,
+                cx.listener(Self::on_rename_key),
+            )
+            .into_any_element()
         } else {
             let tid = t.id.clone();
             let is_active = t.is_active;

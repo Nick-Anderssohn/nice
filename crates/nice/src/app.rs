@@ -2581,6 +2581,17 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        Scenario {
+            name: "pane-strip",
+            open: crate::pane_strip_live::open_pane_strip_window,
+            gate: Gate::SelfReported {
+                // A pill-vs-band drag differential, the overflow adds + chevron,
+                // an auto-center select, and a chevron click, with their settles —
+                // generous headroom (self-activates + preflights the AX grant).
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
     ]
 }
 

@@ -70,12 +70,28 @@
 //!   click-to-rename time gate (R11 reuses it).
 //! * [`sidebar`] — [`SidebarModel`] (+ [`SidebarMode`]): collapsed/mode/peek
 //!   state and the toggle + peek render/clear methods (R12 triggers them).
+//!
+//! ## Pane strip geometry (R11 pure port)
+//!
+//! * [`strip_geometry`] — [`StripGeometry`], the toolbar pane strip's pure
+//!   visibility math (edge fades + the offscreen id set), ported from
+//!   `Sources/Nice/Views/PaneStripGeometry.swift`, plus
+//!   [`should_show_overflow_chevron`], the reservation + `>=2`-panes overflow
+//!   rule ported *behaviorally* from `PaneStripOverflowEstimator.swift` (its
+//!   width-estimation machinery does not survive — GPUI's real layout
+//!   replaces it). The overflow chevron's attention badge is **not** a third
+//!   predicate here: it reuses [`Tab::has_offscreen_attention`] (R8) fed by
+//!   [`StripGeometry::offscreen_pane_ids`]. [`center_offset_x`] is the pure
+//!   auto-center-on-activate offset math (the GPUI-real-layout replacement for
+//!   SwiftUI's `scrollTo(anchor: .center)`), kept here so the R11 view and the
+//!   in-process itests share one arithmetic.
 
 mod pane;
 mod project;
 pub mod rename_gate;
 pub mod selection;
 pub mod sidebar;
+pub mod strip_geometry;
 mod tab;
 mod tab_model;
 
@@ -84,5 +100,8 @@ pub use project::Project;
 pub use rename_gate::InlineRenameClickGate;
 pub use selection::SidebarTabSelection;
 pub use sidebar::{SidebarMode, SidebarModel};
+pub use strip_geometry::{
+    center_offset_x, should_show_overflow_chevron, Rect, StripGeometry, EDGE_TOLERANCE,
+};
 pub use tab::Tab;
 pub use tab_model::{FsProbe, TabModel};

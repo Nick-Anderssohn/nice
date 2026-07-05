@@ -35,13 +35,26 @@
 //!     ring/breathe pulse), reused by R11's toolbar pills.
 //!   * [`context_menu`] — the in-house context-menu popup (anchored + deferred +
 //!     click-away/Esc), reused by R11.
+//!   * [`inline_rename`] — the shared inline-rename field (char-by-char editor +
+//!     caret) the R10 sidebar row and the R11 toolbar pill both mount.
 //!   * [`sidebar_actions`] — the `SidebarActions` create/close/select seam
 //!     (R10 model-only; R13 rewires it to real sessions).
+//!   * [`pane_strip_actions`] — the `PaneStripActions` pane select/close/add
+//!     seam the R11 toolbar drives (model-only; R13 rewires it too).
 //!   * [`sidebar_shell`] — the R10 sessions-mode sidebar: the shell layout
 //!     (floating card / collapsed cap / peek / resize) and the sidebar card
 //!     (project groups, tab rows, footer, mode/collapse toggles, multi-select
 //!     routing, inline rename, Esc collapse), driving the R8 model through the
 //!     `SidebarActions` seam.
+//!   * [`toolbar`] — the R11 window toolbar pane strip: the brand block, the
+//!     scroll-tracked pill row with its overflow chevron + attention badge and
+//!     edge fades, inline pill rename, per-kind context menus, and the trailing
+//!     `+`, driving the R8 model through the `PaneStripActions` seam.
+//!   * [`pane_strip_live`] — the R11 live pane-strip self-test scenario
+//!     (`pane-strip`): real CGEvents drive the shipped `WindowToolbarView`'s
+//!     pill-vs-band drag differential + overflow chevron + auto-center, judged
+//!     against AppKit frame reads (the in-process real-layout differentials live
+//!     in `nice-itests`).
 //!   * [`sidebar_live`] — the R10 live sidebar self-test scenario (`sidebar`):
 //!     real CGEvents drive the shipped `SidebarShellView`'s resize clamp +
 //!     double-click reset and the top-strip-vs-body drag differential, judged
@@ -54,17 +67,21 @@
 mod app;
 mod chrome_live;
 mod context_menu;
+mod inline_rename;
 mod input_live;
 mod niceties_drop;
 mod niceties_held;
 mod niceties_overlay;
 mod niceties_zoom;
+mod pane_strip_actions;
+mod pane_strip_live;
 mod platform;
 mod sidebar_actions;
 mod sidebar_live;
 mod sidebar_shell;
 mod status_dot;
 mod theme;
+mod toolbar;
 
 fn main() {
     match std::env::var("NICE_RS_SELFTEST") {

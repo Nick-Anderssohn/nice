@@ -74,3 +74,11 @@ mod chrome_band;
 // driven by simulated clicks + `advance_clock`.
 #[cfg(test)]
 mod sidebar_multiselect;
+
+// R11 pane-strip real-layout differentials — libtest `#[gpui::test]` cases on the
+// mocked context. Mirrors `WindowToolbarView`'s strip logic (unimportable from a
+// dev/test crate) over a REAL `ScrollHandle` + the REAL `nice-model` strip
+// predicates, asserting overflow onset / fades / badge / ✕-slot reservation /
+// select-close-rename routing / centering against real Taffy layout.
+#[cfg(test)]
+mod pane_strip;

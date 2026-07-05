@@ -170,6 +170,47 @@ The GPUI application. Structure (grows over later cycles):
     click-away monitor → a `cx.on_blur` focus-out subscription.
   - `sidebar_live` — the R10 live sidebar self-test scenario (`sidebar`, see the
     table below).
+- **Toolbar (R11 pane strip).** The window toolbar's pane strip — the brand
+  block (logo + "Nice" + separator), the horizontally-scrolling row of pane
+  pills (leading status dot / terminal glyph, truncating title, hover/active ✕
+  with an always-reserved 16pt slot, active styling, inline rename, per-kind
+  context menus), the overflow chevron with its 6pt attention badge, the 16pt
+  edge fades, and the trailing `+` — all riding the R9 chrome band and driving
+  the R8 model through an injected seam. The Swift `PaneStripOverflowEstimator`
+  width-estimation machinery does **not** survive: GPUI reads real layout, so a
+  tracked `ScrollHandle` drives overflow / fades / offscreen / auto-center
+  directly (the pure predicates live in `nice-model`'s `strip_geometry`; R8's
+  `Tab::has_offscreen_attention` is reused for the badge, never re-derived — one
+  status model, dossier G2). The reservation rule that kills the
+  show-chevron→shrink→hide feedback loop survives behaviorally: the chevron + `+`
+  slots are unconditionally reserved, so the overflow decision never depends on
+  the chevron's own visibility. **P4–P6 pill drag (reorder / cross-window /
+  tear-off) is excluded — R25 owns it** (it adds drag on GPUI's own drag API,
+  including the pure `PaneStripDropResolver`); **the trailing update pill (P7) is
+  R27** (its slot stays empty). Absent drag support and the empty update-pill
+  slot are by design; a reviewer must not flag them. Real session wiring for
+  select/close/create is R13 (it rewires the seam without touching strip
+  internals); OSC auto-titles reaching pills is R13/R15; busy-close confirmation
+  is R18. Modules:
+  - `inline_rename` — the shared inline-rename field (the char-by-char editor +
+    caret + the pure `apply_rename_key` editing rule) extracted from the R10
+    sidebar so the sidebar row and the toolbar pill mount the *same* field (R11's
+    H2 pre-work); the rename *gate* stays R10's `InlineRenameClickGate`.
+  - `pane_strip_actions` — the `PaneStripActions` select/close/add-terminal seam
+    (the pane-level sibling of `SidebarActions`). `ModelPaneStripActions` is the
+    R11 model-only impl (select moves `active_pane_id`; close routes through the
+    single `TabModel::extract_pane`; add through the R8 `add_pane` "Terminal N"
+    counter — nothing spawns until R13).
+  - `toolbar` — one `WindowToolbarView` entity owning the per-window state (the
+    `TabModel`, the injected seam, the `ScrollHandle`, hovered pill, rename draft,
+    open menu) and rendering the whole strip. Empty-submit pill rename resets to
+    the per-kind auto-default via the R8 `rename_pane` (the pill reimplements no
+    title policy).
+  - `pane_strip_live` — the R11 live pane-strip self-test scenario (`pane-strip`,
+    see the table below). Its in-process real-layout differentials (overflow
+    onset, fades, badge, ✕-slot reservation, select/close/rename routing,
+    centering) live in `nice-itests`' `pane_strip` cases — a simulated event
+    can't move a real frame, and real Taffy layout is deterministic in-process.
 - `main.rs` — dispatches on `NICE_RS_SELFTEST`: unset runs the normal app,
   set runs the self-test driver.
 
@@ -622,6 +663,7 @@ the window, and moves to the next scenario.
 | `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
 | `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-rs-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/pane tests on. `Gate::SelfReported`. |
 | `chrome` | The R9 live window-chrome gate (Validation §1–§4). Opens the shipped chrome shell (`WindowChromeView` band + repositioned native traffic lights + full-screen wiring) over a silent live pane and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. **§1** — via `platform::standard_window_button_frames`, asserts all three buttons exist, the close button's visual centre sits on the y-26 row and its x-origin at 17, and the three are equally pitched (pitch read from the live frames), **re-asserted after a resize, a focus bounce, and a full-screen enter+exit** (the BUG-B stale-capture guard). **§2** — a CGEvent press-drag on the empty band vs the terminal content area, judged by real NSWindow frame reads (the content drag must leave the window put). **§3** — reads (never writes) `AppleActionOnDoubleClick`, posts a CGEvent double-click on the band, and checks the window state matches the predicted zoom / miniaturize / none, plus a double-click while full screen is a no-op (the band's `!is_fullscreen` gate). **§4** — dispatches `ToggleFullScreen` and asserts `is_fullscreen()` + the View-menu title flip, both ways. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Effects a synthetic CGEvent provably can't drive (a window drag via `performWindowDragWithEvent:` follows the *physical* cursor, which `CGEventPostToPid` doesn't move) are recorded as a **DEFERRED HUMAN PASS**, not fail-looped — the same honest-deferral pattern `input-live` uses for synthetic IME composition. `Gate::SelfReported`. |
+| `pane-strip` | The R11 live toolbar pane-strip gate (Validation §3). Mounts the real `WindowToolbarView` over a seeded Main tab and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit frame reads. Asserts the drag differential with pills present — a CGEvent press-drag starting on a pill **selects** the pill AND leaves the NSWindow frame **put** (hard-asserted only when the select confirms the synthetic press LANDED, else DEFERRED — a `CGEventPostToPid` mouse event need not land on a gpui hitbox), while the same drag on the empty toolbar band **moves** the window (DEFERRED — `performWindowDragWithEvent:` tracks the physical cursor `CGEventPostToPid` doesn't move) — plus the reserved-width overflow **showing the chevron** on a real window (hard, real layout), an **activate-from-elsewhere** that makes an offscreen pane active (hard) and auto-centers it into view (DEFERRED on repaint timing), and the **overflow menu opening** on a real chevron click (DEFERRED on a synthetic miss). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing — the same honest-deferral for synthetic mouse gestures `chrome` / `sidebar` use. The in-process overflow-onset / edge-fades / attention-badge / ✕-slot-reservation / select-close-rename / centering **real-layout** differentials live in `nice-itests`' `pane_strip` cases (a simulated event can't move a real frame; real Taffy layout is deterministic in-process). `Gate::SelfReported`. |
 | `sidebar` | The R10 live sessions-sidebar gate (Validation §3–§4). Mounts the real `SidebarShellView` (no pty — the shell hosts no terminal this cycle) and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. Asserts the expanded card reports the **240pt** default width; a CGEvent drag on the trailing resize handle **clamps at 160 and 480** and a CGEvent double-click **resets to 240**; **collapse** brings up the cap and its geometry drift guards hold — the cap reserve clears the LIVE zoom button's trailing edge, the restore button's rect has **zero x-overlap** with any traffic light, R9's close-x / y-26 / equal-pitch geometry is **re-asserted** (`standard_window_button_frames`, the BUG-B guard), and the cap width equals the lights reserve + 42; **restore** returns the column; a CGEvent drag on the sidebar top strip moves the window (R9 band pattern) while the **same drag inside the card body leaves the frame put** (hard). **§4 dots** — with the model driven into all four states (thinking / waiting-unacked / waiting-acked / idle), the dot colour per token and the pulse-presence rule are asserted at the state level off the view's own R8 predicates (`SidebarShellView::tab_dot_inputs`; pixel corroboration is best-effort under `capture`). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing; the resize clamps/reset and the strip window-move hard-assert when the synthetic gesture drives the real behaviour, else **DEFER** (the 6pt resize handle a synthetic press may miss; the `performWindowDragWithEvent:` physical-cursor limitation), the same honest-deferral pattern `chrome` uses. The in-process multi-select / rename-gate / Esc / band-arm **classification** differentials live in `nice-itests`' `sidebar_multiselect` cases (a simulated event can't move a real frame). `Gate::SelfReported`. |
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
