@@ -2689,6 +2689,22 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R13: the session-manager lifecycle gate — drives the real SessionManager
+        // on a real WindowState (create-and-spawn, deferred spawn, clean-exit
+        // neighbor refocus, last-pane dissolve + fallback, held detour) over real
+        // ptys, headless (no view). Self-reported; it registers no WindowRegistry,
+        // so it stays before the `multiwindow` scenario that installs the
+        // quit-when-empty close observer.
+        Scenario {
+            name: "session-lifecycle",
+            open: crate::session_lifecycle::open_session_lifecycle_window,
+            gate: Gate::SelfReported {
+                // Two readiness polls + two routed exits + the held detour, each on
+                // the real pty clock, plus settles; generous headroom.
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.

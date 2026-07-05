@@ -91,6 +91,7 @@ mod niceties_zoom;
 mod pane_strip_actions;
 mod pane_strip_live;
 mod platform;
+mod session_lifecycle;
 mod session_manager;
 mod sidebar_actions;
 mod sidebar_live;
