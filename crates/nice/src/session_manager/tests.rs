@@ -7,12 +7,57 @@
 //! model mutations, which these reproduce without a gpui context — the spawn /
 //! focus side effects are exercised by the slice-3 `session-lifecycle` scenario.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use nice_model::{Pane, PaneKind, Project, Tab, TabModel};
+use nice_model::{Pane, PaneKind, Project, SidebarTabSelection, Tab, TabModel, TabStatus};
 use nice_term_view::TerminalEvent;
 
-use super::{clip_title, default_mint_id, SessionManager, PANE_TITLE_MAX};
+use super::{
+    clip_title, default_mint_id, DissolveTerminus, PaneLaunchStatus, SessionManager,
+    PANE_TITLE_MAX,
+};
+
+/// A fresh empty selection for cascade tests that don't seed a multi-selection.
+fn selection() -> SidebarTabSelection {
+    SidebarTabSelection::new()
+}
+
+/// Seed a `[Claude, Terminal 1]` tab (Claude focused) into project `project_id`
+/// (created or appended-to) — the Rust twin of `TabModelFixtures.seedClaudeTab`.
+/// Returns `(claude_pane_id, terminal_pane_id)`. `is_claude_running` is explicit
+/// so the paneHeld case can seed a running Claude and observe the flag clearing.
+fn seed_claude_tab_in(
+    model: &mut TabModel,
+    project_id: &str,
+    tab_id: &str,
+    is_claude_running: bool,
+) -> (String, String) {
+    let claude_id = format!("{tab_id}-claude");
+    let terminal_id = format!("{tab_id}-t1");
+    let path = format!("/tmp/{project_id}");
+    let mut claude = Pane::new(&claude_id, "Claude", PaneKind::Claude);
+    claude.is_claude_running = is_claude_running;
+    let mut tab = Tab::new(tab_id, "New tab", &path);
+    tab.panes = vec![
+        claude,
+        Pane::new(&terminal_id, "Terminal 1", PaneKind::Terminal),
+    ];
+    tab.active_pane_id = Some(claude_id.clone());
+    tab.next_terminal_index = 2;
+    if let Some(p) = model.projects.iter_mut().find(|p| p.id == project_id) {
+        p.tabs.push(tab);
+    } else {
+        model.projects.push(Project {
+            id: project_id.into(),
+            name: project_id.to_uppercase(),
+            path: path.into(),
+            tabs: vec![tab],
+        });
+    }
+    (claude_id, terminal_id)
+}
 
 /// A manager with a deterministic, collision-free id minter (`<prefix>N`) so
 /// ported tests that add panes can reason about ids if they need to.
@@ -579,6 +624,7 @@ fn route_title_changed_updates_terminal_pane_pill() {
 
     mgr.route_terminal_event(
         &mut model,
+        &mut selection(),
         "t1",
         &terminal_id,
         &TerminalEvent::TitleChanged("nvim foo.rb".to_string()),
@@ -602,6 +648,7 @@ fn route_cwd_changed_writes_pane_cwd_only() {
 
     mgr.route_terminal_event(
         &mut model,
+        &mut selection(),
         "t1",
         "p1",
         &TerminalEvent::CwdChanged(std::path::PathBuf::from("/Users/nick/Downloads")),
@@ -613,10 +660,11 @@ fn route_cwd_changed_writes_pane_cwd_only() {
 }
 
 #[test]
-fn route_title_reset_and_lifecycle_events_are_noops() {
+fn route_title_reset_and_output_started_leave_the_pill() {
     // TitleReset carries no new label (terminal title-policy only accepts a
-    // non-empty set); OutputStarted / Exited are slice-2 concerns. None may
-    // panic or mutate the pill here.
+    // non-empty set); OutputStarted only clears the launch overlay. Neither may
+    // panic or mutate the pill. (Exited routes to pane_exited — covered by the
+    // paneExited / route-exit cases below.)
     let mut mgr = counting_manager();
     let mut model = seeded();
     let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
@@ -630,16 +678,19 @@ fn route_title_reset_and_lifecycle_events_are_noops() {
         .title
         .clone();
 
-    mgr.route_terminal_event(&mut model, "t1", &terminal_id, &TerminalEvent::TitleReset);
-    mgr.route_terminal_event(&mut model, "t1", &terminal_id, &TerminalEvent::OutputStarted);
     mgr.route_terminal_event(
         &mut model,
+        &mut selection(),
         "t1",
         &terminal_id,
-        &TerminalEvent::Exited {
-            status: nice_term_core::ExitStatus::Exited(0),
-            held: false,
-        },
+        &TerminalEvent::TitleReset,
+    );
+    mgr.route_terminal_event(
+        &mut model,
+        &mut selection(),
+        "t1",
+        &terminal_id,
+        &TerminalEvent::OutputStarted,
     );
 
     let after = model
@@ -651,7 +702,7 @@ fn route_title_reset_and_lifecycle_events_are_noops() {
         .unwrap()
         .title
         .clone();
-    assert_eq!(after, before, "reset + lifecycle events must not touch the pill");
+    assert_eq!(after, before, "reset + first-output must not touch the pill");
 }
 
 // ===========================================================================
@@ -679,4 +730,605 @@ fn default_mint_id_is_prefixed_and_unique() {
     dedup.sort();
     dedup.dedup();
     assert_eq!(dedup.len(), ids.len(), "back-to-back mints must not collide");
+}
+
+// ===========================================================================
+// AppStatePaneLifecycleTests — paneExited (ported)
+// ===========================================================================
+
+#[test]
+fn pane_exited_removes_pane_and_shifts_active_to_neighbor() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, terminal_id) = seed_claude_tab_in(&mut model, "p", "t1", false);
+    model.select_tab("t1");
+
+    // Focus the claude pane, then exit it — focus must shift to the neighbor
+    // (the terminal pane at index 1).
+    mgr.set_active_pane(&mut model, "t1", &claude_id);
+    let res = mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id);
+
+    let tab = model.tab_for("t1").unwrap();
+    assert_eq!(tab.panes.len(), 1);
+    assert_eq!(tab.panes[0].id, terminal_id);
+    assert_eq!(
+        tab.active_pane_id.as_deref(),
+        Some(terminal_id.as_str()),
+        "focus must shift to the surviving pane; a dangling activePaneId breaks the toolbar"
+    );
+    assert_eq!(
+        res.refocus_tab.as_deref(),
+        Some("t1"),
+        "the tab survived → the live caller spawns the refocused companion (step 4)"
+    );
+    assert_eq!(res.terminus, DissolveTerminus::None);
+}
+
+#[test]
+fn pane_exited_last_pane_dissolves_tab() {
+    // Seed two extra projects so dissolving one tab doesn't empty everything
+    // (which would fire the window terminus).
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (c1, term1) = seed_claude_tab_in(&mut model, "p1", "t1", false);
+    seed_claude_tab_in(&mut model, "p2", "t2", false);
+
+    mgr.pane_exited(&mut model, &mut selection(), "t1", &c1);
+    mgr.pane_exited(&mut model, &mut selection(), "t1", &term1);
+
+    assert!(
+        model.tab_for("t1").is_none(),
+        "tab must dissolve once every pane exits"
+    );
+    assert!(
+        model.tab_for("t2").is_some(),
+        "other tabs must not be touched by one tab's dissolve"
+    );
+}
+
+#[test]
+fn pane_exited_dissolved_active_tab_falls_back_to_first_available() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (c1, term1) = seed_claude_tab_in(&mut model, "p1", "t1", false);
+    seed_claude_tab_in(&mut model, "p2", "t2", false);
+    model.select_tab("t1");
+
+    mgr.pane_exited(&mut model, &mut selection(), "t1", &c1);
+    mgr.pane_exited(&mut model, &mut selection(), "t1", &term1);
+
+    // Dissolving the active tab leaves active_tab_id at the first tab in
+    // navigable order — the Terminals Main tab.
+    assert_eq!(model.active_tab_id(), Some(TabModel::MAIN_TERMINAL_TAB_ID));
+}
+
+#[test]
+fn pane_exited_unknown_pane_is_noop() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let before = main_tab(&model).panes.len();
+
+    let res = mgr.pane_exited(&mut model, &mut selection(), main_tab_id(), "does-not-exist");
+
+    assert_eq!(
+        main_tab(&model).panes.len(),
+        before,
+        "unknown paneId must not corrupt state"
+    );
+    assert_eq!(
+        res.refocus_tab.as_deref(),
+        Some(main_tab_id()),
+        "the tab survived untouched"
+    );
+    assert_eq!(res.terminus, DissolveTerminus::None);
+}
+
+#[test]
+fn pane_exited_last_tab_of_last_project_reports_window_emptied() {
+    // Dissolving the only tab in the window (the seeded Terminals Main tab, its
+    // single pane) leaves every project empty — the terminus the live caller
+    // turns into close-window-or-quit. (The Swift lifecycle tests deliberately
+    // seed extra projects to AVOID this; here we pin the signal itself.)
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let main = main_tab_id();
+    let pane_id = main_tab(&model).panes[0].id.clone();
+
+    let res = mgr.pane_exited(&mut model, &mut selection(), main, &pane_id);
+
+    assert!(model.tab_for(main).is_none(), "the last tab dissolved");
+    assert_eq!(
+        res.terminus,
+        DissolveTerminus::WindowEmptied,
+        "every project empty → the window-emptied terminus fires"
+    );
+}
+
+// ===========================================================================
+// AppStatePaneLifecycleTests — paneHeld (ported)
+// ===========================================================================
+
+#[test]
+fn pane_held_flips_is_alive_and_idles_status() {
+    // Seed a running Claude pane mid-think, then hold it: is_alive → false, the
+    // pulsing status idles out, the ack clears, and is_claude_running clears.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p", "t1", true);
+    model.mutate_tab("t1", |tab| {
+        let pane = tab.panes.iter_mut().find(|p| p.id == claude_id).unwrap();
+        pane.status = TabStatus::Thinking;
+        pane.waiting_acknowledged = false;
+    });
+
+    mgr.pane_held(&mut model, "t1", &claude_id);
+
+    let pane = model
+        .tab_for("t1")
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id == claude_id)
+        .unwrap();
+    assert!(!pane.is_alive, "paneHeld flips is_alive to false");
+    assert_eq!(pane.status, TabStatus::Idle, "paneHeld idles the status out");
+    assert!(
+        !pane.waiting_acknowledged,
+        "paneHeld clears waiting_acknowledged so a future waiting pane can pulse"
+    );
+    assert!(
+        !pane.is_claude_running,
+        "paneHeld clears is_claude_running (a held pty is a corpse, not a live shell)"
+    );
+}
+
+#[test]
+fn pane_held_keeps_pane_in_tab_panes_array() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p", "t1", false);
+    let before = model.tab_for("t1").unwrap().panes.len();
+
+    mgr.pane_held(&mut model, "t1", &claude_id);
+
+    let tab = model.tab_for("t1").unwrap();
+    assert_eq!(
+        tab.panes.len(),
+        before,
+        "paneHeld must not remove the pane — that's paneExited's job"
+    );
+    assert!(
+        tab.panes.iter().any(|p| p.id == claude_id),
+        "the held pane must still be findable by id"
+    );
+}
+
+#[test]
+fn pane_held_clears_launch_overlay() {
+    // Exit-before-first-byte: the overlay was still up when the process died;
+    // paneHeld must clear it so the placeholder doesn't sit on the held footer.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    mgr.set_launch_overlay_grace(Duration::ZERO);
+    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p", "t1", false);
+    mgr.register_pane_launch(&claude_id, "claude");
+    assert!(
+        mgr.pane_launch_state(&claude_id).is_some(),
+        "pre-condition: overlay entry exists before paneHeld"
+    );
+
+    mgr.pane_held(&mut model, "t1", &claude_id);
+
+    assert!(
+        mgr.pane_launch_state(&claude_id).is_none(),
+        "paneHeld must clear the launch overlay"
+    );
+}
+
+#[test]
+fn pane_held_unknown_pane_is_noop() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let before = main_tab(&model).panes.len();
+
+    mgr.pane_held(&mut model, main_tab_id(), "does-not-exist");
+
+    assert_eq!(main_tab(&model).panes.len(), before);
+}
+
+// ===========================================================================
+// AppStateLaunchOverlayTests (ported)
+// ===========================================================================
+
+#[test]
+fn register_pane_launch_zero_grace_immediately_visible() {
+    let mut mgr = counting_manager();
+    mgr.set_launch_overlay_grace(Duration::ZERO);
+
+    let armed = mgr.register_pane_launch("p1", "claude -w foo");
+
+    assert!(!armed, "zero grace promotes synchronously — no deadline to arm");
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Visible {
+            command: "claude -w foo".into()
+        }),
+        "with a zero-second grace the overlay is promoted immediately"
+    );
+}
+
+#[test]
+fn clear_pane_launch_removes_visible_entry() {
+    let mut mgr = counting_manager();
+    mgr.set_launch_overlay_grace(Duration::ZERO);
+    mgr.register_pane_launch("p1", "claude");
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Visible {
+            command: "claude".into()
+        })
+    );
+
+    mgr.clear_pane_launch("p1");
+
+    assert!(
+        mgr.pane_launch_state("p1").is_none(),
+        "first-byte clear must remove the entry entirely"
+    );
+}
+
+#[test]
+fn clear_pane_launch_before_deadline_fires_suppresses_overlay() {
+    // Non-zero grace → registration leaves the entry Pending (the live caller
+    // arms the deadline). Clear before the deadline fires, then simulate the
+    // deadline firing via promote_pane_launch: the Pending-guard early-exits.
+    let mut mgr = counting_manager();
+    mgr.set_launch_overlay_grace(Duration::from_millis(200));
+    let armed = mgr.register_pane_launch("p1", "claude");
+    assert!(armed, "non-zero grace defers to the injected deadline");
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Pending {
+            command: "claude".into()
+        })
+    );
+
+    mgr.clear_pane_launch("p1");
+    // Deadline fires after the clear — must not resurrect the overlay.
+    mgr.promote_pane_launch("p1");
+
+    assert!(
+        mgr.pane_launch_state("p1").is_none(),
+        "a cleared pane must stay cleared even after the grace deadline fires"
+    );
+}
+
+#[test]
+fn register_pane_launch_async_path_promotes_on_deadline() {
+    let mut mgr = counting_manager();
+    mgr.set_launch_overlay_grace(Duration::from_millis(150));
+    mgr.register_pane_launch("p1", "claude -w slow");
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Pending {
+            command: "claude -w slow".into()
+        }),
+        "before the deadline the state is Pending — overlay stays hidden"
+    );
+
+    // The injected deadline fires (App-Nap-safe in production, direct here).
+    mgr.promote_pane_launch("p1");
+
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Visible {
+            command: "claude -w slow".into()
+        }),
+        "after the deadline the entry is promoted to Visible"
+    );
+}
+
+#[test]
+fn register_pane_launch_replaces_prior_entry() {
+    // A second register for the same paneId replaces the first (defends against
+    // in-place pane promotion re-using an id that already had state).
+    let mut mgr = counting_manager();
+    mgr.set_launch_overlay_grace(Duration::ZERO);
+    mgr.register_pane_launch("p1", "claude");
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Visible {
+            command: "claude".into()
+        })
+    );
+
+    mgr.register_pane_launch("p1", "claude --resume");
+
+    assert_eq!(
+        mgr.pane_launch_state("p1"),
+        Some(&PaneLaunchStatus::Visible {
+            command: "claude --resume".into()
+        }),
+        "re-registering must overwrite the command, not stack entries"
+    );
+}
+
+#[test]
+fn pane_exited_clears_launch_state() {
+    // A pane that exits — even silently, before emitting any byte — must not
+    // leave a stale overlay entry behind.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    mgr.set_launch_overlay_grace(Duration::ZERO);
+    let pane_id = "p-exit";
+    let mut tab = Tab::new("t1", "t", "/tmp");
+    tab.panes = vec![Pane::new(pane_id, "Claude", PaneKind::Claude)];
+    tab.active_pane_id = Some(pane_id.to_string());
+    model.projects.push(Project {
+        id: "p".into(),
+        name: "P".into(),
+        path: "/tmp".into(),
+        tabs: vec![tab],
+    });
+    mgr.register_pane_launch(pane_id, "claude");
+    assert!(mgr.pane_launch_state(pane_id).is_some());
+
+    mgr.pane_exited(&mut model, &mut selection(), "t1", pane_id);
+
+    assert!(
+        mgr.pane_launch_state(pane_id).is_none(),
+        "an exited pane must leave no stale overlay entry"
+    );
+}
+
+// ===========================================================================
+// AppStateTabSelectionTests — prune wiring through the dissolve cascade (ported)
+// ===========================================================================
+
+#[test]
+fn closing_tab_prunes_from_multi_selection() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "pa", "a", false);
+    seed_claude_tab_in(&mut model, "pb", "b", false);
+    let mut sel = SidebarTabSelection::new();
+    sel.replace("a");
+    let _ = sel.toggle("b");
+    assert_eq!(
+        sel.selected_tab_ids(),
+        &HashSet::from(["a".to_string(), "b".to_string()])
+    );
+
+    mgr.close_tab(&mut model, &mut sel, "a");
+
+    assert_eq!(
+        sel.selected_tab_ids(),
+        &HashSet::from(["b".to_string()]),
+        "finalize_dissolved_tab must prune so closed tabs don't linger in the selection"
+    );
+}
+
+#[test]
+fn closing_tab_clears_anchor_when_anchor_was_the_closed_tab() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "pa", "a", false);
+    seed_claude_tab_in(&mut model, "pb", "b", false);
+    let mut sel = SidebarTabSelection::new();
+    sel.replace("b");
+    let _ = sel.toggle("a"); // toggle moves the anchor to the toggled id
+    assert_eq!(sel.last_clicked_tab_id(), Some("a"));
+
+    mgr.close_tab(&mut model, &mut sel, "a");
+
+    assert_eq!(
+        sel.last_clicked_tab_id(),
+        None,
+        "the anchor must clear when its tab dissolves"
+    );
+}
+
+#[test]
+fn closing_tab_keeps_anchor_when_anchor_survives() {
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "pa", "a", false);
+    seed_claude_tab_in(&mut model, "pb", "b", false);
+    let mut sel = SidebarTabSelection::new();
+    sel.replace("b");
+    let _ = sel.toggle("a"); // anchor is now `a`; we close `b` instead
+
+    mgr.close_tab(&mut model, &mut sel, "b");
+
+    assert_eq!(
+        sel.last_clicked_tab_id(),
+        Some("a"),
+        "the anchor must survive when a different tab dissolves"
+    );
+    assert_eq!(sel.selected_tab_ids(), &HashSet::from(["a".to_string()]));
+}
+
+// ===========================================================================
+// Tri-state close shapes — held / spawning / model-only all reach the cascade
+// (AppStateCloseProjectTests's three no-live-child shapes + the
+// NiceTerminalViewDeferredSpawnTests distinctions).
+// ===========================================================================
+
+#[test]
+fn close_tab_claude_tab_with_unspawned_companion_dissolves() {
+    // Model-only shape: neither pane has a session. Close must still dissolve
+    // the row — an earlier cut left the tab alive with its unfocused companion.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "p1", "t1", false);
+    seed_claude_tab_in(&mut model, "p2", "t2", false); // keep off the window terminus
+
+    mgr.close_tab(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.tab_for("t1").is_none(),
+        "close must dissolve the tab even when the companion terminal was never spawned"
+    );
+    assert!(
+        model.projects.iter().any(|p| p.id == "p1"),
+        "close tab must leave the containing project in place (only close-project removes it)"
+    );
+}
+
+#[test]
+fn close_tab_armed_deferred_claude_pane_with_unspawned_companion_dissolves() {
+    // Spawning shape: the Claude pane captured a deferred spawn that never fired
+    // (paneIsSpawned true), the companion is model-only. Close routes the Claude
+    // pane through terminate_pane's armed fast path → synthesized nil exit.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p1", "t1", false);
+    seed_claude_tab_in(&mut model, "p2", "t2", false);
+    mgr.mark_synthetic_armed_deferred_pane("t1", &claude_id);
+
+    mgr.close_tab(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.tab_for("t1").is_none(),
+        "close on a never-focused resume-deferred Claude tab must dissolve the sidebar row"
+    );
+    assert!(model.projects.iter().any(|p| p.id == "p1"));
+}
+
+#[test]
+fn close_tab_held_claude_pane_with_unspawned_companion_dissolves() {
+    // Held shape: the Claude pane's process already died (view mounted), the
+    // companion is model-only. Close routes the held pane through terminate_pane's
+    // held fast path → synchronous pane_exited → cascade.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p1", "t1", false);
+    seed_claude_tab_in(&mut model, "p2", "t2", false);
+    model.mutate_tab("t1", |tab| {
+        let pane = tab.panes.iter_mut().find(|p| p.id == claude_id).unwrap();
+        pane.is_alive = false;
+        pane.is_claude_running = false;
+    });
+    mgr.mark_synthetic_held_pane("t1", &claude_id);
+
+    mgr.close_tab(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.tab_for("t1").is_none(),
+        "close on a held-pane tab must dissolve the row, not just remove the panes"
+    );
+    assert!(model.projects.iter().any(|p| p.id == "p1"));
+}
+
+// ===========================================================================
+// Validation ordering probes (a)–(d)
+// ===========================================================================
+
+#[test]
+fn probe_a_exit_refocuses_neighbor_and_flags_companion_spawn_before_dissolve() {
+    // (a) Exiting the active pane refocuses the slot neighbor AND signals the
+    // deferred-companion spawn (step 4), and the dissolve check runs AFTER — a
+    // surviving tab with a refocused companion must NOT dissolve. pane_exited
+    // returns refocus_tab=Some (→ the live caller spawns the companion) with
+    // terminus=None, proving the exit handled the refocus-onto-companion case
+    // instead of dissolving.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, terminal_id) = seed_claude_tab_in(&mut model, "p", "t1", false);
+    model.select_tab("t1");
+    mgr.set_active_pane(&mut model, "t1", &claude_id);
+
+    let res = mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id);
+
+    let tab = model.tab_for("t1").expect("tab must survive — a companion remains");
+    assert_eq!(
+        tab.active_pane_id.as_deref(),
+        Some(terminal_id.as_str()),
+        "focus refocuses onto the slot neighbor (the deferred companion)"
+    );
+    assert_eq!(
+        res.refocus_tab.as_deref(),
+        Some("t1"),
+        "the surviving tab is flagged for the step-4 companion spawn"
+    );
+    assert_eq!(
+        res.terminus,
+        DissolveTerminus::None,
+        "the dissolve check ran after the refocus and saw a non-empty tab"
+    );
+}
+
+#[test]
+fn probe_b_noop_title_re_report_reports_no_change() {
+    // (b) A no-op title re-report fires no mutation event: pane_title_changed
+    // returns did-change (the caller's R18 save gate). A real change returns
+    // true; re-reporting the same title returns false.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (_claude, terminal_id) = seed_claude_tab_in(&mut model, "p", "t1", false);
+
+    assert!(
+        mgr.pane_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb"),
+        "a real title change reports changed"
+    );
+    assert!(
+        !mgr.pane_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb"),
+        "re-reporting the current title must report no change (no mutation event)"
+    );
+}
+
+#[test]
+fn probe_c_terminate_all_two_held_panes_visits_each_once() {
+    // (c) terminate_all with two held panes completes without skipping or
+    // double-visiting an entry: both panes removed, tab dissolved, both synthetic
+    // markers consumed. The snapshot-first iteration is what makes this safe (the
+    // first held pane_exited mutates the model + cache mid-loop).
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    // A tab with two panes, both marked held (kind is irrelevant to terminate).
+    let mut tab = Tab::new("t1", "t", "/tmp/p1");
+    tab.panes = vec![
+        Pane::new("t1-a", "A", PaneKind::Terminal),
+        Pane::new("t1-b", "B", PaneKind::Terminal),
+    ];
+    tab.active_pane_id = Some("t1-a".to_string());
+    tab.next_terminal_index = 3;
+    model.projects.push(Project {
+        id: "p1".into(),
+        name: "P1".into(),
+        path: "/tmp/p1".into(),
+        tabs: vec![tab],
+    });
+    seed_claude_tab_in(&mut model, "p2", "t2", false); // keep off the window terminus
+    mgr.mark_synthetic_held_pane("t1", "t1-a");
+    mgr.mark_synthetic_held_pane("t1", "t1-b");
+
+    mgr.terminate_all(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.tab_for("t1").is_none(),
+        "both held panes exit and the tab dissolves — no entry skipped"
+    );
+    // Both one-shot markers consumed exactly once (a double-visit would have
+    // found the marker already gone and mis-routed as model-only).
+    assert!(!mgr.pane_is_spawned("t1", "t1-a"));
+    assert!(!mgr.pane_is_spawned("t1", "t1-b"));
+}
+
+#[test]
+fn probe_d_close_model_only_tab_reaches_cascade_synchronously() {
+    // (d) Closing a tab whose panes are all model-only reaches the cascade
+    // synchronously — no async pane-exit to wait on, the tab is gone on return.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "p1", "t1", false);
+    seed_claude_tab_in(&mut model, "p2", "t2", false);
+
+    let terminus = mgr.close_tab(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.tab_for("t1").is_none(),
+        "a model-only tab dissolves synchronously on close_tab's return"
+    );
+    assert_eq!(terminus, DissolveTerminus::None, "other projects remain non-empty");
 }
