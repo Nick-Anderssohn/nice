@@ -17,6 +17,8 @@
 //!   `Sources/Nice/Theme/Typography.swift`.
 //! * [`chrome_geometry`] — top-bar / sidebar / traffic-light / card geometry,
 //!   from `WindowChrome.swift` and `AppShellView.swift`.
+//! * [`status`] — status-dot visual tokens (the 8pt dot, the "waiting" blue,
+//!   the ring/breathe pulse constants), from `StatusDot.swift`.
 //!
 //! The tiny adapter from these plain types into gpui color types lives
 //! downstream (crates/nice, R9), NOT here — that is what keeps this crate
@@ -26,9 +28,11 @@ pub mod accent;
 pub mod chrome_geometry;
 pub mod color;
 pub mod palette;
+pub mod status;
 pub mod typography;
 
 pub use accent::AccentPreset;
 pub use color::Srgba;
 pub use palette::{ColorScheme, Palette, SlotColor, Slots, SystemColor};
+pub use status::{BreathePulse, RingPulse};
 pub use typography::TypographyAlias;

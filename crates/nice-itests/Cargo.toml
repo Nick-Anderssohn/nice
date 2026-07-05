@@ -66,6 +66,13 @@ anyhow = "1"
 # test-support for THIS crate's own exemplars only (never a normal dep — see the
 # header). Turns on `TestAppContext`/`VisualTestAppContext` + `render_to_image`.
 gpui = { path = "../../vendor/zed/crates/gpui", features = ["test-support"] }
+# The R10 pure sidebar state (selection / rename-gate / tab tree) the in-process
+# multi-select classification tests drive through simulated events. gpui-free +
+# used ONLY by this crate's own `#[cfg(test)]` `sidebar_multiselect` module (the
+# real `SidebarShellView` routing it mirrors lives in the `nice` binary, which a
+# dev/test crate cannot import — the same constraint the R9 `chrome_band` probe
+# has), so it is a dev-dependency, never a normal one.
+nice-model = { path = "../nice-model" }
 # The real MacPlatform the visual exemplar wraps in a `VisualTestAppContext`
 # (`gpui_platform::current_platform(false)`), plus the `test-support` half that
 # compiles the macOS `MacWindow::render_to_image` OVERRIDE (via

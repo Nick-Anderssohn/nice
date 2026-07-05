@@ -66,3 +66,11 @@ mod behavior_exemplars;
 // an interactive child never reaches the band; the ~2pt drag-threshold split).
 #[cfg(test)]
 mod chrome_band;
+
+// R10 sidebar multi-select / rename-gate / disclosure classification
+// differentials — libtest `#[gpui::test]` cases on the mocked context. Mirrors
+// the `SidebarShellView` routing (unimportable from a dev/test crate, like the
+// `chrome_band` band) over the REAL `nice-model` selection / rename-gate types,
+// driven by simulated clicks + `advance_clock`.
+#[cfg(test)]
+mod sidebar_multiselect;

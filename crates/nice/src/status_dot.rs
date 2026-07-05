@@ -1,0 +1,327 @@
+//! `StatusDot` — the sidebar/toolbar status dot, ported from
+//! `Sources/Nice/Views/StatusDot.swift`. An 8pt circle whose colour maps to a
+//! [`TabStatus`], with two repeat-forever pulse animations: an expanding outer
+//! ring and a breathing inner dot. Rendered by slice 3's sidebar `TabRow` and
+//! reused by R11's toolbar pills.
+//!
+//! ## Reads R8, never recomputes (binding decision)
+//!
+//! The dot's state is supplied by the caller from the R8 model predicates — it
+//! is **not** recomputed here:
+//!
+//!   * [`StatusDot::status`] comes from [`nice_model::Tab::status`] (or, for
+//!     R11's per-pane pills, [`nice_model::Pane::status`]);
+//!   * [`StatusDot::suppress_waiting_pulse`] comes from
+//!     [`nice_model::Tab::waiting_acknowledged`] (per-pane:
+//!     [`nice_model::Pane::waiting_acknowledged`]).
+//!
+//! The *writer* of acknowledgment-on-view is the session/focus logic landing in
+//! R13; this component only renders pulse-suppression off the fields as they
+//! are. The pulse rule ([`status_dot_should_pulse`]) is: **thinking** always
+//! pulses, **waiting** pulses until acknowledged, **idle** never
+//! (`StatusDot.swift:47-53`).
+//!
+//! ## Colours (binding decision)
+//!
+//! Per-status base colour ([`status_dot_base_color`]): **thinking** = the user's
+//! accent, **waiting** = the fixed [`nice_theme::status::WAITING_DOT`] blue,
+//! **idle** = the active palette's `ink3`. The palette-dependent colours (accent,
+//! idle) are resolved by the caller and passed in, keeping this component
+//! palette-agnostic and reusable; only the one hardcoded "waiting" blue is read
+//! straight from the token.
+
+// The component's constructor + builder setters have no in-crate caller until
+// slice 3 (the sidebar `TabRow`) and R11 (toolbar pills) wire them; it is a
+// deliberately-exported reusable component (plan "Exported contracts"). The pure
+// colour/pulse helpers below ARE exercised by this module's unit tests.
+#![allow(dead_code)]
+
+use std::time::Duration;
+
+use gpui::{
+    bounce, div, ease_in_out, px, App, Animation, AnimationExt, ElementId, IntoElement,
+    ParentElement, RenderOnce, Rgba, Styled, Window,
+};
+
+use nice_model::TabStatus;
+use nice_theme::color::Srgba;
+use nice_theme::status::{
+    BreathePulse, RingPulse, BREATHE_MAX_OPACITY, DOT_FRAME_PADDING, DOT_SIZE, THINKING_BREATHE,
+    THINKING_RING, WAITING_BREATHE, WAITING_DOT, WAITING_RING,
+};
+
+use crate::theme::srgba_to_rgba;
+
+/// The base (unanimated) dot colour for `status`, given the caller-resolved
+/// palette-dependent colours. Ported from `StatusDot.baseColor`
+/// (`StatusDot.swift:27-37`): thinking → `accent`, waiting → the fixed
+/// [`WAITING_DOT`] blue, idle → `idle` (the palette's `ink3`).
+pub(crate) fn status_dot_base_color(status: TabStatus, accent: Srgba, idle: Srgba) -> Srgba {
+    match status {
+        TabStatus::Thinking => accent,
+        TabStatus::Waiting => WAITING_DOT,
+        TabStatus::Idle => idle,
+    }
+}
+
+/// Whether the dot pulses for `status`. Ported from `StatusDot.shouldPulse`
+/// (`StatusDot.swift:47-53`): thinking always pulses, waiting pulses until
+/// acknowledged (`suppress_waiting_pulse`), idle never.
+pub(crate) fn status_dot_should_pulse(status: TabStatus, suppress_waiting_pulse: bool) -> bool {
+    match status {
+        TabStatus::Thinking => true,
+        TabStatus::Waiting => !suppress_waiting_pulse,
+        TabStatus::Idle => false,
+    }
+}
+
+/// The ring + breathe pulse specs for a pulsing `status`. Only `thinking` and
+/// `waiting` pulse (idle never reaches here); returns the per-status
+/// (`StatusDot.swift:94-99,107-111`) constants.
+fn pulse_specs(status: TabStatus) -> (RingPulse, BreathePulse) {
+    match status {
+        TabStatus::Waiting => (WAITING_RING, WAITING_BREATHE),
+        // Thinking (and the idle fallthrough, which never pulses) use the
+        // thinking timings.
+        TabStatus::Thinking | TabStatus::Idle => (THINKING_RING, THINKING_BREATHE),
+    }
+}
+
+/// A quadratic ease-out (`1 − (1 − t)²`) — a close, dependency-free stand-in for
+/// SwiftUI's `.easeOut` used by the expanding ring (`StatusDot.swift:99`). gpui's
+/// stock `ease_out_quint` is far steeper, so a local quadratic is the faithful
+/// choice.
+fn ease_out_quadratic(t: f32) -> f32 {
+    let inv = 1.0 - t;
+    1.0 - inv * inv
+}
+
+/// The status dot component. Construct with [`StatusDot::new`]; the palette
+/// colours (`accent` = thinking, `idle` = the palette's `ink3`) are resolved by
+/// the caller. See the module docs for the "reads R8, never recomputes" rule.
+#[derive(IntoElement)]
+pub(crate) struct StatusDot {
+    /// Unique element-id seed so each dot's per-layer animation state is
+    /// distinct even when many dots render as siblings (one per sidebar row).
+    id: ElementId,
+    status: TabStatus,
+    /// Thinking colour — the user's accent (default Terracotta).
+    accent: Srgba,
+    /// Idle colour — the active palette's `ink3` slot.
+    idle: Srgba,
+    /// Inner-dot diameter (pt). Defaults to [`DOT_SIZE`] (8).
+    size: f32,
+    /// Fed from the R8 `waiting_acknowledged` predicate: suppresses the
+    /// **waiting** pulse when the user is already looking at the owning tab/pane.
+    suppress_waiting_pulse: bool,
+    /// Disables the pulse entirely (for snapshots / non-animated previews),
+    /// mirroring Swift's `pulsePaused` (`StatusDot.swift:21`).
+    pulse_paused: bool,
+}
+
+impl StatusDot {
+    /// A status dot for `status`, with the caller-resolved `accent` (thinking)
+    /// and `idle` (the palette's `ink3`) colours. `id` seeds the per-layer
+    /// animation element-ids and must be unique among sibling dots (e.g. the tab
+    /// id). Size defaults to [`DOT_SIZE`]; the pulse flags default off.
+    pub(crate) fn new(
+        id: impl Into<ElementId>,
+        status: TabStatus,
+        accent: Srgba,
+        idle: Srgba,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            status,
+            accent,
+            idle,
+            size: DOT_SIZE,
+            suppress_waiting_pulse: false,
+            pulse_paused: false,
+        }
+    }
+
+    /// Override the inner-dot diameter (pt).
+    pub(crate) fn size(mut self, size: f32) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Suppress the **waiting** pulse — pass [`nice_model::Tab::waiting_acknowledged`]
+    /// (never recomputed here).
+    pub(crate) fn suppress_waiting_pulse(mut self, suppress: bool) -> Self {
+        self.suppress_waiting_pulse = suppress;
+        self
+    }
+
+    /// Freeze the pulse (previews / snapshots).
+    pub(crate) fn pulse_paused(mut self, paused: bool) -> Self {
+        self.pulse_paused = paused;
+        self
+    }
+}
+
+impl RenderOnce for StatusDot {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let base = status_dot_base_color(self.status, self.accent, self.idle);
+        let base_rgba: Rgba = srgba_to_rgba(base);
+        let size = self.size;
+        // The outer frame the ring expands within — `size + 4` on a side
+        // (`StatusDot.swift:70`). The inner dot centres inside it.
+        let frame = size + DOT_FRAME_PADDING;
+        let dot_offset = (frame - size) / 2.0;
+
+        // Centre a fixed-size stack; the ring/dot are absolutely positioned so
+        // the growing ring overflows outward without disturbing layout.
+        let mut root = div().relative().w(px(frame)).h(px(frame));
+
+        let pulses = status_dot_should_pulse(self.status, self.suppress_waiting_pulse)
+            && !self.pulse_paused;
+
+        if pulses {
+            let (ring, breathe) = pulse_specs(self.status);
+
+            // Expanding outer ring: scale `1.0 → max_scale` (easeOut) while
+            // opacity fades `start_opacity → 0`, repeating forever without
+            // autoreversing (`StatusDot.swift:91-102`).
+            let ring_id: ElementId = (self.id.clone(), "status-ring").into();
+            let ring_layer = div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(frame))
+                .h(px(frame))
+                .rounded_full()
+                .bg(base_rgba)
+                .opacity(ring.start_opacity)
+                .with_animation(
+                    ring_id,
+                    Animation::new(Duration::from_secs_f32(ring.duration_secs))
+                        .repeat()
+                        .with_easing(ease_out_quadratic),
+                    move |el, delta| {
+                        let scale = 1.0 + delta * (ring.max_scale - 1.0);
+                        let d = frame * scale;
+                        let offset = (frame - d) / 2.0;
+                        let opacity = ring.start_opacity * (1.0 - delta);
+                        el.w(px(d)).h(px(d)).left(px(offset)).top(px(offset)).opacity(opacity)
+                    },
+                );
+
+            // Breathing inner dot: opacity oscillates `min_opacity ↔ 1.0` with an
+            // ease-in-out that autoreverses (`StatusDot.swift:104-113`). gpui's
+            // `repeat()` is a non-autoreversing sawtooth, so `bounce(ease_in_out)`
+            // supplies the there-and-back shape and the period is `2 ×` the
+            // Swift half-cycle so each direction keeps its cited duration.
+            let breathe_id: ElementId = (self.id.clone(), "status-breathe").into();
+            let breathe_layer = div()
+                .absolute()
+                .left(px(dot_offset))
+                .top(px(dot_offset))
+                .w(px(size))
+                .h(px(size))
+                .rounded_full()
+                .bg(base_rgba)
+                .opacity(breathe.min_opacity)
+                .with_animation(
+                    breathe_id,
+                    Animation::new(Duration::from_secs_f32(2.0 * breathe.duration_secs))
+                        .repeat()
+                        .with_easing(bounce(ease_in_out)),
+                    move |el, eased| {
+                        let opacity =
+                            breathe.min_opacity + eased * (BREATHE_MAX_OPACITY - breathe.min_opacity);
+                        el.opacity(opacity)
+                    },
+                );
+
+            root = root.child(ring_layer).child(breathe_layer);
+        } else {
+            // Static filled dot, full opacity (`StatusDot.swift:64-68`).
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(dot_offset))
+                    .top(px(dot_offset))
+                    .w(px(size))
+                    .h(px(size))
+                    .rounded_full()
+                    .bg(base_rgba),
+            );
+        }
+
+        root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accent() -> Srgba {
+        Srgba::rgb(0.788, 0.392, 0.259) // Terracotta, the default accent.
+    }
+
+    fn idle() -> Srgba {
+        Srgba::rgb(0.460, 0.441, 0.427) // Nice/Dark ink3.
+    }
+
+    #[test]
+    fn base_color_maps_status_per_swift() {
+        // StatusDot.swift:27-37.
+        assert_eq!(status_dot_base_color(TabStatus::Thinking, accent(), idle()), accent());
+        assert_eq!(status_dot_base_color(TabStatus::Waiting, accent(), idle()), WAITING_DOT);
+        assert_eq!(status_dot_base_color(TabStatus::Idle, accent(), idle()), idle());
+    }
+
+    #[test]
+    fn thinking_always_pulses() {
+        // StatusDot.swift:48 — thinking pulses regardless of suppression.
+        assert!(status_dot_should_pulse(TabStatus::Thinking, false));
+        assert!(status_dot_should_pulse(TabStatus::Thinking, true));
+    }
+
+    #[test]
+    fn waiting_pulses_until_acknowledged() {
+        // StatusDot.swift:49 — waiting pulses only while NOT acknowledged.
+        assert!(status_dot_should_pulse(TabStatus::Waiting, false));
+        assert!(!status_dot_should_pulse(TabStatus::Waiting, true));
+    }
+
+    #[test]
+    fn idle_never_pulses() {
+        // StatusDot.swift:50 — idle never pulses.
+        assert!(!status_dot_should_pulse(TabStatus::Idle, false));
+        assert!(!status_dot_should_pulse(TabStatus::Idle, true));
+    }
+
+    #[test]
+    fn pulse_specs_select_per_status() {
+        assert_eq!(pulse_specs(TabStatus::Waiting), (WAITING_RING, WAITING_BREATHE));
+        assert_eq!(pulse_specs(TabStatus::Thinking), (THINKING_RING, THINKING_BREATHE));
+    }
+
+    #[test]
+    fn ease_out_quadratic_is_monotone_0_to_1() {
+        assert_eq!(ease_out_quadratic(0.0), 0.0);
+        assert_eq!(ease_out_quadratic(1.0), 1.0);
+        // Eases OUT: past the midpoint by t=0.5 (0.75 > 0.5).
+        assert!(ease_out_quadratic(0.5) > 0.5);
+    }
+
+    #[test]
+    fn suppress_flag_and_helpers_never_borrow_across_status() {
+        // The "reads R8, never recomputes" contract in helper form: the pulse
+        // decision is a pure function of (status, suppress) only.
+        for &status in &[TabStatus::Thinking, TabStatus::Waiting, TabStatus::Idle] {
+            let a = status_dot_should_pulse(status, false);
+            let b = status_dot_should_pulse(status, true);
+            // Only waiting is sensitive to the suppress flag.
+            if status == TabStatus::Waiting {
+                assert_ne!(a, b);
+            } else {
+                assert_eq!(a, b);
+            }
+        }
+    }
+}

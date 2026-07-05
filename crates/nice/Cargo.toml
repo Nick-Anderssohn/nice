@@ -25,6 +25,10 @@ nice-harness = { path = "../nice-harness" }
 # asserts against. Pure data, no gpui — the app owns the token -> gpui::Rgba
 # adapter (see the swatch grid in `app.rs`), per the crates/README Layering rule.
 nice-theme = { path = "../nice-theme" }
+# The per-window document model (R8): the R10 sidebar components read the tab
+# status model (`TabStatus`, and downstream the tree/selection) — the StatusDot
+# renders `Tab::status` / `Tab::waiting_acknowledged` without recomputing them.
+nice-model = { path = "../nice-model" }
 # The terminal renderer (R4) and its headless core: the `term-render` self-test
 # scenario drives a fixture-fed `nice_term_core::Session` through the
 # `nice-term-view` renderer and asserts the painted pixels.

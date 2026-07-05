@@ -2570,6 +2570,17 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        Scenario {
+            name: "sidebar",
+            open: crate::sidebar_live::open_sidebar_window,
+            gate: Gate::SelfReported {
+                // Resize drags + double-click, a collapse/restore round trip, the
+                // strip/body drag differential, and their settles — generous
+                // headroom (self-activates + preflights the AX grant internally).
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
     ]
 }
 

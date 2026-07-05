@@ -57,13 +57,32 @@
 //! originating root's former children on first-branch promotion, while
 //! [`TabModel::insert_handoff_child`] deliberately does **not** re-parent — the
 //! anchor stays root.
+//!
+//! ## Sidebar UI state (R10 pure ports)
+//!
+//! More gpui-free value-state modules the R10 sidebar builds over — ported
+//! case-for-case from the pure-Swift seams and unit-testable exactly like the
+//! tree above:
+//!
+//! * [`selection`] — [`SidebarTabSelection`], the Finder-style multi-select
+//!   model and the "selection ⊇ {active_tab_id}" invariant.
+//! * [`rename_gate`] — [`InlineRenameClickGate`], the injected-clock
+//!   click-to-rename time gate (R11 reuses it).
+//! * [`sidebar`] — [`SidebarModel`] (+ [`SidebarMode`]): collapsed/mode/peek
+//!   state and the toggle + peek render/clear methods (R12 triggers them).
 
 mod pane;
 mod project;
+pub mod rename_gate;
+pub mod selection;
+pub mod sidebar;
 mod tab;
 mod tab_model;
 
 pub use pane::{Pane, PaneKind, TabStatus};
 pub use project::Project;
+pub use rename_gate::InlineRenameClickGate;
+pub use selection::SidebarTabSelection;
+pub use sidebar::{SidebarMode, SidebarModel};
 pub use tab::Tab;
 pub use tab_model::{FsProbe, TabModel};
