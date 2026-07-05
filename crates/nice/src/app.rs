@@ -655,11 +655,17 @@ fn build_window_root(
         crate::sidebar_shell::SidebarShellView::new_composed(
             state.clone(),
             toolbar.clone().into(),
-            pane_host.into(),
+            pane_host.clone().into(),
             cx,
         )
     });
-    let shell = cx.new(|cx| crate::app_shell::AppShellView::new(state, sidebar, toolbar, cx));
+    // M2 Item D focus routing: the toolbar / sidebar return key focus to the
+    // active terminal through the pane host (rename commit/cancel, context-menu
+    // dismissal, and the chrome-click focus bounce).
+    toolbar.update(cx, |t, _| t.set_pane_host(pane_host.clone()));
+    sidebar.update(cx, |s, _| s.set_pane_host(pane_host.clone()));
+    let shell =
+        cx.new(|cx| crate::app_shell::AppShellView::new(state, sidebar, toolbar, pane_host, cx));
 
     // R9 (slice 2): keep the View menu's full-screen title in sync as this window
     // enters / exits full screen (now hung on the shell root instead of the bare

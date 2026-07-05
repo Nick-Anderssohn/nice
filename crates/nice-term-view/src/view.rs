@@ -6,8 +6,15 @@
 //! The caret's solid/hollow state is **computed** from
 //! `focus_handle.is_focused(window) && window.is_window_active()` every frame —
 //! there is deliberately **no separately-maintained focus flag** (that is
-//! pain-catalog mechanism #5, remembered-not-computed state). R13 later directs
-//! focus here via `focus_handle.focus()`.
+//! pain-catalog mechanism #5, remembered-not-computed state).
+//!
+//! Focus routing (M2 Item D): the view grabs key focus exactly **once**, on its
+//! first render — a fresh pane starts focused with no app wiring — and never
+//! again, so app chrome (an inline-rename field, a context menu) can hold focus
+//! without the terminal yanking it back the next frame. Every later move is
+//! explicit: the app calls [`TerminalView::focus`] (pane/tab activation, rename
+//! commit/cancel, menu dismissal), and a mouse-down on the view re-focuses it
+//! via gpui's tracked-focus transfer (`track_focus` on the root div).
 //!
 //! ## R5 input path
 //!
@@ -113,6 +120,11 @@ pub struct TerminalView {
     font_px: f32,
     metrics: TerminalMetrics,
     focus_handle: FocusHandle,
+    /// Whether the first-render focus grab has run (M2 Item D focus-once). Set
+    /// on the first [`Render::render`]; never cleared. All later focus moves are
+    /// explicit ([`focus`](Self::focus), click-to-focus) so app chrome can hold
+    /// focus without the terminal stealing it back per frame.
+    focused_once: bool,
     /// The pure marked-text (preedit) state machine driven by the platform IME.
     ime: ImeState,
     /// Option-as-Meta policy (SwiftTerm-parity default `Both`). Consulted per
@@ -132,6 +144,20 @@ pub struct TerminalView {
     /// by the mouse handlers on the next event for pixel→cell hit-testing. Shared
     /// so paint writes it without re-entering this entity (see [`TerminalElement`]).
     paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Whether the element schedules a pty grid refit when its painted bounds
+    /// change (M2 Item E — window resize → `resize_pty_to_fit`). Off by default:
+    /// fixed-grid embeddings (the pixel-assertion self-tests spawn at an exact
+    /// `rows × cols` and key their sample points on it) must never have their
+    /// grid silently re-fitted. The shipped app's pane host opts in via
+    /// [`set_auto_refit`](Self::set_auto_refit).
+    auto_refit: bool,
+    /// The last `(rows, cols)` successfully pushed to the pty by
+    /// [`resize_pty_to_fit`](Self::resize_pty_to_fit) — the resize feedback-loop
+    /// guard: a refit that computes the same fit is skipped, so
+    /// resize → SIGWINCH → repaint can never re-trigger itself. `None` until the
+    /// first successful push (and reset on a held-pane respawn, whose fresh
+    /// shell spawns at the spec size and must be refit unconditionally).
+    last_pty_fit: Option<(u16, u16)>,
     /// An in-progress local selection drag, anchored at the **buffer** cell
     /// `(line, column)` the left button went down on (`line` negative in
     /// scrollback). `Some` between mouse-down and the ending mouse-up; each drag
@@ -238,11 +264,14 @@ impl TerminalView {
             font_px,
             metrics,
             focus_handle: cx.focus_handle(),
+            focused_once: false,
             ime: ImeState::new(),
             option_as_meta: OptionAsMeta::default(),
             keycode_probe: None,
             image_drop_provider: None,
             paint_bounds: Rc::new(Cell::new(None)),
+            auto_refit: false,
+            last_pty_fit: None,
             drag_anchor: None,
             last_report_cell: None,
             wheel_accum: 0.0,
@@ -301,16 +330,37 @@ impl TerminalView {
     ///
     /// Best-effort: before the first paint there are no bounds (skip — the next
     /// paint picks up the size anyway), and a not-yet-spawned / exited session
-    /// errors, which is dropped (nothing to reflow).
-    fn resize_pty_to_fit(&self, cx: &App) {
+    /// errors, which is dropped (nothing to reflow; the fit is then NOT recorded,
+    /// so a later spawn still gets its refit).
+    ///
+    /// M2 Item E adds the third caller — a deferred callback scheduled by the
+    /// element when its painted bounds change — and the feedback-loop guard: the
+    /// computed fit is compared against [`last_pty_fit`](Self::last_pty_fit) and
+    /// a no-delta refit is skipped, so resize → SIGWINCH → output → repaint can
+    /// never re-trigger itself.
+    pub(crate) fn resize_pty_to_fit(&mut self, cx: &App) {
         if let Some(bounds) = self.paint_bounds.get() {
             let (rows, cols) = fit_grid(
                 f32::from(bounds.size.width),
                 f32::from(bounds.size.height),
                 self.metrics,
             );
-            let _ = self.handle.read(cx).session().resize(rows, cols);
+            if self.last_pty_fit == Some((rows, cols)) {
+                return; // no rows/cols delta — nothing to push (loop guard)
+            }
+            if self.handle.read(cx).session().resize(rows, cols).is_ok() {
+                self.last_pty_fit = Some((rows, cols));
+            }
         }
+    }
+
+    /// Opt in to bounds-driven pty refits (M2 Item E): when set, a change in the
+    /// element's painted bounds schedules [`resize_pty_to_fit`](Self::resize_pty_to_fit)
+    /// via `cx.defer` (outside the paint pass), so the grid tracks a live window
+    /// resize. The shipped pane host sets this; fixed-grid scenario embeddings
+    /// leave it off (their pixel assertions key on the exact spawn grid).
+    pub fn set_auto_refit(&mut self, on: bool) {
+        self.auto_refit = on;
     }
 
     // R12: `zoom_font` / `reset_font` / `try_zoom_chord` were removed here. The
@@ -319,9 +369,19 @@ impl TerminalView {
     // this view keeps observing that entity (see `on_font_changed`) and re-metrics
     // on every zoom, but no longer intercepts the chords in its key path.
 
-    /// The view's focus handle (R5 drives key input through it; R13 focuses it).
+    /// The view's focus handle (R5 drives key input through it; the app's focus
+    /// routing reads it — see [`focus`](Self::focus)).
     pub fn focus_handle_ref(&self) -> &FocusHandle {
         &self.focus_handle
+    }
+
+    /// Move key focus to this terminal — the explicit focus-routing seam (M2
+    /// Item D). The app calls it on pane/tab activation and when handing focus
+    /// back after a chrome interaction (inline-rename commit/cancel, context-menu
+    /// dismissal). Idempotent: `Window::focus` early-returns if this handle
+    /// already holds focus.
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus_handle, cx);
     }
 
     /// Install the macOS keyCode side-channel (see [`KeyCodeProbe`]). The app
@@ -498,7 +558,10 @@ impl TerminalView {
                 // A fresh launch gets a fresh overlay grace (re-armed next paint).
                 self.overlay.reset();
                 self.overlay_armed = false;
-                // The fresh shell spawns at the spec size; refit it to the window.
+                // The fresh shell spawns at the spec size; refit it to the window
+                // unconditionally (the guard would otherwise skip a fit equal to
+                // the OLD session's last push — but this is a NEW pty).
+                self.last_pty_fit = None;
                 self.resize_pty_to_fit(cx);
                 cx.notify();
             }
@@ -1140,10 +1203,17 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Take focus once (idempotent — `Window::focus` early-returns if this
-        // handle already holds it) so the caret's computed focus state is live
-        // without a stored flag. R13 will own focus routing across panes.
-        window.focus(&self.focus_handle, cx);
+        // Focus-once (M2 Item D): grab key focus on this view's FIRST render
+        // only, so a fresh pane starts focused without app wiring. The grab
+        // never recurs — an inline-rename field or context menu that takes
+        // focus keeps it (the pre-M2 per-frame grab yanked it back the next
+        // frame, killing rename typing). Later moves are explicit: the app's
+        // focus routing calls [`TerminalView::focus`], and a click on the view
+        // re-focuses it via gpui's tracked-focus mouse-down transfer.
+        if !self.focused_once {
+            self.focused_once = true;
+            window.focus(&self.focus_handle, cx);
+        }
 
         let caret_solid = self.focus_handle.is_focused(window) && window.is_window_active();
 
@@ -1196,6 +1266,7 @@ impl Render for TerminalView {
             caret_solid,
             ime,
             self.paint_bounds.clone(),
+            self.auto_refit,
         );
 
         div()

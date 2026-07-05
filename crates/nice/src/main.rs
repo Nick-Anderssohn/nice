@@ -35,6 +35,10 @@
 //!     affordance, typing is inert, and dismiss respawns a fresh shell.
 //!   * [`theme`] — the token → `gpui::Rgba` colour adapter shared by the R10/R11
 //!     chrome components.
+//!   * [`sf_symbols`] — runtime SF Symbol icons (M2 feel-check Item A): the
+//!     cached `NSImage(systemSymbolName:)` → tinted `RenderImage` pipeline the
+//!     R10/R11 chrome icons render through (Unicode stand-ins remain only as
+//!     fallbacks).
 //!   * [`status_dot`] — the R10 `StatusDot` component (per-status colour + the
 //!     ring/breathe pulse), reused by R11's toolbar pills.
 //!   * [`context_menu`] — the in-house context-menu popup (anchored + deferred +
@@ -46,7 +50,7 @@
 //!   * [`pane_strip_actions`] — the `PaneStripActions` pane select/close/add
 //!     seam the R11 toolbar drives (model-only; R13 rewires it too).
 //!   * [`sidebar_shell`] — the R10 sessions-mode sidebar: the shell layout
-//!     (floating card / collapsed cap / peek / resize) and the sidebar card
+//!     (floating card / collapsed full-width band / peek / resize) and the sidebar card
 //!     (project groups, tab rows, footer, mode/collapse toggles, multi-select
 //!     routing, inline rename, Esc collapse), driving the R8 model through the
 //!     `SidebarActions` seam.
@@ -99,6 +103,7 @@ mod pane_strip_live;
 mod platform;
 mod session_lifecycle;
 mod session_manager;
+mod sf_symbols;
 mod sidebar_actions;
 mod sidebar_live;
 mod sidebar_shell;

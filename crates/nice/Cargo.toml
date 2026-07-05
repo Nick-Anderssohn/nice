@@ -58,6 +58,11 @@ libc = "0.2"
 # own reader (same `core_foundation` versions it links — no new fetch).
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+# SF Symbol icons (`sf_symbols`): the tinted coverage masks are packed into
+# `image::Frame`s for `gpui::RenderImage` (gpui's own frame type). Same crate
+# version gpui links (already in the workspace lock) so the types unify; no
+# extra codecs pulled here — gpui enables its own feature set.
+image = { version = "0.25", default-features = false }
 
 [features]
 # Screenshot capture (Window::render_to_image), gated so it stays OUT of the

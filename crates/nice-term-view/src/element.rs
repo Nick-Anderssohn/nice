@@ -160,6 +160,10 @@ pub struct TerminalElement {
     /// against exactly what was painted. `Rc<Cell>` (not an entity re-borrow) so
     /// paint never re-enters the view — see [`crate::view::TerminalView`].
     paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Whether a change in the painted bounds schedules a pty grid refit on the
+    /// view (M2 Item E). Mirrors `TerminalView::auto_refit`; when false (the
+    /// fixed-grid scenario embeddings) paint only publishes the bounds.
+    auto_refit: bool,
 }
 
 /// Y (logical px) of the top of grid row 0 under the bottom-anchored layout (T4)
@@ -205,6 +209,7 @@ impl TerminalElement {
         caret_solid: bool,
         ime: ImeInput,
         paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        auto_refit: bool,
     ) -> Self {
         let default_bg = theme.background.to_u32();
         let foreground = theme.foreground.to_u32();
@@ -244,6 +249,7 @@ impl TerminalElement {
             metrics,
             ime,
             paint_bounds,
+            auto_refit,
         }
     }
 
@@ -262,12 +268,30 @@ impl TerminalElement {
             metrics,
             ime,
             paint_bounds,
+            auto_refit,
         } = self;
 
         // Publish this frame's grid bounds for the view's mouse hit-testing (read
         // on the next mouse event). Same `bounds` the IME anchor + `grid_top_y`
         // use, so a click resolves to the cell that was actually painted there.
-        paint_bounds.set(Some(bounds));
+        let prev_bounds = paint_bounds.replace(Some(bounds));
+
+        // M2 Item E — window resize → pty grid refit. When the painted bounds
+        // changed (a live window resize, a layout change, or the first paint),
+        // schedule the view's `resize_pty_to_fit` OUTSIDE this paint pass
+        // (`cx.defer`; updating the view entity mid-paint would re-enter it).
+        // The deferred refit reads the freshly-published `paint_bounds`, so it
+        // fits exactly what this frame painted; its `last_pty_fit` guard drops
+        // sub-cell bounds deltas and breaks the resize → SIGWINCH → repaint
+        // feedback loop (an unchanged-bounds repaint never even schedules).
+        // The T4 bottom-anchored `grid_top_y` math is untouched — once the grid
+        // tracks the view, only the sub-row remainder shows at the top.
+        if auto_refit && prev_bounds != Some(bounds) {
+            let view = ime.view.clone();
+            cx.defer(move |cx| {
+                view.update(cx, |view, cx| view.resize_pty_to_fit(cx));
+            });
+        }
 
         // Register the platform IME input handler for this frame (paint-phase
         // only, active while our focus handle holds focus) — the ime-spike's

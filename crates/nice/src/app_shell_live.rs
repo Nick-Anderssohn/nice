@@ -34,10 +34,16 @@
 //!    removes the active extra pane from the model, the active pane refocuses to a
 //!    surviving neighbor, and the pane host re-hosts that neighbor (the departed
 //!    pane's view is dissolved from the composition; the neighbor stays live).
+//!    Then two M2 feel-check behaviour gates ride the same window: **inline-rename
+//!    focus routing** (Item D — real typed keys land in the rename field, Return
+//!    commits + Escape cancels, and key focus returns to the active terminal each
+//!    time) and **window resize → pty grid refit** (Item E — a real vertical frame
+//!    resize re-fits the active pane's pty rows and restores them on un-resize).
 //! 5. **⌘B collapses / expands the card.** A real ⌘B CGEvent — the R12 shortcut table
 //!    binds *toggle-sidebar* to `cmd-b` (the plan's "⌘S" predates that table) —
-//!    collapses the card, and the shell's intended leading-column width shrinks
-//!    ~240 → ~124pt ([`SidebarShellView::scenario_leading_column_width`], which
+//!    collapses the card, and the shell's intended leading-column width drops
+//!    240 → 0 (the M2 collapsed design reserves no leading column — one
+//!    full-width band; [`SidebarShellView::scenario_leading_column_width`], which
 //!    re-derives that width from the collapse flag — not a laid-out `Bounds` read),
 //!    and a second ⌘B restores it.
 //! 6. **Teardown releases every session; the closed pane's pty is reaped.**
@@ -69,7 +75,7 @@ use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_term_view::TerminalSessionHandle;
 use nice_theme::chrome_geometry::SIDEBAR_DEFAULT_WIDTH;
 
-use crate::app_shell::{AppShellView, PANE_STRIP_ROOT_LABEL, SIDEBAR_ROOT_LABEL};
+use crate::app_shell::{AppShellView, PaneHostView, PANE_STRIP_ROOT_LABEL, SIDEBAR_ROOT_LABEL};
 use crate::platform;
 use crate::sidebar_shell::SidebarShellView;
 use crate::toolbar::WindowToolbarView;
@@ -83,6 +89,19 @@ const KC_T: u16 = 17;
 /// ⌘B — ToggleSidebar (`CGKeyCode` for `b`). The R12 table binds *toggle-sidebar*
 /// to `cmd-b`; the plan's "⌘S" for this step predates that binding table.
 const KC_B: u16 = 11;
+/// `x` — the bare printable typed into the inline-rename field (M2 Item D).
+const KC_X: u16 = 7;
+/// Return — commits an inline rename.
+const KC_RETURN: u16 = 36;
+/// Escape — cancels an inline rename (the `SidebarShell` Esc action).
+const KC_ESC: u16 = 53;
+
+/// Vertical shrink applied for the resize→refit check (pt). Big enough to lose
+/// several grid rows at any sane cell height.
+const RESIZE_DY: f64 = -160.0;
+/// Poll cap for the pty grid to refit after a window resize (the paint-driven
+/// defer → `resize_pty_to_fit` → `Session::resize` path, M2 Item E).
+const REFIT_POLLS: usize = 30;
 
 /// The macOS `AXRole` a `gpui::Role::Group` maps to (accesskit_macos →
 /// `NSAccessibilityGroupRole`), i.e. what the two anchors must expose as — the same
@@ -216,7 +235,17 @@ async fn run_app_shell(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>) -
     // 4. Closing the extra pane refocuses a neighbor (the pane host re-hosts it) —
     //    returns the closed pane's pty pid: the pane host drops its view on close, so
     //    that pty's only remaining ref is the SessionManager's, which teardown reaps.
-    let closed_pid = close_pane_checks(cx, &toolbar, &state, &main_tab, &mut failures).await;
+    let closed_pid =
+        close_pane_checks(cx, whandle, &toolbar, &state, &main_tab, &mut failures).await;
+
+    // 4.5 Inline-rename focus routing (M2 Item D): keys land in the rename
+    //     field, Enter commits + returns focus to the terminal, Escape cancels
+    //     the sidebar tab rename + returns focus.
+    rename_focus_checks(cx, whandle, &shell, &toolbar, &sidebar, &state, pid, &mut failures).await;
+
+    // 4.75 Window resize → pty grid refit (M2 Item E): a vertical window resize
+    //      re-fits the active pane's pty grid (rows track the window; cols hold).
+    resize_refit_checks(cx, whandle, &state, &main_tab, &mut failures).await;
 
     // 5. ⌘B collapses / expands the card (geometry read) — last, so the AX
     //    assertions above ran while the card (and its anchor) was expanded.
@@ -406,6 +435,7 @@ async fn strip_add_checks(
 
 async fn close_pane_checks(
     cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
     toolbar: &Entity<WindowToolbarView>,
     state: &Entity<WindowState>,
     tab: &str,
@@ -430,7 +460,9 @@ async fn close_pane_checks(
 
     // Close the active extra pane through the real pill-× path.
     let closed_c = closed.clone();
-    let _ = toolbar.update(cx, |v, cx| v.drive_close_pane(&closed_c, cx));
+    let _ = whandle.update(cx, |_root, window, app| {
+        toolbar.update(app, |v, cx| v.drive_close_pane(&closed_c, window, cx))
+    });
     settle(cx, 400).await;
 
     let pills_after = toolbar_pane_ids(cx, toolbar);
@@ -463,6 +495,329 @@ async fn close_pane_checks(
     closed_pid
 }
 
+// ---- 4.5 inline-rename focus routing (M2 Item D) ----------------------------
+
+/// Drives the SHIPPED rename paths with real CGEvent keys against the real key
+/// window:
+///
+/// * pill rename: `drive_begin_rename` (the gate-passed title-tap /
+///   context-menu entry path) → a typed `x` lands in the FIELD (not the pty) →
+///   Return commits the model title → key focus returns to the active terminal;
+/// * sidebar tab rename: `drive_begin_tab_rename` → typed `x` lands in the
+///   field → Escape (the `SidebarShell` Esc action) cancels, title unchanged →
+///   key focus returns to the active terminal.
+///
+/// Pre-M2 the terminal re-grabbed focus every frame, so the field lost focus the
+/// same frame it was focused and every key hit the pty — this check pins the
+/// focus-once + explicit-routing fix.
+async fn rename_focus_checks(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    shell: &Entity<AppShellView>,
+    toolbar: &Entity<WindowToolbarView>,
+    sidebar: &Entity<SidebarShellView>,
+    state: &Entity<WindowState>,
+    pid: i32,
+    failures: &mut Vec<String>,
+) {
+    rekey(cx, whandle).await;
+    let pane_host = shell.update(cx, |s, _| s.scenario_pane_host());
+    let Some(tab) = active_tab_id(cx, state) else {
+        failures.push("rename-focus: no active tab".to_string());
+        return;
+    };
+
+    // Baseline: the pane host routed key focus to the active terminal.
+    if active_terminal_focused(cx, whandle, &pane_host) != Some(true) {
+        failures.push(
+            "rename-focus: the active terminal does not hold key focus before the rename — \
+             activation focus routing (PaneHostView) is not working"
+                .to_string(),
+        );
+        return;
+    }
+
+    // --- pill rename: type + Enter-commit + refocus ---
+    let _ = whandle.update(cx, |_r, window, app| {
+        toolbar.update(app, |v, cx| v.drive_begin_rename(window, cx))
+    });
+    settle(cx, 200).await;
+    let (editing, field_focused) = whandle
+        .update(cx, |_r, window, app| {
+            toolbar.update(app, |v, _| {
+                (v.scenario_rename_editing(), v.scenario_rename_focused(window))
+            })
+        })
+        .unwrap_or((false, false));
+    if !editing || !field_focused {
+        failures.push(format!(
+            "rename-focus: after begin-rename the pill field is editing={editing} focused={field_focused} \
+             (expected both true — the terminal must not steal focus back)"
+        ));
+        return;
+    }
+
+    let draft_before = toolbar.update(cx, |v, _| v.scenario_rename_draft());
+    tap(cx, pid, KC_X, 0).await;
+    let draft_after = toolbar.update(cx, |v, _| v.scenario_rename_draft());
+    if draft_after != format!("{draft_before}x") {
+        failures.push(format!(
+            "rename-focus: typed 'x' but the draft went '{draft_before}' → '{draft_after}' — the key \
+             did not land in the rename field (did it reach the pty instead?)"
+        ));
+    }
+
+    tap(cx, pid, KC_RETURN, 0).await;
+    settle(cx, 200).await;
+    if toolbar.update(cx, |v, _| v.scenario_rename_editing()) {
+        failures.push("rename-focus: Return did not commit the pill rename".to_string());
+    }
+    let committed = state.update(cx, |s, _| {
+        s.model.tab_for(&tab).and_then(|t| {
+            let pid = t.active_pane_id.as_deref()?;
+            t.panes.iter().find(|p| p.id == pid).map(|p| p.title.clone())
+        })
+    });
+    if committed.as_deref() != Some(draft_after.as_str()) {
+        failures.push(format!(
+            "rename-focus: committed title is {committed:?}, expected '{draft_after}'"
+        ));
+    }
+    if active_terminal_focused(cx, whandle, &pane_host) != Some(true) {
+        failures.push(
+            "rename-focus: key focus did not return to the active terminal after the Enter commit"
+                .to_string(),
+        );
+    } else {
+        eprintln!(
+            "[selftest] app-shell rename-focus: pill rename — typed key landed in the field, \
+             Return committed '{draft_after}', focus returned to the terminal"
+        );
+    }
+
+    // --- pill rename: Escape-cancel + refocus (the toolbar's own owner
+    //     binding — the sidebar's Esc is the shell action, tested below) ---
+    let title_before = state.update(cx, |s, _| {
+        s.model.tab_for(&tab).and_then(|t| {
+            let pid = t.active_pane_id.as_deref()?;
+            t.panes.iter().find(|p| p.id == pid).map(|p| p.title.clone())
+        })
+    });
+    let _ = whandle.update(cx, |_r, window, app| {
+        toolbar.update(app, |v, cx| v.drive_begin_rename(window, cx))
+    });
+    settle(cx, 200).await;
+    tap(cx, pid, KC_X, 0).await;
+    tap(cx, pid, KC_ESC, 0).await;
+    settle(cx, 200).await;
+    if toolbar.update(cx, |v, _| v.scenario_rename_editing()) {
+        failures.push("rename-focus: Escape did not cancel the pill rename".to_string());
+    }
+    let title_now = state.update(cx, |s, _| {
+        s.model.tab_for(&tab).and_then(|t| {
+            let pid = t.active_pane_id.as_deref()?;
+            t.panes.iter().find(|p| p.id == pid).map(|p| p.title.clone())
+        })
+    });
+    if title_now != title_before {
+        failures.push(format!(
+            "rename-focus: pill Escape cancel changed the title {title_before:?} → {title_now:?}"
+        ));
+    }
+    if active_terminal_focused(cx, whandle, &pane_host) != Some(true) {
+        failures.push(
+            "rename-focus: key focus did not return to the terminal after the pill Escape cancel"
+                .to_string(),
+        );
+    } else {
+        eprintln!(
+            "[selftest] app-shell rename-focus: pill rename — Escape cancelled (title unchanged), \
+             focus returned to the terminal"
+        );
+    }
+
+    // --- sidebar tab rename: type + Escape-cancel + refocus ---
+    let title_before = state.update(cx, |s, _| s.model.tab_for(&tab).map(|t| t.title.clone()));
+    let _ = whandle.update(cx, |_r, window, app| {
+        sidebar.update(app, |v, cx| v.drive_begin_tab_rename(window, cx))
+    });
+    settle(cx, 200).await;
+    let (editing, field_focused) = whandle
+        .update(cx, |_r, window, app| {
+            sidebar.update(app, |v, _| {
+                (v.scenario_tab_rename_editing(), v.scenario_tab_rename_focused(window))
+            })
+        })
+        .unwrap_or((false, false));
+    if !editing || !field_focused {
+        failures.push(format!(
+            "rename-focus: after begin-tab-rename the sidebar field is editing={editing} \
+             focused={field_focused} (expected both true)"
+        ));
+        return;
+    }
+    let draft_before = sidebar.update(cx, |v, _| v.scenario_tab_rename_draft());
+    tap(cx, pid, KC_X, 0).await;
+    let draft_after = sidebar.update(cx, |v, _| v.scenario_tab_rename_draft());
+    if draft_after != format!("{draft_before}x") {
+        failures.push(format!(
+            "rename-focus: typed 'x' but the tab-rename draft went '{draft_before}' → '{draft_after}'"
+        ));
+    }
+    tap(cx, pid, KC_ESC, 0).await;
+    settle(cx, 200).await;
+    if sidebar.update(cx, |v, _| v.scenario_tab_rename_editing()) {
+        failures.push(
+            "rename-focus: Escape did not cancel the sidebar tab rename (is the SidebarShell Esc \
+             binding installed?)"
+                .to_string(),
+        );
+    }
+    let title_after = state.update(cx, |s, _| s.model.tab_for(&tab).map(|t| t.title.clone()));
+    if title_after != title_before {
+        failures.push(format!(
+            "rename-focus: Escape cancel changed the tab title {title_before:?} → {title_after:?}"
+        ));
+    }
+    if active_terminal_focused(cx, whandle, &pane_host) != Some(true) {
+        failures.push(
+            "rename-focus: key focus did not return to the active terminal after the Escape cancel"
+                .to_string(),
+        );
+    } else {
+        eprintln!(
+            "[selftest] app-shell rename-focus: sidebar tab rename — typed key landed in the field, \
+             Escape cancelled (title unchanged), focus returned to the terminal"
+        );
+    }
+}
+
+/// Whether the pane host's active terminal holds key focus right now.
+fn active_terminal_focused(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    pane_host: &Entity<PaneHostView>,
+) -> Option<bool> {
+    whandle
+        .update(cx, |_r, window, app| {
+            pane_host
+                .read(app)
+                .active_terminal_focus_handle(app)
+                .map(|fh| fh.is_focused(window))
+        })
+        .ok()
+        .flatten()
+}
+
+// ---- 4.75 window resize → pty grid refit (M2 Item E) ------------------------
+
+/// Shrinks the shipped window 160pt vertically and asserts the ACTIVE pane's
+/// pty grid loses rows (cols hold — the width didn't change), then restores the
+/// frame and asserts the rows come back. This pins the paint-driven refit
+/// wiring (`TerminalElement` bounds delta → deferred `resize_pty_to_fit` →
+/// `Session::resize` → TIOCSWINSZ/SIGWINCH); pre-M2 the grid stayed at its
+/// spawn size forever.
+async fn resize_refit_checks(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    state: &Entity<WindowState>,
+    tab: &str,
+    failures: &mut Vec<String>,
+) {
+    // The raw content-view pointer: the resize must be issued OUTSIDE any gpui
+    // update (no App borrow outstanding) or gpui never processes the new
+    // viewport on this pin — see `platform::resize_window_by`'s note. The
+    // CGEvent posts follow the same pattern.
+    let Some(ns_view) = whandle
+        .update(cx, |_r, w, _a| platform::ns_view_of(w) as usize)
+        .ok()
+        .filter(|p| *p != 0)
+    else {
+        failures.push("resize-refit: could not resolve the window's NSView".to_string());
+        return;
+    };
+    let Some(pane) = state.update(cx, |s, _| {
+        s.model.tab_for(tab).and_then(|t| t.active_pane_id.clone())
+    }) else {
+        failures.push("resize-refit: no active pane".to_string());
+        return;
+    };
+    let Some(handle) = pane_handle(cx, state, tab, &pane) else {
+        failures.push("resize-refit: the active pane has no live session".to_string());
+        return;
+    };
+    let dims = |cx: &mut AsyncApp, h: &Entity<TerminalSessionHandle>| {
+        h.update(cx, |h, _| h.session().dimensions())
+    };
+    let Some((rows0, cols0)) = dims(cx, &handle) else {
+        failures.push("resize-refit: the active pane's pty has no dimensions".to_string());
+        return;
+    };
+
+    // Shrink 160pt vertically → the bottom-anchored grid must LOSE rows. Each
+    // poll forces a fresh frame (a `WindowState` notify → the shell re-renders →
+    // the frontmost window presents — the same nudge the AX poll uses): the
+    // refit trigger is paint-driven, and a programmatic `setFrame` on this
+    // otherwise-idle, non-RAF window does not by itself present a frame (an
+    // interactive user resize paints continuously, so the live app needs no
+    // such nudge).
+    platform::resize_window_ptr_by(ns_view, 0.0, RESIZE_DY);
+    let mut shrunk: Option<(u16, u16)> = None;
+    for _ in 0..REFIT_POLLS {
+        let _ = state.update(cx, |_s, cx| cx.notify());
+        settle(cx, POLL_MS).await;
+        if let Some((r, c)) = dims(cx, &handle) {
+            if r < rows0 {
+                shrunk = Some((r, c));
+                break;
+            }
+        }
+    }
+    match shrunk {
+        Some((r, c)) => {
+            if c != cols0 {
+                failures.push(format!(
+                    "resize-refit: a pure vertical shrink changed cols {cols0}→{c} (rows {rows0}→{r})"
+                ));
+            } else {
+                eprintln!(
+                    "[selftest] app-shell resize-refit: 160pt vertical shrink refit the pty \
+                     {rows0}×{cols0} → {r}×{c}"
+                );
+            }
+        }
+        None => {
+            failures.push(format!(
+                "resize-refit: pty grid stayed {rows0}×{cols0} after a 160pt vertical shrink — \
+                 the resize→refit wiring (M2 Item E) did not fire"
+            ));
+            // Still restore the frame below so later checks see the original size.
+        }
+    }
+
+    // Restore the frame → the rows must come back to the original fit (same
+    // per-poll repaint nudge as the shrink leg).
+    platform::resize_window_ptr_by(ns_view, 0.0, -RESIZE_DY);
+    let mut restored = false;
+    for _ in 0..REFIT_POLLS {
+        let _ = state.update(cx, |_s, cx| cx.notify());
+        settle(cx, POLL_MS).await;
+        if dims(cx, &handle) == Some((rows0, cols0)) {
+            restored = true;
+            break;
+        }
+    }
+    if restored {
+        eprintln!("[selftest] app-shell resize-refit: frame restored, pty refit back to {rows0}×{cols0}");
+    } else {
+        failures.push(format!(
+            "resize-refit: after restoring the frame the pty did not return to {rows0}×{cols0} \
+             (got {:?})",
+            dims(cx, &handle)
+        ));
+    }
+}
+
 // ---- 5. ⌘B collapses / expands the card (geometry read) --------------------
 
 async fn cmd_b_checks(
@@ -493,9 +848,10 @@ async fn cmd_b_checks(
         failures.push(
             "⌘B: the card did not collapse — the toggle-sidebar chord did not reach the shipped shell (or nothing re-rendered)".to_string(),
         );
-    } else if !(width1 + GEOM_EPS < width0) {
+    } else if width1.abs() > GEOM_EPS {
         failures.push(format!(
-            "⌘B: collapsed flag set but the intended leading-column width did not shrink ({width0:.1}→{width1:.1}pt)"
+            "⌘B: collapsed flag set but the intended leading-column width is {width1:.1}pt — the M2 \
+             collapsed design reserves NO leading column (expected 0)"
         ));
     } else {
         eprintln!("[selftest] app-shell ⌘B: card collapsed, leading column {width0:.1}→{width1:.1}pt");
@@ -658,9 +1014,11 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             stats: IntervalStats::default(),
             detail: "app-shell OK (through the shipped builder): both AX anchors exposed as AXGroup, \
                      ⌘T added a visible pill + switched pane content, the strip + spawned a real pty \
-                     whose output rendered, closing the extra pane refocused a live neighbor, ⌘B \
-                     collapsed + expanded the card (geometry read), and teardown released every \
-                     session + reaped the closed pane's pty (still-hosted panes reap on window \
+                     whose output rendered, closing the extra pane refocused a live neighbor, inline \
+                     rename routed real keys to the field (Return committed / Escape cancelled, focus \
+                     returned to the terminal both times), a real vertical resize refit the pty grid \
+                     and back, ⌘B collapsed + expanded the card (geometry read), and teardown released \
+                     every session + reaped the closed pane's pty (still-hosted panes reap on window \
                      close — external ps sweep)."
                 .to_string(),
         }

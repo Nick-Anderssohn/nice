@@ -1,7 +1,7 @@
 //! `sidebar` self-test scenario — the R10 sessions-mode sidebar LIVE gate
 //! (Validation §3–§4), the sibling of [`crate::chrome_live`]: it mounts the real
 //! [`SidebarShellView`] on a real, frontmost NSWindow and ground-truths its
-//! geometry + resize + collapse cap against AppKit reads, driving the
+//! geometry + resize + collapsed band against AppKit reads, driving the
 //! synthetic-gesture halves with **real CGEvents**.
 //!
 //! It posts real CGEvents (mouse down / drag / up / double-click) to nice-rs's
@@ -16,12 +16,14 @@
 //!     invisible zone a synthetic press may miss, an unregistered drag is a
 //!     **DEFERRED HUMAN PASS**, not a fail (the same honest-deferral
 //!     `chrome_live` uses for effects a synthetic CGEvent provably can't drive).
-//!   * **§3 collapse cap geometry** — collapsing brings up the cap; its reserve
-//!     clears the LIVE zoom button's trailing edge and the restore button's rect
+//!   * **§3 collapsed band geometry** — collapsing removes the leading column
+//!     entirely (the M2 design: no cap card; `scenario_leading_column_width`
+//!     reports 0). In the full-width band, the 82pt traffic-light spacer clears
+//!     the LIVE zoom button's trailing edge and the bare restore button's rect
 //!     has zero x-overlap with any traffic light (drift assertions over R9's
-//!     [`standard_window_button_frames`]), the R9 close-x / y-26 / equal-pitch
-//!     geometry is **re-asserted** (the BUG-B stale-capture guard), and the cap
-//!     width equals the lights reserve + 42. Restoring returns the column.
+//!     [`standard_window_button_frames`]), and the R9 close-x / y-26 /
+//!     equal-pitch geometry is **re-asserted** (the BUG-B stale-capture guard).
+//!     Restoring returns the column.
 //!   * **§3 drag differential** — a CGEvent press-drag on the sidebar top strip
 //!     (R9 band pattern) vs the same drag inside the card body (a tab-row
 //!     region), judged by real NSWindow frame reads: the strip drag moves the
@@ -48,8 +50,8 @@ use gpui::{prelude::*, AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_model::{Pane, PaneKind, Tab, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
-    traffic_light_reserved_width, CARD_INSET, COLLAPSED_CAP_TRAILING_WIDTH, SIDEBAR_DEFAULT_WIDTH,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, TRAFFIC_LIGHT_CENTER_FROM_TOP,
+    traffic_light_reserved_width, CARD_INSET, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH, TRAFFIC_LIGHT_CENTER_FROM_TOP,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette};
@@ -74,8 +76,8 @@ const PITCH_TOL: f32 = 0.6;
 /// Tolerance (pt) for a width-clamp / reset assertion (`clamp` is exact; this
 /// only absorbs the CGEvent content↔global round-trip).
 const WIDTH_TOL: f32 = 1.0;
-/// The restore button's diameter (pt) inside the collapsed cap — the 24pt icon
-/// button `SidebarShellView::icon_button` mints (`sidebar_shell.rs`).
+/// The restore button's diameter (pt) in the collapsed full-width band — the
+/// 24pt icon button `SidebarShellView::icon_button` mints (`sidebar_shell.rs`).
 const RESTORE_BUTTON_W: f32 = 24.0;
 /// A resize drag distance (pt) large enough to force the clamp from any start in
 /// [160, 480] (min−max span is 320, so ±400 always overshoots the bound).
@@ -214,8 +216,9 @@ async fn run_sidebar(cx: &mut AsyncApp, whandle: WindowHandle<SidebarShellView>)
     // §3 — the drag differential (strip moves the window; body drag does not).
     drag_differential(cx, whandle, pid, &mut failures, &mut deferred).await;
 
-    // §3 — collapse cap geometry (drift assertions + R9 re-assert), then restore.
-    collapse_cap_checks(cx, whandle, &view, &mut failures).await;
+    // §3 — collapsed band geometry (no leading column + drift assertions + R9
+    // re-assert), then restore.
+    collapse_checks(cx, whandle, &view, &mut failures).await;
     restore_check(cx, &view, &mut failures).await;
 
     // §4 — dot colour + pulse per state (state-level, off the view's predicates).
@@ -329,10 +332,10 @@ async fn resize_checks(
     if (w_low - w0).abs() <= WIDTH_TOL {
         // The 6pt handle press did not register — a synthetic-event limitation,
         // not a shell bug. Defer the whole resize section; the expanded-width and
-        // collapse-cap geometry were / are still hard-asserted.
+        // collapsed-band geometry were / are still hard-asserted.
         deferred.push(
             "resize: the CGEvent press did not land on the 6pt resize handle (width unchanged) — \
-             DEFERRED to a human drag. The expanded default width and the collapse-cap geometry \
+             DEFERRED to a human drag. The expanded default width and the collapsed-band geometry \
              were still hard-asserted."
                 .to_string(),
         );
@@ -521,9 +524,9 @@ async fn do_cg_drag(
     platform::post_left_mouse_up(pid, gx + DRAG_DX, gy, 1);
 }
 
-// ---- §3 collapse cap geometry + restore ------------------------------------
+// ---- §3 collapsed band geometry + restore -----------------------------------
 
-async fn collapse_cap_checks(
+async fn collapse_checks(
     cx: &mut AsyncApp,
     whandle: WindowHandle<SidebarShellView>,
     view: &Entity<SidebarShellView>,
@@ -536,56 +539,60 @@ async fn collapse_cap_checks(
         return;
     }
 
+    // M2 Item B pin: the collapsed shell reserves NO leading column — the old
+    // floating cap card is gone, replaced by one full-width title-bar band.
+    let lead = view.update(cx, |v, cx| v.scenario_leading_column_width(cx));
+    if lead != 0.0 {
+        failures.push(format!(
+            "collapse: leading column width {lead:.1} while collapsed — the M2 design renders a \
+             full-width band with no reserved column (expected 0)"
+        ));
+    } else {
+        eprintln!("[selftest] sidebar collapse: no leading column (full-width band; the cap card is gone)");
+    }
+
     // The native buttons survive the collapse untouched — re-assert R9 geometry
     // (the BUG-B stale-capture guard).
     let Some(frames) = read_button_frames(cx, whandle) else {
-        failures.push("collapse cap: standard_window_button_frames returned None".to_string());
+        failures.push("collapse: standard_window_button_frames returned None".to_string());
         return;
     };
     match check_geometry(&frames) {
-        Ok(d) => eprintln!("[selftest] sidebar cap geometry (R9 re-assert): {d}"),
-        Err(e) => failures.push(format!("collapse cap geometry: {e}")),
+        Ok(d) => eprintln!("[selftest] sidebar collapsed-band geometry (R9 re-assert): {d}"),
+        Err(e) => failures.push(format!("collapse band geometry: {e}")),
     }
 
-    // The cap's leading reserve (content x [CARD_INSET, CARD_INSET + reserve]) must
-    // clear the LIVE zoom button's trailing edge, and the restore button — which
-    // begins right after the reserve — must have zero x-overlap with any light.
+    // The band's 82pt traffic-light spacer must clear the LIVE zoom button's
+    // trailing edge, and the bare restore button — which sits immediately
+    // after the spacer, so its rect starts at content x = the reserve — must
+    // have zero x-overlap with any light.
     let reserve = traffic_light_reserved_width();
-    let reserve_trailing = CARD_INSET + reserve;
-    let restore_x_min = reserve_trailing;
+    let restore_x_min = reserve;
     let restore_x_max = restore_x_min + RESTORE_BUTTON_W;
 
     let [close, mini, zoom] = &frames;
     let zoom_trailing = zoom.x + zoom.width;
-    if reserve_trailing + GEOMETRY_TOL < zoom_trailing {
+    if reserve + GEOMETRY_TOL < zoom_trailing {
         failures.push(format!(
-            "collapse cap: reserve trailing edge {reserve_trailing:.1} does not clear the live zoom \
-             button trailing edge {zoom_trailing:.1} — the cap would clip the zoom button"
+            "collapse band: the {reserve:.1}pt traffic-light spacer does not clear the live zoom \
+             button trailing edge {zoom_trailing:.1} — the restore button would sit over the lights"
         ));
     } else {
-        eprintln!("[selftest] sidebar cap reserve {reserve_trailing:.1}pt clears the live zoom trailing edge {zoom_trailing:.1}pt");
+        eprintln!("[selftest] sidebar band spacer {reserve:.1}pt clears the live zoom trailing edge {zoom_trailing:.1}pt");
     }
     for (name, f) in [("close", close), ("minimize", mini), ("zoom", zoom)] {
         let light_trailing = f.x + f.width;
         if restore_x_min + GEOMETRY_TOL < light_trailing {
             failures.push(format!(
-                "collapse cap: restore button rect [{restore_x_min:.1},{restore_x_max:.1}] overlaps \
+                "collapse band: restore button rect [{restore_x_min:.1},{restore_x_max:.1}] overlaps \
                  the {name} light [{:.1},{light_trailing:.1}] (must have zero overlap)",
                 f.x
             ));
         }
     }
     eprintln!(
-        "[selftest] sidebar cap: restore button at x≥{restore_x_min:.1}pt, zero overlap with the traffic lights"
+        "[selftest] sidebar collapse: restore button at x≥{restore_x_min:.1}pt, zero overlap with the traffic lights"
     );
-
-    // Cap width = lights reserve + 42 (documentary — the shipped constant).
-    let cap_width = reserve + COLLAPSED_CAP_TRAILING_WIDTH;
-    if (cap_width - 124.0).abs() > 0.01 {
-        failures.push(format!(
-            "collapse cap width: reserve + trailing = {cap_width:.1}, expected 124 (82 reserve + 42)"
-        ));
-    }
 }
 
 async fn restore_check(
@@ -667,11 +674,11 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: format!(
-                "all hard sidebar assertions passed (expanded width, collapse-cap geometry + R9 \
-                 re-assert + reserve/overlap drift guards, restore, card-body drag no-move, dot \
-                 colour/pulse per state); the resize clamps + double-click reset and the strip \
-                 window-move hard-assert when the synthetic gesture drives the real behaviour, \
-                 else DEFER; {} item(s) DEFERRED to a human pass",
+                "all hard sidebar assertions passed (expanded width, collapsed band: no leading \
+                 column + R9 re-assert + spacer/overlap drift guards, restore, card-body drag \
+                 no-move, dot colour/pulse per state); the resize clamps + double-click reset and \
+                 the strip window-move hard-assert when the synthetic gesture drives the real \
+                 behaviour, else DEFER; {} item(s) DEFERRED to a human pass",
                 deferred.len()
             ),
         }

@@ -281,6 +281,228 @@ pub fn standard_window_button_frames(window: &Window) -> Option<[WindowButtonFra
 }
 
 // ===========================================================================
+// M2 feel-check Item A — SF Symbol rasterization.
+//
+// GPUI has no SF Symbol renderer, so the app's icons rasterize
+// `NSImage(systemSymbolName:)` through AppKit at runtime (pixel parity with
+// Swift Nice, no bundled assets). This is the foreign half: resolve the
+// symbol, apply an `NSImageSymbolConfiguration` (point size + weight), and
+// draw it into a CoreGraphics bitmap at the window's backing scale, returning
+// the straight coverage mask. The Rust half (`crate::sf_symbols`) tints that
+// mask into a gpui `RenderImage` and caches it — keeping every objc2/CG
+// crossing in this one module (all-Rust rule).
+// ===========================================================================
+
+// AppKit `NSFontWeight` constants (each an extern `CGFloat` global). Linked
+// rather than hardcoded so the exact platform values feed
+// `NSImageSymbolConfiguration` — the same weights Swift's
+// `.font(.system(size:weight:))` resolves.
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    static NSFontWeightRegular: f64;
+    static NSFontWeightSemibold: f64;
+}
+
+/// AppKit's `NSFontWeightRegular` (CGFloat).
+pub fn ns_font_weight_regular() -> f64 {
+    // SAFETY: reading an extern AppKit CGFloat constant.
+    unsafe { NSFontWeightRegular }
+}
+
+/// AppKit's `NSFontWeightSemibold`.
+pub fn ns_font_weight_semibold() -> f64 {
+    // SAFETY: reading an extern AppKit CGFloat constant.
+    unsafe { NSFontWeightSemibold }
+}
+
+// CoreGraphics bitmap-context FFI for the symbol rasterizer (hand-declared in
+// the raw style this module already uses for CGEvent).
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    fn CGColorSpaceRelease(space: *mut c_void);
+    fn CGBitmapContextCreate(
+        data: *mut c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: *mut c_void,
+        bitmap_info: u32,
+    ) -> *mut c_void;
+    fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
+    fn CGBitmapContextGetBytesPerRow(ctx: *mut c_void) -> usize;
+    fn CGContextRelease(ctx: *mut c_void);
+    fn CGContextScaleCTM(ctx: *mut c_void, sx: f64, sy: f64);
+}
+
+/// `kCGImageAlphaPremultipliedLast` — RGBA with premultiplied alpha, the only
+/// 32-bit-with-alpha layout CGBitmapContext supports for drawing. Only the
+/// alpha channel is read back (a coverage mask), so the premultiplication of
+/// the colour channels never matters.
+const CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+/// Opaque `CGContext` used ONLY to give the
+/// `graphicsContextWithCGContext:flipped:` argument the Objective-C type
+/// encoding AppKit declares (`^{CGContext=}`): objc2's `msg_send!` verifies
+/// encodings in debug builds and rejects a bare `*mut c_void` (`^v`) there.
+#[repr(C)]
+struct OpaqueCGContext {
+    _priv: [u8; 0],
+}
+
+// SAFETY: `*mut OpaqueCGContext` encodes as `^{CGContext=}`, exactly the
+// `CGContextRef` encoding the AppKit method declares.
+unsafe impl objc2::RefEncode for OpaqueCGContext {
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGContext", &[]));
+}
+
+/// `NSCompositingOperationSourceOver`.
+const NS_COMPOSITING_SOURCE_OVER: u64 = 2;
+
+/// One rasterized SF Symbol: a straight (non-premultiplied) per-pixel coverage
+/// mask, row-major, top row first, one byte per device pixel.
+pub struct SymbolBitmap {
+    /// Coverage (0 transparent … 255 fully inked), `px_width * px_height` bytes.
+    pub coverage: Vec<u8>,
+    /// Bitmap width in device pixels (`ceil(point width × scale)`).
+    pub px_width: usize,
+    /// Bitmap height in device pixels.
+    pub px_height: usize,
+}
+
+/// Rasterize the SF Symbol `name` at `point_size` / `ns_weight` (an AppKit
+/// `NSFontWeight`, see the accessors above) into a coverage mask at `scale`
+/// device pixels per point (the window's backing scale). `None` when the
+/// symbol name does not resolve on this OS, or any AppKit/CG step fails —
+/// callers fall back to the Unicode stand-in glyph so nothing goes blank.
+///
+/// # Threading
+/// Main thread only, with an active autorelease pool (every caller is a gpui
+/// render pass, which satisfies both — same contract as the geometry readers
+/// above).
+pub fn rasterize_sf_symbol(
+    name: &str,
+    point_size: f32,
+    ns_weight: f64,
+    scale: f32,
+) -> Option<SymbolBitmap> {
+    // SAFETY: class methods on NSImage / NSImageSymbolConfiguration /
+    // NSGraphicsContext return autoreleased objects (get rule — nothing to
+    // release); the CG colour space / bitmap context are +1 handles released
+    // below. Drawing happens inside a saved/restored NSGraphicsContext scope on
+    // the main thread. The bitmap data pointer is owned by the context and read
+    // before the context is released.
+    unsafe {
+        let ns_name = ns_string(name);
+        let base: *mut AnyObject = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: ns_name,
+            accessibilityDescription: std::ptr::null_mut::<AnyObject>()
+        ];
+        if base.is_null() {
+            return None;
+        }
+        // Point size + weight (the palette tint is applied by the Rust half —
+        // the coverage mask is colour-independent).
+        let config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: point_size as f64,
+            weight: ns_weight
+        ];
+        let image: *mut AnyObject = if config.is_null() {
+            base
+        } else {
+            let configured: *mut AnyObject = msg_send![base, imageWithSymbolConfiguration: config];
+            if configured.is_null() {
+                base
+            } else {
+                configured
+            }
+        };
+
+        let size: NSSize = msg_send![image, size];
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return None;
+        }
+        let scale = f64::from(scale.max(1.0));
+        let px_width = (size.width * scale).ceil() as usize;
+        let px_height = (size.height * scale).ceil() as usize;
+        if px_width == 0 || px_height == 0 {
+            return None;
+        }
+
+        let space = CGColorSpaceCreateDeviceRGB();
+        let ctx = CGBitmapContextCreate(
+            std::ptr::null_mut(),
+            px_width,
+            px_height,
+            8,
+            px_width * 4,
+            space,
+            CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            return None;
+        }
+        // Draw in point coordinates; the CTM maps them onto the device-pixel
+        // bitmap.
+        CGContextScaleCTM(ctx, scale, scale);
+
+        let _: () = msg_send![class!(NSGraphicsContext), saveGraphicsState];
+        let gctx: *mut AnyObject = msg_send![
+            class!(NSGraphicsContext),
+            graphicsContextWithCGContext: ctx as *mut OpaqueCGContext,
+            flipped: false
+        ];
+        let _: () = msg_send![class!(NSGraphicsContext), setCurrentContext: gctx];
+        let rect = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size,
+        };
+        let zero = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        let _: () = msg_send![
+            image,
+            drawInRect: rect,
+            fromRect: zero,
+            operation: NS_COMPOSITING_SOURCE_OVER,
+            fraction: 1.0f64
+        ];
+        let _: () = msg_send![class!(NSGraphicsContext), restoreGraphicsState];
+
+        let data = CGBitmapContextGetData(ctx) as *const u8;
+        if data.is_null() {
+            CGContextRelease(ctx);
+            return None;
+        }
+        let row_bytes = CGBitmapContextGetBytesPerRow(ctx);
+        // Bitmap-context memory is top row first (pixel (0,0) of the buffer is
+        // the visual top-left), so a straight row walk yields a top-down mask.
+        let mut coverage = vec![0u8; px_width * px_height];
+        for y in 0..px_height {
+            for x in 0..px_width {
+                coverage[y * px_width + x] = *data.add(y * row_bytes + x * 4 + 3);
+            }
+        }
+        CGContextRelease(ctx);
+
+        Some(SymbolBitmap {
+            coverage,
+            px_width,
+            px_height,
+        })
+    }
+}
+
+// ===========================================================================
 // R7 drag-drop — raw-image pasteboard fallback.
 //
 // gpui's macOS backend registers only `NSFilenamesPboardType` for drags, so a
@@ -1093,8 +1315,27 @@ pub fn set_window_frame(window: &Window, frame: [f64; 4]) {
 /// (no animation), leaving the origin fixed. Used only to FIRE gpui's resize
 /// handler for the BUG-B "traffic lights survive a resize" re-assert; pair with a
 /// restoring call (`-dw, -dh`).
+///
+/// NOTE (verified on this pin): calling this from INSIDE a `window.update`
+/// closure resizes the NSWindow, but gpui never processes the new viewport —
+/// the synchronous AppKit resize callback cannot re-enter the already-borrowed
+/// App, and the notification is dropped, so gpui keeps laying out at the stale
+/// size (the chrome BUG-B re-assert doesn't care: its traffic-light re-apply is
+/// platform-side). A scenario that needs gpui to SEE the resize (the M2 Item E
+/// refit check) must capture the view pointer first and call
+/// [`resize_window_ptr_by`] from its task with no App borrow outstanding — the
+/// same pattern as the CGEvent posts.
 pub fn resize_window_by(window: &Window, dw: f64, dh: f64) {
-    let ns_view = ns_view_of(window);
+    resize_window_ptr_by(ns_view_of(window) as usize, dw, dh);
+}
+
+/// [`resize_window_by`] over a raw content-`NSView` pointer (captured via
+/// [`ns_view_of`] inside an earlier `window.update`), callable from a scenario
+/// task with NO gpui App borrow outstanding so the synchronous AppKit resize
+/// callback can re-enter gpui and update its viewport. Main-thread only; the
+/// pointer must belong to a still-open window.
+pub fn resize_window_ptr_by(ns_view: usize, dw: f64, dh: f64) {
+    let ns_view = ns_view as *mut c_void;
     if ns_view.is_null() {
         return;
     }

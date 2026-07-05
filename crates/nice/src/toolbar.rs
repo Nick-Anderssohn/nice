@@ -71,9 +71,10 @@ use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 use nice_theme::AccentPreset;
 
-use crate::app_shell::PANE_STRIP_ROOT_LABEL;
+use crate::app_shell::{PaneHostView, PANE_STRIP_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
+use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::window_state::WindowState;
@@ -157,18 +158,32 @@ const SQUARE_BTN_HOVER_INK_ALPHA: f32 = 0.08;
 /// Active-pill drop shadow (`WindowToolbarView.swift:787-792`).
 const PILL_SHADOW_ALPHA: f32 = 0.04;
 
-// ---- Icon glyphs (Unicode stand-ins — GPUI has no SF Symbol renderer, exactly
-// like the R10 sidebar's header/footer glyphs; these are cosmetic) -------------
+// ---- Icons (SF Symbols + Unicode fallbacks / stand-ins) ----------------------
+//
+// The pill/chevron/plus/close icons are real SF Symbols rendered through
+// `crate::sf_symbols` (M2 feel-check Item A); each ICON_* glyph remains as the
+// never-blank fallback. The overflow-menu rows keep their glyph stand-ins (the
+// pinned `ContextMenu` is plain-label), and the logo mark keeps the `❯`
+// stand-in (Swift's custom SVG mark stays out of scope this cycle).
 
-const ICON_TERMINAL: &str = "\u{276F}"; // ❯  (SF "terminal")
-const ICON_CLOSE: &str = "\u{2715}"; // ✕  (SF "xmark")
-const ICON_CHEVRON_DOWN: &str = "\u{25BE}"; // ▾  (SF "chevron.down")
-const ICON_PLUS: &str = "+"; // SF "plus"
-const ICON_CHECK: &str = "\u{2713}"; // ✓  (SF "checkmark")
+const ICON_TERMINAL: &str = "\u{276F}"; // ❯  fallback for SF_TERMINAL + menu rows
+const ICON_CLOSE: &str = "\u{2715}"; // ✕  fallback for SF_CLOSE
+const ICON_CHEVRON_DOWN: &str = "\u{25BE}"; // ▾  fallback for SF_CHEVRON_DOWN
+const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
+const ICON_CHECK: &str = "\u{2713}"; // ✓  (menu-row stand-in, SF "checkmark")
 const ICON_CLAUDE_DOT: &str = "\u{25CF}"; // ●  (menu-row stand-in for the StatusDot)
 /// The white brand mark inside the accent square — a stand-in for the SVG
 /// chevron+underline in `Logo.swift` (no SVG asset pipeline this cycle).
 const ICON_LOGO_MARK: &str = "\u{276F}"; // ❯
+
+/// Pill leading icon (`WindowToolbarView.swift:903-906`).
+const SF_TERMINAL: &str = "terminal";
+/// Pill close button (`WindowToolbarView.swift:984-986`).
+const SF_CLOSE: &str = "xmark";
+/// Overflow chevron (`WindowToolbarView.swift:1045-1047`).
+const SF_CHEVRON_DOWN: &str = "chevron.down";
+/// New-tab button (`WindowToolbarView.swift:1134-1136`).
+const SF_PLUS: &str = "plus";
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 
@@ -334,6 +349,22 @@ pub(crate) struct WindowToolbarView {
     band_press: Option<Point<Pixels>>,
     /// Root focus handle (hosts the toolbar key context).
     focus_handle: FocusHandle,
+    /// The window's pane-content host, wired by `crate::app::build_window_root`
+    /// (M2 Item D): the seam through which the strip returns key focus to the
+    /// active terminal after a rename commit/cancel and on menu dismissal.
+    /// `None` in the isolated `pane-strip` scenario (refocus is then a no-op).
+    pane_host: Option<Entity<PaneHostView>>,
+    /// Chrome-click focus bounce (M2 Item D): a click on empty toolbar chrome
+    /// transfers key focus to `focus_handle` via gpui's tracked-focus mouse-down
+    /// transfer; this `on_focus` subscription bounces it straight back to the
+    /// active terminal (chrome never keeps focus — Swift parity). Installed on
+    /// the first render (the subscription needs a `Window`).
+    focus_bounce_sub: Option<Subscription>,
+    /// The window's backing scale factor, re-sampled at the top of every
+    /// [`Render::render`] so the SF Symbol rasterizer draws at device
+    /// resolution. The 2.0 initial value only covers code paths before the
+    /// first render (none read it).
+    window_scale: f32,
 }
 
 impl WindowToolbarView {
@@ -359,7 +390,16 @@ impl WindowToolbarView {
             center_pending: false,
             band_press: None,
             focus_handle: cx.focus_handle(),
+            pane_host: None,
+            focus_bounce_sub: None,
+            window_scale: 2.0,
         }
+    }
+
+    /// Wire the window's pane host (called once by `build_window_root`) so the
+    /// strip can return key focus to the active terminal (M2 Item D).
+    pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
+        self.pane_host = Some(host);
     }
 
     // MARK: - Model access / snapshot
@@ -516,8 +556,8 @@ impl WindowToolbarView {
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
         // Replacing any prior subscription here drops it OUTSIDE its callback.
-        self.rename_blur_sub = Some(cx.on_blur(&self.rename_focus, window, |this, _w, cx| {
-            this.commit_rename(cx);
+        self.rename_blur_sub = Some(cx.on_blur(&self.rename_focus, window, |this, window, cx| {
+            this.commit_rename(window, cx);
         }));
         cx.notify();
     }
@@ -526,37 +566,50 @@ impl WindowToolbarView {
     /// resets to the per-kind auto-default + consumes a counter slot — asymmetry
     /// 3; the pill reimplements none of it). Idempotent: a stray focus-out after
     /// the edit already ended does nothing.
-    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((tab_id, pane_id)) = self.editing_pane.take() else {
             return;
         };
         let draft = std::mem::take(&mut self.draft_title);
         self.state
             .update(cx, |ws, _| ws.model.rename_pane(&tab_id, &pane_id, &draft));
-        self.refocus_terminal_after_rename();
+        self.refocus_terminal_after_rename(window, cx);
         cx.notify();
     }
 
-    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_pane.take().is_none() {
             return;
         }
         self.draft_title.clear();
-        self.refocus_terminal_after_rename();
+        self.refocus_terminal_after_rename(window, cx);
         cx.notify();
     }
 
-    /// R13 hook: Swift's `commitEdit`/`cancelEdit` call
-    /// `sessions.focusActiveTerminal()` so the terminal regains first responder
-    /// after a rename (dossier G10). There is no live session to focus this cycle
-    /// (R13 rewires the seam), so this is intentionally a no-op placeholder —
-    /// the hook, not the behavior.
-    fn refocus_terminal_after_rename(&mut self) {}
+    /// Swift's `commitEdit`/`cancelEdit` call `sessions.focusActiveTerminal()`
+    /// so the terminal regains first responder after a rename (dossier G10).
+    /// Here the window's [`PaneHostView`] owns the hosted terminal views, so
+    /// focus routes back through its `focus_active_terminal` (M2 Item D). A
+    /// no-op in the isolated `pane-strip` scenario (no pane host wired).
+    fn refocus_terminal_after_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(host) = self.pane_host.clone() {
+            host.update(cx, |host, cx| host.focus_active_terminal(window, cx));
+        }
+    }
 
-    fn on_rename_key(&mut self, event: &gpui::KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_rename_key(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
-        // Escape cancels via the shell/pill Esc path, not here — the shared editor
-        // leaves it Ignored.
+        // Escape cancels the pill rename HERE — the shared editor leaves Escape
+        // Ignored by design ("the owner's Esc binding cancels"), and unlike the
+        // sidebar (whose shell-level Esc action cancels its tab rename) the pill
+        // has no shell action of its own, so its owner binding is this listener.
+        // The sidebar shell's Esc action runs first (ancestor dispatch) and
+        // propagates when it has nothing to do (M2 Item D: "Escape cancels").
+        if ks.key == "escape" && !ks.modifiers.platform && !ks.modifiers.control {
+            self.cancel_rename(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         match apply_rename_key(
             &mut self.draft_title,
             &ks.key,
@@ -565,7 +618,7 @@ impl WindowToolbarView {
             ks.modifiers.control,
         ) {
             RenameKeyOutcome::Commit => {
-                self.commit_rename(cx);
+                self.commit_rename(window, cx);
                 cx.stop_propagation();
             }
             RenameKeyOutcome::Edited => {
@@ -585,12 +638,12 @@ impl WindowToolbarView {
 
     /// A plain (unmodified) press on a pill body: select the pane. Commits any
     /// in-flight rename on another pill first.
-    fn select_pane(&mut self, pane_id: &str, cx: &mut Context<Self>) {
+    fn select_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab_id) = self.active_tab_id(cx) else {
             return;
         };
         if self.editing_pane.is_some() {
-            self.commit_rename(cx);
+            self.commit_rename(window, cx);
         }
         self.state.update(cx, |ws, _| {
             ws.pane_strip_actions
@@ -616,18 +669,18 @@ impl WindowToolbarView {
             }
             // else: same-click-as-select window — no-op.
         } else {
-            self.select_pane(pane_id, cx);
+            self.select_pane(pane_id, window, cx);
         }
     }
 
     /// Close a pane through the seam, committing any in-flight edit first
     /// (`WindowToolbarView.swift:912-916`).
-    fn close_pane(&mut self, pane_id: &str, cx: &mut Context<Self>) {
+    fn close_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab_id) = self.active_tab_id(cx) else {
             return;
         };
         if self.editing_pane.is_some() {
-            self.commit_rename(cx);
+            self.commit_rename(window, cx);
         }
         self.state.update(cx, |ws, _| {
             ws.pane_strip_actions
@@ -679,9 +732,9 @@ impl WindowToolbarView {
         let close = {
             let w = weak.clone();
             let pid = pid.clone();
-            ContextMenuItem::entry(close_menu_label(kind), move |_window, app| {
+            ContextMenuItem::entry(close_menu_label(kind), move |window, app| {
                 let _ = w.update(app, |this, cx| {
-                    this.close_pane(&pid, cx);
+                    this.close_pane(&pid, window, cx);
                 });
             })
         };
@@ -706,9 +759,9 @@ impl WindowToolbarView {
             .into_iter()
             .map(|(pid, label)| {
                 let w = weak.clone();
-                ContextMenuItem::entry(label, move |_window, app| {
+                ContextMenuItem::entry(label, move |window, app| {
                     let _ = w.update(app, |this, cx| {
-                        this.select_pane(&pid, cx);
+                        this.select_pane(&pid, window, cx);
                     });
                 })
             })
@@ -725,10 +778,21 @@ impl WindowToolbarView {
         cx: &mut Context<Self>,
     ) {
         let menu = cx.new(|cx| ContextMenu::new(position, items, window, cx));
-        self.menu_sub = Some(cx.subscribe(&menu, |this, _menu, _ev: &DismissEvent, cx| {
-            this.context_menu = None;
-            cx.notify();
-        }));
+        self.menu_sub = Some(cx.subscribe_in(
+            &menu,
+            window,
+            |this, _menu, _ev: &DismissEvent, window, cx| {
+                this.context_menu = None;
+                // The menu grabbed key focus on open; hand it back to the active
+                // terminal — unless the dismissed action began an inline rename
+                // (the Rename entry focuses the field before the menu dismisses),
+                // which must keep the field focused (M2 Item D).
+                if this.editing_pane.is_none() {
+                    this.refocus_terminal_after_rename(window, cx);
+                }
+                cx.notify();
+            },
+        ));
         self.context_menu = Some(menu);
         cx.notify();
     }
@@ -906,7 +970,8 @@ impl WindowToolbarView {
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
 
-        // Leading icon: per-pane StatusDot for Claude, terminal glyph otherwise.
+        // Leading icon: per-pane StatusDot for Claude, else the `terminal`
+        // symbol — 12pt regular in a 12pt box (`WindowToolbarView.swift:903-906`).
         let leading = match vm.kind {
             PaneKind::Claude => StatusDot::new(
                 SharedString::from(format!("pill.{}", vm.id)),
@@ -922,9 +987,15 @@ impl WindowToolbarView {
                 .justify_center()
                 .w(px(PILL_ICON_SIZE))
                 .h(px(PILL_ICON_SIZE))
-                .text_size(px(PILL_ICON_SIZE))
-                .text_color(if is_active { ink2 } else { ink3 })
-                .child(SharedString::from(ICON_TERMINAL))
+                .child(sf_symbol_icon(
+                    SF_TERMINAL,
+                    ICON_TERMINAL,
+                    PILL_ICON_SIZE,
+                    SymbolWeight::Regular,
+                    if is_active { ink2 } else { ink3 },
+                    self.window_scale,
+                    cx,
+                ))
                 .into_any_element(),
         };
 
@@ -1016,7 +1087,7 @@ impl WindowToolbarView {
             .child(close)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
+                cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
                     // A press that bubbles here from inside the editing field (or
                     // on the editing pill's own icon/padding) must keep the edit
                     // alive, not commit + reselect — Swift's `if !isEditing`
@@ -1025,7 +1096,7 @@ impl WindowToolbarView {
                         cx.stop_propagation();
                         return;
                     }
-                    this.select_pane(&pid_select, cx);
+                    this.select_pane(&pid_select, window, cx);
                     cx.stop_propagation();
                 }),
             )
@@ -1053,6 +1124,16 @@ impl WindowToolbarView {
     ) -> impl IntoElement {
         let hover = ink_alpha(s, CLOSE_HOVER_INK_ALPHA);
         let pid = pane_id.to_string();
+        // 9pt semibold `xmark`, ink3 (`WindowToolbarView.swift:984-986`).
+        let icon = sf_symbol_icon(
+            SF_CLOSE,
+            ICON_CLOSE,
+            CLOSE_GLYPH_SIZE,
+            SymbolWeight::Semibold,
+            slot_to_rgba(s.ink3),
+            self.window_scale,
+            cx,
+        );
         let mut btn = div()
             .flex_none()
             .flex()
@@ -1061,17 +1142,14 @@ impl WindowToolbarView {
             .w(px(CLOSE_BTN_SIZE))
             .h(px(CLOSE_BTN_SIZE))
             .rounded(px(CLOSE_BTN_RADIUS))
-            .text_size(px(CLOSE_GLYPH_SIZE))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(slot_to_rgba(s.ink3))
-            .child(SharedString::from(ICON_CLOSE));
+            .child(icon);
         if visible {
             btn = btn
                 .hover(move |st| st.bg(hover))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
-                        this.close_pane(&pid, cx);
+                    cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                        this.close_pane(&pid, window, cx);
                         cx.stop_propagation();
                     }),
                 );
@@ -1108,6 +1186,16 @@ impl WindowToolbarView {
     fn render_chevron(&self, has_attention: bool, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = ink_alpha(s, SQUARE_BTN_HOVER_INK_ALPHA);
         let accent = srgba_to_rgba(self.accent);
+        // 10pt semibold `chevron.down`, ink2 (`WindowToolbarView.swift:1045-1047`).
+        let icon = sf_symbol_icon(
+            SF_CHEVRON_DOWN,
+            ICON_CHEVRON_DOWN,
+            CHEVRON_GLYPH_SIZE,
+            SymbolWeight::Semibold,
+            slot_to_rgba(s.ink2),
+            self.window_scale,
+            cx,
+        );
         div()
             .relative()
             .flex()
@@ -1116,11 +1204,8 @@ impl WindowToolbarView {
             .w(px(SQUARE_BTN_SIZE))
             .h(px(SQUARE_BTN_SIZE))
             .rounded(px(SQUARE_BTN_RADIUS))
-            .text_size(px(CHEVRON_GLYPH_SIZE))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(slot_to_rgba(s.ink2))
             .hover(move |st| st.bg(hover))
-            .child(SharedString::from(ICON_CHEVRON_DOWN))
+            .child(icon)
             // 6pt accent attention badge at the top-trailing corner.
             .when(has_attention, |el| {
                 el.child(
@@ -1146,6 +1231,16 @@ impl WindowToolbarView {
     /// The trailing "+" — always visible, pinned in its own reserved slot.
     fn render_new_tab_slot(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = ink_alpha(s, SQUARE_BTN_HOVER_INK_ALPHA);
+        // 11pt semibold `plus`, ink2 (`WindowToolbarView.swift:1134-1136`).
+        let icon = sf_symbol_icon(
+            SF_PLUS,
+            ICON_PLUS,
+            PLUS_GLYPH_SIZE,
+            SymbolWeight::Semibold,
+            slot_to_rgba(s.ink2),
+            self.window_scale,
+            cx,
+        );
         div()
             .flex_none()
             .flex()
@@ -1162,11 +1257,8 @@ impl WindowToolbarView {
                     .w(px(SQUARE_BTN_SIZE))
                     .h(px(SQUARE_BTN_SIZE))
                     .rounded(px(SQUARE_BTN_RADIUS))
-                    .text_size(px(PLUS_GLYPH_SIZE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(slot_to_rgba(s.ink2))
                     .hover(move |st| st.bg(hover))
-                    .child(SharedString::from(ICON_PLUS))
+                    .child(icon)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
@@ -1197,6 +1289,20 @@ impl Focusable for WindowToolbarView {
 
 impl Render for WindowToolbarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Re-sample the backing scale so the SF Symbol cache renders (and hits)
+        // at this window's device resolution.
+        self.window_scale = window.scale_factor();
+        // Chrome-click focus bounce (M2 Item D, installed once — it needs a
+        // `Window`, which `new` doesn't have): a click on empty toolbar chrome
+        // focuses this root via gpui's tracked-focus transfer; hand it straight
+        // back to the active terminal so chrome never keeps key focus. A rename
+        // begin never lands here (the field's own handle takes focus, not this
+        // root), so the bounce cannot fight the rename field.
+        if self.focus_bounce_sub.is_none() {
+            self.focus_bounce_sub = Some(cx.on_focus(&self.focus_handle, window, |this, window, cx| {
+                this.refocus_terminal_after_rename(window, cx);
+            }));
+        }
         // Reset the rename gate + auto-center when the active pane changed.
         self.sync_active_pane(window, cx);
 
@@ -1229,16 +1335,10 @@ impl Render for WindowToolbarView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
             .child(self.render_brand(&s))
             .child(self.render_strip(&panes, &s, cx))
-            // Trailing update-pill slot stays empty until R27.
-            .child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .w_full()
-                    .h(px(1.0))
-                    .bg(slot_to_rgba(s.line)),
-            )
+            // Trailing update-pill slot stays empty until R27. The toolbar's
+            // old local bottom hairline is gone — the shell paints one
+            // full-width title-bar divider at window level instead
+            // (`SidebarShellView::build_top_bar_divider`, M2 Item C).
             .children(self.context_menu.clone())
     }
 }
@@ -1300,8 +1400,8 @@ impl WindowToolbarView {
     }
 
     /// Drive a pane selection through the real path.
-    pub(crate) fn drive_select_pane(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        self.select_pane(pane_id, cx);
+    pub(crate) fn drive_select_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_pane(pane_id, window, cx);
     }
 
     /// Drive a terminal-pane add through the real path.
@@ -1310,8 +1410,36 @@ impl WindowToolbarView {
     }
 
     /// Drive a pane close through the real path.
-    pub(crate) fn drive_close_pane(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        self.close_pane(pane_id, cx);
+    pub(crate) fn drive_close_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_pane(pane_id, window, cx);
+    }
+
+    /// Begin an inline rename of the ACTIVE pane through the real path (the
+    /// gate-passed title tap and the context-menu Rename entry both land in
+    /// `begin_editing`) — the `app-shell` scenario's focus-routing driver.
+    pub(crate) fn drive_begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.active_tab_id(cx) else {
+            return;
+        };
+        let Some(pane_id) = self.active_pane_id(cx) else {
+            return;
+        };
+        self.begin_editing(&tab_id, &pane_id, window, cx);
+    }
+
+    /// Whether an inline pane rename is in flight.
+    pub(crate) fn scenario_rename_editing(&self) -> bool {
+        self.editing_pane.is_some()
+    }
+
+    /// The in-flight rename draft (the scenario's "keys land in the field" read).
+    pub(crate) fn scenario_rename_draft(&self) -> String {
+        self.draft_title.clone()
+    }
+
+    /// Whether the rename field currently holds key focus.
+    pub(crate) fn scenario_rename_focused(&self, window: &Window) -> bool {
+        self.rename_focus.is_focused(window)
     }
 
     /// Set a pane's `(status, viewed)` on the model (the scenario drives attention

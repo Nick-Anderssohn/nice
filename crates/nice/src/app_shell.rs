@@ -9,14 +9,14 @@
 //! ## How the three surfaces compose (gpui-native, no Swift seam ports)
 //!
 //! The layout tree is rooted in [`SidebarShellView`], which already owns the two
-//! shell modes (expanded floating card / collapsed cap), the peek overlay, and
+//! shell modes (expanded floating card / collapsed full-width band), the peek overlay, and
 //! the resize handle. R13.5 threads the toolbar band and the pane content into
 //! its previously-placeholder content region through two injected `AnyView`
 //! slots (`main_toolbar` / `main_body`) — mirroring Swift's `expandedShell`
-//! (`HStack { card ; VStack { WindowToolbarView ; mainContent } }`) and
-//! `collapsedShell` (`VStack { HStack { cap ; WindowToolbarView } ; mainContent }`)
-//! without re-deriving the collapse/peek/resize geometry the sidebar already
-//! encodes. `AppShellView` itself is thin: it carries the window-level
+//! (`HStack { card ; VStack { WindowToolbarView ; mainContent } }`); the
+//! collapsed shell is the M2 full-width band (spacer + restore + toolbar — an
+//! approved divergence from Swift's `collapsedShell` cap card) — without
+//! re-deriving the collapse/peek/resize geometry the sidebar already encodes. `AppShellView` itself is thin: it carries the window-level
 //! peek-clear modifier observer (the R12 keymap's `on_window_modifiers_changed`,
 //! formerly on `WindowChromeView`) and re-renders the whole shell subtree when
 //! any of its parts notify — so a pill click (which notifies only the toolbar)
@@ -49,7 +49,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gpui::{div, prelude::*, rgb, AnyElement, Context, Entity, Render, Subscription, Window};
+use gpui::{
+    div, prelude::*, rgb, AnyElement, App, Context, Entity, FocusHandle, Render, Subscription,
+    Window,
+};
 
 use nice_term_view::{FontSettings, TerminalSessionHandle, TerminalTheme, TerminalView};
 use nice_theme::color::Srgba;
@@ -77,6 +80,11 @@ pub(crate) struct AppShellView {
     /// Held so a re-render of the whole shell can be forced when any composed
     /// part notifies (the observers below). Kept alive alongside `sidebar`.
     toolbar: Entity<WindowToolbarView>,
+    /// The pane-content host mounted in the sidebar's body slot. Held here so
+    /// the `app-shell` scenario can reach the SAME host the window renders (the
+    /// M2 Item D focus-routing assertions read its active terminal's focus
+    /// handle) — not a parallel copy.
+    pane_host: Entity<PaneHostView>,
     /// Kept for lifetime + future direct routing; the shared per-window state.
     state: Entity<WindowState>,
     /// Re-render the shell subtree whenever the shared state (keymap-driven
@@ -98,6 +106,7 @@ impl AppShellView {
         state: Entity<WindowState>,
         sidebar: Entity<SidebarShellView>,
         toolbar: Entity<WindowToolbarView>,
+        pane_host: Entity<PaneHostView>,
         cx: &mut Context<Self>,
     ) -> Self {
         let subs = vec![
@@ -108,6 +117,7 @@ impl AppShellView {
         Self {
             sidebar,
             toolbar,
+            pane_host,
             state,
             _subs: subs,
         }
@@ -131,6 +141,12 @@ impl AppShellView {
     /// / close-pane assertions).
     pub(crate) fn scenario_toolbar(&self) -> Entity<WindowToolbarView> {
         self.toolbar.clone()
+    }
+
+    /// The shell's pane-content host (its active terminal's focus handle drives
+    /// the M2 Item D focus-routing assertions).
+    pub(crate) fn scenario_pane_host(&self) -> Entity<PaneHostView> {
+        self.pane_host.clone()
     }
 }
 
@@ -223,8 +239,31 @@ impl PaneHostView {
             view.set_keycode_probe(Arc::new(crate::platform::current_event_keycode));
             view.set_image_drop_provider(Arc::new(crate::platform::read_dropped_image_to_temp));
             view.set_launch_deadline(crate::platform::launch_deadline());
+            // M2 Item E: the shipped shell's grid tracks the window — a painted
+            // bounds change re-fits the pty (rows/cols → TIOCSWINSZ/SIGWINCH).
+            // Fixed-grid scenario embeddings deliberately leave this off.
+            view.set_auto_refit(true);
             view
         })
+    }
+
+    /// Move key focus to the active pane's hosted terminal, if any — the
+    /// app-side focus-routing seam (M2 Item D). The toolbar / sidebar call it
+    /// after an inline-rename commit/cancel and on context-menu dismissal, and
+    /// the chrome roots bounce stray chrome-click focus back through it. A
+    /// no-op when the active pane has no hosted view (a model-only Claude pane).
+    pub(crate) fn focus_active_terminal(&self, window: &mut Window, cx: &mut App) {
+        if let Some(fh) = self.active_terminal_focus_handle(cx) {
+            window.focus(&fh, cx);
+        }
+    }
+
+    /// The active pane's terminal focus handle, if a view is hosted for it —
+    /// the `app-shell` scenario's "focus returned to the terminal" read.
+    pub(crate) fn active_terminal_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        let (_, pane) = self.last_active.as_ref()?;
+        let view = self.cache.get(pane)?;
+        Some(view.read(cx).focus_handle_ref().clone())
     }
 }
 
@@ -271,7 +310,8 @@ impl Render for PaneHostView {
         self.cache.retain(|pid, _| all_pane_ids.contains(pid));
 
         // On a switch, run the sole activation path + re-point the present kick.
-        if active != self.last_active {
+        let activation_changed = active != self.last_active;
+        if activation_changed {
             self.last_active = active.clone();
             if let Some((tab, pane)) = active.clone() {
                 let state = self.state.clone();
@@ -313,6 +353,22 @@ impl Render for PaneHostView {
             }
             None => pane_placeholder().into_any_element(),
         };
+
+        // Focus follows activation (M2 Item D): the terminal's per-frame render
+        // grab is gone (focus-once in `TerminalView`), so the host moves key
+        // focus to the newly-active pane's terminal on every activation change —
+        // window open, ⌘T, pill/row click, pane-step, close-refocus. Runs after
+        // the cache fill above so a just-activated terminal pane (spawned
+        // synchronously by `activate_pane`) is focusable this same render. A
+        // pane with no hosted view (Claude placeholder) has nothing to focus.
+        if activation_changed {
+            if let Some((_, pane)) = &active {
+                if let Some(view) = self.cache.get(pane) {
+                    let fh = view.read(cx).focus_handle_ref().clone();
+                    window.focus(&fh, cx);
+                }
+            }
+        }
 
         div().size_full().child(content)
     }

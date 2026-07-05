@@ -143,6 +143,14 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
     register_app_level_actions(cx);
     register_window_scoped_actions(cx);
 
+    // The sidebar shell's Esc binding (`CollapseSidebarSelection`, context
+    // "SidebarShell") — cancels an in-flight inline rename / collapses a
+    // multi-selection, else propagates so Esc still reaches the terminal.
+    // Installed here so the shipped app (and every scenario that installs the
+    // keymap) gets it; it previously had no caller, so Esc-cancel never fired
+    // live (M2 Item D acceptance: "Escape cancels").
+    crate::sidebar_shell::install_sidebar_key_bindings(cx);
+
     let mut bindings = table_bindings(cx);
     // Fold R9's ⌃⌘F (non-rebindable — not in the table) into the same wiring.
     // Its handler + the View-menu title live in `crate::app`.

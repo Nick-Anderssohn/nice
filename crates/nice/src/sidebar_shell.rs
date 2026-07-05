@@ -1,6 +1,6 @@
 //! The R10 sessions-mode sidebar: the shell layout plus the sidebar card,
 //! ported from `Sources/Nice/Views/AppShellView.swift` (the shell — layout
-//! modes, floating card, resize handle, collapsed cap, peek overlay) and
+//! modes, floating card, resize handle, collapsed band, peek overlay) and
 //! `Sources/Nice/Views/SidebarView.swift` (the card content — project groups,
 //! tab rows, footer, and the multi-select / rename / Esc behaviour). The pure
 //! state it drives ships gpui-free in `nice-model` (slice 1): [`SidebarModel`],
@@ -46,13 +46,14 @@
 //!
 //! ## Icons
 //!
-//! GPUI has no SF Symbol renderer and adding an SVG asset pipeline is out of
-//! scope this cycle, so the header/footer glyphs use Unicode stand-ins (a later
-//! cycle can swap in real vector assets). In particular the disclosure "chevron"
-//! is a **glyph swap** (`▸` closed / `▾` open) rather than a rotation transform —
-//! the pinned gpui exposes no element rotation, and the swap reads the same
-//! 0°→90° affordance. These are cosmetic; the behaviour (disclosure toggles row
-//! visibility, mode flips, collapse toggles) is what the itests pin.
+//! The header/footer/row icons are real SF Symbols rendered at runtime through
+//! [`crate::sf_symbols`] (`NSImage(systemSymbolName:)` rasterized + tinted at
+//! the window's backing scale, cached per size/weight/colour/scale — M2
+//! feel-check Item A). Each keeps its original Unicode stand-in as a
+//! never-blank fallback for a symbol name that fails to resolve. The
+//! disclosure "chevron" remains a **glyph swap** (`▸` closed / `▾` open)
+//! rather than a rotation transform — the pinned gpui exposes no element
+//! rotation, and the swap reads the same 0°→90° affordance.
 
 // The view + its install fn have no in-crate caller until slice 4 wires the
 // `sidebar` self-test scenario; it is a deliberately-exported surface (plan
@@ -72,17 +73,18 @@ use gpui::{
 use nice_model::{InlineRenameClickGate, SidebarMode, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
     traffic_light_reserved_width, CARD_BORDER_OPACITY, CARD_BORDER_WIDTH, CARD_CORNER_RADIUS,
-    CARD_INSET, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET, COLLAPSED_CAP_HEIGHT,
-    COLLAPSED_CAP_TRAILING_WIDTH, INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH,
-    SIDEBAR_MIN_WIDTH, SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, TOP_BAR_HEIGHT,
+    CARD_INSET, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET,
+    INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, TOP_BAR_HEIGHT,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 use nice_theme::AccentPreset;
 
-use crate::app_shell::SIDEBAR_ROOT_LABEL;
+use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
+use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::window_state::WindowState;
@@ -127,16 +129,29 @@ const TOP_STRIP_CONTROLS_TOP: f32 = 8.0;
 /// The mode/collapse toggles' trailing offset (`AppShellView.swift:813`).
 const TOP_STRIP_CONTROLS_TRAILING: f32 = 10.0;
 
-// ---- Icon glyphs (Unicode stand-ins — see module docs) ----------------------
+// ---- Icons (SF Symbols + their Unicode fallbacks — see module docs) ---------
 
-const ICON_CHEVRON_CLOSED: &str = "\u{25B8}"; // ▸
+const ICON_CHEVRON_CLOSED: &str = "\u{25B8}"; // ▸ (disclosure — stays a glyph swap)
 const ICON_CHEVRON_OPEN: &str = "\u{25BE}"; // ▾
-const ICON_TERMINAL: &str = "\u{276F}"; // ❯ (prompt glyph — the `terminal` symbol)
-const ICON_PLUS: &str = "+";
-const ICON_MODE_TABS: &str = "\u{2630}"; // ☰ (list.bullet)
-const ICON_MODE_FILES: &str = "\u{25A4}"; // ▤ (folder)
-const ICON_SIDEBAR: &str = "\u{25A8}"; // ▨ (sidebar.left — collapse & expand)
-const ICON_GEAR: &str = "\u{2699}"; // ⚙ (gearshape)
+const ICON_TERMINAL: &str = "\u{276F}"; // ❯ fallback for SF_TERMINAL
+const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
+const ICON_MODE_TABS: &str = "\u{2630}"; // ☰ fallback for SF_MODE_TABS
+const ICON_MODE_FILES: &str = "\u{25A4}"; // ▤ fallback for SF_MODE_FILES
+const ICON_SIDEBAR: &str = "\u{25A8}"; // ▨ fallback for SF_SIDEBAR
+const ICON_GEAR: &str = "\u{2699}"; // ⚙ fallback for SF_GEAR
+
+/// Tab-row / pill leading icon (`SidebarView.swift:602`).
+const SF_TERMINAL: &str = "terminal";
+/// Group-header add button (`SidebarView.swift:379`).
+const SF_PLUS: &str = "plus";
+/// Sidebar mode toggle: tabs (`AppShellView.swift`'s `SidebarModeIconButton`).
+const SF_MODE_TABS: &str = "list.bullet";
+/// Sidebar mode toggle: files.
+const SF_MODE_FILES: &str = "folder";
+/// Collapse / restore toggle (`AppShellView.swift:1153`).
+const SF_SIDEBAR: &str = "sidebar.left";
+/// Footer Settings gear (`SidebarView.swift`'s footer `SidebarIconButton`).
+const SF_GEAR: &str = "gearshape";
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 
@@ -179,12 +194,6 @@ fn disclosure_glyph(is_open: bool) -> &'static str {
     }
 }
 
-/// The width of the collapsed cap: the traffic-light reserve plus room for the
-/// restore button and a trailing drag strip (`AppShellView.swift:953`).
-fn collapsed_cap_width() -> f32 {
-    traffic_light_reserved_width() + COLLAPSED_CAP_TRAILING_WIDTH
-}
-
 // ---- Colour helpers (Nice/Dark; the SidebarBackground palette seam) ----------
 
 /// The R10 chrome slot table — Nice/Dark, matching the shipped chrome band
@@ -194,8 +203,8 @@ fn dark_slots() -> Slots {
 }
 
 /// The `SidebarBackground` palette-switch seam (`SidebarBackground.swift:21-46`).
-/// R10 ships the flat `.nice` arm only: the sidebar column and the collapsed cap
-/// paint a flat `niceBg2` panel. R21 slots the vibrancy materials (the `.macOS`
+/// R10 ships the flat `.nice` arm only: the sidebar column paints a flat
+/// `niceBg2` panel. R21 slots the vibrancy materials (the `.macOS`
 /// / Catppuccin arms) in here; keeping the switch behind one function is what
 /// makes that a localized change.
 fn sidebar_background(s: &Slots) -> Rgba {
@@ -281,10 +290,9 @@ pub(crate) struct SidebarShellView {
 
     /// R13.5 composition slot: the toolbar band (the R11 `WindowToolbarView`),
     /// rendered in the 52pt top-bar-accessory position — right of the card in the
-    /// expanded shell, right of the collapsed cap in the collapsed shell
-    /// (mirroring Swift's `AppShellView`). `None` in the isolated `sidebar`
-    /// scenario, which mounts the shell standalone and keeps the placeholder
-    /// content region.
+    /// expanded shell, right of the restore button in the collapsed shell's
+    /// full-width band. `None` in the isolated `sidebar` scenario, which mounts
+    /// the shell standalone and keeps the placeholder content region.
     main_toolbar: Option<AnyView>,
     /// R13.5 composition slot: the pane-content host (`PaneHostView`), rendered as
     /// the shell's fill body below the toolbar. `None` in the isolated scenario.
@@ -327,9 +335,25 @@ pub(crate) struct SidebarShellView {
 
     /// Root focus handle (hosts the `SidebarShell` key context for Esc).
     focus_handle: FocusHandle,
+    /// The window's pane-content host, wired by `crate::app::build_window_root`
+    /// (M2 Item D): the seam through which the shell returns key focus to the
+    /// active terminal after a rename commit/cancel and on menu dismissal.
+    /// `None` in the isolated `sidebar` scenario (refocus is then a no-op).
+    pane_host: Option<Entity<PaneHostView>>,
+    /// Chrome-click focus bounce (M2 Item D): a click on empty shell chrome
+    /// (card body, top strip, footer) focuses this root via gpui's tracked-focus
+    /// mouse-down transfer; this `on_focus` subscription bounces it straight
+    /// back to the active terminal (chrome never keeps focus — Swift parity).
+    /// Installed on the first render (the subscription needs a `Window`).
+    focus_bounce_sub: Option<Subscription>,
     /// The user's accent — the thinking-dot colour + selection tint. Terracotta
     /// default (palette switching is R21).
     accent: Srgba,
+    /// The window's backing scale factor, re-sampled at the top of every
+    /// [`Render::render`] so the SF Symbol rasterizer draws at device
+    /// resolution. The 2.0 initial value only covers code paths before the
+    /// first render (none read it).
+    window_scale: f32,
 }
 
 impl SidebarShellView {
@@ -362,8 +386,17 @@ impl SidebarShellView {
             context_menu: None,
             menu_sub: None,
             focus_handle: cx.focus_handle(),
+            pane_host: None,
+            focus_bounce_sub: None,
             accent: AccentPreset::Terracotta.color(),
+            window_scale: 2.0,
         }
+    }
+
+    /// Wire the window's pane host (called once by `build_window_root`) so the
+    /// shell can return key focus to the active terminal (M2 Item D).
+    pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
+        self.pane_host = Some(host);
     }
 
     /// The R13.5 composed shell: same shared-state shell as [`new`](Self::new)
@@ -540,32 +573,46 @@ impl SidebarShellView {
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
         // Replacing any prior subscription here drops it OUTSIDE its callback.
-        self.rename_blur_sub = Some(cx.on_blur(&self.rename_focus, window, |this, _w, cx| {
-            this.commit_rename(cx);
+        self.rename_blur_sub = Some(cx.on_blur(&self.rename_focus, window, |this, window, cx| {
+            this.commit_rename(window, cx);
         }));
         cx.notify();
     }
 
     /// Commit the draft (empty input is a model no-op — asymmetry 3). Idempotent:
     /// a stray focus-out after the edit already ended does nothing.
-    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.editing_tab_id.take() else {
             return;
         };
         let draft = std::mem::take(&mut self.draft_title);
         self.state.update(cx, |ws, _| ws.model.rename_tab(&id, &draft));
+        self.refocus_terminal_after_rename(window, cx);
         cx.notify();
     }
 
-    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_tab_id.take().is_none() {
             return;
         }
         self.draft_title.clear();
+        self.refocus_terminal_after_rename(window, cx);
         cx.notify();
     }
 
-    fn on_rename_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Swift's rename end paths call `sessions.focusActiveTerminal()` so the
+    /// terminal regains first responder (dossier G10). Here the window's
+    /// [`PaneHostView`] owns the hosted terminal views, so focus routes back
+    /// through its `focus_active_terminal` (M2 Item D — the sidebar-rename
+    /// equivalent of the toolbar's refocus). A no-op in the isolated `sidebar`
+    /// scenario (no pane host wired).
+    fn refocus_terminal_after_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(host) = self.pane_host.clone() {
+            host.update(cx, |host, cx| host.focus_active_terminal(window, cx));
+        }
+    }
+
+    fn on_rename_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         // Escape is consumed by the shell Esc action (which cancels rename) before
         // this bubble-phase listener runs; the shared editor leaves it Ignored.
@@ -577,7 +624,7 @@ impl SidebarShellView {
             ks.modifiers.control,
         ) {
             RenameKeyOutcome::Commit => {
-                self.commit_rename(cx);
+                self.commit_rename(window, cx);
                 cx.stop_propagation();
             }
             RenameKeyOutcome::Edited => {
@@ -640,11 +687,11 @@ impl SidebarShellView {
     fn on_collapse_esc(
         &mut self,
         _action: &CollapseSidebarSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.editing_tab_id.is_some() {
-            self.cancel_rename(cx);
+            self.cancel_rename(window, cx);
             return; // consumed
         }
         let multi = self.state.read(cx).selection.selected_tab_ids().len() > 1;
@@ -748,10 +795,21 @@ impl SidebarShellView {
         cx: &mut Context<Self>,
     ) {
         let menu = cx.new(|cx| ContextMenu::new(position, items, window, cx));
-        self.menu_sub = Some(cx.subscribe(&menu, |this, _menu, _ev: &DismissEvent, cx| {
-            this.context_menu = None;
-            cx.notify();
-        }));
+        self.menu_sub = Some(cx.subscribe_in(
+            &menu,
+            window,
+            |this, _menu, _ev: &DismissEvent, window, cx| {
+                this.context_menu = None;
+                // The menu grabbed key focus on open; hand it back to the active
+                // terminal — unless the dismissed action began an inline rename
+                // (the Rename Tab entry focuses the field before the menu
+                // dismisses), which must keep the field focused (M2 Item D).
+                if this.editing_tab_id.is_none() {
+                    this.refocus_terminal_after_rename(window, cx);
+                }
+                cx.notify();
+            },
+        ));
         self.context_menu = Some(menu);
         cx.notify();
     }
@@ -857,12 +915,22 @@ impl SidebarShellView {
         mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let s = dark_slots();
+        // `flex_row_reverse` keeps the LAYOUT exactly as before — the first
+        // child sits at the main-end, so the main column still fills the right
+        // and the card still docks left — while flipping the PAINT order to
+        // main column → divider → card. That order is what the Item C hairline
+        // needs: drawn over the toolbar band's opaque chrome, but under the
+        // floating card, which overlaps it by design (the line stays visible
+        // in the gutters).
         div()
+            .relative()
             .flex()
-            .flex_row()
+            .flex_row_reverse()
             .size_full()
-            .child(self.build_sidebar_card(&groups, true, false, mode, cx))
             .child(self.build_main_column())
+            .child(self.build_top_bar_divider(&s))
+            .child(self.build_sidebar_card(&groups, true, false, mode, cx))
     }
 
     fn build_collapsed_shell(
@@ -881,19 +949,43 @@ impl SidebarShellView {
             .flex_col()
             .size_full()
             .child(
-                // Top row: the collapsed cap (traffic lights + restore) beside the
-                // toolbar band (Swift's `HStack { collapsedCap ; WindowToolbarView }`);
-                // in the isolated scenario the toolbar slot is absent and the R9/R11
-                // chrome filler stands in. The pane content extends full-width beneath.
+                // Top row: one full-width 52pt title-bar band (M2 feel-check
+                // Item B — the floating collapsed cap is GONE, an approved
+                // divergence from the Swift parity design): a spacer reserving
+                // the native traffic-light zone, the bare restore button (no
+                // card, border, rounding, or shadow behind it), then the
+                // toolbar accessory; in the isolated scenario the accessory is
+                // the R9/R11 chrome filler. The pane content extends
+                // full-width beneath.
                 div()
                     .flex()
                     .flex_row()
+                    .items_center()
                     .w_full()
                     .h(px(TOP_BAR_HEIGHT))
-                    .child(self.build_collapsed_cap(&s, cx))
+                    .bg(slot_to_rgba(s.chrome))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(traffic_light_reserved_width()))
+                            .h_full(),
+                    )
+                    .child(self.icon_button(
+                        SF_SIDEBAR,
+                        ICON_SIDEBAR,
+                        &s,
+                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                            this.toggle_collapsed(cx);
+                            cx.stop_propagation();
+                        }),
+                        cx,
+                    ))
                     .child(self.build_collapsed_top_accessory(&s)),
             )
             .child(self.build_main_body())
+            // The Item C divider paints over the band chrome but under the
+            // peek overlay (emitted next).
+            .child(self.build_top_bar_divider(&s))
             .children(peek)
     }
 
@@ -975,6 +1067,7 @@ impl SidebarShellView {
                     .gap(px(4.0))
                     .child(self.mode_button(
                         "sidebar.mode.tabs",
+                        SF_MODE_TABS,
                         ICON_MODE_TABS,
                         tabs_active,
                         accent,
@@ -984,9 +1077,11 @@ impl SidebarShellView {
                             cx.notify();
                             cx.stop_propagation();
                         }),
+                        cx,
                     ))
                     .child(self.mode_button(
                         "sidebar.mode.files",
+                        SF_MODE_FILES,
                         ICON_MODE_FILES,
                         files_active,
                         accent,
@@ -996,32 +1091,53 @@ impl SidebarShellView {
                             cx.notify();
                             cx.stop_propagation();
                         }),
+                        cx,
                     ))
                     .child(self.icon_button(
+                        SF_SIDEBAR,
                         ICON_SIDEBAR,
                         s,
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
                             this.toggle_collapsed(cx);
                             cx.stop_propagation();
                         }),
+                        cx,
                     )),
             )
     }
 
     /// A 24pt header icon button (mode toggle): accent-tinted when active, hover
-    /// fill otherwise (`AppShellView.swift:1097-1134`).
+    /// fill otherwise (`AppShellView.swift:1097-1134`). The 13pt symbol is
+    /// semibold + ink when active, regular + ink2 otherwise — each tint its own
+    /// [`sf_symbol_icon`] cache entry.
+    #[allow(clippy::too_many_arguments)]
     fn mode_button(
         &self,
         _id: &str,
-        glyph: &'static str,
+        symbol: &'static str,
+        fallback_glyph: &'static str,
         active: bool,
         accent: Srgba,
         s: &Slots,
         on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let ink = slot_to_rgba(s.ink);
         let ink2 = slot_to_rgba(s.ink2);
         let hover = ink_alpha(s, ICON_BUTTON_HOVER_ALPHA);
+        let icon = sf_symbol_icon(
+            symbol,
+            fallback_glyph,
+            13.0,
+            if active {
+                SymbolWeight::Semibold
+            } else {
+                SymbolWeight::Regular
+            },
+            if active { ink } else { ink2 },
+            self.window_scale,
+            cx,
+        );
         div()
             .flex()
             .items_center()
@@ -1029,28 +1145,33 @@ impl SidebarShellView {
             .w(px(24.0))
             .h(px(24.0))
             .rounded(px(INNER_CORNER_RADIUS))
-            .text_size(px(13.0))
-            .font_weight(if active {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::NORMAL
-            })
-            .text_color(if active { ink } else { ink2 })
             .when(active, |el| el.bg(selection_tint(accent, 1.0)))
             .when(!active, |el| el.hover(move |st| st.bg(hover)))
-            .child(SharedString::from(glyph))
+            .child(icon)
             .on_mouse_down(MouseButton::Left, on_down)
     }
 
-    /// A plain 24pt icon button (collapse / footer): hover fill only
-    /// (`SidebarView.swift:1018-1044`).
+    /// A plain 24pt icon button (the `sidebar.left` collapse / restore toggle):
+    /// hover fill only, 14pt regular ink2 (`SidebarView.swift:1018-1044`,
+    /// `AppShellView.swift:1145-1166`).
     fn icon_button(
         &self,
-        glyph: &'static str,
+        symbol: &'static str,
+        fallback_glyph: &'static str,
         s: &Slots,
         on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let hover = ink_alpha(s, ICON_BUTTON_HOVER_ALPHA);
+        let icon = sf_symbol_icon(
+            symbol,
+            fallback_glyph,
+            14.0,
+            SymbolWeight::Regular,
+            slot_to_rgba(s.ink2),
+            self.window_scale,
+            cx,
+        );
         div()
             .flex()
             .items_center()
@@ -1058,10 +1179,8 @@ impl SidebarShellView {
             .w(px(24.0))
             .h(px(24.0))
             .rounded(px(INNER_CORNER_RADIUS))
-            .text_size(px(14.0))
-            .text_color(slot_to_rgba(s.ink2))
             .hover(move |st| st.bg(hover))
-            .child(SharedString::from(glyph))
+            .child(icon)
             .on_mouse_down(MouseButton::Left, on_down)
     }
 
@@ -1209,6 +1328,16 @@ impl SidebarShellView {
 
         if show_add {
             let add_hover = ink_alpha(s, ADD_BUTTON_HOVER_ALPHA);
+            // 10pt semibold `plus` in an 18pt box (`SidebarView.swift:379-383`).
+            let add_icon = sf_symbol_icon(
+                SF_PLUS,
+                ICON_PLUS,
+                10.0,
+                SymbolWeight::Semibold,
+                ink2,
+                self.window_scale,
+                cx,
+            );
             header = header.child(
                 div()
                     .flex()
@@ -1217,11 +1346,8 @@ impl SidebarShellView {
                     .w(px(18.0))
                     .h(px(18.0))
                     .rounded(px(4.0))
-                    .text_size(px(10.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(ink2)
                     .hover(move |st| st.bg(add_hover))
-                    .child(SharedString::from(ICON_PLUS))
+                    .child(add_icon)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
@@ -1256,7 +1382,8 @@ impl SidebarShellView {
         let hover = ink_alpha(s, HOVER_INK_ALPHA);
         let indent = row_indent(t.indented);
 
-        // Leading icon: the status dot for a Claude tab, else the terminal glyph.
+        // Leading icon: the status dot for a Claude tab, else the `terminal`
+        // symbol — 12pt regular ink3 in a 16pt box (`SidebarView.swift:602-607`).
         let leading = if t.has_claude {
             StatusDot::new(
                 SharedString::from(t.id.clone()),
@@ -1273,9 +1400,15 @@ impl SidebarShellView {
                 .justify_center()
                 .w(px(16.0))
                 .h(px(16.0))
-                .text_size(px(12.0))
-                .text_color(ink3)
-                .child(SharedString::from(ICON_TERMINAL))
+                .child(sf_symbol_icon(
+                    SF_TERMINAL,
+                    ICON_TERMINAL,
+                    12.0,
+                    SymbolWeight::Regular,
+                    ink3,
+                    self.window_scale,
+                    cx,
+                ))
                 .into_any_element()
         };
 
@@ -1317,7 +1450,7 @@ impl SidebarShellView {
                             return;
                         }
                         if this.editing_tab_id.is_some() {
-                            this.commit_rename(cx);
+                            this.commit_rename(window, cx);
                         }
                         this.handle_title_tap(
                             &tid,
@@ -1359,13 +1492,13 @@ impl SidebarShellView {
             .child(title)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     if this.editing_tab_id.as_deref() == Some(tid_tap.as_str()) {
                         cx.stop_propagation();
                         return;
                     }
                     if this.editing_tab_id.is_some() {
-                        this.commit_rename(cx);
+                        this.commit_rename(window, cx);
                     }
                     this.route_click(&tid_tap, e.modifiers.platform, e.modifiers.shift, cx);
                     cx.notify();
@@ -1386,7 +1519,17 @@ impl SidebarShellView {
     /// The footer: a trailing Settings gear over a 1pt top rule. The gear is a
     /// disabled placeholder until R23 (the Settings window) — it renders dimmed
     /// and does nothing.
-    fn build_footer(&self, s: &Slots, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn build_footer(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+        // 14pt regular `gearshape`, dimmed to ink3 while disabled.
+        let gear = sf_symbol_icon(
+            SF_GEAR,
+            ICON_GEAR,
+            14.0,
+            SymbolWeight::Regular,
+            slot_to_rgba(s.ink3),
+            self.window_scale,
+            cx,
+        );
         div()
             .relative()
             .flex()
@@ -1421,9 +1564,7 @@ impl SidebarShellView {
                             .w(px(24.0))
                             .h(px(24.0))
                             .rounded(px(INNER_CORNER_RADIUS))
-                            .text_size(px(14.0))
-                            .text_color(slot_to_rgba(s.ink3))
-                            .child(SharedString::from(ICON_GEAR)),
+                            .child(gear),
                     ),
             )
     }
@@ -1442,40 +1583,21 @@ impl SidebarShellView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_resize_mouse_down))
     }
 
-    /// The collapsed cap: a small card in the top-bar's upper-left hosting the
-    /// three native traffic lights (in the leading reserve) plus the restore
-    /// button, centred on the y-26 row (`AppShellView.swift:934-972`).
-    fn build_collapsed_cap(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The full-width 1px title-bar divider (M2 feel-check Item C): one
+    /// hairline (`s.line`) spanning the whole window at the bottom of the 52pt
+    /// band, in both shell states — it replaces the toolbar's old local bottom
+    /// border, which stopped at the sidebar edge. The callers order it OVER the
+    /// band/body chrome but UNDER the floating sidebar card / peek overlay, so
+    /// the expanded card deliberately overlaps it (the line stays visible in
+    /// the gutters). Pure paint: no id, no listeners, no hitbox.
+    fn build_top_bar_divider(&self, s: &Slots) -> impl IntoElement {
         div()
-            .flex_none()
-            .pl(px(CARD_INSET))
-            .py(px(CARD_INSET))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .w(px(collapsed_cap_width()))
-                    .h(px(COLLAPSED_CAP_HEIGHT))
-                    .rounded(px(CARD_CORNER_RADIUS))
-                    .bg(sidebar_background(s))
-                    .border(px(CARD_BORDER_WIDTH))
-                    .border_color(card_border_color(s))
-                    .shadow(card_shadow())
-                    // Leading reserve for the native traffic lights (they render
-                    // over this; the restore button sits just past them).
-                    .child(div().w(px(traffic_light_reserved_width())).h_full())
-                    .child(self.icon_button(
-                        ICON_SIDEBAR,
-                        s,
-                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.toggle_collapsed(cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    // Trailing drag strip.
-                    .child(div().flex_1().h_full()),
-            )
+            .absolute()
+            .left_0()
+            .top(px(TOP_BAR_HEIGHT - 1.0))
+            .w_full()
+            .h(px(1.0))
+            .bg(slot_to_rgba(s.line))
     }
 
     /// The content column to the right of (expanded) or beneath (collapsed) the
@@ -1580,13 +1702,13 @@ impl SidebarShellView {
         self.sidebar_width
     }
 
-    /// Whether the sidebar is collapsed (drives the cap-vs-column assertion).
+    /// Whether the sidebar is collapsed (drives the band-vs-column assertion).
     pub(crate) fn is_collapsed(&self, cx: &App) -> bool {
         self.state.read(cx).sidebar.collapsed()
     }
 
-    /// Drive the real collapse toggle (used to bring up / dismiss the collapsed
-    /// cap in the scenario).
+    /// Drive the real collapse toggle (used to enter / leave the collapsed
+    /// full-width-band state in the scenario).
     pub(crate) fn drive_toggle_collapsed(&mut self, cx: &mut Context<Self>) {
         self.toggle_collapsed(cx);
     }
@@ -1609,21 +1731,48 @@ impl SidebarShellView {
     }
 
     /// The width the shell sizes its leading column to right now — the docked card
-    /// width (`sidebar_width`) when expanded, the fixed collapsed-cap width when
-    /// collapsed — the exact values [`build_sidebar_card`](Self::build_sidebar_card) /
-    /// [`build_collapsed_cap`](Self::build_collapsed_cap) size their roots to. This is
-    /// the *intended* column width, re-derived from the collapse flag (and the
-    /// `sidebar_width` field), NOT a read of the rendered element's laid-out `Bounds`.
-    /// The `app-shell` scenario samples it across a ⌘B toggle to confirm the intended
-    /// leading-column width tracks the collapse (~240 → ~124pt); because that scenario
-    /// never resizes, the shrink follows from the collapse flag rather than an
-    /// independent layout measurement.
+    /// width (`sidebar_width`) when expanded, and **0 when collapsed**: the M2
+    /// collapsed design reserves no leading column at all (the floating cap is
+    /// gone; the top row is one full-width band — see
+    /// [`build_collapsed_shell`](Self::build_collapsed_shell)). This is the
+    /// *intended* column width, re-derived from the collapse flag (and the
+    /// `sidebar_width` field), NOT a read of the rendered element's laid-out
+    /// `Bounds`. The `app-shell` scenario samples it across a ⌘B toggle to
+    /// confirm 240 → 0 → 240; because that scenario never resizes, the change
+    /// follows from the collapse flag rather than an independent layout
+    /// measurement.
     pub(crate) fn scenario_leading_column_width(&self, cx: &App) -> f32 {
         if self.is_collapsed(cx) {
-            collapsed_cap_width()
+            0.0
         } else {
             self.sidebar_width
         }
+    }
+
+    /// Begin an inline rename of the ACTIVE tab through the real path (the
+    /// gate-passed title tap and the context-menu Rename Tab entry both land in
+    /// `begin_editing`) — the `app-shell` scenario's focus-routing driver.
+    pub(crate) fn drive_begin_tab_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.state.read(cx).model.active_tab_id().map(str::to_owned) else {
+            return;
+        };
+        self.begin_editing(&tab_id, window, cx);
+    }
+
+    /// Whether an inline tab rename is in flight.
+    pub(crate) fn scenario_tab_rename_editing(&self) -> bool {
+        self.editing_tab_id.is_some()
+    }
+
+    /// The in-flight tab-rename draft (the scenario's "keys land in the field"
+    /// read).
+    pub(crate) fn scenario_tab_rename_draft(&self) -> String {
+        self.draft_title.clone()
+    }
+
+    /// Whether the tab-rename field currently holds key focus.
+    pub(crate) fn scenario_tab_rename_focused(&self, window: &Window) -> bool {
+        self.rename_focus.is_focused(window)
     }
 }
 
@@ -1634,7 +1783,21 @@ impl Focusable for SidebarShellView {
 }
 
 impl Render for SidebarShellView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Re-sample the backing scale so the SF Symbol cache renders (and hits)
+        // at this window's device resolution.
+        self.window_scale = window.scale_factor();
+        // Chrome-click focus bounce (M2 Item D, installed once — it needs a
+        // `Window`, which `new` doesn't have): a click on empty shell chrome
+        // focuses this root via gpui's tracked-focus transfer; hand it straight
+        // back to the active terminal so chrome never keeps key focus. A rename
+        // begin never lands here (the field's own handle takes focus, not this
+        // root), so the bounce cannot fight the rename field.
+        if self.focus_bounce_sub.is_none() {
+            self.focus_bounce_sub = Some(cx.on_focus(&self.focus_handle, window, |this, window, cx| {
+                this.refocus_terminal_after_rename(window, cx);
+            }));
+        }
         let (collapsed, mode, peeking_model) = {
             let ws = self.state.read(cx);
             (ws.sidebar.collapsed(), ws.sidebar.mode(), ws.sidebar.peeking())
@@ -1709,14 +1872,6 @@ mod tests {
         assert_eq!(disclosure_glyph(true), ICON_CHEVRON_OPEN);
         assert_eq!(disclosure_glyph(false), ICON_CHEVRON_CLOSED);
         assert_ne!(disclosure_glyph(true), disclosure_glyph(false));
-    }
-
-    #[test]
-    fn collapsed_cap_width_is_reserve_plus_trailing() {
-        // 82 (lights reserve) + 42 (restore + drag strip) = 124
-        // (AppShellView.swift:953).
-        assert_eq!(collapsed_cap_width(), traffic_light_reserved_width() + 42.0);
-        assert_eq!(collapsed_cap_width(), 124.0);
     }
 
     #[test]

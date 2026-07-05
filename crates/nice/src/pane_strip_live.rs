@@ -321,7 +321,9 @@ async fn overflow_checks(
     // make it active (hard) and scroll it back into view (deferred on repaint).
     let p0_offscreen_before =
         read_bool(cx, view, |v, cx| v.scenario_offscreen_pane_ids(cx).contains("p0"));
-    let _ = view.update(cx, |v, cx| v.drive_select_pane("p0", cx));
+    // The toolbar IS this scenario window's root view, so drive it through the
+    // root-update context (a nested `view.update` would re-enter the entity).
+    let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
     settle(cx, 500).await;
     if read_active(cx, view).as_deref() == Some("p0") {
         eprintln!("[selftest] pane-strip centering: selecting p0 made it active");

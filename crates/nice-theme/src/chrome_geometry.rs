@@ -59,10 +59,10 @@ pub const TRAFFIC_LIGHT_DEFAULT_LEADING: f32 = 20.0;
 /// zoom-trailing. `WindowChrome.swift:72`.
 pub const TRAFFIC_LIGHT_CLUSTER_WIDTH: f32 = 54.0;
 
-/// Leading width (pt) the collapsed cap reserves for the nudged traffic lights:
-/// `default_leading + nudge_x + cluster_width` = 82. A conservative
-/// stale-macOS upper bound, decoupled from the OS-robust placer.
-/// `WindowChrome.swift:85-87`.
+/// Leading width (pt) the collapsed shell's full-width title-bar band reserves
+/// for the nudged traffic lights: `default_leading + nudge_x + cluster_width`
+/// = 82. A conservative stale-macOS upper bound, decoupled from the OS-robust
+/// placer. `WindowChrome.swift:85-87`.
 pub const fn traffic_light_reserved_width() -> f32 {
     TRAFFIC_LIGHT_DEFAULT_LEADING + TRAFFIC_LIGHT_NUDGE_X + TRAFFIC_LIGHT_CLUSTER_WIDTH
 }
@@ -108,10 +108,9 @@ pub const MACOS26_TRAFFIC_LIGHT_LEADINGS: [f32; 3] = [9.0, 32.0, 55.0];
 /// preserves the OS-native pitch itself; see the block comment above.
 pub const MACOS26_TRAFFIC_LIGHT_PITCH: f32 = 23.0;
 
-// ---- Cards (sidebar / collapsed cap) ----------------------------------------
+// ---- Cards (sidebar) ---------------------------------------------------------
 
-/// Corner radius (pt) of the floating sidebar & collapsed-cap cards.
-/// `AppShellView.swift:825,958`.
+/// Corner radius (pt) of the floating sidebar card. `AppShellView.swift:825`.
 pub const CARD_CORNER_RADIUS: f32 = 8.0;
 
 /// Corner radius (pt) of inner chrome elements (pills, etc.).
@@ -137,12 +136,9 @@ pub const CARD_SHADOW_Y_OFFSET: f32 = 2.0;
 /// Card drop-shadow color = black at this opacity. `AppShellView.swift:838`.
 pub const CARD_SHADOW_OPACITY: f32 = 0.15;
 
-/// Collapsed-cap height (pt). `AppShellView.swift:953`.
-pub const COLLAPSED_CAP_HEIGHT: f32 = 40.0;
-
-/// Collapsed-cap width (pt) past the traffic-light reserve — room for the
-/// restore button and a trailing drag strip. `AppShellView.swift:953`.
-pub const COLLAPSED_CAP_TRAILING_WIDTH: f32 = 42.0;
+// The COLLAPSED_CAP_* constants are gone with the cap itself (M2 feel-check
+// Item B): the collapsed shell renders one full-width title-bar band, an
+// approved divergence from the Swift parity design (`AppShellView.swift:953`).
 
 #[cfg(test)]
 mod tests {
@@ -197,7 +193,7 @@ mod tests {
 
     #[test]
     fn card_constants_match_swift() {
-        assert_eq!(CARD_CORNER_RADIUS, 8.0); // AppShellView.swift:825,958
+        assert_eq!(CARD_CORNER_RADIUS, 8.0); // AppShellView.swift:825
         assert_eq!(INNER_CORNER_RADIUS, 6.0); // AppShellView.swift:1124,1158
         assert_eq!(CARD_INSET, 6.0); // AppShellView.swift:839
         assert_eq!(CARD_BORDER_WIDTH, 0.5); // AppShellView.swift:830
@@ -205,7 +201,5 @@ mod tests {
         assert_eq!(CARD_SHADOW_RADIUS, 4.0); // AppShellView.swift:838
         assert_eq!(CARD_SHADOW_Y_OFFSET, 2.0); // AppShellView.swift:838
         assert_eq!(CARD_SHADOW_OPACITY, 0.15); // AppShellView.swift:838
-        assert_eq!(COLLAPSED_CAP_HEIGHT, 40.0); // AppShellView.swift:953
-        assert_eq!(COLLAPSED_CAP_TRAILING_WIDTH, 42.0); // AppShellView.swift:953
     }
 }
