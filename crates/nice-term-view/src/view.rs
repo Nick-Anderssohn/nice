@@ -405,6 +405,15 @@ impl TerminalView {
                     cx.notify();
                 }
             }
+            // OSC title/cwd ride this same entity (R13) but are **app-level**
+            // concerns — the pane pill label, the tab auto-title, per-pane cwd
+            // persistence — routed by the session manager's own subscription on
+            // this entity, not the view. The view holds no title/cwd state, so it
+            // ignores them (a hidden pane has no view at all, which is exactly why
+            // these events live on the entity).
+            TerminalEvent::TitleChanged(_)
+            | TerminalEvent::TitleReset
+            | TerminalEvent::CwdChanged(_) => {}
             // `TerminalEvent` is `#[non_exhaustive]` for cross-crate consumers, but
             // it is defined in THIS crate, so this match is exhaustive here — a
             // future lifecycle variant will (rightly) force the view to handle it.
