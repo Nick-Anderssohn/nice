@@ -549,6 +549,16 @@ pub fn run() {
         // window (the first + every ⌘N) threads the same zdotdir / user-zdotdir
         // into its SessionManager's shell env.
         install_shell_inject_bootstrap(cx);
+        // R16: install (or refresh) the Claude Code SessionStart hook — the
+        // frozen socket-client script at ~/.nice/nice-claude-hook.sh (mode 0755)
+        // plus its ~/.claude/settings.json entry — so /clear, /branch,
+        // --fork-session, and cwd moves relay session rotations back over the
+        // control socket. Runs from app::run ONLY (never run_selftest, per the
+        // tranche-3 hermeticity rule: the regression suite must never write the
+        // real ~/.claude / ~/.nice). Slotted after R15's reaper (in the bootstrap
+        // above) and before the first pane spawns — it touches no ptys. Failures
+        // are logged and swallowed (the feature degrades, the app still runs).
+        crate::claude_hook_installer::install();
         if let Err(e) = open_managed_window(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);

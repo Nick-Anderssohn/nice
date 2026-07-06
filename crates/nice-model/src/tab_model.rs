@@ -206,6 +206,21 @@ impl TabModel {
             .collect()
     }
 
+    /// The id of the tab whose pane list contains `pane_id`, scanning every
+    /// project including the pinned Terminals group (`TabModel.swift:211-220`).
+    /// The reverse index the SessionStart hook's `session_update` uses to route a
+    /// pane's rotated session id / cwd back onto its owning tab. Scoped to this
+    /// `TabModel` — a per-window lookup, never a global index — so a pane owned by
+    /// a sibling window returns `None` here. Returns an owned id (the id must
+    /// outlive later `&mut self` mutations the rotation handler makes).
+    pub fn tab_id_owning(&self, pane_id: &str) -> Option<String> {
+        self.projects
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .find(|t| t.panes.iter().any(|pane| pane.id == pane_id))
+            .map(|t| t.id.clone())
+    }
+
     // MARK: - Selection
 
     /// Select a tab. The single `active_tab_id` writer — carries the Swift

@@ -53,8 +53,8 @@ use nice_term_view::TerminalEvent;
 use crate::control_socket::{NiceControlSocket, Reply, RecordedSocketMessage, SocketMessage};
 use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
 use crate::session_manager::{
-    compose_claude_reply, mint_session_uuid, ClaudeReplyDecision, ClaudeTabPlacement,
-    DissolveTerminus, SessionManager,
+    compose_claude_reply, mint_session_uuid, ClaudeReplyDecision, ClaudeSessionMode,
+    ClaudeTabPlacement, DissolveTerminus, SessionManager,
 };
 use crate::sidebar_actions::{ModelSidebarActions, SidebarActions};
 
@@ -75,6 +75,37 @@ fn mint_session_id() -> String {
 struct NewTabSpawn {
     cwd: String,
     args: Vec<String>,
+}
+
+/// The deferred-resume branch-parent spawn returned by the pure model half of a
+/// `session_update` ([`WindowState::materialize_branch_parent`]). The
+/// `insert_branch_parent` MODEL mutation has already landed (the sibling parent
+/// tab + its `[Claude, Terminal 1]` panes are in the tree); the
+/// gpui-context-carrying router still owes the parent's Claude-pane pty (a
+/// `.resumeDeferred` login shell). Splitting the mutation from the spawn keeps
+/// the rotation classification unit-testable without a gpui context — the mirror
+/// of [`NewTabSpawn`].
+struct BranchParentSpawn {
+    /// The minted parent tab id (its Claude pane is `<tab_id>-claude`).
+    tab_id: String,
+    /// The minted Claude pane id to spawn the deferred-resume pty on.
+    claude_pane_id: String,
+    /// The parent's cwd — the PRE-rotation cwd (captured by `insert_branch_parent`
+    /// before the caller's `update_tab_cwd` moves the originating tab).
+    cwd: String,
+    /// The pre-rotation session id the parent resumes (`claude --resume <id>`).
+    old_session_id: String,
+}
+
+/// Outcome of the pure model half of a `session_update`
+/// ([`WindowState::apply_session_update`]): whether any tab state actually
+/// changed — the R18 save signal, Swift's `onSessionMutation`; nothing persists
+/// yet — and, when the rotation classified as a `/branch`, the deferred-resume
+/// [`BranchParentSpawn`] the router must fulfil with its gpui context.
+#[derive(Default)]
+struct SessionUpdateOutcome {
+    did_mutate: bool,
+    spawn: Option<BranchParentSpawn>,
 }
 
 /// The per-window composition root. One per Nice window, owned by a
@@ -312,8 +343,10 @@ impl WindowState {
     /// drain task (wired by the R14 env-injection slice's `open_managed_window`).
     ///
     /// Takes the window's `&mut Context` (R15): the `claude` newtab decision spawns
-    /// a Claude pane, which needs a gpui context. The `session_update` / `handoff`
-    /// sub-handlers stay context-free.
+    /// a Claude pane, which needs a gpui context. The `handoff` sub-handler stays
+    /// context-free; `session_update`'s handler is context-free too (the pure
+    /// rotation flow), returning a deferred-resume [`BranchParentSpawn`] the router
+    /// fulfils here with `cx` when the rotation was a `/branch` (R16).
     pub(crate) fn route_socket_message(
         &mut self,
         msg: SocketMessage,
@@ -332,7 +365,11 @@ impl WindowState {
                 session_id,
                 source,
                 cwd,
-            } => self.handle_session_update(pane_id, session_id, source, cwd),
+            } => {
+                if let Some(spawn) = self.handle_session_update(pane_id, session_id, source, cwd) {
+                    self.spawn_branch_parent(spawn, cx);
+                }
+            }
             SocketMessage::Handoff {
                 cwd,
                 handoff_file,
@@ -487,22 +524,182 @@ impl WindowState {
         self.claude_settings_path.clone()
     }
 
-    /// `session_update` action stub — fully parsed, no-op body. R16 fills it with
-    /// the session-id / cwd rotation routing (`SessionsModel.applySessionUpdate`).
+    /// `session_update` handler — the Rust twin of Swift
+    /// `SessionsModel.handleClaudeSessionUpdate` (`SessionsModel.swift:946-963`).
+    /// The SessionStart hook relays a pane's rotated session id / cwd; this records
+    /// the normalized message, runs the pure rotation flow
+    /// ([`apply_session_update`](Self::apply_session_update)), and returns the
+    /// deferred-resume [`BranchParentSpawn`] for the router to fulfil with `cx`
+    /// when the rotation classified as a `/branch`.
+    ///
+    /// Context-free itself (fire-and-forget: R14's transport dropped the client fd
+    /// BEFORE dispatch, so the handler never replies). The gpui-context spawn lives
+    /// in [`spawn_branch_parent`](Self::spawn_branch_parent) — the mirror of the
+    /// `claude` handler's [`resolve_claude_request`](Self::resolve_claude_request) /
+    /// spawn split.
     fn handle_session_update(
         &mut self,
         pane_id: String,
         session_id: String,
         source: Option<String>,
         cwd: Option<String>,
-    ) {
+    ) -> Option<BranchParentSpawn> {
         self.record_socket_message(RecordedSocketMessage::SessionUpdate {
-            pane_id,
-            session_id,
-            source,
-            cwd,
+            pane_id: pane_id.clone(),
+            session_id: session_id.clone(),
+            source: source.clone(),
+            cwd: cwd.clone(),
         });
-        // No-op: the client fd was already closed before dispatch (fire-and-forget).
+        self.apply_session_update(&pane_id, &session_id, source.as_deref(), cwd.as_deref())
+            .spawn
+    }
+
+    /// The pure model half of a `session_update` — the rotation flow per the
+    /// PROTECTED ordering (`SessionsModel.swift:946-963`), unit-testable without a
+    /// gpui context. Resolve the owning tab by pane (stale/unknown pane ⇒ silent
+    /// no-op) → capture `old_id` → `update_claude_session_id` (equality
+    /// short-circuit: a redundant forward mutates nothing) → **iff
+    /// `source == "resume"` && `old_id` exists && `old_id != session_id`:
+    /// materialize the branch parent, BEFORE the cwd update** (so the sibling
+    /// inherits the pre-rotation cwd) → `update_tab_cwd` (None/empty filtered).
+    /// An unknown/absent source with an id change is a plain id update, NEVER a
+    /// parent (deliberately miss an occasional `/branch` rather than spawn a
+    /// phantom parent from a mis-classified `/clear`).
+    ///
+    /// Returns whether anything changed (the R18 save signal — `onSessionMutation`;
+    /// nothing persists yet) plus the deferred-resume spawn the caller owes.
+    fn apply_session_update(
+        &mut self,
+        pane_id: &str,
+        session_id: &str,
+        source: Option<&str>,
+        cwd: Option<&str>,
+    ) -> SessionUpdateOutcome {
+        let Some(tab_id) = self.model.tab_id_owning(pane_id) else {
+            return SessionUpdateOutcome::default();
+        };
+        let old_id = self
+            .model
+            .tab_for(&tab_id)
+            .and_then(|t| t.claude_session_id.clone());
+        let id_changed = self.update_claude_session_id(&tab_id, session_id);
+        // /branch classification: a `resume` source with an ACTUAL id change is the
+        // signature of `/branch` and `--fork-session`. Real `/resume` keeps the id
+        // stable (absorbed by the short-circuit above), `/clear` reports
+        // `source == "clear"`, and a nil/unknown source is treated as a plain id
+        // update. Materialize BEFORE the cwd update so the sibling parent inherits
+        // the pre-rotation cwd.
+        let spawn = if source == Some("resume") {
+            match &old_id {
+                Some(old) if old != session_id => self.materialize_branch_parent(&tab_id, old),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Apply cwd to the ORIGINATING tab only — after branch materialization, so
+        // the sibling parent keeps the pre-rotation cwd.
+        let cwd_changed = self.update_tab_cwd(&tab_id, cwd);
+        SessionUpdateOutcome {
+            did_mutate: id_changed || spawn.is_some() || cwd_changed,
+            spawn,
+        }
+    }
+
+    /// Update `tab.claude_session_id` when Claude rotates its session mid-process
+    /// (`SessionsModel.swift:972-984`). Equality short-circuit: a redundant forward
+    /// (the hook fires on every SessionStart — this cheapness contract keeps a
+    /// steady stream of identical ids from churning the save layer) mutates
+    /// nothing. Returns whether the id actually changed.
+    ///
+    /// R18: the real `onSessionMutation` save flush hangs off this `true` return;
+    /// nothing persists yet (the outcome's `did_mutate` is the standin the tests
+    /// assert on).
+    fn update_claude_session_id(&mut self, tab_id: &str, session_id: &str) -> bool {
+        let mut changed = false;
+        self.model.mutate_tab(tab_id, |tab| {
+            if tab.claude_session_id.as_deref() != Some(session_id) {
+                tab.claude_session_id = Some(session_id.to_string());
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    /// Adopt Claude's reported cwd onto the originating tab (`SessionsModel.swift:
+    /// 1001-1009`): the None/empty shapes short-circuit (an older hook payload
+    /// omitting cwd, or a defensive empty string), else the actual mutation +
+    /// per-pane follow policy lives on [`TabModel::adopt_tab_cwd`]. Returns whether
+    /// anything changed (the R18 save signal — nothing persists yet).
+    fn update_tab_cwd(&mut self, tab_id: &str, cwd: Option<&str>) -> bool {
+        match cwd {
+            Some(c) if !c.is_empty() => self.model.adopt_tab_cwd(tab_id, c),
+            _ => false,
+        }
+    }
+
+    /// Materialize the pre-`/branch` session as a sibling parent tab pinned to
+    /// `old_session_id`, inserted immediately above the originating tab
+    /// (`SessionsModel.swift:1031-1065`). Composes landed pieces: mint the tab +
+    /// `-claude`/`-t1` pane ids, hand the model the tree mutation
+    /// ([`TabModel::insert_branch_parent`], which refuses a Terminals/unknown
+    /// originating tab ⇒ `None`, and does the depth-1 root-promotion re-parenting),
+    /// then return the deferred-resume spawn the caller owes.
+    ///
+    /// The parent's cwd is read from the returned-by-value node HERE, before the
+    /// caller's [`update_tab_cwd`](Self::update_tab_cwd) moves the originating tab
+    /// into the post-rotation worktree: `insert_branch_parent` copied
+    /// `originating.cwd` at insertion, so `parent.cwd` is the PRE-rotation cwd —
+    /// which is what the sibling's `claude --resume <old id>` needs (the old-id
+    /// transcript is bucketed under the pre-rotation path). Rust's by-value return
+    /// makes the ordering structural; the ported cwd-move test pins it anyway.
+    fn materialize_branch_parent(
+        &mut self,
+        originating_tab_id: &str,
+        old_session_id: &str,
+    ) -> Option<BranchParentSpawn> {
+        let new_id = self.session.mint_tab_id("t");
+        let claude_pane_id = format!("{new_id}-claude");
+        let terminal_pane_id = format!("{new_id}-t1");
+        let parent = self.model.insert_branch_parent(
+            originating_tab_id,
+            &new_id,
+            &claude_pane_id,
+            &terminal_pane_id,
+            old_session_id,
+        )?;
+        Some(BranchParentSpawn {
+            tab_id: new_id,
+            claude_pane_id,
+            cwd: parent.cwd,
+            old_session_id: old_session_id.to_string(),
+        })
+    }
+
+    /// Fulfil a [`BranchParentSpawn`]: register the parent's (empty) session
+    /// container so its deferred companion's later
+    /// [`ensure_active_pane_spawned`](crate::session_manager::SessionManager::ensure_active_pane_spawned)
+    /// precondition holds, then spawn the parent's Claude pane in
+    /// [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) mode — a plain login
+    /// shell carrying `claude --resume <old id>` as `NICE_PREFILL_COMMAND` (nothing
+    /// resumes, and no tokens are spent, until the user opens the parent tab and
+    /// presses Enter). Fire-and-forget: a spawn failure degrades to a model-only
+    /// recovery tab (the tree mutation already landed), so it is logged-and-swallowed
+    /// like the rest of the rotation feature.
+    fn spawn_branch_parent(&mut self, spawn: BranchParentSpawn, cx: &mut gpui::Context<WindowState>) {
+        self.session.register_tab_session(&spawn.tab_id);
+        let settings = self.claude_settings_path.clone();
+        let _ = self.session.spawn_claude_pane(
+            &spawn.tab_id,
+            &spawn.claude_pane_id,
+            &spawn.cwd,
+            &ClaudeSessionMode::ResumeDeferred(spawn.old_session_id),
+            &[],
+            settings.as_deref(),
+            cx,
+        );
+        // Re-render so the sidebar shows the new sibling parent + re-parented child.
+        cx.notify();
     }
 
     /// `handoff` action stub. R14 replies `error: handoff is not supported yet`;
@@ -937,11 +1134,13 @@ mod tests {
     }
 
     #[test]
-    fn session_update_stub_records_normalized_message_and_sends_no_reply() {
+    fn session_update_records_normalized_message_and_unknown_pane_is_no_op() {
         let mut state = WindowState::new("/home/u");
         // session_update is fire-and-forget and context-free — drive the sub-handler
-        // directly. It just records the parsed, normalized message (R16 fills the body).
-        state.handle_session_update("P1".into(), "S1".into(), Some("resume".into()), None);
+        // directly. It records the parsed, normalized message, and an unknown pane id
+        // (no tab owns "P1") classifies as a silent no-op ⇒ no branch-parent spawn.
+        let spawn = state.handle_session_update("P1".into(), "S1".into(), Some("resume".into()), None);
+        assert!(spawn.is_none(), "an unknown pane must not materialize a branch parent");
         let recorded = state.recorded_socket_messages();
         assert_eq!(recorded.len(), 1);
         assert_eq!(
@@ -952,6 +1151,585 @@ mod tests {
                 source: Some("resume".into()),
                 cwd: None,
             }
+        );
+    }
+
+    // ---- R16 AppStateClaudeSessionUpdateTests + AppStateBranchTrackingTests -----
+    //
+    // Ported from Swift `AppStateClaudeSessionUpdateTests` (16) and
+    // `AppStateBranchTrackingTests` (16). Each drives `apply_session_update` — the
+    // pure model half of the `session_update` handler — so the rotation
+    // classification + tree composition + cwd adoption are observable without a
+    // gpui context (the deferred-resume SPAWN + the shipped-window end-to-end are
+    // the `claude-lifecycle` scenario). `SessionUpdateOutcome::did_mutate` stands
+    // in for Swift's `onSessionMutation` save signal (nothing persists until R18).
+    //
+    // R18: the two persistence round-trip cases in the Swift branch suite —
+    // `test_persistedTab_parentTabId_roundTrips` and
+    // `test_persistedTab_legacyJsonWithoutParentTabId_decodesAsNil` — are
+    // PersistedTab JSON encode/decode tests. Their model half (`Tab::parent_tab_id`)
+    // is landed and exercised by the branch cases below; the persisted-shape
+    // round-trip lands with R18's session store.
+
+    /// Seed a `[Claude, Terminal 1]` tab (Claude focused, NOT running — deferred /
+    /// pre-promotion shape) into a fresh non-Terminals project `project_id` at
+    /// `path`, with `session_id`. The Rust twin of `TabModelFixtures.seedClaudeTab`.
+    /// The tab cwd + project path are both `path`. Claude pane `<tab>-claude`,
+    /// terminal `<tab>-t1`.
+    fn seed_rotation_tab(
+        model: &mut TabModel,
+        project_id: &str,
+        tab_id: &str,
+        session_id: &str,
+        path: &str,
+    ) {
+        let claude_id = format!("{tab_id}-claude");
+        let term_id = format!("{tab_id}-t1");
+        let mut tab = Tab::new(tab_id, "New tab", path);
+        tab.panes = vec![
+            Pane::new(&claude_id, "Claude", PaneKind::Claude),
+            Pane::new(&term_id, "Terminal 1", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some(claude_id);
+        tab.claude_session_id = Some(session_id.to_string());
+        tab.next_terminal_index = 2;
+        model.ensure_project(project_id, &project_id.to_uppercase(), path);
+        let pi = model.projects.iter().position(|p| p.id == project_id).unwrap();
+        model.projects[pi].tabs.push(tab);
+    }
+
+    /// The tabs of project `project_id`, cloned for post-mutation assertions.
+    fn project_tabs(state: &WindowState, project_id: &str) -> Vec<Tab> {
+        state
+            .model
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.tabs.clone())
+            .unwrap_or_default()
+    }
+
+    fn tab_session_id(state: &WindowState, tab_id: &str) -> Option<String> {
+        state
+            .model
+            .tab_for(tab_id)
+            .and_then(|t| t.claude_session_id.clone())
+    }
+
+    // === AppStateClaudeSessionUpdateTests =====================================
+
+    #[test]
+    fn session_update_unknown_pane_id_is_no_op() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/tmp/p");
+        let out = state.apply_session_update("definitely-not-a-real-pane-id", "should-be-ignored", None, None);
+        assert!(!out.did_mutate);
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("S1"), "unknown pane must not mutate any tab");
+    }
+
+    #[test]
+    fn session_update_updates_target_tab_when_multiple_projects_exist() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p1", "t1", "S1", "/tmp/p1");
+        seed_rotation_tab(&mut state.model, "p2", "t2", "S2", "/tmp/p2");
+        seed_rotation_tab(&mut state.model, "p3", "t3", "S3", "/tmp/p3");
+        // Update the middle tab — the reverse scan must hit the right project even
+        // when it is not first.
+        state.apply_session_update("t2-claude", "S2-NEW", None, None);
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("S1"));
+        assert_eq!(tab_session_id(&state, "t2").as_deref(), Some("S2-NEW"));
+        assert_eq!(tab_session_id(&state, "t3").as_deref(), Some("S3"));
+    }
+
+    #[test]
+    fn session_update_resolves_by_pane_id_not_tab_id() {
+        // Pane ids and tab ids are distinct namespaces; passing a tab id must not
+        // match a tab (its pane list holds "t1-claude"/"t1-t1", not "t1").
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/tmp/p");
+        let out = state.apply_session_update("t1", "should-not-apply", None, None);
+        assert!(!out.did_mutate);
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("S1"));
+    }
+
+    #[test]
+    fn session_update_redundant_update_leaves_value_unchanged() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/tmp/p");
+        let first = state.apply_session_update("t1-claude", "S1", None, None);
+        let second = state.apply_session_update("t1-claude", "S1", None, None);
+        assert!(!first.did_mutate, "same id must not mutate");
+        assert!(!second.did_mutate, "the second redundant update must not mutate either");
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("S1"));
+    }
+
+    #[test]
+    fn session_update_new_session_id_replaces_old() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        let out = state.apply_session_update("t1-claude", "NEW", None, None);
+        assert!(out.did_mutate);
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn session_update_is_scoped_to_owning_window() {
+        // Window A owns "tA-claude"; window B owns "tB-claude". A cross-window send
+        // (A's handler receives B's pane) is a no-op on both — A's tab_id_owning
+        // returns None, and nothing dispatched to B.
+        let mut a = WindowState::new("/home/u");
+        seed_rotation_tab(&mut a.model, "pA", "tA", "A-INIT", "/tmp/pA");
+        let mut b = WindowState::new("/home/u");
+        seed_rotation_tab(&mut b.model, "pB", "tB", "B-INIT", "/tmp/pB");
+
+        a.apply_session_update("tB-claude", "LEAKED", None, None);
+        assert_eq!(tab_session_id(&a, "tA").as_deref(), Some("A-INIT"), "A untouched by a B-shaped pane");
+        assert_eq!(tab_session_id(&b, "tB").as_deref(), Some("B-INIT"), "B untouched until its own handler runs");
+
+        b.apply_session_update("tB-claude", "B-NEW", None, None);
+        assert_eq!(tab_session_id(&b, "tB").as_deref(), Some("B-NEW"));
+        assert_eq!(tab_session_id(&a, "tA").as_deref(), Some("A-INIT"), "B's mutation must not bleed into A");
+    }
+
+    #[test]
+    fn session_update_stale_pane_after_pane_exited_is_no_op() {
+        // The hook fires asynchronously: a session_update can land after its pane
+        // exited. The tab still exists (its terminal pane survives), but the pane id
+        // no longer maps to it, so the id must not be mutated.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/tmp/p");
+        // Baseline: a live update lands.
+        state.apply_session_update("t1-claude", "S1-LIVE", None, None);
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("S1-LIVE"));
+        // The claude pane exits (model-only removal — no live pty needed).
+        let (model, selection) = (&mut state.model, &mut state.selection);
+        state.session.pane_exited(model, selection, "t1", "t1-claude");
+        assert!(
+            state.model.tab_for("t1").is_some_and(|t| !t.panes.iter().any(|p| p.id == "t1-claude")),
+            "precondition: claude pane is gone after pane_exited"
+        );
+        // A late update for the now-defunct pane arrives.
+        let out = state.apply_session_update("t1-claude", "S1-STALE", None, None);
+        assert!(!out.did_mutate);
+        assert_eq!(
+            tab_session_id(&state, "t1").as_deref(),
+            Some("S1-LIVE"),
+            "stale pane id must not mutate the surviving tab"
+        );
+    }
+
+    // -- cwd update path --------------------------------------------------------
+
+    #[test]
+    fn session_update_cwd_matching_current_is_no_op() {
+        // Steady state: every SessionStart emits cwd even when nothing moved. The
+        // matching-cwd + matching-id case must not churn (both branches short-circuit).
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        let out = state.apply_session_update("t1-claude", "S1", Some("clear"), Some("/Users/nick/Projects/notes"));
+        assert_eq!(state.model.tab_for("t1").map(|t| t.cwd.as_str()), Some("/Users/nick/Projects/notes"));
+        assert!(!out.did_mutate, "matching cwd + matching id must not fire the save signal");
+    }
+
+    #[test]
+    fn session_update_cwd_differing_updates_tab_and_claude_pane() {
+        // The shape the feature fixes: bare `claude -w` lands in an auto-named
+        // worktree; the hook forwards it and tab.cwd + the (nil-cwd) claude pane follow.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
+        let out = state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
+        let tab = state.model.tab_for("t1").unwrap();
+        assert_eq!(tab.cwd, worktree, "tab.cwd moves to the worktree");
+        let claude = tab.panes.iter().find(|p| p.kind == PaneKind::Claude).unwrap();
+        assert_eq!(claude.cwd.as_deref(), Some(worktree), "nil-cwd claude pane follows the tab");
+        assert!(out.did_mutate, "cwd change must fire the save signal");
+    }
+
+    #[test]
+    fn session_update_cwd_companion_terminal_follows_when_matching_old_cwd() {
+        // A terminal companion still tracking the pre-update tab.cwd (not yet cd'd
+        // via OSC 7) is pulled along so a later shell lands inside the worktree.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        state.model.mutate_tab("t1", |tab| {
+            for pane in tab.panes.iter_mut().filter(|p| p.kind == PaneKind::Terminal) {
+                pane.cwd = Some("/Users/nick/Projects/notes".into());
+            }
+        });
+        let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
+        state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
+        let term = state.model.tab_for("t1").unwrap().panes.iter().find(|p| p.kind == PaneKind::Terminal).unwrap().cwd.clone();
+        assert_eq!(term.as_deref(), Some(worktree), "companion matching the old cwd follows into the worktree");
+    }
+
+    #[test]
+    fn session_update_cwd_companion_terminal_diverged_stays_put() {
+        // A companion already tracking the user elsewhere via OSC 7 must not snap
+        // back into the claude worktree.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        let user_cd = "/Users/nick/Projects/notes/some/subdir";
+        state.model.mutate_tab("t1", |tab| {
+            for pane in tab.panes.iter_mut().filter(|p| p.kind == PaneKind::Terminal) {
+                pane.cwd = Some(user_cd.into());
+            }
+        });
+        let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
+        state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
+        let term = state.model.tab_for("t1").unwrap().panes.iter().find(|p| p.kind == PaneKind::Terminal).unwrap().cwd.clone();
+        assert_eq!(term.as_deref(), Some(user_cd), "diverged OSC-7-tracked companion stays put");
+    }
+
+    #[test]
+    fn session_update_cwd_nil_pane_cwd_follows_the_tab() {
+        // A nil pane.cwd is "still following the tab" and inherits the new tab.cwd
+        // (the rule that makes the always-nil-cwd claude pane track the worktree).
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        assert!(
+            state.model.tab_for("t1").unwrap().panes.iter().find(|p| p.kind == PaneKind::Terminal).unwrap().cwd.is_none(),
+            "precondition: terminal pane cwd starts nil"
+        );
+        let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
+        state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
+        let term = state.model.tab_for("t1").unwrap().panes.iter().find(|p| p.kind == PaneKind::Terminal).unwrap().cwd.clone();
+        assert_eq!(term.as_deref(), Some(worktree), "nil pane cwd inherits the new tab.cwd");
+    }
+
+    #[test]
+    fn session_update_cwd_nil_in_payload_is_no_op() {
+        // An older hook script omits cwd; the socket normalizes it to None, and the
+        // handler short-circuits without touching tab.cwd.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        state.apply_session_update("t1-claude", "S1", Some("clear"), None);
+        assert_eq!(state.model.tab_for("t1").map(|t| t.cwd.as_str()), Some("/Users/nick/Projects/notes"));
+    }
+
+    #[test]
+    fn session_update_cwd_empty_in_payload_is_no_op() {
+        // Defense-in-depth: an empty-string cwd is treated as None even if the socket
+        // layer regressed (the cwd field rode in from a user-modifiable hook script).
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        state.apply_session_update("t1-claude", "S1", Some("clear"), Some(""));
+        assert_eq!(state.model.tab_for("t1").map(|t| t.cwd.as_str()), Some("/Users/nick/Projects/notes"));
+    }
+
+    #[test]
+    fn session_update_cwd_identical_updates_mutate_exactly_once() {
+        // Two same-cwd updates: only the first mutates; the second is already at the
+        // target value and short-circuits in adopt_tab_cwd's change detection.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S1", "/Users/nick/Projects/notes");
+        let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
+        let first = state.apply_session_update("t1-claude", "S1", Some("clear"), Some(worktree));
+        let second = state.apply_session_update("t1-claude", "S1", Some("clear"), Some(worktree));
+        assert!(first.did_mutate, "first update mutates");
+        assert!(!second.did_mutate, "redundant identical update must not re-mutate");
+    }
+
+    // -- branch + cwd ordering (the pin) ---------------------------------------
+
+    #[test]
+    fn session_update_branch_rotation_with_cwd_move_sibling_inherits_old_cwd() {
+        // `/branch` (resume + id-change) spawns a sibling parent pinned to the OLD
+        // id. The pre-rotation transcript lives in the OLD bucket, so the sibling
+        // must inherit the OLD cwd even though the originating tab moves. If the cwd
+        // update ran before materialization, the sibling would pick up the
+        // post-rotation worktree and its resume would point at the wrong bucket.
+        let original_cwd = "/Users/nick/Projects/notes";
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD-ID", original_cwd);
+        assert_eq!(state.model.tab_for("t1").map(|t| t.cwd.as_str()), Some(original_cwd));
+
+        let new_cwd = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
+        state.apply_session_update("t1-claude", "NEW-ID", Some("resume"), Some(new_cwd));
+
+        // The originating tab — post-rotation — sits in the worktree with the new id.
+        let orig = state.model.tab_for("t1").unwrap();
+        assert_eq!(orig.cwd, new_cwd, "originating tab reflects the post-rotation cwd");
+        assert_eq!(orig.claude_session_id.as_deref(), Some("NEW-ID"));
+
+        // The sibling parent — pinned to OLD-ID — holds the PRE-rotation cwd.
+        let tabs = project_tabs(&state, "p");
+        let sibling = tabs.iter().find(|t| t.claude_session_id.as_deref() == Some("OLD-ID"));
+        let sibling = sibling.expect("branch rotation must materialize a sibling parent");
+        assert_eq!(
+            sibling.cwd, original_cwd,
+            "sibling parent inherits the OLD cwd — its old-id transcript lives in the pre-rotation bucket"
+        );
+    }
+
+    // === AppStateBranchTrackingTests ==========================================
+
+    #[test]
+    fn branch_resume_with_id_change_creates_parent_tab() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.model.mutate_tab("t1", |t| t.title = "wire up the foo".into());
+
+        state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
+
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 2, "branch adds exactly one sibling parent tab");
+        // Parent inserted immediately above the originating tab: order reads [parent, child].
+        let (parent, child) = (&tabs[0], &tabs[1]);
+        assert_eq!(child.id, "t1", "originating tab keeps its id");
+        assert_eq!(child.claude_session_id.as_deref(), Some("NEW"), "originating tab adopts the post-rotation id");
+        assert_eq!(child.parent_tab_id.as_deref(), Some(parent.id.as_str()), "originating tab points at the new parent");
+        assert_eq!(parent.claude_session_id.as_deref(), Some("OLD"), "parent pinned to the pre-rotation id");
+        assert!(parent.parent_tab_id.is_none(), "parent stays at root");
+        assert_eq!(parent.title, "wire up the foo", "parent inherits the title");
+        assert_eq!(parent.cwd, child.cwd, "parent inherits the cwd");
+        assert_eq!(parent.panes.len(), 2);
+        assert!(parent.panes.iter().any(|p| p.kind == PaneKind::Claude), "parent has a claude pane");
+        assert!(parent.panes.iter().any(|p| p.kind == PaneKind::Terminal), "parent has a companion terminal");
+    }
+
+    #[test]
+    fn branch_clear_with_id_change_does_not_create_parent() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.apply_session_update("t1-claude", "NEW", Some("clear"), None);
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 1, "/clear must not spawn a parent tab");
+        assert_eq!(tabs[0].claude_session_id.as_deref(), Some("NEW"), "/clear still updates the id in place");
+        assert!(tabs[0].parent_tab_id.is_none());
+    }
+
+    #[test]
+    fn branch_missing_source_does_not_create_parent() {
+        // Older hook payloads (and any future Claude that drops `source`) surface as
+        // None; the conservative no-parent path — rather miss a /branch than
+        // misclassify a /clear.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.apply_session_update("t1-claude", "NEW", None, None);
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 1, "missing source must not spawn a parent tab");
+        assert_eq!(tabs[0].claude_session_id.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn branch_resume_with_same_id_does_not_create_parent() {
+        // A real `claude --resume <id>` keeps the id stable; the short-circuit
+        // absorbs it and the id-change guard blocks the parent.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "SAME", "/tmp/p");
+        state.apply_session_update("t1-claude", "SAME", Some("resume"), None);
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 1, "resume without rotation must not spawn a parent tab");
+        assert_eq!(tabs[0].claude_session_id.as_deref(), Some("SAME"));
+    }
+
+    #[test]
+    fn branch_first_promotes_parent_to_root_and_originating_becomes_child() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S0", "/tmp/p");
+        state.apply_session_update("t1-claude", "S1", Some("resume"), None);
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 2);
+        let (parent, originating) = (&tabs[0], &tabs[1]);
+        assert!(parent.parent_tab_id.is_none(), "first parent becomes the lineage root");
+        assert_eq!(originating.parent_tab_id.as_deref(), Some(parent.id.as_str()), "originating tab is a depth-1 child of the new root");
+    }
+
+    #[test]
+    fn branch_second_adds_sibling_child_under_same_root() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S0", "/tmp/p");
+        state.apply_session_update("t1-claude", "S1", Some("resume"), None);
+        let root_id = project_tabs(&state, "p")[0].id.clone();
+        state.apply_session_update("t1-claude", "S2", Some("resume"), None);
+
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 3);
+        let (root, second, originating) = (&tabs[0], &tabs[1], &tabs[2]);
+        assert_eq!(root.id, root_id, "root never changes once established");
+        assert_eq!(root.claude_session_id.as_deref(), Some("S0"), "root pins the very first pre-/branch session");
+        assert!(root.parent_tab_id.is_none(), "root stays at depth 0");
+        assert_eq!(originating.id, "t1");
+        assert_eq!(originating.claude_session_id.as_deref(), Some("S2"), "originating carries the freshest id");
+        assert_eq!(originating.parent_tab_id.as_deref(), Some(root_id.as_str()), "originating keeps pointing at the original root");
+        assert_eq!(second.claude_session_id.as_deref(), Some("S1"), "second parent pins the id current right before the second /branch");
+        assert_eq!(second.parent_tab_id.as_deref(), Some(root_id.as_str()), "second parent is a sibling under the same root");
+    }
+
+    #[test]
+    fn branch_third_keeps_adding_siblings_under_same_root() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S0", "/tmp/p");
+        for (i, new_session) in ["S1", "S2", "S3"].iter().enumerate() {
+            state.apply_session_update("t1-claude", new_session, Some("resume"), None);
+            assert_eq!(project_tabs(&state, "p").len(), i + 2, "each /branch adds one parent");
+        }
+        let tabs = project_tabs(&state, "p");
+        let root = &tabs[0];
+        assert!(root.parent_tab_id.is_none());
+        assert_eq!(root.claude_session_id.as_deref(), Some("S0"));
+        for tab in tabs.iter().skip(1) {
+            assert_eq!(tab.parent_tab_id.as_deref(), Some(root.id.as_str()), "every non-root tab points at the original root");
+        }
+        assert_eq!(tabs.last().unwrap().id, "t1", "originating tab stays at the bottom in display order");
+        assert_eq!(tabs.last().unwrap().claude_session_id.as_deref(), Some("S3"));
+    }
+
+    #[test]
+    fn branch_closing_parent_clears_child_parent_tab_id() {
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
+        let parent = project_tabs(&state, "p")[0].clone();
+        assert_eq!(project_tabs(&state, "p")[1].parent_tab_id.as_deref(), Some(parent.id.as_str()), "precondition: child points at parent");
+
+        // Dissolve the parent by exiting all its panes (model-level cascade).
+        for pane_id in parent.panes.iter().map(|p| p.id.clone()) {
+            let (model, selection) = (&mut state.model, &mut state.selection);
+            state.session.pane_exited(model, selection, &parent.id, &pane_id);
+        }
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 1, "parent is gone after its panes all exited");
+        assert_eq!(tabs[0].id, "t1");
+        assert!(tabs[0].parent_tab_id.is_none(), "child's parent_tab_id is cleared when parent dissolves");
+    }
+
+    #[test]
+    fn branch_closing_child_does_not_mutate_parent() {
+        // The dangling-pointer sweep only mutates tabs that pointed at the removed
+        // id; closing a child (which nothing points at) leaves the parent's
+        // parent_tab_id (None) exactly as it was.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
+        let parent = project_tabs(&state, "p")[0].clone();
+        let child = project_tabs(&state, "p")[1].clone();
+        assert!(parent.parent_tab_id.is_none(), "precondition: parent at root");
+        assert_eq!(child.parent_tab_id.as_deref(), Some(parent.id.as_str()), "precondition: child under parent");
+
+        for pane_id in child.panes.iter().map(|p| p.id.clone()) {
+            let (model, selection) = (&mut state.model, &mut state.selection);
+            state.session.pane_exited(model, selection, &child.id, &pane_id);
+        }
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 1, "child is gone, parent remains");
+        assert_eq!(tabs[0].id, parent.id);
+        assert!(tabs[0].parent_tab_id.is_none(), "parent's parent_tab_id must NOT be cleared when an unrelated child closes");
+    }
+
+    #[test]
+    fn branch_materialization_is_scoped_to_owning_window() {
+        // A /branch-shaped signal addressed to B's pane, dispatched into A, is a
+        // no-op on both — A's tab_id_owning returns None.
+        let mut a = WindowState::new("/home/u");
+        seed_rotation_tab(&mut a.model, "pA", "tA", "A0", "/tmp/pA");
+        let mut b = WindowState::new("/home/u");
+        seed_rotation_tab(&mut b.model, "pB", "tB", "B0", "/tmp/pB");
+
+        a.apply_session_update("tB-claude", "B-LEAKED", Some("resume"), None);
+        assert_eq!(project_tabs(&a, "pA").len(), 1, "A must not materialize a parent for a B-shaped pane");
+        assert_eq!(tab_session_id(&a, "tA").as_deref(), Some("A0"));
+        assert_eq!(project_tabs(&b, "pB").len(), 1, "B untouched — A was the dispatch target");
+        assert_eq!(tab_session_id(&b, "tB").as_deref(), Some("B0"));
+
+        // B's own handler DOES materialize a parent (proves scoping wasn't a false negative).
+        b.apply_session_update("tB-claude", "B1", Some("resume"), None);
+        assert_eq!(project_tabs(&b, "pB").len(), 2, "B's own /branch materializes a parent in B");
+        assert_eq!(project_tabs(&a, "pA").len(), 1, "B's /branch must not bleed a parent into A");
+        assert_eq!(tab_session_id(&a, "tA").as_deref(), Some("A0"));
+    }
+
+    #[test]
+    fn branch_on_root_preserves_depth1_by_reparenting_former_children() {
+        // /branch on a lineage root: the new parent becomes the new root, the old
+        // root slides to a depth-1 child, AND every former child of the old root is
+        // re-parented to the new root (otherwise they'd become depth-2).
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "S0", "/tmp/p");
+        state.apply_session_update("t1-claude", "S1", Some("resume"), None);
+        let old_root = project_tabs(&state, "p")[0].clone();
+        assert!(old_root.parent_tab_id.is_none(), "precondition: old root is the root");
+        state.apply_session_update("t1-claude", "S2", Some("resume"), None);
+
+        // /branch on the OLD ROOT. Its claude pane id and current session (S0).
+        let old_root_claude = old_root.panes.iter().find(|p| p.kind == PaneKind::Claude).unwrap().id.clone();
+        state.apply_session_update(&old_root_claude, "S0-PRIME", Some("resume"), None);
+
+        let tabs = project_tabs(&state, "p");
+        let roots: Vec<&Tab> = tabs.iter().filter(|t| t.parent_tab_id.is_none()).collect();
+        assert_eq!(roots.len(), 1, "exactly one root remains in the lineage");
+        let new_root = roots[0];
+        assert_ne!(new_root.id, old_root.id, "old root is no longer at depth 0");
+        for tab in tabs.iter().filter(|t| t.id != new_root.id) {
+            assert_eq!(tab.parent_tab_id.as_deref(), Some(new_root.id.as_str()), "every non-root tab is re-parented to the new root");
+        }
+        assert_eq!(tabs.iter().find(|t| t.id == "t1").unwrap().claude_session_id.as_deref(), Some("S2"), "t1 untouched by the /branch on the root");
+        assert_eq!(new_root.claude_session_id.as_deref(), Some("S0"), "new root pins the id current on old root right before its /branch");
+        assert_eq!(tabs.iter().find(|t| t.id == old_root.id).unwrap().claude_session_id.as_deref(), Some("S0-PRIME"), "old root now holds its post-rotation id");
+    }
+
+    #[test]
+    fn branch_on_nil_claude_session_id_is_no_op() {
+        // A claude tab whose session id is None (claude not yet started): the
+        // id-change guard requires a non-None old id, so the id is set in place but
+        // no parent spawns.
+        let mut state = WindowState::new("/home/u");
+        state.model.ensure_project("p-nil", "P-NIL", "/tmp/p-nil");
+        let mut tab = Tab::new("t-nil", "Pre-claude", "/tmp/p-nil");
+        tab.panes = vec![
+            Pane::new("t-nil-claude", "Claude", PaneKind::Claude),
+            Pane::new("t-nil-t1", "Terminal 1", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some("t-nil-claude".into());
+        tab.claude_session_id = None;
+        let pi = state.model.projects.iter().position(|p| p.id == "p-nil").unwrap();
+        state.model.projects[pi].tabs.push(tab);
+
+        state.apply_session_update("t-nil-claude", "FIRST", Some("resume"), None);
+        let tabs = project_tabs(&state, "p-nil");
+        assert_eq!(tabs.len(), 1, "no parent when the originating tab had no prior session id");
+        assert_eq!(tabs[0].claude_session_id.as_deref(), Some("FIRST"), "id still set in place");
+        assert!(tabs[0].parent_tab_id.is_none());
+    }
+
+    #[test]
+    fn branch_signal_on_terminals_tab_is_no_op() {
+        // The pinned Terminals group never hosts Claude; a resume+rotation addressed
+        // to a Terminals pane must not materialize a parent (insert_branch_parent
+        // refuses the Terminals project).
+        let mut state = WindowState::new("/home/u");
+        let terminals = TabModel::TERMINALS_PROJECT_ID;
+        let before = project_tabs(&state, terminals).len();
+        let main = TabModel::MAIN_TERMINAL_TAB_ID;
+        let main_pane = state.model.tab_for(main).unwrap().panes[0].id.clone();
+        // Give the Main tab a session id so the id-change guard would otherwise fire.
+        state.model.mutate_tab(main, |t| t.claude_session_id = Some("OLD".into()));
+
+        state.apply_session_update(&main_pane, "FRESH", Some("resume"), None);
+        assert_eq!(project_tabs(&state, terminals).len(), before, "Terminals tab count must not change on a spurious branch signal");
+    }
+
+    #[test]
+    fn branch_parent_pane_is_not_running_ignores_shell_osc_title() {
+        // The materialized parent's claude pane is is_claude_running == false
+        // (deferred resume). Its pty hosts a plain zsh whose theme OSC titles must
+        // NOT clobber the parent's inherited title — the OSC gate drops the whole
+        // Claude branch until the socket in-place promotion opens it.
+        let mut state = WindowState::new("/home/u");
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.model.mutate_tab("t1", |t| t.title = "wire up the foo".into());
+        state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
+
+        let parent = project_tabs(&state, "p")[0].clone();
+        let parent_claude = parent.panes.iter().find(|p| p.kind == PaneKind::Claude).unwrap().clone();
+        assert!(!parent_claude.is_claude_running, "sanity: branch parent's claude pane is deferred");
+
+        let model = &mut state.model;
+        state.session.pane_title_changed(model, &parent.id, &parent_claude.id, "Nick@Nicks MacBook Air:~/Projects/nice");
+        assert_eq!(
+            project_tabs(&state, "p")[0].title, "wire up the foo",
+            "branch parent's inherited title must survive its deferred-resume zsh's OSC titles"
         );
     }
 }

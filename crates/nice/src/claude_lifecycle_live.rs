@@ -24,6 +24,13 @@
 //!   invocation cwd while its `Tab.cwd` carries `.claude/worktrees/foo`.
 //! * **(e) exit routes in the shipped window** — a real `exit` in a live terminal
 //!   pane removes it from the SHIPPED window (the subscription-lift proof).
+//! * **(f) session_update rotation (R16)** — a raw-`UnixStream` `session_update`
+//!   with `source:"resume"` + a new id + a cwd move materializes a sibling parent
+//!   tab pinned to the OLD id, `is_claude_running == false`, at ROOT
+//!   (`parent_tab_id == None`) with the PRE-rotation cwd, while the originating tab
+//!   is re-parented UNDER it (indented) and moves into the post-rotation worktree;
+//!   a `source:"clear"` update rotates the id in place with NO new tab; a
+//!   cwd-bearing update adopts onto `Tab.cwd`.
 //!
 //! ## Hermeticity
 //!
@@ -361,6 +368,95 @@ async fn run_claude_lifecycle(
         None => failures.push("(e) exit: could not add + spawn the read-then-exit fixture pane".into()),
     }
 
+    // === (f) session_update rotation: /branch parent + /clear + cwd adopt =========
+    // Reuse the tab promoted in leg (c): "promote-tab" (in non-Terminals project
+    // "promote-proj"), whose claude pane "promote-pane" is now a running Claude with
+    // a minted session id. That minted id is the pre-rotation OLD id.
+    let old_sid = state.update(cx, |s, _cx| {
+        s.model.tab_for("promote-tab").and_then(|t| t.claude_session_id.clone())
+    });
+    match old_sid {
+        None => failures.push("(f) rotation: the promoted tab carries no session id to rotate".into()),
+        Some(old_sid) => {
+            // -- f1 /branch: source=resume + a NEW id + a cwd move. The pre-rotation
+            //    cwd is `work_a` (seed_promotable_terminal_tab set promote-tab.cwd).
+            let branch_wt = format!("{work_a}/.claude/worktrees/branch-wt");
+            send_session_update(cx, &socket_path, "promote-pane", "branch-new-id", Some("resume"), Some(&branch_wt)).await;
+            match poll_branch_parent(cx, &state, "promote-proj", &old_sid, "promote-tab").await {
+                None => failures.push(
+                    "(f) branch: no sibling parent tab pinned to the OLD id materialized in promote-proj".into(),
+                ),
+                Some(parent_id) => {
+                    let snap = state.update(cx, |s, _cx| {
+                        let parent = s.model.tab_for(&parent_id).cloned();
+                        let orig = s.model.tab_for("promote-tab").cloned();
+                        (parent, orig)
+                    });
+                    let (parent, orig) = snap;
+                    let parent = parent.expect("parent id just polled must resolve");
+                    let orig = orig.expect("originating promote-tab must still exist");
+                    // Sibling parent: deferred (not running), pinned to OLD id, at ROOT.
+                    let parent_claude = parent.panes.iter().find(|p| p.kind == PaneKind::Claude);
+                    if parent_claude.map(|p| p.is_claude_running) != Some(false) {
+                        failures.push("(f) branch: sibling parent's claude pane must be is_claude_running == false (deferred)".into());
+                    }
+                    if parent.parent_tab_id.is_some() {
+                        failures.push(format!(
+                            "(f) branch: ROOT PROMOTION — the new parent must render at root (parent_tab_id == None), got {:?}",
+                            parent.parent_tab_id
+                        ));
+                    }
+                    // The sibling inherits the PRE-rotation cwd (its old-id transcript
+                    // lives in the pre-rotation bucket) — the ordering pin, live.
+                    if parent.cwd != work_a {
+                        failures.push(format!(
+                            "(f) branch: sibling parent must inherit the pre-rotation cwd {work_a:?}, got {:?}",
+                            parent.cwd
+                        ));
+                    }
+                    // Originating tab: re-parented UNDER the new root (renders indented —
+                    // the landed row_indent contract keys off parent_tab_id.is_some()),
+                    // moved into the post-rotation worktree, carrying the NEW id.
+                    if orig.parent_tab_id.as_deref() != Some(parent_id.as_str()) {
+                        failures.push(format!(
+                            "(f) branch: originating tab must be re-parented under the new root (indented), got parent_tab_id {:?}",
+                            orig.parent_tab_id
+                        ));
+                    }
+                    if orig.cwd != branch_wt {
+                        failures.push(format!(
+                            "(f) branch: originating tab must move to the post-rotation worktree {branch_wt:?}, got {:?}",
+                            orig.cwd
+                        ));
+                    }
+                    if orig.claude_session_id.as_deref() != Some("branch-new-id") {
+                        failures.push(format!(
+                            "(f) branch: originating tab must carry the NEW session id, got {:?}",
+                            orig.claude_session_id
+                        ));
+                    }
+                }
+            }
+
+            // -- f2 /clear: source=clear + a new id ⇒ id updates in place, NO new tab.
+            let count_before_clear = project_tab_count(cx, &state, "promote-proj");
+            send_session_update(cx, &socket_path, "promote-pane", "cleared-id", Some("clear"), None).await;
+            if !poll_tab_session_id(cx, &state, "promote-tab", "cleared-id").await {
+                failures.push("(f) clear: /clear must update the originating tab's session id in place".into());
+            }
+            if project_tab_count(cx, &state, "promote-proj") != count_before_clear {
+                failures.push("(f) clear: /clear must NOT materialize a new tab".into());
+            }
+
+            // -- f3 cwd adopt: a same-id update carrying a fresh cwd ⇒ Tab.cwd adopts.
+            let adopt_cwd = format!("{work_a}/.claude/worktrees/adopt-wt");
+            send_session_update(cx, &socket_path, "promote-pane", "cleared-id", Some("clear"), Some(&adopt_cwd)).await;
+            if !poll_tab_cwd(cx, &state, "promote-tab", &adopt_cwd).await {
+                failures.push("(f) cwd adopt: a cwd-bearing update must adopt onto Tab.cwd".into());
+            }
+        }
+    }
+
     // === teardown: drop every session so no zsh / stub outlives the window ========
     let _ = state.update(cx, |s, _cx| s.teardown());
     settle(cx, 200).await;
@@ -378,8 +474,12 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      sidebar-dot status Thinking → Waiting; a second `claude` in that tab was \
                      refused (newtab); a terminal pane promoted in place (inplace <uuid> + model \
                      flip); `claude -w foo` split Tab.cwd into .claude/worktrees/foo anchored at \
-                     the invocation cwd; and a typed `exit` removed a live terminal pane via the \
-                     shipped subscription lift."
+                     the invocation cwd; a typed `exit` removed a live terminal pane via the \
+                     shipped subscription lift; and a `session_update` /branch rotation \
+                     (source=resume + new id + cwd move) materialized a deferred sibling parent \
+                     pinned to the OLD id at root with the pre-rotation cwd while the originating \
+                     tab re-parented under it into the post-rotation worktree, a /clear rotated \
+                     the id in place with no new tab, and a cwd-bearing update adopted Tab.cwd."
                 .to_string(),
         }
     } else {
@@ -469,6 +569,62 @@ fn claude_json(cwd: &str, args: &[String], tab_id: &str, pane_id: &str) -> Strin
 /// Minimal JSON string escaping (temp paths + kebab args carry no control chars).
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Fire-and-forget a `session_update` over the control socket. It carries no reply
+/// (the parser drops the client fd BEFORE dispatch — fire-and-forget), so connect
+/// ONCE (retrying only the connect until the socket answers or a short deadline),
+/// write the framed line exactly once, and return; the caller polls the model for
+/// the routed mutation. Writing exactly once matters: a re-sent line would
+/// materialize a second phantom branch parent.
+async fn send_session_update(
+    cx: &mut AsyncApp,
+    socket_path: &str,
+    pane_id: &str,
+    session_id: &str,
+    source: Option<&str>,
+    cwd: Option<&str>,
+) {
+    let payload = session_update_json(pane_id, session_id, source, cwd);
+    let path = socket_path.to_string();
+    let done = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            match UnixStream::connect(&path) {
+                Ok(mut s) => {
+                    let _ = s.write_all(payload.as_bytes());
+                    let _ = s.write_all(b"\n");
+                    let _ = s.flush();
+                    // The server reads the buffered line, then hits EOF on our drop.
+                    return;
+                }
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    let _ = done.join();
+    // Let the foreground drain route the fire-and-forget message before we poll.
+    settle(cx, POLL_MS).await;
+}
+
+/// Build a frozen `session_update` NDJSON request line (absent `source`/`cwd` are
+/// omitted, exactly as the hook script does when the field is empty).
+fn session_update_json(pane_id: &str, session_id: &str, source: Option<&str>, cwd: Option<&str>) -> String {
+    let mut fields = format!(
+        "\"action\":\"session_update\",\"paneId\":\"{}\",\"sessionId\":\"{}\"",
+        json_escape(pane_id),
+        json_escape(session_id),
+    );
+    if let Some(src) = source {
+        fields.push_str(&format!(",\"source\":\"{}\"", json_escape(src)));
+    }
+    if let Some(c) = cwd {
+        fields.push_str(&format!(",\"cwd\":\"{}\"", json_escape(c)));
+    }
+    format!("{{{fields}}}")
 }
 
 /// Whether `s` is a lowercase RFC-4122 v4 UUID (`8-4-4-4-12`, version nibble `4`,
@@ -568,6 +724,77 @@ fn tab_cwd_and_project_path(
             .map(|(pi, _)| s.model.projects[pi].path.clone());
         (cwd, proj)
     })
+}
+
+/// Poll until a tab in `project_id` (other than `exclude_tab`) is pinned to
+/// `session_id`, returning its id — the materialized branch parent, located by its
+/// pinned OLD session id (the originating tab excluded, since it briefly held the
+/// same id pre-rotation).
+async fn poll_branch_parent(
+    cx: &mut AsyncApp,
+    state: &Entity<WindowState>,
+    project_id: &str,
+    session_id: &str,
+    exclude_tab: &str,
+) -> Option<String> {
+    for _ in 0..ROUTE_POLLS {
+        settle(cx, POLL_MS).await;
+        let found = state.update(cx, |s, _cx| {
+            s.model.projects.iter().find(|p| p.id == project_id).and_then(|p| {
+                p.tabs
+                    .iter()
+                    .find(|t| t.id != exclude_tab && t.claude_session_id.as_deref() == Some(session_id))
+                    .map(|t| t.id.clone())
+            })
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The number of tabs currently in `project_id` (0 if the project is gone).
+fn project_tab_count(cx: &mut AsyncApp, state: &Entity<WindowState>, project_id: &str) -> usize {
+    state.update(cx, |s, _cx| {
+        s.model
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.tabs.len())
+            .unwrap_or(0)
+    })
+}
+
+async fn poll_tab_session_id(
+    cx: &mut AsyncApp,
+    state: &Entity<WindowState>,
+    tab_id: &str,
+    want: &str,
+) -> bool {
+    for _ in 0..ROUTE_POLLS {
+        settle(cx, POLL_MS).await;
+        if tab_session_id(cx, state, tab_id).as_deref() == Some(want) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn poll_tab_cwd(
+    cx: &mut AsyncApp,
+    state: &Entity<WindowState>,
+    tab_id: &str,
+    want: &str,
+) -> bool {
+    for _ in 0..ROUTE_POLLS {
+        settle(cx, POLL_MS).await;
+        let got = state.update(cx, |s, _cx| s.model.tab_for(tab_id).map(|t| t.cwd.clone()));
+        if got.as_deref() == Some(want) {
+            return true;
+        }
+    }
+    false
 }
 
 async fn poll_tab_status(

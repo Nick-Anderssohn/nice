@@ -93,6 +93,12 @@
 //!     shadow + OSC 7 emitter + prefill tail), the self-healing stub writer, and
 //!     the per-variant Application Support location + `NICE_APPLICATION_SUPPORT_ROOT`
 //!     override seam (`app::run` bootstrap wiring lands later in R14).
+//!   * [`claude_hook_installer`] — the R16 Claude `SessionStart` hook installer:
+//!     the FROZEN socket-client script body (byte-for-byte with the Swift
+//!     installer, installed at `~/.nice/nice-claude-hook.sh`, mode 0755) + the
+//!     non-destructive `~/.claude/settings.json` merge (nested SessionStart
+//!     group, stale-`UserPromptSubmit` strip, write-only-if-changed), both
+//!     against injectable base paths; `app::run` bootstrap wiring only.
 //!   * [`tmp_sweep`] — the R14 stale-`$TMPDIR` sweep: the pure `tempFileDecision`
 //!     classifier + the `nice-*.sock` / legacy `nice-zdotdir-*` sweep with an
 //!     injected `kill(pid,0)` liveness probe (keeps a live sibling app's debris).
@@ -104,6 +110,7 @@ mod app;
 mod app_shell;
 mod app_shell_live;
 mod chrome_live;
+mod claude_hook_installer;
 mod claude_lifecycle_live;
 mod context_menu;
 mod control_socket;

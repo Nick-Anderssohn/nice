@@ -1000,6 +1000,37 @@ fn navigable_sidebar_tab_ids_terminals_always_first() {
 }
 
 #[test]
+fn tab_id_owning_resolves_by_pane_across_projects_and_is_scoped() {
+    // A pane's owning tab is found by scanning every project's pane lists — even
+    // when the owner is not the first project — and pane ids are a distinct
+    // namespace from tab ids, so a tab-id-shaped query never matches a pane.
+    let mut model = model_empty("/tmp/main");
+    seed_claude_tab(&mut model, "p1", "t1", "S1", "/tmp/p1", true);
+    seed_claude_tab(&mut model, "p2", "t2", "S2", "/tmp/p2", true);
+    seed_claude_tab(&mut model, "p3", "t3", "S3", "/tmp/p3", true);
+
+    // Resolves the middle project's claude pane (reverse scan hits a non-first
+    // project) and its companion terminal pane.
+    assert_eq!(model.tab_id_owning("t2-claude").as_deref(), Some("t2"));
+    assert_eq!(model.tab_id_owning("t2-t1").as_deref(), Some("t2"));
+    // The pinned Terminals group is scanned too — its Main pane resolves.
+    let main_pane = model
+        .tab_for(TabModel::MAIN_TERMINAL_TAB_ID)
+        .unwrap()
+        .panes[0]
+        .id
+        .clone();
+    assert_eq!(
+        model.tab_id_owning(&main_pane).as_deref(),
+        Some(TabModel::MAIN_TERMINAL_TAB_ID)
+    );
+    // A tab id is not a pane id — passing one must not match any pane list.
+    assert_eq!(model.tab_id_owning("t1"), None);
+    // An entirely unknown pane id (stale / from another window) is None.
+    assert_eq!(model.tab_id_owning("definitely-not-a-pane"), None);
+}
+
+#[test]
 fn next_sidebar_tab_is_no_op_when_only_main_terminal_exists() {
     let mut model = model_empty("/tmp/main");
     model.select_tab(TabModel::MAIN_TERMINAL_TAB_ID);

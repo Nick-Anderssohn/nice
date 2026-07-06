@@ -302,6 +302,15 @@ impl SessionManager {
         (self.mint_id)(prefix)
     }
 
+    /// Mint a fresh tab id via the injected seam — the branch-parent
+    /// materialization path (`WindowState::materialize_branch_parent`) mints its
+    /// tab + `-claude`/`-t1` pane ids up front to hand to the model's
+    /// `insert_branch_parent` (which takes them as params), mirroring
+    /// `create_claude_tab`'s internal `self.mint("t")`.
+    pub(crate) fn mint_tab_id(&self, prefix: &str) -> String {
+        self.mint(prefix)
+    }
+
     // MARK: - Pane title / cwd routing (pure model, unit-tested)
 
     /// A pane's shell emitted OSC 7 with a new working directory. Stash it on
