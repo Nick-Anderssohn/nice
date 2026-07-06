@@ -1122,6 +1122,17 @@ impl TabModel {
         }
         None
     }
+
+    /// Derive the on-disk worktree directory name Claude creates from a `-w`
+    /// value. Claude Code sanitizes `/` → `+` when materializing the worktree
+    /// directory (so `foo/bar` becomes `foo+bar`); Nice mirrors that so the
+    /// companion terminal's `Tab.cwd` lands in the same directory Claude
+    /// actually created (`SessionsModel.swift:677-682`). Pure counterpart to
+    /// [`TabModel::extract_worktree_name`] (which pulls the raw `-w` value);
+    /// the caller joins `<cwd>/.claude/worktrees/<sanitized>`.
+    pub fn sanitize_worktree_name(name: &str) -> String {
+        name.replace('/', "+")
+    }
 }
 
 // MARK: - Pure free helpers

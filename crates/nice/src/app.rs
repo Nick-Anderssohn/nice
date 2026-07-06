@@ -581,8 +581,14 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
     //    `nice-zdotdir-*` dirs) whose owning pid is gone. Cross-app safe: a live
     //    sibling's debris is kept (pid-liveness rule).
     crate::tmp_sweep::sweep_stale_temp_files();
-    // R15: OrphanShellReaper::reap() slots here — reap orphan zsh from prior
-    // crashes before any new pane spawns (macOS caps kern.tty.ptmx_max at 511).
+    // R15 (C12): reap zsh orphaned by prior crashes / SIGKILLs BEFORE any new pane
+    // spawns, so we don't inherit a starved pty table (macOS caps kern.tty.ptmx_max
+    // at 511). Match = PPID==1 & uid==me & comm=="zsh" & env has NICE_TAB_ID=; never
+    // name-pattern matching. Best-effort + synchronous; `run_selftest` never runs it.
+    let reaped = crate::orphan_reaper::reap(&crate::orphan_reaper::ReaperEnv::live());
+    if reaped > 0 {
+        eprintln!("nice-rs: reaped {reaped} orphan zsh shell(s) from prior runs");
+    }
     // 2. Write the ZDOTDIR stubs (overwrite-always self-heal). A write failure is
     //    non-fatal: zdotdir stays None and panes still get NICE_SOCKET.
     let zdotdir = match crate::shell_inject::write_stubs(&crate::shell_inject::default_location()) {
@@ -600,6 +606,57 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
         zdotdir,
         user_zdotdir,
     });
+    // 4. Kick off the C11 claude-binary probe (last, per the sweep→reap→zdotdir→
+    //    probe ordering). Delivers to a process-global the Claude spawn path reads.
+    kickoff_claude_probe(cx);
+}
+
+/// The C11 claude-binary probe (Swift `NiceServices.bootstrap`'s
+/// `resolvedClaudePath` resolution, `NiceServices.swift:331-346`). Runs from
+/// [`run`]'s bootstrap ONLY. `NICE_CLAUDE_OVERRIDE` wins **synchronously** (the
+/// stub seam) and seeds the global at once; otherwise the login-shell `command -v`
+/// probe runs on the background executor (NEVER blocking window init on
+/// `waitUntilExit`) and delivers its result to the same process-global on the
+/// foreground when it completes. The spawn path also re-reads the override at spawn
+/// time, so a scenario's stub resolves even though `run_selftest` skips this.
+fn kickoff_claude_probe(cx: &mut App) {
+    use crate::session_manager::ResolvedClaudePath;
+    if let Ok(over) = std::env::var("NICE_CLAUDE_OVERRIDE") {
+        if !over.is_empty() {
+            cx.set_global(ResolvedClaudePath(Some(over)));
+            return;
+        }
+    }
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let resolved = acx
+            .background_executor()
+            .spawn(async { run_which_claude() })
+            .await;
+        let _ = acx.update(|app| app.set_global(ResolvedClaudePath(resolved)));
+    })
+    .detach();
+}
+
+/// Run `/bin/zsh -ilc 'command -v -- claude'` and return the absolute path if
+/// found — Swift `NiceServices.runWhich` (`NiceServices.swift:427-446`). A
+/// login-interactive shell so the user's `.zshenv`/`.zshrc` PATH additions are
+/// honored (Nice launched from Finder/Spotlight otherwise inherits only the macOS
+/// default PATH). Accepts only exit-0 stdout that trims to an absolute path.
+fn run_which_claude() -> Option<String> {
+    let out = std::process::Command::new("/bin/zsh")
+        .args(["-ilc", "command -v -- claude"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.starts_with('/') {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 /// Mint + arm this window's control socket and thread its shell-injection env into
@@ -661,7 +718,7 @@ pub(crate) fn arm_window_control_socket(
                 match rx.try_recv() {
                     Ok(msg) => {
                         if this
-                            .update(acx, |ws, _cx| ws.route_socket_message(msg))
+                            .update(acx, |ws, cx| ws.route_socket_message(msg, cx))
                             .is_err()
                         {
                             return; // window entity gone
@@ -775,6 +832,11 @@ fn build_window_root(
     // registration-order fallback stands until the window is first keyed.
     let id = window.window_handle().window_id();
     WindowRegistry::register(cx, id, state.clone());
+    // R15 subscription lift: stash this window's handle so the pane-event
+    // subscription (wired lazily by `PaneHostView`'s render sweep) can actuate a
+    // RoutedExit's every-project-empty terminus (close/quit) — a `&mut Window` a
+    // subscription callback otherwise lacks.
+    state.update(cx, |ws, _cx| ws.set_window_handle(window.window_handle()));
     state.update(cx, |_state, cx| {
         cx.observe_window_activation(window, |_state, window, cx| {
             if window.is_window_active() {
@@ -2901,6 +2963,30 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // pane, a socket self-heal poll, and the teardown reap — each on the
                 // real pty / socket clock; generous headroom.
                 budget: Duration::from_secs(90),
+            },
+            activate: true,
+        },
+        // R15: the Claude tab lifecycle gate — drives the WHOLE Claude flow over the
+        // SHIPPED window (open_managed_window / build_window_root) with a real
+        // control socket + real ptys + the live route_terminal_event subscription
+        // lift: a socket newtab spawns a running Claude tab (minted v4 uuid, stub
+        // OSC titles drive the sidebar-dot status Thinking → Waiting); a second
+        // `claude` in that tab is refused; a terminal pane promotes in place
+        // (inplace <uuid> + model flip); `claude -w foo` splits Tab.cwd into
+        // .claude/worktrees/foo; a typed `exit` removes a live pane via the
+        // subscription lift. Stub-`claude` via NICE_CLAUDE_OVERRIDE + sandbox HOME
+        // (never the real claude / real ~). Registered BEFORE `multiwindow`: its
+        // build_window_root only `register`s (no WindowRegistry close observer), so
+        // its window never trips the quit-when-empty terminus.
+        Scenario {
+            name: "claude-lifecycle",
+            open: crate::claude_lifecycle_live::open_claude_lifecycle_window,
+            gate: Gate::SelfReported {
+                // A socket round-trip + a spawned stub's two OSC titles (with a line
+                // of input between), a promotion, a worktree split, and a
+                // read-then-exit pane — each on the real socket / pty clock; generous
+                // headroom.
+                budget: Duration::from_secs(75),
             },
             activate: true,
         },

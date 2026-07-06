@@ -102,9 +102,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use gpui::{App, Entity, FocusHandle, Window};
+use gpui::{App, Entity, FocusHandle, Global, Window};
 
-use nice_model::{PaneKind, SidebarTabSelection, TabModel, TabStatus};
+use nice_model::{Pane, PaneKind, SidebarTabSelection, Tab, TabModel, TabStatus};
 use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
 use nice_term_view::{TerminalEvent, TerminalSessionHandle, DEFAULT_LAUNCH_OVERLAY_GRACE};
 
@@ -392,18 +392,44 @@ impl SessionManager {
                 changed
             }
             PaneKind::Claude => {
-                // R15: the Claude branch — split the braille-spinner (U+2800..
-                // U+28FF → thinking) / sparkle (U+2733 → waiting) status prefix,
-                // apply the status transition, and feed the trailing label into
-                // the tab auto-title (dropping the "Claude Code" placeholder).
-                // Gated on `is_claude_running`, which is `false` for all of R13
-                // (only R15's socket promotion flips it), so the entire branch
-                // drops now — no status, no OSC-driven tab title. R15 fills this
-                // in without retrofitting the gate.
+                // R15 T5: the Claude branch — split the braille-spinner (U+2800..
+                // U+28FF → thinking) / sparkle (U+2733 → waiting) status prefix via
+                // [`parse_claude_title`], apply the status transition, and feed the
+                // trailing label into the tab auto-title (dropping the "Claude Code"
+                // placeholder). Gated on `is_claude_running`: a deferred-resume
+                // Claude pane is a plain `zsh` whose theme OSC titles must not
+                // clobber the persisted session label, so the whole branch drops
+                // until the socket in-place promotion (the only production
+                // false→true flip) opens the gate (`SessionsModel.swift:416-474`).
                 if !is_claude_running {
                     return false;
                 }
-                // R15: status-prefix split + apply_auto_title land here.
+                let (status, label) = parse_claude_title(title);
+                if let Some(new_status) = status {
+                    // Acknowledge the pulse only when the user is actually looking at
+                    // this pane — the viewed tab's active pane (Swift's
+                    // `viewing && isActivePane`). A manually-renamed Claude pane still
+                    // flips status: the title lock lives in the terminal branch, not
+                    // here (`AppStatePaneLifecycleTests.claudePane_manuallySet_...`).
+                    let viewing = model.active_tab_id() == Some(tab_id);
+                    model.mutate_tab(tab_id, |tab| {
+                        let is_active_pane = tab.active_pane_id.as_deref() == Some(pane_id);
+                        if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
+                            pane.apply_status_transition(new_status, viewing && is_active_pane);
+                        }
+                    });
+                }
+                // The trailing label humanizes into the TAB auto-title — never the
+                // Claude pane's own pill (that stays "Claude"/the user's rename).
+                // Skip an empty label and Claude's generic "Claude Code" placeholder.
+                let raw_label = label.trim();
+                if raw_label.is_empty() || raw_label == "Claude Code" {
+                    return false;
+                }
+                model.apply_auto_title(tab_id, raw_label);
+                // This branch never writes the pane pill, so the pill-label-changed
+                // signal is always `false` (status + tab title flow through the
+                // model's own mutation hooks).
                 false
             }
         }
@@ -1038,9 +1064,27 @@ impl SessionManager {
             .map(|session| session.handle.clone())
     }
 
-    /// Register an **empty** per-tab session container without spawning any pane
-    /// — the claude-tab creation path this cycle, where the claude pane is
-    /// model-only (no process until R15) and the companion terminal is deferred.
+    /// Every `(tab_id, pane_id)` with a live pane session right now — the
+    /// enumeration the shipped window's subscribe-once sweep
+    /// ([`crate::window_state::WindowState::subscribe_spawned_panes`]) walks to
+    /// wire each freshly-spawned pane's entity to [`route_terminal_event`](Self::route_terminal_event).
+    /// Order is unspecified (a `HashMap` walk); the sweep dedupes by key, so
+    /// order does not matter.
+    pub(crate) fn live_pane_keys(&self) -> Vec<(String, String)> {
+        self.tabs
+            .iter()
+            .flat_map(|(tab_id, panes)| {
+                panes
+                    .keys()
+                    .map(move |pane_id| (tab_id.clone(), pane_id.clone()))
+            })
+            .collect()
+    }
+
+    /// Register an **empty** per-tab session container without spawning any pane.
+    /// On the claude-tab creation path it runs just before the eager Claude spawn
+    /// (`create_claude_tab` calls `spawn_claude_pane` immediately — claude-kind
+    /// panes never lazy-spawn) while the companion terminal stays deferred.
     /// It exists so [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)'s
     /// "the tab already has a session" precondition holds when the user first
     /// focuses the deferred companion. Idempotent.
@@ -1107,6 +1151,27 @@ impl SessionManager {
             return Ok(());
         }
         merge_env_spec_wins(&mut spec.env, self.window_pane_env_pairs(tab_id, pane_id));
+        self.spawn_session_raw(tab_id, pane_id, spec, cx)
+    }
+
+    /// Spawn + cache a live session from `spec` **verbatim** — no window
+    /// injection. The Claude spawn path ([`spawn_claude_pane`](Self::spawn_claude_pane))
+    /// uses this because a Claude pane's env is fully determined by
+    /// [`build_claude_extra_env`] (it deliberately omits `ZDOTDIR` for a
+    /// non-deferred pane, so it `exec`s claude under the user's own rc — matching
+    /// Swift's per-mode env); routing it through [`spawn_pane`](Self::spawn_pane)'s
+    /// blanket injection would re-add `ZDOTDIR`/`NICE_USER_ZDOTDIR` it doesn't
+    /// want. Idempotent per `(tab, pane)`.
+    fn spawn_session_raw(
+        &mut self,
+        tab_id: &str,
+        pane_id: &str,
+        spec: SpawnSpec,
+        cx: &mut App,
+    ) -> Result<()> {
+        if self.has_pane(tab_id, pane_id) {
+            return Ok(());
+        }
         let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
         let focus = cx.focus_handle();
         self.tabs
@@ -1116,10 +1181,193 @@ impl SessionManager {
         Ok(())
     }
 
+    /// The ONE shared Claude-tab constructor — the Rust twin of Swift's
+    /// near-duplicate `createTabFromMainTerminal` (socket newtab path) /
+    /// `createClaudeTabInProject` (sidebar project-`+` path)
+    /// (`SessionsModel.swift:650-714, :758-794`). Builds the `[Claude, Terminal 1]`
+    /// shape (Claude focused), places it, selects it, registers the tab session,
+    /// and spawns the Claude pane from `spawn_cwd` (claude resolves/creates its own
+    /// `-w` worktree) — the companion terminal stays **deferred** (model-only until
+    /// first focus, per Swift `makeSession(initialTerminalPaneId: nil)`).
+    ///
+    /// The Claude pane is created with `is_claude_running = true` from day one (the
+    /// PROTECTED creation invariant: it gates the ≤1-Claude promotion refusal, the
+    /// OSC title/status pulse, and auto-titles). The session UUID is pre-minted
+    /// (real v4, via [`mint_session_uuid`]) so `--session-id` is passed now and the
+    /// same id persists for later `--resume`.
+    ///
+    /// `settings_path` is the injectable theme-sync provider's output (R17 fills it;
+    /// `None` until then). Returns the new tab id, or `None` for a bad placement (an
+    /// unknown / pinned-Terminals project id).
+    pub(crate) fn create_claude_tab(
+        &mut self,
+        model: &mut TabModel,
+        placement: ClaudeTabPlacement,
+        args: &[String],
+        settings_path: Option<&str>,
+        cx: &mut App,
+    ) -> Option<String> {
+        // Placement-specific facts, resolved before we mint anything that would
+        // otherwise leak on a bad project id.
+        let (title, tab_cwd, spawn_cwd, extra_args): (String, String, String, Vec<String>) =
+            match &placement {
+                ClaudeTabPlacement::Bucket { cwd } => (
+                    // The bucketing anchor (`project_path`) stays `cwd`; the tab cwd
+                    // follows the `-w` worktree in.
+                    claude_tab_title_from_args(args),
+                    claude_worktree_cwd(cwd, args),
+                    cwd.clone(),
+                    args.to_vec(),
+                ),
+                ClaudeTabPlacement::Project { project_id } => {
+                    // The pinned Terminals group only holds terminal tabs.
+                    if project_id == TabModel::TERMINALS_PROJECT_ID {
+                        return None;
+                    }
+                    let pi = model.projects.iter().position(|p| &p.id == project_id)?;
+                    let path = model.projects[pi].path.clone();
+                    ("New tab".to_string(), path.clone(), path, Vec::new())
+                }
+            };
+
+        let tab_id = self.mint("t");
+        let claude_pane_id = format!("{tab_id}-claude");
+        let terminal_pane_id = format!("{tab_id}-t1");
+        let session_id = mint_session_uuid();
+
+        // The Claude pane is `is_claude_running = true` at creation (PROTECTED).
+        let mut claude_pane = Pane::new(&claude_pane_id, "Claude", PaneKind::Claude);
+        claude_pane.is_claude_running = true;
+        let mut tab = Tab::new(&tab_id, title, tab_cwd);
+        tab.panes = vec![
+            claude_pane,
+            Pane::new(&terminal_pane_id, "Terminal 1", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some(claude_pane_id.clone());
+        tab.claude_session_id = Some(session_id.clone());
+        tab.next_terminal_index = 2;
+
+        match &placement {
+            ClaudeTabPlacement::Bucket { cwd } => model.add_tab_to_projects(tab, cwd),
+            ClaudeTabPlacement::Project { project_id } => {
+                let pi = model.projects.iter().position(|p| &p.id == project_id)?;
+                model.projects[pi].tabs.push(tab);
+            }
+        }
+        model.select_tab(&tab_id);
+        // The (empty) session container so the deferred companion's later
+        // `ensure_active_pane_spawned` precondition ("the tab has a session") holds.
+        self.register_tab_session(&tab_id);
+
+        // Spawn the Claude pane immediately (claude-kind panes never lazy-spawn).
+        let _ = self.spawn_claude_pane(
+            &tab_id,
+            &claude_pane_id,
+            &spawn_cwd,
+            &ClaudeSessionMode::New(session_id),
+            &extra_args,
+            settings_path,
+            cx,
+        );
+        Some(tab_id)
+    }
+
+    /// Spawn a **Claude-kind** pane's child — the Rust twin of Swift
+    /// `TabPtySession.spawnClaudePane` (`TabPtySession.swift:275-340`). The spec is
+    /// mode-driven:
+    ///
+    /// * [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) → a plain login shell
+    ///   (`zsh -il`) carrying `NICE_PREFILL_COMMAND` (the injected zshrc pre-types
+    ///   `claude --resume <id>`); the launch overlay is suppressed (a quiescent
+    ///   prefilled shell isn't "launching").
+    /// * Probe resolved a `claude` binary → `zsh -ilc "exec <claude> …"` via
+    ///   [`build_claude_exec_command`], env from [`build_claude_extra_env`].
+    /// * Probe unresolved → a plain `zsh -il` with **no** Nice env (Swift's
+    ///   `environment: nil` fallback: the pane renders as Claude but is really a
+    ///   shell). No retro-upgrade when the probe later resolves.
+    ///
+    /// The env comes wholly from [`build_claude_extra_env`] (which reads this
+    /// window's socket / zdotdir facts) and the spawn bypasses the blanket window
+    /// injection ([`spawn_session_raw`](Self::spawn_session_raw)) — see that method.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_claude_pane(
+        &mut self,
+        tab_id: &str,
+        pane_id: &str,
+        cwd: &str,
+        mode: &ClaudeSessionMode,
+        extra_args: &[String],
+        settings_path: Option<&str>,
+        cx: &mut App,
+    ) -> Result<()> {
+        // Window shell-injection facts (None on a manager that never armed a socket).
+        let (socket_path, zdotdir, user_zdotdir) = match &self.window_shell_env {
+            Some(env) => (
+                env.socket_path.clone(),
+                env.zdotdir.clone(),
+                env.user_zdotdir.clone(),
+            ),
+            None => (None, None, None),
+        };
+        // `NICE_CLAUDE_OVERRIDE` in the env means the wrapper owns the full argv —
+        // suppress every Nice-injected flag (re-read here, the test seam).
+        let is_override = std::env::var("NICE_CLAUDE_OVERRIDE")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let claude = resolve_claude_binary(cx);
+
+        let spec = if matches!(mode, ClaudeSessionMode::ResumeDeferred(_)) {
+            let env = build_claude_extra_env(
+                mode,
+                tab_id,
+                pane_id,
+                socket_path.as_deref(),
+                zdotdir.as_deref(),
+                user_zdotdir.as_deref(),
+                settings_path.map(str::to_string),
+            );
+            SpawnSpec::shell(cwd).with_env(env)
+        } else if let Some(claude) = claude.as_deref() {
+            let env = build_claude_extra_env(
+                mode,
+                tab_id,
+                pane_id,
+                socket_path.as_deref(),
+                zdotdir.as_deref(),
+                user_zdotdir.as_deref(),
+                settings_path.map(str::to_string),
+            );
+            let exec_line =
+                build_claude_exec_command(claude, mode, extra_args, is_override, settings_path);
+            // `SpawnSpec::command` wraps its arg as `zsh -ilc "exec <cmd>"`; the
+            // composer already emits `exec <claude> …`, so hand it the post-`exec`
+            // remainder (the composer always prefixes `exec `, so the strip is total).
+            let command = exec_line
+                .strip_prefix("exec ")
+                .unwrap_or(&exec_line)
+                .to_string();
+            SpawnSpec::command(command, cwd).with_env(env)
+        } else {
+            // Probe unresolved: plain shell, no Nice env (Swift `environment: nil`).
+            SpawnSpec::shell(cwd)
+        };
+
+        self.spawn_session_raw(tab_id, pane_id, spec, cx)?;
+
+        // Launch-overlay policy: register the user-facing command string; a
+        // deferred-resume pane suppresses it (Swift `installLaunchOverlayHooks`'s
+        // early return for `.resumeDeferred`). The live window root clears it on
+        // first output / exit via the routed events (the subscription lift).
+        if !matches!(mode, ClaudeSessionMode::ResumeDeferred(_)) {
+            let _ = self.register_pane_launch(pane_id, claude_launch_display_command(mode, extra_args));
+        }
+        Ok(())
+    }
+
     /// Spawn the active pane's deferred pty if it was modelled up front — Swift's
     /// `ensureActivePaneSpawned` (`SessionsModel.swift:553-565`). Only for a
     /// **terminal-kind** active pane (claude-kind panes never lazy-spawn — they
-    /// stay model-only until R15) whose tab already has a session container and
+    /// eager-spawn at tab creation as of R15) whose tab already has a session container and
     /// whose pty isn't live yet. The spawn cwd resolves per-pane (last OSC 7,
     /// else the tab/project fallback). Never creates a tab container itself.
     pub(crate) fn ensure_active_pane_spawned(
@@ -1251,6 +1499,60 @@ fn default_mint_id(prefix: &str) -> String {
     format!("{prefix}{ms}-{:04x}", c & 0xffff)
 }
 
+/// Mint a fresh lowercased UUIDv4 session id (Swift's
+/// `UUID().uuidString.lowercased()` at `SessionsModel.swift:664, :866`). This is
+/// a SEPARATE mint from [`default_mint_id`]: tab/pane ids stay the time-sortable
+/// ms+counter form, but a Claude session id is handed to the `claude` CLI as
+/// `--session-id`/`--resume` and must be a real v4 UUID (the CLI validates the
+/// shape), so it needs 122 bits of real entropy with the version/variant bits
+/// set — not a counter.
+///
+/// Hand-rolled over `getentropy` rather than pulling the `uuid` crate: the
+/// workspace is deliberately dependency-frugal and `libc` is already a dep
+/// (matching `nice-model`'s no-`uuid` minting note). 16 random bytes, then
+/// RFC 4122 §4.4: byte 6 high nibble → `0100` (version 4), byte 8 top two bits
+/// → `10` (variant 1). Rendered lowercase `8-4-4-4-12`.
+pub(crate) fn mint_session_uuid() -> String {
+    let mut b = random_16_bytes();
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
+}
+
+/// 16 cryptographically-random bytes via `getentropy(2)` (macOS, buflen ≤ 256 so
+/// a single call always suffices). On the near-impossible failure path
+/// (`getentropy` only fails on `EFAULT`/`EIO`, neither reachable with a valid
+/// 16-byte stack buffer) fall back to a time+counter+address mix so minting
+/// stays infallible like Swift's `UUID()`; the version/variant bits are set by
+/// the caller regardless, so the UUID shape is always valid even in the
+/// degraded case.
+fn random_16_bytes() -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    // SAFETY: `buf` is a live 16-byte stack buffer; `getentropy` writes exactly
+    // `buflen` bytes into it and reads nothing. 16 ≤ 256 (the `GETENTROPY_MAX`),
+    // so it never short-fills.
+    let rc = unsafe { libc::getentropy(buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if rc == 0 {
+        return buf;
+    }
+    // Degraded fallback — see the doc comment. Never expected to run.
+    static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let c = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mix = nanos ^ (c.wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ (&buf as *const _ as u64);
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte = (mix >> ((i % 8) * 8)) as u8 ^ (c >> (i % 8)) as u8;
+    }
+    buf
+}
+
 /// Merge `injected` env pairs into `spec_env` **spec-wins**: a key already
 /// present on the caller-built spec keeps its value; only keys absent from the
 /// spec are appended. The inverse of `nice_term_core::build_env`'s caller-wins
@@ -1290,15 +1592,16 @@ pub(crate) enum ClaudeSessionMode {
 /// Build the extra-env pairs for a **Claude** pane. Pure port of Swift
 /// `TabPtySession.buildClaudeExtraEnv` (`TabPtySession.swift:875-902`).
 ///
-/// The per-mode matrix is R14's FROZEN spec (R15 wires this function and may
-/// extend the signature — never the matrix): EVERY mode sets `TERM_PROGRAM`,
+/// The per-mode matrix is R14's FROZEN spec (R15 wired this function into the
+/// live spawn path and may extend the signature — never the matrix): EVERY mode sets `TERM_PROGRAM`,
 /// `NICE_TAB_ID`, `NICE_PANE_ID`, and `NICE_SOCKET` (when a socket exists) so the
 /// SessionStart hook can reach Nice; ONLY [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred)
 /// adds `ZDOTDIR` (when set), the always-present `NICE_USER_ZDOTDIR` (empty when
 /// none), and the `NICE_PREFILL_COMMAND` the stub's `print -z` tail pre-types.
 ///
-/// **Production-unused until R15** wires it (marked via the module-wide
-/// `dead_code` allow). `settings_path` is threaded now but always `None` until
+/// Was production-unused before R15; R15's [`spawn_claude_pane`](SessionManager::spawn_claude_pane)
+/// now wires it as the live env composer for every Claude pane spawn.
+/// `settings_path` is threaded now but always `None` until
 /// R17 fills R15's theme-sync provider; when `Some`, it splices a single-quoted
 /// `--settings <path>` before `--resume` in the prefill line (theme parity for a
 /// deferred-resumed session), matching the Swift source byte-for-byte.
@@ -1331,18 +1634,288 @@ pub(crate) fn build_claude_extra_env(
             "NICE_USER_ZDOTDIR".to_string(),
             user_zdotdir.unwrap_or("").to_string(),
         ));
-        // Pre-type the resume command the user runs with Enter. Splice
-        // `--settings <path>` (single-quoted for the interactive shell line) when
-        // theme sync is on, so the deferred-resumed session adopts Nice's theme.
-        let settings_arg = settings_path
-            .map(|p| format!(" --settings {}", nice_term_core::shell_single_quote(&p)))
-            .unwrap_or_default();
+        // Pre-type the resume command the user runs with Enter. The prefill
+        // string is an R15-owned protocol composer (see
+        // [`build_claude_prefill_command`]); the FROZEN format is
+        // `claude[ --settings '<path>'] --resume <sid>`.
         env.push((
             "NICE_PREFILL_COMMAND".to_string(),
-            format!("claude{settings_arg} --resume {session_id}"),
+            build_claude_prefill_command(settings_path.as_deref(), session_id),
         ));
     }
     env
+}
+
+/// Build the deferred-resume prefill command the injected zshrc's `print -z`
+/// pre-types at the prompt — the FROZEN wire string
+/// `claude[ --settings '<path>'] --resume <sid>` (a compatibility contract with
+/// the shell helpers already installed on user disks). Pure port of the
+/// `NICE_PREFILL_COMMAND` construction in Swift
+/// `TabPtySession.buildClaudeExtraEnv` (`TabPtySession.swift:898-899`),
+/// extracted as a discrete composer per the R15 "owns ALL protocol/exec
+/// composers" decision.
+///
+/// `settings_path` is the injectable theme-sync provider's output (R17 fills
+/// it; `None` until then): when `Some`, a single-quoted `--settings <path>` is
+/// spliced BEFORE `--resume` so the deferred-resumed session adopts Nice's
+/// theme, matching the exec builder's flag order.
+pub(crate) fn build_claude_prefill_command(settings_path: Option<&str>, session_id: &str) -> String {
+    let settings_arg = settings_path
+        .map(|p| format!(" --settings {}", nice_term_core::shell_single_quote(p)))
+        .unwrap_or_default();
+    format!("claude{settings_arg} --resume {session_id}")
+}
+
+/// Assemble the `exec <claude> …` command line for the inner `zsh -ilc`
+/// invocation. Pure port of Swift `TabPtySession.buildClaudeExecCommand`
+/// (`TabPtySession.swift:938-970`) — factored out so unit tests lock the flag
+/// ordering contract without spawning a pty.
+///
+/// Flag-order rule (load-bearing): `--settings <path>` (a global flag with its
+/// own value) is emitted FIRST, then `--session-id`/`--resume` and their UUID,
+/// then `extra_claude_args` — so the UUID is never consumed as the value of a
+/// trailing flag. Every splice goes through
+/// [`shell_single_quote`](nice_term_core::shell_single_quote).
+///
+/// - `is_override == true` (set when `NICE_CLAUDE_OVERRIDE` is in the env)
+///   suppresses EVERY Nice-injected flag — the wrapper owns the full argv;
+///   the result is just `exec '<claude>'`.
+/// - [`Resume`](ClaudeSessionMode::Resume) deliberately DROPS `extra_claude_args`
+///   (the transcript already carries the session's flags).
+/// - [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) is handled outside
+///   this helper (it spawns a plain shell, not `exec claude`); passing it here
+///   returns just `exec '<claude>'` defensively.
+/// - `settings_path` is the injectable theme-sync provider's output (R17 fills
+///   it; `None` until then). It is skipped under `is_override`.
+pub(crate) fn build_claude_exec_command(
+    claude: &str,
+    mode: &ClaudeSessionMode,
+    extra_claude_args: &[String],
+    is_override: bool,
+    settings_path: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        "exec".to_string(),
+        nice_term_core::shell_single_quote(claude),
+    ];
+    if !is_override {
+        // Nice-managed theme pointer (`{"theme":"custom:nice"}`) — a global flag
+        // with its own value; emit it before the session flags so it never sits
+        // between `--session-id`/`--resume` and their UUID.
+        if let Some(sp) = settings_path {
+            parts.push("--settings".to_string());
+            parts.push(nice_term_core::shell_single_quote(sp));
+        }
+        match mode {
+            ClaudeSessionMode::None => {
+                parts.extend(
+                    extra_claude_args
+                        .iter()
+                        .map(|a| nice_term_core::shell_single_quote(a)),
+                );
+            }
+            ClaudeSessionMode::New(id) => {
+                parts.push("--session-id".to_string());
+                parts.push(nice_term_core::shell_single_quote(id));
+                parts.extend(
+                    extra_claude_args
+                        .iter()
+                        .map(|a| nice_term_core::shell_single_quote(a)),
+                );
+            }
+            ClaudeSessionMode::Resume(id) => {
+                parts.push("--resume".to_string());
+                parts.push(nice_term_core::shell_single_quote(id));
+            }
+            ClaudeSessionMode::ResumeDeferred(_) => {}
+        }
+    }
+    parts.join(" ")
+}
+
+/// The socket `claude` handler's newtab/inplace decision, minus the wire
+/// formatting. R15 slice-2's handler builds this from the model; the composer
+/// ([`compose_claude_reply`]) renders it byte-exact. Ported from the reply
+/// tail of Swift `handleClaudeSocketRequest` (`SessionsModel.swift:897-910`).
+pub(crate) enum ClaudeReplyDecision {
+    /// Open a new sidebar tab — reply `newtab`.
+    NewTab,
+    /// Promote the requesting pane in place. `parsed_from_args` is true when the
+    /// client's `args` already carried the session id (`--resume`/`--session-id`),
+    /// which selects the bare `inplace` / `-` placeholder forms; `session_id` is
+    /// the resolved id (parsed, or a freshly minted UUID) the wrapper prepends.
+    InPlace {
+        parsed_from_args: bool,
+        session_id: String,
+    },
+}
+
+/// Compose the socket `claude` reply — the FROZEN R14 grammar (≤3
+/// whitespace-separated positional fields). Pure port of the reply tail of
+/// Swift `handleClaudeSocketRequest` (`SessionsModel.swift:897-910`); an
+/// R15-owned protocol composer.
+///
+/// The four byte-exact variants:
+/// - `newtab`
+/// - `inplace` — in-place, args already carried the id, theme sync off
+/// - `inplace <uuid>` — in-place, minted id, theme sync off
+/// - `inplace <uuid|-> <path>` — theme sync on: the third field is the
+///   `--settings` path the wrapper splices; the second is the minted uuid, or
+///   `-` when the client's args already named the session.
+///
+/// `settings_path` is the injectable theme-sync provider's output (R17 fills
+/// it; `None` until then). With `settings_path == None` the replies are
+/// byte-identical to the two shorter forms.
+pub(crate) fn compose_claude_reply(
+    decision: &ClaudeReplyDecision,
+    settings_path: Option<&str>,
+) -> String {
+    match decision {
+        ClaudeReplyDecision::NewTab => "newtab".to_string(),
+        ClaudeReplyDecision::InPlace {
+            parsed_from_args,
+            session_id,
+        } => match settings_path {
+            Some(path) => {
+                // `-` sid placeholder when the client's args already carry the
+                // session, so the pointer can follow as the 3rd field; else the
+                // freshly minted id.
+                let sid_field = if *parsed_from_args {
+                    "-"
+                } else {
+                    session_id.as_str()
+                };
+                format!("inplace {sid_field} {path}")
+            }
+            None => {
+                if *parsed_from_args {
+                    "inplace".to_string()
+                } else {
+                    format!("inplace {session_id}")
+                }
+            }
+        },
+    }
+}
+
+/// Split a Claude OSC title into its status prefix and the trailing label,
+/// per the T5 grammar. Pure port of the status-prefix extraction in Swift
+/// `paneTitleChanged`'s Claude branch (`SessionsModel.swift:439-453`): the
+/// first Unicode scalar in `U+2800..=U+28FF` (braille spinner) ⇒
+/// [`Thinking`](TabStatus::Thinking); exactly `U+2733` (✳ sparkle) ⇒
+/// [`Waiting`](TabStatus::Waiting); anything else ⇒ no status change and the
+/// whole string is the label.
+///
+/// Returns `(status, label)` where `label` is the input with the status prefix
+/// scalar removed (untrimmed — the caller trims, drops the empty / `Claude Code`
+/// placeholder, and feeds the rest to `apply_auto_title`; that wiring is R15
+/// slice-3's `pane_title_changed` branch).
+pub(crate) fn parse_claude_title(title: &str) -> (Option<TabStatus>, &str) {
+    let Some(first) = title.chars().next() else {
+        return (None, title);
+    };
+    let cp = first as u32;
+    if (0x2800..=0x28FF).contains(&cp) {
+        (Some(TabStatus::Thinking), &title[first.len_utf8()..])
+    } else if cp == 0x2733 {
+        (Some(TabStatus::Waiting), &title[first.len_utf8()..])
+    } else {
+        (None, title)
+    }
+}
+
+/// Where [`SessionManager::create_claude_tab`] puts the new tab — the two Swift
+/// call sites' only real divergence (`SessionsModel.swift:650-714, :758-794`).
+pub(crate) enum ClaudeTabPlacement {
+    /// The socket `newtab` path (Swift `createTabFromMainTerminal`): bucket the tab
+    /// by `cwd` via [`TabModel::add_tab_to_projects`] (git-root / longest-prefix),
+    /// title from `args`, `-w` worktree split honored.
+    Bucket { cwd: String },
+    /// The sidebar project-`+` path (Swift `createClaudeTabInProject`): append
+    /// directly to `project_id`, title `"New tab"`, no worktree split, no extra args.
+    Project { project_id: String },
+}
+
+/// Process-global resolved absolute path to the `claude` binary — the Rust twin of
+/// Swift `SessionsModel.resolvedClaudePath`, delivered by the C11 bootstrap probe
+/// (`crate::app`). The Claude spawn path consults it via
+/// [`resolve_claude_binary`]. `Some(None)` means the probe ran and found no
+/// `claude` (the spawn falls back to a plain shell); absent means the probe hasn't
+/// delivered yet (early launch — same "no retro-upgrade" race Swift tolerates).
+#[derive(Clone)]
+pub(crate) struct ResolvedClaudePath(pub(crate) Option<String>);
+
+impl Global for ResolvedClaudePath {}
+
+/// Resolve the `claude` binary at spawn time (Swift `resolvedClaudePath` read):
+/// `NICE_CLAUDE_OVERRIDE` wins **synchronously** — re-read every spawn because it
+/// is the test seam pointing "claude" at a stub, and `run_selftest` deliberately
+/// skips the bootstrap probe that would otherwise seed the global — else the
+/// process-global [`ResolvedClaudePath`] the bootstrap probe set.
+fn resolve_claude_binary(cx: &App) -> Option<String> {
+    if let Ok(over) = std::env::var("NICE_CLAUDE_OVERRIDE") {
+        if !over.is_empty() {
+            return Some(over);
+        }
+    }
+    cx.try_global::<ResolvedClaudePath>()
+        .and_then(|g| g.0.clone())
+}
+
+/// The Claude tab's title from its invocation `args` — Swift
+/// `createTabFromMainTerminal`'s title closure (`SessionsModel.swift:653-659`):
+/// join with spaces, take the first 40 chars, trim; an empty result (no args, or
+/// all-whitespace) falls back to `"New tab"`. A third, independent 40-char cap
+/// (pane pills clip at 40 too — [`PANE_TITLE_MAX`] — but separately).
+fn claude_tab_title_from_args(args: &[String]) -> String {
+    if args.is_empty() {
+        return "New tab".to_string();
+    }
+    let joined = args.join(" ");
+    let capped: String = joined.chars().take(40).collect();
+    let trimmed = capped.trim();
+    if trimmed.is_empty() {
+        "New tab".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The Claude tab's `Tab.cwd` — Swift `createTabFromMainTerminal`'s `sessionCwd`
+/// (`SessionsModel.swift:675-683`): when the user ran `claude -w <name>`, Claude
+/// creates and runs inside a worktree at `<cwd>/.claude/worktrees/<sanitized>`
+/// (`/`→`+` via [`TabModel::sanitize_worktree_name`]); otherwise the tab cwd is
+/// `cwd`. The bucketing anchor (`project_path`) stays `cwd` regardless, so the
+/// sidebar still buckets the tab under the parent project. The `-w`/`--worktree`
+/// **space form** only is recognized (the extractor is landed in `nice-model`); the
+/// `=` form is deliberately NOT a worktree while session-id takes both.
+fn claude_worktree_cwd(cwd: &str, args: &[String]) -> String {
+    match TabModel::extract_worktree_name(args) {
+        Some(name) => {
+            let sanitized = TabModel::sanitize_worktree_name(&name);
+            format!("{}/.claude/worktrees/{}", cwd.trim_end_matches('/'), sanitized)
+        }
+        None => cwd.to_string(),
+    }
+}
+
+/// The human-readable command string the launch overlay shows for a fresh Claude
+/// pane — Swift `TabPtySession.launchDisplayCommand` (`TabPtySession.swift:618-634`):
+/// deliberately skips the `zsh -ilc "exec …"` wrapper and the `--session-id <uuid>`
+/// plumbing so the user sees what *they* asked for. `.resume` → `claude --resume`;
+/// otherwise `claude` (no args) or `claude <user args>`. `.resumeDeferred` is
+/// suppressed by the caller, so it never reaches here.
+fn claude_launch_display_command(mode: &ClaudeSessionMode, extra_args: &[String]) -> String {
+    match mode {
+        ClaudeSessionMode::Resume(_) => "claude --resume".to_string(),
+        _ => {
+            if extra_args.is_empty() {
+                "claude".to_string()
+            } else {
+                format!("claude {}", extra_args.join(" "))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

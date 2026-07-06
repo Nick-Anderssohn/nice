@@ -14,10 +14,11 @@
 //!    create-and-spawn path (a new terminal tab + its `Terminal 1`) and the strip
 //!    `+` path ([`add_terminal_to_active_tab`]) both spawn their pty **synchronously**
 //!    (Swift `addPane` semantics — an explicit add is never deferred).
-//! 2. **Deferred companion spawn on focus** — the project `+` seam builds the
-//!    `[Claude, Terminal 1]` shape and registers the tab's session container, but
-//!    spawns **neither** pane (the Claude pane stays model-only until R15, the
-//!    companion is deferred); selecting the companion runs
+//! 2. **Claude spawns now; companion spawns on focus** — the project `+` seam
+//!    builds the `[Claude, Terminal 1]` shape through the ONE shared constructor,
+//!    which (R15) spawns the Claude pane **immediately** (claude-kind panes never
+//!    lazy-spawn; the pane execs the hermetic `NICE_CLAUDE_OVERRIDE` stub) while
+//!    the companion terminal stays **deferred**; selecting the companion runs
 //!    [`ensure_active_pane_spawned`] and its pty forks on that first focus.
 //! 3. **Clean-exit neighbor refocus** — exiting the active terminal's shell with a
 //!    clean `exit 0` (not held) removes the pane and re-points the active pane to
@@ -53,6 +54,7 @@
 //! [`add_terminal_to_active_tab`]: crate::session_manager::SessionManager::add_terminal_to_active_tab
 //! [`ensure_active_pane_spawned`]: crate::session_manager::SessionManager::ensure_active_pane_spawned
 
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -62,6 +64,7 @@ use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_term_core::SpawnSpec;
 use nice_term_view::{TerminalEvent, TerminalSessionHandle};
 
+use crate::session_manager::ClaudeTabPlacement;
 use crate::window_state::WindowState;
 
 // -- fixed geometry / timing -------------------------------------------------
@@ -112,6 +115,14 @@ pub fn open_session_lifecycle_window(cx: &mut AsyncApp) -> Result<AnyWindowHandl
     std::fs::create_dir_all(&base)?;
     let cwd = base.to_string_lossy().to_string();
 
+    // R15: the project-+ leg now spawns a real Claude pane. Point `claude` at a
+    // hermetic stub via NICE_CLAUDE_OVERRIDE (the spawn path re-reads it) so the
+    // regression suite never launches the machine's real claude — the async probe
+    // never runs under `run_selftest`, but the override is belt-and-suspenders and
+    // matches the shipped seam. The stub just idles (this leg asserts the pane
+    // SPAWNED, not its output).
+    install_stub_claude_override(&base)?;
+
     // The per-window state (the real R12 composition root, filled with the R13
     // SessionManager). Created before the window so the async driver owns a handle.
     // `AsyncApp`'s `update` / entity `update` return the value directly (they panic
@@ -132,6 +143,23 @@ pub fn open_session_lifecycle_window(cx: &mut AsyncApp) -> Result<AnyWindowHandl
     .detach();
 
     Ok(window)
+}
+
+/// Write an executable stub `claude` under `base/bin` and point
+/// `NICE_CLAUDE_OVERRIDE` at it (process-wide — the spawn path reads the process
+/// env). The stub idles so the spawned pane stays live; it NEVER the machine's
+/// real claude (hermeticity). Overwrite-always so a re-run / prior scenario's
+/// override is replaced by this one.
+fn install_stub_claude_override(base: &std::path::Path) -> Result<()> {
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let stub = bin.join("claude");
+    std::fs::write(&stub, "#!/bin/sh\nexec sleep 2147483647\n")?;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+    // SAFETY: single-threaded scenario setup, before any pane forks; matches the
+    // existing `std::env::set_var` seams (nice-harness selftest, spawn.rs).
+    unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -222,23 +250,30 @@ fn strip_add_and_spawn(
 }
 
 /// The `project +` seam: build the `[Claude, Terminal 1]` shape in `PROJECT_ID`
-/// and register the tab's (empty) session container — but spawn **nothing** (the
-/// Claude pane is model-only until R15; the companion is deferred). Returns
-/// `(tab_id, claude_pane_id, companion_pane_id)`.
+/// through the ONE shared constructor [`SessionManager::create_claude_tab`](crate::session_manager::SessionManager::create_claude_tab),
+/// which (R15) **spawns the Claude pane immediately** (claude-kind panes never
+/// lazy-spawn) while the companion terminal stays deferred. The Claude pane execs
+/// the `NICE_CLAUDE_OVERRIDE` stub (hermetic — never the machine's real claude).
+/// Returns `(tab_id, claude_pane_id, companion_pane_id)`.
 fn project_new_claude_tab(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
 ) -> Option<(String, String, String)> {
-    state.update(cx, |s, _cx| {
-        let tab_id = s
-            .sidebar_actions
-            .create_claude_tab_in_project(&mut s.model, PROJECT_ID)?;
+    state.update(cx, |s, cx| {
+        let model = &mut s.model;
+        let session = &mut s.session;
+        let tab_id = session.create_claude_tab(
+            model,
+            ClaudeTabPlacement::Project {
+                project_id: PROJECT_ID.to_string(),
+            },
+            &[],
+            None,
+            cx,
+        )?;
         let tab = s.model.tab_for(&tab_id)?;
         let claude = tab.panes.first()?.id.clone();
         let companion = tab.panes.get(1)?.id.clone();
-        // The container exists so ensure_active_pane_spawned's "tab already has
-        // a session" precondition holds when the companion is first focused.
-        s.session.register_tab_session(&tab_id);
         Some((tab_id, claude, companion))
     })
 }
@@ -320,14 +355,23 @@ async fn run_session_lifecycle(
         None => failures.push("strip-+: add_terminal_to_active_tab returned no pane".into()),
     }
 
-    // === 3. project-+ claude tab: neither spawns; companion spawns on focus ====
+    // === 3. project-+ claude tab: Claude pane spawns now; companion on focus ====
+    // R15 rewrote this leg: the Claude pane now spawns immediately through the ONE
+    // shared constructor (claude-kind panes never lazy-spawn), while the companion
+    // terminal stays deferred until first focus.
     match project_new_claude_tab(cx, &state) {
         Some((c_tab, c_claude, c_companion)) => {
-            if has_pane(cx, &state, &c_tab, &c_claude) || has_pane(cx, &state, &c_tab, &c_companion)
-            {
+            if !has_pane(cx, &state, &c_tab, &c_claude) {
                 failures.push(
-                    "project-+: a claude-tab pane spawned a pty up front (Claude = model-only, \
-                     companion = deferred)"
+                    "project-+: the Claude pane did not spawn its pty up front (claude-kind \
+                     panes never lazy-spawn)"
+                        .into(),
+                );
+            }
+            if has_pane(cx, &state, &c_tab, &c_companion) {
+                failures.push(
+                    "project-+: the companion terminal spawned a pty up front (it must stay \
+                     deferred until first focus)"
                         .into(),
                 );
             }
@@ -337,16 +381,9 @@ async fn run_session_lifecycle(
                     "deferred spawn: focusing the companion terminal did not fork its pty".into(),
                 );
             }
-            if has_pane(cx, &state, &c_tab, &c_claude) {
-                failures.push(
-                    "deferred spawn: the Claude pane forked a pty (it must stay model-only \
-                     until R15)"
-                        .into(),
-                );
-            }
         }
         None => failures.push(
-            "project-+: create_claude_tab_in_project (the project-+ seam) produced no tab".into(),
+            "project-+: create_claude_tab (the project-+ seam) produced no tab".into(),
         ),
     }
 
@@ -568,11 +605,12 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: "session lifecycle OK: Terminals-+/strip-+ create-and-spawn forked ptys \
-                     synchronously; the project-+ [Claude, Terminal 1] tab spawned neither pane \
-                     up front and its companion forked on first focus; a clean exit refocused the \
-                     slot neighbor; the last-pane exit dissolved the tab and fell back to the \
-                     Terminals-order Main tab; a non-zero exit held its pane (is_alive == false, \
-                     still mounted); teardown dropped every session."
+                     synchronously; the project-+ [Claude, Terminal 1] tab spawned its Claude pane \
+                     immediately (hermetic stub) while the companion stayed deferred and forked on \
+                     first focus; a clean exit refocused the slot neighbor; the last-pane exit \
+                     dissolved the tab and fell back to the Terminals-order Main tab; a non-zero \
+                     exit held its pane (is_alive == false, still mounted); teardown dropped every \
+                     session."
                 .to_string(),
         }
     } else {

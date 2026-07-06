@@ -1188,6 +1188,29 @@ fn extract_worktree_name_absent_returns_none() {
     assert_eq!(TabModel::extract_worktree_name(&["--model", "sonnet"]), None);
 }
 
+// MARK: - sanitize_worktree_name (`/`→`+`, mirroring Claude's worktree-dir
+// derivation; `SessionsModel.swift:677-682`).
+
+#[test]
+fn sanitize_worktree_name_replaces_slash_with_plus() {
+    assert_eq!(TabModel::sanitize_worktree_name("foo/bar"), "foo+bar");
+}
+
+#[test]
+fn sanitize_worktree_name_replaces_every_slash() {
+    assert_eq!(TabModel::sanitize_worktree_name("a/b/c"), "a+b+c");
+}
+
+#[test]
+fn sanitize_worktree_name_no_slash_unchanged() {
+    assert_eq!(TabModel::sanitize_worktree_name("feature-x"), "feature-x");
+}
+
+#[test]
+fn sanitize_worktree_name_empty_unchanged() {
+    assert_eq!(TabModel::sanitize_worktree_name(""), "");
+}
+
 // MARK: - extract_claude_session_id
 
 #[test]

@@ -17,9 +17,6 @@
 //!
 //!   * [`ModelSidebarActions::create_terminal_tab`] — one terminal-only tab with
 //!     a single "Terminal 1" pane, appended to the pinned Terminals project.
-//!   * [`ModelSidebarActions::create_claude_tab_in_project`] — the
-//!     `[Claude, Terminal 1]` pane shape (a Claude pane focused, plus a companion
-//!     terminal), appended to the named project.
 //!
 //! ## Selection is the caller's concern
 //!
@@ -49,15 +46,6 @@ pub(crate) trait SidebarActions {
     /// it. Returns the new tab id (or `None` if the Terminals project is somehow
     /// absent). R13 spawns the pty; R10 only shapes the model.
     fn create_terminal_tab(&mut self, model: &mut TabModel) -> Option<String>;
-
-    /// Create a new tab in `project_id` with the `[Claude, Terminal 1]` pane
-    /// shape (the Claude pane focused) and select it. Returns the new tab id (or
-    /// `None` if `project_id` is unknown). Model-only — nothing spawns.
-    fn create_claude_tab_in_project(
-        &mut self,
-        model: &mut TabModel,
-        project_id: &str,
-    ) -> Option<String>;
 
     /// Select `tab_id` — the [`TabModel::select_tab`] passthrough.
     fn select_tab(&mut self, model: &mut TabModel, tab_id: &str);
@@ -142,30 +130,6 @@ impl SidebarActions for ModelSidebarActions {
         Some(tab_id)
     }
 
-    fn create_claude_tab_in_project(
-        &mut self,
-        model: &mut TabModel,
-        project_id: &str,
-    ) -> Option<String> {
-        let pi = model.projects.iter().position(|p| p.id == project_id)?;
-        let tab_id = self.mint("claude-tab");
-        let claude_pane_id = self.mint("pane");
-        let terminal_pane_id = self.mint("pane");
-        let path = model.projects[pi].path.clone();
-        let mut tab = Tab::new(tab_id.clone(), "New tab", path);
-        // The [Claude, Terminal 1] shape: the Claude pane focused, with a
-        // companion terminal (dossier G3 — model-only, nothing spawns).
-        tab.panes = vec![
-            Pane::new(claude_pane_id.clone(), "Claude", PaneKind::Claude),
-            Pane::new(terminal_pane_id, "Terminal 1", PaneKind::Terminal),
-        ];
-        tab.active_pane_id = Some(claude_pane_id);
-        tab.next_terminal_index = 2;
-        model.projects[pi].tabs.push(tab);
-        model.select_tab(&tab_id);
-        Some(tab_id)
-    }
-
     fn select_tab(&mut self, model: &mut TabModel, tab_id: &str) {
         model.select_tab(tab_id);
     }
@@ -238,38 +202,6 @@ mod tests {
         assert_eq!(created.panes[0].title, "Terminal 1");
         assert_eq!(created.next_terminal_index, 2);
         assert_eq!(model.active_tab_id(), Some(id.as_str()));
-    }
-
-    #[test]
-    fn create_claude_tab_builds_claude_terminal_shape_and_selects() {
-        let mut model = seeded();
-        let mut actions = ModelSidebarActions::new();
-
-        let id = actions
-            .create_claude_tab_in_project(&mut model, "proj")
-            .unwrap();
-
-        let tab = model.tab_for(&id).unwrap();
-        assert_eq!(tab.panes.len(), 2, "[Claude, Terminal 1] — two panes");
-        assert_eq!(tab.panes[0].kind, PaneKind::Claude);
-        assert_eq!(tab.panes[1].kind, PaneKind::Terminal);
-        assert_eq!(tab.panes[1].title, "Terminal 1");
-        assert_eq!(
-            tab.active_pane_id.as_deref(),
-            Some(tab.panes[0].id.as_str()),
-            "the Claude pane is focused"
-        );
-        assert!(tab.has_claude(), "the tab reads as a Claude tab for the dot");
-        assert_eq!(model.active_tab_id(), Some(id.as_str()));
-    }
-
-    #[test]
-    fn create_claude_tab_unknown_project_is_none() {
-        let mut model = seeded();
-        let mut actions = ModelSidebarActions::new();
-        assert!(actions
-            .create_claude_tab_in_project(&mut model, "nope")
-            .is_none());
     }
 
     #[test]

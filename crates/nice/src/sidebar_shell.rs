@@ -84,6 +84,7 @@ use nice_theme::AccentPreset;
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
+use crate::session_manager::ClaudeTabPlacement;
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -663,12 +664,28 @@ impl SidebarShellView {
     }
 
     fn add_tab_in_group(&mut self, group_id: &str, is_terminals: bool, cx: &mut Context<Self>) {
-        self.state.update(cx, |ws, _| {
+        self.state.update(cx, |ws, wcx| {
             if is_terminals {
+                // Terminal tab: model-only; its pane spawns render-driven on first
+                // activation (`ensure_active_pane_spawned`).
                 ws.sidebar_actions.create_terminal_tab(&mut ws.model);
             } else {
-                ws.sidebar_actions
-                    .create_claude_tab_in_project(&mut ws.model, group_id);
+                // R15: a real Claude tab through the ONE shared constructor — mints
+                // the session UUID, registers the session, and spawns the Claude
+                // pane immediately (claude-kind panes never lazy-spawn); the
+                // companion terminal stays deferred.
+                let settings = ws.claude_settings_path_provider();
+                let model = &mut ws.model;
+                let session = &mut ws.session;
+                let _ = session.create_claude_tab(
+                    model,
+                    ClaudeTabPlacement::Project {
+                        project_id: group_id.to_string(),
+                    },
+                    &[],
+                    settings.as_deref(),
+                    wcx,
+                );
             }
         });
         self.reseed_selection_after_create(cx);

@@ -275,39 +275,159 @@ fn pane_placeholder() -> impl IntoElement {
     div().size_full().bg(rgb(0x11141b))
 }
 
+// ---------------------------------------------------------------------------
+// Pure host logic (target resolution + cache eviction) — extracted so it is
+// unit-testable off-view (`PaneHostView` lives in the `nice` BINARY, which
+// `nice-itests` cannot import, so the render-level placeholder→TerminalView swap
+// is asserted in the `claude-lifecycle` scenario and the pure logic here). The
+// render path calls exactly these, so the tests cover the code the window runs.
+// ---------------------------------------------------------------------------
+
+/// The active `(tab_id, pane_id)` the host should follow — the active tab's
+/// active pane, or `None` when the model has no active tab / that tab has no
+/// active pane. Whether a live session (and thus a `TerminalView`) exists for it
+/// is a separate question the render answers via
+/// [`SessionManager::pane_handle`](crate::session_manager::SessionManager::pane_handle):
+/// a model-only Claude pane resolves as the target here but has no handle, so the
+/// render shows the [`pane_placeholder`] until its spawn/promotion caches one.
+fn active_pane_target(model: &nice_model::TabModel) -> Option<(String, String)> {
+    let tab = model.active_tab_id()?;
+    let pane = model.tab_for(tab)?.active_pane_id.clone()?;
+    Some((tab.to_string(), pane))
+}
+
+/// Every pane id present in the model right now — the live set the cache is
+/// pruned against (a cached view whose pane id is absent has left the model).
+fn model_pane_ids(model: &nice_model::TabModel) -> HashSet<String> {
+    let mut all = HashSet::new();
+    for project in &model.projects {
+        for tab in &project.tabs {
+            for pane in &tab.panes {
+                all.insert(pane.id.clone());
+            }
+        }
+    }
+    all
+}
+
+/// The cached pane ids to evict — those no longer present in `live` (the pane
+/// left the model). Returns owned ids so the caller can mutate the cache without
+/// aliasing its key iterator.
+fn stale_cache_ids<'a>(
+    cached: impl IntoIterator<Item = &'a String>,
+    live: &HashSet<String>,
+) -> Vec<String> {
+    cached
+        .into_iter()
+        .filter(|id| !live.contains(*id))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure host-logic tests (target resolution + eviction). The render-level
+    //! placeholder→`TerminalView` swap (a model-only Claude pane shows the
+    //! placeholder; its spawn/promotion swaps to a cached view) is asserted in the
+    //! `claude-lifecycle` scenario — `PaneHostView` needs a live gpui window a plain
+    //! `#[test]` can't build, per the placement rule.
+    use super::{active_pane_target, model_pane_ids, stale_cache_ids};
+    use nice_model::{Pane, PaneKind, Tab, TabModel};
+    use std::collections::HashSet;
+
+    /// A model with a non-Terminals project holding one `[Claude, Terminal 1]`
+    /// tab (Claude focused + active), returning `(model, claude_id, term_id)`.
+    fn model_with_claude_tab() -> (TabModel, String, String) {
+        let mut model = TabModel::new("/home/u");
+        model.ensure_project("p", "P", "/home/u/proj");
+        let claude_id = "t1-claude".to_string();
+        let term_id = "t1-t1".to_string();
+        let mut tab = Tab::new("t1", "New tab", "/home/u/proj");
+        tab.panes = vec![
+            Pane::new(&claude_id, "Claude", PaneKind::Claude),
+            Pane::new(&term_id, "Terminal 1", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some(claude_id.clone());
+        let pi = model.projects.iter().position(|p| p.id == "p").unwrap();
+        model.projects[pi].tabs.push(tab);
+        model.select_tab("t1");
+        (model, claude_id, term_id)
+    }
+
+    #[test]
+    fn active_pane_target_resolves_the_active_tabs_active_pane() {
+        let (model, claude_id, _term) = model_with_claude_tab();
+        assert_eq!(
+            active_pane_target(&model),
+            Some(("t1".to_string(), claude_id)),
+            "the host follows the active tab's active pane (a model-only Claude pane \
+             still resolves as the target — the render shows the placeholder until a \
+             handle exists)"
+        );
+    }
+
+    #[test]
+    fn model_pane_ids_collects_every_pane_across_projects_and_tabs() {
+        let (model, claude_id, term_id) = model_with_claude_tab();
+        let ids = model_pane_ids(&model);
+        // The seeded Terminals Main pane + the claude tab's two panes.
+        assert!(ids.contains(&claude_id));
+        assert!(ids.contains(&term_id));
+        let main_pane = model
+            .tab_for(TabModel::MAIN_TERMINAL_TAB_ID)
+            .unwrap()
+            .panes[0]
+            .id
+            .clone();
+        assert!(ids.contains(&main_pane), "the pinned Main tab's pane is included");
+    }
+
+    #[test]
+    fn stale_cache_ids_evicts_panes_that_left_the_model() {
+        // Cache holds three panes; two are still live, one has left the model.
+        let cached: Vec<String> = vec!["a".into(), "gone".into(), "b".into()];
+        let live: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let stale = stale_cache_ids(cached.iter(), &live);
+        assert_eq!(stale, vec!["gone".to_string()], "only the departed pane is evicted");
+    }
+
+    #[test]
+    fn stale_cache_ids_evicts_nothing_when_all_cached_panes_are_live() {
+        let cached: Vec<String> = vec!["a".into(), "b".into()];
+        let live: HashSet<String> = ["a".to_string(), "b".to_string(), "c".to_string()]
+            .into_iter()
+            .collect();
+        assert!(stale_cache_ids(cached.iter(), &live).is_empty());
+    }
+}
+
 impl Render for PaneHostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Snapshot the active pane + the full set of live pane ids up front, then
-        // drop the state borrow before any mutation.
+        // Snapshot the active pane + the full set of live pane ids up front (via the
+        // pure resolvers so the target/eviction logic is unit-testable off-view),
+        // then drop the state borrow before any mutation.
         let (active, all_pane_ids): (Option<(String, String)>, HashSet<String>) = {
             let ws = self.state.read(cx);
-            let model = &ws.model;
-            let tab = model.active_tab_id().map(str::to_owned);
-            let pane = tab
-                .as_deref()
-                .and_then(|t| model.tab_for(t))
-                .and_then(|t| t.active_pane_id.clone());
-            let active = match (tab, pane) {
-                (Some(t), Some(p)) => Some((t, p)),
-                _ => None,
-            };
-            let mut all = HashSet::new();
-            for project in &model.projects {
-                for t in &project.tabs {
-                    for p in &t.panes {
-                        all.insert(p.id.clone());
-                    }
-                }
-            }
-            (active, all)
+            (active_pane_target(&ws.model), model_pane_ids(&ws.model))
         };
+
+        // R15 subscription lift: subscribe any freshly-spawned pane (the Main pane,
+        // deferred terminals `activate_pane` forks below, and Claude panes the socket
+        // / sidebar seams spawn) to `route_terminal_event`, so OSC titles / cwd / exits
+        // reach the model in the SHIPPED window — not just the `session-lifecycle`
+        // scenario. Idempotent (subscribe-once dedupe on the window state), so it is
+        // safe to sweep on every render.
+        self.state
+            .update(cx, |ws, wcx| ws.subscribe_spawned_panes(wcx));
 
         // Drop cached views for panes that left the model (the PROTECTED
         // "dropped when the pane leaves the model"). The pane's pty session lives
         // on in the `SessionManager` until window teardown reaps it (SIGHUP→
         // SIGKILL); wiring the UI close actions to the R13 dissolve cascade is
         // out of this composition slice.
-        self.cache.retain(|pid, _| all_pane_ids.contains(pid));
+        for stale in stale_cache_ids(self.cache.keys(), &all_pane_ids) {
+            self.cache.remove(&stale);
+        }
 
         // On a switch, run the sole activation path + re-point the present kick.
         let activation_changed = active != self.last_active;

@@ -16,8 +16,11 @@ use nice_term_core::SpawnSpec;
 use nice_term_view::TerminalEvent;
 
 use super::{
-    build_claude_extra_env, clip_title, default_mint_id, merge_env_spec_wins, ClaudeSessionMode,
-    DissolveTerminus, PaneLaunchStatus, SessionManager, WindowShellEnv, PANE_TITLE_MAX,
+    build_claude_exec_command, build_claude_extra_env, build_claude_prefill_command,
+    claude_launch_display_command, claude_tab_title_from_args, claude_worktree_cwd, clip_title,
+    compose_claude_reply, default_mint_id, merge_env_spec_wins, mint_session_uuid, parse_claude_title,
+    ClaudeReplyDecision, ClaudeSessionMode, DissolveTerminus, PaneLaunchStatus, SessionManager,
+    WindowShellEnv, PANE_TITLE_MAX,
 };
 
 /// A fresh empty selection for cascade tests that don't seed a multi-selection.
@@ -521,6 +524,172 @@ fn pane_title_changed_claude_deferred_resume_ignores_status_prefix() {
         title_before,
         "Tab title must not change while is_claude_running is false."
     );
+}
+
+// ===========================================================================
+// Claude-branch T5 status parsing (ported AppStatePaneLifecycleTests, running)
+// ===========================================================================
+
+/// Seed a `[Claude, Terminal 1]` tab whose Claude pane is **running** (the
+/// post-promotion / creation state that opens the T5 OSC gate). Selects the tab
+/// so `apply_status_transition`'s viewed-pane ack fires like the shipped window.
+fn seed_running_claude_tab(model: &mut TabModel, tab_id: &str) -> (String, String) {
+    let (claude_id, terminal_id) = seed_claude_tab(model, tab_id);
+    model.mutate_tab(tab_id, |tab| {
+        if let Some(p) = tab.panes.iter_mut().find(|p| p.id == claude_id) {
+            p.is_claude_running = true;
+        }
+    });
+    model.select_tab(tab_id);
+    (claude_id, terminal_id)
+}
+
+#[test]
+fn pane_title_changed_claude_braille_spinner_sets_thinking_and_humanizes_title() {
+    // U+2840 is inside the braille spinner range (0x2800..=0x28FF) Claude uses
+    // for "thinking"; the trailing label humanizes onto the tab title.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-top-bar-height");
+
+    let pane = model
+        .tab_for("t1")
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id == claude_id)
+        .unwrap();
+    assert_eq!(pane.status, nice_model::TabStatus::Thinking);
+    assert_eq!(model.tab_for("t1").unwrap().title, "Fix top bar height");
+}
+
+#[test]
+fn pane_title_changed_claude_sparkle_sets_waiting() {
+    // U+2733 (✳) is the sparkle Claude uses for "waiting for input."
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2733} needs-input");
+
+    let pane = model
+        .tab_for("t1")
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id == claude_id)
+        .unwrap();
+    assert_eq!(pane.status, nice_model::TabStatus::Waiting);
+}
+
+#[test]
+fn pane_title_changed_claude_placeholder_label_ignored() {
+    // "Claude Code" is the generic placeholder Claude emits before a session has
+    // a real name — it must not clobber an existing tab title.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
+    assert_eq!(model.tab_for("t1").unwrap().title, "Fix bug");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} Claude Code");
+    assert_eq!(
+        model.tab_for("t1").unwrap().title,
+        "Fix bug",
+        "Placeholder 'Claude Code' must not overwrite a real session title."
+    );
+}
+
+#[test]
+fn pane_title_changed_claude_unknown_prefix_treated_as_label() {
+    // A non-braille, non-sparkle first char means no status update — the whole
+    // string is the label.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "refactor-auth-layer");
+
+    let pane = model
+        .tab_for("t1")
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id == claude_id)
+        .unwrap();
+    assert_eq!(pane.status, nice_model::TabStatus::Idle, "no prefix ⇒ no status change");
+    assert_eq!(model.tab_for("t1").unwrap().title, "Refactor auth layer");
+}
+
+#[test]
+fn pane_title_changed_claude_manually_set_pane_still_flips_status() {
+    // The pane-level title lock is a *title* lock, not a *status* lock: a renamed
+    // Claude pane must still flip status when claude emits a braille prefix, and
+    // its custom pill name must survive (the OSC gate lives in the terminal
+    // branch, never blocking status extraction).
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+    model.mutate_tab("t1", |tab| {
+        if let Some(p) = tab.panes.iter_mut().find(|p| p.id == claude_id) {
+            p.title = "deploy session".to_string();
+            p.title_manually_set = true;
+        }
+    });
+
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-top-bar-height");
+
+    let pane = model
+        .tab_for("t1")
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id == claude_id)
+        .unwrap();
+    assert_eq!(pane.status, nice_model::TabStatus::Thinking, "status still flips");
+    assert_eq!(pane.title, "deploy session", "the user's custom pill name survives");
+}
+
+#[test]
+fn pane_title_changed_claude_accepts_title_after_promotion() {
+    // The full deferred-resume → live-claude story: the gate holds against zsh
+    // OSC while is_claude_running is false, and RELEASES after the promotion
+    // flips it true (`AppStatePaneLifecycleTests.acceptsTitleAfterPromotion`).
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    let (claude_id, _t) = seed_claude_tab(&mut model, "t1"); // is_claude_running == false
+    model.select_tab("t1");
+    let title_before = model.tab_for("t1").unwrap().title.clone();
+
+    // Pre-promotion: zsh OSC ignored.
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "Nick@host:~/repo");
+    assert_eq!(
+        model.tab_for("t1").unwrap().title,
+        title_before,
+        "gate must hold before is_claude_running flips true"
+    );
+
+    // Simulate the socket-handshake promotion that flips the flag.
+    model.mutate_tab("t1", |tab| {
+        if let Some(p) = tab.panes.iter_mut().find(|p| p.id == claude_id) {
+            p.is_claude_running = true;
+        }
+    });
+
+    // Post-promotion: real claude OSC accepted; status flips, label humanizes.
+    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
+    let pane = model
+        .tab_for("t1")
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id == claude_id)
+        .unwrap();
+    assert_eq!(pane.status, nice_model::TabStatus::Thinking, "status fires once the gate releases");
+    assert_eq!(model.tab_for("t1").unwrap().title, "Fix bug", "auto-title applies once the gate releases");
 }
 
 // ===========================================================================
@@ -1527,5 +1696,597 @@ fn claude_extra_env_settings_path_splices_into_prefill() {
         value_of(&env, "NICE_PREFILL_COMMAND"),
         Some("claude --settings '/Users/nick/Library/Application Support/settings.json' --resume SID"),
         "--settings must precede --resume and be single-quoted"
+    );
+}
+
+// =====================================================================
+// build_claude_exec_command — the exec-command flag matrix
+// (TabPtySessionClaudeArgsTests, `TabPtySession.swift:938-970`). Regressions
+// silently break resume (wrong flag order eats the UUID), fresh sessions
+// (missing --session-id ⇒ CLI picks its own id and Nice can't resume), and the
+// override branch (NICE_CLAUDE_OVERRIDE must suppress every injected flag).
+// =====================================================================
+
+fn args(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+/// `.none` with no extra args → bare `exec '<claude>'`.
+#[test]
+fn exec_command_none_no_session_flag_no_extra_args() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::None,
+        &[],
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/usr/local/bin/claude'");
+}
+
+/// `.none` appends extra args, each single-quoted.
+#[test]
+fn exec_command_none_with_extra_args_appended_quoted() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::None,
+        &args(&["--foo", "bar baz"]),
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/usr/local/bin/claude' '--foo' 'bar baz'");
+}
+
+/// `.new` emits `--session-id <uuid>` BEFORE the user's extra args (load-bearing
+/// order — else the UUID is parsed as the trailing flag's value).
+#[test]
+fn exec_command_new_emits_session_id_before_extra_args() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::New("abc-123".into()),
+        &args(&["--model", "opus"]),
+        false,
+        None,
+    );
+    assert_eq!(
+        cmd,
+        "exec '/usr/local/bin/claude' --session-id 'abc-123' '--model' 'opus'"
+    );
+}
+
+/// `.resume` emits `--resume <uuid>` and DROPS extra args (the transcript
+/// already carries the session's flags).
+#[test]
+fn exec_command_resume_emits_resume_flag_drops_extra_args() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::Resume("abc-123".into()),
+        &args(&["--model", "opus"]),
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/usr/local/bin/claude' --resume 'abc-123'");
+}
+
+/// `.resumeDeferred` doesn't `exec claude` at all — the helper returns just the
+/// exec prefix defensively (the caller uses the plain-shell branch instead).
+#[test]
+fn exec_command_resume_deferred_emits_only_exec_prefix() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::ResumeDeferred("abc-123".into()),
+        &[],
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/usr/local/bin/claude'");
+}
+
+/// NICE_CLAUDE_OVERRIDE (`is_override`) suppresses `--session-id`.
+#[test]
+fn exec_command_override_suppresses_session_flag() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::New("abc-123".into()),
+        &args(&["--model", "opus"]),
+        true,
+        None,
+    );
+    assert_eq!(cmd, "exec '/usr/local/bin/claude'");
+}
+
+/// Override suppresses `--resume` too.
+#[test]
+fn exec_command_override_suppresses_resume_flag() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::Resume("abc-123".into()),
+        &[],
+        true,
+        None,
+    );
+    assert_eq!(cmd, "exec '/usr/local/bin/claude'");
+}
+
+/// A path with spaces is single-quoted as one token.
+#[test]
+fn exec_command_path_with_spaces_quoted() {
+    let cmd = build_claude_exec_command(
+        "/Users/dev user/bin/claude",
+        &ClaudeSessionMode::None,
+        &[],
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/Users/dev user/bin/claude'");
+}
+
+/// A path with an embedded single quote uses the `'\''` escape.
+#[test]
+fn exec_command_path_with_single_quote_uses_escape_sequence() {
+    let cmd = build_claude_exec_command(
+        "/Users/dev's/claude",
+        &ClaudeSessionMode::None,
+        &[],
+        false,
+        None,
+    );
+    assert_eq!(cmd, r#"exec '/Users/dev'\''s/claude'"#);
+}
+
+/// Shell metacharacters in extra args pass through literally inside single
+/// quotes — the shell must receive `$HOME` / backtick verbatim.
+#[test]
+fn exec_command_extra_arg_shell_metacharacters_pass_through_literally() {
+    let cmd = build_claude_exec_command(
+        "/claude",
+        &ClaudeSessionMode::None,
+        &args(&["$HOME", "`whoami`"]),
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/claude' '$HOME' '`whoami`'");
+}
+
+/// A stale/deleted-transcript UUID is emitted anyway — no arg-build-time
+/// validation (the user sees claude's own "session not found" in the pty).
+#[test]
+fn exec_command_resume_stale_uuid_emits_resume_flag_anyway() {
+    let cmd = build_claude_exec_command(
+        "/usr/local/bin/claude",
+        &ClaudeSessionMode::Resume("00000000-deleted-transcript-0000".into()),
+        &[],
+        false,
+        None,
+    );
+    assert_eq!(
+        cmd,
+        "exec '/usr/local/bin/claude' --resume '00000000-deleted-transcript-0000'"
+    );
+}
+
+/// `--settings <path>` is emitted BEFORE `--session-id` (a global flag with its
+/// own value must never sit between `--session-id`/`--resume` and their UUID).
+#[test]
+fn exec_command_settings_path_emitted_before_session_id() {
+    let cmd = build_claude_exec_command(
+        "/c",
+        &ClaudeSessionMode::New("abc-123".into()),
+        &args(&["--model", "opus"]),
+        false,
+        Some("/Users/x/.nice/claude-theme-settings.json"),
+    );
+    assert_eq!(
+        cmd,
+        "exec '/c' --settings '/Users/x/.nice/claude-theme-settings.json' --session-id 'abc-123' '--model' 'opus'"
+    );
+}
+
+/// `--settings <path>` is emitted before `--resume`.
+#[test]
+fn exec_command_settings_path_emitted_before_resume() {
+    let cmd = build_claude_exec_command(
+        "/c",
+        &ClaudeSessionMode::Resume("abc-123".into()),
+        &[],
+        false,
+        Some("/s.json"),
+    );
+    assert_eq!(cmd, "exec '/c' --settings '/s.json' --resume 'abc-123'");
+}
+
+/// `settings_path == None` omits the flag entirely.
+#[test]
+fn exec_command_settings_path_none_omits_flag() {
+    let cmd = build_claude_exec_command(
+        "/c",
+        &ClaudeSessionMode::New("abc-123".into()),
+        &[],
+        false,
+        None,
+    );
+    assert_eq!(cmd, "exec '/c' --session-id 'abc-123'");
+}
+
+/// Override suppresses `--settings` like every other injected flag.
+#[test]
+fn exec_command_settings_path_suppressed_by_override() {
+    let cmd = build_claude_exec_command(
+        "/c",
+        &ClaudeSessionMode::New("abc-123".into()),
+        &[],
+        true,
+        Some("/s.json"),
+    );
+    assert_eq!(cmd, "exec '/c'");
+}
+
+/// A settings path with a space is single-quoted.
+#[test]
+fn exec_command_settings_path_quoted_when_contains_space() {
+    let cmd = build_claude_exec_command(
+        "/c",
+        &ClaudeSessionMode::None,
+        &[],
+        false,
+        Some("/Users/dev user/.nice/s.json"),
+    );
+    assert_eq!(cmd, "exec '/c' --settings '/Users/dev user/.nice/s.json'");
+}
+
+// =====================================================================
+// build_claude_prefill_command — the FROZEN deferred-resume prefill string
+// (`claude[ --settings '<path>'] --resume <sid>`, `TabPtySession.swift:898-899`).
+// =====================================================================
+
+#[test]
+fn prefill_command_omits_settings_when_none() {
+    assert_eq!(
+        build_claude_prefill_command(None, "abc-123"),
+        "claude --resume abc-123"
+    );
+}
+
+#[test]
+fn prefill_command_splices_single_quoted_settings_before_resume() {
+    assert_eq!(
+        build_claude_prefill_command(Some("/s.json"), "abc-123"),
+        "claude --settings '/s.json' --resume abc-123"
+    );
+}
+
+#[test]
+fn prefill_command_settings_path_with_space_single_quoted() {
+    assert_eq!(
+        build_claude_prefill_command(Some("/Users/dev user/s.json"), "SID"),
+        "claude --settings '/Users/dev user/s.json' --resume SID"
+    );
+}
+
+// =====================================================================
+// compose_claude_reply — the FROZEN socket reply grammar (≤3 positional fields;
+// reply tail of `handleClaudeSocketRequest`, `SessionsModel.swift:897-910`).
+// =====================================================================
+
+/// The newtab path replies `newtab` regardless of any settings path.
+#[test]
+fn reply_newtab() {
+    assert_eq!(compose_claude_reply(&ClaudeReplyDecision::NewTab, None), "newtab");
+    assert_eq!(
+        compose_claude_reply(&ClaudeReplyDecision::NewTab, Some("/s.json")),
+        "newtab",
+        "a settings path never changes the newtab reply"
+    );
+}
+
+/// In-place, args already carried the id, sync off → bare `inplace`
+/// (`test_inplaceWithSessionId_flipsIsClaudeRunningTrue_andRepliesInplace`).
+#[test]
+fn reply_inplace_parsed_id_sync_off_is_bare_inplace() {
+    let decision = ClaudeReplyDecision::InPlace {
+        parsed_from_args: true,
+        session_id: "OLD".into(),
+    };
+    assert_eq!(compose_claude_reply(&decision, None), "inplace");
+}
+
+/// In-place, minted id, sync off → `inplace <uuid>`
+/// (`test_inplaceWithoutSessionId_mintsFreshIdAndRepliesWithIt`).
+#[test]
+fn reply_inplace_minted_id_sync_off_appends_uuid() {
+    let decision = ClaudeReplyDecision::InPlace {
+        parsed_from_args: false,
+        session_id: "minted-uuid".into(),
+    };
+    assert_eq!(compose_claude_reply(&decision, None), "inplace minted-uuid");
+}
+
+/// Sync on + user-supplied session id → `inplace - <path>` (the `-` sid
+/// placeholder, then the settings pointer as the 3rd field;
+/// `test_inplaceWithSessionId_syncOn_appendsSettingsPointer`).
+#[test]
+fn reply_inplace_parsed_id_sync_on_uses_dash_placeholder() {
+    let decision = ClaudeReplyDecision::InPlace {
+        parsed_from_args: true,
+        session_id: "unused".into(),
+    };
+    assert_eq!(
+        compose_claude_reply(&decision, Some("/ptr.json")),
+        "inplace - /ptr.json"
+    );
+}
+
+/// Sync on + minted id → `inplace <uuid> <path>` (real minted id, not `-`;
+/// `test_inplaceWithoutSessionId_syncOn_appendsSettingsPointerAfterMintedId`).
+#[test]
+fn reply_inplace_minted_id_sync_on_appends_uuid_then_path() {
+    let decision = ClaudeReplyDecision::InPlace {
+        parsed_from_args: false,
+        session_id: "minted-uuid".into(),
+    };
+    assert_eq!(
+        compose_claude_reply(&decision, Some("/ptr.json")),
+        "inplace minted-uuid /ptr.json"
+    );
+}
+
+/// Sync off replies are byte-identical to the pre-theming protocol — no third
+/// field ever appears (`test_inplace_syncOff_repliesByteIdentical`).
+#[test]
+fn reply_inplace_sync_off_never_has_third_field() {
+    for parsed in [true, false] {
+        let decision = ClaudeReplyDecision::InPlace {
+            parsed_from_args: parsed,
+            session_id: "x".into(),
+        };
+        let reply = compose_claude_reply(&decision, None);
+        assert!(
+            reply.split(' ').count() <= 2,
+            "sync-off reply {reply:?} must be ≤2 fields"
+        );
+    }
+}
+
+// =====================================================================
+// parse_claude_title — the T5 status/label split (`SessionsModel.swift:439-453`).
+// The pure split; the trim / empty-skip / "Claude Code" placeholder / auto-title
+// pipeline is R15 slice-3's pane_title_changed branch.
+// =====================================================================
+
+/// A braille-spinner first scalar (U+2800..=U+28FF) ⇒ Thinking; the label is the
+/// remainder after the prefix scalar.
+#[test]
+fn parse_title_braille_spinner_sets_thinking() {
+    let (status, label) = parse_claude_title("\u{2840} fix-top-bar-height");
+    assert_eq!(status, Some(TabStatus::Thinking));
+    assert_eq!(label, " fix-top-bar-height");
+}
+
+/// The braille range is inclusive at both ends.
+#[test]
+fn parse_title_braille_range_boundaries_set_thinking() {
+    assert_eq!(parse_claude_title("\u{2800}x").0, Some(TabStatus::Thinking));
+    assert_eq!(parse_claude_title("\u{28FF}x").0, Some(TabStatus::Thinking));
+}
+
+/// The sparkle ✳ (U+2733) ⇒ Waiting.
+#[test]
+fn parse_title_sparkle_sets_waiting() {
+    let (status, label) = parse_claude_title("\u{2733} needs-input");
+    assert_eq!(status, Some(TabStatus::Waiting));
+    assert_eq!(label, " needs-input");
+}
+
+/// A non-braille, non-sparkle first char ⇒ no status change; the whole string is
+/// the label.
+#[test]
+fn parse_title_unknown_prefix_treated_as_label() {
+    let (status, label) = parse_claude_title("refactor-auth-layer");
+    assert_eq!(status, None);
+    assert_eq!(label, "refactor-auth-layer");
+}
+
+/// The generic "Claude Code" placeholder is not special-cased HERE — it parses
+/// as a plain label (slice-3's branch drops it after trimming).
+#[test]
+fn parse_title_placeholder_is_a_plain_label() {
+    assert_eq!(parse_claude_title("Claude Code"), (None, "Claude Code"));
+    // With a braille prefix, the status still flips and the label carries the
+    // placeholder (which the caller trims and drops).
+    assert_eq!(
+        parse_claude_title("\u{2840} Claude Code"),
+        (Some(TabStatus::Thinking), " Claude Code")
+    );
+}
+
+/// An empty title yields no status and an empty label (the caller skips it).
+#[test]
+fn parse_title_empty_is_none_empty_label() {
+    assert_eq!(parse_claude_title(""), (None, ""));
+}
+
+/// A bare status glyph with no trailing label still flips the status; the label
+/// is empty.
+#[test]
+fn parse_title_bare_status_glyph_empty_label() {
+    assert_eq!(
+        parse_claude_title("\u{2733}"),
+        (Some(TabStatus::Waiting), "")
+    );
+}
+
+// =====================================================================
+// mint_session_uuid — real lowercased UUIDv4 (getentropy-backed), a separate
+// mint from the ms+counter tab/pane id minter.
+// =====================================================================
+
+/// Canonical `8-4-4-4-12` lowercase hex shape, 36 chars, hyphens at the fixed
+/// offsets.
+#[test]
+fn session_uuid_canonical_format() {
+    let id = mint_session_uuid();
+    assert_eq!(id.len(), 36, "{id}");
+    let bytes = id.as_bytes();
+    assert_eq!(bytes[8], b'-');
+    assert_eq!(bytes[13], b'-');
+    assert_eq!(bytes[18], b'-');
+    assert_eq!(bytes[23], b'-');
+    for (i, c) in id.char_indices() {
+        if [8, 13, 18, 23].contains(&i) {
+            continue;
+        }
+        assert!(
+            c.is_ascii_hexdigit() && !c.is_ascii_uppercase(),
+            "char {i} = {c:?} must be lowercase hex in {id}"
+        );
+    }
+}
+
+/// Version nibble is `4` and the variant nibble is one of `8/9/a/b` (RFC 4122
+/// version 4, variant 1).
+#[test]
+fn session_uuid_version_and_variant_bits() {
+    for _ in 0..256 {
+        let id = mint_session_uuid();
+        let bytes = id.as_bytes();
+        // Version nibble: first char of the third group (index 14).
+        assert_eq!(bytes[14], b'4', "version nibble must be 4 in {id}");
+        // Variant nibble: first char of the fourth group (index 19).
+        assert!(
+            matches!(bytes[19], b'8' | b'9' | b'a' | b'b'),
+            "variant nibble must be 8/9/a/b in {id}"
+        );
+    }
+}
+
+/// Reparsed bytes carry the exact version (4) and variant (0b10) bits.
+#[test]
+fn session_uuid_bits_survive_reparse() {
+    let id = mint_session_uuid();
+    let hex: String = id.chars().filter(|c| *c != '-').collect();
+    let byte6 = u8::from_str_radix(&hex[12..14], 16).unwrap();
+    let byte8 = u8::from_str_radix(&hex[16..18], 16).unwrap();
+    assert_eq!(byte6 >> 4, 4, "byte 6 high nibble = version 4");
+    assert_eq!(byte8 >> 6, 0b10, "byte 8 top two bits = variant 1");
+}
+
+/// A batch of mints are all distinct (122 bits of entropy ⇒ no collision at
+/// human creation rates).
+#[test]
+fn session_uuid_uniqueness() {
+    let mut seen = HashSet::new();
+    for _ in 0..1000 {
+        assert!(seen.insert(mint_session_uuid()), "duplicate session uuid minted");
+    }
+}
+
+// ---- R15 Claude-tab constructor pure helpers --------------------------------
+//
+// The constructor itself (`create_claude_tab`) spawns a pty, so its end-to-end
+// shape is the slice-3 `claude-lifecycle` scenario; these pin the pure pieces it
+// composes (Swift `createTabFromMainTerminal`'s title + sessionCwd closures and
+// `TabPtySession.launchDisplayCommand`).
+
+// claude_tab_title_from_args — join, 40-char cap, trim, empty ⇒ "New tab".
+
+#[test]
+fn claude_title_empty_args_is_new_tab() {
+    assert_eq!(claude_tab_title_from_args(&[]), "New tab");
+}
+
+#[test]
+fn claude_title_joins_args_with_spaces() {
+    let args = vec!["--resume".to_string(), "abc-123".to_string()];
+    assert_eq!(claude_tab_title_from_args(&args), "--resume abc-123");
+}
+
+#[test]
+fn claude_title_caps_at_40_chars() {
+    // A single 50-char arg: the cut lands mid-content, no trailing space to trim.
+    let args = vec!["x".repeat(50)];
+    let title = claude_tab_title_from_args(&args);
+    assert_eq!(title, "x".repeat(40));
+    assert_eq!(title.chars().count(), 40);
+}
+
+#[test]
+fn claude_title_trims_trailing_space_exposed_by_the_cut() {
+    // 39 x's + " tail" joins to 44 chars; the 40-char cut lands on the space after
+    // the x-run, which is then trimmed off (→ 39 x's).
+    let args = vec!["x".repeat(39), "tail".to_string()];
+    let title = claude_tab_title_from_args(&args);
+    assert_eq!(title, "x".repeat(39));
+}
+
+#[test]
+fn claude_title_all_whitespace_falls_back_to_new_tab() {
+    let args = vec!["   ".to_string()];
+    assert_eq!(claude_tab_title_from_args(&args), "New tab");
+}
+
+// claude_worktree_cwd — Tab.cwd worktree split (`-w` space form only, `/`→`+`).
+
+#[test]
+fn claude_worktree_cwd_no_worktree_is_plain_cwd() {
+    assert_eq!(claude_worktree_cwd("/tmp/p", &[]), "/tmp/p");
+    // The `=` form is deliberately NOT a worktree (session-id takes both; worktree
+    // is space-form only — the landed extractor enforces it).
+    let eq = vec!["--worktree=foo".to_string()];
+    assert_eq!(claude_worktree_cwd("/tmp/p", &eq), "/tmp/p");
+}
+
+#[test]
+fn claude_worktree_cwd_space_form_builds_worktree_path() {
+    let args = vec!["-w".to_string(), "feature".to_string()];
+    assert_eq!(
+        claude_worktree_cwd("/tmp/p", &args),
+        "/tmp/p/.claude/worktrees/feature"
+    );
+}
+
+#[test]
+fn claude_worktree_cwd_sanitizes_slash_to_plus() {
+    // Claude sanitizes `/` → `+` when deriving the on-disk worktree dir name.
+    let args = vec!["--worktree".to_string(), "foo/bar".to_string()];
+    assert_eq!(
+        claude_worktree_cwd("/tmp/p", &args),
+        "/tmp/p/.claude/worktrees/foo+bar"
+    );
+}
+
+#[test]
+fn claude_worktree_cwd_trims_trailing_slash_on_anchor() {
+    let args = vec!["-w".to_string(), "wt".to_string()];
+    assert_eq!(
+        claude_worktree_cwd("/tmp/p/", &args),
+        "/tmp/p/.claude/worktrees/wt"
+    );
+}
+
+// claude_launch_display_command — the user-facing overlay string.
+
+#[test]
+fn claude_display_command_plain() {
+    assert_eq!(
+        claude_launch_display_command(&ClaudeSessionMode::New("uuid".into()), &[]),
+        "claude"
+    );
+}
+
+#[test]
+fn claude_display_command_with_user_args_hides_session_plumbing() {
+    let args = vec!["--dangerously-skip-permissions".to_string()];
+    // The overlay shows the user's args, never `--session-id <uuid>` / the zsh wrap.
+    assert_eq!(
+        claude_launch_display_command(&ClaudeSessionMode::New("uuid".into()), &args),
+        "claude --dangerously-skip-permissions"
+    );
+}
+
+#[test]
+fn claude_display_command_resume_hides_uuid() {
+    assert_eq!(
+        claude_launch_display_command(&ClaudeSessionMode::Resume("uuid".into()), &[]),
+        "claude --resume"
     );
 }
