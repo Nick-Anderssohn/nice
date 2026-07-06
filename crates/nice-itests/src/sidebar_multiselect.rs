@@ -242,6 +242,18 @@ impl SidebarProbe {
         self.selection.sync_active_tab_id(active.as_deref());
     }
 
+    /// Mirror of the shipped `NextSidebarTab` keymap handler (`keymap.rs`, the R10
+    /// keyboard tab-cycle ⌘⌥↓): advance the model's active tab, then re-sync the
+    /// selection's active mirror — `WindowState::sync_selection_to_active_tab`, the
+    /// fix. The handler previously mutated only the model, leaving the prior-active
+    /// row a stale selection-set member (the faint-highlight residue). Mouse paths
+    /// sync inline in [`route_click`](Self::route_click); this is the keyboard analog.
+    fn route_next_sidebar_tab(&mut self) {
+        self.model.select_next_sidebar_tab();
+        let active = self.model.active_tab_id().map(str::to_string);
+        self.selection.sync_active_tab_id(active.as_deref());
+    }
+
     /// Mirror of `SidebarShellView::handle_title_tap` (`sidebar_shell.rs:420`): a
     /// plain tap on the already-active row enters rename only past the gate;
     /// otherwise it routes like a plain select. Reads the simulated clock so a
@@ -670,6 +682,40 @@ fn shift_click_extends_from_sticky_anchor(cx: &mut TestAppContext) {
     vcx.simulate_click(row_bg_point(2), Modifiers::shift()); // ⇧ -> re-extend to "t2"
     assert_eq!(selection(&probe, vcx), ids(&["t1", "t2"]), "re-extend still measured from the sticky anchor");
     assert_eq!(anchor(&probe, vcx).as_deref(), Some("t1"), "anchor stayed put across the second extension");
+}
+
+// ============================================================================
+// keyboard sidebar-nav re-syncs the selection (the ⌘⌥↓ residue fix)
+// ============================================================================
+
+/// Keyboard sidebar-nav (`NextSidebarTab`, ⌘⌥↓) collapses the multi-selection to
+/// the new active tab: the previously-active/selected rows must NOT linger in the
+/// selection set (the faint `SELECTED_DIM_FACTOR` highlight residue). This is the
+/// gap the file's mouse-only cases missed — the shipped keymap handler mutated the
+/// model without re-syncing `selection`, so a prior-active row stayed a
+/// dim-tinted set member. Seed a >1 selection whose active tab is one member,
+/// cycle, and assert the set is exactly the new active tab.
+#[gpui::test]
+fn keyboard_nav_resyncs_selection_to_new_active(cx: &mut TestAppContext) {
+    let (probe, vcx) = mount_probe(cx, seed_flat_model());
+
+    // Build a two-row selection: {terminals-main, t1}, active on t1.
+    vcx.simulate_click(row_bg_point(0), Modifiers::none()); // -> {terminals-main}
+    vcx.simulate_click(row_bg_point(1), Modifiers::command()); // + t1 (now active)
+    assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
+    assert_eq!(active(&probe, vcx).as_deref(), Some("t1"));
+
+    // Keyboard-cycle to the next tab: the selection must collapse onto it, dropping
+    // both the prior-active row (t1) and the other set member (terminals-main).
+    probe.update(vcx, |p, _| p.route_next_sidebar_tab());
+
+    let new_active = active(&probe, vcx).expect("a tab is active after cycling");
+    assert_ne!(new_active, "t1", "the cycle moved the active tab off t1");
+    assert_eq!(
+        selection(&probe, vcx),
+        ids(&[new_active.as_str()]),
+        "keyboard nav collapses the selection to the new active tab — no stale prior-active row lingers"
+    );
 }
 
 // ============================================================================

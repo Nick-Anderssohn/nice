@@ -12,7 +12,11 @@
 #
 # All-Rust rule: no `objc2` lives here. The one sanctioned AppKit crossing the
 # renderer needs (the demand-present kick for occluded windows) is injected from
-# `crates/nice/src/platform` in a later slice; this crate stays objc2-free.
+# `crates/nice/src/platform`; this crate stays objc2-free. It does make one
+# hand-declared CoreFoundation call — `CFRunLoopWakeUp(CFRunLoopGetMain())`, the
+# App-Nap-safe wake for the event-driven session drain (`session_handle.rs`) —
+# which is process-global C FFI (no window, no objc2, no new dep), replicated
+# locally rather than injected because it needs nothing window-specific.
 [package]
 name = "nice-term-view"
 version = "0.1.0"

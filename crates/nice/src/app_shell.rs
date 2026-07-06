@@ -265,6 +265,14 @@ impl PaneHostView {
         let view = self.cache.get(pane)?;
         Some(view.read(cx).focus_handle_ref().clone())
     }
+
+    /// The cached [`TerminalView`] hosting `pane_id`, if the host has built one —
+    /// the `claude-lifecycle` /branch-overlay leg's read: it activates the deferred
+    /// branch parent, then asserts that pane's view never flashed the stray
+    /// "Launching…" overlay (its `OutputStarted` fired while it had no view).
+    pub(crate) fn scenario_terminal_for(&self, pane_id: &str) -> Option<Entity<TerminalView>> {
+        self.cache.get(pane_id).cloned()
+    }
 }
 
 /// The pane-host's fill when the active pane has no live session yet (a

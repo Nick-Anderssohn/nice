@@ -52,6 +52,13 @@ pub fn make_terminal(
     handle: Entity<TerminalSessionHandle>,
     metrics: TerminalMetrics,
 ) -> Entity<TerminalView> {
+    // Opt this mocked-context session out of the event-driven drain wake BEFORE
+    // the first paint's `run_until_parked` registers the drain's waker: the pty
+    // feeder runs on a real OS thread, and waking a gpui task from it trips the
+    // deterministic test scheduler's determinism guard. Mocked-context tests never
+    // need the drain (they read the grid / capture file directly). See
+    // `TerminalSessionHandle::set_event_wake_enabled`.
+    handle.update(cx, |h, _cx| h.set_event_wake_enabled(false));
     let theme = TerminalTheme::nice_default_dark();
     let accent = AccentPreset::Terracotta.color();
     let font = cx.new(|_cx| {

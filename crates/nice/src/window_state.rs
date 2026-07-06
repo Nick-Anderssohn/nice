@@ -222,6 +222,18 @@ impl WindowState {
         self.window_handle = Some(handle);
     }
 
+    /// Mirror the model's active tab into the multi-selection — the Rust analog of
+    /// Swift's single active-tab observer (`SidebarView.swift:75-77`). Keyboard tab
+    /// cycling (`NextSidebarTab` / `PrevSidebarTab`) mutates only the model, so the
+    /// selection's active mirror must be re-synced here or the previously-active row
+    /// lingers in `selection` as a faint `SELECTED_DIM_FACTOR` highlight; mouse
+    /// paths already sync inline via `route_click`. Keeps the "selection ⊇ {active
+    /// tab}" invariant (`sync_active_tab_id` collapses when the new active tab is
+    /// outside the set).
+    pub(crate) fn sync_selection_to_active_tab(&mut self) {
+        self.selection.sync_active_tab_id(self.model.active_tab_id());
+    }
+
     /// R15 subscription lift — the shipped-window twin of the
     /// `session-lifecycle` scenario's `spawn_and_subscribe` (the tranche's known
     /// integration gap: `route_terminal_event` was wired ONLY in that scenario, so

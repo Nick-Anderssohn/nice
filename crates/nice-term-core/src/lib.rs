@@ -47,7 +47,7 @@ pub mod session;
 pub mod spawn;
 pub mod vt;
 
-pub use deferred::{should_hold_on_exit, Phase, Session, SessionEvent};
+pub use deferred::{should_hold_on_exit, DrainWake, Phase, Session, SessionEvent};
 pub use pty::{ExitStatus, ExitWaiter, PtyProcess};
 pub use quoting::{shell_backslash_escape, shell_single_quote};
 pub use session::{DamageCallback, TermSession};

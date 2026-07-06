@@ -435,6 +435,79 @@ async fn run_claude_lifecycle(
                             orig.claude_session_id
                         ));
                     }
+
+                    // -- f1-overlay (Bug 1): activating the deferred branch parent
+                    //    must NOT flash the stray "Launching…" overlay. Its
+                    //    ResumeDeferred shell already spawned + printed its prompt
+                    //    while the parent tab was INACTIVE, so the pane's one-shot
+                    //    OutputStarted fired to zero view subscribers; the FRESH
+                    //    TerminalView mounted on first visit must read the latched
+                    //    output_started and start its overlay cleared (never arming
+                    //    the grace). NOTE: activating only mounts + focuses the view —
+                    //    it never presses Enter, so the prefilled `claude --resume`
+                    //    stays un-run (hermeticity: the stub claude is never spawned).
+                    let parent_claude = parent
+                        .panes
+                        .iter()
+                        .find(|p| p.kind == PaneKind::Claude)
+                        .map(|p| p.id.clone());
+                    match parent_claude {
+                        None => failures
+                            .push("(f) branch-overlay: the sibling parent has no Claude pane".into()),
+                        Some(parent_pane) => {
+                            let printed = match pane_handle(cx, &state, &parent_id, &parent_pane) {
+                                Some(h) => poll_grid_nonempty(cx, &h).await,
+                                None => false,
+                            };
+                            if !printed {
+                                failures.push(
+                                    "(f) branch-overlay: the branch parent's deferred shell never \
+                                     printed a prompt (cannot conclude the overlay was suppressed)"
+                                        .into(),
+                                );
+                            } else {
+                                // Activate the parent tab: the shipped host builds a
+                                // fresh TerminalView for its already-output pane.
+                                let _ = state.update(cx, |s, cx| {
+                                    s.model.select_tab(&parent_id);
+                                    cx.notify();
+                                });
+                                // Well past the 750 ms launch grace: a buggy overlay
+                                // would have armed on first paint and shown by now.
+                                settle(cx, 1200).await;
+                                let view = whandle
+                                    .update(cx, |shell, _w, _a| shell.scenario_pane_host())
+                                    .ok()
+                                    .and_then(|ph| {
+                                        ph.update(cx, |ph, _| ph.scenario_terminal_for(&parent_pane))
+                                    });
+                                match view {
+                                    None => failures.push(
+                                        "(f) branch-overlay: activating the branch parent mounted no \
+                                         TerminalView for its pane".into(),
+                                    ),
+                                    Some(view) => {
+                                        let (visible, ever) = view.update(cx, |v, _| {
+                                            (v.overlay_visible(), v.overlay_ever_visible())
+                                        });
+                                        if visible {
+                                            failures.push(
+                                                "(f) branch-overlay: the \"Launching…\" overlay is \
+                                                 VISIBLE on the branch parent (Bug 1 regressed)".into(),
+                                            );
+                                        }
+                                        if ever {
+                                            failures.push(
+                                                "(f) branch-overlay: the overlay FLASHED on the branch \
+                                                 parent (overlay_ever_visible latched — Bug 1 regressed)"
+                                                    .into(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -932,6 +1005,21 @@ async fn poll_grid_contains(
         settle(cx, POLL_MS).await;
         let grid = handle.update(cx, |h, _cx| h.session().grid_lines().join("\n"));
         if grid.contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll until the pane's grid holds any non-whitespace content — the deferred
+/// branch-parent shell's prompt. By the time it prints, that pane's one-shot
+/// `OutputStarted` has fired (and, since the pane has no view yet, drained to zero
+/// subscribers) — the exact precondition the /branch-overlay leg reproduces.
+async fn poll_grid_nonempty(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> bool {
+    for _ in 0..READY_POLLS {
+        settle(cx, POLL_MS).await;
+        let grid = handle.update(cx, |h, _cx| h.session().grid_lines().join("\n"));
+        if grid.chars().any(|c| !c.is_whitespace()) {
             return true;
         }
     }

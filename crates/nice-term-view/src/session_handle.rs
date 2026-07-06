@@ -12,36 +12,62 @@
 //! A [`crate::view::TerminalView`] observes this entity to repaint; the entity
 //! never reaches back into a view.
 //!
-//! ## Draining
+//! ## Draining (event-driven, no idle timer)
 //!
 //! The session's outward events arrive on a plain `std::sync::mpsc` channel fed
 //! from the session's feeder / exit-watcher threads, and its damage-wake is a
 //! `Send` callback fired from the feeder thread (never under the `Term` lock).
 //! Neither may touch gpui from those threads, so this entity bridges them onto
-//! the gpui foreground executor: the damage-wake bumps a `Send` atomic counter,
-//! and one spawned task drains the event channel + observes the counter,
-//! translating both into on-entity `cx.emit` / `cx.notify`.
+//! the gpui foreground executor via a [`DrainSignal`]: the feeder's damage-wake
+//! bumps a `Send` counter **and signals** the drain; every channel send signals
+//! it too (feeder events ride their trailing damage-wake; the exit-watcher's
+//! `Exited`, which has none, fires an explicit [`nice_term_core::DrainWake`]).
+//! One spawned foreground task parks on the signal, and each wake drains the
+//! event channel to empty + observes the counter, translating both into
+//! on-entity `cx.emit` / `cx.notify`.
 //!
-//! **Damage → present.** The drain task turns a damage bump into `cx.notify()`
-//! **plus an explicit present kick** on a short poll. `cx.notify()` alone is
-//! enough for a frontmost, continuously-repainting window (the self-test
-//! scenarios drive `request_animation_frame`), but it **never presents while a
-//! window's CVDisplayLink is stopped** (occluded) — a real pane needs the
+//! The signal **coalesces**: only the idle→pending edge dispatches a wake, so a
+//! burst of output/events schedules exactly one drain pass (batching preserved,
+//! no per-event wakeups). A send racing the drain-goes-idle edge is not lost —
+//! the park future re-checks the pending flag after storing its waker, and the
+//! producer sets that flag before waking. At true idle **nothing re-arms**: the
+//! task is parked with zero wakeups (this replaced an 8 ms poll timer that cost
+//! ~1.4% CPU per session, even occluded — M3 Bug 3).
+//!
+//! **App-Nap safety.** The wake must reach gpui's main run loop from a pty
+//! background thread even when the app is idle/occluded. macOS App Nap defers
+//! *coalescable dispatch timers* indefinitely (the very reason the old poll
+//! leaked while occluded and the reason a timer-based re-arm is unusable here),
+//! but a **non-timer** main-queue wake is not deferred that way. So [`signal`]
+//! does two things, belt-and-suspenders, exactly like R14's control-socket drain
+//! (`socket_channel` in `crates/nice`): wake the parked task's `Waker` AND force
+//! the main `CFRunLoop` out of its wait via `CFRunLoopWakeUp(CFRunLoopGetMain())`
+//! so the foreground executor re-polls now. That runloop poke is the sole
+//! CoreFoundation crossing in this crate ([`wake_main_runloop`], hand-declared,
+//! process-global — NOT the objc2/AppKit present-kick crossing, which stays
+//! injected from `crates/nice/src/platform`).
+//!
+//! **Damage → present.** A damage bump also yields `cx.notify()` **plus an
+//! explicit present kick**. `cx.notify()` alone is enough for a frontmost,
+//! continuously-repainting window (the self-test scenarios drive
+//! `request_animation_frame`), but it **never presents while a window's
+//! CVDisplayLink is stopped** (occluded) — a real pane needs the
 //! `setNeedsDisplay` kick to force `displayLayer:` on the next CA commit. That
 //! kick is objc2, so it is **injected** as a callback ([`set_present_kick`]) the
-//! app constructs in `crates/nice/src/platform`; this crate stays objc2-free.
-//! The kick is cloned out of the entity and fired on the bare `AsyncApp`
-//! *outside* the entity update, so re-entering the window handle never nests
-//! inside the entity's borrow. (Replacing the poll itself with an event-driven
-//! wake is a still-later optimization; the atomic-counter seam already exists.)
+//! app constructs in `crates/nice/src/platform`. The kick is cloned out of the
+//! entity and fired on the bare `AsyncApp` *outside* the entity update, so
+//! re-entering the window handle never nests inside the entity's borrow.
 //!
 //! [`set_present_kick`]: TerminalSessionHandle::set_present_kick
+//! [`signal`]: DrainSignal::signal
 
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll, Waker};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -49,7 +75,9 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use anyhow::Result;
 use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, Task};
 
-use nice_term_core::{DamageCallback, ExitStatus, Session, SessionEvent, SharedTerm, SpawnSpec};
+use nice_term_core::{
+    DamageCallback, DrainWake, ExitStatus, Session, SessionEvent, SharedTerm, SpawnSpec,
+};
 
 /// The injected demand-present kick: a `setNeedsDisplay`-on-the-window callback
 /// the app constructs in `crates/nice/src/platform` (the sole sanctioned objc2
@@ -59,11 +87,139 @@ use nice_term_core::{DamageCallback, ExitStatus, Session, SessionEvent, SharedTe
 /// out of the entity and call it after the update returns.
 pub type PresentKick = Arc<dyn Fn(&mut AsyncApp)>;
 
-/// How often the drain task polls the session's event channel + damage counter.
-/// A slice-1 stand-in for the event-driven damage wake + present kick a later
-/// slice installs; small enough to feel immediate, coarse enough to stay cheap
-/// while idle (it only `notify`s when the damage counter actually moved).
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(8);
+/// The wake bridge between the pty background threads and the parked foreground
+/// drain task (see the module "Draining" docs). Held by the entity's drain task
+/// and — via the [`DamageCallback`] / [`DrainWake`] closures — by the session's
+/// feeder and exit-watcher threads.
+///
+/// Concurrency: `pending` is the coalescing edge flag (idle→pending dispatches a
+/// wake; further signals while a drain is already scheduled just ride it).
+/// `waker` is the parked drain task's [`Waker`]. `damage` is the monotonic
+/// repaint-accounting counter (the drain present-kicks only when it moves).
+/// `runloop_wake` is the App-Nap-safe main-runloop poke fired on the edge
+/// (`wake_main_runloop` in production; a test double in unit tests).
+///
+/// `wake_enabled` gates whether [`signal`](Self::signal) actually wakes the gpui
+/// task, and defaults **on**. It exists solely for the mocked
+/// [`gpui::TestAppContext`]: waking a gpui foreground task from a pty background
+/// thread trips gpui's deterministic test scheduler (`schedule_local` must run on
+/// the test thread), so the mocked-context test harness turns it off via
+/// [`TerminalSessionHandle::set_event_wake_enabled`]. Production, hidden panes,
+/// and the live-platform self-tests all run enabled with no wiring — a
+/// window-scoped enable would wrongly starve windowless/hidden panes whose
+/// title/cwd/exit events must still flow (see the module top docs), so the safe
+/// default is on and only the deterministic harness opts out (a forgotten opt-out
+/// panics loudly rather than silently dropping production wakes).
+struct DrainSignal {
+    pending: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+    damage: AtomicU64,
+    wake_enabled: AtomicBool,
+    runloop_wake: Box<dyn Fn() + Send + Sync>,
+}
+
+impl DrainSignal {
+    fn new(runloop_wake: impl Fn() + Send + Sync + 'static) -> Self {
+        DrainSignal {
+            pending: AtomicBool::new(false),
+            waker: Mutex::new(None),
+            damage: AtomicU64::new(0),
+            wake_enabled: AtomicBool::new(true),
+            runloop_wake: Box::new(runloop_wake),
+        }
+    }
+
+    /// Wake the drain task (coalesced, App-Nap-safe). Called from a pty
+    /// background thread on every channel send and every damage bump.
+    ///
+    /// Only the idle→pending edge dispatches the actual wake: while a drain is
+    /// already scheduled (pending already set) later signals just ride it, so a
+    /// burst schedules one drain pass, not one wake per event. `pending` is set
+    /// with `Release` and read by the park future with `Acquire`/`AcqRel`, so the
+    /// producer's writes (the enqueued event, the damage bump) are visible to the
+    /// woken drain (the swaps form a release sequence carrying every prior bump).
+    fn signal(&self) {
+        if self.pending.swap(true, Ordering::Release) {
+            return; // a drain is already scheduled — batch onto it
+        }
+        if !self.wake_enabled.load(Ordering::Acquire) {
+            // Disabled only under the mocked TestAppContext (see the struct docs):
+            // set `pending` but never touch the gpui task from this background
+            // thread. Never reached in production / on a live platform.
+            return;
+        }
+        if let Some(w) = self.waker.lock().unwrap().take() {
+            w.wake();
+        }
+        // Belt-and-suspenders App-Nap wake: a coalescable timer would be deferred
+        // while idle/occluded; forcing the main runloop out of its wait is not
+        // (see the module "App-Nap safety" note).
+        (self.runloop_wake)();
+    }
+
+    /// Record output damage (repaint accounting) then wake the drain. Fired by
+    /// the feeder's [`DamageCallback`] after each parsed chunk.
+    fn note_damage(&self) {
+        self.damage.fetch_add(1, Ordering::Release);
+        self.signal();
+    }
+}
+
+/// The park future the drain task awaits between passes. Resolves as soon as a
+/// signal is (or already was) pending, storing the task's waker where a producer
+/// thread reaches it. The double-check after storing the waker closes the
+/// classic lost-wakeup race: a producer that flips `pending` between the first
+/// check and the store is caught by the second check (it set the flag before it
+/// woke us).
+struct DrainReady {
+    signal: Arc<DrainSignal>,
+}
+
+impl Future for DrainReady {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            return Poll::Ready(());
+        }
+        *self.signal.waker.lock().unwrap() = Some(cx.waker().clone());
+        if self.signal.pending.swap(false, Ordering::AcqRel) {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+}
+
+/// Force the app's main `CFRunLoop` out of its wait so the foreground executor
+/// re-polls the parked drain task NOW — immune to App-Nap timer coalescing (see
+/// the module "App-Nap safety" note). Process-global (`CFRunLoopGetMain`),
+/// window-independent, safe from any thread.
+///
+/// This is the sole CoreFoundation crossing in this crate; it is deliberately
+/// NOT the injected objc2/AppKit present-kick crossing — `CFRunLoopWakeUp` needs
+/// nothing window-specific, so replicating it locally (the spec's steer) is
+/// leaner than threading another injected callback through every window-wiring
+/// site. Mirrors `wake_main_runloop` in `crates/nice/src/platform`.
+#[cfg(target_os = "macos")]
+fn wake_main_runloop() {
+    // CoreFoundation, hand-declared (already linked into the app via gpui); the
+    // explicit `link` also pulls it into this crate's own test binary.
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
+        fn CFRunLoopWakeUp(rl: *mut std::ffi::c_void);
+    }
+    // SAFETY: `CFRunLoopGetMain` returns the app's main runloop (or, implausibly,
+    // null, which `CFRunLoopWakeUp` tolerates as a no-op); neither takes ownership.
+    unsafe {
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
+}
+
+/// Non-macOS stand-in (this crate only ships on macOS; keeps a `cargo check` on
+/// another host honest). The plain `Waker` wake is the whole mechanism there.
+#[cfg(not(target_os = "macos"))]
+fn wake_main_runloop() {}
 
 /// A typed event re-emitted onto the gpui side, mirroring
 /// [`nice_term_core::SessionEvent`]. `#[non_exhaustive]` so a still-later cycle
@@ -140,10 +296,15 @@ pub struct TerminalSessionHandle {
     ///
     /// [`set_present_kick`]: TerminalSessionHandle::set_present_kick
     present_kick: Option<PresentKick>,
+    /// The wake bridge the drain task parks on, shared with the session's
+    /// feeder + exit-watcher threads (see [`DrainSignal`]). Held here too so
+    /// [`set_event_wake_enabled`](Self::set_event_wake_enabled) can reach it (the
+    /// mocked-test opt-out); re-pointed at the fresh signal on a respawn.
+    drain_signal: Arc<DrainSignal>,
     /// The drain task. Held so it is cancelled when the entity drops (a dropped
-    /// `Task` is cancelled), so no task outlives its session. The damage counter
-    /// it observes — the seam the demand-present kick hangs off of — lives inside
-    /// the task + the session's damage callback.
+    /// `Task` is cancelled), so no task outlives its session. It parks on
+    /// [`drain_signal`](Self::drain_signal) between passes (event-driven, no idle
+    /// timer — see the module "Draining" docs).
     _drain: Task<()>,
 }
 
@@ -162,20 +323,12 @@ impl TerminalSessionHandle {
         spec: SpawnSpec,
         scrollback_lines: usize,
     ) -> Result<Entity<Self>> {
-        let damage = Arc::new(AtomicU64::new(0));
-        let on_damage: DamageCallback = {
-            let damage = Arc::clone(&damage);
-            // Non-blocking, never under the `Term` lock, never re-enters gpui —
-            // honours nice-term-core's damage-wake contract. Just bumps a flag.
-            Box::new(move || {
-                damage.fetch_add(1, Ordering::Release);
-            })
-        };
-        let (session, events) = Session::spawn(spec.clone(), scrollback_lines, on_damage)?;
+        let (session, events, signal) = spawn_signalled_session(spec.clone(), scrollback_lines)?;
 
         let entity = cx.new(|cx| {
+            let drain_signal = Arc::clone(&signal);
             let drain = cx.spawn(async move |this, cx| {
-                drain_loop(this, cx, events, damage).await;
+                drain_loop(this, cx, events, signal).await;
             });
             TerminalSessionHandle {
                 session,
@@ -183,6 +336,7 @@ impl TerminalSessionHandle {
                 scrollback_lines,
                 scroll_accum: 0.0,
                 present_kick: None,
+                drain_signal,
                 _drain: drain,
             }
         });
@@ -209,23 +363,23 @@ impl TerminalSessionHandle {
             .with_env(self.spec.env.clone())
             .with_size(rows, cols);
 
-        let damage = Arc::new(AtomicU64::new(0));
-        let on_damage: DamageCallback = {
-            let damage = Arc::clone(&damage);
-            Box::new(move || {
-                damage.fetch_add(1, Ordering::Release);
-            })
-        };
         // Spawn the fresh session FIRST; only swap it in on success so a failed
         // respawn leaves the held pane intact (its output stays readable) rather
         // than blanking the view to a dead session.
-        let (session, events) = Session::spawn(shell_spec.clone(), self.scrollback_lines, on_damage)?;
+        let (session, events, signal) =
+            spawn_signalled_session(shell_spec.clone(), self.scrollback_lines)?;
+        // Carry the event-wake enable state across the respawn (defaults on; a
+        // mocked-test handle that opted out keeps opting out on the fresh signal).
+        signal
+            .wake_enabled
+            .store(self.drain_signal.wake_enabled.load(Ordering::Acquire), Ordering::Release);
         self.session = session;
         // Future dismissals of this pane respawn a shell too (the command spec is
         // gone once its held pane is dismissed).
         self.spec = shell_spec;
+        self.drain_signal = Arc::clone(&signal);
         self._drain = cx.spawn(async move |this, cx| {
-            drain_loop(this, cx, events, damage).await;
+            drain_loop(this, cx, events, signal).await;
         });
         cx.notify();
         Ok(())
@@ -238,6 +392,24 @@ impl TerminalSessionHandle {
     /// prior kick — a re-parent (R13) re-points it at the new window.
     pub fn set_present_kick(&mut self, kick: impl Fn(&mut AsyncApp) + 'static) {
         self.present_kick = Some(Arc::new(kick));
+    }
+
+    /// Enable or disable the event-driven drain wake (defaults **enabled**).
+    ///
+    /// **Only the mocked [`gpui::TestAppContext`] test harness calls this, with
+    /// `false`.** The event-driven drain wakes its parked foreground task from the
+    /// pty feeder/exit-watcher background threads (App-Nap-safe; see the module
+    /// docs). Under gpui's deterministic *test* scheduler that cross-thread wake
+    /// trips a determinism guard (`schedule_local` must run on the test thread),
+    /// so a mocked-context test — which never needs the drain (it reads the grid /
+    /// capture file directly) — turns the wake off. Production, hidden/windowless
+    /// panes, and the live-platform self-tests all leave it on; there is no reason
+    /// to disable it there. Disable BEFORE the first `run_until_parked` so it lands
+    /// before the drain task registers its waker.
+    pub fn set_event_wake_enabled(&self, enabled: bool) {
+        self.drain_signal
+            .wake_enabled
+            .store(enabled, Ordering::Release);
     }
 
     /// The shared `Term` the renderer locks (briefly) to read cells for a paint,
@@ -257,6 +429,17 @@ impl TerminalSessionHandle {
     /// Mutable access to the wrapped session (resize / close — later slices).
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    /// Whether the wrapped session's child has produced its first output byte yet
+    /// — the latched `OutputStarted` fact, forwarded from
+    /// [`nice_term_core::Session::output_started`]. The view reads it in
+    /// [`TerminalView::new`](crate::view::TerminalView) to pre-clear its launch
+    /// overlay when the view is built AFTER output already started (a pane spawned
+    /// while its tab was inactive, first visited now): the one-shot `OutputStarted`
+    /// already fired to zero subscribers, so there is no event left to replay.
+    pub fn output_started(&self) -> bool {
+        self.session.output_started()
     }
 
     /// Set a simple (non-block) selection spanning `start ..= end`, in **buffer**
@@ -364,19 +547,52 @@ fn take_scroll_steps(accum: &mut f32, delta: f32) -> i32 {
     whole as i32
 }
 
-/// The drain task body: poll the session's event channel and its damage
-/// counter, translating both onto the entity. Ends when the entity is gone (any
-/// `update` returns `Err`). See the module docs for why this is a poll (the
-/// event-driven wake + present kick is a later slice).
+/// Build a [`DrainSignal`] and spawn `spec`'s session wired to wake it: the
+/// feeder's [`DamageCallback`] bumps the repaint counter and signals; the
+/// exit-watcher's `Exited` (which has no trailing damage-wake) fires the
+/// [`DrainWake`]. Returns the session, its event receiver, and the signal to
+/// hand the drain task. Shared by [`TerminalSessionHandle::spawn`] and
+/// [`TerminalSessionHandle::respawn_shell`].
+fn spawn_signalled_session(
+    spec: SpawnSpec,
+    scrollback_lines: usize,
+) -> Result<(Session, Receiver<SessionEvent>, Arc<DrainSignal>)> {
+    let signal = Arc::new(DrainSignal::new(wake_main_runloop));
+    let on_damage: DamageCallback = {
+        let signal = Arc::clone(&signal);
+        // Non-blocking, never under the `Term` lock, never re-enters gpui —
+        // honours nice-term-core's damage-wake contract: bump the repaint counter
+        // and signal the drain.
+        Box::new(move || signal.note_damage())
+    };
+    let drain_wake: DrainWake = {
+        let signal = Arc::clone(&signal);
+        // The exit-watcher's `Exited` wakes the same drain but bumps NO damage —
+        // an exit is not new grid content (present-kick behaviour unchanged).
+        Arc::new(move || signal.signal())
+    };
+    let (session, events) =
+        Session::spawn_with_drain_wake(spec, scrollback_lines, on_damage, drain_wake)?;
+    Ok((session, events, signal))
+}
+
+/// The drain task body: park on the [`DrainSignal`], and on each wake drain the
+/// session's event channel to empty + observe the damage counter, translating
+/// both onto the entity. Event-driven — **no idle timer** (M3 Bug 3): at idle
+/// the task is parked with zero wakeups until a pty background thread signals.
+/// Ends when the entity is gone (any `update` returns `Err`) or the session's
+/// senders are dropped (`Disconnected`).
 async fn drain_loop(
     this: gpui::WeakEntity<TerminalSessionHandle>,
     cx: &mut gpui::AsyncApp,
     events: Receiver<SessionEvent>,
-    damage: Arc<AtomicU64>,
+    signal: Arc<DrainSignal>,
 ) {
     let mut last_damage = 0u64;
     loop {
-        // Drain every pending event, emitting + notifying for each.
+        // Drain every queued event, emitting + notifying for each. One wake
+        // drains everything available — no per-event wakeups under heavy output.
+        let mut disconnected = false;
         loop {
             match events.try_recv() {
                 Ok(ev) => {
@@ -392,13 +608,16 @@ async fn drain_loop(
                         }
                     }
                 }
-                // No more events queued this tick.
+                // No more events queued this pass.
                 Err(TryRecvError::Empty) => break,
-                // The session's senders live with the `Session` this entity
-                // owns, so a disconnect only happens as the entity is torn down.
-                // Stop draining events but keep servicing damage until `update`
-                // reports the entity gone.
-                Err(TryRecvError::Disconnected) => break,
+                // The session's senders live with the `Session` this entity owns,
+                // so a disconnect means the session was dropped (teardown, or a
+                // respawn that will restart this task over a fresh stream). Do a
+                // final damage sweep, then exit — nothing more will arrive.
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
 
@@ -406,7 +625,7 @@ async fn drain_loop(
         // kick. The kick is cloned out of the entity here and fired below on the
         // bare `AsyncApp`, *outside* the update, so re-entering the window handle
         // never nests inside this entity's borrow (see the module docs).
-        let current = damage.load(Ordering::Acquire);
+        let current = signal.damage.load(Ordering::Acquire);
         if current != last_damage {
             last_damage = current;
             let kick = match this.update(cx, |this, cx| {
@@ -421,15 +640,234 @@ async fn drain_loop(
             }
         }
 
-        cx.background_executor().timer(DRAIN_POLL_INTERVAL).await;
+        if disconnected {
+            return;
+        }
+
+        // Park until the next event/damage signal — event-driven, no idle timer.
+        DrainReady {
+            signal: Arc::clone(&signal),
+        }
+        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{take_scroll_steps, to_terminal_event, TerminalEvent};
+    use super::{take_scroll_steps, to_terminal_event, DrainReady, DrainSignal, TerminalEvent};
     use nice_term_core::{ExitStatus, SessionEvent};
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+    // ---- Drain gating (event-driven wake) -----------------------------------
+    //
+    // These test the pure gating logic — the pending-flag edge, the parked-waker
+    // wake, and the App-Nap-safe runloop poke — with NO gpui and NO wall-clock /
+    // cadence asserts (banned). "One scheduled drain" == one wake of the parked
+    // task's `Waker` (and one runloop poke); "idle" == the flag stays clear and
+    // the park future returns `Pending`.
+
+    /// A `Waker` that counts how many times it was woken.
+    struct CountingWaker {
+        wakes: AtomicUsize,
+    }
+    impl CountingWaker {
+        fn new() -> Arc<Self> {
+            Arc::new(CountingWaker {
+                wakes: AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.wakes.load(Ordering::SeqCst)
+        }
+    }
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A [`DrainSignal`] whose runloop-wake increments a shared counter, so the
+    /// App-Nap belt-and-suspenders poke is observable without a real runloop.
+    fn signal_with_counters() -> (Arc<DrainSignal>, Arc<AtomicUsize>) {
+        let runloop = Arc::new(AtomicUsize::new(0));
+        let signal = {
+            let runloop = Arc::clone(&runloop);
+            Arc::new(DrainSignal::new(move || {
+                runloop.fetch_add(1, Ordering::SeqCst);
+            }))
+        };
+        (signal, runloop)
+    }
+
+    /// Poll a fresh [`DrainReady`] over `signal` with `waker` once.
+    fn poll_ready(signal: &Arc<DrainSignal>, waker: &Waker) -> Poll<()> {
+        let mut fut = DrainReady {
+            signal: Arc::clone(signal),
+        };
+        let mut cx = TaskContext::from_waker(waker);
+        Pin::new(&mut fut).poll(&mut cx)
+    }
+
+    #[test]
+    fn idle_schedules_no_work() {
+        // No signal → nothing wakes, nothing pokes the runloop, and the drain
+        // parks (Pending). This is the whole point of the fix: zero idle wakeups.
+        let (signal, runloop) = signal_with_counters();
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        assert!(
+            poll_ready(&signal, &waker).is_pending(),
+            "a signal with nothing pending must park the drain"
+        );
+        assert_eq!(counter.count(), 0, "no wake without a signal");
+        assert_eq!(runloop.load(Ordering::SeqCst), 0, "no runloop poke while idle");
+    }
+
+    #[test]
+    fn one_signal_schedules_exactly_one_drain() {
+        // Parked drain + one signal → exactly one waker wake + one runloop poke,
+        // and the park future then resolves once (Ready) before parking again.
+        let (signal, runloop) = signal_with_counters();
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        assert!(poll_ready(&signal, &waker).is_pending(), "drain parks first");
+
+        signal.signal();
+        assert_eq!(counter.count(), 1, "one signal wakes the parked drain once");
+        assert_eq!(
+            runloop.load(Ordering::SeqCst),
+            1,
+            "one signal pokes the runloop once (App-Nap belt-and-suspenders)"
+        );
+
+        assert!(
+            poll_ready(&signal, &waker).is_ready(),
+            "the woken drain runs exactly one pass"
+        );
+        assert!(
+            poll_ready(&signal, &waker).is_pending(),
+            "after the pass the drain parks again — no residual work"
+        );
+        assert_eq!(counter.count(), 1, "re-parking never re-wakes");
+    }
+
+    #[test]
+    fn burst_coalesces_to_one_drain() {
+        // A burst (many events/damage before the drain runs) schedules ONE drain
+        // pass, not one wake per event — batching preserved, no per-event wakeups.
+        let (signal, runloop) = signal_with_counters();
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        assert!(poll_ready(&signal, &waker).is_pending(), "drain parks first");
+
+        for _ in 0..8 {
+            signal.signal();
+        }
+        assert_eq!(counter.count(), 1, "a burst wakes the drain exactly once");
+        assert_eq!(
+            runloop.load(Ordering::SeqCst),
+            1,
+            "a burst pokes the runloop exactly once (only the idle→pending edge)"
+        );
+
+        // One pass clears the coalesced pending; then it parks (nothing residual).
+        assert!(poll_ready(&signal, &waker).is_ready(), "one pass drains the burst");
+        assert!(
+            poll_ready(&signal, &waker).is_pending(),
+            "the whole burst was one drain"
+        );
+    }
+
+    #[test]
+    fn send_during_drain_schedules_one_followup() {
+        // The race edge: a signal that lands while the drain is mid-pass (after it
+        // cleared pending, before it re-parks) must still produce a follow-up
+        // drain — exactly one, then idle.
+        let (signal, _runloop) = signal_with_counters();
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        // Drain parks, an event arrives, the drain wakes and runs a pass.
+        assert!(poll_ready(&signal, &waker).is_pending());
+        signal.signal();
+        assert!(
+            poll_ready(&signal, &waker).is_ready(),
+            "the woken drain begins a pass (pending consumed)"
+        );
+
+        // A second event lands WHILE that pass is still running (before re-park).
+        signal.signal();
+
+        // Re-parking sees it and schedules exactly one follow-up pass...
+        assert!(
+            poll_ready(&signal, &waker).is_ready(),
+            "a send during the drain is not lost — it schedules one follow-up"
+        );
+        // ...and nothing after that.
+        assert!(
+            poll_ready(&signal, &waker).is_pending(),
+            "no spurious extra drain after the follow-up"
+        );
+    }
+
+    #[test]
+    fn disabled_signal_sets_pending_but_never_wakes() {
+        // The mocked-TestAppContext opt-out: when disabled, a signal sets pending
+        // (so a drain driven by other means still sees the work) but NEVER wakes
+        // the gpui task or pokes the runloop — that cross-thread wake is what the
+        // deterministic test scheduler forbids.
+        let (signal, runloop) = signal_with_counters();
+        signal.wake_enabled.store(false, Ordering::Release);
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        assert!(poll_ready(&signal, &waker).is_pending(), "drain parks first");
+
+        signal.signal();
+        assert_eq!(counter.count(), 0, "a disabled signal must not wake the task");
+        assert_eq!(
+            runloop.load(Ordering::SeqCst),
+            0,
+            "a disabled signal must not poke the runloop"
+        );
+        // Pending is still set, so a drain that IS polled would run a pass.
+        assert!(
+            poll_ready(&signal, &waker).is_ready(),
+            "pending is set even while disabled"
+        );
+    }
+
+    #[test]
+    fn note_damage_bumps_counter_and_signals() {
+        // The feeder path: note_damage records damage (repaint accounting) AND
+        // wakes the drain, coalescing like any other signal.
+        let (signal, runloop) = signal_with_counters();
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        assert!(poll_ready(&signal, &waker).is_pending(), "drain parks first");
+        assert_eq!(signal.damage.load(Ordering::Acquire), 0);
+
+        signal.note_damage();
+        assert_eq!(
+            signal.damage.load(Ordering::Acquire),
+            1,
+            "note_damage bumps the repaint counter"
+        );
+        assert_eq!(counter.count(), 1, "note_damage wakes the drain");
+        assert_eq!(runloop.load(Ordering::SeqCst), 1, "note_damage pokes the runloop");
+    }
 
     /// A scripted core event stream — every current [`SessionEvent`] variant —
     /// must surface through the entity's translator instead of being dropped.

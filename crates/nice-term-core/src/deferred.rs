@@ -47,8 +47,12 @@
 //! render thread) and the pty's reaper thread (the sole `waitpid`), a `Session`
 //! adds one **exit-watcher** thread: it blocks on the pty's [`ExitWaiter`],
 //! classifies held (latching the intentional flag *at exit time*), records the
-//! outcome, and sends [`SessionEvent::Exited`]. `OutputStarted` is emitted from
-//! the feeder thread by wrapping the caller's [`DamageCallback`] — the wrap
+//! outcome, sends [`SessionEvent::Exited`], then fires the optional [`DrainWake`]
+//! (see [`Session::spawn_with_drain_wake`]). `Exited` is the one outward event a
+//! feeder-driven [`DamageCallback`] fire does NOT trail — the child is dead, so
+//! no further output/damage arrives — so an event-driven consumer's drain would
+//! never learn of the exit without this explicit poke. `OutputStarted` is emitted
+//! from the feeder thread by wrapping the caller's [`DamageCallback`] — the wrap
 //! fires the event on the first parsed chunk, then delegates, so it honours the
 //! damage-wake contract (non-blocking, never under the `Term` lock). Dropping a
 //! `Session` is a deliberate teardown: it latches intentional, kills the child's
@@ -90,6 +94,24 @@ pub fn should_hold_on_exit(status: ExitStatus, intentional: bool) -> bool {
         ExitStatus::Exited(code) => code != 0,
     }
 }
+
+/// A drain-wake the exit-watcher fires after enqueuing [`SessionEvent::Exited`]
+/// (installed via [`Session::spawn_with_drain_wake`]; absent for a plain
+/// [`Session::spawn`] / [`Session::deferred`]).
+///
+/// `Exited` is the **only** outward event NOT trailed by a [`DamageCallback`]
+/// fire: the feeder-sourced events (`OutputStarted` / `TitleChanged` /
+/// `TitleReset` / `CwdChanged`) are each emitted while the feeder processes a read
+/// chunk and are immediately followed by that chunk's damage-wake, whereas the
+/// dead child produces no further output. An event-driven UI adapter that wakes
+/// its drain off the damage-wake would therefore never learn of an exit; this
+/// poke closes that gap.
+///
+/// `Send + Sync` (fired from the watcher thread; the adapter clones it into a
+/// signal shared with the feeder). gpui-free — a plain callback like
+/// [`DamageCallback`]; nice-term-core neither knows nor cares that the adapter
+/// makes it wake a foreground task App-Nap-safely.
+pub type DrainWake = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// The externally-observable lifecycle state — the closed type a caller matches
 /// on instead of force-reading a nil-able pty (designing out BUG A).
@@ -178,6 +200,10 @@ pub struct Session {
     /// Write-once exit facts, filled by the watcher; the source of truth for the
     /// `Exited` phase.
     outcome: Arc<OnceLock<ExitOutcome>>,
+    /// Optional drain-wake the exit-watcher fires after sending `Exited` (see
+    /// [`DrainWake`] / [`Session::spawn_with_drain_wake`]). `None` for bare/test
+    /// sessions that read the [`Receiver`] synchronously.
+    drain_wake: Option<DrainWake>,
     state: State,
     /// The exit-watcher thread (see the module "Threading" note). Joined on drop.
     watcher: Option<JoinHandle<()>>,
@@ -206,6 +232,7 @@ impl Session {
             output_started: Arc::new(AtomicBool::new(false)),
             intentional: Arc::new(AtomicBool::new(false)),
             outcome: Arc::new(OnceLock::new()),
+            drain_wake: None,
             state: State::NotSpawned,
             watcher: None,
         };
@@ -221,6 +248,25 @@ impl Session {
         on_damage: DamageCallback,
     ) -> io::Result<(Session, Receiver<SessionEvent>)> {
         let (mut session, rx) = Session::deferred(spec, scrollback_lines, on_damage);
+        session.trigger()?;
+        Ok((session, rx))
+    }
+
+    /// Like [`Session::spawn`], but the caller also supplies a [`DrainWake`] the
+    /// exit-watcher fires right after enqueuing [`SessionEvent::Exited`]. The
+    /// event-driven UI adapter (`nice-term-view`) needs this: it wakes its drain
+    /// off the [`DamageCallback`], and `Exited` is the one event with no trailing
+    /// damage-wake, so without this poke the drain would never learn of the exit
+    /// (see [`DrainWake`]). Equivalent to [`Session::deferred`] + install the wake
+    /// + [`Session::trigger`], so the watcher is wired with the wake in hand.
+    pub fn spawn_with_drain_wake(
+        spec: SpawnSpec,
+        scrollback_lines: usize,
+        on_damage: DamageCallback,
+        drain_wake: DrainWake,
+    ) -> io::Result<(Session, Receiver<SessionEvent>)> {
+        let (mut session, rx) = Session::deferred(spec, scrollback_lines, on_damage);
+        session.drain_wake = Some(drain_wake);
         session.trigger()?;
         Ok((session, rx))
     }
@@ -285,6 +331,7 @@ impl Session {
         let events = self.events.clone();
         let intentional = Arc::clone(&self.intentional);
         let outcome = Arc::clone(&self.outcome);
+        let drain_wake = self.drain_wake.clone();
         let watcher = match std::thread::Builder::new()
             .name("nice-term-exit-watch".to_string())
             .spawn(move || {
@@ -293,6 +340,13 @@ impl Session {
                 // Write-once: the first (and only) exit wins.
                 let _ = outcome.set(ExitOutcome { status, held });
                 let _ = events.send(SessionEvent::Exited { status, held });
+                // Poke the event-driven consumer's drain: `Exited` is the one
+                // outward event with no trailing damage-wake, so the drain would
+                // otherwise never learn the child exited. Fired AFTER the send so
+                // the drain observes the event once woken. No-op when unset.
+                if let Some(wake) = &drain_wake {
+                    wake();
+                }
             }) {
             Ok(h) => h,
             Err(e) => {
@@ -340,6 +394,16 @@ impl Session {
     /// [`should_hold_on_exit`] said hold).
     pub fn is_held(&self) -> bool {
         matches!(self.phase(), Phase::Exited { held: true, .. })
+    }
+
+    /// Whether the child has produced its first output byte yet — the latched
+    /// `OutputStarted` fact (`true` once the first parsed chunk fired the wrapped
+    /// damage-wake, and thus the one-shot [`SessionEvent::OutputStarted`]). A view
+    /// built AFTER this latched — a pane spawned while its tab was inactive and
+    /// first visited later, whose one-shot event fired to zero subscribers — reads
+    /// it to start its launch overlay already-cleared instead of arming the grace.
+    pub fn output_started(&self) -> bool {
+        self.output_started.load(Ordering::SeqCst)
     }
 
     /// The child's pid while spawned (== its process-group id), else `None`.

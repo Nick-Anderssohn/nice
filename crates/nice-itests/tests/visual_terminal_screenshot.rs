@@ -86,6 +86,13 @@ fn run() -> Result<()> {
 
     let metrics = TerminalMetrics::new(CELL_W, CELL_H);
     let handle = TerminalSessionHandle::spawn(&mut cx, spec, DEFAULT_SCROLLBACK_LINES)?;
+    // Deterministic scheduling here too (VisualTestAppContext drives a
+    // TestDispatcher), so opt out of the event-driven drain wake before the first
+    // `run_until_parked`: the pty feeder thread must not wake a gpui task under
+    // the test scheduler. The renderer reads the shared `Term` directly and the
+    // loop below forces its own `refresh()`, so the drain is not relied upon.
+    // See `TerminalSessionHandle::set_event_wake_enabled`.
+    handle.update(&mut cx, |h, _cx| h.set_event_wake_enabled(false));
     let theme = TerminalTheme::nice_default_dark();
     let accent = AccentPreset::Terracotta.color();
     let font = cx.new(|_cx| FontSettings::fixed(SharedString::from("Menlo"), 13.0, metrics));

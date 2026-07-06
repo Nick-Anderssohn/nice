@@ -276,6 +276,17 @@ impl TerminalView {
             let f = font.read(cx);
             (f.family(), f.px(), f.metrics())
         };
+        // A view built AFTER its pane already produced output — a deferred pane
+        // spawned while its tab was inactive, first visited now — must not flash the
+        // "Launching…" overlay: that pane's one-shot `OutputStarted` fired to zero
+        // subscribers, so no event will ever clear the overlay for it. Reconstruct
+        // the cleared state from the session's latched `output_started` fact, so the
+        // first-paint arm gate (`overlay.is_pending()`) never arms. A view mounted at
+        // spawn sees `output_started == false` and arms the grace normally.
+        let mut overlay = LaunchOverlay::new();
+        if handle.read(cx).output_started() {
+            overlay.clear();
+        }
         Self {
             handle,
             theme,
@@ -300,7 +311,7 @@ impl TerminalView {
             last_report_cell: None,
             wheel_accum: 0.0,
             last_focus_reported: None,
-            overlay: LaunchOverlay::new(),
+            overlay,
             overlay_armed: false,
             overlay_grace: DEFAULT_LAUNCH_OVERLAY_GRACE,
             launch_deadline: None,

@@ -74,7 +74,8 @@ enum OverlayPhase {
     /// Grace elapsed with no output — the overlay is showing.
     Visible,
     /// First output byte (or the child exited) arrived — cleared, never shows
-    /// again for this launch.
+    /// again for this launch. Also the state a view built after its pane already
+    /// output starts in (the one-shot clear had no subscriber to replay to).
     Cleared,
 }
 
@@ -82,7 +83,9 @@ enum OverlayPhase {
 ///
 /// Drive it from the R3 [`TerminalEvent`](crate::TerminalEvent) stream + the
 /// grace deadline: [`on_grace_elapsed`](Self::on_grace_elapsed) when the deadline
-/// fires, [`clear`](Self::clear) on `OutputStarted`/`Exited`. The view reads
+/// fires, [`clear`](Self::clear) on `OutputStarted`/`Exited` (or at view
+/// construction when the pane already output — see
+/// [`TerminalView::new`](crate::view::TerminalView)). The view reads
 /// [`is_visible`](Self::is_visible) to paint and [`ever_visible`](Self::ever_visible)
 /// is the "did the overlay ever render?" counter Validation §4's fast-path case
 /// asserts stays `false`.
@@ -140,8 +143,10 @@ impl LaunchOverlay {
     }
 
     /// The child produced its first output byte, or exited — clear the overlay
-    /// permanently (Swift's `clearPaneLaunch` on `onFirstData` / pane exit).
-    /// Idempotent; returns whether the phase changed.
+    /// permanently (Swift's `clearPaneLaunch` on `onFirstData` / pane exit). Also
+    /// called once at [`TerminalView::new`](crate::view::TerminalView) when the
+    /// pane already output before the view existed (the one-shot event had no
+    /// subscriber). Idempotent; returns whether the phase changed.
     pub fn clear(&mut self) -> bool {
         if self.phase != OverlayPhase::Cleared {
             self.phase = OverlayPhase::Cleared;

@@ -15,13 +15,14 @@
 //! session is deliberately dropped at end of scope → its process group is torn
 //! down (SIGHUP/SIGKILL) and its child reaped, so the suite leaks no shells.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use nice_term_core::{
-    shell_single_quote, DamageCallback, ExitStatus, Phase, Session, SessionEvent, SpawnSpec,
-    DEFAULT_SCROLLBACK_LINES,
+    shell_single_quote, DamageCallback, DrainWake, ExitStatus, Phase, Session, SessionEvent,
+    SpawnSpec, DEFAULT_SCROLLBACK_LINES,
 };
 
 /// Base argv token the cleanliness sweep greps for.
@@ -272,6 +273,36 @@ fn output_started_fires_on_first_output() {
         "OutputStarted never fired for a command that printed output"
     );
     assert!(saw_exited, "Exited never fired");
+
+    drop(session);
+}
+
+#[test]
+fn drain_wake_fires_after_exited_event() {
+    // `Exited` is the one outward event with no trailing damage-wake, so the
+    // exit-watcher must poke the installed DrainWake itself — otherwise an
+    // event-driven consumer's drain never learns the child exited. Assert the
+    // wake fires, and that once it has, the `Exited` event is already queued
+    // (the watcher sends BEFORE it wakes, so a woken drain always finds it).
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let drain_wake: DrainWake = {
+        let wakes = Arc::clone(&wakes);
+        Arc::new(move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let spec = SpawnSpec::command(wrap("exit 0", SENTINEL), "/private/tmp").with_env(test_env());
+    let (session, events) =
+        Session::spawn_with_drain_wake(spec, DEFAULT_SCROLLBACK_LINES, no_wake(), drain_wake)
+            .expect("spawn command pane with drain wake");
+
+    assert!(
+        poll_until(|| wakes.load(Ordering::SeqCst) >= 1),
+        "drain-wake never fired after the child exited"
+    );
+    // The wake trails the send, so the event is already available now.
+    let (status, _held) = recv_exited(&events).expect("Exited queued before the drain-wake fired");
+    assert_eq!(status, ExitStatus::Exited(0));
 
     drop(session);
 }

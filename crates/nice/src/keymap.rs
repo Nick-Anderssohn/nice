@@ -191,12 +191,16 @@ fn register_window_scoped_actions(cx: &mut App) {
     cx.on_action(|_: &NextSidebarTab, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
             s.model.select_next_sidebar_tab();
+            // Re-sync the selection to the new active tab (Swift's active-tab
+            // observer) — else the prior-active row lingers as a dim highlight.
+            s.sync_selection_to_active_tab();
             trigger_peek_if_collapsed(s);
         });
     });
     cx.on_action(|_: &PrevSidebarTab, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
             s.model.select_prev_sidebar_tab();
+            s.sync_selection_to_active_tab();
             trigger_peek_if_collapsed(s);
         });
     });
