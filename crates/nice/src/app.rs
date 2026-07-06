@@ -512,6 +512,35 @@ pub(crate) fn install_fullscreen_menu_sync<V: 'static>(
 const LIVE_ROWS: u16 = 36;
 const LIVE_COLS: u16 = 118;
 
+/// R17: the process-level Claude theme-sync gate. `true` ⇒ mirror Nice's theme
+/// into Claude and hand Nice-launched Claudes the `--settings` pointer; `false` ⇒
+/// leave Claude on its own theme. Read once at [`run`] from this app's own
+/// CFPreferences domain (`syncClaudeTheme`, absent ⇒ ON — the
+/// `disable_font_smoothing` own-domain precedent), so `defaults write …
+/// syncClaudeTheme -bool false` is the dev-time escape hatch until R23 binds the
+/// Settings toggle to the same key. [`open_managed_window`] reads it to fill each
+/// window's R15 provider.
+///
+/// UNSET under [`run_selftest`]: the launch-time theme write and the provider fill
+/// never run there (tranche-3 hermeticity — the regression suite must not write
+/// the real `~/.claude` / `~/.nice`), so a scenario that wants sync installs this
+/// gate itself.
+struct ClaudeThemeSyncGate(bool);
+
+impl Global for ClaudeThemeSyncGate {}
+
+/// Scenario-only seam (R17 `claude-e2e`): set the process Claude theme-sync gate.
+/// [`run`] sets it from CFPreferences; [`run_selftest`] never does (hermeticity),
+/// so the `claude-e2e` scenario installs it explicitly — ON before it opens the
+/// shipped window (so [`open_managed_window`]'s provider fill lights up the
+/// `--settings` pointer through the SHIPPED path), then OFF for the gate-OFF
+/// settings-less-parity leg. Not a production entry point; the only non-`run`
+/// caller is the scenario. R21/R23 later re-source a window's provider on a live
+/// toggle; here the scenario re-fills it (mirroring `open_managed_window`).
+pub(crate) fn set_claude_theme_sync_gate(cx: &mut App, on: bool) {
+    cx.set_global(ClaudeThemeSyncGate(on));
+}
+
 /// Run the shipped application: one window hosting a single live terminal pane
 /// running the login shell, quit on window close.
 pub fn run() {
@@ -559,6 +588,26 @@ pub fn run() {
         // above) and before the first pane spawns — it touches no ptys. Failures
         // are logged and swallowed (the feature degrades, the app still runs).
         crate::claude_hook_installer::install();
+        // R17: the Claude theme-sync gate + the write-on-startup of the current
+        // (fixed) terminal theme. The gate is read from this app's own
+        // CFPreferences domain (`syncClaudeTheme`, absent ⇒ ON); a `defaults write`
+        // is the dev-time toggle until R23's Settings UI binds the same key. When
+        // ON, mirror the shipped default theme (`nice_default_dark` + Terracotta —
+        // the same fixed pair `build_window_root` paints) into Claude's
+        // live-reloaded custom-theme file once; the `--settings` pointer file is
+        // ensured on read when a Claude pane spawns (the provider fill in
+        // `open_managed_window`). app::run ONLY — `run_selftest` never writes the
+        // real ~/.claude / ~/.nice (tranche-3 hermeticity). Failures are logged and
+        // swallowed inside the writer (Claude renders fine on its own theme).
+        let sync_claude_theme = crate::platform::read_bool_pref("syncClaudeTheme", true);
+        cx.set_global(ClaudeThemeSyncGate(sync_claude_theme));
+        if sync_claude_theme {
+            crate::claude_theme_sync::write(
+                &TerminalTheme::nice_default_dark(),
+                ColorScheme::Dark,
+                AccentPreset::Terracotta.color(),
+            );
+        }
         if let Err(e) = open_managed_window(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);
@@ -582,6 +631,26 @@ struct ShellInjectConfig {
 }
 
 impl Global for ShellInjectConfig {}
+
+/// Scenario-only seam (R17 `claude-e2e`): install a [`ShellInjectConfig`] so the
+/// SHIPPED window built by [`open_managed_window`] forks its Main pane WITH the
+/// synthetic `ZDOTDIR` rc chain (the `claude()` shadow) — the `claude-e2e` scenario
+/// needs a live shadow in the real Main pane to drive the typed handshake, and
+/// [`run_selftest`] never runs the real [`install_shell_inject_bootstrap`]
+/// (hermeticity). The scenario points `zdotdir` at a stub-written FIXTURE dir (never
+/// the real Application Support location) and resets it to `(None, None)` at
+/// teardown so the later `multiwindow` scenario's windows fork socket-only, exactly
+/// as before.
+pub(crate) fn set_scenario_shell_inject_config(
+    cx: &mut App,
+    zdotdir: Option<String>,
+    user_zdotdir: Option<String>,
+) {
+    cx.set_global(ShellInjectConfig {
+        zdotdir,
+        user_zdotdir,
+    });
+}
 
 /// The R14 process-wide shell-injection bootstrap (Swift `NiceServices.bootstrap`).
 /// Runs from [`run`] ONLY — never [`run_selftest`], so the regression suite never
@@ -784,6 +853,20 @@ pub(crate) fn open_managed_window(
     // `PaneHostView` hosts. Spawning it here (not lazily) preserves its command +
     // grid size.
     let state = cx.new(|_cx| WindowState::new(cwd));
+
+    // R17: fill R15's Claude theme-sync `--settings` provider from the process
+    // gate. ON ⇒ the ensure-on-read pointer path (`~/.nice/…`), which the Claude
+    // exec/spawn/reply/prefill composers splice; OFF — or the gate UNSET, as under
+    // run_selftest — ⇒ None, so OFF spawns get no `--settings` and the regression
+    // suite never writes the real ~/.nice. Set before the Main pane forks so a
+    // later Claude spawn in this window sees it.
+    let sync_on = cx
+        .try_global::<ClaudeThemeSyncGate>()
+        .map(|g| g.0)
+        .unwrap_or(false);
+    let claude_settings = crate::claude_theme_sync::settings_path_for_gate(sync_on);
+    state.update(cx, |ws, _cx| ws.set_claude_settings_path(claude_settings));
+
     let main = {
         let ws = state.read(cx);
         let tab = ws.model.active_tab_id().map(str::to_owned);
@@ -2997,6 +3080,32 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // read-then-exit pane — each on the real socket / pty clock; generous
                 // headroom.
                 budget: Duration::from_secs(75),
+            },
+            activate: true,
+        },
+        // R17: the Milestone-3 shipped-surface gate — drives the SHIPPED window
+        // (open_managed_window / build_window_root) the way a user does: types
+        // `claude\n` into real ptys carrying the R14 `claude()` shadow, with R17's
+        // theme sync ON. A typed newtab opens a running Claude tab (minted v4 uuid,
+        // stub OSC titles pulse the shipped sidebar-dot Thinking → Waiting); a typed
+        // in-place promotion through the real zsh wrapper exec's the stub with
+        // `--settings <ptr> --session-id <uuid>` argv; a session_update /branch +
+        // /clear rotate on the shipped sidebar; the theme + pointer files land at the
+        // nice-rs slug; and with the gate flipped OFF a fresh typed promotion is
+        // settings-less. Stub-`claude` via NICE_CLAUDE_OVERRIDE + PATH, sandbox HOME,
+        // sandbox theme/pointer files (never the real claude / ~/.claude / ~/.nice).
+        // Registered BEFORE `multiwindow`: its build_window_root only `register`s (no
+        // WindowRegistry close observer), so its window never trips the quit-when-
+        // empty terminus; teardown resets the scenario ShellInjectConfig.
+        Scenario {
+            name: "claude-e2e",
+            open: crate::claude_e2e_live::open_claude_e2e_window,
+            gate: Gate::SelfReported {
+                // Three typed real-shell handshakes (Main newtab + two promotions),
+                // each waiting on rc readiness + the socket round-trip + the stub's
+                // OSC titles, plus the two-step rotation and the teardown reap —
+                // each on the real pty / socket clock; generous headroom.
+                budget: Duration::from_secs(120),
             },
             activate: true,
         },

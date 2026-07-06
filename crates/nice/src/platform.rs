@@ -85,6 +85,45 @@ pub fn disable_font_smoothing() {
     }
 }
 
+/// Read a boolean from this app's own CFPreferences domain — the same
+/// `kCFPreferencesCurrentApplication` domain [`disable_font_smoothing`] writes and
+/// gpui's smoothing reader consults. Returns `default` when the key is absent or
+/// not a valid boolean.
+///
+/// R17's Claude theme-sync gate (`syncClaudeTheme`, default ON) is read through
+/// this once at bootstrap, so `defaults write dev.nickanderssohn.nice-rs
+/// syncClaudeTheme -bool false` is the dev-time escape hatch until R23 binds a
+/// Settings toggle to the same key (the `disable_font_smoothing` own-domain FFI
+/// precedent, in the read direction). Call on the main thread before the first
+/// window opens.
+pub fn read_bool_pref(key: &str, default: bool) -> bool {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesGetAppBooleanValue,
+    };
+
+    let key = CFString::new(key);
+    let mut exists: u8 = 0;
+    // SAFETY: `key` is a live CF object for the duration of the call;
+    // `kCFPreferencesCurrentApplication` is a valid constant domain; `&mut exists`
+    // is a valid `Boolean` out-param. The call only READS the app domain and
+    // reports via `exists` whether the key was present with a valid boolean
+    // format — we fall back to `default` when it was not.
+    let value = unsafe {
+        CFPreferencesGetAppBooleanValue(
+            key.as_concrete_TypeRef(),
+            kCFPreferencesCurrentApplication,
+            &mut exists,
+        )
+    };
+    if exists != 0 {
+        value != 0
+    } else {
+        default
+    }
+}
+
 /// The macOS keyCode side-channel feeding the R5 keyboard encoder.
 ///
 /// gpui's `Keystroke` on the pin carries only `{modifiers, key, key_char}` — no

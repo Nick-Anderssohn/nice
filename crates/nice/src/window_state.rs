@@ -288,6 +288,17 @@ impl WindowState {
         self.claude_settings_path = path;
     }
 
+    /// Fill R15's Claude theme-sync `--settings` provider (R17 slice 2). The
+    /// shipped window builder (`crate::app::open_managed_window`) computes the value
+    /// from the process gate (`ClaudeThemeSyncGate` →
+    /// [`crate::claude_theme_sync::settings_path_for_gate`]) and sets it here before
+    /// the Main pane forks, so a later Claude spawn/reply/prefill sees it. `None` ⇒
+    /// Claude spawns get no `--settings` (sync off, or the gate unset under
+    /// `run_selftest`). R21 re-sources this on live theme/toggle changes.
+    pub(crate) fn set_claude_settings_path(&mut self, path: Option<String>) {
+        self.claude_settings_path = path;
+    }
+
     /// The Claude theme-sync `--settings` pointer provider value (R17 fills it;
     /// `None` in R15). Read by the sidebar project-`+` seam when it spawns a fresh
     /// Claude tab. The socket reply consults [`effective_inplace_settings`](Self::effective_inplace_settings)
@@ -1730,6 +1741,251 @@ mod tests {
         assert_eq!(
             project_tabs(&state, "p")[0].title, "wire up the foo",
             "branch parent's inherited title must survive its deferred-resume zsh's OSC titles"
+        );
+    }
+
+    // ---- R17 SessionsModelClaudeThemeSyncTests + real-provider socket cases ----
+    //
+    // The R17 gate fills R15's `--settings` provider from a process-level bool
+    // (default ON, read from CFPreferences at bootstrap — see
+    // `crate::app::ClaudeThemeSyncGate`). These pin the GATING semantics (the gate's
+    // Some/None mapping and its ensure-on-read side effect) and the six byte-level
+    // ON/OFF × {exec, reply, prefill} results driven through R15's REAL composers
+    // with the REAL provider value (not an arbitrary stub), plus the `-` placeholder
+    // and the `--settings`-already-present suppression. Hermetic: the provider
+    // resolves against a throwaway home, so no test touches the developer's real
+    // `~/.nice`. // R21: live retheme / toggle fan-out re-sources this value.
+    use crate::claude_theme_sync::settings_path_for_gate_in;
+    use crate::session_manager::{build_claude_exec_command, build_claude_prefill_command};
+
+    /// A throwaway home dir removed on drop (never the real `~/.nice` — hermeticity).
+    struct ScratchHome(std::path::PathBuf);
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch_home() -> ScratchHome {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("r17-gate-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch home");
+        ScratchHome(dir)
+    }
+
+    // ---- gating semantics ---------------------------------------------------
+
+    /// Gate ON ⇒ `Some(pointer path)`, and reading it ENSURES the pointer file
+    /// exists with the exact `custom:nice-rs` bytes (Swift's ensure-on-read,
+    /// `ClaudeThemeSync.swift:122-131`).
+    #[test]
+    fn gate_on_provider_is_ensure_on_read_pointer_path() {
+        let home = scratch_home();
+        let provider = settings_path_for_gate_in(true, &home.0).expect("gate on ⇒ Some");
+        assert_eq!(
+            std::path::PathBuf::from(&provider),
+            crate::claude_theme_sync::theme_settings_path(&home.0)
+        );
+        let bytes = std::fs::read(&provider).expect("pointer file ensured on read");
+        assert_eq!(bytes, b"{\n  \"theme\": \"custom:nice-rs\"\n}");
+    }
+
+    /// Gate OFF ⇒ `None`, and nothing is written (no `~/.nice` under the home).
+    #[test]
+    fn gate_off_provider_is_none_and_writes_nothing() {
+        let home = scratch_home();
+        assert!(settings_path_for_gate_in(false, &home.0).is_none());
+        assert!(
+            !home.0.join(".nice").exists(),
+            "OFF must not create the pointer dir"
+        );
+    }
+
+    /// The gate's CFPreferences read falls back to the default when the key is
+    /// absent (Swift `syncClaudeTheme` defaults ON). A random unset key is a
+    /// side-effect-free read of the app domain.
+    #[test]
+    fn read_bool_pref_absent_key_returns_default() {
+        assert!(crate::platform::read_bool_pref("nice_rs_r17_absent_key_xyz", true));
+        assert!(!crate::platform::read_bool_pref("nice_rs_r17_absent_key_xyz", false));
+    }
+
+    /// The PRESENT-key branch (`exists != 0`) — the path a user's `defaults write
+    /// dev.nickanderssohn.nice-rs syncClaudeTheme -bool false` actually takes, and
+    /// the branch `read_bool_pref_absent_key_returns_default` never reaches. A key
+    /// SET in the app domain wins over the passed `default` in BOTH directions, so
+    /// this pins `exists != 0` AND the `value != 0` mapping: were the FFI miswired
+    /// (exists/value swapped, or the boolean inverted) the absent-key test would
+    /// still pass while the escape hatch silently did nothing. Uses the own-domain
+    /// `CFPreferencesSetAppValue` write side `disable_font_smoothing` relies on
+    /// (this test binary's own `kCFPreferencesCurrentApplication` domain, never the
+    /// app's), and removes the scratch key afterwards so the domain is left as found.
+    #[test]
+    fn read_bool_pref_present_key_overrides_default() {
+        use core_foundation::base::TCFType;
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::string::CFString;
+        use core_foundation_sys::preferences::{
+            kCFPreferencesCurrentApplication, CFPreferencesAppSynchronize, CFPreferencesSetAppValue,
+        };
+
+        let key = "nice_rs_r17_present_key_probe";
+        let cf_key = CFString::new(key);
+
+        // Set the scratch key to a CFBoolean and flush it to the in-memory app
+        // cache the reader consults (the same set+synchronize handshake
+        // `disable_font_smoothing` uses so gpui's later same-process read sees it).
+        // SAFETY: `cf_key` / the CFBoolean constant are live for each call;
+        // `kCFPreferencesCurrentApplication` is a valid constant domain; the write
+        // is in-process only, to this test binary's own domain.
+        let set_bool = |v: bool| unsafe {
+            let value = if v {
+                CFBoolean::true_value()
+            } else {
+                CFBoolean::false_value()
+            };
+            CFPreferencesSetAppValue(
+                cf_key.as_concrete_TypeRef(),
+                value.as_CFTypeRef(),
+                kCFPreferencesCurrentApplication,
+            );
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+        };
+
+        // Present TRUE beats default=false (exists != 0 AND value != 0 => true).
+        set_bool(true);
+        assert!(
+            crate::platform::read_bool_pref(key, false),
+            "a present true key must override default=false"
+        );
+
+        // Present FALSE beats default=true (exists != 0 AND value == 0 => false) —
+        // the `defaults write … syncClaudeTheme -bool false` escape-hatch path.
+        set_bool(false);
+        assert!(
+            !crate::platform::read_bool_pref(key, true),
+            "a present false key must override default=true"
+        );
+
+        // Remove the scratch key (a null value deletes it) so the run leaves the
+        // domain as it found it.
+        // SAFETY: same domain / key ref as above; a null value is the documented
+        // delete sentinel for `CFPreferencesSetAppValue`.
+        unsafe {
+            CFPreferencesSetAppValue(
+                cf_key.as_concrete_TypeRef(),
+                std::ptr::null(),
+                kCFPreferencesCurrentApplication,
+            );
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+        }
+    }
+
+    // ---- six byte-level ON/OFF × {exec, reply, prefill} (real composers) -----
+
+    /// exec ON: the exec command splices `--settings '<real pointer>'` BEFORE
+    /// `--session-id` — the flag order that keeps the UUID from being eaten.
+    #[test]
+    fn gate_on_exec_command_carries_real_settings_pointer() {
+        let home = scratch_home();
+        let provider = settings_path_for_gate_in(true, &home.0);
+        let cmd = build_claude_exec_command(
+            "/c",
+            &ClaudeSessionMode::New("abc-123".into()),
+            &[],
+            false,
+            provider.as_deref(),
+        );
+        let ptr = provider.unwrap();
+        assert_eq!(cmd, format!("exec '/c' --settings '{ptr}' --session-id 'abc-123'"));
+    }
+
+    /// exec OFF: byte-identical to the settings-free exec form.
+    #[test]
+    fn gate_off_exec_command_is_settings_free() {
+        let provider = settings_path_for_gate_in(false, std::path::Path::new("/unused"));
+        let cmd = build_claude_exec_command(
+            "/c",
+            &ClaudeSessionMode::New("abc-123".into()),
+            &[],
+            false,
+            provider.as_deref(),
+        );
+        assert_eq!(cmd, "exec '/c' --session-id 'abc-123'");
+    }
+
+    /// prefill ON: the deferred-resume prefill splices `--settings '<real ptr>'`
+    /// before `--resume`.
+    #[test]
+    fn gate_on_prefill_carries_real_settings_pointer() {
+        let home = scratch_home();
+        let provider = settings_path_for_gate_in(true, &home.0);
+        let line = build_claude_prefill_command(provider.as_deref(), "SID");
+        let ptr = provider.unwrap();
+        assert_eq!(line, format!("claude --settings '{ptr}' --resume SID"));
+    }
+
+    /// prefill OFF: byte-identical to the settings-free prefill form.
+    #[test]
+    fn gate_off_prefill_is_settings_free() {
+        let provider = settings_path_for_gate_in(false, std::path::Path::new("/unused"));
+        let line = build_claude_prefill_command(provider.as_deref(), "SID");
+        assert_eq!(line, "claude --resume SID");
+    }
+
+    /// reply ON: an in-place promotion whose args already carry the session id
+    /// replies `inplace - <real ptr>` — the `-` placeholder lets the pointer ride
+    /// as the 3rd field. Driven through the REAL socket-request path
+    /// (`resolve_claude_request` → `compose_claude_reply`) with the REAL provider.
+    #[test]
+    fn gate_on_reply_uses_dash_placeholder_and_real_pointer() {
+        let home = scratch_home();
+        let provider = settings_path_for_gate_in(true, &home.0);
+        let ptr = provider.clone().unwrap();
+        let mut state = WindowState::new("/home/u");
+        state.set_claude_settings_path(provider);
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", "abc-123"], "t1", &claude),
+            format!("inplace - {ptr}\n")
+        );
+    }
+
+    /// reply OFF: the same promotion with the gate OFF replies the bare `inplace`
+    /// — byte-identical to the pre-theming protocol.
+    #[test]
+    fn gate_off_reply_is_byte_identical() {
+        let mut state = WindowState::new("/home/u");
+        state.set_claude_settings_path(settings_path_for_gate_in(
+            false,
+            std::path::Path::new("/unused"),
+        ));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", "abc-123"], "t1", &claude),
+            "inplace\n"
+        );
+    }
+
+    /// suppression: gate ON but the client's args already carry `--settings` ⇒ the
+    /// reply must NOT append a second pointer (Swift's
+    /// `themeCache.syncClaudeTheme && !args.contains("--settings")`).
+    #[test]
+    fn gate_on_reply_suppresses_pointer_when_args_already_have_settings() {
+        let home = scratch_home();
+        let mut state = WindowState::new("/home/u");
+        state.set_claude_settings_path(settings_path_for_gate_in(true, &home.0));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+        assert_eq!(
+            drive_claude(
+                &mut state,
+                "/tmp/p",
+                &["--settings", "/whatever.json", "--resume", "abc-123"],
+                "t1",
+                &claude
+            ),
+            "inplace\n"
         );
     }
 }
