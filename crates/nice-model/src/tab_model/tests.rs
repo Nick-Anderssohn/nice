@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::*;
+use crate::{PersistedPane, PersistedTab};
 
 // MARK: - Test filesystem seam
 
@@ -2334,3 +2335,106 @@ fn apply_auto_title_caps_humanized_title_at_40_chars() {
     assert_eq!(title, "Aaaa bbbb cccc dddd eeee ffff gggg hhhh", "capped on a word boundary, trailing space trimmed");
 }
 
+
+// MARK: - from_parts (R18 restore constructor)
+
+#[test]
+fn from_parts_does_not_seed_terminals_or_main() {
+    // Unlike `new`/`with_fs`, restore's constructor trusts the saved grouping:
+    // no synthesized Terminals project, no Main tab.
+    let project = Project {
+        id: "nice".into(),
+        name: "Nice".into(),
+        path: "/work".into(),
+        tabs: vec![Tab::new("t1", "Ship", "/work")],
+    };
+    let model = TabModel::from_parts(vec![project], Some("t1".into()), fake_fs("/home", &[]));
+    assert_eq!(model.projects.len(), 1);
+    assert_eq!(model.projects[0].id, "nice");
+    assert!(
+        model
+            .projects
+            .iter()
+            .all(|p| p.id != TabModel::TERMINALS_PROJECT_ID),
+        "from_parts must NOT synthesize a Terminals project"
+    );
+    assert_eq!(model.active_tab_id(), Some("t1"));
+}
+
+#[test]
+fn from_parts_preserves_empty_projects_and_no_active() {
+    let model = TabModel::from_parts(vec![], None, fake_fs("/home", &[]));
+    assert!(model.projects.is_empty());
+    assert_eq!(model.active_tab_id(), None);
+}
+
+// MARK: - live_pane_counts (W5 quit/close counting)
+
+#[test]
+fn live_pane_counts_folds_both_kinds_over_is_alive() {
+    let mut tab = Tab::new("t1", "Tab", "/w");
+    tab.panes = vec![
+        claude("c1"),
+        claude("c2"),
+        terminal("term1", "Terminal 1"),
+    ];
+    let project = Project {
+        id: "p".into(),
+        name: "P".into(),
+        path: "/w".into(),
+        tabs: vec![tab],
+    };
+    let model = TabModel::from_parts(vec![project], Some("t1".into()), fake_fs("/home", &[]));
+    assert_eq!(model.live_pane_counts(), (2, 1));
+}
+
+#[test]
+fn live_pane_counts_excludes_held_not_alive_panes() {
+    let mut held_claude = claude("c1");
+    held_claude.is_alive = false;
+    let mut tab = Tab::new("t1", "Tab", "/w");
+    tab.panes = vec![held_claude, terminal("term1", "Terminal 1")];
+    let project = Project {
+        id: "p".into(),
+        name: "P".into(),
+        path: "/w".into(),
+        tabs: vec![tab],
+    };
+    let model = TabModel::from_parts(vec![project], Some("t1".into()), fake_fs("/home", &[]));
+    assert_eq!(
+        model.live_pane_counts(),
+        (0, 1),
+        "a held (not-alive) pane must not be counted"
+    );
+}
+
+#[test]
+fn live_pane_counts_counts_modelled_but_unspawned_panes() {
+    // A restored pane hydrates is_alive = true before any pty spawns — it DOES
+    // count (the Swift quirk, preserved).
+    let persisted = PersistedTab {
+        id: "t1".into(),
+        title: "Restored".into(),
+        cwd: "/w".into(),
+        claude_session_id: Some("sid".into()),
+        active_pane_id: None,
+        panes: vec![PersistedPane {
+            id: "c".into(),
+            title: "Claude".into(),
+            kind: PaneKind::Claude,
+            cwd: None,
+            title_manually_set: None,
+        }],
+        title_manually_set: None,
+        parent_tab_id: None,
+        next_terminal_index: None,
+    };
+    let project = Project {
+        id: "p".into(),
+        name: "P".into(),
+        path: "/w".into(),
+        tabs: vec![persisted.hydrate()],
+    };
+    let model = TabModel::from_parts(vec![project], Some("t1".into()), fake_fs("/home", &[]));
+    assert_eq!(model.live_pane_counts(), (1, 0));
+}

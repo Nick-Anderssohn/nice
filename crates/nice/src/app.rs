@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui::{
     div, point, prelude::*, px, rgb, size, AnyWindowHandle, App, AppContext, AsyncApp, Bounds,
-    Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, SharedString, TitlebarOptions,
-    WeakEntity, Window,
+    Context, DisplayId, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, SharedString,
+    TitlebarOptions, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
@@ -134,10 +134,26 @@ const TRAFFIC_LIGHT_BUTTON_HEIGHT: f32 = 14.0;
 /// (including the R5 live-input scenarios in [`crate::input_live`]); only the
 /// shipped live window wraps its content in the [`WindowChromeView`] band.
 pub(crate) fn window_options() -> WindowOptions {
-    let bounds = Bounds {
+    window_options_with(None, None)
+}
+
+/// [`window_options`] with an optional restored-frame override (W6): when
+/// `bounds` is `Some`, the window opens at that geometry on `display_id` instead
+/// of the fixed default placement. The traffic-light position, hidden titlebar,
+/// and `is_movable: false` are IDENTICAL to the default — the frame override
+/// only replaces `window_bounds` (+ `display_id`), so the one function stays the
+/// single source of the Nice chrome (the plan's "don't fork" rule). `run`'s ⌘N
+/// and every self-test scenario call the no-arg [`window_options`], which passes
+/// `(None, None)`; only the restore fan-out
+/// ([`open_managed_window_with`]) passes a saved bounds.
+pub(crate) fn window_options_with(
+    bounds: Option<Bounds<Pixels>>,
+    display_id: Option<DisplayId>,
+) -> WindowOptions {
+    let bounds = bounds.unwrap_or(Bounds {
         origin: point(px(160.0), px(160.0)),
         size: size(px(960.0), px(640.0)),
-    };
+    });
     // Traffic-light target — the DOCUMENTED divergence from Swift's captured-
     // default-plus-8: gpui takes an ABSOLUTE close-button origin, so x is the
     // macOS-26 native close leading (9, `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]`) + the
@@ -166,6 +182,9 @@ pub(crate) fn window_options() -> WindowOptions {
         is_resizable: true,
         focus: true,
         show: true,
+        // W6: open the restored window on its saved display (None ⇒ gpui picks
+        // the primary, the default-placement behavior).
+        display_id,
         ..Default::default()
     }
 }
@@ -402,6 +421,13 @@ gpui::actions!(nice, [ToggleFullScreen]);
 // it lives here, not in the rebindable defaults table.
 gpui::actions!(nice, [NewWindow]);
 
+// R18 (W5): the Nice-owned quit + window-close accelerators. gpui cannot veto
+// macOS terminate, so quit confirmation lives on this `Quit` action (⌘Q + the app
+// menu's "Quit Nice RS Dev") and window-close confirmation on `CloseWindow` (⌘W +
+// File ▸ "Close Window" + the red-button `on_window_should_close` gate). Both are
+// fixed window-management actions like `NewWindow` (not rebindable).
+gpui::actions!(nice, [Quit, CloseWindow]);
+
 /// The View-menu full-screen item's title, flipped by the window's current
 /// full-screen state — Swift parity (`NiceApp.swift:180-184`): "Exit Full
 /// Screen" while full screen, "Enter Full Screen" otherwise.
@@ -423,13 +449,18 @@ fn fullscreen_menu_title(is_fullscreen: bool) -> &'static str {
 /// (`gpui/examples/set_menus.rs:124-128`).
 fn app_menus(is_fullscreen: bool) -> Vec<Menu> {
     vec![
-        // The application menu — empty for now (R12's keymap slice fills it with
-        // Quit / etc.). Precedes File so AppKit renders it as the bold app menu.
-        Menu::new("Nice RS Dev"),
+        // The application menu — AppKit renders the first menu bold with the
+        // process name. R18 fills it with "Quit Nice RS Dev" (⌘Q). Precedes File
+        // so AppKit renders it as the bold app menu.
+        Menu::new("Nice RS Dev").items([MenuItem::action("Quit Nice RS Dev", Quit)]),
         // File ▸ New Window (⌘N) — mints a fresh isolated window (plan: every ⌘N
-        // opens a NEW window, nothing de-dups). The accelerator comes from the
-        // `cmd-n` binding in `install_new_window_command`.
-        Menu::new("File").items([MenuItem::action("New Window", NewWindow)]),
+        // opens a NEW window, nothing de-dups); File ▸ Close Window (⌘W) — the
+        // W5-confirmed window close. Accelerators come from the `cmd-n` / `cmd-w`
+        // bindings in `install_new_window_command` / `install_lifecycle_commands`.
+        Menu::new("File").items([
+            MenuItem::action("New Window", NewWindow),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
         Menu::new("View").items([MenuItem::action(
             fullscreen_menu_title(is_fullscreen),
             ToggleFullScreen,
@@ -476,6 +507,256 @@ pub(crate) fn install_new_window_command(cx: &mut App) {
     // ⌘N — a non-rebindable window-management accelerator (like ⌃⌘F). `None`
     // context = active in every dispatch context.
     cx.bind_keys([KeyBinding::new("cmd-n", NewWindow, None)]);
+}
+
+// ---------------------------------------------------------------------------
+// R18 (W5) — Nice-owned quit / window-close confirmation + persistence flush.
+//
+// gpui cannot veto macOS terminate (`on_app_quit` is non-cancelable), so the
+// confirmation lives on the `Quit` / `CloseWindow` actions + the red-button
+// `on_window_should_close` gate (wired at registration in `build_window_root`).
+// The verbatim wording + the `AppQuitting` latch + the disk-reason routing live
+// in `crate::lifecycle`; the in-house dialog in `crate::confirmation_modal`.
+// ---------------------------------------------------------------------------
+
+/// Wire the ⌘Q / ⌘W lifecycle commands + the Dock-quit persistence flush, once,
+/// from [`run`]. Global handlers (so the accelerators work with any window
+/// focused). The `on_app_quit` flush is the idempotent snapshot+flush half of
+/// [`quit_cascade`] — it also covers a dissolve-terminus `cx.quit()` and a
+/// Dock-menu Quit that bypass the confirmation path.
+pub(crate) fn install_lifecycle_commands(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx: &mut App| request_quit(cx));
+    cx.on_action(|_: &CloseWindow, cx: &mut App| request_close_active_window(cx));
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
+    ]);
+    // The willTerminate-observer twin (L4 step 9): snapshot + flush every window
+    // on any terminate (Dock quit, dissolve-terminus `cx.quit()`, or the tail of
+    // `quit_cascade`). Idempotent — `AppQuitting` may already be set.
+    cx.on_app_quit(|cx: &mut App| {
+        flush_all_window_snapshots(cx);
+        async move {}
+    })
+    .detach();
+}
+
+/// L4 step 8: open the session store + install it as the process Global — from
+/// [`run`] ONLY (never [`run_selftest`], per the tranche-4 hermeticity rule: the
+/// regression suite must never resolve real `~/Library/Application Support` /
+/// `~/.claude` paths or write real state). The own store path + the one-time Swift
+/// migration source both resolve here (the `shell_inject` app::run-only
+/// convention); the migration reads the Swift file ONLY when the own store is
+/// absent and writes the OWN store only. Once installed, every persistence hook
+/// goes live; before this call they are no-ops.
+fn install_session_store(_cx: &mut App) {
+    let own = crate::session_store::default_store_path();
+    let swift = crate::session_store::swift_migration_source();
+    let store = crate::session_store::SessionStore::open(own, Some(swift));
+    crate::session_store::install_global(store);
+}
+
+/// The cwd-heal projects root (L3/C5) — `~/.claude/projects` in production,
+/// overridable via `NICE_CLAUDE_PROJECTS_ROOT` (the injection seam the
+/// `persistence-restore` scenario points at a temp bucket tree). Resolved from
+/// [`run`]'s fan-out only.
+fn claude_projects_root() -> PathBuf {
+    match std::env::var("NICE_CLAUDE_PROJECTS_ROOT") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => crate::cwd_heal::default_claude_projects_root(),
+    }
+}
+
+/// L4 step 10: the restore fan-out that replaces the single `open_managed_window`
+/// at launch (Swift's `SessionStore` adoption loop + `WindowSession` restore).
+/// Loads the store once, runs the ghost pre-pass (drop crashed-mid-restore
+/// projectless windows from the store — the SAME `!projects.is_empty()` filter the
+/// loop applies, so after it every survivor is restorable), then opens one window
+/// per saved slot via [`open_managed_window_with`] (seed + cwd-heal root). Zero
+/// restorable slots ⇒ one fresh default window. A post-restore
+/// `prune_empty_windows_keeping` drops any leftover zero-tab store slot, keeping
+/// every just-restored id (Swift's `pruneEmptyWindows(keeping:)`). No
+/// `WindowClaimLedger`, no SceneStorage, no fan-out tokens — one
+/// `Application::run`, the windows opened explicitly (the do-not-port list).
+///
+/// Returns the number of windows opened (always ≥ 1) — a zero return would mean
+/// the app launched with no window, which the caller treats as a fatal start
+/// failure.
+pub(crate) fn run_restore_fan_out(cx: &mut App) -> Result<usize> {
+    let saved = crate::session_store::load();
+
+    // Ghost pre-pass: remove projectless (crashed-mid-restore) windows from the
+    // store so they never accumulate and are never opened.
+    for w in &saved.windows {
+        if !crate::restore::is_restorable(w) {
+            crate::session_store::remove(&w.id);
+        }
+    }
+
+    let restorable: Vec<_> = saved
+        .windows
+        .iter()
+        .filter(|w| crate::restore::is_restorable(w))
+        .collect();
+
+    if restorable.is_empty() {
+        // Nothing to restore ⇒ today's single default window (a fresh Terminals+Main
+        // tree, a minted UUID window id).
+        open_managed_window(cx)?;
+        return Ok(1);
+    }
+
+    let root = claude_projects_root();
+    let mut restored_ids: Vec<String> = Vec::new();
+    for w in restorable {
+        let seed = crate::restore::hydrate_seed(w);
+        let id = seed.window_id.clone();
+        open_managed_window_with(cx, Some(seed), Some(root.clone()))?;
+        restored_ids.push(id);
+    }
+    // Post-restore GC, keeping every restored id (so an empty Terminals-only
+    // restored window survives).
+    crate::session_store::prune_empty_windows_keeping(&restored_ids);
+    Ok(restored_ids.len())
+}
+
+/// Total live panes `(claude, terminal)` across every registered window — the ⌘Q
+/// counting rule (Swift `AppDelegate.applicationShouldTerminate:34-40`).
+fn total_live_pane_counts(cx: &App) -> (usize, usize) {
+    let mut claude = 0;
+    let mut terminal = 0;
+    for state in WindowRegistry::all_states(cx) {
+        let (c, t) = state.read(cx).live_pane_counts();
+        claude += c;
+        terminal += t;
+    }
+    (claude, terminal)
+}
+
+/// Snapshot + upsert every registered window into the session store, then flush.
+/// The idempotent persistence half shared by [`quit_cascade`] and the
+/// `on_app_quit` handler. A no-op when no store Global is installed.
+fn flush_all_window_snapshots(cx: &App) {
+    for state in WindowRegistry::all_states(cx) {
+        crate::session_store::upsert(state.read(cx).persisted_snapshot());
+    }
+    crate::session_store::flush();
+}
+
+/// ⌘Q / Quit-menu handler. Zero live panes ⇒ [`quit_cascade`] with no dialog;
+/// else present the quit confirmation in the active window (confirm ⇒ cascade,
+/// cancel ⇒ total no-op).
+fn request_quit(cx: &mut App) {
+    let (claude, terminal) = total_live_pane_counts(cx);
+    if claude + terminal == 0 {
+        quit_cascade(cx);
+        return;
+    }
+    // Host the dialog in the active window — pull its state by id so the modal is
+    // stashed on the SAME window that renders it.
+    let Some(win) = cx.active_window() else {
+        quit_cascade(cx);
+        return;
+    };
+    let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+        quit_cascade(cx);
+        return;
+    };
+    let copy = crate::lifecycle::quit_dialog_copy(claude, terminal);
+    let _ = win.update(cx, |_root, window, app| {
+        state.update(app, |ws, wcx| {
+            ws.present_confirmation(
+                copy.title,
+                copy.message,
+                copy.confirm_label,
+                "Cancel",
+                false,
+                move |confirmed, _window, app| {
+                    if confirmed {
+                        quit_cascade(app);
+                    }
+                },
+                window,
+                wcx,
+            );
+        });
+    });
+}
+
+/// The confirmed-quit cascade (Swift's ordered terminate path). Order is
+/// load-bearing (plan "Quit-wipe sequencing"): (1) set [`AppQuitting`] FIRST so
+/// every subsequent window close is inert (preserve, never remove); (2) snapshot
+/// + upsert every window; (3) synchronous flush; (4) tear sessions down
+/// (persist-before-kill); (5) `cx.quit()`.
+pub(crate) fn quit_cascade(cx: &mut App) {
+    cx.set_global(crate::lifecycle::AppQuitting);
+    flush_all_window_snapshots(cx);
+    for state in WindowRegistry::all_states(cx) {
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+    cx.quit();
+}
+
+/// ⌘W / File ▸ Close Window handler: run the same decision as the red-button gate
+/// on the active window, closing it (programmatically, bypassing the gate) when
+/// no confirmation is needed.
+fn request_close_active_window(cx: &mut App) {
+    let Some(win) = cx.active_window() else {
+        return;
+    };
+    let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+        return;
+    };
+    let _ = win.update(cx, |_root, window, app| {
+        if request_window_close(state, window, app) {
+            window.remove_window();
+        }
+    });
+}
+
+/// The shared ⌘W / red-traffic-light close decision (Swift
+/// `CloseConfirmationDelegate.windowShouldClose`). Returns whether the close may
+/// proceed immediately: the `on_window_should_close` gate returns this as its
+/// bool, and `request_close_active_window` calls `remove_window()` when `true`.
+///
+/// Once quit has begun ([`AppQuitting`]) every close is unconditional. With no
+/// live panes the close is unconditional too — but marks `user_initiated_close`
+/// so the slot is dropped from disk. With live panes it presents the confirmation
+/// (confirm ⇒ set the flag + `remove_window()`; cancel ⇒ total no-op) and vetoes
+/// the immediate close.
+pub(crate) fn request_window_close(
+    state: Entity<WindowState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    if cx.has_global::<crate::lifecycle::AppQuitting>() {
+        return true;
+    }
+    let (claude, terminal) = state.read(cx).live_pane_counts();
+    if claude + terminal == 0 {
+        state.update(cx, |ws, _cx| ws.set_user_initiated_close(true));
+        return true;
+    }
+    let copy = crate::lifecycle::close_dialog_copy(claude, terminal);
+    let confirm_state = state.clone();
+    state.update(cx, |ws, wcx| {
+        ws.present_confirmation(
+            copy.title,
+            copy.message,
+            copy.confirm_label,
+            "Cancel",
+            false,
+            move |confirmed, window, app| {
+                if confirmed {
+                    confirm_state.update(app, |ws, _cx| ws.set_user_initiated_close(true));
+                    window.remove_window();
+                }
+            },
+            window,
+            wcx,
+        );
+    });
+    false
 }
 
 /// Keep the View-menu full-screen title in sync with `window` (called once as the
@@ -563,6 +844,11 @@ pub fn run() {
         // R12: ⌘N / File ▸ New Window — every invocation opens a fresh isolated
         // window (see `install_new_window_command` / `open_managed_window`).
         install_new_window_command(cx);
+        // R18 (W5): ⌘Q / Quit + ⌘W / Close Window confirmation actions + menu
+        // items, plus the `on_app_quit` snapshot+flush (the willTerminate-observer
+        // twin). Slice-3's L4 pass folds these into the composed bootstrap order;
+        // wiring them here keeps the quit/close confirmation live meanwhile.
+        install_lifecycle_commands(cx);
         // R12: the app-wide shortcut keymap — the 13 rebindable actions + ⌃⌘F
         // generated from `nice_model::shortcuts`, their handlers, and the hoisted
         // process-level `FontSettings` every window shares. Must run before the
@@ -608,7 +894,14 @@ pub fn run() {
                 AccentPreset::Terracotta.color(),
             );
         }
-        if let Err(e) = open_managed_window(cx) {
+        // R18 (L4 step 8): open + install the session store (own path + one-time
+        // Swift migration read), so the restore fan-out below sees the saved
+        // windows and every later persistence hook goes live. app::run ONLY.
+        install_session_store(cx);
+        // R18 (L4 step 10): the restore fan-out replaces the single
+        // `open_managed_window` — one window per saved slot (ghost pre-pass +
+        // cwd-heal), or one fresh default window when nothing is restorable.
+        if let Err(e) = run_restore_fan_out(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);
         }
@@ -838,21 +1131,42 @@ pub(crate) fn arm_window_control_socket(
 pub(crate) fn open_managed_window(
     cx: &mut App,
 ) -> Result<WindowHandle<crate::app_shell::AppShellView>> {
-    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    let spec = match std::env::var("NICE_RS_COMMAND") {
-        // A one-off command pane (the live-smoke path: `ls -la`, colour tests).
-        Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd.clone()),
-        // The default: an interactive login shell (`zsh -il`).
-        _ => SpawnSpec::shell(cwd.clone()),
-    }
-    .with_size(LIVE_ROWS, LIVE_COLS);
+    open_managed_window_with(cx, None, None)
+}
 
-    // Mint the window's shared state (its `TabModel` seeds the pinned Terminals
-    // group + Main tab with one terminal pane), then spawn that Main pane into
-    // the window's `SessionManager` with the full spec — the pane the shell's
-    // `PaneHostView` hosts. Spawning it here (not lazily) preserves its command +
-    // grid size.
-    let state = cx.new(|_cx| WindowState::new(cwd));
+/// [`open_managed_window`] parameterized by an optional restore
+/// [`WindowSeed`](crate::restore::WindowSeed) (L2/L3) and an optional cwd-heal
+/// `projects_root` (L3/C5). `seed = None` is the fresh / ⌘N window (a seeded
+/// Terminals+Main tree, its Main pane eagerly spawned with the shipped spec to
+/// preserve `NICE_RS_COMMAND` + grid size); `seed = Some` rebuilds a saved
+/// window ([`WindowState::with_seed`]) whose panes lazy-spawn on activation
+/// (never eagerly — the documented restore divergence that kills the 0×0-pty
+/// hazard), opens it at the restored frame (W6), runs the cwd-heal pass over its
+/// Claude tabs, and fires restore's single explicit save (the save-gate lift).
+pub(crate) fn open_managed_window_with(
+    cx: &mut App,
+    seed: Option<crate::restore::WindowSeed>,
+    projects_root: Option<PathBuf>,
+) -> Result<WindowHandle<crate::app_shell::AppShellView>> {
+    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let restoring = seed.is_some();
+    let restored_frame = seed.as_ref().and_then(|s| s.frame.clone());
+
+    // Mint the window's shared state. Fresh ⇒ a seeded Terminals+Main tree;
+    // restore ⇒ the rebuilt saved tree (trusts the grouping, keeps the saved id).
+    let state = match seed {
+        Some(seed) => cx.new(|_cx| WindowState::with_seed(seed)),
+        None => cx.new(|_cx| WindowState::new(cwd.clone())),
+    };
+
+    // L3/C5: the restore-time cwd-heal pass over the rebuilt model's Claude tabs
+    // (terminal tabs never heal), BEFORE the window opens so the active pane
+    // lazy-spawns in the healed cwd. No-op for a fresh window.
+    if let Some(root) = &projects_root {
+        state.update(cx, |ws, _cx| {
+            crate::restore::heal_model_cwds(&mut ws.model, root);
+        });
+    }
 
     // R17: fill R15's Claude theme-sync `--settings` provider from the process
     // gate. ON ⇒ the ensure-on-read pointer path (`~/.nice/…`), which the Claude
@@ -867,7 +1181,13 @@ pub(crate) fn open_managed_window(
     let claude_settings = crate::claude_theme_sync::settings_path_for_gate(sync_on);
     state.update(cx, |ws, _cx| ws.set_claude_settings_path(claude_settings));
 
-    let main = {
+    // The Main pane spawn is fresh-window-only: a restored window's active pane
+    // (terminal or deferred-resume Claude) lazy-spawns through `PaneHostView`'s
+    // activation path (`ensure_active_pane_spawned`), so restore never forks a pane
+    // here.
+    let main = if restoring {
+        None
+    } else {
         let ws = state.read(cx);
         let tab = ws.model.active_tab_id().map(str::to_owned);
         let pane = tab
@@ -891,13 +1211,34 @@ pub(crate) fn open_managed_window(
     });
 
     if let Some((tab_id, pane_id)) = main {
+        let spec = match std::env::var("NICE_RS_COMMAND") {
+            // A one-off command pane (the live-smoke path: `ls -la`, colour tests).
+            Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd.clone()),
+            // The default: an interactive login shell (`zsh -il`).
+            _ => SpawnSpec::shell(cwd.clone()),
+        }
+        .with_size(LIVE_ROWS, LIVE_COLS);
         state.update(cx, |ws, cx| ws.session.spawn_pane(&tab_id, &pane_id, spec, cx))?;
     }
 
-    let handle = cx.open_window(window_options(), {
+    // W6: open at the restored frame when one survives the visible-screen clamp;
+    // else default placement.
+    let options = match crate::window_frame::restored_window_bounds(restored_frame.as_ref(), cx) {
+        Some((bounds, display_id)) => window_options_with(Some(bounds), display_id),
+        None => window_options(),
+    };
+    let handle = cx.open_window(options, {
         let state = state.clone();
         move |window, cx| build_window_root(state, window, cx)
     })?;
+
+    // Restore's single explicit save (the save-gate lift): the rebuild + repairs +
+    // activeTab re-apply + cwd heal all landed with no live mutation observer, so
+    // one upsert(snapshot) persists the healed, repaired shape. No-op for a fresh
+    // window and when no store is installed.
+    if restoring {
+        state.update(cx, |ws, _cx| ws.save_to_store());
+    }
     Ok(handle)
 }
 
@@ -925,6 +1266,14 @@ fn build_window_root(
     // registration-order fallback stands until the window is first keyed.
     let id = window.window_handle().window_id();
     WindowRegistry::register(cx, id, state.clone());
+    // R18 (W5): the red-traffic-light close gate (reserved for R18 by
+    // `window_registry.rs`). With live panes it presents the confirmation and
+    // vetoes (`false`); the confirm handler calls `remove_window()` (which does
+    // not re-enter the gate). Once quit begins it returns `true` unconditionally.
+    window.on_window_should_close(cx, {
+        let state = state.clone();
+        move |window, cx| request_window_close(state.clone(), window, cx)
+    });
     // R15 subscription lift: stash this window's handle so the pane-event
     // subscription (wired lazily by `PaneHostView`'s render sweep) can actuate a
     // RoutedExit's every-project-empty terminus (close/quit) — a `&mut Window` a
@@ -934,6 +1283,18 @@ fn build_window_root(
         cx.observe_window_activation(window, |_state, window, cx| {
             if window.is_window_active() {
                 WindowRegistry::note_active(cx, window.window_handle().window_id());
+            }
+        })
+        .detach();
+    });
+    // R18 (W6): capture this window's on-screen frame on move AND resize (the one
+    // observer fires for both; the store's debounce absorbs a band-drag stream),
+    // skipping capture while fullscreen, then schedule the debounced save. A no-op
+    // save when no store Global is installed.
+    state.update(cx, |_state, cx| {
+        cx.observe_window_bounds(window, |ws, window, _cx| {
+            if ws.capture_frame(window) {
+                ws.save_to_store();
             }
         })
         .detach();
@@ -3106,6 +3467,25 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // OSC titles, plus the two-step rotation and the teardown reap —
                 // each on the real pty / socket clock; generous headroom.
                 budget: Duration::from_secs(120),
+            },
+            activate: true,
+        },
+        // R18: the session persistence + restore gate. Drives the SHIPPED restore
+        // path over a temp store (injected paths), covering the restore round-trip,
+        // the debounced socket-mutation write, the W5 veto via the REAL close
+        // button, the fan-out selection, quit-cascade disposition, and Swift
+        // migration. Registered BEFORE `multiwindow`: it registers the
+        // `WindowRegistry` WITHOUT `install` (quit-when-empty would kill the suite),
+        // so `multiwindow` stays the sole installer, last.
+        Scenario {
+            name: "persistence-restore",
+            open: crate::persistence_restore_live::open_persistence_restore_window,
+            gate: Gate::SelfReported {
+                // Restore + a deferred-resume prefill grid poll, a debounced store
+                // write poll, two real close-button clicks + modal answers, and the
+                // store-level fan-out/migration legs — each on the real pty / disk
+                // clock; generous headroom.
+                budget: Duration::from_secs(90),
             },
             activate: true,
         },

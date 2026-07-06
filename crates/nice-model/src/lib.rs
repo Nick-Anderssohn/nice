@@ -17,6 +17,15 @@
 //!   [`Tab::recover_next_terminal_index`] hydration helper.
 //! * [`Project`] — an ordered group of tabs.
 //!
+//! **The persistence leaves** (`SessionStore.swift`, model-shaped half):
+//!
+//! * [`PersistedPane`] / [`PersistedTab`] / [`PersistedProject`] — the v3
+//!   schema value types (camelCase JSON, Swift's shape **minus `branch`**) plus
+//!   `from_model` snapshot / `hydrate` with the exact restore defaults, and
+//!   [`snapshot_projects`] (the empty-project drop rule). The window envelope
+//!   (`PersistedState`/`PersistedWindow`/`PersistedFrame`) + the store I/O live
+//!   in `crates/nice`; these gpui-free leaves are what round-trip and hydrate.
+//!
 //! **The document** (`TabModel.swift`):
 //!
 //! * [`TabModel`] — the per-window projects/tabs/panes tree: seeding + the
@@ -97,6 +106,7 @@
 //!   see the module docs).
 
 mod pane;
+mod persisted;
 mod project;
 pub mod rename_gate;
 pub mod selection;
@@ -107,6 +117,7 @@ mod tab;
 mod tab_model;
 
 pub use pane::{Pane, PaneKind, TabStatus};
+pub use persisted::{snapshot_projects, PersistedPane, PersistedProject, PersistedTab};
 pub use project::Project;
 pub use rename_gate::InlineRenameClickGate;
 pub use selection::SidebarTabSelection;

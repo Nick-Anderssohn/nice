@@ -300,6 +300,47 @@ fn state_for(cx: &mut AsyncApp, id: gpui::WindowId) -> Option<Entity<WindowState
     cx.update(|app| WindowRegistry::state_for_window(app, id))
 }
 
+/// This window's persisted session id (R18: the persisted window id in
+/// `sessions.json`).
+fn session_id_of(cx: &mut AsyncApp, state: &Entity<WindowState>) -> String {
+    state.update(cx, |s, _cx| s.session_id().to_string())
+}
+
+/// Whether `id` is a lowercased RFC-4122 v4 UUID (the shape R18 mints for a fresh
+/// / ⌘N window id — retiring the old `win-<seq>` stand-in): `8-4-4-4-12` hex with
+/// version nibble `4` and variant nibble in `[89ab]`.
+fn is_uuid_v4(id: &str) -> bool {
+    let b = id.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if *c != b'-' {
+                    return false;
+                }
+            }
+            14 => {
+                if *c != b'4' {
+                    return false;
+                }
+            }
+            19 => {
+                if !matches!(c, b'8' | b'9' | b'a' | b'b') {
+                    return false;
+                }
+            }
+            _ => {
+                if !c.is_ascii_hexdigit() || c.is_ascii_uppercase() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 async fn run_multiwindow(
     cx: &mut AsyncApp,
     window_a: AnyWindowHandle,
@@ -366,6 +407,33 @@ async fn run_multiwindow(
     // Identify window B (the new handle) for the routing + close checks.
     let b_handle = cx
         .update(|app| app.windows().into_iter().find(|w| w.window_id() != a_id));
+
+    // === R18 (L2) — ⌘N mints a UUID window id, distinct from A's =============
+    // The ⌘N window's `session_id` IS its persisted `sessions.json` id, so it must
+    // be a real minted UUID (never the retired `win-<seq>` stand-in, which
+    // restarts at 1 each launch and would collide across relaunches) and distinct
+    // from A's.
+    if let Some(b_handle) = b_handle {
+        if let (Some(a_st), Some(b_st)) =
+            (state_for(cx, a_id), state_for(cx, b_handle.window_id()))
+        {
+            let a_sid = session_id_of(cx, &a_st);
+            let b_sid = session_id_of(cx, &b_st);
+            if !is_uuid_v4(&a_sid) {
+                failures.push(format!("window A's session id is not a minted UUID: '{a_sid}'"));
+            }
+            if !is_uuid_v4(&b_sid) {
+                failures.push(format!(
+                    "⌘N window B's session id is not a minted UUID: '{b_sid}'"
+                ));
+            }
+            if a_sid == b_sid {
+                failures.push(format!(
+                    "⌘N minted the same window id as A ('{a_sid}') — ids must be unique per window"
+                ));
+            }
+        }
+    }
 
     // === §3 — ⌘T routes to the key window B; A's model is unchanged ==========
     if let Some(b_handle) = b_handle {
@@ -510,6 +578,11 @@ async fn run_multiwindow(
     }
 
     // === §3 — close B: deregister + fallback to the surviving window A =======
+    // R18: `remove_window()` is a PROGRAMMATIC close — by design it bypasses the
+    // `on_window_should_close` confirmation gate (programmatic ≠ a user red-button
+    // / ⌘W close), so B closes straight through with no modal even though the gate
+    // is now wired on every window. B carries only a live terminal here, so the
+    // gate would otherwise confirm; that it doesn't is the invariant this leg pins.
     if let Some(b_handle) = b_handle {
         let reg_before = registry_count(cx);
         let win_before = windows_len(cx);

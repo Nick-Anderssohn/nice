@@ -673,8 +673,11 @@ impl WindowToolbarView {
         }
     }
 
-    /// Close a pane through the seam, committing any in-flight edit first
-    /// (`WindowToolbarView.swift:912-916`).
+    /// Close a pane, committing any in-flight edit first
+    /// (`WindowToolbarView.swift:912-916`). W5/R18: the shipped path routes
+    /// through the real session close (pty release + dissolve cascade + save)
+    /// rather than the model-only `PaneStripActions` stub, then actuates the
+    /// window-emptied terminus.
     fn close_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab_id) = self.active_tab_id(cx) else {
             return;
@@ -682,11 +685,11 @@ impl WindowToolbarView {
         if self.editing_pane.is_some() {
             self.commit_rename(window, cx);
         }
-        self.state.update(cx, |ws, _| {
-            ws.pane_strip_actions
-                .close_pane(&mut ws.model, &tab_id, pane_id)
-        });
+        let terminus = self
+            .state
+            .update(cx, |ws, _| ws.close_pane_via_session(&tab_id, pane_id));
         cx.notify();
+        crate::session_manager::SessionManager::apply_dissolve_terminus(terminus, window, cx);
     }
 
     /// Add a terminal pane to the active tab through the seam

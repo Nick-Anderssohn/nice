@@ -84,7 +84,7 @@ use nice_theme::AccentPreset;
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
-use crate::session_manager::ClaudeTabPlacement;
+use crate::session_manager::{ClaudeTabPlacement, SessionManager};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -758,19 +758,26 @@ impl SidebarShellView {
         let ids = action_ids.clone();
         let tid = tab_id.to_string();
         let w = weak.clone();
-        items.push(ContextMenuItem::entry(close_label, move |_window, app| {
-            let _ = w.update(app, |this, cx| {
-                this.state.update(cx, |ws, _| {
-                    ws.selection.snap_if_right_click_outside(&tid);
-                    if ids.len() > 1 {
-                        ws.sidebar_actions.close_tabs(&mut ws.model, &ids);
-                    } else {
-                        ws.sidebar_actions.close_tab(&mut ws.model, &tid);
-                    }
-                });
-                this.reconcile_selection_after_close(cx);
-                cx.notify();
-            });
+        // W5/R18: the shipped path now routes through the real session close
+        // (pty release + dissolve cascade + save) rather than the model-only
+        // `SidebarActions` stub, then actuates the window-emptied terminus.
+        items.push(ContextMenuItem::entry(close_label, move |window, app| {
+            let terminus = w
+                .update(app, |this, cx| {
+                    let terminus = this.state.update(cx, |ws, _| {
+                        ws.selection.snap_if_right_click_outside(&tid);
+                        if ids.len() > 1 {
+                            ws.close_tabs_via_session(&ids)
+                        } else {
+                            ws.close_tab_via_session(&tid)
+                        }
+                    });
+                    this.reconcile_selection_after_close(cx);
+                    cx.notify();
+                    terminus
+                })
+                .unwrap_or_default();
+            SessionManager::apply_dissolve_terminus(terminus, window, app);
         }));
 
         self.present_context_menu(items, position, window, cx);
@@ -792,13 +799,21 @@ impl SidebarShellView {
         }
         let weak = cx.weak_entity();
         let gid = group_id.to_string();
-        let items = vec![ContextMenuItem::entry("Close Project", move |_window, app| {
-            let _ = weak.update(app, |this, cx| {
-                this.state
-                    .update(cx, |ws, _| ws.sidebar_actions.close_project(&mut ws.model, &gid));
-                this.reconcile_selection_after_close(cx);
-                cx.notify();
-            });
+        // W5/R18: route through the real close (pending-removal flag → row drop on
+        // last dissolve + pty release + save), then actuate the window-emptied
+        // terminus.
+        let items = vec![ContextMenuItem::entry("Close Project", move |window, app| {
+            let terminus = weak
+                .update(app, |this, cx| {
+                    let terminus = this
+                        .state
+                        .update(cx, |ws, _| ws.close_project_via_session(&gid));
+                    this.reconcile_selection_after_close(cx);
+                    cx.notify();
+                    terminus
+                })
+                .unwrap_or_default();
+            SessionManager::apply_dissolve_terminus(terminus, window, app);
         })];
         self.present_context_menu(items, position, window, cx);
     }

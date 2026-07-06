@@ -132,6 +132,55 @@ impl TabModel {
         }
     }
 
+    /// Construct a document from already-hydrated `projects` + a saved
+    /// `active_tab_id`, WITHOUT seeding a Terminals/Main tab. The restore
+    /// constructor: [`TabModel::new`]/[`TabModel::with_fs`] always seed a fresh
+    /// Terminals project + Main tab, which restore must NOT do — it trusts the
+    /// saved grouping (`WindowSession.restoreSavedWindow` rebuilds from the
+    /// persisted projects). Like the initializers, the `active_tab_id`
+    /// assignment does not run the `didSet` side effects (no acknowledge, no
+    /// mutation event) — the caller runs restore's single explicit save.
+    pub fn from_parts(
+        projects: Vec<Project>,
+        active_tab_id: Option<String>,
+        fs: Box<dyn FsProbe>,
+    ) -> Self {
+        TabModel {
+            projects,
+            active_tab_id,
+            fs,
+            on_tree_mutation: None,
+        }
+    }
+
+    /// [`TabModel::from_parts`] with the production [`StdFs`] probe — the R18
+    /// restore call site (`crate::window_state::WindowState::with_seed`) has no
+    /// injected fs, so this is the disk-backed default.
+    pub fn from_parts_std(projects: Vec<Project>, active_tab_id: Option<String>) -> Self {
+        Self::from_parts(projects, active_tab_id, Box::new(StdFs))
+    }
+
+    /// Snapshot of this window's live panes grouped by kind — the quit /
+    /// window-close confirmation counting rule (`TabModel.swift:186-200`). A
+    /// pure fold over `pane.is_alive`: BOTH kinds count, held (not-alive) panes
+    /// don't, and modelled-but-unspawned panes (a restored pane hydrates
+    /// `is_alive = true`) DO — the Swift quirk, preserved deliberately.
+    pub fn live_pane_counts(&self) -> (usize, usize) {
+        let mut claude = 0;
+        let mut terminal = 0;
+        for project in &self.projects {
+            for tab in &project.tabs {
+                for pane in tab.panes.iter().filter(|p| p.is_alive) {
+                    match pane.kind {
+                        PaneKind::Claude => claude += 1,
+                        PaneKind::Terminal => terminal += 1,
+                    }
+                }
+            }
+        }
+        (claude, terminal)
+    }
+
     /// Install the did-mutate observer. Replaces any previously-installed one.
     pub fn set_on_tree_mutation(&mut self, cb: impl FnMut() + 'static) {
         self.on_tree_mutation = Some(RefCell::new(Box::new(cb)));

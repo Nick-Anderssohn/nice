@@ -1359,6 +1359,44 @@ fn ns_window_of(window: &Window) -> Option<*mut AnyObject> {
     }
 }
 
+/// Perform the standard window-close action (`-[NSWindow performClose:]`) — the
+/// EXACT action the red traffic-light close button's target invokes. It routes
+/// through the window delegate's `windowShouldClose:` (gpui's
+/// `on_window_should_close` gate) and only closes if it returns `true`, so with
+/// live panes it presents the W5 veto modal and the window stays open — WITHOUT
+/// invoking the should-close closure directly (AppKit invokes it via the
+/// delegate). The `persistence-restore` scenario uses this to drive the veto: a
+/// synthetic CGEvent click on the native traffic-light button does not
+/// hit-test to it under gpui's full-size-content-view window (verified
+/// on-device), so `performClose:` is the real close-button action driven through
+/// the same delegate path.
+pub fn perform_window_close(window: &Window) {
+    perform_window_close_ptr(ns_view_of(window));
+}
+
+/// [`perform_window_close`] from a raw content-`NSView` pointer (captured earlier
+/// via [`ns_view_of`]). Because `-performClose:` SYNCHRONOUSLY invokes
+/// `windowShouldClose:` — which re-enters gpui to present the veto modal — it MUST
+/// be called with NO outstanding gpui `App`/`Window` borrow (from the scenario's
+/// task, never inside a `window.update` closure), exactly like the CGEvent posts
+/// and the present-kick. Calling it inside an update borrow panics gpui's
+/// async-context (the borrow-reentrancy warning at `platform.rs`).
+pub fn perform_window_close_ptr(ns_view: *mut c_void) {
+    if ns_view.is_null() {
+        return;
+    }
+    // SAFETY: `ns_view` is a live content `NSView`; `-window` is a get-rule read,
+    // `-performClose:` a main-thread action with a valid `nil` sender.
+    unsafe {
+        let view = ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let _: () = msg_send![ns_window, performClose: std::ptr::null_mut::<AnyObject>()];
+    }
+}
+
 /// De-miniaturize the window (`-[NSWindow deminiaturize:]`), so the scenario can
 /// recover after a double-click whose `AppleActionOnDoubleClick` is "Minimize".
 pub fn deminiaturize_window(window: &Window) {

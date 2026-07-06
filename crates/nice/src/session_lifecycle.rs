@@ -287,7 +287,8 @@ fn project_new_claude_tab(
 fn activate_pane(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, pane_id: &str) {
     let _ = state.update(cx, |s, cx| {
         s.session.set_active_pane(&mut s.model, tab_id, pane_id);
-        s.session.ensure_active_pane_spawned(&s.model, tab_id, cx);
+        // No Claude tabs in this scenario, so no `--settings` provider is needed.
+        s.session.ensure_active_pane_spawned(&s.model, tab_id, None, cx);
     });
 }
 

@@ -1485,6 +1485,68 @@ fn probe_c_terminate_all_two_held_panes_visits_each_once() {
     assert!(!mgr.pane_is_spawned("t1", "t1-b"));
 }
 
+// ---- W5 (R18) project-pending-removal (Close Project) -----------------------
+
+#[test]
+fn pending_removal_drops_project_row_when_its_last_tab_dissolves() {
+    // Close Project marks the project pending; closing its (model-only) tab
+    // dissolves it, and finalize drops the now-empty non-Terminals row.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "proj", "t1", false);
+    // Another project keeps the window non-empty (so no terminus fires).
+    seed_claude_tab_in(&mut model, "other", "t2", false);
+    mgr.mark_project_pending_removal("proj");
+
+    let terminus = mgr.close_tab(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.projects.iter().all(|p| p.id != "proj"),
+        "the pending non-Terminals project row drops when its last tab dissolves"
+    );
+    assert_eq!(terminus, DissolveTerminus::None, "the other project keeps the window alive");
+}
+
+#[test]
+fn pending_removal_keeps_row_until_the_last_tab_goes() {
+    // A multi-tab pending project keeps its row (and the flag) across the first
+    // dissolve; only the final tab drops the row.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "proj", "t1", false);
+    seed_claude_tab_in(&mut model, "proj", "t2", false); // same project, 2nd tab
+    mgr.mark_project_pending_removal("proj");
+
+    mgr.close_tab(&mut model, &mut selection(), "t1");
+    assert!(
+        model.projects.iter().any(|p| p.id == "proj"),
+        "an earlier-tab dissolve keeps the pending flag + the project row"
+    );
+
+    mgr.close_tab(&mut model, &mut selection(), "t2");
+    assert!(
+        model.projects.iter().all(|p| p.id != "proj"),
+        "the last-tab dissolve finally drops the pending project row"
+    );
+}
+
+#[test]
+fn unmarked_project_row_survives_an_empty_tab_dissolve() {
+    // Without the pending flag, a dissolved tab leaves its (now-empty) project
+    // row in place — the default (non-Close-Project) close behavior.
+    let mut mgr = counting_manager();
+    let mut model = seeded();
+    seed_claude_tab_in(&mut model, "proj", "t1", false);
+    seed_claude_tab_in(&mut model, "other", "t2", false);
+
+    mgr.close_tab(&mut model, &mut selection(), "t1");
+
+    assert!(
+        model.projects.iter().any(|p| p.id == "proj"),
+        "an unmarked project's empty row survives (only Close Project drops it)"
+    );
+}
+
 #[test]
 fn probe_d_close_model_only_tab_reaches_cascade_synchronously() {
     // (d) Closing a tab whose panes are all model-only reaches the cascade

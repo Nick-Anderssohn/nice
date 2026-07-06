@@ -144,8 +144,10 @@ pub(crate) enum DissolveTerminus {
 
 impl DissolveTerminus {
     /// Combine two terminus outcomes across a multi-pane close loop:
-    /// `WindowEmptied` wins (once the window is empty it stays empty).
-    fn or(self, other: DissolveTerminus) -> DissolveTerminus {
+    /// `WindowEmptied` wins (once the window is empty it stays empty). Used by the
+    /// `close_tab`/close batch loops here and by
+    /// [`crate::window_state::WindowState`]'s multi-tab close aggregation.
+    pub(crate) fn or(self, other: DissolveTerminus) -> DissolveTerminus {
         match (self, other) {
             (DissolveTerminus::WindowEmptied, _) | (_, DissolveTerminus::WindowEmptied) => {
                 DissolveTerminus::WindowEmptied
@@ -270,6 +272,12 @@ pub(crate) struct SessionManager {
     /// for this window, so managers built directly by scenarios/itests inject
     /// nothing. See [`WindowShellEnv`].
     window_shell_env: Option<WindowShellEnv>,
+    /// W5 (R18): project ids the user asked to close whole (Swift's
+    /// `CloseRequestCoordinator.projectsPendingRemoval`). Read — not cleared —
+    /// by [`finalize_dissolved_tab`](Self::finalize_dissolved_tab) on each tab
+    /// dissolve so a multi-tab project keeps the flag across earlier dissolves;
+    /// cleared when its last tab empties and the row drops.
+    pending_project_removal: HashSet<String>,
 }
 
 impl SessionManager {
@@ -294,6 +302,18 @@ impl SessionManager {
             synthetic_armed: HashSet::new(),
             mint_id,
             window_shell_env: None,
+            pending_project_removal: HashSet::new(),
+        }
+    }
+
+    /// Mark `project_id` for whole-project removal (W5 "Close Project"): its row
+    /// drops from the tree once its last tab dissolves
+    /// ([`finalize_dissolved_tab`](Self::finalize_dissolved_tab)). The pinned
+    /// Terminals group is never marked. Swift's
+    /// `CloseRequestCoordinator.projectsPendingRemoval.insert`.
+    pub(crate) fn mark_project_pending_removal(&mut self, project_id: &str) {
+        if project_id != TabModel::TERMINALS_PROJECT_ID {
+            self.pending_project_removal.insert(project_id.to_string());
         }
     }
 
@@ -794,8 +814,8 @@ impl SessionManager {
 
         // Declared-but-inert subscriber hooks (later rows):
         //   * file-browser per-tab cleanup           → R19
-        //   * project-pending-removal flag + row drop → R18 (Close Project owns it)
-        //   * debounced session save (onSessionMutation) → R18
+        //   * debounced session save (onSessionMutation) → the UI-close callers
+        //     (`WindowState::save_to_store`) schedule it; R18.
 
         // Selection prune (R10 multi-select): drop the dissolved id (and clear a
         // dangling anchor/active mirror) before any view re-renders against the
@@ -813,9 +833,23 @@ impl SessionManager {
             // the window is going away, so leaving the stale id is harmless).
         }
 
+        // W5 (R18) project-pending-removal (Swift `AppState.finalizeDissolvedTab:349-355`):
+        // if the user asked to close this whole project and its last tab just
+        // dissolved, drop the (non-Terminals) row. Read without clearing until it
+        // empties so earlier-tab dissolves in a multi-tab project keep the flag.
+        if pi < model.projects.len() {
+            let project_id = model.projects[pi].id.clone();
+            if self.pending_project_removal.contains(&project_id)
+                && model.projects[pi].tabs.is_empty()
+                && project_id != TabModel::TERMINALS_PROJECT_ID
+            {
+                self.pending_project_removal.remove(&project_id);
+                model.projects.remove(pi);
+            }
+        }
+
         // Every-project-empty terminus (Swift closes this window when another is
-        // live, else quits the app). Project-row removal is R18 (inert above), so
-        // an emptied project row still counts as empty here.
+        // live, else quits the app).
         if model.projects.iter().all(|p| p.tabs.is_empty()) {
             DissolveTerminus::WindowEmptied
         } else {
@@ -1374,15 +1408,31 @@ impl SessionManager {
     }
 
     /// Spawn the active pane's deferred pty if it was modelled up front — Swift's
-    /// `ensureActivePaneSpawned` (`SessionsModel.swift:553-565`). Only for a
-    /// **terminal-kind** active pane (claude-kind panes never lazy-spawn — they
-    /// eager-spawn at tab creation as of R15) whose tab already has a session container and
-    /// whose pty isn't live yet. The spawn cwd resolves per-pane (last OSC 7,
-    /// else the tab/project fallback). Never creates a tab container itself.
+    /// `ensureActivePaneSpawned` (`SessionsModel.swift:553-565`), extended for R18
+    /// restore. Two lazy-spawn arms, both gated on the tab having a session
+    /// container and the pty not being live yet:
+    ///
+    /// * a **terminal-kind** active pane spawns a plain login shell in its
+    ///   resolved cwd (last OSC 7, else the tab/project fallback) — unchanged;
+    /// * a **claude-kind** active pane lazy-spawns **only in resume-deferred
+    ///   form** (L3): iff the tab carries a `claude_session_id`, the pane is not
+    ///   yet spawned, and no Claude is running, it spawns a plain login shell
+    ///   carrying `claude --resume <sid>` as `NICE_PREFILL_COMMAND` (nothing runs
+    ///   until the user opens the tab and presses Enter). This **supersedes** R15's
+    ///   "claude never lazy-spawns" note: a *restored* Claude pane returns modelled
+    ///   but unspawned and must lazy-spawn its deferred-resume shell on first
+    ///   activation. A *running* Claude pane (already spawned, or one promoted in
+    ///   place) still never lazy-spawns — the `is_claude_running` / already-spawned
+    ///   guards below reject it.
+    ///
+    /// Never creates a tab container itself. `settings_path` is R17's theme
+    /// `--settings` pointer (threaded from the window's provider), spliced into the
+    /// deferred-resume prefill; `None` ⇒ no `--settings` (sync off / gate unset).
     pub(crate) fn ensure_active_pane_spawned(
         &mut self,
         model: &TabModel,
         tab_id: &str,
+        settings_path: Option<&str>,
         cx: &mut App,
     ) {
         let Some(tab) = model.tab_for(tab_id) else {
@@ -1394,10 +1444,32 @@ impl SessionManager {
         let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) else {
             return;
         };
-        if pane.kind != PaneKind::Terminal {
+        if !self.tab_has_session(tab_id) || self.has_pane(tab_id, &pane_id) {
             return;
         }
-        if !self.tab_has_session(tab_id) || self.has_pane(tab_id, &pane_id) {
+        // L3 restore arm: a claude-kind active pane lazy-spawns its deferred-resume
+        // shell (never a running claude). A running-claude or session-less pane is
+        // left to its eager/socket spawn path.
+        if pane.kind == PaneKind::Claude {
+            if pane.is_claude_running {
+                return;
+            }
+            let Some(sid) = tab.claude_session_id.clone() else {
+                return;
+            };
+            let cwd = model.resolved_spawn_cwd_for_pane(tab, pane);
+            let _ = self.spawn_claude_pane(
+                tab_id,
+                &pane_id,
+                &cwd,
+                &ClaudeSessionMode::ResumeDeferred(sid),
+                &[],
+                settings_path,
+                cx,
+            );
+            return;
+        }
+        if pane.kind != PaneKind::Terminal {
             return;
         }
         let cwd = model.resolved_spawn_cwd_for_pane(tab, pane);
@@ -1443,11 +1515,12 @@ impl SessionManager {
         model: &mut TabModel,
         tab_id: &str,
         pane_id: &str,
+        settings_path: Option<&str>,
         window: &mut Window,
         cx: &mut App,
     ) {
         self.set_active_pane(model, tab_id, pane_id);
-        self.ensure_active_pane_spawned(model, tab_id, cx);
+        self.ensure_active_pane_spawned(model, tab_id, settings_path, cx);
         self.focus_active_pane(model, tab_id, window, cx);
     }
 

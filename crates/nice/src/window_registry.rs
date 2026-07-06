@@ -178,6 +178,16 @@ impl WindowRegistry {
             .map_or(0, |r| r.entries.len())
     }
 
+    /// Every live window's per-window state (W5: the ⌘Q pane-count sum + the
+    /// quit-cascade snapshot/teardown loop — Swift's `registry.allAppStates`).
+    /// Cloned handles so the global borrow ends before the caller reads/updates
+    /// each entity.
+    pub(crate) fn all_states(cx: &App) -> Vec<Entity<WindowState>> {
+        cx.try_global::<WindowRegistry>()
+            .map(|r| r.entries.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Remove window `id` from the map + MRU, returning its state handle.
     fn deregister(cx: &mut App, id: WindowId) -> Option<Entity<WindowState>> {
         let reg = cx.default_global::<WindowRegistry>();
@@ -185,19 +195,52 @@ impl WindowRegistry {
         reg.entries.remove(&id)
     }
 
-    /// Window-close handler: deregister, tear the window's state down (the hook
-    /// R13 extends to session teardown), and quit when the last window closes.
-    /// Quit-when-empty keeps the single-window "close quits the app" behavior
-    /// while letting a multi-window app survive closing one of several windows.
+    /// Window-close handler: route the window's disk fate (W5), tear its state
+    /// down (session teardown), and quit when the last window closes.
+    ///
+    /// R18: the disk reason routes on [`crate::lifecycle::close_disposition`] —
+    /// `AppQuitting` (quit began) or a default close ⇒ preserve the snapshot
+    /// (upsert); only a confirmed red-button / ⌘W close (`user_initiated_close`)
+    /// ⇒ remove the slot. `remove` MUST flush so a quit right after can't
+    /// resurrect the slot from a stale debounce (both branches flush). All a
+    /// no-op when no store Global is installed. Quit-when-empty keeps the
+    /// single-window "close quits the app" behavior while a multi-window app
+    /// survives closing one of several windows.
     pub(crate) fn handle_window_closed(cx: &mut App, id: WindowId) {
-        if let Some(state) = Self::deregister(cx, id) {
-            state.update(cx, |s, _cx| s.teardown());
-        }
+        Self::route_close_disk_fate(cx, id);
         let empty = cx
             .try_global::<WindowRegistry>()
             .map_or(true, |r| r.entries.is_empty());
         if empty {
             cx.quit();
+        }
+    }
+
+    /// The disk-fate + teardown half of [`handle_window_closed`], WITHOUT the
+    /// quit-when-empty: deregister the window, route its disk fate
+    /// ([`crate::lifecycle::close_disposition`] — remove+flush on a confirmed user
+    /// close, else preserve+flush), and tear its sessions down (pty reap). The
+    /// `persistence-restore` scenario installs a SCOPED `on_window_closed` observer
+    /// calling THIS (never [`handle_window_closed`]) so its window close routes the
+    /// real disk fate + reaps its ptys without the quit-when-empty that would kill
+    /// the suite (it registers the `WindowRegistry` WITHOUT `install`).
+    pub(crate) fn route_close_disk_fate(cx: &mut App, id: WindowId) {
+        if let Some(state) = Self::deregister(cx, id) {
+            let app_quitting = cx.has_global::<crate::lifecycle::AppQuitting>();
+            let (user_initiated, snapshot) = {
+                let s = state.read(cx);
+                (s.user_initiated_close(), s.persisted_snapshot())
+            };
+            match crate::lifecycle::close_disposition(app_quitting, user_initiated) {
+                crate::lifecycle::CloseDisposition::Remove => {
+                    crate::session_store::remove(&snapshot.id)
+                }
+                crate::lifecycle::CloseDisposition::Preserve => {
+                    crate::session_store::upsert(snapshot)
+                }
+            }
+            crate::session_store::flush();
+            state.update(cx, |s, _cx| s.teardown());
         }
     }
 }

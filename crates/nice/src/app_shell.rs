@@ -151,7 +151,11 @@ impl AppShellView {
 }
 
 impl Render for AppShellView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // W5/R18: the confirmation dialog presented over this window, if any. It
+        // lives on the shared `WindowState` (so the app-level quit/close paths can
+        // present it) and renders as a deferred overlay above the whole shell.
+        let modal = self.state.read(cx).pending_modal();
         div()
             .size_full()
             // R12: the window-level peek clear (moved here from `WindowChromeView`
@@ -164,6 +168,7 @@ impl Render for AppShellView {
                 crate::keymap::on_window_modifiers_changed(event, cx)
             })
             .child(self.sidebar.clone())
+            .children(modal)
     }
 }
 
@@ -449,9 +454,13 @@ impl Render for PaneHostView {
                     // when a tab is first shown). Idempotent; not a spawn itself —
                     // spawning still flows through `activate_pane`.
                     ws.session.register_tab_session(&tab);
+                    // R18 (L3): a restored Claude active pane lazy-spawns its
+                    // deferred-resume shell here — thread the window's `--settings`
+                    // provider in before the model/session split borrows `ws`.
+                    let settings = ws.claude_settings_path_provider();
                     let model = &mut ws.model;
                     let session = &mut ws.session;
-                    session.activate_pane(model, &tab, &pane, window, wcx);
+                    session.activate_pane(model, &tab, &pane, settings.as_deref(), window, wcx);
                 });
                 // Re-point the demand-present kick to the (now-active) pane's
                 // handle so its damage kicks this window while occluded.

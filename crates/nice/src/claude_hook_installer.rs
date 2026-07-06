@@ -47,8 +47,9 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use crate::atomic_file::write_atomic;
 
 use serde_json::{json, Map, Value};
 
@@ -351,22 +352,6 @@ fn sort_value(v: &Value) -> Value {
     }
 }
 
-/// Atomically replace `path` with `contents`: write a pid-suffixed sibling in the
-/// same directory, `chmod` it if `mode` is given, then rename over the target
-/// (rename is atomic within a filesystem — a pty child mid-read never sees a
-/// half-written file). Setting the mode on the temp BEFORE the rename means the
-/// final path is never briefly non-executable.
-fn write_atomic(path: &Path, contents: &[u8], mode: Option<u32>) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
-    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
-    fs::write(&tmp, contents)?;
-    if let Some(m) = mode {
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(m))?;
-    }
-    fs::rename(&tmp, path)
-}
-
 /// `~/.nice/` — a no-space dotdir so Claude's shell-based hook runner doesn't
 /// word-split the command path. Nice and `Nice RS Dev` share it because the
 /// script content is variant-agnostic (both write the same body).
@@ -391,6 +376,7 @@ fn home_dir() -> String {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};

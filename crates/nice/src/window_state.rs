@@ -44,12 +44,13 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui::AnyWindowHandle;
+use gpui::{AnyWindowHandle, AppContext};
 use nice_model::{PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, TabModel};
 use nice_term_view::TerminalEvent;
 
+use crate::confirmation_modal::ConfirmationModal;
+use crate::restore::WindowSeed;
 use crate::control_socket::{NiceControlSocket, Reply, RecordedSocketMessage, SocketMessage};
 use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
 use crate::session_manager::{
@@ -58,15 +59,16 @@ use crate::session_manager::{
 };
 use crate::sidebar_actions::{ModelSidebarActions, SidebarActions};
 
-/// Process-wide monotonic source of per-window session ids. Cheap, dependency-
-/// free stand-in for Swift's `UUID().uuidString` window-session id — R13 owns
-/// the real session identity, but a stable unique id per window exists now so
-/// the registry's per-session-id lookup (undo routing, Stage 5) has a real key
-/// to match on.
-static NEXT_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
-
+/// Mint a fresh window-session id — R18 (L2): a real lowercased UUIDv4 (reusing
+/// R15's [`mint_session_uuid`], no `uuid` crate), so `WindowState::session_id`
+/// **is** the persisted window id in `sessions.json`. Every fresh / ⌘N window
+/// mints one here; a restored window reuses its saved id
+/// ([`WindowState::with_seed`]). This retires the old `win-<seq>` stand-in —
+/// the persisted id must be stable across relaunches and never collide with a
+/// saved slot, so a monotonic per-process counter (which restarts at 1 every
+/// launch) can't serve.
 fn mint_session_id() -> String {
-    format!("win-{}", NEXT_SESSION_SEQ.fetch_add(1, Ordering::Relaxed))
+    mint_session_uuid()
 }
 
 /// A deferred `newtab` spawn request returned by
@@ -171,6 +173,30 @@ pub(crate) struct WindowState {
     /// pane is subscribed exactly once (its entity's `Drop` retires the
     /// subscription when the pane leaves the model / teardown).
     subscribed_panes: HashSet<String>,
+    /// W5: the user explicitly closed this window (red traffic light / ⌘W). Set
+    /// ONLY by the confirmed close path
+    /// ([`set_user_initiated_close`](Self::set_user_initiated_close)); read by
+    /// [`crate::window_registry::WindowRegistry::handle_window_closed`] to route
+    /// the disk fate ([`crate::lifecycle::close_disposition`]) — Swift's
+    /// `AppState.userInitiatedClose`. Default `false` (preserve is the safe
+    /// failure mode).
+    user_initiated_close: bool,
+    /// W5: the confirmation dialog currently presented over this window, if any.
+    /// [`crate::app_shell::AppShellView`] renders it while present; the confirm /
+    /// cancel / Esc / click-away paths emit `DismissEvent`, which
+    /// [`present_confirmation`](Self::present_confirmation)'s subscription clears.
+    pending_modal: Option<gpui::Entity<ConfirmationModal>>,
+    /// Holds the `DismissEvent` subscription for [`pending_modal`](Self::pending_modal)
+    /// alive; dropped/replaced when a new modal is presented or the window tears
+    /// down.
+    modal_sub: Option<gpui::Subscription>,
+    /// W6: the last on-screen frame captured for this window (Cocoa bottom-left
+    /// screen points), read into [`persisted_snapshot`](Self::persisted_snapshot)
+    /// so a saved window restores at its geometry. Updated by
+    /// [`capture_frame`](Self::capture_frame) from the window's
+    /// `observe_window_bounds` (skipped while fullscreen). `None` until the first
+    /// bounds observation (⇒ default placement on restore).
+    last_frame: Option<crate::session_store::PersistedFrame>,
 }
 
 impl WindowState {
@@ -211,7 +237,62 @@ impl WindowState {
             claude_settings_path: None,
             window_handle: None,
             subscribed_panes: HashSet::new(),
+            user_initiated_close: false,
+            pending_modal: None,
+            modal_sub: None,
+            last_frame: None,
         }
+    }
+
+    /// Rebuild a window from a persisted seed — the L2/L3 restore constructor
+    /// (Swift `WindowSession.restoreSavedWindow`, `:326-365`). Unlike
+    /// [`with_model`](Self::with_model), which seeds a fresh Terminals+Main tree,
+    /// this trusts the SAVED grouping: it builds the document from the hydrated
+    /// projects via [`TabModel::from_parts`] (no fresh Terminals/Main), runs the
+    /// same repair pass restore always does — `repair_project_structure()` then
+    /// `prune_dangling_parent_references()` — then re-applies the saved active tab
+    /// **iff it survived** the repairs (else the first navigable tab), and adopts
+    /// the saved window id + collapsed-sidebar flag. The selection is re-seeded
+    /// from the resolved active tab so the "selection ⊇ {active tab}" invariant
+    /// holds from construction.
+    ///
+    /// No save fires here (the model carries no mutation observer yet — the save
+    /// gate): the restore fan-out runs restore's single explicit save
+    /// ([`save_to_store`](Self::save_to_store)) after the cwd-heal pass, matching
+    /// Swift's "suppress saves during restore, then one save".
+    pub(crate) fn with_seed(seed: WindowSeed) -> Self {
+        let WindowSeed {
+            window_id,
+            projects,
+            active_tab_id,
+            sidebar_collapsed,
+            ..
+        } = seed;
+
+        let mut model = TabModel::from_parts_std(projects, active_tab_id);
+        // Restore repairs (trust the grouping, then fix structural drift):
+        // re-pin project/tab shape, then drop parent links to tabs that didn't
+        // survive.
+        model.repair_project_structure();
+        model.prune_dangling_parent_references();
+        // Re-apply the saved active tab iff it still exists after the repairs,
+        // else fall back to the first navigable tab (Swift re-applies `activeTabId`
+        // only when the tab survived).
+        let resolved_active = model
+            .active_tab_id()
+            .filter(|id| model.tab_for(id).is_some())
+            .map(str::to_string)
+            .or_else(|| model.navigable_sidebar_tab_ids().into_iter().next());
+        if let Some(active) = resolved_active {
+            model.select_tab(&active);
+        }
+
+        let mut state = Self::with_model(model);
+        state.session_id = window_id;
+        state.sidebar = SidebarModel::new(sidebar_collapsed, SidebarMode::Tabs);
+        // Re-seed the selection from the (possibly repair-shifted) active tab.
+        state.selection.sync_active_tab_id(state.model.active_tab_id());
+        state
     }
 
     /// Stash this window's handle (the shipped builder calls it at
@@ -413,6 +494,16 @@ impl WindowState {
                 reply,
             ),
         }
+        // R18 (post-gate save trigger): a socket-driven mutation (a `claude`
+        // newtab / in-place promotion, or a `session_update` rotation) changed the
+        // tab tree — schedule the debounced upsert (Swift's `onSessionMutation` →
+        // `scheduleSaveCurrentWindow`). A no-op when no store Global is installed,
+        // and the store coalesces a burst into one write. The gpui-free model's
+        // `FnMut()` mutation observer cannot snapshot the whole window (it has no
+        // `cx`), so the live save triggers hang off the mutation SITES — here for
+        // the socket path, `observe_window_bounds` for frames, and the UI-close
+        // methods for dissolves — each funnelling into `upsert(snapshot)` + debounce.
+        self.save_to_store();
     }
 
     /// Handle a `claude` invocation from a pane's zsh wrapper — the Rust twin of
@@ -779,6 +870,215 @@ impl WindowState {
         &self.recorded_socket_messages
     }
 
+    // MARK: - W5 quit / window-close (R18)
+
+    /// This window's live-pane counts `(claude, terminal)` — the quit / close
+    /// confirmation counting rule ([`nice_model::TabModel::live_pane_counts`]).
+    pub(crate) fn live_pane_counts(&self) -> (usize, usize) {
+        self.model.live_pane_counts()
+    }
+
+    /// Whether the user explicitly closed this window (red button / ⌘W) — read by
+    /// [`crate::window_registry::WindowRegistry::handle_window_closed`] to route
+    /// the disk fate. Swift's `AppState.userInitiatedClose`.
+    pub(crate) fn user_initiated_close(&self) -> bool {
+        self.user_initiated_close
+    }
+
+    /// Flip the user-initiated-close flag (the confirmed red-button / ⌘W path, or
+    /// the no-live-panes unconditional close). Only ever set to `true`; a window
+    /// that stays open (Cancel) leaves it `false`.
+    pub(crate) fn set_user_initiated_close(&mut self, value: bool) {
+        self.user_initiated_close = value;
+    }
+
+    /// The persisted snapshot of this window for the session store — id from the
+    /// window's [`session_id`](Self::session_id) (the persisted window id; a fresh
+    /// / ⌘N window mints a UUID, a restored one keeps its saved id),
+    /// `sidebar_collapsed` from the live sidebar, projects via
+    /// [`nice_model::snapshot_projects`] (empty non-Terminals projects dropped),
+    /// and the W6 [`last_frame`](Self::last_frame) captured from the bounds
+    /// observer (`None` until the first observation ⇒ default placement).
+    pub(crate) fn persisted_snapshot(&self) -> crate::session_store::PersistedWindow {
+        crate::session_store::PersistedWindow {
+            id: self.session_id.clone(),
+            active_tab_id: self.model.active_tab_id().map(|s| s.to_string()),
+            sidebar_collapsed: self.sidebar.collapsed(),
+            projects: nice_model::snapshot_projects(&self.model.projects),
+            frame: self.last_frame.clone(),
+        }
+    }
+
+    /// W6: capture `window`'s current on-screen frame (Cocoa points) into
+    /// [`last_frame`](Self::last_frame), UNLESS it is fullscreen — Swift saved the
+    /// fullscreen frame, a known wart we deliberately fix by skipping capture
+    /// while `matches!(window.window_bounds(), WindowBounds::Fullscreen(_))`, so a
+    /// window that quit fullscreen restores at its last windowed geometry. Called
+    /// from the window's `observe_window_bounds` (move AND resize). Returns whether
+    /// the frame changed (so the caller can skip a redundant save).
+    pub(crate) fn capture_frame(&mut self, window: &gpui::Window) -> bool {
+        if matches!(window.window_bounds(), gpui::WindowBounds::Fullscreen(_)) {
+            return false;
+        }
+        let Some([x, y, width, height]) = crate::platform::window_screen_frame(window) else {
+            return false;
+        };
+        let captured = crate::session_store::PersistedFrame { x, y, width, height };
+        if self.last_frame.as_ref() == Some(&captured) {
+            return false;
+        }
+        self.last_frame = Some(captured);
+        true
+    }
+
+    /// The dissolve save hook (R18): snapshot this window into the session store
+    /// (debounced upsert). A no-op when no store Global is installed (every test /
+    /// non-restore scenario), so it is safe to call from every UI-close path.
+    pub(crate) fn save_to_store(&self) {
+        crate::session_store::upsert(self.persisted_snapshot());
+    }
+
+    /// Present a confirmation dialog over this window (the generic W5/R18 surface).
+    /// Mints the [`ConfirmationModal`], subscribes to its `DismissEvent` (clearing
+    /// [`pending_modal`](Self::pending_modal)), stashes it, and notifies so
+    /// [`crate::app_shell::AppShellView`] renders it. `completion(confirmed, ..)`
+    /// runs once before dismissal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn present_confirmation(
+        &mut self,
+        title: impl Into<gpui::SharedString>,
+        message: impl Into<gpui::SharedString>,
+        confirm_label: impl Into<gpui::SharedString>,
+        cancel_label: impl Into<gpui::SharedString>,
+        destructive_confirm: bool,
+        completion: impl Fn(bool, &mut gpui::Window, &mut gpui::App) + 'static,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        let modal = cx.new(|mcx| {
+            ConfirmationModal::new(
+                title,
+                message,
+                confirm_label,
+                cancel_label,
+                destructive_confirm,
+                completion,
+                window,
+                mcx,
+            )
+        });
+        // Clear the pending modal when it dismisses (confirm / cancel / Esc /
+        // click-away all emit DismissEvent). The stale subscription is dropped
+        // when the next modal replaces it or the window tears down.
+        let sub = cx.subscribe(&modal, |ws, _modal, _event: &gpui::DismissEvent, cx| {
+            ws.pending_modal = None;
+            cx.notify();
+        });
+        self.pending_modal = Some(modal);
+        self.modal_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// The confirmation dialog currently presented over this window, if any —
+    /// [`crate::app_shell::AppShellView`]'s render reads it.
+    pub(crate) fn pending_modal(&self) -> Option<gpui::Entity<ConfirmationModal>> {
+        self.pending_modal.clone()
+    }
+
+    /// Real close of a tab through the session manager (pty release + dissolve
+    /// cascade) — the shipped-path replacement for the model-only
+    /// `SidebarActions::close_tab` stub. Returns the terminus the caller actuates
+    /// via [`SessionManager::apply_dissolve_terminus`], and schedules the dissolve
+    /// save.
+    pub(crate) fn close_tab_via_session(&mut self, tab_id: &str) -> DissolveTerminus {
+        let terminus = self
+            .session
+            .close_tab(&mut self.model, &mut self.selection, tab_id);
+        self.save_to_store();
+        terminus
+    }
+
+    /// Real close of a batch of tabs (the "Close N Tabs" path). Aggregates each
+    /// tab's terminus; schedules a single save at the end.
+    pub(crate) fn close_tabs_via_session(&mut self, tab_ids: &[String]) -> DissolveTerminus {
+        let mut terminus = DissolveTerminus::None;
+        for id in tab_ids {
+            terminus = terminus.or(self.session.close_tab(&mut self.model, &mut self.selection, id));
+        }
+        self.save_to_store();
+        terminus
+    }
+
+    /// Real close of a whole project (the sidebar "Close Project" path), porting
+    /// Swift's `CloseRequestCoordinator.hardKillProject` (`:369-389`): the pinned
+    /// Terminals group is never closed; an already-empty non-Terminals project row
+    /// drops directly; otherwise the project is marked pending-removal and each of
+    /// its tabs is hard-closed — the last dissolve drops the now-empty row
+    /// ([`SessionManager::finalize_dissolved_tab`]). Schedules the dissolve save.
+    pub(crate) fn close_project_via_session(&mut self, project_id: &str) -> DissolveTerminus {
+        if project_id == TabModel::TERMINALS_PROJECT_ID {
+            return DissolveTerminus::None;
+        }
+        let Some(pi) = self.model.projects.iter().position(|p| p.id == project_id) else {
+            return DissolveTerminus::None;
+        };
+        let tab_ids: Vec<String> = self.model.projects[pi]
+            .tabs
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+
+        let terminus = if tab_ids.is_empty() {
+            // Empty non-Terminals project: drop the row directly + reselect.
+            self.model.projects.remove(pi);
+            let active_gone = self
+                .model
+                .active_tab_id()
+                .is_some_and(|a| self.model.tab_for(a).is_none());
+            if active_gone {
+                if let Some(first) = self.model.navigable_sidebar_tab_ids().into_iter().next() {
+                    self.model.select_tab(&first);
+                }
+            }
+            if self.model.projects.iter().all(|p| p.tabs.is_empty()) {
+                DissolveTerminus::WindowEmptied
+            } else {
+                DissolveTerminus::None
+            }
+        } else {
+            self.session.mark_project_pending_removal(project_id);
+            let mut terminus = DissolveTerminus::None;
+            for id in &tab_ids {
+                terminus =
+                    terminus.or(self.session.close_tab(&mut self.model, &mut self.selection, id));
+            }
+            terminus
+        };
+        self.save_to_store();
+        terminus
+    }
+
+    /// Real close of one pane on `tab_id` (the toolbar pill × path) — the
+    /// shipped-path replacement for the model-only `PaneStripActions::close_pane`
+    /// stub. A spawned pane routes through [`SessionManager::terminate_pane`]
+    /// (SIGHUP→SIGKILL + model removal via `pane_exited`, dissolving the tab when
+    /// it was the last pane); a model-only pane (a lazy companion never focused)
+    /// is dropped from the model directly and the tab dissolved if it was the last
+    /// — so the × is never dead. Returns the terminus; schedules the dissolve save.
+    pub(crate) fn close_pane_via_session(&mut self, tab_id: &str, pane_id: &str) -> DissolveTerminus {
+        let terminus = if self.session.pane_is_spawned(tab_id, pane_id) {
+            self.session
+                .terminate_pane(&mut self.model, &mut self.selection, tab_id, pane_id)
+                .terminus
+        } else {
+            self.model.extract_pane(pane_id, tab_id);
+            self.session
+                .dissolve_tab_if_empty(&mut self.model, &mut self.selection, tab_id)
+        };
+        self.save_to_store();
+        terminus
+    }
+
     /// Tear the window's owned resources down on close. R12 has nothing to stop
     /// (the shipped live terminal is owned by the view and dies with the window's
     /// entity, exactly as before this cycle); this is the hook
@@ -804,7 +1104,7 @@ impl WindowState {
 mod tests {
     use super::*;
     use crate::control_socket::{Reply, RecordedSocketMessage};
-    use nice_model::{Pane, PaneKind, Tab, TabModel};
+    use nice_model::{Pane, PaneKind, Project, Tab, TabModel};
     use std::io::Read;
     use std::os::unix::net::UnixStream;
 
@@ -872,6 +1172,250 @@ mod tests {
             b.model.tab_for(&new_id).is_none(),
             "A's new tab never appears in B"
         );
+    }
+
+    // ---- W5 (R18) UI-close wiring + snapshot --------------------------------
+
+    /// Seed a window whose model has the pinned Terminals group plus one
+    /// non-Terminals project "proj" with two model-only terminal tabs.
+    fn window_with_project() -> WindowState {
+        let mut model = TabModel::new("/home/u");
+        model.ensure_project("proj", "Proj", "/home/u/proj");
+        let pi = model.projects.iter().position(|p| p.id == "proj").unwrap();
+        for id in ["t-a", "t-b"] {
+            let mut tab = Tab::new(id, id, "/home/u/proj");
+            let pane = format!("{id}-p");
+            tab.panes = vec![Pane::new(&pane, "Terminal 1", PaneKind::Terminal)];
+            tab.active_pane_id = Some(pane);
+            model.projects[pi].tabs.push(tab);
+        }
+        WindowState::with_model(model)
+    }
+
+    #[test]
+    fn close_project_via_session_drops_the_project_row() {
+        let mut ws = window_with_project();
+        let terminus = ws.close_project_via_session("proj");
+        assert!(
+            ws.model.projects.iter().all(|p| p.id != "proj"),
+            "Close Project drops the non-Terminals row once its tabs dissolve"
+        );
+        assert!(ws.model.tab_for("t-a").is_none());
+        assert!(ws.model.tab_for("t-b").is_none());
+        assert!(
+            ws.model.projects.iter().any(|p| p.id == TabModel::TERMINALS_PROJECT_ID),
+            "the pinned Terminals group is never closed"
+        );
+        // The Terminals group still has the Main tab, so the window isn't empty.
+        assert_eq!(terminus, DissolveTerminus::None);
+    }
+
+    #[test]
+    fn close_project_via_session_empty_project_drops_directly() {
+        let mut model = TabModel::new("/home/u");
+        model.ensure_project("empty", "Empty", "/home/u/empty");
+        let mut ws = WindowState::with_model(model);
+
+        let terminus = ws.close_project_via_session("empty");
+
+        assert!(
+            ws.model.projects.iter().all(|p| p.id != "empty"),
+            "an already-empty non-Terminals project row drops directly"
+        );
+        assert_eq!(terminus, DissolveTerminus::None);
+    }
+
+    #[test]
+    fn close_project_via_session_refuses_terminals_group() {
+        let mut ws = WindowState::new("/home/u");
+        let terminus = ws.close_project_via_session(TabModel::TERMINALS_PROJECT_ID);
+        assert!(
+            ws.model.projects.iter().any(|p| p.id == TabModel::TERMINALS_PROJECT_ID),
+            "the pinned Terminals group can never be closed"
+        );
+        assert_eq!(terminus, DissolveTerminus::None);
+    }
+
+    #[test]
+    fn close_tab_via_session_dissolves_a_model_only_tab() {
+        let mut ws = window_with_project();
+        ws.close_tab_via_session("t-a");
+        assert!(ws.model.tab_for("t-a").is_none(), "the model-only tab dissolves");
+        assert!(ws.model.tab_for("t-b").is_some(), "its sibling survives");
+        assert!(
+            ws.model.projects.iter().any(|p| p.id == "proj"),
+            "the project row survives while it still has a tab"
+        );
+    }
+
+    #[test]
+    fn close_pane_via_session_removes_a_model_only_pane() {
+        // A tab with two model-only panes; closing one leaves the tab with one.
+        let mut model = TabModel::new("/home/u");
+        model.ensure_project("proj", "Proj", "/home/u/proj");
+        let pi = model.projects.iter().position(|p| p.id == "proj").unwrap();
+        let mut tab = Tab::new("t", "T", "/home/u/proj");
+        tab.panes = vec![
+            Pane::new("p1", "A", PaneKind::Terminal),
+            Pane::new("p2", "B", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some("p1".into());
+        model.projects[pi].tabs.push(tab);
+        let mut ws = WindowState::with_model(model);
+
+        let terminus = ws.close_pane_via_session("t", "p1");
+
+        let tab = ws.model.tab_for("t").unwrap();
+        assert_eq!(tab.panes.len(), 1, "the closed model-only pane is gone");
+        assert_eq!(tab.panes[0].id, "p2");
+        assert_eq!(terminus, DissolveTerminus::None);
+    }
+
+    #[test]
+    fn persisted_snapshot_carries_id_sidebar_and_projects() {
+        let mut ws = window_with_project();
+        ws.sidebar.toggle_sidebar(); // expanded → collapsed
+        let snap = ws.persisted_snapshot();
+        assert_eq!(snap.id, ws.session_id());
+        assert!(snap.sidebar_collapsed, "the live collapse state is captured");
+        assert_eq!(
+            snap.frame, None,
+            "frame stays None until the window's bounds observer captures one (no window here)"
+        );
+        // The non-Terminals project + the pinned Terminals group both persist.
+        assert!(snap.projects.iter().any(|p| p.id == "proj"));
+        assert!(snap
+            .projects
+            .iter()
+            .any(|p| p.id == TabModel::TERMINALS_PROJECT_ID));
+    }
+
+    #[test]
+    fn user_initiated_close_flag_defaults_false_and_sets() {
+        let mut ws = WindowState::new("/home/u");
+        assert!(!ws.user_initiated_close(), "defaults false (preserve is safe)");
+        ws.set_user_initiated_close(true);
+        assert!(ws.user_initiated_close());
+    }
+
+    // ---- L2/L3 restore (with_model selection re-seed + with_seed) -----------
+
+    fn terminal_tab(id: &str, cwd: &str) -> Tab {
+        let mut tab = Tab::new(id, id, cwd);
+        let pane = format!("{id}-p");
+        tab.panes = vec![Pane::new(&pane, "Terminal 1", PaneKind::Terminal)];
+        tab.active_pane_id = Some(pane);
+        tab
+    }
+
+    #[test]
+    fn with_model_reseeds_selection_from_non_default_active_tab() {
+        // The R13.5 caveat made load-bearing by restore: a `WindowState` built
+        // around a model whose active tab ISN'T the default Main must have its
+        // multi-selection re-seeded from that active tab (else the sidebar shows
+        // no selected row). Build a two-project model active on a non-Main tab.
+        let mut model = TabModel::new("/home/u");
+        model.ensure_project("proj", "Proj", "/home/u/proj");
+        let pi = model.projects.iter().position(|p| p.id == "proj").unwrap();
+        model.projects[pi].tabs.push(terminal_tab("t-x", "/home/u/proj"));
+        model.select_tab("t-x");
+
+        let ws = WindowState::with_model(model);
+        assert_eq!(ws.model.active_tab_id(), Some("t-x"));
+        assert!(
+            ws.selection.contains("t-x"),
+            "with_model must re-seed the selection from the model's active tab"
+        );
+        assert!(
+            !ws.selection.contains(TabModel::MAIN_TERMINAL_TAB_ID),
+            "the default Main tab is not selected when it isn't active"
+        );
+    }
+
+    /// A hydrated seed: the pinned Terminals group (with Main) + a "proj" project
+    /// carrying `t-a` and `t-b`, active on `t-b`, collapsed sidebar, saved id.
+    fn restore_seed(window_id: &str, active: Option<&str>, collapsed: bool) -> WindowSeed {
+        let terminals = Project {
+            id: TabModel::TERMINALS_PROJECT_ID.into(),
+            name: "Terminals".into(),
+            path: "/home/u".into(),
+            tabs: vec![terminal_tab(TabModel::MAIN_TERMINAL_TAB_ID, "/home/u")],
+        };
+        let proj = Project {
+            id: "proj".into(),
+            name: "Proj".into(),
+            path: "/home/u/proj".into(),
+            tabs: vec![
+                terminal_tab("t-a", "/home/u/proj"),
+                terminal_tab("t-b", "/home/u/proj"),
+            ],
+        };
+        WindowSeed {
+            window_id: window_id.into(),
+            projects: vec![terminals, proj],
+            active_tab_id: active.map(str::to_string),
+            sidebar_collapsed: collapsed,
+            frame: None,
+        }
+    }
+
+    #[test]
+    fn with_seed_adopts_id_collapse_and_rebuilds_saved_tree() {
+        let ws = WindowState::with_seed(restore_seed("win-restored", Some("t-b"), true));
+        // The saved window id is adopted verbatim (L2 identity), NOT a fresh mint.
+        assert_eq!(ws.session_id(), "win-restored");
+        assert!(ws.sidebar.collapsed(), "the saved collapse flag restores");
+        // The saved grouping is trusted: proj + its two tabs + the Terminals group.
+        assert!(ws.model.tab_for("t-a").is_some());
+        assert!(ws.model.tab_for("t-b").is_some());
+        assert!(ws.model.projects.iter().any(|p| p.id == "proj"));
+        // The saved active tab is re-applied and the selection re-seeded from it.
+        assert_eq!(ws.model.active_tab_id(), Some("t-b"));
+        assert!(ws.selection.contains("t-b"));
+    }
+
+    #[test]
+    fn with_seed_falls_back_to_first_navigable_when_active_absent() {
+        // A saved active id that no longer resolves (e.g. its tab was pruned) ⇒
+        // the first navigable tab (the Terminals Main tab) becomes active.
+        let ws = WindowState::with_seed(restore_seed("w", Some("ghost-tab"), false));
+        assert_eq!(
+            ws.model.active_tab_id(),
+            Some(TabModel::MAIN_TERMINAL_TAB_ID),
+            "an unresolved saved active tab falls back to the first navigable tab"
+        );
+    }
+
+    #[test]
+    fn with_seed_prunes_dangling_parent_reference() {
+        // A restored child tab whose parent didn't survive: the repair pass clears
+        // the dangling parent link so the tab renders at root instead of orphaned.
+        let mut seed = restore_seed("w", Some("t-a"), false);
+        let pi = seed.projects.iter().position(|p| p.id == "proj").unwrap();
+        let ti = seed.projects[pi].tabs.iter().position(|t| t.id == "t-a").unwrap();
+        seed.projects[pi].tabs[ti].parent_tab_id = Some("never-existed".into());
+
+        let ws = WindowState::with_seed(seed);
+        let t_a = ws.model.tab_for("t-a").expect("t-a survives");
+        assert_eq!(
+            t_a.parent_tab_id, None,
+            "prune_dangling_parent_references clears a link to a non-existent parent"
+        );
+    }
+
+    #[test]
+    fn with_seed_does_not_seed_a_second_terminals_main() {
+        // from_parts must NOT inject a fresh Terminals+Main (that's `new`'s job) —
+        // restore trusts the saved grouping, so there is exactly ONE Main tab.
+        let ws = WindowState::with_seed(restore_seed("w", Some("t-a"), false));
+        let mains = ws
+            .model
+            .projects
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter(|t| t.id == TabModel::MAIN_TERMINAL_TAB_ID)
+            .count();
+        assert_eq!(mains, 1, "restore rebuilds the saved tree, never re-seeds Main");
     }
 
     #[test]
