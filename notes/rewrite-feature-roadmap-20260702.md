@@ -75,7 +75,7 @@ own test harness.)
 | W2 | Empty-chrome drag-to-move + double-click runs the user's `AppleActionOnDoubleClick` (zoom/minimize); pill presses structurally excluded via per-press hit-test | `Sources/Nice/Views/Chrome/ChromeEventRouter.swift`, `Sources/Nice/Views/WindowDragRegion.swift` |
 | W3 | Multi-window: ⌘N opens a fully isolated window (own tabs/panes/ptys/socket); focused-window routing for process-wide subsystems | `NiceApp.swift` (`WindowGroup`, `NewWindowButton`), `Sources/Nice/State/WindowRegistry.swift`, `Sources/Nice/Views/AppShellView.swift` |
 | W4 | Native full screen + View ▸ Enter/Exit Full Screen menu item (⌃⌘F) | `NiceApp.swift` (`FullScreenTracker`, commands) |
-| W5 | Close/quit confirmation when live panes would die (⌘Q counts all windows; red-button/⌘W counts one) | `Sources/Nice/State/AppDelegate.swift`, `Sources/Nice/State/CloseRequestCoordinator.swift`, `WindowRegistry.swift` (`CloseConfirmationDelegate`), `Sources/Nice/State/SessionLifecycleController.swift` |
+| W5 | Close/quit confirmation when live panes would die (⌘Q counts all windows; red-button/⌘W counts one) — rewrite splits this: alive-pane quit/window-close half = R18; busy-pane tab/pill-close half (`CloseRequestCoordinator`) = **R20.5** | `Sources/Nice/State/AppDelegate.swift`, `Sources/Nice/State/CloseRequestCoordinator.swift`, `WindowRegistry.swift` (`CloseConfirmationDelegate`), `Sources/Nice/State/SessionLifecycleController.swift` |
 | W6 | Window frame persistence + restore (constrained to visible screen) | `Sources/Nice/State/WindowSession.swift`, `SessionStore.swift` (`PersistedFrame`) |
 
 ### E. Sidebar (sessions mode)
@@ -361,8 +361,10 @@ pulse; `/clear`/`/branch` tracked — Claude parity with today minus restore.
   seamless migration; drop the `branch` field), L2 (window identity + claim
   ledger + launch fan-out; no SceneStorage in GPUI — persist window ids in
   the store itself), L3 (deferred-resume prefill restore via C5, cwd heal),
-  W5 (close/quit confirmation counting live panes), W6 (frames), L4 (the
-  bootstrap sequence order). Size **L**. Deps: R13, R15 (prefill), R12.
+  W5 (close/quit confirmation counting live panes — the alive-pane
+  quit/window-close half; the busy-pane close half moved to R20.5), W6
+  (frames), L4 (the bootstrap sequence order). Size **L**. Deps: R13, R15
+  (prefill), R12.
 
 **Milestone 4:** quit and relaunch restores windows/tabs/panes with
 `claude --resume` pre-typed — the app is now a credible daily driver.
@@ -382,8 +384,19 @@ pulse; `/clear`/`/branch` tracked — Claude parity with today minus restore.
   interop — objc2; GPUI clipboard API doesn't carry file URLs), F8 (inline
   rename + validators + cwd-impact scan), F9 (in-tree drag/drop rules +
   drop-into-terminal already covered by R7). Size **L**. Deps: R19.
+- **R20.5. Busy-pane close confirmation (`CloseRequestCoordinator` port).**
+  Added 2026-07-05 (tranche-4 plan review): the busy-pane half of W5 —
+  gate tab/project/pill-× closes on *busy* panes with Swift's dialogs and
+  counting rules (`CloseRequestCoordinator.swift:268-279`). Busy = a
+  thinking/waiting Claude (landed `TabStatus`) or a shell with a
+  foreground child (`tcgetpgrp(master_fd) != shell pgid` — the session
+  manager owns the fds). Until this lands, UI closes are unconfirmed
+  hard-kills (a documented tranche-4 divergence; W5's quit/window-close
+  confirmations DO ship in R18). Size **S–M**. Deps: R18 (real UI closes +
+  the confirm-modal component), R15 (statuses).
 
-**Milestone 5:** files mode at parity (minus editors, by design).
+**Milestone 5:** files mode at parity (minus editors, by design); busy-pane
+close confirmation restored (R20.5).
 
 ### Stage 6 — Settings, theming, shortcuts UI
 
