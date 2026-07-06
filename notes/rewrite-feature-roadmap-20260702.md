@@ -100,8 +100,8 @@ own test harness.)
 | P2 | "+" button: add a terminal pane to the active tab (auto-named "Terminal N") | `WindowToolbarView.swift` (`NewTabBtn`), `SessionsModel.swift` (`addTerminalToActiveTab`) |
 | P3 | Overflow chevron with attention badge when an attention-worthy pill is scrolled offscreen; edge fades; width-estimation to dodge SwiftUI virtualization | `Sources/Nice/Views/PaneStripOverflowEstimator.swift`, `Sources/Nice/Views/PaneStripGeometry.swift`, `WindowToolbarView.swift` (`OverflowMenuButton`) |
 | P4 | Pill drag → reorder within the strip | `Sources/Nice/Views/PaneStripDropResolver.swift`, `WindowToolbarView.swift` (`PaneStripDropDelegate`) |
-| P5 | Pill drag → cross-window move: live pty + view handed between windows via an in-process registry (pasteboard carries only the id); Claude panes become a fresh sidebar tab in the target | `Sources/Nice/Views/PaneDragSource.swift`, `Sources/Nice/State/LivePaneRegistry.swift`, `Sources/Nice/Views/PaneMigrationCoordinator.swift`, `SessionsModel.swift` (`adoptLivePane`, `adoptClaudePaneAsNewTab`, `adoptTerminalPaneAsNewTab`, `adoptTerminalPaneAsMainTerminal`) |
-| P6 | Pill drag → tear-off: released over empty desktop opens a brand-new window adopting the live pane (token-paired seed so the right window claims it) | `Sources/Nice/Views/PaneTearOffController.swift`, `NiceServices.swift` (tear-off seed pairing), `NiceApp.swift` (value-presenting `WindowGroup`) |
+| P5 | Pill drag → cross-window move: live pty + view handed between windows via an in-process registry (pasteboard carries only the id); Claude panes become a fresh sidebar tab in the target — **CUT** (§2, 2026-07-05) | `Sources/Nice/Views/PaneDragSource.swift`, `Sources/Nice/State/LivePaneRegistry.swift`, `Sources/Nice/Views/PaneMigrationCoordinator.swift`, `SessionsModel.swift` (`adoptLivePane`, `adoptClaudePaneAsNewTab`, `adoptTerminalPaneAsNewTab`, `adoptTerminalPaneAsMainTerminal`) |
+| P6 | Pill drag → tear-off: released over empty desktop opens a brand-new window adopting the live pane (token-paired seed so the right window claims it) — **CUT** (§2, 2026-07-05) | `Sources/Nice/Views/PaneTearOffController.swift`, `NiceServices.swift` (tear-off seed pairing), `NiceApp.swift` (value-presenting `WindowGroup`) |
 | P7 | Update pill (trailing edge) with popover: brew upgrade instructions when a newer GitHub release exists | `Sources/Nice/Views/UpdateAvailablePill.swift` |
 
 ### G. File explorer (sidebar files mode)
@@ -197,6 +197,26 @@ editor overrides. Also kept: `TabPtySession.addTerminalPane(command:)`'s
 generic run-a-command-in-a-pane capability is not scheduled for the rewrite
 (its only user was the editor pane); re-add it later only if something needs
 it.
+
+### Pane cross-window move + tear-off (P5, P6) — CUT
+
+Cut by Nick 2026-07-05 (during tranche-3 execution / tranche-4 planning).
+The rewrite drops both pill-drag exit paths: **P5** (drag a pill into
+another window — live pty handed over in-process) and **P6** (drag a pill
+onto the desktop — a new window adopts the pane). **P4 in-strip reorder
+stays** (R25), as do drag-into-terminal (T7, landed with R7) and the file
+tree's own DnD (F9, R20).
+
+Rationale: these two carried the roadmap's only unresolved GPUI design
+risk (in-app drag sessions have no NSDraggingSource end-of-drag
+equivalent — old §4.2), and their Swift implementations are the most
+seam-workaround-heavy code in the app (`LivePaneRegistry`,
+`PaneMigrationCoordinator`, `PaneTearOffController` — all already on the
+chrome-pain do-not-port list, so a Rust redesign would have been built
+from scratch either way). Sources for the record are in the §1.F rows
+above; the Swift tear-off UITest hook (`--uitest-tearoff-hook`) and its
+suites have no Rust successor. Window creation paths in the rewrite
+remain ⌘N (R12) and restore fan-out (R18).
 
 Also not carried: `Tab.branch` (M5, vestigial dead field).
 
@@ -389,20 +409,16 @@ pulse; `/clear`/`/branch` tracked — Claude parity with today minus restore.
 
 ### Stage 7 — Advanced pane management
 
-- **R25. Pill drag: reorder, cross-window move, tear-off.** P4 (strip
-  reorder — GPUI `on_drag`/drop), P5 (live-pane registry + migration
-  coordinator: in-process handoff of a running terminal entity between
-  windows — GPUI entities are app-global, which should make this *simpler*
-  than the AppKit version), P6 (tear-off: detect drag ended outside any
-  Nice window and open a new window adopting the pane). **Open question:
-  GPUI's drag sessions are in-app; "released over empty desktop" detection
-  needs verification — fallback design: a drag-out-of-window-bounds
-  threshold instead of NSDraggingSource end-operation semantics.** Sources:
-  `PaneDragSource.swift`, `LivePaneRegistry.swift`,
-  `PaneMigrationCoordinator.swift`, `PaneTearOffController.swift`. Size
-  **L**. Deps: R11, R12, R13, R18.
+- **R25. Pill drag: reorder within the strip.** P4 only (GPUI
+  `on_drag`/drop over the R11 strip). P5 (cross-window move) and P6
+  (tear-off) are **CUT** (§2, 2026-07-05) — and with them the stage's
+  open design question (in-app drag-session end detection, old §4.2).
+  Sources: `Sources/Nice/Views/PaneStripDropResolver.swift`,
+  `WindowToolbarView.swift` (`PaneStripDropDelegate`). Size **S**.
+  Deps: R8, R11.
 
-**Milestone 7:** full pane-drag parity (the current app's flagship trick).
+**Milestone 7:** in-strip pill reorder at parity; moving panes between
+windows is deliberately gone (§2).
 
 ### Stage 8 — Ecosystem & polish
 
@@ -423,7 +439,9 @@ documented cut; retire the Swift app.
 1. **IME arbitration (§13 G1)** — the one gate that could force a small
    `gpui_macos` patch; resolved inside R5 by the live spike
    (`spikes/phase0-poc/ime-spike/SCOPE.md`).
-2. **Tear-off end-of-drag detection** (R25) — no NSDraggingSource
+2. **Tear-off end-of-drag detection** (R25) — **RESOLVED BY CUT
+   (2026-07-05)**: P5/P6 are cut (§2); P4's in-strip reorder needs no
+   end-of-drag-outside-window semantics. Original question: no NSDraggingSource
    `endedAt:operation:` equivalent confirmed in GPUI; verify or redesign
    the gesture.
 3. **Vibrancy parity** (R10/R21) — `WindowBackgroundAppearance::Blurred`
