@@ -83,6 +83,7 @@ use nice_theme::AccentPreset;
 
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
+use crate::file_browser::view::FileBrowserView;
 use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
 use crate::session_manager::{ClaudeTabPlacement, SessionManager};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
@@ -334,6 +335,12 @@ pub(crate) struct SidebarShellView {
     /// The menu's dismiss subscription.
     menu_sub: Option<Subscription>,
 
+    /// R19: the files-mode browser view, created lazily the first time the sidebar
+    /// enters files mode and rendered by [`build_body`](Self::build_body) in place
+    /// of the tab list (peeking keeps showing the tabs — the preserved invariant).
+    /// One per window; owns its own kqueue watcher + scroll handle.
+    file_browser: Option<Entity<FileBrowserView>>,
+
     /// Root focus handle (hosts the `SidebarShell` key context for Esc).
     focus_handle: FocusHandle,
     /// The window's pane-content host, wired by `crate::app::build_window_root`
@@ -386,6 +393,7 @@ impl SidebarShellView {
             rename_blur_sub: None,
             context_menu: None,
             menu_sub: None,
+            file_browser: None,
             focus_handle: cx.focus_handle(),
             pane_host: None,
             focus_bounce_sub: None,
@@ -1233,8 +1241,13 @@ impl SidebarShellView {
         let show_tabs = peeking || mode == SidebarMode::Tabs;
         if show_tabs {
             self.build_tab_list(groups, s, cx).into_any_element()
+        } else if let Some(fb) = self.file_browser.clone() {
+            // R19: the real file browser (mounted here in place of the landed
+            // placeholder). `render` mints it on first entry to files mode.
+            fb.into_any_element()
         } else {
-            // Files mode placeholder (R19 swaps the real browser in).
+            // Defensive fallback: files mode with no browser yet (never happens —
+            // `render` creates it before this — but keeps `build_body` total).
             div()
                 .flex_1()
                 .w_full()
@@ -1806,6 +1819,13 @@ impl SidebarShellView {
     pub(crate) fn scenario_tab_rename_focused(&self, window: &Window) -> bool {
         self.rename_focus.is_focused(window)
     }
+
+    /// The files-mode browser view, if it has been created (the sidebar entered
+    /// files mode at least once) — the `file-browser` scenario's handle onto the
+    /// mounted tree.
+    pub(crate) fn scenario_file_browser(&self) -> Option<Entity<FileBrowserView>> {
+        self.file_browser.clone()
+    }
 }
 
 impl Focusable for SidebarShellView {
@@ -1834,6 +1854,13 @@ impl Render for SidebarShellView {
             let ws = self.state.read(cx);
             (ws.sidebar.collapsed(), ws.sidebar.mode(), ws.sidebar.peeking())
         };
+        // R19: mint the files-mode browser view the first time we enter files mode
+        // (kept afterwards; one kqueue watcher per window, spawned on demand).
+        if mode == SidebarMode::Files && self.file_browser.is_none() {
+            let state = self.state.clone();
+            let accent = self.accent;
+            self.file_browser = Some(cx.new(|cx| FileBrowserView::new(state, accent, cx)));
+        }
         let groups = self.snapshot_groups(cx);
         let shell = if collapsed {
             self.build_collapsed_shell(groups, mode, peeking_model, cx)

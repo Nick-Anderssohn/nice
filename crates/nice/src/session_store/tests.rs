@@ -140,6 +140,7 @@ fn make_window(id: &str, tabs: Vec<PersistedTab>) -> PersistedWindow {
         id: id.into(),
         active_tab_id,
         sidebar_collapsed: false,
+        sidebar_mode: None,
         projects,
         frame: None,
     }
@@ -169,6 +170,7 @@ fn make_session_window(id: &str, session_id: &str) -> PersistedWindow {
         id: id.into(),
         active_tab_id: Some(tab.id.clone()),
         sidebar_collapsed: false,
+        sidebar_mode: None,
         projects: vec![PersistedProject {
             id: format!("project-{id}"),
             name: format!("Project {id}"),
@@ -177,6 +179,37 @@ fn make_session_window(id: &str, session_id: &str) -> PersistedWindow {
         }],
         frame: None,
     }
+}
+
+/// R19: the optional per-window `sidebarMode` field round-trips through the
+/// JSON schema (serialized `"sidebarMode":"files"`), and an absent field decodes
+/// to `None` (the pre-R19 / shape-tolerant path) so old saves stay readable.
+#[test]
+fn sidebar_mode_round_trips_and_defaults_absent() {
+    let mut w = make_window("w", vec![]);
+    w.sidebar_mode = Some(nice_model::SidebarMode::Files);
+    let state = PersistedState {
+        version: CURRENT_VERSION,
+        windows: vec![w],
+    };
+    let bytes = serialize_state(&state).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.contains("\"sidebarMode\": \"files\""),
+        "sidebar_mode serializes under the camelCase key with the lowercase enum: {text}"
+    );
+
+    let decoded: PersistedState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        decoded.windows[0].sidebar_mode,
+        Some(nice_model::SidebarMode::Files)
+    );
+
+    // A pre-R19 document with no sidebarMode key decodes to None (absent ⇒ Tabs
+    // is applied at restore time by `WindowState::with_seed`).
+    let legacy = r#"{"version":3,"windows":[{"id":"w","sidebarCollapsed":false,"projects":[]}]}"#;
+    let decoded: PersistedState = serde_json::from_str(legacy).unwrap();
+    assert_eq!(decoded.windows[0].sidebar_mode, None);
 }
 
 fn first_tab_session_id(window: &PersistedWindow) -> Option<String> {
@@ -498,6 +531,7 @@ fn round_trip_preserves_every_field() {
         id: "w1".into(),
         active_tab_id: Some("t1".into()),
         sidebar_collapsed: true,
+        sidebar_mode: None,
         projects: vec![PersistedProject {
             id: "nice".into(),
             name: "Nice".into(),
@@ -548,6 +582,7 @@ fn round_trip_preserves_nil_optionals() {
         id: "w1".into(),
         active_tab_id: None,
         sidebar_collapsed: false,
+        sidebar_mode: None,
         projects: vec![PersistedProject {
             id: "terminals".into(),
             name: "Terminals".into(),
@@ -583,6 +618,7 @@ fn persisted_window_round_trip_with_frame() {
         id: "w1".into(),
         active_tab_id: Some("t1".into()),
         sidebar_collapsed: false,
+        sidebar_mode: None,
         projects: vec![PersistedProject {
             id: "p".into(),
             name: "P".into(),

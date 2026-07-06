@@ -898,6 +898,19 @@ pub fn run() {
         // Swift migration read), so the restore fan-out below sees the saved
         // windows and every later persistence hook goes live. app::run ONLY.
         install_session_store(cx);
+        // R19: install the production `WorkspaceOps` seam (open / open-with /
+        // reveal / Launch-Services enumeration / Other… chooser) as the process
+        // Global — the ONLY place the shipped objc2 workspace calls are reached.
+        // `run_selftest` installs a recording fake instead (hermeticity: no test
+        // or scenario ever launches a real app). app::run ONLY.
+        crate::file_browser::workspace_ops::install_production(cx);
+        // R19 (F2): load the file-browser sort preferences from `ui_settings.json`
+        // (`<support-root>/Nice RS Dev/`) into their process Global (write-through
+        // on change). Launch-time read + default-path resolution live here in
+        // app::run ONLY — `run_selftest` installs a defaults+temp-path store.
+        cx.set_global(crate::file_browser::sort_settings_store::SortSettingsStore::load(
+            crate::file_browser::sort_settings_store::default_ui_settings_path(),
+        ));
         // R18 (L4 step 10): the restore fan-out replaces the single
         // `open_managed_window` — one window per saved slot (ghost pre-pass +
         // cwd-heal), or one fresh default window when nothing is restorable.
@@ -3489,6 +3502,30 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R19: the file-explorer shipped-surface gate — drives the SHIPPED window
+        // (open_managed_window / build_window_root) with the sidebar in files mode:
+        // ⌘⇧B swaps in the tree (AX root + fixture row), single-click expand/
+        // collapse, double-click re-root, a double-click file records one open on
+        // the recording WorkspaceOps fake (nothing launched), right-click menus
+        // (file vs folder) + the two-stage Open With, the live kqueue watcher
+        // surfaces a created row, the sort-direction + hidden toggles + a real ⌘⇧.
+        // work, and ⌘⇧B still flips modes. Fixture tree under a temp dir; the
+        // recording fake is installed process-wide by run_selftest. Registered
+        // BEFORE `multiwindow`: its build_window_root only `register`s (no
+        // WindowRegistry close observer), so its window never trips the quit-when-
+        // empty terminus.
+        Scenario {
+            name: "file-browser",
+            open: crate::file_browser_live::open_file_browser_window,
+            gate: Gate::SelfReported {
+                // ⌘⇧B + AX poll, expand/collapse, re-root, a fake-dispatch double
+                // click, two right-click menus + Open With, the live watcher poll,
+                // sort/hidden toggles + ⌘⇧., and the mode flip — each with CGEvent
+                // settles; generous headroom.
+                budget: Duration::from_secs(75),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.
@@ -3514,6 +3551,22 @@ pub fn run_selftest(selector: String) {
     crate::platform::disable_font_smoothing();
     let scenarios = selftest_scenarios();
     gpui_platform::application().run(move |cx: &mut App| {
+        // R19 hermeticity: install the RECORDING `WorkspaceOps` fake process-wide
+        // BEFORE any scenario runs — no scenario may launch a real app, reveal in
+        // the real Finder, or query live Launch Services; the fake's log is the
+        // only evidence. The production impl (objc2) is installed by `run` only.
+        crate::file_browser::workspace_ops::install_recording_fake(cx);
+        // R19 (F2): the sort store initialized with DEFAULTS + a throwaway temp
+        // path — never the real `ui_settings.json` (the launch-time read +
+        // default-path resolution stay in `run`). A scenario that toggles sort
+        // writes only this temp file.
+        let sort_path = std::env::temp_dir().join(format!(
+            "nice-rs-selftest-ui-settings-{}.json",
+            std::process::id()
+        ));
+        cx.set_global(
+            crate::file_browser::sort_settings_store::SortSettingsStore::with_defaults(sort_path),
+        );
         nice_harness::selftest::drive(cx, &selector, scenarios);
     });
 }

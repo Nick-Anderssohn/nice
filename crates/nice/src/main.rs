@@ -119,6 +119,8 @@ mod confirmation_modal;
 mod context_menu;
 mod control_socket;
 mod cwd_heal;
+mod file_browser;
+mod file_browser_live;
 mod inline_rename;
 mod lifecycle;
 mod input_live;

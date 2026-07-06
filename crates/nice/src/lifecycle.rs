@@ -210,6 +210,7 @@ mod tests {
             id: id.to_string(),
             active_tab_id: Some("t".to_string()),
             sidebar_collapsed: false,
+            sidebar_mode: None,
             projects: vec![PersistedProject {
                 id: "terminals".to_string(),
                 name: "Terminals".to_string(),

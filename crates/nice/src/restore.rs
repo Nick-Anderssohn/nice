@@ -36,6 +36,11 @@ pub(crate) struct WindowSeed {
     /// Whether the sidebar was collapsed (restored FROM THE STORE — the
     /// deliberate divergence from Swift's SceneStorage restore).
     pub(crate) sidebar_collapsed: bool,
+    /// R19: the saved sidebar mode (tabs / files), or `None` ⇒ Tabs (a pre-R19
+    /// save, or a window last in tabs mode). Seeded into the rebuilt
+    /// [`SidebarModel`](nice_model::SidebarModel) by
+    /// [`WindowState::with_seed`](crate::window_state::WindowState::with_seed).
+    pub(crate) sidebar_mode: Option<nice_model::SidebarMode>,
     /// The saved on-screen frame (Cocoa points), or `None` ⇒ default placement.
     pub(crate) frame: Option<PersistedFrame>,
 }
@@ -59,6 +64,7 @@ pub(crate) fn hydrate_seed(window: &PersistedWindow) -> WindowSeed {
         projects: window.projects.iter().map(|p| p.hydrate()).collect(),
         active_tab_id: window.active_tab_id.clone(),
         sidebar_collapsed: window.sidebar_collapsed,
+        sidebar_mode: window.sidebar_mode,
         frame: window.frame.clone(),
     }
 }
@@ -107,6 +113,7 @@ mod tests {
             id: "w1".into(),
             active_tab_id: None,
             sidebar_collapsed: false,
+            sidebar_mode: None,
             projects,
             frame: None,
         }

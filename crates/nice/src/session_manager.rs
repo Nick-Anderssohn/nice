@@ -278,6 +278,16 @@ pub(crate) struct SessionManager {
     /// dissolve so a multi-tab project keeps the flag across earlier dissolves;
     /// cleared when its last tab empties and the row drops.
     pending_project_removal: HashSet<String>,
+    /// R19: tab ids dissolved since the last drain — the file-browser per-tab
+    /// cleanup hook. [`finalize_dissolved_tab`](Self::finalize_dissolved_tab) (the
+    /// single tab-removal entry point) pushes here; [`WindowState`](crate::window_state::WindowState),
+    /// which owns the [`FileBrowserStore`](nice_model::file_browser::FileBrowserStore),
+    /// drains it via [`take_dissolved_tab_ids`](Self::take_dissolved_tab_ids) after
+    /// each cascade to drop the closed tab's browser state. Kept here (not threaded
+    /// through the cascade signatures) so every dissolve path — UI close AND the
+    /// route_terminal_event pane-exit — funnels one removal list without rippling
+    /// the store into `SessionManager`.
+    dissolved_tab_ids: Vec<String>,
 }
 
 impl SessionManager {
@@ -303,7 +313,16 @@ impl SessionManager {
             mint_id,
             window_shell_env: None,
             pending_project_removal: HashSet::new(),
+            dissolved_tab_ids: Vec::new(),
         }
+    }
+
+    /// Drain the tab ids dissolved since the last call — the R19 file-browser
+    /// cleanup hook. [`WindowState`](crate::window_state::WindowState) calls this
+    /// after every session cascade and drops each id's browser state from its
+    /// [`FileBrowserStore`](nice_model::file_browser::FileBrowserStore).
+    pub(crate) fn take_dissolved_tab_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.dissolved_tab_ids)
     }
 
     /// Mark `project_id` for whole-project removal (W5 "Close Project"): its row
@@ -812,8 +831,12 @@ impl SessionManager {
         // pty-session release (Swift's `removePtySession`).
         self.tabs.remove(tab_id);
 
-        // Declared-but-inert subscriber hooks (later rows):
-        //   * file-browser per-tab cleanup           → R19
+        // Subscriber hooks (later rows):
+        //   * file-browser per-tab cleanup (R19): record the dissolved tab id so
+        //     `WindowState` drops its `FileBrowserStore` entry after the cascade
+        //     (the single tab-removal entry point, so every dissolve path — UI
+        //     close AND the pane-exit route — funnels one removal list).
+        self.dissolved_tab_ids.push(tab_id.to_string());
         //   * debounced session save (onSessionMutation) → the UI-close callers
         //     (`WindowState::save_to_store`) schedule it; R18.
 

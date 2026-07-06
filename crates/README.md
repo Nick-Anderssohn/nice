@@ -516,7 +516,64 @@ The GPUI application. Structure (grows over later cycles):
       actions + menu items → shell-inject bootstrap → hook install (R16) → theme-sync
       write (R17) → **[R18]** session store init + load + one-time Swift migration →
       **[R18]** `on_app_quit` flush → **[R18]** the restore fan-out replacing the
-      single `open_managed_window`.
+      single `open_managed_window`. **[R19]** installs the production `WorkspaceOps`
+      Global + loads the `ui_settings.json` sort store (both `app::run` only; a
+      recording fake + a defaults/temp sort store replace them under
+      `run_selftest`).
+  - **File explorer (R19).** The sidebar's files mode, ported from the pure-Swift
+    `FileBrowser*` seams. The gpui-free model family lives in
+    `nice-model::file_browser` (below); `crates/nice/src/file_browser/` owns the
+    impure seams:
+    - `file_browser/view` — `FileBrowserView`, the gpui view mounted by
+      `SidebarShellView::build_body` in place of the landed files-mode placeholder
+      (peeking still shows the tab list — the preserved invariant). A
+      `uniform_list` disclosure tree over the pure `visible_order` projection
+      (fixed-height rows: depth indent, disclosure chevron glyph-swap, SF-symbol
+      icon via the static extension map, name), the project header (click resets
+      root to the tab cwd), the control strip (up-nav, sort-criterion menu,
+      direction toggle, hidden toggle), and the missing-folder / no-active-tab
+      empty states. Clicks route through the hand-rolled **280 ms**
+      `FileBrowserClickRouter` (never gpui's native `click_count`: single =
+      select/expand a folder, double folder = re-root, double file = open); both
+      deselect handlers (empty-area click + `on_mouse_down_out`); scroll resets to
+      the top on a root change; the `nice-rs-file-browser-root` AX anchor
+      (`.id()` + `role(Group)` + `aria_label`). The R19 **context menu**
+      (right-click → pure-read selection → **Open / Open With ▸ / Reveal in Finder
+      / ─ / Copy Path**, `can_paste = can_rename = false`), snap-on-action, the
+      **two-stage Open With ▸** (the shared `ContextMenu` has no submenus: the
+      first entry arms a second menu opened next render, listing the apps default-
+      first + trailing "Other…"; enumeration runs lazily at that open), and Copy
+      Path via the clipboard. **R20** flips `can_paste`/`can_rename` and adds the
+      Rename/Copy/Cut/Paste/Move-to-Trash views + handlers + cut-ghost/drop
+      highlights — the model rows already exist.
+    - `file_browser/watcher` — the `DirectoryWatcherHub`, one kqueue fd + one OS
+      thread per window (slice 2). The view recomputes a **desired watch set**
+      (the expanded dirs on screen + the root, visible order) each render and
+      diffs it via `set_watched`; a change wakes the main runloop and a nap-safe
+      foreground drain re-renders (a fresh read heals the row set —
+      reload-on-render). Teardown wakes the thread via an `EVFILT_USER` event so
+      it joins and every fd closes (open-fd count → 0).
+    - `file_browser/sort_settings_store` — the process-wide `SortSettingsStore`
+      (`ui_settings.json` under `Nice RS Dev/`), the F2 sort prefs (slice 2). The
+      control strip write-throughs it (only-if-changed, atomic, unknown top-level
+      keys preserved for R21/R23).
+    - `file_browser/workspace_ops` — the single injectable `WorkspaceOps` seam
+      (slice 2): open / open-with / reveal / Launch-Services enumeration / the
+      Other… chooser. Production impl (objc2 in `platform.rs`) installed as a
+      Global by `app::run` only; `run_selftest` installs a **recording fake**
+      process-wide before any scenario — no test/scenario ever launches a real
+      app, reveals in the real Finder, or queries live Launch Services. R20's
+      trash + pasteboard get their OWN seams (not extensions of this trait).
+    - **Wiring (this cycle):** the per-window `FileBrowserStore` lives on
+      `WindowState` (`Tab.id → FileBrowserState`, in-memory only); a dissolved
+      tab's state is dropped via the `SessionManager` dissolved-id accumulator
+      drained after every close cascade (the single removal path). R19 adds the
+      optional per-window `sidebarMode` schema slot and is its sole writer/reader
+      (kept `Option`/`skip_serializing_if` so pre-R19 files decode); it persists
+      the mode through the session store (absent ⇒ Tabs).
+      `ToggleHiddenFiles` (⌘⇧.) and `ToggleSidebarMode` (⌘⇧B) are live in `keymap`.
+    - `file_browser_live` — the `file-browser` self-test scenario (see the table
+      below).
   - `keymap` — the shortcut dispatch: 13 gpui `actions!` + key bindings generated
     from the gpui-free `nice_model::shortcuts` table (`ShortcutAction` +
     `default_bindings`), the Rust replacement for the `NSEvent` monitor. The
@@ -525,10 +582,12 @@ The GPUI application. Structure (grows over later cycles):
     out through the hoisted process-level `FontSettings` (one entity every
     `TerminalView` observes — the plan's font fan-out); the 8 window-scoped actions
     (sidebar toggle/mode, sidebar-tab cycle, pane step, new pane, hidden-files)
-    route through `WindowRegistry::active_state`. Three actions are declared
-    deferred no-op markers with owners (`toggleHiddenFiles` → R19, undo/redo →
-    R20) — consumed, not silently missing (a matched chord always leaks **zero**
-    bytes to the pty). R9's ⌃⌘F folds into the same `bind_keys` call. `install_
+    route through `WindowRegistry::active_state`. **R19** filled the
+    `ToggleHiddenFiles` (⌘⇧.) body (files mode active AND a browser state exists
+    for the active tab — the Swift double gate) and made `ToggleSidebarMode`
+    (⌘⇧B) schedule the persistence upsert; undo/redo stay declared deferred no-op
+    markers → R20 — consumed, not silently missing (a matched chord always leaks
+    **zero** bytes to the pty). R9's ⌃⌘F folds into the same `bind_keys` call. `install_
     shortcuts` is idempotent (a process-level guard) so the self-test suite — which
     runs several keymap-installing scenarios in one process — registers the handlers
     once. **Documented divergence — character-based matching at the gpui pin:**
@@ -804,6 +863,25 @@ divergence from Swift's layout-independent `keyCode` match; there is no
 keycode-binding API at the gpui pin). Window-management accelerators that are not
 rebindable (New Window ⌘N, Toggle Full Screen ⌃⌘F) are deliberately absent from
 this table — they live as fixed actions in `crates/nice`.
+
+**File-browser model family (R19 pure port).** `file_browser` — the gpui-free
+state behind the sidebar's files mode, ported case-for-case from the pure-Swift
+`FileBrowser*` seams: `listing` (`entries` dirs-first filter + within-bucket
+comparator, `visible_order` flatten — lstat symlink semantics, the dual
+dot-prefix / BSD `UF_HIDDEN` hidden filter, Unicode-lowercase name fold),
+`sort` (the `FileBrowserSortCriterion` / `FileBrowserSortSettings` value type
+reused as the `ui_settings.json` schema surface), `state` / `store` (per-tab
+`root_path` + expanded set + sticky cwd-aware `show_hidden` + owned selection;
+the per-window `tab_id → state` map with lazy `ensure_state`, `remove_state`,
+and the ⌘⇧. `toggle_hidden_files_if_exists` gate), `selection` (path-keyed
+Finder multi-select + the pure right-click read / snap-on-action split),
+`click_router` (the hand-rolled **280 ms** double-click detector with the
+per-path `activated_at` stamp R20 feeds into `InlineRenameClickGate` — the hook,
+not the rename), `menu` (the FULL context-menu visibility matrix in frozen
+order, incl. the R20 rows), `open_with` (the pure ordering / dedup /
+synthesized-default function the production `WorkspaceOps` lookups feed), and
+`header` (`file_browser_header_title`). R19's `crates/nice` layer wraps these;
+R20 consumes `visible_order`, the selection snap hooks, and the menu matrix.
 
 ### `crates/nice-theme` (lib)
 
@@ -1144,6 +1222,7 @@ the window, and moves to the next scenario.
 | `claude-lifecycle` | The R15/R16 Claude tab lifecycle gate. Drives the WHOLE `claude` flow over the **shipped window** (`open_managed_window` / `build_window_root`, the exact path `run` takes) with a **real control socket**, **real ptys**, and the live `route_terminal_event` subscription lift. `NICE_CLAUDE_OVERRIDE` points `claude` at a stub script (emits a braille-prefixed then a ✳-prefixed OSC title, idling between) — never the machine's real `claude`; `HOME` is sandboxed for the Main pane's login shell; every Claude pane spawns in a socket-supplied sandbox work dir. Six legs: **(a) socket newtab + T5 status** — a raw-`UnixStream` `claude` with an empty `tabId` replies `newtab`, a fresh Claude tab appears with a minted **valid v4** session UUID, its Claude pane SPAWNED (the stub runs) and `is_claude_running == true` FROM CREATION, and the stub's braille then (after a line of input) ✳ OSC titles drive the tab's sidebar-dot status **Thinking → Waiting** through the shipped subscription; **(b) ≤1-running-Claude refusal** — a second `claude` from that tab's real pane ids replies `newtab` (Swift's `test_existingClaudeRunning_repliesNewtab`); **(c) in-place promotion** — a terminal pane in a non-Terminals project promotes on a `claude`: reply begins `inplace <uuid>` (a valid v4 uuid field 2, an optional R17 settings 3rd field TOLERATED) and the pane flips kind→Claude + `is_claude_running` false→true; **(d) worktree split** — `claude -w foo` buckets the new tab under the invocation cwd while its `Tab.cwd` carries `.claude/worktrees/foo`; **(e) exit routes in the shipped window** — a real `exit` in a live terminal pane (added to the Main tab so the tab survives — no dissolve, no quit-terminus) is removed from the SHIPPED window via the subscription lift (the proof the lift reached shipped code); **(f) session_update rotation (R16)** — a fire-and-forget raw-`UnixStream` `session_update` with `source:"resume"` + a new id + a cwd move materializes a sibling parent tab pinned to the OLD id, `is_claude_running == false`, at ROOT (`parent_tab_id == None`) with the PRE-rotation cwd, while the originating tab re-parents UNDER it (indented — the landed `row_indent` contract) and moves into the post-rotation worktree with the NEW id; a `source:"clear"` update rotates the id in place with NO new tab; a cwd-bearing update adopts onto `Tab.cwd`. Grid/model polls are bounded + fail-loud. Never launches the real `claude`, never writes the real `~` / Application Support. Needs **no** Accessibility grant (raw sockets + pty writes). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
 | `claude-e2e` | The R17 Milestone-3 shipped-surface gate (Validation §4, the tranche-3 close-out owner). Drives the **shipped window** (`open_managed_window` / `build_window_root`) the way a **user** does — typing `claude\n` into real ptys carrying the R14 `claude()` shadow — with R17's **theme sync ON** (the process gate installed via the `set_claude_theme_sync_gate` seam so `open_managed_window`'s provider fill lights up through the SHIPPED path; the Main pane forks WITH the shadow via the `set_scenario_shell_inject_config` seam pointing `ZDOTDIR` at fixture stubs). Fully sandboxed: a fake `$HOME` + marker `.zshrc`, a stub `claude` on `PATH` **and** `NICE_CLAUDE_OVERRIDE` (echoes its argv, then braille/✳ OSC titles), a temp `ZDOTDIR`, and the theme/pointer files written against sandbox paths — never the real `claude` / `~/.claude` / `~/.nice`. Six legs (bounded fail-loud grid/model polls): **(a) typed newtab + theme sync ON** — `claude\n` in the real Main pane handshakes over the socket, the Terminals-group Main tab forces `newtab`, a fresh Claude tab appears with its stub SPAWNED (`is_claude_running` from creation) and a **valid v4** session UUID, and the window's `--settings` provider resolved to the sandbox pointer (the Main-tab newtab spawn runs under `NICE_CLAUDE_OVERRIDE`, so `build_claude_exec_command` suppresses the Nice flags — the wrapper-spliced argv is asserted in leg (c)); **(b) status pulse** — the new Claude pane's braille then (after a line of input) ✳ stub OSC titles drive the shipped sidebar-dot status **Thinking → Waiting**; **(c) typed in-place promotion through the real zsh wrapper** — a live terminal pane in a non-Terminals project, typing `claude\n`: the reply is `inplace <uuid> <ptr>` (theme sync ON) and the grid shows the stub `exec`'d with `--settings <ptr> --session-id <uuid>` argv (whitespace-insensitively, since the long argv hard-wraps) while the model flips kind→Claude + `is_claude_running` true; **(d) rotation on the shipped sidebar** — a raw-socket `session_update` `source:"resume"` + new id materializes the branch parent at ROOT (`parent_tab_id == None`) with the originating tab re-parented + indented beneath it (root promotion), then a `source:"clear"` rotates the id in place with NO new tab; **(e) theme + pointer files present** — the theme file at the `nice-rs` slug carries `"_niceManaged": true` and the pointer file holds the exact `{"theme":"custom:nice-rs"}` bytes; **(f) gate-OFF parity** — with the gate flipped OFF and the window provider re-filled, a fresh typed promotion is settings-less (the wrapper `exec`s the stub with `--session-id <uuid>` and NO `--settings` — byte-identical to the pre-theming protocol). Teardown reaps every session and resets the scenario `ShellInjectConfig`. Needs **no** Accessibility grant (pty writes + raw sockets, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
 | `persistence-restore` | The R18 session persistence + restore gate (Validation §3). Drives the **shipped window** path with a **temp session store** (injected via `NICE_APPLICATION_SUPPORT_ROOT`) seeded with a hand-authored v3-shaped `sessions.json` (a Claude tab with a deliberately stale cwd + a planted fake `~/.claude/projects` bucket/transcript, a terminal tab with pane cwds, a `parentTabId` pair, a frame, `sidebarCollapsed: true`), a sandbox `HOME`/`ZDOTDIR`, and a stub `claude` (`NICE_CLAUDE_OVERRIDE` — the real `claude` is never spawned). One `Application::run`; the restore/fan-out fns are called **explicitly** (the shell-socket precedent, no relaunch). The legs: **(a)** restore round-trip on the shipped window (`open_managed_window_with` + `build_window_root`) — the model tree matches the fixture, lineage intact, sidebar collapsed (leading column width 0), the frame applied (read back via `window_screen_frame` within tolerance), the cwd-heal corrected the stale Claude cwd, and a bounded grid-poll shows the pre-typed `claude --resume <sid>` with NOTHING executed; **(b)** a raw-socket mutation + rename polls the store file for the debounced coalesced write; **(c)** the **W5 veto** — with live panes, the REAL close action (`-[NSWindow performClose:]`, the exact action the red traffic-light button's target invokes, routed through the delegate's `windowShouldClose:` gate — NOT the should-close closure directly; the traffic-light frame helper is asserted to locate the close button, but a synthetic CGEvent click does not hit-test to the native button under gpui's full-size-content window, verified on-device) leaves the window OPEN, the modal shows (AX role+label), Cancel is a total no-op (file byte-identical), Confirm closes + the slot disappears; **(d)** re-running the restore fan-out against the same store yields exactly the surviving slot's window (seed id/parts/frame match); **(e)** a unit-level quit cascade (two windows, both snapshots survive + a close after `AppQuitting` is inert — the wipe regression); **(f)** migration — a Swift-shaped fixture ⇒ lossless adopt, `branch` ignored, own file written, source bytes untouched. **Registers the `WindowRegistry` WITHOUT `install`** (quit-when-empty would kill the suite), registered **before** `multiwindow` (the sole installer, last). `Gate::SelfReported`. |
+| `file-browser` | The R19 file-explorer shipped-surface gate (Validation §3). Opens through the **shipped builder** (`open_managed_window` / `build_window_root`) with the active tab rooted at a temp fixture tree, and drives the sidebar's files mode: a real **⌘⇧B** CGEvent swaps the tab list for the tree (the AX root `nice-rs-file-browser-root` surfaces as an `AXGroup` — poll forces a repaint per tick, the shipped shell doesn't RAF — and a fixture row is model-read-corroborated as rendered); **single-click expand/collapse** of a fixture dir; **double-click a folder re-roots** the tree (model `root_path`); **double-click a file** records **exactly one** `open` on the recording `WorkspaceOps` fake and **nothing is launched** (the fake's log is the only evidence); **right-click menus** — a file shows Open / Open With ▸ / Reveal in Finder / Copy Path, a folder OMITS Open + Open With (the pinned rule), and the **Open With ▸ second stage** lists the fake's apps **default-first** (`Zed (default)`, then alphabetized, then `Other…`); the **live kqueue watcher** surfaces a file created in an expanded dir as a new row within a bounded fail-loud poll (create → 120 ms debounce → wake → foreground drain → re-render — NO forced notify, so only a watcher-driven render can pass); the **sort-direction toggle** reorders rows; the **hidden toggle + a real ⌘⇧. chord** hide then re-show a dotfile (the shipped keymap's files-mode-AND-state-exists double gate); and **⌘⇧B still flips modes**. Hermetic: fixture under a temp dir, the recording fake installed process-wide by `run_selftest` — no real app launch / Finder reveal / Launch-Services query. Preflights `AXIsProcessTrusted()` and FAILs loudly on a missing grant. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
 | `multiwindow` | The R12 live multi-window + shortcut-dispatch gate (Validation §2–§5). Drives the shipped `WindowRegistry` / `WindowState` / `keymap` on **real `NSWindow`s** with **real CGEvents** to nice-rs's own pid. Opens window A as a capture-tee managed window (the `input-live` pattern) registered in the process-wide registry, then asserts: **⌘N** opens a second, isolated, registry-tracked window (the registry count **and** `App::windows()` both step 1 → 2); **⌘T** posted while window B is key adds a pane to B's `WindowState` model only, leaving A's model signature unchanged (isolation + focused-window routing through `active_state`); **⌘=** grows the one process-level `FontSettings` every window observes (the font fan-out) and leaks **zero** bytes into A's capture-tee pty; the **pass-through differential** — a plain `x` reaches the pty as `x`, while **⌘⌥↓** cycles the sidebar and leaks **zero** capture bytes (a matched chord is consumed, an unmatched key falls through byte-identically); **live peek** — with A's sidebar collapsed, ⌘⌥↓ floats the peek and a modifiers-release clears it via the window-level `on_modifiers_changed` observer; and **close/deregister/fallback** — closing B deregisters it (registry + `NSWindow` count drop) and a window-scoped action then falls back to the surviving window A. Matching is **character-based** at the gpui pin (the documented divergence from Swift's physical-keycode match — see the `keymap` module notes). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make every chord a no-op). The per-pid flagsChanged the peek-clear needs is not synthesizable via `CGEventPostToPid`, so the modifier release is driven as a real `ModifiersChangedEvent` through GPUI's own dispatch (the same `on_modifiers_changed` path). The in-process isolation / routing / all-13-fire / peek **differentials** live in `nice-itests`' `multiwindow` cases. Registered **last** in `selftest_scenarios` (it installs the registry whose close observer quits when the registry empties). `Gate::SelfReported`. |
 | `sidebar` | The R10 live sessions-sidebar gate (Validation §3–§4). Mounts the real `SidebarShellView` (no pty — the shell hosts no terminal this cycle) and drives it with **real mouse CGEvents** to nice-rs's own pid, ground-truthed against AppKit reads. Asserts the expanded card reports the **240pt** default width; a CGEvent drag on the trailing resize handle **clamps at 160 and 480** and a CGEvent double-click **resets to 240**; **collapse** removes the leading column entirely (the M2 design: no cap card; `scenario_leading_column_width` reports 0) and the full-width band's drift guards hold — the 82pt traffic-light spacer clears the LIVE zoom button's trailing edge, the bare restore button's rect has **zero x-overlap** with any traffic light, and R9's close-x / y-26 / equal-pitch geometry is **re-asserted** (`standard_window_button_frames`, the BUG-B guard); **restore** returns the column; a CGEvent drag on the sidebar top strip moves the window (R9 band pattern) while the **same drag inside the card body leaves the frame put** (hard). **§4 dots** — with the model driven into all four states (thinking / waiting-unacked / waiting-acked / idle), the dot colour per token and the pulse-presence rule are asserted at the state level off the view's own R8 predicates (`SidebarShellView::tab_dot_inputs`; pixel corroboration is best-effort under `capture`). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing; the resize clamps/reset and the strip window-move hard-assert when the synthetic gesture drives the real behaviour, else **DEFER** (the 6pt resize handle a synthetic press may miss; the `performWindowDragWithEvent:` physical-cursor limitation), the same honest-deferral pattern `chrome` uses. The in-process multi-select / rename-gate / Esc / band-arm **classification** differentials live in `nice-itests`' `sidebar_multiselect` cases (a simulated event can't move a real frame). `Gate::SelfReported`. |
 

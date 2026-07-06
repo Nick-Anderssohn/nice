@@ -97,6 +97,22 @@
 //!
 //! ## Keyboard-shortcut data (R12 pure port)
 //!
+//! ## File-browser model family (R19 pure ports)
+//!
+//! * [`file_browser`] — the gpui-free model family behind the sidebar's files
+//!   mode: [`file_browser::listing`] (dirs-first filter + sort + visible-order
+//!   flatten), [`file_browser::sort`] (the persisted sort-preference value
+//!   type), [`file_browser::state`]/[`file_browser::store`] (per-tab
+//!   in-memory root/expansion/hidden state + the per-window catalog),
+//!   [`file_browser::selection`] (the Finder-style multi-select model keyed by
+//!   path), [`file_browser::click_router`] (the hand-rolled 280 ms
+//!   double-click detector + `activated_at` rename hook),
+//!   [`file_browser::menu`] (the context-menu visibility matrix),
+//!   [`file_browser::open_with`] (the pure "Open With ▸" ordering function),
+//!   and [`file_browser::header::file_browser_header_title`]. Ported
+//!   case-for-case from the pure-Swift `FileBrowser*` seams; the views,
+//!   kqueue watcher, and objc2 platform calls stay in `crates/nice`.
+//!
 //! * [`shortcuts`] — [`ShortcutAction`] (the closed 13-action rebindable set) +
 //!   [`default_bindings`] (the default-combo table as data), ported from
 //!   `Sources/Nice/State/KeyboardShortcuts.swift`. Gpui-free: R12's keymap slice
@@ -105,6 +121,7 @@
 //!   the gpui pin (a documented divergence from Swift's physical-keycode match —
 //!   see the module docs).
 
+pub mod file_browser;
 mod pane;
 mod persisted;
 mod project;

@@ -61,6 +61,7 @@ use gpui::{
 };
 
 use nice_model::shortcuts::{default_bindings, default_combo, ShortcutAction};
+use nice_model::SidebarMode;
 use nice_term_view::FontSettings;
 
 use crate::window_registry::WindowRegistry;
@@ -221,15 +222,27 @@ fn register_window_scoped_actions(cx: &mut App) {
         with_active_state(cx, |s, _cx| s.sidebar.toggle_sidebar());
     });
     cx.on_action(|_: &ToggleSidebarMode, cx: &mut App| {
-        with_active_state(cx, |s, _cx| s.sidebar.toggle_sidebar_mode());
+        with_active_state(cx, |s, _cx| {
+            s.sidebar.toggle_sidebar_mode();
+            // R19: persist the new per-window sidebar mode so it restores (the
+            // debounced upsert; a no-op when no store Global is installed).
+            s.save_to_store();
+        });
     });
     cx.on_action(|_: &ToggleHiddenFiles, cx: &mut App| {
-        with_active_state(cx, |_s, _cx| {
-            // DEFERRED to R19 (the file-browser hidden-files toggle). Routed
-            // through active_state — matching Swift's
-            // `appState.toggleFileBrowserHiddenFiles()` — so R19 has the window
-            // to mutate; registered (not silently missing) so ⌘⇧. is consumed
-            // rather than leaking to the pty. No-op today.
+        with_active_state(cx, |s, _cx| {
+            // R19: the Swift double gate (`appState.toggleFileBrowserHiddenFiles()`)
+            // — flip dotfile visibility for the active tab ONLY when the sidebar is
+            // in files mode AND a browser state already exists for that tab
+            // (`toggle_hidden_files_if_exists` enforces the second gate, allocating
+            // nothing when the user never opened the browser). Registered (not
+            // silently missing) so ⌘⇧. is consumed rather than leaking to the pty.
+            if s.sidebar.mode() != SidebarMode::Files {
+                return;
+            }
+            if let Some(tab_id) = s.model.active_tab_id().map(str::to_owned) {
+                s.file_browser.toggle_hidden_files_if_exists(&tab_id);
+            }
         });
     });
 }

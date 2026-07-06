@@ -157,6 +157,16 @@ impl ContextMenu {
         cx.emit(DismissEvent);
     }
 
+    /// The visible entry labels in order (separators skipped) — a read seam for
+    /// self-test scenarios asserting menu contents (e.g. the R19 file-browser
+    /// right-click visibility matrix + the Open With ▸ second stage).
+    pub(crate) fn item_labels(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(|i| i.label().map(str::to_string))
+            .collect()
+    }
+
     /// The Nice/Dark chrome slot table the popup paints with. Mirrors the shipped
     /// chrome band (`app::nice_dark_slots`): R10 chrome is Nice/Dark; palette
     /// switching is R21.

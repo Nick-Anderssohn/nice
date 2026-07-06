@@ -107,6 +107,13 @@ pub struct PersistedWindow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tab_id: Option<String>,
     pub sidebar_collapsed: bool,
+    /// R19: which sidebar mode (`tabs` / `files`) the window last showed, restored
+    /// per window (Swift's per-window `SceneStorage` mode). OPTIONAL so pre-R19
+    /// files decode (absent ⇒ Tabs, [`nice_model::SidebarMode`]'s restore default)
+    /// and the shape-tolerant schema stays non-breaking — R19 adds this schema
+    /// slot and is its sole writer/reader (the DO-NOT-SIMPLIFY seam split).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_mode: Option<nice_model::SidebarMode>,
     pub projects: Vec<PersistedProject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame: Option<PersistedFrame>,

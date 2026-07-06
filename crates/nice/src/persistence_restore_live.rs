@@ -563,6 +563,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
         id: "keep-me".into(),
         active_tab_id: None,
         sidebar_collapsed: false,
+        sidebar_mode: None,
         projects: sample_projects(),
         frame: Some(FIXTURE_FRAME),
     };
@@ -570,6 +571,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
         id: "ghost".into(),
         active_tab_id: None,
         sidebar_collapsed: false,
+        sidebar_mode: None,
         projects: vec![],
         frame: None,
     };

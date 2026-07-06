@@ -46,6 +46,7 @@
 use std::collections::HashSet;
 
 use gpui::{AnyWindowHandle, AppContext};
+use nice_model::file_browser::FileBrowserStore;
 use nice_model::{PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, TabModel};
 use nice_term_view::TerminalEvent;
 
@@ -197,6 +198,13 @@ pub(crate) struct WindowState {
     /// `observe_window_bounds` (skipped while fullscreen). `None` until the first
     /// bounds observation (⇒ default placement on restore).
     last_frame: Option<crate::session_store::PersistedFrame>,
+    /// R19: the per-window file-browser state catalog (`Tab.id → FileBrowserState`),
+    /// lazily populated when a tab first renders in files mode. In-memory only
+    /// (never persisted). The [`FileBrowserView`](crate::file_browser::view::FileBrowserView)
+    /// reads / mutates it through this handle; a dissolved tab's entry is dropped
+    /// via [`prune_dissolved_file_browser_states`](Self::prune_dissolved_file_browser_states)
+    /// off the session dissolve cascade.
+    pub(crate) file_browser: FileBrowserStore,
 }
 
 impl WindowState {
@@ -241,6 +249,12 @@ impl WindowState {
             pending_modal: None,
             modal_sub: None,
             last_frame: None,
+            // R19: seed the file-browser store's cwd-aware `show_hidden` heuristic
+            // against the injected home (the Swift `NSHomeDirectory()` seam). Empty
+            // states are created lazily on first files-mode render.
+            file_browser: FileBrowserStore::new(
+                std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+            ),
         }
     }
 
@@ -266,6 +280,7 @@ impl WindowState {
             projects,
             active_tab_id,
             sidebar_collapsed,
+            sidebar_mode,
             ..
         } = seed;
 
@@ -289,7 +304,9 @@ impl WindowState {
 
         let mut state = Self::with_model(model);
         state.session_id = window_id;
-        state.sidebar = SidebarModel::new(sidebar_collapsed, SidebarMode::Tabs);
+        // R19: restore the saved sidebar mode (absent ⇒ Tabs — the pre-R19 / never-
+        // toggled default).
+        state.sidebar = SidebarModel::new(sidebar_collapsed, sidebar_mode.unwrap_or(SidebarMode::Tabs));
         // Re-seed the selection from the (possibly repair-shifted) active tab.
         state.selection.sync_active_tab_id(state.model.active_tab_id());
         state
@@ -354,6 +371,10 @@ impl WindowState {
                 let routed = ws
                     .session
                     .route_terminal_event(model, selection, &t, &p, event);
+                // R19: a routed pane-exit may have dissolved a tab — drop its
+                // file-browser state (the pane-exit dissolve path, not covered by
+                // the UI-close methods above).
+                ws.prune_dissolved_file_browser_states();
                 // Re-render so `PaneHostView` re-activates: a routed pane removal
                 // shifts the active pane, and its activation change re-runs
                 // `activate_pane` (neighbor deferred-companion spawn + key focus),
@@ -904,6 +925,9 @@ impl WindowState {
             id: self.session_id.clone(),
             active_tab_id: self.model.active_tab_id().map(|s| s.to_string()),
             sidebar_collapsed: self.sidebar.collapsed(),
+            // R19: persist the live sidebar mode so a restored window reopens in
+            // the mode it was last in (absent on decode ⇒ Tabs).
+            sidebar_mode: Some(self.sidebar.mode()),
             projects: nice_model::snapshot_projects(&self.model.projects),
             frame: self.last_frame.clone(),
         }
@@ -985,6 +1009,17 @@ impl WindowState {
         self.pending_modal.clone()
     }
 
+    /// R19: drop the file-browser state of every tab dissolved since the last
+    /// drain (the session cascade records them; see
+    /// [`SessionManager::take_dissolved_tab_ids`]). Called after every cascade so a
+    /// long session doesn't accumulate stale per-tab browser states — the single
+    /// removal path for [`FileBrowserStore`](nice_model::file_browser::FileBrowserStore).
+    fn prune_dissolved_file_browser_states(&mut self) {
+        for tab_id in self.session.take_dissolved_tab_ids() {
+            self.file_browser.remove_state(&tab_id);
+        }
+    }
+
     /// Real close of a tab through the session manager (pty release + dissolve
     /// cascade) — the shipped-path replacement for the model-only
     /// `SidebarActions::close_tab` stub. Returns the terminus the caller actuates
@@ -994,6 +1029,7 @@ impl WindowState {
         let terminus = self
             .session
             .close_tab(&mut self.model, &mut self.selection, tab_id);
+        self.prune_dissolved_file_browser_states();
         self.save_to_store();
         terminus
     }
@@ -1005,6 +1041,7 @@ impl WindowState {
         for id in tab_ids {
             terminus = terminus.or(self.session.close_tab(&mut self.model, &mut self.selection, id));
         }
+        self.prune_dissolved_file_browser_states();
         self.save_to_store();
         terminus
     }
@@ -1054,6 +1091,7 @@ impl WindowState {
             }
             terminus
         };
+        self.prune_dissolved_file_browser_states();
         self.save_to_store();
         terminus
     }
@@ -1075,6 +1113,7 @@ impl WindowState {
             self.session
                 .dissolve_tab_if_empty(&mut self.model, &mut self.selection, tab_id)
         };
+        self.prune_dissolved_file_browser_states();
         self.save_to_store();
         terminus
     }
@@ -1355,6 +1394,7 @@ mod tests {
             projects: vec![terminals, proj],
             active_tab_id: active.map(str::to_string),
             sidebar_collapsed: collapsed,
+            sidebar_mode: None,
             frame: None,
         }
     }
@@ -1400,6 +1440,64 @@ mod tests {
         assert_eq!(
             t_a.parent_tab_id, None,
             "prune_dangling_parent_references clears a link to a non-existent parent"
+        );
+    }
+
+    // ---- R19: sidebar-mode persistence + file-browser dissolve cleanup ------
+
+    #[test]
+    fn persisted_snapshot_carries_sidebar_mode() {
+        // R19: the live sidebar mode round-trips through the snapshot (Swift's
+        // per-window SceneStorage mode). Fresh windows default to Tabs.
+        let ws = window_with_project();
+        assert_eq!(
+            ws.persisted_snapshot().sidebar_mode,
+            Some(SidebarMode::Tabs),
+            "a fresh window snapshots the default Tabs mode"
+        );
+        let mut ws = window_with_project();
+        ws.sidebar.toggle_sidebar_mode(); // Tabs → Files
+        assert_eq!(
+            ws.persisted_snapshot().sidebar_mode,
+            Some(SidebarMode::Files),
+            "toggling to files mode is captured in the snapshot"
+        );
+    }
+
+    #[test]
+    fn with_seed_restores_sidebar_mode_absent_defaults_tabs() {
+        // R19: a saved Files mode restores; an absent field (pre-R19 save) ⇒ Tabs.
+        let mut seed = restore_seed("w-files", Some("t-a"), false);
+        seed.sidebar_mode = Some(SidebarMode::Files);
+        let ws = WindowState::with_seed(seed);
+        assert_eq!(ws.sidebar.mode(), SidebarMode::Files, "the saved mode restores");
+
+        let ws = WindowState::with_seed(restore_seed("w-none", Some("t-a"), false));
+        assert_eq!(
+            ws.sidebar.mode(),
+            SidebarMode::Tabs,
+            "an absent sidebar_mode restores to Tabs (the pre-R19 default)"
+        );
+    }
+
+    #[test]
+    fn file_browser_state_dropped_on_tab_dissolve() {
+        // R19: the dissolve cascade drops the closed tab's file-browser state (the
+        // single removal path) so a long session doesn't leak per-tab states.
+        let mut ws = window_with_project();
+        ws.file_browser.ensure_state("t-a", "/home/u/proj");
+        ws.file_browser.ensure_state("t-b", "/home/u/proj");
+        assert!(ws.file_browser.state_for("t-a").is_some());
+
+        ws.close_tab_via_session("t-a");
+
+        assert!(
+            ws.file_browser.state_for("t-a").is_none(),
+            "the dissolved tab's file-browser state is dropped"
+        );
+        assert!(
+            ws.file_browser.state_for("t-b").is_some(),
+            "a surviving sibling keeps its file-browser state"
         );
     }
 

@@ -400,6 +400,21 @@ unsafe impl objc2::RefEncode for OpaqueCGContext {
 /// `NSCompositingOperationSourceOver`.
 const NS_COMPOSITING_SOURCE_OVER: u64 = 2;
 
+/// Opaque block type used ONLY to give a nil block argument (e.g. a
+/// `completionHandler:`) the Objective-C block encoding (`@?`) objc2's debug
+/// `msg_send!` verification demands — passing a bare `*mut AnyObject` (`@`) there
+/// panics on the encoding mismatch, the same gotcha as [`OpaqueCGContext`].
+#[repr(C)]
+struct OpaqueBlock {
+    _priv: [u8; 0],
+}
+
+// SAFETY: `*mut OpaqueBlock` encodes as `@?`, the block-pointer encoding a
+// `completionHandler:` argument declares.
+unsafe impl objc2::RefEncode for OpaqueBlock {
+    const ENCODING_REF: objc2::Encoding = objc2::Encoding::Block;
+}
+
 /// One rasterized SF Symbol: a straight (non-premultiplied) per-pixel coverage
 /// mask, row-major, top row first, one byte per device pixel.
 pub struct SymbolBitmap {
@@ -710,9 +725,12 @@ type CfTypeRef = *const c_void;
 pub const FLAG_COMMAND: u64 = 0x0010_0000;
 
 /// The `CGEventFlags` ⌥ (Option / Alternate) mask — carried with ⌘ on the
-/// `multiwindow` scenario's ⌘⌥↓ sidebar-tab chord. (The remaining shift `0x20000`
-/// / control `0x40000` masks stay omitted until a chord assertion needs one.)
+/// `multiwindow` scenario's ⌘⌥↓ sidebar-tab chord.
 pub const FLAG_OPTION: u64 = 0x0008_0000;
+
+/// The `CGEventFlags` ⇧ (Shift) mask — carried with ⌘ on the R19 `file-browser`
+/// scenario's ⌘⇧B (toggle sidebar mode) and ⌘⇧. (toggle hidden files) chords.
+pub const FLAG_SHIFT: u64 = 0x0002_0000;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -1624,4 +1642,213 @@ pub fn apple_action_on_double_click() -> DoubleClickAction {
 unsafe fn ns_string(s: &str) -> *mut AnyObject {
     let c = std::ffi::CString::new(s).unwrap_or_default();
     msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
+}
+
+// ===========================================================================
+// R19 file-browser workspace calls — the FIVE OS-integration primitives behind
+// the `WorkspaceOps` seam (`crate::file_browser::workspace_ops`): open with the
+// OS default, open with a chosen application, reveal in Finder, enumerate the
+// applications that can open a file (+ the default), and the "Other…" chooser.
+//
+// This is the ONLY module allowed to make the workspace / open-panel objc2
+// calls (the hermeticity audit greps for that: the production symbols live here
+// and nowhere else in `crates/nice/src`). Every call is reached ONLY through the
+// `WorkspaceOps` Global — the production impl wires these; `run_selftest`
+// installs a recording fake that never enters this file. All are main-thread /
+// autorelease-pool callers (a gpui menu action), the same contract as the
+// geometry readers above.
+// ===========================================================================
+
+/// Extract a Rust `String` from an `NSString *` (via `-UTF8String`). `None` for
+/// a null string or a null UTF-8 buffer.
+///
+/// # Safety
+/// `s` is a valid `NSString *` or null; main thread with an autorelease pool.
+unsafe fn string_from_ns(s: *mut AnyObject) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    let utf8: *const std::os::raw::c_char = msg_send![s, UTF8String];
+    if utf8.is_null() {
+        return None;
+    }
+    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+}
+
+/// `-[NSURL fileURLWithPath:]` for `path`.
+///
+/// # Safety
+/// Main thread with an autorelease pool.
+unsafe fn file_url(path: &str) -> *mut AnyObject {
+    let ns = ns_string(path);
+    msg_send![class!(NSURL), fileURLWithPath: ns]
+}
+
+/// The symlink-resolved, standardized filesystem path of a file `NSURL` — the
+/// key the Open-With ordering dedupes on (one bundle reachable through several
+/// symlinks collapses to one entry).
+///
+/// # Safety
+/// `url` is a valid file `NSURL *`; main thread with an autorelease pool.
+unsafe fn standardized_path(url: *mut AnyObject) -> Option<String> {
+    if url.is_null() {
+        return None;
+    }
+    let resolved: *mut AnyObject = msg_send![url, URLByResolvingSymlinksInPath];
+    let use_url = if resolved.is_null() { url } else { resolved };
+    let path: *mut AnyObject = msg_send![use_url, path];
+    string_from_ns(path)
+}
+
+/// An application bundle's display name: `CFBundleDisplayName` → `CFBundleName`
+/// → the file name without its extension (`OpenWithProvider.swift` parity).
+///
+/// # Safety
+/// `app_url` is a valid application-bundle `NSURL *`; main thread + pool.
+unsafe fn app_display_name(app_url: *mut AnyObject) -> String {
+    let bundle: *mut AnyObject = msg_send![class!(NSBundle), bundleWithURL: app_url];
+    if !bundle.is_null() {
+        for key in ["CFBundleDisplayName", "CFBundleName"] {
+            let k = ns_string(key);
+            let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: k];
+            if let Some(name) = string_from_ns(value) {
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
+    }
+    // Fallback: the last path component without the `.app` extension.
+    let last: *mut AnyObject = msg_send![app_url, lastPathComponent];
+    let file = string_from_ns(last).unwrap_or_default();
+    file.strip_suffix(".app").unwrap_or(&file).to_string()
+}
+
+/// `-[NSWorkspace openURL:]` — open `path` with the OS default handler.
+///
+/// # Safety
+/// Main thread with an autorelease pool.
+pub fn workspace_open(path: &str) {
+    unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let url = file_url(path);
+        let _: Bool = msg_send![ws, openURL: url];
+    }
+}
+
+/// `-[NSWorkspace openURLs:withApplicationAtURL:configuration:completionHandler:]`
+/// — open `path` with the application at `app_path` (nil completion handler).
+///
+/// # Safety
+/// Main thread with an autorelease pool.
+pub fn workspace_open_with(path: &str, app_path: &str) {
+    unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let url = file_url(path);
+        let app_url = file_url(app_path);
+        let urls: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: url];
+        let config: *mut AnyObject =
+            msg_send![class!(NSWorkspaceOpenConfiguration), configuration];
+        // The completion handler is a block param (`@?`), not a plain object —
+        // give the nil the block encoding so objc2's debug encoding check accepts
+        // it (the same class of gotcha as `OpaqueCGContext` above).
+        let null_handler: *mut OpaqueBlock = std::ptr::null_mut();
+        let _: () = msg_send![
+            ws,
+            openURLs: urls,
+            withApplicationAtURL: app_url,
+            configuration: config,
+            completionHandler: null_handler
+        ];
+    }
+}
+
+/// `-[NSWorkspace activateFileViewerSelectingURLs:]` — reveal `path` in Finder.
+///
+/// # Safety
+/// Main thread with an autorelease pool.
+pub fn workspace_reveal(path: &str) {
+    unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let url = file_url(path);
+        let urls: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: url];
+        let _: () = msg_send![ws, activateFileViewerSelectingURLs: urls];
+    }
+}
+
+/// `-[NSWorkspace URLsForApplicationsToOpenURL:]` + `URLForApplicationToOpenURL:`
+/// — every application that can open `path`, as `(standardized_app_path,
+/// display_name)` in Launch Services order, plus the user's default app path (if
+/// any). The `WorkspaceOps` production impl feeds this into the pure Open-With
+/// ordering function.
+///
+/// # Safety
+/// Main thread with an autorelease pool.
+pub fn workspace_apps_for(path: &str) -> (Vec<(String, String)>, Option<String>) {
+    unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let target = file_url(path);
+
+        let arr: *mut AnyObject = msg_send![ws, URLsForApplicationsToOpenURL: target];
+        let mut apps: Vec<(String, String)> = Vec::new();
+        if !arr.is_null() {
+            let count: usize = msg_send![arr, count];
+            for i in 0..count {
+                let app_url: *mut AnyObject = msg_send![arr, objectAtIndex: i];
+                if let Some(std_path) = standardized_path(app_url) {
+                    let name = app_display_name(app_url);
+                    apps.push((std_path, name));
+                }
+            }
+        }
+
+        let default_url: *mut AnyObject = msg_send![ws, URLForApplicationToOpenURL: target];
+        let default = standardized_path(default_url);
+        (apps, default)
+    }
+}
+
+/// The "Other…" chooser: an `NSOpenPanel` rooted at `/Applications`, filtered to
+/// application bundles, prompt "Open". Returns the chosen application's path, or
+/// `None` if the user cancels. Modal — production only (the recording fake
+/// answers in tests / scenarios).
+///
+/// # Safety
+/// Main thread with an autorelease pool.
+pub fn workspace_choose_application() -> Option<String> {
+    // `NSModalResponseOK` — the panel's accept response.
+    const NS_MODAL_RESPONSE_OK: isize = 1;
+    unsafe {
+        let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
+        if panel.is_null() {
+            return None;
+        }
+        let _: () = msg_send![panel, setCanChooseFiles: true];
+        let _: () = msg_send![panel, setCanChooseDirectories: false];
+        let _: () = msg_send![panel, setAllowsMultipleSelection: false];
+        let _: () = msg_send![panel, setResolvesAliases: true];
+        let apps_dir = file_url("/Applications");
+        let _: () = msg_send![panel, setDirectoryURL: apps_dir];
+        let prompt = ns_string("Open");
+        let _: () = msg_send![panel, setPrompt: prompt];
+        // Restrict to `.app` bundles.
+        let app_type = ns_string("app");
+        let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: app_type];
+        let _: () = msg_send![panel, setAllowedFileTypes: types];
+
+        let response: isize = msg_send![panel, runModal];
+        if response != NS_MODAL_RESPONSE_OK {
+            return None;
+        }
+        let urls: *mut AnyObject = msg_send![panel, URLs];
+        if urls.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![urls, count];
+        if count == 0 {
+            return None;
+        }
+        let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
+        standardized_path(url)
+    }
 }
