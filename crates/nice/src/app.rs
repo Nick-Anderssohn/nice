@@ -982,11 +982,20 @@ pub fn run() {
         // resolution live here in app::run ONLY — `run_selftest` installs a
         // defaults+temp store + the catalog stub (no SharedThemeState, no write).
         // Slice 3 extends this boot order (OS reconcile + the R17-live wiring).
+        // R22: resolve the imported-theme storage dir under the same
+        // `<support-root>/Nice RS Dev/` root (via `NICE_APPLICATION_SUPPORT_ROOT`)
+        // and create it on demand, then thread it into the catalog the live theme
+        // installs enumerate at boot. Path resolution + the create live in
+        // app::run ONLY — `run_selftest` hands a throwaway temp dir (no write).
+        let terminal_themes_dir =
+            crate::terminal_theme_catalog::default_terminal_themes_dir();
+        let _ = std::fs::create_dir_all(&terminal_themes_dir);
         crate::theme_settings::install_live_theme(
             cx,
             crate::theme_settings::ThemeSettingsStore::load(
                 crate::theme_settings::default_theme_settings_path(),
             ),
+            terminal_themes_dir,
         );
         // R21: now that the live `SharedThemeState` carries the active resolved
         // triple, do the R17 boot Claude theme-sync write from it (gate-gated
@@ -3751,9 +3760,17 @@ pub fn run_selftest(selector: String) {
             "nice-rs-selftest-theme-settings-{}.json",
             std::process::id()
         ));
+        // R22: a throwaway temp terminal-themes dir — never the real
+        // `terminal-themes/`. `TerminalThemeCatalog::new` enumerates it read-only
+        // (it does not exist ⇒ empty imports), so there is no launch-time write.
+        let terminal_themes_dir = std::env::temp_dir().join(format!(
+            "nice-rs-selftest-terminal-themes-{}",
+            std::process::id()
+        ));
         crate::theme_settings::install_selftest_theme_defaults(
             cx,
             crate::theme_settings::ThemeSettingsStore::with_defaults(theme_path),
+            terminal_themes_dir,
         );
         nice_harness::selftest::drive(cx, &selector, scenarios);
     });

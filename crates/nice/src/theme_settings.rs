@@ -505,10 +505,17 @@ fn fallback_chrome_slots() -> Slots {
 /// Install the live theme globals for the shipped app (`app::run` ONLY, before
 /// the first window): the production [`OsSchemeSource`], the loaded `store` (its
 /// scheme reconciled to the OS appearance in memory for a sync-on install), the
-/// built-in catalog stub, and the [`SharedThemeState`] entity minted from them.
-/// The per-window `Window::observe_window_appearance` adapter (wired in
-/// `build_window_root`) and the R17-live Claude write ride on top of this.
-pub fn install_live_theme(cx: &mut App, mut store: ThemeSettingsStore) {
+/// terminal-theme catalog (the full built-in table + the imported files
+/// enumerated from `terminal_themes_dir`, resolved by `app::run` under the
+/// `NICE_APPLICATION_SUPPORT_ROOT` convention), and the [`SharedThemeState`]
+/// entity minted from them. The per-window `Window::observe_window_appearance`
+/// adapter (wired in `build_window_root`) and the R17-live Claude write ride on
+/// top of this.
+pub fn install_live_theme(
+    cx: &mut App,
+    mut store: ThemeSettingsStore,
+    terminal_themes_dir: PathBuf,
+) {
     // Register the production OS-scheme source first, then reconcile the loaded
     // selection to the current OS appearance in memory (a sync-on fresh install
     // adopts the system scheme — the `scheme = OS at first launch` default) BEFORE
@@ -518,7 +525,7 @@ pub fn install_live_theme(cx: &mut App, mut store: ThemeSettingsStore) {
     if let Some(os) = current_os_scheme(cx) {
         store.reconcile_scheme_in_memory(os);
     }
-    let catalog = TerminalThemeCatalog::with_builtins();
+    let catalog = TerminalThemeCatalog::new(terminal_themes_dir);
     let entity = cx.new(|_| ThemeState::from_stores(&store, &catalog));
     cx.set_global(store);
     cx.set_global(catalog);
@@ -794,12 +801,18 @@ pub(crate) fn claude_sync_if_gated(cx: &App) {
 }
 
 /// Install the self-test theme globals (`run_selftest`): the defaults+temp store
-/// and the catalog stub, but NOT [`SharedThemeState`] — scenarios paint the
-/// Nice/Dark fallback unless a scenario opts into live theming by minting the
-/// entity itself (slice 3's `theme-fanout`). No launch-time write (hermeticity).
-pub fn install_selftest_theme_defaults(cx: &mut App, store: ThemeSettingsStore) {
+/// and the catalog over a throwaway temp `terminal_themes_dir`, but NOT
+/// [`SharedThemeState`] — scenarios paint the Nice/Dark fallback unless a scenario
+/// opts into live theming by minting the entity itself (slice 3's `theme-fanout`).
+/// `TerminalThemeCatalog::new` enumerates the (nonexistent) temp dir read-only, so
+/// there is no launch-time write (hermeticity).
+pub fn install_selftest_theme_defaults(
+    cx: &mut App,
+    store: ThemeSettingsStore,
+    terminal_themes_dir: PathBuf,
+) {
     cx.set_global(store);
-    cx.set_global(TerminalThemeCatalog::with_builtins());
+    cx.set_global(TerminalThemeCatalog::new(terminal_themes_dir));
 }
 
 #[cfg(test)]
@@ -1013,13 +1026,18 @@ mod tests {
         assert_eq!(off.active_slots(), nice_theme::palette::NICE_DARK);
     }
 
-    /// `active_terminal_id` selects the per-scheme slot; combined with the stub
-    /// catalog the default Catppuccin ids resolve to the Nice default (the
-    /// R22-additive fallback). Named per Validation §1.
+    /// `active_terminal_id` selects the per-scheme slot; combined with R22's full
+    /// catalog the default Catppuccin ids now resolve to the REAL Catppuccin
+    /// built-ins (the additive upgrade, no default-flip), while a genuinely
+    /// unknown id still falls back to the Nice default per scheme.
     #[test]
     fn active_terminal_id_and_unknown_id_nice_default_fallback() {
         use crate::terminal_theme_catalog::TerminalThemeCatalog;
-        let catalog = TerminalThemeCatalog::with_builtins();
+        // A hermetic catalog over a throwaway temp dir (no imports).
+        let catalog = TerminalThemeCatalog::new(std::env::temp_dir().join(format!(
+            "nice-rs-theme-settings-catalog-{}",
+            std::process::id()
+        )));
 
         let a = Appearance::default();
 
@@ -1035,14 +1053,19 @@ mod tests {
         };
         assert_eq!(dark.active_terminal_id(), "catppuccin-mocha");
 
-        // The stub catalog lacks those ids → Nice default per scheme.
-        assert_eq!(
+        // R22: those ids are real built-ins now — NOT the Nice-default fallback.
+        assert_ne!(
             catalog.resolve(light.active_terminal_id(), ColorScheme::Light),
             nice_term_view::TerminalTheme::nice_default_light()
         );
-        assert_eq!(
+        assert_ne!(
             catalog.resolve(dark.active_terminal_id(), ColorScheme::Dark),
             nice_term_view::TerminalTheme::nice_default_dark()
+        );
+        // A genuinely unknown id still falls back per scheme.
+        assert_eq!(
+            catalog.resolve("does-not-exist", ColorScheme::Light),
+            nice_term_view::TerminalTheme::nice_default_light()
         );
     }
 

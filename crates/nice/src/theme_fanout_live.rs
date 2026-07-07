@@ -32,6 +32,12 @@
 //!   sandbox `nice-rs.json` colors file (byte-diff via the landed only-if-changed
 //!   writer); `apply_sync_claude_theme` re-sources every window's `--settings`
 //!   provider so a subsequently-spawned pane would get / lose the flag.
+//! * **(f) R22 Ghostty import end-to-end.** A fixture `.ghostty` written under the
+//!   sandbox support root is `import_theme`d through the Global catalog (parse →
+//!   persist verbatim as `<slug>.ghostty` → enter the imported list), resolves by
+//!   id, and — once `apply_terminal_theme_id` (R21) makes it live for the active
+//!   scheme — recolors the live terminal pane (render theme swap + a pixel sample),
+//!   proving parse → persist → catalog → resolve → fan-out on a real window.
 //!
 //! ## Hermeticity (tranche-5 rule)
 //!
@@ -56,7 +62,7 @@ use gpui::{AnyWindowHandle, AppContext as _, AsyncApp, Entity, WindowHandle};
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_theme::palette::{ColorScheme, Slots};
 use nice_theme::AccentPreset;
-use nice_term_view::TerminalTheme;
+use nice_term_view::{TerminalColor, TerminalTheme};
 
 use crate::app_shell::{AppShellView, PaneHostView};
 use crate::terminal_theme_catalog::TerminalThemeCatalog;
@@ -73,6 +79,10 @@ struct Fixture {
     home: PathBuf,
     zdotdir: PathBuf,
     theme_store_path: PathBuf,
+    /// The imported terminal-theme storage dir (R22) — the catalog enumerates it
+    /// at boot and `import_theme` persists into it. Under the temp base, never the
+    /// real `terminal-themes/` (hermeticity).
+    terminal_themes_dir: PathBuf,
 }
 
 impl Fixture {
@@ -105,7 +115,14 @@ impl Fixture {
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
         let theme_store_path = base.join("ui_settings.json");
-        Ok(Fixture { base, home, zdotdir, theme_store_path })
+        let terminal_themes_dir = base.join("terminal-themes");
+        Ok(Fixture {
+            base,
+            home,
+            zdotdir,
+            theme_store_path,
+            terminal_themes_dir,
+        })
     }
 
     /// The sandbox Claude colors file the R17-live write lands at
@@ -144,6 +161,7 @@ pub fn open_theme_fanout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let home = fixture.home.to_string_lossy().into_owned();
     let zdotdir = fixture.zdotdir.to_string_lossy().into_owned();
     let theme_path = fixture.theme_store_path.clone();
+    let terminal_themes_dir = fixture.terminal_themes_dir.clone();
     // The injected OS scheme stub, shared with the driver so it can flip it. Seeded
     // Dark (matches the store's fresh-install placeholder, so the boot reconcile is
     // a no-op and the baseline is deterministic).
@@ -159,7 +177,9 @@ pub fn open_theme_fanout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         // — a scenario opting into live theming mints them itself). Override the
         // defaults store with one at the sandbox path so apply_* persists hermetically.
         let store = ThemeSettingsStore::load(theme_path.clone());
-        let catalog = TerminalThemeCatalog::with_builtins();
+        // R22: the catalog over the sandbox terminal-themes dir (empty at boot),
+        // so the import leg's `import_theme` persists + resolves hermetically.
+        let catalog = TerminalThemeCatalog::new(terminal_themes_dir.clone());
         let entity = {
             let state = ThemeState::from_stores(&store, &catalog);
             app.new(|_| state)
@@ -333,6 +353,7 @@ async fn run_theme_fanout(
     accent_leg(cx, &pane_host, &main_pane, &mut failures).await;
     terminal_id_latency_leg(cx, any, &pane_host, &main_pane, &mut failures).await;
     claude_sync_leg(cx, &state, fixture, &mut failures).await;
+    imported_theme_leg(cx, any, &pane_host, &main_pane, fixture, &mut failures).await;
 
     build_report(failures)
 }
@@ -573,6 +594,111 @@ async fn claude_sync_leg(
     }
 }
 
+// -- leg (f): R22 Ghostty import — parse → persist → catalog → resolve → paint -
+
+/// A well-formed Ghostty theme fixture with a vivid magenta background (so the
+/// recolor is unmistakable against the dark baseline) and a full 16-entry palette.
+fn imported_theme_source() -> String {
+    let mut s = String::from(
+        "# imported neon fixture\n\
+         background = #ff00ff\n\
+         foreground = #ffffff\n\
+         cursor-color = #ffff00\n\
+         selection-background = #202020\n",
+    );
+    for i in 0..16u8 {
+        s.push_str(&format!("palette = {i}=#00{i:02x}00\n"));
+    }
+    s
+}
+
+/// End-to-end R22 leg: write a fixture `.ghostty` under the sandbox support root,
+/// `import_theme` it through the Global catalog, confirm it persisted as
+/// `<slug>.ghostty` + entered the catalog + resolves, then `apply_terminal_theme_id`
+/// (R21) to its id for the active scheme and assert the live terminal pane recolors
+/// to the imported background — proving parse → persist → catalog → resolve → R21
+/// fan-out on a real window.
+async fn imported_theme_leg(
+    cx: &mut AsyncApp,
+    handle: AnyWindowHandle,
+    pane_host: &Entity<PaneHostView>,
+    pane_id: &str,
+    fixture: &Fixture,
+    failures: &mut Vec<String>,
+) {
+    const NEON: TerminalColor = TerminalColor::new(0xff, 0x00, 0xff);
+
+    let Some((theme_before, _)) = terminal_theme_accent(cx, pane_host, pane_id) else {
+        failures.push("(f) baseline: Main pane TerminalView vanished".into());
+        return;
+    };
+    let pixels_before = sample_terminal(cx, handle).ok();
+
+    // Write the fixture into the sandbox terminal-themes dir (create-on-demand).
+    if let Err(e) = std::fs::create_dir_all(&fixture.terminal_themes_dir) {
+        failures.push(format!("(f) could not create the sandbox terminal-themes dir: {e}"));
+        return;
+    }
+    let fixture_path = fixture.terminal_themes_dir.join("Imported Neon.ghostty");
+    if let Err(e) = std::fs::write(&fixture_path, imported_theme_source()) {
+        failures.push(format!("(f) could not write the fixture theme file: {e}"));
+        return;
+    }
+
+    // Import through the Global catalog (the R22 Exported surface).
+    let import = cx.update(|app| {
+        app.global_mut::<TerminalThemeCatalog>()
+            .import_theme(&fixture_path)
+    });
+    let entry = match import {
+        Ok(e) => e,
+        Err(e) => {
+            failures.push(format!("(f) import_theme rejected a well-formed fixture: {e:?}"));
+            return;
+        }
+    };
+    if entry.id != "imported-neon" {
+        failures.push(format!("(f) import slug mismatch: got '{}', want 'imported-neon'", entry.id));
+    }
+    // Persisted under the temp support root as `<slug>.ghostty`.
+    if !fixture.terminal_themes_dir.join("imported-neon.ghostty").exists() {
+        failures.push("(f) import did not persist <slug>.ghostty under the temp support root".into());
+    }
+    // Entered the catalog: resolves to its background for the active scheme.
+    let active = store_scheme(cx);
+    let resolved_bg = cx.update(|app| {
+        app.global::<TerminalThemeCatalog>()
+            .resolve(&entry.id, active)
+            .background
+    });
+    if resolved_bg != NEON {
+        failures.push("(f) the imported theme did not resolve to its background through the catalog".into());
+    }
+
+    // Make it live for the active scheme (R21 mutator) — the pane recolors.
+    cx.update(|app| theme_settings::apply_terminal_theme_id(app, active, &entry.id));
+    settle(cx, 300).await;
+
+    match terminal_theme_accent(cx, pane_host, pane_id) {
+        Some((theme_now, _)) if theme_now != theme_before && theme_now.background == NEON => {
+            eprintln!("[selftest] theme-fanout (f): an imported Ghostty theme parsed → persisted → entered the catalog → resolved → recolored the live pane");
+        }
+        Some(_) => failures
+            .push("(f) the imported theme did not recolor the Main pane's render theme".into()),
+        None => failures.push("(f) the Main pane TerminalView vanished after applying the import".into()),
+    }
+    if let (Some(before), Some(after)) = (pixels_before, sample_terminal(cx, handle).ok()) {
+        let delta = max_channel_delta(&before, &after);
+        if delta <= 8 {
+            failures.push(format!(
+                "(f) the live terminal did not recolor to the imported theme (max channel delta {delta} <= 8)"
+            ));
+        } else {
+            eprintln!("[selftest] theme-fanout (f): live terminal pixel recolored to the imported theme (max channel delta {delta})");
+        }
+    }
+}
+
 // -- reads / report ----------------------------------------------------------
 
 fn active_tab_and_pane(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<(String, String)> {
@@ -594,7 +720,9 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      recolored the pane accent (the cursor-None caret); (c) an inactive-slot terminal-id \
                      change was latent (no recolor, persisted) and the next scheme flip applied it; \
                      (e) the gate ON re-sourced the --settings provider + wrote the colors file, a gate-ON \
-                     theme change rewrote it (byte-diff), and the gate OFF cleared the provider"
+                     theme change rewrote it (byte-diff), and the gate OFF cleared the provider; \
+                     (f) an imported Ghostty theme parsed → persisted as <slug>.ghostty under the temp \
+                     support root → entered the catalog → resolved → recolored the live terminal pane"
                 .to_string(),
         }
     } else {
