@@ -44,7 +44,7 @@ use gpui::{
 };
 
 use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
-use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
+use nice_theme::palette::Slots;
 
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
@@ -169,10 +169,11 @@ impl ConfirmationModal {
         cx.emit(DismissEvent);
     }
 
-    /// The Nice/Dark chrome slot table (mirrors [`crate::context_menu`]).
-    fn chrome_slots() -> Slots {
-        slots(Palette::Nice, ColorScheme::Dark)
-            .expect("Nice + Dark is a valid palette/scheme combo")
+    /// The active chrome slot table (mirrors [`crate::context_menu`]) — the live
+    /// [`SharedThemeState`](crate::theme_settings::SharedThemeState) (Nice/Dark
+    /// fallback when the theme global is absent). R21: was a fixed Nice/Dark table.
+    fn chrome_slots(cx: &App) -> Slots {
+        crate::theme_settings::active_chrome_slots(cx)
     }
 }
 
@@ -186,7 +187,7 @@ impl EventEmitter<DismissEvent> for ConfirmationModal {}
 
 impl Render for ConfirmationModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = Self::chrome_slots();
+        let s = Self::chrome_slots(cx);
         let hover = srgba_to_rgba(srgba_with_alpha(
             crate::theme::slot_srgba(s.ink),
             HOVER_INK_ALPHA,

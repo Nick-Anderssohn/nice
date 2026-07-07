@@ -59,7 +59,7 @@ use crate::inline_rename::{
     dispatch_rename_key, edit_spans, EditSpans, FieldColors, FieldProbe, RenameKeyOutcome,
 };
 use nice_theme::color::Srgba;
-use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
+use nice_theme::palette::Slots;
 
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::file_browser::history::FileOperationHistoryGlobal;
@@ -1888,7 +1888,7 @@ impl Focusable for FileBrowserView {
 impl gpui::Render for FileBrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_scale = window.scale_factor();
-        let s = chrome_slots();
+        let s = chrome_slots(cx);
 
         // Deferred Open With ▸ second stage: open it now (render has the Window
         // `ContextMenu::new` needs; the first menu already dismissed).
@@ -1981,8 +1981,11 @@ impl gpui::Render for FileBrowserView {
 
 // MARK: - Free helpers -------------------------------------------------------
 
-fn chrome_slots() -> Slots {
-    slots(Palette::Nice, ColorScheme::Dark).expect("Nice + Dark is a valid palette/scheme combo")
+/// The active chrome slot table for the file browser — the live
+/// [`SharedThemeState`](crate::theme_settings::SharedThemeState) (Nice/Dark
+/// fallback when the theme global is absent). R21: was a fixed Nice/Dark table.
+fn chrome_slots(cx: &gpui::App) -> Slots {
+    crate::theme_settings::active_chrome_slots(cx)
 }
 
 /// Row colours resolved once per render and copied into each row.
@@ -2245,8 +2248,8 @@ struct DragPreview {
 }
 
 impl gpui::Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let s = chrome_slots();
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = chrome_slots(cx);
         let label = if self.count == 1 {
             "1 item".to_string()
         } else {

@@ -81,8 +81,7 @@ use nice_theme::chrome_geometry::{
     SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, TOP_BAR_HEIGHT,
 };
 use nice_theme::color::Srgba;
-use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
-use nice_theme::AccentPreset;
+use nice_theme::palette::Slots;
 
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
@@ -203,17 +202,20 @@ fn disclosure_glyph(is_open: bool) -> &'static str {
 
 // ---- Colour helpers (Nice/Dark; the SidebarBackground palette seam) ----------
 
-/// The R10 chrome slot table — Nice/Dark, matching the shipped chrome band
-/// (`crate::app::nice_dark_slots`). Palette switching is R21.
-fn dark_slots() -> Slots {
-    slots(Palette::Nice, ColorScheme::Dark).expect("Nice + Dark is a valid palette/scheme combo")
+/// The active chrome slot table — the live
+/// [`SharedThemeState`](crate::theme_settings::SharedThemeState) (Nice/Dark
+/// fallback when the theme global is absent, i.e. the isolated `sidebar`
+/// scenario). R21: was a fixed Nice/Dark table.
+fn active_slots(cx: &App) -> Slots {
+    crate::theme_settings::active_chrome_slots(cx)
 }
 
 /// The `SidebarBackground` palette-switch seam (`SidebarBackground.swift:21-46`).
-/// R10 ships the flat `.nice` arm only: the sidebar column paints a flat
-/// `niceBg2` panel. R21 slots the vibrancy materials (the `.macOS`
-/// / Catppuccin arms) in here; keeping the switch behind one function is what
-/// makes that a localized change.
+/// R21 (S9): the sidebar column paints the ACTIVE palette's `background2` slot as
+/// a flat panel — Nice reads as the flat `niceBg2` panel, Catppuccin as its flat
+/// tinted `background2` (real vibrancy + the macOS arm are deferred with the macOS
+/// palette). Because `s` is now the active palette's slots (via
+/// [`active_slots`]), this seam follows the live theme with no extra branch.
 fn sidebar_background(s: &Slots) -> Rgba {
     slot_to_rgba(s.background2)
 }
@@ -407,7 +409,11 @@ impl SidebarShellView {
             focus_handle: cx.focus_handle(),
             pane_host: None,
             focus_bounce_sub: None,
-            accent: AccentPreset::Terracotta.color(),
+            // R21: seed the accent from the live `SharedThemeState` (Terracotta
+            // fallback when the theme global is absent, i.e. isolated scenarios).
+            // The render path re-reads it live per frame; this seed feeds the
+            // `accent()` accessor + the lazily-minted file browser.
+            accent: crate::theme_settings::active_chrome_accent(cx),
             window_scale: 2.0,
         }
     }
@@ -966,7 +972,7 @@ impl SidebarShellView {
         mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let s = dark_slots();
+        let s = active_slots(cx);
         // `flex_row_reverse` keeps the LAYOUT exactly as before — the first
         // child sits at the main-end, so the main column still fills the right
         // and the card still docks left — while flipping the PAINT order to
@@ -979,7 +985,7 @@ impl SidebarShellView {
             .flex()
             .flex_row_reverse()
             .size_full()
-            .child(self.build_main_column())
+            .child(self.build_main_column(cx))
             .child(self.build_top_bar_divider(&s))
             .child(self.build_sidebar_card(&groups, true, false, mode, cx))
     }
@@ -991,7 +997,7 @@ impl SidebarShellView {
         peeking_model: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let s = dark_slots();
+        let s = active_slots(cx);
         let peeking = peeking_model || self.peek_mouse_pinned;
         let peek = peeking.then(|| self.build_peek_overlay(&groups, peeking, mode, cx));
         div()
@@ -1033,7 +1039,7 @@ impl SidebarShellView {
                     ))
                     .child(self.build_collapsed_top_accessory(&s)),
             )
-            .child(self.build_main_body())
+            .child(self.build_main_body(cx))
             // The Item C divider paints over the band chrome but under the
             // peek overlay (emitted next).
             .child(self.build_top_bar_divider(&s))
@@ -1054,7 +1060,7 @@ impl SidebarShellView {
         mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let s = dark_slots();
+        let s = active_slots(cx);
         let card_width = if resizable {
             self.sidebar_width
         } else {
@@ -1097,7 +1103,7 @@ impl SidebarShellView {
     /// move, double-click zoom); the buttons consume their own presses so the
     /// band passes them through.
     fn build_top_strip(&self, s: &Slots, mode: SidebarMode, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = self.accent;
+        let accent = crate::theme_settings::active_chrome_accent(cx);
         let tabs_active = mode == SidebarMode::Tabs;
         let files_active = mode == SidebarMode::Files;
         div()
@@ -1431,7 +1437,7 @@ impl SidebarShellView {
     }
 
     fn build_tab_row(&self, t: &TabVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let accent = self.accent;
+        let accent = crate::theme_settings::active_chrome_accent(cx);
         let ink = slot_to_rgba(s.ink);
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
@@ -1676,27 +1682,27 @@ impl SidebarShellView {
     /// `sidebar` scenario); R13.5's composed shell replaces it with the toolbar
     /// band + pane-content host via the [`main_toolbar`](Self::main_toolbar) /
     /// [`main_body`](Self::main_body) slots.
-    fn build_content(&self) -> impl IntoElement {
+    fn build_content(&self, cx: &App) -> impl IntoElement {
         div()
             .flex_1()
             .min_h_0()
             .size_full()
-            .bg(slot_to_rgba(dark_slots().background))
+            .bg(slot_to_rgba(active_slots(cx).background))
     }
 
     /// The expanded shell's right column: the toolbar band stacked over the pane
     /// body (Swift's `VStack { WindowToolbarView ; mainContent }`). When no
     /// content is injected this is the placeholder [`build_content`](Self::build_content)
     /// verbatim, so the isolated `sidebar` scenario's layout is unchanged.
-    fn build_main_column(&self) -> gpui::AnyElement {
+    fn build_main_column(&self, cx: &App) -> gpui::AnyElement {
         if self.main_toolbar.is_none() && self.main_body.is_none() {
-            return self.build_content().into_any_element();
+            return self.build_content(cx).into_any_element();
         }
         let mut col = div().flex().flex_col().flex_1().min_w_0().h_full();
         if let Some(toolbar) = &self.main_toolbar {
             col = col.child(toolbar.clone());
         }
-        col.child(self.build_main_body()).into_any_element()
+        col.child(self.build_main_body(cx)).into_any_element()
     }
 
     /// The collapsed shell's top-row accessory beside the cap: the toolbar band
@@ -1722,7 +1728,7 @@ impl SidebarShellView {
 
     /// The pane content fill below the toolbar / cap row: the injected pane-host
     /// when composed, else the placeholder [`build_content`](Self::build_content).
-    fn build_main_body(&self) -> gpui::AnyElement {
+    fn build_main_body(&self, cx: &App) -> gpui::AnyElement {
         if let Some(body) = &self.main_body {
             div()
                 .flex_1()
@@ -1730,7 +1736,7 @@ impl SidebarShellView {
                 .child(body.clone())
                 .into_any_element()
         } else {
-            self.build_content().into_any_element()
+            self.build_content(cx).into_any_element()
         }
     }
 
@@ -1903,7 +1909,7 @@ impl Render for SidebarShellView {
         // (kept afterwards; one kqueue watcher per window, spawned on demand).
         if mode == SidebarMode::Files && self.file_browser.is_none() {
             let state = self.state.clone();
-            let accent = self.accent;
+            let accent = crate::theme_settings::active_chrome_accent(cx);
             let fb = cx.new(|cx| FileBrowserView::new(state, accent, cx));
             // R20 (F8): push the pane host down so a rename exit hands key focus
             // back to the active terminal (set_pane_host runs before first render).
@@ -1947,6 +1953,8 @@ pub(crate) fn install_sidebar_key_bindings(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nice_theme::palette::{slots, ColorScheme, Palette};
+    use nice_theme::AccentPreset;
 
     #[test]
     fn clamp_sidebar_width_bounds_at_160_and_480() {
@@ -1986,9 +1994,11 @@ mod tests {
 
     #[test]
     fn sidebar_background_is_flat_nice_bg2() {
-        // The SidebarBackground palette seam ships the flat niceBg2 panel this
-        // cycle (SidebarBackground.swift:26-27).
-        let s = dark_slots();
+        // The SidebarBackground seam paints the active palette's `background2` as a
+        // flat panel; with the Nice/Dark reference table it is the flat niceBg2
+        // panel (SidebarBackground.swift:26-27).
+        let s = slots(Palette::Nice, ColorScheme::Dark)
+            .expect("Nice + Dark is a valid palette/scheme combo");
         let bg = sidebar_background(&s);
         let want = slot_srgba(s.background2);
         assert_eq!((bg.r, bg.g, bg.b), (want.r, want.g, want.b));

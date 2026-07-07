@@ -93,3 +93,13 @@ mod pane_strip;
 // collapsed-cycle peek set + modifier-release clear.
 #[cfg(test)]
 mod multiwindow;
+
+// R21 terminal-view theme/accent live-recolor setters — libtest `#[gpui::test]`
+// cases on the mocked context. Exercises the boundary-legal
+// `TerminalView::set_theme` / `set_accent` fan-out seam: each mutates the field +
+// fires `cx.notify()` (no view rebuild), and an accent-only change recolors the
+// caret on a `cursor: None` theme. Lives here (not `nice-term-view`) because that
+// crate has no test harness — `nice-itests` is where the view is driven under a
+// `TestAppContext`.
+#[cfg(test)]
+mod theme_setters;

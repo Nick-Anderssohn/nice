@@ -70,9 +70,7 @@ use nice_model::{
     TabStatus,
 };
 use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
-use nice_theme::color::Srgba;
-use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
-use nice_theme::AccentPreset;
+use nice_theme::palette::Slots;
 
 use crate::app_shell::{PaneHostView, PANE_STRIP_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
@@ -245,10 +243,11 @@ fn band_drag_threshold_crossed(dx: f32, dy: f32) -> bool {
 
 // ---- Colour helpers (Nice/Dark; matches the shipped chrome band) -------------
 
-/// The R11 chrome slot table — Nice/Dark, matching the shipped band
-/// (`crate::app::nice_dark_slots`). Palette switching is R21.
-fn dark_slots() -> Slots {
-    slots(Palette::Nice, ColorScheme::Dark).expect("Nice + Dark is a valid palette/scheme combo")
+/// The active chrome slot table — the live
+/// [`SharedThemeState`](crate::theme_settings::SharedThemeState) (Nice/Dark
+/// fallback when the theme global is absent). R21: was a fixed Nice/Dark table.
+fn active_slots(cx: &App) -> Slots {
+    crate::theme_settings::active_chrome_slots(cx)
 }
 
 /// The `ink` slot at straight alpha `a` — the translucent hover fills.
@@ -313,9 +312,6 @@ pub(crate) struct WindowToolbarView {
     /// which the keymap's window-scoped pane actions (⌘T, pane-step) become
     /// visible in the strip. Held so the subscription lives as long as the view.
     _state_sub: Subscription,
-    /// The user's accent — the Claude dot's thinking colour, the brand mark, and
-    /// the attention badge. Terracotta default (palette switching is R21).
-    accent: Srgba,
 
     /// The pill (if any) the cursor is over, keyed by `Pane.id`. Lives in the
     /// container so only one close "×" is ever visible at a time
@@ -377,15 +373,15 @@ pub(crate) struct WindowToolbarView {
 }
 
 impl WindowToolbarView {
-    /// A toolbar over the window's shared [`WindowState`], Terracotta accent,
-    /// nothing hovered or editing. Observing the state re-renders the strip when a
-    /// sibling holder (the keymap) mutates the shared model.
+    /// A toolbar over the window's shared [`WindowState`], nothing hovered or
+    /// editing. Observing the state re-renders the strip when a sibling holder
+    /// (the keymap) mutates the shared model. The accent is read live per frame
+    /// from the shared theme state during render, not cached on the view.
     pub(crate) fn new(state: Entity<WindowState>, cx: &mut Context<Self>) -> Self {
         let state_sub = cx.observe(&state, |_this, _state, cx| cx.notify());
         Self {
             state,
             _state_sub: state_sub,
-            accent: AccentPreset::Terracotta.color(),
             hovered_pane_id: None,
             editing_pane: None,
             rename_editor: None,
@@ -866,8 +862,8 @@ impl WindowToolbarView {
 
     // MARK: - Rendering
 
-    fn render_brand(&self, s: &Slots) -> impl IntoElement {
-        let accent = srgba_to_rgba(self.accent);
+    fn render_brand(&self, s: &Slots, cx: &App) -> impl IntoElement {
+        let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
         div()
             .flex()
             .flex_row()
@@ -996,7 +992,7 @@ impl WindowToolbarView {
     }
 
     fn render_pill(&self, vm: &PaneVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let accent = self.accent;
+        let accent = crate::theme_settings::active_chrome_accent(cx);
         let is_active = vm.is_active;
         let ink = slot_to_rgba(s.ink);
         let ink2 = slot_to_rgba(s.ink2);
@@ -1232,7 +1228,7 @@ impl WindowToolbarView {
 
     fn render_chevron(&self, has_attention: bool, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = ink_alpha(s, SQUARE_BTN_HOVER_INK_ALPHA);
-        let accent = srgba_to_rgba(self.accent);
+        let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
         // 10pt semibold `chevron.down`, ink2 (`WindowToolbarView.swift:1045-1047`).
         let icon = sf_symbol_icon(
             SF_CHEVRON_DOWN,
@@ -1353,7 +1349,7 @@ impl Render for WindowToolbarView {
         // Reset the rename gate + auto-center when the active pane changed.
         self.sync_active_pane(window, cx);
 
-        let s = dark_slots();
+        let s = active_slots(cx);
         let panes = self.snapshot_panes(cx);
 
         div()
@@ -1380,7 +1376,7 @@ impl Render for WindowToolbarView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_band_mouse_down))
             .on_mouse_move(cx.listener(Self::on_band_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
-            .child(self.render_brand(&s))
+            .child(self.render_brand(&s, cx))
             .child(self.render_strip(&panes, &s, cx))
             // Trailing update-pill slot stays empty until R27. The toolbar's
             // old local bottom hairline is gone — the shell paints one

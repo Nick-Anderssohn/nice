@@ -265,6 +265,32 @@ impl PaneHostView {
         })
     }
 
+    /// Push a live theme + accent recolor into every hosted pane (R21 fan-out).
+    /// Updates the host's own `theme`/`accent` so panes built LATER seed with the
+    /// new colors too, then pushes into each cached [`TerminalView`] via the
+    /// boundary-legal [`TerminalView::set_theme`] setter. Slice 3's
+    /// `apply_theme_fanout` calls this per window (walking
+    /// [`WindowRegistry::all_states`](crate::window_registry::WindowRegistry)); this
+    /// slice provides the push seam.
+    pub(crate) fn set_theme(&mut self, theme: TerminalTheme, accent: Srgba, cx: &mut Context<Self>) {
+        self.theme = theme.clone();
+        self.accent = accent;
+        for view in self.cache.values() {
+            view.update(cx, |v, vcx| v.set_theme(theme.clone(), accent, vcx));
+        }
+    }
+
+    /// Push a live accent-only recolor into every hosted pane (R21 accent fan-out),
+    /// leaving the terminal theme untouched. Updates the host's `accent` so later
+    /// panes seed with it too. The accent-only companion to
+    /// [`set_theme`](Self::set_theme).
+    pub(crate) fn set_accent(&mut self, accent: Srgba, cx: &mut Context<Self>) {
+        self.accent = accent;
+        for view in self.cache.values() {
+            view.update(cx, |v, vcx| v.set_accent(accent, vcx));
+        }
+    }
+
     /// Move key focus to the active pane's hosted terminal, if any — the
     /// app-side focus-routing seam (M2 Item D). The toolbar / sidebar call it
     /// after an inline-rename commit/cancel and on context-menu dismissal, and

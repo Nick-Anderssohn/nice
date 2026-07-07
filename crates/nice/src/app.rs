@@ -44,7 +44,7 @@ use nice_theme::chrome_geometry::{
     TRAFFIC_LIGHT_NUDGE_X,
 };
 use nice_theme::color::Srgba;
-use nice_theme::palette::{slots, ColorScheme, Palette, SlotColor, Slots};
+use nice_theme::palette::SlotColor;
 use nice_theme::AccentPreset;
 
 use crate::window_registry::WindowRegistry;
@@ -205,23 +205,18 @@ fn band_drag_threshold_crossed(dx: f32, dy: f32) -> bool {
     dx * dx + dy * dy >= BAND_DRAG_THRESHOLD_PX * BAND_DRAG_THRESHOLD_PX
 }
 
-/// The Nice / Dark chrome table — the shipped live window's palette/scheme (its
-/// terminal theme is `nice_default_dark`). Both the `chrome` and `line` slots the
-/// band paints are sRGB literals here.
-fn nice_dark_slots() -> Slots {
-    slots(Palette::Nice, ColorScheme::Dark).expect("Nice + Dark is a valid palette/scheme combo")
+/// The chrome band's fill — the ACTIVE palette's `chrome` slot (translucent
+/// background), matching `AppShellView.swift:1001`'s edge-to-edge toolbar band.
+/// R21: reads the live [`SharedThemeState`](crate::theme_settings::SharedThemeState)
+/// (Nice/Dark fallback when absent) instead of the fixed Nice/Dark table.
+fn band_chrome_color(cx: &App) -> Rgba {
+    slot_rgba(crate::theme_settings::active_chrome_slots(cx).chrome)
 }
 
-/// The chrome band's fill — the Nice/Dark `chrome` slot (translucent background),
-/// matching `AppShellView.swift:1001`'s edge-to-edge toolbar band.
-fn band_chrome_color() -> Rgba {
-    slot_rgba(nice_dark_slots().chrome)
-}
-
-/// The band's 1pt bottom rule — the Nice/Dark `line` slot, matching the toolbar's
-/// `niceLine` separator (`AppShellView.swift:1002-1004`).
-fn band_rule_color() -> Rgba {
-    slot_rgba(nice_dark_slots().line)
+/// The band's 1pt bottom rule — the ACTIVE palette's `line` slot, matching the
+/// toolbar's `niceLine` separator (`AppShellView.swift:1002-1004`).
+fn band_rule_color(cx: &App) -> Rgba {
+    slot_rgba(crate::theme_settings::active_chrome_slots(cx).line)
 }
 
 /// Adapt a nice-theme [`SlotColor`] to a gpui [`Rgba`] (the app owns this token →
@@ -374,7 +369,7 @@ impl Render for WindowChromeView {
                     .flex_none()
                     .w_full()
                     .h(px(TOP_BAR_HEIGHT))
-                    .bg(band_chrome_color())
+                    .bg(band_chrome_color(cx))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_band_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_band_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
@@ -385,7 +380,7 @@ impl Render for WindowChromeView {
                             .left_0()
                             .w_full()
                             .h(px(1.0))
-                            .bg(band_rule_color()),
+                            .bg(band_rule_color(cx)),
                     ),
             )
             .child(
@@ -884,6 +879,16 @@ pub(crate) fn set_claude_theme_sync_gate(cx: &mut App, on: bool) {
     cx.set_global(ClaudeThemeSyncGate(on));
 }
 
+/// Read the process Claude theme-sync gate (absent ⇒ OFF, the `run_selftest`
+/// default). R21's live wiring reads it to decide whether an `apply_*` theme change
+/// mirrors the active triple into Claude's colors file
+/// ([`crate::theme_settings::claude_sync_if_gated`]).
+pub(crate) fn claude_theme_sync_gate_on(cx: &App) -> bool {
+    cx.try_global::<ClaudeThemeSyncGate>()
+        .map(|g| g.0)
+        .unwrap_or(false)
+}
+
 /// Run the shipped application: one window hosting a single live terminal pane
 /// running the login shell, quit on window close.
 pub fn run() {
@@ -949,13 +954,10 @@ pub fn run() {
         // swallowed inside the writer (Claude renders fine on its own theme).
         let sync_claude_theme = crate::platform::read_bool_pref("syncClaudeTheme", true);
         cx.set_global(ClaudeThemeSyncGate(sync_claude_theme));
-        if sync_claude_theme {
-            crate::claude_theme_sync::write(
-                &TerminalTheme::nice_default_dark(),
-                ColorScheme::Dark,
-                AccentPreset::Terracotta.color(),
-            );
-        }
+        // R21: the boot Claude theme-sync write is deferred until AFTER the theme
+        // store mints the live `SharedThemeState` below, so it mirrors the ACTIVE
+        // resolved triple (persisted appearance + OS reconcile) instead of the old
+        // fixed `nice_default_dark` + Terracotta pair.
         // R18 (L4 step 8): open + install the session store (own path + one-time
         // Swift migration read), so the restore fan-out below sees the saved
         // windows and every later persistence hook goes live. app::run ONLY.
@@ -973,6 +975,24 @@ pub fn run() {
         cx.set_global(crate::file_browser::sort_settings_store::SortSettingsStore::load(
             crate::file_browser::sort_settings_store::default_ui_settings_path(),
         ));
+        // R21: load the theme store from the SAME `ui_settings.json` and mint the
+        // live `SharedThemeState` (+ install the terminal-theme catalog stub)
+        // BEFORE the first window opens, so every chrome view + terminal pane reads
+        // the persisted appearance from birth. Launch-time read + default-path
+        // resolution live here in app::run ONLY — `run_selftest` installs a
+        // defaults+temp store + the catalog stub (no SharedThemeState, no write).
+        // Slice 3 extends this boot order (OS reconcile + the R17-live wiring).
+        crate::theme_settings::install_live_theme(
+            cx,
+            crate::theme_settings::ThemeSettingsStore::load(
+                crate::theme_settings::default_theme_settings_path(),
+            ),
+        );
+        // R21: now that the live `SharedThemeState` carries the active resolved
+        // triple, do the R17 boot Claude theme-sync write from it (gate-gated
+        // inside). Replaces the removed fixed-triple write above; app::run ONLY
+        // (never `run_selftest`, which mints no `SharedThemeState` and no gate).
+        crate::theme_settings::claude_sync_if_gated(cx);
         // R20 (F5–F7): the process-wide file-operation history (over the shipped
         // objc2 `ProductionTrasher` → real Trash) as a gpui `Entity` in a Global —
         // ⌘Z/⌘⇧Z and the browser menu handlers drive it, per-window drift banners
@@ -1393,10 +1413,40 @@ fn build_window_root(
     // font as the old single-terminal window and follows the active pane through
     // `SessionManager::activate_pane`.
     let font = crate::keymap::shared_font_settings(cx);
-    let theme = TerminalTheme::nice_default_dark();
-    let accent = AccentPreset::Terracotta.color();
+    // R21: seed new panes with the live active terminal theme + accent
+    // (`SharedThemeState`), replacing the fixed `nice_default_dark` + Terracotta
+    // pair. Falls back to that same pair when the theme global is absent (a
+    // scenario driving `build_window_root` without live theming), so the shipped
+    // pre-R21 look is unchanged for those paths.
+    let (theme, accent) = crate::theme_settings::active_terminal_theme_and_accent(cx);
     let pane_host =
         cx.new(|cx| crate::app_shell::PaneHostView::new(state.clone(), theme, accent, font, cx));
+    // R21: stash the pane host on the window state so the process theme fan-out
+    // (`apply_theme_fanout`) can reach this window's terminal panes through
+    // `WindowRegistry::all_states`.
+    state.update(cx, |ws, _cx| ws.set_pane_host(pane_host.clone()));
+    // R21: the OS-appearance sync adapter (OQ1) — on a system light/dark switch,
+    // reconcile the store (a no-op unless `sync_with_os`, which then fans chrome +
+    // panes + Claude out). Wired on the `Window` directly (NOT through a
+    // `WindowState` Context): the fan-out reads every window's `WindowState`, so the
+    // callback must run with a clean `&mut App`, never inside a `WindowState` update
+    // (that would re-enter the entity read). The value comes from the injected
+    // `OsSchemeSource` (production reads gpui's window appearance; a scenario reads
+    // its stub) so no leg reads the real system appearance. One observer per window;
+    // whichever fires reconciles the process-wide store.
+    window
+        .observe_window_appearance(|_window, cx| {
+            // Defer the reconcile to the end of the current effect cycle: the
+            // callback fires with the window "taken" out of the app, and the fan-out
+            // touches windows (`refresh_windows`) + entities, so running it inline
+            // would re-enter the taken window (the R20.5 taken-window discipline).
+            cx.defer(|cx| {
+                if let Some(os) = crate::theme_settings::current_os_scheme(cx) {
+                    crate::theme_settings::reconcile_with_os(cx, os);
+                }
+            });
+        })
+        .detach();
     let toolbar = cx.new(|cx| crate::toolbar::WindowToolbarView::new(state.clone(), cx));
     let sidebar = cx.new(|cx| {
         crate::sidebar_shell::SidebarShellView::new_composed(
@@ -1610,13 +1660,17 @@ fn to_u8(c: f32) -> u8 {
     (c * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-/// The swatch set the `tokens` scenario renders and asserts: every slot of one
-/// concrete palette × scheme (Nice / Dark — the combo whose slots are all sRGB
-/// literals, with no paint-time macOS system colours) followed by the five
-/// accent presets. 11 + 5 = 16 swatches, exactly filling the 4×4 grid.
-fn tokens_swatches() -> Vec<Swatch> {
-    let s = slots(Palette::Nice, ColorScheme::Dark)
-        .expect("Nice + Dark is a valid palette/scheme combo");
+/// The swatch set the `tokens` scenario renders and asserts: every slot of the
+/// ACTIVE chrome palette × scheme followed by the five accent presets. 11 + 5 = 16
+/// swatches, exactly filling the 4×4 grid. R21: reads the active `Slots` from
+/// [`SharedThemeState`](crate::theme_settings::SharedThemeState); with no theme
+/// global installed (the self-test process) this is the shipped Nice/Dark
+/// fallback — the combo whose slots are all sRGB literals, with no paint-time
+/// macOS system colours — so the scenario's pixel round-trip is unchanged. The
+/// scenario renders and asserts the SAME `Slots`, so the adapter test stays
+/// self-consistent whatever the active palette.
+fn tokens_swatches(cx: &App) -> Vec<Swatch> {
+    let s = crate::theme_settings::active_chrome_slots(cx);
     let palette_slots: [(&'static str, SlotColor); 11] = [
         ("background", s.background),
         ("background2", s.background2),
@@ -1727,7 +1781,7 @@ impl Render for SwatchGridView {
 /// paint and hard-exits nonzero on any out-of-tolerance channel; on success it
 /// returns quietly so the unchanged driver prints `SELFTEST PASS tokens`.
 fn open_tokens_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let swatches = tokens_swatches();
+    let swatches = cx.update(|app| tokens_swatches(app));
     let handle = cx.open_window(window_options(), {
         let swatches = swatches.clone();
         move |_window, cx| {
@@ -3622,6 +3676,30 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R21: the live theme-system gate — drives the SHIPPED window
+        // (open_managed_window / build_window_root) with the live theme globals
+        // installed (store at a temp path, catalog stub, a scenario-minted
+        // SharedThemeState + injected OsSchemeSource stub), then drives the store
+        // apply_* mutators + reconcile_with_os and asserts BOTH fan-out halves:
+        // chrome (active Slots) and a live terminal pane (pushed TerminalTheme + a
+        // ground-truth pixel recolor), plus the OS-sync gate, the userPicked
+        // sync-off contradiction, the inactive-slot latency, and the R17-live Claude
+        // mirror (colors-file byte-diff + provider re-source). Sandbox HOME + temp
+        // theme store + NICE_CLAUDE_OVERRIDE stub + injected OS-scheme stub (never
+        // the real ~/.claude / ~/.nice / system appearance). Registered BEFORE
+        // `multiwindow`: its build_window_root only `register`s (no WindowRegistry
+        // close observer), so its window never trips the quit-when-empty terminus.
+        Scenario {
+            name: "theme-fanout",
+            open: crate::theme_fanout_live::open_theme_fanout_window,
+            gate: Gate::SelfReported {
+                // A real login-shell spawn + grid-mount poll, several apply_* +
+                // reconcile settles, two window pixel captures, and the R17-live
+                // file writes — each on the real pty / disk clock; generous headroom.
+                budget: Duration::from_secs(60),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.
@@ -3662,6 +3740,20 @@ pub fn run_selftest(selector: String) {
         ));
         cx.set_global(
             crate::file_browser::sort_settings_store::SortSettingsStore::with_defaults(sort_path),
+        );
+        // R21: the theme store initialized with DEFAULTS + a throwaway temp path,
+        // plus the terminal-theme catalog stub — never the real `ui_settings.json`
+        // (no launch-time write; the read + default-path resolution stay in `run`).
+        // `SharedThemeState` is deliberately NOT minted here: scenarios paint the
+        // Nice/Dark + Terracotta fallback unless one opts into live theming by
+        // minting the entity itself (slice 3's `theme-fanout`).
+        let theme_path = std::env::temp_dir().join(format!(
+            "nice-rs-selftest-theme-settings-{}.json",
+            std::process::id()
+        ));
+        crate::theme_settings::install_selftest_theme_defaults(
+            cx,
+            crate::theme_settings::ThemeSettingsStore::with_defaults(theme_path),
         );
         nice_harness::selftest::drive(cx, &selector, scenarios);
     });

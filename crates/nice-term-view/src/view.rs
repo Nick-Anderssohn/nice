@@ -450,6 +450,44 @@ impl TerminalView {
         self.auto_refit = on;
     }
 
+    /// Live-recolor this pane (R21 theme fan-out): replace the render `theme` +
+    /// caret `accent` and repaint, no view rebuild — the same field-update +
+    /// `cx.notify()` shape as [`on_font_changed`](Self::on_font_changed). The paint
+    /// path already follows `accent` for the caret when the theme's cursor is unset
+    /// (see [`accent_rgba`](Self::accent_rgba)), so a scheme / terminal-theme change
+    /// carries its own accent through here. **Boundary-legal** (TRANCHE-2-NOTES §4):
+    /// plain color values in — the app pushes these from `SharedThemeState`; this
+    /// view crate never observes an app entity.
+    pub fn set_theme(&mut self, theme: TerminalTheme, accent: Srgba, cx: &mut Context<Self>) {
+        self.theme = theme;
+        self.accent = accent;
+        cx.notify();
+    }
+
+    /// Live-recolor only the accent (R21 accent fan-out): the caret / launch
+    /// overlay tint, leaving the terminal `theme` untouched. Repaints without a
+    /// rebuild. Boundary-legal (plain `Srgba` in), the accent-only companion to
+    /// [`set_theme`](Self::set_theme).
+    pub fn set_accent(&mut self, accent: Srgba, cx: &mut Context<Self>) {
+        self.accent = accent;
+        cx.notify();
+    }
+
+    /// The current render theme (read accessor). Lets the R21 fan-out probe
+    /// (`nice-itests`) assert [`set_theme`](Self::set_theme) mutated the field and
+    /// inspect `theme.cursor` (the `None` ⇒ caret-follows-accent precondition).
+    pub fn theme(&self) -> &TerminalTheme {
+        &self.theme
+    }
+
+    /// The current caret / launch-overlay accent (read accessor). When the render
+    /// theme's `cursor` is unset the block caret paints in exactly this color
+    /// (`element.rs`), so an [`set_accent`](Self::set_accent) that changes this
+    /// value recolors the caret on a `cursor: None` theme.
+    pub fn accent(&self) -> Srgba {
+        self.accent
+    }
+
     // R12: `zoom_font` / `reset_font` / `try_zoom_chord` were removed here. The
     // ⌘=/⌘−/⌘0 zoom chords are app-level keyboard shortcuts now (`crate::keymap`
     // in `crates/nice`), which drive the shared `FontSettings` entity directly;

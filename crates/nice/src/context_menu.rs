@@ -35,7 +35,7 @@ use gpui::{
 };
 
 use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
-use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
+use nice_theme::palette::Slots;
 
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
@@ -167,19 +167,18 @@ impl ContextMenu {
             .collect()
     }
 
-    /// The Nice/Dark chrome slot table the popup paints with. Mirrors the shipped
-    /// chrome band (`app::nice_dark_slots`): R10 chrome is Nice/Dark; palette
-    /// switching is R21.
-    fn chrome_slots() -> Slots {
-        slots(Palette::Nice, ColorScheme::Dark)
-            .expect("Nice + Dark is a valid palette/scheme combo")
+    /// The active chrome slot table the popup paints with — the live
+    /// [`SharedThemeState`](crate::theme_settings::SharedThemeState) (Nice/Dark
+    /// fallback when the theme global is absent). R21: was a fixed Nice/Dark table.
+    fn chrome_slots(cx: &App) -> Slots {
+        crate::theme_settings::active_chrome_slots(cx)
     }
 
     /// Build one item's element. Associated (not `&self`) so the render loop can
     /// borrow `cx` mutably for `cx.listener` without also holding a borrow of
     /// `self`.
     fn render_item(item: &ContextMenuItem, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let s = Self::chrome_slots();
+        let s = Self::chrome_slots(cx);
         match item {
             ContextMenuItem::Separator => div()
                 .h(px(1.0))
@@ -234,7 +233,7 @@ impl EventEmitter<DismissEvent> for ContextMenu {}
 
 impl Render for ContextMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = Self::chrome_slots();
+        let s = Self::chrome_slots(cx);
         let rows: Vec<gpui::AnyElement> = self
             .items
             .iter()

@@ -41,17 +41,15 @@ use gpui::Global;
 use nice_model::file_browser::{FileBrowserSortCriterion, FileBrowserSortSettings};
 use serde::{Deserialize, Serialize};
 
-/// The on-disk `ui_settings.json` document. `version` + `file_browser_sort` are
-/// R19's own keys; `extra` captures every OTHER top-level key so a rewrite
-/// preserves sections future stages (R21/R23) add.
-#[derive(Debug, Serialize, Deserialize)]
+/// The on-disk `ui_settings.json` document, for DECODING R19's own keys.
+/// `version` + `file_browser_sort` are the keys this store reads; every OTHER
+/// top-level key is ignored on read (serde default) and preserved on write by
+/// [`write_ui_settings_merged`]'s read-merge-write, so no flatten catch-all is
+/// needed here.
+#[derive(Debug, Deserialize)]
 struct UiSettingsDoc {
-    version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_browser_sort: Option<SortSection>,
-    /// Unknown top-level keys, preserved verbatim across rewrites.
-    #[serde(flatten)]
-    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The `file_browser_sort` object, decoded tolerantly: a missing / unknown
@@ -68,30 +66,28 @@ struct SortSection {
 
 const SCHEMA_VERSION: u32 = 1;
 
-/// The process-wide file-browser sort store: the current settings, the injected
-/// file path, and any unknown top-level keys held for round-tripping.
+/// The process-wide file-browser sort store: the current settings and the
+/// injected file path. Co-writers' sections in the shared file are preserved by
+/// [`write_ui_settings_merged`]'s read-merge-write — the store no longer holds a
+/// boot-captured `extra`, which could go stale between a load and a later write
+/// and clobber a co-writer's section (the false premise R21 closes, OQ3).
 pub struct SortSettingsStore {
     path: PathBuf,
     settings: FileBrowserSortSettings,
-    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Global for SortSettingsStore {}
 
 impl SortSettingsStore {
     /// Load the store from `path`. A missing or malformed file yields defaults
-    /// (name / ascending) with no extra keys — never an error (fail-soft, Swift
-    /// parity: a corrupt pref reads as the default, it doesn't crash the app).
+    /// (name / ascending) — never an error (fail-soft, Swift parity: a corrupt
+    /// pref reads as the default, it doesn't crash the app).
     pub fn load(path: PathBuf) -> Self {
-        let (settings, extra) = match std::fs::read(&path) {
+        let settings = match std::fs::read(&path) {
             Ok(bytes) => Self::decode(&bytes),
-            Err(_) => (FileBrowserSortSettings::default(), Default::default()),
+            Err(_) => FileBrowserSortSettings::default(),
         };
-        Self {
-            path,
-            settings,
-            extra,
-        }
+        Self { path, settings }
     }
 
     /// Construct a store with explicit defaults at `path`, WITHOUT touching disk
@@ -101,7 +97,6 @@ impl SortSettingsStore {
         Self {
             path,
             settings: FileBrowserSortSettings::default(),
-            extra: Default::default(),
         }
     }
 
@@ -117,8 +112,8 @@ impl SortSettingsStore {
 
     /// Apply `new` and write through to disk **only if it changed**. Returns
     /// `Ok(true)` when a disk write happened, `Ok(false)` when the value was
-    /// unchanged (no write), or an I/O error from the atomic write. Preserved
-    /// unknown top-level keys ride along on every write.
+    /// unchanged (no write), or an I/O error from the atomic write. Co-writers'
+    /// sections in the shared file ride along untouched (read-merge-write).
     pub fn set(&mut self, new: FileBrowserSortSettings) -> std::io::Result<bool> {
         if new == self.settings {
             return Ok(false);
@@ -128,48 +123,74 @@ impl SortSettingsStore {
         Ok(true)
     }
 
-    /// Serialize the current state and atomically replace the file.
+    /// Write the `file_browser_sort` section through the shared read-merge-write
+    /// writer, preserving every other top-level key (`appearance`, etc.).
     fn write(&self) -> std::io::Result<()> {
-        let doc = UiSettingsDoc {
-            version: SCHEMA_VERSION,
-            file_browser_sort: Some(SortSection {
-                criterion: Some(self.settings.criterion.as_raw().to_string()),
-                ascending: Some(self.settings.ascending),
-            }),
-            extra: self.extra.clone(),
+        let section = SortSection {
+            criterion: Some(self.settings.criterion.as_raw().to_string()),
+            ascending: Some(self.settings.ascending),
         };
-        // `to_vec_pretty` for a human-diffable small config file.
-        let bytes = serde_json::to_vec_pretty(&doc)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        crate::atomic_file::write_atomic(&self.path, &bytes, None)
+        write_ui_settings_merged(&self.path, |map| {
+            map.insert(
+                "file_browser_sort".to_string(),
+                serde_json::to_value(section).expect("SortSection serializes"),
+            );
+        })
     }
 
-    /// Decode bytes into `(settings, extra)`, applying the tolerant defaulting.
-    /// Malformed JSON falls back to defaults + no extra.
-    fn decode(
-        bytes: &[u8],
-    ) -> (
-        FileBrowserSortSettings,
-        serde_json::Map<String, serde_json::Value>,
-    ) {
+    /// Decode bytes into settings, applying the tolerant defaulting. Malformed
+    /// JSON falls back to defaults.
+    fn decode(bytes: &[u8]) -> FileBrowserSortSettings {
         match serde_json::from_slice::<UiSettingsDoc>(bytes) {
             Ok(doc) => {
                 let section = doc.file_browser_sort.unwrap_or(SortSection {
                     criterion: None,
                     ascending: None,
                 });
-                let settings = FileBrowserSortSettings::from_stored(
-                    section.criterion.as_deref(),
-                    section.ascending,
-                );
-                (settings, doc.extra)
+                FileBrowserSortSettings::from_stored(section.criterion.as_deref(), section.ascending)
             }
-            Err(_) => (FileBrowserSortSettings::default(), Default::default()),
+            Err(_) => FileBrowserSortSettings::default(),
         }
     }
+}
+
+/// The single shared `ui_settings.json` **read-merge-write** writer (R21, OQ3).
+///
+/// Reads the current file into a raw top-level object (missing / malformed ⇒ an
+/// empty object), stamps the schema `version`, lets `mutate` overwrite ONLY the
+/// caller's own section key, then atomically rewrites — so every OTHER top-level
+/// key is preserved verbatim regardless of load order. This is what makes
+/// section clobbering impossible for every co-writer: the landed sort store's
+/// old boot-captured `extra` serialization did NOT preserve a co-writer's
+/// section written after this store's `load` (it re-serialized a stale snapshot).
+/// R21's `appearance` writes AND this store's `file_browser_sort` write both
+/// route through here; R23 (`fonts`/`advanced`) and R24 (`shortcuts`) reuse it
+/// verbatim rather than reinventing a per-store merge.
+///
+/// Writes go through [`crate::atomic_file::write_atomic`] (temp sibling + rename)
+/// and `to_vec_pretty` for a human-diffable file. The caller guards only-if-changed
+/// (each store compares its own value before calling `set`).
+pub(crate) fn write_ui_settings_merged(
+    path: &Path,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> std::io::Result<()> {
+    // Read the current document as a raw object so unknown keys round-trip
+    // untouched; a missing or malformed file starts from an empty object.
+    let mut map: serde_json::Map<String, serde_json::Value> = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
+    };
+    map.insert(
+        "version".to_string(),
+        serde_json::Value::from(SCHEMA_VERSION),
+    );
+    mutate(&mut map);
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(map))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::atomic_file::write_atomic(path, &bytes, None)
 }
 
 /// Resolve the default `ui_settings.json` path:
@@ -273,6 +294,36 @@ mod tests {
         assert_eq!(raw["file_browser_sort"]["criterion"], "date_modified");
         assert_eq!(raw["file_browser_sort"]["ascending"], false);
         assert_eq!(raw["version"], 1);
+    }
+
+    /// A co-writer's section (R21's `appearance`) survives a `file_browser_sort`
+    /// write — the read-merge-write guarantee (OQ3). This is the case the old
+    /// boot-captured-`extra` writer would have clobbered when the sort write
+    /// happened AFTER the appearance section was planted post-load.
+    #[test]
+    fn appearance_section_survives_sort_write() {
+        let path = temp_path("cowriter");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"appearance":{"scheme":"dark","accent":"ocean"}}"#,
+        )
+        .unwrap();
+
+        let mut store = SortSettingsStore::load(path.clone());
+        store
+            .set(FileBrowserSortSettings {
+                criterion: FileBrowserSortCriterion::DateModified,
+                ascending: false,
+            })
+            .unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // The sort write landed.
+        assert_eq!(raw["file_browser_sort"]["criterion"], "date_modified");
+        // The co-writer's appearance section is untouched.
+        assert_eq!(raw["appearance"]["scheme"], "dark");
+        assert_eq!(raw["appearance"]["accent"], "ocean");
     }
 
     /// Unset fields default: a file with only a criterion still reads ascending;

@@ -205,6 +205,15 @@ pub(crate) struct WindowState {
     /// via [`prune_dissolved_file_browser_states`](Self::prune_dissolved_file_browser_states)
     /// off the session dissolve cascade.
     pub(crate) file_browser: FileBrowserStore,
+    /// R21: this window's mounted pane-content host, stashed at
+    /// [`crate::app::build_window_root`] so the process-level theme fan-out
+    /// ([`crate::theme_settings::apply_theme_fanout`]) can reach every window's
+    /// terminal panes: it walks [`crate::window_registry::WindowRegistry::all_states`]
+    /// → each `WindowState` → this host → its cached `TerminalView`s, pushing the new
+    /// colors through the boundary-legal setters (the `SessionThemeCache` analog).
+    /// `None` on a `WindowState` never mounted by the shipped builder (unit tests /
+    /// headless scenarios), so the fan-out simply skips it.
+    pane_host: Option<gpui::Entity<crate::app_shell::PaneHostView>>,
 }
 
 /// Selftest instrumentation: a process-global count of demand-present kicks fired
@@ -277,6 +286,7 @@ impl WindowState {
             // render, defaulting to dotfiles-hidden (the 2026-07-07 deviation from
             // Swift's cwd-aware `show_hidden` heuristic).
             file_browser: FileBrowserStore::new(),
+            pane_host: None,
         }
     }
 
@@ -340,6 +350,22 @@ impl WindowState {
     /// terminus actuation.
     pub(crate) fn set_window_handle(&mut self, handle: AnyWindowHandle) {
         self.window_handle = Some(handle);
+    }
+
+    /// R21: stash this window's mounted pane host (the shipped builder calls it at
+    /// [`crate::app::build_window_root`]) so the process theme fan-out can push
+    /// recolors into its terminal panes.
+    pub(crate) fn set_pane_host(
+        &mut self,
+        pane_host: gpui::Entity<crate::app_shell::PaneHostView>,
+    ) {
+        self.pane_host = Some(pane_host);
+    }
+
+    /// R21: this window's mounted pane host, if the shipped builder mounted one.
+    /// [`crate::theme_settings::apply_theme_fanout`] reads it to reach the panes.
+    pub(crate) fn pane_host(&self) -> Option<gpui::Entity<crate::app_shell::PaneHostView>> {
+        self.pane_host.clone()
     }
 
     /// Mirror the model's active tab into the multi-selection — the Rust analog of
