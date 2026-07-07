@@ -96,6 +96,16 @@ const KC_RETURN: u16 = 36;
 /// Escape — cancels an inline rename (the `SidebarShell` Esc action).
 const KC_ESC: u16 = 53;
 
+/// Insert `ch` immediately before the last char of `s` (the expected result of a
+/// caret-left + type in the rename cursor-editing legs). An empty string yields
+/// just `ch`.
+fn insert_before_last(s: &str, ch: char) -> String {
+    let mut chars: Vec<char> = s.chars().collect();
+    let pos = chars.len().saturating_sub(1);
+    chars.insert(pos, ch);
+    chars.into_iter().collect()
+}
+
 /// Vertical shrink applied for the resize→refit check (pt). Big enough to lose
 /// several grid rows at any sane cell height.
 const RESIZE_DY: f64 = -160.0;
@@ -569,6 +579,24 @@ async fn rename_focus_checks(
         ));
     }
 
+    // Cursor editing: move the caret one char left, then type via a real key
+    // event — it must INSERT at the caret (mid-string), not append. Proves the
+    // pill's field is the cursor-capable editor (arrows + mid-string insert), not
+    // the old append-only field.
+    let mid_before = draft_after.clone();
+    let _ = whandle.update(cx, |_r, _w, app| {
+        toolbar.update(app, |v, cx| v.drive_rename_arrow(false, cx))
+    });
+    tap(cx, pid, KC_X, 0).await;
+    let draft_after = toolbar.update(cx, |v, _| v.scenario_rename_draft());
+    let expected_mid = insert_before_last(&mid_before, 'x');
+    if draft_after != expected_mid {
+        failures.push(format!(
+            "rename cursor: after ←+type 'x' the pill draft should insert mid-string ('{expected_mid}'), \
+             got '{draft_after}' — the caret did not move / insert at position"
+        ));
+    }
+
     tap(cx, pid, KC_RETURN, 0).await;
     settle(cx, 200).await;
     if toolbar.update(cx, |v, _| v.scenario_rename_editing()) {
@@ -666,6 +694,28 @@ async fn rename_focus_checks(
             "rename-focus: typed 'x' but the tab-rename draft went '{draft_before}' → '{draft_after}'"
         ));
     }
+
+    // Cursor editing: ←, then type via a real key event — insert at the caret
+    // (mid-string), proving the sidebar tab field is cursor-capable too.
+    let mid_before = draft_after.clone();
+    let _ = whandle.update(cx, |_r, _w, app| {
+        sidebar.update(app, |v, cx| v.drive_tab_rename_arrow(false, cx))
+    });
+    tap(cx, pid, KC_X, 0).await;
+    let mid_after = sidebar.update(cx, |v, _| v.scenario_tab_rename_draft());
+    let expected_mid = insert_before_last(&mid_before, 'x');
+    if mid_after != expected_mid {
+        failures.push(format!(
+            "rename cursor: after ←+type 'x' the tab draft should insert mid-string ('{expected_mid}'), \
+             got '{mid_after}'"
+        ));
+    } else {
+        eprintln!(
+            "[selftest] app-shell rename cursor: pill + sidebar-tab fields insert mid-string after ← \
+             (cursor-capable editor)"
+        );
+    }
+
     tap(cx, pid, KC_ESC, 0).await;
     settle(cx, 200).await;
     if sidebar.update(cx, |v, _| v.scenario_tab_rename_editing()) {

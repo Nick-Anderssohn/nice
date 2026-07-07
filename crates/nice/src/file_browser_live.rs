@@ -581,19 +581,17 @@ async fn sort_and_hidden_checks(
     fb.update(cx, |v, cx| v.drive_toggle_direction(cx));
     settle(cx, 150).await;
 
-    // Hidden: .env is shown by default (non-home cwd); the control-strip toggle
-    // hides it, and a real ⌘⇧. chord shows it again.
+    // Hidden: dotfiles default to HIDDEN everywhere (the 2026-07-07 deviation
+    // from Swift's cwd heuristic), so .env is absent until the user opts in; a
+    // real ⌘⇧. chord reveals it, and the control-strip toggle hides it again.
     let dotfile = fixture.path(".env");
     let shown = |cx: &mut AsyncApp| fb.update(cx, |v, _| v.scenario_rendered_paths()).iter().any(|p| p == &dotfile);
-    if !shown(cx) {
-        failures.push(format!("hidden: the dotfile {dotfile} should be shown by default (non-home cwd)"));
-    }
-    fb.update(cx, |v, cx| v.drive_toggle_hidden(cx));
-    settle(cx, 200).await;
     if shown(cx) {
-        failures.push("hidden: the control-strip toggle did not hide the dotfile".to_string());
+        failures.push(format!(
+            "hidden: the dotfile {dotfile} must be HIDDEN by default (the 2026-07-07 deviation)"
+        ));
     }
-    // ⌘⇧. re-show: dispatch the SHIPPED `ToggleHiddenFiles` action (the ⌘⇧.
+    // ⌘⇧. reveal: dispatch the SHIPPED `ToggleHiddenFiles` action (the ⌘⇧.
     // binding's target) directly. A synthetic shift+`.` CGEvent does NOT decode to
     // the base `.` key at the gpui pin (the documented character-matching
     // divergence — the same reason `multiwindow` only drives letter/arrow chords),
@@ -604,12 +602,21 @@ async fn sort_and_hidden_checks(
     settle(cx, 250).await;
     if !shown(cx) {
         failures.push(
-            "hidden: the shipped ToggleHiddenFiles action (⌘⇧.) did not re-show the dotfile — \
+            "hidden: the shipped ToggleHiddenFiles action (⌘⇧.) did not reveal the dotfile — \
              the files-mode/state-exists double gate did not fire"
                 .to_string(),
         );
+    }
+    // The control-strip toggle hides it again (restoring the hidden default).
+    fb.update(cx, |v, cx| v.drive_toggle_hidden(cx));
+    settle(cx, 200).await;
+    if shown(cx) {
+        failures.push("hidden: the control-strip toggle did not re-hide the dotfile".to_string());
     } else {
-        eprintln!("[selftest] file-browser: hidden toggle hid the dotfile; the shipped ⌘⇧. action re-showed it");
+        eprintln!(
+            "[selftest] file-browser: dotfiles hidden by default; ⌘⇧. revealed .env, \
+             the control-strip toggle hid it again"
+        );
     }
 }
 
@@ -799,6 +806,47 @@ async fn r20_legs(
         eprintln!("[selftest] file-browser R20: menu-rename typed+committed (base preselected), Esc reverted, '/' stayed in edit mode");
     }
     cancel_rename(cx, whandle, fb).await; // clean up the open field
+
+    // (d') click-to-position: a click INSIDE the open field repositions the caret
+    //      without restarting the edit — the selection collapses to the clicked
+    //      char boundary and the preselection is NOT reset. Round-trips through the
+    //      real shape/measure hit-test: measure boundary 3's x, click just past it,
+    //      and assert the caret lands on 3.
+    let clickme = fixture.path("slashme.txt"); // "slashme.txt" — base "slashme" [0,7)
+    begin_rename(cx, whandle, fb, &clickme).await;
+    let sel0 = fb.update(cx, |v, _| v.scenario_rename_selection());
+    let (mapped, sel_after, still) = whandle
+        .update(cx, |_r, window, app| {
+            fb.update(app, |v, cx| {
+                let x = v.scenario_rename_x_for_index(3, window).unwrap_or(0.0);
+                let placed = v.drive_rename_click_at_local_x(x + 0.5, window, cx);
+                (placed, v.scenario_rename_selection(), v.scenario_is_renaming())
+            })
+        })
+        .unwrap_or((None, None, false));
+    if !still {
+        failures.push(
+            "rename click: the click ended / restarted the edit (edit mode dropped)".to_string(),
+        );
+    }
+    if sel_after == sel0 {
+        failures.push(format!(
+            "rename click: the caret did not move — selection stayed at the preselection {sel0:?} \
+             (the click likely re-tripped begin-rename instead of repositioning)"
+        ));
+    }
+    if mapped != Some(3) || sel_after != Some((3, 3)) {
+        failures.push(format!(
+            "rename click: a click at boundary 3 should collapse the caret to (3,3); \
+             got mapped={mapped:?} sel={sel_after:?}"
+        ));
+    } else {
+        eprintln!(
+            "[selftest] file-browser R20: a click inside the rename field repositioned the caret \
+             to index 3 without restarting the edit"
+        );
+    }
+    cancel_rename(cx, whandle, fb).await;
 
     // (e) in-tree drag of a multi-selection onto a folder row moves it; the accent
     //     hover-highlight predicate (can_drop) is asserted.

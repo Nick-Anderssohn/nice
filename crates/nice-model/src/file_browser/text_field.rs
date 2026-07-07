@@ -165,10 +165,48 @@ impl TextFieldEditor {
         }
     }
 
+    /// Collapse the selection to a caret at `pos` (clamped to the text length) —
+    /// the click-to-position action. The pointer picks a boundary via
+    /// [`char_index_for_x`]; this drops the caret there and clears any selection,
+    /// so a subsequent keystroke inserts at the click point rather than replacing
+    /// the whole field.
+    pub fn place_cursor(&mut self, pos: usize) {
+        self.collapse_to(pos.min(self.chars.len()));
+    }
+
     fn collapse_to(&mut self, pos: usize) {
         self.anchor = pos;
         self.caret = pos;
     }
+}
+
+/// Map a click x-offset (pixels from the text's left edge) to the nearest
+/// character-boundary index.
+///
+/// `boundaries[i]` is the x-position of boundary `i`: for a field of `n`
+/// characters there are `n + 1` boundaries, with `boundaries[0] == 0.0` (before
+/// the first char) and `boundaries[n]` the full line width (after the last).
+/// Returns the index whose boundary is closest to `x`. A click past the trailing
+/// edge clamps to `n` (caret at the end); a click before the start clamps to `0`.
+/// Ties round to the earlier (left) boundary.
+///
+/// Pure and font-agnostic: the caller measures the glyph advances (via the
+/// window's text system) and hands the resulting boundary table in, so the
+/// rounding rule is unit-tested without a window.
+pub fn char_index_for_x(boundaries: &[f32], x: f32) -> usize {
+    if boundaries.is_empty() {
+        return 0;
+    }
+    let mut best = 0;
+    let mut best_dist = (boundaries[0] - x).abs();
+    for (i, &b) in boundaries.iter().enumerate().skip(1) {
+        let d = (b - x).abs();
+        if d < best_dist {
+            best = i;
+            best_dist = d;
+        }
+    }
+    best
 }
 
 /// The basename-preselection length for `name`: the base length for a
@@ -353,5 +391,79 @@ mod tests {
     fn preselect_len_dotfile_selects_all() {
         // `.zshrc` is whole-name base (no extension) → select everything.
         assert_eq!(preselect_len(".zshrc", false), 6);
+    }
+
+    // MARK: - place_cursor
+
+    #[test]
+    fn place_cursor_drops_a_collapsed_caret_and_clears_selection() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3); // [0,3) selected
+        e.place_cursor(2);
+        assert_eq!(e.cursor(), 2);
+        assert_eq!(e.selection(), (2, 2));
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn place_cursor_clamps_past_the_end() {
+        let mut e = TextFieldEditor::new("abc");
+        e.place_cursor(99);
+        assert_eq!(e.cursor(), 3);
+        assert_eq!(e.selection(), (3, 3));
+    }
+
+    #[test]
+    fn place_cursor_then_type_inserts_at_the_click_point() {
+        // Click between 'a' and 'b' of "abc", then type 'X' → "aXbc".
+        let mut e = TextFieldEditor::new("abc");
+        e.place_cursor(1);
+        e.apply_key(Char('X'));
+        assert_eq!(e.text(), "aXbc");
+        assert_eq!(e.cursor(), 2);
+    }
+
+    // MARK: - char_index_for_x
+
+    /// Boundaries for a 3-char monospace-ish line at 10px/char: [0,10,20,30].
+    const B: &[f32] = &[0.0, 10.0, 20.0, 30.0];
+
+    #[test]
+    fn char_index_for_x_snaps_to_nearest_boundary() {
+        assert_eq!(char_index_for_x(B, 0.0), 0);
+        assert_eq!(char_index_for_x(B, 4.0), 0); // closer to 0 than 10
+        assert_eq!(char_index_for_x(B, 6.0), 1); // closer to 10 than 0
+        assert_eq!(char_index_for_x(B, 14.0), 1);
+        assert_eq!(char_index_for_x(B, 16.0), 2);
+    }
+
+    #[test]
+    fn char_index_for_x_past_the_end_clamps_to_last() {
+        assert_eq!(char_index_for_x(B, 100.0), 3);
+    }
+
+    #[test]
+    fn char_index_for_x_before_the_start_clamps_to_zero() {
+        assert_eq!(char_index_for_x(B, -50.0), 0);
+    }
+
+    #[test]
+    fn char_index_for_x_midpoint_ties_round_left() {
+        // Exactly halfway between boundary 0 (0.0) and boundary 1 (10.0).
+        assert_eq!(char_index_for_x(B, 5.0), 0);
+    }
+
+    #[test]
+    fn char_index_for_x_empty_boundaries_is_zero() {
+        assert_eq!(char_index_for_x(&[], 12.0), 0);
+    }
+
+    #[test]
+    fn char_index_for_x_handles_uneven_advances() {
+        // Proportional font: a narrow 'i' then a wide 'W'. Boundaries [0,4,20].
+        let b = &[0.0, 4.0, 20.0];
+        assert_eq!(char_index_for_x(b, 1.0), 0);
+        assert_eq!(char_index_for_x(b, 3.0), 1); // 3 is closer to 4 than to 0
+        assert_eq!(char_index_for_x(b, 11.0), 1); // closer to 4 than to 20
+        assert_eq!(char_index_for_x(b, 13.0), 2); // closer to 20 than to 4
     }
 }

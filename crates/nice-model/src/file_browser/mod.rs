@@ -70,4 +70,4 @@ pub use selection::FileBrowserSelection;
 pub use sort::{FileBrowserSortCriterion, FileBrowserSortSettings};
 pub use state::FileBrowserState;
 pub use store::FileBrowserStore;
-pub use text_field::{preselect_len, Key as TextFieldKey, TextFieldEditor};
+pub use text_field::{char_index_for_x, preselect_len, Key as TextFieldKey, TextFieldEditor};

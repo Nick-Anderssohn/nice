@@ -61,7 +61,9 @@
 // this module's unit tests.
 #![allow(dead_code)]
 
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -70,6 +72,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, SharedString, Subscription, Window,
 };
 
+use nice_model::file_browser::TextFieldEditor;
 use nice_model::{InlineRenameClickGate, SidebarMode, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
     traffic_light_reserved_width, CARD_BORDER_OPACITY, CARD_BORDER_WIDTH, CARD_CORNER_RADIUS,
@@ -84,7 +87,7 @@ use nice_theme::AccentPreset;
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::file_browser::view::FileBrowserView;
-use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
+use crate::inline_rename::{dispatch_rename_key, edit_spans, rename_field, FieldColors, RenameKeyOutcome};
 use crate::session_manager::{ClaudeTabPlacement, SessionManager};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
@@ -320,8 +323,11 @@ pub(crate) struct SidebarShellView {
 
     /// The tab currently being inline-renamed, if any.
     editing_tab_id: Option<String>,
-    /// The in-flight rename draft.
-    draft_title: String,
+    /// The in-flight rename editor (cursor + selection; `None` when not editing).
+    rename_editor: Option<TextFieldEditor>,
+    /// The rename field's text-area left edge (window coords), written by the
+    /// field's layout probe each paint and read by its click-to-position handler.
+    rename_text_left: Rc<Cell<f32>>,
     /// When the current active tab became active — the rename gate reference.
     activated_at: Option<Instant>,
     /// Focus for the inline-rename field (grabbed on begin, released on commit).
@@ -387,7 +393,8 @@ impl SidebarShellView {
             collapsed_projects: HashSet::new(),
             hovered_project: None,
             editing_tab_id: None,
-            draft_title: String::new(),
+            rename_editor: None,
+            rename_text_left: Rc::new(Cell::new(0.0)),
             activated_at: Some(Instant::now()),
             rename_focus: cx.focus_handle(),
             rename_blur_sub: None,
@@ -578,7 +585,8 @@ impl SidebarShellView {
             return;
         };
         self.editing_tab_id = Some(tab_id.to_string());
-        self.draft_title = title;
+        // Cursor at the end (typing appends) — the prior char-append behaviour.
+        self.rename_editor = Some(TextFieldEditor::new(&title));
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
         // Replacing any prior subscription here drops it OUTSIDE its callback.
@@ -594,7 +602,7 @@ impl SidebarShellView {
         let Some(id) = self.editing_tab_id.take() else {
             return;
         };
-        let draft = std::mem::take(&mut self.draft_title);
+        let draft = self.rename_editor.take().map(|e| e.text()).unwrap_or_default();
         self.state.update(cx, |ws, _| ws.model.rename_tab(&id, &draft));
         self.refocus_terminal_after_rename(window, cx);
         cx.notify();
@@ -604,9 +612,20 @@ impl SidebarShellView {
         if self.editing_tab_id.take().is_none() {
             return;
         }
-        self.draft_title.clear();
+        self.rename_editor = None;
         self.refocus_terminal_after_rename(window, cx);
         cx.notify();
+    }
+
+    /// Reposition the caret from a click hit-test — collapse the selection to the
+    /// clicked boundary and re-grab field focus (the click already stopped
+    /// propagation, so the tab's title-tap gate never re-trips).
+    fn place_rename_cursor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.rename_editor.as_mut() {
+            editor.place_cursor(index);
+            self.rename_focus.focus(window, cx);
+            cx.notify();
+        }
     }
 
     /// Swift's rename end paths call `sessions.focusActiveTerminal()` so the
@@ -624,14 +643,22 @@ impl SidebarShellView {
     fn on_rename_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         // Escape is consumed by the shell Esc action (which cancels rename) before
-        // this bubble-phase listener runs; the shared editor leaves it Ignored.
-        match apply_rename_key(
-            &mut self.draft_title,
-            &ks.key,
-            ks.key_char.as_deref(),
-            ks.modifiers.platform,
-            ks.modifiers.control,
-        ) {
+        // this bubble-phase listener runs; the shared editor leaves it Ignored so
+        // that action still fires.
+        let outcome = {
+            let Some(editor) = self.rename_editor.as_mut() else {
+                return;
+            };
+            dispatch_rename_key(
+                editor,
+                &ks.key,
+                ks.key_char.as_deref(),
+                ks.modifiers.shift,
+                ks.modifiers.platform,
+                ks.modifiers.control,
+            )
+        };
+        match outcome {
             RenameKeyOutcome::Commit => {
                 self.commit_rename(window, cx);
                 cx.stop_propagation();
@@ -1459,15 +1486,30 @@ impl SidebarShellView {
 
         // Title view: the inline-rename field while editing, else the label.
         let title: gpui::AnyElement = if t.is_editing {
+            let spans = self
+                .rename_editor
+                .as_ref()
+                .map(edit_spans)
+                .unwrap_or_else(|| edit_spans(&TextFieldEditor::new("")));
+            let colors = FieldColors {
+                bg: slot_to_rgba(s.background3),
+                border: slot_to_rgba(s.line_strong),
+                text: ink,
+                caret: srgba_to_rgba(accent),
+                selection: selection_tint(accent, 1.0),
+            };
+            let weak = cx.weak_entity();
             rename_field(
                 &self.rename_focus,
-                &self.draft_title,
+                &spans,
                 "SidebarRename",
-                slot_to_rgba(s.background3),
-                slot_to_rgba(s.line_strong),
-                ink,
+                colors,
                 13.0,
+                self.rename_text_left.clone(),
                 cx.listener(Self::on_rename_key),
+                move |index, window, app| {
+                    let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));
+                },
             )
             .into_any_element()
         } else {
@@ -1812,7 +1854,26 @@ impl SidebarShellView {
     /// The in-flight tab-rename draft (the scenario's "keys land in the field"
     /// read).
     pub(crate) fn scenario_tab_rename_draft(&self) -> String {
-        self.draft_title.clone()
+        self.rename_editor.as_ref().map(|e| e.text()).unwrap_or_default()
+    }
+
+    /// The in-flight tab-rename selection `(start, end)` as char offsets — the
+    /// scenario asserts caret moves / mid-string edits through it.
+    pub(crate) fn scenario_tab_rename_selection(&self) -> Option<(usize, usize)> {
+        self.rename_editor.as_ref().map(|e| e.selection())
+    }
+
+    /// Move the tab-rename caret one char left/right (the scenario's arrow-key
+    /// driver — direct so it needn't post an arrow CGEvent).
+    pub(crate) fn drive_tab_rename_arrow(&mut self, right: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = self.rename_editor.as_mut() {
+            editor.apply_key(if right {
+                nice_model::file_browser::TextFieldKey::Right
+            } else {
+                nice_model::file_browser::TextFieldKey::Left
+            });
+            cx.notify();
+        }
     }
 
     /// Whether the tab-rename field currently holds key focus.

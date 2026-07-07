@@ -31,8 +31,10 @@
 //! `aria_label("nice-rs-file-browser-root")` — the shipped-surface AX anchor the
 //! `file-browser` scenario walks for (`app_shell.rs:68` convention).
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -53,7 +55,7 @@ use nice_model::InlineRenameClickGate;
 use crate::app_shell::PaneHostView;
 use crate::file_browser::cwd_snapshot::build_snapshot;
 use crate::file_browser::rename::{self, ConfirmSpec, RenameCommit};
-use nice_theme::chrome_geometry::INNER_CORNER_RADIUS;
+use crate::inline_rename::{dispatch_rename_key, edit_spans, EditSpans, FieldColors, RenameKeyOutcome};
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 
@@ -127,28 +129,6 @@ struct RowVm {
     /// R20 (F9): the drag set this row's `on_drag` carries — the whole selection
     /// when the row is selected, else just this row (Finder's select-then-drag).
     drag_paths: Vec<String>,
-}
-
-/// The active rename field's text, split at the selection so the row can render a
-/// caret (collapsed) or a highlighted range plus pre/post text.
-#[derive(Clone)]
-struct EditSpans {
-    pre: String,
-    sel: String,
-    post: String,
-    collapsed: bool,
-}
-
-/// Split an editor's text at its selection for rendering.
-fn edit_spans(editor: &TextFieldEditor) -> EditSpans {
-    let text: Vec<char> = editor.text().chars().collect();
-    let (s, e) = editor.selection();
-    EditSpans {
-        pre: text[..s].iter().collect(),
-        sel: text[s..e].iter().collect(),
-        post: text[e..].iter().collect(),
-        collapsed: s == e,
-    }
 }
 
 /// The per-render snapshot the view builds its element tree from.
@@ -237,6 +217,10 @@ pub(crate) struct FileBrowserView {
     /// internal drag (session non-empty) from a Finder-inbound drop (empty
     /// session).
     drag: FileBrowserDragState,
+    /// The rename field's text-area left edge (window coordinates), written by the
+    /// field's layout probe each paint and read by its click handler to turn a
+    /// click-x into a caret position.
+    rename_text_left: Rc<Cell<f32>>,
 }
 
 /// The active inline-rename edit session (F8): the pure editing model plus the
@@ -312,6 +296,7 @@ impl FileBrowserView {
             sole_activated: None,
             pane_host: None,
             drag: FileBrowserDragState::default(),
+            rename_text_left: Rc::new(Cell::new(0.0)),
         }
     }
 
@@ -999,45 +984,48 @@ impl FileBrowserView {
         }
     }
 
+    /// Reposition the caret from a click hit-test: collapse the selection to the
+    /// clicked char boundary and re-grab field focus. The field's click handler
+    /// already `stop_propagation`ed, so the row's begin-rename gate never re-trips.
+    fn place_rename_cursor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.rename.as_mut() {
+            state.editor.place_cursor(index);
+            self.rename_focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
     /// The field's key handler: Return commits, Esc cancels, everything else edits
-    /// the pure model. Always stops propagation while editing so the keystroke
-    /// never leaks to the keymap / terminal.
+    /// the pure model through the shared [`dispatch_rename_key`]. Always stops
+    /// propagation while editing so the keystroke never leaks to the keymap /
+    /// terminal.
     fn on_rename_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rename.is_none() {
+        let ks = &event.keystroke;
+        // The file-browser field owns its own Esc binding (there is no shell Esc
+        // action over it), so cancel here before the shared dispatch (which leaves
+        // Escape Ignored for owners like this).
+        if ks.key == "escape" {
+            self.cancel_rename(window, cx);
+            cx.stop_propagation();
             return;
         }
-        let ks = &event.keystroke;
-        match ks.key.as_str() {
-            "enter" | "return" => self.commit_rename(window, cx),
-            "escape" => self.cancel_rename(window, cx),
-            "backspace" => self.apply_editor_key(TextFieldKey::Backspace, cx),
-            "delete" => self.apply_editor_key(TextFieldKey::ForwardDelete, cx),
-            "left" => self.apply_editor_key(
-                if ks.modifiers.shift {
-                    TextFieldKey::ShiftLeft
-                } else {
-                    TextFieldKey::Left
-                },
-                cx,
-            ),
-            "right" => self.apply_editor_key(
-                if ks.modifiers.shift {
-                    TextFieldKey::ShiftRight
-                } else {
-                    TextFieldKey::Right
-                },
-                cx,
-            ),
-            "a" if ks.modifiers.platform => self.apply_editor_key(TextFieldKey::SelectAll, cx),
-            _ => {
-                if !ks.modifiers.platform && !ks.modifiers.control {
-                    if let Some(ch) = ks.key_char.as_ref().and_then(|s| s.chars().next()) {
-                        if !ch.is_control() {
-                            self.apply_editor_key(TextFieldKey::Char(ch), cx);
-                        }
-                    }
-                }
-            }
+        let outcome = {
+            let Some(state) = self.rename.as_mut() else {
+                return;
+            };
+            dispatch_rename_key(
+                &mut state.editor,
+                &ks.key,
+                ks.key_char.as_deref(),
+                ks.modifiers.shift,
+                ks.modifiers.platform,
+                ks.modifiers.control,
+            )
+        };
+        match outcome {
+            RenameKeyOutcome::Commit => self.commit_rename(window, cx),
+            RenameKeyOutcome::Edited => cx.notify(),
+            RenameKeyOutcome::Ignored => {}
         }
         cx.stop_propagation();
     }
@@ -1570,9 +1558,20 @@ impl FileBrowserView {
         let count = rows.len();
         let weak = cx.weak_entity();
         let rename_focus = self.rename_focus.clone();
+        let text_left = self.rename_text_left.clone();
         uniform_list("file-browser.tree", count, move |range, _window, app| {
             range
-                .map(|i| render_row(&rows[i], weak.clone(), colors, scale, &rename_focus, app))
+                .map(|i| {
+                    render_row(
+                        &rows[i],
+                        weak.clone(),
+                        colors,
+                        scale,
+                        &rename_focus,
+                        text_left.clone(),
+                        app,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .track_scroll(&self.scroll)
@@ -1729,6 +1728,33 @@ impl FileBrowserView {
     /// Type one printable character into the active rename field.
     pub(crate) fn drive_rename_type(&mut self, ch: char, cx: &mut Context<Self>) {
         self.apply_editor_key(TextFieldKey::Char(ch), cx);
+    }
+
+    /// The x-offset (from the text's left edge) of char boundary `index` in the
+    /// active field — the scenario picks a click target with it.
+    pub(crate) fn scenario_rename_x_for_index(&self, index: usize, window: &Window) -> Option<f32> {
+        let text = self.rename.as_ref()?.editor.text();
+        Some(crate::inline_rename::char_boundary_x(
+            window, &text, NAME_SIZE, index,
+        ))
+    }
+
+    /// Drive a click INSIDE the open rename field at `local_x` (pixels from the
+    /// text's left edge): hit-test the char boundary and reposition the caret,
+    /// exactly as the field's mouse handler does (minus the window-coordinate
+    /// offset the probe supplies live). Returns the char index the caret landed
+    /// at. Proves a click repositions the cursor WITHOUT restarting the edit (the
+    /// rename session is untouched — no `begin_rename`).
+    pub(crate) fn drive_rename_click_at_local_x(
+        &mut self,
+        local_x: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let text = self.rename.as_ref()?.editor.text();
+        let index = crate::inline_rename::char_index_for_click(window, &text, NAME_SIZE, 0.0, local_x);
+        self.place_rename_cursor(index, window, cx);
+        Some(index)
     }
 
     /// Select the whole rename field (⌘A) — the scenario helper for retyping a
@@ -1970,6 +1996,7 @@ fn render_row(
     c: RowColors,
     scale: f32,
     rename_focus: &FocusHandle,
+    text_left: Rc<Cell<f32>>,
     app: &mut App,
 ) -> AnyElement {
     let indent = row.depth as f32 * INDENT_PER_LEVEL;
@@ -2033,7 +2060,9 @@ fn render_row(
                 )),
         )
         .child(match &row.editing {
-            Some(spans) => render_rename_field(spans, rename_focus, weak.clone(), c),
+            Some(spans) => {
+                render_rename_field(spans, rename_focus, weak.clone(), c, text_left.clone())
+            }
             None => div()
                 .flex_1()
                 .text_size(px(NAME_SIZE))
@@ -2130,65 +2159,42 @@ fn render_row(
     .into_any_element()
 }
 
-/// Render the inline-rename field for the editing row (F8): the pure editing
-/// model's text with a caret (collapsed cursor) or a highlighted selection range,
-/// bordered in the accent, tracking the rename focus handle and routing keys back
-/// through the view. This is the NEW input component wrapping slice 1's
-/// `TextFieldEditor` (the landed `inline_rename` field is deliberately untouched).
+/// Render the inline-rename field for the editing row (F8) via the shared
+/// [`crate::inline_rename::rename_field`]: the pure editing model's text with a
+/// caret (collapsed cursor) or a highlighted selection range, the shared field
+/// chrome (background3 fill + line_strong border), key routing back through
+/// [`FileBrowserView::on_rename_key`], and click-to-position through
+/// [`FileBrowserView::place_rename_cursor`].
 fn render_rename_field(
     spans: &EditSpans,
     rename_focus: &FocusHandle,
     weak: gpui::WeakEntity<FileBrowserView>,
     c: RowColors,
+    text_left: Rc<Cell<f32>>,
 ) -> AnyElement {
-    let mut text_row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .child(
-            div()
-                .text_size(px(NAME_SIZE))
-                .text_color(c.ink)
-                .child(SharedString::from(spans.pre.clone())),
-        );
-    if spans.collapsed {
-        // Caret: a thin accent bar at the cursor position (full alpha — the
-        // sel_bg tint is invisible at 1px).
-        text_row = text_row.child(div().w(px(1.0)).h(px(14.0)).bg(c.caret));
-    } else {
-        text_row = text_row.child(
-            div()
-                .bg(c.sel_bg)
-                .text_size(px(NAME_SIZE))
-                .text_color(c.ink)
-                .child(SharedString::from(spans.sel.clone())),
-        );
-    }
-    text_row = text_row.child(
-        div()
-            .text_size(px(NAME_SIZE))
-            .text_color(c.ink)
-            .child(SharedString::from(spans.post.clone())),
-    );
-
-    // Field chrome matches the sidebar-tab / pane-pill `rename_field`: an opaque
-    // background3 box with a line_strong border, so the editor stands out from
-    // the accent-tinted selected row underneath it.
-    div()
-        .id("file-browser.rename-field")
-        .flex_1()
-        .track_focus(rename_focus)
-        .px(px(6.0))
-        .py(px(2.0))
-        .rounded(px(INNER_CORNER_RADIUS))
-        .bg(c.field_bg)
-        .border(px(1.0))
-        .border_color(c.field_border)
-        .on_key_down(move |e: &KeyDownEvent, window, app| {
-            let _ = weak.update(app, |this, cx| this.on_rename_key(e, window, cx));
-        })
-        .child(text_row)
-        .into_any_element()
+    let colors = FieldColors {
+        bg: c.field_bg,
+        border: c.field_border,
+        text: c.ink,
+        caret: c.caret,
+        selection: c.sel_bg,
+    };
+    let weak_key = weak.clone();
+    crate::inline_rename::rename_field(
+        rename_focus,
+        spans,
+        "FileBrowserRename",
+        colors,
+        NAME_SIZE,
+        text_left,
+        move |e: &KeyDownEvent, window, app| {
+            let _ = weak_key.update(app, |this, cx| this.on_rename_key(e, window, cx));
+        },
+        move |index, window, app| {
+            let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));
+        },
+    )
+    .into_any_element()
 }
 
 /// The BSD lstat "is this a real directory" check (mirrors the pure listing's

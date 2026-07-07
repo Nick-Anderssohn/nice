@@ -52,7 +52,9 @@
 // pure label / geometry helpers below ARE exercised by this module's unit tests.
 #![allow(dead_code)]
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -62,6 +64,7 @@ use gpui::{
     Window,
 };
 
+use nice_model::file_browser::TextFieldEditor;
 use nice_model::{
     center_offset_x, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry, Tab,
     TabStatus,
@@ -73,7 +76,7 @@ use nice_theme::AccentPreset;
 
 use crate::app_shell::{PaneHostView, PANE_STRIP_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
-use crate::inline_rename::{apply_rename_key, rename_field, RenameKeyOutcome};
+use crate::inline_rename::{dispatch_rename_key, edit_spans, rename_field, FieldColors, RenameKeyOutcome};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -319,8 +322,11 @@ pub(crate) struct WindowToolbarView {
 
     /// The `(tab_id, pane_id)` currently being inline-renamed, if any.
     editing_pane: Option<(String, String)>,
-    /// The in-flight rename draft.
-    draft_title: String,
+    /// The in-flight rename editor (cursor + selection; `None` when not editing).
+    rename_editor: Option<TextFieldEditor>,
+    /// The rename field's text-area left edge (window coords), written by the
+    /// field's layout probe each paint and read by its click-to-position handler.
+    rename_text_left: Rc<Cell<f32>>,
     /// When the active pane last changed — the rename gate reference.
     activated_at: Option<Instant>,
     /// Focus for the inline-rename field (grabbed on begin, released on commit).
@@ -379,7 +385,8 @@ impl WindowToolbarView {
             accent: AccentPreset::Terracotta.color(),
             hovered_pane_id: None,
             editing_pane: None,
-            draft_title: String::new(),
+            rename_editor: None,
+            rename_text_left: Rc::new(Cell::new(0.0)),
             activated_at: Some(Instant::now()),
             rename_focus: cx.focus_handle(),
             rename_blur_sub: None,
@@ -551,7 +558,8 @@ impl WindowToolbarView {
         else {
             return;
         };
-        self.draft_title = title;
+        // Cursor at the end (typing appends) — the prior char-append behaviour.
+        self.rename_editor = Some(TextFieldEditor::new(&title));
         self.editing_pane = Some((tab_id.to_string(), pane_id.to_string()));
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
@@ -570,7 +578,7 @@ impl WindowToolbarView {
         let Some((tab_id, pane_id)) = self.editing_pane.take() else {
             return;
         };
-        let draft = std::mem::take(&mut self.draft_title);
+        let draft = self.rename_editor.take().map(|e| e.text()).unwrap_or_default();
         self.state
             .update(cx, |ws, _| ws.model.rename_pane(&tab_id, &pane_id, &draft));
         self.refocus_terminal_after_rename(window, cx);
@@ -581,9 +589,20 @@ impl WindowToolbarView {
         if self.editing_pane.take().is_none() {
             return;
         }
-        self.draft_title.clear();
+        self.rename_editor = None;
         self.refocus_terminal_after_rename(window, cx);
         cx.notify();
+    }
+
+    /// Reposition the caret from a click hit-test — collapse the selection to the
+    /// clicked boundary and re-grab field focus (the click already stopped
+    /// propagation, so the pill's select/rename gate never re-trips).
+    fn place_rename_cursor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.rename_editor.as_mut() {
+            editor.place_cursor(index);
+            self.rename_focus.focus(window, cx);
+            cx.notify();
+        }
     }
 
     /// Swift's `commitEdit`/`cancelEdit` call `sessions.focusActiveTerminal()`
@@ -610,13 +629,20 @@ impl WindowToolbarView {
             cx.stop_propagation();
             return;
         }
-        match apply_rename_key(
-            &mut self.draft_title,
-            &ks.key,
-            ks.key_char.as_deref(),
-            ks.modifiers.platform,
-            ks.modifiers.control,
-        ) {
+        let outcome = {
+            let Some(editor) = self.rename_editor.as_mut() else {
+                return;
+            };
+            dispatch_rename_key(
+                editor,
+                &ks.key,
+                ks.key_char.as_deref(),
+                ks.modifiers.shift,
+                ks.modifiers.platform,
+                ks.modifiers.control,
+            )
+        };
+        match outcome {
             RenameKeyOutcome::Commit => {
                 self.commit_rename(window, cx);
                 cx.stop_propagation();
@@ -1004,15 +1030,30 @@ impl WindowToolbarView {
 
         // Title: the shared inline-rename field while editing, else the label.
         let title: gpui::AnyElement = if vm.is_editing {
+            let spans = self
+                .rename_editor
+                .as_ref()
+                .map(edit_spans)
+                .unwrap_or_else(|| edit_spans(&TextFieldEditor::new("")));
+            let colors = FieldColors {
+                bg: slot_to_rgba(s.background3),
+                border: slot_to_rgba(s.line_strong),
+                text: if is_active { ink } else { ink2 },
+                caret: srgba_to_rgba(accent),
+                selection: srgba_to_rgba(srgba_with_alpha(accent, 0.3)),
+            };
+            let weak = cx.weak_entity();
             rename_field(
                 &self.rename_focus,
-                &self.draft_title,
+                &spans,
                 "PaneRename",
-                slot_to_rgba(s.background3),
-                slot_to_rgba(s.line_strong),
-                if is_active { ink } else { ink2 },
+                colors,
                 PILL_TEXT_SIZE,
+                self.rename_text_left.clone(),
                 cx.listener(Self::on_rename_key),
+                move |index, window, app| {
+                    let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));
+                },
             )
             .into_any_element()
         } else {
@@ -1437,7 +1478,26 @@ impl WindowToolbarView {
 
     /// The in-flight rename draft (the scenario's "keys land in the field" read).
     pub(crate) fn scenario_rename_draft(&self) -> String {
-        self.draft_title.clone()
+        self.rename_editor.as_ref().map(|e| e.text()).unwrap_or_default()
+    }
+
+    /// The in-flight rename selection `(start, end)` as char offsets — the
+    /// scenario asserts caret moves / mid-string edits through it.
+    pub(crate) fn scenario_rename_selection(&self) -> Option<(usize, usize)> {
+        self.rename_editor.as_ref().map(|e| e.selection())
+    }
+
+    /// Move the rename caret one char left/right (the scenario's arrow-key driver
+    /// — direct so it needn't post an arrow CGEvent).
+    pub(crate) fn drive_rename_arrow(&mut self, right: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = self.rename_editor.as_mut() {
+            editor.apply_key(if right {
+                nice_model::file_browser::TextFieldKey::Right
+            } else {
+                nice_model::file_browser::TextFieldKey::Left
+            });
+            cx.notify();
+        }
     }
 
     /// Whether the rename field currently holds key focus.

@@ -43,8 +43,10 @@
 //!     ring/breathe pulse), reused by R11's toolbar pills.
 //!   * [`context_menu`] — the in-house context-menu popup (anchored + deferred +
 //!     click-away/Esc), reused by R11.
-//!   * [`inline_rename`] — the shared inline-rename field (char-by-char editor +
-//!     caret) the R10 sidebar row and the R11 toolbar pill both mount.
+//!   * [`inline_rename`] — the shared cursor-capable inline-rename field (the
+//!     `TextFieldEditor` model + caret/selection rendering + click-to-position)
+//!     the file-browser row, the sidebar tab title, and the toolbar pane pill
+//!     all mount.
 //!   * [`sidebar_actions`] — the `SidebarActions` create/close/select seam
 //!     (R10 model-only; R13 rewires it to real sessions).
 //!   * [`pane_strip_actions`] — the `PaneStripActions` pane select/close/add
