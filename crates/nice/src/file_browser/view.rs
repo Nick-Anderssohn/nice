@@ -53,6 +53,7 @@ use nice_model::InlineRenameClickGate;
 use crate::app_shell::PaneHostView;
 use crate::file_browser::cwd_snapshot::build_snapshot;
 use crate::file_browser::rename::{self, ConfirmSpec, RenameCommit};
+use nice_theme::chrome_geometry::INNER_CORNER_RADIUS;
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 
@@ -1562,6 +1563,9 @@ impl FileBrowserView {
             ink: slot_to_rgba(s.ink),
             ink2: slot_to_rgba(s.ink2),
             ink3: slot_to_rgba(s.ink3),
+            field_bg: slot_to_rgba(s.background3),
+            field_border: slot_to_rgba(s.line_strong),
+            caret: srgba_to_rgba(self.accent),
         };
         let count = rows.len();
         let weak = cx.weak_entity();
@@ -1946,6 +1950,15 @@ struct RowColors {
     ink: Rgba,
     ink2: Rgba,
     ink3: Rgba,
+    /// Rename-field chrome — the same slots the sidebar tab / pane pill
+    /// `rename_field` uses (background3 fill + line_strong border), so the
+    /// editor reads as a field against the accent-tinted selected row instead
+    /// of vanishing into it.
+    field_bg: Rgba,
+    field_border: Rgba,
+    /// Full-alpha accent for the collapsed caret bar (sel_bg's 22% tint is
+    /// invisible at 1px).
+    caret: Rgba,
 }
 
 /// Render one tree row (free fn so the `uniform_list` `'static` closure builds it
@@ -2139,8 +2152,9 @@ fn render_rename_field(
                 .child(SharedString::from(spans.pre.clone())),
         );
     if spans.collapsed {
-        // Caret: a thin accent bar at the cursor position.
-        text_row = text_row.child(div().w(px(1.0)).h(px(14.0)).bg(c.sel_bg));
+        // Caret: a thin accent bar at the cursor position (full alpha — the
+        // sel_bg tint is invisible at 1px).
+        text_row = text_row.child(div().w(px(1.0)).h(px(14.0)).bg(c.caret));
     } else {
         text_row = text_row.child(
             div()
@@ -2157,13 +2171,19 @@ fn render_rename_field(
             .child(SharedString::from(spans.post.clone())),
     );
 
+    // Field chrome matches the sidebar-tab / pane-pill `rename_field`: an opaque
+    // background3 box with a line_strong border, so the editor stands out from
+    // the accent-tinted selected row underneath it.
     div()
         .id("file-browser.rename-field")
         .flex_1()
         .track_focus(rename_focus)
-        .px(px(2.0))
-        .border_1()
-        .border_color(c.sel_bg)
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(INNER_CORNER_RADIUS))
+        .bg(c.field_bg)
+        .border(px(1.0))
+        .border_color(c.field_border)
         .on_key_down(move |e: &KeyDownEvent, window, app| {
             let _ = weak.update(app, |this, cx| this.on_rename_key(e, window, cx));
         })
