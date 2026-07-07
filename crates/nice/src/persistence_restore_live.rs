@@ -470,8 +470,12 @@ async fn veto_leg(
     // outstanding gpui borrow (performClose: re-enters gpui synchronously to
     // present the veto modal — calling it inside `update` would panic).
     let view_ptr = whandle.update(cx, |_v, w, _a| platform::ns_view_of(w)).unwrap_or(std::ptr::null_mut());
+    // Sample the modal present-kick counter across the close: presenting the veto
+    // modal must fire exactly this path's kick (asserted just below).
+    let kicks_before_close = crate::window_state::modal_present_kick_count();
     platform::perform_window_close_ptr(view_ptr);
     settle(cx, 400).await;
+    let kicks_after_present = crate::window_state::modal_present_kick_count();
 
     // The window stays OPEN (the veto) and the modal is presented.
     if cx.update(|app| WindowRegistry::state_for_window(app, win_id)).is_none() {
@@ -480,6 +484,21 @@ async fn veto_leg(
     }
     if !state.update(cx, |s, _| s.pending_modal().is_some()) {
         failures.push("(c) the close action did not present the confirmation modal".into());
+    }
+    // REGRESSION PIN (present-kick fix): presenting the modal must have fired the
+    // demand-present kick on this window's NSView. Pre-fix, `present_confirmation`
+    // was `cx.notify()`-only; on an occluded window (stopped CVDisplayLink) notify
+    // never presents, so the modal grabbed focus but painted nothing and the app
+    // looked frozen — every quit/close funnels here because an idle shell keeps a
+    // pane alive. The frontmost self-test window can't reproduce the occluded
+    // pixels (its link runs, so notify presents), so we pin the MECHANISM directly:
+    // the modal-kick counter must have advanced across the present. With the kick
+    // absent (pre-fix) this delta is 0 and the assert fails.
+    if kicks_after_present <= kicks_before_close {
+        failures.push(format!(
+            "(c) presenting the modal fired no present-kick (count {kicks_before_close} → \
+             {kicks_after_present}); an occluded window would paint nothing"
+        ));
     }
     // The modal's confirm button is exposed to the AX tree (role + label).
     // AccessKit builds its tree lazily one frame AFTER the first AX query, so poll
@@ -504,8 +523,19 @@ async fn veto_leg(
     let own = cx.update(|_| session_store::default_store_path());
     session_store::flush();
     let before = std::fs::read(&own).unwrap_or_default();
+    // Dismissing the modal must ALSO fire a present-kick, so the backdrop/overlay
+    // clears on a non-presenting window instead of leaving a ghost (the second
+    // half of the fix).
+    let kicks_before_dismiss = crate::window_state::modal_present_kick_count();
     resolve_modal(cx, whandle, state, false);
     settle(cx, 300).await;
+    let kicks_after_dismiss = crate::window_state::modal_present_kick_count();
+    if kicks_after_dismiss <= kicks_before_dismiss {
+        failures.push(format!(
+            "(c) dismissing the modal fired no present-kick (count {kicks_before_dismiss} → \
+             {kicks_after_dismiss}); the backdrop would ghost on an occluded window"
+        ));
+    }
     if cx.update(|app| WindowRegistry::state_for_window(app, win_id)).is_none() {
         failures.push("(c) Cancel closed the window (must be a total no-op)".into());
     }

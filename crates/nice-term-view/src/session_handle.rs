@@ -26,13 +26,17 @@
 //! event channel to empty + observes the counter, translating both into
 //! on-entity `cx.emit` / `cx.notify`.
 //!
-//! The signal **coalesces**: only the idle→pending edge dispatches a wake, so a
-//! burst of output/events schedules exactly one drain pass (batching preserved,
-//! no per-event wakeups). A send racing the drain-goes-idle edge is not lost —
-//! the park future re-checks the pending flag after storing its waker, and the
-//! producer sets that flag before waking. At true idle **nothing re-arms**: the
-//! task is parked with zero wakeups (this replaced an 8 ms poll timer that cost
-//! ~1.4% CPU per session, even occluded — M3 Bug 3).
+//! The signal **coalesces the drain**: the `pending` flag batches a burst of
+//! output/events into exactly **one drain pass** (the park future clears the
+//! flag, so the pass services the whole backlog — batching preserved). It does
+//! NOT gate the wake itself: every signal wakes the parked waker and pokes the
+//! main runloop, so a poke lost while the runloop is mid-cycle self-heals on the
+//! next signal (see [`signal`] and `control_socket.rs`). A send racing the
+//! drain-goes-idle edge is not lost — the park future re-checks the pending flag
+//! after storing its waker, and the producer sets that flag before waking. At
+//! true idle **nothing re-arms**: there are no signals at all, so the task is
+//! parked with zero wakeups (this replaced an 8 ms poll timer that cost ~1.4% CPU
+//! per session, even occluded — M3 Bug 3).
 //!
 //! **App-Nap safety.** The wake must reach gpui's main run loop from a pty
 //! background thread even when the app is idle/occluded. macOS App Nap defers
@@ -92,12 +96,14 @@ pub type PresentKick = Arc<dyn Fn(&mut AsyncApp)>;
 /// and — via the [`DamageCallback`] / [`DrainWake`] closures — by the session's
 /// feeder and exit-watcher threads.
 ///
-/// Concurrency: `pending` is the coalescing edge flag (idle→pending dispatches a
-/// wake; further signals while a drain is already scheduled just ride it).
-/// `waker` is the parked drain task's [`Waker`]. `damage` is the monotonic
-/// repaint-accounting counter (the drain present-kicks only when it moves).
-/// `runloop_wake` is the App-Nap-safe main-runloop poke fired on the edge
-/// (`wake_main_runloop` in production; a test double in unit tests).
+/// Concurrency: `pending` is the drain-coalescing flag ("work to drain"; the
+/// park future clears it, so a burst runs in one pass). It does NOT gate the
+/// wake — every [`signal`](Self::signal) wakes the waker and pokes the runloop
+/// so a lost poke self-heals (see `signal`). `waker` is the parked drain task's
+/// [`Waker`]. `damage` is the monotonic repaint-accounting counter (the drain
+/// present-kicks only when it moves). `runloop_wake` is the App-Nap-safe
+/// main-runloop poke fired on every signal (`wake_main_runloop` in production; a
+/// test double in unit tests).
 ///
 /// `wake_enabled` gates whether [`signal`](Self::signal) actually wakes the gpui
 /// task, and defaults **on**. It exists solely for the mocked
@@ -132,16 +138,30 @@ impl DrainSignal {
     /// Wake the drain task (coalesced, App-Nap-safe). Called from a pty
     /// background thread on every channel send and every damage bump.
     ///
-    /// Only the idle→pending edge dispatches the actual wake: while a drain is
-    /// already scheduled (pending already set) later signals just ride it, so a
-    /// burst schedules one drain pass, not one wake per event. `pending` is set
-    /// with `Release` and read by the park future with `Acquire`/`AcqRel`, so the
-    /// producer's writes (the enqueued event, the damage bump) are visible to the
-    /// woken drain (the swaps form a release sequence carrying every prior bump).
+    /// `pending` still **coalesces the drain scheduling** — it flags "there is
+    /// work to drain" and the park future clears it, so a backlog runs in one
+    /// pass, not one pass per signal. But the waker-wake and the runloop poke
+    /// below fire on **every** signal, NOT only the idle→pending edge. This is
+    /// the self-healing R14 semantics (`SocketSender::post` in
+    /// `crates/nice/src/control_socket.rs`, ~:807): `CFRunLoopWakeUp` only wakes
+    /// a *waiting* runloop, so a poke fired while the main loop is mid-cycle is a
+    /// silent no-op — and an idle/App-Nap-eligible main queue can defer the woken
+    /// runnable. If only the edge poked, one such lost poke would strand
+    /// `pending == true` forever and every later signal would early-return: the
+    /// drain would never run again (typed chars stop echoing until an unrelated
+    /// runloop event limps it forward). Re-poking on every signal lets the next
+    /// signal recover a lost wake. It costs nothing at true idle: at idle there
+    /// are NO signals at all (the M3 win was deleting the 8 ms poll re-arm, not
+    /// the per-signal poke).
+    ///
+    /// `pending` is set with `Release` (a `swap`, keeping the release-sequence
+    /// property the park future's `Acquire`/`AcqRel` reads rely on — the prior
+    /// return value is now simply unused) so the producer's writes (the enqueued
+    /// event, the damage bump) are visible to the woken drain.
     fn signal(&self) {
-        if self.pending.swap(true, Ordering::Release) {
-            return; // a drain is already scheduled — batch onto it
-        }
+        // Coalesce the drain scheduling — but do NOT branch on the prior value:
+        // the wake below must fire on every signal, not just the edge.
+        let _ = self.pending.swap(true, Ordering::Release);
         if !self.wake_enabled.load(Ordering::Acquire) {
             // Disabled only under the mocked TestAppContext (see the struct docs):
             // set `pending` but never touch the gpui task from this background
@@ -151,9 +171,11 @@ impl DrainSignal {
         if let Some(w) = self.waker.lock().unwrap().take() {
             w.wake();
         }
-        // Belt-and-suspenders App-Nap wake: a coalescable timer would be deferred
-        // while idle/occluded; forcing the main runloop out of its wait is not
-        // (see the module "App-Nap safety" note).
+        // Belt-and-suspenders App-Nap wake, fired on EVERY signal (the self-heal):
+        // a coalescable timer would be deferred while idle/occluded, and a poke
+        // that lands mid-cycle is a no-op; forcing the main runloop out of its
+        // wait on the next signal recovers a lost poke (see the module "App-Nap
+        // safety" note and `control_socket.rs`).
         (self.runloop_wake)();
     }
 
@@ -774,11 +796,17 @@ mod tests {
         for _ in 0..8 {
             signal.signal();
         }
-        assert_eq!(counter.count(), 1, "a burst wakes the drain exactly once");
+        // The parked waker is *taken* on the first signal, so the drain is woken
+        // exactly once for the burst — the batching that matters (one drain pass
+        // per backlog) is preserved.
+        assert_eq!(counter.count(), 1, "a burst wakes the parked drain exactly once");
+        // The runloop poke, by contrast, fires on EVERY signal (self-healing):
+        // one poke lost mid-cycle must not strand the drain, so each signal
+        // re-pokes. Batching lives in `pending`/the waker, not in throttling pokes.
         assert_eq!(
             runloop.load(Ordering::SeqCst),
-            1,
-            "a burst pokes the runloop exactly once (only the idle→pending edge)"
+            8,
+            "every signal re-pokes the runloop (self-heal); coalescing is the single drain pass, not fewer pokes"
         );
 
         // One pass clears the coalesced pending; then it parks (nothing residual).
@@ -867,6 +895,61 @@ mod tests {
         );
         assert_eq!(counter.count(), 1, "note_damage wakes the drain");
         assert_eq!(runloop.load(Ordering::SeqCst), 1, "note_damage pokes the runloop");
+    }
+
+    #[test]
+    fn signal_repokes_when_prior_poke_was_lost() {
+        // The drain-wake starvation wedge (fix/drain-wake-starvation).
+        //
+        // `CFRunLoopWakeUp` only wakes a *waiting* runloop: a poke fired while the
+        // main loop is mid-cycle is a silent no-op, and an idle/App-Nap-eligible
+        // main queue can defer the woken runnable. Model that lost poke here as a
+        // parked drain (waker stored, `pending` left true by the edge signal) that
+        // is NEVER re-polled — the runnable the first poke would have run does not
+        // run. A *second* signal must STILL re-poke the runloop so that deferred
+        // runnable gets another chance to run: the R14 control-socket self-heal
+        // (`SocketSender::post` re-pokes on every call — control_socket.rs ~:807).
+        //
+        // PRE-FIX this hit `if pending.swap(true) { return; }` on the second
+        // signal and did nothing — the runloop poke count stayed at 1 and the drain
+        // wedged forever (typed chars stop echoing until an unrelated runloop event
+        // limps it forward, exactly the reported freeze). The assertion below is
+        // the FIXED contract: every signal with unserviced work re-pokes.
+        let (signal, runloop) = signal_with_counters();
+        let counter = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&counter));
+
+        // Drain parks, storing its waker; `pending` is clear.
+        assert!(poll_ready(&signal, &waker).is_pending(), "drain parks first");
+
+        // First signal — the idle→pending edge. It takes+wakes the waker and pokes
+        // the runloop once. We MODEL the lost poke by NOT re-polling the park
+        // future: the drain stays parked and `pending` stays stuck true.
+        signal.signal();
+        assert_eq!(counter.count(), 1, "the edge signal wakes the parked waker once");
+        assert_eq!(runloop.load(Ordering::SeqCst), 1, "the edge signal pokes once");
+
+        // Second signal, with `pending` still true and the drain still parked. This
+        // is the wedge case. Post-fix it MUST re-poke (the self-heal); pre-fix it
+        // early-returned and this stayed 1.
+        signal.signal();
+        assert_eq!(
+            runloop.load(Ordering::SeqCst),
+            2,
+            "every signal with unserviced work re-pokes the runloop (self-heal); \
+             pre-fix this stayed 1 and the drain wedged"
+        );
+
+        // And the invariant `pending` actually owns still holds: however many
+        // signals fired, ONE drain pass services the whole coalesced backlog.
+        assert!(
+            poll_ready(&signal, &waker).is_ready(),
+            "one pass services the coalesced backlog"
+        );
+        assert!(
+            poll_ready(&signal, &waker).is_pending(),
+            "…then the drain parks — the backlog was drained in a single pass"
+        );
     }
 
     /// A scripted core event stream — every current [`SessionEvent`] variant —

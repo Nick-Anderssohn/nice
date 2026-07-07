@@ -207,6 +207,30 @@ pub(crate) struct WindowState {
     pub(crate) file_browser: FileBrowserStore,
 }
 
+/// Selftest instrumentation: a process-global count of demand-present kicks fired
+/// by the confirmation-modal path ([`WindowState::present_kick_modal`] — one on
+/// present, one on dismiss). The `persistence-restore` scenario reads it via
+/// [`modal_present_kick_count`] to PIN that `present_confirmation` actually kicks
+/// the window: the regression that made quit/close dialogs never paint on an
+/// occluded window (a stopped CVDisplayLink where `cx.notify()` alone never
+/// presents — `crate::platform` fact 1) was precisely that this kick was absent.
+/// The frontmost self-test window can't reproduce the occluded *pixels*, but this
+/// counter pins the mechanism deterministically (0 pre-fix → nonzero post-fix).
+///
+/// The counter is only ever *incremented* under the `selftest` feature (see
+/// [`WindowState::present_kick_modal`]), so the shipped bundle pays no runtime
+/// cost and it stays a constant 0 there. It is compiled unconditionally only so
+/// the always-built scenario module can reference the reader.
+static MODAL_PRESENT_KICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reader for [`MODAL_PRESENT_KICKS`] — the running total of confirmation-modal
+/// present-kicks fired this process (a constant 0 outside `selftest`). The
+/// `persistence-restore` scenario samples deltas across present / dismiss to pin
+/// the present-kick fix.
+pub(crate) fn modal_present_kick_count() -> u64 {
+    MODAL_PRESENT_KICKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl WindowState {
     /// A fresh default window: a seeded [`TabModel`] rooted at `initial_cwd`
     /// (pinned Terminals group + Main tab, per `TabModel::new`), an expanded
@@ -967,6 +991,14 @@ impl WindowState {
     /// [`pending_modal`](Self::pending_modal)), stashes it, and notifies so
     /// [`crate::app_shell::AppShellView`] renders it. `completion(confirmed, ..)`
     /// runs once before dismissal.
+    ///
+    /// Notifying is not enough on an occluded window: `cx.notify()` never PRESENTS
+    /// while the CVDisplayLink is stopped (`crate::platform` fact 1), so the modal
+    /// would grab focus but paint nothing — the app looks frozen (this is exactly
+    /// how every quit/close silently died: an idle shell keeps a pane alive, so all
+    /// three controls take the modal path). We therefore fire the same demand-present
+    /// kick the terminal drain uses, both on present and on dismiss (so the backdrop
+    /// clears too). See [`present_kick_modal`](Self::present_kick_modal).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn present_confirmation(
         &mut self,
@@ -991,16 +1023,55 @@ impl WindowState {
                 mcx,
             )
         });
+        // This window's backing NSView, captured now (while we hold `window`) so
+        // the dismiss subscription — which has no `&mut Window` — can kick the same
+        // view without a re-entrant `window.update`. The content view is stable for
+        // the window's lifetime, and a dismiss can only fire while that window is
+        // still alive (teardown drops the subscription instead of emitting), so the
+        // captured pointer is valid at both present and dismiss time. Null on a
+        // headless / not-yet-on-screen window, where `present_kick` is a no-op.
+        let ns_view = crate::platform::ns_view_of(window);
         // Clear the pending modal when it dismisses (confirm / cancel / Esc /
         // click-away all emit DismissEvent). The stale subscription is dropped
         // when the next modal replaces it or the window tears down.
-        let sub = cx.subscribe(&modal, |ws, _modal, _event: &gpui::DismissEvent, cx| {
-            ws.pending_modal = None;
-            cx.notify();
-        });
+        let sub = cx.subscribe(
+            &modal,
+            move |ws, _modal, _event: &gpui::DismissEvent, cx| {
+                ws.pending_modal = None;
+                cx.notify();
+                // `cx.notify()` alone never PRESENTS while this window's
+                // CVDisplayLink is stopped (occluded window — see `crate::platform`),
+                // so the backdrop/overlay would linger as a ghost on a
+                // non-presenting window. Kick the NSView so the cleared modal paints
+                // on the next CA commit regardless of link state.
+                Self::present_kick_modal(ns_view);
+            },
+        );
         self.pending_modal = Some(modal);
         self.modal_sub = Some(sub);
         cx.notify();
+        // Same present weakness in the other direction: on an occluded window the
+        // freshly-stashed modal would grab keyboard focus but paint zero pixels
+        // (the app looks dead — every quit/close funnels here because an idle shell
+        // still counts as a live pane). The terminal drain carries this exact kick;
+        // the modal has no RAF of its own, so fire it explicitly here.
+        Self::present_kick_modal(ns_view);
+    }
+
+    /// Fire the demand-present kick on this window's backing `NSView` so a
+    /// confirmation modal (and its later dismissal) paints even when the window's
+    /// CVDisplayLink is stopped — `cx.notify()` alone never presents on an occluded
+    /// window (`crate::platform` fact 1). The terminal drain uses the same kick
+    /// (`crate::app::install_present_kick`). A null view (headless / no AppKit
+    /// handle yet) is a safe no-op.
+    fn present_kick_modal(ns_view: *mut std::ffi::c_void) {
+        // Selftest instrumentation (see `modal_present_kick_count`): count the kick
+        // so the `persistence-restore` scenario can pin that this path fires it.
+        #[cfg(feature = "selftest")]
+        MODAL_PRESENT_KICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `ns_view` is this window's live content `NSView` (from
+        // `platform::ns_view_of`) or null, which `present_kick` treats as a no-op.
+        unsafe { crate::platform::present_kick(ns_view) };
     }
 
     /// The confirmation dialog currently presented over this window, if any —
