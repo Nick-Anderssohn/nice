@@ -482,10 +482,24 @@ pub(crate) fn install_fullscreen_command(cx: &mut App) {
     // re-applies the traffic-light position on exit, so the y-26 row survives
     // the round trip with no code of ours. A menu click dispatches the action to
     // the key window; ⌃⌘F does the same via the keymap binding.
+    // Defer the window-touching body: a key/menu action is dispatched from
+    // *inside* the window's `update` (gpui `window.rs` wraps dispatch in
+    // `handle.update`, which `take()`s the window Box out of `cx.windows` for the
+    // duration — `app.rs` `update_window_id`). Touching that SAME window with
+    // `window.update` while it is taken returns `Err("window not found")`, so the
+    // toggle silently no-ops. `cx.defer` runs the body at the end of the current
+    // effect cycle, after the dispatch update has returned the window to
+    // `cx.windows` (App::defer's contract). See the `Quit` / `CloseWindow` twins.
     cx.on_action(|_: &ToggleFullScreen, cx: &mut App| {
-        if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_root, window, _cx| window.toggle_fullscreen());
-        }
+        cx.defer(|cx| {
+            if let Some(window) = cx.active_window() {
+                if let Err(e) =
+                    window.update(cx, |_root, window, _cx| window.toggle_fullscreen())
+                {
+                    eprintln!("nice-rs: ToggleFullScreen could not reach the active window: {e:#}");
+                }
+            }
+        });
     });
     // Initial bar: the window opens windowed, so the item reads "Enter Full
     // Screen"; the bounds observer flips it on the first transition.
@@ -525,8 +539,17 @@ pub(crate) fn install_new_window_command(cx: &mut App) {
 /// [`quit_cascade`] — it also covers a dissolve-terminus `cx.quit()` and a
 /// Dock-menu Quit that bypass the confirmation path.
 pub(crate) fn install_lifecycle_commands(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx: &mut App| request_quit(cx));
-    cx.on_action(|_: &CloseWindow, cx: &mut App| request_close_active_window(cx));
+    // Both bodies touch the active window via `window.update`, but a key/menu
+    // action is dispatched from *inside* that window's `update` (gpui `take()`s
+    // the window Box out of `cx.windows` for the dispatch — `window.rs` /
+    // `app.rs` `update_window_id`). Re-entering `window.update` on the SAME window
+    // while it is taken returns `Err`, which the old `let _ =` swallowed — so quit
+    // / close-window silently no-op'd (the confirmation was never presented).
+    // `cx.defer` runs the body at the end of the current effect cycle, once the
+    // dispatch update has returned the window to `cx.windows` (App::defer's
+    // documented contract), so the re-entrant `window.update` now succeeds.
+    cx.on_action(|_: &Quit, cx: &mut App| cx.defer(request_quit));
+    cx.on_action(|_: &CloseWindow, cx: &mut App| cx.defer(request_close_active_window));
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
@@ -690,7 +713,10 @@ fn request_quit(cx: &mut App) {
         return;
     };
     let copy = crate::lifecycle::quit_dialog_copy(claude, terminal);
-    let _ = win.update(cx, |_root, window, app| {
+    // Runs deferred (see `install_lifecycle_commands`), so the window is back in
+    // `cx.windows` and this `update` succeeds; log rather than swallow a genuine
+    // failure (e.g. the window closed between dispatch and defer).
+    let result = win.update(cx, |_root, window, app| {
         state.update(app, |ws, wcx| {
             ws.present_confirmation(
                 copy.title,
@@ -708,6 +734,9 @@ fn request_quit(cx: &mut App) {
             );
         });
     });
+    if let Err(e) = result {
+        eprintln!("nice-rs: request_quit could not present the quit confirmation: {e:#}");
+    }
 }
 
 /// The confirmed-quit cascade (Swift's ordered terminate path). Order is
@@ -734,11 +763,17 @@ fn request_close_active_window(cx: &mut App) {
     let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
         return;
     };
-    let _ = win.update(cx, |_root, window, app| {
+    // Runs deferred (see `install_lifecycle_commands`), so the window is back in
+    // `cx.windows` and this `update` succeeds; log rather than swallow a genuine
+    // failure.
+    let result = win.update(cx, |_root, window, app| {
         if request_window_close(state, window, app) {
             window.remove_window();
         }
     });
+    if let Err(e) = result {
+        eprintln!("nice-rs: request_close_active_window could not reach the active window: {e:#}");
+    }
 }
 
 /// The shared ⌘W / red-traffic-light close decision (Swift

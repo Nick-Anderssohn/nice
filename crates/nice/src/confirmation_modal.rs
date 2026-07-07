@@ -48,6 +48,37 @@ use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
+/// Selftest instrumentation (Bug B pin): the confirmation-modal backdrop's last
+/// PAINTED bounds as `(x, y, width, height)` in window content points, recorded
+/// on every paint of the deferred overlay (see [`ConfirmationModal::render`]).
+/// The `persistence-restore` scenario reads it via [`modal_backdrop_painted_bounds`]
+/// to assert the backdrop rasterizes at ~full window content size — the regression
+/// (Bug B) was that, as a flex child of the shell root, the `size_full()` backdrop
+/// resolved to empty/zero layout bounds and the deferred paint rasterized nothing
+/// while focus/AX still registered in prepaint, so a pixel-blind test passed twice.
+/// Recorded only under `selftest`; a constant `None` in the shipped bundle (the
+/// probe element is compiled out there), so the reader is always callable but the
+/// backing store is `selftest`-only.
+#[cfg(feature = "selftest")]
+static MODAL_BACKDROP_BOUNDS: std::sync::Mutex<Option<(f32, f32, f32, f32)>> =
+    std::sync::Mutex::new(None);
+
+/// Reader for [`MODAL_BACKDROP_BOUNDS`]: the last painted backdrop bounds as
+/// `(x, y, width, height)` in window content points, or `None` if the backdrop
+/// has not painted this process. A constant `None` outside `selftest`. Always
+/// compiled so the always-built scenario module can name it in a plain
+/// `cargo build -p nice`.
+pub(crate) fn modal_backdrop_painted_bounds() -> Option<(f32, f32, f32, f32)> {
+    #[cfg(feature = "selftest")]
+    {
+        *MODAL_BACKDROP_BOUNDS.lock().unwrap()
+    }
+    #[cfg(not(feature = "selftest"))]
+    {
+        None
+    }
+}
+
 /// The confirm button's stable element id + `aria_label` (the AX anchor a
 /// scenario matches on).
 pub(crate) const CONFIRM_ACCEPT_ID: &str = "confirm.accept";
@@ -262,8 +293,20 @@ impl Render for ConfirmationModal {
 
         // Full-window dimmed backdrop; a press anywhere on it cancels
         // (click-away). The card centers over it and swallows its own presses.
+        //
+        // Bug B fix: `absolute().inset_0()` — NOT `size_full()`. The modal is
+        // composed as a flex child of the shell's flex root
+        // (`AppShellView::render` → `.children(modal)`); a `size_full()` child
+        // there resolves to empty/zero layout bounds, so the deferred paint
+        // rasterized nothing (focus/AX still registered in prepaint regardless of
+        // bounds — which is why the dialog "worked" yet painted zero pixels). An
+        // absolutely-positioned, zero-inset overlay stretches to the window's full
+        // content box independent of the flex layout, so the backdrop covers the
+        // window and the card centers over it (the same bounds-independence the
+        // `context_menu` overlay gets from `anchored()`).
         let backdrop = div()
-            .size_full()
+            .absolute()
+            .inset_0()
             .flex()
             .items_center()
             .justify_center()
@@ -276,6 +319,34 @@ impl Render for ConfirmationModal {
                 }),
             )
             .child(card);
+
+        // Selftest instrumentation (Bug B pin): a zero-visual absolute-inset probe
+        // that fills the backdrop and records the backdrop's PAINTED bounds into
+        // `MODAL_BACKDROP_BOUNDS`. The `persistence-restore` scenario reads it via
+        // `modal_backdrop_painted_bounds` and asserts the backdrop rasterized at
+        // ~full window content size (non-empty), not the zero bounds Bug B
+        // collapsed it to. Compiled out of the shipped bundle.
+        #[cfg(feature = "selftest")]
+        let backdrop = backdrop.child(
+            // The canvas is itself `absolute().inset_0()` so its OWN laid-out
+            // bounds equal the backdrop's full content box (a plain, un-sized
+            // canvas would collapse to zero on its flex main axis). Recording the
+            // canvas's painted bounds thus reports the backdrop's real full-window
+            // bounds.
+            gpui::canvas(
+                |_, _, _| (),
+                |bounds, _, _, _| {
+                    *MODAL_BACKDROP_BOUNDS.lock().unwrap() = Some((
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.size.width),
+                        f32::from(bounds.size.height),
+                    ));
+                },
+            )
+            .absolute()
+            .inset_0(),
+        );
 
         deferred(backdrop).with_priority(MODAL_PRIORITY)
     }

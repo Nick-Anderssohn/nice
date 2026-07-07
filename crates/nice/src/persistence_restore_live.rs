@@ -217,6 +217,13 @@ pub fn open_persistence_restore_window(cx: &mut AsyncApp) -> Result<AnyWindowHan
 
     let whandle: WindowHandle<AppShellView> = cx.update(|app| -> Result<_> {
         crate::keymap::install_shortcuts(app);
+        // Register the REAL ⌘Q / ⌘W global action handlers under test (leg (g)):
+        // `run_selftest` does not wire the lifecycle commands, so the scenario must
+        // install them to exercise the shipped `Quit` / `CloseWindow` handlers (the
+        // Bug-A taken-window re-entrancy lives in their bodies). Idempotent enough
+        // here — this scenario is the only caller, and its `on_app_quit` flush is a
+        // no-op once the store Global is cleared at teardown.
+        crate::app::install_lifecycle_commands(app);
         // Injectable paths (resolved by app::run in production; the scenario is the
         // hermetic injection point).
         // SAFETY: single-threaded scenario setup.
@@ -408,6 +415,16 @@ async fn run_persistence_restore(
         failures.push("(b) the restored window armed no control socket to drive".into());
     }
 
+    // === (g) the REAL Quit action via gpui's dispatch path (Bug A pin) ======
+    // Placed BEFORE (c) so the window is still alive. Bug A: a key/menu action is
+    // dispatched from inside the window's `update`, which `take()`s the window Box
+    // out of `cx.windows`; the global `Quit` handler's `request_quit` then
+    // re-entered `window.update` on that SAME taken window, got `Err`, and the old
+    // `let _ =` swallowed it — so ⌘Q / the Quit menu silently no-op'd and the
+    // confirmation never showed. This leg dispatches the real `Quit` action, which
+    // reproduces the taken-window re-entrancy, and asserts the modal appears.
+    quit_action_leg(cx, whandle, &state, &mut failures).await;
+
     // === (c) W5 veto via the REAL close button ==============================
     if !cx.update(|_| platform::accessibility_trusted()) {
         failures.push(
@@ -431,6 +448,92 @@ async fn run_persistence_restore(
     }
 
     build_report(failures)
+}
+
+// -- leg (g): the real Quit action via gpui's dispatch path (Bug A) ----------
+
+/// Dispatch the shipped `Quit` action through gpui's action-dispatch machinery
+/// (the same node dispatch a ⌘Q keystroke reaches) and assert the confirmation
+/// modal is presented — the Bug-A pin. gpui `Window::dispatch_action` re-enters
+/// `window.update` before running the global handler, so the global `Quit`
+/// handler runs with this window `take()`n out of `cx.windows` — the exact
+/// re-entrancy Bug A hit. Pre-fix, `request_quit`'s re-entrant `window.update`
+/// returned `Err` (swallowed) and no modal appeared; post-fix `request_quit` is
+/// deferred, runs after the window is returned, and presents the modal. Both the
+/// window-dispatch path and the menu-ish `App::dispatch_action` path are covered.
+/// Every dispatch is gated on THIS window being frontmost, because `request_quit`
+/// resolves its target via `cx.active_window()`: were the window not active, a
+/// dispatch could route `request_quit` into `quit_cascade` → `cx.quit()` and tear
+/// down the whole suite. The modal answer is always Cancel — a total no-op that
+/// never quits and leaves clean state for leg (c).
+async fn quit_action_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    state: &Entity<WindowState>,
+    failures: &mut Vec<String>,
+) {
+    use crate::app::Quit;
+
+    let _ = cx.update(|app| app.activate(true));
+    let _ = whandle.update(cx, |_v, w, _a| w.activate_window());
+    settle(cx, 300).await;
+    let win_id = AnyWindowHandle::from(whandle).window_id();
+
+    // Clear any lingering modal from earlier legs before we start.
+    if state.update(cx, |s, _| s.pending_modal().is_some()) {
+        resolve_modal(cx, whandle, state, false);
+        settle(cx, 200).await;
+    }
+
+    let active_here = |cx: &mut AsyncApp| -> bool {
+        cx.update(|app| app.active_window().map(|w| w.window_id()) == Some(win_id))
+    };
+
+    // --- window-dispatch path (the ⌘Q keystroke route) ---
+    if !active_here(cx) {
+        failures.push(
+            "(g) the restored window is not frontmost — cannot safely dispatch the Quit action \
+             (request_quit routes through active_window); free the display Space and re-run"
+                .into(),
+        );
+        return;
+    }
+    let _ = whandle.update(cx, |_v, window, app| {
+        window.dispatch_action(Box::new(Quit), app);
+    });
+    // Let the deferred dispatch + the deferred request_quit + the present run.
+    settle(cx, 400).await;
+    if !state.update(cx, |s, _| s.pending_modal().is_some()) {
+        failures.push(
+            "(g) dispatching the real Quit action presented no confirmation modal (Bug A: the \
+             global handler re-entered window.update on the taken window and the swallowed Err \
+             made quit silently no-op)"
+                .into(),
+        );
+    } else {
+        resolve_modal(cx, whandle, state, false); // Cancel — a total no-op.
+        settle(cx, 200).await;
+        if state.update(cx, |s, _| s.pending_modal().is_some()) {
+            failures.push("(g) the Quit confirmation did not dismiss on Cancel".into());
+        }
+    }
+
+    // --- menu-ish path: App::dispatch_action (the File ▸ Quit menu route) ---
+    // App::dispatch_action enters active_window.update first, then the same
+    // window.dispatch_action defer — reproducing the identical taken-window path.
+    if active_here(cx) {
+        let _ = cx.update(|app| app.dispatch_action(&Quit));
+        settle(cx, 400).await;
+        if !state.update(cx, |s, _| s.pending_modal().is_some()) {
+            failures.push(
+                "(g) the menu-route App::dispatch_action(Quit) presented no modal (Bug A menu path)"
+                    .into(),
+            );
+        } else {
+            resolve_modal(cx, whandle, state, false); // Cancel — a total no-op.
+            settle(cx, 200).await;
+        }
+    }
 }
 
 // -- leg (c): the W5 veto via the real close button --------------------------
@@ -517,6 +620,60 @@ async fn veto_leg(
         Ok(role) if role == "AXButton" => {}
         Ok(role) => failures.push(format!("(c) modal confirm button role = '{role}', want AXButton")),
         Err(e) => failures.push(format!("(c) modal confirm button not in the AX tree: {e}")),
+    }
+
+    // REGRESSION PIN (Bug B): the modal backdrop overlay must RASTERIZE at ~full
+    // window content size, not the zero/empty bounds it collapsed to as a
+    // `size_full()` flex child of the shell root (deferred paint then drew nothing
+    // while focus/AX still registered — a pixel-blind test passed twice). The
+    // `absolute().inset_0()` overlay now fills the window; the selftest probe
+    // (`confirmation_modal`) records the backdrop's painted bounds. The AX poll
+    // above forced repaints, so the backdrop has painted by now. We assert on the
+    // MECHANISM (painted bounds), not pixels.
+    let content = whandle
+        .update(cx, |_v, w, _a| {
+            let s = w.viewport_size();
+            (f32::from(s.width), f32::from(s.height))
+        })
+        .ok();
+    match crate::confirmation_modal::modal_backdrop_painted_bounds() {
+        Some((x, y, bw, bh)) => {
+            eprintln!(
+                "[selftest] persistence-restore (Bug B): modal backdrop painted bounds = \
+                 origin ({x:.1},{y:.1}) size {bw:.1}x{bh:.1}; window content = {content:?}"
+            );
+            if let Some((cw, ch)) = content {
+                // The overlay must COVER the window's visible content box: near the
+                // top-left origin AND extending across ~the full content in each
+                // axis. Assert coverage rather than size alone, because Bug B's real
+                // symptom was a full-SIZE backdrop pushed to origin (0, contentH) —
+                // laid out below the shell's other flex children, entirely off the
+                // bottom of the window, so it rasterized full pixels OFF-SCREEN
+                // (zero visible). The `absolute().inset_0()` overlay instead pins to
+                // (0,0) and fills the window. Tolerances are generous (chrome /
+                // rounding slack); the pre-fix off-screen origin (y ≈ contentH) blows
+                // well past them.
+                const ORIGIN_TOL: f32 = 8.0;
+                let near_origin = x.abs() <= ORIGIN_TOL && y.abs() <= ORIGIN_TOL;
+                let covers = (x + bw) >= cw * 0.8 && (y + bh) >= ch * 0.8;
+                if !(near_origin && covers) {
+                    failures.push(format!(
+                        "(c) the modal backdrop bounds origin ({x:.1},{y:.1}) size {bw:.1}x{bh:.1} \
+                         do not cover the window content box {cw:.1}x{ch:.1} from the top-left \
+                         (Bug B pin — overlay not a full-window inset_0 overlay; near_origin={near_origin}, \
+                         covers={covers})"
+                    ));
+                }
+            } else {
+                failures
+                    .push("(c) could not read the window content size for the Bug B bounds pin".into());
+            }
+        }
+        None => failures.push(
+            "(c) the modal backdrop never recorded painted bounds — the deferred overlay did not \
+             paint (Bug B instrumentation absent)"
+                .into(),
+        ),
     }
 
     // Cancel is a total no-op: the store file is byte-identical across it.
