@@ -1485,6 +1485,36 @@ fn probe_c_terminate_all_two_held_panes_visits_each_once() {
     assert!(!mgr.pane_is_spawned("t1", "t1-b"));
 }
 
+// ---- R20.5 terminal foreground-child busy seam ------------------------------
+
+#[test]
+fn synthetic_foreground_child_marker_reports_busy() {
+    // The seam the busy-close → confirmation-modal wiring is unit-tested on:
+    // a marker forces a "shell has a foreground child" answer with no real pty
+    // running a real command (the live `tcgetpgrp` is covered by the scenario).
+    let mut mgr = counting_manager();
+    mgr.mark_synthetic_foreground_child("t1", "t1-a");
+    assert_eq!(
+        mgr.synthetic_or_absent_foreground_child("t1", "t1-a"),
+        Some(true),
+        "a synthetic-foreground-child marker must report busy without a real pty"
+    );
+}
+
+#[test]
+fn model_only_pane_has_no_foreground_child() {
+    // A model-only / absent pane — no cached session and no synthetic marker —
+    // is NOT busy (`shell_has_foreground_child` ⇒ false), mirroring Swift's
+    // `guard let entry = entries[id] else { return false }`: a lazy companion
+    // terminal never focused is idle, not a foreground-child holder.
+    let mgr = counting_manager();
+    assert_eq!(
+        mgr.synthetic_or_absent_foreground_child("t1", "t1-a"),
+        Some(false),
+        "an absent/model-only pane must not be classified as having a foreground child"
+    );
+}
+
 // ---- W5 (R18) project-pending-removal (Close Project) -----------------------
 
 #[test]

@@ -45,9 +45,9 @@
 
 use std::collections::HashSet;
 
-use gpui::{AnyWindowHandle, AppContext};
+use gpui::{AnyWindowHandle, AppContext, Entity};
 use nice_model::file_browser::FileBrowserStore;
-use nice_model::{PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, TabModel};
+use nice_model::{Pane, PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, TabModel, TabStatus};
 use nice_term_view::TerminalEvent;
 
 use crate::confirmation_modal::ConfirmationModal;
@@ -1187,6 +1187,362 @@ impl WindowState {
         terminus
     }
 
+    // MARK: - R20.5 busy-close gates (CloseRequestCoordinator port)
+    //
+    // The three UI close affordances (toolbar pill ✕, sidebar "Close Tab"/"Close
+    // N Tabs", sidebar "Close Project") route through these gates instead of
+    // calling `close_*_via_session` directly. Each classifies the close scope's
+    // panes as BUSY (D-BUSY) — an alive Claude that is thinking/waiting, or an
+    // alive terminal whose shell has a foreground child — and then either presents
+    // the R18 `ConfirmationModal` (`destructive_confirm = true`, "Force quit") in
+    // front of the existing kill route, or, when nothing is busy, runs the kill
+    // route immediately (exactly today's unconfirmed behavior, D0). This is a
+    // DISTINCT system from R18's alive-pane quit/window-close confirmation (D0);
+    // the two counters never chain.
+
+    /// Whether one pane is BUSY (D-BUSY, ported 1:1 from Swift's `isBusy`,
+    /// `CloseRequestCoordinator.swift:268-279`). Reads the terminal-foreground
+    /// signal from the [`SessionManager`] seam (synthetic-first, else the
+    /// `tcgetpgrp` probe) only for a `Terminal` pane, then defers to the pure
+    /// [`pane_is_busy_with`](Self::pane_is_busy_with) core.
+    fn pane_is_busy(&self, tab_id: &str, pane: &Pane, cx: &gpui::App) -> bool {
+        // Short-circuit: only a Terminal pane consults the shell foreground signal
+        // (the syscall is skipped entirely for Claude / dead panes).
+        let terminal_has_foreground_child = matches!(pane.kind, PaneKind::Terminal)
+            && self.session.shell_has_foreground_child(tab_id, &pane.id, cx);
+        Self::pane_is_busy_with(pane, terminal_has_foreground_child)
+    }
+
+    /// The pure D-BUSY predicate given the terminal-foreground signal — the
+    /// gpui-free core of [`pane_is_busy`](Self::pane_is_busy), unit-testable
+    /// without a `SessionManager` / gpui `App`:
+    /// 1. `!pane.is_alive` ⇒ **not busy** (a held/dead pane is never busy —
+    ///    dead-first guard).
+    /// 2. `Claude` ⇒ busy iff `status` is `Thinking`/`Waiting` (an idle Claude at
+    ///    rest is disposable; read the PER-PANE status, not any tab aggregate).
+    /// 3. `Terminal` ⇒ busy iff `terminal_has_foreground_child` (the caller's
+    ///    `tcgetpgrp`/synthetic signal; a terminal pane's `status` is meaningless).
+    fn pane_is_busy_with(pane: &Pane, terminal_has_foreground_child: bool) -> bool {
+        if !pane.is_alive {
+            return false;
+        }
+        match pane.kind {
+            PaneKind::Claude => matches!(pane.status, TabStatus::Thinking | TabStatus::Waiting),
+            PaneKind::Terminal => terminal_has_foreground_child,
+        }
+    }
+
+    /// The [`describe`](crate::close_confirm::describe)d busy panes of `tab_id`, in
+    /// pane order, honoring the `is_alive && isBusy` pre-filter (Swift
+    /// `requestCloseTab` `:126-129`). Empty when the tab is absent or nothing is
+    /// busy.
+    fn busy_descriptions_in_tab(&self, tab_id: &str, cx: &gpui::App) -> Vec<String> {
+        let Some(tab) = self.model.tab_for(tab_id) else {
+            return Vec::new();
+        };
+        tab.panes
+            .iter()
+            .filter(|p| self.pane_is_busy(tab_id, p, cx))
+            .map(crate::close_confirm::describe)
+            .collect()
+    }
+
+    /// Prune + re-sync the selection against the surviving tabs after a close —
+    /// the model/selection half of the sidebar handlers' post-close reconcile
+    /// (formerly `SidebarShellView::reconcile_selection_after_close`). Runs in BOTH
+    /// the idle-immediate and the confirm-completion paths (D9); a confirmed close
+    /// that skipped it would strand a stale selection.
+    pub(crate) fn reconcile_selection_after_close(&mut self) {
+        let valid: HashSet<String> =
+            self.model.navigable_sidebar_tab_ids().into_iter().collect();
+        let active = self.model.active_tab_id().map(|s| s.to_string());
+        self.selection.prune(&valid);
+        self.selection.sync_active_tab_id(active.as_deref());
+    }
+
+    /// Gate the toolbar pill ✕ close of one pane (Swift `requestClosePane`
+    /// `:104-117`). Busy ⇒ present the `.pane` modal; idle ⇒ close immediately.
+    pub(crate) fn request_close_pane(
+        &mut self,
+        tab_id: &str,
+        pane_id: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.pending_modal().is_some() {
+            eprintln!(
+                "nice-rs: request_close_pane({tab_id}, {pane_id}) ignored — a confirmation modal \
+                 is already up"
+            );
+            return;
+        }
+        let busy_desc = self
+            .model
+            .tab_for(tab_id)
+            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
+            .filter(|p| self.pane_is_busy(tab_id, p, cx))
+            .map(crate::close_confirm::describe);
+        match busy_desc {
+            Some(desc) => {
+                let message = crate::close_confirm::pane_message(&[desc]);
+                let state = cx.entity();
+                let tid = tab_id.to_string();
+                let pid = pane_id.to_string();
+                self.present_confirmation(
+                    crate::close_confirm::TITLE,
+                    message,
+                    crate::close_confirm::CONFIRM_LABEL,
+                    crate::close_confirm::CANCEL_LABEL,
+                    true,
+                    move |confirmed, window, app| {
+                        if confirmed {
+                            Self::commit_close_pane(&state, &tid, &pid, window, app);
+                        }
+                    },
+                    window,
+                    cx,
+                );
+            }
+            None => {
+                let terminus = self.close_pane_via_session(tab_id, pane_id);
+                self.reconcile_selection_after_close();
+                cx.notify();
+                SessionManager::apply_dissolve_terminus(terminus, window, cx);
+            }
+        }
+    }
+
+    /// The confirmed-`.pane` completion: re-resolve by id (never a stale `Pane`,
+    /// D2) and run the existing kill route + reconcile + terminus (D9).
+    fn commit_close_pane(
+        state: &Entity<Self>,
+        tab_id: &str,
+        pane_id: &str,
+        window: &mut gpui::Window,
+        app: &mut gpui::App,
+    ) {
+        let terminus = state.update(app, |ws, cx| {
+            let terminus = ws.close_pane_via_session(tab_id, pane_id);
+            ws.reconcile_selection_after_close();
+            cx.notify();
+            terminus
+        });
+        SessionManager::apply_dissolve_terminus(terminus, window, app);
+    }
+
+    /// Gate the sidebar "Close Tab" close of one tab (Swift `requestCloseTab`
+    /// `:123-135`). Any alive busy pane ⇒ present the `.tab` modal; else close
+    /// immediately.
+    pub(crate) fn request_close_tab(
+        &mut self,
+        tab_id: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.pending_modal().is_some() {
+            eprintln!(
+                "nice-rs: request_close_tab({tab_id}) ignored — a confirmation modal is already up"
+            );
+            return;
+        }
+        let busy = self.busy_descriptions_in_tab(tab_id, cx);
+        if busy.is_empty() {
+            let terminus = self.close_tab_via_session(tab_id);
+            self.reconcile_selection_after_close();
+            cx.notify();
+            SessionManager::apply_dissolve_terminus(terminus, window, cx);
+            return;
+        }
+        let message = crate::close_confirm::tab_message(&busy);
+        let state = cx.entity();
+        let tid = tab_id.to_string();
+        self.present_confirmation(
+            crate::close_confirm::TITLE,
+            message,
+            crate::close_confirm::CONFIRM_LABEL,
+            crate::close_confirm::CANCEL_LABEL,
+            true,
+            move |confirmed, window, app| {
+                if confirmed {
+                    Self::commit_close_tabs(&state, std::slice::from_ref(&tid), window, app);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Gate the sidebar project-context "Close Project" close (Swift
+    /// `requestCloseProject` `:219-236`). The pinned Terminals group has no Close
+    /// Project affordance and never presents a dialog (its kill route no-ops it,
+    /// `close_project_via_session:1125`); otherwise any alive busy pane across the
+    /// project's tabs ⇒ present the `.project` modal, else close immediately.
+    pub(crate) fn request_close_project(
+        &mut self,
+        project_id: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.pending_modal().is_some() {
+            eprintln!(
+                "nice-rs: request_close_project({project_id}) ignored — a confirmation modal is \
+                 already up"
+            );
+            return;
+        }
+        // The pinned Terminals group is never a Close-Project scope: don't present
+        // a dialog for it (the kill route already guards it to a no-op).
+        let busy = if project_id == TabModel::TERMINALS_PROJECT_ID {
+            Vec::new()
+        } else {
+            self.model
+                .projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .into_iter()
+                .flat_map(|project| {
+                    project.tabs.iter().flat_map(|t| {
+                        t.panes
+                            .iter()
+                            .filter(|p| self.pane_is_busy(&t.id, p, cx))
+                            .map(crate::close_confirm::describe)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        if busy.is_empty() {
+            let terminus = self.close_project_via_session(project_id);
+            self.reconcile_selection_after_close();
+            cx.notify();
+            SessionManager::apply_dissolve_terminus(terminus, window, cx);
+            return;
+        }
+        let message = crate::close_confirm::project_message(&busy);
+        let state = cx.entity();
+        let pid = project_id.to_string();
+        self.present_confirmation(
+            crate::close_confirm::TITLE,
+            message,
+            crate::close_confirm::CONFIRM_LABEL,
+            crate::close_confirm::CANCEL_LABEL,
+            true,
+            move |confirmed, window, app| {
+                if confirmed {
+                    Self::commit_close_project(&state, &pid, window, app);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The confirmed-`.project` completion (D2/D9).
+    fn commit_close_project(
+        state: &Entity<Self>,
+        project_id: &str,
+        window: &mut gpui::Window,
+        app: &mut gpui::App,
+    ) {
+        let terminus = state.update(app, |ws, cx| {
+            let terminus = ws.close_project_via_session(project_id);
+            ws.reconcile_selection_after_close();
+            cx.notify();
+            terminus
+        });
+        SessionManager::apply_dissolve_terminus(terminus, window, app);
+    }
+
+    /// Gate the sidebar "Close N Tabs" multi-select close — the partial-eager flow
+    /// (Swift `requestCloseTabs` `:145-191`, D5/§T). A single id degrades to the
+    /// `.tab` gate. Otherwise idle tabs are hard-killed NOW (rows vanish before any
+    /// dialog); only busy survivors are gated behind ONE `.tabs` modal. On cancel
+    /// the busy survivors stay ALIVE while the already-closed idle members stay
+    /// CLOSED — a *partial* close, NOT a total no-op.
+    pub(crate) fn request_close_tabs(
+        &mut self,
+        ids: &[String],
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // §T.1 — single id degrades to the identical `.tab` wording.
+        if ids.len() == 1 {
+            self.request_close_tab(&ids[0], window, cx);
+            return;
+        }
+        // §T.2 — re-entrancy guard (D7).
+        if self.pending_modal().is_some() {
+            eprintln!(
+                "nice-rs: request_close_tabs({} tabs) ignored — a confirmation modal is already up",
+                ids.len()
+            );
+            return;
+        }
+        // §T.3 — classify each EXISTING id into idle vs busy.
+        let TabsCloseSplit {
+            idle_ids,
+            busy_ids,
+            busy_summaries,
+        } = split_tabs_close_batch(ids, |id| {
+            self.model
+                .tab_for(id)
+                .map(|t| (t.title.clone(), self.busy_descriptions_in_tab(id, cx)))
+        });
+        // §T.4 — eagerly close the idle tabs NOW (rows vanish immediately). Any
+        // terminus is at most `WindowEmptied`, which can only fire when NO busy
+        // survivors remain (they keep the window non-empty) — so actuating it is
+        // safe in both branches below.
+        let idle_terminus = if idle_ids.is_empty() {
+            DissolveTerminus::None
+        } else {
+            let terminus = self.close_tabs_via_session(&idle_ids);
+            self.reconcile_selection_after_close();
+            cx.notify();
+            terminus
+        };
+        // §T.5 — everything was idle and is gone.
+        if busy_ids.is_empty() {
+            SessionManager::apply_dissolve_terminus(idle_terminus, window, cx);
+            return;
+        }
+        // Busy survivors remain: actuate the idle terminus (never `WindowEmptied`
+        // here) then present ONE `.tabs` modal over the survivors.
+        SessionManager::apply_dissolve_terminus(idle_terminus, window, cx);
+        let message = crate::close_confirm::tabs_message(&busy_summaries);
+        let state = cx.entity();
+        self.present_confirmation(
+            crate::close_confirm::TITLE,
+            message,
+            crate::close_confirm::CONFIRM_LABEL,
+            crate::close_confirm::CANCEL_LABEL,
+            true,
+            move |confirmed, window, app| {
+                if confirmed {
+                    Self::commit_close_tabs(&state, &busy_ids, window, app);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The confirmed-`.tab`/`.tabs` completion: re-resolve by id and run the batch
+    /// kill route + reconcile + terminus (D2/D9). Shared by the singular `.tab`
+    /// gate (a one-element slice) and the `.tabs` multi-select gate.
+    fn commit_close_tabs(
+        state: &Entity<Self>,
+        tab_ids: &[String],
+        window: &mut gpui::Window,
+        app: &mut gpui::App,
+    ) {
+        let terminus = state.update(app, |ws, cx| {
+            let terminus = ws.close_tabs_via_session(tab_ids);
+            ws.reconcile_selection_after_close();
+            cx.notify();
+            terminus
+        });
+        SessionManager::apply_dissolve_terminus(terminus, window, app);
+    }
+
     /// Tear the window's owned resources down on close. R12 has nothing to stop
     /// (the shipped live terminal is owned by the view and dies with the window's
     /// entity, exactly as before this cycle); this is the hook
@@ -1206,6 +1562,46 @@ impl WindowState {
         // survives. R18 flushes the session snapshot before this runs. Idempotent.
         self.session.teardown();
     }
+}
+
+/// The idle-vs-busy split of a `.tabs` (multi-select) close batch — the pure
+/// result of [`split_tabs_close_batch`], consumed by
+/// [`WindowState::request_close_tabs`] (§T.3).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TabsCloseSplit {
+    /// Tabs with no alive busy pane — hard-killed eagerly, before any dialog.
+    idle_ids: Vec<String>,
+    /// Tabs with ≥1 alive busy pane — gated behind the one `.tabs` modal.
+    busy_ids: Vec<String>,
+    /// The busy tabs' `<Title> (<p1>, <p2>)` summaries, parallel to `busy_ids`.
+    busy_summaries: Vec<String>,
+}
+
+/// Bucket a multi-select close batch into idle vs busy (§T.3), the pure core of
+/// [`WindowState::request_close_tabs`] — gpui-free, so the bucketing is
+/// unit-testable without a live window. `classify(id)` returns `None` for a
+/// vanished id (skipped — Swift iterates the id list, `:177-183`), else
+/// `Some((title, busy_descriptions))`: an empty description list means idle,
+/// non-empty means busy (its summary is built from the title + descriptions).
+fn split_tabs_close_batch(
+    ids: &[String],
+    mut classify: impl FnMut(&str) -> Option<(String, Vec<String>)>,
+) -> TabsCloseSplit {
+    let mut split = TabsCloseSplit::default();
+    for id in ids {
+        let Some((title, busy)) = classify(id) else {
+            continue;
+        };
+        if busy.is_empty() {
+            split.idle_ids.push(id.clone());
+        } else {
+            split.busy_ids.push(id.clone());
+            split
+                .busy_summaries
+                .push(crate::close_confirm::busy_tab_summary(&title, &busy));
+        }
+    }
+    split
 }
 
 #[cfg(test)]
@@ -2710,5 +3106,112 @@ mod tests {
             ),
             "inplace\n"
         );
+    }
+
+    // MARK: - R20.5 busy classification (D-BUSY) + `.tabs` split bucketing
+    //
+    // The full `request_close_*` gates need a gpui `Window` + `Context` (the
+    // `nice` binary links no gpui test-support), so these pin the two extracted
+    // pure cores: the per-pane busy predicate and the multi-select split. The
+    // busy→modal WIRING is covered end-to-end by the `close-confirmation` live
+    // scenario; the terminal foreground-child seam by `session_manager` unit tests.
+
+    fn claude_pane(id: &str, status: TabStatus) -> Pane {
+        let mut p = Pane::new(id, "auth-refactor", PaneKind::Claude);
+        p.status = status;
+        p
+    }
+
+    #[test]
+    fn busy_idle_claude_and_idle_shell_are_not_busy() {
+        // The core parity assert (Swift `isBusy` `:268-279`): an idle Claude at
+        // rest (the default pre-first-title state) is DISPOSABLE, and an idle shell
+        // (no foreground child) is NOT busy — both close with no dialog.
+        let idle_claude = claude_pane("c", TabStatus::Idle);
+        assert!(
+            !WindowState::pane_is_busy_with(&idle_claude, false),
+            "an idle Claude is disposable, not busy"
+        );
+        let shell = Pane::new("t", "npm run dev", PaneKind::Terminal);
+        assert!(
+            !WindowState::pane_is_busy_with(&shell, false),
+            "a shell with no foreground child is idle, not busy"
+        );
+    }
+
+    #[test]
+    fn busy_thinking_or_waiting_claude_is_busy() {
+        for status in [TabStatus::Thinking, TabStatus::Waiting] {
+            assert!(
+                WindowState::pane_is_busy_with(&claude_pane("c", status), false),
+                "a {status:?} Claude is busy"
+            );
+        }
+    }
+
+    #[test]
+    fn busy_terminal_follows_the_foreground_child_signal() {
+        let shell = Pane::new("t", "cat", PaneKind::Terminal);
+        assert!(
+            WindowState::pane_is_busy_with(&shell, true),
+            "a shell WITH a foreground child is busy (the terminal arm follows the syscall/seam)"
+        );
+        assert!(
+            !WindowState::pane_is_busy_with(&shell, false),
+            "the same shell WITHOUT a foreground child is not busy"
+        );
+    }
+
+    #[test]
+    fn busy_dead_pane_is_never_busy_even_when_thinking() {
+        // The dead-first guard (D-BUSY §1): a held/dead pane is never busy, even a
+        // Claude frozen mid-`Thinking` or a terminal reporting a foreground child.
+        let mut dead_claude = claude_pane("c", TabStatus::Thinking);
+        dead_claude.is_alive = false;
+        assert!(!WindowState::pane_is_busy_with(&dead_claude, false));
+        let mut dead_shell = Pane::new("t", "cat", PaneKind::Terminal);
+        dead_shell.is_alive = false;
+        assert!(
+            !WindowState::pane_is_busy_with(&dead_shell, true),
+            "a dead shell is not busy even if a stale foreground-child signal is passed"
+        );
+    }
+
+    #[test]
+    fn split_tabs_buckets_idle_and_busy_and_builds_summaries() {
+        // §T.3: idle tabs (empty busy list) bucket into `idle_ids`; busy tabs into
+        // `busy_ids` with a `<Title> (<p1>, <p2>)` summary; a vanished id is skipped.
+        let ids = vec![
+            "idle-1".to_string(),
+            "busy-1".to_string(),
+            "gone".to_string(),
+            "idle-2".to_string(),
+        ];
+        let split = split_tabs_close_batch(&ids, |id| match id {
+            "idle-1" => Some(("Idle One".to_string(), vec![])),
+            "idle-2" => Some(("Idle Two".to_string(), vec![])),
+            "busy-1" => Some((
+                "My Project".to_string(),
+                vec!["Claude (auth-refactor)".to_string(), "npm run dev".to_string()],
+            )),
+            _ => None, // "gone" — a vanished id
+        });
+        assert_eq!(split.idle_ids, vec!["idle-1", "idle-2"]);
+        assert_eq!(split.busy_ids, vec!["busy-1"]);
+        assert_eq!(
+            split.busy_summaries,
+            vec!["My Project (Claude (auth-refactor), npm run dev)".to_string()],
+            "the busy summary is the BusyTabEntry-style paren join"
+        );
+    }
+
+    #[test]
+    fn split_tabs_all_idle_yields_no_busy_survivors() {
+        // Every member idle ⇒ the whole batch is eager-closed, nothing gated (§T.5).
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let split = split_tabs_close_batch(&ids, |id| Some((id.to_string(), vec![])));
+        assert_eq!(split.idle_ids, vec!["a", "b"]);
+        assert!(split.busy_ids.is_empty());
+        assert!(split.busy_summaries.is_empty());
     }
 }

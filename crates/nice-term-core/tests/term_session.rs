@@ -333,3 +333,54 @@ fn damage_wake_fires_after_lock_released() {
 
     reap(session);
 }
+
+#[test]
+fn idle_shell_at_prompt_has_no_foreground_child() {
+    // R20.5 fallback (the `tcgetpgrp == child_pid` arm ⇒ false): an interactive
+    // login shell sitting at its prompt IS the terminal's foreground process
+    // group (it is the session/pgroup leader), so it has NO foreground child and
+    // must classify as not busy. Drive one command to a marker so we know the
+    // shell processed input and returned to the prompt, then assert the predicate
+    // reads false. A wide grid keeps the echoed input from wrapping the marker.
+    let spec = SpawnSpec::shell("/private/tmp")
+        .with_env(test_env())
+        .with_size(50, 200);
+    let session =
+        TermSession::spawn(&spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn shell-only");
+
+    session
+        .write_input(b"echo IDLEOK\n")
+        .expect("write to pty");
+    assert!(
+        poll_until(|| session.grid_contains("IDLEOK")),
+        "shell never echoed the readiness marker"
+    );
+    // Back at the prompt with no command running: no foreground child.
+    assert!(
+        poll_until(|| !session.has_foreground_child()),
+        "an idle shell at its prompt must have no foreground child"
+    );
+
+    reap(session);
+}
+
+#[test]
+fn exited_pane_has_no_foreground_child() {
+    // R20.5 fallback (dead pty ⇒ false): after the child exits, `tcgetpgrp` on
+    // the master no longer names a live foreground group, so the predicate must
+    // report no foreground child rather than a spurious busy state.
+    let spec = SpawnSpec::command(wrap("exit 0"), "/private/tmp").with_env(test_env());
+    let session = TermSession::spawn(&spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn");
+
+    // Wait for the child to actually exit before probing the dead pty.
+    assert!(
+        session.wait_timeout(Duration::from_secs(20)).is_some(),
+        "command pane did not exit within timeout"
+    );
+    assert!(
+        !session.has_foreground_child(),
+        "an exited pane's dead pty must report no foreground child"
+    );
+
+    reap(session);
+}

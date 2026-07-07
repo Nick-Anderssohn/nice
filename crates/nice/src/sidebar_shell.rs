@@ -90,7 +90,7 @@ use crate::file_browser::view::FileBrowserView;
 use crate::inline_rename::{
     dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe, RenameKeyOutcome,
 };
-use crate::session_manager::{ClaudeTabPlacement, SessionManager};
+use crate::session_manager::ClaudeTabPlacement;
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -554,17 +554,6 @@ impl SidebarShellView {
         });
     }
 
-    /// Prune + re-sync the selection against the surviving tabs after a close.
-    fn reconcile_selection_after_close(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |ws, _| {
-            let valid: HashSet<String> =
-                ws.model.navigable_sidebar_tab_ids().into_iter().collect();
-            let active = ws.model.active_tab_id().map(|s| s.to_string());
-            ws.selection.prune(&valid);
-            ws.selection.sync_active_tab_id(active.as_deref());
-        });
-    }
-
     /// Re-seed the selection + arm the rename gate after a create/select (the new
     /// tab is already the model's active tab).
     fn reseed_selection_after_create(&mut self, cx: &mut Context<Self>) {
@@ -796,26 +785,23 @@ impl SidebarShellView {
         let ids = action_ids.clone();
         let tid = tab_id.to_string();
         let w = weak.clone();
-        // W5/R18: the shipped path now routes through the real session close
-        // (pty release + dissolve cascade + save) rather than the model-only
-        // `SidebarActions` stub, then actuates the window-emptied terminus.
+        // R20.5: route through the busy-close gate. A tab with an alive busy pane
+        // (thinking/waiting Claude, or a shell with a foreground child) interposes
+        // the "Force quit" confirmation; an idle tab still closes immediately (pty
+        // release + dissolve cascade + save + reconcile + terminus). The multi-tab
+        // gate is partial-eager: idle members close now, only busy survivors are
+        // gated (D5). The gate owns the reconcile + notify + terminus in every path.
         items.push(ContextMenuItem::entry(close_label, move |window, app| {
-            let terminus = w
-                .update(app, |this, cx| {
-                    let terminus = this.state.update(cx, |ws, _| {
-                        ws.selection.snap_if_right_click_outside(&tid);
-                        if ids.len() > 1 {
-                            ws.close_tabs_via_session(&ids)
-                        } else {
-                            ws.close_tab_via_session(&tid)
-                        }
-                    });
-                    this.reconcile_selection_after_close(cx);
-                    cx.notify();
-                    terminus
-                })
-                .unwrap_or_default();
-            SessionManager::apply_dissolve_terminus(terminus, window, app);
+            let _ = w.update(app, |this, cx| {
+                this.state.update(cx, |ws, wcx| {
+                    ws.selection.snap_if_right_click_outside(&tid);
+                    if ids.len() > 1 {
+                        ws.request_close_tabs(&ids, window, wcx);
+                    } else {
+                        ws.request_close_tab(&tid, window, wcx);
+                    }
+                });
+            });
         }));
 
         self.present_context_menu(items, position, window, cx);
@@ -837,21 +823,16 @@ impl SidebarShellView {
         }
         let weak = cx.weak_entity();
         let gid = group_id.to_string();
-        // W5/R18: route through the real close (pending-removal flag → row drop on
-        // last dissolve + pty release + save), then actuate the window-emptied
-        // terminus.
+        // R20.5: route through the busy-close gate — a project with an alive busy
+        // pane across its tabs interposes the "Force quit" confirmation; an idle
+        // project still closes immediately (pending-removal flag → row drop on last
+        // dissolve + pty release + save + reconcile + terminus). The gate owns the
+        // reconcile + notify + terminus in both paths.
         let items = vec![ContextMenuItem::entry("Close Project", move |window, app| {
-            let terminus = weak
-                .update(app, |this, cx| {
-                    let terminus = this
-                        .state
-                        .update(cx, |ws, _| ws.close_project_via_session(&gid));
-                    this.reconcile_selection_after_close(cx);
-                    cx.notify();
-                    terminus
-                })
-                .unwrap_or_default();
-            SessionManager::apply_dissolve_terminus(terminus, window, app);
+            let _ = weak.update(app, |this, cx| {
+                this.state
+                    .update(cx, |ws, wcx| ws.request_close_project(&gid, window, wcx));
+            });
         })];
         self.present_context_menu(items, position, window, cx);
     }

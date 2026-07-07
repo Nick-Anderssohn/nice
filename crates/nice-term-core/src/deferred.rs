@@ -411,6 +411,22 @@ impl Session {
         self.session().map(|ts| ts.child_pid())
     }
 
+    /// Whether the pane's shell has a **foreground child** running (R20.5's
+    /// terminal-busy signal) — delegates to
+    /// [`TermSession::has_foreground_child`], which reads `tcgetpgrp(master_fd)`
+    /// against this session's own pty fd (see that method for the full
+    /// definition + fallback semantics).
+    ///
+    /// A `NotSpawned` / `Spawning` session (no live pty) has no foreground child,
+    /// so this returns `false` — the model-only / unspawned pane path (a lazy
+    /// companion terminal never focused is idle, not busy; mirrors Swift's
+    /// `guard let entry … else return false`). Only a `bool` crosses the
+    /// terminal-stack boundary; the raw fd never does.
+    pub fn has_foreground_child(&self) -> bool {
+        self.session()
+            .is_some_and(|ts| ts.has_foreground_child())
+    }
+
     /// The recorded exit status if the child has exited, else `None`. (`held`
     /// is not part of this — read [`Session::phase`] / [`Session::is_held`].)
     pub fn try_status(&self) -> Option<ExitStatus> {

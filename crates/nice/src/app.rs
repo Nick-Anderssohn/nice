@@ -3598,6 +3598,30 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R20.5: the busy-pane close-confirmation gate. Drives the SHIPPED window
+        // (open_managed_window / build_window_root) with a real ZDOTDIR-blanked
+        // terminal shell: an idle pill-✕ close is immediate (no modal); a shell
+        // given a real foreground child (`sleep`) is gated behind the "Force quit"
+        // modal (the ONE true-`tcgetpgrp` leg) — cancel keeps it, confirm kills it;
+        // and a `.tabs` batch of one idle + one busy tab partial-closes on cancel.
+        // Only the pill-✕ close is a real CGEvent; the modal is answered via
+        // ConfirmationModal::resolve. Stub-`claude` via NICE_CLAUDE_OVERRIDE + a
+        // sandbox HOME/ZDOTDIR (never the real claude / ~). Registered BEFORE
+        // `multiwindow`: its build_window_root only `register`s (no WindowRegistry
+        // close observer), so its pane/tab closes never trip the quit-when-empty
+        // terminus (the driver keeps the Main tab populated throughout).
+        Scenario {
+            name: "close-confirmation",
+            open: crate::close_confirm_live::open_close_confirmation_window,
+            gate: Gate::SelfReported {
+                // Two real-shell spawns + grid-readiness polls, a real
+                // foreground-child (`sleep`) poll, three real-CGEvent pill-✕ closes
+                // + modal answers, and the `.tabs` batch — each on the real pty /
+                // AX clock; generous headroom.
+                budget: Duration::from_secs(90),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.

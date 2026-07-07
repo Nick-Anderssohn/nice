@@ -247,6 +247,45 @@ impl TermSession {
         self.pty.child_pid()
     }
 
+    /// Whether the pane's shell has a **foreground child** — i.e. a command is
+    /// running in the foreground of this pty other than the login shell itself.
+    ///
+    /// The pane's shell is a session / process-group leader (its pgid ==
+    /// [`child_pid`](Self::child_pid), via `login_tty`), so while it merely sits
+    /// at its prompt the terminal's foreground process group *is* the shell and
+    /// `tcgetpgrp(master_fd) == child_pid`. When the shell spawns a foreground
+    /// command the kernel moves the terminal's foreground group to that command's
+    /// pgid, so `tcgetpgrp(master_fd) != child_pid`. That inequality is the busy
+    /// signal R20.5's close confirmation reads for a terminal pane (mirrors
+    /// Swift's `TabPtySession` `tcgetpgrp` probe: Swift's `getpgid(shellPid)`
+    /// collapses to `child_pid()` here because the shell is a session leader).
+    ///
+    /// **Fallback ⇒ `false` (not busy), never a spurious confirmation:** any
+    /// failure — a closed / invalid master fd (`fd < 0`), a non-leader / dead
+    /// shell (`child_pid <= 0`), or `tcgetpgrp` itself returning `<= 0` (e.g. the
+    /// slave already hung up) — is treated as "no foreground child".
+    ///
+    /// Only this `bool` leaves the crate; the raw fd never crosses the
+    /// terminal-stack boundary (the syscall lives here, next to the fd it owns).
+    pub fn has_foreground_child(&self) -> bool {
+        let fd = self.pty.master_fd();
+        if fd < 0 {
+            return false;
+        }
+        let child = self.pty.child_pid();
+        if child <= 0 {
+            return false;
+        }
+        // SAFETY: `fd` is this session's live pty master, owned by `self.pty`
+        // (closed only on drop). `tcgetpgrp` only reads the terminal's foreground
+        // process-group id and takes no ownership of the fd.
+        let fg = unsafe { libc::tcgetpgrp(fd) };
+        if fg <= 0 {
+            return false;
+        }
+        fg != child
+    }
+
     /// The child's recorded exit status if it has already exited, else `None`.
     /// Held-pane classification (a later slice) consumes this; this slice does
     /// not classify.

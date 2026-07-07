@@ -703,10 +703,12 @@ impl WindowToolbarView {
     }
 
     /// Close a pane, committing any in-flight edit first
-    /// (`WindowToolbarView.swift:912-916`). W5/R18: the shipped path routes
-    /// through the real session close (pty release + dissolve cascade + save)
-    /// rather than the model-only `PaneStripActions` stub, then actuates the
-    /// window-emptied terminus.
+    /// (`WindowToolbarView.swift:912-916`). R20.5: routes through the busy-close
+    /// gate ([`WindowState::request_close_pane`]) — a busy pane (a shell with a
+    /// foreground child) interposes the "Force quit" confirmation; an idle pane
+    /// still closes immediately (pty release + dissolve cascade + save + terminus),
+    /// exactly as before. The gate owns the reconcile + notify + terminus in both
+    /// paths.
     fn close_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab_id) = self.active_tab_id(cx) else {
             return;
@@ -714,11 +716,9 @@ impl WindowToolbarView {
         if self.editing_pane.is_some() {
             self.commit_rename(window, cx);
         }
-        let terminus = self
-            .state
-            .update(cx, |ws, _| ws.close_pane_via_session(&tab_id, pane_id));
-        cx.notify();
-        crate::session_manager::SessionManager::apply_dissolve_terminus(terminus, window, cx);
+        self.state.update(cx, |ws, wcx| {
+            ws.request_close_pane(&tab_id, pane_id, window, wcx);
+        });
     }
 
     /// Add a terminal pane to the active tab through the seam
@@ -1444,6 +1444,23 @@ impl WindowToolbarView {
         let tab = self.active_tab(cx)?;
         let ix = tab.panes.iter().position(|p| p.id == pane_id)?;
         self.scroll.bounds_for_item(ix)
+    }
+
+    /// The on-screen content-view centre of `pane_id`'s trailing "×" close square,
+    /// as `(x, y_from_top)` — the R20.5 `close-confirmation` scenario's real-CGEvent
+    /// target. The `×` is the pill's last child: `PILL_TRAILING_PAD` in from the
+    /// right edge, `CLOSE_BTN_SIZE` wide, so its centre sits `PILL_TRAILING_PAD +
+    /// CLOSE_BTN_SIZE/2` left of the pill's right edge. The offset-free pill bounds
+    /// get the live scroll offset applied (matching `scenario_pill_bounds`'s
+    /// coordinate convention). `None` when the pane is not laid out. NB the `×` is
+    /// only hit-testable while the pane is hovered/active — select it first.
+    pub(crate) fn scenario_close_button_center(&self, pane_id: &str, cx: &App) -> Option<(f32, f32)> {
+        let b = self.scenario_pill_bounds(pane_id, cx)?;
+        let off = f32::from(self.scroll.offset().x);
+        let right = f32::from(b.origin.x) + off + f32::from(b.size.width);
+        let x = right - PILL_TRAILING_PAD - CLOSE_BTN_SIZE / 2.0;
+        let y = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
+        Some((x, y))
     }
 
     /// Drive a pane selection through the real path.

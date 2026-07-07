@@ -453,6 +453,16 @@ impl TerminalSessionHandle {
         &mut self.session
     }
 
+    /// Whether the wrapped session's shell has a **foreground child** running —
+    /// the terminal-busy signal R20.5's close confirmation reads for a terminal
+    /// pane. A thin passthrough to [`nice_term_core::Session::has_foreground_child`]
+    /// (which reads `tcgetpgrp(master_fd)` inside `nice-term-core`, next to the
+    /// fd it owns): only this `bool` crosses the terminal-stack boundary, never
+    /// the raw fd. An unspawned session ⇒ `false` (see that method).
+    pub fn has_foreground_child(&self) -> bool {
+        self.session.has_foreground_child()
+    }
+
     /// Whether the wrapped session's child has produced its first output byte yet
     /// — the latched `OutputStarted` fact, forwarded from
     /// [`nice_term_core::Session::output_started`]. The view reads it in

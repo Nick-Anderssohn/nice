@@ -306,3 +306,22 @@ fn drain_wake_fires_after_exited_event() {
 
     drop(session);
 }
+
+#[test]
+fn deferred_session_has_no_foreground_child() {
+    // R20.5 fallback: a `NotSpawned` session (no live pty) has no foreground
+    // child — the model-only / unspawned-pane path (a lazy companion terminal
+    // never focused is idle, not busy). No syscall runs; the delegate short-
+    // circuits on the absent `TermSession`.
+    let spec = SpawnSpec::command(wrap("sleep 60; exit 0", SENTINEL), "/private/tmp")
+        .with_env(test_env());
+    let (session, _events) = Session::deferred(spec, DEFAULT_SCROLLBACK_LINES, no_wake());
+
+    assert_eq!(session.phase(), Phase::NotSpawned);
+    assert!(
+        !session.has_foreground_child(),
+        "an unspawned session must report no foreground child"
+    );
+    // Never triggered → no child was ever spawned, nothing to reap.
+    drop(session);
+}

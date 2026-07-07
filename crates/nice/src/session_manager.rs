@@ -261,6 +261,15 @@ pub(crate) struct SessionManager {
     /// having run (`syntheticArmedDeferredPanes` — the armed-but-not-fired
     /// deferred spawn). One-shot: consumed on terminate.
     synthetic_armed: HashSet<String>,
+    /// R20.5 test seam: `<tab>:<pane>` keys
+    /// [`shell_has_foreground_child`](Self::shell_has_foreground_child) reports as
+    /// busy (a shell with a foreground child) WITHOUT a real pty running a real
+    /// command. Lets the busy-close → confirmation-modal wiring be unit-tested off
+    /// the live `tcgetpgrp` syscall (which needs a real foreground child and is
+    /// covered once by the live scenario). Always empty in production — nothing
+    /// populates it outside the [`mark_synthetic_foreground_child`](Self::mark_synthetic_foreground_child)
+    /// test seam. Mirrors the `synthetic_spawned`/`_held`/`_armed` seams.
+    synthetic_foreground_child: HashSet<String>,
     /// Injectable id minter (test seam). Production default:
     /// `<prefix><ms>-<suffix>` — the millisecond keeps ids roughly time-sortable
     /// for log triage; the short suffix keeps two creations in the same
@@ -310,6 +319,7 @@ impl SessionManager {
             synthetic_spawned: HashSet::new(),
             synthetic_held: HashSet::new(),
             synthetic_armed: HashSet::new(),
+            synthetic_foreground_child: HashSet::new(),
             mint_id,
             window_shell_env: None,
             pending_project_removal: HashSet::new(),
@@ -1076,6 +1086,67 @@ impl SessionManager {
         self.synthetic_armed.insert(key);
     }
 
+    /// R20.5 test seam: mark `(tab_id, pane_id)` as a terminal pane whose shell
+    /// has a **foreground child** — [`shell_has_foreground_child`](Self::shell_has_foreground_child)
+    /// then reports it busy WITHOUT a real pty running a real command, so the
+    /// busy-close → confirmation-modal wiring is unit-testable off the live
+    /// `tcgetpgrp` syscall (covered once by the live scenario). Mirrors
+    /// [`mark_synthetic_held_pane`](Self::mark_synthetic_held_pane).
+    pub(crate) fn mark_synthetic_foreground_child(&mut self, tab_id: &str, pane_id: &str) {
+        self.synthetic_foreground_child
+            .insert(synthetic_key(tab_id, pane_id));
+    }
+
+    /// Whether `(tab_id, pane_id)`'s shell has a foreground child — R20.5's
+    /// terminal-busy signal (a `PaneKind::Terminal` pane is busy iff this is
+    /// `true`). Consults the synthetic seam FIRST (a
+    /// [`mark_synthetic_foreground_child`](Self::mark_synthetic_foreground_child)
+    /// marker ⇒ `true`, so the busy→modal wiring is unit-testable without a real
+    /// child), else reads the real session handle's
+    /// [`has_foreground_child`](nice_term_view::TerminalSessionHandle::has_foreground_child)
+    /// (which runs the `tcgetpgrp` probe inside `nice-term-core`; only a `bool`
+    /// crosses the boundary). A **model-only / absent** pane — no cached session
+    /// and no synthetic marker — is NOT busy (`false`; mirrors Swift's
+    /// `guard let entry = entries[id] else { return false }` — a lazy companion
+    /// terminal never focused is idle, not busy).
+    pub(crate) fn shell_has_foreground_child(
+        &self,
+        tab_id: &str,
+        pane_id: &str,
+        cx: &App,
+    ) -> bool {
+        match self.synthetic_or_absent_foreground_child(tab_id, pane_id) {
+            Some(answer) => answer,
+            // A real session is cached and no synthetic override applies — read
+            // the true fd predicate off its handle.
+            None => self
+                .pane_handle(tab_id, pane_id)
+                .map(|handle| handle.read(cx).has_foreground_child())
+                .unwrap_or(false),
+        }
+    }
+
+    /// The synthetic-seam / absent-pane answer for
+    /// [`shell_has_foreground_child`](Self::shell_has_foreground_child), or `None`
+    /// when a real handle must be read. Pure (no `cx`), so the seam-first and
+    /// model-only-`false` paths are unit-testable without a gpui context (the
+    /// `nice` crate links no gpui test-support):
+    /// - a synthetic-foreground-child marker ⇒ `Some(true)`;
+    /// - no live session cached for this pane ⇒ `Some(false)` (model-only/absent);
+    /// - otherwise ⇒ `None` (a real handle exists; read its fd predicate).
+    fn synthetic_or_absent_foreground_child(&self, tab_id: &str, pane_id: &str) -> Option<bool> {
+        if self
+            .synthetic_foreground_child
+            .contains(&synthetic_key(tab_id, pane_id))
+        {
+            return Some(true);
+        }
+        if !self.has_pane(tab_id, pane_id) {
+            return Some(false);
+        }
+        None
+    }
+
     /// Actuate a [`DissolveTerminus`] via R12's registry (the gpui side of the
     /// every-project-empty terminus — live-wired slice 3): close this window when
     /// another live window remains, else quit the app. A no-op for
@@ -1559,6 +1630,7 @@ impl SessionManager {
         self.synthetic_spawned.clear();
         self.synthetic_held.clear();
         self.synthetic_armed.clear();
+        self.synthetic_foreground_child.clear();
     }
 }
 

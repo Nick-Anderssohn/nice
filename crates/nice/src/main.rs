@@ -117,6 +117,8 @@ mod claude_e2e_live;
 mod claude_hook_installer;
 mod claude_theme_sync;
 mod claude_lifecycle_live;
+mod close_confirm;
+mod close_confirm_live;
 mod confirmation_modal;
 mod context_menu;
 mod control_socket;
