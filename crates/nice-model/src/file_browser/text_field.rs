@@ -452,6 +452,19 @@ mod tests {
         assert_eq!(char_index_for_x(B, 5.0), 0);
     }
 
+    /// The half-glyph convention: `boundaries[i]` is the LEFT edge of char `i`
+    /// (`boundaries[0] == 0.0`, final entry = end of text), so a click on the
+    /// LEFT half of glyph `i` puts the caret BEFORE it (index `i`) and a click
+    /// on its RIGHT half puts the caret AFTER it (index `i + 1`).
+    #[test]
+    fn char_index_for_x_left_half_before_right_half_after() {
+        // Glyph 1 spans [10, 20): left half → caret 1, right half → caret 2.
+        assert_eq!(char_index_for_x(B, 12.0), 1, "left half of glyph 1 → before it");
+        assert_eq!(char_index_for_x(B, 18.0), 2, "right half of glyph 1 → after it");
+        // And glyph 0 spans [0, 10): its left half is caret 0, never 1.
+        assert_eq!(char_index_for_x(B, 2.0), 0, "left half of glyph 0 → caret 0");
+    }
+
     #[test]
     fn char_index_for_x_empty_boundaries_is_zero() {
         assert_eq!(char_index_for_x(&[], 12.0), 0);

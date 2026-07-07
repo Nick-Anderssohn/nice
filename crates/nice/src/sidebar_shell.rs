@@ -87,7 +87,9 @@ use nice_theme::AccentPreset;
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::file_browser::view::FileBrowserView;
-use crate::inline_rename::{dispatch_rename_key, edit_spans, rename_field, FieldColors, RenameKeyOutcome};
+use crate::inline_rename::{
+    dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe, RenameKeyOutcome,
+};
 use crate::session_manager::{ClaudeTabPlacement, SessionManager};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
@@ -325,9 +327,10 @@ pub(crate) struct SidebarShellView {
     editing_tab_id: Option<String>,
     /// The in-flight rename editor (cursor + selection; `None` when not editing).
     rename_editor: Option<TextFieldEditor>,
-    /// The rename field's text-area left edge (window coords), written by the
-    /// field's layout probe each paint and read by its click-to-position handler.
-    rename_text_left: Rc<Cell<f32>>,
+    /// The rename field's painted geometry (text-run + field-box left edges,
+    /// window coords), written by the field's layout probes each paint and read
+    /// by its click-to-position handler.
+    rename_probe: Rc<Cell<FieldProbe>>,
     /// When the current active tab became active — the rename gate reference.
     activated_at: Option<Instant>,
     /// Focus for the inline-rename field (grabbed on begin, released on commit).
@@ -394,7 +397,7 @@ impl SidebarShellView {
             hovered_project: None,
             editing_tab_id: None,
             rename_editor: None,
-            rename_text_left: Rc::new(Cell::new(0.0)),
+            rename_probe: Rc::new(Cell::new(FieldProbe::default())),
             activated_at: Some(Instant::now()),
             rename_focus: cx.focus_handle(),
             rename_blur_sub: None,
@@ -1505,7 +1508,7 @@ impl SidebarShellView {
                 "SidebarRename",
                 colors,
                 13.0,
-                self.rename_text_left.clone(),
+                self.rename_probe.clone(),
                 cx.listener(Self::on_rename_key),
                 move |index, window, app| {
                     let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));

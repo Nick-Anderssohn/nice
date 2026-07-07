@@ -55,7 +55,9 @@ use nice_model::InlineRenameClickGate;
 use crate::app_shell::PaneHostView;
 use crate::file_browser::cwd_snapshot::build_snapshot;
 use crate::file_browser::rename::{self, ConfirmSpec, RenameCommit};
-use crate::inline_rename::{dispatch_rename_key, edit_spans, EditSpans, FieldColors, RenameKeyOutcome};
+use crate::inline_rename::{
+    dispatch_rename_key, edit_spans, EditSpans, FieldColors, FieldProbe, RenameKeyOutcome,
+};
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 
@@ -217,10 +219,10 @@ pub(crate) struct FileBrowserView {
     /// internal drag (session non-empty) from a Finder-inbound drop (empty
     /// session).
     drag: FileBrowserDragState,
-    /// The rename field's text-area left edge (window coordinates), written by the
-    /// field's layout probe each paint and read by its click handler to turn a
-    /// click-x into a caret position.
-    rename_text_left: Rc<Cell<f32>>,
+    /// The rename field's painted geometry (text-run + field-box left edges,
+    /// window coordinates), written by the field's layout probes each paint and
+    /// read by its click handler to turn a click-x into a caret position.
+    rename_probe: Rc<Cell<FieldProbe>>,
 }
 
 /// The active inline-rename edit session (F8): the pure editing model plus the
@@ -296,7 +298,7 @@ impl FileBrowserView {
             sole_activated: None,
             pane_host: None,
             drag: FileBrowserDragState::default(),
-            rename_text_left: Rc::new(Cell::new(0.0)),
+            rename_probe: Rc::new(Cell::new(FieldProbe::default())),
         }
     }
 
@@ -1558,7 +1560,7 @@ impl FileBrowserView {
         let count = rows.len();
         let weak = cx.weak_entity();
         let rename_focus = self.rename_focus.clone();
-        let text_left = self.rename_text_left.clone();
+        let probe = self.rename_probe.clone();
         uniform_list("file-browser.tree", count, move |range, _window, app| {
             range
                 .map(|i| {
@@ -1568,7 +1570,7 @@ impl FileBrowserView {
                         colors,
                         scale,
                         &rename_focus,
-                        text_left.clone(),
+                        probe.clone(),
                         app,
                     )
                 })
@@ -1739,20 +1741,36 @@ impl FileBrowserView {
         ))
     }
 
-    /// Drive a click INSIDE the open rename field at `local_x` (pixels from the
-    /// text's left edge): hit-test the char boundary and reposition the caret,
-    /// exactly as the field's mouse handler does (minus the window-coordinate
-    /// offset the probe supplies live). Returns the char index the caret landed
-    /// at. Proves a click repositions the cursor WITHOUT restarting the edit (the
-    /// rename session is untouched — no `begin_rename`).
-    pub(crate) fn drive_rename_click_at_local_x(
+    /// The field's painted geometry `(field_left, text_left)` (window
+    /// coordinates), as recorded by the two live layout probes. The scenario
+    /// cross-checks them against each other (`text_left - field_left` must be the
+    /// 6px field padding) so a probe regression to the field-box bias — the click
+    /// off-by-one — cannot cancel out of the click assertions.
+    pub(crate) fn scenario_rename_probe(&self) -> (f32, f32) {
+        let p = self.rename_probe.get();
+        (p.field_left, p.text_left)
+    }
+
+    /// Drive a click INSIDE the open rename field at WINDOW x `window_x`,
+    /// through the exact production math: hit-test against the live probe's
+    /// `text_left` (as the field's mouse handler does) and reposition the caret.
+    /// Returns the char index the caret landed at. Proves a click repositions the
+    /// cursor WITHOUT restarting the edit (the rename session is untouched — no
+    /// `begin_rename`).
+    pub(crate) fn drive_rename_click_at_window_x(
         &mut self,
-        local_x: f32,
+        window_x: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
         let text = self.rename.as_ref()?.editor.text();
-        let index = crate::inline_rename::char_index_for_click(window, &text, NAME_SIZE, 0.0, local_x);
+        let index = crate::inline_rename::char_index_for_click(
+            window,
+            &text,
+            NAME_SIZE,
+            self.rename_probe.get().text_left,
+            window_x,
+        );
         self.place_rename_cursor(index, window, cx);
         Some(index)
     }
@@ -1996,7 +2014,7 @@ fn render_row(
     c: RowColors,
     scale: f32,
     rename_focus: &FocusHandle,
-    text_left: Rc<Cell<f32>>,
+    probe: Rc<Cell<FieldProbe>>,
     app: &mut App,
 ) -> AnyElement {
     let indent = row.depth as f32 * INDENT_PER_LEVEL;
@@ -2061,7 +2079,7 @@ fn render_row(
         )
         .child(match &row.editing {
             Some(spans) => {
-                render_rename_field(spans, rename_focus, weak.clone(), c, text_left.clone())
+                render_rename_field(spans, rename_focus, weak.clone(), c, probe.clone())
             }
             None => div()
                 .flex_1()
@@ -2170,7 +2188,7 @@ fn render_rename_field(
     rename_focus: &FocusHandle,
     weak: gpui::WeakEntity<FileBrowserView>,
     c: RowColors,
-    text_left: Rc<Cell<f32>>,
+    probe: Rc<Cell<FieldProbe>>,
 ) -> AnyElement {
     let colors = FieldColors {
         bg: c.field_bg,
@@ -2186,7 +2204,7 @@ fn render_rename_field(
         "FileBrowserRename",
         colors,
         NAME_SIZE,
-        text_left,
+        probe,
         move |e: &KeyDownEvent, window, app| {
             let _ = weak_key.update(app, |this, cx| this.on_rename_key(e, window, cx));
         },

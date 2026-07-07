@@ -151,6 +151,26 @@ pub(crate) struct FieldColors {
     pub(crate) selection: Rgba,
 }
 
+/// The field's painted geometry, written by two layout probes each paint:
+///
+/// * `text_left` — the TEXT RUN's left edge in window coordinates. The probe
+///   sits inside the padding-less, border-less text row, so its box left IS the
+///   x that glyph offsets are measured from. This is what the click hit-test
+///   subtracts. (Probing the outer FIELD box here was the click off-by-one bug:
+///   taffy positions an `absolute().inset_0()` child relative to its direct
+///   parent's box inside the border, so a probe on the field recorded
+///   `text_left − 6px` — the field's horizontal padding — and every click read
+///   ~6px right, one narrow glyph.)
+/// * `field_left` — the outer field box's probe, kept so scenarios can
+///   cross-check the two probes against each other: `text_left − field_left`
+///   must equal the field's horizontal padding (6px), which catches a
+///   regression to the field-box bias without trusting either probe alone.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FieldProbe {
+    pub(crate) field_left: f32,
+    pub(crate) text_left: f32,
+}
+
 /// Map a click at window-x `click_x` to a char-boundary index into `text`, using
 /// the window's text system to measure each glyph advance at `text_size`.
 /// `text_left` is the text's left edge in window coordinates (captured by the
@@ -217,9 +237,9 @@ pub(crate) fn char_boundary_x(window: &Window, text: &str, text_size: f32, index
 /// editor's `spans` (pre text, then a caret or a highlighted selection, then post
 /// text), wired to `on_key` and to a click handler that repositions the caret.
 ///
-/// * `text_left` is a per-field cell the layout probe writes each paint (the text
-///   area's left edge in window coordinates); the click handler reads it to turn
-///   a window-x into a text-relative offset.
+/// * `probe` is a per-field cell two layout probes write each paint (see
+///   [`FieldProbe`]); the click handler reads `text_left` from it to turn a
+///   window-x into a text-relative offset.
 /// * `on_key` is the caller's key handler (built with `cx.listener` / a weak
 ///   entity); it dispatches through [`dispatch_rename_key`] and commits/cancels.
 /// * `on_click_index` receives the hit-tested char index; the caller places the
@@ -227,7 +247,7 @@ pub(crate) fn char_boundary_x(window: &Window, text: &str, text_size: f32, index
 ///
 /// The click handler `stop_propagation`s so the press never reaches the row / tab
 /// / pill mouse handler beneath it — the fix for "a click inside the field
-/// restarts the edit".
+/// restarts the edit". The pointer shows the text I-beam over the whole field.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rename_field(
     focus: &FocusHandle,
@@ -235,14 +255,32 @@ pub(crate) fn rename_field(
     key_context: &'static str,
     colors: FieldColors,
     text_size: f32,
-    text_left: Rc<Cell<f32>>,
+    probe: Rc<Cell<FieldProbe>>,
     on_key: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
     on_click_index: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    // Text-run probe: an absolute inset-0 canvas inside the padding-less,
+    // border-less text row — taffy resolves it against the row's own box, whose
+    // left edge IS the first glyph's x origin (see [`FieldProbe::text_left`]).
+    let text_capture = probe.clone();
+    let text_probe = canvas(
+        |_, _, _| (),
+        move |bounds, _, _, _| {
+            text_capture.set(FieldProbe {
+                text_left: f32::from(bounds.origin.x),
+                ..text_capture.get()
+            })
+        },
+    )
+    .absolute()
+    .inset_0();
+
     let mut text_row = div()
+        .relative()
         .flex()
         .flex_row()
         .items_center()
+        .child(text_probe)
         .child(
             div()
                 .text_size(px(text_size))
@@ -269,13 +307,17 @@ pub(crate) fn rename_field(
             .child(SharedString::from(spans.post.clone())),
     );
 
-    // Layout probe: a zero-visual absolute-inset canvas that records the field's
-    // content-box left (= the text's left edge, since the text row starts at the
-    // padding edge) into `text_left` each paint. The click handler reads it.
-    let capture = text_left.clone();
-    let probe = canvas(
+    // Field-box probe: the scenario's independent cross-check anchor (see
+    // [`FieldProbe::field_left`]). NOT used by the click hit-test.
+    let field_capture = probe.clone();
+    let field_probe = canvas(
         |_, _, _| (),
-        move |bounds, _, _, _| capture.set(f32::from(bounds.origin.x)),
+        move |bounds, _, _, _| {
+            field_capture.set(FieldProbe {
+                field_left: f32::from(bounds.origin.x),
+                ..field_capture.get()
+            })
+        },
     )
     .absolute()
     .inset_0();
@@ -292,15 +334,16 @@ pub(crate) fn rename_field(
         .bg(colors.bg)
         .border(px(1.0))
         .border_color(colors.border)
+        .cursor_text()
         .child(text_row)
-        .child(probe)
+        .child(field_probe)
         .on_key_down(on_key)
         .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, app| {
             let idx = char_index_for_click(
                 window,
                 &full_text,
                 text_size,
-                text_left.get(),
+                probe.get().text_left,
                 f32::from(e.position.x),
             );
             on_click_index(idx, window, app);

@@ -808,42 +808,81 @@ async fn r20_legs(
     cancel_rename(cx, whandle, fb).await; // clean up the open field
 
     // (d') click-to-position: a click INSIDE the open field repositions the caret
-    //      without restarting the edit — the selection collapses to the clicked
-    //      char boundary and the preselection is NOT reset. Round-trips through the
-    //      real shape/measure hit-test: measure boundary 3's x, click just past it,
-    //      and assert the caret lands on 3.
+    //      without restarting the edit. Bias-proofed against the probe-offset bug
+    //      class (the field-box-vs-text-run off-by-one): (1) the two live layout
+    //      probes are cross-checked against each other — the text-run probe must
+    //      sit exactly the field's 6px horizontal padding right of the field-box
+    //      probe, so a probe regression cannot cancel out of the click math; and
+    //      (2) the clicks pin the half-glyph convention at REAL window
+    //      coordinates through the production probe path: the text's left pixel
+    //      edge → caret 0, the left half of glyph 3 → caret 3 (before it), just
+    //      right of glyph 3's midpoint → caret 4 (after it).
     let clickme = fixture.path("slashme.txt"); // "slashme.txt" — base "slashme" [0,7)
     begin_rename(cx, whandle, fb, &clickme).await;
+    settle(cx, 250).await; // let a paint run so the layout probes record
     let sel0 = fb.update(cx, |v, _| v.scenario_rename_selection());
-    let (mapped, sel_after, still) = whandle
-        .update(cx, |_r, window, app| {
-            fb.update(app, |v, cx| {
-                let x = v.scenario_rename_x_for_index(3, window).unwrap_or(0.0);
-                let placed = v.drive_rename_click_at_local_x(x + 0.5, window, cx);
-                (placed, v.scenario_rename_selection(), v.scenario_is_renaming())
-            })
-        })
-        .unwrap_or((None, None, false));
-    if !still {
-        failures.push(
-            "rename click: the click ended / restarted the edit (edit mode dropped)".to_string(),
-        );
-    }
-    if sel_after == sel0 {
+    let (field_left, text_left) = fb.update(cx, |v, _| v.scenario_rename_probe());
+    // (1) probe cross-check: the text run sits at field box + 6px padding (the
+    // taffy absolute-inset origin excludes the 1px border). A ~0 delta is the
+    // recorded-the-field-box bug that biased every click one glyph right.
+    let delta = text_left - field_left;
+    if !(5.0..=8.0).contains(&delta) {
         failures.push(format!(
-            "rename click: the caret did not move — selection stayed at the preselection {sel0:?} \
-             (the click likely re-tripped begin-rename instead of repositioning)"
+            "rename click: probe cross-check failed — text_left({text_left}) - field_left({field_left}) \
+             = {delta}, expected ≈6px (the field padding); the text probe is not on the text run"
         ));
     }
-    if mapped != Some(3) || sel_after != Some((3, 3)) {
+    // (2) half-glyph convention at window coordinates, through the real probe math.
+    let checks: Vec<(String, f32, usize)> = whandle
+        .update(cx, |_r, window, app| {
+            fb.update(app, |v, _| {
+                let b3 = v.scenario_rename_x_for_index(3, window).unwrap_or(0.0);
+                let b4 = v.scenario_rename_x_for_index(4, window).unwrap_or(0.0);
+                vec![
+                    ("text left edge → caret 0".to_string(), text_left + 0.5, 0),
+                    ("left half of glyph 3 → caret 3".to_string(), text_left + b3 + 1.0, 3),
+                    (
+                        "right of glyph 3's midpoint → caret 4".to_string(),
+                        text_left + (b3 + b4) / 2.0 + 1.0,
+                        4,
+                    ),
+                ]
+            })
+        })
+        .unwrap_or_default();
+    for (what, x, want) in checks {
+        let (mapped, sel_after, still) = whandle
+            .update(cx, |_r, window, app| {
+                fb.update(app, |v, cx| {
+                    let placed = v.drive_rename_click_at_window_x(x, window, cx);
+                    (placed, v.scenario_rename_selection(), v.scenario_is_renaming())
+                })
+            })
+            .unwrap_or((None, None, false));
+        if !still {
+            failures.push(format!(
+                "rename click ({what}): the click ended / restarted the edit (edit mode dropped)"
+            ));
+            break;
+        }
+        if mapped != Some(want) || sel_after != Some((want, want)) {
+            failures.push(format!(
+                "rename click ({what}): clicked window-x {x:.1}, expected caret {want}; \
+                 got mapped={mapped:?} sel={sel_after:?}"
+            ));
+        }
+    }
+    let sel_final = fb.update(cx, |v, _| v.scenario_rename_selection());
+    if sel_final == sel0 {
         failures.push(format!(
-            "rename click: a click at boundary 3 should collapse the caret to (3,3); \
-             got mapped={mapped:?} sel={sel_after:?}"
+            "rename click: the caret never moved — selection stayed at the preselection {sel0:?} \
+             (clicks likely re-tripped begin-rename instead of repositioning)"
         ));
     } else {
         eprintln!(
-            "[selftest] file-browser R20: a click inside the rename field repositioned the caret \
-             to index 3 without restarting the edit"
+            "[selftest] file-browser R20: rename-field clicks repositioned the caret at real \
+             window coordinates (probe delta {delta:.1}px; left-edge→0, glyph-3 left half→3, \
+             past midpoint→4) without restarting the edit"
         );
     }
     cancel_rename(cx, whandle, fb).await;
