@@ -6,11 +6,9 @@
 //! ⌘⇧. shortcut needs.
 //!
 //! In-memory only — see [`crate::file_browser::state::FileBrowserState`] for
-//! why expansion / scroll state isn't worth persisting across launches.
-//!
-//! The store carries the injected `home` (the Swift states read
-//! `NSHomeDirectory()` globally; this port threads it in so the cwd-aware
-//! `show_hidden` seed stays testable and disk-free).
+//! why expansion / scroll state isn't worth persisting across launches, and for
+//! the hidden-files default (dotfiles hidden everywhere by default — the
+//! 2026-07-07 deviation from Swift's cwd heuristic).
 
 use crate::file_browser::state::FileBrowserState;
 use std::collections::HashMap;
@@ -19,17 +17,12 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct FileBrowserStore {
     states: HashMap<String, FileBrowserState>,
-    home: String,
 }
 
 impl FileBrowserStore {
-    /// A fresh, empty store seeding new states against `home` (the injected
-    /// `NSHomeDirectory()` seam).
-    pub fn new(home: impl Into<String>) -> Self {
-        Self {
-            states: HashMap::new(),
-            home: home.into(),
-        }
+    /// A fresh, empty store.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Fetch the state for `tab_id`, creating one rooted at `cwd` if none
@@ -40,7 +33,7 @@ impl FileBrowserStore {
     pub fn ensure_state(&mut self, tab_id: &str, cwd: &str) -> &mut FileBrowserState {
         self.states
             .entry(tab_id.to_string())
-            .or_insert_with(|| FileBrowserState::new(cwd, &self.home))
+            .or_insert_with(|| FileBrowserState::new(cwd))
     }
 
     /// The state for `tab_id`, if one exists — a pure read that never
@@ -82,10 +75,8 @@ impl FileBrowserStore {
 mod tests {
     use super::*;
 
-    const HOME: &str = "/Users/tester";
-
     fn store() -> FileBrowserStore {
-        FileBrowserStore::new(HOME)
+        FileBrowserStore::new()
     }
 
     // MARK: - ensure_state

@@ -273,12 +273,10 @@ impl WindowState {
             pending_modal: None,
             modal_sub: None,
             last_frame: None,
-            // R19: seed the file-browser store's cwd-aware `show_hidden` heuristic
-            // against the injected home (the Swift `NSHomeDirectory()` seam). Empty
-            // states are created lazily on first files-mode render.
-            file_browser: FileBrowserStore::new(
-                std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
-            ),
+            // Per-tab file-browser states are created lazily on first files-mode
+            // render, defaulting to dotfiles-hidden (the 2026-07-07 deviation from
+            // Swift's cwd-aware `show_hidden` heuristic).
+            file_browser: FileBrowserStore::new(),
         }
     }
 

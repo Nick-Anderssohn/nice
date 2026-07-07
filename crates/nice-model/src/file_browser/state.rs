@@ -30,33 +30,29 @@ pub struct FileBrowserState {
 }
 
 impl FileBrowserState {
-    /// Seed a state rooted at `root_path`. `show_hidden` is derived from the cwd
-    /// via [`FileBrowserState::default_show_hidden`] (hidden off in `$HOME`, on
-    /// elsewhere); the root is seeded into `expanded_paths` so files render on
-    /// first draw (`FileBrowserState.swift:58-64`). `home` is injected (the
-    /// Swift `NSHomeDirectory()` seam) so the cwd heuristic is testable.
-    pub fn new(root_path: impl Into<String>, home: &str) -> Self {
+    /// Seed a state rooted at `root_path`, with dotfiles **hidden** by default;
+    /// the root is seeded into `expanded_paths` so files render on first draw
+    /// (`FileBrowserState.swift:58-64`).
+    ///
+    /// INTENTIONAL DEVIATION from the Swift app (user decision 2026-07-07): a new
+    /// tab always defaults to hidden-off (dotfiles hidden), regardless of cwd.
+    /// The Swift original seeded `show_hidden` from a cwd heuristic — hidden off
+    /// only in `$HOME`, on in every project root so `.gitignore` / `.env` showed
+    /// — but the user prefers a clean listing everywhere by default. A per-tab
+    /// value, once the user toggles it (⌘⇧. / the eye control), keeps winning:
+    /// the [`FileBrowserStore`](crate::file_browser::FileBrowserStore) creates a
+    /// state on first access and never re-seeds it, so only brand-new tabs take
+    /// this default.
+    pub fn new(root_path: impl Into<String>) -> Self {
         let root_path = root_path.into();
-        let show_hidden = Self::default_show_hidden(&root_path, home);
         let mut expanded_paths = BTreeSet::new();
         expanded_paths.insert(root_path.clone());
         Self {
             root_path,
             expanded_paths,
-            show_hidden,
+            show_hidden: false,
             selection: FileBrowserSelection::new(),
         }
-    }
-
-    /// Seed value for `show_hidden` from the spawning cwd: hidden **off** iff
-    /// the cwd is exactly `home` (the dotfile flood there isn't useful default
-    /// content), **on** everywhere else (a project root's `.gitignore`, `.env`
-    /// etc. are content the developer expects to see). Comparison standardizes
-    /// both sides (tilde expansion + trailing-slash / `.`-`..` normalization)
-    /// so `~`, `~/`, and the literal home path agree
-    /// (`FileBrowserState.swift:74-79`).
-    pub fn default_show_hidden(cwd: &str, home: &str) -> bool {
-        standardize(cwd, home) != standardize(home, home)
     }
 
     /// The directory currently shown as the tree root.
@@ -120,107 +116,28 @@ impl FileBrowserState {
     }
 }
 
-/// Standardize a path for the home-vs-elsewhere comparison: expand a leading
-/// `~` to `home`, then lexically normalize (drop empty / `.` components,
-/// resolve `..`, strip trailing slashes). Symlinks are NOT resolved — matching
-/// `URL.standardizedFileURL`, which the Swift original relies on.
-fn standardize(path: &str, home: &str) -> String {
-    let expanded = if path == "~" {
-        home.to_string()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        format!("{}/{}", home.trim_end_matches('/'), rest)
-    } else {
-        path.to_string()
-    };
-    normalize_lexical(&expanded)
-}
-
-fn normalize_lexical(p: &str) -> String {
-    let absolute = p.starts_with('/');
-    let mut comps: Vec<&str> = Vec::new();
-    for c in p.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => {
-                comps.pop();
-            }
-            x => comps.push(x),
-        }
-    }
-    let joined = comps.join("/");
-    if absolute {
-        format!("/{joined}")
-    } else {
-        joined
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A fixed injected home so the cwd heuristic tests don't depend on the
-    /// test runner's real `$HOME` (the Swift suite uses `NSHomeDirectory()`;
-    /// this port injects it, which the plan requires).
-    const HOME: &str = "/Users/tester";
-
-    // MARK: - default_show_hidden
-
-    /// `FileBrowserStateTests.test_defaultShowHidden_inHomeDir_isFalse`
-    #[test]
-    fn default_show_hidden_in_home_dir_is_false() {
-        assert!(!FileBrowserState::default_show_hidden(HOME, HOME));
-    }
-
-    /// `FileBrowserStateTests.test_defaultShowHidden_homeDirWithTrailingSlash_isFalse`
-    #[test]
-    fn default_show_hidden_home_dir_with_trailing_slash_is_false() {
-        let with_slash = format!("{HOME}/");
-        assert!(!FileBrowserState::default_show_hidden(&with_slash, HOME));
-    }
-
-    /// `FileBrowserStateTests.test_defaultShowHidden_tildePath_isFalse`
-    #[test]
-    fn default_show_hidden_tilde_path_is_false() {
-        assert!(!FileBrowserState::default_show_hidden("~", HOME));
-    }
-
-    /// `FileBrowserStateTests.test_defaultShowHidden_subdirOfHome_isTrue`
-    #[test]
-    fn default_show_hidden_subdir_of_home_is_true() {
-        let sub = format!("{HOME}/Projects");
-        assert!(FileBrowserState::default_show_hidden(&sub, HOME));
-    }
-
-    /// `FileBrowserStateTests.test_defaultShowHidden_unrelatedPath_isTrue`
-    #[test]
-    fn default_show_hidden_unrelated_path_is_true() {
-        assert!(FileBrowserState::default_show_hidden("/tmp/some-project", HOME));
-    }
-
-    /// `FileBrowserStateTests.test_defaultShowHidden_filesystemRoot_isTrue`
-    #[test]
-    fn default_show_hidden_filesystem_root_is_true() {
-        assert!(FileBrowserState::default_show_hidden("/", HOME));
-    }
 
     // MARK: - init
 
     /// `FileBrowserStateTests.test_init_seedsExpandedPathsWithRoot`
     #[test]
     fn init_seeds_expanded_paths_with_root() {
-        let state = FileBrowserState::new("/tmp/proj", HOME);
+        let state = FileBrowserState::new("/tmp/proj");
         assert!(state.expanded_paths().contains("/tmp/proj"));
     }
 
-    /// `FileBrowserStateTests.test_init_seedsShowHiddenFromCwd`
+    /// New tabs default to hidden-off (dotfiles hidden) everywhere — the
+    /// INTENTIONAL deviation from the Swift cwd heuristic (user decision
+    /// 2026-07-07). A project root no longer shows `.gitignore` / `.env` by
+    /// default; the user opts in with ⌘⇧. or the eye control.
     #[test]
-    fn init_seeds_show_hidden_from_cwd() {
-        let home_state = FileBrowserState::new(HOME, HOME);
-        assert!(!home_state.show_hidden(), "home tabs default to hidden-off");
-
-        let project_state = FileBrowserState::new("/tmp/proj", HOME);
-        assert!(project_state.show_hidden(), "non-home tabs default to hidden-on");
+    fn init_defaults_show_hidden_off_everywhere() {
+        assert!(!FileBrowserState::new("/tmp/proj").show_hidden());
+        assert!(!FileBrowserState::new("/Users/tester").show_hidden());
+        assert!(!FileBrowserState::new("/").show_hidden());
     }
 
     // MARK: - set_root_path (the didSet)
@@ -228,7 +145,7 @@ mod tests {
     /// `FileBrowserStateTests.test_rootPath_didSet_addsNewRootToExpandedPaths`
     #[test]
     fn set_root_path_adds_new_root_to_expanded_paths() {
-        let mut state = FileBrowserState::new("/tmp/proj", HOME);
+        let mut state = FileBrowserState::new("/tmp/proj");
         state.set_root_path("/tmp/proj/Sources");
         assert!(state.expanded_paths().contains("/tmp/proj/Sources"));
     }
@@ -236,7 +153,7 @@ mod tests {
     /// `FileBrowserStateTests.test_rootPath_didSet_preservesPriorExpansionInOtherSubtrees`
     #[test]
     fn set_root_path_preserves_prior_expansion_in_other_subtrees() {
-        let mut state = FileBrowserState::new("/tmp/proj", HOME);
+        let mut state = FileBrowserState::new("/tmp/proj");
         state.insert_expanded("/tmp/proj/Sources");
         state.set_root_path("/elsewhere");
         assert!(state.expanded_paths().contains("/tmp/proj/Sources"));
@@ -248,7 +165,7 @@ mod tests {
     /// `FileBrowserStateTests.test_toggleExpansion_addsThenRemoves`
     #[test]
     fn toggle_expansion_adds_then_removes() {
-        let mut state = FileBrowserState::new("/tmp/proj", HOME);
+        let mut state = FileBrowserState::new("/tmp/proj");
         assert!(!state.expanded_paths().contains("/tmp/proj/Sources"));
         state.toggle_expansion("/tmp/proj/Sources");
         assert!(state.expanded_paths().contains("/tmp/proj/Sources"));
@@ -259,7 +176,7 @@ mod tests {
     /// `FileBrowserStateTests.test_toggleExpansion_doesNotAffectOtherEntries`
     #[test]
     fn toggle_expansion_does_not_affect_other_entries() {
-        let mut state = FileBrowserState::new("/tmp/proj", HOME);
+        let mut state = FileBrowserState::new("/tmp/proj");
         state.insert_expanded("/tmp/proj/Sources");
         state.toggle_expansion("/tmp/proj/Tests");
         assert!(state.expanded_paths().contains("/tmp/proj/Sources"));
