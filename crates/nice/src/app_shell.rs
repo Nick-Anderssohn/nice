@@ -87,6 +87,11 @@ pub(crate) struct AppShellView {
     pane_host: Entity<PaneHostView>,
     /// Kept for lifetime + future direct routing; the shared per-window state.
     state: Entity<WindowState>,
+    /// R20 (F6): the per-window drift banner — a bottom overlay observing the ONE
+    /// process-wide file-operation history. Mounted here so every window shows the
+    /// same transient message regardless of sidebar mode (Swift parity); renders
+    /// nothing when no history Global is installed.
+    banner: Entity<crate::file_browser::banner::DriftBannerView>,
     /// Re-render the shell subtree whenever the shared state (keymap-driven
     /// actions), the toolbar (pill clicks), or the sidebar (row clicks) notifies.
     /// A pill/row click notifies only its own view; without observing them here
@@ -109,16 +114,21 @@ impl AppShellView {
         pane_host: Entity<PaneHostView>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let banner = cx.new(crate::file_browser::banner::DriftBannerView::new);
         let subs = vec![
             cx.observe(&state, |_this, _e, cx| cx.notify()),
             cx.observe(&sidebar, |_this, _e, cx| cx.notify()),
             cx.observe(&toolbar, |_this, _e, cx| cx.notify()),
+            // The banner drives its own re-render on a published message, but the
+            // shell re-renders the whole subtree, so keep it in lockstep.
+            cx.observe(&banner, |_this, _e, cx| cx.notify()),
         ];
         Self {
             sidebar,
             toolbar,
             pane_host,
             state,
+            banner,
             _subs: subs,
         }
     }
@@ -168,6 +178,9 @@ impl Render for AppShellView {
                 crate::keymap::on_window_modifiers_changed(event, cx)
             })
             .child(self.sidebar.clone())
+            // R20 (F6): the drift banner floats as a bottom overlay above the shell
+            // (below any presented modal).
+            .child(self.banner.clone())
             .children(modal)
     }
 }

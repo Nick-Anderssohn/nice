@@ -556,6 +556,33 @@ fn install_session_store(_cx: &mut App) {
     crate::session_store::install_global(store);
 }
 
+/// R20 (F5–F7): install the process-wide file-operation history + the pasteboard
+/// adapter as gpui Globals. `run` ONLY — the history's [`ProductionTrasher`] hits
+/// the real Trash and the pasteboard binds the general system pasteboard, both of which a
+/// test/scenario replaces with a temp-dir fake / named pasteboard (mutating either
+/// real surface is a blocking hermeticity finding).
+fn install_file_operations(cx: &mut App) {
+    use crate::file_browser::history::{FileOperationHistory, FileOperationHistoryGlobal};
+    use crate::file_browser::ops::{FileOperationsService, ProductionTrasher};
+    use crate::file_browser::pasteboard::{FilePasteboard, FilePasteboardGlobal, ProductionFilePasteboard};
+
+    let service = FileOperationsService::new(Box::new(ProductionTrasher));
+    let history = cx.new(|_| FileOperationHistory::new(service, None));
+    // The production focus-follow closure: cross-window ⌘Z routes focus back to
+    // the originating window (activate + sidebar → Files + select the origin tab),
+    // resolved via the `WindowRegistry`. Installed here + also by the
+    // `file-browser` composition leg (both over a registry-registered window set).
+    crate::file_browser::focus_route::install(cx, &history);
+    cx.set_global(FileOperationHistoryGlobal(history));
+
+    // SAFETY: `run` executes on the main thread inside `application().run`, which
+    // holds an autorelease pool — the contract `PasteboardRef::general` requires.
+    let general = unsafe { crate::platform::PasteboardRef::general() };
+    let pasteboard: Box<dyn FilePasteboard> =
+        Box::new(ProductionFilePasteboard::new(general));
+    cx.set_global(FilePasteboardGlobal::new(pasteboard));
+}
+
 /// The cwd-heal projects root (L3/C5) — `~/.claude/projects` in production,
 /// overridable via `NICE_CLAUDE_PROJECTS_ROOT` (the injection seam the
 /// `persistence-restore` scenario points at a temp bucket tree). Resolved from
@@ -911,6 +938,16 @@ pub fn run() {
         cx.set_global(crate::file_browser::sort_settings_store::SortSettingsStore::load(
             crate::file_browser::sort_settings_store::default_ui_settings_path(),
         ));
+        // R20 (F5–F7): the process-wide file-operation history (over the shipped
+        // objc2 `ProductionTrasher` → real Trash) as a gpui `Entity` in a Global —
+        // ⌘Z/⌘⇧Z and the browser menu handlers drive it, per-window drift banners
+        // observe it. And the ONE pasteboard adapter, bound over
+        // the general system pasteboard HERE ONLY (hermeticity: `run_selftest` / tests
+        // install a fake or named pasteboard instead — mutating the general
+        // pasteboard is blocking). The production focus-follow window-activation
+        // closure is installed by the composition slice; absent, cross-window undo
+        // still applies its inverse (headlessly) and surfaces drift banners.
+        install_file_operations(cx);
         // R18 (L4 step 10): the restore fan-out replaces the single
         // `open_managed_window` — one window per saved slot (ghost pre-pass +
         // cwd-heal), or one fresh default window when nothing is restorable.

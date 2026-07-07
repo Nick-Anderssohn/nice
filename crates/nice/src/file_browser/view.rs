@@ -32,25 +32,34 @@
 //! `file-browser` scenario walks for (`app_shell.rs:68` convention).
 
 use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, uniform_list, AnyElement, App, Context, Entity, FocusHandle, Focusable,
-    FontWeight, MouseButton, MouseDownEvent, Pixels, Point, Rgba, ScrollStrategy, SharedString,
-    Subscription, Task, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, AnyElement, App, Context, Entity, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Rgba,
+    ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
 
 use nice_model::file_browser::listing::visible_order;
 use nice_model::file_browser::menu::FileBrowserContextMenuItem;
 use nice_model::file_browser::{
-    file_browser_header_title, ClickModifier, FileBrowserClickRouter, FileBrowserContextMenuModel,
-    FileBrowserSortCriterion, FileBrowserSortSettings,
+    file_browser_header_title, preselect_len, ClickModifier, FileBrowserClickRouter,
+    FileBrowserContextMenuModel, FileBrowserSortCriterion, FileBrowserSortSettings, TextFieldEditor,
+    TextFieldKey, DOUBLE_CLICK_WINDOW,
 };
+use nice_model::InlineRenameClickGate;
+
+use crate::app_shell::PaneHostView;
+use crate::file_browser::cwd_snapshot::build_snapshot;
+use crate::file_browser::rename::{self, ConfirmSpec, RenameCommit};
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
 
 use crate::context_menu::{ContextMenu, ContextMenuItem};
+use crate::file_browser::history::FileOperationHistoryGlobal;
+use crate::file_browser::ops::{paste_destination, FileOperationOrigin};
+use crate::file_browser::pasteboard::{FilePasteboardGlobal, Intent};
 use crate::file_browser::sort_settings_store::SortSettingsStore;
 use crate::file_browser::watcher::DirectoryWatcherHub;
 use crate::file_browser::workspace_ops::{open_with_entries, WorkspaceOpsGlobal};
@@ -82,6 +91,8 @@ const STRIP_BUTTON: f32 = 20.0;
 const HOVER_INK_ALPHA: f32 = 0.06;
 /// Selection tint alpha on the accent.
 const SEL_ALPHA: f32 = 0.22;
+/// Drag-hover highlight alpha on the accent (F9 — the target folder's tint).
+const DRAG_HOVER_ALPHA: f32 = 0.30;
 /// The trailing quiet-window poll cadence for the watcher drain (nap-safe: a
 /// background-executor timer runs on an OS thread, never the App-Nap-deferred
 /// runloop — the watcher's own `wake_main_runloop` keeps latency tight).
@@ -103,8 +114,40 @@ struct RowVm {
     is_expanded: bool,
     is_selected: bool,
     is_root: bool,
+    /// R20 (F7): the row is on the pasteboard with cut intent — rendered ghosted
+    /// (0.45 opacity) until the cut is pasted or invalidated.
+    is_cut: bool,
     icon_symbol: &'static str,
     icon_glyph: &'static str,
+    /// R20 (F8): when this row is being renamed, the field's text split into the
+    /// pre-selection / selection / post-selection spans (else the plain name label
+    /// renders). `None` for every non-editing row.
+    editing: Option<EditSpans>,
+    /// R20 (F9): the drag set this row's `on_drag` carries — the whole selection
+    /// when the row is selected, else just this row (Finder's select-then-drag).
+    drag_paths: Vec<String>,
+}
+
+/// The active rename field's text, split at the selection so the row can render a
+/// caret (collapsed) or a highlighted range plus pre/post text.
+#[derive(Clone)]
+struct EditSpans {
+    pre: String,
+    sel: String,
+    post: String,
+    collapsed: bool,
+}
+
+/// Split an editor's text at its selection for rendering.
+fn edit_spans(editor: &TextFieldEditor) -> EditSpans {
+    let text: Vec<char> = editor.text().chars().collect();
+    let (s, e) = editor.selection();
+    EditSpans {
+        pre: text[..s].iter().collect(),
+        sel: text[s..e].iter().collect(),
+        post: text[e..].iter().collect(),
+        collapsed: s == e,
+    }
 }
 
 /// The per-render snapshot the view builds its element tree from.
@@ -158,6 +201,59 @@ pub(crate) struct FileBrowserView {
     accent: Srgba,
     /// The window backing scale (re-sampled each render for the SF-symbol cache).
     window_scale: f32,
+    /// R20 (F8): a one-shot rename request set by the context-menu "Rename"
+    /// handler, the Return trigger, and the slow-second-click deferral. Consumed
+    /// by the next render (which has the `Window` [`begin_rename`](Self::begin_rename)
+    /// needs to grab field focus) exactly like [`pending_open_with`](Self::pending_open_with).
+    pending_rename_path: Option<String>,
+    /// R20 (F8): the active inline-rename edit session (the field's editing model
+    /// + its target), or `None` when no row is being renamed.
+    rename: Option<RenameState>,
+    /// The rename field's focus handle — grabbed when a rename begins (so
+    /// commit-on-blur fires when focus leaves), distinct from the panel
+    /// [`focus_handle`](Self::focus_handle).
+    rename_focus: FocusHandle,
+    /// Commit-on-blur subscription, alive while a rename is active (dropped on
+    /// commit / cancel so a stale blur can't re-fire).
+    rename_blur_sub: Option<Subscription>,
+    /// The Swift focus-call-counter test seam: bumped on EVERY rename exit path
+    /// (commit / cancel / validation failure / modal cancel) so a test asserts
+    /// focus was handed back exactly once per rename.
+    refocus_count: usize,
+    /// Generation guard for the slow-second-click deferral — a bumped value
+    /// cancels an armed-but-not-yet-fired deferred rename (a fast second click,
+    /// a selection change, or a rename begin).
+    rename_click_gen: u64,
+    /// The path currently the SOLE selection and when it became so — the
+    /// `activated_at` stamp the slow-second-click gate ([`InlineRenameClickGate`])
+    /// reads.
+    sole_activated: Option<(String, Instant)>,
+    /// The window's pane host, so a rename exit hands key focus back to the active
+    /// terminal (`refocus_terminal_after_rename` parity). Pushed down by
+    /// [`SidebarShellView`](crate::sidebar_shell::SidebarShellView).
+    pane_host: Option<Entity<PaneHostView>>,
+    /// R20 (F9): the in-tree drag session — the dragged paths — distinguishing an
+    /// internal drag (session non-empty) from a Finder-inbound drop (empty
+    /// session).
+    drag: FileBrowserDragState,
+}
+
+/// The active inline-rename edit session (F8): the pure editing model plus the
+/// target it renames.
+struct RenameState {
+    path: String,
+    is_dir: bool,
+    editor: TextFieldEditor,
+}
+
+/// The per-browser drag session (F9), the Rust twin of Swift's
+/// `FileBrowserDragState`: `session` is the dragged path set (non-empty ⇒ an
+/// internal drag; rules run on it). The accent drag-target highlight is NOT
+/// tracked here — it comes from gpui's `drag_over::<ExternalPaths>` style
+/// closure on directory rows.
+#[derive(Default)]
+struct FileBrowserDragState {
+    session: Vec<String>,
 }
 
 impl FileBrowserView {
@@ -206,7 +302,22 @@ impl FileBrowserView {
             focus_handle: cx.focus_handle(),
             accent,
             window_scale: 2.0,
+            pending_rename_path: None,
+            rename: None,
+            rename_focus: cx.focus_handle(),
+            rename_blur_sub: None,
+            refocus_count: 0,
+            rename_click_gen: 0,
+            sole_activated: None,
+            pane_host: None,
+            drag: FileBrowserDragState::default(),
         }
+    }
+
+    /// Push down the window's pane host so a rename exit hands key focus back to
+    /// the active terminal (called by [`SidebarShellView`](crate::sidebar_shell::SidebarShellView)).
+    pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
+        self.pane_host = Some(host);
     }
 
     // MARK: - Snapshot
@@ -245,6 +356,19 @@ impl FileBrowserView {
         // The shared-state borrow (`ws`) ends here (NLL) — everything below is
         // computed from the owned locals cloned out above.
 
+        // R20 (F7): the observable cut set — rows in it render ghosted. Empty when
+        // no pasteboard Global is installed or the cut companion is stale.
+        let cut: HashSet<PathBuf> = cx
+            .try_global::<FilePasteboardGlobal>()
+            .map(|g| g.0.cut_paths())
+            .unwrap_or_default();
+
+        // R20 (F8): the row currently in rename edit mode, plus its field spans.
+        let editing: Option<(String, EditSpans)> = self
+            .rename
+            .as_ref()
+            .map(|r| (r.path.clone(), edit_spans(&r.editor)));
+
         let root_exists = Path::new(&root).exists();
         let projection = if root_exists {
             visible_order(
@@ -258,20 +382,45 @@ impl FileBrowserView {
             Vec::new()
         };
 
+        // If the row being renamed disappeared (deleted / collapsed out of view),
+        // drop the draft (Swift parity — the field goes away with the row).
+        if let Some((path, _)) = &editing {
+            if !projection.iter().any(|p| p == path) {
+                self.rename = None;
+                self.rename_blur_sub = None;
+            }
+        }
+
+        // R20 (F9): the selected rows in on-screen order — a drag of any selected
+        // row carries the whole selection.
+        let ordered_selection: Vec<String> =
+            projection.iter().filter(|p| selected.contains(*p)).cloned().collect();
+
         let rows = projection
             .iter()
             .map(|p| {
                 let is_dir = is_dir_lstat(p);
                 let is_expanded = is_dir && expanded.contains(p);
+                let is_selected = selected.contains(p);
                 RowVm {
                     name: last_component(p),
                     depth: depth_of(&root, p),
                     is_dir,
                     is_expanded,
-                    is_selected: selected.contains(p),
+                    is_selected,
                     is_root: p == &root,
+                    is_cut: cut.contains(Path::new(p)),
                     icon_symbol: icon_symbol(p, is_dir, is_expanded),
                     icon_glyph: icon_glyph(is_dir),
+                    editing: editing
+                        .as_ref()
+                        .filter(|(path, _)| path == p)
+                        .map(|(_, spans)| spans.clone()),
+                    drag_paths: if is_selected && ordered_selection.len() > 1 {
+                        ordered_selection.clone()
+                    } else {
+                        vec![p.clone()]
+                    },
                     path: p.clone(),
                 }
             })
@@ -356,15 +505,28 @@ impl FileBrowserView {
         )
     }
 
-    /// Route a row click through the 280 ms detector and apply its effect.
+    /// Route a row click through the 280 ms detector and apply its effect. Any
+    /// click first cancels a pending slow-second-click deferral (bumps the
+    /// generation); a slow second click on an already-sole-selected FILE re-arms
+    /// it. Folders keep their single-click expand/collapse (a folder's slow second
+    /// click is claimed by expand/collapse, so folder rename stays on the menu /
+    /// Return triggers — a documented divergence that keeps R19's expand/collapse
+    /// contract intact).
     fn on_row_click(&mut self, path: &str, modifier: ClickModifier, cx: &mut Context<Self>) {
         use nice_model::file_browser::ClickAction::*;
+        self.rename_click_gen += 1; // any click cancels a pending deferral
+        let now = Instant::now();
+        let was_sole = self.is_sole_selected(path, cx);
         let projection = self.current_projection(cx);
-        let action = self.router.route(path, modifier, Instant::now());
+        let action = self.router.route(path, modifier, now);
         match action {
-            Toggle { path } => self.with_active_fb_state(cx, |st| st.selection_mut().toggle(&path)),
+            Toggle { path } => {
+                self.sole_activated = None;
+                self.with_active_fb_state(cx, |st| st.selection_mut().toggle(&path));
+            }
             Extend { path } => {
-                self.with_active_fb_state(cx, |st| st.selection_mut().extend(&path, &projection))
+                self.sole_activated = None;
+                self.with_active_fb_state(cx, |st| st.selection_mut().extend(&path, &projection));
             }
             SingleActivate { path } => {
                 let is_dir = is_dir_lstat(&path);
@@ -376,8 +538,27 @@ impl FileBrowserView {
                         st.toggle_expansion(&path);
                     }
                 });
+                // Slow-second-click rename (files only): if the row was ALREADY the
+                // sole selection and the click gate has elapsed, arm the deferral.
+                let activated_at = self.sole_activated.as_ref().and_then(|(p, t)| {
+                    if p == &path {
+                        Some(*t)
+                    } else {
+                        None
+                    }
+                });
+                if !is_dir
+                    && was_sole
+                    && InlineRenameClickGate::can_begin_edit(activated_at, now, DOUBLE_CLICK_WINDOW)
+                {
+                    self.arm_slow_rename(path.clone(), cx);
+                } else {
+                    // Newly sole-selected — stamp the activation clock.
+                    self.sole_activated = Some((path.clone(), now));
+                }
             }
             DoubleActivate { path } => {
+                self.sole_activated = None;
                 if is_dir_lstat(&path) {
                     self.with_active_fb_state(cx, |st| st.set_root_path(&path));
                 } else {
@@ -412,15 +593,20 @@ impl FileBrowserView {
         }
     }
 
-    /// Copy Path (R19): newline-join the target paths onto the clipboard
-    /// (Finder "Copy as Pathname" parity). `// R20:` reroutes this through the
-    /// pasteboard adapter so it also clears the cut companion.
+    /// Copy Path: newline-join the target paths onto the pasteboard (Finder "Copy
+    /// as Pathname" parity). R20 reroutes this through the pasteboard adapter (the
+    /// browser's SINGLE pasteboard writer) so a text write also clears any cut
+    /// companion — the gpui clipboard API is no longer used here. A no-op when no
+    /// pasteboard Global is installed (never a fallback to the real general
+    /// pasteboard — hermeticity).
     fn copy_paths(&self, paths: &[String], cx: &mut App) {
         if paths.is_empty() {
             return;
         }
         let joined = paths.join("\n");
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(joined));
+        if cx.has_global::<FilePasteboardGlobal>() {
+            cx.global_mut::<FilePasteboardGlobal>().0.write_text(&joined);
+        }
     }
 
     // MARK: - Context menu (right-click → pure-read selection → R19 entries)
@@ -439,8 +625,16 @@ impl FileBrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // R19 passes can_paste = can_rename = false; R20 flips them + adds the rest.
-        let model = FileBrowserContextMenuModel::build(is_dir, is_root, false, false);
+        // R20 flips the two R19-frozen capabilities (no model reordering):
+        //  * can_paste — a lazy adapter read at menu open (file URLs present?).
+        //  * can_rename — the pure `/`-gate AND single-target (multi-select hides it).
+        let can_paste = cx
+            .try_global::<FilePasteboardGlobal>()
+            .map(|g| g.0.read().is_some())
+            .unwrap_or(false);
+        let can_rename = nice_model::file_browser::rename_validator::can_rename(path)
+            && self.selection_count(cx) <= 1;
+        let model = FileBrowserContextMenuModel::build(is_dir, is_root, can_paste, can_rename);
         let weak = cx.weak_entity();
         let clicked = path.to_string();
         let mut items: Vec<ContextMenuItem> = Vec::new();
@@ -495,9 +689,44 @@ impl FileBrowserView {
                         });
                     }));
                 }
-                // Rename / Copy / Cut / Paste / Move to Trash → R20 (model rows
-                // exist; views + handlers land there). Not rendered this cycle.
-                _ => {}
+                // R20 handlers — each snaps the selection first (Finder's
+                // snap-on-action), then performs its op through the shared service /
+                // pasteboard adapter.
+                FileBrowserContextMenuItem::Rename => {
+                    let e = weak.clone();
+                    let p = clicked.clone();
+                    items.push(ContextMenuItem::entry("Rename", move |_w, app| {
+                        let _ = e.update(app, |this, cx| this.menu_rename(&p, cx));
+                    }));
+                }
+                FileBrowserContextMenuItem::Copy => {
+                    let e = weak.clone();
+                    let p = clicked.clone();
+                    items.push(ContextMenuItem::entry("Copy", move |_w, app| {
+                        let _ = e.update(app, |this, cx| this.menu_copy(&p, cx));
+                    }));
+                }
+                FileBrowserContextMenuItem::Cut => {
+                    let e = weak.clone();
+                    let p = clicked.clone();
+                    items.push(ContextMenuItem::entry("Cut", move |_w, app| {
+                        let _ = e.update(app, |this, cx| this.menu_cut(&p, cx));
+                    }));
+                }
+                FileBrowserContextMenuItem::Paste => {
+                    let e = weak.clone();
+                    let p = clicked.clone();
+                    items.push(ContextMenuItem::entry("Paste", move |_w, app| {
+                        let _ = e.update(app, |this, cx| this.menu_paste(&p, is_dir, cx));
+                    }));
+                }
+                FileBrowserContextMenuItem::Trash => {
+                    let e = weak.clone();
+                    let p = clicked.clone();
+                    items.push(ContextMenuItem::entry("Move to Trash", move |_w, app| {
+                        let _ = e.update(app, |this, cx| this.menu_trash(&p, cx));
+                    }));
+                }
             }
         }
         self.present_menu(items, position, window, cx);
@@ -607,6 +836,500 @@ impl FileBrowserView {
             ordered.push(path.to_string());
         }
         ordered
+    }
+
+    // MARK: - R20 file-operation menu handlers (all through the snap hook)
+
+    /// The number of paths selected for the active tab (multi-select gate).
+    fn selection_count(&self, cx: &App) -> usize {
+        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+            return 0;
+        };
+        self.state
+            .read(cx)
+            .file_browser
+            .state_for(&tab_id)
+            .map(|s| s.selection().selected_paths().len())
+            .unwrap_or(0)
+    }
+
+    /// The op origin: this window's session id + active tab (undo routes back here).
+    fn origin(&self, cx: &App) -> FileOperationOrigin {
+        let ws = self.state.read(cx);
+        FileOperationOrigin::new(
+            ws.session_id().to_string(),
+            ws.model.active_tab_id().map(str::to_string),
+        )
+    }
+
+    /// The shared history entity, if a Global is installed.
+    fn history(&self, cx: &App) -> Option<Entity<crate::file_browser::history::FileOperationHistory>> {
+        cx.try_global::<FileOperationHistoryGlobal>().map(|g| g.0.clone())
+    }
+
+    /// Context-menu "Rename": snap, then record the one-shot rename request the
+    /// rename-UI slice consumes. Rename is single-target (the menu item is hidden
+    /// on a multi-selection).
+    fn menu_rename(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.snap_and_resolve(path, cx);
+        self.pending_rename_path = Some(path.to_string());
+        cx.notify();
+    }
+
+    /// Context-menu "Copy": snap, then write the resolved targets to the pasteboard
+    /// with copy intent (external pasters see a plain `public.file-url` copy).
+    fn menu_copy(&mut self, path: &str, cx: &mut Context<Self>) {
+        let targets = self.snap_and_resolve(path, cx);
+        self.write_pasteboard(&targets, Intent::Copy, cx);
+    }
+
+    /// Context-menu "Cut": snap, then write with cut intent (an in-process fiction
+    /// that ghosts the rows; external pasters still see a copy).
+    fn menu_cut(&mut self, path: &str, cx: &mut Context<Self>) {
+        let targets = self.snap_and_resolve(path, cx);
+        self.write_pasteboard(&targets, Intent::Cut, cx);
+    }
+
+    fn write_pasteboard(&mut self, targets: &[String], intent: Intent, cx: &mut Context<Self>) {
+        if targets.is_empty() || !cx.has_global::<FilePasteboardGlobal>() {
+            return;
+        }
+        let paths: Vec<PathBuf> = targets.iter().map(PathBuf::from).collect();
+        cx.global_mut::<FilePasteboardGlobal>().0.write(&paths, intent);
+        // Re-render so the cut ghost appears / clears on these rows.
+        cx.notify();
+    }
+
+    /// Context-menu "Paste": snap, read the pasteboard, resolve the destination
+    /// (into a directory row / a file's parent), dispatch copy (copy intent) or
+    /// move (cut intent) through the shared service, push to the history, and clear
+    /// the cut companion after a move. Service errors land on the drift banner.
+    fn menu_paste(&mut self, clicked: &str, is_dir: bool, cx: &mut Context<Self>) {
+        // Snap first (the Finder snap-on-action rule fires from every handler).
+        self.snap_and_resolve(clicked, cx);
+        let read = if cx.has_global::<FilePasteboardGlobal>() {
+            cx.global::<FilePasteboardGlobal>().0.read()
+        } else {
+            None
+        };
+        let Some(read) = read else {
+            return;
+        };
+        let Some(history) = self.history(cx) else {
+            return;
+        };
+        let dest = paste_destination(Path::new(clicked), is_dir);
+        let origin = self.origin(cx);
+        let sources = read.urls.clone();
+        let intent = read.intent;
+        history.update(cx, |h, hcx| {
+            let result = match intent {
+                Intent::Copy => h.service().copy(&sources, &dest, origin),
+                Intent::Cut => h.service().move_(&sources, &dest, origin),
+            };
+            match result {
+                Ok(op) => h.push(op),
+                Err(e) => h.set_drift_message(format!("Couldn't paste: {e}")),
+            }
+            hcx.notify();
+        });
+        if intent == Intent::Cut && cx.has_global::<FilePasteboardGlobal>() {
+            cx.global_mut::<FilePasteboardGlobal>().0.clear_cut_intent();
+        }
+        cx.notify();
+    }
+
+    /// Context-menu "Move to Trash": snap, recycle the resolved targets through the
+    /// injected `Trasher`, push to the history. Errors land on the drift banner.
+    fn menu_trash(&mut self, path: &str, cx: &mut Context<Self>) {
+        let targets = self.snap_and_resolve(path, cx);
+        if targets.is_empty() {
+            return;
+        }
+        let Some(history) = self.history(cx) else {
+            return;
+        };
+        let origin = self.origin(cx);
+        let sources: Vec<PathBuf> = targets.iter().map(PathBuf::from).collect();
+        history.update(cx, |h, hcx| {
+            match h.service().trash(&sources, origin) {
+                Ok(op) => h.push(op),
+                Err(e) => h.set_drift_message(format!("Couldn't move to Trash: {e}")),
+            }
+            hcx.notify();
+        });
+        cx.notify();
+    }
+
+    // MARK: - R20 inline rename (F8)
+
+    /// Enter rename edit mode for `path`: seed the field with the basename
+    /// preselected (files with an extension select the base only; folders /
+    /// extension-less / dotfiles select everything), grab field focus, and arm
+    /// commit-on-blur. Cancels any pending slow-second-click deferral.
+    fn begin_rename(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_click_gen += 1; // cancel any armed deferral
+        let is_dir = is_dir_lstat(path);
+        let name = last_component(path);
+        let editor = TextFieldEditor::with_selection(&name, preselect_len(&name, is_dir));
+        self.rename = Some(RenameState {
+            path: path.to_string(),
+            is_dir,
+            editor,
+        });
+        self.rename_focus.focus(window, cx);
+        self.arm_commit_on_blur(window, cx);
+        cx.notify();
+    }
+
+    /// (Re)install the commit-on-blur subscription (the ported one-shot guard: a
+    /// prior subscription is dropped OUTSIDE its own callback).
+    fn arm_commit_on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_blur_sub = Some(cx.on_blur(&self.rename_focus, window, |this, window, cx| {
+            this.commit_rename(window, cx);
+        }));
+    }
+
+    /// Apply one editing key to the active field.
+    fn apply_editor_key(&mut self, key: TextFieldKey, cx: &mut Context<Self>) {
+        if let Some(state) = self.rename.as_mut() {
+            state.editor.apply_key(key);
+            cx.notify();
+        }
+    }
+
+    /// The field's key handler: Return commits, Esc cancels, everything else edits
+    /// the pure model. Always stops propagation while editing so the keystroke
+    /// never leaks to the keymap / terminal.
+    fn on_rename_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.is_none() {
+            return;
+        }
+        let ks = &event.keystroke;
+        match ks.key.as_str() {
+            "enter" | "return" => self.commit_rename(window, cx),
+            "escape" => self.cancel_rename(window, cx),
+            "backspace" => self.apply_editor_key(TextFieldKey::Backspace, cx),
+            "delete" => self.apply_editor_key(TextFieldKey::ForwardDelete, cx),
+            "left" => self.apply_editor_key(
+                if ks.modifiers.shift {
+                    TextFieldKey::ShiftLeft
+                } else {
+                    TextFieldKey::Left
+                },
+                cx,
+            ),
+            "right" => self.apply_editor_key(
+                if ks.modifiers.shift {
+                    TextFieldKey::ShiftRight
+                } else {
+                    TextFieldKey::Right
+                },
+                cx,
+            ),
+            "a" if ks.modifiers.platform => self.apply_editor_key(TextFieldKey::SelectAll, cx),
+            _ => {
+                if !ks.modifiers.platform && !ks.modifiers.control {
+                    if let Some(ch) = ks.key_char.as_ref().and_then(|s| s.chars().next()) {
+                        if !ch.is_control() {
+                            self.apply_editor_key(TextFieldKey::Char(ch), cx);
+                        }
+                    }
+                }
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    /// Commit the active rename. One-shot via `rename.take()` (an Esc-cancel /
+    /// prior commit can't double-fire on the follow-on blur). Empty / unchanged
+    /// cancels silently; `/`-or-`:` stays in edit mode; a sibling collision
+    /// surfaces the frozen banner + cancels; otherwise proceeds through the two
+    /// async confirmation modals to the apply.
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.rename.take() else {
+            return;
+        };
+        self.rename_blur_sub = None;
+        let draft = state.editor.text();
+        match rename::evaluate_commit(&state.path, &draft, |c| Path::new(c).exists()) {
+            RenameCommit::Cancel => self.end_rename_refocus(window, cx),
+            RenameCommit::StayInEdit => {
+                // Keep the field open so the user fixes the illegal character.
+                self.rename = Some(state);
+                self.rename_focus.focus(window, cx);
+                self.arm_commit_on_blur(window, cx);
+                cx.notify();
+            }
+            RenameCommit::Collision(msg) => {
+                self.publish_drift(msg, cx);
+                self.end_rename_refocus(window, cx);
+            }
+            RenameCommit::Proceed { dest } => {
+                let new_name = last_component(&dest.to_string_lossy());
+                let snapshot = build_snapshot(cx);
+                let specs = rename::modals_for(&state.path, &new_name, state.is_dir, &snapshot);
+                let source = PathBuf::from(&state.path);
+                let origin = self.origin(cx);
+                self.run_rename_modals(specs, source, dest, origin, window, cx);
+            }
+        }
+    }
+
+    /// Cancel the active rename (Esc / row-disappear) and hand focus back.
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.take().is_none() {
+            return;
+        }
+        self.rename_blur_sub = None;
+        self.end_rename_refocus(window, cx);
+    }
+
+    /// Present the ORDERED confirmation modals (extension-change, then CWD-impact)
+    /// before applying; each modal's confirm advances to the next, any cancel
+    /// aborts and refocuses the terminal (the fs stays untouched). Empty specs ⇒
+    /// apply immediately.
+    fn run_rename_modals(
+        &mut self,
+        specs: Vec<ConfirmSpec>,
+        source: PathBuf,
+        dest: PathBuf,
+        origin: FileOperationOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((first, rest)) = specs.split_first() else {
+            self.perform_rename(&source, &dest, origin, cx);
+            self.end_rename_refocus(window, cx);
+            return;
+        };
+        let first = first.clone();
+        let rest = rest.to_vec();
+        let weak = cx.weak_entity();
+        self.state.update(cx, |ws, wcx| {
+            ws.present_confirmation(
+                first.title,
+                first.message,
+                first.confirm_label,
+                first.cancel_label,
+                true,
+                move |confirmed, window, app| {
+                    let _ = weak.update(app, |this, cx| {
+                        if confirmed {
+                            this.run_rename_modals(
+                                rest.clone(),
+                                source.clone(),
+                                dest.clone(),
+                                origin.clone(),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            this.end_rename_refocus(window, cx);
+                        }
+                    });
+                },
+                window,
+                wcx,
+            );
+        });
+    }
+
+    /// Apply the validated rename through the shared service (a raw single-pair
+    /// Move — collision auto-rename bypassed) and push to the history; a collision
+    /// / error lands on the drift banner.
+    fn perform_rename(
+        &mut self,
+        source: &Path,
+        dest: &Path,
+        origin: FileOperationOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(history) = self.history(cx) else {
+            return;
+        };
+        let mut err = None;
+        history.update(cx, |h, hcx| {
+            match rename::apply_rename(h.service(), source, dest, origin) {
+                Ok(op) => h.push(op),
+                Err(e) => err = Some(e),
+            }
+            hcx.notify();
+        });
+        if let Some(e) = err {
+            self.publish_drift(e, cx);
+        }
+        cx.notify();
+    }
+
+    /// Route a transient failure to the ONE drift channel (the per-window banner).
+    fn publish_drift(&self, message: String, cx: &mut App) {
+        if let Some(h) = self.history(cx) {
+            h.update(cx, |h, hcx| {
+                h.set_drift_message(message);
+                hcx.notify();
+            });
+        }
+    }
+
+    /// Every rename exit funnels here: bump the focus-call counter (the test seam)
+    /// and hand key focus back to the active terminal via the pane host.
+    fn end_rename_refocus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refocus_count += 1;
+        if let Some(host) = self.pane_host.clone() {
+            host.update(cx, |host, cx| host.focus_active_terminal(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// The path currently the sole selection, if exactly one row is selected.
+    fn single_selected_path(&self, cx: &App) -> Option<String> {
+        let (tab_id, _) = self.active_tab_cwd(cx)?;
+        let paths = self
+            .state
+            .read(cx)
+            .file_browser
+            .state_for(&tab_id)?
+            .selection()
+            .selected_paths()
+            .clone();
+        if paths.len() == 1 {
+            paths.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// Whether `path` is exactly the sole selection.
+    fn is_sole_selected(&self, path: &str, cx: &App) -> bool {
+        self.single_selected_path(cx).as_deref() == Some(path)
+    }
+
+    /// Arm a deferred slow-second-click rename: after the 280 ms double-click
+    /// window, if no fast second click bumped the generation and `path` is still
+    /// the sole selection, request the rename (consumed on the next render). A
+    /// fast second click reads as a double-click (open / re-root) and cancels this.
+    fn arm_slow_rename(&mut self, path: String, cx: &mut Context<Self>) {
+        self.rename_click_gen += 1;
+        let generation = self.rename_click_gen;
+        cx.spawn(async move |this, acx| {
+            acx.background_executor()
+                .timer(DOUBLE_CLICK_WINDOW)
+                .await;
+            let _ = this.update(acx, |this, cx| {
+                if this.rename_click_gen == generation
+                    && this.rename.is_none()
+                    && this.is_sole_selected(&path, cx)
+                {
+                    this.pending_rename_path = Some(path.clone());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    // MARK: - R20 in-tree drag & drop (F9)
+
+    /// The active-tab selection in on-screen order (empty when none / no tab).
+    fn ordered_selection(&self, cx: &App) -> Vec<String> {
+        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+            return Vec::new();
+        };
+        let selected = match self.state.read(cx).file_browser.state_for(&tab_id) {
+            Some(st) => st.selection().selected_paths().clone(),
+            None => return Vec::new(),
+        };
+        self.current_projection(cx)
+            .into_iter()
+            .filter(|p| selected.contains(p))
+            .collect()
+    }
+
+    /// Begin an in-tree drag of `path`: the whole selection when `path` is
+    /// selected, else just `path` (Finder's select-then-drag). Records the drag
+    /// session so a drop onto a directory row is treated as internal.
+    fn begin_row_drag(&mut self, path: &str, cx: &mut Context<Self>) -> Vec<String> {
+        let selection = self.ordered_selection(cx);
+        let sources = if selection.iter().any(|p| p == path) {
+            selection
+        } else {
+            vec![path.to_string()]
+        };
+        self.drag.session = sources.clone();
+        sources
+    }
+
+    /// Handle a drop onto directory `dest`. Internal (a live drag session) uses the
+    /// session paths; a Finder-inbound drop uses the dropped [`gpui::ExternalPaths`].
+    /// Rejected by the pure `can_drop` rule ⇒ no-op.
+    fn handle_drop(
+        &mut self,
+        dropped: &gpui::ExternalPaths,
+        dest: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session = std::mem::take(&mut self.drag.session);
+        let sources: Vec<String> = if session.is_empty() {
+            dropped
+                .paths()
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            session
+        };
+        self.perform_internal_drop(&sources, dest, window, cx);
+    }
+
+    /// Resolve move-vs-copy (Option modifier read at drop time + same/cross-volume)
+    /// and commit the drop. Rejected drops are dropped silently by the pure rule.
+    fn perform_internal_drop(
+        &mut self,
+        sources: &[String],
+        dest: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+        if !nice_model::file_browser::can_drop(&refs, dest) {
+            return;
+        }
+        let option_held = window.modifiers().alt;
+        let same_volume = sources_share_volume(sources, dest);
+        let op = nice_model::file_browser::drop_operation(option_held, same_volume);
+        self.move_or_copy(sources, dest, op, cx);
+    }
+
+    /// Commit a resolved drop into `dest` (the pasteboard is skipped — a drag is
+    /// not a cut). Push to the history; failures land on the drift channel.
+    fn move_or_copy(
+        &mut self,
+        sources: &[String],
+        dest: &str,
+        op: nice_model::file_browser::FileDragOperation,
+        cx: &mut Context<Self>,
+    ) {
+        use nice_model::file_browser::FileDragOperation;
+        let Some(history) = self.history(cx) else {
+            return;
+        };
+        let origin = self.origin(cx);
+        let src_paths: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+        let dest_path = PathBuf::from(dest);
+        history.update(cx, |h, hcx| {
+            let result = match op {
+                FileDragOperation::Move => h.service().move_(&src_paths, &dest_path, origin),
+                FileDragOperation::Copy => h.service().copy(&src_paths, &dest_path, origin),
+            };
+            match result {
+                Ok(recorded) => h.push(recorded),
+                Err(e) => h.set_drift_message(format!("Couldn't move: {e}")),
+            }
+            hcx.notify();
+        });
+        cx.notify();
     }
 
     // MARK: - Control strip actions
@@ -835,15 +1558,17 @@ impl FileBrowserView {
         let colors = RowColors {
             sel_bg: srgba_to_rgba(srgba_with_alpha(self.accent, SEL_ALPHA)),
             hover: srgba_to_rgba(srgba_with_alpha(slot_srgba(s.ink), HOVER_INK_ALPHA)),
+            drag_hover: srgba_to_rgba(srgba_with_alpha(self.accent, DRAG_HOVER_ALPHA)),
             ink: slot_to_rgba(s.ink),
             ink2: slot_to_rgba(s.ink2),
             ink3: slot_to_rgba(s.ink3),
         };
         let count = rows.len();
         let weak = cx.weak_entity();
+        let rename_focus = self.rename_focus.clone();
         uniform_list("file-browser.tree", count, move |range, _window, app| {
             range
-                .map(|i| render_row(&rows[i], weak.clone(), colors, scale, app))
+                .map(|i| render_row(&rows[i], weak.clone(), colors, scale, &rename_focus, app))
                 .collect::<Vec<_>>()
         })
         .track_scroll(&self.scroll)
@@ -973,6 +1698,136 @@ impl FileBrowserView {
         self.toggle_direction(cx);
     }
 
+    // MARK: - R20 rename / cut / paste / trash driver seams (scenario reads)
+
+    /// Begin an inline rename for `path` (the menu / Return / slow-click terminus).
+    pub(crate) fn drive_begin_rename(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_rename(path, window, cx);
+    }
+
+    /// Whether a row is currently being renamed.
+    pub(crate) fn scenario_is_renaming(&self) -> bool {
+        self.rename.is_some()
+    }
+
+    /// The current rename field text, if editing (the field-model read the
+    /// scenario asserts a typed edit against).
+    pub(crate) fn scenario_rename_text(&self) -> Option<String> {
+        self.rename.as_ref().map(|r| r.editor.text())
+    }
+
+    /// The current rename field selection `(start, end)` — the scenario asserts the
+    /// basename preselection through it.
+    pub(crate) fn scenario_rename_selection(&self) -> Option<(usize, usize)> {
+        self.rename.as_ref().map(|r| r.editor.selection())
+    }
+
+    /// Type one printable character into the active rename field.
+    pub(crate) fn drive_rename_type(&mut self, ch: char, cx: &mut Context<Self>) {
+        self.apply_editor_key(TextFieldKey::Char(ch), cx);
+    }
+
+    /// Select the whole rename field (⌘A) — the scenario helper for retyping a
+    /// full new name (the basename preselection alone keeps the old extension, so
+    /// an extension-change rename must replace the whole field).
+    pub(crate) fn drive_rename_select_all(&mut self, cx: &mut Context<Self>) {
+        self.apply_editor_key(TextFieldKey::SelectAll, cx);
+    }
+
+    /// The title of the confirmation modal currently presented over this view's
+    /// window, if any — the scenario asserts a rename confirmation was presented
+    /// (and matches its wording) through it. Read-only; the ANSWER is driven from
+    /// the raw app context (never inside a `FileBrowserView` update — the modal's
+    /// completion re-enters this view to recurse/refocus, so resolving it inside
+    /// an update would double-borrow this entity).
+    pub(crate) fn scenario_pending_modal_title(&self, cx: &App) -> Option<String> {
+        self.state
+            .read(cx)
+            .pending_modal()
+            .map(|m| m.read(cx).scenario_title())
+    }
+
+    /// Commit the active rename (the Return / click-away terminus).
+    pub(crate) fn drive_rename_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_rename(window, cx);
+    }
+
+    /// Cancel the active rename (the Esc terminus).
+    pub(crate) fn drive_rename_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_rename(window, cx);
+    }
+
+    /// The focus-call counter (the Swift test seam): total rename exits so far.
+    pub(crate) fn scenario_refocus_count(&self) -> usize {
+        self.refocus_count
+    }
+
+    /// Drive the context-menu "Move to Trash" op for `path` (the real handler).
+    pub(crate) fn drive_trash(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.menu_trash(path, cx);
+    }
+
+    /// Drive the context-menu "Copy" op for `path`.
+    pub(crate) fn drive_copy(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.menu_copy(path, cx);
+    }
+
+    /// Drive the context-menu "Cut" op for `path`.
+    pub(crate) fn drive_cut(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.menu_cut(path, cx);
+    }
+
+    /// Drive the context-menu "Paste" op onto `path`.
+    pub(crate) fn drive_paste(&mut self, path: &str, cx: &mut Context<Self>) {
+        let is_dir = is_dir_lstat(path);
+        self.menu_paste(path, is_dir, cx);
+    }
+
+    /// The paths currently rendered ghosted (cut intent) — the scenario's cut-ghost
+    /// read.
+    pub(crate) fn scenario_cut_paths(&self, cx: &App) -> Vec<String> {
+        cx.try_global::<FilePasteboardGlobal>()
+            .map(|g| {
+                g.0.cut_paths()
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drive an in-tree drag of the current selection (or just `path`) onto the
+    /// directory `dest` — the DnD commit seam (the real `on_drop` path constructs
+    /// the same [`gpui::ExternalPaths`] payload).
+    pub(crate) fn drive_drag_drop(&mut self, path: &str, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let sources = self.begin_row_drag(path, cx);
+        self.perform_internal_drop(&sources, dest, window, cx);
+    }
+
+    /// Whether a drag of the current selection (or just `path`) onto `dest` would
+    /// be accepted — the pure `can_drop` rule that gates the accent hover highlight
+    /// AND the drop (the scenario asserts the highlight predicate through it).
+    pub(crate) fn scenario_can_drop(&self, path: &str, dest: &str, cx: &App) -> bool {
+        let selection = self.ordered_selection(cx);
+        let sources = if selection.iter().any(|p| p == path) {
+            selection
+        } else {
+            vec![path.to_string()]
+        };
+        let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+        nice_model::file_browser::can_drop(&refs, dest)
+    }
+
+    /// Select `path` as the sole selection (scenario drag setup).
+    pub(crate) fn drive_select(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.with_active_fb_state(cx, |st| st.selection_mut().replace(&[path.to_string()], None));
+    }
+
+    /// Add `path` to the selection (⌘-click parity — scenario multi-select setup).
+    pub(crate) fn drive_add_to_selection(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.with_active_fb_state(cx, |st| st.selection_mut().toggle(path));
+    }
+
     // MARK: - Render body (called by SidebarShellView::build_body)
 }
 
@@ -992,6 +1847,18 @@ impl gpui::Render for FileBrowserView {
         if self.context_menu.is_none() {
             if let Some((path, pos)) = self.pending_open_with.take() {
                 self.open_open_with_menu(&path, pos, window, cx);
+            }
+        }
+
+        // R20 (F8): consume a queued rename request (context-menu "Rename", the
+        // Return trigger, or the slow-second-click deferral) now that render has
+        // the `Window` `begin_rename` needs to grab field focus. Only `/` is
+        // refused (defense in depth — the triggers already gate).
+        if self.rename.is_none() {
+            if let Some(path) = self.pending_rename_path.take() {
+                if nice_model::file_browser::can_rename(&path) {
+                    self.begin_rename(&path, window, cx);
+                }
             }
         }
 
@@ -1021,18 +1888,40 @@ impl gpui::Render for FileBrowserView {
             .role(gpui::Role::Group)
             .aria_label(FILE_BROWSER_ROOT_LABEL)
             .track_focus(&self.focus_handle)
+            // R20 (F8): the browser panel's own key context. A row click parks
+            // focus here; Return then begins rename iff exactly one row is
+            // selected. With a terminal (or any field) focused the context never
+            // matches, so terminals keep Return — the structural first-responder
+            // guard replacing Swift's NSEvent monitor.
+            .key_context("FileBrowser")
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if this.rename.is_some() {
+                    return; // the field owns keys while editing
+                }
+                if matches!(e.keystroke.key.as_str(), "enter" | "return") {
+                    if let Some(path) = this.single_selected_path(cx) {
+                        if nice_model::file_browser::can_rename(&path) {
+                            this.begin_rename(&path, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
             // Clicks outside any row (empty area, and the click-away replacement
-            // for Swift's window monitor) clear the selection.
+            // for Swift's window monitor) clear the selection and commit any
+            // active rename (a click-away commit).
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                cx.listener(|this, _e: &MouseDownEvent, window, cx| {
+                    this.commit_rename(window, cx);
                     this.clear_selection(cx);
                 }),
             )
-            .on_mouse_down_out(cx.listener(|this, _e, _w, cx| {
+            .on_mouse_down_out(cx.listener(|this, _e, window, cx| {
+                this.commit_rename(window, cx);
                 this.clear_selection(cx);
             }))
             .child(header)
@@ -1053,6 +1942,7 @@ fn chrome_slots() -> Slots {
 struct RowColors {
     sel_bg: Rgba,
     hover: Rgba,
+    drag_hover: Rgba,
     ink: Rgba,
     ink2: Rgba,
     ink3: Rgba,
@@ -1060,11 +1950,13 @@ struct RowColors {
 
 /// Render one tree row (free fn so the `uniform_list` `'static` closure builds it
 /// without borrowing the view; clicks re-enter the view through `weak`).
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     row: &RowVm,
     weak: gpui::WeakEntity<FileBrowserView>,
     c: RowColors,
     scale: f32,
+    rename_focus: &FocusHandle,
     app: &mut App,
 ) -> AnyElement {
     let indent = row.depth as f32 * INDENT_PER_LEVEL;
@@ -1075,6 +1967,7 @@ fn render_row(
     let is_root = row.is_root;
 
     let mut el = div()
+        .id(SharedString::from(row.path.clone()))
         .flex()
         .flex_row()
         .items_center()
@@ -1089,6 +1982,11 @@ fn render_row(
     } else {
         let hover = c.hover;
         el = el.hover(move |st| st.bg(hover));
+    }
+    // R20 (F7): a cut row is ghosted at 0.45 opacity until the cut is pasted or
+    // invalidated (any pasteboard mutation un-ghosts it via the snapshot's cut set).
+    if row.is_cut {
+        el = el.opacity(0.45);
     }
     // Disclosure slot (chevron for dirs; blank for files). Decorative — a plain
     // click anywhere on a folder row already toggles expansion (the router's
@@ -1121,16 +2019,78 @@ fn render_row(
                     app,
                 )),
         )
-        .child(
-            div()
+        .child(match &row.editing {
+            Some(spans) => render_rename_field(spans, rename_focus, weak.clone(), c),
+            None => div()
                 .flex_1()
                 .text_size(px(NAME_SIZE))
                 .text_color(c.ink)
-                .child(SharedString::from(row.name.clone())),
+                .child(SharedString::from(row.name.clone()))
+                .into_any_element(),
+        });
+
+    // R20 (F9): drag source — the payload IS `gpui::ExternalPaths` (the app's
+    // first `on_drag` consumer). One payload type means a directory row's drop
+    // handler serves both internal drags and Finder-inbound drops, AND dragging a
+    // row onto a terminal feeds T7's target for free. Suppressed while editing.
+    if row.editing.is_none() {
+        let drag_paths = row.drag_paths.clone();
+        let weak_drag = weak.clone();
+        let start_path = row.path.clone();
+        el = el.on_drag(
+            ExternalPaths(drag_paths.iter().map(PathBuf::from).collect()),
+            move |paths: &ExternalPaths, _offset, _window, app| {
+                let sources: Vec<String> = paths
+                    .paths()
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let count = sources.len();
+                let start = start_path.clone();
+                let _ = weak_drag.update(app, |this, cx| {
+                    // Record the internal drag session (select-then-drag the row if
+                    // it wasn't part of the selection).
+                    this.begin_row_drag(&start, cx);
+                    cx.notify();
+                });
+                app.new(|_| DragPreview { count })
+            },
         );
+    }
+
+    // R20 (F9): directory rows are drop targets for the same `ExternalPaths`
+    // payload — the pure `can_drop` rule gates them and the accent hover highlight
+    // shows a valid target.
+    if is_dir {
+        let dest_can = row.path.clone();
+        let dest_drop = row.path.clone();
+        let drag_hover = c.drag_hover;
+        let weak_drop = weak.clone();
+        el = el
+            .drag_over::<ExternalPaths>(move |style, _paths, _window, _app| style.bg(drag_hover))
+            .can_drop(move |dragged, _window, _app| {
+                dragged
+                    .downcast_ref::<ExternalPaths>()
+                    .map(|ep| {
+                        let srcs: Vec<String> = ep
+                            .paths()
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect();
+                        let refs: Vec<&str> = srcs.iter().map(String::as_str).collect();
+                        nice_model::file_browser::can_drop(&refs, &dest_can)
+                    })
+                    .unwrap_or(false)
+            })
+            .on_drop::<ExternalPaths>(move |paths: &ExternalPaths, window, app| {
+                let _ = weak_drop.update(app, |this, cx| {
+                    this.handle_drop(paths, &dest_drop, window, cx);
+                });
+            });
+    }
 
     let weak_left = weak.clone();
-    el.on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _window, app| {
+    el.on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, app| {
         let modifier = if e.modifiers.platform {
             ClickModifier::Command
         } else if e.modifiers.shift {
@@ -1141,6 +2101,9 @@ fn render_row(
         let p = path_for_click.clone();
         let _ = weak_left.update(app, |this, cx| {
             this.on_row_click(&p, modifier, cx);
+            // Parking focus in the browser panel makes Return-to-rename work and
+            // fires commit-on-blur when the user later clicks away / switches tabs.
+            this.focus_handle.focus(window, cx);
             cx.stop_propagation();
         });
     })
@@ -1154,12 +2117,108 @@ fn render_row(
     .into_any_element()
 }
 
+/// Render the inline-rename field for the editing row (F8): the pure editing
+/// model's text with a caret (collapsed cursor) or a highlighted selection range,
+/// bordered in the accent, tracking the rename focus handle and routing keys back
+/// through the view. This is the NEW input component wrapping slice 1's
+/// `TextFieldEditor` (the landed `inline_rename` field is deliberately untouched).
+fn render_rename_field(
+    spans: &EditSpans,
+    rename_focus: &FocusHandle,
+    weak: gpui::WeakEntity<FileBrowserView>,
+    c: RowColors,
+) -> AnyElement {
+    let mut text_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(
+            div()
+                .text_size(px(NAME_SIZE))
+                .text_color(c.ink)
+                .child(SharedString::from(spans.pre.clone())),
+        );
+    if spans.collapsed {
+        // Caret: a thin accent bar at the cursor position.
+        text_row = text_row.child(div().w(px(1.0)).h(px(14.0)).bg(c.sel_bg));
+    } else {
+        text_row = text_row.child(
+            div()
+                .bg(c.sel_bg)
+                .text_size(px(NAME_SIZE))
+                .text_color(c.ink)
+                .child(SharedString::from(spans.sel.clone())),
+        );
+    }
+    text_row = text_row.child(
+        div()
+            .text_size(px(NAME_SIZE))
+            .text_color(c.ink)
+            .child(SharedString::from(spans.post.clone())),
+    );
+
+    div()
+        .id("file-browser.rename-field")
+        .flex_1()
+        .track_focus(rename_focus)
+        .px(px(2.0))
+        .border_1()
+        .border_color(c.sel_bg)
+        .on_key_down(move |e: &KeyDownEvent, window, app| {
+            let _ = weak.update(app, |this, cx| this.on_rename_key(e, window, cx));
+        })
+        .child(text_row)
+        .into_any_element()
+}
+
 /// The BSD lstat "is this a real directory" check (mirrors the pure listing's
 /// private `path_is_dir_lstat`: a symlink-to-dir is NOT a directory row).
 fn is_dir_lstat(path: &str) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_dir())
         .unwrap_or(false)
+}
+
+/// Whether every source shares `dest`'s volume (device id). An unreadable source
+/// or dest is treated as cross-volume so the drop defensively COPIES (a raw
+/// cross-volume rename would fail) — the Swift `areOnSameVolume` fallback.
+fn sources_share_volume(sources: &[String], dest: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dest_dev) = std::fs::metadata(dest).map(|m| m.dev()) else {
+        return false;
+    };
+    sources.iter().all(|s| {
+        std::fs::metadata(s)
+            .map(|m| m.dev() == dest_dev)
+            .unwrap_or(false)
+    })
+}
+
+/// The small "N items" drag preview (F9) — gpui has no drag-cursor operation cue
+/// at the pin, so this floating chip is the only drag affordance.
+struct DragPreview {
+    count: usize,
+}
+
+impl gpui::Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let s = chrome_slots();
+        let label = if self.count == 1 {
+            "1 item".to_string()
+        } else {
+            format!("{} items", self.count)
+        };
+        div()
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .bg(slot_to_rgba(s.panel))
+            .border_1()
+            .border_color(slot_to_rgba(s.line))
+            .text_size(px(NAME_SIZE))
+            .text_color(slot_to_rgba(s.ink))
+            .child(SharedString::from(label))
+    }
 }
 
 fn last_component(path: &str) -> String {

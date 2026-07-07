@@ -8,9 +8,10 @@
 //! *readiness* waits on an OS-thread pty child (bounded, fail-loud), not timing
 //! assertions.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::TestAppContext;
+use gpui::{ExternalPaths, TestAppContext};
 use nice_term_core::DEFAULT_SCROLLBACK_LINES;
 use nice_term_view::{TerminalMetrics, TerminalSessionHandle};
 
@@ -106,5 +107,48 @@ fn advance_clock_promotes_launch_overlay(cx: &mut TestAppContext) {
     assert!(
         vcx.read(|app| terminal.read(app).overlay_visible()),
         "advancing the simulated clock past the grace must promote the launch overlay to visible"
+    );
+}
+
+/// **R20 (F9): a file-browser row-drag payload is accepted by the terminal's
+/// drop target.** The in-tree drag's payload IS a `gpui::ExternalPaths` (the same
+/// value the file browser's `on_drag` constructs from a row's drag set), so
+/// dragging a tree row onto a terminal must feed T7's landed
+/// [`nice_term_view::TerminalView::handle_external_paths_drop`] for free. This
+/// pins that contract: a payload built exactly as the browser builds it types the
+/// escaped, space-joined, space-padded paths at the prompt. (Execution model:
+/// mocked `TestAppContext`, libtest.)
+#[gpui::test]
+fn file_browser_row_drag_payload_reaches_terminal(cx: &mut TestAppContext) {
+    let dir = session::temp_dir("rowdrag").expect("temp dir");
+    let cap = dir.join("capture.bin");
+    let spec = session::capture_tee_spec(&dir, &cap, 24, 80);
+    let handle =
+        TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES).expect("spawn session");
+    let (terminal, vcx) =
+        behavior::mount_terminal(cx, handle.clone(), TerminalMetrics::new(CELL_W, CELL_H));
+
+    // Readiness: prove raw mode is live before recording the assertion offset.
+    handle
+        .update(vcx, |h, _cx| h.session().write_input(b"__ready__"))
+        .expect("pty accepted the readiness probe");
+    session::poll_capture_contains(&cap, b"__ready__", CAPTURE_TIMEOUT)
+        .expect("capture-tee pipeline ready");
+
+    // Construct the payload EXACTLY as the file browser's row `on_drag` does — an
+    // `ExternalPaths` over the row's drag set (here a two-row selection, one path
+    // carrying a space so the escape path is exercised).
+    let drag_paths = ["/proj/a.txt", "/proj/b c.txt"];
+    let payload = ExternalPaths(drag_paths.iter().map(PathBuf::from).collect());
+
+    let start = session::cap_len(&cap);
+    terminal.update(vcx, |view, cx| view.handle_external_paths_drop(&payload, cx));
+
+    let got = session::poll_capture_after(&cap, start, 28, CAPTURE_TIMEOUT)
+        .expect("the row-drag payload's escaped paths reached the pty");
+    assert_eq!(
+        got, br#" /proj/a.txt /proj/b\ c.txt "#,
+        "the terminal must accept a file-browser row-drag ExternalPaths payload and type the \
+         space-joined, backslash-escaped, space-padded paths (T7 target reused by F9)"
     );
 }

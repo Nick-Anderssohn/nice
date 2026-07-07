@@ -173,16 +173,15 @@ fn register_app_level_actions(cx: &mut App) {
     cx.on_action(|_: &DecreaseFontSize, cx: &mut App| zoom_shared_font(cx, -1));
     cx.on_action(|_: &ResetFontSizes, cx: &mut App| reset_shared_font(cx));
 
-    // Undo / redo file operations — DEFERRED to R20. Registered (not silently
-    // missing, dossier G4) so the chords are consumed like Swift's shared
-    // `FileOperationHistory`; app-level because that history follows focus
-    // internally. R20 fills these bodies (`fileOperationHistory.undo()/redo()`).
-    cx.on_action(|_: &UndoFileOperation, _cx: &mut App| {
-        // R20: route to the shared file-operation history's undo.
-    });
-    cx.on_action(|_: &RedoFileOperation, _cx: &mut App| {
-        // R20: route to the shared file-operation history's redo.
-    });
+    // Undo / redo file operations (R20). App-level + unconditional (Swift parity,
+    // `KeyboardShortcutMonitor.swift:128-133`): the chords dispatch through the ONE
+    // process-wide `FileOperationHistory` BEFORE any focused-window/terminal
+    // routing, so ⌘Z in window B undoes window A's op and the chord is consumed even
+    // with a terminal focused and even on an empty stack (the history's own no-op).
+    // The history follows focus back to the originating window internally. No
+    // Global (a scenario that never installed one) ⇒ inert, like the font handlers.
+    cx.on_action(|_: &UndoFileOperation, cx: &mut App| dispatch_file_history(cx, true));
+    cx.on_action(|_: &RedoFileOperation, cx: &mut App| dispatch_file_history(cx, false));
 }
 
 /// Window-scoped handlers: they mutate the focused window's [`WindowState`],
@@ -277,6 +276,33 @@ fn with_active_state(cx: &mut App, f: impl FnOnce(&mut WindowState, &mut Context
             cx.notify();
         });
     }
+}
+
+/// Drive the process-wide file-operation history's undo (`undo == true`) or redo.
+/// A no-op when no [`FileOperationHistoryGlobal`] is installed (a scenario that
+/// never stood the history up); the `cx.notify()` inside the entity update wakes
+/// the per-window drift-banner observers so a published message renders.
+fn dispatch_file_history(cx: &mut App, undo: bool) {
+    use crate::file_browser::history::FileOperationHistoryGlobal;
+    let Some(history) = cx
+        .try_global::<FileOperationHistoryGlobal>()
+        .map(|g| g.0.clone())
+    else {
+        return;
+    };
+    // Snapshot the live windows for the cx-less focus-follow closure BEFORE the
+    // undo/redo, then drive the resolved cross-window focus routes AFTER (both
+    // no-ops when no focus router is installed). See `focus_route`.
+    crate::file_browser::focus_route::refresh_live(cx);
+    history.update(cx, |h, cx| {
+        if undo {
+            h.undo();
+        } else {
+            h.redo();
+        }
+        cx.notify();
+    });
+    crate::file_browser::focus_route::drive_pending(cx);
 }
 
 fn zoom_shared_font(cx: &mut App, delta: i32) {

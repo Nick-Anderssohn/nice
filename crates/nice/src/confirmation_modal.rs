@@ -118,6 +118,12 @@ impl ConfirmationModal {
         }
     }
 
+    /// The modal's title line — the `file-browser` scenario asserts the
+    /// rename-confirmation wording through it (a presented modal's identity).
+    pub(crate) fn scenario_title(&self) -> String {
+        self.title.to_string()
+    }
+
     /// Resolve the modal: run `completion(confirmed)` once, then dismiss.
     /// Idempotent via [`done`](Self::done). `pub(crate)` so the
     /// `persistence-restore` scenario can drive the modal's Cancel / Confirm

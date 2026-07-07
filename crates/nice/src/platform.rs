@@ -581,6 +581,8 @@ extern "C" {
     static NSPasteboardNameDrag: *const AnyObject;
     static NSPasteboardTypePNG: *const AnyObject;
     static NSPasteboardTypeTIFF: *const AnyObject;
+    /// `NSPasteboardTypeString` — the plain-text UTI the R20 Copy-Path write uses.
+    static NSPasteboardTypeString: *const AnyObject;
 }
 
 /// `NSBitmapImageFileType.png` — the file-type selector for
@@ -1850,5 +1852,263 @@ pub fn workspace_choose_application() -> Option<String> {
         }
         let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
         standardized_path(url)
+    }
+}
+
+// ===========================================================================
+// R20 file-operations foreign side — the objc2 Trash + system-pasteboard
+// primitives behind the `Trasher` / `FilePasteboard` seams
+// (`crate::file_browser::{ops, pasteboard}`), plus a public App-Nap-safe delay
+// wrapper for the drift banner's auto-dismiss.
+//
+// This is the ONLY module that touches `NSFileManager -trashItemAtURL:…` or
+// `NSPasteboard` for file-URL / text interop (the hermeticity audit greps for
+// exactly that: the production symbols live here and nowhere else in
+// `crates/nice/src`). Tests inject a `FakeTrasher` / fake `FilePasteboard`, or —
+// for the objc2 round-trip cases — a NAMED pasteboard invisible to Finder.
+// All callers are main-thread / autorelease-pool contexts (a gpui menu action or
+// `app::run` bootstrap), the same contract as the workspace readers above.
+// ===========================================================================
+
+/// The App-Nap-safe delay the drift banner's 3.5 s auto-dismiss rides — the
+/// `pub` wrapper the plan asks for over the private [`AppNapSafeDelay`] (mirror
+/// of the [`launch_deadline`] factory). A bare `background_executor().timer` is
+/// indefinitely deferred by App Nap on an idle/occluded window (spike 6), which
+/// is exactly the state a window sits in while a stale banner lingers; this rides
+/// the dedicated-OS-thread sleep + main-runloop wake instead. `await` it inside a
+/// foreground `cx.spawn`.
+pub fn nap_safe_delay(delay: Duration) -> impl Future<Output = ()> {
+    AppNapSafeDelay {
+        delay,
+        done: Arc::new(AtomicBool::new(false)),
+        armed: false,
+    }
+}
+
+// -- Trash (NSFileManager -trashItemAtURL:resultingItemURL:error:) ------------
+
+/// Recycle each path in `urls` through `-[NSFileManager
+/// trashItemAtURL:resultingItemURL:error:]`, returning `(original, trashed)`
+/// pairs in input order. Synchronous, per-item, in order; on the FIRST failure it
+/// returns `Err` with the `NSError` description — earlier items stay trashed
+/// (ops are NOT transactional), matching the frozen [`Trasher`](crate::file_browser::ops::Trasher)
+/// contract. The `resultingItemURL:` / `error:` out-params are `NSURL**` / `NSError**`
+/// (`^@`): a `*mut *mut AnyObject` supplies that encoding, sidestepping the
+/// `OpaqueCGContext`-class encoding gotcha (a bare object pointer would mis-encode).
+///
+/// # Safety contract
+/// Main thread with an active autorelease pool (a gpui menu action satisfies both).
+pub fn trash_items(urls: &[PathBuf]) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let mut out = Vec::with_capacity(urls.len());
+    // SAFETY: `defaultManager` is a get-rule singleton; `file_url` yields an
+    // autoreleased NSURL; the two out-params are valid `NSURL**` / `NSError**`
+    // slots (null-initialised, only written by the callee); on success `resulting`
+    // is an autoreleased NSURL we only read a path from.
+    unsafe {
+        let fm: *mut AnyObject = msg_send![class!(NSFileManager), defaultManager];
+        for original in urls {
+            let path_str = original.to_string_lossy();
+            let url = file_url(&path_str);
+            let mut resulting: *mut AnyObject = std::ptr::null_mut();
+            let mut error: *mut AnyObject = std::ptr::null_mut();
+            let ok: Bool = msg_send![
+                fm,
+                trashItemAtURL: url,
+                resultingItemURL: (&mut resulting) as *mut *mut AnyObject,
+                error: (&mut error) as *mut *mut AnyObject
+            ];
+            if !ok.as_bool() {
+                let message = if error.is_null() {
+                    format!("couldn't move '{}' to the Trash", path_str)
+                } else {
+                    let desc: *mut AnyObject = msg_send![error, localizedDescription];
+                    string_from_ns(desc)
+                        .unwrap_or_else(|| format!("couldn't move '{}' to the Trash", path_str))
+                };
+                return Err(message);
+            }
+            let trashed = if resulting.is_null() {
+                original.clone()
+            } else {
+                let path: *mut AnyObject = msg_send![resulting, path];
+                string_from_ns(path)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| original.clone())
+            };
+            out.push((original.clone(), trashed));
+        }
+    }
+    Ok(out)
+}
+
+// -- Pasteboard (NSPasteboard file-URL + text interop) ------------------------
+
+/// A retained handle onto an `NSPasteboard` — the general system pasteboard
+/// (`app::run` binds it once) or a NAMED test pasteboard (invisible to Finder /
+/// other apps, the isolated-pasteboard-round-trip precedent). Every browser
+/// pasteboard write goes through the standard `public.file-url`
+/// (`writeObjects:[NSURL]`) or plain-text type so Nice interoperates with Finder
+/// both directions — closing gpui's write gap (`gpui_macos` silently drops
+/// `ExternalPaths`). The production [`FilePasteboard`](crate::file_browser::pasteboard::FilePasteboard)
+/// impl forwards to this; the objc2 code is exercised identically by named-pasteboard
+/// integration tests.
+pub struct PasteboardRef {
+    /// The retained `NSPasteboard *`. Released on drop (balanced with the `retain`
+    /// in the constructors).
+    pasteboard: *mut AnyObject,
+}
+
+impl PasteboardRef {
+    /// Bind the general system pasteboard (`+[NSPasteboard generalPasteboard]`).
+    /// `app::run` ONLY — the shipped Copy / Cut / Paste / Copy-Path surface.
+    ///
+    /// # Safety
+    /// Main thread with an active autorelease pool.
+    pub unsafe fn general() -> Self {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        Self::retaining(pb)
+    }
+
+    /// Create an isolated NAMED pasteboard (`+[NSPasteboard pasteboardWithName:]`)
+    /// — invisible to Finder / other apps. The round-trip integration tests use
+    /// this so they exercise the SAME objc2 write/read path without ever mutating
+    /// the general pasteboard. Call [`release_globally`](Self::release_globally)
+    /// before drop to destroy the named pasteboard.
+    ///
+    /// # Safety
+    /// Main thread with an active autorelease pool.
+    pub unsafe fn named(name: &str) -> Self {
+        let ns_name = ns_string(name);
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), pasteboardWithName: ns_name];
+        Self::retaining(pb)
+    }
+
+    /// Retain `pb` so the handle owns a +1 reference for its lifetime.
+    ///
+    /// # Safety
+    /// `pb` is a valid `NSPasteboard *` (or null, tolerated as a dead handle).
+    unsafe fn retaining(pb: *mut AnyObject) -> Self {
+        if !pb.is_null() {
+            let _: *mut AnyObject = msg_send![pb, retain];
+        }
+        Self { pasteboard: pb }
+    }
+
+    /// Replace the pasteboard contents with `paths` as `public.file-url` items
+    /// (`clearContents` + `writeObjects:[NSURL fileURLWithPath:]`).
+    pub fn write_file_urls(&self, paths: &[PathBuf]) {
+        if self.pasteboard.is_null() {
+            return;
+        }
+        // SAFETY: live retained pasteboard; each `file_url` is an autoreleased
+        // NSURL added to an autoreleased NSMutableArray; `writeObjects:` copies the
+        // items. Main-thread / pool caller.
+        unsafe {
+            let _: isize = msg_send![self.pasteboard, clearContents];
+            let array: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+            for path in paths {
+                let url = file_url(&path.to_string_lossy());
+                if !url.is_null() {
+                    let _: () = msg_send![array, addObject: url];
+                }
+            }
+            let _: Bool = msg_send![self.pasteboard, writeObjects: array];
+        }
+    }
+
+    /// Read the pasteboard's file URLs (`readObjectsForClasses:[NSURL] options:nil`,
+    /// filtered to `isFileURL`) as filesystem paths. Non-file URLs (e.g. an `http`
+    /// URL another app copied) are skipped, mirroring the Swift file-URL filter.
+    pub fn read_file_urls(&self) -> Vec<PathBuf> {
+        if self.pasteboard.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: live retained pasteboard; `readObjectsForClasses:options:` returns
+        // an autoreleased NSArray of autoreleased NSURLs; we only read `isFileURL` /
+        // `path` from each. `NSURL`'s class object is passed as the sole element of
+        // the classes array. Main-thread / pool caller.
+        unsafe {
+            let url_class: *const AnyObject =
+                (class!(NSURL) as *const objc2::runtime::AnyClass).cast();
+            let classes: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: url_class];
+            let options: *mut AnyObject = std::ptr::null_mut();
+            let objs: *mut AnyObject =
+                msg_send![self.pasteboard, readObjectsForClasses: classes, options: options];
+            if objs.is_null() {
+                return Vec::new();
+            }
+            let count: usize = msg_send![objs, count];
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let url: *mut AnyObject = msg_send![objs, objectAtIndex: i];
+                if url.is_null() {
+                    continue;
+                }
+                let is_file: Bool = msg_send![url, isFileURL];
+                if !is_file.as_bool() {
+                    continue;
+                }
+                let path: *mut AnyObject = msg_send![url, path];
+                if let Some(p) = string_from_ns(path) {
+                    out.push(PathBuf::from(p));
+                }
+            }
+            out
+        }
+    }
+
+    /// Replace the pasteboard contents with plain text (`clearContents` +
+    /// `setString:forType:NSPasteboardTypeString`) — the Copy-Path write.
+    pub fn write_text(&self, text: &str) {
+        if self.pasteboard.is_null() {
+            return;
+        }
+        // SAFETY: live retained pasteboard; `ns_string` is an autoreleased NSString;
+        // `NSPasteboardTypeString` is an interned type constant. Main-thread / pool.
+        unsafe {
+            let _: isize = msg_send![self.pasteboard, clearContents];
+            let s = ns_string(text);
+            let ty = NSPasteboardTypeString;
+            let _: Bool = msg_send![self.pasteboard, setString: s, forType: ty];
+        }
+    }
+
+    /// The pasteboard's `changeCount` — bumped by any writer (us or another app),
+    /// which is how the in-process cut companion detects an external mutation.
+    pub fn change_count(&self) -> i64 {
+        if self.pasteboard.is_null() {
+            return 0;
+        }
+        // SAFETY: live retained pasteboard; `-changeCount` is a get-rule NSInteger.
+        unsafe {
+            let count: isize = msg_send![self.pasteboard, changeCount];
+            count as i64
+        }
+    }
+
+    /// Destroy a NAMED pasteboard (`-releaseGlobally`) — tests call this before
+    /// dropping their isolated pasteboard so it leaves no global trace. A no-op on
+    /// the general pasteboard's handle would be wrong, so only tests (which own a
+    /// named pasteboard) call it.
+    ///
+    /// # Safety
+    /// Main thread; the handle must be a named pasteboard (never the general one).
+    pub unsafe fn release_globally(&self) {
+        if !self.pasteboard.is_null() {
+            let _: () = msg_send![self.pasteboard, releaseGlobally];
+        }
+    }
+}
+
+impl Drop for PasteboardRef {
+    fn drop(&mut self) {
+        if !self.pasteboard.is_null() {
+            // SAFETY: balances the `retain` in `retaining`; after this the handle
+            // relinquishes its +1. The general pasteboard is a long-lived singleton
+            // AppKit also retains, so releasing our +1 never deallocates it.
+            unsafe {
+                let _: () = msg_send![self.pasteboard, release];
+            }
+        }
     }
 }

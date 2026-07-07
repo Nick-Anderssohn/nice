@@ -1859,7 +1859,13 @@ impl Render for SidebarShellView {
         if mode == SidebarMode::Files && self.file_browser.is_none() {
             let state = self.state.clone();
             let accent = self.accent;
-            self.file_browser = Some(cx.new(|cx| FileBrowserView::new(state, accent, cx)));
+            let fb = cx.new(|cx| FileBrowserView::new(state, accent, cx));
+            // R20 (F8): push the pane host down so a rename exit hands key focus
+            // back to the active terminal (set_pane_host runs before first render).
+            if let Some(host) = self.pane_host.clone() {
+                fb.update(cx, |fb, _| fb.set_pane_host(host));
+            }
+            self.file_browser = Some(fb);
         }
         let groups = self.snapshot_groups(cx);
         let shell = if collapsed {

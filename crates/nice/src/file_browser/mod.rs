@@ -27,6 +27,30 @@
 //!   actions behind the [`workspace_ops`] Global, and the AX root anchor. Mounted
 //!   by [`crate::sidebar_shell::SidebarShellView`]'s `build_body`.
 
+// R20 file-operations layer (F5–F9): the ops engine, the app-wide undo/redo
+// history, the pasteboard adapter, rename, and in-tree DnD. Slice 2 wired the
+// impure halves onto them — the objc2 `ProductionTrasher` /
+// `ProductionFilePasteboard` (forwarding to `platform.rs`), the history `Entity`
+// + `Global`, the `FilePasteboardGlobal`, the ⌘Z/⌘⇧Z keymap bodies, the
+// per-window drift `banner`, and the menu handlers + ghost rows; slice 3 added
+// rename + DnD. The final-composition slice fills the production focus-follow
+// closure ([`focus_route`], the cross-window undo routing) so ⌘Z in one window
+// routes focus back to the originator. Some fakes and future-consumer seams stay
+// test-/future-only, hence the retained `allow(dead_code)`.
+#[allow(dead_code)]
+pub mod banner;
+#[allow(dead_code)]
+pub mod cwd_snapshot;
+#[allow(dead_code)]
+pub mod focus_route;
+#[allow(dead_code)]
+pub mod history;
+#[allow(dead_code)]
+pub mod ops;
+#[allow(dead_code)]
+pub mod pasteboard;
+#[allow(dead_code)]
+pub mod rename;
 pub mod sort_settings_store;
 pub mod view;
 pub mod watcher;
