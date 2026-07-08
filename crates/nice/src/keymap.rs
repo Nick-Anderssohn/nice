@@ -119,6 +119,13 @@ pub(crate) fn shared_font_settings(cx: &App) -> Entity<FontSettings> {
     cx.global::<SharedFontSettings>().0.clone()
 }
 
+/// The process-level terminal font entity, if installed (`None` before
+/// [`install_shortcuts`]). R23's Font pane uses this defensive accessor so a pane
+/// build never panics when the keymap has not been wired.
+pub(crate) fn try_shared_font_settings(cx: &App) -> Option<Entity<FontSettings>> {
+    cx.try_global::<SharedFontSettings>().map(|g| g.0.clone())
+}
+
 /// Wire the app-wide shortcut system, once, from `crate::app::run` (and from the
 /// self-test scenarios that drive the shortcuts) before the first window opens:
 ///
@@ -138,8 +145,48 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
     }
     cx.set_global(ShortcutsInstalled);
 
-    let font = cx.new(FontSettings::resolved_default);
-    cx.set_global(SharedFontSettings(font));
+    // R23: seed the shared terminal font from the persisted `fonts` section (loaded
+    // into `SettingsPrefsStore` before this in `app::run`; a defaults+temp store in
+    // `run_selftest`). Values are copied out first so the store borrow ends before
+    // `cx.new`. Applying them inside the constructor (before any subscriber exists)
+    // means the seed emits no observable `FontZoom` to the sidebar.
+    let (seed_px, seed_family, seed_sidebar_px) =
+        match cx.try_global::<crate::settings::prefs_store::SettingsPrefsStore>() {
+            Some(store) => (
+                store.terminal_font_px(),
+                store.terminal_font_family(),
+                store.sidebar_font_px(),
+            ),
+            None => (None, None, None),
+        };
+    let font = cx.new(|cx| {
+        let mut f = FontSettings::resolved_default(cx);
+        if let Some(px) = seed_px {
+            f.set_px(px, cx);
+        }
+        if let Some(fam) = &seed_family {
+            f.set_family(Some(fam.clone().into()), cx);
+        }
+        f
+    });
+    cx.set_global(SharedFontSettings(font.clone()));
+
+    // R23 (D3): the app-level sidebar-font entity, coupled to the terminal
+    // `FontZoom` for the proportional rescale, seeded from the persisted sidebar
+    // size. Installed alongside the terminal font so the sidebar chrome + the Font
+    // pane can always read it.
+    let terminal_px = font.read(cx).px();
+    let sidebar_px =
+        seed_sidebar_px.unwrap_or(crate::settings::sidebar_font::DEFAULT_SIDEBAR_FONT_PX);
+    let sidebar = cx.new(|cx| {
+        crate::settings::sidebar_font::SharedSidebarFontSettings::new(
+            sidebar_px,
+            terminal_px,
+            &font,
+            cx,
+        )
+    });
+    cx.set_global(crate::settings::sidebar_font::SharedSidebarFont(sidebar));
 
     register_app_level_actions(cx);
     register_window_scoped_actions(cx);

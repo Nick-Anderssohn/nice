@@ -74,6 +74,19 @@ serde_json = "1"
 # workspace lock (nice-model pulls the same version); no new fetch.
 serde = { version = "1", features = ["derive"] }
 
+[dev-dependencies]
+# `gpui/test-support` for THIS crate's own `#[gpui::test]` unit cases ONLY — the
+# app-level entity/`&mut App` behavior that `nice-itests` cannot cover because a
+# dev/test crate cannot import this binary crate (`SharedSidebarFontSettings`,
+# `perform_remove_imported`). This is the MOCKED `TestAppContext` half only
+# (TestPlatform + NoopTextSystem, no Metal); it does NOT pull
+# `gpui_platform/test-support`, so the process-wide `framebufferOnly=false`
+# flip never enters this graph. Being a dev-dependency, the v2 feature resolver
+# keeps it OUT of the normal build: `cargo build [--release] -p nice` and
+# `cargo tree -p nice --edges normal` stay test-support-free (Validation §4), so
+# it can never reach the shipped bundle. Mirrors `nice-itests`'s own dev-dep.
+gpui = { path = "../../vendor/zed/crates/gpui", features = ["test-support"] }
+
 [features]
 # Screenshot capture (Window::render_to_image), gated so it stays OUT of the
 # shipped bundle: enabling it turns on test-support, which flips

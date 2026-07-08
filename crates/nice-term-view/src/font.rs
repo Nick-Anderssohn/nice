@@ -170,35 +170,79 @@ impl FontSettings {
     /// move). Mirrors `FontSettings.swift`'s `zoom(by:)` (terminal is the anchor;
     /// the sidebar scale it also drives is R10, off the [`FontZoom`] event).
     pub fn zoom_by(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let new_px = clamp_px(self.px + delta as f32);
-        if new_px != self.px {
-            self.set_px(new_px, cx);
-        }
+        self.set_px(self.px + delta as f32, cx);
     }
 
     /// ⌘0 — snap back to the default size exactly. A no-op if already at default.
     pub fn reset(&mut self, cx: &mut Context<Self>) {
-        if self.px != DEFAULT_TERMINAL_FONT_PX {
-            self.set_px(DEFAULT_TERMINAL_FONT_PX, cx);
-        }
+        self.set_px(DEFAULT_TERMINAL_FONT_PX, cx);
     }
 
-    /// Apply a new (already in-range) size: recompute metrics, then emit the
-    /// typed [`FontZoom`] (R10's surface) + `notify` (the views' `cx.observe`).
-    fn set_px(&mut self, new_px: f32, cx: &mut Context<Self>) {
+    /// Set the terminal point size (R23's Font-pane size slider + the ⌘±/⌘0 zoom).
+    /// The input is **clamped** to `[MIN, MAX]` ([`clamp_px`]); a size that does not
+    /// actually move is a no-op (never emits / notifies). On a real change: recompute
+    /// metrics, emit the typed [`FontZoom`] (the sidebar's proportional subscriber +
+    /// R10's surface), and `notify` (the views' `cx.observe` re-metric). Takes plain
+    /// `f32` only — boundary-legal (a terminal size IS a terminal concept).
+    pub fn set_px(&mut self, px: f32, cx: &mut Context<Self>) {
+        let new_px = clamp_px(px);
+        if new_px == self.px {
+            return;
+        }
         self.px = new_px;
+        self.recompute_metrics(cx);
+        cx.emit(FontZoom { px: new_px });
+        cx.notify();
+    }
+
+    /// Override the terminal font family (R23's Font-pane family picker). `Some(f)`
+    /// makes `f` the sole chain entry (resolved through the text system, GPUI
+    /// substituting a system font if it is unavailable); `None` restores the shipped
+    /// [`default_font_chain`]. Re-resolves the family, re-metrics, emits [`FontZoom`]
+    /// (so the sidebar's subscriber sees a change event — the point size is
+    /// unchanged, so it is a proportional no-op), and `notify`s every view to
+    /// re-metric. Takes `Option<SharedString>` only — boundary-legal (a terminal
+    /// family IS a terminal concept).
+    pub fn set_family(&mut self, family: Option<SharedString>, cx: &mut Context<Self>) {
+        self.chain = match family {
+            Some(f) => vec![f],
+            None => default_font_chain(),
+        };
+        let ts = cx.text_system().clone();
+        self.family = resolve_family(&ts, &self.chain);
+        self.recompute_metrics(cx);
+        cx.emit(FontZoom { px: self.px });
+        cx.notify();
+    }
+
+    /// Reset the terminal font to the shipped defaults (R23's Font-pane "Reset to
+    /// defaults"): the [`default_font_chain`] at [`DEFAULT_TERMINAL_FONT_PX`]. Unlike
+    /// [`set_px`](Self::set_px) this does NOT emit [`FontZoom`] — the sidebar's own
+    /// reset is driven explicitly by the Font-pane handler, so a proportional rescale
+    /// off this reset would fight it. Re-resolves + re-metrics and `notify`s the views.
+    pub fn reset_to_defaults(&mut self, cx: &mut Context<Self>) {
+        self.chain = default_font_chain();
+        let ts = cx.text_system().clone();
+        self.family = resolve_family(&ts, &self.chain);
+        self.px = DEFAULT_TERMINAL_FONT_PX;
+        self.recompute_metrics(cx);
+        cx.notify();
+    }
+
+    /// Recompute [`metrics`](Self::metrics) for the current `family` at the current
+    /// `px` — derived through the text system (the shipped path) or scaled from the
+    /// pinned base box (the renderer self-tests' [`MetricsMode::Fixed`]).
+    fn recompute_metrics(&mut self, cx: &mut Context<Self>) {
         self.metrics = match self.mode {
             MetricsMode::Derived => {
                 let ts = cx.text_system().clone();
-                cell_metrics(&ts, &self.family, new_px)
+                cell_metrics(&ts, &self.family, self.px)
             }
             MetricsMode::Fixed {
                 base_px,
                 base_metrics,
-            } => scale_metrics(base_metrics, new_px / base_px),
+            } => scale_metrics(base_metrics, self.px / base_px),
         };
-        cx.emit(FontZoom { px: new_px });
-        cx.notify();
     }
 }
 

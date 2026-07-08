@@ -124,6 +124,44 @@ pub fn read_bool_pref(key: &str, default: bool) -> bool {
     }
 }
 
+/// Write a boolean into this app's own CFPreferences domain — the write sibling
+/// of [`read_bool_pref`], targeting the same `kCFPreferencesCurrentApplication`
+/// domain (the [`disable_font_smoothing`] own-domain FFI precedent, in the write
+/// direction) and synchronizing so the next [`read_bool_pref`] of the same key
+/// (incl. R17's boot gate read) sees the new value.
+///
+/// R23's Settings "Sync Claude Code theme" toggle persists through this to the
+/// `syncClaudeTheme` key R17 reads at boot (D4) — the single source of truth,
+/// keeping the `defaults write dev.nickanderssohn.nice-rs syncClaudeTheme` dev
+/// hatch valid. **Hermeticity:** this touches the REAL CFPrefs domain, so it is
+/// reachable ONLY from the live toggle handler in `app::run`-installed UI — never
+/// from `run_selftest` or a test (the scenario drives the toggle's LIVE arm via
+/// R21's `apply_sync_claude_theme`, not this write). Call on the main thread.
+pub fn write_bool_pref(key: &str, value: bool) {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesAppSynchronize, CFPreferencesSetAppValue,
+    };
+
+    let key = CFString::new(key);
+    let value = CFBoolean::from(value);
+    // SAFETY: `key`/`value` are live CF objects for the duration of the calls;
+    // `kCFPreferencesCurrentApplication` is a valid constant domain. The set is
+    // in-memory (+ synchronize flushes it) so a later same-process/boot
+    // `read_bool_pref` sees it. We own both CF objects until they drop after this
+    // scope — no aliasing.
+    unsafe {
+        CFPreferencesSetAppValue(
+            key.as_concrete_TypeRef(),
+            value.as_CFTypeRef(),
+            kCFPreferencesCurrentApplication,
+        );
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    }
+}
+
 /// The macOS keyCode side-channel feeding the R5 keyboard encoder.
 ///
 /// gpui's `Keystroke` on the pin carries only `{modifiers, key, key_char}` — no
@@ -827,6 +865,39 @@ pub fn main_bundle_name() -> Option<String> {
             return None;
         }
         let key = CFString::new("CFBundleName");
+        let value: CFTypeRef =
+            CFBundleGetValueForInfoDictionaryKey(bundle, key.as_concrete_TypeRef());
+        if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
+            return None;
+        }
+        let name = CFString::wrap_under_get_rule(value as CFStringRef);
+        Some(name.to_string())
+    }
+}
+
+/// The running app's `CFBundleShortVersionString` (e.g. `"0.17.0"`), or `None`
+/// when the process is not bundled — a bare `cargo run` or the test binary has no
+/// `Info.plist`. Mirrors Swift's
+/// `Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")`; R23's
+/// About pane reads it, falling back to `CARGO_PKG_VERSION`.
+pub fn main_bundle_short_version() -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::base::{CFGetTypeID, CFTypeRef};
+    use core_foundation_sys::bundle::{
+        CFBundleGetMainBundle, CFBundleGetValueForInfoDictionaryKey,
+    };
+    use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
+
+    // SAFETY: a get-rule read of the process's own main bundle (thread-safe, no run
+    // loop, takes no ownership); the value's type id is checked to be a CFString
+    // before it is wrapped under the get rule (no over-release).
+    unsafe {
+        let bundle = CFBundleGetMainBundle();
+        if bundle.is_null() {
+            return None;
+        }
+        let key = CFString::new("CFBundleShortVersionString");
         let value: CFTypeRef =
             CFBundleGetValueForInfoDictionaryKey(bundle, key.as_concrete_TypeRef());
         if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
@@ -1836,6 +1907,53 @@ pub fn workspace_choose_application() -> Option<String> {
         // Restrict to `.app` bundles.
         let app_type = ns_string("app");
         let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: app_type];
+        let _: () = msg_send![panel, setAllowedFileTypes: types];
+
+        let response: isize = msg_send![panel, runModal];
+        if response != NS_MODAL_RESPONSE_OK {
+            return None;
+        }
+        let urls: *mut AnyObject = msg_send![panel, URLs];
+        if urls.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![urls, count];
+        if count == 0 {
+            return None;
+        }
+        let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
+        standardized_path(url)
+    }
+}
+
+/// R23 Import…: an `NSOpenPanel` filtered to Ghostty theme files
+/// (`.ghostty` / `.conf`), prompt "Import". Returns the chosen file's path, or
+/// `None` if the user cancels. Modal — production ONLY (the `RecordingFilePicker`
+/// answers in tests / scenarios, so no real panel ever opens under the suite).
+///
+/// # Safety
+/// Main thread with an autorelease pool (a gpui button handler satisfies both).
+pub fn choose_theme_file() -> Option<String> {
+    // `NSModalResponseOK` — the panel's accept response.
+    const NS_MODAL_RESPONSE_OK: isize = 1;
+    unsafe {
+        let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
+        if panel.is_null() {
+            return None;
+        }
+        let _: () = msg_send![panel, setCanChooseFiles: true];
+        let _: () = msg_send![panel, setCanChooseDirectories: false];
+        let _: () = msg_send![panel, setAllowsMultipleSelection: false];
+        let _: () = msg_send![panel, setResolvesAliases: true];
+        let prompt = ns_string("Import");
+        let _: () = msg_send![panel, setPrompt: prompt];
+        // Restrict to Ghostty theme files (`.ghostty` import-written, `.conf`
+        // hand-placed) — the extensions R22's catalog enumerates.
+        let ghostty = ns_string("ghostty");
+        let conf = ns_string("conf");
+        let objs: [*mut AnyObject; 2] = [ghostty, conf];
+        let types: *mut AnyObject =
+            msg_send![class!(NSArray), arrayWithObjects: objs.as_ptr(), count: 2usize];
         let _: () = msg_send![panel, setAllowedFileTypes: types];
 
         let response: isize = msg_send![panel, runModal];

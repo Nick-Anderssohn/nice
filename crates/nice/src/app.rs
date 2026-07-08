@@ -445,9 +445,15 @@ fn fullscreen_menu_title(is_fullscreen: bool) -> &'static str {
 fn app_menus(is_fullscreen: bool) -> Vec<Menu> {
     vec![
         // The application menu — AppKit renders the first menu bold with the
-        // process name. R18 fills it with "Quit Nice RS Dev" (⌘Q). Precedes File
-        // so AppKit renders it as the bold app menu.
-        Menu::new("Nice RS Dev").items([MenuItem::action("Quit Nice RS Dev", Quit)]),
+        // process name. R18 fills it with "Quit Nice RS Dev" (⌘Q); R23 adds
+        // "Settings…" (⌘,, the macOS-convention app-menu slot) which dispatches the
+        // `OpenSettings` action. Precedes File so AppKit renders it as the bold app
+        // menu.
+        Menu::new("Nice RS Dev").items([
+            MenuItem::action("Settings…", crate::settings::window::OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit Nice RS Dev", Quit),
+        ]),
         // File ▸ New Window (⌘N) — mints a fresh isolated window (plan: every ⌘N
         // opens a NEW window, nothing de-dups); File ▸ Close Window (⌘W) — the
         // W5-confirmed window close. Accelerators come from the `cmd-n` / `cmd-w`
@@ -916,6 +922,18 @@ pub fn run() {
         // twin). Slice-3's L4 pass folds these into the composed bootstrap order;
         // wiring them here keeps the quit/close confirmation live meanwhile.
         install_lifecycle_commands(cx);
+        // R23: ⌘, / "Settings…" — opens (or focuses) the singleton Settings window.
+        // A fixed window-management accelerator like ⌘N / ⌘Q / ⌘W; the window is
+        // UNREGISTERED (D7), so it stays out of the registry + shortcut dispatch.
+        crate::settings::window::install_open_settings_command(cx);
+        // R23: load the `fonts` + `advanced` sections of `ui_settings.json` into the
+        // `SettingsPrefsStore` Global BEFORE `install_shortcuts`, which seeds the
+        // shared terminal font + the app-level sidebar-font entity from the persisted
+        // `fonts` size/family. Launch-time read + default-path resolution live here in
+        // `app::run` ONLY — `run_selftest` installs a defaults+temp-path store.
+        cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::load(
+            crate::file_browser::sort_settings_store::default_ui_settings_path(),
+        ));
         // R12: the app-wide shortcut keymap — the 13 rebindable actions + ⌃⌘F
         // generated from `nice_model::shortcuts`, their handlers, and the hoisted
         // process-level `FontSettings` every window shares. Must run before the
@@ -968,6 +986,12 @@ pub fn run() {
         // `run_selftest` installs a recording fake instead (hermeticity: no test
         // or scenario ever launches a real app). app::run ONLY.
         crate::file_browser::workspace_ops::install_production(cx);
+        // R23: install the production `FilePickerOps` seam (the objc2 `NSOpenPanel`
+        // Import… chooser filtered to `.ghostty`/`.conf`) as the process Global —
+        // the ONLY place the real panel is reached. `run_selftest` installs a
+        // `RecordingFilePicker` instead (hermeticity: no test/scenario opens a real
+        // panel; import fixtures are temp files). app::run ONLY.
+        crate::settings::file_picker::install_production(cx);
         // R19 (F2): load the file-browser sort preferences from `ui_settings.json`
         // (`<support-root>/Nice RS Dev/`) into their process Global (write-through
         // on change). Launch-time read + default-path resolution live here in
@@ -3709,6 +3733,24 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R23: the settings-window gate — leg (a), the ⌘, singleton. Drives
+        // OpenSettings over a minimal host window: ⌘, opens exactly one settings
+        // window (a fresh handle, not the host), a second ⌘, focuses it (no second
+        // window), and closing it clears the singleton Global. Registered BEFORE
+        // `multiwindow`: the settings window is UNREGISTERED (D7) and
+        // `install_open_settings_command`'s close observer only clears the Global
+        // (never quits), so nothing here trips the quit-when-empty terminus
+        // `multiwindow` relies on being last. Later slices add legs b–e.
+        Scenario {
+            name: "settings-window",
+            open: crate::settings::scenario::open_settings_window_scenario,
+            gate: Gate::SelfReported {
+                // Two open/focus drives + a close, each with an activation settle;
+                // generous headroom.
+                budget: Duration::from_secs(30),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.
@@ -3739,6 +3781,12 @@ pub fn run_selftest(selector: String) {
         // the real Finder, or query live Launch Services; the fake's log is the
         // only evidence. The production impl (objc2) is installed by `run` only.
         crate::file_browser::workspace_ops::install_recording_fake(cx);
+        // R23 hermeticity: install the RECORDING `FilePickerOps` fake process-wide
+        // BEFORE any scenario runs — no scenario opens a real `NSOpenPanel`; the
+        // `settings-window` scenario scripts the chosen path to a temp fixture and
+        // reads the fake's call count back. The production panel (objc2) is
+        // installed by `run` only.
+        crate::settings::file_picker::install_recording_fake(cx);
         // R19 (F2): the sort store initialized with DEFAULTS + a throwaway temp
         // path — never the real `ui_settings.json` (the launch-time read +
         // default-path resolution stay in `run`). A scenario that toggles sort
@@ -3750,6 +3798,18 @@ pub fn run_selftest(selector: String) {
         cx.set_global(
             crate::file_browser::sort_settings_store::SortSettingsStore::with_defaults(sort_path),
         );
+        // R23: the settings-prefs store (fonts + advanced) with DEFAULTS + a
+        // throwaway temp path — never the real `ui_settings.json` (the launch-time
+        // read + default-path resolution stay in `run`). Installed BEFORE any
+        // scenario so a scenario's `install_shortcuts` seeds the font entities from
+        // defaults, and a Font-pane slider change writes only this temp file.
+        let prefs_path = std::env::temp_dir().join(format!(
+            "nice-rs-selftest-settings-prefs-{}.json",
+            std::process::id()
+        ));
+        cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::with_defaults(
+            prefs_path,
+        ));
         // R21: the theme store initialized with DEFAULTS + a throwaway temp path,
         // plus the terminal-theme catalog stub — never the real `ui_settings.json`
         // (no launch-time write; the read + default-path resolution stay in `run`).

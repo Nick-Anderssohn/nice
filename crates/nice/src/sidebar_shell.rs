@@ -373,6 +373,15 @@ pub(crate) struct SidebarShellView {
     /// resolution. The 2.0 initial value only covers code paths before the
     /// first render (none read it).
     window_scale: f32,
+    /// R23 (D3): the sidebar base point size, read from the app-level
+    /// [`SharedSidebarFontSettings`](crate::settings::sidebar_font) each render.
+    /// Sidebar text sizes scale proportionally off it ([`sidebar_pt`](Self::sidebar_pt));
+    /// the 12pt default is identity, so an absent entity (the isolated scenarios)
+    /// leaves the chrome pixel-identical.
+    sidebar_font_px: f32,
+    /// Re-render when the sidebar-font entity notifies (a Font-pane size change).
+    /// `None` when the entity is absent (isolated scenarios).
+    _sidebar_font_sub: Option<Subscription>,
 }
 
 impl SidebarShellView {
@@ -385,6 +394,15 @@ impl SidebarShellView {
     /// holder (the keymap) mutates it.
     pub(crate) fn new(state: Entity<WindowState>, cx: &mut Context<Self>) -> Self {
         let state_sub = cx.observe(&state, |_this, _state, cx| cx.notify());
+        // R23 (D3): observe the app-level sidebar-font entity so a Font-pane size
+        // change repaints the sidebar chrome. Absent in isolated scenarios.
+        let sidebar_font = crate::settings::sidebar_font::shared_sidebar_font(cx);
+        let sidebar_font_px = sidebar_font
+            .as_ref()
+            .map(|e| e.read(cx).px())
+            .unwrap_or(crate::settings::sidebar_font::DEFAULT_SIDEBAR_FONT_PX);
+        let sidebar_font_sub =
+            sidebar_font.map(|e| cx.observe(&e, |_this, _e, cx| cx.notify()));
         Self {
             state,
             _state_sub: state_sub,
@@ -415,7 +433,16 @@ impl SidebarShellView {
             // `accent()` accessor + the lazily-minted file browser.
             accent: crate::theme_settings::active_chrome_accent(cx),
             window_scale: 2.0,
+            sidebar_font_px,
+            _sidebar_font_sub: sidebar_font_sub,
         }
+    }
+
+    /// The proportional point size of a `base`-sized sidebar element against the
+    /// 12pt anchor (`sidebar_size(sidebar_px, base)`, D3). At the 12pt default this
+    /// is identity, so the chrome is unchanged until the user resizes the sidebar.
+    fn sidebar_pt(&self, base: f32) -> f32 {
+        crate::settings::sidebar_font::sidebar_size(self.sidebar_font_px, base)
     }
 
     /// Wire the window's pane host (called once by `build_window_root`) so the
@@ -1271,7 +1298,7 @@ impl SidebarShellView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.0))
+                .text_size(px(self.sidebar_pt(12.0)))
                 .text_color(slot_to_rgba(s.ink3))
                 .child(SharedString::from("Files"))
                 .into_any_element()
@@ -1348,7 +1375,7 @@ impl SidebarShellView {
             )
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(self.sidebar_pt(10.0)))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(ink2)
                     .child(SharedString::from(disclosure_glyph(g.is_open)))
@@ -1363,7 +1390,7 @@ impl SidebarShellView {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(12.0))
+                    .text_size(px(self.sidebar_pt(12.0)))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(ink2)
                     .child(SharedString::from(g.name.to_uppercase()))
@@ -1382,7 +1409,7 @@ impl SidebarShellView {
                     .py(px(1.0))
                     .rounded_full()
                     .bg(ink_alpha(s, COUNT_PILL_INK_ALPHA))
-                    .text_size(px(10.0))
+                    .text_size(px(self.sidebar_pt(10.0)))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(ink3)
                     .child(SharedString::from(g.count.to_string())),
@@ -1494,7 +1521,7 @@ impl SidebarShellView {
                 &spans,
                 "SidebarRename",
                 colors,
-                13.0,
+                self.sidebar_pt(13.0),
                 self.rename_probe.clone(),
                 cx.listener(Self::on_rename_key),
                 move |index, window, app| {
@@ -1511,7 +1538,7 @@ impl SidebarShellView {
                 .py(px(2.0))
                 .whitespace_nowrap()
                 .truncate()
-                .text_size(px(13.0))
+                .text_size(px(self.sidebar_pt(13.0)))
                 .font_weight(if is_active {
                     FontWeight::SEMIBOLD
                 } else {
@@ -1890,6 +1917,9 @@ impl Render for SidebarShellView {
         // Re-sample the backing scale so the SF Symbol cache renders (and hits)
         // at this window's device resolution.
         self.window_scale = window.scale_factor();
+        // R23 (D3): re-read the sidebar base size so a live Font-pane change repaints
+        // the chrome at the new proportional sizes.
+        self.sidebar_font_px = crate::settings::sidebar_font::current_sidebar_px(cx);
         // Chrome-click focus bounce (M2 Item D, installed once — it needs a
         // `Window`, which `new` doesn't have): a click on empty shell chrome
         // focuses this root via gpui's tracked-focus transfer; hand it straight
