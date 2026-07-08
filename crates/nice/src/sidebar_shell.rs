@@ -1620,20 +1620,22 @@ impl SidebarShellView {
         div().px(px(6.0)).w_full().child(inner).into_any_element()
     }
 
-    /// The footer: a trailing Settings gear over a 1pt top rule. The gear is a
-    /// disabled placeholder until R23 (the Settings window) — it renders dimmed
-    /// and does nothing.
+    /// The footer: a trailing Settings gear over a 1pt top rule. The gear
+    /// dispatches R23's [`OpenSettings`](crate::settings::window::OpenSettings)
+    /// — the same action the "Settings…" app-menu item and ⌘, fire — so all
+    /// three routes share the singleton open-or-focus handler.
     fn build_footer(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
-        // 14pt regular `gearshape`, dimmed to ink3 while disabled.
+        // 14pt regular `gearshape`, ink2 like the other icon buttons.
         let gear = sf_symbol_icon(
             SF_GEAR,
             ICON_GEAR,
             14.0,
             SymbolWeight::Regular,
-            slot_to_rgba(s.ink3),
+            slot_to_rgba(s.ink2),
             self.window_scale,
             cx,
         );
+        let hover = ink_alpha(s, ICON_BUTTON_HOVER_ALPHA);
         div()
             .relative()
             .flex()
@@ -1660,15 +1662,32 @@ impl SidebarShellView {
                     .justify_end()
                     .w_full()
                     .child(
-                        // Disabled Settings gear (R23 wires the Settings window).
+                        // The Settings gear: opens (or focuses) the singleton
+                        // Settings window through the shared `OpenSettings`
+                        // action. `.id()` + `Role::Button` expose it to the
+                        // macOS AX tree (the settings scenario's anchor idiom).
                         div()
+                            .id("sidebar.settings")
+                            .role(gpui::Role::Button)
+                            .aria_label("Settings")
                             .flex()
                             .items_center()
                             .justify_center()
                             .w(px(24.0))
                             .h(px(24.0))
                             .rounded(px(INNER_CORNER_RADIUS))
-                            .child(gear),
+                            .hover(move |st| st.bg(hover))
+                            .child(gear)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_this, _e: &MouseDownEvent, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::settings::window::OpenSettings),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            ),
                     ),
             )
     }
