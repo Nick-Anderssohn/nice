@@ -1,6 +1,10 @@
 #!/bin/bash
 # quitprobe.sh — black-box acceptance test for nice-rs quit/close confirmations,
-# driven with REAL CGEvents/AX against the INSTALLED app. A quit-bug fix does
+# driven with REAL CGEvents/AX against the INSTALLED app. Keys post via
+# CGEventPostToPid to the app's own pid (the standing rule): globally-posted
+# synthetic keys can be consumed by third-party ACTIVE event taps (Wispr Flow
+# ate synthetic Escape system-wide, 2026-07-07 — physical keys unaffected),
+# which false-fails the Escape-cancel asserts against a healthy app. A quit-bug fix does
 # not count until this prints OVERALL: PASS.
 #
 # Usage: scripts/quitprobe/quitprobe.sh   (helpers auto-compiled to ./.build)
@@ -48,7 +52,7 @@ probe_visible() { # probe_visible <name> <trigger-cmd...>
   local d; d=$(diffpct "$OUT/$name-before.png" "$OUT/$name-after.png")
   say "$name center diff: $d (need > 0.008)"
   awk "BEGIN{exit !($d > 0.008)}"; assert "$name: dialog visibly painted" $?
-  "$H/keypost" 53; sleep 1.0
+  "$H/keypost" 53 "$PID"; sleep 1.0
   kill -0 "$PID" 2>/dev/null; assert "$name: app alive after Escape" $?
   shoot "$OUT/$name-dismissed.png"
   d=$(diffpct "$OUT/$name-before.png" "$OUT/$name-dismissed.png")
@@ -56,13 +60,13 @@ probe_visible() { # probe_visible <name> <trigger-cmd...>
   awk "BEGIN{exit !($d < 0.008)}"; assert "$name: dialog visibly dismissed" $?
 }
 
-probe_visible "A-cmdq"  "$H/keypost" 12 cmd
+probe_visible "A-cmdq"  "$H/keypost" 12 cmd "$PID"
 probe_visible "C-redbtn" osascript -e 'tell application "System Events" to tell process "nice-rs" to click button 1 of window 1'
 probe_visible "D-menu"  osascript -e 'tell application "System Events" to tell process "nice-rs" to click (first menu item of menu 1 of menu bar item 2 of menu bar 1 whose name begins with "Quit")'
 
 # B: confirm actually quits
-"$H/keypost" 12 cmd; sleep 1.3
-"$H/keypost" 36; sleep 2.0
+"$H/keypost" 12 cmd "$PID"; sleep 1.3
+"$H/keypost" 36 "$PID"; sleep 2.0
 if kill -0 "$PID" 2>/dev/null; then assert "B: Enter confirms quit (process exits)" 1
 else assert "B: Enter confirms quit (process exits)" 0; fi
 
