@@ -21,12 +21,15 @@
 //! slice 1 ([`pane_placeholder`]); later slices of this cycle replace them.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, MouseButton, Render, SharedString, Window,
+    div, prelude::*, px, AnyElement, App, Bounds, Context, DismissEvent, Entity, MouseButton,
+    Pixels, Render, SharedString, Subscription, Window,
 };
 
 use nice_theme::color::Srgba;
 use nice_theme::palette::Slots;
 
+use crate::context_menu::{ContextMenu, ContextMenuItem};
+use crate::settings::controls::{self, DropdownItem};
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
 /// Left-rail width (Swift `SettingsView.swift:113`).
@@ -90,13 +93,82 @@ pub(crate) struct SettingsRootView {
     /// The selected rail slug (default `"appearance"`). Owned by R23, untouched by
     /// R24 (Exported contract 2).
     active: SharedString,
+    /// The open dropdown popup, if any — the panes stay stateless free functions,
+    /// so the one open menu (trigger id + [`ContextMenu`] entity) lives here (the
+    /// toolbar's `present_context_menu` owner pattern).
+    open_dropdown: Option<OpenDropdown>,
+}
+
+/// The one open dropdown menu: which trigger opened it, the popup entity, and the
+/// dismiss subscription keeping the state in sync.
+struct OpenDropdown {
+    trigger_id: SharedString,
+    menu: Entity<ContextMenu>,
+    _dismiss_sub: Subscription,
 }
 
 impl SettingsRootView {
     pub(crate) fn new() -> Self {
         Self {
             active: SharedString::from("appearance"),
+            open_dropdown: None,
         }
+    }
+
+    /// Toggle a [`controls::dropdown`]'s menu: close it when this trigger's menu
+    /// is already open, else open a [`ContextMenu`] of the options anchored under
+    /// the trigger, at least as wide as it, checkmarking the selected option.
+    /// Click-away / Esc / selection all emit [`DismissEvent`], which clears the
+    /// state here.
+    ///
+    /// Ordering note: clicking the OPEN dropdown's own trigger both fires the
+    /// menu's capture-phase click-away (`dismiss` → a DEFERRED [`DismissEvent`])
+    /// and, in the bubble phase, this toggle. The bubble runs first, hits the
+    /// same-trigger branch, and drops the menu + subscription — so the deferred
+    /// event dies undelivered and the click reads as a clean close. The dismiss
+    /// subscription guards on the menu entity so a stale dismissal can never
+    /// clear a NEWER dropdown (e.g. opening B while A is open drops A first).
+    pub(crate) fn toggle_dropdown(
+        &mut self,
+        trigger_id: SharedString,
+        trigger_bounds: Bounds<Pixels>,
+        items: Vec<DropdownItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(open) = self.open_dropdown.take() {
+            cx.notify();
+            if open.trigger_id == trigger_id {
+                return;
+            }
+        }
+        let menu_items: Vec<ContextMenuItem> =
+            items.into_iter().map(DropdownItem::into_menu_item).collect();
+        let menu = cx.new(|cx| {
+            ContextMenu::new(controls::menu_position_for(trigger_bounds), menu_items, window, cx)
+                .with_min_width(trigger_bounds.size.width)
+                .with_max_height(controls::menu_max_height())
+        });
+        let sub = cx.subscribe_in(
+            &menu,
+            window,
+            |this, menu, _ev: &DismissEvent, _window, cx| {
+                if this
+                    .open_dropdown
+                    .as_ref()
+                    .is_some_and(|open| open.menu == *menu)
+                {
+                    this.open_dropdown = None;
+                }
+                cx.notify();
+            },
+        );
+        self.open_dropdown = Some(OpenDropdown {
+            trigger_id,
+            menu,
+            _dismiss_sub: sub,
+        });
+        cx.notify();
     }
 
     /// One rail button: a11y id `settings.section.<slug>` + [`gpui::Role::Button`]
@@ -191,14 +263,22 @@ impl Render for SettingsRootView {
             .bg(panel)
             .child(rail)
             .child(content)
+            // The open dropdown menu (if any) — its own render defers + anchors
+            // itself at window coords, so root-level placement is layout-neutral.
+            .children(self.open_dropdown.as_ref().map(|open| open.menu.clone()))
     }
 }
 
 /// Build the content for the active section slug (the content-area dispatch). The
-/// `shortcuts` arm delegates to [`shortcuts_pane`] (the R24 seam); the other arms
-/// build their pane bodies. Takes only `(&mut Window, &mut App)` and reads its own
-/// globals (Exported contract 3).
-pub(crate) fn render_section(active: SharedString, window: &mut Window, cx: &mut App) -> AnyElement {
+/// `shortcuts` arm delegates to [`shortcuts_pane`] (the R24 seam). Takes the root
+/// view's `Context` because the Appearance / Font panes host dropdowns whose open
+/// state lives on [`SettingsRootView`]; the other panes still read only globals
+/// (their arms deref the `Context` down to `&mut App`).
+pub(crate) fn render_section(
+    active: SharedString,
+    window: &mut Window,
+    cx: &mut Context<SettingsRootView>,
+) -> AnyElement {
     match section_pane_for_slug(active.as_ref()) {
         SectionPane::Appearance => appearance_pane(window, cx),
         SectionPane::Shortcuts => shortcuts_pane(window, cx),
@@ -245,8 +325,10 @@ pub(crate) fn setting_subtitle(text: impl Into<SharedString>, cx: &App) -> impl 
 }
 
 /// `SettingRow` (`SettingsView.swift:697-737`) — a flex label (with an optional
-/// hint) on the left, the trailing control on the right, 10pt vertical padding and
-/// a 1pt `niceLine` bottom rule. Reused by every pane + R24's recorder rows.
+/// hint) on the left, ONE compact content-width control right-aligned on the
+/// shared right edge (label/hint `flex_1`, control `flex_none`, vertically
+/// centered), 10pt vertical padding and a 1pt `niceLine` bottom rule. Reused by
+/// every pane + R24's recorder rows.
 ///
 /// Exported for the panes (slices 2/3) + R24's Shortcuts pane; no in-crate caller
 /// until those land (the deliberately-exported-block pattern).
@@ -276,13 +358,13 @@ pub(crate) fn setting_row(
     div()
         .flex()
         .flex_row()
-        .items_start()
+        .items_center()
         .gap(px(12.0))
         .py(px(10.0))
         .border_b_1()
         .border_color(slot_to_rgba(slots.line))
         .child(label_col)
-        .child(control)
+        .child(div().flex_none().child(control))
 }
 
 // -- panes --------------------------------------------------------------------
@@ -297,12 +379,12 @@ pub(crate) fn shortcuts_pane(window: &mut Window, cx: &mut App) -> AnyElement {
 }
 
 /// Appearance pane (The spec §Appearance) — full scope per D6.
-fn appearance_pane(window: &mut Window, cx: &mut App) -> AnyElement {
+fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     crate::settings::appearance_pane::appearance_pane(window, cx)
 }
 
 /// Font pane (The spec §Font, G9) — the live font sliders + family picker + Reset.
-fn font_pane(window: &mut Window, cx: &mut App) -> AnyElement {
+fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     crate::settings::font_pane::font_pane(window, cx)
 }
 

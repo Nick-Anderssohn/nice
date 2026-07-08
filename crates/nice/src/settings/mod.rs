@@ -38,6 +38,7 @@ pub(crate) mod about_pane;
 pub(crate) mod advanced_pane;
 pub(crate) mod appearance_pane;
 pub(crate) mod claude_pane;
+pub(crate) mod controls;
 pub(crate) mod file_picker;
 pub(crate) mod font_pane;
 pub(crate) mod prefs_store;

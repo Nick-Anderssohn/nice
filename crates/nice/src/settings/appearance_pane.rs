@@ -15,20 +15,25 @@
 //! error row), so the pane stays a pure builder.
 //!
 //! Fidelity (D8): gpui has no native `Picker`/segmented control, so the chrome /
-//! terminal-theme pickers render as inline selectable chips and the scheme control
-//! as a two-segment toggle — a faithful-not-identical port. The contract each
-//! control keeps is "selection → the exact `apply_*` call + the exact a11y id".
+//! terminal-theme pickers render as in-house NSPopUpButton-style dropdowns
+//! ([`crate::settings::controls::dropdown`] — trigger + anchored popup), the
+//! Sync toggle as a track+thumb switch, and the scheme control as a two-segment
+//! toggle — a faithful port of the prod look. The contract each control keeps is
+//! "selection → the exact `apply_*` call + the exact a11y id" (the option ids are
+//! the old chip ids, now menu-item ids).
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, FontWeight, MouseButton, Rgba, SharedString, Window,
+    div, prelude::*, px, AnyElement, App, Context, FontWeight, MouseButton, Rgba, SharedString,
+    Window,
 };
 
 use nice_theme::palette::{ColorScheme, Palette};
 use nice_theme::AccentPreset;
 
 use crate::ghostty_theme_parser::GhosttyParseError;
-use crate::settings::root::{setting_row, setting_subtitle, setting_title};
-use crate::terminal_theme_catalog::{TerminalThemeCatalog, ThemeImportError};
+use crate::settings::controls::{dropdown, toggle_switch, DropdownItem};
+use crate::settings::root::{setting_row, setting_subtitle, setting_title, SettingsRootView};
+use crate::terminal_theme_catalog::{CatalogEntry, TerminalThemeCatalog, ThemeImportError};
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::theme_settings::{self, ThemeSettingsStore};
 
@@ -219,7 +224,7 @@ fn chrome_palettes_for(scheme: ColorScheme) -> Vec<Palette> {
 }
 
 /// The Appearance pane body (The spec §Appearance).
-pub(crate) fn appearance_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
+pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     let slots = theme_settings::active_chrome_slots(cx);
     let accent_color = theme_settings::active_chrome_accent(cx);
     let selected_bg = srgba_to_rgba(srgba_with_alpha(accent_color, 0.18));
@@ -240,7 +245,6 @@ pub(crate) fn appearance_pane(_window: &mut Window, cx: &mut App) -> AnyElement 
 
     let ink = slot_to_rgba(slots.ink);
     let ink2 = slot_to_rgba(slots.ink2);
-    let ink3 = slot_to_rgba(slots.ink3);
     let line = slot_to_rgba(slots.line);
     let panel = slot_to_rgba(slots.panel);
 
@@ -254,7 +258,7 @@ pub(crate) fn appearance_pane(_window: &mut Window, cx: &mut App) -> AnyElement 
     col = col.child(setting_row(
         "Sync with OS theme",
         Some("Match Nice's light / dark mode to the system setting.".into()),
-        toggle_control("settings.theme.sync", sync_on, selected_bg, ink, ink3, move |cx| {
+        toggle_switch("settings.theme.sync", sync_on, cx, move |cx| {
             theme_settings::apply_sync_with_os(cx, !sync_on);
         }),
         cx,
@@ -278,67 +282,73 @@ pub(crate) fn appearance_pane(_window: &mut Window, cx: &mut App) -> AnyElement 
     ));
 
     // --- Light mode group --------------------------------------------------
+    let light_chrome = appearance.chrome_palette_for(ColorScheme::Light);
+    let light_theme_id = appearance.terminal_theme_id_for(ColorScheme::Light).to_string();
+    let light_theme_label = theme_display_name(&light_themes, &light_theme_id);
     col = col
         .child(setting_subtitle("Light mode", cx))
         .child(setting_row(
             "Chrome",
             None,
-            palette_control(
+            dropdown(
                 "settings.appearance.chromeLight",
-                ColorScheme::Light,
-                appearance.chrome_palette_for(ColorScheme::Light),
-                selected_bg,
-                selected_border,
-                ink,
-                line,
+                palette_label(light_chrome),
+                chrome_dropdown_items("settings.appearance.chromeLight", ColorScheme::Light, light_chrome),
+                window,
+                cx,
             ),
             cx,
         ))
         .child(setting_row(
             "Terminal theme",
             None,
-            terminal_theme_control(
+            dropdown(
                 "settings.terminal.lightPicker",
-                ColorScheme::Light,
-                appearance.terminal_theme_id_for(ColorScheme::Light).to_string(),
-                &light_themes,
-                selected_bg,
-                selected_border,
-                ink,
-                line,
+                light_theme_label,
+                terminal_theme_dropdown_items(
+                    "settings.terminal.lightPicker",
+                    ColorScheme::Light,
+                    &light_theme_id,
+                    &light_themes,
+                ),
+                window,
+                cx,
             ),
             cx,
         ));
 
     // --- Dark mode group ---------------------------------------------------
+    let dark_chrome = appearance.chrome_palette_for(ColorScheme::Dark);
+    let dark_theme_id = appearance.terminal_theme_id_for(ColorScheme::Dark).to_string();
+    let dark_theme_label = theme_display_name(&dark_themes, &dark_theme_id);
     col = col
         .child(setting_subtitle("Dark mode", cx))
         .child(setting_row(
             "Chrome",
             None,
-            palette_control(
+            dropdown(
                 "settings.appearance.chromeDark",
-                ColorScheme::Dark,
-                appearance.chrome_palette_for(ColorScheme::Dark),
-                selected_bg,
-                selected_border,
-                ink,
-                line,
+                palette_label(dark_chrome),
+                chrome_dropdown_items("settings.appearance.chromeDark", ColorScheme::Dark, dark_chrome),
+                window,
+                cx,
             ),
             cx,
         ))
         .child(setting_row(
             "Terminal theme",
             None,
-            terminal_theme_control(
+            dropdown(
                 "settings.terminal.darkPicker",
-                ColorScheme::Dark,
-                appearance.terminal_theme_id_for(ColorScheme::Dark).to_string(),
-                &dark_themes,
-                selected_bg,
-                selected_border,
-                ink,
-                line,
+                dark_theme_label,
+                terminal_theme_dropdown_items(
+                    "settings.terminal.darkPicker",
+                    ColorScheme::Dark,
+                    &dark_theme_id,
+                    &dark_themes,
+                ),
+                window,
+                cx,
             ),
             cx,
         ));
@@ -392,37 +402,6 @@ pub(crate) fn appearance_pane(_window: &mut Window, cx: &mut App) -> AnyElement 
     }
 
     col.into_any_element()
-}
-
-/// A pill toggle: filled with the selection tint + "On"/"Off" when on, hollow when
-/// off. `a11y` id + [`gpui::Role::Button`]; the click runs `on_click` on `&mut App`.
-fn toggle_control(
-    a11y: &'static str,
-    on: bool,
-    selected_bg: Rgba,
-    ink: Rgba,
-    ink3: Rgba,
-    on_click: impl Fn(&mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(a11y)
-        .role(gpui::Role::Button)
-        .aria_label(if on { "On" } else { "Off" })
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(52.0))
-        .py(px(4.0))
-        .rounded(px(6.0))
-        .text_size(px(11.5))
-        .font_weight(FontWeight::MEDIUM)
-        .cursor_pointer()
-        .when(on, |d| d.bg(selected_bg).text_color(ink))
-        .when(!on, |d| d.text_color(ink3))
-        .child(if on { "On" } else { "Off" })
-        .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-            on_click(cx);
-        })
 }
 
 /// The Light | Dark segmented control (a11y `settings.appearance.scheme`).
@@ -502,106 +481,60 @@ fn accent_control(selected: AccentPreset, selected_border: Rgba) -> impl IntoEle
     row
 }
 
-/// The per-scheme chrome-palette picker: inline selectable chips over the
-/// per-scheme set. Click → `apply_chrome_palette(scheme, palette)`.
-#[allow(clippy::too_many_arguments)]
-fn palette_control(
+/// The selected terminal theme's display label — the dropdown trigger text.
+/// Falls back to the raw id when the selection is not in `entries` (a transiently
+/// dangling slot).
+fn theme_display_name(entries: &[CatalogEntry], id: &str) -> String {
+    entries
+        .iter()
+        .find(|e| e.id == id)
+        .map(|e| e.display_name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// The per-scheme chrome-palette dropdown options (option a11y ids
+/// `{a11y}.{palette.raw_value()}` — the old chip ids). Selection →
+/// `apply_chrome_palette(scheme, palette)`.
+fn chrome_dropdown_items(
     a11y: &'static str,
     scheme: ColorScheme,
     selected: Palette,
-    selected_bg: Rgba,
-    selected_border: Rgba,
-    ink: Rgba,
-    line: Rgba,
-) -> impl IntoElement {
-    let mut row = div().id(a11y).flex().flex_row().gap(px(6.0));
-    for palette in chrome_palettes_for(scheme) {
-        let is_selected = palette == selected;
-        row = row.child(chip(
-            SharedString::from(format!("{a11y}.{}", palette.raw_value())),
-            palette_label(palette),
-            is_selected,
-            selected_bg,
-            selected_border,
-            ink,
-            line,
-            move |cx: &mut App| theme_settings::apply_chrome_palette(cx, scheme, palette),
-        ));
-    }
-    row
+) -> Vec<DropdownItem> {
+    chrome_palettes_for(scheme)
+        .into_iter()
+        .map(|palette| {
+            DropdownItem::new(
+                format!("{a11y}.{}", palette.raw_value()),
+                palette_label(palette),
+                palette == selected,
+                move |cx: &mut App| theme_settings::apply_chrome_palette(cx, scheme, palette),
+            )
+        })
+        .collect()
 }
 
-/// The per-scheme terminal-theme picker: inline selectable chips over
-/// `themes(for: scheme)`. Click → `apply_terminal_theme_id(scheme, id)`.
-#[allow(clippy::too_many_arguments)]
-fn terminal_theme_control(
+/// The per-scheme terminal-theme dropdown options over `themes(for: scheme)` —
+/// built-ins AND imports, exactly the old chip list (option a11y ids
+/// `{a11y}.{theme id}`). Selection → `apply_terminal_theme_id(scheme, id)`.
+fn terminal_theme_dropdown_items(
     a11y: &'static str,
     scheme: ColorScheme,
-    selected_id: String,
-    entries: &[crate::terminal_theme_catalog::CatalogEntry],
-    selected_bg: Rgba,
-    selected_border: Rgba,
-    ink: Rgba,
-    line: Rgba,
-) -> impl IntoElement {
-    let mut row = div()
-        .id(a11y)
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .gap(px(6.0));
-    for entry in entries {
-        let id = entry.id.clone();
-        let is_selected = id == selected_id;
-        let click_id = id.clone();
-        row = row.child(chip(
-            SharedString::from(format!("{a11y}.{id}")),
-            SharedString::from(entry.display_name.clone()),
-            is_selected,
-            selected_bg,
-            selected_border,
-            ink,
-            line,
-            move |cx: &mut App| {
-                theme_settings::apply_terminal_theme_id(cx, scheme, &click_id)
-            },
-        ));
-    }
-    row
-}
-
-/// One selectable chip (the picker primitive): a labeled rounded rect, accent-
-/// tinted + accent-bordered when selected. Click runs `on_click` on `&mut App`.
-#[allow(clippy::too_many_arguments)]
-fn chip(
-    id: SharedString,
-    label: impl Into<SharedString>,
-    is_selected: bool,
-    selected_bg: Rgba,
-    selected_border: Rgba,
-    ink: Rgba,
-    line: Rgba,
-    on_click: impl Fn(&mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .role(gpui::Role::Button)
-        .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(6.0))
-        .border_1()
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(ink)
-        .cursor_pointer()
-        .when(is_selected, |d| {
-            d.bg(selected_bg).border_color(selected_border)
+    selected_id: &str,
+    entries: &[CatalogEntry],
+) -> Vec<DropdownItem> {
+    entries
+        .iter()
+        .map(|entry| {
+            let id = entry.id.clone();
+            let click_id = id.clone();
+            DropdownItem::new(
+                format!("{a11y}.{id}"),
+                entry.display_name.clone(),
+                id == selected_id,
+                move |cx: &mut App| theme_settings::apply_terminal_theme_id(cx, scheme, &click_id),
+            )
         })
-        .when(!is_selected, |d| d.border_color(line))
-        .child(label.into())
-        .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-            on_click(cx);
-        })
+        .collect()
 }
 
 /// The Import… button (a11y `settings.terminal.import`).
@@ -743,6 +676,37 @@ mod tests {
         assert!(!chrome_palettes_for(ColorScheme::Dark).contains(&Palette::MacOs));
     }
 
+    // --- the dropdown option lists (the old chip contract, now menu items) ----
+
+    #[test]
+    fn chrome_dropdown_items_keep_the_chip_ids_labels_and_selection() {
+        let items =
+            chrome_dropdown_items("settings.appearance.chromeDark", ColorScheme::Dark, Palette::Nice);
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            [
+                "settings.appearance.chromeDark.nice",
+                "settings.appearance.chromeDark.catppuccinMocha",
+            ]
+        );
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
+        assert_eq!(labels, ["Nice", "Catppuccin Mocha"]);
+        let selected: Vec<bool> = items.iter().map(|i| i.selected).collect();
+        assert_eq!(selected, [true, false], "exactly the current palette is checkmarked");
+    }
+
+    #[test]
+    fn theme_display_name_resolves_the_selected_entry_or_falls_back_to_the_id() {
+        let entries = vec![CatalogEntry {
+            id: "cool-import".to_string(),
+            display_name: "Cool Import".to_string(),
+            scope: crate::terminal_theme_catalog::ThemeScope::Either,
+        }];
+        assert_eq!(theme_display_name(&entries, "cool-import"), "Cool Import");
+        assert_eq!(theme_display_name(&entries, "gone-theme"), "gone-theme");
+    }
+
     // --- perform_remove_imported (the delete-imported-theme flow) -------------
     //
     // App-level `#[gpui::test]`s on the MOCKED `TestAppContext` (no Metal, no
@@ -866,6 +830,48 @@ mod tests {
                 before,
                 "removing an unknown id is a no-op (the !removed early return)"
             );
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[gpui::test]
+    fn dropdown_selection_drives_the_exact_apply_calls(cx: &mut TestAppContext) {
+        let base = setup_with_import(cx, "dropdown-apply");
+        cx.update(|app| {
+            // Chrome: selecting the Catppuccin Mocha option applies that palette
+            // to the Dark scheme slot (the old chip's exact apply_chrome_palette).
+            let chrome = chrome_dropdown_items(
+                "settings.appearance.chromeDark",
+                ColorScheme::Dark,
+                Palette::Nice,
+            );
+            chrome
+                .iter()
+                .find(|i| i.id.as_ref() == "settings.appearance.chromeDark.catppuccinMocha")
+                .expect("the mocha option is offered")
+                .select(app);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .chrome_palette_for(ColorScheme::Dark),
+                Palette::CatppuccinMocha
+            );
+
+            // Terminal theme: selecting the imported theme's option applies its id
+            // to the Dark scheme slot (the old chip's exact apply_terminal_theme_id).
+            let entries = app.global::<TerminalThemeCatalog>().themes(ColorScheme::Dark);
+            let themes = terminal_theme_dropdown_items(
+                "settings.terminal.darkPicker",
+                ColorScheme::Dark,
+                &dark_slot_id(app),
+                &entries,
+            );
+            themes
+                .iter()
+                .find(|i| i.id.as_ref() == "settings.terminal.darkPicker.cool-import")
+                .expect("the imported theme is offered")
+                .select(app);
+            assert_eq!(dark_slot_id(app), "cool-import");
         });
         let _ = std::fs::remove_dir_all(&base);
     }

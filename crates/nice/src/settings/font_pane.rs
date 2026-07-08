@@ -6,21 +6,28 @@
 //! `ui_settings.json` (the [`SettingsPrefsStore`]).
 //!
 //! ## Stateless-pane shape
-//! Like the Appearance / Claude panes this is a free `render` function
-//! (`(&mut Window, &mut App) -> AnyElement`): it reads the shared font entities +
-//! the prefs store at build time and each control's handler mutates them on
-//! `&mut App`. gpui has no native slider (D8), so the two sizes are discrete
-//! steppers (−/readout/+) — a faithful-not-identical functional port whose contract
-//! is "step → the exact `set_px` call + the exact a11y id".
+//! Like the Appearance / Claude panes this is a free `render` function: it reads
+//! the shared font entities + the prefs store at build time and each control's
+//! handler mutates them on `&mut App` (it takes the root view's `Context` only so
+//! the family dropdown can host its popup — see
+//! [`crate::settings::controls::dropdown`]). gpui has no native slider (D8), so
+//! the two sizes are discrete steppers (−/readout/+) — a faithful-not-identical
+//! functional port whose contract is "step → the exact `set_px` call + the exact
+//! a11y id"; the family picker is an NSPopUpButton-style dropdown whose option
+//! ids are the old chip ids.
 
-use gpui::{div, prelude::*, px, AnyElement, App, FontWeight, MouseButton, Rgba, SharedString, Window};
+use gpui::{
+    div, prelude::*, px, AnyElement, App, Context, FontWeight, MouseButton, Rgba, SharedString,
+    Window,
+};
 
 use nice_term_view::DEFAULT_TERMINAL_FONT_PX;
 
+use crate::settings::controls::{dropdown, DropdownItem};
 use crate::settings::prefs_store::SettingsPrefsStore;
-use crate::settings::root::{setting_row, setting_title};
+use crate::settings::root::{setting_row, setting_title, SettingsRootView};
 use crate::settings::sidebar_font;
-use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::theme::slot_to_rgba;
 use crate::theme_settings;
 
 /// The curated monospace candidates (Swift `SettingsFontPane.swift:92-105`), mapped
@@ -139,11 +146,8 @@ fn current_state(cx: &App) -> (f32, Option<String>, f32) {
 }
 
 /// The Font pane body (The spec §Font).
-pub(crate) fn font_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
+pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     let slots = theme_settings::active_chrome_slots(cx);
-    let accent = theme_settings::active_chrome_accent(cx);
-    let selected_bg = srgba_to_rgba(srgba_with_alpha(accent, 0.18));
-    let selected_border = srgba_to_rgba(accent);
     let ink = slot_to_rgba(slots.ink);
     let ink3 = slot_to_rgba(slots.ink3);
     let line = slot_to_rgba(slots.line);
@@ -156,6 +160,11 @@ pub(crate) fn font_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
         .child(setting_title("Font", cx));
 
     // --- Terminal font family ---------------------------------------------
+    let installed = cx.text_system().all_font_names();
+    let family_label: SharedString = match family.as_deref() {
+        Some(fam) => SharedString::from(fam.to_string()),
+        None => DEFAULT_FAMILY_LABEL.into(),
+    };
     col = col.child(setting_row(
         "Terminal font",
         Some(
@@ -163,7 +172,13 @@ pub(crate) fn font_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
              this Mac; monospace works best."
                 .into(),
         ),
-        family_control(cx, family.as_deref(), selected_bg, selected_border, ink, line),
+        dropdown(
+            "settings.font.terminalFamily",
+            family_label,
+            family_dropdown_items(family_options(installed), family.as_deref()),
+            window,
+            cx,
+        ),
         cx,
     ));
 
@@ -208,20 +223,14 @@ pub(crate) fn font_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     col.into_any_element()
 }
 
-/// The family picker: a "Default (SF Mono)" chip (→ `None`) then the curated
-/// candidates then every other installed family, alphabetized. Selection →
-/// [`apply_terminal_family`]. Container a11y `settings.font.terminalFamily`.
-fn family_control(
-    cx: &App,
-    selected: Option<&str>,
-    selected_bg: Rgba,
-    selected_border: Rgba,
-    ink: Rgba,
-    line: Rgba,
-) -> impl IntoElement {
-    // The offered order: Default, curated (in order), then the remaining installed
-    // families alphabetized (deduped against the curated set).
-    let installed = cx.text_system().all_font_names();
+/// The "Default (SF Mono)" option's label (→ `apply_terminal_family(None)`).
+const DEFAULT_FAMILY_LABEL: &str = "Default (SF Mono)";
+
+/// The offered family list, in dropdown order: `(label, family-or-None)` — the
+/// Default row (→ `None`), the curated candidates (in order), then every other
+/// installed family alphabetized (deduped against the curated set). Pure so the
+/// ordering/dedup contract is unit-testable without a text system.
+fn family_options(installed: Vec<String>) -> Vec<(String, Option<String>)> {
     let mut extra: Vec<String> = installed
         .into_iter()
         .filter(|n| !CURATED_FAMILIES.iter().any(|c| c == n))
@@ -229,74 +238,38 @@ fn family_control(
     extra.sort();
     extra.dedup();
 
-    let mut row = div()
-        .id("settings.font.terminalFamily")
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .gap(px(6.0));
-
-    // "Default (SF Mono)" → None.
-    let is_default = selected.is_none();
-    row = row.child(family_chip(
-        "settings.font.terminalFamily.default",
-        "Default (SF Mono)",
-        is_default,
-        selected_bg,
-        selected_border,
-        ink,
-        line,
-        None,
-    ));
-
-    for fam in CURATED_FAMILIES.iter().map(|s| s.to_string()).chain(extra) {
-        let is_sel = selected == Some(fam.as_str());
-        row = row.child(family_chip(
-            SharedString::from(format!("settings.font.terminalFamily.{fam}")),
-            SharedString::from(fam.clone()),
-            is_sel,
-            selected_bg,
-            selected_border,
-            ink,
-            line,
-            Some(SharedString::from(fam)),
-        ));
-    }
-    row
+    let mut options = vec![(DEFAULT_FAMILY_LABEL.to_string(), None)];
+    options.extend(
+        CURATED_FAMILIES
+            .iter()
+            .map(|s| s.to_string())
+            .chain(extra)
+            .map(|fam| (fam.clone(), Some(fam))),
+    );
+    options
 }
 
-/// One family chip: click → [`apply_terminal_family`] with `family` (`None` = the
-/// "Default" chip).
-#[allow(clippy::too_many_arguments)]
-fn family_chip(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    is_selected: bool,
-    selected_bg: Rgba,
-    selected_border: Rgba,
-    ink: Rgba,
-    line: Rgba,
-    family: Option<SharedString>,
-) -> impl IntoElement {
-    div()
-        .id(id.into())
-        .role(gpui::Role::Button)
-        .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(6.0))
-        .border_1()
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(ink)
-        .cursor_pointer()
-        .when(is_selected, |d| {
-            d.bg(selected_bg).border_color(selected_border)
+/// The family dropdown options (option a11y ids
+/// `settings.font.terminalFamily.default` / `settings.font.terminalFamily.{fam}`
+/// — the old chip ids). Selection → [`apply_terminal_family`].
+fn family_dropdown_items(
+    options: Vec<(String, Option<String>)>,
+    selected: Option<&str>,
+) -> Vec<DropdownItem> {
+    options
+        .into_iter()
+        .map(|(label, family)| {
+            let id = match &family {
+                Some(fam) => format!("settings.font.terminalFamily.{fam}"),
+                None => "settings.font.terminalFamily.default".to_string(),
+            };
+            let is_selected = family.as_deref() == selected;
+            let apply_family = family.map(SharedString::from);
+            DropdownItem::new(id, label, is_selected, move |cx: &mut App| {
+                apply_terminal_family(cx, apply_family.clone());
+            })
         })
-        .when(!is_selected, |d| d.border_color(line))
-        .child(label.into())
-        .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-            apply_terminal_family(cx, family.clone());
-        })
+        .collect()
 }
 
 /// A discrete size stepper: `−` / `<n> pt` readout / `+`, each clamped by the
@@ -377,4 +350,52 @@ fn reset_button(ink: Rgba, line: Rgba) -> impl IntoElement {
         .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
             reset_fonts(cx);
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn family_options_lead_with_default_then_curated_then_alphabetized_extras() {
+        let installed = vec![
+            "Zapfino".to_string(),
+            "Menlo".to_string(), // curated — must dedup, not repeat
+            "Arial".to_string(),
+            "Arial".to_string(), // installed dupe — must dedup
+        ];
+        let options = family_options(installed);
+        assert_eq!(options[0], (DEFAULT_FAMILY_LABEL.to_string(), None));
+        // The curated set follows, in its declared order.
+        for (i, curated) in CURATED_FAMILIES.iter().enumerate() {
+            assert_eq!(options[1 + i].1.as_deref(), Some(*curated));
+        }
+        // Then the remaining installed families, alphabetized + deduped.
+        let tail: Vec<&str> = options[1 + CURATED_FAMILIES.len()..]
+            .iter()
+            .map(|(_, f)| f.as_deref().unwrap())
+            .collect();
+        assert_eq!(tail, ["Arial", "Zapfino"]);
+    }
+
+    #[test]
+    fn family_dropdown_items_keep_the_chip_ids_and_checkmark_the_selection() {
+        let options = vec![
+            (DEFAULT_FAMILY_LABEL.to_string(), None),
+            ("Menlo".to_string(), Some("Menlo".to_string())),
+        ];
+
+        // No override ⇒ the Default row is the selection.
+        let items = family_dropdown_items(options.clone(), None);
+        assert_eq!(items[0].id.as_ref(), "settings.font.terminalFamily.default");
+        assert_eq!(items[0].label.as_ref(), DEFAULT_FAMILY_LABEL);
+        assert!(items[0].selected);
+        assert_eq!(items[1].id.as_ref(), "settings.font.terminalFamily.Menlo");
+        assert!(!items[1].selected);
+
+        // A family override checkmarks exactly that row.
+        let items = family_dropdown_items(options, Some("Menlo"));
+        assert!(!items[0].selected);
+        assert!(items[1].selected);
+    }
 }

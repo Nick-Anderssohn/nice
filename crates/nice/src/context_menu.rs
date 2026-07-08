@@ -31,7 +31,7 @@ use std::rc::Rc;
 use gpui::{
     anchored, deferred, div, px, App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Point, Render,
-    SharedString, Styled, Window,
+    SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
@@ -70,6 +70,13 @@ pub(crate) struct ContextMenuEntry {
     disabled: bool,
     /// Run on click (enabled rows only), before dismissal.
     handler: MenuHandler,
+    /// `Some(is_selected)` for selectable rows (the settings-dropdown use): the
+    /// row renders a leading checkmark column ("✓" when selected, blank
+    /// otherwise, so labels stay aligned). `None` for plain action rows.
+    selected: Option<bool>,
+    /// A stable a11y id for the row (dropdown menu items carry one; plain
+    /// context-menu rows do not).
+    id: Option<SharedString>,
 }
 
 impl ContextMenuItem {
@@ -82,6 +89,25 @@ impl ContextMenuItem {
             label: label.into(),
             disabled: false,
             handler: Rc::new(handler),
+            selected: None,
+            id: None,
+        })
+    }
+
+    /// A selectable (dropdown-style) row: a stable a11y `id`, a leading
+    /// checkmark column reflecting `selected`, running `handler` on click.
+    pub(crate) fn selectable(
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        selected: bool,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        ContextMenuItem::Entry(ContextMenuEntry {
+            label: label.into(),
+            disabled: false,
+            handler: Rc::new(handler),
+            selected: Some(selected),
+            id: Some(id.into()),
         })
     }
 
@@ -93,6 +119,8 @@ impl ContextMenuItem {
             label: label.into(),
             disabled: true,
             handler: Rc::new(|_, _| {}),
+            selected: None,
+            id: None,
         })
     }
 
@@ -119,6 +147,23 @@ impl ContextMenuItem {
     pub(crate) fn is_enabled(&self) -> bool {
         matches!(self, ContextMenuItem::Entry(e) if !e.disabled)
     }
+
+    /// `Some(is_selected)` for a selectable (dropdown-style) row; `None` for a
+    /// plain entry or separator.
+    pub(crate) fn selected(&self) -> Option<bool> {
+        match self {
+            ContextMenuItem::Entry(e) => e.selected,
+            ContextMenuItem::Separator => None,
+        }
+    }
+
+    /// The row's stable a11y id, when it carries one (selectable rows).
+    pub(crate) fn entry_id(&self) -> Option<&str> {
+        match self {
+            ContextMenuItem::Entry(e) => e.id.as_deref(),
+            ContextMenuItem::Separator => None,
+        }
+    }
 }
 
 /// The context-menu popup. Construct with [`ContextMenu::new`]; the owner holds
@@ -129,6 +174,13 @@ pub(crate) struct ContextMenu {
     /// position). The [`anchored`] element flips its corner to stay on-screen.
     position: Point<Pixels>,
     focus_handle: FocusHandle,
+    /// Minimum popup width — defaults to [`CONTEXT_MENU_MIN_WIDTH`]; a settings
+    /// dropdown passes its trigger width so the menu never reads narrower than
+    /// the button that opened it.
+    min_width: Pixels,
+    /// When set, the panel caps its height and the item list scrolls (long
+    /// dropdown lists, e.g. every installed font family).
+    max_height: Option<Pixels>,
 }
 
 impl ContextMenu {
@@ -149,7 +201,21 @@ impl ContextMenu {
             items,
             position,
             focus_handle,
+            min_width: px(CONTEXT_MENU_MIN_WIDTH),
+            max_height: None,
         }
+    }
+
+    /// Widen the minimum popup width (never below the component default).
+    pub(crate) fn with_min_width(mut self, width: Pixels) -> Self {
+        self.min_width = self.min_width.max(width);
+        self
+    }
+
+    /// Cap the panel height; overflowing items scroll.
+    pub(crate) fn with_max_height(mut self, height: Pixels) -> Self {
+        self.max_height = Some(height);
+        self
     }
 
     /// Dismiss the menu — emits [`DismissEvent`] for the owner to drop it.
@@ -187,13 +253,23 @@ impl ContextMenu {
                 .bg(slot_to_rgba(s.line))
                 .into_any_element(),
             ContextMenuItem::Entry(entry) => {
-                let row = div()
+                let mut row = div()
                     .flex()
                     .items_center()
                     .px_2()
                     .py_1()
-                    .rounded(px(INNER_CORNER_RADIUS))
-                    .child(entry.label.clone());
+                    .rounded(px(INNER_CORNER_RADIUS));
+                // Selectable rows carry a fixed leading checkmark column so the
+                // labels of selected and unselected options stay aligned.
+                if let Some(selected) = entry.selected {
+                    row = row.child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .child(SharedString::from(if selected { "✓" } else { "" })),
+                    );
+                }
+                let row = row.child(entry.label.clone());
                 if entry.disabled {
                     // Dimmed, non-interactive.
                     row.text_color(slot_to_rgba(s.ink3)).into_any_element()
@@ -203,20 +279,30 @@ impl ContextMenu {
                         HOVER_INK_ALPHA,
                     ));
                     let handler = entry.handler.clone();
-                    row.text_color(slot_to_rgba(s.ink))
+                    // Run the action, then dismiss. Consume the press so it
+                    // never reaches the row/band behind.
+                    let on_down =
+                        cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                            handler(window, cx);
+                            this.dismiss(cx);
+                            cx.stop_propagation();
+                        });
+                    let row = row
+                        .text_color(slot_to_rgba(s.ink))
                         .cursor_pointer()
-                        .hover(move |style| style.bg(hover))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event, window, cx| {
-                                // Run the action, then dismiss. Consume the press
-                                // so it never reaches the row/band behind.
-                                handler(window, cx);
-                                this.dismiss(cx);
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .into_any_element()
+                        .hover(move |style| style.bg(hover));
+                    match entry.id.clone() {
+                        // Dropdown items surface a stable a11y id + menu-item role.
+                        Some(id) => row
+                            .id(id)
+                            .role(gpui::Role::MenuItem)
+                            .aria_label(entry.label.clone())
+                            .on_mouse_down(MouseButton::Left, on_down)
+                            .into_any_element(),
+                        None => row
+                            .on_mouse_down(MouseButton::Left, on_down)
+                            .into_any_element(),
+                    }
                 }
             }
         }
@@ -240,7 +326,8 @@ impl Render for ContextMenu {
             .map(|item| Self::render_item(item, cx))
             .collect();
 
-        let panel = div()
+        let mut panel = div()
+            .id("context-menu.panel")
             .track_focus(&self.focus_handle)
             .key_context("ContextMenu")
             // Capture presses inside the panel's empty areas so they never fall
@@ -258,15 +345,18 @@ impl Render for ContextMenu {
             }))
             .flex()
             .flex_col()
-            .min_w(px(CONTEXT_MENU_MIN_WIDTH))
+            .min_w(self.min_width)
             .py_1()
             .px_1()
             .bg(slot_to_rgba(s.panel))
             .border_1()
             .border_color(slot_to_rgba(s.line))
             .rounded(px(CARD_CORNER_RADIUS))
-            .shadow_lg()
-            .children(rows);
+            .shadow_lg();
+        if let Some(max_height) = self.max_height {
+            panel = panel.max_h(max_height).overflow_y_scroll();
+        }
+        let panel = panel.children(rows);
 
         // Anchor at the click point (flipping corners to stay on-screen), and
         // defer so the popup paints above all ancestors and sidebar chrome.
@@ -301,6 +391,28 @@ mod tests {
         assert!(item.is_separator());
         assert!(!item.is_enabled());
         assert_eq!(item.label(), None);
+    }
+
+    #[test]
+    fn selectable_entry_carries_id_selected_flag_and_label() {
+        let on = ContextMenuItem::selectable("picker.opt-a", "Option A", true, |_, _| {});
+        assert!(on.is_enabled());
+        assert_eq!(on.label(), Some("Option A"));
+        assert_eq!(on.selected(), Some(true));
+        assert_eq!(on.entry_id(), Some("picker.opt-a"));
+
+        let off = ContextMenuItem::selectable("picker.opt-b", "Option B", false, |_, _| {});
+        assert_eq!(off.selected(), Some(false));
+        assert_eq!(off.entry_id(), Some("picker.opt-b"));
+    }
+
+    #[test]
+    fn plain_entries_and_separators_are_not_selectable_and_carry_no_id() {
+        assert_eq!(ContextMenuItem::entry("Close Tab", |_, _| {}).selected(), None);
+        assert_eq!(ContextMenuItem::entry("Close Tab", |_, _| {}).entry_id(), None);
+        assert_eq!(ContextMenuItem::disabled("Settings…").selected(), None);
+        assert_eq!(ContextMenuItem::separator().selected(), None);
+        assert_eq!(ContextMenuItem::separator().entry_id(), None);
     }
 
     #[test]
