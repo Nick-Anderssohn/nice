@@ -1409,6 +1409,93 @@ impl SessionManager {
         Some(tab_id)
     }
 
+    /// The handoff-flavored Claude-tab constructor — the Rust twin of Swift
+    /// `SessionsModel.createHandoffTab` (`SessionsModel.swift:1246-1303`). Modelled
+    /// on [`create_claude_tab`](Self::create_claude_tab) (the same
+    /// `[Claude, Terminal 1]` shape, Claude focused + `is_claude_running = true`
+    /// from creation, the deferred companion terminal, a pre-minted v4 session
+    /// UUID passed as `--session-id`, `next_terminal_index = 2`, the new tab
+    /// selected + its session container registered), differing in exactly the
+    /// D3/D4/D5 ways:
+    ///
+    /// * **(D4) the title is fixed AND locked** — set to `title` up front with
+    ///   `title_manually_set = true`, so Claude's OSC auto-title cannot overwrite
+    ///   the `[HANDOFF] …` label once the fresh session names itself (unlike an
+    ///   ordinary claude tab, which keeps auto-title).
+    /// * **(D3) placement nests one indent under the originating tab** — via
+    ///   [`TabModel::insert_handoff_child`] (depth-1 lineage, the invariant
+    ///   `/branch` uses), falling back to [`TabModel::add_tab_to_projects`] (cwd
+    ///   bucketing) when the anchor is empty / unknown / in the Terminals group,
+    ///   so a top-level handoff (Main Terminal, or a stale id) still opens.
+    /// * **(D5) the seeded `prompt` is the FINAL positional arg**, preceded by the
+    ///   optional `--model`/`--effort` flags ([`handoff_extra_args`]), so the
+    ///   launch line becomes
+    ///   `claude --session-id <id> [--model <m>] [--effort <e>] '<prompt>'`, which
+    ///   auto-runs the prompt matched to the originating session's model/effort.
+    ///
+    /// `settings_path` threads the R17 theme-sync pointer exactly as
+    /// [`create_claude_tab`] does. Returns the new tab id (placement here never
+    /// fails — the fallback always buckets — but the signature mirrors
+    /// [`create_claude_tab`] for symmetry).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_handoff_tab(
+        &mut self,
+        model: &mut TabModel,
+        under_tab_id: &str,
+        cwd: &str,
+        title: String,
+        prompt: String,
+        model_id: &str,
+        effort: &str,
+        settings_path: Option<&str>,
+        cx: &mut App,
+    ) -> Option<String> {
+        let tab_id = self.mint("t");
+        let claude_pane_id = format!("{tab_id}-claude");
+        let terminal_pane_id = format!("{tab_id}-t1");
+        // Pre-mint the session UUID so `--session-id` is passed now and the same
+        // id persists for later `--resume` (create_claude_tab parity).
+        let session_id = mint_session_uuid();
+
+        let mut claude_pane = Pane::new(&claude_pane_id, "Claude", PaneKind::Claude);
+        claude_pane.is_claude_running = true;
+        let mut tab = Tab::new(&tab_id, title, cwd);
+        tab.panes = vec![
+            claude_pane,
+            Pane::new(&terminal_pane_id, "Terminal 1", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some(claude_pane_id.clone());
+        tab.claude_session_id = Some(session_id.clone());
+        // (D4) Lock the "[HANDOFF] …" title against Claude's OSC auto-title.
+        tab.title_manually_set = true;
+        tab.next_terminal_index = 2;
+
+        // (D3) Nest under the originating tab; else bucket at top level so a
+        // Main-Terminal (or stale-id) handoff still opens. `insert_handoff_child`
+        // consumes `tab` on the success path, so clone for the attempt and hand
+        // the original to the bucketing fallback (Swift passes a value type twice).
+        if !model.insert_handoff_child(tab.clone(), under_tab_id) {
+            model.add_tab_to_projects(tab, cwd);
+        }
+        model.select_tab(&tab_id);
+        // The (empty) session container so the deferred companion's later
+        // `ensure_active_pane_spawned` precondition ("the tab has a session") holds.
+        self.register_tab_session(&tab_id);
+
+        // (D5) --model/--effort (each omitted when empty) then the prompt LAST.
+        let extra_args = handoff_extra_args(model_id, effort, &prompt);
+        let _ = self.spawn_claude_pane(
+            &tab_id,
+            &claude_pane_id,
+            cwd,
+            &ClaudeSessionMode::New(session_id),
+            &extra_args,
+            settings_path,
+            cx,
+        );
+        Some(tab_id)
+    }
+
     /// Spawn a **Claude-kind** pane's child — the Rust twin of Swift
     /// `TabPtySession.spawnClaudePane` (`TabPtySession.swift:275-340`). The spec is
     /// mode-driven:
@@ -2093,6 +2180,69 @@ fn claude_launch_display_command(mode: &ClaudeSessionMode, extra_args: &[String]
             }
         }
     }
+}
+
+/// The prefix on every handoff-tab title — Swift `handoffTitlePrefix`
+/// (`SessionsModel.swift:1161`). A single existing occurrence is stripped before
+/// re-prefixing so a handoff-fired-from-a-handoff reads `[HANDOFF] Foo`, not
+/// `[HANDOFF] [HANDOFF] Foo`.
+const HANDOFF_TITLE_PREFIX: &str = "[HANDOFF] ";
+
+/// Build the locked `[HANDOFF] …` title for a handoff tab from the originating
+/// tab's current title — pure port of Swift `handoffTitle`
+/// (`SessionsModel.swift:1173-1181`), unit-tested directly like
+/// [`build_claude_exec_command`]. Strips a single leading `[HANDOFF] ` (no
+/// stacking), trims whitespace/newlines, and falls back to `Session` when the
+/// result is empty (a `None` / blank / whitespace-only originating title — which
+/// would otherwise yield a ragged `[HANDOFF]    `).
+pub(crate) fn handoff_title(originating_title: Option<&str>) -> String {
+    let raw = originating_title.unwrap_or("");
+    // `strip_prefix` mirrors Swift's `hasPrefix` + `dropFirst(prefix.count)`.
+    let stripped = raw.strip_prefix(HANDOFF_TITLE_PREFIX).unwrap_or(raw);
+    let trimmed = stripped.trim();
+    let base = if trimmed.is_empty() { "Session" } else { trimmed };
+    format!("{HANDOFF_TITLE_PREFIX}{base}")
+}
+
+/// Build the initial prompt seeded into a handoff session — pure port of Swift
+/// `handoffPrompt` (`SessionsModel.swift:1194-1200`). Always points Claude at the
+/// notes file; the continuation is the skill's custom `instructions` when
+/// non-blank (direct `/nice-handoff-rs <args>` invocations), else a default
+/// read-and-wait directive (a no-arg / model-triggered handoff must NOT
+/// auto-resume — it lands the fresh session read-and-await so the user stays in
+/// control). The default's em-dash `—` is load-bearing (byte parity with Swift).
+pub(crate) fn handoff_prompt(handoff_file: &str, instructions: &str) -> String {
+    let trimmed = instructions.trim();
+    let directive = if trimmed.is_empty() {
+        "Do not start working yet — once you have read it, wait for the user to tell you how to proceed."
+    } else {
+        trimmed
+    };
+    format!("Read the handoff notes at {handoff_file}. {directive}")
+}
+
+/// Build the `extra_claude_args` for a handoff session so the fresh session
+/// launches matched to the originating one — pure port of Swift
+/// `handoffExtraArgs` (`SessionsModel.swift:1215-1221`). `model`/`effort` become
+/// optional `--model <id>` / `--effort <tier>` flags (each omitted when empty, so
+/// an unknown model / absent `CLAUDE_EFFORT` falls back to claude's own
+/// defaults); the `prompt` MUST stay the FINAL element — it is the single
+/// positional arg claude auto-runs, and flags must precede it. Combined with
+/// [`build_claude_exec_command`] (which emits `--session-id <id>` then these args
+/// verbatim), the launch line becomes
+/// `claude --session-id <id> [--model <m>] [--effort <e>] '<prompt>'`.
+pub(crate) fn handoff_extra_args(model: &str, effort: &str, prompt: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if !model.is_empty() {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if !effort.is_empty() {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
+    }
+    args.push(prompt.to_string());
+    args
 }
 
 #[cfg(test)]

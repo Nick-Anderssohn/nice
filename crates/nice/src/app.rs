@@ -740,6 +740,76 @@ fn request_quit(cx: &mut App) {
     }
 }
 
+/// R26 (D8): whether the one-time first-launch handoff-skill prompt may offer.
+/// Mirrors Swift `shouldSuppressFirstLaunchPrompt` (`AppShellView.swift:118-123`):
+/// suppressed whenever `NICE_APPLICATION_SUPPORT_ROOT` is set (a scenario / harness
+/// redirecting Application Support), UNLESS `NICE_FORCE_FIRST_LAUNCH_PROMPT` is ALSO
+/// set (the deliberate opt-in for a prompt-exercising harness). In the shipped app
+/// neither var is set, so the prompt offers normally. The `once-ever` guard is the
+/// separate persisted `handoffSkillPromptSeen` flag, checked at the fire site.
+fn should_offer_handoff_prompt() -> bool {
+    should_offer_handoff_prompt_from(
+        std::env::var_os("NICE_APPLICATION_SUPPORT_ROOT").is_some(),
+        std::env::var_os("NICE_FORCE_FIRST_LAUNCH_PROMPT").is_some(),
+    )
+}
+
+/// Pure gate logic for [`should_offer_handoff_prompt`], split out so the unit test
+/// drives it directly without mutating process env (which would race the parallel
+/// `shell_inject` tests reading `NICE_APPLICATION_SUPPORT_ROOT`).
+fn should_offer_handoff_prompt_from(support_root_set: bool, force_prompt_set: bool) -> bool {
+    !support_root_set || force_prompt_set
+}
+
+/// R26 (D8/D9): present the one-time first-launch prompt offering to install the
+/// handoff skill, hosted on the active window via the same resolve pattern as
+/// [`request_quit`]. Both buttons persist `handoffSkillPromptSeen = true` so the
+/// prompt never reappears regardless of the answer; "Install" installs the `-rs`
+/// skill, "Not Now" ensures it removed (both idempotent through
+/// [`crate::skill_installer::sync`]). Fired deferred from [`run`] (D9 re-entrancy)
+/// so the just-opened active window is fully in `cx.windows` when this `update`
+/// runs. `run`-only — [`run_selftest`] never reaches this path (hermeticity: the
+/// suite fires no prompt and writes no CFPref).
+fn present_handoff_prompt(cx: &mut App) {
+    let Some(win) = cx.active_window() else {
+        return;
+    };
+    let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+        return;
+    };
+    let result = win.update(cx, |_root, window, app| {
+        state.update(app, |ws, wcx| {
+            ws.present_confirmation(
+                "Install the Nice Handoff skill?",
+                "The /nice-handoff-rs skill lets Claude hand off the current work to a fresh session in a new tab. You can change this anytime in Settings.",
+                "Install",
+                "Not Now",
+                false,
+                move |confirmed, _window, app| {
+                    // Persist the choice + reconcile on-disk state, then mark the
+                    // prompt seen so it never reappears (both buttons set it).
+                    crate::platform::write_bool_pref("installHandoffSkill", confirmed);
+                    crate::skill_installer::sync(confirmed);
+                    // Keep the in-memory render mirror in step with the CFPref, matching
+                    // `perform_toggle_install_handoff`: otherwise the Claude settings
+                    // toggle (which renders from `handoff_skill_gate_on`, not the
+                    // CFPref) stays stale for the rest of this session — it only
+                    // self-heals on the next boot reconcile.
+                    crate::app::set_handoff_skill_gate(app, confirmed);
+                    crate::platform::write_bool_pref("handoffSkillPromptSeen", true);
+                },
+                window,
+                wcx,
+            );
+        });
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "nice-rs: present_handoff_prompt could not present the first-launch prompt: {e:#}"
+        );
+    }
+}
+
 /// The confirmed-quit cascade (Swift's ordered terminate path). Order is
 /// load-bearing (plan "Quit-wipe sequencing"): (1) set [`AppQuitting`] FIRST so
 /// every subsequent window close is inert (preserve, never remove); (2) snapshot
@@ -895,6 +965,35 @@ pub(crate) fn claude_theme_sync_gate_on(cx: &App) -> bool {
         .unwrap_or(false)
 }
 
+/// R26's in-memory mirror of the `installHandoffSkill` CFPref — the SOURCE the
+/// Claude-pane's handoff toggle RENDERS from, so a scenario / `run_selftest`
+/// render never reads the real `dev.nickanderssohn.nice-rs` CFPrefs domain (D7
+/// render-read note). Seeded ONCE in [`run`] from the CFPref (Step 5, the
+/// bootstrap reconcile), UNSET under [`run_selftest`] — absent ⇒ OFF (default),
+/// exactly like [`ClaudeThemeSyncGate`]. The CFPref stays the persisted source
+/// of truth; this Global is only the render mirror, kept in step by
+/// `perform_toggle_install_handoff` on every toggle.
+struct HandoffSkillGate(bool);
+
+impl Global for HandoffSkillGate {}
+
+/// Seed / update the process handoff-skill render gate. [`run`] sets it from the
+/// CFPref at boot; the Claude-pane toggle handler re-sets it on every flip so the
+/// re-render reflects the new state. Not reachable from `run_selftest` at boot
+/// (hermeticity) — a render there sees the absent Global ⇒ OFF.
+pub(crate) fn set_handoff_skill_gate(cx: &mut App, on: bool) {
+    cx.set_global(HandoffSkillGate(on));
+}
+
+/// Read the process handoff-skill render gate (absent ⇒ OFF, the `run_selftest`
+/// default). The Claude-pane toggle reads THIS at render time — never
+/// `read_bool_pref` — so a scenario render stays off the real CFPrefs domain.
+pub(crate) fn handoff_skill_gate_on(cx: &App) -> bool {
+    cx.try_global::<HandoffSkillGate>()
+        .map(|g| g.0)
+        .unwrap_or(false)
+}
+
 /// Run the shipped application: one window hosting a single live terminal pane
 /// running the login shell, quit on window close.
 pub fn run() {
@@ -973,6 +1072,23 @@ pub fn run() {
         // above) and before the first pane spawns — it touches no ptys. Failures
         // are logged and swallowed (the feature degrades, the app still runs).
         crate::claude_hook_installer::install();
+        // R26: reconcile the on-disk Nice Handoff skill to the persisted
+        // `installHandoffSkill` CFPref, then seed the render gate. Read the flag
+        // once (default OFF) and `skill_installer::sync` HEALS the on-disk state
+        // to it at launch — installing (or removing) the `-rs` SKILL.md + helper
+        // if the user toggled while the app was closed, or a prior write was
+        // partial. Seed `HandoffSkillGate` from the SAME value so the Claude
+        // pane's toggle renders the persisted state without touching CFPrefs at
+        // render time. Both the skill files and the flag are the dev build's
+        // `-rs` identity — the unsuffixed prod `/nice-handoff` is never touched
+        // (D2). app::run ONLY (never run_selftest, per tranche-3 hermeticity: the
+        // regression suite must not write the real ~/.claude / ~/.nice, and a
+        // suite render sees the absent gate ⇒ OFF). Failures are logged and
+        // swallowed inside `sync` (the app runs fine; only the handoff feature
+        // degrades).
+        let install_handoff_skill = crate::platform::read_bool_pref("installHandoffSkill", false);
+        crate::skill_installer::sync(install_handoff_skill);
+        cx.set_global(HandoffSkillGate(install_handoff_skill));
         // R17: the Claude theme-sync gate + the write-on-startup of the current
         // (fixed) terminal theme. The gate is read from this app's own
         // CFPreferences domain (`syncClaudeTheme`, absent ⇒ ON); a `defaults write`
@@ -1056,6 +1172,18 @@ pub fn run() {
         if let Err(e) = run_restore_fan_out(cx) {
             eprintln!("nice-rs: failed to start the terminal: {e:#}");
             std::process::exit(1);
+        }
+        // R26 (D8/D9): offer the one-time first-launch handoff-skill prompt once
+        // centrally, AFTER the restore fan-out opened the window(s). Gated on the
+        // persisted `handoffSkillPromptSeen` flag (once-ever) plus the harness
+        // suppression gate; deferred so the just-opened active window is fully back
+        // in `cx.windows` when `present_handoff_prompt`'s `win.update` runs (the
+        // `request_quit` re-entrancy rule, R20.5 / `4875d9c`). `run`-only — never
+        // `run_selftest`, so the suite fires no prompt and writes no CFPref.
+        if should_offer_handoff_prompt()
+            && !crate::platform::read_bool_pref("handoffSkillPromptSeen", false)
+        {
+            cx.defer(|cx| present_handoff_prompt(cx));
         }
     });
 }
@@ -3770,6 +3898,31 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R26: the handoff gate — drives the SHIPPED window (open_managed_window /
+        // build_window_root) over a real control socket + real ptys: the installer
+        // round-trips the two -rs files against INJECTED scratch dirs (never the
+        // real ~/.claude / ~/.nice); a socket `handoff` naming a seeded originating
+        // Claude tab opens a nested [HANDOFF]-titled tab (locked, parented under the
+        // originating tab) whose stub argv carries --session-id/--model/--effort +
+        // the prompt last; a miss (empty tabId) still replies `ok` and opens a
+        // top-level [HANDOFF] Session tab; and empty model/effort omit both flags.
+        // The stub `claude` is seeded via the ResolvedClaudePath Global with
+        // NICE_CLAUDE_OVERRIDE UNSET (so is_override stays false and the flags emit);
+        // no real claude spawns. Sandbox HOME (no rc) for the driver's lifetime.
+        // Registered BEFORE `multiwindow`: its build_window_root only `register`s
+        // (no WindowRegistry close observer), so its window never trips the
+        // quit-when-empty terminus that `multiwindow` owns as the last gate.
+        Scenario {
+            name: "handoff",
+            open: crate::handoff_live::open_handoff_window,
+            gate: Gate::SelfReported {
+                // The installer leg (pure fs), a socket round-trip + a spawned stub
+                // recording its argv, a miss fallback, and a flags-omit spawn — each
+                // on the real socket / pty clock; generous headroom.
+                budget: Duration::from_secs(75),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.
@@ -3869,6 +4022,31 @@ pub fn run_selftest(selector: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_launch_prompt_gate_suppresses_under_support_root_override() {
+        // Swift `shouldSuppressFirstLaunchPrompt` parity: the shipped app (neither
+        // var set) offers; a harness redirecting Application Support
+        // (`NICE_APPLICATION_SUPPORT_ROOT` set) suppresses UNLESS it also opts back
+        // in via `NICE_FORCE_FIRST_LAUNCH_PROMPT`. Driven through the pure inner
+        // helper so no process-env mutation races the parallel `shell_inject` tests.
+        assert!(
+            should_offer_handoff_prompt_from(false, false),
+            "shipped app (no overrides) offers the prompt"
+        );
+        assert!(
+            !should_offer_handoff_prompt_from(true, false),
+            "a redirected support root suppresses the prompt"
+        );
+        assert!(
+            should_offer_handoff_prompt_from(true, true),
+            "the force-prompt opt-in re-enables it under a redirected root"
+        );
+        assert!(
+            should_offer_handoff_prompt_from(false, true),
+            "the force-prompt opt-in alone still offers"
+        );
+    }
 
     #[test]
     fn band_drag_threshold_is_2pt_radius_squared() {

@@ -18,9 +18,10 @@ use nice_term_view::TerminalEvent;
 use super::{
     build_claude_exec_command, build_claude_extra_env, build_claude_prefill_command,
     claude_launch_display_command, claude_tab_title_from_args, claude_worktree_cwd, clip_title,
-    compose_claude_reply, default_mint_id, merge_env_spec_wins, mint_session_uuid, parse_claude_title,
-    ClaudeReplyDecision, ClaudeSessionMode, DissolveTerminus, PaneLaunchStatus, SessionManager,
-    WindowShellEnv, PANE_TITLE_MAX,
+    compose_claude_reply, default_mint_id, handoff_extra_args, handoff_prompt, handoff_title,
+    merge_env_spec_wins, mint_session_uuid, parse_claude_title, ClaudeReplyDecision,
+    ClaudeSessionMode, DissolveTerminus, PaneLaunchStatus, SessionManager, WindowShellEnv,
+    PANE_TITLE_MAX,
 };
 
 /// A fresh empty selection for cascade tests that don't seed a multi-selection.
@@ -2380,5 +2381,95 @@ fn claude_display_command_resume_hides_uuid() {
     assert_eq!(
         claude_launch_display_command(&ClaudeSessionMode::Resume("uuid".into()), &[]),
         "claude --resume"
+    );
+}
+
+// handoff_title — the locked "[HANDOFF] …" label (R26). Strip a single existing
+// prefix (no stacking), trim, blank → "Session".
+
+#[test]
+fn handoff_title_prefixes_a_plain_title() {
+    assert_eq!(handoff_title(Some("Foo")), "[HANDOFF] Foo");
+}
+
+#[test]
+fn handoff_title_does_not_stack_an_existing_prefix() {
+    // A handoff fired FROM a handoff tab reads "[HANDOFF] Foo", not doubled.
+    assert_eq!(handoff_title(Some("[HANDOFF] Foo")), "[HANDOFF] Foo");
+}
+
+#[test]
+fn handoff_title_none_falls_back_to_session() {
+    assert_eq!(handoff_title(None), "[HANDOFF] Session");
+}
+
+#[test]
+fn handoff_title_whitespace_only_falls_back_to_session() {
+    // A whitespace-only title would otherwise yield a ragged "[HANDOFF]    ".
+    assert_eq!(handoff_title(Some("   ")), "[HANDOFF] Session");
+}
+
+#[test]
+fn handoff_title_trims_surrounding_whitespace() {
+    assert_eq!(handoff_title(Some("  Bar  ")), "[HANDOFF] Bar");
+}
+
+// handoff_prompt — always points at the notes file; blank instructions get the
+// default read-and-wait directive, custom instructions override it.
+
+#[test]
+fn handoff_prompt_empty_instructions_uses_default_directive() {
+    assert_eq!(
+        handoff_prompt("/x/y.md", ""),
+        "Read the handoff notes at /x/y.md. Do not start working yet — once you have \
+         read it, wait for the user to tell you how to proceed."
+    );
+}
+
+#[test]
+fn handoff_prompt_custom_instructions_override_the_default() {
+    assert_eq!(
+        handoff_prompt("/x/y.md", "keep going"),
+        "Read the handoff notes at /x/y.md. keep going"
+    );
+}
+
+#[test]
+fn handoff_prompt_whitespace_only_instructions_fall_back_to_default() {
+    assert_eq!(
+        handoff_prompt("/x/y.md", "   \n\t "),
+        "Read the handoff notes at /x/y.md. Do not start working yet — once you have \
+         read it, wait for the user to tell you how to proceed."
+    );
+}
+
+// handoff_extra_args — optional --model/--effort flags, prompt ALWAYS last.
+
+#[test]
+fn handoff_extra_args_empty_model_and_effort_is_just_the_prompt() {
+    assert_eq!(handoff_extra_args("", "", "P"), vec!["P".to_string()]);
+}
+
+#[test]
+fn handoff_extra_args_model_only() {
+    assert_eq!(
+        handoff_extra_args("claude-opus-4-8", "", "P"),
+        vec!["--model", "claude-opus-4-8", "P"]
+    );
+}
+
+#[test]
+fn handoff_extra_args_effort_only() {
+    assert_eq!(
+        handoff_extra_args("", "xhigh", "P"),
+        vec!["--effort", "xhigh", "P"]
+    );
+}
+
+#[test]
+fn handoff_extra_args_model_and_effort_then_prompt_last() {
+    assert_eq!(
+        handoff_extra_args("m", "xhigh", "P"),
+        vec!["--model", "m", "--effort", "xhigh", "P"]
     );
 }

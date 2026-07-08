@@ -516,10 +516,11 @@ impl WindowState {
     /// drain task (wired by the R14 env-injection slice's `open_managed_window`).
     ///
     /// Takes the window's `&mut Context` (R15): the `claude` newtab decision spawns
-    /// a Claude pane, which needs a gpui context. The `handoff` sub-handler stays
-    /// context-free; `session_update`'s handler is context-free too (the pure
-    /// rotation flow), returning a deferred-resume [`BranchParentSpawn`] the router
-    /// fulfils here with `cx` when the rotation was a `/branch` (R16).
+    /// a Claude pane, which needs a gpui context. The `handoff` sub-handler (R26)
+    /// likewise takes `cx` — like the `claude` arm, it spawns a fresh Claude tab.
+    /// `session_update`'s handler is context-free (the pure rotation flow),
+    /// returning a deferred-resume [`BranchParentSpawn`] the router fulfils here
+    /// with `cx` when the rotation was a `/branch` (R16).
     pub(crate) fn route_socket_message(
         &mut self,
         msg: SocketMessage,
@@ -561,6 +562,7 @@ impl WindowState {
                 tab_id,
                 pane_id,
                 reply,
+                cx,
             ),
         }
         // R18 (post-gate save trigger): a socket-driven mutation (a `claude`
@@ -885,11 +887,22 @@ impl WindowState {
         cx.notify();
     }
 
-    /// `handoff` action stub. R14 replies `error: handoff is not supported yet`;
-    /// the installed helper's `error*` branch handles that gracefully (the user
-    /// gets a clear message instead of a silent hang). R26 fills this body with
-    /// the nested-handoff-tab open + `ok` reply (`SkillInstaller` / handoff
-    /// receiver).
+    /// Handle a `handoff` request from the `/nice-handoff-rs` skill's helper — the
+    /// Rust twin of Swift `SessionsModel.handleHandoffRequest`
+    /// (`SessionsModel.swift:1108-1156`). Opens a fresh Claude tab pre-loaded with
+    /// the handoff notes: nested one indent under the originating tab, or top-level
+    /// on a resolution miss, and ALWAYS replies `ok` (D3).
+    ///
+    /// The originating tab is resolved exactly as the `claude` request does
+    /// ([`resolve_claude_request`](Self::resolve_claude_request)): a non-empty id,
+    /// NOT in the Terminals group, present in the model, AND owning the sending
+    /// pane. A miss is NOT an error — a handoff from the Main Terminal (or a stale
+    /// pane id) must still open a tab — so it falls back to a top-level insert
+    /// (unlike the `claude` in-place-promotion path, where a miss opens a newtab
+    /// too but never nests). Mirrors the `claude` arm's spawn shape (D6): borrow
+    /// settings/model/session, build + spawn through
+    /// [`create_handoff_tab`](crate::session_manager::SessionManager::create_handoff_tab),
+    /// then `sync_active_tab_id` + `cx.notify()`.
     #[allow(clippy::too_many_arguments)]
     fn handle_handoff(
         &mut self,
@@ -901,17 +914,71 @@ impl WindowState {
         tab_id: String,
         pane_id: String,
         reply: Reply,
+        cx: &mut gpui::Context<WindowState>,
     ) {
         self.record_socket_message(RecordedSocketMessage::Handoff {
-            cwd,
-            handoff_file,
-            instructions,
-            model,
-            effort,
-            tab_id,
-            pane_id,
+            cwd: cwd.clone(),
+            handoff_file: handoff_file.clone(),
+            instructions: instructions.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
         });
-        reply.send("error: handoff is not supported yet");
+
+        // Resolve the originating tab (owned clones so the immutable model borrow
+        // ends before the mutable spawn borrow). A miss ⇒ `None` fields, which
+        // steer the tab top-level (D3).
+        let (originating_id, originating_title, spawn_cwd) = {
+            let originating = if !tab_id.is_empty()
+                && !self.model.is_terminals_project_tab(&tab_id)
+            {
+                self.model
+                    .tab_for(&tab_id)
+                    .filter(|t| t.panes.iter().any(|p| p.id == pane_id))
+            } else {
+                None
+            };
+            (
+                originating.map(|t| t.id.clone()),
+                originating.map(|t| t.title.clone()),
+                // Prefer the resolved tab's live cwd (it may have moved into a
+                // worktree); else the payload cwd.
+                originating.map(|t| t.cwd.clone()).unwrap_or(cwd),
+            )
+        };
+
+        let title = crate::session_manager::handoff_title(originating_title.as_deref());
+        let prompt = crate::session_manager::handoff_prompt(&handoff_file, &instructions);
+        // Nest under the RESOLVED originating tab, never the raw payload `tab_id`:
+        // on a miss we pass "" so `insert_handoff_child` rejects it and the tab
+        // opens top-level, keeping nesting coherent with the title/cwd (which
+        // already key off the resolved tab).
+        let under = originating_id.unwrap_or_default();
+
+        let settings = self.claude_settings_path.clone();
+        let model_doc = &mut self.model;
+        let session = &mut self.session;
+        let created = session.create_handoff_tab(
+            model_doc,
+            &under,
+            &spawn_cwd,
+            title,
+            prompt,
+            &model,
+            &effort,
+            settings.as_deref(),
+            cx,
+        );
+        if created.is_some() {
+            // Keep the "selection ⊇ {active tab}" invariant: the new tab is now
+            // active. Re-render so the nested / top-level tab appears.
+            self.selection.sync_active_tab_id(self.model.active_tab_id());
+            cx.notify();
+        }
+        // The tab opened (nested or top-level) — ALWAYS reply `ok`. Swift's only
+        // hard error ("no window") cannot occur for a live WindowState.
+        reply.send("ok");
     }
 
     /// Record a routed message for the scenario / routing tests. Compiled to a
@@ -2027,27 +2094,16 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn handoff_stub_replies_error_and_records_message() {
-        let (client, server) = UnixStream::pair().unwrap();
-        let mut state = WindowState::new("/home/u");
-        // The `handoff` sub-handler is context-free (only `claude` needs the gpui
-        // context for its newtab spawn), so drive it directly.
-        state.handle_handoff(
-            "/tmp/work".into(),
-            "/tmp/work/.claude/handoff/h.md".into(),
-            String::new(),
-            String::new(),
-            String::new(),
-            "t1".into(),
-            "p1".into(),
-            Reply::for_test(server),
-        );
-        // R14 stub: the installed helper's `error*` branch degrades gracefully.
-        // R26 replaces the body with a nested-tab open + `ok` reply.
-        assert_eq!(read_reply(client), "error: handoff is not supported yet\n");
-        assert_eq!(state.recorded_socket_messages().len(), 1);
-    }
+    // R26 replaced the R14 `handoff` stub (which replied
+    // `error: handoff is not supported yet`) with a real handler that opens a
+    // nested `[HANDOFF]` Claude tab and replies `ok`. The new body takes a gpui
+    // `Context` (it spawns a Claude pane, like the `claude` arm), so it can no
+    // longer be driven from a plain `#[test]` in this binary crate (which never
+    // links gpui test-support) — its behavior (nested + top-level-fallback open,
+    // the locked title, the `--session-id`/`--model`/`--effort`/prompt argv, and
+    // the always-`ok` reply) is pinned end-to-end by the `handoff` self-test
+    // scenario (`crate::handoff_live`), and its pure title/prompt/arg helpers are
+    // unit-tested in `session_manager`.
 
     // ---- R15 SessionsModelClaudeSocketRequestTests (decision + reply) --------
     //

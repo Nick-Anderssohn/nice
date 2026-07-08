@@ -39,11 +39,33 @@ pub(crate) fn sync_claude_live_arm(cx: &mut App, on: bool) {
     cx.refresh_windows();
 }
 
+/// The handoff-skill toggle handler (R26, D10) — the shipped click path. Persist
+/// the new value to the `installHandoffSkill` CFPref (the boot-reconcile gate's
+/// single source of truth), update the in-memory `HandoffSkillGate` so the
+/// re-render reflects it, sync the on-disk `-rs` skill files to the new state,
+/// then repaint. Unlike the sync-theme toggle there is NO unit-observable
+/// live-arm split: the toggle's ONLY effect is real filesystem writes (tested
+/// hermetically at the installer's `sync_with` seam against scratch dirs), so a
+/// split would buy no hermetic coverage (YAGNI). Reaches the REAL CFPrefs domain
+/// AND the real `~/.claude` / `~/.nice`, so it is called ONLY from the live UI
+/// handler in an `app::run`-installed window — NEVER `run_selftest`, never a test.
+pub(crate) fn perform_toggle_install_handoff(cx: &mut App, on: bool) {
+    crate::platform::write_bool_pref("installHandoffSkill", on);
+    crate::app::set_handoff_skill_gate(cx, on);
+    crate::skill_installer::sync(on);
+    cx.refresh_windows();
+}
+
 /// The Claude pane body (The spec §Claude). The "Sync Claude Code theme" control
 /// is the shared [`toggle_switch`] (a11y `settings.claude.syncClaudeTheme`);
 /// click → [`perform_toggle_sync_claude`] with the flipped value.
 pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     let on = crate::app::claude_theme_sync_gate_on(cx);
+    // R26: the handoff-skill toggle RENDERS from the in-memory gate (seeded once
+    // from the CFPref in `app::run`), NOT `read_bool_pref` — so a scenario /
+    // `run_selftest` render never reads the real CFPrefs domain (D7). Absent
+    // gate ⇒ OFF.
+    let handoff_on = crate::app::handoff_skill_gate_on(cx);
 
     div()
         .flex()
@@ -61,6 +83,25 @@ pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
             toggle_switch("settings.claude.syncClaudeTheme", on, cx, move |cx| {
                 perform_toggle_sync_claude(cx, !on);
             }),
+            cx,
+        ))
+        .child(setting_row(
+            "Install the Nice Handoff skill",
+            Some(
+                "Adds the global /nice-handoff-rs Claude Code skill and installs \
+                 ~/.nice/nice-handoff-rs.sh. When run inside a Claude pane, the skill \
+                 writes a handoff file capturing the current work and opens a new tab so \
+                 a fresh session can continue from where this one left off."
+                    .into(),
+            ),
+            toggle_switch(
+                "settings.claude.installHandoffSkill",
+                handoff_on,
+                cx,
+                move |cx| {
+                    perform_toggle_install_handoff(cx, !handoff_on);
+                },
+            ),
             cx,
         ))
         .into_any_element()
