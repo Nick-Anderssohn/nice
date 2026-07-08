@@ -149,6 +149,7 @@ mod settings;
 mod sf_symbols;
 mod shell_inject;
 mod shell_socket_live;
+mod shortcuts_store;
 mod sidebar_actions;
 mod sidebar_live;
 mod sidebar_shell;

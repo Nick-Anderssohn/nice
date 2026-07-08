@@ -939,6 +939,20 @@ pub fn run() {
         // process-level `FontSettings` every window shares. Must run before the
         // first window opens: `open_managed_window` reads the shared font entity.
         crate::keymap::install_shortcuts(cx);
+        // R24 (G6): load the persisted rebindable-shortcut map from the `shortcuts`
+        // section of the SAME `ui_settings.json` into the `ShortcutBindings` Global,
+        // seeded from `default_bindings()` when the section is absent/malformed (the
+        // frozen load rules). Launch-time read + default-path resolution live here in
+        // `app::run` ONLY — `run_selftest` installs a defaults+temp-path store.
+        cx.set_global(crate::shortcuts_store::ShortcutBindings::load(
+            crate::shortcuts_store::default_shortcut_bindings_path(),
+        ));
+        // R24 (G7): re-apply the just-loaded map over the default keymap that
+        // `install_shortcuts` bound — `rebuild_keymap` clears every binding and
+        // re-emits the 13 LIVE combos plus the PROTECTED non-rebindable set, so a
+        // persisted rebind (or explicit unbind) is live from boot. Harmless when the
+        // section is absent (the store is at defaults, so the board is unchanged).
+        crate::keymap::rebuild_keymap(cx);
         // R14: the process-wide shell-injection bootstrap — app::run ONLY (NEVER
         // run_selftest, so the regression suite never writes real user files, per
         // the tranche-3 hermeticity rule). Order (Swift NiceServices.bootstrap):
@@ -3733,21 +3747,26 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
-        // R23: the settings-window gate — leg (a), the ⌘, singleton. Drives
-        // OpenSettings over a minimal host window: ⌘, opens exactly one settings
-        // window (a fresh handle, not the host), a second ⌘, focuses it (no second
-        // window), and closing it clears the singleton Global. Registered BEFORE
-        // `multiwindow`: the settings window is UNREGISTERED (D7) and
-        // `install_open_settings_command`'s close observer only clears the Global
-        // (never quits), so nothing here trips the quit-when-empty terminus
-        // `multiwindow` relies on being last. Later slices add legs b–e.
+        // R23/R24: the settings-window gate — R23's ⌘, singleton + Appearance/Font/
+        // Import legs, R24's recorder legs (s1–s3), and R24's §6 tranche-5 FINAL
+        // COMPOSITION leg over the REAL registered launch window (a rebound chord
+        // dispatches, the non-rebindable set survives, ⌘, opens settings + a live
+        // theme change repaints shipped chrome + a terminal cell, and a busy pane
+        // close presents R20.5's confirmation — the Milestone-6 claim). The R23 host
+        // legs run over minimal host windows; the §6 leg opens its OWN shipped window
+        // (`open_managed_window`, whose `build_window_root` only `register`s — no
+        // WindowRegistry close observer) and reaps it. Registered BEFORE
+        // `multiwindow`: the settings window is UNREGISTERED (D7) and nothing here
+        // installs the quit-when-empty observer `multiwindow` owns as the last gate.
         Scenario {
             name: "settings-window",
             open: crate::settings::scenario::open_settings_window_scenario,
             gate: Gate::SelfReported {
-                // Two open/focus drives + a close, each with an activation settle;
-                // generous headroom.
-                budget: Duration::from_secs(30),
+                // R23's open/focus/import legs + R24's recorder legs (real CGEvents)
+                // + the §6 composition leg (a shipped window spawn + terminal mount,
+                // several theme flips + pixel captures, and a busy-close modal), each
+                // with its activation/settle; generous headroom.
+                budget: Duration::from_secs(120),
             },
             activate: true,
         },
@@ -3809,6 +3828,17 @@ pub fn run_selftest(selector: String) {
         ));
         cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::with_defaults(
             prefs_path,
+        ));
+        // R24 (G6): the rebindable-shortcut store with DEFAULTS + a throwaway temp
+        // path — never the real `ui_settings.json` (the launch-time read +
+        // default-path resolution stay in `run`). A scenario that rebinds a shortcut
+        // writes only this temp file; a fresh scenario reads all 13 defaults.
+        let shortcuts_path = std::env::temp_dir().join(format!(
+            "nice-rs-selftest-shortcuts-{}.json",
+            std::process::id()
+        ));
+        cx.set_global(crate::shortcuts_store::ShortcutBindings::with_defaults(
+            shortcuts_path,
         ));
         // R21: the theme store initialized with DEFAULTS + a throwaway temp path,
         // plus the terminal-theme catalog stub — never the real `ui_settings.json`

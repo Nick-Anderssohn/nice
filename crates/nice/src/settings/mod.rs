@@ -43,5 +43,6 @@ pub(crate) mod font_pane;
 pub(crate) mod prefs_store;
 pub(crate) mod root;
 pub(crate) mod scenario;
+pub(crate) mod shortcuts_pane;
 pub(crate) mod sidebar_font;
 pub(crate) mod window;

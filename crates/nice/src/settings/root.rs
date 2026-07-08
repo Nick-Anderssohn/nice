@@ -287,24 +287,13 @@ pub(crate) fn setting_row(
 
 // -- panes --------------------------------------------------------------------
 
-/// The Shortcuts pane body — a PLACEHOLDER (Exported contract 3). R24's entire
-/// integration is to replace THIS function's body with its recorder-field
-/// ShortcutsPane, reading its own binding-store Global from `cx` and building its
-/// recorder capture from `window`. R24 touches only this function; it does not
-/// edit the rail, the selection state, the dispatch match, or any other pane.
-pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
-    let slots = crate::theme_settings::active_chrome_slots(cx);
-    div()
-        .flex()
-        .flex_col()
-        .child(setting_title("Shortcuts", cx))
-        .child(
-            div()
-                .text_size(px(12.0))
-                .text_color(slot_to_rgba(slots.ink2))
-                .child("Keyboard shortcut customization is coming soon."),
-        )
-        .into_any_element()
+/// The Shortcuts pane body (Exported contract 3, R24 seam) — delegates to R24's
+/// recorder-field [`ShortcutsPane`](crate::settings::shortcuts_pane), which reads
+/// the [`ShortcutBindings`](crate::shortcuts_store::ShortcutBindings) Global from
+/// `cx` and builds its capture from `window`. R24 replaced ONLY this body; the rail,
+/// the selection state, the dispatch match, and the other panes are untouched.
+pub(crate) fn shortcuts_pane(window: &mut Window, cx: &mut App) -> AnyElement {
+    crate::settings::shortcuts_pane::shortcuts_pane(window, cx)
 }
 
 /// Appearance pane (The spec §Appearance) — full scope per D6.

@@ -356,9 +356,9 @@ The GPUI application. Structure (grows over later cycles):
     `settings_rail_sections()` (six slugs in order) + the `render_section` dispatch;
     the shared `setting_title` / `setting_subtitle` / `setting_row` building blocks.
     **The R24 pane-hosting seam:** the `shortcuts` slug delegates to
-    `shortcuts_pane(window, cx) -> AnyElement`, a placeholder body — R24's ENTIRE
-    integration is to replace that ONE function's body; the rail, selection state,
-    and dispatch match stay untouched.
+    `shortcuts_pane(window, cx) -> AnyElement`, whose body R24 replaced with the
+    recorder-field pane (`settings/shortcuts_pane`, below); the rail, selection
+    state, and dispatch match stayed untouched.
   - `appearance_pane` (R21/R22 pickers + Import + the §ImportError copy R23 owns) /
     `claude_pane` (the Sync-Claude-theme toggle) / `font_pane` (G9 — the terminal
     family picker + terminal-size / sidebar-size steppers + Reset) / `advanced_pane`
@@ -383,6 +383,33 @@ The GPUI application. Structure (grows over later cycles):
   - `file_picker` (D5, slice 2) — the injectable `FilePickerOps` seam for Import…
     (production `NSOpenPanel` from `app::run`; a `RecordingFilePicker` from
     `run_selftest`; no real panel in any test/scenario).
+  - `shortcuts_pane` (R24) — the recorder-field pane filling the seam above. One
+    `setting_row` per rebindable `ShortcutAction` (all 13); each row's control is a
+    recorder field: at rest the bound combo as key-pills (or "Not bound") + a
+    per-action **Reset** shown only when `!is_at_default` (Swift parity); in capture
+    mode a focus-scoped `on_key_down` that reads the chord — plain Escape cancels, a
+    conflicting combo shows an `"Already used by <label>"` row with **Replace** /
+    **Cancel**, a free combo commits. Transient capture state (which action is
+    recording, a pending combo + its conflict, the recorder `FocusHandle`) rides the
+    `RecorderState` gpui `Global` (the stateless-pane-over-a-Global shape R23's
+    `ImportFeedback` uses), installed lazily on first record — no path, no disk.
+
+    **Capture mechanism (D3, adapted to the gpui pin).** At this pin the dispatch
+    order is action bindings BEFORE key-down listeners (`window.rs`: a bound chord
+    fires its action and stops propagation, so `on_key_down` never sees it), so a
+    bare `on_key_down` cannot intercept a chord that is already bound — exactly the
+    chords conflict detection must read (⌘T, ⌘B, …). The faithful realization of
+    D3's rationale ("read the chord without triggering it") is therefore to **stand
+    the keymap down while recording**: `enter_record` calls `clear_key_bindings()` so
+    every chord falls through to the recorder's `on_key_down`, and `teardown` calls
+    `keymap::rebuild_keymap` to restore the full board (incl. any freshly-committed
+    binding). This is a *closer* port of Swift than the plan's wording — Swift stands
+    its `KeyboardShortcutMonitor` down and installs a higher-priority local monitor
+    while recording. The keymap outage is bounded to the capture interaction and torn
+    down on commit / cancel / Esc / **focus-out** (rail switch, window close,
+    click-away — the `.onDisappear` guarantee, via `Window::on_focus_out`). The pure
+    capture decision (`decide_capture` → `Ignore` / `Cancel` / `Commit` / `Conflict`)
+    is gpui-free and `#[test]`-covered.
   - **Live-vs-persist:** Appearance → R21 `apply_*` (persists `appearance`);
     Font family/size → shared `FontSettings` (persists `fonts.*`); sidebar size →
     `SharedSidebarFontSettings` (persists `fonts.sidebar_font_size`); Sync-Claude →
@@ -877,7 +904,45 @@ The GPUI application. Structure (grows over later cycles):
     layout-parity is R24's question (it owns rebinding). We do not patch gpui for
     this — a pin change is a human decision. The peek trigger's clear half
     (`on_window_modifiers_changed`) is the window-level modifier-release observer
-    the shipped `WindowChromeView` installs.
+    the shipped `WindowChromeView` installs. **R24 (G7) — `rebuild_keymap(cx)`:**
+    the SOLE caller of `clear_key_bindings()` + `bind_keys(..)` on any binding change
+    (boot-load, rebind, per-action reset). gpui has no per-binding remove, so the
+    only live-rebind primitive is a **total** clear + full re-bind. `rebuild_keymap`
+    re-emits, on every rebuild, the 13 LIVE combos from `ShortcutBindings` (an unbound
+    action omitted; a persisted/user token that fails to parse is logged + skipped,
+    never a panic — unlike the statically-valid defaults) PLUS the **PROTECTED
+    non-rebindable re-install set** — ⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@`SidebarShell`, ⌘, — each
+    rebuilt exactly as its owner installed it (the `use_key_equivalents` bit differs),
+    because the total clear wipes them too and dropping any is a shipped regression
+    (the dedicated re-install `#[gpui::test]` guards it). It does NOT re-register
+    action handlers (those stay one-shot in `install_shortcuts`;
+    double-registration double-fires). `peek_relevant_modifiers` reads the LIVE map
+    (D4) so a rebound sidebar-nav chord re-points the peek at its new modifiers.
+  - `shortcuts_store` (R24, G6) — `ShortcutBindings`, the mutable/persisted binding
+    map: a gpui `Global` of `HashMap<ShortcutAction, Option<OwnedCombo>>` (always all
+    13 keys; `None` = explicitly unbound), seeded from `default_bindings()`. Reads
+    `binding` / `is_at_default` / `bindings`; free-standing mutators
+    `set_binding` / `reset` take `&mut App`, persist only-if-changed, THEN call
+    `keymap::rebuild_keymap` (the `theme_settings` mutator pattern — the borrow ends
+    before the rebuild). Persistence is the **`shortcuts` section of
+    `ui_settings.json`** (D5): a token-string schema keyed by the Swift `rawValue`
+    action id (`"newTerminalPane"`, …), each value a canonical gpui chord token
+    (`"cmd-alt-down"`, `"cmd--"`, `"cmd-shift-."`) or JSON `null` for unbound, written
+    THROUGH the shared `write_ui_settings_merged` read-merge-write writer so every
+    co-owner section (`appearance` / `fonts` / `file_browser_sort` / any unknown key)
+    rides along untouched. Frozen load rules (Swift parity): absent section ⇒ all 13
+    defaults; malformed ⇒ defaults (fail-soft); unknown action key dropped; present +
+    `null` ⇒ unbound; **absent from a present section ⇒ unbound** (preserves explicit
+    clears across launches). The write rule persists the FULL 13-entry map with
+    explicit `null` (a self-describing, diffable file; load-equivalent to Swift's
+    omit-unbound form). **Token-vs-keyCode divergence (D1):** the schema is
+    token-based where Swift's `keyboardShortcuts` blob is keyCode-based, and the two
+    apps have distinct bundle ids, so R24 does NOT migrate Swift's blob — every user
+    starts fresh at defaults (a keyCode→token table is speculative work for a
+    clean-install app; the pins match the character-based-matching divergence the
+    `keymap` module documents). Injected path via `NICE_APPLICATION_SUPPORT_ROOT`,
+    resolved in `app::run` ONLY; `run_selftest` installs a defaults+temp store and
+    performs no launch-time write (hermeticity).
   - `multiwindow` — the R12 live multi-window self-test scenario (`multiwindow`,
     see the table below). Its in-process isolation / routing / all-13-fire / peek
     **differentials** live in `nice-itests`' `multiwindow` cases (mirrors over the
@@ -1529,7 +1594,7 @@ the window, and moves to the next scenario.
 | `file-browser` | The R19 file-explorer shipped-surface gate (Validation §3). Opens through the **shipped builder** (`open_managed_window` / `build_window_root`) with the active tab rooted at a temp fixture tree, and drives the sidebar's files mode: a real **⌘⇧B** CGEvent swaps the tab list for the tree (the AX root `nice-rs-file-browser-root` surfaces as an `AXGroup` — poll forces a repaint per tick, the shipped shell doesn't RAF — and a fixture row is model-read-corroborated as rendered); **single-click expand/collapse** of a fixture dir; **double-click a folder re-roots** the tree (model `root_path`); **double-click a file** records **exactly one** `open` on the recording `WorkspaceOps` fake and **nothing is launched** (the fake's log is the only evidence); **right-click menus** — a file shows Open / Open With ▸ / Reveal in Finder / Copy Path, a folder OMITS Open + Open With (the pinned rule), and the **Open With ▸ second stage** lists the fake's apps **default-first** (`Zed (default)`, then alphabetized, then `Other…`); the **live kqueue watcher** surfaces a file created in an expanded dir as a new row within a bounded fail-loud poll (create → 120 ms debounce → wake → foreground drain → re-render — NO forced notify, so only a watcher-driven render can pass); the **sort-direction toggle** reorders rows; the **hidden toggle + a real ⌘⇧. chord** hide then re-show a dotfile (the shipped keymap's files-mode-AND-state-exists double gate); and **⌘⇧B still flips modes**. **R20 legs** (the scenario installs a fresh history over a temp-dir `FakeTrasher` + a recording fake pasteboard — never the production Trash / general pasteboard): **(a)** copy → paste twice into a folder lands `foo.txt` then `foo copy.txt`; **(b)** cut ghosts the rows, paste MOVES the tree, and an external-style pasteboard mutation degrades the cut to a copy (un-ghosts); **(c)** trash (FakeTrasher) → **⌘Z** (the shipped `UndoFileOperation`) restores into a still-collapsed dir → **⌘⇧Z** re-trashes; **(d)** menu-rename with a typed edit + Return commits (basename preselected — asserted via the field model), Esc reverts, and a `/` draft STAYS in edit mode; **(e)** an in-tree drag of a multi-selection onto a folder row MOVES both (the `can_drop` hover-highlight predicate asserted); **(f)** deleting an undo target then ⌘Z shows the frozen drift banner and drops the op. **§6 final-composition leg (the Milestone-5 claim, Validation step 6):** in files mode, click-select two rows and context-menu **Copy → Paste** into a folder (recorded on the fake pasteboard + applied on disk); **slow-second-click rename** a row and commit; a **⌘N** CGEvent opens a SECOND real window B (the `multiwindow` precedent — this scenario now also installs the `NewWindow` command, its `build_window_root` still only `register`s so B never trips quit-when-empty); a **⌘Z** CGEvent posted to window B undoes window A's op AND the focus route brings window A frontmost (`active_window == A`) with its sidebar back in **Files** mode and the **origin tab** selected; window B is then programmatically closed. This is the only leg driving two real windows + the production focus-follow closure (installed here over the registry-registered windows). Hermetic: fixture under a temp dir, the recording fakes (`WorkspaceOps` + `FakeTrasher` + fake pasteboard) — no real app launch / Finder reveal / Launch-Services query / real Trash / general pasteboard. Preflights `AXIsProcessTrusted()` and FAILs loudly on a missing grant. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
 | `close-confirmation` | The R20.5 busy-pane close-confirmation gate (Validation §3). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with a real ZDOTDIR-blanked terminal shell over one `Application::run`; a stub `claude` on `NICE_CLAUDE_OVERRIDE` (never the real `claude`), a sandbox `HOME`/`ZDOTDIR`. The three legs: **(a) idle close is immediate** — with the shell idle at a prompt, closing the active pane's pill ✕ closes it with **no modal** (`pending_modal().is_none()`); **(b) busy shell is gated** — the shell is given a real foreground child (a `sleep`), polled to `has_foreground_child()` true (the ONLY leg exercising the true `tcgetpgrp != child_pid` syscall, against a hermetic stub child), then a pill-✕ close **vetoes** (window/tab stays, `pending_modal().is_some()`, the modal's `Force quit` button is a live AX node — `ax_find_titled_role` → `AXButton`); **Cancel** (`ConfirmationModal::resolve(.., false)`) closes nothing, then a second pill-✕ close + **Confirm** (`resolve(.., true)`) force-quits the busy pane (reaping the `sleep`); **(c) `.tabs` partial-cancel** (D5) — a batch of one idle + one busy tab (the busy tab marked through the `synthetic_foreground_child` seam) drives `request_close_tabs`, and on **Cancel** the idle member is already gone while the busy survivor REMAINS (NOT a total no-op). **The pill-✕ gesture** asserts the ✕ is a real, on-screen, locatable target and then drives the EXACT pill-✕ handler (`WindowToolbarView::close_pane` → the gate) rather than a synthetic CGEvent coordinate click: under the shipped **full-size-content** window a `CGEventPostToPid` mouse click does not hit-test to gpui content (re-verified on-device — a body-centre click did not select the pane; the same limitation `persistence-restore` hit for the traffic light, which drove `-[NSWindow performClose:]`). The modal is always answered via `ConfirmationModal::resolve`. Preflights `AXIsProcessTrusted()` (for the leg-(b) AX button probe) and FAILs loudly on a missing grant. Registered **before** `multiwindow`: `open_managed_window` only `register`s the `WindowRegistry` (no quit-when-empty close observer), and the driver keeps the Main tab populated so no close empties the window. `Gate::SelfReported`. |
 | `theme-fanout` | The R21 live theme-system gate (Validation §4). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with the live theme globals installed — a `ThemeSettingsStore` at a **temp** `ui_settings.json`, the `TerminalThemeCatalog` over a sandbox `terminal-themes/` dir (R22), a scenario-minted `SharedThemeState`, and an **injected `OsSchemeSource` stub** over a flippable cell (`run_selftest` mints none of these). Sandbox `HOME` (held for the whole driver so the R17-live Claude writes land under `<home>/.claude`), a blanked `ZDOTDIR` rc chain for the Main pane's shell, a `NICE_CLAUDE_OVERRIDE` stub — never the real `~/.claude` / `~/.nice` / system appearance. Legs (bounded fail-loud state polls): **(a/d) OS-sync scheme flip fans BOTH halves** — with `sync_with_os` ON, flipping the OS stub + `reconcile_with_os` flips `scheme`; the active chrome `Slots` change, the Main pane's `TerminalView` swaps its render theme, AND a **pixel sample on the live terminal recolors** (`nice_harness::capture::sample_window_pixels`, max channel delta > 8/255) — proving chrome + terminal across the window; with sync OFF, driving the stub is a no-op; **(d) manual contradiction** — re-enabling sync pins the scheme to the OS, then a manual `apply_scheme` to the other scheme turns `sync_with_os` off (`userPicked`); **(b) accent** — `apply_accent` pushes a new accent into the pane (the cursor-None caret color); **(c) terminal-id latency** — an INACTIVE-scheme `apply_terminal_theme_id` does NOT recolor the pane (persisted, latent) and the next scheme flip makes that slot active (leg (c) sets `nice-default-dark`, whose payload matches the scheme's Nice default, so the latency check stays a clean no-op; leg (f) exercises a distinct-theme active recolor now that R22's catalog resolves real themes); **(e) R17-live** — with the gate ON a theme change rewrites the sandbox `nice-rs.json` colors file (byte-diff via the landed only-if-changed writer) and `apply_sync_claude_theme` re-sources every window's `--settings` provider (asserted through `claude_settings_path_provider`); **(f) R22 Ghostty import** — a fixture `.ghostty` written under the sandbox `terminal-themes/` dir is `import_theme`d through the Global catalog (parse → persist verbatim as `<slug>.ghostty` → enter the imported list → resolve by id), then `apply_terminal_theme_id` (R21) makes it live for the active scheme and the live terminal pane recolors to the imported background (render theme swap + pixel sample > 8/255) — parse → persist → catalog → resolve → fan-out end to end. Needs **no** Accessibility grant (drives the store `apply_*` API + pixel readback, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `settings-window` | The R23 Settings-window gate (Validation §2–§3). Drives the ⌘, Settings window over a minimal host window in ONE `Application::run` (the open/apply fns driven explicitly, no relaunch), fully sandboxed: a `run_selftest` defaults+temp `SettingsPrefsStore` / theme store / catalog, a scenario-minted `SharedThemeState` + injected `OsSchemeSource` stub, and the `RecordingFilePicker` (no real `NSOpenPanel`). Legs: **(a) ⌘, singleton** — the first `OpenSettings` opens exactly one settings window (a fresh handle, `App::windows()`+1, the `SettingsWindow` Global `Some`), a second focuses the SAME window (no second window, handle unchanged), close clears the Global; **(b) live Appearance fan-out** — `apply_accent` flips the resolved `ThemeState` the chrome paints from (the composed real-window pixel assert is R24's, per the Validation split); **(c) Font slider fan-out + persist** — the Font pane's terminal-size handler changes the shared `FontSettings` px + re-metrics, a subsequent ⌘= (`zoom_by`) continues from the slider value on the SAME entity (no desync), and the `fonts` section on the temp `ui_settings.json` reflects the change; **(d) Import through the fake picker** — a scripted temp `.ghostty` imports through the `FilePickerOps` seam into `imported_entries()`/`themes(for:)`, a malformed fixture surfaces the exact mapped §ImportError string; **(e) rail** — `settings_rail_sections()` exposes the six slugs incl. the `shortcuts` placeholder (the R24 seam). The settings window is UNREGISTERED (D7), and the scenario installs no `WindowRegistry` close observer. Needs **no** Accessibility grant (drives the open/apply fns + reads state, not CGEvents). Registered **before** `multiwindow`. `Gate::SelfReported`. |
+| `settings-window` | The R23 Settings-window gate (Validation §2–§3). Drives the ⌘, Settings window over a minimal host window in ONE `Application::run` (the open/apply fns driven explicitly, no relaunch), fully sandboxed: a `run_selftest` defaults+temp `SettingsPrefsStore` / theme store / catalog, a scenario-minted `SharedThemeState` + injected `OsSchemeSource` stub, and the `RecordingFilePicker` (no real `NSOpenPanel`). Legs: **(a) ⌘, singleton** — the first `OpenSettings` opens exactly one settings window (a fresh handle, `App::windows()`+1, the `SettingsWindow` Global `Some`), a second focuses the SAME window (no second window, handle unchanged), close clears the Global; **(b) live Appearance fan-out** — `apply_accent` flips the resolved `ThemeState` the chrome paints from (the composed real-window pixel assert is R24's, per the Validation split); **(c) Font slider fan-out + persist** — the Font pane's terminal-size handler changes the shared `FontSettings` px + re-metrics, a subsequent ⌘= (`zoom_by`) continues from the slider value on the SAME entity (no desync), and the `fonts` section on the temp `ui_settings.json` reflects the change; **(d) Import through the fake picker** — a scripted temp `.ghostty` imports through the `FilePickerOps` seam into `imported_entries()`/`themes(for:)`, a malformed fixture surfaces the exact mapped §ImportError string; **(e) rail** — `settings_rail_sections()` exposes the six slugs incl. the `shortcuts` row (the R24 pane); **(s1–s3) the R24 recorder** — over a dedicated host window rendering the shipped `shortcuts_pane` body (R23's live-window active-pane state is private, so this renders the identical pane): s1 enters recording on `newTerminalPane` and a REAL ⌘Y chord (`post_key_tap`, own pid) rebinds it, s2 captures ⌘B (ToggleSidebar's default) → the "Already used by <label>" conflict + Replace clears the loser and binds this action, s3 Reset restores the default and `is_at_default` flips; a `SavedInputSource` is held across the leg (IME restore) and `AXIsProcessTrusted()` is preflighted (a dropped chord fails loudly). **(§6) the tranche-5 final composition (Milestone 6)** — over the **REAL registered launch window** (`open_managed_window` / `build_window_root`, NOT a host; the §6 leg opens + reaps its own shipped window over a hermetic ZDOTDIR/HOME/`NICE_CLAUDE_OVERRIDE` fixture, its `build_window_root` only `register`s so it never trips quit-when-empty), by CGEvent to nice-rs's own pid: **(6a)** a rebound chord dispatches — `set_binding(newTerminalPane → ⌘Y)` then a real ⌘Y adds a pane to the shipped window's `WindowState` and the old default ⌘T no longer does (`rebuild_keymap` dropped it); **(6b)** the PROTECTED non-rebindable set (⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@SidebarShell, ⌘,) survives the total clear — a `key_bindings()` presence audit (the `keymap` re-install probe, on the live board); **(6c)** a real ⌘, opens R23's settings window (the `OpenSettings` non-rebindable firing LIVE, `App::windows()`+1), then a live theme change (`apply_accent` + `apply_scheme`) repaints the shipped **chrome** AND a **terminal cell** (`sample_window_pixels`, max channel delta > 8/255 on both — the composed pixel assert the R23 `settings-window` leg (b) deferred to R24; the stub selftest catalog makes `apply_terminal_theme_id` a latent no-op, so the terminal recolor comes from the scheme flip, as `theme-fanout` proves); **(6d)** a busy pane (marked through the `synthetic_foreground_child` seam — the true `tcgetpgrp` is `close-confirmation`'s) close presents R20.5's `ConfirmationModal` (`pending_modal()` + the `CONFIRM_ACCEPT_ID` AXButton), cancelled. The launch window is reaped (`WindowState::teardown`) + the rebind reset at teardown so nothing leaks to `multiwindow`. This composed board is the Milestone-6 claim; no earlier cycle asserted it together. The settings window is UNREGISTERED (D7), and the scenario installs no `WindowRegistry` close observer. The s1–s3 + §6 legs need the Accessibility grant (real CGEvents); a–e do not. Registered **before** `multiwindow`. `Gate::SelfReported`. |
 | `multiwindow` | The R12 live multi-window + shortcut-dispatch gate (Validation §2–§5). Drives the shipped `WindowRegistry` / `WindowState` / `keymap` on **real `NSWindow`s** with **real CGEvents** to nice-rs's own pid. Opens window A as a capture-tee managed window (the `input-live` pattern) registered in the process-wide registry, then asserts: **⌘N** opens a second, isolated, registry-tracked window (the registry count **and** `App::windows()` both step 1 → 2); **⌘T** posted while window B is key adds a pane to B's `WindowState` model only, leaving A's model signature unchanged (isolation + focused-window routing through `active_state`); **⌘=** grows the one process-level `FontSettings` every window observes (the font fan-out) and leaks **zero** bytes into A's capture-tee pty; the **pass-through differential** — a plain `x` reaches the pty as `x`, while **⌘⌥↓** cycles the sidebar and leaks **zero** capture bytes (a matched chord is consumed, an unmatched key falls through byte-identically); **live peek** — with A's sidebar collapsed, ⌘⌥↓ floats the peek and a modifiers-release clears it via the window-level `on_modifiers_changed` observer; and **close/deregister/fallback** — closing B deregisters it (registry + `NSWindow` count drop) and a window-scoped action then falls back to the surviving window A. Matching is **character-based** at the gpui pin (the documented divergence from Swift's physical-keycode match — see the `keymap` module notes). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make every chord a no-op). The per-pid flagsChanged the peek-clear needs is not synthesizable via `CGEventPostToPid`, so the modifier release is driven as a real `ModifiersChangedEvent` through GPUI's own dispatch (the same `on_modifiers_changed` path). The in-process isolation / routing / all-13-fire / peek **differentials** live in `nice-itests`' `multiwindow` cases. Registered **last** in `selftest_scenarios` (it installs the registry whose close observer quits when the registry empties). `Gate::SelfReported`. |
 
 **Tranche-3 close-out (Milestone 3).** `claude-e2e` is the standing Milestone-3
@@ -1570,6 +1635,44 @@ of a native hover submenu; and the busy-pane close-confirmation deferral is now
 roadmap row **R20.5**. Two **manual feel-check** items no automated test covers (the
 hermeticity rule forbids the real Trash / general pasteboard): a real Finder
 copy/paste round-trip and a real-Trash trash+undo.
+
+**Tranche-5 close-out (Milestone 6) — full preferences parity, minus the Editors
+pane.** R20.5→R21→R22→R23→**R24** land Milestone 6: the busy-pane close
+confirmation (R20.5), the live theme system + per-scheme palettes/accent + Claude
+mirror (R21), the terminal-theme catalog + Ghostty import (R22), the Settings window
++ Appearance/Font/Claude/Advanced/About panes + persistence (R23), and rebindable
+shortcuts — the mutable/persisted binding map, whole-keymap-rebuild dispatch, the
+recorder field, and per-action Reset (R24). The `settings-window` scenario is the
+standing Milestone-6 regression; its **§6 final-composition leg** — over the REAL
+registered launch window: a rebound chord dispatches, the non-rebindable set
+survives the rebuild, ⌘, opens Settings + a live theme change repaints shipped
+chrome AND a terminal cell (pixel-level), and a busy pane close presents R20.5's
+confirmation — asserts the composed board on the shipped surface (TRANCHE-2-NOTES
+§6). **R24 owns the tranche's ONE full regression sweep** (`cargo test --workspace`
+AND `NICE_RS_SELFTEST=all`, release + `selftest`, strictly serial, `multiwindow`
+last); no earlier tranche-5 cycle runs the full suite. **Deliberate divergences**
+(reviewers must not "fix" them): shortcut matching is **gpui token / produced
+character**, not Swift's physical keyCodes, and there is **no migration of Swift's
+`keyboardShortcuts` UserDefaults blob** — every user starts fresh at the 13 defaults
+(R24 D1; distinct bundle ids, a keyCode→token table is speculative YAGNI); conflict
+detection is **intra-table only** — a collision with a fixed accelerator or a system
+shortcut is undetected (Swift's own blind spot); dispatch is a **whole-keymap
+rebuild** (`clear_key_bindings()` + re-`bind_keys` of the live 13 PLUS the PROTECTED
+non-rebindable set) rather than an `NSEvent` monitor (on the DO-NOT-PORT list — gpui
+has no per-binding remove at the pin, R24 D2); the persisted write form is the FULL
+13-entry map with explicit JSON `null` for unbound (load-equivalent to Swift's
+omit-unbound, R24 schema); the unregistered Settings window **quits-when-empty per
+R23 D7**; R23 ships an **inert smooth-scroll** toggle and **omits the handoff-skill
+toggle** (deferred); and R22 does **not auto-select an imported theme into the active
+slot** (Swift auto-selects) — import enters the catalog latent, the user picks it.
+Two dev-time carryovers: the managed Claude theme slug stays `nice-rs` (never
+clobbers the Swift app's live `custom:nice` sync) until the parity rename, and ⌘Z/⌘⇧Z
+are now genuinely rebindable (R20's app-wide-unconditional note is superseded here).
+**Scenario-suite diff (this tranche):** the new scenarios are `close-confirmation`
+(R20.5), `theme-fanout` (R21+R22), and `settings-window` (R23, extended by R24 with
+the s1–s3 recorder legs + the §6 composition legs); `multiwindow` stays registered
+last (unchanged); no other landed scenario's assertions changed. Milestone 6 ("full
+preferences parity minus Editors, by design") is ready for Nick's feel-check.
 
 Later cycles add scenarios by pushing onto the `Vec<Scenario>` returned from
 `crates/nice/src/app.rs`'s `selftest_scenarios()`. A `Cadence`-gated scenario

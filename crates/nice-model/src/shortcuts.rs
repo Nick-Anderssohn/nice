@@ -107,6 +107,37 @@ impl ShortcutAction {
             ShortcutAction::RedoFileOperation => "Redo file operation",
         }
     }
+
+    /// The stable string id for this action — the persistence key in the
+    /// `shortcuts` section of `ui_settings.json` and R24's binding-map key. Ported
+    /// verbatim from Swift's `ShortcutAction` `rawValue` (`enum ShortcutAction:
+    /// String`, `KeyboardShortcuts.swift:37-70`), so the two apps agree on the JSON
+    /// key even though their persisted VALUES (gpui token vs keyCode) diverge
+    /// deliberately. Adding a case here must add its id (and a defaults-table row).
+    pub fn id(self) -> &'static str {
+        match self {
+            ShortcutAction::NextSidebarTab => "nextSidebarTab",
+            ShortcutAction::PrevSidebarTab => "prevSidebarTab",
+            ShortcutAction::NextPane => "nextPane",
+            ShortcutAction::PrevPane => "prevPane",
+            ShortcutAction::NewTerminalPane => "newTerminalPane",
+            ShortcutAction::ToggleSidebar => "toggleSidebar",
+            ShortcutAction::ToggleSidebarMode => "toggleSidebarMode",
+            ShortcutAction::ToggleHiddenFiles => "toggleHiddenFiles",
+            ShortcutAction::IncreaseFontSize => "increaseFontSize",
+            ShortcutAction::DecreaseFontSize => "decreaseFontSize",
+            ShortcutAction::ResetFontSizes => "resetFontSizes",
+            ShortcutAction::UndoFileOperation => "undoFileOperation",
+            ShortcutAction::RedoFileOperation => "redoFileOperation",
+        }
+    }
+
+    /// The action for a stable string [`id`](ShortcutAction::id), or `None` for an
+    /// unknown id (the persistence load rule "an unknown action key ⇒ dropped
+    /// silently" — the store simply skips a key `from_id` rejects).
+    pub fn from_id(id: &str) -> Option<ShortcutAction> {
+        ShortcutAction::ALL.into_iter().find(|a| a.id() == id)
+    }
 }
 
 /// The four modifiers a shortcut can carry — the Rust mirror of Swift's
@@ -299,6 +330,121 @@ pub fn default_combo(action: ShortcutAction) -> Option<KeyCombo> {
         .map(|(_, c)| c)
 }
 
+/// An **owned** key combo — a [`Modifiers`] set plus an owned gpui key-token
+/// `String`. The mutable / persisted counterpart of [`KeyCombo`], whose `key` is a
+/// `&'static str` fixed at compile time by the defaults table. R24's binding store
+/// holds `OwnedCombo`s because a user-recorded or persisted chord is not `'static`.
+/// It carries the same canonical token format as [`KeyCombo::chord_str`], so the
+/// two interconvert losslessly ([`From<KeyCombo>`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OwnedCombo {
+    /// The modifier set held with the key.
+    pub modifiers: Modifiers,
+    /// The owned gpui key token (e.g. `"down"`, `"t"`, `"-"`, `"."`).
+    pub key: String,
+}
+
+impl From<KeyCombo> for OwnedCombo {
+    /// Own a static default combo (the seed for the mutable map from
+    /// [`default_bindings`]).
+    fn from(c: KeyCombo) -> Self {
+        Self {
+            modifiers: c.modifiers,
+            key: c.key.to_string(),
+        }
+    }
+}
+
+impl OwnedCombo {
+    /// The canonical gpui keystroke token for this combo — identical format to
+    /// [`KeyCombo::chord_str`]: the modifiers in the fixed `cmd`,`ctrl`,`alt`,
+    /// `shift` order (each with a trailing `-`) followed by the key token. This is
+    /// the exact string persisted in the `shortcuts` section and fed to
+    /// `gpui::KeyBinding` (e.g. `"cmd-alt-down"`, `"cmd--"`, `"cmd-shift-."`).
+    pub fn to_token(&self) -> String {
+        let mut s = String::new();
+        if self.modifiers.command {
+            s.push_str("cmd-");
+        }
+        if self.modifiers.control {
+            s.push_str("ctrl-");
+        }
+        if self.modifiers.alt {
+            s.push_str("alt-");
+        }
+        if self.modifiers.shift {
+            s.push_str("shift-");
+        }
+        s.push_str(&self.key);
+        s
+    }
+
+    /// Parse a canonical gpui keystroke token into an [`OwnedCombo`]. Strips the
+    /// four modifier prefixes (`cmd-` / `ctrl-` / `alt-` / `shift-`) off the front
+    /// in a loop, then takes whatever remains as the key token — so the trailing-`-`
+    /// minus (`"cmd--"` ⇒ key `"-"`) and the shifted period (`"cmd-shift-."` ⇒ key
+    /// `"."`) parse correctly. Returns `None` for an empty token or a token that is
+    /// all modifiers with no key (e.g. `""`, `"cmd-"`). Tolerant of modifier order
+    /// on input; [`to_token`](OwnedCombo::to_token) always re-emits canonical order.
+    /// Our key tokens never collide with a modifier name, so greedy stripping is
+    /// unambiguous.
+    pub fn from_token(token: &str) -> Option<Self> {
+        let mut rest = token;
+        let mut modifiers = Modifiers::default();
+        loop {
+            if let Some(r) = rest.strip_prefix("cmd-") {
+                modifiers.command = true;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("ctrl-") {
+                modifiers.control = true;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("alt-") {
+                modifiers.alt = true;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("shift-") {
+                modifiers.shift = true;
+                rest = r;
+            } else {
+                break;
+            }
+        }
+        if rest.is_empty() {
+            return None;
+        }
+        Some(Self {
+            modifiers,
+            key: rest.to_string(),
+        })
+    }
+}
+
+/// The OTHER rebindable action already bound to `combo`, or `None` if the combo is
+/// free within the table. **Intra-table only**, Swift's rule verbatim
+/// (`KeyboardShortcuts.swift:238-252`): it scans the 13-action `bindings`, skips
+/// `excluding` (so re-saving an action's own combo is not a self-conflict), and
+/// returns the first OTHER action whose bound combo equals `combo`. Modifier
+/// comparison is already masked to ⌃⌥⇧⌘ ([`Modifiers`] carries only those four).
+///
+/// It deliberately does NOT consider the fixed accelerators (⌘N / ⌃⌘F / ⌘, / ⌘Q /
+/// ⌘W) or system shortcuts — a collision with one of those is undetected, the same
+/// documented blind spot Swift has. `bindings` yields `(action, Option<&combo>)`;
+/// an unbound action (`None`) never conflicts.
+pub fn conflicting_action<'a>(
+    bindings: impl IntoIterator<Item = (ShortcutAction, Option<&'a OwnedCombo>)>,
+    combo: &OwnedCombo,
+    excluding: ShortcutAction,
+) -> Option<ShortcutAction> {
+    bindings.into_iter().find_map(|(action, bound)| {
+        if action == excluding {
+            return None;
+        }
+        match bound {
+            Some(c) if c == combo => Some(action),
+            _ => None,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +514,169 @@ mod tests {
         for action in ShortcutAction::ALL {
             assert!(!action.label().is_empty(), "{action:?} has a label");
         }
+    }
+
+    #[test]
+    fn action_ids_round_trip_and_are_distinct() {
+        // Every id maps back to its action, and the 13 ids are unique — the JSON
+        // key set the `shortcuts` persistence section is keyed by.
+        let mut ids = HashSet::new();
+        for action in ShortcutAction::ALL {
+            let id = action.id();
+            assert!(!id.is_empty(), "{action:?} has an id");
+            assert!(ids.insert(id), "id {id:?} is not unique");
+            assert_eq!(ShortcutAction::from_id(id), Some(action));
+        }
+        // A spot-check of the Swift rawValues (KeyboardShortcuts.swift:37-70).
+        assert_eq!(ShortcutAction::NewTerminalPane.id(), "newTerminalPane");
+        assert_eq!(ShortcutAction::UndoFileOperation.id(), "undoFileOperation");
+        // An unknown id is dropped (persistence load rule 3).
+        assert_eq!(ShortcutAction::from_id("notAnAction"), None);
+    }
+
+    /// Owned-combo ↔ token-string round-trip, covering the three format edge cases
+    /// the persistence schema names: the trailing-`-` minus (`cmd--`), the shifted
+    /// period (`cmd-shift-.`), and a modifier+arrow (`cmd-alt-down`). Also the
+    /// no-modifier and all-modifier cases.
+    #[test]
+    fn owned_combo_token_round_trip() {
+        let cases = [
+            ("cmd-alt-down", Modifiers::COMMAND_ALT, "down"),
+            ("cmd--", Modifiers::COMMAND, "-"),
+            ("cmd-shift-.", Modifiers::COMMAND_SHIFT, "."),
+            ("cmd-shift-z", Modifiers::COMMAND_SHIFT, "z"),
+            ("cmd-0", Modifiers::COMMAND, "0"),
+            (
+                "cmd-ctrl-alt-shift-t",
+                Modifiers {
+                    command: true,
+                    control: true,
+                    alt: true,
+                    shift: true,
+                },
+                "t",
+            ),
+            (
+                "-",
+                Modifiers::default(), // a bare key, no modifiers
+                "-",
+            ),
+        ];
+        for (token, modifiers, key) in cases {
+            let parsed = OwnedCombo::from_token(token).expect("token parses");
+            assert_eq!(parsed.modifiers, modifiers, "modifiers for {token:?}");
+            assert_eq!(parsed.key, key, "key for {token:?}");
+            // The canonical re-emission is exactly the input (all inputs canonical).
+            assert_eq!(parsed.to_token(), token, "round-trips to {token:?}");
+        }
+    }
+
+    /// Modifier order on INPUT is tolerated; output is canonical.
+    #[test]
+    fn from_token_tolerates_modifier_order() {
+        let parsed = OwnedCombo::from_token("shift-cmd-alt-down").unwrap();
+        assert_eq!(parsed.modifiers, {
+            let mut m = Modifiers::COMMAND_ALT;
+            m.shift = true;
+            m
+        });
+        assert_eq!(parsed.key, "down");
+        // Re-emitted in canonical cmd,ctrl,alt,shift order.
+        assert_eq!(parsed.to_token(), "cmd-alt-shift-down");
+    }
+
+    /// A token that is empty or all-modifiers-no-key is rejected.
+    #[test]
+    fn from_token_rejects_keyless() {
+        assert_eq!(OwnedCombo::from_token(""), None);
+        assert_eq!(OwnedCombo::from_token("cmd-"), None);
+        assert_eq!(OwnedCombo::from_token("cmd-shift-"), None);
+    }
+
+    /// Every default combo owns-and-round-trips through the token string — the
+    /// interchange the persistence layer writes.
+    #[test]
+    fn default_combos_own_and_round_trip() {
+        for (action, combo) in default_bindings() {
+            let owned = OwnedCombo::from(combo);
+            assert_eq!(owned.to_token(), combo.chord_str(), "{action:?} token");
+            assert_eq!(
+                OwnedCombo::from_token(&owned.to_token()),
+                Some(owned.clone()),
+                "{action:?} round-trips"
+            );
+        }
+    }
+
+    /// `conflicting_action` — Swift's intra-table rule
+    /// (`KeyboardShortcuts.swift:238-252`): a free combo → `None`; a combo held by
+    /// another action → that action; an action's OWN combo excluding itself →
+    /// `None` (re-saving is not a self-conflict); comparison is masked to ⌃⌥⇧⌘.
+    #[test]
+    fn conflicting_action_intra_table_rules() {
+        // The default map as an owned (action, Some(combo)) list.
+        let bindings: Vec<(ShortcutAction, Option<OwnedCombo>)> = default_bindings()
+            .into_iter()
+            .map(|(a, c)| (a, Some(OwnedCombo::from(c))))
+            .collect();
+        let view = || bindings.iter().map(|(a, c)| (*a, c.as_ref()));
+
+        // A distinct, unbound combo conflicts with nothing.
+        let free = OwnedCombo::from_token("cmd-y").unwrap();
+        assert_eq!(
+            conflicting_action(view(), &free, ShortcutAction::NewTerminalPane),
+            None
+        );
+
+        // `cmd-t` is NewTerminalPane's default. Asking on behalf of a DIFFERENT
+        // action (ToggleSidebar) finds the holder.
+        let cmd_t = OwnedCombo::from_token("cmd-t").unwrap();
+        assert_eq!(
+            conflicting_action(view(), &cmd_t, ShortcutAction::ToggleSidebar),
+            Some(ShortcutAction::NewTerminalPane)
+        );
+
+        // Re-saving NewTerminalPane's own combo, excluding itself, is not a
+        // self-conflict.
+        assert_eq!(
+            conflicting_action(view(), &cmd_t, ShortcutAction::NewTerminalPane),
+            None
+        );
+
+        // An unbound action never conflicts: drop NewTerminalPane's binding, then
+        // `cmd-t` is free.
+        let mut cleared = bindings.clone();
+        for (a, c) in cleared.iter_mut() {
+            if *a == ShortcutAction::NewTerminalPane {
+                *c = None;
+            }
+        }
+        assert_eq!(
+            conflicting_action(
+                cleared.iter().map(|(a, c)| (*a, c.as_ref())),
+                &cmd_t,
+                ShortcutAction::ToggleSidebar
+            ),
+            None
+        );
+    }
+
+    /// Conflict comparison is over the full masked `(modifiers, key)` pair: the
+    /// same key with a different modifier set does not conflict.
+    #[test]
+    fn conflicting_action_compares_modifiers() {
+        let bindings: Vec<(ShortcutAction, Option<OwnedCombo>)> = default_bindings()
+            .into_iter()
+            .map(|(a, c)| (a, Some(OwnedCombo::from(c))))
+            .collect();
+        let view = || bindings.iter().map(|(a, c)| (*a, c.as_ref()));
+
+        // NewTerminalPane holds plain `cmd-t`. `cmd-shift-t` shares the key but not
+        // the modifier set — no conflict.
+        let cmd_shift_t = OwnedCombo::from_token("cmd-shift-t").unwrap();
+        assert_eq!(
+            conflicting_action(view(), &cmd_shift_t, ShortcutAction::ToggleSidebar),
+            None
+        );
     }
 }

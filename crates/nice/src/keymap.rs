@@ -56,8 +56,8 @@
 //! layer — this layer never encodes.
 
 use gpui::{
-    Action, App, AppContext, Context, Entity, Global, KeyBinding, Modifiers, ModifiersChangedEvent,
-    PlatformKeyboardMapper,
+    Action, App, AppContext, Context, Entity, Global, InvalidKeystrokeError, KeyBinding, Modifiers,
+    ModifiersChangedEvent, PlatformKeyboardMapper,
 };
 
 use nice_model::shortcuts::{default_bindings, default_combo, ShortcutAction};
@@ -208,6 +208,93 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
         cx.keyboard_mapper().as_ref(),
     ));
     cx.bind_keys(bindings);
+}
+
+/// Rebuild the live gpui keymap from the current
+/// [`ShortcutBindings`](crate::shortcuts_store::ShortcutBindings) map (G7, D2) — the
+/// SOLE caller of `clear_key_bindings()` + `bind_keys(..)` on any binding change
+/// (boot-load, rebind, per-action reset). gpui has no per-binding remove; the only
+/// live-rebind primitive is a total clear followed by a re-bind of the full set
+/// (both queue `Effect::RefreshWindows`), so a single owner is the only way to keep
+/// the non-rebindable re-install honest.
+///
+/// It re-emits, on every rebuild:
+///
+/// * the 13 LIVE rebindable combos from the store (an unbound action is omitted; a
+///   persisted/user token that fails to parse is logged and skipped, never a panic
+///   — unlike the statically-valid defaults table); and
+/// * the PROTECTED non-rebindable set (see [`non_rebindable_bindings`]) — because
+///   `clear_key_bindings()` is TOTAL, it wipes those too, so they must be restored
+///   here or they vanish after the first rebind (the plan's biggest regression risk).
+///
+/// It does NOT re-register action handlers — those stay one-shot in
+/// [`install_shortcuts`] (double-registration double-fires). When no
+/// [`ShortcutBindings`](crate::shortcuts_store::ShortcutBindings) Global is installed
+/// (a scenario that never seeded it), the live combos fall back to the defaults
+/// table, so the rebuilt board matches the boot board.
+pub(crate) fn rebuild_keymap(cx: &mut App) {
+    let mapper = cx.keyboard_mapper().clone();
+    let mut bindings: Vec<KeyBinding> = Vec::new();
+
+    match cx.try_global::<crate::shortcuts_store::ShortcutBindings>() {
+        Some(store) => {
+            // Snapshot the live (action, token) pairs so the immutable store borrow
+            // ends before we build bindings and before the mutable clear/bind below.
+            let live: Vec<(ShortcutAction, String)> = ShortcutAction::ALL
+                .into_iter()
+                .filter_map(|action| store.binding(action).map(|c| (action, c.to_token())))
+                .collect();
+            for (action, token) in live {
+                match shortcut_binding(action, &token, mapper.as_ref()) {
+                    Ok(binding) => bindings.push(binding),
+                    Err(e) => eprintln!(
+                        "nice-rs: skipping unparseable shortcut token {token:?} for {action:?}: {e}"
+                    ),
+                }
+            }
+        }
+        // No store yet ⇒ the default board (the try_global-with-defaults idiom).
+        None => bindings.extend(table_bindings(cx)),
+    }
+
+    bindings.extend(non_rebindable_bindings(cx));
+
+    cx.clear_key_bindings();
+    cx.bind_keys(bindings);
+}
+
+/// The PROTECTED non-rebindable re-install set (R24 — getting this wrong is the
+/// plan's biggest regression risk). [`rebuild_keymap`]'s `clear_key_bindings()` is
+/// total — it wipes EVERY binding, not just the 13 — so each of these must be
+/// re-emitted on every rebuild exactly as its owner originally installed it
+/// (the `use_key_equivalents` bit differs per entry). A missing entry is a shipped
+/// regression caught by the dedicated re-install test.
+fn non_rebindable_bindings(cx: &App) -> Vec<KeyBinding> {
+    vec![
+        // 1. ⌃⌘F full screen — `load_binding` (`use_key_equivalents=true` + the
+        //    keyboard mapper), mirroring `install_shortcuts`.
+        load_binding(
+            "ctrl-cmd-f",
+            crate::app::ToggleFullScreen,
+            cx.keyboard_mapper().as_ref(),
+        ),
+        // 2. ⌘N new window — `KeyBinding::new`, `crate::app::install_new_window_command`.
+        KeyBinding::new("cmd-n", crate::app::NewWindow, None),
+        // 3. ⌘Q quit — `KeyBinding::new`, `crate::app::install_lifecycle_commands`.
+        KeyBinding::new("cmd-q", crate::app::Quit, None),
+        // 4. ⌘W close window — `KeyBinding::new`, same.
+        KeyBinding::new("cmd-w", crate::app::CloseWindow, None),
+        // 5. Esc collapse-sidebar-selection — `KeyBinding::new`, `Some("SidebarShell")`
+        //    context, `crate::sidebar_shell::install_sidebar_key_bindings`.
+        KeyBinding::new(
+            "escape",
+            crate::sidebar_shell::CollapseSidebarSelection,
+            Some("SidebarShell"),
+        ),
+        // 6. ⌘, open settings — `KeyBinding::new`, R23's
+        //    `crate::settings::window::install_open_settings_command`.
+        KeyBinding::new("cmd-,", crate::settings::window::OpenSettings, None),
+    ]
 }
 
 // -- handlers ----------------------------------------------------------------
@@ -375,34 +462,46 @@ fn table_bindings(cx: &App) -> Vec<KeyBinding> {
     let mapper = cx.keyboard_mapper().clone();
     default_bindings()
         .into_iter()
-        .map(|(action, combo)| shortcut_binding(action, &combo.chord_str(), mapper.as_ref()))
+        .map(|(action, combo)| {
+            // The default chords are static table data, so a parse failure is a
+            // programmer error — hence `expect`. (The LIVE path in `rebuild_keymap`
+            // instead logs-and-skips, since a persisted token is not statically valid.)
+            shortcut_binding(action, &combo.chord_str(), mapper.as_ref())
+                .expect("static default shortcut chord parses")
+        })
         .collect()
 }
 
-/// Map a [`ShortcutAction`] value to a [`KeyBinding`] for its gpui action struct.
-/// The one place the data table meets the compile-time action types; the
-/// exhaustive match makes a newly-added `ShortcutAction` a compile error until it
-/// is bound here.
+/// Build a [`KeyBinding`] for `action`'s gpui action struct from `chord`, with
+/// `use_key_equivalents` semantics and no context predicate (`None` = active in
+/// every dispatch context, like Swift's process-wide monitor). The one place the
+/// data table meets the compile-time action types; the exhaustive match makes a
+/// newly-added `ShortcutAction` a compile error until it is bound here.
+///
+/// Fallible: `chord` may be a user-recorded / persisted token (via the LIVE
+/// [`rebuild_keymap`] path), which is not statically guaranteed to parse. The
+/// caller decides — the static defaults path `expect`s, the live path logs-and-skips.
 fn shortcut_binding(
     action: ShortcutAction,
     chord: &str,
     mapper: &dyn PlatformKeyboardMapper,
-) -> KeyBinding {
-    match action {
-        ShortcutAction::NextSidebarTab => load_binding(chord, NextSidebarTab, mapper),
-        ShortcutAction::PrevSidebarTab => load_binding(chord, PrevSidebarTab, mapper),
-        ShortcutAction::NextPane => load_binding(chord, NextPane, mapper),
-        ShortcutAction::PrevPane => load_binding(chord, PrevPane, mapper),
-        ShortcutAction::NewTerminalPane => load_binding(chord, NewTerminalPane, mapper),
-        ShortcutAction::ToggleSidebar => load_binding(chord, ToggleSidebar, mapper),
-        ShortcutAction::ToggleSidebarMode => load_binding(chord, ToggleSidebarMode, mapper),
-        ShortcutAction::ToggleHiddenFiles => load_binding(chord, ToggleHiddenFiles, mapper),
-        ShortcutAction::IncreaseFontSize => load_binding(chord, IncreaseFontSize, mapper),
-        ShortcutAction::DecreaseFontSize => load_binding(chord, DecreaseFontSize, mapper),
-        ShortcutAction::ResetFontSizes => load_binding(chord, ResetFontSizes, mapper),
-        ShortcutAction::UndoFileOperation => load_binding(chord, UndoFileOperation, mapper),
-        ShortcutAction::RedoFileOperation => load_binding(chord, RedoFileOperation, mapper),
-    }
+) -> Result<KeyBinding, InvalidKeystrokeError> {
+    let boxed: Box<dyn Action> = match action {
+        ShortcutAction::NextSidebarTab => Box::new(NextSidebarTab),
+        ShortcutAction::PrevSidebarTab => Box::new(PrevSidebarTab),
+        ShortcutAction::NextPane => Box::new(NextPane),
+        ShortcutAction::PrevPane => Box::new(PrevPane),
+        ShortcutAction::NewTerminalPane => Box::new(NewTerminalPane),
+        ShortcutAction::ToggleSidebar => Box::new(ToggleSidebar),
+        ShortcutAction::ToggleSidebarMode => Box::new(ToggleSidebarMode),
+        ShortcutAction::ToggleHiddenFiles => Box::new(ToggleHiddenFiles),
+        ShortcutAction::IncreaseFontSize => Box::new(IncreaseFontSize),
+        ShortcutAction::DecreaseFontSize => Box::new(DecreaseFontSize),
+        ShortcutAction::ResetFontSizes => Box::new(ResetFontSizes),
+        ShortcutAction::UndoFileOperation => Box::new(UndoFileOperation),
+        ShortcutAction::RedoFileOperation => Box::new(RedoFileOperation),
+    };
+    KeyBinding::load(chord, boxed, None, true, None, mapper)
 }
 
 /// Build one keybinding with `use_key_equivalents = true` (the documented
@@ -438,20 +537,22 @@ pub(crate) fn on_window_modifiers_changed(event: &ModifiersChangedEvent, cx: &mu
     // cycle that mounts the overlay passes the real pin here (plan: "unless the
     // mouse is pinning the overlay" — R10's view-layer hover state).
     let mouse_pinned = false;
-    if should_end_peek(event.modifiers, peek_relevant_modifiers(), mouse_pinned) {
+    if should_end_peek(event.modifiers, peek_relevant_modifiers(cx), mouse_pinned) {
         state.update(cx, |s, _cx| s.sidebar.end_sidebar_peek());
     }
 }
 
 /// The union of the two sidebar-tab-cycle shortcuts' modifier sets (⌘⌥ by
-/// default) — the modifiers whose full release ends a peek. Read from the
-/// defaults table (Swift reads the live bindings; R24's rebinding will make this
-/// read the user's combos).
-fn peek_relevant_modifiers() -> Modifiers {
+/// default) — the modifiers whose full release ends a peek. Reads the LIVE
+/// bindings (D4): rebinding a sidebar-nav chord to a different modifier set must
+/// re-point the peek at the NEW modifiers, else the overlay watches the wrong keys
+/// (the landed TODO). Falls back to the defaults when no store Global is installed
+/// (a scenario that never seeded it); an unbound sidebar-tab action contributes no
+/// modifiers.
+fn peek_relevant_modifiers(cx: &App) -> Modifiers {
     let mut relevant = Modifiers::default();
     for action in [ShortcutAction::NextSidebarTab, ShortcutAction::PrevSidebarTab] {
-        if let Some(combo) = default_combo(action) {
-            let m = combo.modifiers;
+        if let Some(m) = live_combo_modifiers(cx, action) {
             relevant.control |= m.control;
             relevant.alt |= m.alt;
             relevant.shift |= m.shift;
@@ -459,6 +560,17 @@ fn peek_relevant_modifiers() -> Modifiers {
         }
     }
     relevant
+}
+
+/// The modifier set of `action`'s LIVE combo, read from the
+/// [`ShortcutBindings`](crate::shortcuts_store::ShortcutBindings) Global (D4). An
+/// unbound action yields `None`. Falls back to `action`'s default combo when no
+/// store Global is installed, so peek behaves identically pre-store-seed.
+fn live_combo_modifiers(cx: &App, action: ShortcutAction) -> Option<nice_model::shortcuts::Modifiers> {
+    match cx.try_global::<crate::shortcuts_store::ShortcutBindings>() {
+        Some(store) => store.binding(action).map(|c| c.modifiers),
+        None => default_combo(action).map(|c| c.modifiers),
+    }
 }
 
 /// Pure peek-clear decision: end the peek when none of the `relevant` modifiers
@@ -478,6 +590,8 @@ fn should_end_peek(current: Modifiers, relevant: Modifiers, mouse_pinned: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shortcuts_store::ShortcutBindings;
+    use nice_model::shortcuts::OwnedCombo;
 
     /// gpui `Modifiers` with only the given flags set (helper for the peek tests).
     fn mods(control: bool, alt: bool, shift: bool, platform: bool) -> Modifiers {
@@ -490,19 +604,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn peek_relevant_modifiers_are_command_alt() {
-        // The default sidebar-tab combos are both ⌘⌥, so the peek is held open by
-        // ⌘ or ⌥ (and nothing else).
-        let r = peek_relevant_modifiers();
-        assert!(r.platform, "⌘ holds the peek");
-        assert!(r.alt, "⌥ holds the peek");
-        assert!(!r.control && !r.shift, "no other modifier holds the peek");
+    /// ⌘⌥ — the default sidebar-tab-cycle modifier set the `should_end_peek` tests
+    /// exercise (equivalent to `peek_relevant_modifiers` with no store installed).
+    fn command_alt() -> Modifiers {
+        mods(false, true, false, true)
+    }
+
+    /// A unique `ui_settings.json` temp path for a store the gpui tests install.
+    /// The store's persist is fail-soft, but a real, unique path keeps the write a
+    /// no-op collision-free (never the real support root — hermeticity).
+    fn unique_temp_ui_settings(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nice-keymap-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("ui_settings.json")
     }
 
     #[test]
     fn peek_stays_while_any_relevant_modifier_is_held() {
-        let relevant = peek_relevant_modifiers(); // ⌘⌥
+        let relevant = command_alt(); // ⌘⌥
         // Both held → stays.
         assert!(!should_end_peek(mods(false, true, false, true), relevant, false));
         // Only ⌘ still held (⌥ released) → stays (Swift keeps it until BOTH lift).
@@ -513,7 +638,7 @@ mod tests {
 
     #[test]
     fn peek_ends_when_all_relevant_modifiers_release() {
-        let relevant = peek_relevant_modifiers();
+        let relevant = command_alt();
         // Nothing held → end.
         assert!(should_end_peek(mods(false, false, false, false), relevant, false));
         // An unrelated modifier (⇧ / ⌃) held but neither ⌘ nor ⌥ → still end.
@@ -524,7 +649,83 @@ mod tests {
     fn mouse_pin_keeps_the_peek_even_with_no_modifiers() {
         // The pointer pinning the overlay wins over modifier release (dossier
         // G6 / R10's hover pin) — never ends while pinned.
-        let relevant = peek_relevant_modifiers();
+        let relevant = command_alt();
         assert!(!should_end_peek(mods(false, false, false, false), relevant, true));
+    }
+
+    /// D4 / Validation §2a(e): `peek_relevant_modifiers` reads the LIVE map. With no
+    /// store it falls back to the ⌘⌥ defaults; after rebinding a sidebar-tab chord to
+    /// a ⌃⇧ combo the relevant set tracks the NEW modifiers (unioned with the other,
+    /// still-default sidebar-tab combo).
+    #[gpui::test]
+    fn peek_relevant_modifiers_default_then_live(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            // No store yet ⇒ the defaults: both sidebar-tab combos are ⌘⌥.
+            let r = peek_relevant_modifiers(cx);
+            assert!(r.platform && r.alt, "⌘⌥ hold the peek by default");
+            assert!(!r.control && !r.shift, "no other modifier holds the peek by default");
+
+            cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("peek-live")));
+            // Rebind NextSidebarTab ⌘⌥↓ -> ⌃⇧↓ (persist + rebuild happen inside).
+            ShortcutBindings::set_binding(
+                cx,
+                ShortcutAction::NextSidebarTab,
+                OwnedCombo::from_token("ctrl-shift-down"),
+            );
+
+            let r = peek_relevant_modifiers(cx);
+            assert!(r.control, "the rebound ⌃ now holds the peek");
+            assert!(r.shift, "the rebound ⇧ now holds the peek");
+            // PrevSidebarTab is still ⌘⌥, so ⌘⌥ remain relevant too (the union).
+            assert!(r.platform && r.alt, "the other sidebar-tab combo keeps ⌘⌥ relevant");
+        });
+    }
+
+    /// The non-rebindable re-install audit (the plan's biggest-regression test,
+    /// Validation §3). After a rebind + `rebuild_keymap` (both driven by
+    /// `set_binding`), EVERY PROTECTED non-rebindable chord (⌃⌘F, ⌘N, ⌘Q, ⌘W,
+    /// Esc@SidebarShell, ⌘,) is still present in the keymap — the total
+    /// `clear_key_bindings()` must not have dropped them — AND the new live chord is
+    /// bound to `NewTerminalPane` while the old default `cmd-t` is not.
+    #[gpui::test]
+    fn rebuild_keeps_non_rebindables_and_swaps_live_combo(cx: &mut gpui::TestAppContext) {
+        use gpui::Keystroke;
+
+        cx.update(|cx| {
+            cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings(
+                "non-rebindable",
+            )));
+            // Rebind NewTerminalPane ⌘T -> ⌘Y; set_binding persists then rebuilds.
+            ShortcutBindings::set_binding(
+                cx,
+                ShortcutAction::NewTerminalPane,
+                OwnedCombo::from_token("cmd-y"),
+            );
+
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            // A binding for `action` whose (single) keystroke exactly matches `chord`.
+            let bound = |action: &dyn Action, chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .bindings_for_action(action)
+                    .any(|b| matches!(b.match_keystrokes(std::slice::from_ref(&ks)), Some(false)))
+            };
+
+            // Every PROTECTED non-rebindable survives the total clear.
+            assert!(bound(&crate::app::ToggleFullScreen, "ctrl-cmd-f"), "⌃⌘F re-installed");
+            assert!(bound(&crate::app::NewWindow, "cmd-n"), "⌘N re-installed");
+            assert!(bound(&crate::app::Quit, "cmd-q"), "⌘Q re-installed");
+            assert!(bound(&crate::app::CloseWindow, "cmd-w"), "⌘W re-installed");
+            assert!(
+                bound(&crate::sidebar_shell::CollapseSidebarSelection, "escape"),
+                "Esc@SidebarShell re-installed"
+            );
+            assert!(bound(&crate::settings::window::OpenSettings, "cmd-,"), "⌘, re-installed");
+
+            // The rebound live combo is bound; the old default is gone.
+            assert!(bound(&NewTerminalPane, "cmd-y"), "the new ⌘Y drives NewTerminalPane");
+            assert!(!bound(&NewTerminalPane, "cmd-t"), "the old ⌘T no longer drives NewTerminalPane");
+        });
     }
 }
