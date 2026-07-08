@@ -181,6 +181,11 @@ pub(crate) struct ContextMenu {
     /// When set, the panel caps its height and the item list scrolls (long
     /// dropdown lists, e.g. every installed font family).
     max_height: Option<Pixels>,
+    /// Which corner of the menu sits at `position` (default top-left — the
+    /// context-menu click point). A settings dropdown passes top-right with the
+    /// trigger's bottom-right so the menu right-aligns to its button, the
+    /// NSPopUpButton attachment. `anchored` still flips it to stay on-screen.
+    anchor_corner: gpui::Anchor,
 }
 
 impl ContextMenu {
@@ -203,6 +208,7 @@ impl ContextMenu {
             focus_handle,
             min_width: px(CONTEXT_MENU_MIN_WIDTH),
             max_height: None,
+            anchor_corner: gpui::Anchor::TopLeft,
         }
     }
 
@@ -215,6 +221,12 @@ impl ContextMenu {
     /// Cap the panel height; overflowing items scroll.
     pub(crate) fn with_max_height(mut self, height: Pixels) -> Self {
         self.max_height = Some(height);
+        self
+    }
+
+    /// Put this corner of the menu at the anchor position (see `anchor_corner`).
+    pub(crate) fn with_anchor_corner(mut self, corner: gpui::Anchor) -> Self {
+        self.anchor_corner = corner;
         self
     }
 
@@ -360,7 +372,13 @@ impl Render for ContextMenu {
 
         // Anchor at the click point (flipping corners to stay on-screen), and
         // defer so the popup paints above all ancestors and sidebar chrome.
-        deferred(anchored().position(self.position).child(panel)).with_priority(CONTEXT_MENU_PRIORITY)
+        deferred(
+            anchored()
+                .position(self.position)
+                .anchor(self.anchor_corner)
+                .child(panel),
+        )
+        .with_priority(CONTEXT_MENU_PRIORITY)
     }
 }
 

@@ -23,6 +23,8 @@ pub(crate) fn about_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.0))
         .gap(px(4.0))
         .child(setting_title("About", cx))
         .child(

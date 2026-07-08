@@ -157,6 +157,8 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     let mut col = div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.0))
         .child(setting_title("Font", cx));
 
     // --- Terminal font family ---------------------------------------------

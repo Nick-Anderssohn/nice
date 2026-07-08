@@ -335,6 +335,8 @@ pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     let mut col = div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.0))
         .child(setting_title("Shortcuts", cx))
         .child(
             div()

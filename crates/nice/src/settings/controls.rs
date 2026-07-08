@@ -227,7 +227,9 @@ pub(crate) fn dropdown(
 /// The menu-position + sizing knobs [`SettingsRootView::toggle_dropdown`] uses —
 /// re-exported here so the geometry lives beside the trigger that produces it.
 pub(crate) fn menu_position_for(trigger_bounds: Bounds<Pixels>) -> gpui::Point<Pixels> {
-    trigger_bounds.bottom_left() + gpui::point(px(0.0), px(DROPDOWN_MENU_GAP))
+    // Bottom-RIGHT: the menu's top-right corner sits here (Corner::TopRight),
+    // right-aligning the popup to its trigger like NSPopUpButton.
+    trigger_bounds.bottom_right() + gpui::point(px(0.0), px(DROPDOWN_MENU_GAP))
 }
 
 /// The menu height cap (see [`DROPDOWN_MENU_MAX_HEIGHT`]).
@@ -259,14 +261,14 @@ mod tests {
     }
 
     #[test]
-    fn menu_anchors_under_the_trigger_bottom_left() {
+    fn menu_anchors_under_the_trigger_bottom_right() {
         let bounds = Bounds {
             origin: point(px(100.0), px(50.0)),
             size: gpui::size(px(120.0), px(24.0)),
         };
         assert_eq!(
             menu_position_for(bounds),
-            point(px(100.0), px(50.0 + 24.0 + DROPDOWN_MENU_GAP))
+            point(px(100.0 + 120.0), px(50.0 + 24.0 + DROPDOWN_MENU_GAP))
         );
     }
 }

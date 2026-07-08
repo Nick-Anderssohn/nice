@@ -12,7 +12,7 @@
 //! [`sync_claude_live_arm`]'s off→on colors-file write no-ops — it never touches
 //! the real `~/.claude` — leaving the gate flip as the clean assertion.
 
-use gpui::{div, prelude::*, AnyElement, App, Window};
+use gpui::{px, div, prelude::*, AnyElement, App, Window};
 
 use crate::settings::controls::toggle_switch;
 use crate::settings::root::{setting_row, setting_title};
@@ -48,6 +48,8 @@ pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.0))
         .child(setting_title("Claude", cx))
         .child(setting_row(
             "Sync Claude Code theme",

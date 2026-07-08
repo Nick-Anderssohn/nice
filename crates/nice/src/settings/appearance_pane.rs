@@ -251,6 +251,8 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     let mut col = div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.0))
         .child(setting_title("Appearance", cx));
 
     // --- Sync with OS ------------------------------------------------------

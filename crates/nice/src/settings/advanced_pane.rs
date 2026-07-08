@@ -3,7 +3,7 @@
 //! scroll-animation backend is deferred `nice-term-*` feel work; the toggle
 //! persists to `advanced.smooth_scroll` but has no rendering effect this cycle).
 
-use gpui::{div, prelude::*, AnyElement, App, Window};
+use gpui::{px, div, prelude::*, AnyElement, App, Window};
 
 use crate::settings::controls::toggle_switch;
 use crate::settings::prefs_store::SettingsPrefsStore;
@@ -33,6 +33,8 @@ pub(crate) fn advanced_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.0))
         .child(setting_title("Advanced", cx))
         .child(setting_row(
             "Smooth scrolling",

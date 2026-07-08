@@ -148,6 +148,7 @@ impl SettingsRootView {
             ContextMenu::new(controls::menu_position_for(trigger_bounds), menu_items, window, cx)
                 .with_min_width(trigger_bounds.size.width)
                 .with_max_height(controls::menu_max_height())
+                .with_anchor_corner(gpui::Anchor::TopRight)
         });
         let sub = cx.subscribe_in(
             &menu,
@@ -250,6 +251,10 @@ impl Render for SettingsRootView {
                 div()
                     .flex()
                     .flex_col()
+                    // Fill the scroll container's width (never its max-content):
+                    // without this, one over-wide row widens the whole column and
+                    // every control's shared right edge clips past the window.
+                    .w_full()
                     .px(px(24.0))
                     .py(px(18.0))
                     .child(render_section(self.active.clone(), window, cx)),
@@ -340,7 +345,9 @@ pub(crate) fn setting_row(
     cx: &App,
 ) -> impl IntoElement {
     let slots = crate::theme_settings::active_chrome_slots(cx);
-    let mut label_col = div().flex().flex_col().flex_1().gap(px(2.0)).child(
+    // `min_w(0)` lets the label column shrink below its text's natural width
+    // (the hint then wraps) instead of pushing the control past the right edge.
+    let mut label_col = div().flex().flex_col().flex_1().min_w(px(0.0)).gap(px(2.0)).child(
         div()
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -358,6 +365,10 @@ pub(crate) fn setting_row(
     div()
         .flex()
         .flex_row()
+        // Fill the pane column and never let the row's own min-content (long
+        // hint text) widen it past the window (`min_w(0)` kills the floor).
+        .w_full()
+        .min_w(px(0.0))
         .items_center()
         .gap(px(12.0))
         .py(px(10.0))
