@@ -59,15 +59,15 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, linear_color_stop, linear_gradient, point, prelude::*, px, App, Bounds, BoxShadow, Context,
-    DismissEvent, Entity, FocusHandle, Focusable, FontWeight, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, SharedString, Subscription,
-    Window,
+    DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable, FontWeight, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, SharedString,
+    Subscription, Window,
 };
 
 use nice_model::file_browser::TextFieldEditor;
 use nice_model::{
-    center_offset_x, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry, Tab,
-    TabStatus,
+    center_offset_x, resolve, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry,
+    Tab, TabStatus,
 };
 use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 use nice_theme::palette::Slots;
@@ -296,6 +296,53 @@ struct PaneVm {
     is_editing: bool,
 }
 
+// ---- Pill drag (R25 reorder) ------------------------------------------------
+
+/// The value a pill drag carries: just the dragged pane id and the tab it lives
+/// in (D3). `'static`, no pasteboard/string encoding — this is a purely in-app
+/// `gpui` drag payload, the type gate `on_drop::<PaneDragPayload>` matches on.
+/// Carrying `tab_id` makes the drop's `move_pane` robust to any active-tab change
+/// mid-drag. R25 is reorder-within-one-strip only: the CUT cross-window path's
+/// `PaneDragOrigin.sourceWindowSessionId` / `sourceIndex` are deliberately absent
+/// (scope fence).
+#[derive(Clone)]
+struct PaneDragPayload {
+    pane_id: SharedString,
+    tab_id: SharedString,
+}
+
+/// The drag "ghost" that follows the cursor: a simplified pill chip (icon-less
+/// title at the pill's radius/height, reduced opacity), NOT a bitmap snapshot
+/// (D4). gpui positions it under the cursor automatically, so it does not
+/// position itself.
+struct PaneDragGhost {
+    title: SharedString,
+}
+
+impl Render for PaneDragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = active_slots(cx);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(PILL_HEIGHT))
+            .max_w(px(PILL_MAX_WIDTH))
+            .pl(px(PILL_LEADING_PAD))
+            .pr(px(PILL_TRAILING_PAD))
+            .rounded(px(PILL_RADIUS))
+            .bg(slot_to_rgba(s.panel))
+            .border_1()
+            .border_color(slot_to_rgba(s.line))
+            .opacity(0.85)
+            .text_size(px(PILL_TEXT_SIZE))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(slot_to_rgba(s.ink))
+            .whitespace_nowrap()
+            .child(self.title.clone())
+    }
+}
+
 // ---- The view ---------------------------------------------------------------
 
 /// The per-window toolbar (brand block + pane strip). Construct with
@@ -352,6 +399,14 @@ pub(crate) struct WindowToolbarView {
 
     /// Empty-band window-drag press origin (R9 band pattern), not yet a drag.
     band_press: Option<Point<Pixels>>,
+
+    /// The pill-reorder drop slot the cursor currently resolves to, already gated
+    /// through [`TabModel::would_move_pane`] (a no-op slot resolves to `None`, D7).
+    /// Recomputed in the scroll row's `on_drag_move` and cleared on drop / when the
+    /// cursor leaves the strip (D8). The insertion line reads it, gated additionally
+    /// on `cx.has_active_drag()` so a dropped-nowhere release drops the line the same
+    /// frame (D10). `None` whenever no pill drag is in flight.
+    drag_target: Option<(String, bool)>,
     /// Root focus handle (hosts the toolbar key context).
     focus_handle: FocusHandle,
     /// The window's pane-content host, wired by `crate::app::build_window_root`
@@ -395,6 +450,7 @@ impl WindowToolbarView {
             last_active_pane: None,
             center_pending: false,
             band_press: None,
+            drag_target: None,
             focus_handle: cx.focus_handle(),
             pane_host: None,
             focus_bounce_sub: None,
@@ -912,6 +968,109 @@ impl WindowToolbarView {
             )
     }
 
+    // MARK: - Pill reorder (R25)
+
+    /// The scroll row's `on_drag_move`: recompute the gated drop slot while a pill
+    /// drag is in flight. Fires in the Capture phase for EVERY window mouse-move
+    /// while a `PaneDragPayload` is dragging — including over the terminal body
+    /// below the strip — so it FIRST guards strip containment (the port of Swift's
+    /// `dropExited`, `WindowToolbarView.swift:529-536`): a cursor outside the row's
+    /// hitbox clears `drag_target` and returns, else the row-only x-resolver would
+    /// paint an insertion line while dragging straight down into the terminal (D8).
+    /// When contained, the cursor's viewport-relative x is `position.x -
+    /// bounds.origin.x` (the row IS the tracked viewport, so `bounds.origin.x ==
+    /// viewport_left`), fed with the model pane order + viewport-relative frames to
+    /// the pure [`resolve`], whose `would_move` gate closes over
+    /// [`TabModel::would_move_pane`]. The result (a no-op slot resolves to `None`)
+    /// is stored for the drop to read (D9).
+    fn on_pill_drag_move(
+        &mut self,
+        event: &DragMoveEvent<PaneDragPayload>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Containment guard (dropExited port): a cursor outside the strip clears
+        // any pending slot so the line does not linger while dragging into the
+        // terminal body.
+        if !event.bounds.contains(&event.event.position) {
+            if self.drag_target.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let payload = event.drag(cx).clone();
+        let dragged = payload.pane_id.to_string();
+        let tab_id = payload.tab_id.to_string();
+        let x_rel = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+        let pane_order = self.pane_ids(cx);
+        let frames = self.strip_geometry(cx).pane_frames;
+        let new_target = {
+            let ws = self.state.read(cx);
+            resolve(&dragged, x_rel, &pane_order, &frames, |target, place_after| {
+                ws.model.would_move_pane(&dragged, &tab_id, target, place_after)
+            })
+        };
+        if self.drag_target != new_target {
+            self.drag_target = new_target;
+            cx.notify();
+        }
+    }
+
+    /// The scroll row's `on_drop`: commit the reorder to the slot the last
+    /// `on_drag_move` resolved (D9). Reads the stored `drag_target` (the mouse-up
+    /// carries no position), calls [`TabModel::move_pane`] synchronously — gpui
+    /// clears `active_drag` itself after this listener, so no deferral is needed —
+    /// then persists explicitly via [`WindowState::save_to_store`] (D5: the
+    /// `on_tree_mutation` observer is wired nowhere, so a reorder would not
+    /// otherwise save). Selection/focus are untouched (`move_pane` never touches
+    /// `active_pane_id`). A drop resolving to `None` (a horizontal inter-pill gap,
+    /// or a no-op slot) just clears the field.
+    fn on_pill_drop(&mut self, payload: &PaneDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((target, place_after)) = self.drag_target.take() {
+            let dragged = payload.pane_id.to_string();
+            let tab_id = payload.tab_id.to_string();
+            self.state.update(cx, |ws, _| {
+                ws.model.move_pane(&dragged, &tab_id, &target, place_after);
+                ws.save_to_store();
+            });
+        }
+        cx.notify();
+    }
+
+    /// The reorder insertion line: a 2pt vertical accent bar at the resolved target
+    /// slot's edge, an absolute child of `scroll_wrap` (D10). `edge_x` is the target
+    /// frame's leading edge (`place_after == false`) or trailing edge (`== true`),
+    /// read from the viewport-relative `pane_frames`. Painted only while
+    /// `drag_target` is set AND gpui still has an active drag — the `has_active_drag`
+    /// conjunct drops the line the instant a dropped-nowhere mouse-up clears
+    /// `active_drag`, even if a stale `drag_target` somehow survived. Because
+    /// `drag_target` is already `would_move_pane`-gated, no line shows for a no-op
+    /// slot. Pure paint: no id, no listeners.
+    fn insertion_line(&self, cx: &App) -> Option<gpui::AnyElement> {
+        if !cx.has_active_drag() {
+            return None;
+        }
+        let (target, place_after) = self.drag_target.as_ref()?;
+        let frames = self.strip_geometry(cx).pane_frames;
+        let frame = frames.get(target)?;
+        let edge_x = if *place_after {
+            frame.max_x()
+        } else {
+            frame.min_x()
+        };
+        let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
+        Some(
+            div()
+                .absolute()
+                .left(px(edge_x - 1.0))
+                .top_0()
+                .w(px(2.0))
+                .h(px(PILL_HEIGHT))
+                .bg(accent)
+                .into_any_element(),
+        )
+    }
+
     /// The pill strip: a horizontally-scrolling row of pills (flex-filling), then
     /// the always-reserved chevron slot, then the always-visible `+`.
     fn render_strip(&self, panes: &[PaneVm], s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
@@ -919,8 +1078,18 @@ impl WindowToolbarView {
         let show_chevron = self.show_chevron(cx);
         let has_attention = self.has_offscreen_attention(cx);
 
+        // The active tab id — captured once and threaded into each pill's drag
+        // payload (D3) so the drop's `move_pane` is robust to any active-tab change
+        // mid-drag.
+        let tab_id = self.active_tab_id(cx).unwrap_or_default();
+
         // The tracked scroll viewport (fixed width — the two trailing slots are
-        // always reserved) hosting the pill row.
+        // always reserved) hosting the pill row. It is ALSO the drop target: the
+        // row is the tracked viewport whose `bounds.origin.x == viewport_left`, so
+        // `on_drag_move` here yields a valid viewport-relative `x_rel` (a
+        // pill-attached mover would see the pill's own hitbox bounds instead —
+        // D8). `on_drag_move` recomputes the gated `drag_target`; `on_drop` commits
+        // it. Both key on the `PaneDragPayload` type; no `can_drop` predicate.
         let mut row = div()
             .id("toolbar.paneStrip")
             .track_scroll(&self.scroll)
@@ -929,13 +1098,18 @@ impl WindowToolbarView {
             .flex_row()
             .items_center()
             .gap(px(PILL_ROW_GAP))
-            .size_full();
+            .size_full()
+            .on_drag_move(cx.listener(Self::on_pill_drag_move))
+            .on_drop(cx.listener(Self::on_pill_drop));
         for vm in panes {
-            row = row.child(self.render_pill(vm, s, cx));
+            row = row.child(self.render_pill(vm, &tab_id, s, cx));
         }
 
         // The scroll wrapper carries the two edge fades as absolute overlays so
-        // they sit at the viewport's own leading / trailing edges.
+        // they sit at the viewport's own leading / trailing edges. It is also the
+        // viewport-fixed host for the reorder insertion line (D10): `scroll_wrap`'s
+        // origin is the viewport left, and `pane_frames` are viewport-relative, so
+        // the line's x is directly the target frame edge.
         let scroll_wrap = div()
             .relative()
             .flex_1()
@@ -947,7 +1121,8 @@ impl WindowToolbarView {
             })
             .when(geometry.can_scroll_trailing(), |el| {
                 el.child(self.edge_fade(true, s))
-            });
+            })
+            .children(self.insertion_line(cx));
 
         div()
             .flex_1()
@@ -991,7 +1166,7 @@ impl WindowToolbarView {
         }
     }
 
-    fn render_pill(&self, vm: &PaneVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_pill(&self, vm: &PaneVm, tab_id: &str, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = crate::theme_settings::active_chrome_accent(cx);
         let is_active = vm.is_active;
         let ink = slot_to_rgba(s.ink);
@@ -1112,7 +1287,19 @@ impl WindowToolbarView {
         let pid_menu = vm.id.clone();
         let kind = vm.kind;
 
+        // The stable per-pane element id the drag arms from (D11, exported
+        // contract `toolbar.pill.<pane_id>`). No `aria_label` — tests drive by
+        // geometry, not AX.
+        let pill_id = SharedString::from(format!("toolbar.pill.{}", vm.id));
+        // The drag payload (D3) + the ghost title (D4). Captured at drag start.
+        let drag_payload = PaneDragPayload {
+            pane_id: SharedString::from(vm.id.clone()),
+            tab_id: SharedString::from(tab_id.to_string()),
+        };
+        let ghost_title = SharedString::from(vm.title.clone());
+
         let mut pill = div()
+            .id(pill_id)
             .flex()
             .flex_row()
             .items_center()
@@ -1128,6 +1315,17 @@ impl WindowToolbarView {
             .child(leading)
             .child(title)
             .child(close)
+            // The pill carries `.id()` + `on_drag` ONLY — `on_drag_move` / `on_drop`
+            // live on the scroll row (the tracked viewport, D8). The ghost follows
+            // the cursor (gpui positions it), so it ignores the constructor's
+            // `Point` offset. Coexists with the mouse-down select below: gpui's
+            // drag-arming recorder is a separate window-level listener keyed on the
+            // hitbox hover, not this element's handler (D6, proven by the F9 file
+            // drag).
+            .on_drag(drag_payload, move |_payload, _offset, _window, app| {
+                let title = ghost_title.clone();
+                app.new(|_| PaneDragGhost { title })
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
@@ -1404,6 +1602,13 @@ impl WindowToolbarView {
     pub(crate) fn active_pane_id(&self, cx: &App) -> Option<String> {
         self.active_tab(cx)
             .and_then(|t| t.active_pane_id.clone())
+    }
+
+    /// The current pill-reorder drop slot `(target_pane_id, place_after)` — the
+    /// gated `drag_target` (D7), the deterministic slot the in-process reorder
+    /// itests assert against and the live scenario can read.
+    pub(crate) fn scenario_drag_target(&self) -> Option<(String, bool)> {
+        self.drag_target.clone()
     }
 
     /// Whether the overflow chevron currently renders.

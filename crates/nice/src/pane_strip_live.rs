@@ -23,6 +23,14 @@
 //!     `CGEventPostToPid` does not move. This is "R9's contract still holds with
 //!     pills present," ground-truthed on a real frame — the same honest-deferral
 //!     `chrome_live` / `sidebar_live` use for synthetic mouse gestures.
+//!   * **§3 pill reorder (R25).** A CGEvent press-drag of the `p1` pill leftward
+//!     past `p0`'s midpoint reorders it BEFORE `p0` (`pane_ids()` flips to
+//!     `[p1, p0]`) and commits + persists via `move_pane` + `save_to_store` —
+//!     hard-asserted only when the press is shown to have LANDED (the drag
+//!     selected `p1`, the same landed-gate the drag differential uses), else
+//!     DEFERRED (a `CGEventPostToPid` press need not land on a gpui hitbox; the
+//!     deterministic reorder is pinned in-process by `nice-itests`). It never
+//!     reads a vacuous "order unchanged" as a pass.
 //!   * **§3 overflow chevron (real layout).** After enough panes are added to
 //!     overflow the reserved-width viewport, the chevron renders — asserted HARD
 //!     from the view's own real-layout predicate on a REAL on-screen window (the
@@ -62,6 +70,11 @@ use crate::window_state::WindowState;
 const DRAG_DX: f64 = 48.0;
 /// A frame delta (pt) below which the window is considered "unchanged".
 const FRAME_EPS: f64 = 4.0;
+/// How far LEFT of `p0`'s centre the reorder release lands. A pill's centre IS
+/// its midpoint, and the resolver flips on `x > mid_x`, so releasing a few pt
+/// left of centre resolves to the before-`p0` slot (`place_after == false`)
+/// while staying inside `p0`'s frame.
+const REORDER_BEFORE_MARGIN: f64 = 15.0;
 /// How many terminal panes to add so the strip overflows its viewport and the
 /// chevron shows (comfortably past the ~780pt viewport with ~130pt pills).
 const OVERFLOW_ADDS: usize = 8;
@@ -165,6 +178,9 @@ async fn run_pane_strip(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarVi
 
     // §3 — the drag differential (pill press does not move + selects; band drag does).
     drag_differential(cx, whandle, &view, pid, &mut failures, &mut deferred).await;
+
+    // §3 — pill reorder (R25): drag p1 before p0 and assert the model reordered.
+    reorder_leg(cx, whandle, &view, pid, &mut failures, &mut deferred).await;
 
     // §3 — overflow chevron (real layout) + centering + menu-opens.
     overflow_checks(cx, whandle, &view, pid, &mut failures, &mut deferred).await;
@@ -289,6 +305,116 @@ async fn do_cg_drag(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarView>,
     platform::post_left_mouse_up(pid, gx + DRAG_DX, gy, 1);
 }
 
+// ---- §3 pill reorder (R25) -------------------------------------------------
+
+/// Drag the `p1` pill leftward past `p0`'s midpoint and assert the model
+/// reorders it BEFORE `p0` — but only when the press is shown to have LANDED
+/// (the drag selected `p1`), the same honest-deferral the drag differential
+/// uses. A synthetic `CGEventPostToPid` press need not land on a gpui hitbox, so
+/// a non-landing press DEFERS rather than reading a vacuous "order unchanged" as
+/// a pass; the deterministic reorder proof lives in-process (`nice-itests`).
+async fn reorder_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<WindowToolbarView>,
+    view: &Entity<WindowToolbarView>,
+    pid: i32,
+    failures: &mut Vec<String>,
+    deferred: &mut Vec<String>,
+) {
+    // Reset the active pane to p0 so a landed press on p1 flips active p0→p1 —
+    // the delivery signal (`move_pane` never touches `active_pane_id`, so the
+    // flip evidences the PRESS landing, not the reorder). The toolbar IS this
+    // scenario window's root view, so drive it through the root-update context.
+    let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
+    settle(cx, 250).await;
+
+    let order_before = read_order(cx, view);
+    if order_before.len() != 2 || order_before[0].as_str() != "p0" || order_before[1].as_str() != "p1" {
+        // A prior leg left the strip in an unexpected order — DEFER rather than
+        // assert against a moving target (should not happen: the earlier legs
+        // are order-preserving no-ops).
+        deferred.push(format!(
+            "reorder: expected the strip to read [p0, p1] before the reorder drag but it read \
+             {order_before:?} — skipping the reorder leg (a prior leg perturbed the order)"
+        ));
+        return;
+    }
+
+    let start = read_pill_center(cx, view, "p1");
+    let target = read_pill_center(cx, view, "p0");
+    let (Some((sx, sy)), Some((tx, ty))) = (start, target) else {
+        failures.push(
+            "reorder: p0/p1 pills were not laid out (no bounds) — cannot post the reorder drag"
+                .to_string(),
+        );
+        return;
+    };
+    // Release LEFT of p0's midpoint (its centre IS the midpoint) so the resolver
+    // yields the before-p0 slot (`place_after == false`).
+    let end_x = tx - REORDER_BEFORE_MARGIN;
+
+    let active_before = read_active(cx, view);
+    do_cg_drag_between(cx, whandle, pid, sx, sy, end_x, ty).await;
+    settle(cx, 400).await;
+    let active_after = read_active(cx, view);
+    let order_after = read_order(cx, view);
+
+    let landed = active_before.as_deref() != Some("p1") && active_after.as_deref() == Some("p1");
+    if landed {
+        let reordered = order_after.len() == 2
+            && order_after[0].as_str() == "p1"
+            && order_after[1].as_str() == "p0";
+        if reordered {
+            eprintln!(
+                "[selftest] pane-strip reorder: dragged p1 before p0 — the strip now reads [p1, p0] \
+                 (move_pane committed + save_to_store persisted; active stays p1)"
+            );
+        } else {
+            failures.push(format!(
+                "reorder: the press landed (p1 selected) but the strip order is {order_after:?}, not \
+                 [p1, p0] — dragging p1 left past p0's midpoint must reorder it before p0"
+            ));
+        }
+    } else {
+        deferred.push(format!(
+            "reorder: the synthetic press did not register on p1's pill (active {active_after:?}, was \
+             {active_before:?}) — a CGEventPostToPid mouse event need not land on a gpui hitbox. \
+             DEFERRED to a human drag; the deterministic reorder (move over B past its midpoint → \
+             order changes) is hard-asserted in-process (nice-itests)."
+        ));
+    }
+    let _ = cx.update(|app| app.activate(true));
+    settle(cx, 200).await;
+}
+
+/// Post a synthetic left press-drag from content point `(sx, sy)` to `(ex, ey)`
+/// — down, arm, 8 interpolated drag steps, release at the end — for the reorder
+/// leg. Unlike [`do_cg_drag`]'s fixed rightward nudge, this lands on a chosen
+/// target so the drop resolves to a specific slot.
+async fn do_cg_drag_between(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<WindowToolbarView>,
+    pid: i32,
+    sx: f64,
+    sy: f64,
+    ex: f64,
+    ey: f64,
+) {
+    let g0 = to_global(cx, whandle, sx, sy);
+    let g1 = to_global(cx, whandle, ex, ey);
+    let (Some((gx0, gy0)), Some((gx1, gy1))) = (g0, g1) else {
+        return;
+    };
+    platform::post_left_mouse_down(pid, gx0, gy0, 1);
+    settle(cx, 90).await;
+    let steps = 8;
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        platform::post_left_mouse_dragged(pid, gx0 + (gx1 - gx0) * t, gy0 + (gy1 - gy0) * t);
+    }
+    platform::post_left_mouse_up(pid, gx1, gy1, 1);
+}
+
 // ---- §3 overflow: chevron + centering + menu-opens -------------------------
 
 async fn overflow_checks(
@@ -374,6 +500,11 @@ async fn overflow_checks(
 
 fn read_active(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>) -> Option<String> {
     view.update(cx, |v, cx| v.active_pane_id(cx))
+}
+
+/// The strip's current pane order (`pane_ids()`), the reorder assertion surface.
+fn read_order(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>) -> Vec<String> {
+    view.update(cx, |v, cx| v.pane_ids(cx))
 }
 
 fn read_bool(

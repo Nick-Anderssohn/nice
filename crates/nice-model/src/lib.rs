@@ -123,6 +123,7 @@
 
 pub mod file_browser;
 mod pane;
+mod pane_strip_drop;
 mod persisted;
 mod project;
 pub mod rename_gate;
@@ -134,6 +135,7 @@ mod tab;
 mod tab_model;
 
 pub use pane::{Pane, PaneKind, TabStatus};
+pub use pane_strip_drop::{pane_target, resolve};
 pub use persisted::{snapshot_projects, PersistedPane, PersistedProject, PersistedTab};
 pub use project::Project;
 pub use rename_gate::InlineRenameClickGate;

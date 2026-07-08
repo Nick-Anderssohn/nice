@@ -47,14 +47,14 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, point, prelude::*, px, Bounds, Context, Entity, IntoElement, Modifiers, MouseButton,
-    MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString, TestAppContext,
+    div, point, prelude::*, px, Bounds, Context, DragMoveEvent, Entity, IntoElement, Modifiers,
+    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString, TestAppContext,
     VisualTestContext, Window,
 };
 
 use nice_model::{
-    center_offset_x, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry, Tab,
-    TabModel, TabStatus,
+    center_offset_x, resolve, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry,
+    Tab, TabModel, TabStatus,
 };
 
 // ---- Geometry (deterministic, fixed-width pills) ----------------------------
@@ -106,6 +106,32 @@ fn viewport_relative_rect(item_left: f32, item_width: f32, offset_x: f32, viewpo
     Rect::new(item_left + offset_x - viewport_left, item_width)
 }
 
+// ---- Pill drag (R25 reorder) mirror -----------------------------------------
+
+/// Mirror of the shipped `PaneDragPayload` (`toolbar.rs`, D3): the dragged pane id
+/// + its tab, the type gate `on_drop::<PaneDragPayload>` matches on. The shipped
+/// type is private to the `nice` binary (which this dev crate cannot import), so
+/// the probe carries its own structurally-identical payload — the drag wiring
+/// under test is the arming + resolve + move, not the type name.
+#[derive(Clone)]
+struct PaneDragPayload {
+    pane_id: SharedString,
+    tab_id: SharedString,
+}
+
+/// The cursor-following drag ghost (mirror of the shipped `PaneDragGhost`, D4). Its
+/// paint is irrelevant to these behaviour tests — only that a drag armed and a
+/// ghost view exists — so it renders a bare title box.
+struct DragGhost {
+    title: SharedString,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().child(self.title.clone())
+    }
+}
+
 // ---- The probe --------------------------------------------------------------
 
 /// A flat pane strip mirroring `WindowToolbarView`'s real-layout logic over the
@@ -130,6 +156,11 @@ struct PaneStripProbe {
     draft: String,
     /// Monotonic id source for added panes (mirrors `ModelPaneStripActions`).
     next_id: u64,
+    /// The gated pill-reorder drop slot (mirror of the view's `drag_target`, D7):
+    /// `(target_pane_id, place_after)`, already filtered through
+    /// [`TabModel::would_move_pane`]. Recomputed in `on_pill_drag_move`, cleared on
+    /// drop / strip exit.
+    drag_target: Option<(String, bool)>,
 }
 
 impl PaneStripProbe {
@@ -143,6 +174,7 @@ impl PaneStripProbe {
             editing_pane: None,
             draft: String::new(),
             next_id: 0,
+            drag_target: None,
         }
     }
 
@@ -312,6 +344,54 @@ impl PaneStripProbe {
         cx.stop_propagation();
     }
 
+    /// The scroll row's `on_drag_move` (mirror of the view's `on_pill_drag_move`,
+    /// D8): guard strip containment (the `dropExited` port), else recompute the
+    /// gated drop slot from the cursor's viewport-relative x + the model order +
+    /// the viewport-relative frames, through the pure [`resolve`] whose `would_move`
+    /// gate closes over [`TabModel::would_move_pane`].
+    fn on_pill_drag_move(
+        &mut self,
+        event: &DragMoveEvent<PaneDragPayload>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.bounds.contains(&event.event.position) {
+            if self.drag_target.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let payload = event.drag(cx).clone();
+        let dragged = payload.pane_id.to_string();
+        let tab_id = payload.tab_id.to_string();
+        let x_rel = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+        let pane_order = self.pane_ids();
+        let frames = self.strip_geometry().pane_frames;
+        let new_target = {
+            let model = &self.model;
+            resolve(&dragged, x_rel, &pane_order, &frames, |target, place_after| {
+                model.would_move_pane(&dragged, &tab_id, target, place_after)
+            })
+        };
+        if self.drag_target != new_target {
+            self.drag_target = new_target;
+            cx.notify();
+        }
+    }
+
+    /// The scroll row's `on_drop` (mirror of the view's `on_pill_drop`, D9): commit
+    /// the reorder to the stored slot via [`TabModel::move_pane`] synchronously,
+    /// then clear the field. (The view also calls `save_to_store`; the probe has no
+    /// store, matching the isolated-scenario contract.)
+    fn on_pill_drop(&mut self, payload: &PaneDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((target, place_after)) = self.drag_target.take() {
+            let dragged = payload.pane_id.to_string();
+            let tab_id = payload.tab_id.to_string();
+            self.model.move_pane(&dragged, &tab_id, &target, place_after);
+        }
+        cx.notify();
+    }
+
     // ---- render ------------------------------------------------------------
 
     fn pill(&self, pane: &Pane, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -337,7 +417,19 @@ impl PaneStripProbe {
             close = close.opacity(0.0);
         }
 
+        // The stable per-pane element id the drag arms from + the drag payload +
+        // ghost title (mirror of the view's `.id()` + `on_drag`, D3/D4/D11). The
+        // `.id()` also persists the pill's `pending_mouse_down` element-state across
+        // frames — which is what lets a press-then-move arm the drag.
+        let pill_id = SharedString::from(format!("probe.pill.{}", pane.id));
+        let payload = PaneDragPayload {
+            pane_id: SharedString::from(pane.id.clone()),
+            tab_id: SharedString::from(self.tab_id.clone()),
+        };
+        let ghost_title = SharedString::from(pane.title.clone());
+
         div()
+            .id(pill_id)
             .flex_none()
             .flex()
             .flex_row()
@@ -346,6 +438,11 @@ impl PaneStripProbe {
             .pl(px(PILL_PAD_L))
             .pr(px(PILL_PAD_R))
             .h(px(PILL_H))
+            // Pill carries `.id()` + `on_drag` ONLY (the row owns move/drop, D8).
+            .on_drag(payload, move |_p, _off, _w, app| {
+                let title = ghost_title.clone();
+                app.new(|_| DragGhost { title })
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
@@ -379,7 +476,11 @@ impl Render for PaneStripProbe {
             .flex_row()
             .items_center()
             .gap(px(ROW_GAP))
-            .size_full();
+            .size_full()
+            // The row is the drop target (mirror of the view, D8/D9): `on_drag_move`
+            // recomputes the gated slot, `on_drop` commits it.
+            .on_drag_move(cx.listener(Self::on_pill_drag_move))
+            .on_drop(cx.listener(Self::on_pill_drop));
         for pane in &panes {
             row = row.child(self.pill(pane, cx));
         }
@@ -459,6 +560,41 @@ fn pill_center(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pane
         let off = p.scroll.offset().x;
         point(b.origin.x + off + b.size.width / 2.0, b.origin.y + b.size.height / 2.0)
     })
+}
+
+/// An on-screen point at horizontal fraction `frac` across a pill's laid-out
+/// width (y at its vertical centre): `frac == 0.5` is the centre (exactly the
+/// pill's `mid_x`, so the bare `x > mid_x` split lands `place_after == false`),
+/// `> 0.5` the right half (`place_after == true`), `< 0.5` the left half.
+fn pill_point_at(
+    probe: &Entity<PaneStripProbe>,
+    vcx: &mut VisualTestContext,
+    pane_id: &str,
+    frac: f32,
+) -> Point<Pixels> {
+    probe.read_with(vcx, |p, _| {
+        let b = p.pill_bounds(pane_id).expect("pill laid out");
+        let off = p.scroll.offset().x;
+        point(b.origin.x + off + b.size.width * frac, b.origin.y + b.size.height / 2.0)
+    })
+}
+
+/// Arm a pill drag: press at pane `pane_id`'s centre, then move past the 2pt
+/// `DRAG_THRESHOLD` so gpui's window-level recorder promotes the pending press to
+/// an `active_drag` (records `pending_mouse_down` on the pill's persisted
+/// element-state, then arms on the move). Returns whether the drag armed.
+fn arm_pill_drag(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pane_id: &str) -> bool {
+    let start = pill_point_at(probe, vcx, pane_id, 0.5);
+    vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    // A move well past the 2pt threshold arms the drag.
+    vcx.simulate_mouse_move(
+        point(start.x + px(6.0), start.y),
+        Some(MouseButton::Left),
+        Modifiers::none(),
+    );
+    vcx.run_until_parked();
+    vcx.update(|_window, cx| cx.has_active_drag())
 }
 
 /// The on-screen centre of a pill's ✕ slot (its trailing reserved square).
@@ -728,6 +864,179 @@ fn close_click_closes_without_activating_and_body_click_activates(cx: &mut TestA
     let b = pill_center(&probe, vcx, "p1");
     vcx.simulate_click(b, Modifiers::none());
     assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p1"), "a body click activates the pill");
+}
+
+// ============================================================================
+// pill drag reorder (R25): arms alongside select, resolves + commits a slot,
+// suppresses no-ops, and clears on strip exit
+// ============================================================================
+
+/// D6 (land FIRST): adding `.id()` + `on_drag` to the pill does NOT break the
+/// mouse-down select — a press-then-move > 2pt ARMS a drag (an `active_drag` /
+/// ghost appears), while a plain press-release with NO move still select-only's
+/// and never reorders. gpui's drag-arming recorder is a separate window-level
+/// listener keyed on the hitbox hover, so it coexists with the pill's own
+/// `stop_propagation` mouse-down.
+#[gpui::test]
+fn drag_arms_alongside_select_and_plain_click_still_selects(cx: &mut TestAppContext) {
+    let (model, tab_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+
+    // A press-then-move past the threshold arms a drag.
+    let armed = arm_pill_drag(&probe, vcx, "p1");
+    assert!(armed, "a press-then-move > 2pt arms a pill drag (active_drag present)");
+    // Order untouched by merely arming — no drop yet.
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "arming a drag does not reorder");
+    // Release to clear the drag before the next leg.
+    let here = pill_point_at(&probe, vcx, "p1", 0.5);
+    vcx.simulate_mouse_up(here, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert!(!vcx.update(|_w, cx| cx.has_active_drag()), "the drag cleared on mouse-up");
+
+    // A plain click (down→up, no move) on a different pill still select-only's and
+    // never reorders.
+    let center = pill_center(&probe, vcx, "p2");
+    vcx.simulate_click(center, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p2"), "a plain click still selects");
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "a plain click never reorders");
+}
+
+/// End-to-end reorder: arm a drag on a NON-active pill, move over another pill
+/// past its `mid_x` (→ `place_after == true`), assert the resolved
+/// `drag_target`, drop, and assert the order changed with the active pane
+/// unchanged (`move_pane` never touches `active_pane_id`).
+#[gpui::test]
+fn drag_reorder_after_slot_moves_pane_and_keeps_active(cx: &mut TestAppContext) {
+    let (model, tab_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+
+    // Drag p1 (non-active) onto p2's right half.
+    assert!(arm_pill_drag(&probe, vcx, "p1"), "drag arms");
+    let over_p2_right = pill_point_at(&probe, vcx, "p2", 0.75);
+    vcx.simulate_mouse_move(over_p2_right, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        read(&probe, vcx, |p| p.drag_target.clone()),
+        Some(("p2".to_string(), true)),
+        "over p2's right half resolves to (p2, place_after=true)"
+    );
+
+    vcx.simulate_mouse_up(over_p2_right, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p2", "p1"], "p1 moved after p2");
+    // The press that began the drag selects the pressed pill (real pill behavior);
+    // `move_pane` then leaves that active pane put — it never shuffles the active
+    // id. (The "active pane truly unchanged by the move alone" isolation is the
+    // active-pill case, which drags the already-active pill.)
+    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p1"), "the move leaves the active pane put");
+    assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "drag_target cleared after drop");
+}
+
+/// The before-slot mirror: dropping a pill on a target's LEFT half
+/// (`place_after == false`) lands it before that target. p2 dragged onto p1's
+/// left half is a real move (p2 is not already before p1).
+#[gpui::test]
+fn drag_reorder_before_slot_lands_pane_before_target(cx: &mut TestAppContext) {
+    let (model, tab_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+
+    assert!(arm_pill_drag(&probe, vcx, "p2"), "drag arms");
+    let over_p1_left = pill_point_at(&probe, vcx, "p1", 0.25);
+    vcx.simulate_mouse_move(over_p1_left, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        read(&probe, vcx, |p| p.drag_target.clone()),
+        Some(("p1".to_string(), false)),
+        "over p1's left half resolves to (p1, place_after=false)"
+    );
+
+    vcx.simulate_mouse_up(over_p1_left, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p2", "p1"], "p2 moved before p1");
+}
+
+/// No-op suppression (the `would_move_pane` gate): dropping a pill onto ITSELF, or
+/// into the adjacent slot it already occupies, resolves `drag_target` to `None`
+/// and never reorders. p0→before-p1 is the adjacent no-op (p0 is already there).
+#[gpui::test]
+fn drag_no_op_slots_are_suppressed(cx: &mut TestAppContext) {
+    let (model, tab_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+
+    // Self-drop: drag p1, hover its own centre — target == dragged, gated out.
+    assert!(arm_pill_drag(&probe, vcx, "p1"), "drag arms");
+    let over_self = pill_point_at(&probe, vcx, "p1", 0.75);
+    vcx.simulate_mouse_move(over_self, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "a self-drop resolves to no slot");
+    vcx.simulate_mouse_up(over_self, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "self-drop reorders nothing");
+
+    // Adjacent no-op: drag p0 onto p1's left half — p0 is already immediately
+    // before p1, so the move would not change order.
+    assert!(arm_pill_drag(&probe, vcx, "p0"), "drag arms");
+    let over_p1_left = pill_point_at(&probe, vcx, "p1", 0.25);
+    vcx.simulate_mouse_move(over_p1_left, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "the adjacent slot is a no-op, gated out");
+    vcx.simulate_mouse_up(over_p1_left, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "the adjacent no-op reorders nothing");
+}
+
+/// Vertical exit / dropped-nowhere (D8 `dropExited` port + D10 gate): resolve a
+/// slot over a pill, then move the cursor BELOW the strip (outside the row's
+/// bounds) → `drag_target` clears to `None`; releasing there reorders nothing.
+#[gpui::test]
+fn drag_vertical_exit_clears_target_and_release_is_a_no_op(cx: &mut TestAppContext) {
+    let (model, tab_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+
+    assert!(arm_pill_drag(&probe, vcx, "p1"), "drag arms");
+    let over_p2_right = pill_point_at(&probe, vcx, "p2", 0.75);
+    vcx.simulate_mouse_move(over_p2_right, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        read(&probe, vcx, |p| p.drag_target.clone()),
+        Some(("p2".to_string(), true)),
+        "a slot resolves while over the strip"
+    );
+
+    // Drag straight down into the terminal body (well below the 28pt strip): the
+    // containment guard clears the pending slot so no line lingers.
+    let below = point(over_p2_right.x, over_p2_right.y + px(200.0));
+    vcx.simulate_mouse_move(below, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "leaving the strip vertically clears the slot");
+
+    // Releasing over nothing reorders nothing and clears the drag.
+    vcx.simulate_mouse_up(below, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "a dropped-nowhere release is a no-op");
+    assert!(!vcx.update(|_w, cx| cx.has_active_drag()), "gpui cleared the drag on the outside mouse-up");
+    assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "no slot survives the release");
+}
+
+/// Dragging the ACTIVE pill reorders it and keeps it active (`move_pane` never
+/// touches `active_pane_id`).
+#[gpui::test]
+fn dragging_the_active_pill_reorders_and_keeps_it_active(cx: &mut TestAppContext) {
+    let (model, tab_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+
+    // Drag the active p0 onto p2's right half.
+    assert!(arm_pill_drag(&probe, vcx, "p0"), "drag arms on the active pill");
+    let over_p2_right = pill_point_at(&probe, vcx, "p2", 0.75);
+    vcx.simulate_mouse_move(over_p2_right, Some(MouseButton::Left), Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), Some(("p2".to_string(), true)));
+
+    vcx.simulate_mouse_up(over_p2_right, MouseButton::Left, Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p1", "p2", "p0"], "the active pill moved to the end");
+    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p0"), "it is still active after the move");
 }
 
 // ============================================================================
