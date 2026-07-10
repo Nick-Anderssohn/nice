@@ -2049,22 +2049,32 @@ fn render_row(
     if row.is_cut {
         el = el.opacity(0.45);
     }
-    // Disclosure slot (chevron for dirs; blank for files). Decorative — a plain
-    // click anywhere on a folder row already toggles expansion (the router's
-    // primary action), so the chevron needs no separate handler.
-    let chevron = if is_dir {
-        SharedString::from(if row.is_expanded { CHEVRON_OPEN } else { CHEVRON_CLOSED })
-    } else {
-        SharedString::from("")
-    };
+    // Disclosure slot (chevron for dirs; blank 12px spacer for files so names
+    // stay aligned). Decorative — a plain click anywhere on a folder row
+    // already toggles expansion (the router's primary action), so the chevron
+    // needs no separate handler. Prod parity (FileBrowserView.swift:581-592):
+    // SF Symbol chevron.right at 10pt semibold, 0.7 opacity, rotated 90° when
+    // expanded — rendered here as a chevron.right/chevron.down glyph swap,
+    // matching this file's existing chevron idiom.
+    let mut disclosure = div().w(px(DISCLOSURE_SLOT)).flex().justify_center();
+    if is_dir {
+        let (symbol, fallback) = if row.is_expanded {
+            ("chevron.down", CHEVRON_OPEN)
+        } else {
+            ("chevron.right", CHEVRON_CLOSED)
+        };
+        disclosure = disclosure.opacity(0.7).child(sf_symbol_icon(
+            symbol,
+            fallback,
+            10.0,
+            SymbolWeight::Semibold,
+            c.ink2,
+            scale,
+            app,
+        ));
+    }
     el = el
-        .child(
-            div()
-                .w(px(DISCLOSURE_SLOT))
-                .text_size(px(9.0))
-                .text_color(c.ink2)
-                .child(chevron),
-        )
+        .child(disclosure)
         .child(
             div()
                 .w(px(ICON_FRAME))
@@ -2084,8 +2094,15 @@ fn render_row(
             Some(spans) => {
                 render_rename_field(spans, rename_focus, weak.clone(), c, probe.clone())
             }
+            // min_w_0 lets the flex item shrink below the name's intrinsic
+            // width; middle truncation matches prod
+            // (FileBrowserView.swift:914-918, `.truncationMode(.middle)`).
             None => div()
                 .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_middle()
                 .text_size(px(NAME_SIZE))
                 .text_color(c.ink)
                 .child(SharedString::from(row.name.clone()))
