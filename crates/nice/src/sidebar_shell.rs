@@ -42,7 +42,12 @@
 //!     click-away and cancel on Esc.
 //!
 //! The S7 drag-reorder machinery (`SidebarDragState`, the drop delegates, the
-//! insertion line) is **excluded, not missing** — R25 owns it.
+//! insertion line) is ported here with gpui's own drag pipeline (M7.8 feel-check
+//! round 2): rows arm an [`TabDragPayload`] drag via `on_drag`, each project
+//! group's container hosts `on_drag_move`/`on_drop` with bounds-containment
+//! clearing (the R25 listener split), and [`tab_drop_target`] is the pure
+//! midpoint resolver (`SidebarDropResolver.tabTarget`,
+//! `SidebarView.swift:994-1013`).
 //!
 //! ## Icons
 //!
@@ -61,15 +66,16 @@
 // this module's unit tests.
 #![allow(dead_code)]
 
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, point, prelude::*, px, AnyView, App, BoxShadow, Context, CursorStyle, DismissEvent, Entity,
-    FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, SharedString, Subscription, Window,
+    div, point, prelude::*, px, AnyView, App, BoxShadow, ClickEvent, Context, CursorStyle,
+    DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable, FontWeight, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
+    SharedString, Subscription, Window,
 };
 
 use nice_model::file_browser::TextFieldEditor;
@@ -135,6 +141,24 @@ const TOP_STRIP_CONTROLS_TOP: f32 = 8.0;
 /// The mode/collapse toggles' trailing offset (`AppShellView.swift:813`).
 const TOP_STRIP_CONTROLS_TRAILING: f32 = 10.0;
 
+// ---- Text line heights (AppKit parity) --------------------------------------
+//
+// gpui's default line height is `phi()` (≈1.618× the font size), which inflates
+// every content-sized sidebar box: a 13px row title gets a ~21px line box where
+// AppKit/SwiftUI gives the 13pt system font a 16pt line
+// (`NSLayoutManager.defaultLineHeight`), making RS rows ~33px tall vs prod's
+// 28pt. These are the measured `defaultLineHeight(for: .systemFont(ofSize:))`
+// values for the sizes the sidebar uses; each is scaled through
+// [`sidebar_pt`](SidebarShellView::sidebar_pt) alongside its font size.
+
+/// Line height for the 13pt row title (row = max(16, 16+4) + 8 = 28pt, the
+/// Swift TabRow height).
+const LINE_HEIGHT_13: f32 = 16.0;
+/// Line height for the 12pt group-header name.
+const LINE_HEIGHT_12: f32 = 15.0;
+/// Line height for the 10pt chevron glyph / count-pill text.
+const LINE_HEIGHT_10: f32 = 12.0;
+
 // ---- Icons (SF Symbols + their Unicode fallbacks — see module docs) ---------
 
 const ICON_CHEVRON_CLOSED: &str = "\u{25B8}"; // ▸ (disclosure — stays a glyph swap)
@@ -198,6 +222,42 @@ fn disclosure_glyph(is_open: bool) -> &'static str {
     } else {
         ICON_CHEVRON_CLOSED
     }
+}
+
+/// Pick the row slot a cursor y points at within a project group: above the
+/// first row (the header area) → before it; below the last row (the trailing
+/// gap) → after it; over a row → midpoint split; no match → `None`. The pure
+/// port of `SidebarDropResolver.tabTarget` (`SidebarView.swift:994-1013`).
+/// `frames` are each painted row's `(min_y, max_y)` in the same coordinate
+/// space as `y` (window coords here); a collapsed group paints no rows, so its
+/// ids have no frames and every branch misses — same net `nil` as Swift's
+/// empty `tabFrames` snapshot.
+fn tab_drop_target(
+    y: f32,
+    tab_order: &[String],
+    frames: &HashMap<String, (f32, f32)>,
+) -> Option<(String, bool)> {
+    let first = tab_order.first()?;
+    if let Some(&(min_y, _)) = frames.get(first) {
+        if y < min_y {
+            return Some((first.clone(), false));
+        }
+    }
+    if let Some(last) = tab_order.last() {
+        if let Some(&(_, max_y)) = frames.get(last) {
+            if y > max_y {
+                return Some((last.clone(), true));
+            }
+        }
+    }
+    for id in tab_order {
+        if let Some(&(min_y, max_y)) = frames.get(id) {
+            if y >= min_y && y <= max_y {
+                return Some((id.clone(), y > (min_y + max_y) / 2.0));
+            }
+        }
+    }
+    None
 }
 
 // ---- Colour helpers (Nice/Dark; the SidebarBackground palette seam) ----------
@@ -280,6 +340,64 @@ struct GroupVm {
     tabs: Vec<TabVm>,
 }
 
+// ---- Row drag (the S7 sidebar reorder, ported on the R25 pattern) -----------
+
+/// The value a sidebar row drag carries: just the dragged tab id (Swift stashes
+/// it in `SidebarDragState` + an `NSItemProvider`, `SidebarView.swift:654-657`;
+/// here it is a purely in-app gpui payload the `on_drop::<TabDragPayload>` type
+/// gate matches on). Same-project-only is enforced by the model
+/// ([`TabModel::would_move_tab`] refuses cross-project targets), not the
+/// payload.
+#[derive(Clone)]
+struct TabDragPayload {
+    tab_id: SharedString,
+}
+
+/// The drag ghost that follows the cursor: a simplified row chip (title only,
+/// reduced opacity) — the R25 `PaneDragGhost` pattern, not a bitmap snapshot.
+/// gpui positions it under the cursor automatically.
+struct TabRowDragGhost {
+    title: SharedString,
+}
+
+impl Render for TabRowDragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = active_slots(cx);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(24.0))
+            .max_w(px(200.0))
+            .px(px(10.0))
+            .rounded(px(4.0))
+            .bg(slot_to_rgba(s.panel))
+            .border_1()
+            .border_color(slot_to_rgba(s.line))
+            .opacity(0.85)
+            .text_size(px(13.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(slot_to_rgba(s.ink))
+            .whitespace_nowrap()
+            .truncate()
+            .child(self.title.clone())
+    }
+}
+
+/// Where the reorder insertion line paints: the owning project group, the
+/// already-gated slot, and the line's group-relative y (the target row's top or
+/// bottom edge). Single-valued on the view so only one group ever paints a line
+/// at a time — a new group's `on_drag_move` writing it implicitly clears any
+/// stale line in another group (Swift's single-valued `SidebarDropTarget`,
+/// `SidebarView.swift:823-831`).
+#[derive(Clone, PartialEq)]
+struct SidebarDropTarget {
+    project_id: String,
+    target_tab_id: String,
+    place_after: bool,
+    line_y: f32,
+}
+
 // ---- The view ---------------------------------------------------------------
 
 /// The per-window sessions-mode sidebar shell. Construct with
@@ -324,6 +442,21 @@ pub(crate) struct SidebarShellView {
     collapsed_projects: HashSet<String>,
     /// The project whose header is hovered (reveals its `+` button).
     hovered_project: Option<String>,
+
+    /// Per-paint window-coord vertical extents `(min_y, max_y)` of each painted
+    /// tab row, keyed by tab id — the Swift `TabFramesKey` preference analog
+    /// (`SidebarView.swift:805-810`), written by a canvas probe inside each row
+    /// and cleared at the top of every render so closed tabs / collapsed groups
+    /// can't leave stale frames.
+    row_frames: Rc<RefCell<HashMap<String, (f32, f32)>>>,
+    /// The row-reorder drop slot the cursor currently resolves to, already gated
+    /// through [`TabModel::would_move_tab`] (a no-op / cross-project slot
+    /// resolves to `None`). Recomputed in each group's `on_drag_move`, cleared
+    /// on drop / when the cursor leaves the owning group (the R25 `drag_target`
+    /// pattern + Swift's `dropExited`). The insertion line reads it, gated
+    /// additionally on `cx.has_active_drag()` so a dropped-nowhere release
+    /// drops the line the same frame.
+    drag_target: Option<SidebarDropTarget>,
 
     /// The tab currently being inline-renamed, if any.
     editing_tab_id: Option<String>,
@@ -415,6 +548,8 @@ impl SidebarShellView {
             band_press: None,
             collapsed_projects: HashSet::new(),
             hovered_project: None,
+            row_frames: Rc::new(RefCell::new(HashMap::new())),
+            drag_target: None,
             editing_tab_id: None,
             rename_editor: None,
             rename_probe: Rc::new(Cell::new(FieldProbe::default())),
@@ -779,6 +914,122 @@ impl SidebarShellView {
             // Nothing to collapse — let Esc reach the focused terminal.
             cx.propagate();
         }
+    }
+
+    // MARK: - Row drag-reorder (`ProjectGroupDropDelegate` port, R25 pattern)
+
+    /// A group container's `on_drag_move`: recompute the gated drop slot while a
+    /// row drag is in flight. Fires for EVERY window mouse-move while a
+    /// [`TabDragPayload`] drags — including over other groups and the pane body —
+    /// so it FIRST guards containment (the port of Swift's `dropExited`,
+    /// `SidebarView.swift:888-896`, and R25's D8): a cursor outside this group
+    /// clears only a slot this group owns (another group's `on_drag_move` may
+    /// already have overwritten it — Swift's `ownsCurrentIndicator`). When
+    /// contained, the cursor's window y is resolved against this group's painted
+    /// row frames ([`tab_drop_target`], midpoint rule) and gated through
+    /// [`TabModel::would_move_tab`] — cross-project and no-op slots resolve to
+    /// `None`, so no line paints and a drop is a no-op (prod's `dropUpdated`
+    /// proposing `.forbidden`).
+    fn on_tab_drag_move(
+        &mut self,
+        group_id: &str,
+        event: &DragMoveEvent<TabDragPayload>,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.bounds.contains(&event.event.position) {
+            if self
+                .drag_target
+                .as_ref()
+                .is_some_and(|t| t.project_id == group_id)
+            {
+                self.drag_target = None;
+                cx.notify();
+            }
+            return;
+        }
+        let dragged = event.drag(cx).tab_id.to_string();
+        let y = f32::from(event.event.position.y);
+        let frames = self.row_frames.borrow().clone();
+        let new_target = {
+            let ws = self.state.read(cx);
+            let order: Vec<String> = ws
+                .model
+                .projects
+                .iter()
+                .find(|p| p.id == group_id)
+                .map(|p| p.tabs.iter().map(|t| t.id.clone()).collect())
+                .unwrap_or_default();
+            tab_drop_target(y, &order, &frames).filter(|(target, place_after)| {
+                ws.model.would_move_tab(&dragged, target, *place_after)
+            })
+        }
+        .map(|(target_tab_id, place_after)| {
+            // `tab_drop_target` only returns ids it found frames for.
+            let (min_y, max_y) = frames[&target_tab_id];
+            let edge = if place_after { max_y } else { min_y };
+            SidebarDropTarget {
+                project_id: group_id.to_string(),
+                target_tab_id,
+                place_after,
+                line_y: edge - f32::from(event.bounds.origin.y),
+            }
+        });
+        if self.drag_target != new_target {
+            self.drag_target = new_target;
+            cx.notify();
+        }
+    }
+
+    /// A group container's `on_drop`: commit the reorder to the slot the last
+    /// `on_drag_move` resolved, guarded to the owning group. Calls
+    /// [`TabModel::move_tab`] synchronously — gpui clears `active_drag` itself
+    /// after this listener, so prod's next-runloop-tick deferral
+    /// (`SidebarView.swift:897-915`) has no analog to port — then persists
+    /// explicitly via `WindowState::save_to_store` (the R25 D5 rule:
+    /// `on_tree_mutation` is wired nowhere, so a reorder would not otherwise
+    /// save). A drop with no resolved slot just clears the field.
+    fn on_tab_drop(&mut self, group_id: &str, payload: &TabDragPayload, cx: &mut Context<Self>) {
+        if let Some(target) = self.drag_target.take() {
+            if target.project_id == group_id {
+                let dragged = payload.tab_id.to_string();
+                self.state.update(cx, |ws, _| {
+                    ws.model
+                        .move_tab(&dragged, &target.target_tab_id, target.place_after);
+                    ws.save_to_store();
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// The reorder insertion line for one group: a 2pt accent bar inset 6pt
+    /// horizontally to match the row background's rounded rect, centred on the
+    /// target row's top or bottom edge (`SidebarView.swift:333-344` and the
+    /// `indicatorY` offset at `:262-266`). Painted only while this group owns
+    /// the resolved slot AND gpui still has an active drag — the
+    /// `has_active_drag` conjunct drops the line the instant a dropped-nowhere
+    /// mouse-up clears `active_drag` (R25 D10). Because `drag_target` is
+    /// already `would_move_tab`-gated, no line shows for a no-op or
+    /// cross-project slot. Pure paint: no id, no listeners.
+    fn insertion_line(&self, group_id: &str, cx: &App) -> Option<gpui::AnyElement> {
+        if !cx.has_active_drag() {
+            return None;
+        }
+        let target = self.drag_target.as_ref()?;
+        if target.project_id != group_id {
+            return None;
+        }
+        let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
+        Some(
+            div()
+                .absolute()
+                .left(px(6.0))
+                .right(px(6.0))
+                .top(px(target.line_y - 1.0))
+                .h(px(2.0))
+                .bg(accent)
+                .into_any_element(),
+        )
     }
 
     // MARK: - Context menu
@@ -1316,15 +1567,14 @@ impl SidebarShellView {
             .flex_1()
             .w_full()
             // Empty-area click collapses a multi-selection back to the active tab
-            // (rows consume their own presses, so this fires only for the gaps /
-            // padding / unfilled bottom — `SidebarView.swift:142-163`).
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                    this.collapse_selection_to_active(cx);
-                    cx.notify();
-                }),
-            )
+            // (`SidebarView.swift:142-163`, a `.onTapGesture` — so a CLICK, not a
+            // mouse-down: rows consume their own clicks via `stop_propagation`,
+            // and a row drag ending over empty space fires no click at all, so
+            // this only ever sees the gaps / padding / unfilled bottom).
+            .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
+                this.collapse_selection_to_active(cx);
+                cx.notify();
+            }))
             .child(
                 div()
                     .flex()
@@ -1376,6 +1626,7 @@ impl SidebarShellView {
             .child(
                 div()
                     .text_size(px(self.sidebar_pt(10.0)))
+                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_10)))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(ink2)
                     .child(SharedString::from(disclosure_glyph(g.is_open)))
@@ -1391,6 +1642,7 @@ impl SidebarShellView {
                 div()
                     .flex_1()
                     .text_size(px(self.sidebar_pt(12.0)))
+                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_12)))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(ink2)
                     .child(SharedString::from(g.name.to_uppercase()))
@@ -1410,12 +1662,18 @@ impl SidebarShellView {
                     .rounded_full()
                     .bg(ink_alpha(s, COUNT_PILL_INK_ALPHA))
                     .text_size(px(self.sidebar_pt(10.0)))
+                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_10)))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(ink3)
                     .child(SharedString::from(g.count.to_string())),
             );
 
-        if show_add {
+        // The add button is ALWAYS laid out — prod hover-hides it with
+        // `opacity(0)` + `allowsHitTesting(false)`, never removing it from the
+        // HStack (`SidebarView.swift:314-316`) — so the 18pt box keeps the
+        // header at a constant height (26pt: max(name 15, button 18) + 8)
+        // instead of jumping on hover.
+        {
             let add_hover = ink_alpha(s, ADD_BUTTON_HOVER_ALPHA);
             // 10pt semibold `plus` in an 18pt box (`SidebarView.swift:379-383`).
             let add_icon = sf_symbol_icon(
@@ -1427,24 +1685,30 @@ impl SidebarShellView {
                 self.window_scale,
                 cx,
             );
-            header = header.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(18.0))
-                    .h(px(18.0))
-                    .rounded(px(4.0))
+            let mut btn = div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(18.0))
+                .h(px(18.0))
+                .rounded(px(4.0))
+                .child(add_icon);
+            if show_add {
+                btn = btn
                     .hover(move |st| st.bg(add_hover))
-                    .child(add_icon)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
                             this.add_tab_in_group(&gid_add, is_terminals, cx);
                             cx.stop_propagation();
                         }),
-                    ),
-            );
+                    );
+            } else {
+                // Reserved but invisible + inert (opacity 0, no handler) — the
+                // R25 close-"×" slot pattern.
+                btn = btn.opacity(0.0);
+            }
+            header = header.child(btn);
         }
 
         let rows: Vec<gpui::AnyElement> = g
@@ -1453,13 +1717,30 @@ impl SidebarShellView {
             .map(|t| self.build_tab_row(t, s, cx))
             .collect();
 
+        // The group container is the drop region (Swift attaches the
+        // `ProjectGroupDropDelegate` to this same VStack, `SidebarView.swift:270`):
+        // it spans the header, every row, and the 4pt trailing padding, so a row
+        // can drop "above the first tab" (header area) or "below the last tab"
+        // (trailing gap). `relative` hosts the absolute insertion line.
+        let gid_move = gid.clone();
+        let gid_drop = gid.clone();
         div()
+            .relative()
             .flex()
             .flex_col()
             .w_full()
             .pb(px(4.0))
+            .on_drag_move(cx.listener(
+                move |this, e: &DragMoveEvent<TabDragPayload>, _w, cx| {
+                    this.on_tab_drag_move(&gid_move, e, cx);
+                },
+            ))
+            .on_drop(cx.listener(move |this, payload: &TabDragPayload, _w, cx| {
+                this.on_tab_drop(&gid_drop, payload, cx);
+            }))
             .child(header)
             .children(rows)
+            .children(self.insertion_line(&g.id, cx))
             .into_any_element()
     }
 
@@ -1516,7 +1797,7 @@ impl SidebarShellView {
                 selection: selection_tint(accent, 1.0),
             };
             let weak = cx.weak_entity();
-            rename_field(
+            let field = rename_field(
                 &self.rename_focus,
                 &spans,
                 "SidebarRename",
@@ -1527,18 +1808,37 @@ impl SidebarShellView {
                 move |index, window, app| {
                     let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));
                 },
-            )
-            .into_any_element()
+            );
+            // Wrap rather than touch the shared `rename_field`: the line height
+            // cascades into the field's text runs, keeping the editing row near
+            // the label row's 28pt (the field's 1px borders still add 2px —
+            // prod's `strokeBorder` overlay adds none).
+            div()
+                .flex_1()
+                .flex()
+                .line_height(px(self.sidebar_pt(LINE_HEIGHT_13)))
+                .child(field)
+                .into_any_element()
         } else {
             let tid = t.id.clone();
             let is_active = t.is_active;
+            // The title tap is a CLICK (mouse-up with no drag), not a mouse-down
+            // — Swift's `.onTapGesture` (`SidebarView.swift:795`). gpui's click
+            // machinery never fires a click once a drag armed (pending press
+            // state is cleared while `active_drag` is set), so pressing the
+            // active row's title and dragging can no longer fall into rename.
+            // No left mouse-down listener here: a child's `stop_propagation` on
+            // mouse-down would kill the ROW's window-level click/drag arming
+            // for presses on the title (most of the row's width).
             div()
+                .id(SharedString::from(format!("sidebar.tab.{}.title", t.id)))
                 .flex_1()
                 .px(px(6.0))
                 .py(px(2.0))
                 .whitespace_nowrap()
                 .truncate()
                 .text_size(px(self.sidebar_pt(13.0)))
+                .line_height(px(self.sidebar_pt(LINE_HEIGHT_13)))
                 .font_weight(if is_active {
                     FontWeight::SEMIBOLD
                 } else {
@@ -1546,37 +1846,68 @@ impl SidebarShellView {
                 })
                 .text_color(if is_active { ink } else { ink2 })
                 .child(SharedString::from(t.title.clone()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                        if this.editing_tab_id.as_deref() == Some(tid.as_str()) {
-                            cx.stop_propagation();
-                            return;
-                        }
-                        if this.editing_tab_id.is_some() {
-                            this.commit_rename(window, cx);
-                        }
-                        this.handle_title_tap(
-                            &tid,
-                            e.modifiers.platform,
-                            e.modifiers.shift,
-                            window,
-                            cx,
-                        );
-                        cx.notify();
-                        cx.stop_propagation();
-                    }),
-                )
+                .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                    let mods = e.modifiers();
+                    this.handle_title_tap(&tid, mods.platform, mods.shift, window, cx);
+                    cx.notify();
+                    // Consume so the row's own click listener doesn't also
+                    // route a second (redundant) selection pass.
+                    cx.stop_propagation();
+                }))
                 .into_any_element()
         };
 
-        let tid_tap = t.id.clone();
+        let tid_down = t.id.clone();
+        let tid_click = t.id.clone();
         let tid_menu = t.id.clone();
         let is_active = t.is_active;
         let is_selected = t.is_selected;
 
+        // Row-frame probe: an absolute inset-0 canvas recording this row's
+        // painted vertical extent in window coords each paint — the Swift
+        // `TabFramesKey` GeometryReader analog (`SidebarView.swift:249-257`).
+        // The drop resolver reads these frames at drag time.
+        let frames = self.row_frames.clone();
+        let probe_id = t.id.clone();
+        let frame_probe = gpui::canvas(
+            |_, _, _| (),
+            move |bounds: gpui::Bounds<Pixels>, _, _, _| {
+                frames.borrow_mut().insert(
+                    probe_id,
+                    (
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.origin.y + bounds.size.height),
+                    ),
+                );
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        // The drag payload + ghost title, captured at build time (R25 D3/D4).
+        let drag_payload = TabDragPayload {
+            tab_id: SharedString::from(t.id.clone()),
+        };
+        let ghost_title = SharedString::from(t.title.clone());
+
         // The inner row (colored rounded rect), inset 6pt from the card edges.
+        //
+        // Gesture wiring (Swift parity, `SidebarView.swift:588-657`):
+        //   * selection routes on CLICK (`.onTapGesture` fires on mouse-up and
+        //     never after a drag) — `on_click`, not `on_mouse_down`, so a
+        //     drag-to-reorder press doesn't double as a tap;
+        //   * the row carries `.id()` + `on_drag` ONLY — `on_drag_move` /
+        //     `on_drop` live on the GROUP container (the R25 pill-vs-row
+        //     listener split);
+        //   * the left mouse-DOWN listener only mirrors prod's click-away
+        //     monitor (`SidebarView.swift:484-498`): it commits another row's
+        //     in-flight rename at press time. It deliberately does NOT
+        //     `stop_propagation` — gpui's click/drag arming for this row is a
+        //     window-level recorder that already ran, but the tab list's
+        //     empty-area click machinery must also keep seeing the press.
         let inner = div()
+            .id(SharedString::from(format!("sidebar.tab.{}", t.id)))
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -1592,23 +1923,41 @@ impl SidebarShellView {
             .when(!is_active && !is_selected, |el| {
                 el.hover(move |st| st.bg(hover))
             })
+            .child(frame_probe)
             .child(leading)
             .child(title)
+            .on_drag(drag_payload, move |_payload, _offset, _window, app| {
+                let title = ghost_title.clone();
+                app.new(|_| TabRowDragGhost { title })
+            })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                    if this.editing_tab_id.as_deref() == Some(tid_tap.as_str()) {
+                cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                    if this.editing_tab_id.as_deref() == Some(tid_down.as_str()) {
+                        // A press on the editing row's own icon/padding keeps
+                        // the edit alive (the field swallows its own presses)
+                        // — Swift's `guard !isEditing` (`SidebarView.swift:522`).
                         cx.stop_propagation();
                         return;
                     }
                     if this.editing_tab_id.is_some() {
                         this.commit_rename(window, cx);
                     }
-                    this.route_click(&tid_tap, e.modifiers.platform, e.modifiers.shift, cx);
-                    cx.notify();
-                    cx.stop_propagation();
                 }),
             )
+            .on_click(cx.listener(move |this, e: &ClickEvent, _window, cx| {
+                if this.editing_tab_id.as_deref() == Some(tid_click.as_str()) {
+                    cx.stop_propagation();
+                    return;
+                }
+                let mods = e.modifiers();
+                this.route_click(&tid_click, mods.platform, mods.shift, cx);
+                cx.notify();
+                // Consume so the tab list's empty-area click (selection
+                // collapse) doesn't also fire — rows absorb their own taps
+                // (`SidebarView.swift:155-160`).
+                cx.stop_propagation();
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
@@ -1936,6 +2285,10 @@ impl Render for SidebarShellView {
         // Re-sample the backing scale so the SF Symbol cache renders (and hits)
         // at this window's device resolution.
         self.window_scale = window.scale_factor();
+        // Drop the previous frame's row extents — the paint that follows this
+        // render re-records every VISIBLE row, so closed tabs and collapsed
+        // groups can't leave stale frames for the drop resolver to hit.
+        self.row_frames.borrow_mut().clear();
         // R23 (D3): re-read the sidebar base size so a live Font-pane change repaints
         // the chrome at the new proportional sizes.
         self.sidebar_font_px = crate::settings::sidebar_font::current_sidebar_px(cx);
@@ -2051,6 +2404,63 @@ mod tests {
         let bg = sidebar_background(&s);
         let want = slot_srgba(s.background2);
         assert_eq!((bg.r, bg.g, bg.b), (want.r, want.g, want.b));
+    }
+
+    // ---- tab_drop_target (mirrors Tests/NiceUnitTests/SidebarDropResolverTests.swift)
+
+    /// Three 28pt rows stacked from y=100 (a: 100-128, b: 128-156, c: 156-184).
+    fn frames3() -> HashMap<String, (f32, f32)> {
+        HashMap::from([
+            ("a".to_string(), (100.0, 128.0)),
+            ("b".to_string(), (128.0, 156.0)),
+            ("c".to_string(), (156.0, 184.0)),
+        ])
+    }
+
+    fn order3() -> Vec<String> {
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    }
+
+    #[test]
+    fn drop_over_first_tab_splits_on_midpoint() {
+        let (f, o) = (frames3(), order3());
+        assert_eq!(tab_drop_target(105.0, &o, &f), Some(("a".to_string(), false)));
+        assert_eq!(tab_drop_target(125.0, &o, &f), Some(("a".to_string(), true)));
+    }
+
+    #[test]
+    fn drop_above_first_tab_header_area_is_before_first() {
+        assert_eq!(
+            tab_drop_target(80.0, &order3(), &frames3()),
+            Some(("a".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn drop_below_last_tab_trailing_gap_is_after_last() {
+        assert_eq!(
+            tab_drop_target(200.0, &order3(), &frames3()),
+            Some(("c".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn drop_over_middle_tab_splits_on_midpoint() {
+        let (f, o) = (frames3(), order3());
+        assert_eq!(tab_drop_target(135.0, &o, &f), Some(("b".to_string(), false)));
+        assert_eq!(tab_drop_target(150.0, &o, &f), Some(("b".to_string(), true)));
+    }
+
+    #[test]
+    fn drop_in_empty_group_is_none() {
+        assert_eq!(tab_drop_target(120.0, &[], &frames3()), None);
+    }
+
+    #[test]
+    fn drop_in_collapsed_group_no_frames_is_none() {
+        // A collapsed group paints no rows, so its ids carry no frames — every
+        // branch misses (Swift's empty `tabFrames` snapshot).
+        assert_eq!(tab_drop_target(120.0, &order3(), &HashMap::new()), None);
     }
 
     #[test]
