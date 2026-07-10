@@ -18,7 +18,12 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::{Term, TermMode};
+use alacritty_terminal::vte::ansi::{
+    cursor_icon::CursorIcon, Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler,
+    Hyperlink, KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys,
+    PrivateMode, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+};
 
 use crate::deferred::SessionEvent;
 
@@ -129,6 +134,136 @@ fn write_all_fd(fd: RawFd, data: &[u8]) {
     }
 }
 
+/// SwiftTerm-parity VT handler: a thin forwarding wrapper around alacritty's
+/// `Term` that the feeder parses into instead of the bare `Term`, overriding
+/// exactly one control: **ED(2) — `CSI 2 J`, erase-all — erases the screen in
+/// place** instead of alacritty's xterm-alike "scroll the viewport into
+/// history" (`Grid::clear_viewport`).
+///
+/// Why: prod (SwiftTerm fork, `Terminal.swift` `cmdEraseInDisplay` case 2)
+/// resets each viewport line in place — erased content is *gone*, not pushed
+/// into scrollback. macOS `/usr/bin/clear` emits `ESC[3J ESC[H ESC[2J` — ED(3)
+/// **first** — so under alacritty's semantics ED(3) clears the old history and
+/// then ED(2) pushes the just-cleared prompt into it, leaving the pre-`clear`
+/// screen reachable by scrolling up. Prod leaves nothing. Parity = in-place.
+///
+/// Everything else forwards verbatim to `Term`'s own [`Handler`] impl via
+/// UFCS (never method syntax, which could resolve to a same-named inherent
+/// method). The forward list is the complete `Handler` surface of the pinned
+/// `vte` 0.15 (71 methods, all `()`-returning, all default-no-op) minus
+/// `clear_screen`; on a vte/alacritty upgrade, re-diff the trait — a missed
+/// new method would silently no-op here.
+///
+/// Damage note: the in-place branch does not mark alacritty's internal
+/// per-line damage (`Term::mark_fully_damaged` is private). Nothing in Nice
+/// consumes `Term::damage()` — the renderer repaints from a full grid snapshot
+/// on the feeder's own damage-wake, which fires after every parsed chunk.
+pub(crate) struct ParityTerm<'a>(pub(crate) &'a mut Term<EventProxy>);
+
+/// Forward `Handler` methods verbatim to the wrapped `Term`'s impl.
+macro_rules! forward_handler {
+    ($($name:ident($($arg:ident: $ty:ty),*);)+) => {
+        $(
+            #[inline]
+            fn $name(&mut self, $($arg: $ty),*) {
+                Handler::$name(&mut *self.0, $($arg),*)
+            }
+        )+
+    };
+}
+
+impl Handler for ParityTerm<'_> {
+    /// ED — with the parity override for ED(2) on the primary screen. The
+    /// alt screen has no history, so alacritty's own behaviour there is
+    /// already in-place; delegate it (and every other clear mode) unchanged.
+    fn clear_screen(&mut self, mode: ClearMode) {
+        if matches!(mode, ClearMode::All) && !self.0.mode().contains(TermMode::ALT_SCREEN) {
+            // SwiftTerm `cmdEraseInDisplay` case 2: reset every viewport line
+            // in place (to the cursor template, i.e. the current erase
+            // attributes) — do NOT rotate the region into scrollback.
+            self.0.grid_mut().reset_region(..);
+            // ED(2) also drops any selection (alacritty's All branch does the
+            // same unconditionally).
+            self.0.selection = None;
+        } else {
+            Handler::clear_screen(&mut *self.0, mode);
+        }
+    }
+
+    forward_handler! {
+        set_title(title: Option<String>);
+        set_cursor_style(style: Option<CursorStyle>);
+        set_cursor_shape(shape: CursorShape);
+        input(c: char);
+        goto(line: i32, col: usize);
+        goto_line(line: i32);
+        goto_col(col: usize);
+        insert_blank(n: usize);
+        move_up(n: usize);
+        move_down(n: usize);
+        identify_terminal(intermediate: Option<char>);
+        device_status(n: usize);
+        move_forward(col: usize);
+        move_backward(col: usize);
+        move_down_and_cr(row: usize);
+        move_up_and_cr(row: usize);
+        put_tab(count: u16);
+        backspace();
+        carriage_return();
+        linefeed();
+        bell();
+        substitute();
+        newline();
+        set_horizontal_tabstop();
+        scroll_up(n: usize);
+        scroll_down(n: usize);
+        insert_blank_lines(n: usize);
+        delete_lines(n: usize);
+        erase_chars(n: usize);
+        delete_chars(n: usize);
+        move_backward_tabs(count: u16);
+        move_forward_tabs(count: u16);
+        save_cursor_position();
+        restore_cursor_position();
+        clear_line(mode: LineClearMode);
+        clear_tabs(mode: TabulationClearMode);
+        set_tabs(interval: u16);
+        reset_state();
+        reverse_index();
+        terminal_attribute(attr: Attr);
+        set_mode(mode: Mode);
+        unset_mode(mode: Mode);
+        report_mode(mode: Mode);
+        set_private_mode(mode: PrivateMode);
+        unset_private_mode(mode: PrivateMode);
+        report_private_mode(mode: PrivateMode);
+        set_scrolling_region(top: usize, bottom: Option<usize>);
+        set_keypad_application_mode();
+        unset_keypad_application_mode();
+        set_active_charset(index: CharsetIndex);
+        configure_charset(index: CharsetIndex, charset: StandardCharset);
+        set_color(index: usize, color: Rgb);
+        dynamic_color_sequence(prefix: String, index: usize, terminator: &str);
+        reset_color(index: usize);
+        clipboard_store(clipboard: u8, base64: &[u8]);
+        clipboard_load(clipboard: u8, terminator: &str);
+        decaln();
+        push_title();
+        pop_title();
+        text_area_size_pixels();
+        text_area_size_chars();
+        set_hyperlink(hyperlink: Option<Hyperlink>);
+        set_mouse_cursor_icon(icon: CursorIcon);
+        report_keyboard_mode();
+        push_keyboard_mode(mode: KeyboardModes);
+        pop_keyboard_modes(to_pop: u16);
+        set_keyboard_mode(mode: KeyboardModes, behavior: KeyboardModesApplyBehavior);
+        set_modify_other_keys(mode: ModifyOtherKeys);
+        report_modify_other_keys();
+        set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
+    }
+}
+
 /// The [`Dimensions`] alacritty needs at `Term::new` / `Term::resize`. Only the
 /// three required methods are meaningful; `history_size` (a provided method)
 /// falls out of `total_lines - screen_lines == 0` here, which is correct — the
@@ -224,4 +359,125 @@ fn row_text(term: &Term<EventProxy>, line: Line, cols: usize) -> String {
     let end = s.trim_end().len();
     s.truncate(end);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pins the SwiftTerm-parity ED semantics of [`ParityTerm`] (headless: a
+    //! bare `Term` + `Processor`, no pty). Prod reference:
+    //! `SwiftTerm/Sources/SwiftTerm/Terminal.swift` `cmdEraseInDisplay` —
+    //! case 2 erases viewport lines in place (never pushes into scrollback),
+    //! case 3 trims the scrollback.
+
+    use super::*;
+    use alacritty_terminal::term::Config;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    const ROWS: usize = 5;
+    const COLS: usize = 20;
+
+    fn new_term() -> Term<EventProxy> {
+        let config = Config {
+            scrolling_history: DEFAULT_SCROLLBACK_LINES,
+            ..Config::default()
+        };
+        // fd -1: no reply sequences are exercised here, writes are dropped.
+        Term::new(
+            config,
+            &TermSize {
+                rows: ROWS,
+                cols: COLS,
+            },
+            EventProxy::new(-1, None),
+        )
+    }
+
+    /// Feed bytes through the same parity handler the session feeder uses.
+    fn feed(term: &mut Term<EventProxy>, bytes: &[u8]) {
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut ParityTerm(term), bytes);
+    }
+
+    /// Print enough numbered lines that some scroll into history.
+    fn fill_with_history(term: &mut Term<EventProxy>) {
+        for i in 0..(ROWS + 4) {
+            feed(term, format!("line-{i}\r\n").as_bytes());
+        }
+        assert!(
+            term.grid().history_size() > 0,
+            "setup: expected lines to have scrolled into history"
+        );
+    }
+
+    fn viewport_is_blank(term: &Term<EventProxy>) -> bool {
+        visible_snapshot(term).rows.iter().all(|r| r.is_empty())
+    }
+
+    /// macOS `/usr/bin/clear` (`ESC[3J ESC[H ESC[2J` — ED(3) FIRST): afterwards
+    /// the scrollback is empty and scrolling up can reveal nothing, matching
+    /// prod. Under bare alacritty semantics ED(2) would re-push the viewport
+    /// into the just-cleared history, leaving it scrollable — the M7.8 bug.
+    #[test]
+    fn macos_clear_sequence_leaves_no_scrollback() {
+        let mut term = new_term();
+        fill_with_history(&mut term);
+
+        feed(&mut term, b"\x1b[3J\x1b[H\x1b[2J");
+
+        assert_eq!(
+            term.grid().history_size(),
+            0,
+            "clear must leave nothing scrollable"
+        );
+        assert!(viewport_is_blank(&term), "clear must blank the viewport");
+        assert!(
+            all_buffer_lines(&term).iter().all(|r| r.is_empty()),
+            "no buffer line (history or screen) may retain content"
+        );
+    }
+
+    /// xterm-order clear (`ESC[H ESC[2J ESC[3J`) must end in the same state.
+    #[test]
+    fn xterm_clear_sequence_leaves_no_scrollback() {
+        let mut term = new_term();
+        fill_with_history(&mut term);
+
+        feed(&mut term, b"\x1b[H\x1b[2J\x1b[3J");
+
+        assert_eq!(term.grid().history_size(), 0);
+        assert!(viewport_is_blank(&term));
+    }
+
+    /// ED(2) alone, prod parity (SwiftTerm `cmdEraseInDisplay` case 2): the
+    /// viewport is erased **in place** — pre-existing scrollback is kept
+    /// exactly as-is, and the erased screen content is NOT added to it.
+    #[test]
+    fn ed2_alone_erases_in_place_without_touching_history() {
+        let mut term = new_term();
+        fill_with_history(&mut term);
+        let history_before = term.grid().history_size();
+
+        feed(&mut term, b"\x1b[2J");
+
+        assert_eq!(
+            term.grid().history_size(),
+            history_before,
+            "ED(2) must neither push the screen into history nor clear it"
+        );
+        assert!(viewport_is_blank(&term), "ED(2) must blank the viewport");
+    }
+
+    /// ED(2) on the alt screen delegates to alacritty unchanged (the alt
+    /// screen has no history, and in-place erase is already its behaviour).
+    #[test]
+    fn ed2_on_alt_screen_stays_in_place() {
+        let mut term = new_term();
+        feed(&mut term, b"\x1b[?1049halt-content");
+        assert!(visible_snapshot(&term).contains("alt-content"));
+
+        feed(&mut term, b"\x1b[2J");
+
+        assert_eq!(term.grid().history_size(), 0);
+        assert!(viewport_is_blank(&term));
+    }
 }

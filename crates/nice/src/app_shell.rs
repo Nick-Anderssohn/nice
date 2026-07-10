@@ -347,6 +347,46 @@ fn pane_placeholder() -> impl IntoElement {
 }
 
 // ---------------------------------------------------------------------------
+// Prod-parity terminal content insets (M7.8 feel-check Bug 2). The effective
+// prod inset is the SUM of Swift's app-level `mainContent` padding
+// (`Sources/Nice/Views/AppShellView.swift`) and the SwiftTerm view's own cell-
+// area geometry (the fork at `SwiftTerm/Sources/SwiftTerm`): SwiftTerm draws
+// glyphs from x=0 / no internal padding, EXCEPT that it reserves the scroller
+// width on the trailing edge (`MacTerminalView.getEffectiveWidth = width −
+// scrollerWidth`). `nice-term-view` likewise paints from its bounds origin
+// with zero internal inset (`TERMINAL_BOTTOM_GAP == 0` mirrors prod's
+// `TerminalContainerView.bottomInset == 0`), so the whole prod inset is
+// applied here, app-side, around the hosted pane. Padding shrinks the
+// `TerminalView`'s painted bounds, so the grid refit (auto_refit → 200 ms
+// debounce → TIOCSWINSZ) re-fits cols/rows to the inset content area — the
+// same path any window resize takes. The uncovered gap composites over the
+// window backing layer's terminal-theme fill (see `AppShellView::render`), so
+// it paints as terminal background exactly like Swift's
+// `.padding(…).background(terminalBackgroundColor)`.
+// ---------------------------------------------------------------------------
+
+/// Leading gap between the sidebar card's trailing edge and the first glyph
+/// column — Swift `mainContent`'s `.padding(.leading, 20)`
+/// (`AppShellView.swift:1063`; SwiftTerm adds 0).
+const CONTENT_INSET_LEADING: f32 = 20.0;
+
+/// Top gap below the toolbar band — Swift `.padding(.top, 12)`
+/// (`AppShellView.swift:1054`). The sub-row remainder still parks below this,
+/// at the top of the bottom-anchored grid, exactly as in prod.
+const CONTENT_INSET_TOP: f32 = 12.0;
+
+/// Bottom gap under the last grid row — Swift `.padding(.bottom, 9)`
+/// (`AppShellView.swift:1062`; `TerminalContainerView.bottomInset` is 0).
+const CONTENT_INSET_BOTTOM: f32 = 9.0;
+
+/// Trailing gap to the window's right edge. Swift adds NO trailing padding,
+/// but SwiftTerm reserves the overlay scroller's width out of the cell area
+/// (`MacTerminalView.swift:696-699`; `TerminalHost.swift:85` sets
+/// `.overlay`), so prod text ends ≥ `NSScroller.scrollerWidth(for: .regular,
+/// scrollerStyle: .overlay)` = 17.0 from the edge (measured on macOS 26).
+const CONTENT_INSET_TRAILING: f32 = 17.0;
+
+// ---------------------------------------------------------------------------
 // Window-level backing layer (Swift `windowBackground`,
 // `AppShellView.swift:988-1023`) — the opaque base every per-window surface
 // composites over. Pure color resolvers are split out so they are unit-testable
@@ -636,6 +676,15 @@ impl Render for PaneHostView {
             }
         }
 
-        div().size_full().child(content)
+        // Prod-parity content insets around the hosted pane (constants above).
+        // Applied to placeholder and terminal alike — Swift pads both branches
+        // of `mainContent` (the placeholder branch keeps its leading pad).
+        div()
+            .size_full()
+            .pl(px(CONTENT_INSET_LEADING))
+            .pt(px(CONTENT_INSET_TOP))
+            .pb(px(CONTENT_INSET_BOTTOM))
+            .pr(px(CONTENT_INSET_TRAILING))
+            .child(content)
     }
 }

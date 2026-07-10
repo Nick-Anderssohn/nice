@@ -377,8 +377,11 @@ fn spawn_feeder(
                     {
                         // Hold the lock ONLY to parse; the wake below is fired
                         // after this scope drops the guard (damage-wake contract).
+                        // Parse through the SwiftTerm-parity handler (ED(2)
+                        // erases in place instead of scrolling into history —
+                        // see `vt::ParityTerm`), not the bare `Term`.
                         let mut guard = term.lock();
-                        parser.advance(&mut *guard, chunk);
+                        parser.advance(&mut vt::ParityTerm(&mut *guard), chunk);
                     }
                     on_damage();
                 } else if n == 0 {
