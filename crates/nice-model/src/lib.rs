@@ -120,6 +120,14 @@
 //!   rebinding UI consumes the same data. Matching is character-token based at
 //!   the gpui pin (a documented divergence from Swift's physical-keycode match —
 //!   see the module docs).
+//!
+//! ## Update-checker version compare (R27 pure port)
+//!
+//! * [`SemanticVersion`] — the dotted-integer version parser + component-wise
+//!   compare `ReleaseChecker` (crates/nice) uses to decide whether a GitHub
+//!   release tag is newer than the running app, ported from
+//!   `Sources/Nice/State/SemanticVersion.swift`. Not full semver: no
+//!   prerelease/build-metadata handling, non-negative dotted integers only.
 
 pub mod file_browser;
 mod pane;
@@ -128,6 +136,7 @@ mod persisted;
 mod project;
 pub mod rename_gate;
 pub mod selection;
+mod semantic_version;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod strip_geometry;
@@ -140,6 +149,7 @@ pub use persisted::{snapshot_projects, PersistedPane, PersistedProject, Persiste
 pub use project::Project;
 pub use rename_gate::InlineRenameClickGate;
 pub use selection::SidebarTabSelection;
+pub use semantic_version::SemanticVersion;
 pub use shortcuts::{default_bindings, default_combo, KeyCombo, Modifiers, ShortcutAction};
 pub use sidebar::{SidebarMode, SidebarModel};
 pub use strip_geometry::{

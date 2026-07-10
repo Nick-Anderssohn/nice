@@ -80,6 +80,7 @@ use crate::inline_rename::{
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::update_popover::UpdatePopover;
 use crate::window_state::WindowState;
 
 // ---- Geometry / behaviour constants (Swift provenance) ----------------------
@@ -117,6 +118,18 @@ const PILL_ICON_SIZE: f32 = 12.0;
 /// Inter-pill spacing inside the scroll row (`HStack(spacing: 2)`,
 /// `WindowToolbarView.swift:292`).
 const PILL_ROW_GAP: f32 = 2.0;
+
+/// The trailing update pill's AX element id (`UpdateAvailablePill.swift:58`).
+/// Distinct from the per-pane pills' ids and the status-dot's `pill.<id>` so an
+/// AX walk / a scenario can find it unambiguously (R27, the reserved trailing
+/// slot).
+const UPDATE_PILL_ID: &str = "toolbar.updateAvailable";
+/// The trailing update pill's text + AX title (`UpdateAvailablePill.swift:41`).
+const UPDATE_PILL_LABEL: &str = "Update available";
+/// The pill's leading SF Symbol (`UpdateAvailablePill.swift:36`).
+const SF_ARROW_UP_CIRCLE: &str = "arrow.up.circle.fill";
+/// Never-blank fallback for [`SF_ARROW_UP_CIRCLE`].
+const ICON_ARROW_UP: &str = "\u{2191}"; // ↑
 
 /// The close "×" square (`WindowToolbarView.swift:987`). Its 16pt slot is always
 /// reserved so the pill width never jumps on hover.
@@ -386,6 +399,18 @@ pub(crate) struct WindowToolbarView {
     /// The menu's dismiss subscription.
     menu_sub: Option<Subscription>,
 
+    /// The trailing update-pill's popover, if open (R27, D9). The pill click
+    /// presents it via `cx.defer_in`; a click-away / Esc / a second pill click
+    /// drops it (the `context_menu` field pattern).
+    update_popover: Option<Entity<UpdatePopover>>,
+    /// The popover's dismiss subscription.
+    update_popover_sub: Option<Subscription>,
+    /// The update pill's last-painted window-content bounds, recorded by a canvas
+    /// probe in [`render_update_pill`](Self::render_update_pill) — the
+    /// `update-check` scenario reads it to target the pill's centre for the real
+    /// guarded-HID click. `None` until the pill has painted.
+    update_pill_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+
     /// The pill row's real-layout scroll state — the source of overflow / fades /
     /// centering (replaces the dead width estimator).
     scroll: ScrollHandle,
@@ -446,6 +471,9 @@ impl WindowToolbarView {
             rename_blur_sub: None,
             context_menu: None,
             menu_sub: None,
+            update_popover: None,
+            update_popover_sub: None,
+            update_pill_bounds: Rc::new(Cell::new(None)),
             scroll: ScrollHandle::new(),
             last_active_pane: None,
             center_pending: false,
@@ -1509,6 +1537,123 @@ impl WindowToolbarView {
                     ),
             )
     }
+
+    /// The trailing update pill (R27, P7) — the conditional `.child` in the
+    /// reserved trailing slot, rendered ONLY when a newer release is available
+    /// ([`crate::release_check::update_available`] returns `Some`). When absent it
+    /// emits NOTHING (no reserved space): the toolbar with no update is
+    /// byte-identical to today. Frozen appearance/AX/copy
+    /// (`UpdateAvailablePill.swift:25-64`): text `"Update available"`, a leading
+    /// `arrow.up.circle.fill` glyph, the house accent tint, the reused `PILL_*`
+    /// box metrics + hover fill, `.id`/`.role`/`.aria_label` AX anchor, and
+    /// `stop_propagation` on its mouse-down so the R9 empty-band drag/zoom doesn't
+    /// fire under it. The click presents the popover via `cx.defer_in` (D9).
+    fn render_update_pill(&self, s: &Slots, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        // The pill's render gate: a newer release exists. `None` ⇒ no pill.
+        crate::release_check::update_available(cx)?;
+        let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
+        let hover = ink_alpha(s, PILL_HOVER_INK_ALPHA);
+        let icon = sf_symbol_icon(
+            SF_ARROW_UP_CIRCLE,
+            ICON_ARROW_UP,
+            PILL_ICON_SIZE,
+            SymbolWeight::Semibold,
+            accent,
+            self.window_scale,
+            cx,
+        );
+        Some(
+            div()
+                .id(UPDATE_PILL_ID)
+                .role(gpui::Role::Button)
+                .aria_label(UPDATE_PILL_LABEL)
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(PILL_GAP))
+                .h(px(PILL_HEIGHT))
+                .pl(px(PILL_LEADING_PAD))
+                .pr(px(PILL_TRAILING_PAD))
+                .rounded(px(PILL_RADIUS))
+                .cursor_pointer()
+                .hover(move |st| st.bg(hover))
+                // A zero-visual probe recording the pill's painted window-content
+                // bounds so the `update-check` scenario can target its centre for
+                // the real guarded-HID click (the confirmation-modal backdrop-probe
+                // idiom). Absolute + zero-inset so it fills the pill without
+                // perturbing the flex row.
+                .child({
+                    let sink = self.update_pill_bounds.clone();
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, _, _| sink.set(Some(bounds)),
+                    )
+                    .absolute()
+                    .inset_0()
+                })
+                .child(icon)
+                .child(
+                    div()
+                        .text_size(px(PILL_TEXT_SIZE))
+                        .text_color(accent)
+                        .child(SharedString::from(UPDATE_PILL_LABEL)),
+                )
+                // Consume the press so the R9 empty-band drag / zoom never arms
+                // under the pill, then present the popover at the click point. The
+                // defer is load-bearing (D9): gpui takes the window out of
+                // `cx.windows` mid-dispatch, so opening a window-anchored child
+                // from this handler must run at the end of the effect cycle
+                // (`defer_in` re-fetches the window — the 4875d9c rule).
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, e: &MouseDownEvent, window, cx| {
+                        let position = e.position;
+                        cx.stop_propagation();
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.toggle_update_popover(position, window, cx);
+                        });
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Toggle the update popover: a click while it is open closes it (the Swift
+    /// pill's popover toggle, `UpdateAvailablePill.swift:60-64`); otherwise mint a
+    /// fresh [`UpdatePopover`] anchored at `position`, subscribe to its dismissal,
+    /// and store it.
+    fn toggle_update_popover(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.update_popover.is_some() {
+            self.update_popover = None;
+            self.update_popover_sub = None;
+            cx.notify();
+            return;
+        }
+        let latest = crate::release_check::update_available(cx);
+        let popover = cx.new(|cx| UpdatePopover::new(position, latest.as_deref(), window, cx));
+        self.update_popover_sub = Some(cx.subscribe_in(
+            &popover,
+            window,
+            |this, _popover, _ev: &DismissEvent, window, cx| {
+                this.update_popover = None;
+                // The popover grabbed key focus on open; hand it back to the
+                // active terminal (unless a rename is mid-flight — parity with the
+                // context-menu dismissal).
+                if this.editing_pane.is_none() {
+                    this.refocus_terminal_after_rename(window, cx);
+                }
+                cx.notify();
+            },
+        ));
+        self.update_popover = Some(popover);
+        cx.notify();
+    }
 }
 
 /// Whether a title tap on the active pill may begin a rename: the R10
@@ -1576,11 +1721,17 @@ impl Render for WindowToolbarView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
             .child(self.render_brand(&s, cx))
             .child(self.render_strip(&panes, &s, cx))
-            // Trailing update-pill slot stays empty until R27. The toolbar's
-            // old local bottom hairline is gone — the shell paints one
-            // full-width title-bar divider at window level instead
+            // Trailing update-pill slot (R27, P7): the conditional update pill,
+            // inserted between the strip and the popup layer. It renders ONLY when
+            // a newer release is available — absent, it emits nothing, so the
+            // toolbar with no update is byte-identical to today. The toolbar's old
+            // local bottom hairline is gone — the shell paints one full-width
+            // title-bar divider at window level instead
             // (`SidebarShellView::build_top_bar_divider`, M2 Item C).
+            .children(self.render_update_pill(&s, cx))
             .children(self.context_menu.clone())
+            // The update popover (D9), rendered as a deferred child while open.
+            .children(self.update_popover.clone())
     }
 }
 
@@ -1626,6 +1777,64 @@ impl WindowToolbarView {
     /// The fully-offscreen pane ids (drives the fades / badge assertions).
     pub(crate) fn scenario_offscreen_pane_ids(&self, cx: &App) -> std::collections::HashSet<String> {
         self.strip_geometry(cx).offscreen_pane_ids()
+    }
+
+    // --- R27 update pill / popover (the `update-check` scenario read/drive seam) ---
+
+    /// Whether the trailing update pill's render gate is satisfied (a newer
+    /// release is available) — the `update-check` scenario's deterministic pill
+    /// visibility read, alongside the real AX-tree walk.
+    pub(crate) fn scenario_update_pill_visible(&self, cx: &App) -> bool {
+        crate::release_check::update_available(cx).is_some()
+    }
+
+    /// The update pill's painted centre in window-content coords `(x, y_from_top)`,
+    /// or `None` until it has painted — the real guarded-HID click target.
+    pub(crate) fn scenario_update_pill_center(&self) -> Option<(f64, f64)> {
+        let b = self.update_pill_bounds.get()?;
+        let x = f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
+        let y = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
+        Some((x as f64, y as f64))
+    }
+
+    /// Open the update popover in-process (the deterministic drive path — the
+    /// content/copy assertions must run even when a synthetic global-HID click on
+    /// the pill is DEFERRED). A no-op when already open. Anchored at the window
+    /// origin — the anchor point is irrelevant to the asserted content.
+    pub(crate) fn drive_open_update_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_popover.is_none() {
+            self.toggle_update_popover(point(px(0.0), px(0.0)), window, cx);
+        }
+    }
+
+    /// Whether the update popover is currently open — the scenario reads this
+    /// after a real pill click to confirm it opened.
+    pub(crate) fn scenario_update_popover_open(&self) -> bool {
+        self.update_popover.is_some()
+    }
+
+    /// The open popover's two brew command strings, or `None` when it is closed —
+    /// the scenario asserts both exact commands are present, in order.
+    pub(crate) fn scenario_update_popover_commands(&self, cx: &App) -> Option<Vec<String>> {
+        self.update_popover
+            .as_ref()
+            .map(|p| p.read(cx).scenario_commands())
+    }
+
+    /// Drive one Copy in the open popover (writes command `index` to the
+    /// clipboard) — the scenario then asserts the clipboard holds that command. A
+    /// no-op when the popover is closed.
+    pub(crate) fn drive_copy_update_command(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(popover) = self.update_popover.clone() {
+            popover.update(cx, |p, cx| p.copy_command(index, cx));
+        }
+    }
+
+    /// Drop the update popover (between the scenario's success and error legs).
+    pub(crate) fn drive_dismiss_update_popover(&mut self, cx: &mut Context<Self>) {
+        self.update_popover = None;
+        self.update_popover_sub = None;
+        cx.notify();
     }
 
     /// Whether the attention badge should light (a fully-offscreen pane needs

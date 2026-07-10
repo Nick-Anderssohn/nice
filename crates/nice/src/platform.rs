@@ -740,6 +740,19 @@ fn write_dropped_image(bytes: &[u8]) -> Option<PathBuf> {
 // (the global HID tap). The scenarios post to nice-rs's OWN pid, so an injected
 // keystroke can only ever reach this process, never whatever the user is typing
 // into elsewhere on the machine.
+//
+// R27 CARVE-OUT (the ONLY exception, narrowly fenced): a global `CGEventPost`
+// (the HID tap) is permitted ONLY through the two named seams
+// [`post_global_left_click`] / [`post_global_left_drag`] below, ONLY from
+// selftest / scenario code (the R27 §6 close-out composition leg), and ONLY
+// after that leg's REQUIRED preflight has verified our window owns the target
+// point (activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point
+// z-order check); on preflight failure the caller DEFERS LOUDLY and does NOT
+// post. The carve-out exists because pid-posted MOUSE events silently drop
+// (hover paints, `mouseDown` never fires — the M6 record), so the composed
+// leg's real clicks/drags MUST go through the global tap. **Keyboard synthetic
+// events remain `CGEventPostToPid`-only, unchanged.** No other call site may use
+// the global seams.
 // ===========================================================================
 
 // Opaque CoreFoundation / CoreGraphics / Carbon handles. All are pointer-width;
@@ -782,6 +795,10 @@ extern "C" {
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventPostToPid(pid: i32, event: CGEventRef);
+    /// `CFArrayRef CGWindowListCopyWindowInfo(CGWindowListOption, CGWindowID)` —
+    /// a +1 array of per-window info dictionaries, ordered FRONT-to-back. The R27
+    /// guarded-HID preflight z-order check (see [`frontmost_window_owns_point`]).
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CfArrayRef;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -1027,6 +1044,82 @@ pub fn ax_find_titled_role(pid: i32, label: &str) -> Result<String, String> {
         let result = ax_find_role_by_title(app, label, 64, &mut budget);
         CFRelease(app as *const c_void);
         result.ok_or_else(|| format!("no AX element titled '{label}' found in the tree"))
+    }
+}
+
+/// Depth-first search for the first `AXWindow` titled `window_title`, then within
+/// THAT window's subtree return the `AXRole` of the first node titled `label`.
+/// Bounded by `depth` (levels remaining) and `budget` (total nodes visited).
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+unsafe fn ax_find_role_by_title_in_window(
+    element: AXUIElementRef,
+    window_title: &str,
+    label: &str,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<String> {
+    if depth == 0 || *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+
+    // The target window: scope the `label` lookup to its subtree ONLY (its own
+    // title is `window_title`, never `label`, so this cannot false-match itself).
+    if ax_copy_string(element, "AXRole").as_deref() == Some("AXWindow")
+        && ax_copy_string(element, "AXTitle").as_deref() == Some(window_title)
+    {
+        return ax_find_role_by_title(element, label, depth, budget);
+    }
+
+    let children = ax_copy_attr(element, "AXChildren");
+    if children.is_null() {
+        return None;
+    }
+    let count = CFArrayGetCount(children as CfArrayRef);
+    let mut found = None;
+    for i in 0..count {
+        let child = CFArrayGetValueAtIndex(children as CfArrayRef, i) as AXUIElementRef;
+        if child.is_null() {
+            continue;
+        }
+        if let Some(role) =
+            ax_find_role_by_title_in_window(child, window_title, label, depth - 1, budget)
+        {
+            found = Some(role);
+            break;
+        }
+    }
+    CFRelease(children as *const c_void);
+    found
+}
+
+/// Like [`ax_find_titled_role`], but the `label` search is scoped to the subtree
+/// of the first `AXWindow` titled `window_title` — so a `label`-titled node in
+/// ANOTHER of the process's windows or in a lingering menu cannot be mistaken for
+/// the one in the window under test (the serial self-test-suite hazard: the same
+/// process hosts many scenarios' windows). Same main-thread threading contract as
+/// [`ax_find_titled_role`].
+pub fn ax_find_titled_role_in_window(
+    pid: i32,
+    window_title: &str,
+    label: &str,
+) -> Result<String, String> {
+    // SAFETY: `AXUIElementCreateApplication` returns a +1 handle (or null); the walk
+    // releases every owned/borrowed CF handle per the Create/Get rules, then the
+    // +1 app handle.
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Err("AXUIElementCreateApplication returned null".to_string());
+        }
+        let mut budget = 5000usize;
+        let result = ax_find_role_by_title_in_window(app, window_title, label, 64, &mut budget);
+        CFRelease(app as *const c_void);
+        result.ok_or_else(|| {
+            format!("no AX element titled '{label}' found in the '{window_title}' window subtree")
+        })
     }
 }
 
@@ -1329,6 +1422,11 @@ const CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
 // `NSPoint` (== `CGPoint`, two `CGFloat`/`f64`): it is `repr(C)` for the extern
 // CGEvent call AND implements objc2's `Encode` for the `msg_send!` conversions.
 
+/// `kCGHIDEventTap` — the global hardware-input event tap. Used ONLY by the R27
+/// carve-out seams below (`post_global_left_click` / `post_global_left_drag`); the
+/// pid-posted family above never touches it.
+const CG_HID_EVENT_TAP: u32 = 0;
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGEventCreateMouseEvent(
@@ -1338,6 +1436,9 @@ extern "C" {
         button: u32,
     ) -> CGEventRef;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    /// Post to the GLOBAL HID tap (not a pid). R27 carve-out ONLY — see the
+    /// SAFETY INVARIANT amendment above and the two seams below.
+    fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
 /// Post one synthetic left-mouse event of `mouse_type` at CG-global point
@@ -1380,6 +1481,220 @@ pub fn post_left_mouse_dragged(pid: i32, x: f64, y: f64) {
 /// Post a synthetic left-mouse-UP at CG-global `(x, y)` to `pid`.
 pub fn post_left_mouse_up(pid: i32, x: f64, y: f64, click_count: i64) {
     post_mouse_event(pid, CG_EVENT_LEFT_MOUSE_UP, x, y, click_count.max(1));
+}
+
+/// Post one synthetic left-mouse event of `mouse_type` at CG-global `(x, y)` to
+/// the GLOBAL HID tap (`CGEventPost(kCGHIDEventTap, …)`), stamping `click_count`
+/// (>=1) into the click-state field. The R27 carve-out helper — see
+/// [`post_global_left_click`] / [`post_global_left_drag`] and the SAFETY INVARIANT
+/// amendment above.
+fn post_global_mouse_event(mouse_type: u32, x: f64, y: f64, click_count: i64) {
+    // SAFETY: `CGEventCreateMouseEvent(nil, …)` returns a +1 event (or null,
+    // guarded); we optionally set its click-state field, post it to the global
+    // HID tap, then release the +1.
+    unsafe {
+        let event = CGEventCreateMouseEvent(
+            std::ptr::null_mut(),
+            mouse_type,
+            NSPoint { x, y },
+            CG_MOUSE_BUTTON_LEFT,
+        );
+        if event.is_null() {
+            return;
+        }
+        if click_count > 1 {
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_count);
+        }
+        CGEventPost(CG_HID_EVENT_TAP, event);
+        CFRelease(event as *const c_void);
+    }
+}
+
+/// **R27 carve-out (SELFTEST/SCENARIO ONLY).** Post a synthetic left-mouse
+/// DOWN+UP click at CG-global `(x, y)` via the GLOBAL HID tap — NOT
+/// `CGEventPostToPid` — because pid-posted mouse events silently drop (hover
+/// paints, `mouseDown` never fires — the M6 record). `click_state` (>=1) becomes
+/// `NSEvent.clickCount`. The ONLY safe caller is the R27 §6 close-out composition
+/// leg, which MUST run its preflight FIRST (activate + raise +
+/// `CGWindowListCopyWindowInfo` frontmost-at-point) and DEFER LOUDLY when our
+/// window does not own the point — never a blind post. See the SAFETY INVARIANT
+/// amendment above. Not yet called until the §6 leg lands (slice 4).
+#[allow(dead_code)]
+pub fn post_global_left_click(x: f64, y: f64, click_state: i64) {
+    let clicks = click_state.max(1);
+    post_global_mouse_event(CG_EVENT_LEFT_MOUSE_DOWN, x, y, clicks);
+    post_global_mouse_event(CG_EVENT_LEFT_MOUSE_UP, x, y, clicks);
+}
+
+/// **R27 carve-out (SELFTEST/SCENARIO ONLY).** Post a synthetic left-mouse
+/// DRAGGED at CG-global `(x, y)` via the GLOBAL HID tap. Same carve-out
+/// discipline as [`post_global_left_click`]: the caller sequences a
+/// [`post_global_left_down`], a run of these drag steps, and a
+/// [`post_global_left_up`], each behind the §6 preflight.
+#[allow(dead_code)]
+pub fn post_global_left_drag(x: f64, y: f64) {
+    post_global_mouse_event(CG_EVENT_LEFT_MOUSE_DRAGGED, x, y, 1);
+}
+
+/// **R27 carve-out (SELFTEST/SCENARIO ONLY).** Post a synthetic left-mouse DOWN
+/// (no matching UP) at CG-global `(x, y)` via the GLOBAL HID tap — the start of a
+/// held drag ([`post_global_left_drag`] steps then [`post_global_left_up`]). Unlike
+/// [`post_global_left_click`], which fires DOWN+UP together (a tap), this leaves the
+/// button HELD so the drag steps track. Same carve-out discipline: the caller MUST
+/// run the §6 preflight (activate + raise + frontmost-at-point) BEFORE it and DEFER
+/// LOUDLY when our window does not own the point — never a blind post.
+#[allow(dead_code)]
+pub fn post_global_left_down(x: f64, y: f64) {
+    post_global_mouse_event(CG_EVENT_LEFT_MOUSE_DOWN, x, y, 1);
+}
+
+/// **R27 carve-out (SELFTEST/SCENARIO ONLY).** Post a synthetic left-mouse UP at
+/// CG-global `(x, y)` via the GLOBAL HID tap — the release ending a held drag begun
+/// with [`post_global_left_down`]. Same carve-out discipline as
+/// [`post_global_left_down`].
+#[allow(dead_code)]
+pub fn post_global_left_up(x: f64, y: f64) {
+    post_global_mouse_event(CG_EVENT_LEFT_MOUSE_UP, x, y, 1);
+}
+
+/// `CGWindowListOption` bits: on-screen windows only, desktop elements excluded.
+const CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+const CG_WINDOW_LIST_EXCLUDE_DESKTOP: u32 = 1 << 4;
+/// `kCGNullWindowID` — the "relative to no window" sentinel.
+const CG_NULL_WINDOW_ID: u32 = 0;
+
+/// Read a CF-dictionary entry (by string key) as a raw `CFTypeRef`, borrowed from
+/// the dictionary (get-rule — do NOT release). `None` when the key is absent.
+///
+/// # Safety
+/// `dict` must be a live `CFDictionaryRef`.
+unsafe fn cf_dict_value(dict: *const c_void, key: &str) -> Option<*const c_void> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::dictionary::{CFDictionaryGetValueIfPresent, CFDictionaryRef};
+
+    let cf_key = CFString::new(key);
+    let mut value: *const c_void = std::ptr::null();
+    let present = CFDictionaryGetValueIfPresent(
+        dict as CFDictionaryRef,
+        cf_key.as_concrete_TypeRef() as *const c_void,
+        &mut value as *mut *const c_void,
+    );
+    if present == 0 || value.is_null() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Read a `CFNumber`-valued dictionary entry as `f64`. `None` if absent / not a
+/// number.
+///
+/// # Safety
+/// `dict` must be a live `CFDictionaryRef`.
+unsafe fn cf_dict_f64(dict: *const c_void, key: &str) -> Option<f64> {
+    use core_foundation_sys::number::{kCFNumberFloat64Type, CFNumberGetValue, CFNumberRef};
+
+    let value = cf_dict_value(dict, key)?;
+    let mut out: f64 = 0.0;
+    let ok = CFNumberGetValue(
+        value as CFNumberRef,
+        kCFNumberFloat64Type,
+        &mut out as *mut f64 as *mut c_void,
+    );
+    if ok {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Read a `CFNumber`-valued dictionary entry as `i64`. `None` if absent / not a
+/// number.
+///
+/// # Safety
+/// `dict` must be a live `CFDictionaryRef`.
+unsafe fn cf_dict_i64(dict: *const c_void, key: &str) -> Option<i64> {
+    use core_foundation_sys::number::{kCFNumberSInt64Type, CFNumberGetValue, CFNumberRef};
+
+    let value = cf_dict_value(dict, key)?;
+    let mut out: i64 = 0;
+    let ok = CFNumberGetValue(
+        value as CFNumberRef,
+        kCFNumberSInt64Type,
+        &mut out as *mut i64 as *mut c_void,
+    );
+    if ok {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// **R27 guarded-HID preflight (SELFTEST/SCENARIO ONLY).** Whether the topmost
+/// normal, visible window covering CG-global `(x, y)` belongs to THIS process —
+/// the z-order half of the mandatory preflight before any [`post_global_left_click`]
+/// / [`post_global_left_drag`] (the SAFETY INVARIANT carve-out). Walks
+/// `CGWindowListCopyWindowInfo`'s front-to-back list, skips the menu bar / dock /
+/// status overlays (window layer `!= 0`) and fully-transparent windows, and
+/// returns whether the FIRST normal window whose bounds contain the point is
+/// ours. `false` — the honest default — whenever another app's window is on top
+/// at that point, no window covers it, or the query fails; the caller then DEFERS
+/// LOUDLY and does NOT post, so an unattended `NICE_RS_SELFTEST=all` run can never
+/// send a click into another app. The caller must ALSO activate + raise our window
+/// first (this is only the z-order check).
+#[allow(dead_code)]
+pub fn frontmost_window_owns_point(x: f64, y: f64) -> bool {
+    // SAFETY: `CGWindowListCopyWindowInfo` returns a +1 CFArray (or null, guarded)
+    // of borrowed CFDictionary entries; we read borrowed CFNumber/CFDictionary
+    // values (get-rule, not released) and release the +1 array at the end.
+    unsafe {
+        let info = CGWindowListCopyWindowInfo(
+            CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | CG_WINDOW_LIST_EXCLUDE_DESKTOP,
+            CG_NULL_WINDOW_ID,
+        );
+        if info.is_null() {
+            return false;
+        }
+        let our_pid = std::process::id() as i64;
+        let count = CFArrayGetCount(info);
+        let mut owns = false;
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(info, i);
+            if dict.is_null() {
+                continue;
+            }
+            // Only normal windows decide ownership; skip overlays (layer != 0) and
+            // invisible windows (alpha 0).
+            if cf_dict_i64(dict, "kCGWindowLayer").unwrap_or(i64::MAX) != 0 {
+                continue;
+            }
+            if cf_dict_f64(dict, "kCGWindowAlpha").unwrap_or(0.0) <= 0.0 {
+                continue;
+            }
+            let Some(bounds) = cf_dict_value(dict, "kCGWindowBounds") else {
+                continue;
+            };
+            let (Some(bx), Some(by), Some(bw), Some(bh)) = (
+                cf_dict_f64(bounds, "X"),
+                cf_dict_f64(bounds, "Y"),
+                cf_dict_f64(bounds, "Width"),
+                cf_dict_f64(bounds, "Height"),
+            ) else {
+                continue;
+            };
+            let inside = x >= bx && x < bx + bw && y >= by && y < by + bh;
+            if !inside {
+                continue;
+            }
+            // The first (topmost) normal, visible window covering the point decides
+            // ownership — if it is not ours, another app is on top here.
+            owns = cf_dict_i64(dict, "kCGWindowOwnerPID").unwrap_or(-1) == our_pid;
+            break;
+        }
+        CFRelease(info as *const c_void);
+        owns
+    }
 }
 
 /// The window's `frame` in Cocoa screen points (bottom-left origin, y up):
@@ -1971,6 +2286,160 @@ pub fn choose_theme_file() -> Option<String> {
         let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
         standardized_path(url)
     }
+}
+
+// ===========================================================================
+// R27 update check — the one synchronous NSURLSession GitHub Releases GET
+// (Binding decision D1). This is the ONLY module that touches OS networking; the
+// production `ReleaseFetcher` forwards here, and `run_selftest` installs a
+// recording fake that never enters this file (hermeticity). ZERO new
+// transport/TLS crate: `NSURLSession` reaches Security.framework's system trust
+// store directly, exactly as the app's existing objc2 links reach AppKit. The
+// only Foundation-block helper is `block2` (objc2 family, already in the lock).
+// ===========================================================================
+
+/// The result of a successful [`http_get`]: the HTTP status and the response body
+/// bytes. The caller (the `ReleaseFetcher`) checks `200..300` and decodes the body
+/// — serde stays in the app layer, not here.
+pub struct HttpGetResponse {
+    /// The HTTP status code off the `NSHTTPURLResponse` (clamped into `u16`).
+    pub status: u16,
+    /// The response body bytes (copied out of the completion handler's `NSData`).
+    pub body: Vec<u8>,
+}
+
+/// One synchronous HTTP GET via `NSURLSession` (D1): build an
+/// `NSMutableURLRequest` with `url` + `headers` + `timeoutInterval`, run a
+/// `dataTaskWithRequest:completionHandler:`, and block THIS thread on a channel
+/// until the completion handler (invoked on `NSURLSession`'s own delegate queue)
+/// delivers the result. Returns `Ok(HttpGetResponse)` on ANY HTTP response (2xx
+/// or not — the caller decides), or `Err(message)` on a transport failure /
+/// missing HTTP response.
+///
+/// **Must be called off a BACKGROUND thread** (the `ReleaseChecker` worker /
+/// `background_executor`), NEVER the foreground — it blocks. `objc2` + `block2`
+/// reach Foundation with no new transport crate.
+///
+/// # Safety / threading
+/// The completion block runs on a background delegate thread; it fully COPIES the
+/// bytes + status into owned Rust values BEFORE signalling, so nothing autoreleased
+/// escapes the delegate's pool. The `RcBlock` is kept alive across the blocking
+/// `recv` (`NSURLSession` retains the block for the task's duration).
+pub fn http_get(
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout_secs: f64,
+) -> Result<HttpGetResponse, String> {
+    use block2::RcBlock;
+    use objc2::rc::autoreleasepool;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<HttpGetResponse, String>>();
+    // completionHandler:^(NSData *data, NSURLResponse *response, NSError *error).
+    // The three `id` out-params are plain object pointers (`@`); `*mut AnyObject`
+    // matches. The block is created OUTSIDE any autorelease pool (block2 heap-
+    // allocates it) and kept alive until after `recv`. `tx` is moved in (the sole
+    // sender), so the channel closes if the task is torn down before delivering.
+    let handler = RcBlock::new(
+        move |data: *mut AnyObject, response: *mut AnyObject, error: *mut AnyObject| {
+            // SAFETY: the completion-handler out-params, any of which may be null;
+            // `extract_http_result` does read-only get-rule reads + copies bytes.
+            let result = unsafe { extract_http_result(data, response, error) };
+            let _ = tx.send(result);
+        },
+    );
+
+    // Build + start the request inside an autorelease pool (this may run on a
+    // background worker thread with no ambient pool).
+    let started: Result<(), String> = autoreleasepool(|_pool| {
+        // SAFETY: Foundation calls on autoreleased objects; nulls are guarded, and
+        // `NSURLSession` retains the request + block for the task's duration.
+        unsafe {
+            let url_ns = ns_string(url);
+            let ns_url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_ns];
+            if ns_url.is_null() {
+                return Err(format!("invalid URL: {url}"));
+            }
+            let request: *mut AnyObject =
+                msg_send![class!(NSMutableURLRequest), requestWithURL: ns_url];
+            if request.is_null() {
+                return Err("failed to build the request".to_string());
+            }
+            let get = ns_string("GET");
+            let _: () = msg_send![request, setHTTPMethod: get];
+            let _: () = msg_send![request, setTimeoutInterval: timeout_secs];
+            for (name, value) in headers {
+                let v = ns_string(value);
+                let n = ns_string(name);
+                let _: () = msg_send![request, setValue: v, forHTTPHeaderField: n];
+            }
+            let session: *mut AnyObject = msg_send![class!(NSURLSession), sharedSession];
+            if session.is_null() {
+                return Err("no shared NSURLSession".to_string());
+            }
+            let task: *mut AnyObject = msg_send![
+                session,
+                dataTaskWithRequest: request,
+                completionHandler: &*handler
+            ];
+            if task.is_null() {
+                return Err("failed to create the data task".to_string());
+            }
+            let _: () = msg_send![task, resume];
+            Ok(())
+        }
+    });
+    started?;
+
+    // Block this (worker) thread until the delegate queue delivers. `handler` is
+    // kept alive across the recv (NSURLSession retains it, but we hold it too).
+    let out = rx
+        .recv()
+        .map_err(|_| "the completion handler was dropped without a result".to_string())?;
+    drop(handler);
+    out
+}
+
+/// Copy the completion-handler out-params into an owned [`HttpGetResponse`] or an
+/// error message, on the delegate thread, before the autorelease pool drains.
+///
+/// # Safety
+/// `data` / `response` / `error` are the `dataTaskWithRequest:completionHandler:`
+/// args: an `NSData *`, an `NSURLResponse *` (expected `NSHTTPURLResponse`), and
+/// an `NSError *`, any of which may be null. All reads are get-rule; the body
+/// bytes are copied into an owned `Vec` before return.
+unsafe fn extract_http_result(
+    data: *mut AnyObject,
+    response: *mut AnyObject,
+    error: *mut AnyObject,
+) -> Result<HttpGetResponse, String> {
+    if !error.is_null() {
+        let desc: *mut AnyObject = msg_send![error, localizedDescription];
+        let msg = string_from_ns(desc).unwrap_or_else(|| "network error".to_string());
+        return Err(msg);
+    }
+    if response.is_null() {
+        return Err("no response".to_string());
+    }
+    // `statusCode` is an `NSHTTPURLResponse` property; guard against a non-HTTP
+    // response (which lacks the selector) before sending it.
+    let is_http: Bool = msg_send![response, isKindOfClass: class!(NSHTTPURLResponse)];
+    if !is_http.as_bool() {
+        return Err("non-HTTP response".to_string());
+    }
+    let status: isize = msg_send![response, statusCode];
+    let status = status.clamp(0, u16::MAX as isize) as u16;
+    let body = if data.is_null() {
+        Vec::new()
+    } else {
+        let bytes: *const u8 = msg_send![data, bytes];
+        let len: usize = msg_send![data, length];
+        if bytes.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(bytes, len).to_vec()
+        }
+    };
+    Ok(HttpGetResponse { status, body })
 }
 
 // ===========================================================================

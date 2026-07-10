@@ -1166,6 +1166,28 @@ pub fn run() {
         // closure is installed by the composition slice; absent, cross-window undo
         // still applies its inverse (headlessly) and surfaces drift banners.
         install_file_operations(cx);
+        // R27 (U1): the update checker. Install the production `ReleaseFetcher`
+        // seam (the objc2 `NSURLSession` GET behind `platform.rs`) — the ONLY
+        // place the shipped network call is reached; `run_selftest` installs a
+        // recording fake instead (hermeticity: no test/scenario hits the network).
+        // Then load the `update_check` section of `ui_settings.json` into its
+        // `UpdateCheckStore` Global and construct + install the process-wide
+        // `ReleaseCheckerGlobal`, which SEEDS from the cached tag so the trailing
+        // toolbar pill can render on frame 1 after a relaunch that already knew of
+        // an update. Launch-time read + default-path resolution live here in
+        // `app::run` ONLY. All BEFORE the restore fan-out opens the first window so
+        // its toolbar reads a live checker. The periodic worker is started ONLY
+        // when `LAUNCH_CHECK_ENABLED` (D6: false for the `0.1.0` dev build, so it
+        // never fetches or nags against Swift Nice's tags); the feature stays fully
+        // built + wired + tested and a scenario drives `check_now` via the seam.
+        crate::release_check::release_fetch::install_production(cx);
+        cx.set_global(crate::release_check::UpdateCheckStore::load(
+            crate::file_browser::sort_settings_store::default_ui_settings_path(),
+        ));
+        crate::release_check::install(cx);
+        if crate::release_check::LAUNCH_CHECK_ENABLED {
+            crate::release_check::start(cx);
+        }
         // R18 (L4 step 10): the restore fan-out replaces the single
         // `open_managed_window` — one window per saved slot (ghost pre-pass +
         // cwd-heal), or one fresh default window when nothing is restorable.
@@ -3923,6 +3945,57 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
+        // R27: the update-checker gate — mounts the real WindowToolbarView over a
+        // seeded tab and drives the WHOLE nudge through the INJECTED recording
+        // ReleaseFetcher (never the real network / github.com, never the launch
+        // timer): a newer tag flips update_available + exposes the trailing pill as
+        // an AXButton; a real guarded-HID click (behind the activate + raise +
+        // CGWindowListCopyWindowInfo frontmost-at-point preflight — DEFER LOUDLY on
+        // a miss, never a blind global post) opens the popover; its two exact brew
+        // commands + a Copy → clipboard are asserted in-process; and a fetch error
+        // stays silent with no pill (layout stability). Registered BEFORE
+        // `multiwindow`: it registers no WindowRegistry (no quit-when-empty close
+        // observer), so its window never trips the terminus `multiwindow` owns last.
+        Scenario {
+            name: "update-check",
+            open: crate::update_check_live::open_update_check_window,
+            gate: Gate::SelfReported {
+                // check_now marshal-back polls, the AX-tree activation poll, a
+                // guarded-HID click with its preflight/settle, the in-process
+                // content + Copy legs, and the error-leg poll; generous headroom.
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
+        // R27 §6: the tranche-6 CLOSE-OUT composition leg — composes the whole
+        // tranche's board on the REAL shipped launch window (open_managed_window /
+        // build_window_root → AppShellView, the exact path `run` takes): (a) the R27
+        // update pill appears on the SHIPPED toolbar off the injected fetcher and a
+        // guarded global-HID click opens its popover; (b) a real guarded global-HID
+        // drag commits an R25 pill reorder on the shipped strip; (c) a socket
+        // `handoff` opens a nested [HANDOFF]-titled tab on the shipped window (stub
+        // claude, never real) and ⌘, opens R23's shipped settings window exposing
+        // the Claude section (the R26 handoff toggle's home). The R25 drag + R27
+        // click post via the NEW guarded global-HID seams (activate + raise +
+        // CGWindowListCopyWindowInfo frontmost-at-point preflight — DEFER LOUDLY on a
+        // miss, never a blind post); ⌘, stays CGEventPostToPid. Sandbox HOME (no rc)
+        // + a stub claude via the ResolvedClaudePath Global. A SavedInputSource is
+        // held for the leg. Registered BEFORE `multiwindow`: its build_window_root
+        // only `register`s (no WindowRegistry close observer), so its window never
+        // trips the quit-when-empty terminus `multiwindow` owns as the last gate.
+        Scenario {
+            name: "tranche6-composition",
+            open: crate::tranche6_composition_live::open_tranche6_composition_window,
+            gate: Gate::SelfReported {
+                // A check_now marshal-back + AX poll, a guarded-HID pill click, a
+                // guarded-HID reorder drag, a socket handoff round-trip + tab
+                // creation, a stub-claude pane spawn, and a ⌘, settings open + AX
+                // rail poll — each on the real socket / pty / AX clock; generous
+                // headroom.
+                budget: Duration::from_secs(90),
+            },
+            activate: true,
+        },
         // R12: registered LAST — it installs the real WindowRegistry, whose close
         // observer quits when the registry empties, so the harness closing its
         // window A (after the scenario) must be the final window close in the run.
@@ -4015,6 +4088,24 @@ pub fn run_selftest(selector: String) {
             crate::theme_settings::ThemeSettingsStore::with_defaults(theme_path),
             terminal_themes_dir,
         );
+        // R27 hermeticity: install the RECORDING `ReleaseFetcher` fake process-wide
+        // BEFORE any scenario runs — no scenario hits the real network / github.com;
+        // the `update-check` scenario scripts the tag/error and drives `check_now`
+        // explicitly against it. The production objc2 GET is installed by `run`
+        // only. The `UpdateCheckStore` gets DEFAULTS + a throwaway temp path (never
+        // the real `ui_settings.json`), so its empty cache seeds no pill — keeping
+        // the toolbar layout-identical for the pane-strip / chrome / app-shell /
+        // sidebar scenarios. Construct + install the checker WITHOUT starting the
+        // worker (no launch-time network — the worker is `run`-only + gated).
+        crate::release_check::release_fetch::install_recording_fake(cx);
+        let update_check_path = std::env::temp_dir().join(format!(
+            "nice-rs-selftest-update-check-{}.json",
+            std::process::id()
+        ));
+        cx.set_global(crate::release_check::UpdateCheckStore::with_defaults(
+            update_check_path,
+        ));
+        crate::release_check::install(cx);
         nice_harness::selftest::drive(cx, &selector, scenarios);
     });
 }

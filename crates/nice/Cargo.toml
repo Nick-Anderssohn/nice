@@ -39,6 +39,13 @@ anyhow = "1"
 # the demand-present kick uses objc2 msg_send + raw-window-handle to reach the
 # window's NSView. objc2/raw-window-handle 0.6 match what gpui_macos links.
 objc2 = "0.6"
+# R27 (D1): the completion-handler block for the one synchronous `NSURLSession`
+# GitHub Releases GET behind `platform::http_get`. `block2` is the objc2 family's
+# block companion (MIT OR Apache-2.0) and is ALREADY resolved in the workspace
+# `Cargo.lock` (0.6.2, matching objc2 0.6.4) as a transitive dep — adding it as a
+# direct dep of `nice` causes NO lock churn and pulls NO new crate / no transport
+# or TLS backend. NSURLSession reaches OS TLS (Security.framework) itself.
+block2 = "0.6"
 # The R9 traffic-light geometry reader (`platform::standard_window_button_frames`)
 # reads live `standardWindowButton` frames; `NSRect` and its `CGFloat` fields come
 # from objc2-foundation's geometry module. Pinned to the exact version gpui_macos

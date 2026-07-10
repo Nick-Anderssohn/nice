@@ -496,8 +496,10 @@ The GPUI application. Structure (grows over later cycles):
   — the drag arms alongside it. **P5 (cross-window move) + P6 (tear-off) are CUT**
   (scope fence): no `NSDraggingSource` / `LivePaneRegistry` / tear-off host, no
   `extract_pane` / `insert_pane`, and no non-`.slot` resolver destinations.
-  **The trailing update pill (P7) is R27** (its slot stays empty). The empty
-  update-pill slot is by design; a reviewer must not flag it. Real session wiring for
+  **The trailing update pill (P7) LANDED in R27**: the reserved trailing slot now
+  holds a conditional pill that renders ONLY when the release checker reports a
+  newer version (see **Update checker (R27)** below) — absent an update it emits
+  nothing, so the toolbar is byte-identical to before. Real session wiring for
   select/close/create is R13 (it rewires the seam without touching strip
   internals); OSC auto-titles reaching pills is R13/R15; busy-close confirmation
   is R18. Modules:
@@ -523,7 +525,42 @@ The GPUI application. Structure (grows over later cycles):
     `on_drag_move` / `on_drop` (resolving the slot through `pane_strip_drop` +
     committing `TabModel::move_pane` + `save_to_store`), the transient
     `drag_target: Option<(target_pane_id, place_after)>` slot state, and the
-    insertion-line overlay on `scroll_wrap`.
+    insertion-line overlay on `scroll_wrap`. **R27** adds the trailing update pill:
+    `render_update_pill` reads `release_check::update_available(cx)` and renders the
+    conditional pill (AX id `toolbar.updateAvailable`, role Button, `stop_propagation`
+    on its press) only when a newer release exists; the pill click presents the
+    `UpdatePopover` via `cx.defer_in` (D9 — gpui takes the window out of `cx.windows`
+    mid-dispatch), and the view holds the `Option<Entity<UpdatePopover>>` + its
+    `DismissEvent` subscription (the `context_menu` field pattern).
+  - `update_popover` — the `UpdatePopover` `ManagedView` (R27, D9): the small
+    anchored card under the pill (`deferred(anchored(...))`, click-away + Esc
+    dismiss) rendering the header (`Update available: <version>`), the two brew
+    command rows (`brew update`, `brew upgrade --cask nice`) each with a Copy button
+    (clipboard write + the 1.5 s "Copied" revert, D8), and the
+    `Restart Nice after upgrading.` footer. A dedicated component, not a bent
+    `ContextMenu` (whose item enum stays closed).
+  - `update_check_live` — the R27 `update-check` self-test scenario (see the table
+    below): drives the whole nudge through the injected recording fetcher, asserts
+    the pill exposes on the AX tree + its popover contents/Copy in-process, and
+    clicks the real pill via the guarded global-HID seam behind the
+    frontmost-at-point preflight (DEFER on a miss).
+  - `tranche6_composition_live` — the R27 §6 **tranche-6 close-out** composition
+    self-test scenario (`tranche6-composition`, registered before `multiwindow`).
+    R27 is the last plan of tranche 6, so it owns the ONE composed assert of the
+    whole tranche's board on the REAL shipped launch window (`open_managed_window` /
+    `build_window_root` → `AppShellView`): **(a)** the R27 update pill appears on the
+    SHIPPED toolbar off the injected fetcher and a guarded global-HID click opens its
+    popover; **(b)** a real guarded global-HID drag commits an R25 pill reorder on
+    the shipped strip; **(c)** a socket `handoff` opens a nested `[HANDOFF]`-titled
+    tab on the shipped window (stub claude, never real) and ⌘, opens R23's shipped
+    settings window exposing the Claude section (the R26 `settings.claude.installHandoffSkill`
+    toggle's home). The R25 drag + R27 click post through the new
+    `platform::post_global_left_{down,drag,up}` / `post_global_left_click` seams
+    behind the mandatory activate + raise + `CGWindowListCopyWindowInfo`
+    frontmost-at-point preflight (DEFER LOUDLY on a miss — never a blind post); ⌘,
+    stays `CGEventPostToPid`. R27 also owns the tranche's ONE full regression sweep
+    (`cargo test --workspace` + `NICE_RS_SELFTEST=all`, release, strictly serial,
+    `multiwindow` last) — it lives here and in no other t6 plan.
   - `pane_strip_live` — the R11 live pane-strip self-test scenario (`pane-strip`,
     see the table below). Its in-process real-layout differentials (overflow
     onset, fades, badge, ✕-slot reservation, select/close/rename routing,
@@ -1168,6 +1205,70 @@ The GPUI application. Structure (grows over later cycles):
     Registered **before** `multiwindow` (`open_managed_window` only `register`s the
     `WindowRegistry`; the driver keeps the Main tab populated so no close empties
     the window).
+- **Update checker (R27, U1 + P7).** The release-check nudge — a **nudge, not an
+  updater** (port of Swift's `ReleaseChecker`): poll GitHub Releases on a slow
+  cadence, compare the latest tag to the running version, and — if newer — show a
+  trailing toolbar pill whose popover prints two `brew` commands the user runs
+  themselves. No download, no Sparkle, no self-update, **no settings toggle**
+  (strict Swift parity, D7). Modules live in `crates/nice` (`release_check/`) +
+  `nice-model` (the pure version compare) — app-shaped, zero new crates. Pieces:
+  - `nice-model::SemanticVersion` — the pure dotted-integer parse + compare (trim,
+    strip one leading `v`/`V`, split on `.` requiring every component to be a
+    non-negative integer else `None`, missing trailing components compare as 0,
+    component-wise **not** lexicographic so `0.1.9 < 0.1.10`). `is_newer(latest,
+    current)` is `false` if either fails to parse. Ported 1:1 with its Swift tests.
+  - `release_check::release_fetch` — the injectable `ReleaseFetcher` seam (the
+    `WorkspaceOps` twin): `trait ReleaseFetcher: Send + Sync` behind a
+    `ReleaseFetcherGlobal(Arc<dyn ReleaseFetcher>)` (an **`Arc`**, not a `Box`: the
+    blocking fetch clones it onto a background thread and marshals only the
+    `Result` back). `ProductionReleaseFetcher` forwards to the objc2
+    `NSURLSession` GET in `platform::http_get` (the ONLY network call, behind
+    `platform.rs`); `RecordingReleaseFetcher` returns a canned tag/error + logs
+    calls. `install_production` from `app::run` ONLY; `install_recording_fake` from
+    `run_selftest` ONLY — **no test or scenario ever touches the real network /
+    `github.com`** (hermeticity).
+  - The GitHub request (frozen): `GET
+    https://api.github.com/repos/Nick-Anderssohn/nice/releases/latest` (built from
+    `const REPO_SLUG`; `/releases/latest` excludes drafts + prereleases for free)
+    with `Accept: application/vnd.github+json` + a mandatory `User-Agent`, 10 s
+    timeout, no ETag / auth; require `200..300`, decode `{ tag_name }` only.
+  - `release_check::update_check_store` — the cached last-seen tag in a **new
+    `update_check` section of `ui_settings.json`** (not `UserDefaults`, D3),
+    persisted through R21's ONE shared `write_ui_settings_merged` read-merge-write
+    writer (co-owner sections `appearance`/`fonts`/`shortcuts`/… round-trip
+    untouched). Read at checker construction so the pill can render on frame 1 after
+    a relaunch that already knew of an update.
+  - `release_check` (the checker Global, D2) — the process-wide
+    `ReleaseCheckerGlobal` (`update_available` / `latest_version`), seeded from the
+    cache at construction; `check_now(cx)` runs one fetch on the background executor
+    and marshals back, applying `apply_latest` (recompute the flag) + caching the
+    tag **unconditionally on success even if it parses to garbage** (so a bad
+    response can't re-nag) + swallowing every error silently + `refresh_windows()`
+    to repaint the pill (a Global, not an entity); `start(cx)` spawns the nap-safe
+    3 s / 6 h worker. The toolbar reads it through the `update_available(cx)` free
+    fn (exactly as it reads `active_chrome_accent`).
+  - **Dev-build launch gate (D6 — a product decision, flag for Nick):**
+    `LAUNCH_CHECK_ENABLED = false`. `Nice RS Dev.app` ships at crate version
+    `0.1.0` with no published GitHub release or Homebrew cask of its own, so
+    comparing `0.1.0` against Swift Nice's `vX.Y.Z` tags would light the pill
+    spuriously on every launch. `app::run` installs the checker + reads the cache
+    but does NOT start the worker while the flag is off — so the shipped dev build
+    never fetches and never nags. The feature stays fully built, wired, and tested
+    (the `update-check` scenario drives `check_now` via the injected seam). When the
+    Rust app ships as a real release with its own cask + tags aligned to
+    `CARGO_PKG_VERSION`, flip `LAUNCH_CHECK_ENABLED` to `true` and repoint the
+    `REPO_SLUG` / `CASK_NAME` constants — no logic change.
+  - The pill + `UpdatePopover` live in the toolbar (see **Toolbar** above): the
+    conditional trailing pill (AX `toolbar.updateAvailable`) + the anchored popover
+    with the two `brew` commands + Copy buttons.
+  - Platform seams added for R27 in `platform.rs`: `http_get` (the NSURLSession
+    GET); the SELFTEST-ONLY guarded global-HID `post_global_left_click` /
+    `post_global_left_drag` (the ONLY `CGEventPost(kCGHIDEventTap)` call sites — the
+    SAFETY-INVARIANT carve-out, permitted only after the preflight below, because
+    pid-posted mouse events silently drop); and `frontmost_window_owns_point` (the
+    z-order half of that preflight, via `CGWindowListCopyWindowInfo`). Keyboard
+    synthetic events stay `CGEventPostToPid`-only.
+
 - `main.rs` — dispatches on `NICE_RS_SELFTEST`: unset runs the normal app,
   set runs the self-test driver.
 
@@ -1681,6 +1782,8 @@ the window, and moves to the next scenario.
 | `theme-fanout` | The R21 live theme-system gate (Validation §4). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with the live theme globals installed — a `ThemeSettingsStore` at a **temp** `ui_settings.json`, the `TerminalThemeCatalog` over a sandbox `terminal-themes/` dir (R22), a scenario-minted `SharedThemeState`, and an **injected `OsSchemeSource` stub** over a flippable cell (`run_selftest` mints none of these). Sandbox `HOME` (held for the whole driver so the R17-live Claude writes land under `<home>/.claude`), a blanked `ZDOTDIR` rc chain for the Main pane's shell, a `NICE_CLAUDE_OVERRIDE` stub — never the real `~/.claude` / `~/.nice` / system appearance. Legs (bounded fail-loud state polls): **(a/d) OS-sync scheme flip fans BOTH halves** — with `sync_with_os` ON, flipping the OS stub + `reconcile_with_os` flips `scheme`; the active chrome `Slots` change, the Main pane's `TerminalView` swaps its render theme, AND a **pixel sample on the live terminal recolors** (`nice_harness::capture::sample_window_pixels`, max channel delta > 8/255) — proving chrome + terminal across the window; with sync OFF, driving the stub is a no-op; **(d) manual contradiction** — re-enabling sync pins the scheme to the OS, then a manual `apply_scheme` to the other scheme turns `sync_with_os` off (`userPicked`); **(b) accent** — `apply_accent` pushes a new accent into the pane (the cursor-None caret color); **(c) terminal-id latency** — an INACTIVE-scheme `apply_terminal_theme_id` does NOT recolor the pane (persisted, latent) and the next scheme flip makes that slot active (leg (c) sets `nice-default-dark`, whose payload matches the scheme's Nice default, so the latency check stays a clean no-op; leg (f) exercises a distinct-theme active recolor now that R22's catalog resolves real themes); **(e) R17-live** — with the gate ON a theme change rewrites the sandbox `nice-rs.json` colors file (byte-diff via the landed only-if-changed writer) and `apply_sync_claude_theme` re-sources every window's `--settings` provider (asserted through `claude_settings_path_provider`); **(f) R22 Ghostty import** — a fixture `.ghostty` written under the sandbox `terminal-themes/` dir is `import_theme`d through the Global catalog (parse → persist verbatim as `<slug>.ghostty` → enter the imported list → resolve by id), then `apply_terminal_theme_id` (R21) makes it live for the active scheme and the live terminal pane recolors to the imported background (render theme swap + pixel sample > 8/255) — parse → persist → catalog → resolve → fan-out end to end. Needs **no** Accessibility grant (drives the store `apply_*` API + pixel readback, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
 | `settings-window` | The R23 Settings-window gate (Validation §2–§3). Drives the ⌘, Settings window over a minimal host window in ONE `Application::run` (the open/apply fns driven explicitly, no relaunch), fully sandboxed: a `run_selftest` defaults+temp `SettingsPrefsStore` / theme store / catalog, a scenario-minted `SharedThemeState` + injected `OsSchemeSource` stub, and the `RecordingFilePicker` (no real `NSOpenPanel`). Legs: **(a) ⌘, singleton** — the first `OpenSettings` opens exactly one settings window (a fresh handle, `App::windows()`+1, the `SettingsWindow` Global `Some`), a second focuses the SAME window (no second window, handle unchanged), close clears the Global; **(b) live Appearance fan-out** — `apply_accent` flips the resolved `ThemeState` the chrome paints from (the composed real-window pixel assert is R24's, per the Validation split); **(c) Font slider fan-out + persist** — the Font pane's terminal-size handler changes the shared `FontSettings` px + re-metrics, a subsequent ⌘= (`zoom_by`) continues from the slider value on the SAME entity (no desync), and the `fonts` section on the temp `ui_settings.json` reflects the change; **(d) Import through the fake picker** — a scripted temp `.ghostty` imports through the `FilePickerOps` seam into `imported_entries()`/`themes(for:)`, a malformed fixture surfaces the exact mapped §ImportError string; **(e) rail** — `settings_rail_sections()` exposes the six slugs incl. the `shortcuts` row (the R24 pane); **(s1–s3) the R24 recorder** — over a dedicated host window rendering the shipped `shortcuts_pane` body (R23's live-window active-pane state is private, so this renders the identical pane): s1 enters recording on `newTerminalPane` and a REAL ⌘Y chord (`post_key_tap`, own pid) rebinds it, s2 captures ⌘B (ToggleSidebar's default) → the "Already used by <label>" conflict + Replace clears the loser and binds this action, s3 Reset restores the default and `is_at_default` flips; a `SavedInputSource` is held across the leg (IME restore) and `AXIsProcessTrusted()` is preflighted (a dropped chord fails loudly). **(§6) the tranche-5 final composition (Milestone 6)** — over the **REAL registered launch window** (`open_managed_window` / `build_window_root`, NOT a host; the §6 leg opens + reaps its own shipped window over a hermetic ZDOTDIR/HOME/`NICE_CLAUDE_OVERRIDE` fixture, its `build_window_root` only `register`s so it never trips quit-when-empty), by CGEvent to nice-rs's own pid: **(6a)** a rebound chord dispatches — `set_binding(newTerminalPane → ⌘Y)` then a real ⌘Y adds a pane to the shipped window's `WindowState` and the old default ⌘T no longer does (`rebuild_keymap` dropped it); **(6b)** the PROTECTED non-rebindable set (⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@SidebarShell, ⌘,) survives the total clear — a `key_bindings()` presence audit (the `keymap` re-install probe, on the live board); **(6c)** a real ⌘, opens R23's settings window (the `OpenSettings` non-rebindable firing LIVE, `App::windows()`+1), then a live theme change (`apply_accent` + `apply_scheme`) repaints the shipped **chrome** AND a **terminal cell** (`sample_window_pixels`, max channel delta > 8/255 on both — the composed pixel assert the R23 `settings-window` leg (b) deferred to R24; the stub selftest catalog makes `apply_terminal_theme_id` a latent no-op, so the terminal recolor comes from the scheme flip, as `theme-fanout` proves); **(6d)** a busy pane (marked through the `synthetic_foreground_child` seam — the true `tcgetpgrp` is `close-confirmation`'s) close presents R20.5's `ConfirmationModal` (`pending_modal()` + the `CONFIRM_ACCEPT_ID` AXButton), cancelled. The launch window is reaped (`WindowState::teardown`) + the rebind reset at teardown so nothing leaks to `multiwindow`. This composed board is the Milestone-6 claim; no earlier cycle asserted it together. The settings window is UNREGISTERED (D7), and the scenario installs no `WindowRegistry` close observer. The s1–s3 + §6 legs need the Accessibility grant (real CGEvents); a–e do not. Registered **before** `multiwindow`. `Gate::SelfReported`. |
 | `handoff` | The R26 handoff gate (Validation §3). Drives the **shipped window** (`open_managed_window` / `build_window_root`) over a **real control socket** + **real ptys**, fully sandboxed: scratch `skill_dir` / `helper_dir` under a temp root (auto-removed), a temp `HOME` / blanked `ZDOTDIR`, and a stub `claude` that records its full argv — seeded via the `ResolvedClaudePath` Global (`NICE_CLAUDE_OVERRIDE` UNSET, so `is_override` stays false and the Nice-injected flags emit for the argv legs to assert), never the machine's real `claude` / real `~/.claude` / `~/.nice`. Legs: **(a) installer round-trip (hermetic, injected dirs)** — `sync_with(true, skill_dir, helper_dir)` lands both `-rs` files (helper at 0o755), a re-run leaves mtimes stable (idempotent), and `sync_with(false, …)` removes the `nice-handoff-rs/` skill subtree + the helper FILE while `helper_dir` SURVIVES (a planted R16 `nice-claude-hook.sh` sibling proven untouched — the `~/.nice/` ownership asymmetry); **(b) handoff socket → nested tab** — a raw `handoff` JSON line naming an originating claude tab's `tabId`/`paneId` plus a custom `instructions`/`model`/`effort` replies `ok`, a NEW tab appears nested one indent under the originating tab (`parent_tab_id` → the originating id) with the LOCKED title `[HANDOFF] <originating title>` + `title_manually_set == true`, and the stub's recorded argv carries `--session-id <v4 uuid>` then `--model <m> --effort <e>` then the prompt `Read the handoff notes at <handoffFile>. <instructions>` as the FINAL positional; **(c) top-level fallback on a miss** — a `handoff` with an empty `tabId` still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` tab (`parent_tab_id == None`), proving a miss is a fallback, not a drop; **(d) empty model/effort omit their flags** — `model:""` / `effort:""` records argv carrying NEITHER `--model` NOR `--effort`, the prompt still last. The first-launch prompt is NOT exercised here (it does not fire under `run_selftest` by construction; its gate + copy are covered by the `should_offer_handoff_prompt` unit test + the verbatim plan copy). Needs **no** Accessibility grant (raw sockets + pty writes, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `update-check` | The R27 update-checker gate (Validation §4). Mounts the real `WindowToolbarView` over a seeded tab and drives the WHOLE release-check nudge through the **injected** `RecordingReleaseFetcher` (installed process-wide by `run_selftest`) — never the real network / `github.com`, and never the launch timer (the worker is `run`-only + gated). **Success leg:** script the fetcher to a newer tag (`v9.9.9`), drive the foreground `check_now`, and assert `update_available` flips to `Some("v9.9.9")`; the trailing pill then renders — proven BOTH deterministically (the render gate) AND on the **real AX tree** (an `AXButton` titled `Update available`, polled while forcing a repaint per tick, the `ax-probe`/`app-shell` pattern). A **real guarded-HID click** on the pill (behind the mandatory preflight: activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point via `platform::frontmost_window_owns_point`) opens the popover — hard-asserted when the preflight passes, else **DEFERRED LOUDLY** (never a blind `CGEventPost` — the pid-only invariant's carve-out safety). The popover's contents (`brew update` then `brew upgrade --cask nice`, a Copy per row) and one Copy → clipboard write are asserted **in-process** (so a DEFERRED real click never weakens the content coverage — the `pane-strip` in-process-pins-content precedent). **Error leg:** reset the checker to a clean state, script a fetch ERROR, drive `check_now`, and assert `update_available` STAYS false and NO pill renders (the silent-error + layout-stability contract). No chord is typed (no `SavedInputSource` needed); the only synthetic input is the one guarded global-HID click, fenced by its preflight, and it preflights `AXIsProcessTrusted()`. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `tranche6-composition` | The R27 §6 **tranche-6 close-out** composition gate (Validation §6). Composes the whole tranche's board on the **REAL shipped launch window** (`open_managed_window` / `build_window_root` → `AppShellView`, the exact path `run` takes — never a scenario-only toolbar), sandboxed: a temp `HOME` (no rc) + a stub `claude` idling via the `ResolvedClaudePath` Global (`NICE_CLAUDE_OVERRIDE` UNSET), and the `run_selftest`-installed `RecordingReleaseFetcher` (never the real network / `github.com`). A `SavedInputSource` is held for the leg. Legs: **(a) R27 update pill** — script the fetcher to `v9.9.9`, drive the foreground `check_now` on the shipped window → the trailing pill appears on the SHIPPED toolbar (AX `AXButton` titled `Update available`), and a **real guarded global-HID click** (behind the mandatory activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point preflight) opens its popover showing `brew update` + `brew upgrade --cask nice` (hard when the preflight passes; else DEFERRED, with the popover contents still asserted in-process); **(b) R25 pill reorder** — with ≥2 panes, a **real guarded global-HID drag** of the trailing pill left past the leader's midpoint commits a reorder read back off the shipped strip (`pane_ids()` flips), hard-asserted only on a demonstrably-landed press (else DEFERRED — the `pane-strip` honest-deferral); **(c) R26 handoff** — a raw-`UnixStream` `handoff` naming a seeded originating Claude tab replies `ok` and opens a nested `[HANDOFF] my-project` tab on the shipped window (LOCKED title, parented under the originating tab, spawning the stub claude), and a real ⌘, (`CGEventPostToPid`) opens R23's shipped settings window whose rail exposes the **Claude section** (`AXButton` titled `Claude`) — the home of R26's `settings.claude.installHandoffSkill` toggle (whose click behaviour is pinned by R26's `claude_pane` unit test + the `handoff` installer scenario). The R25 drag + R27 click post via the new `platform::post_global_left_{down,drag,up}` / `post_global_left_click` seams (SELFTEST-ONLY carve-out — the ONLY global `CGEventPost` call sites, guarded by the preflight; a failed preflight DEFERS LOUDLY, never a blind post); ⌘, stays `CGEventPostToPid`. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
 | `multiwindow` | The R12 live multi-window + shortcut-dispatch gate (Validation §2–§5). Drives the shipped `WindowRegistry` / `WindowState` / `keymap` on **real `NSWindow`s** with **real CGEvents** to nice-rs's own pid. Opens window A as a capture-tee managed window (the `input-live` pattern) registered in the process-wide registry, then asserts: **⌘N** opens a second, isolated, registry-tracked window (the registry count **and** `App::windows()` both step 1 → 2); **⌘T** posted while window B is key adds a pane to B's `WindowState` model only, leaving A's model signature unchanged (isolation + focused-window routing through `active_state`); **⌘=** grows the one process-level `FontSettings` every window observes (the font fan-out) and leaks **zero** bytes into A's capture-tee pty; the **pass-through differential** — a plain `x` reaches the pty as `x`, while **⌘⌥↓** cycles the sidebar and leaks **zero** capture bytes (a matched chord is consumed, an unmatched key falls through byte-identically); **live peek** — with A's sidebar collapsed, ⌘⌥↓ floats the peek and a modifiers-release clears it via the window-level `on_modifiers_changed` observer; and **close/deregister/fallback** — closing B deregisters it (registry + `NSWindow` count drop) and a window-scoped action then falls back to the surviving window A. Matching is **character-based** at the gpui pin (the documented divergence from Swift's physical-keycode match — see the `keymap` module notes). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make every chord a no-op). The per-pid flagsChanged the peek-clear needs is not synthesizable via `CGEventPostToPid`, so the modifier release is driven as a real `ModifiersChangedEvent` through GPUI's own dispatch (the same `on_modifiers_changed` path). The in-process isolation / routing / all-13-fire / peek **differentials** live in `nice-itests`' `multiwindow` cases. Registered **last** in `selftest_scenarios` (it installs the registry whose close observer quits when the registry empties). `Gate::SelfReported`. |
 
 **Tranche-3 close-out (Milestone 3).** `claude-e2e` is the standing Milestone-3
