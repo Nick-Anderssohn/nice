@@ -329,6 +329,12 @@ impl PaneStripProbe {
 
     // ---- event handlers ----------------------------------------------------
 
+    /// NOTE (M7.8 round 3): the SHIPPED view now routes the pill select on
+    /// CLICK (mouse-up with no drag — prod's `.onTapGesture`), not on the
+    /// press; this probe keeps driving the routing on the down event for
+    /// determinism. What it pins is the select/close ROUTING + the
+    /// ✕-consumes-press differential, not the gesture phase; the phase (a drag
+    /// suppresses the click) is asserted black-box in `pane_strip_live`.
     fn on_pill_down(&mut self, pane_id: &str, cx: &mut Context<Self>) {
         self.select_pane(pane_id);
         cx.notify();

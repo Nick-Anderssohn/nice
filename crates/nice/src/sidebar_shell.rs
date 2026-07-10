@@ -260,6 +260,66 @@ fn tab_drop_target(
     None
 }
 
+/// Build the drop-resolution scope for a drag of `dragged` over one project
+/// group — the target order and frame spans [`tab_drop_target`] resolves
+/// against — subtree-aware (M7.8 round 3, matching [`TabModel::move_tab`]'s
+/// block semantics):
+///
+/// * **Root drag** (dragged has no parent): one unit per top-level BLOCK
+///   (root + its depth-1 children), keyed by the root id, spanning the union
+///   of the block's painted row frames. Midpoint math then answers
+///   before/after the WHOLE block — "after a parent visually at its bottom
+///   edge" is after its last child, and no slot inside a group is ever
+///   proposed (or a line drawn there).
+/// * **Child drag**: only the rows of the dragged tab's own block (its root,
+///   then the siblings) — a slot anywhere else resolves to `None`, and
+///   `would_move_tab` rejects the boundary cases (before the root / other
+///   blocks) the row scope still reaches.
+///
+/// `rows` is the group's `(tab_id, parent_tab_id)` list in display order;
+/// `frames` the per-row painted extents. Pure — unit-tested below.
+fn drag_scope(
+    rows: &[(String, Option<String>)],
+    dragged: &str,
+    frames: &HashMap<String, (f32, f32)>,
+) -> (Vec<String>, HashMap<String, (f32, f32)>) {
+    let dragged_parent = rows
+        .iter()
+        .find(|(id, _)| id == dragged)
+        .and_then(|(_, p)| p.clone());
+    match dragged_parent {
+        None => {
+            // Block units keyed by root id, in first-appearance display order.
+            let mut order: Vec<String> = Vec::new();
+            let mut spans: HashMap<String, (f32, f32)> = HashMap::new();
+            for (id, parent) in rows {
+                let root = parent.as_ref().unwrap_or(id);
+                if !order.iter().any(|r| r == root) {
+                    order.push(root.clone());
+                }
+                if let Some(&(min_y, max_y)) = frames.get(id) {
+                    spans
+                        .entry(root.clone())
+                        .and_modify(|s| {
+                            s.0 = s.0.min(min_y);
+                            s.1 = s.1.max(max_y);
+                        })
+                        .or_insert((min_y, max_y));
+                }
+            }
+            (order, spans)
+        }
+        Some(root_id) => {
+            let order: Vec<String> = rows
+                .iter()
+                .filter(|(id, p)| *id == root_id || p.as_deref() == Some(root_id.as_str()))
+                .map(|(id, _)| id.clone())
+                .collect();
+            (order, frames.clone())
+        }
+    }
+}
+
 // ---- Colour helpers (Nice/Dark; the SidebarBackground palette seam) ----------
 
 /// The active chrome slot table — the live
@@ -321,6 +381,8 @@ struct TabVm {
     id: String,
     title: String,
     indented: bool,
+    /// Depth-1 children under this tab (the drag ghost's `+N` group hint).
+    child_count: usize,
     has_claude: bool,
     status: TabStatus,
     waiting_ack: bool,
@@ -355,9 +417,12 @@ struct TabDragPayload {
 
 /// The drag ghost that follows the cursor: a simplified row chip (title only,
 /// reduced opacity) — the R25 `PaneDragGhost` pattern, not a bitmap snapshot.
-/// gpui positions it under the cursor automatically.
+/// gpui positions it under the cursor automatically. A parent dragging its
+/// child block appends a dim `+N` so the chip reads as the whole group.
 struct TabRowDragGhost {
     title: SharedString,
+    /// Depth-1 children coming along with the drag (0 for a childless row).
+    child_count: usize,
 }
 
 impl Render for TabRowDragGhost {
@@ -367,6 +432,7 @@ impl Render for TabRowDragGhost {
             .flex()
             .flex_row()
             .items_center()
+            .gap(px(6.0))
             .h(px(24.0))
             .max_w(px(200.0))
             .px(px(10.0))
@@ -381,6 +447,16 @@ impl Render for TabRowDragGhost {
             .whitespace_nowrap()
             .truncate()
             .child(self.title.clone())
+            .when(self.child_count > 0, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(slot_to_rgba(s.ink3))
+                        .child(SharedString::from(format!("+{}", self.child_count))),
+                )
+            })
     }
 }
 
@@ -620,6 +696,11 @@ impl SidebarShellView {
                             id: t.id.clone(),
                             title: t.title.clone(),
                             indented: t.parent_tab_id.is_some(),
+                            child_count: p
+                                .tabs
+                                .iter()
+                                .filter(|c| c.parent_tab_id.as_deref() == Some(t.id.as_str()))
+                                .count(),
                             has_claude: t.has_claude(),
                             status: t.status(),
                             waiting_ack: t.waiting_acknowledged(),
@@ -926,10 +1007,11 @@ impl SidebarShellView {
     /// clears only a slot this group owns (another group's `on_drag_move` may
     /// already have overwritten it — Swift's `ownsCurrentIndicator`). When
     /// contained, the cursor's window y is resolved against this group's painted
-    /// row frames ([`tab_drop_target`], midpoint rule) and gated through
-    /// [`TabModel::would_move_tab`] — cross-project and no-op slots resolve to
-    /// `None`, so no line paints and a drop is a no-op (prod's `dropUpdated`
-    /// proposing `.forbidden`).
+    /// row frames — collapsed through [`drag_scope`] into subtree-aware units
+    /// ([`tab_drop_target`], midpoint rule) — and gated through
+    /// [`TabModel::would_move_tab`] — cross-project, illegal-lineage, and no-op
+    /// slots resolve to `None`, so no line paints and a drop is a no-op (prod's
+    /// `dropUpdated` proposing `.forbidden`).
     fn on_tab_drag_move(
         &mut self,
         group_id: &str,
@@ -952,27 +1034,38 @@ impl SidebarShellView {
         let frames = self.row_frames.borrow().clone();
         let new_target = {
             let ws = self.state.read(cx);
-            let order: Vec<String> = ws
+            let rows: Vec<(String, Option<String>)> = ws
                 .model
                 .projects
                 .iter()
                 .find(|p| p.id == group_id)
-                .map(|p| p.tabs.iter().map(|t| t.id.clone()).collect())
+                .map(|p| {
+                    p.tabs
+                        .iter()
+                        .map(|t| (t.id.clone(), t.parent_tab_id.clone()))
+                        .collect()
+                })
                 .unwrap_or_default();
-            tab_drop_target(y, &order, &frames).filter(|(target, place_after)| {
-                ws.model.would_move_tab(&dragged, target, *place_after)
-            })
+            // Subtree-aware scope: a root drag resolves against whole-block
+            // units (the insertion line snaps to block boundaries); a child
+            // drag against its own sibling run only.
+            let (order, spans) = drag_scope(&rows, &dragged, &frames);
+            tab_drop_target(y, &order, &spans)
+                .filter(|(target, place_after)| {
+                    ws.model.would_move_tab(&dragged, target, *place_after)
+                })
+                .map(|(target_tab_id, place_after)| {
+                    // `tab_drop_target` only returns ids it found spans for.
+                    let (min_y, max_y) = spans[&target_tab_id];
+                    let edge = if place_after { max_y } else { min_y };
+                    (target_tab_id, place_after, edge)
+                })
         }
-        .map(|(target_tab_id, place_after)| {
-            // `tab_drop_target` only returns ids it found frames for.
-            let (min_y, max_y) = frames[&target_tab_id];
-            let edge = if place_after { max_y } else { min_y };
-            SidebarDropTarget {
-                project_id: group_id.to_string(),
-                target_tab_id,
-                place_after,
-                line_y: edge - f32::from(event.bounds.origin.y),
-            }
+        .map(|(target_tab_id, place_after, edge)| SidebarDropTarget {
+            project_id: group_id.to_string(),
+            target_tab_id,
+            place_after,
+            line_y: edge - f32::from(event.bounds.origin.y),
         });
         if self.drag_target != new_target {
             self.drag_target = new_target;
@@ -1889,6 +1982,7 @@ impl SidebarShellView {
             tab_id: SharedString::from(t.id.clone()),
         };
         let ghost_title = SharedString::from(t.title.clone());
+        let ghost_child_count = t.child_count;
 
         // The inner row (colored rounded rect), inset 6pt from the card edges.
         //
@@ -1928,7 +2022,10 @@ impl SidebarShellView {
             .child(title)
             .on_drag(drag_payload, move |_payload, _offset, _window, app| {
                 let title = ghost_title.clone();
-                app.new(|_| TabRowDragGhost { title })
+                app.new(|_| TabRowDragGhost {
+                    title,
+                    child_count: ghost_child_count,
+                })
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -2461,6 +2558,68 @@ mod tests {
         // A collapsed group paints no rows, so its ids carry no frames — every
         // branch misses (Swift's empty `tabFrames` snapshot).
         assert_eq!(tab_drop_target(120.0, &order3(), &HashMap::new()), None);
+    }
+
+    // ---- drag_scope (subtree-aware drop units, M7.8 round 3) ----------------
+
+    /// The repro tree: `A [A1 A2] B [B1] C`, 28pt rows from y=100.
+    fn lineage_rows() -> Vec<(String, Option<String>)> {
+        [
+            ("A", None),
+            ("A1", Some("A")),
+            ("A2", Some("A")),
+            ("B", None),
+            ("B1", Some("B")),
+            ("C", None),
+        ]
+        .into_iter()
+        .map(|(id, p)| (id.to_string(), p.map(str::to_string)))
+        .collect()
+    }
+
+    fn lineage_frames() -> HashMap<String, (f32, f32)> {
+        lineage_rows()
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                let top = 100.0 + 28.0 * i as f32;
+                (id.clone(), (top, top + 28.0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn root_drag_scope_collapses_blocks_into_units() {
+        let (order, spans) = drag_scope(&lineage_rows(), "C", &lineage_frames());
+        assert_eq!(order, ["A", "B", "C"]);
+        // A's unit spans its whole block: rows 0-2 → 100..184.
+        assert_eq!(spans["A"], (100.0, 184.0));
+        assert_eq!(spans["B"], (184.0, 240.0));
+        assert_eq!(spans["C"], (240.0, 268.0));
+    }
+
+    #[test]
+    fn root_drag_midpoint_is_block_level() {
+        let (order, spans) = drag_scope(&lineage_rows(), "C", &lineage_frames());
+        // y=150 is over A's SECOND row but above the block midpoint (142):
+        // resolves after the whole A block, never between A and its children…
+        assert_eq!(tab_drop_target(150.0, &order, &spans), Some(("A".into(), true)));
+        // …and y=120 (top half of the block) is before it.
+        assert_eq!(tab_drop_target(120.0, &order, &spans), Some(("A".into(), false)));
+    }
+
+    #[test]
+    fn child_drag_scope_is_its_own_block_rows() {
+        let frames = lineage_frames();
+        let (order, spans) = drag_scope(&lineage_rows(), "A2", &frames);
+        assert_eq!(order, ["A", "A1", "A2"]);
+        // Row-granularity spans (untouched frames): a slot between siblings
+        // stays resolvable.
+        assert_eq!(spans["A1"], frames["A1"]);
+        // Rows outside the block are not in the order, so a cursor over B's
+        // row (y=190) falls into the below-last branch → after A2 (the last
+        // sibling), which the model gates as a no-op when unchanged.
+        assert_eq!(tab_drop_target(190.0, &order, &spans), Some(("A2".into(), true)));
     }
 
     #[test]

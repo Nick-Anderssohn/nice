@@ -335,14 +335,22 @@ impl TabModel {
 
     /// Move `tab_id` to a new slot within the same project, relative to
     /// `target_tab_id`. No-op — and no event — when the tabs aren't in the same
-    /// project, either id is unknown, or the move wouldn't change order. Tabs
-    /// in the pinned Terminals project reorder internally but never leave it
-    /// (cross-project is a no-op) (`TabModel.swift:485-500`).
+    /// project, either id is unknown, the slot is illegal for the dragged tab's
+    /// lineage, or the move wouldn't change order. Tabs in the pinned Terminals
+    /// project reorder internally but never leave it (cross-project is a no-op)
+    /// (`TabModel.swift:485-500`).
+    ///
+    /// **Deliberate divergence from prod** (M7.8 feel-check round 3): Swift's
+    /// `moveTab` moves a single row and ignores the depth-1 lineage, so
+    /// dragging a parent strands its children and a foreign tab can land
+    /// inside another parent's group. Here the move is subtree-aware — see
+    /// [`plan_tab_move`] for the full slot legality rules:
+    /// * a ROOT tab moves with its entire child block, gathered contiguously;
+    /// * a root can only land at another BLOCK's boundary (never interleaved,
+    ///   never inside its own subtree);
+    /// * a CHILD reorders among its own siblings only.
     pub fn move_tab(&mut self, tab_id: &str, target_tab_id: &str, place_after: bool) {
-        if tab_id == target_tab_id {
-            return;
-        }
-        let (Some((sp, si)), Some((dp, di))) = (
+        let (Some((sp, _)), Some((dp, _))) = (
             self.project_tab_index(tab_id),
             self.project_tab_index(target_tab_id),
         ) else {
@@ -351,25 +359,23 @@ impl TabModel {
         if sp != dp {
             return;
         }
-        let mut insert_index = if place_after { di + 1 } else { di };
-        if si < insert_index {
-            insert_index -= 1;
-        }
-        if insert_index == si {
+        let tabs = &mut self.projects[sp].tabs;
+        let Some(order) = plan_tab_move(tabs, tab_id, target_tab_id, place_after) else {
             return;
-        }
-        let tab = self.projects[sp].tabs.remove(si);
-        self.projects[sp].tabs.insert(insert_index, tab);
+        };
+        let mut old: Vec<Option<Tab>> = tabs.drain(..).map(Some).collect();
+        *tabs = order
+            .iter()
+            .map(|&i| old[i].take().expect("plan_tab_move yields a permutation"))
+            .collect();
         self.fire_mutation();
     }
 
     /// Mirrors [`TabModel::move_tab`] without mutating — true iff the drop
-    /// would actually reorder (`TabModel.swift:505-514`).
+    /// would actually reorder (`TabModel.swift:505-514`, with the same
+    /// subtree-aware divergence as [`TabModel::move_tab`]).
     pub fn would_move_tab(&self, tab_id: &str, target_tab_id: &str, place_after: bool) -> bool {
-        if tab_id == target_tab_id {
-            return false;
-        }
-        let (Some((sp, si)), Some((dp, di))) = (
+        let (Some((sp, _)), Some((dp, _))) = (
             self.project_tab_index(tab_id),
             self.project_tab_index(target_tab_id),
         ) else {
@@ -378,11 +384,7 @@ impl TabModel {
         if sp != dp {
             return false;
         }
-        let mut insert_index = if place_after { di + 1 } else { di };
-        if si < insert_index {
-            insert_index -= 1;
-        }
-        insert_index != si
+        plan_tab_move(&self.projects[sp].tabs, tab_id, target_tab_id, place_after).is_some()
     }
 
     // MARK: - Panes: reorder / insert / extract
@@ -1200,6 +1202,143 @@ impl TabModel {
 }
 
 // MARK: - Pure free helpers
+
+/// Plan the reorder [`TabModel::move_tab`] performs on one project's tab list:
+/// the resulting display order as a permutation of indices into `tabs`, or
+/// `None` when the drop is illegal or would not change the order.
+///
+/// The depth-1 lineage (`Tab::parent_tab_id`) partitions a project's tabs into
+/// BLOCKS: a root tab plus every tab pointing at it. The slot rules keep every
+/// block visually contiguous (children always read as nested under their
+/// parent — a foreign row interleaved into a group would visually adopt the
+/// children below it):
+///
+/// * **Root drag** (dragged tab has no parent): the root moves together with
+///   its whole child block, child order preserved, gathered contiguously (a
+///   previously scattered block self-heals). The landing slot is a block
+///   boundary of the target's block — BEFORE it when the drop names the target
+///   root itself with `place_after == false`, otherwise AFTER the entire
+///   block (an interior slot — a child row, or "just after the parent row" —
+///   normalizes to the block's end; lineage is never rewritten by a drag, so
+///   a root cannot be dropped INTO a group). A drop anywhere inside the
+///   dragged tab's own block is a no-op.
+/// * **Child drag**: the child reorders among its own siblings only — legal
+///   targets are its root with `place_after == true` (the slot at the top of
+///   the sibling run) or a sibling with either edge. Everything else
+///   (before its root, another block, another project) is illegal: dragging
+///   can't re-parent, so a child leaving its block would keep its indent and
+///   read as nested under whatever row it landed beneath.
+fn plan_tab_move(
+    tabs: &[Tab],
+    tab_id: &str,
+    target_tab_id: &str,
+    place_after: bool,
+) -> Option<Vec<usize>> {
+    if tab_id == target_tab_id {
+        return None;
+    }
+    let src = tabs.iter().position(|t| t.id == tab_id)?;
+    let dst = tabs.iter().position(|t| t.id == target_tab_id)?;
+
+    let order = match tabs[src].parent_tab_id.clone() {
+        None => plan_root_block_move(tabs, src, dst, place_after)?,
+        Some(root_id) => plan_child_move(tabs, src, dst, place_after, &root_id)?,
+    };
+    // A plan that reproduces the current order is a no-op (no event).
+    if order.iter().enumerate().all(|(i, &j)| i == j) {
+        return None;
+    }
+    Some(order)
+}
+
+/// Indices of the depth-1 children of the root at `root_idx`, in display order.
+fn child_indices(tabs: &[Tab], root_idx: usize) -> Vec<usize> {
+    let root_id = tabs[root_idx].id.as_str();
+    tabs.iter()
+        .enumerate()
+        .filter(|(_, t)| t.parent_tab_id.as_deref() == Some(root_id))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The root-drag half of [`plan_tab_move`].
+fn plan_root_block_move(
+    tabs: &[Tab],
+    src: usize,
+    dst: usize,
+    place_after: bool,
+) -> Option<Vec<usize>> {
+    // The dragged block re-inserts in canonical order — root first, then its
+    // children in display order — so a block the old single-row move already
+    // scattered self-heals on the next real move.
+    let mut dragged_block = vec![src];
+    dragged_block.extend(child_indices(tabs, src));
+    // Resolve the target's block root. A dangling parent pointer (should be
+    // impossible after `prune_dangling_parent_references`) rejects the drop.
+    let target_root = match tabs[dst].parent_tab_id.as_deref() {
+        None => dst,
+        Some(pid) => tabs.iter().position(|t| t.id == pid)?,
+    };
+    if target_root == src {
+        // The slot lands inside the dragged tab's own subtree.
+        return None;
+    }
+    // Block boundaries are the target block's displayed extremes (min/max
+    // index), robust to a scattered target block too.
+    let target_first = child_indices(tabs, target_root)
+        .into_iter()
+        .fold(target_root, usize::min);
+    let target_last = child_indices(tabs, target_root)
+        .into_iter()
+        .fold(target_root, usize::max);
+    // Before the target block only when the drop names its root's leading
+    // edge; every interior slot normalizes to after the whole block.
+    let before = dst == target_root && !place_after;
+
+    let rest: Vec<usize> = (0..tabs.len())
+        .filter(|i| !dragged_block.contains(i))
+        .collect();
+    let anchor_index = if before {
+        rest.iter().position(|i| *i == target_first)?
+    } else {
+        rest.iter().position(|i| *i == target_last)? + 1
+    };
+    let mut order = Vec::with_capacity(tabs.len());
+    order.extend_from_slice(&rest[..anchor_index]);
+    order.extend_from_slice(&dragged_block);
+    order.extend_from_slice(&rest[anchor_index..]);
+    Some(order)
+}
+
+/// The child-drag half of [`plan_tab_move`].
+fn plan_child_move(
+    tabs: &[Tab],
+    src: usize,
+    dst: usize,
+    place_after: bool,
+    root_id: &str,
+) -> Option<Vec<usize>> {
+    let dst_tab = &tabs[dst];
+    let legal = if dst_tab.id == root_id {
+        place_after
+    } else {
+        dst_tab.parent_tab_id.as_deref() == Some(root_id)
+    };
+    if !legal {
+        return None;
+    }
+    // Single-row move (the original `moveTab` index math).
+    let mut insert = if place_after { dst + 1 } else { dst };
+    if src < insert {
+        insert -= 1;
+    }
+    if insert == src {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..tabs.len()).filter(|i| *i != src).collect();
+    order.insert(insert, src);
+    Some(order)
+}
 
 /// Strip any `<X>/.claude/worktrees/<name>/...` suffix and return `<X>`. A
 /// Nice-specific convention: a session in a Nice-managed worktree resolves to

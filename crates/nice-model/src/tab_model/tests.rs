@@ -979,6 +979,160 @@ fn move_tab_terminals_to_user_project_is_no_op() {
 }
 
 // =====================================================================
+// TabModelSubtreeReorderTests (M7.8 round 3 — parent drags move the block)
+// =====================================================================
+
+/// One project shaped like the repro tree:
+/// `[A, A1*, A2*, B, B1*, C]` where `*` marks a depth-1 child (parent in
+/// brackets): A1/A2 under A, B1 under B, C standalone.
+fn lineage_project_model() -> TabModel {
+    let mut model = model_empty("/tmp/main");
+    let mut project = make_project("p1", "P1", 0);
+    for (tid, parent) in [
+        ("A", None),
+        ("A1", Some("A")),
+        ("A2", Some("A")),
+        ("B", None),
+        ("B1", Some("B")),
+        ("C", None),
+    ] {
+        let pid = format!("{}-p0", tid);
+        let mut tab = Tab::new(tid, tid, "/tmp/p1");
+        tab.panes = vec![terminal(&pid, "zsh")];
+        tab.active_pane_id = Some(pid);
+        tab.parent_tab_id = parent.map(str::to_string);
+        project.tabs.push(tab);
+    }
+    model.projects = vec![project];
+    model
+}
+
+#[test]
+fn move_parent_after_block_carries_whole_subtree() {
+    let mut model = lineage_project_model();
+    // Drop A after C's block (C is standalone): the whole A block moves,
+    // children in order, still nested.
+    model.move_tab("A", "C", true);
+    assert_eq!(tab_ids_in(&model, "p1"), ["B", "B1", "C", "A", "A1", "A2"]);
+    assert_eq!(model.tab_for("A1").unwrap().parent_tab_id.as_deref(), Some("A"));
+    assert_eq!(model.tab_for("A2").unwrap().parent_tab_id.as_deref(), Some("A"));
+}
+
+#[test]
+fn move_parent_before_block_carries_whole_subtree() {
+    let mut model = lineage_project_model();
+    // Drop B's block before A's block.
+    model.move_tab("B", "A", false);
+    assert_eq!(tab_ids_in(&model, "p1"), ["B", "B1", "A", "A1", "A2", "C"]);
+}
+
+#[test]
+fn move_parent_onto_own_child_is_no_op() {
+    let mut model = lineage_project_model();
+    let before = tab_ids_in(&model, "p1");
+    for (target, after) in [("A1", false), ("A1", true), ("A2", false), ("A2", true)] {
+        model.move_tab("A", target, after);
+        assert_eq!(tab_ids_in(&model, "p1"), before, "A onto {target}/{after}");
+        assert!(!model.would_move_tab("A", target, after));
+    }
+}
+
+#[test]
+fn move_parent_just_after_target_root_lands_after_its_block() {
+    let mut model = lineage_project_model();
+    // "Just after B's row" is an interior slot (between B and B1) —
+    // normalizes to after B's whole block, keeping the block contiguous.
+    model.move_tab("C", "B", true);
+    assert_eq!(tab_ids_in(&model, "p1"), ["A", "A1", "A2", "B", "B1", "C"]);
+    // ... which here is exactly where C already is: a no-op.
+    assert!(!model.would_move_tab("C", "B", true));
+}
+
+#[test]
+fn move_root_targeting_foreign_child_lands_after_that_block() {
+    let mut model = lineage_project_model();
+    // A slot naming A's child row normalizes to after A's whole block —
+    // a top-level tab can never interleave into a group.
+    model.move_tab("C", "A1", false);
+    assert_eq!(tab_ids_in(&model, "p1"), ["A", "A1", "A2", "C", "B", "B1"]);
+}
+
+#[test]
+fn move_childless_root_between_blocks_still_works() {
+    let mut model = lineage_project_model();
+    model.move_tab("C", "A", false);
+    assert_eq!(tab_ids_in(&model, "p1"), ["C", "A", "A1", "A2", "B", "B1"]);
+}
+
+#[test]
+fn move_parent_gathers_scattered_children() {
+    let mut model = lineage_project_model();
+    // Corrupt the order the way the old single-row move could: A stranded at
+    // the end, children left at the top.
+    let tabs = &mut model.projects[0].tabs;
+    let a = tabs.remove(0);
+    tabs.push(a); // [A1, A2, B, B1, C, A]
+    // Any real move of A re-gathers the block contiguously.
+    model.move_tab("A", "B", false);
+    assert_eq!(tab_ids_in(&model, "p1"), ["A", "A1", "A2", "B", "B1", "C"]);
+}
+
+#[test]
+fn move_child_reorders_among_siblings_only() {
+    let mut model = lineage_project_model();
+    // A2 before A1 — legal sibling reorder.
+    model.move_tab("A2", "A1", false);
+    assert_eq!(tab_ids_in(&model, "p1"), ["A", "A2", "A1", "B", "B1", "C"]);
+    // Parent row with place_after == true is the top-of-run slot.
+    model.move_tab("A1", "A", true);
+    assert_eq!(tab_ids_in(&model, "p1"), ["A", "A1", "A2", "B", "B1", "C"]);
+}
+
+#[test]
+fn move_child_outside_its_block_is_rejected() {
+    let mut model = lineage_project_model();
+    let before = tab_ids_in(&model, "p1");
+    for (target, after) in [
+        ("A", false),  // before its own parent
+        ("B", false),  // another block's root
+        ("B", true),   // inside another block
+        ("B1", true),  // another block's child
+        ("C", true),   // a standalone root
+    ] {
+        model.move_tab("A1", target, after);
+        assert_eq!(tab_ids_in(&model, "p1"), before, "A1 onto {target}/{after}");
+        assert!(!model.would_move_tab("A1", target, after));
+    }
+}
+
+#[test]
+fn subtree_move_fires_one_mutation_and_no_op_fires_none() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut model = lineage_project_model();
+    let count = Rc::new(RefCell::new(0));
+    let c = Rc::clone(&count);
+    model.set_on_tree_mutation(move || *c.borrow_mut() += 1);
+    model.move_tab("A", "C", true);
+    assert_eq!(*count.borrow(), 1, "real block move fires exactly once");
+    model.move_tab("A", "A1", false); // own-subtree drop: no-op
+    model.move_tab("A1", "C", true); // child leaving its block: rejected
+    assert_eq!(*count.borrow(), 1, "illegal/no-op drops fire no event");
+}
+
+#[test]
+fn would_move_parent_matches_move_semantics() {
+    let model = lineage_project_model();
+    assert!(model.would_move_tab("A", "C", true));
+    assert!(model.would_move_tab("B", "A", false));
+    // A after B's block == A back in front of C — a real move.
+    assert!(model.would_move_tab("A", "B", true));
+    // B before its own current successor's block boundary — no order change.
+    assert!(!model.would_move_tab("B", "A", true));
+    assert!(!model.would_move_tab("B", "A1", false));
+}
+
+// =====================================================================
 // TabModelNavigationTests (tab half)
 // =====================================================================
 

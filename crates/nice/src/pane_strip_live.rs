@@ -198,37 +198,54 @@ async fn drag_differential(
     failures: &mut Vec<String>,
     deferred: &mut Vec<String>,
 ) {
-    // --- pill press-drag: the press selects p1 AND the window must NOT move ---
+    // --- pill click selects; a pill press-DRAG neither selects nor moves the window ---
     //
-    // Only a press that actually REACHED the pill (evidenced by the select) lets us
-    // hard-assert the differential — the same honest-deferral chrome_live /
-    // sidebar_live use for synthetic mouse gestures a `CGEventPostToPid` may not
-    // land (a positive click effect is delivery-dependent; the in-process
-    // `nice-itests` cases prove the pill-consumes-press / select routing
-    // deterministically). If the press did not register, DEFER the whole pill
-    // differential rather than read a vacuous "frame unchanged" as a pass.
+    // M7.8 round 3 moved the pill select from mouse-DOWN to CLICK (prod's
+    // `.onTapGesture`, `WindowToolbarView.swift:803-809`), so a select can no
+    // longer evidence a DRAG landing. Delivery is instead proven with a plain
+    // CLICK on the same point first (down+up, no drag — it must select p1).
+    // Only then is the press-drag hard-asserted: the window frame stays put
+    // (the pill consumed the press, the R9 band never armed) AND the drag does
+    // not select (gpui suppresses the click once a drag arms). If the evidence
+    // click did not register, DEFER — the same honest-deferral chrome_live /
+    // sidebar_live use for synthetic mouse gestures a `CGEventPostToPid` may
+    // not land.
     let Some((px_x, px_y)) = read_pill_center(cx, view, "p1") else {
         failures.push("pill drag: p1 pill was not laid out (no bounds) — cannot post the press".to_string());
         return;
     };
     let active_before = read_active(cx, view);
-    let frame_before = read_frame(cx, whandle);
-    do_cg_drag(cx, whandle, pid, px_x, px_y).await;
+    do_cg_click(cx, whandle, pid, px_x, px_y).await;
     settle(cx, 400).await;
-    let active_after = read_active(cx, view);
-    let frame_after = read_frame(cx, whandle);
-
-    let landed = active_before.as_deref() != Some("p1") && active_after.as_deref() == Some("p1");
+    let active_after_click = read_active(cx, view);
+    let landed =
+        active_before.as_deref() != Some("p1") && active_after_click.as_deref() == Some("p1");
     if landed {
-        // The press reached the pill (it selected p1); now the window frame must be
-        // unchanged — the pill consumed the press, so the R9 band never armed.
+        eprintln!(
+            "[selftest] pane-strip pill click: a plain click on p1's pill selected it \
+             (select routes on CLICK — the M7.8 round-3 gesture)"
+        );
+        // Reset active to p0 so the drag half can assert "the drag did NOT select".
+        let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
+        settle(cx, 250).await;
+        let frame_before = read_frame(cx, whandle);
+        do_cg_drag(cx, whandle, pid, px_x, px_y).await;
+        settle(cx, 400).await;
+        let active_after_drag = read_active(cx, view);
+        let frame_after = read_frame(cx, whandle);
+        if active_after_drag.as_deref() != Some("p0") {
+            failures.push(format!(
+                "pill drag: the press-drag on p1 changed the active pane to {active_after_drag:?} — \
+                 a drag must not select (the click is suppressed once the drag arms)"
+            ));
+        }
         match (frame_before, frame_after) {
             (Some(b), Some(a)) => {
                 let dx = a[0] - b[0];
                 let dy = a[1] - b[1];
                 if dx.abs() > FRAME_EPS || dy.abs() > FRAME_EPS {
                     failures.push(format!(
-                        "pill drag: the press selected p1 but ALSO moved the window by ({dx:.1},{dy:.1}) \
+                        "pill drag: the press-drag on p1's pill moved the window by ({dx:.1},{dy:.1}) \
                          — a drag starting on a pill must leave the frame put (the pill consumes the \
                          press before the band)"
                     ));
@@ -236,7 +253,7 @@ async fn drag_differential(
                     settle(cx, 200).await;
                 } else {
                     eprintln!(
-                        "[selftest] pane-strip pill drag: selected p1 AND left the window frame put \
+                        "[selftest] pane-strip pill drag: did not select AND left the window frame put \
                          (the pill claimed the press — R9's contract holds with pills present)"
                     );
                 }
@@ -245,10 +262,10 @@ async fn drag_differential(
         }
     } else {
         deferred.push(format!(
-            "pill press: the synthetic mouse press did not register on p1's pill (active {active_after:?}, \
-             was {active_before:?}) — the same synthetic-gesture limitation the band drag hits (a \
-             CGEventPostToPid mouse event need not land on a gpui hitbox). DEFERRED to a human click; \
-             the pill-consumes-press + select routing is hard-asserted in-process (nice-itests)."
+            "pill click: the synthetic evidence click did not register on p1's pill (active \
+             {active_after_click:?}, was {active_before:?}) — the same synthetic-gesture limitation \
+             the band drag hits (a CGEventPostToPid mouse event need not land on a gpui hitbox). \
+             DEFERRED to a human click; the select routing is hard-asserted in-process (nice-itests)."
         ));
     }
     let _ = cx.update(|app| app.activate(true));
@@ -288,6 +305,18 @@ async fn drag_differential(
     settle(cx, 200).await;
 }
 
+/// Post a plain synthetic left CLICK (down + up, no motion) at the content point
+/// `(cx_pt, cy_pt)` — the delivery-evidence gesture for the round-3 select-on-click
+/// pill contract.
+async fn do_cg_click(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarView>, pid: i32, cx_pt: f64, cy_pt: f64) {
+    let Some((gx, gy)) = to_global(cx, whandle, cx_pt, cy_pt) else {
+        return;
+    };
+    platform::post_left_mouse_down(pid, gx, gy, 1);
+    settle(cx, 60).await;
+    platform::post_left_mouse_up(pid, gx, gy, 1);
+}
+
 /// Post a synthetic left press-drag of `DRAG_DX` pt (rightward) starting at the
 /// content point `(cx_pt, cy_pt)` — the down is posted, allowed to arm, then the
 /// drag steps + release burst so a modal window-drag loop can consume them.
@@ -308,11 +337,13 @@ async fn do_cg_drag(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarView>,
 // ---- §3 pill reorder (R25) -------------------------------------------------
 
 /// Drag the `p1` pill leftward past `p0`'s midpoint and assert the model
-/// reorders it BEFORE `p0` — but only when the press is shown to have LANDED
-/// (the drag selected `p1`), the same honest-deferral the drag differential
-/// uses. A synthetic `CGEventPostToPid` press need not land on a gpui hitbox, so
-/// a non-landing press DEFERS rather than reading a vacuous "order unchanged" as
-/// a pass; the deterministic reorder proof lives in-process (`nice-itests`).
+/// reorders it BEFORE `p0` — but only when delivery at `p1`'s centre is shown
+/// to work, evidenced by a plain CLICK there first (select routes on CLICK
+/// since M7.8 round 3, so a DRAG no longer selects and cannot evidence its own
+/// landing). A synthetic `CGEventPostToPid` gesture need not land on a gpui
+/// hitbox, so a non-landing evidence click DEFERS rather than reading a vacuous
+/// "order unchanged" as a pass; the deterministic reorder proof lives
+/// in-process (`nice-itests`).
 async fn reorder_leg(
     cx: &mut AsyncApp,
     whandle: WindowHandle<WindowToolbarView>,
@@ -321,10 +352,9 @@ async fn reorder_leg(
     failures: &mut Vec<String>,
     deferred: &mut Vec<String>,
 ) {
-    // Reset the active pane to p0 so a landed press on p1 flips active p0→p1 —
-    // the delivery signal (`move_pane` never touches `active_pane_id`, so the
-    // flip evidences the PRESS landing, not the reorder). The toolbar IS this
-    // scenario window's root view, so drive it through the root-update context.
+    // Reset the active pane to p0 so the evidence click on p1 flips active
+    // p0→p1 — the delivery signal. The toolbar IS this scenario window's root
+    // view, so drive it through the root-update context.
     let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
     settle(cx, 250).await;
 
@@ -353,34 +383,46 @@ async fn reorder_leg(
     // yields the before-p0 slot (`place_after == false`).
     let end_x = tx - REORDER_BEFORE_MARGIN;
 
+    // Delivery evidence: a plain click on p1's centre must select it.
     let active_before = read_active(cx, view);
-    do_cg_drag_between(cx, whandle, pid, sx, sy, end_x, ty).await;
+    do_cg_click(cx, whandle, pid, sx, sy).await;
     settle(cx, 400).await;
-    let active_after = read_active(cx, view);
-    let order_after = read_order(cx, view);
-
-    let landed = active_before.as_deref() != Some("p1") && active_after.as_deref() == Some("p1");
+    let active_after_click = read_active(cx, view);
+    let landed =
+        active_before.as_deref() != Some("p1") && active_after_click.as_deref() == Some("p1");
     if landed {
+        do_cg_drag_between(cx, whandle, pid, sx, sy, end_x, ty).await;
+        settle(cx, 400).await;
+        let active_after = read_active(cx, view);
+        let order_after = read_order(cx, view);
         let reordered = order_after.len() == 2
             && order_after[0].as_str() == "p1"
             && order_after[1].as_str() == "p0";
         if reordered {
             eprintln!(
                 "[selftest] pane-strip reorder: dragged p1 before p0 — the strip now reads [p1, p0] \
-                 (move_pane committed + save_to_store persisted; active stays p1)"
+                 (move_pane committed + save_to_store persisted)"
             );
         } else {
             failures.push(format!(
-                "reorder: the press landed (p1 selected) but the strip order is {order_after:?}, not \
-                 [p1, p0] — dragging p1 left past p0's midpoint must reorder it before p0"
+                "reorder: delivery at p1's centre was proven (the evidence click selected it) but \
+                 the strip order is {order_after:?}, not [p1, p0] — dragging p1 left past p0's \
+                 midpoint must reorder it before p0"
+            ));
+        }
+        if active_after.as_deref() != Some("p1") {
+            failures.push(format!(
+                "reorder: the drag changed the active pane to {active_after:?} — `move_pane` never \
+                 touches `active_pane_id`, and a drag must not select (p1 was active from the \
+                 evidence click)"
             ));
         }
     } else {
         deferred.push(format!(
-            "reorder: the synthetic press did not register on p1's pill (active {active_after:?}, was \
-             {active_before:?}) — a CGEventPostToPid mouse event need not land on a gpui hitbox. \
-             DEFERRED to a human drag; the deterministic reorder (move over B past its midpoint → \
-             order changes) is hard-asserted in-process (nice-itests)."
+            "reorder: the synthetic evidence click did not register on p1's pill (active \
+             {active_after_click:?}, was {active_before:?}) — a CGEventPostToPid mouse event need \
+             not land on a gpui hitbox. DEFERRED to a human drag; the deterministic reorder (move \
+             over B past its midpoint → order changes) is hard-asserted in-process (nice-itests)."
         ));
     }
     let _ = cx.update(|app| app.activate(true));
@@ -585,9 +627,10 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             detail: format!(
                 "all hard pane-strip assertions passed (the reserved-width overflow shows the chevron \
                  on a real window, activating an offscreen pane makes it active + reveals it, and — \
-                 when the synthetic press LANDED — the pill press selects + leaves the window frame \
-                 put); the pill press landing, the empty-band window move, and the overflow-menu open \
-                 hard-assert when the synthetic gesture drives the real behaviour, else DEFER; {} \
+                 when the synthetic evidence click LANDED — the pill click selects, the press-drag \
+                 neither selects nor moves the window frame); the evidence-click landing, the \
+                 empty-band window move, and the overflow-menu open hard-assert when the synthetic \
+                 gesture drives the real behaviour, else DEFER; {} \
                  item(s) DEFERRED to a human pass",
                 deferred.len()
             ),

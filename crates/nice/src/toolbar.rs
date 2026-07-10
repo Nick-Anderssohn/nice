@@ -58,10 +58,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, linear_color_stop, linear_gradient, point, prelude::*, px, App, Bounds, BoxShadow, Context,
-    DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable, FontWeight, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, SharedString,
-    Subscription, Window,
+    div, linear_color_stop, linear_gradient, point, prelude::*, px, App, Bounds, BoxShadow,
+    ClickEvent, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable, FontWeight,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle,
+    SharedString, Subscription, Window,
 };
 
 use nice_model::file_browser::TextFieldEditor;
@@ -1260,7 +1260,19 @@ impl WindowToolbarView {
             .into_any_element()
         } else {
             let pid = vm.id.clone();
+            // The title tap is a CLICK (mouse-up with no drag), not a mouse-down
+            // — prod's `.onTapGesture` on `titleView`
+            // (`WindowToolbarView.swift:883-888`) and the same fix the sidebar
+            // row title got in M7.8 round 2. gpui's click machinery never fires
+            // a click once a drag armed (pending press state is cleared while
+            // `active_drag` is set — div.rs:1994-2003), so pressing the active
+            // pill's TITLE and dragging now drags the pill instead of falling
+            // straight into rename. No left mouse-down listener here: a child's
+            // `stop_propagation` on mouse-down would kill the PILL's
+            // window-level click/drag arming for presses on the text (most of
+            // the pill's width).
             div()
+                .id(SharedString::from(format!("toolbar.pill.{}.title", vm.id)))
                 .flex_1()
                 .min_w_0()
                 .whitespace_nowrap()
@@ -1273,13 +1285,12 @@ impl WindowToolbarView {
                 })
                 .text_color(if is_active { ink } else { ink2 })
                 .child(SharedString::from(vm.title.clone()))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
-                        this.handle_title_tap(&pid, window, cx);
-                        cx.stop_propagation();
-                    }),
-                )
+                .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
+                    this.handle_title_tap(&pid, window, cx);
+                    // Consume so the pill's own click listener doesn't also
+                    // run a second (redundant) select pass.
+                    cx.stop_propagation();
+                }))
                 .into_any_element()
         };
 
@@ -1312,6 +1323,7 @@ impl WindowToolbarView {
         };
 
         let pid_select = vm.id.clone();
+        let pid_down = vm.id.clone();
         let pid_menu = vm.id.clone();
         let kind = vm.kind;
 
@@ -1361,14 +1373,39 @@ impl WindowToolbarView {
                     // on the editing pill's own icon/padding) must keep the edit
                     // alive, not commit + reselect — Swift's `if !isEditing`
                     // onTapGesture guard (`WindowToolbarView.swift:808`).
-                    if this.is_editing_pane(&pid_select) {
+                    if this.is_editing_pane(&pid_down) {
                         cx.stop_propagation();
                         return;
                     }
-                    this.select_pane(&pid_select, window, cx);
+                    // Mouse-down only commits ANOTHER pill's in-flight rename
+                    // (prod's click-away mouse monitor fires at press time).
+                    // Selection moved to `on_click` below so a press that arms
+                    // a drag no longer also selects the pane — prod's pill
+                    // `.onTapGesture` is a click, not a press
+                    // (`WindowToolbarView.swift:803-809`).
+                    if this.editing_pane.is_some() {
+                        this.commit_rename(window, cx);
+                    }
+                    // Still consumed: the empty-band window-drag press listener
+                    // sits on the strip behind the pills and must not arm from
+                    // a pill press. gpui's click/drag arming for this pill is a
+                    // window-level recorder that already ran, so this
+                    // `stop_propagation` cannot break the pill's own drag/click.
                     cx.stop_propagation();
                 }),
             )
+            .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
+                // Select on CLICK (mouse-up with no drag) — prod's pill-body
+                // `.onTapGesture` (`WindowToolbarView.swift:803-809`). A drag
+                // that armed suppresses the click, so drag-to-reorder no longer
+                // double-fires a select.
+                if this.is_editing_pane(&pid_select) {
+                    cx.stop_propagation();
+                    return;
+                }
+                this.select_pane(&pid_select, window, cx);
+                cx.stop_propagation();
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
