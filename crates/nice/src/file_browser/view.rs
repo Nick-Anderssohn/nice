@@ -43,7 +43,7 @@ use gpui::{
     ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
 
-use nice_model::file_browser::listing::visible_order;
+use nice_model::file_browser::listing::{path_is_dir, visible_order};
 use nice_model::file_browser::menu::FileBrowserContextMenuItem;
 use nice_model::file_browser::{
     file_browser_header_title, preselect_len, ClickModifier, FileBrowserClickRouter,
@@ -387,7 +387,7 @@ impl FileBrowserView {
         let rows = projection
             .iter()
             .map(|p| {
-                let is_dir = is_dir_lstat(p);
+                let is_dir = is_dir_resolved(p);
                 let is_expanded = is_dir && expanded.contains(p);
                 let is_selected = selected.contains(p);
                 RowVm {
@@ -517,7 +517,7 @@ impl FileBrowserView {
                 self.with_active_fb_state(cx, |st| st.selection_mut().extend(&path, &projection));
             }
             SingleActivate { path } => {
-                let is_dir = is_dir_lstat(&path);
+                let is_dir = is_dir_resolved(&path);
                 self.with_active_fb_state(cx, |st| {
                     st.selection_mut().replace(&[path.clone()], None);
                     // Primary action: a folder toggles expansion; a file only
@@ -547,7 +547,7 @@ impl FileBrowserView {
             }
             DoubleActivate { path } => {
                 self.sole_activated = None;
-                if is_dir_lstat(&path) {
+                if is_dir_resolved(&path) {
                     self.with_active_fb_state(cx, |st| st.set_root_path(&path));
                 } else {
                     self.workspace_open(&path, cx);
@@ -957,7 +957,7 @@ impl FileBrowserView {
     /// commit-on-blur. Cancels any pending slow-second-click deferral.
     fn begin_rename(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.rename_click_gen += 1; // cancel any armed deferral
-        let is_dir = is_dir_lstat(path);
+        let is_dir = is_dir_resolved(path);
         let name = last_component(path);
         let editor = TextFieldEditor::with_selection(&name, preselect_len(&name, is_dir));
         self.rename = Some(RenameState {
@@ -1673,7 +1673,7 @@ impl FileBrowserView {
 
     /// Open the row context menu for `path` (the real right-click path).
     pub(crate) fn drive_right_click(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let is_dir = is_dir_lstat(path);
+        let is_dir = is_dir_resolved(path);
         let is_root = self.scenario_root(cx).as_deref() == Some(path);
         self.open_row_menu(path, is_dir, is_root, Point::default(), window, cx);
     }
@@ -1827,7 +1827,7 @@ impl FileBrowserView {
 
     /// Drive the context-menu "Paste" op onto `path`.
     pub(crate) fn drive_paste(&mut self, path: &str, cx: &mut Context<Self>) {
-        let is_dir = is_dir_lstat(path);
+        let is_dir = is_dir_resolved(path);
         self.menu_paste(path, is_dir, cx);
     }
 
@@ -2235,12 +2235,12 @@ fn render_rename_field(
     .into_any_element()
 }
 
-/// The BSD lstat "is this a real directory" check (mirrors the pure listing's
-/// private `path_is_dir_lstat`: a symlink-to-dir is NOT a directory row).
-fn is_dir_lstat(path: &str) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_dir())
-        .unwrap_or(false)
+/// "Is this row a directory" — the pure listing's [`path_is_dir`] predicate
+/// (follows symlinks: a symlink-to-dir IS a directory row; a broken symlink
+/// isn't). One predicate shared with `entries`/`visible_order` so icons,
+/// expansion, menus, and sorting all agree.
+fn is_dir_resolved(path: &str) -> bool {
+    path_is_dir(path)
 }
 
 /// Whether every source shares `dest`'s volume (device id). An unreadable source

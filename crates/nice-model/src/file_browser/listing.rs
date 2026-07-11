@@ -15,11 +15,16 @@
 //!   (`str::to_lowercase`), not `localizedCaseInsensitiveCompare`'s locale
 //!   collation. A deliberate, test-pinned parity gap (the plan's listing-rules
 //!   decision) — pure and locale-independent.
-//! * **`lstat` semantics throughout.** [`entries`] classifies each child by its
-//!   own file type without following symlinks (`DirEntry::file_type`), so a
-//!   symlink-to-directory renders as a non-expandable **file** row (NSURL
-//!   parity; forecloses watcher cycles). [`visible_order`] recurses only into
-//!   real directories for the same reason.
+//! * **Symlinks to directories classify as directories.** [`entries`] and
+//!   [`visible_order`] resolve a symlink's *target* (`fs::metadata`, one extra
+//!   stat only for symlinks) so a symlink-to-directory renders as a normal
+//!   expandable folder row. This deliberately diverges from Swift prod (NSURL
+//!   `.isDirectoryKey` doesn't follow links, so prod shows a file row) — a
+//!   user-requested fix. A BROKEN symlink degrades to a file row (target stat
+//!   fails ⇒ not a dir). Symlink cycles can't hang anything: expansion is
+//!   user-driven — [`visible_order`] recurses only into paths present in
+//!   `expanded_paths` (a finite set of user clicks), and the watcher watches
+//!   exactly those expanded rows, never walking the tree on its own.
 //! * **Missing modification dates cluster oldest** at [`std::time::UNIX_EPOCH`]
 //!   (the Swift `.distantPast` default) so they sort deterministically rather
 //!   than scattering by filesystem order.
@@ -74,14 +79,21 @@ pub fn entries(
     let mut children: Vec<Child> = Vec::new();
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // `DirEntry::metadata` does not traverse symlinks — lstat semantics, so
-        // a symlink-to-dir classifies as a file and we read the link's own
-        // flags/mtime, not the target's.
+        // `DirEntry::metadata` does not traverse symlinks — the link's OWN
+        // flags/mtime drive the hidden filter and date sort (and stay readable
+        // even when the link is broken).
         let meta = entry.metadata().ok();
-        let is_dir = entry
-            .file_type()
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false);
+        // Directory classification FOLLOWS symlinks: a symlink-to-dir is a
+        // folder row. `entry.file_type()` is free (readdir already knows it);
+        // only actual symlinks pay the extra target stat. A broken symlink's
+        // target stat fails ⇒ file row.
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_symlink() => std::fs::metadata(entry.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false),
+            Ok(ft) => ft.is_dir(),
+            Err(_) => false,
+        };
         let is_hidden_flagged = meta
             .as_ref()
             .map(metadata_is_hidden_flagged)
@@ -149,9 +161,10 @@ fn visit(
     if !expanded_paths.contains(path) {
         return;
     }
-    // lstat: a symlink-to-dir is not a real directory, so we don't recurse into
-    // it — parity with `entries` bucketing and the watcher-cycle foreclosure.
-    if !path_is_dir_lstat(path) {
+    // Follows symlinks (parity with `entries` bucketing): an expanded
+    // symlink-to-dir emits its target's children. Cycles are bounded because
+    // recursion requires each deeper path to be in `expanded_paths`.
+    if !path_is_dir(path) {
         return;
     }
     for child in entries(Path::new(path), show_hidden, criterion, ascending) {
@@ -206,10 +219,13 @@ fn compare(
     }
 }
 
-fn path_is_dir_lstat(path: &str) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_dir())
-        .unwrap_or(false)
+/// Whether `path` is a directory, **following symlinks** — a symlink-to-dir
+/// counts, a broken symlink doesn't (the target stat fails ⇒ `false`). The one
+/// directory-classification predicate for the whole file browser: the view
+/// layer (`crates/nice`) uses it for row icons, expansion, and menu shape so
+/// every consumer agrees on what a folder is.
+pub fn path_is_dir(path: &str) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -453,29 +469,24 @@ mod tests {
         );
     }
 
-    // MARK: - Symlink pin (lstat semantics)
+    // MARK: - Symlinks (follow-target semantics)
 
-    /// The plan's symlink pin: a symlink-to-directory renders as a
-    /// non-expandable **file** row — it sorts into the files bucket, and
-    /// `visible_order` never recurses into it.
+    /// A symlink-to-directory is a normal folder: it sorts into the dirs
+    /// bucket, and when expanded `visible_order` emits its target's children.
     #[test]
-    fn entries_symlink_to_dir_sorts_as_file_and_does_not_expand() {
+    fn entries_symlink_to_dir_sorts_as_dir_and_expands() {
         let t = TempTree::new();
         let real = t.mkdir("real_dir");
-        // real_dir has a child we must NOT surface through the symlink.
         fs::write(real.join("inner.txt"), b"").unwrap();
         t.touch("a_file.txt");
-        // z_link points at real_dir — lstat classifies it as a (file) row.
         let link = t.root.join("z_link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let names = t.names(true, FileBrowserSortCriterion::Name, true);
-        // real_dir is the only directory; the symlink sorts among files
-        // (a_file.txt, z_link) after it.
-        assert_eq!(names, ["real_dir", "a_file.txt", "z_link"]);
+        // Both real_dir and z_link land in the dirs bucket, above the file.
+        assert_eq!(names, ["real_dir", "z_link", "a_file.txt"]);
 
-        // And it does not expand: even with the link path in expanded_paths,
-        // its target's children never appear.
+        // Expanding the link surfaces the target's children (via the link path).
         let link_path = link.to_string_lossy().into_owned();
         let mut expanded = BTreeSet::new();
         expanded.insert(t.root.to_string_lossy().into_owned());
@@ -489,8 +500,80 @@ mod tests {
         );
         assert!(order.contains(&link_path));
         assert!(
-            !order.iter().any(|p| p.ends_with("inner.txt")),
-            "a symlink-to-dir must not expand its target's children"
+            order.iter().any(|p| p == &format!("{link_path}/inner.txt")),
+            "an expanded symlink-to-dir must list its target's children: {order:?}"
+        );
+    }
+
+    /// A symlink to a regular file keeps sorting/behaving as a file.
+    #[test]
+    fn entries_symlink_to_file_stays_a_file() {
+        let t = TempTree::new();
+        let target = t.touch("target.txt");
+        t.mkdir("a_dir");
+        let link = t.root.join("b_link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let names = t.names(true, FileBrowserSortCriterion::Name, true);
+        assert_eq!(names, ["a_dir", "b_link", "target.txt"]);
+        assert!(!path_is_dir(&link.to_string_lossy()));
+    }
+
+    /// A BROKEN symlink degrades to a file row: it still lists (no crash, no
+    /// empty listing), sorts among files, and never expands.
+    #[test]
+    fn entries_broken_symlink_degrades_to_file_row() {
+        let t = TempTree::new();
+        t.mkdir("a_dir");
+        let link = t.root.join("dangling");
+        std::os::unix::fs::symlink(t.root.join("no-such-target"), &link).unwrap();
+
+        let names = t.names(true, FileBrowserSortCriterion::Name, true);
+        assert_eq!(names, ["a_dir", "dangling"]);
+
+        // Even force-marked expanded, it emits no children and doesn't panic.
+        let link_path = link.to_string_lossy().into_owned();
+        let mut expanded = BTreeSet::new();
+        expanded.insert(t.root.to_string_lossy().into_owned());
+        expanded.insert(link_path.clone());
+        let order = visible_order(
+            &t.root.to_string_lossy(),
+            &expanded,
+            true,
+            FileBrowserSortCriterion::Name,
+            true,
+        );
+        assert!(order.contains(&link_path));
+        assert_eq!(order.len(), 3, "root + a_dir + dangling, nothing more");
+    }
+
+    /// A symlink cycle (a dir's symlink pointing back at an ancestor) must not
+    /// hang: recursion is bounded by `expanded_paths`, so even with the cycle
+    /// expanded a few levels deep the traversal terminates.
+    #[test]
+    fn visible_order_symlink_cycle_terminates() {
+        let t = TempTree::new();
+        let sub = t.mkdir("sub");
+        // sub/loop -> root: expanding root → sub → loop → (root again) cycles.
+        std::os::unix::fs::symlink(&t.root, sub.join("loop")).unwrap();
+
+        let root = t.root.to_string_lossy().into_owned();
+        let sub_path = sub.to_string_lossy().into_owned();
+        let loop_path = format!("{sub_path}/loop");
+        // Expand the cycle two turns deep — as a user could by clicking.
+        let expanded = expanded(&[
+            &root,
+            &sub_path,
+            &loop_path,
+            &format!("{loop_path}/sub"),
+            &format!("{loop_path}/sub/loop"),
+        ]);
+        let order = visible_order(&root, &expanded, true, FileBrowserSortCriterion::Name, true);
+        // Terminates (finite) and reaches exactly as deep as the expansions.
+        assert!(order.contains(&format!("{loop_path}/sub/loop/sub")));
+        assert!(
+            !order.iter().any(|p| p.contains("loop/sub/loop/sub/loop/")),
+            "recursion must stop at the expanded frontier: {order:?}"
         );
     }
 

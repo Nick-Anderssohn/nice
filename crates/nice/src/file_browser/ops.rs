@@ -190,7 +190,7 @@ impl Trasher for ProductionTrasher {
 /// Resolve the destination directory a paste / drop lands in for a right-clicked
 /// `target`: INTO the directory when it is one, else its PARENT (the file's
 /// containing folder) — `FileExplorerOrchestrator.swift:139-153`. A raw
-/// path/`is_dir` split (the caller already `lstat`ed the row), so it stays a pure
+/// path/`is_dir` split (the caller already classified the row), so it stays a pure
 /// function.
 pub fn paste_destination(target: &Path, is_dir: bool) -> PathBuf {
     if is_dir {
