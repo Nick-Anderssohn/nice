@@ -277,22 +277,42 @@ fn pick_available(chain: &[SharedString], available: &[String]) -> SharedString 
         .unwrap_or_else(|| SharedString::from("Menlo"))
 }
 
-/// Derive the cell box for `family` at `px` through GPUI's text system.
+/// The backing scale SwiftTerm's cell-width snap is reproduced at. Prod snaps
+/// to the view's live `backingScaleFactor()`; this crate derives metrics at the
+/// app level (no window in scope), so the snap is pinned to Retina's 2×. On a
+/// 2× display the numbers are bit-identical to prod; on a 1× display prod would
+/// snap to whole points where we snap to halves — a ≤0.5px-per-cell divergence
+/// accepted for determinism (metrics must not change when a window migrates
+/// displays, or a zoom round-trip would not reproduce earlier metrics exactly).
+const METRICS_SNAP_SCALE: f32 = 2.0;
+
+/// Derive the cell box for `family` at `px` through GPUI's text system —
+/// mirroring SwiftTerm's `computeFontDimensions` (`AppleTerminalView.swift:339`)
+/// so the grid pitch is bit-identical to prod on a Retina display:
 ///
 /// * width — the advance of `M` (all advances are equal in a monospace, so this
-///   is the cell pitch), taken through [`TextSystem::advance`];
-/// * height — the font's glyph line box `ascent + |descent|`
-///   ([`TextSystem::ascent`] + [`TextSystem::descent`]). GPUI reports `descent`
-///   as a **negative** offset (below the baseline is −y — see
-///   `gpui_macos::text_system`, which negates the font-kit descent), so the box
-///   height is `ascent − descent`, i.e. `ascent + descent.abs()`. GPUI's public
-///   text system does not expose `line_gap` (it lives on the private
-///   `FontMetrics`), so this is the tight ascent+descent box with no extra
-///   leading — enough that adjacent rows' glyphs never overlap; both terms scale
-///   linearly with `px`, so the box grows/shrinks monotonically under zoom.
+///   is the cell pitch), taken through [`TextSystem::advance`], then snapped up
+///   to the pixel grid at [`METRICS_SNAP_SCALE`] (`ceil(w·s)/s`) exactly as
+///   SwiftTerm snaps to avoid sub-pixel seams between adjacent cells (prod
+///   measures `W`; in a monospace every advance is equal, so `M` ≡ `W`);
+/// * height — `ceil(ascent + |descent|)` ([`TextSystem::ascent`] +
+///   [`TextSystem::descent`]; GPUI reports `descent` as a **negative** offset —
+///   below the baseline is −y, see `gpui_macos::text_system` — hence the
+///   `abs`). SwiftTerm computes `ceil(ascent + descent + leading)`; GPUI's
+///   public text system does not expose `line_gap` (it lives on the private
+///   `FontMetrics`), but every font in the shipped chain (SF Mono, JetBrains
+///   Mono NL, Menlo, the Meslo family) carries zero leading, so the ceil'd box
+///   matches prod's. The result is already whole logical px, so SwiftTerm's
+///   backing-scale height snap is a no-op on it.
 ///
-/// Both are raw logical px (a deterministic function of `px`), so a zoom-out back
-/// to a prior size reproduces the earlier metrics **exactly**.
+/// The un-ceil'd `ascent + |descent|` box (pre fix round r6) sat fractionally
+/// under prod's (e.g. 16.40 vs 17.0 at MesloLGS NF 13pt), so the two grids
+/// drifted ~0.6px per row and the bottom-anchored layout surfaced the drift as
+/// a different sub-row remainder — a visibly different gap between the tab bar
+/// and the first terminal row at the same window height.
+///
+/// Both are deterministic functions of `px`, so a zoom-out back to a prior size
+/// reproduces the earlier metrics **exactly**.
 pub fn cell_metrics(
     text_system: &Arc<TextSystem>,
     family: &SharedString,
@@ -307,13 +327,14 @@ pub fn cell_metrics(
     };
     let font_id = text_system.resolve_font(&font);
     let size = px(px_size);
-    let cell_w = text_system
+    let advance = text_system
         .advance(font_id, size, 'M')
         .map(|s| f32::from(s.width))
         .unwrap_or(px_size * 0.6);
+    let cell_w = (advance * METRICS_SNAP_SCALE).ceil() / METRICS_SNAP_SCALE;
     let ascent = f32::from(text_system.ascent(font_id, size));
     let descent = f32::from(text_system.descent(font_id, size));
-    let cell_h = ascent + descent.abs();
+    let cell_h = (ascent + descent.abs()).ceil();
     TerminalMetrics::new(cell_w.max(1.0), cell_h.max(1.0))
 }
 

@@ -77,7 +77,7 @@ use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{
     dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe, RenameKeyOutcome,
 };
-use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
+use crate::sf_symbols::{logo_mark_icon, sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::update_popover::UpdatePopover;
@@ -179,8 +179,9 @@ const PILL_SHADOW_ALPHA: f32 = 0.04;
 // The pill/chevron/plus/close icons are real SF Symbols rendered through
 // `crate::sf_symbols` (M2 feel-check Item A); each ICON_* glyph remains as the
 // never-blank fallback. The overflow-menu rows keep their glyph stand-ins (the
-// pinned `ContextMenu` is plain-label), and the logo mark keeps the `❯`
-// stand-in (Swift's custom SVG mark stays out of scope this cycle).
+// pinned `ContextMenu` is plain-label). The logo mark is `Logo.swift`'s exact
+// chevron+underline stroke, rasterized through the same pipeline
+// (`sf_symbols::logo_mark_icon`, fix round r6).
 
 const ICON_TERMINAL: &str = "\u{276F}"; // ❯  fallback for SF_TERMINAL + menu rows
 const ICON_CLOSE: &str = "\u{2715}"; // ✕  fallback for SF_CLOSE
@@ -188,8 +189,8 @@ const ICON_CHEVRON_DOWN: &str = "\u{25BE}"; // ▾  fallback for SF_CHEVRON_DOWN
 const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
 const ICON_CHECK: &str = "\u{2713}"; // ✓  (menu-row stand-in, SF "checkmark")
 const ICON_CLAUDE_DOT: &str = "\u{25CF}"; // ●  (menu-row stand-in for the StatusDot)
-/// The white brand mark inside the accent square — a stand-in for the SVG
-/// chevron+underline in `Logo.swift` (no SVG asset pipeline this cycle).
+/// Fallback for the brand mark when the CoreGraphics rasterization fails
+/// (`sf_symbols::logo_mark_icon`) — the pre-r6 `❯` stand-in, never blank.
 const ICON_LOGO_MARK: &str = "\u{276F}"; // ❯
 
 /// Pill leading icon (`WindowToolbarView.swift:903-906`).
@@ -946,7 +947,7 @@ impl WindowToolbarView {
 
     // MARK: - Rendering
 
-    fn render_brand(&self, s: &Slots, cx: &App) -> impl IntoElement {
+    fn render_brand(&self, s: &Slots, cx: &mut App) -> impl IntoElement {
         let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
         div()
             .flex()
@@ -954,9 +955,14 @@ impl WindowToolbarView {
             .items_center()
             .gap(px(BRAND_GAP))
             .flex_none()
-            // Brand mark: an accent rounded square with a white chevron stand-in.
+            // Brand mark (`Logo.swift`): the accent rounded square (rect x=1
+            // y=1 20×20 r=6 of the 22×22 viewBox) as a centered div, with the
+            // white chevron+underline stroke rasterized on the exact prod path
+            // overlaid across the full 22pt canvas — the shared viewBox keeps
+            // the two layers registered.
             .child(
                 div()
+                    .relative()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -964,17 +970,27 @@ impl WindowToolbarView {
                     .h(px(LOGO_SIZE))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
                             .w(px(LOGO_SQUARE))
                             .h(px(LOGO_SQUARE))
                             .rounded(px(LOGO_SQUARE_RADIUS))
-                            .bg(accent)
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(white())
-                            .child(SharedString::from(ICON_LOGO_MARK)),
+                            .bg(accent),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(LOGO_SIZE))
+                            .h(px(LOGO_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(logo_mark_icon(
+                                ICON_LOGO_MARK,
+                                white(),
+                                self.window_scale,
+                                cx,
+                            )),
                     ),
             )
             // Wordmark.

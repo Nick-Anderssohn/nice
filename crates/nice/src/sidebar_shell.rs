@@ -56,9 +56,13 @@
 //! the window's backing scale, cached per size/weight/colour/scale — M2
 //! feel-check Item A). Each keeps its original Unicode stand-in as a
 //! never-blank fallback for a symbol name that fails to resolve. The
-//! disclosure "chevron" remains a **glyph swap** (`▸` closed / `▾` open)
-//! rather than a rotation transform — the pinned gpui exposes no element
-//! rotation, and the swap reads the same 0°→90° affordance.
+//! disclosure chevron is an SF-Symbol **swap** (`chevron.right` closed /
+//! `chevron.down` open, the file-browser idiom from fix round r4) rather than
+//! prod's 0°→90° rotation transform — the pinned gpui exposes no element
+//! rotation; the swapped-in `chevron.down` is the same drawn shape. It sits in
+//! a fixed-width slot matching `chevron.right`'s natural layout box, so the
+//! header text never shifts on toggle (prod's rotation keeps the closed box
+//! too, `SidebarView.swift:289-295`).
 
 // The view + its install fn have no in-crate caller until slice 4 wires the
 // `sidebar` self-test scenario; it is a deliberately-exported surface (plan
@@ -158,11 +162,17 @@ const LINE_HEIGHT_13: f32 = 16.0;
 const LINE_HEIGHT_12: f32 = 15.0;
 /// Line height for the 10pt chevron glyph / count-pill text.
 const LINE_HEIGHT_10: f32 = 12.0;
+/// Fixed width of the group-header disclosure slot — `chevron.right`'s natural
+/// layout box at the 10pt symbol size (8×11pt canvas). Prod gives the chevron
+/// no frame and rotates it, which keeps this same closed-state box
+/// (`SidebarView.swift:289-295`); pinning the slot keeps the header text from
+/// shifting when the wider `chevron.down` (11pt canvas) swaps in.
+const HEADER_DISCLOSURE_SLOT: f32 = 8.0;
 
 // ---- Icons (SF Symbols + their Unicode fallbacks — see module docs) ---------
 
-const ICON_CHEVRON_CLOSED: &str = "\u{25B8}"; // ▸ (disclosure — stays a glyph swap)
-const ICON_CHEVRON_OPEN: &str = "\u{25BE}"; // ▾
+const ICON_CHEVRON_CLOSED: &str = "\u{25B8}"; // ▸ fallback for SF_CHEVRON_CLOSED
+const ICON_CHEVRON_OPEN: &str = "\u{25BE}"; // ▾ fallback for SF_CHEVRON_OPEN
 const ICON_TERMINAL: &str = "\u{276F}"; // ❯ fallback for SF_TERMINAL
 const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
 const ICON_MODE_TABS: &str = "\u{2630}"; // ☰ fallback for SF_MODE_TABS
@@ -170,6 +180,11 @@ const ICON_MODE_FILES: &str = "\u{25A4}"; // ▤ fallback for SF_MODE_FILES
 const ICON_SIDEBAR: &str = "\u{25A8}"; // ▨ fallback for SF_SIDEBAR
 const ICON_GEAR: &str = "\u{2699}"; // ⚙ fallback for SF_GEAR
 
+/// Group-header disclosure, closed (`SidebarView.swift:289` — prod rotates
+/// this one symbol; we swap in `chevron.down` for the open state instead).
+const SF_CHEVRON_CLOSED: &str = "chevron.right";
+/// Group-header disclosure, open.
+const SF_CHEVRON_OPEN: &str = "chevron.down";
 /// Tab-row / pill leading icon (`SidebarView.swift:602`).
 const SF_TERMINAL: &str = "terminal";
 /// Group-header add button (`SidebarView.swift:379`).
@@ -214,13 +229,13 @@ fn close_menu_label(count: usize) -> String {
     }
 }
 
-/// The disclosure chevron glyph for an open/closed group (glyph swap — see the
-/// module docs).
-fn disclosure_glyph(is_open: bool) -> &'static str {
+/// The disclosure chevron for an open/closed group as `(sf_symbol_name,
+/// unicode_fallback)` (SF-Symbol swap — see the module docs).
+fn disclosure_icon(is_open: bool) -> (&'static str, &'static str) {
     if is_open {
-        ICON_CHEVRON_OPEN
+        (SF_CHEVRON_OPEN, ICON_CHEVRON_OPEN)
     } else {
-        ICON_CHEVRON_CLOSED
+        (SF_CHEVRON_CLOSED, ICON_CHEVRON_CLOSED)
     }
 }
 
@@ -1716,21 +1731,35 @@ impl SidebarShellView {
                     }
                 }),
             )
-            .child(
+            .child({
+                let (symbol, fallback) = disclosure_icon(g.is_open);
+                // SF Symbol chevron in a fixed slot (see HEADER_DISCLOSURE_SLOT)
+                // — 10pt semibold ink2 at 0.7 opacity, the same treatment as the
+                // file-browser rows (`SidebarView.swift:289-295`).
                 div()
-                    .text_size(px(self.sidebar_pt(10.0)))
-                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_10)))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(ink2)
-                    .child(SharedString::from(disclosure_glyph(g.is_open)))
+                    .flex_none()
+                    .w(px(self.sidebar_pt(HEADER_DISCLOSURE_SLOT)))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .opacity(0.7)
+                    .child(sf_symbol_icon(
+                        symbol,
+                        fallback,
+                        self.sidebar_pt(10.0),
+                        SymbolWeight::Semibold,
+                        ink2,
+                        self.window_scale,
+                        cx,
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
                             this.toggle_disclosure(&gid_chevron, cx);
                             cx.stop_propagation();
                         }),
-                    ),
-            )
+                    )
+            })
             .child(
                 div()
                     .flex_1()
@@ -2485,10 +2514,13 @@ mod tests {
     }
 
     #[test]
-    fn disclosure_glyph_swaps_on_open() {
-        assert_eq!(disclosure_glyph(true), ICON_CHEVRON_OPEN);
-        assert_eq!(disclosure_glyph(false), ICON_CHEVRON_CLOSED);
-        assert_ne!(disclosure_glyph(true), disclosure_glyph(false));
+    fn disclosure_icon_swaps_on_open() {
+        assert_eq!(disclosure_icon(true), (SF_CHEVRON_OPEN, ICON_CHEVRON_OPEN));
+        assert_eq!(
+            disclosure_icon(false),
+            (SF_CHEVRON_CLOSED, ICON_CHEVRON_CLOSED)
+        );
+        assert_ne!(disclosure_icon(true), disclosure_icon(false));
     }
 
     #[test]
