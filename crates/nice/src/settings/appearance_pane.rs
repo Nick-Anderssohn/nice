@@ -271,7 +271,7 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     col = col.child(setting_row(
         "Scheme",
         Some("The active light / dark mode (locked while syncing with the OS).".into()),
-        scheme_control(scheme, sync_on, selected_bg, selected_border, ink, ink2),
+        scheme_control(scheme, sync_on, selected_bg, selected_border, ink),
         cx,
     ));
 
@@ -406,15 +406,22 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     col.into_any_element()
 }
 
+/// The whole-control opacity of the Scheme picker while "Sync with OS theme"
+/// is on — the gpui analogue of prod's SwiftUI `.disabled(tweaks.syncWithOS)`
+/// dimming on the segmented Picker (`SettingsView.swift:318`), which renders
+/// the entire control (labels AND the selected segment's highlight) grayed out.
+const DISABLED_CONTROL_OPACITY: f32 = 0.4;
+
 /// The Light | Dark segmented control (a11y `settings.appearance.scheme`).
-/// Disabled (no handler, dimmed) while `sync_on`.
+/// Disabled while `sync_on`: no click handlers / pointer cursor, and the whole
+/// control renders at [`DISABLED_CONTROL_OPACITY`] so it visibly reads as
+/// locked (prod `.disabled()` parity).
 fn scheme_control(
     scheme: ColorScheme,
     sync_on: bool,
     selected_bg: Rgba,
     selected_border: Rgba,
     ink: Rgba,
-    ink2: Rgba,
 ) -> impl IntoElement {
     let seg = |label: &'static str, value: ColorScheme| {
         let is_active = scheme == value;
@@ -427,7 +434,7 @@ fn scheme_control(
             .rounded(px(5.0))
             .text_size(px(12.0))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(if sync_on { ink2 } else { ink })
+            .text_color(ink)
             .child(label);
         if is_active {
             d = d.bg(selected_bg).border_1().border_color(selected_border);
@@ -446,6 +453,7 @@ fn scheme_control(
         .flex()
         .flex_row()
         .gap(px(4.0))
+        .when(sync_on, |d| d.opacity(DISABLED_CONTROL_OPACITY))
         .child(seg("Light", ColorScheme::Light))
         .child(seg("Dark", ColorScheme::Dark))
 }

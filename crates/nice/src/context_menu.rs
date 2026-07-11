@@ -47,6 +47,19 @@ const CONTEXT_MENU_PRIORITY: usize = 1000;
 /// Alpha applied to the `ink` slot for an item's hover highlight — the plan's
 /// "hover 6% ink" row convention, reused for menu rows.
 const HOVER_INK_ALPHA: f32 = 0.06;
+/// Menu row text point size at the 12pt chrome-font anchor — parity with the
+/// 13pt native NSMenu font every prod menu (sidebar/toolbar/file-browser
+/// context menus, settings pop-up buttons) renders with.
+const MENU_TEXT_BASE: f32 = 13.0;
+
+/// The menu's text size: the 13pt NSMenu base scaled by the user's chrome
+/// (sidebar) font setting — the same settings source the sidebar chrome reads
+/// ([`crate::settings::sidebar_font`]). Without an explicit size the popup
+/// inherited the window default (16px), reading far larger than the chrome
+/// around it.
+fn menu_text_px(sidebar_px: f32) -> f32 {
+    crate::settings::sidebar_font::sidebar_size(sidebar_px, MENU_TEXT_BASE)
+}
 
 /// A menu action's handler: run on click, before the menu dismisses. Takes the
 /// window + app so it can drive the injected `SidebarActions` seam (slice 3).
@@ -360,6 +373,11 @@ impl Render for ContextMenu {
             .min_w(self.min_width)
             .py_1()
             .px_1()
+            // The chrome font (13pt NSMenu parity, scaled by the sidebar-font
+            // setting) — otherwise rows inherit the 16px window default.
+            .text_size(px(menu_text_px(
+                crate::settings::sidebar_font::current_sidebar_px(cx),
+            )))
             .bg(slot_to_rgba(s.panel))
             .border_1()
             .border_color(slot_to_rgba(s.line))
@@ -431,6 +449,16 @@ mod tests {
         assert_eq!(ContextMenuItem::disabled("Settings…").selected(), None);
         assert_eq!(ContextMenuItem::separator().selected(), None);
         assert_eq!(ContextMenuItem::separator().entry_id(), None);
+    }
+
+    #[test]
+    fn menu_text_matches_nsmenu_at_default_and_tracks_the_chrome_font_setting() {
+        // At the 12pt sidebar-font anchor the menu renders at the 13pt native
+        // NSMenu size (prod parity) — NOT the 16px window default.
+        assert_eq!(menu_text_px(12.0), 13.0);
+        // A resized chrome font scales the menu proportionally with it.
+        assert_eq!(menu_text_px(24.0), 26.0);
+        assert_eq!(menu_text_px(8.0), 9.0); // 8*13/12 = 8.67 → round 9
     }
 
     #[test]
