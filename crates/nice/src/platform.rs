@@ -145,6 +145,41 @@ pub fn read_bool_pref(key: &str, default: bool) -> bool {
     }
 }
 
+/// Whether `key` is PRESENT (with a valid boolean format) in this app's own
+/// CFPreferences domain — the presence sibling of [`read_bool_pref`], which
+/// collapses "absent" into its `default`. The settings-import toggle copy
+/// (plan: settings-import-from-prod, decision #4) needs to tell "the user never
+/// set this in the Rust build" (absent → adopt prod's value) apart from "the
+/// user set it to the same value prod happens to hold" (present → leave it),
+/// which the value-only [`read_bool_pref`] cannot. `Some(value)` when the key is
+/// present, `None` when absent. Main thread, before the first window (same
+/// contract as [`read_bool_pref`]).
+pub fn read_own_bool_pref(key: &str) -> Option<bool> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesGetAppBooleanValue,
+    };
+
+    let key = CFString::new(key);
+    let mut exists: u8 = 0;
+    // SAFETY: identical to `read_bool_pref` — a READ of the own app domain with a
+    // valid `Boolean` out-param; we surface the `exists` flag instead of folding
+    // it into a default.
+    let value = unsafe {
+        CFPreferencesGetAppBooleanValue(
+            key.as_concrete_TypeRef(),
+            kCFPreferencesCurrentApplication,
+            &mut exists,
+        )
+    };
+    if exists != 0 {
+        Some(value != 0)
+    } else {
+        None
+    }
+}
+
 /// Write a boolean into this app's own CFPreferences domain — the write sibling
 /// of [`read_bool_pref`], targeting the same `kCFPreferencesCurrentApplication`
 /// domain (the [`disable_font_smoothing`] own-domain FFI precedent, in the write
@@ -181,6 +216,113 @@ pub fn write_bool_pref(key: &str, value: bool) {
         );
         CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
     }
+}
+
+// ===========================================================================
+// Settings-import — prod Swift Nice CFPreferences reader.
+//
+// The first-launch settings import (plan: settings-import-from-prod) reads the
+// user's prod Swift `Nice` UserDefaults so a fresh Rust install comes up looking
+// like their prod instance. Those values live in a DIFFERENT CFPreferences
+// domain from this app's own (`nice-rs`) — prod's bundle id
+// `dev.nickanderssohn.nice` — so the own-domain `read_bool_pref` above cannot
+// reach them. These helpers read arbitrary typed values out of a NAMED domain
+// via `CFPreferencesCopyAppValue(key, applicationID)`, the read half of the same
+// CFPreferences API `disable_font_smoothing` / `read_bool_pref` use.
+//
+// HERMETICITY: the domain is a parameter, and [`prod_settings_domain`] resolves
+// the effective one from the `NICE_PROD_SETTINGS_DOMAIN` env var (falling back to
+// the real prod bundle id). That env override is the single seam every
+// settings-import test — unit and black-box — uses to point the reader at a
+// SCRATCH domain, so no test ever reads Nick's real `dev.nickanderssohn.nice`.
+// ===========================================================================
+
+/// The prod Swift `Nice` CFPreferences domain (bundle id) the first-launch import
+/// reads from when `NICE_PROD_SETTINGS_DOMAIN` is unset.
+pub const PROD_SETTINGS_DOMAIN_DEFAULT: &str = "dev.nickanderssohn.nice";
+
+/// Env var overriding the prod-settings domain — the hermetic test seam. Set it
+/// to a scratch bundle id and the reader (and thus the whole import) reads that
+/// domain instead of the real prod one.
+pub const PROD_SETTINGS_DOMAIN_ENV: &str = "NICE_PROD_SETTINGS_DOMAIN";
+
+/// The CFPreferences domain the prod-settings readers target: the
+/// `NICE_PROD_SETTINGS_DOMAIN` override when set to a non-empty value, else
+/// [`PROD_SETTINGS_DOMAIN_DEFAULT`]. Resolve once and pass the result to the
+/// typed readers below (their `domain` parameter), so a test's scratch-domain
+/// override flows through every read of a single import run.
+pub fn prod_settings_domain() -> String {
+    std::env::var(PROD_SETTINGS_DOMAIN_ENV)
+        .ok()
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or_else(|| PROD_SETTINGS_DOMAIN_DEFAULT.to_string())
+}
+
+/// Copy the raw property-list value for `key` from CFPreferences `domain` as an
+/// owned [`CFType`](core_foundation::base::CFType), or `None` when the key is
+/// absent in that domain. `domain` is an application id (bundle id) such as
+/// `dev.nickanderssohn.nice`. The returned `CFType` releases on drop; the typed
+/// readers below downcast it to the concrete CF class they expect (a type
+/// mismatch — e.g. a string stored where a number is wanted — downcasts to
+/// `None`, never a wrong-typed value).
+fn copy_prod_value(key: &str, domain: &str) -> Option<core_foundation::base::CFType> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::CFPreferencesCopyAppValue;
+
+    let key = CFString::new(key);
+    let domain = CFString::new(domain);
+    // SAFETY: `key`/`domain` are live CF objects for the duration of the call.
+    // `CFPreferencesCopyAppValue` only READS the named domain and follows the
+    // Copy rule (+1 on the returned property-list value), so we hand the non-null
+    // result to `wrap_under_create_rule`, which owns and releases it on drop. A
+    // null return (key absent, or the domain has no preferences) becomes `None`.
+    let value = unsafe {
+        CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), domain.as_concrete_TypeRef())
+    };
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `value` is a non-null, owned (+1) CFTypeRef from the Copy call above.
+    Some(unsafe { CFType::wrap_under_create_rule(value as core_foundation_sys::base::CFTypeRef) })
+}
+
+/// Read a string-valued key from the prod-settings `domain` (e.g. a theme id or
+/// palette name), or `None` when the key is absent or not a `CFString`.
+pub fn read_prod_string(key: &str, domain: &str) -> Option<String> {
+    use core_foundation::string::CFString;
+    copy_prod_value(key, domain)?
+        .downcast::<CFString>()
+        .map(|s| s.to_string())
+}
+
+/// Read a numeric key from the prod-settings `domain` as `f64` (e.g. a font
+/// size), or `None` when the key is absent or not a `CFNumber`. Both integer- and
+/// float-stored numbers read back as `f64` (`defaults write … -int`/`-float`).
+pub fn read_prod_f64(key: &str, domain: &str) -> Option<f64> {
+    use core_foundation::number::CFNumber;
+    copy_prod_value(key, domain)?
+        .downcast::<CFNumber>()
+        .and_then(|n| n.to_f64())
+}
+
+/// Read a boolean key from the prod-settings `domain`, or `None` when the key is
+/// absent or not a `CFBoolean` (a numeric `0`/`1` is NOT treated as a bool).
+pub fn read_prod_bool(key: &str, domain: &str) -> Option<bool> {
+    use core_foundation::boolean::CFBoolean;
+    copy_prod_value(key, domain)?
+        .downcast::<CFBoolean>()
+        .map(bool::from)
+}
+
+/// Read a `CFData` key from the prod-settings `domain` as owned bytes (e.g. prod's
+/// `keyboardShortcuts` JSON `Data` blob), or `None` when the key is absent or not
+/// a `CFData`.
+pub fn read_prod_data(key: &str, domain: &str) -> Option<Vec<u8>> {
+    use core_foundation::data::CFData;
+    copy_prod_value(key, domain)?
+        .downcast::<CFData>()
+        .map(|d| d.bytes().to_vec())
 }
 
 /// The macOS keyCode side-channel feeding the R5 keyboard encoder.
@@ -2881,6 +3023,155 @@ impl Drop for PasteboardRef {
 #[cfg(test)]
 mod tests {
     use super::present_kick_due;
+    use super::{
+        prod_settings_domain, read_prod_bool, read_prod_data, read_prod_f64, read_prod_string,
+        PROD_SETTINGS_DOMAIN_DEFAULT, PROD_SETTINGS_DOMAIN_ENV,
+    };
+
+    // ---- prod-domain CFPreferences reader --------------------------------
+    //
+    // These exercise the REAL CFPreferences FFI (the point of the slice), but
+    // ONLY against per-test SCRATCH domains (`nice.import.test.platform.*`) —
+    // never Nick's real `dev.nickanderssohn.nice`. Each test seeds its scratch
+    // domain via the same `CFPreferencesSetAppValue` + synchronize the app uses,
+    // reads it back through the typed readers, then deletes its keys so the
+    // scratch plist is left empty.
+
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::base::CFTypeRef;
+    use core_foundation_sys::preferences::{CFPreferencesAppSynchronize, CFPreferencesSetAppValue};
+
+    /// Write `value` (already a +1-owned CF object) at `key` into scratch CF
+    /// domain `domain` and flush it, so the readers observe it in-process. A null
+    /// `value` DELETES the key (used for cleanup).
+    ///
+    /// # Safety
+    /// `value` must be a valid CF property-list object or null; `domain` a bundle
+    /// id string. Only ever called with scratch domains from these tests.
+    unsafe fn set_scratch_value(key: &str, value: CFTypeRef, domain: &str) {
+        let key = CFString::new(key);
+        let domain = CFString::new(domain);
+        CFPreferencesSetAppValue(key.as_concrete_TypeRef(), value, domain.as_concrete_TypeRef());
+        CFPreferencesAppSynchronize(domain.as_concrete_TypeRef());
+    }
+
+    /// Delete `keys` from scratch `domain`, flush, and remove the now-empty
+    /// preferences plist — best-effort teardown so a passing test leaves no
+    /// `nice.import.test.platform.*` residue behind (deleting the keys empties the
+    /// domain but cfprefsd still leaves an empty `.plist`, so drop the file too).
+    fn delete_scratch_keys(keys: &[&str], domain: &str) {
+        for key in keys {
+            // SAFETY: null value = delete; scratch domain only.
+            unsafe { set_scratch_value(key, std::ptr::null(), domain) };
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let plist = std::path::Path::new(&home)
+                .join("Library/Preferences")
+                .join(format!("{domain}.plist"));
+            let _ = std::fs::remove_file(plist);
+        }
+    }
+
+    /// A scratch domain unique to this process + the given test tag, so parallel
+    /// tests never share a domain.
+    fn scratch_domain(tag: &str) -> String {
+        format!("nice.import.test.platform.{}.{}", std::process::id(), tag)
+    }
+
+    #[test]
+    fn prod_domain_defaults_and_env_override() {
+        // Default when the override is unset...
+        std::env::remove_var(PROD_SETTINGS_DOMAIN_ENV);
+        assert_eq!(prod_settings_domain(), PROD_SETTINGS_DOMAIN_DEFAULT);
+        // ...an empty override is ignored (still the default)...
+        std::env::set_var(PROD_SETTINGS_DOMAIN_ENV, "");
+        assert_eq!(prod_settings_domain(), PROD_SETTINGS_DOMAIN_DEFAULT);
+        // ...a non-empty override wins.
+        std::env::set_var(PROD_SETTINGS_DOMAIN_ENV, "nice.import.test.override");
+        assert_eq!(prod_settings_domain(), "nice.import.test.override");
+        std::env::remove_var(PROD_SETTINGS_DOMAIN_ENV);
+    }
+
+    #[test]
+    fn reads_string_value() {
+        let domain = scratch_domain("string");
+        let value = CFString::new("Solarized Dark");
+        // SAFETY: live +1 CFString; scratch domain.
+        unsafe { set_scratch_value("themeId", value.as_CFTypeRef(), &domain) };
+        assert_eq!(
+            read_prod_string("themeId", &domain).as_deref(),
+            Some("Solarized Dark")
+        );
+        // Wrong type through a different reader -> None (no coercion).
+        assert_eq!(read_prod_f64("themeId", &domain), None);
+        assert_eq!(read_prod_bool("themeId", &domain), None);
+        delete_scratch_keys(&["themeId"], &domain);
+    }
+
+    #[test]
+    fn reads_numeric_value_as_f64() {
+        let domain = scratch_domain("number");
+        let float_val = CFNumber::from(15.5f64);
+        let int_val = CFNumber::from(42i64);
+        // SAFETY: live +1 CFNumbers; scratch domain.
+        unsafe {
+            set_scratch_value("terminalFontSize", float_val.as_CFTypeRef(), &domain);
+            set_scratch_value("tabWidth", int_val.as_CFTypeRef(), &domain);
+        }
+        assert_eq!(read_prod_f64("terminalFontSize", &domain), Some(15.5));
+        // Integer-stored numbers read back as f64 too.
+        assert_eq!(read_prod_f64("tabWidth", &domain), Some(42.0));
+        // A number is not a string.
+        assert_eq!(read_prod_string("terminalFontSize", &domain), None);
+        delete_scratch_keys(&["terminalFontSize", "tabWidth"], &domain);
+    }
+
+    #[test]
+    fn reads_boolean_value() {
+        let domain = scratch_domain("bool");
+        // SAFETY: `true_value`/`false_value` are shared +1 CFBooleans; scratch domain.
+        unsafe {
+            set_scratch_value("syncClaudeTheme", CFBoolean::true_value().as_CFTypeRef(), &domain);
+            set_scratch_value(
+                "installHandoffSkill",
+                CFBoolean::false_value().as_CFTypeRef(),
+                &domain,
+            );
+        }
+        assert_eq!(read_prod_bool("syncClaudeTheme", &domain), Some(true));
+        assert_eq!(read_prod_bool("installHandoffSkill", &domain), Some(false));
+        delete_scratch_keys(&["syncClaudeTheme", "installHandoffSkill"], &domain);
+    }
+
+    #[test]
+    fn reads_data_value() {
+        let domain = scratch_domain("data");
+        let bytes = br#"{"toggleSidebar":{"keyCode":11,"modifierFlagsRaw":1048576}}"#;
+        let data = CFData::from_buffer(bytes);
+        // SAFETY: live +1 CFData; scratch domain.
+        unsafe { set_scratch_value("keyboardShortcuts", data.as_CFTypeRef(), &domain) };
+        assert_eq!(
+            read_prod_data("keyboardShortcuts", &domain).as_deref(),
+            Some(&bytes[..])
+        );
+        // Data is not a string.
+        assert_eq!(read_prod_string("keyboardShortcuts", &domain), None);
+        delete_scratch_keys(&["keyboardShortcuts"], &domain);
+    }
+
+    #[test]
+    fn absent_key_reads_none() {
+        let domain = scratch_domain("absent");
+        assert_eq!(read_prod_string("neverWritten", &domain), None);
+        assert_eq!(read_prod_f64("neverWritten", &domain), None);
+        assert_eq!(read_prod_bool("neverWritten", &domain), None);
+        assert_eq!(read_prod_data("neverWritten", &domain), None);
+    }
+
 
     // ---- r5d present-kick occlusion gate --------------------------------
     //

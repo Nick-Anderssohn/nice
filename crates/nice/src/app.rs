@@ -1025,6 +1025,19 @@ pub fn run() {
         // A fixed window-management accelerator like ⌘N / ⌘Q / ⌘W; the window is
         // UNREGISTERED (D7), so it stays out of the registry + shortcut dispatch.
         crate::settings::window::install_open_settings_command(cx);
+        // Settings-import (plan: settings-import-from-prod): on a GENUINE first
+        // launch (own `ui_settings.json` absent), copy the user's prod Swift Nice
+        // settings so a fresh Rust install comes up looking + behaving like their
+        // prod instance instead of shipped defaults. Runs BEFORE every `::load`
+        // below so each observes the imported direct settings, AND copies the three
+        // CFPref toggles into the own domain BEFORE the `read_bool_pref` reads at
+        // (`installHandoffSkill`) / (`syncClaudeTheme`) / (`handoffSkillPromptSeen`)
+        // further down. Fully fail-soft: prod-absent / partial data is a clean
+        // no-op, never a panic or a blocked startup, and it runs exactly once (the
+        // eager first-launch write flips the "own store exists" gate). app::run
+        // ONLY — never `run_selftest` (hermeticity: the suite writes no real user
+        // state and reads no real prod domain).
+        crate::settings_import::import_prod_settings_on_first_launch();
         // R23: load the `fonts` + `advanced` sections of `ui_settings.json` into the
         // `SettingsPrefsStore` Global BEFORE `install_shortcuts`, which seeds the
         // shared terminal font + the app-level sidebar-font entity from the persisted

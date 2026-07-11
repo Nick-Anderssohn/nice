@@ -148,6 +148,7 @@ mod session_lifecycle;
 mod session_manager;
 mod session_store;
 mod settings;
+mod settings_import;
 mod sf_symbols;
 mod shell_inject;
 mod shell_socket_live;

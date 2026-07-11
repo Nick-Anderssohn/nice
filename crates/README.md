@@ -999,12 +999,48 @@ The GPUI application. Structure (grows over later cycles):
     explicit `null` (a self-describing, diffable file; load-equivalent to Swift's
     omit-unbound form). **Token-vs-keyCode divergence (D1):** the schema is
     token-based where Swift's `keyboardShortcuts` blob is keyCode-based, and the two
-    apps have distinct bundle ids, so R24 does NOT migrate Swift's blob — every user
-    starts fresh at defaults (a keyCode→token table is speculative work for a
-    clean-install app; the pins match the character-based-matching divergence the
-    `keymap` module documents). Injected path via `NICE_APPLICATION_SUPPORT_ROOT`,
-    resolved in `app::run` ONLY; `run_selftest` installs a defaults+temp store and
-    performs no launch-time write (hermeticity).
+    apps have distinct bundle ids, so R24 itself does NOT migrate Swift's blob —
+    every user starts fresh at defaults from R24's own perspective (the
+    keyCode→token table this note used to call "speculative work for a
+    clean-install app" is no longer speculative — see `settings_import` below,
+    which the settings-import-from-prod plan added as a separate first-launch
+    step that DOES perform exactly this translation, ahead of R24's own load).
+    The pins match the character-based-matching divergence the `keymap` module
+    documents. Injected path via `NICE_APPLICATION_SUPPORT_ROOT`, resolved in
+    `app::run` ONLY; `run_selftest` installs a defaults+temp store and performs
+    no launch-time write (hermeticity).
+  - `settings_import` (settings-import-from-prod plan) — the one-shot
+    first-launch migration from prod Swift `Nice`'s CFPreferences domain into
+    the Rust `ui_settings.json`, gated on the Rust store not yet existing (a
+    genuine first launch) and run in `app::run` immediately before
+    `SettingsPrefsStore::load`, so it precedes both `shortcuts_store`'s
+    `ShortcutBindings::load` and the R24 divergence note above. Two
+    destinations: the direct settings (fonts, smooth-scroll, appearance,
+    file-browser sort — verbatim except the `dateModified`→`date_modified`
+    criterion rawValue) written through the same `write_ui_settings_merged`
+    writer `shortcuts_store` uses; and the `shortcuts` section itself, which
+    decodes prod's `keyboardShortcuts` JSON `Data` blob
+    (`{actionId:{keyCode,modifierFlagsRaw}}`) into gpui chord tokens via an
+    explicit prod-action-id map, a static US-ANSI kVK→key-name table, and an
+    `NSEvent.ModifierFlags`-bit→prefix decode, round-tripped through the real
+    `OwnedCombo` parser in tests. Also copies three CFPref toggles
+    (`syncClaudeTheme`, `installHandoffSkill`, `handoffSkillPromptSeen`) from
+    the prod domain into this app's own domain, only when present-in-prod AND
+    absent-in-own. The prod domain is resolved via
+    `platform::prod_settings_domain()` (default `dev.nickanderssohn.nice`,
+    override `NICE_PROD_SETTINGS_DOMAIN` — the hermetic seam both unit tests
+    and the black-box validation use; production code never reads the real
+    prod domain in a test). Fail-soft throughout: absent/malformed prod data
+    imports what's valid and leaves Rust defaults for the rest, never panics,
+    never blocks startup; the direct-settings write is eager even when prod
+    contributed nothing, so the first-launch gate flips after one launch and a
+    no-prod machine never re-reads prod on every start. Black-box validated
+    (bundle launched directly with a scratch `NICE_APPLICATION_SUPPORT_ROOT` +
+    scratch `NICE_PROD_SETTINGS_DOMAIN`, zero contact with the real prod
+    domain) — see `settings-import-from-prod/VALIDATION.md` in the plans repo
+    for the evidence (imported values landing in `ui_settings.json`, a
+    native-res screenshot of the imported font/theme actually rendering, and
+    an edit-then-relaunch proving the import is truly one-shot).
   - `multiwindow` — the R12 live multi-window self-test scenario (`multiwindow`,
     see the table below). Its in-process isolation / routing / all-13-fire / peek
     **differentials** live in `nice-itests`' `multiwindow` cases (mirrors over the
