@@ -62,7 +62,7 @@
 //!
 //! [`KeyInput`]: nice_term_input::KeyInput
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -86,7 +86,7 @@ use nice_term_input::{
 use nice_theme::Srgba;
 
 use crate::drop::{drop_bytes, ImageDropProvider};
-use crate::element::{fit_grid, grid_top_y, ImeInput, TerminalElement, TerminalMetrics};
+use crate::element::{fit_grid, grid_top_y, GridCache, ImeInput, TerminalElement, TerminalMetrics};
 use crate::font::FontSettings;
 use crate::input::{
     build_key_input, build_modifier_input, encoder_config, kitty_forwards_super, named_key_for,
@@ -151,6 +151,12 @@ pub struct TerminalView {
     /// by the mouse handlers on the next event for pixel→cell hit-testing. Shared
     /// so paint writes it without re-entering this entity (see [`TerminalElement`]).
     paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The cross-frame damage-gated row cache (fix round r5b), reconciled and
+    /// painted by the [`TerminalElement`] built each frame. Shared the same way
+    /// as `paint_bounds` (`Rc`, element-side mutation only) so paint never
+    /// re-enters this entity; the view itself never reads it — it only keeps it
+    /// alive across frames.
+    grid_cache: Rc<RefCell<GridCache>>,
     /// Whether the element schedules a pty grid refit when its painted bounds
     /// change (M2 Item E — window resize → `resize_pty_to_fit`). Off by default:
     /// fixed-grid embeddings (the pixel-assertion self-tests spawn at an exact
@@ -302,6 +308,7 @@ impl TerminalView {
             keycode_probe: None,
             image_drop_provider: None,
             paint_bounds: Rc::new(Cell::new(None)),
+            grid_cache: Rc::new(RefCell::new(GridCache::default())),
             auto_refit: false,
             last_pty_fit: None,
             resize_debounce: RESIZE_DEBOUNCE_DEFAULT,
@@ -794,12 +801,13 @@ impl TerminalView {
             }
             // The one non-gesture key a held pane honours: the dismiss affordance —
             // a bare Enter respawns a fresh shell (like clicking the pill), the only
-            // path that frees the held term.
+            // path that frees the held term. `dismiss_held` issues its own
+            // `cx.notify()` on success; every other consumed key changes nothing
+            // paint reads, so none notifies (r5c lever B — see `dispatch_key`).
             if keystroke.key == "enter" && !m.control && !m.platform && !m.alt {
                 self.dismiss_held(cx);
             }
             cx.stop_propagation();
-            cx.notify();
             return;
         }
 
@@ -810,20 +818,23 @@ impl TerminalView {
 
         // (G1 item 2) An Enter/Tab that just confirmed a composition this cycle is
         // swallowed — no CR/HT reaches the pty (the commit already wrote the text).
+        // No notify: the commit's visible effect was already painted by
+        // `ime_commit`'s own notify; consuming this key changes nothing further.
         let commit_confirm_key =
             (keystroke.key == "enter" || keystroke.key == "tab") && !m.control && !m.platform;
         if swallow && commit_confirm_key {
             cx.stop_propagation();
-            cx.notify();
             return;
         }
 
         // (G1 items 1 & 3) While composing, all key handling belongs to the IME
         // (preedit edits, candidate navigation, commit): the pty stays silent.
         // gpui routes keys to the IME because `marked_text_range` is `Some`, so a
-        // key that still lands here must not encode anything.
+        // key that still lands here must not encode anything. No notify either:
+        // every preedit mutation arrives through the platform input handler
+        // (`ime_set_marked` / `ime_commit` / `ime_unmark`), each of which
+        // notifies itself — this handler mutated nothing paint reads.
         if self.ime.is_composing() {
-            cx.notify();
             return;
         }
 
@@ -837,9 +848,10 @@ impl TerminalView {
         // is Claude-side and deliberately not fixed here.)
         if m.platform && !m.control && !m.alt {
             if keystroke.key == "v" {
+                // No notify: the paste is a pty write — its echo comes back
+                // through damage → drain → throttled notify (see `dispatch_key`).
                 self.paste_clipboard(cx);
                 cx.stop_propagation();
-                cx.notify();
                 return;
             }
             if keystroke.key == "c"
@@ -870,6 +882,11 @@ impl TerminalView {
 
     /// gpui key-up: only relevant to the kitty event-type ladder (press/repeat/
     /// release). In legacy and plain-kitty modes releases encode to nothing.
+    /// Pty-write only — no `cx.notify()`, same contract as [`dispatch_key`]
+    /// (r5c lever B): the release report's echo (if the app paints anything)
+    /// returns through the damage → drain → throttled-notify path.
+    ///
+    /// [`dispatch_key`]: Self::dispatch_key
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.ime.is_composing() {
             return;
@@ -939,8 +956,26 @@ impl TerminalView {
         // Consuming still is deliberate — letting such a key propagate would reach
         // AppKit's unhandled-key path and beep. Chords that *should* yield bytes
         // do (e.g. Ctrl+Shift+C degrades to 0x03 in `legacy_char_sequence`).
+        //
+        // Deliberately NO `cx.notify()` (fix round r5c, lever B). A keystroke's
+        // only effect here is the pty write, which paint cannot see — the echo
+        // mutates the grid via the feeder and comes back through the
+        // damage → drain → throttled-notify path (r5 lever 2), which presents
+        // it. Notifying here instead re-dirtied the window on EVERY key, and
+        // gpui's `dispatch_key_event` force-draws a dirty window before
+        // dispatching each key (vendor/zed/crates/gpui/src/window.rs:4724 — it
+        // needs a fresh dispatch tree), so every keystroke paid a full
+        // immediate-mode draw ON TOP of the echo's own throttled frame: the
+        // 2026-07-10 5 s sample during a 120 cps typing flood counted ~335
+        // main-thread samples inside that pre-dispatch `Window::draw`. Nothing
+        // else in this handler mutates visual state: scroll state is untouched
+        // (no snap-to-bottom exists on key input — wheel scrolling notifies via
+        // the session handle), composing/preedit transitions happen only in the
+        // input-handler callbacks (which notify themselves), and the caret/
+        // focus visuals are driven by focus + window-activation edges, not
+        // keystrokes. Any future key side effect that DOES change what paint
+        // reads must notify at its own site, like `dismiss_held` does.
         cx.stop_propagation();
-        cx.notify();
     }
 
     /// gpui flagsChanged: a bare modifier key (Shift/Ctrl/Alt/⌘) went down or up.
@@ -951,7 +986,8 @@ impl TerminalView {
     /// side-channel; press vs release is computed from the new aggregate modifier
     /// state (see [`build_modifier_input`]). While composing, the encoder still
     /// reports bare modifiers (kitty's composition rule) — the composing flag is
-    /// threaded through so it can.
+    /// threaded through so it can. Pty-write only — no `cx.notify()`, same
+    /// contract as [`dispatch_key`](Self::dispatch_key) (r5c lever B).
     fn on_modifiers_changed(
         &mut self,
         event: &ModifiersChangedEvent,
@@ -1392,6 +1428,7 @@ impl Render for TerminalView {
             ime,
             self.paint_bounds.clone(),
             self.auto_refit,
+            self.grid_cache.clone(),
         );
 
         div()

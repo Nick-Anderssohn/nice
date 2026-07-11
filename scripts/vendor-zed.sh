@@ -1,24 +1,36 @@
 #!/usr/bin/env bash
 #
-# vendor-zed.sh — reproducibly materialize the pinned + bg-luminance-patched
-# GPUI checkout the Rust workspace path-depends on.
+# vendor-zed.sh — reproducibly materialize the pinned + patched GPUI checkout
+# the Rust workspace path-depends on.
 #
-# The checkout itself (vendor/zed, ~1 GB) is gitignored; this script plus
-# patches/zed-bg-luminance.patch are the committed source of truth. Run it once
-# per fresh worktree before the first `cargo build --workspace`.
+# The checkout itself (vendor/zed, ~1 GB) is gitignored; this script plus the
+# patches/*.patch files listed below are the committed source of truth. Run it
+# once per fresh worktree before the first `cargo build --workspace`.
 #
 # Strategy (self-contained, no external fork):
 #   1. Maintain a shared BARE MIRROR at ~/.cache/nice/zed-mirror.git — cloned
 #      from zed-industries/zed once, `git fetch`ed only when the pin is missing.
 #   2. Local-clone (hardlinked objects, cheap) the mirror into vendor/zed.
 #   3. Check out the pinned revision (detached).
-#   4. Apply patches/zed-bg-luminance.patch, skipping cleanly if already applied.
+#   4. Apply each patch, skipping cleanly if already applied:
+#        - zed-bg-luminance.patch: the kitty-style bg-aware glyph composition
+#          curve (SwiftTerm parity).
+#        - zed-display-link-selfheal.patch: fix round r5d — a delayed retry when
+#          gpui_macos's start_display_link cannot (re)start the CVDisplayLink.
+#          On the pin, displayLayer: stops + RECREATES the link around every
+#          demand-present draw, and both of start_display_link's failure paths
+#          (stale occlusion read; DisplayLink::new error) silently leave the
+#          link permanently stopped: the 2026-07-10 presentation wedge (screen
+#          frozen on a stale frame for minutes, app responsive, CVDisplayLink
+#          thread parked with zero callbacks). The patch schedules a ~50 ms
+#          single-flight retry that restarts the link iff the window is still
+#          occlusion-visible, and logs the self-heal.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
 #
-# Changing the pin or dropping the patch is a human decision, not an automated
-# drift — edit ZED_PIN / the patch deliberately.
+# Changing the pin or dropping a patch is a human decision, not an automated
+# drift — edit ZED_PIN / the patch list deliberately.
 set -euo pipefail
 
 ZED_URL="https://github.com/zed-industries/zed"
@@ -31,9 +43,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # worktrees reuse one mirror.
 MIRROR="${NICE_ZED_MIRROR:-$HOME/.cache/nice/zed-mirror.git}"
 VENDOR="$REPO_ROOT/vendor/zed"
-PATCH="$REPO_ROOT/patches/zed-bg-luminance.patch"
-# Marker lives inside the gitignored checkout; its presence means "patch applied".
-MARKER="$VENDOR/.nice-bg-luminance-applied"
+# The committed patch set, applied in order. Each patch pairs with a marker
+# file inside the gitignored checkout; the marker's presence means "applied".
+PATCHES=(
+    "zed-bg-luminance"
+    "zed-display-link-selfheal"
+)
+patch_file() { printf '%s/patches/%s.patch' "$REPO_ROOT" "$1"; }
+marker_file() { printf '%s/.nice-%s-applied' "$VENDOR" "${1#zed-}"; }
 
 log() { printf 'vendor-zed: %s\n' "$*"; }
 
@@ -42,10 +59,12 @@ has_commit() {
     git -C "$1" cat-file -e "${2}^{commit}" 2>/dev/null
 }
 
-if [ ! -f "$PATCH" ]; then
-    echo "vendor-zed: error: patch not found at $PATCH" >&2
-    exit 1
-fi
+for name in "${PATCHES[@]}"; do
+    if [ ! -f "$(patch_file "$name")" ]; then
+        echo "vendor-zed: error: patch not found at $(patch_file "$name")" >&2
+        exit 1
+    fi
+done
 
 # --- 1. Shared bare mirror -------------------------------------------------
 if [ ! -d "$MIRROR" ]; then
@@ -72,32 +91,47 @@ if [ ! -d "$VENDOR/.git" ] || ! has_commit "$VENDOR" "$ZED_PIN"; then
 fi
 
 # --- 3. Check out the pin (detached) ---------------------------------------
+all_markers_present() {
+    local name
+    for name in "${PATCHES[@]}"; do
+        [ -f "$(marker_file "$name")" ] || return 1
+    done
+}
+
 current="$(git -C "$VENDOR" rev-parse -q --verify HEAD 2>/dev/null || echo none)"
-if [ "$current" != "$ZED_PIN" ] || [ ! -f "$MARKER" ]; then
-    # Reset to a pristine pinned tree before (re)applying the patch, so the
-    # result is reproducible regardless of prior partial state.
+if [ "$current" != "$ZED_PIN" ] || ! all_markers_present; then
+    # Reset to a pristine pinned tree before (re)applying the patches, so the
+    # result is reproducible regardless of prior partial state. A checkout that
+    # predates a newly-added patch lands here too (its marker is missing): it
+    # pays one reset + full reapply + gpui rebuild — the designed migration.
     log "checking out pin $ZED_PIN"
     git -C "$VENDOR" checkout --quiet --detach "$ZED_PIN"
     git -C "$VENDOR" reset --quiet --hard "$ZED_PIN"
     git -C "$VENDOR" clean --quiet -fd
-    rm -f "$MARKER"
+    for name in "${PATCHES[@]}"; do
+        rm -f "$(marker_file "$name")"
+    done
 fi
 
-# --- 4. Apply the bg-luminance patch (idempotent) --------------------------
-if [ -f "$MARKER" ]; then
-    log "patch already applied (marker present) — no-op"
-elif git -C "$VENDOR" apply --check "$PATCH" 2>/dev/null; then
-    log "applying bg-luminance patch"
-    git -C "$VENDOR" apply "$PATCH"
-    touch "$MARKER"
-elif git -C "$VENDOR" apply --reverse --check "$PATCH" 2>/dev/null; then
-    # Patch content is present but the marker was lost — record and move on.
-    log "patch already present (marker missing) — recording marker"
-    touch "$MARKER"
-else
-    echo "vendor-zed: error: patch does not apply cleanly to $ZED_PIN" >&2
-    echo "  (tree may be dirty; re-run after 'rm -rf $VENDOR')" >&2
-    exit 1
-fi
+# --- 4. Apply the patch set (idempotent, in order) --------------------------
+for name in "${PATCHES[@]}"; do
+    patch="$(patch_file "$name")"
+    marker="$(marker_file "$name")"
+    if [ -f "$marker" ]; then
+        log "$name: patch already applied (marker present) — no-op"
+    elif git -C "$VENDOR" apply --check "$patch" 2>/dev/null; then
+        log "$name: applying patch"
+        git -C "$VENDOR" apply "$patch"
+        touch "$marker"
+    elif git -C "$VENDOR" apply --reverse --check "$patch" 2>/dev/null; then
+        # Patch content is present but the marker was lost — record and move on.
+        log "$name: patch already present (marker missing) — recording marker"
+        touch "$marker"
+    else
+        echo "vendor-zed: error: $name.patch does not apply cleanly to $ZED_PIN" >&2
+        echo "  (tree may be dirty; re-run after 'rm -rf $VENDOR')" >&2
+        exit 1
+    fi
+done
 
-log "ok — vendor/zed @ $ZED_PIN, bg-luminance patch applied"
+log "ok — vendor/zed @ $ZED_PIN, patches applied: ${PATCHES[*]}"

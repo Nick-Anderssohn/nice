@@ -1155,6 +1155,15 @@ impl WindowState {
     /// window (`crate::platform` fact 1). The terminal drain uses the same kick
     /// (`crate::app::install_present_kick`). A null view (headless / no AppKit
     /// handle yet) is a safe no-op.
+    ///
+    /// Occlusion-gated inside `platform::present_kick` (r5d): on a VISIBLE
+    /// window the `setNeedsDisplay` is skipped — the running display link
+    /// presents the notify-dirtied modal on its next tick — so this path never
+    /// feeds the `displayLayer:` link stop/recreate cycle behind the 2026-07-10
+    /// presentation wedge. Occluded (the case this kick exists for) it fires
+    /// exactly as before. [`MODAL_PRESENT_KICKS`] counts *calls into this
+    /// path*, before the gate, so the `persistence-restore` pin (present +
+    /// dismiss each kick once) is unaffected by the window's occlusion state.
     fn present_kick_modal(ns_view: *mut std::ffi::c_void) {
         // Selftest instrumentation (see `modal_present_kick_count`): count the kick
         // so the `persistence-restore` scenario can pin that this path fires it.

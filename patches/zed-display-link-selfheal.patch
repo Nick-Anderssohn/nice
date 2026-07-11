@@ -1,0 +1,139 @@
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -491,6 +491,13 @@ struct MacWindowState {
+     cursor_style: CursorStyle,
+     cursor_visible: Arc<AtomicBool>,
+     display_link: Option<DisplayLink>,
++    // Nice patch (display-link self-heal): whether a delayed retry of a failed
++    // display-link (re)start is already queued — at most one in flight.
++    display_link_retry_pending: bool,
++    // Nice patch (display-link self-heal): back-pointer for the retry task
++    // (the `synthetic_drag` Weak pattern); set right after the containing Arc
++    // is built in `MacWindow::open`, before any delegate callback can fire.
++    weak_self: Weak<Mutex<MacWindowState>>,
+     renderer: renderer::Renderer,
+     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
+@@ -652,6 +659,17 @@ impl MacWindowState {
+                 .occlusionState()
+                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+             {
++                // Nice patch (display-link self-heal): a plain return here used
++                // to be a silent-death path — `displayLayer:` stops the link
++                // before every draw and re-runs this to restart it, so one
++                // stale not-visible read on a window that IS (or is about to
++                // be) visible left `display_link = None` with nothing
++                // scheduled to restart it until the next occlusion/activation
++                // edge: the window froze on its last frame while the app
++                // stayed responsive. Schedule a delayed re-check; if the
++                // window really is occluded at fire time, the retry no-ops
++                // (the occlusion handler owns the visible-edge restart).
++                self.schedule_display_link_retry();
+                 return;
+             }
+         }
+@@ -661,7 +679,31 @@ impl MacWindowState {
+         {
+             display_link.start().log_err();
+             self.display_link = Some(display_link);
++        } else {
++            // Nice patch (display-link self-heal): `DisplayLink::new` failed
++            // (already logged by `log_err`) on a VISIBLE window — the other
++            // silent-death path. Without a retry the window never presents
++            // again until an occlusion/activation edge happens to re-run this.
++            self.schedule_display_link_retry();
++        }
++    }
++
++    // Nice patch (display-link self-heal): queue ONE delayed re-check after a
++    // failed display-link (re)start. `display_link_retry_pending` guarantees a
++    // single retry in flight no matter how many starts fail while it is queued
++    // (e.g. a demand-present kick storm on an occluded window), so retries
++    // never pile up. See `retry_start_display_link` for the fire-time checks.
++    fn schedule_display_link_retry(&mut self) {
++        if self.display_link_retry_pending {
++            return;
+         }
++        self.display_link_retry_pending = true;
++        self.foreground_executor
++            .spawn(retry_start_display_link(
++                self.weak_self.clone(),
++                self.background_executor.clone(),
++            ))
++            .detach();
+     }
+ 
+     fn stop_display_link(&mut self) {
+@@ -872,6 +914,8 @@ impl MacWindow {
+                 cursor_style: CursorStyle::Arrow,
+                 cursor_visible,
+                 display_link: None,
++                display_link_retry_pending: false,
++                weak_self: Weak::new(),
+                 renderer: renderer::new_renderer(
+                     renderer_context,
+                     native_window as *mut _,
+@@ -914,6 +958,12 @@ impl MacWindow {
+                 sheet_parent: None,
+             })));
+ 
++            // Nice patch (display-link self-heal): give the state a Weak to
++            // itself so `schedule_display_link_retry` can hand the retry task a
++            // handle. Set before the delegate/ivar wiring below, so no callback
++            // can ever observe an empty `weak_self`.
++            window.0.lock().weak_self = Arc::downgrade(&window.0);
++
+             (*native_window).set_ivar(
+                 WINDOW_STATE_IVAR,
+                 Arc::into_raw(window.0.clone()) as *const c_void,
+@@ -2924,6 +2974,50 @@ extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
+     send_file_drop_event(window_state, FileDropEvent::Exited);
+ }
+ 
++// Nice patch (display-link self-heal): how long to wait before re-checking a
++// display link that failed to (re)start. Long enough to outlast a transient
++// occlusion-state/display-reconfiguration hiccup, short enough that a healed
++// window resumes presenting before a user reads it as frozen.
++const DISPLAY_LINK_RETRY_DELAY: Duration = Duration::from_millis(50);
++
++/// Nice patch (display-link self-heal): the delayed re-check queued by
++/// `MacWindowState::schedule_display_link_retry`. Runs on the main thread
++/// (spawned on the window's `ForegroundExecutor`, mirroring `synthetic_drag`;
++/// only the timer awaits on the background executor). No-ops when the window
++/// is gone/closed, when a link is already running (an occlusion / key-status /
++/// `displayLayer:` edge beat us to the restart), or when the window is
++/// genuinely not occlusion-visible (the occlusion handler owns the
++/// visible-edge restart). What remains is exactly the wedge state — a VISIBLE
++/// window with a stopped display link, which nothing else will ever heal — so
++/// log it (making field wedges visible) and re-run `start_display_link`. A
++/// repeat failure re-schedules through the same single-flight guard, so a
++/// persistent fault retries at ~20 Hz instead of freezing presentation
++/// forever.
++async fn retry_start_display_link(
++    window_state: Weak<Mutex<MacWindowState>>,
++    executor: BackgroundExecutor,
++) {
++    executor.timer(DISPLAY_LINK_RETRY_DELAY).await;
++    let Some(window_state) = window_state.upgrade() else {
++        return;
++    };
++    let mut lock = window_state.lock();
++    lock.display_link_retry_pending = false;
++    if lock.closed.load(Ordering::Acquire) || lock.display_link.is_some() {
++        return;
++    }
++    let visible = unsafe {
++        lock.native_window
++            .occlusionState()
++            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
++    };
++    if !visible {
++        return;
++    }
++    log::warn!("display link stopped on a visible window; restarting it (self-heal)");
++    lock.start_display_link();
++}
++
+ async fn synthetic_drag(
+     window_state: Weak<Mutex<MacWindowState>>,
+     drag_id: usize,

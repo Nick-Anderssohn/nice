@@ -11,6 +11,7 @@
 //! `alacritty_terminal::tty` — the pty is Nice's own libc [`crate::PtyProcess`].
 
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -154,11 +155,35 @@ fn write_all_fd(fd: RawFd, data: &[u8]) {
 /// `clear_screen`; on a vte/alacritty upgrade, re-diff the trait — a missed
 /// new method would silently no-op here.
 ///
-/// Damage note: the in-place branch does not mark alacritty's internal
-/// per-line damage (`Term::mark_fully_damaged` is private). Nothing in Nice
-/// consumes `Term::damage()` — the renderer repaints from a full grid snapshot
-/// on the feeder's own damage-wake, which fires after every parsed chunk.
-pub(crate) struct ParityTerm<'a>(pub(crate) &'a mut Term<EventProxy>);
+/// Damage note (binding since fix round r5b): the renderer damage-gates its
+/// per-row snapshot on `Term::damage()` (it re-copies/re-plans ONLY damaged
+/// viewport rows — the full-grid rebuild per draw measured 0.42 cpu_s idle /
+/// 7.67 cpu_s at 120 cps vs Swift's 0.05 / 2.68 on 2026-07-10). The in-place
+/// ED(2) branch mutates the grid through `Grid::reset_region`, which alacritty's
+/// own damage tracking cannot see (`Term::mark_fully_damaged` is private, and
+/// the vanilla `clear_screen` path we bypass is what would have set it) — so
+/// this wrapper raises `full_damage`, an out-of-band "the whole viewport
+/// changed" flag the feeder shares with the renderer
+/// ([`crate::session::TermSession::take_forced_full_damage`]). Every OTHER
+/// forwarded control marks its own damage inside vanilla alacritty 0.26; any
+/// future override that mutates the grid directly MUST raise this flag too, or
+/// the damage-gated renderer will leave stale rows on screen.
+pub(crate) struct ParityTerm<'a> {
+    term: &'a mut Term<EventProxy>,
+    /// Set (never cleared here) when an override mutated the grid outside
+    /// alacritty's damage tracking. Written under the `Term` lock (the feeder
+    /// parses while holding it); the renderer takes-and-clears it under the
+    /// same lock, so no set can race a snapshot.
+    full_damage: &'a AtomicBool,
+}
+
+impl<'a> ParityTerm<'a> {
+    /// Wrap `term` for one parse pass, wiring the out-of-band damage flag the
+    /// in-place ED(2) override raises (see the struct docs).
+    pub(crate) fn new(term: &'a mut Term<EventProxy>, full_damage: &'a AtomicBool) -> Self {
+        ParityTerm { term, full_damage }
+    }
+}
 
 /// Forward `Handler` methods verbatim to the wrapped `Term`'s impl.
 macro_rules! forward_handler {
@@ -166,7 +191,7 @@ macro_rules! forward_handler {
         $(
             #[inline]
             fn $name(&mut self, $($arg: $ty),*) {
-                Handler::$name(&mut *self.0, $($arg),*)
+                Handler::$name(&mut *self.term, $($arg),*)
             }
         )+
     };
@@ -177,16 +202,20 @@ impl Handler for ParityTerm<'_> {
     /// alt screen has no history, so alacritty's own behaviour there is
     /// already in-place; delegate it (and every other clear mode) unchanged.
     fn clear_screen(&mut self, mode: ClearMode) {
-        if matches!(mode, ClearMode::All) && !self.0.mode().contains(TermMode::ALT_SCREEN) {
+        if matches!(mode, ClearMode::All) && !self.term.mode().contains(TermMode::ALT_SCREEN) {
             // SwiftTerm `cmdEraseInDisplay` case 2: reset every viewport line
             // in place (to the cursor template, i.e. the current erase
             // attributes) — do NOT rotate the region into scrollback.
-            self.0.grid_mut().reset_region(..);
+            self.term.grid_mut().reset_region(..);
             // ED(2) also drops any selection (alacritty's All branch does the
             // same unconditionally).
-            self.0.selection = None;
+            self.term.selection = None;
+            // `reset_region` bypasses alacritty's damage tracking (see the
+            // struct docs): tell the damage-gated renderer the whole viewport
+            // changed, or it would keep painting the pre-clear rows.
+            self.full_damage.store(true, Ordering::Release);
         } else {
-            Handler::clear_screen(&mut *self.0, mode);
+            Handler::clear_screen(&mut *self.term, mode);
         }
     }
 
@@ -392,10 +421,14 @@ mod tests {
         )
     }
 
-    /// Feed bytes through the same parity handler the session feeder uses.
-    fn feed(term: &mut Term<EventProxy>, bytes: &[u8]) {
+    /// Feed bytes through the same parity handler the session feeder uses,
+    /// returning whether the pass raised the out-of-band full-damage flag
+    /// (the r5b renderer side-channel — most tests ignore it).
+    fn feed(term: &mut Term<EventProxy>, bytes: &[u8]) -> bool {
         let mut parser: Processor = Processor::new();
-        parser.advance(&mut ParityTerm(term), bytes);
+        let full_damage = AtomicBool::new(false);
+        parser.advance(&mut ParityTerm::new(term, &full_damage), bytes);
+        full_damage.load(Ordering::Acquire)
     }
 
     /// Print enough numbered lines that some scroll into history.
@@ -479,5 +512,54 @@ mod tests {
 
         assert_eq!(term.grid().history_size(), 0);
         assert!(viewport_is_blank(&term));
+    }
+
+    // ---- r5b out-of-band damage flag ------------------------------------
+    //
+    // The renderer damage-gates per-row snapshots on `Term::damage()` (fix
+    // round r5b); the in-place ED(2) override mutates the grid where alacritty
+    // cannot see it, so it must raise the side-channel flag instead — and
+    // ONLY it (a spurious flag would defeat the gating; a missing one leaves
+    // stale rows on screen).
+
+    /// The in-place ED(2) branch (primary screen) bypasses alacritty's damage
+    /// tracking, so it must raise the out-of-band flag for the renderer.
+    #[test]
+    fn ed2_in_place_raises_the_full_damage_flag() {
+        let mut term = new_term();
+        feed(&mut term, b"some-content");
+
+        assert!(
+            feed(&mut term, b"\x1b[2J"),
+            "the in-place ED(2) erase must flag full damage out of band"
+        );
+    }
+
+    /// Ordinary output marks its own damage inside vanilla alacritty; the
+    /// side-channel must stay quiet or every frame would full-invalidate.
+    #[test]
+    fn plain_output_does_not_raise_the_full_damage_flag() {
+        let mut term = new_term();
+        assert!(!feed(&mut term, b"hello\r\nworld"));
+        // ED(3) and ED(0) delegate to alacritty (which tracks its own damage).
+        assert!(!feed(&mut term, b"\x1b[3J\x1b[J"));
+    }
+
+    /// The delegated alt-screen ED(2) runs alacritty's own `clear_screen`,
+    /// which marks the `Term` fully damaged itself — the side-channel is not
+    /// needed and must stay quiet there.
+    #[test]
+    fn ed2_on_alt_screen_uses_alacritty_damage_not_the_flag() {
+        use alacritty_terminal::term::TermDamage;
+
+        let mut term = new_term();
+        feed(&mut term, b"\x1b[?1049halt-content");
+        term.reset_damage();
+
+        assert!(!feed(&mut term, b"\x1b[2J"), "delegated ED(2) must not flag");
+        assert!(
+            matches!(term.damage(), TermDamage::Full),
+            "alacritty's own clear_screen marks the Term fully damaged"
+        );
     }
 }

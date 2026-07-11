@@ -489,6 +489,15 @@ impl Session {
         self.session().map(|ts| ts.term())
     }
 
+    /// Take-and-clear the out-of-band full-damage flag (fix round r5b) —
+    /// delegates to [`TermSession::take_forced_full_damage`] (see it for the
+    /// call-under-the-`Term`-lock contract). `false` if not yet spawned (no
+    /// grid ⇒ nothing to invalidate).
+    pub fn take_forced_full_damage(&self) -> bool {
+        self.session()
+            .is_some_and(|ts| ts.take_forced_full_damage())
+    }
+
     /// The configured per-session scrollback limit (lines).
     pub fn scrollback_limit(&self) -> usize {
         self.scrollback_lines

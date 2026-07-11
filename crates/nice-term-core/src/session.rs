@@ -24,6 +24,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -66,6 +67,14 @@ pub struct TermSession {
     term: SharedTerm,
     feeder: Option<JoinHandle<()>>,
     scrollback_lines: usize,
+    /// Out-of-band "the whole viewport changed" flag for grid mutations
+    /// alacritty's own damage tracking cannot see (today: the parity in-place
+    /// ED(2) erase — see [`crate::vt::ParityTerm`]). The feeder's parity
+    /// handler raises it under the `Term` lock; the damage-gated renderer
+    /// (fix round r5b) takes-and-clears it via
+    /// [`take_forced_full_damage`](Self::take_forced_full_damage) while
+    /// holding the same lock, folding it into a full-invalidate verdict.
+    forced_full_damage: Arc<AtomicBool>,
 }
 
 impl TermSession {
@@ -160,13 +169,22 @@ impl TermSession {
             EventProxy::new(fd, events.clone()),
         )));
 
-        let feeder = spawn_feeder(fd, Arc::clone(&term), on_damage, osc7_tee, events)?;
+        let forced_full_damage = Arc::new(AtomicBool::new(false));
+        let feeder = spawn_feeder(
+            fd,
+            Arc::clone(&term),
+            on_damage,
+            osc7_tee,
+            events,
+            Arc::clone(&forced_full_damage),
+        )?;
 
         Ok(TermSession {
             pty,
             term,
             feeder: Some(feeder),
             scrollback_lines,
+            forced_full_damage,
         })
     }
 
@@ -175,6 +193,19 @@ impl TermSession {
     /// it across a paint/present (mirror the owned grid read API below).
     pub fn term(&self) -> &SharedTerm {
         &self.term
+    }
+
+    /// Take-and-clear the out-of-band full-damage flag (fix round r5b): `true`
+    /// iff, since the last take, a parity VT override mutated the grid where
+    /// alacritty's damage tracking cannot see it (the in-place ED(2) erase —
+    /// see [`crate::vt::ParityTerm`]). The damage-gated renderer folds `true`
+    /// into a full-invalidate verdict alongside `Term::damage()`.
+    ///
+    /// **Call while holding the `Term` lock.** The feeder raises the flag
+    /// mid-parse under that lock; taking it without the lock could clear a
+    /// raise whose grid mutation the caller's snapshot has not seen yet.
+    pub fn take_forced_full_damage(&self) -> bool {
+        self.forced_full_damage.swap(false, Ordering::AcqRel)
     }
 
     /// Write raw input bytes to the child (keystrokes, pastes). No newline is
@@ -349,12 +380,23 @@ fn spawn_feeder(
     on_damage: DamageCallback,
     osc7_tee: bool,
     events: Option<Sender<SessionEvent>>,
+    forced_full_damage: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("nice-term-feeder".to_string())
         .spawn(move || {
             let mut parser: Processor = Processor::new();
-            let mut buf = [0u8; 4096];
+            // 64 KiB per read (fix round r5, lever 3 — input-flood freeze).
+            // The old 4 KiB buffer meant one Term-lock round-trip + one damage
+            // wake (each a CFRunLoopWakeUp poke, `session_handle.rs`) per 4 KiB
+            // of flood output. alacritty 0.26 (the pinned VT stack) reads from
+            // a 1 MiB buffer and parses up to 65535 bytes per lock hold
+            // (`event_loop.rs:24-27` READ_BUFFER_SIZE / MAX_LOCKED_READ);
+            // matching its per-lock byte budget cuts the flood-time signal and
+            // lock rate 16x. Heap-allocated once so the feeder's stack frame
+            // stays small; the parse-under-lock-then-signal-after-unlock
+            // structure below is unchanged.
+            let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
             let mut scanner = Osc7Scanner::new();
             loop {
                 let n = unsafe {
@@ -379,9 +421,15 @@ fn spawn_feeder(
                         // after this scope drops the guard (damage-wake contract).
                         // Parse through the SwiftTerm-parity handler (ED(2)
                         // erases in place instead of scrolling into history —
-                        // see `vt::ParityTerm`), not the bare `Term`.
+                        // see `vt::ParityTerm`), not the bare `Term`. The
+                        // handler raises `forced_full_damage` under this same
+                        // lock when an override mutates the grid outside
+                        // alacritty's damage tracking (r5b renderer contract).
                         let mut guard = term.lock();
-                        parser.advance(&mut vt::ParityTerm(&mut *guard), chunk);
+                        parser.advance(
+                            &mut vt::ParityTerm::new(&mut *guard, &forced_full_damage),
+                            chunk,
+                        );
                     }
                     on_damage();
                 } else if n == 0 {

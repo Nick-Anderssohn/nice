@@ -60,7 +60,33 @@
 //! kick is objc2, so it is **injected** as a callback ([`set_present_kick`]) the
 //! app constructs in `crates/nice/src/platform`. The kick is cloned out of the
 //! entity and fired on the bare `AsyncApp` *outside* the entity update, so
-//! re-entering the window handle never nests inside the entity's borrow.
+//! re-entering the window handle never nests inside the entity's borrow. The
+//! injected kick is itself occlusion-gated app-side (r5d,
+//! `platform::present_kick`): on a VISIBLE window it no-ops (the ticking
+//! display link presents the `cx.notify()` on its next tick) and it only fires
+//! `setNeedsDisplay` while the window is occluded — so this drain may keep
+//! invoking it at the throttled cadence without driving gpui's
+//! `displayLayer:` link stop/recreate storm on visible windows.
+//!
+//! **Damage notify/kick throttling (fix round r5 — input-flood freeze, lever
+//! 2).** Under a pty flood the drain used to notify + kick per damage delta
+//! with no rate bound, keeping the window **permanently dirty** — and gpui's
+//! `dispatch_key_event` force-draws a dirty window before dispatching EVERY
+//! queued key (window.rs `if self.invalidator.is_dirty() { self.draw(cx) }`),
+//! which the 2026-07-10 freeze sample measured as the whole-app freeze's
+//! amplifier (79% of a 51 s freeze in per-cell scene builds; see
+//! `element.rs`). So the drain now applies a **trailing-edge throttle**
+//! ([`PRESENT_THROTTLE`]): a damage-driven notify+kick opens a quiet window;
+//! damage landing inside it is **deferred** — the drain parks on a single
+//! foreground timer for the remainder instead of on the [`DrainSignal`] — and
+//! the pass after the timer issues the final notify+kick. The gate lives in
+//! [`present_gate`] (pure, unit-tested). Contracts held by construction:
+//! the ead2a6b self-heal is untouched (`DrainSignal::signal` still wakes the
+//! waker AND pokes the runloop on EVERY signal — the throttle gates only the
+//! notify/kick *issuance* inside the drain pass); the trailing timer ALWAYS
+//! fires, so the final frame always presents (the drain never parks on the
+//! signal while un-issued damage exists); and at idle no timer exists at all
+//! (the M3 win stands — the timer is created only while deferring).
 //!
 //! [`set_present_kick`]: TerminalSessionHandle::set_present_kick
 //! [`signal`]: DrainSignal::signal
@@ -72,6 +98,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
@@ -442,6 +469,16 @@ impl TerminalSessionHandle {
         self.session.term()
     }
 
+    /// Take-and-clear the core's out-of-band full-damage flag (fix round r5b):
+    /// `true` iff the parity VT handler mutated the grid where alacritty's
+    /// damage tracking cannot see it (the in-place ED(2) erase). The element's
+    /// damage-gated row cache folds `true` into a full-invalidate verdict —
+    /// and must call this **while holding the `Term` lock** (see
+    /// [`nice_term_core::Session::take_forced_full_damage`] for the contract).
+    pub fn take_forced_full_damage(&self) -> bool {
+        self.session.take_forced_full_damage()
+    }
+
     /// The wrapped session, for callers that drive input / resize / lifecycle
     /// (a later slice; exposed now so the entity is the one owner).
     pub fn session(&self) -> &Session {
@@ -608,12 +645,56 @@ fn spawn_signalled_session(
     Ok((session, events, signal))
 }
 
+/// The trailing-edge throttle on damage-driven notify/present kicks (fix round
+/// r5, lever 2 — see the module "Damage notify/kick throttling" docs). ~4-8 ms
+/// per the freeze brief; 6 ms sits between zed's 4 ms pty-event batching
+/// (`terminal.rs` `event_loop`) and a 100 Hz frame's 10 ms budget, so a
+/// throttled present still lands within about a frame while leaving the window
+/// clean for most of the flooded key events `dispatch_key_event` would
+/// otherwise force-draw for. A lone keystroke echo pays nothing: the gate
+/// issues immediately whenever the quiet window has already elapsed.
+const PRESENT_THROTTLE: Duration = Duration::from_millis(6);
+
+/// Verdict of [`present_gate`]: issue the damage notify+kick now, or defer it
+/// to a trailing timer due in the returned remainder of the quiet window.
+#[derive(Debug, PartialEq, Eq)]
+enum PresentGate {
+    Issue,
+    Defer(Duration),
+}
+
+/// Decide whether a damage-driven notify+kick may issue `now`, given the
+/// instant the previous one issued (`None` == never — always issue).
+///
+/// Pure so the throttle contract is unit-testable without gpui or wall-clock
+/// sleeps: inside the quiet window it defers with the exact remainder (what the
+/// trailing timer sleeps), at/after the boundary it issues. The caller
+/// (`drain_loop`) holds the two hard invariants around this gate: a deferred
+/// present is ALWAYS followed by a trailing timer + re-check (never parked on
+/// the signal), and nothing here touches [`DrainSignal::signal`]'s per-signal
+/// wake + runloop poke (the ead2a6b self-heal).
+fn present_gate(now: Instant, last_issue: Option<Instant>, throttle: Duration) -> PresentGate {
+    match last_issue {
+        Some(prev) => {
+            let since = now.saturating_duration_since(prev);
+            if since < throttle {
+                PresentGate::Defer(throttle - since)
+            } else {
+                PresentGate::Issue
+            }
+        }
+        None => PresentGate::Issue,
+    }
+}
+
 /// The drain task body: park on the [`DrainSignal`], and on each wake drain the
 /// session's event channel to empty + observe the damage counter, translating
 /// both onto the entity. Event-driven — **no idle timer** (M3 Bug 3): at idle
 /// the task is parked with zero wakeups until a pty background thread signals.
-/// Ends when the entity is gone (any `update` returns `Err`) or the session's
-/// senders are dropped (`Disconnected`).
+/// The only timer that ever exists is the r5 trailing-edge throttle timer,
+/// while damage is actively being deferred (see [`present_gate`] + the module
+/// throttling docs). Ends when the entity is gone (any `update` returns `Err`)
+/// or the session's senders are dropped (`Disconnected`).
 async fn drain_loop(
     this: gpui::WeakEntity<TerminalSessionHandle>,
     cx: &mut gpui::AsyncApp,
@@ -621,6 +702,10 @@ async fn drain_loop(
     signal: Arc<DrainSignal>,
 ) {
     let mut last_damage = 0u64;
+    // Instant of the last *issued* damage notify+kick — the throttle anchor.
+    // `None` until the first damage, so a session's first output presents with
+    // zero added latency.
+    let mut last_present: Option<Instant> = None;
     loop {
         // Drain every queued event, emitting + notifying for each. One wake
         // drains everything available — no per-event wakeups under heavy output.
@@ -654,21 +739,40 @@ async fn drain_loop(
         }
 
         // Coalesced damage → one notify (repaint request) + one demand-present
-        // kick. The kick is cloned out of the entity here and fired below on the
-        // bare `AsyncApp`, *outside* the update, so re-entering the window handle
-        // never nests inside this entity's borrow (see the module docs).
+        // kick, rate-bounded by the r5 trailing-edge throttle: inside the quiet
+        // window the issuance is deferred to the trailing timer below (which
+        // ALWAYS ends in a re-check, so the final frame always presents —
+        // `last_damage` only advances when the notify+kick actually issues).
+        // The final sweep of a disconnected session bypasses the gate: the
+        // stream is over, there is no flood left to bound, and no timer may
+        // outlive this task. The kick is cloned out of the entity here and
+        // fired below on the bare `AsyncApp`, *outside* the update, so
+        // re-entering the window handle never nests inside this entity's
+        // borrow (see the module docs).
         let current = signal.damage.load(Ordering::Acquire);
+        let mut trailing: Option<Duration> = None;
         if current != last_damage {
-            last_damage = current;
-            let kick = match this.update(cx, |this, cx| {
-                cx.notify();
-                this.present_kick.clone()
-            }) {
-                Ok(k) => k,
-                Err(_) => return, // entity dropped
+            let gate = if disconnected {
+                PresentGate::Issue
+            } else {
+                present_gate(Instant::now(), last_present, PRESENT_THROTTLE)
             };
-            if let Some(kick) = kick {
-                (*kick)(cx);
+            match gate {
+                PresentGate::Issue => {
+                    last_damage = current;
+                    last_present = Some(Instant::now());
+                    let kick = match this.update(cx, |this, cx| {
+                        cx.notify();
+                        this.present_kick.clone()
+                    }) {
+                        Ok(k) => k,
+                        Err(_) => return, // entity dropped
+                    };
+                    if let Some(kick) = kick {
+                        (*kick)(cx);
+                    }
+                }
+                PresentGate::Defer(remaining) => trailing = Some(remaining),
             }
         }
 
@@ -676,17 +780,34 @@ async fn drain_loop(
             return;
         }
 
-        // Park until the next event/damage signal — event-driven, no idle timer.
-        DrainReady {
-            signal: Arc::clone(&signal),
+        match trailing {
+            // Un-issued damage is pending: park on the trailing timer, NOT the
+            // signal, then loop — the next pass re-reads the damage counter and
+            // (now outside the quiet window) issues. This is the always-fires
+            // trailing edge: no damage edge can strand a deferred present,
+            // because the drain never waits on a signal while one is pending.
+            // Signals landing during the sleep still set `pending` + poke the
+            // runloop (`DrainSignal::signal` is untouched); their work is
+            // simply folded into the pass after the timer.
+            Some(remaining) => cx.background_executor().timer(remaining).await,
+            // Nothing deferred: park until the next event/damage signal —
+            // event-driven, zero timers at idle.
+            None => {
+                DrainReady {
+                    signal: Arc::clone(&signal),
+                }
+                .await
+            }
         }
-        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{take_scroll_steps, to_terminal_event, DrainReady, DrainSignal, TerminalEvent};
+    use super::{
+        present_gate, take_scroll_steps, to_terminal_event, DrainReady, DrainSignal, PresentGate,
+        TerminalEvent, PRESENT_THROTTLE,
+    };
     use nice_term_core::{ExitStatus, SessionEvent};
     use std::future::Future;
     use std::path::PathBuf;
@@ -694,6 +815,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::{Context as TaskContext, Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
 
     // ---- Drain gating (event-driven wake) -----------------------------------
     //
@@ -959,6 +1081,78 @@ mod tests {
         assert!(
             poll_ready(&signal, &waker).is_pending(),
             "…then the drain parks — the backlog was drained in a single pass"
+        );
+    }
+
+    // ---- Present throttle (fix round r5, lever 2) ----------------------------
+    //
+    // These pin the pure gate the drain's notify/kick issuance runs through.
+    // Synthetic `Instant`s only — no wall-clock sleeps, no cadence asserts
+    // (banned above). The two loop invariants the gate relies on — a deferred
+    // present is always followed by a trailing timer + re-check, and
+    // `DrainSignal::signal`'s per-signal wake + runloop poke is untouched — are
+    // held by `drain_loop`'s structure and the signal tests above
+    // (`signal_repokes_when_prior_poke_was_lost` is the ead2a6b contract).
+
+    #[test]
+    fn first_damage_presents_immediately() {
+        // No prior present → issue now: a lone keystroke echo (and a session's
+        // first output) pays zero added latency.
+        let now = Instant::now();
+        assert_eq!(present_gate(now, None, PRESENT_THROTTLE), PresentGate::Issue);
+    }
+
+    #[test]
+    fn damage_inside_the_quiet_window_defers_with_the_exact_remainder() {
+        // 2 ms into a 6 ms window → defer, and the trailing timer must sleep
+        // exactly the remaining 4 ms (the trailing edge lands at window end,
+        // not a full window later — the throttle bounds rate, it never
+        // staircases latency).
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(2);
+        assert_eq!(
+            present_gate(now, Some(t0), Duration::from_millis(6)),
+            PresentGate::Defer(Duration::from_millis(4))
+        );
+    }
+
+    #[test]
+    fn damage_at_the_window_boundary_issues() {
+        // The trailing timer wakes the drain at exactly `last + throttle`; the
+        // re-check must issue then (`since < throttle` is strict), or a
+        // boundary wake would defer forever in 0-remainder steps.
+        let t0 = Instant::now();
+        assert_eq!(
+            present_gate(t0 + PRESENT_THROTTLE, Some(t0), PRESENT_THROTTLE),
+            PresentGate::Issue
+        );
+        assert_eq!(
+            present_gate(
+                t0 + PRESENT_THROTTLE + Duration::from_millis(3),
+                Some(t0),
+                PRESENT_THROTTLE
+            ),
+            PresentGate::Issue
+        );
+    }
+
+    #[test]
+    fn trailing_edge_always_issues_after_a_deferral() {
+        // The full deferral round-trip, as drain_loop drives it: issue at t0,
+        // damage at t0+2ms defers with 4 ms remaining, the drain sleeps that
+        // remainder, and the post-timer re-check at t0+6ms issues the final
+        // frame. No damage sequence may end un-presented.
+        let t0 = Instant::now();
+        let throttle = Duration::from_millis(6);
+        let deferred_at = t0 + Duration::from_millis(2);
+        let remaining = match present_gate(deferred_at, Some(t0), throttle) {
+            PresentGate::Defer(r) => r,
+            PresentGate::Issue => panic!("damage inside the window must defer"),
+        };
+        assert_eq!(
+            present_gate(deferred_at + remaining, Some(t0), throttle),
+            PresentGate::Issue,
+            "the pass after the trailing timer must issue the final present"
         );
     }
 

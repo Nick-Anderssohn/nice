@@ -720,6 +720,103 @@ fn diagonal(up_right: bool, down_right: bool, c: &mut Canvas) {
     }
 }
 
+// ---- x-uniform band decomposition (fix round r5c) ----------------------------
+
+/// Decompose an already-laid-out [`Glyph`] into **full-cell-width horizontal
+/// bands** — or prove it cannot be (return `None`).
+///
+/// A glyph is *x-uniform* when its ink, as a function of the cell-local pixel
+/// `(x, y)`, does not depend on `x`: every inked scanline spans the full cell
+/// width `[0, cw_px)` at one uniform coverage. Such a glyph tiles horizontally
+/// by construction — `n` adjacent cells painting the same bands are
+/// pixel-identical to ONE set of bands `n` cells wide — which is what lets
+/// [`crate::element::plan_row`] batch a run of them into one `paint_quad` per
+/// band per RUN instead of per cell (the r5c typing-flood lever; a shell
+/// prompt's ~420-column `─` rule is exactly this shape). This is a *proof
+/// over the computed geometry*, not a code-point whitelist: anything the
+/// canvas model lays out as full-width bands qualifies (`─ ━ ═`, `█`, the
+/// upper/lower partial blocks `▀ ▁▂▃▄▅▆▇`, the `░▒▓` shades — single
+/// full-cell fills whose translucent quads tile seam-free because adjacent
+/// cells' rects are disjoint), and anything with x-structure is rejected by
+/// the geometry itself (verticals, corners, tees, left/right partial blocks,
+/// dashes — their gaps fail the union check, so a dashed line can never
+/// congeal into a solid one).
+///
+/// Verdict rules, per elementary y-interval between fill edges:
+/// * any stroked [`Segment`] disqualifies the glyph (arcs, diagonals);
+/// * an interval covered by NO fill is an empty band (fine — `═` has a gap);
+/// * multiple overlapping fills are allowed only when ALL are opaque
+///   (`coverage == 1.0`; the union is then order-independent — `─` really is
+///   two overlapping arm fills). A translucent fill must be the interval's
+///   ONLY cover: merging would collapse a double-composite into a single one;
+/// * the covering fills' x-union must be EXACTLY `[0, cw_px)` — a gap or a
+///   short edge rejects.
+///
+/// Adjacent equal-coverage bands merge, so `█` comes back as one band. The
+/// returned [`Prim`]s all have `x0 == 0`, `x1 == cw_px`.
+pub(crate) fn x_uniform_bands(glyph: &Glyph, cw_px: i32) -> Option<Vec<Prim>> {
+    if !glyph.segments.is_empty() || glyph.fills.is_empty() {
+        return None;
+    }
+    // Elementary y-intervals: between consecutive fill edges a fill either
+    // covers the whole interval or none of it.
+    let mut edges: Vec<i32> = glyph
+        .fills
+        .iter()
+        .flat_map(|f| [f.y0, f.y1])
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    let mut bands: Vec<Prim> = Vec::new();
+    for w in edges.windows(2) {
+        let (y0, y1) = (w[0], w[1]);
+        let mut cover: Vec<&Prim> = glyph
+            .fills
+            .iter()
+            .filter(|f| f.y0 <= y0 && f.y1 >= y1)
+            .collect();
+        if cover.is_empty() {
+            continue; // uninked scanlines — an empty band is still x-uniform
+        }
+        let coverage = if cover.len() == 1 {
+            cover[0].coverage
+        } else if cover.iter().all(|f| f.coverage >= 1.0) {
+            1.0 // opaque overlaps union order-independently
+        } else {
+            return None; // translucent overlap: merging would change compositing
+        };
+        // The x-union must be exactly [0, cw_px): walk fills in x order and
+        // require gap-free coverage to the far edge.
+        cover.sort_unstable_by_key(|f| f.x0);
+        let mut reach = 0;
+        for f in &cover {
+            if f.x0 > reach {
+                return None; // gap (this is what keeps dashes per-cell)
+            }
+            reach = reach.max(f.x1);
+        }
+        if reach != cw_px {
+            return None; // ink stops short of the cell edge
+        }
+        match bands.last_mut() {
+            // Merge directly-adjacent equal-coverage bands (fewer quads).
+            Some(prev) if prev.y1 == y0 && prev.coverage == coverage => prev.y1 = y1,
+            _ => bands.push(Prim {
+                x0: 0,
+                y0,
+                x1: cw_px,
+                y1,
+                coverage,
+            }),
+        }
+    }
+    if bands.is_empty() {
+        return None; // all fills degenerate — nothing provable to tile
+    }
+    Some(bands)
+}
+
 // ---- bg-luminance composition curve (spike port) ----------------------------
 
 /// Display-gamma Rec-709 luminance of a `0xRRGGBB` color.
@@ -897,6 +994,93 @@ mod tests {
         }
         let cross = procedural_glyph(0x2573, CW, CH, LIGHT).unwrap();
         assert_eq!(cross.segments.len(), 2, "╳ is two diagonals");
+    }
+
+    // ---- x-uniform band decomposition (fix round r5c) -------------------------
+    //
+    // These pin the geometry PROOF behind procedural run batching: a glyph may
+    // only come back `Some(bands)` when painting those bands n cells wide is
+    // pixel-identical to painting the glyph n times — so every rejection case
+    // (x-structure, gaps, strokes) matters as much as every acceptance.
+
+    fn bands(cp: u32) -> Option<Vec<Prim>> {
+        x_uniform_bands(&procedural_glyph(cp, CW, CH, LIGHT).unwrap(), CW)
+    }
+
+    #[test]
+    fn horizontal_rules_are_x_uniform() {
+        // ─ (two overlapping opaque arm fills) and ━ each collapse to ONE
+        // full-width band; ═ keeps its two bands with the gap between them.
+        for (cp, expect_bands) in [(0x2500u32, 1usize), (0x2501, 1), (0x2550, 2)] {
+            let b = bands(cp).unwrap_or_else(|| panic!("U+{cp:04X} must be x-uniform"));
+            assert_eq!(b.len(), expect_bands, "U+{cp:04X}");
+            for band in &b {
+                assert_eq!((band.x0, band.x1), (0, CW), "bands span the full width");
+                assert_eq!(band.coverage, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn full_and_partial_height_blocks_are_x_uniform() {
+        // █ merges to one full-cell band; ▀ ▄ ▁ ▇ are full-width partial bands.
+        let full = bands(0x2588).unwrap();
+        assert_eq!(full, vec![Prim { x0: 0, y0: 0, x1: CW, y1: CH, coverage: 1.0 }]);
+        for cp in [0x2580u32, 0x2584, 0x2581, 0x2587, 0x2594] {
+            let b = bands(cp).unwrap_or_else(|| panic!("U+{cp:04X} must be x-uniform"));
+            assert_eq!(b.len(), 1, "U+{cp:04X} is one partial band");
+            assert_eq!((b[0].x0, b[0].x1), (0, CW));
+        }
+    }
+
+    #[test]
+    fn shades_are_x_uniform_translucent_bands() {
+        // ░▒▓ are single full-cell fills at fractional coverage: adjacent cells'
+        // rects are disjoint, so a merged n-wide translucent quad composites
+        // identically — they batch.
+        for cp in [0x2591u32, 0x2592, 0x2593] {
+            let b = bands(cp).unwrap_or_else(|| panic!("U+{cp:04X} must be x-uniform"));
+            assert_eq!(b.len(), 1);
+            assert!(b[0].coverage < 1.0 && b[0].coverage > 0.0);
+            assert_eq!((b[0].x0, b[0].x1, b[0].y0, b[0].y1), (0, CW, 0, CH));
+        }
+    }
+
+    #[test]
+    fn x_structured_glyphs_are_rejected() {
+        // Verticals, corners, tees, crosses, left/right partial blocks: their
+        // ink depends on x, so tiling them wider would be visibly wrong.
+        for cp in [
+            0x2502u32, // │ vertical
+            0x2503,    // ┃ heavy vertical
+            0x2551,    // ║ double vertical
+            0x250c,    // ┌ corner
+            0x251c,    // ├ tee
+            0x253c,    // ┼ cross
+            0x258c,    // ▌ left half block
+            0x2590,    // ▐ right half block
+            0x2595,    // ▕ right eighth
+            0x2596,    // ▖ quadrant
+        ] {
+            assert!(bands(cp).is_none(), "U+{cp:04X} must stay per-cell");
+        }
+    }
+
+    #[test]
+    fn dashed_rules_are_rejected_by_their_gaps() {
+        // ┄ ┅ ┈ ╌ have full-width y-bands but x GAPS — the union check must
+        // reject them or a dashed rule would congeal into a solid line.
+        for cp in [0x2504u32, 0x2505, 0x2508, 0x254c] {
+            assert!(bands(cp).is_none(), "U+{cp:04X} must stay per-cell");
+        }
+    }
+
+    #[test]
+    fn stroked_glyphs_are_rejected() {
+        // Arcs and diagonals carry Segments, which disqualify outright.
+        for cp in [0x256du32, 0x256f, 0x2571, 0x2573] {
+            assert!(bands(cp).is_none(), "U+{cp:04X} must stay per-cell");
+        }
     }
 
     #[test]

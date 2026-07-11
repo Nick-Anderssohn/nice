@@ -2455,6 +2455,15 @@ impl Render for TermRenderView {
 /// CVDisplayLink is stopped — see `platform`). The objc2 lives in
 /// `crate::platform`; `nice-term-view` only receives the closure. R13 re-points
 /// this on a re-parent.
+///
+/// The kick is occlusion-gated inside `platform::present_kick` (r5d): on a
+/// VISIBLE window it is a no-op — the running display link presents the
+/// notify-dirtied window on its next tick — and it fires only while the window
+/// is occluded, i.e. exactly when gpui has stopped the link and the kick is
+/// the only path to a present. So installing this on every pane stays correct
+/// AND cheap: a flooding pane in a visible window no longer drives the
+/// `displayLayer:` link stop/recreate storm (up to ~166/s at the r5 throttle
+/// cadence) that wedged presentation on 2026-07-10 (see `platform` fact 1).
 pub(crate) fn install_present_kick(
     handle: &Entity<TerminalSessionHandle>,
     window: AnyWindowHandle,

@@ -19,7 +19,28 @@
 //!    state. That kick is [`present_kick`]. (The R1 `smoke` self-test sidesteps
 //!    this by driving continuous `request_animation_frame` repaints on a visible
 //!    window, so it never needs the kick — but later demand-driven scenarios do,
-//!    which is why the helper lives here now.)
+//!    which is why the helper lives here now.) **The converse also holds, and
+//!    the kick is gated on it (fix round r5d):** while a window IS
+//!    occlusion-visible its display link is ticking, `cx.notify()` alone
+//!    presents on the next ~10 ms tick, and the kick is not merely redundant
+//!    but harmful — every `setNeedsDisplay` drives gpui's `displayLayer:`
+//!    (`gpui_macos/src/window.rs`), which STOPS the link, draws with
+//!    `presents_with_transaction`, then RECREATES the link from scratch
+//!    (`start_display_link`: a new CVDisplayLink thread + dispatch source per
+//!    call). Under a pty flood the drain fired that up to ~166/s, and
+//!    `start_display_link` has silent-death paths (a stale occlusion read that
+//!    plain-`return`s; `DisplayLink::new(..).log_err()` → `None`) — one
+//!    transient failure among thousands of recreations left the link
+//!    permanently stopped: the 2026-07-10 presentation wedge, where a mid-flood
+//!    `sample` showed the CVDisplayLink thread parked in `waitUntil` with ZERO
+//!    `display_link_callback` fires in 3 s while the app stayed fully
+//!    responsive (AX ~9 ms) and the screen froze on a stale frame for minutes
+//!    until an activation/occlusion edge restarted the link. So
+//!    [`present_kick`] now fires the `setNeedsDisplay` ONLY when the window is
+//!    NOT occlusion-visible — exactly the states in which gpui keeps the link
+//!    stopped and the kick is the sole path to a present. The occluded-modal
+//!    guarantee (ec0b8f3: quit/close dialogs must paint on an occluded window)
+//!    is preserved verbatim: occluded → the kick fires as before.
 //!
 //! 2. **zed-main frame-caps INACTIVE windows at ~33 ms** (`min_frame_interval`):
 //!    a backgrounded window animates at ~30 fps regardless of the panel refresh.
@@ -224,18 +245,78 @@ pub fn ns_view_of(window: &Window) -> *mut c_void {
     }
 }
 
+/// `NSWindowOcclusionStateVisible` (AppKit: `1UL << 1`) — the only bit of the
+/// `NSWindowOcclusionState` option set. Hand-declared in this module's raw-FFI
+/// style (like the `NS_EVENT_TYPE_*` discriminants above); it is also exactly
+/// the bit gpui's `start_display_link` / `window_did_change_occlusion_state`
+/// test, so the kick gate below and gpui's link lifecycle read the same signal.
+const NS_WINDOW_OCCLUSION_STATE_VISIBLE: u64 = 1 << 1;
+
+/// Whether `ns_view`'s window is currently occlusion-VISIBLE, or `None` when
+/// the view is not hosted in a window (no `NSWindow` to ask). This is the query
+/// half of the r5d kick gate; the decision half is [`present_kick_due`].
+///
+/// # Safety
+/// `ns_view` must be a valid, non-null `NSView*`. Main thread only (an
+/// `NSWindow` property read) — every kick caller already satisfies this: the
+/// drain kick runs inside `window.update` on the foreground executor, and the
+/// modal kick runs inside gpui entity callbacks.
+unsafe fn view_window_occlusion_visible(ns_view: *mut AnyObject) -> Option<bool> {
+    let window: *mut AnyObject = msg_send![ns_view, window];
+    if window.is_null() {
+        return None;
+    }
+    let state: u64 = msg_send![window, occlusionState];
+    Some(state & NS_WINDOW_OCCLUSION_STATE_VISIBLE != 0)
+}
+
+/// The r5d occlusion-gate decision (pure — the unit-testable seam of
+/// [`present_kick`], which is otherwise objc2 all the way down): fire the
+/// `setNeedsDisplay` kick iff the window is NOT known occlusion-visible.
+///
+/// - `Some(true)` (visible) → **skip**: the display link is ticking (gpui stops
+///   it only on occlusion), so the `cx.notify()` that always precedes a kick is
+///   presented by the link's next tick within ~a frame — and firing anyway
+///   would re-enter `displayLayer:`'s stop/draw/recreate cycle, whose
+///   per-recreation failure odds are what wedged presentation on 2026-07-10
+///   (see the module "fact 1" evidence).
+/// - `Some(false)` (occluded/minimized/hidden) → **kick**: the link is stopped;
+///   the kick is the only path to a present (ec0b8f3's occluded-modal fix).
+/// - `None` (view not in a window yet) → **kick**: preserve the pre-gate
+///   behavior in the unknown state; `setNeedsDisplay` on an unhosted view is
+///   harmless, and headless/teardown callers relied on the kick being a no-op
+///   rather than on it being skipped.
+fn present_kick_due(occlusion_visible: Option<bool>) -> bool {
+    !matches!(occlusion_visible, Some(true))
+}
+
 /// Force a demand present on an occluded / display-link-stopped window: mark the
 /// `NSView` and its `CAMetalLayer` as needing display so the next CA commit
 /// drives `displayLayer:` -> gpui request-frame -> `Window::present()` ->
 /// `MetalRenderer::draw`, independent of the display-link state (fact 1 above).
 ///
+/// **Occlusion-gated (r5d):** on an occlusion-VISIBLE window this is a no-op —
+/// the running display link presents the already-notified dirty window on its
+/// next tick, and kicking anyway would stop + recreate that link per call via
+/// `displayLayer:` (up to ~166/s under the drain's throttled flood cadence),
+/// which is the recreate storm that let one transient `start_display_link`
+/// failure freeze presentation for minutes (module "fact 1"). All kick callers
+/// funnel through here — the terminal drain (`app::install_present_kick`) and
+/// the confirmation modal's present/dismiss (`WindowState::present_kick_modal`,
+/// including its Esc/on-key dismiss path) — so the gate covers them uniformly
+/// with no caller changes.
+///
 /// # Safety
 /// `ns_view` must be a valid `NSView*` (e.g. from [`ns_view_of`]) or null.
+/// Main thread only (see [`view_window_occlusion_visible`]).
 pub unsafe fn present_kick(ns_view: *mut c_void) {
     if ns_view.is_null() {
         return;
     }
     let view = ns_view as *mut AnyObject;
+    if !present_kick_due(view_window_occlusion_visible(view)) {
+        return;
+    }
     let _: () = msg_send![view, setNeedsDisplay: true];
     let layer: *mut AnyObject = msg_send![view, layer];
     if !layer.is_null() {
@@ -2697,5 +2778,46 @@ impl Drop for PasteboardRef {
                 let _: () = msg_send![self.pasteboard, release];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::present_kick_due;
+
+    // ---- r5d present-kick occlusion gate --------------------------------
+    //
+    // `present_kick` itself is objc2 (it needs a live NSView/NSWindow), so the
+    // gate is split into an unmockable query (`view_window_occlusion_visible`)
+    // and this pure decision — the same decompose-then-test seam the drain
+    // uses for the kick itself (`set_present_kick` injection) and for the r5
+    // throttle (`present_gate`). These pin the decision table; the end-to-end
+    // "occluded window still presents a modal" behavior is the orchestrator's
+    // black-box check.
+
+    /// Visible window ⇒ the display link is ticking (gpui stops it only on
+    /// occlusion), so the kick must be SKIPPED — firing it re-enters
+    /// `displayLayer:`'s stop/draw/recreate cycle, the ~166/s recreate storm
+    /// behind the 2026-07-10 stopped-link presentation wedge.
+    #[test]
+    fn kick_skipped_when_window_occlusion_visible() {
+        assert!(!present_kick_due(Some(true)));
+    }
+
+    /// Occluded window ⇒ the link is stopped and `cx.notify()` alone never
+    /// presents (module fact 1): the kick MUST fire — this is the ec0b8f3
+    /// occluded-modal guarantee, preserved verbatim.
+    #[test]
+    fn kick_fires_when_window_occluded() {
+        assert!(present_kick_due(Some(false)));
+    }
+
+    /// View not hosted in a window (headless / teardown / pre-show) ⇒ unknown
+    /// state: keep the pre-gate behavior and fire — `setNeedsDisplay` on an
+    /// unhosted view is harmless, and skipping on "unknown" could starve a
+    /// window whose AppKit handle lags its first damage.
+    #[test]
+    fn kick_fires_when_view_has_no_window() {
+        assert!(present_kick_due(None));
     }
 }
