@@ -307,9 +307,10 @@ const METRICS_SNAP_SCALE: f32 = 2.0;
 ///
 /// The un-ceil'd `ascent + |descent|` box (pre fix round r6) sat fractionally
 /// under prod's (e.g. 16.40 vs 17.0 at MesloLGS NF 13pt), so the two grids
-/// drifted ~0.6px per row and the bottom-anchored layout surfaced the drift as
-/// a different sub-row remainder — a visibly different gap between the tab bar
-/// and the first terminal row at the same window height.
+/// drifted ~0.6px per row and the then-bottom-anchored layout surfaced the
+/// drift as a different sub-row remainder — a visibly different gap between the
+/// tab bar and the first terminal row at the same window height. (The grid is
+/// top-anchored now, which would park that drift at the bottom instead.)
 ///
 /// Both are deterministic functions of `px`, so a zoom-out back to a prior size
 /// reproduces the earlier metrics **exactly**.

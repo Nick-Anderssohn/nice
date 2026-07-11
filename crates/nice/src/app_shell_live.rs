@@ -807,7 +807,7 @@ async fn resize_refit_checks(
         return;
     };
 
-    // Shrink 160pt vertically → the bottom-anchored grid must LOSE rows. Each
+    // Shrink 160pt vertically → the refit grid must LOSE rows. Each
     // poll forces a fresh frame (a `WindowState` notify → the shell re-renders →
     // the frontmost window presents — the same nudge the AX poll uses): the
     // refit trigger is paint-driven, and a programmatic `setFrame` on this

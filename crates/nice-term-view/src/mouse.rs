@@ -78,9 +78,9 @@ pub fn report_modifiers(m: gpui::Modifiers) -> VtModifiers {
 
 /// Hit-test a grid-relative pixel offset to a zero-based `(col, row)` cell,
 /// clamped to the grid. `rel_x` is measured from the grid's left edge and
-/// `rel_y` from the top of grid row 0 (`grid_top_y`, the bottom-anchored origin).
-/// A click in the surrounding padding / bottom gap clamps to the nearest edge
-/// cell, so the caller always gets a valid cell.
+/// `rel_y` from the top of grid row 0 (`grid_top_y`, the top-anchored origin).
+/// A click in the surrounding padding / bottom remainder clamps to the nearest
+/// edge cell, so the caller always gets a valid cell.
 pub fn cell_from_offset(
     rel_x: f32,
     rel_y: f32,

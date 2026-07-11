@@ -41,7 +41,7 @@
 //! ## Module map
 //!
 //! * [`pixels`] — pure screenshot-sampling + `±8/255` per-channel pixel-assert
-//!   helpers and the bottom-anchored cell-centre geometry. No gpui test-support.
+//!   helpers and the top-anchored cell-centre geometry. No gpui test-support.
 //! * [`session`] — fixture-session builders (the byte-piped `cat` / `ZDOTDIR`
 //!   pattern and the raw-mode capture-`tee` pattern) and capture-file readers.
 //!   No gpui test-support.

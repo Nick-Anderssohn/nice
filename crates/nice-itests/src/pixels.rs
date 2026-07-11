@@ -1,4 +1,4 @@
-//! Screenshot sampling + pixel-assert helpers, and the bottom-anchored cell
+//! Screenshot sampling + pixel-assert helpers, and the top-anchored cell
 //! geometry the samplers key off.
 //!
 //! Pure arithmetic over an RGBA8 pixel buffer plus `nice-term-view`'s public
@@ -10,7 +10,7 @@
 //! the live floor.
 
 use anyhow::{ensure, Result};
-use nice_term_view::{TerminalMetrics, TERMINAL_BOTTOM_GAP};
+use nice_term_view::TerminalMetrics;
 
 /// Per-channel tolerance (out of 255) for a pixel match — the same band the live
 /// `tokens` / `term-render` self-tests assert within. Keeping one convention
@@ -18,23 +18,14 @@ use nice_term_view::{TerminalMetrics, TERMINAL_BOTTOM_GAP};
 /// passes here would pass there.
 pub const DEFAULT_PIXEL_TOLERANCE: u8 = 8;
 
-/// Logical centre `(x, y)` of grid cell `(row, col)` under the T4 bottom-anchored
-/// layout, for a content view `content_h` logical px tall holding `rows` grid
-/// rows at cell `metrics`. Mirrors [`nice_term_view::grid_top_y`] with the
-/// element origin at `(0, 0)` (the terminal fills the window content area). The
-/// origin y can go negative when the grid is taller than the view (top rows clip)
-/// — the caller keeps the sampled row on-screen.
-pub fn cell_center(
-    content_h: f32,
-    rows: usize,
-    metrics: TerminalMetrics,
-    row: usize,
-    col: usize,
-) -> (f32, f32) {
-    let grid_h = rows as f32 * metrics.cell_h;
-    let origin_y = content_h - TERMINAL_BOTTOM_GAP - grid_h;
+/// Logical centre `(x, y)` of grid cell `(row, col)` under the T4 top-anchored
+/// layout (revised) at cell `metrics`. Mirrors [`nice_term_view::grid_top_y`]
+/// with the element origin at `(0, 0)` (the terminal fills the window content
+/// area), so row 0's top edge is y = 0. Rows past the view's bottom edge clip —
+/// the caller keeps the sampled row on-screen.
+pub fn cell_center(metrics: TerminalMetrics, row: usize, col: usize) -> (f32, f32) {
     let x = col as f32 * metrics.cell_w + metrics.cell_w / 2.0;
-    let y = origin_y + row as f32 * metrics.cell_h + metrics.cell_h / 2.0;
+    let y = row as f32 * metrics.cell_h + metrics.cell_h / 2.0;
     (x, y)
 }
 
@@ -122,15 +113,17 @@ mod tests {
     }
 
     #[test]
-    fn cell_center_is_bottom_anchored() {
-        // 6 rows of 16px in a 200px-tall view: grid occupies the bottom 96px, so
-        // row 0 sits at the top of that block (origin_y = 200 - 96 = 104).
+    fn cell_center_is_top_anchored() {
+        // Row 0's top edge is flush at y = 0 (T4 revised), so its centre sits at
+        // half a cell height; rows stride by the cell height.
         let m = TerminalMetrics::new(8.0, 16.0);
-        let (x, y) = cell_center(200.0, 6, m, 0, 0);
+        let (x, y) = cell_center(m, 0, 0);
         assert_eq!(x, 4.0);
-        assert_eq!(y, 104.0 + 8.0);
+        assert_eq!(y, 8.0);
+        let (_, y1) = cell_center(m, 1, 0);
+        assert_eq!(y1, 16.0 + 8.0);
         // Column strides by the cell width.
-        let (x2, _) = cell_center(200.0, 6, m, 0, 2);
+        let (x2, _) = cell_center(m, 0, 2);
         assert_eq!(x2, 2.0 * 8.0 + 4.0);
     }
 

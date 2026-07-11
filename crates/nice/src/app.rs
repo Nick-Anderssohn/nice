@@ -37,7 +37,6 @@ use nice_harness::workload;
 use nice_term_core::SpawnSpec;
 use nice_term_view::{
     FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
-    TERMINAL_BOTTOM_GAP,
 };
 use nice_theme::chrome_geometry::{
     MACOS26_TRAFFIC_LIGHT_LEADINGS, TOP_BAR_HEIGHT, TRAFFIC_LIGHT_CENTER_FROM_TOP,
@@ -919,8 +918,8 @@ pub(crate) fn install_fullscreen_menu_sync<V: 'static>(
 
 /// The shipped window's initial live-terminal grid size. Chosen to fit inside the
 /// 960×640 window's content area (≈118×36 at the old 8×16 Menlo box, comfortably
-/// inside the SF Mono box the R7 chain now resolves); the pane is bottom-anchored,
-/// so the prompt sits flush at the bottom. The font family + size + cell metrics
+/// inside the SF Mono box the R7 chain now resolves); the pane is top-anchored,
+/// so row 0 sits flush at the content top. The font family + size + cell metrics
 /// are now the app-level [`FontSettings`] (T11): a ⌘+/⌘−/⌘0 zoom re-metrics from
 /// here and resizes the pty to refill the window.
 const LIVE_ROWS: u16 = 36;
@@ -2183,26 +2182,24 @@ const TR_SELECT_COL_END: usize = 6;
 const TR_SELECT_SAMPLE_COL: usize = 4; // inside the selection
 const TR_SELECT_UNSEL_COL: usize = 10; // outside the selection
 
-/// The bottom-anchored grid origin y (top of grid row 0) for a content view of
-/// height `content_h`. The renderer (T4) pins the grid's bottom edge at
-/// `content_h − TERMINAL_BOTTOM_GAP` and lays rows upward, so row 0's top is
-/// `content_h − gap − rows·cellH`. Every sample point below is offset by this so
-/// it lands where the bottom-anchored grid actually paints (not the old
-/// top-anchored origin). Can be negative when the grid is taller than the view
-/// (top rows clipped) — the layout scenario relies on exactly that.
-fn tr_oy(content_h: f32) -> f32 {
-    content_h - TERMINAL_BOTTOM_GAP - TR_ROWS as f32 * TR_CELL_H
+/// The top-anchored grid origin y (top of grid row 0). The renderer (T4,
+/// revised) starts row 0 flush at the element's top edge — these scenario
+/// windows host the terminal at the content view's origin, so the origin is
+/// simply 0 regardless of the content height (rows past the bottom edge clip
+/// — the layout scenario relies on exactly that).
+fn tr_oy() -> f32 {
+    0.0
 }
 
 /// The content view's logical height (the div the terminal fills), read from the
-/// window's viewport size — the bottom-anchor reference every sample point needs
-/// (the renderer derives its origin from this same height, so they agree).
+/// window's viewport size — the bottom-clip reference the layout scenario needs
+/// (the renderer clips the grid at this same height, so they agree).
 fn tr_content_height(handle: AnyWindowHandle, cx: &mut AsyncApp) -> Result<f32> {
     let h = handle.update(cx, |_view, window, _app| window.viewport_size().height)?;
     Ok(h.into())
 }
 
-/// Logical center of grid cell `(row, col)` given the bottom-anchored grid origin
+/// Logical center of grid cell `(row, col)` given the top-anchored grid origin
 /// `oy` (see [`tr_oy`]) — the point a color assertion samples.
 fn tr_cell_center(oy: f32, row: usize, col: usize) -> (f32, f32) {
     (
@@ -2212,7 +2209,7 @@ fn tr_cell_center(oy: f32, row: usize, col: usize) -> (f32, f32) {
 }
 
 /// A point at fractional position `(fx, fy)` (each `0.0..=1.0`) within grid cell
-/// `(row, col)`, bottom-anchored at `oy` — `(0.5, 0.5)` is the centre. Lets an
+/// `(row, col)`, top-anchored at `oy` — `(0.5, 0.5)` is the centre. Lets an
 /// assertion probe a specific region of a glyph (a block half, a corner arm, a
 /// decoration band).
 fn tr_cell_at(oy: f32, row: usize, col: usize, fx: f32, fy: f32) -> (f32, f32) {
@@ -2223,7 +2220,7 @@ fn tr_cell_at(oy: f32, row: usize, col: usize, fx: f32, fy: f32) -> (f32, f32) {
 }
 
 /// `n` points down the vertical centre-line of cell `(row, col)`, from `fy_lo`
-/// to `fy_hi` (bottom-anchored at `oy`) — used to find a thin horizontal
+/// to `fy_hi` (top-anchored at `oy`) — used to find a thin horizontal
 /// decoration (underline / strikethrough) without depending on its exact
 /// font-derived y.
 fn tr_vband(oy: f32, row: usize, col: usize, fy_lo: f32, fy_hi: f32, n: usize) -> Vec<(f32, f32)> {
@@ -2248,7 +2245,7 @@ fn tr_is_strong(p: [u8; 4], r_hi: bool, g_hi: bool, b_hi: bool) -> bool {
 }
 
 /// A `TR_ENGAGE_GRID_X × TR_ENGAGE_GRID_Y` grid of interior points over cell
-/// `(row, col)` (bottom-anchored at `oy`) — inset from the edges so neighbor
+/// `(row, col)` (top-anchored at `oy`) — inset from the edges so neighbor
 /// bleed / the cell border never enters the coverage average.
 fn tr_cell_sample_grid(oy: f32, row: usize, col: usize) -> Vec<(f32, f32)> {
     let x0 = col as f32 * TR_CELL_W;
@@ -2585,9 +2582,9 @@ fn assert_term_render(
     theme: &TerminalTheme,
     accent_rgb8: (u8, u8, u8),
 ) -> Result<()> {
-    // Resolve the bottom-anchored grid origin from the live content height so the
-    // sample points land where the T4 layout actually paints the rows.
-    let oy = tr_oy(tr_content_height(handle, cx)?);
+    // The top-anchored grid origin (row 0 flush at the content top) — the sample
+    // points land where the T4 layout actually paints the rows.
+    let oy = tr_oy();
 
     // Build all sample points in a known order, then slice the results.
     let mut points: Vec<(f32, f32)> = Vec::new();
@@ -2711,8 +2708,8 @@ fn assert_term_render_attrs(
         ((v >> 16) as u8, (v >> 8) as u8, v as u8)
     };
 
-    // Bottom-anchored grid origin from the live content height (T4 layout).
-    let oy = tr_oy(tr_content_height(handle, cx)?);
+    // Top-anchored grid origin (T4 layout, revised).
+    let oy = tr_oy();
 
     // ---- build every sample point, in a fixed order ----
     let mut points: Vec<(f32, f32)> = Vec::new();
@@ -2854,25 +2851,27 @@ fn assert_term_render_attrs(
 }
 
 // ---------------------------------------------------------------------------
-// `term-layout` self-test scenario — the row-quantized, bottom-anchored layout
-// (T4, Validation §3).
+// `term-layout` self-test scenario — the row-quantized, top-anchored layout
+// (T4 revised, Validation §3).
 //
-// A fixed TR_ROWS grid is fed a recognizable top row (green), a penultimate row
+// A fixed TR_ROWS grid is fed a recognizable top row (green), a second row
 // (cyan), and a bottom "prompt" row (magenta). The window is then resized SHORTER
-// than the grid, so the grid is taller than the view and its top rows must clip.
-// The capture asserts the bottom prompt is pinned at the bottom gap, the row
-// above it sits exactly one cell up (correct pitch, bottom-anchored), and the top
-// of the view shows a clipped interior row (default bg) — never the green top
-// marker, which bottom-anchoring has pushed above the view. Nothing is stored, so
-// this same pinning holds continuously during a live resize (no prompt jitter).
+// than the grid, so the grid is taller than the view and its BOTTOM rows must
+// clip. The capture asserts the top row is pinned flush at the view top, the row
+// below it sits exactly one cell down (correct pitch, top-anchored), and the
+// bottom of the view shows a clipped interior row (default bg) — never the
+// magenta prompt marker, which top-anchoring has pushed below the view. Nothing
+// is stored, so this same pinning holds continuously during a live resize (no
+// top-edge jitter; the sub-row wander lives at the bottom — the deliberate
+// divergence from prod's bottom-anchored `TerminalContainerView`).
 // ---------------------------------------------------------------------------
 
 /// Recognizable marker rows (see the scenario header). Full-row truecolor
 /// backgrounds on space cells, so their centers are font-free solid colors.
 const TL_TOP_ROW: usize = 0;
 const TL_TOP_RGB: (u8, u8, u8) = (0, 200, 0); // green — the "top line"
-const TL_PENULT_ROW: usize = TR_ROWS as usize - 2;
-const TL_PENULT_RGB: (u8, u8, u8) = (0, 200, 200); // cyan — one above the prompt
+const TL_SECOND_ROW: usize = 1;
+const TL_SECOND_RGB: (u8, u8, u8) = (0, 200, 200); // cyan — one below the top
 const TL_BOTTOM_ROW: usize = TR_ROWS as usize - 1;
 const TL_BOTTOM_RGB: (u8, u8, u8) = (200, 0, 200); // magenta — the "bottom prompt"
 /// Columns each marker row fills, and the column the assertion samples (well
@@ -2881,7 +2880,7 @@ const TL_MARKER_COLS: usize = 60;
 const TL_SAMPLE_COL: usize = 20;
 /// Requested window height for the resize — chosen so the content view (whatever
 /// the titlebar leaves) is shorter than the grid's `TR_ROWS × TR_CELL_H` (384 px)
-/// and deliberately not a row multiple, so the top rows genuinely clip.
+/// and deliberately not a row multiple, so the bottom rows genuinely clip.
 const TL_RESIZE_H: f32 = 300.0;
 const TL_SAMPLE_DELAY_MS: u64 = 450;
 const TL_RESIZE_SETTLE_MS: u64 = 350;
@@ -2897,7 +2896,7 @@ fn write_term_layout_fixture() -> Result<(PathBuf, PathBuf)> {
     f.push_str("\x1b[2J\x1b[H");
     for (row, rgb) in [
         (TL_TOP_ROW, TL_TOP_RGB),
-        (TL_PENULT_ROW, TL_PENULT_RGB),
+        (TL_SECOND_ROW, TL_SECOND_RGB),
         (TL_BOTTOM_ROW, TL_BOTTOM_RGB),
     ] {
         f.push_str(&format!(
@@ -2912,8 +2911,8 @@ fn write_term_layout_fixture() -> Result<(PathBuf, PathBuf)> {
         }
         f.push_str("\x1b[0m");
     }
-    // Park the caret on the (clipped) top row so it can never disturb a sample.
-    f.push_str(&format!("\x1b[{};1H", TL_TOP_ROW + 1));
+    // Park the caret on the (clipped) bottom row so it can never disturb a sample.
+    f.push_str(&format!("\x1b[{};1H", TL_BOTTOM_ROW + 1));
 
     std::fs::write(&fixture_path, f.as_bytes())?;
     Ok((base, fixture_path))
@@ -2963,8 +2962,8 @@ fn open_term_layout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         acx.background_executor()
             .timer(Duration::from_millis(TL_SAMPLE_DELAY_MS))
             .await;
-        // Resize SHORTER than the grid so the top rows must clip. Bottom-anchoring
-        // keeps the prompt line pinned across the resize (nothing is remembered).
+        // Resize SHORTER than the grid so the bottom rows must clip. Top-anchoring
+        // keeps the top row pinned across the resize (nothing is remembered).
         let _ = window.update(acx, |_view, window, _app| {
             window.resize(size(px(960.0), px(TL_RESIZE_H)));
         });
@@ -2983,56 +2982,59 @@ fn open_term_layout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     Ok(window)
 }
 
-/// Assert the T4 layout after the resize: bottom prompt pinned at the bottom gap,
-/// the row above it one cell up, and the top of the view clipped to a default-bg
-/// interior row (the green top marker pushed above the view, never at the top).
+/// Assert the T4 layout (revised) after the resize: top row pinned flush at the
+/// view top, the row below it one cell down, and the bottom of the view clipped
+/// to a default-bg interior row (the magenta prompt marker pushed below the
+/// view, never at the bottom).
 fn assert_term_layout(handle: AnyWindowHandle, cx: &mut AsyncApp, theme: &TerminalTheme) -> Result<()> {
     let content_h = tr_content_height(handle, cx)?;
-    let oy = tr_oy(content_h);
+    let oy = tr_oy();
     let grid_h = TR_ROWS as f32 * TR_CELL_H;
     let default_bg = (theme.background.r, theme.background.g, theme.background.b);
 
-    // Precondition: the resize made the grid taller than the view, so the top
-    // rows genuinely clip (otherwise the top-clip assertion would be vacuous).
+    // Precondition: the resize made the grid taller than the view, so the bottom
+    // rows genuinely clip (otherwise the bottom-clip assertion would be vacuous).
     anyhow::ensure!(
         grid_h > content_h,
         "term-layout precondition: grid {grid_h}px must exceed content {content_h}px after the \
-         resize (the top-clip case); lower TL_RESIZE_H"
+         resize (the bottom-clip case); lower TL_RESIZE_H"
     );
 
     let sample_x = TL_SAMPLE_COL as f32 * TR_CELL_W + TR_CELL_W / 2.0;
     let points: Vec<(f32, f32)> = vec![
-        // (0) bottom prompt center at the bottom-anchored pinned position.
-        tr_cell_center(oy, TL_BOTTOM_ROW, TL_SAMPLE_COL),
-        // (1) one pixel above the bottom gap — the prompt row fills flush to it.
-        (sample_x, content_h - TERMINAL_BOTTOM_GAP - 1.0),
-        // (2) penultimate row center — exactly one cell above the prompt.
-        tr_cell_center(oy, TL_PENULT_ROW, TL_SAMPLE_COL),
-        // (3) near the very top of the view — a clipped interior row (default bg),
-        //     NOT the green top marker (bottom-anchoring pushed it above the view).
-        (sample_x, 2.0),
+        // (0) top row center at the top-anchored pinned position.
+        tr_cell_center(oy, TL_TOP_ROW, TL_SAMPLE_COL),
+        // (1) one pixel below the view top — the top row fills flush to it.
+        (sample_x, 1.0),
+        // (2) second row center — exactly one cell below the top row.
+        tr_cell_center(oy, TL_SECOND_ROW, TL_SAMPLE_COL),
+        // (3) near the very bottom of the view — a clipped interior row (default
+        //     bg), NOT the magenta prompt marker (top-anchoring pushed it below
+        //     the view).
+        (sample_x, content_h - 2.0),
     ];
 
     let s = nice_harness::capture::sample_window_pixels(handle, cx, &points)?;
     let mut failures: Vec<String> = Vec::new();
-    tr_check(&mut failures, "layout: bottom prompt pinned", TL_BOTTOM_RGB, s[0]);
-    tr_check(&mut failures, "layout: bottom row flush to gap", TL_BOTTOM_RGB, s[1]);
-    tr_check(&mut failures, "layout: row one cell above prompt", TL_PENULT_RGB, s[2]);
-    // The top of the view must be the clipped interior (default bg); if the green
-    // top marker shows here the grid is top-anchored or unclipped — a T4 break.
-    if tr_within(s[3], TL_TOP_RGB, TR_CHANNEL_TOLERANCE) {
+    tr_check(&mut failures, "layout: top row pinned", TL_TOP_RGB, s[0]);
+    tr_check(&mut failures, "layout: top row flush to view top", TL_TOP_RGB, s[1]);
+    tr_check(&mut failures, "layout: row one cell below the top", TL_SECOND_RGB, s[2]);
+    // The bottom of the view must be the clipped interior (default bg); if the
+    // magenta prompt marker shows here the grid is bottom-anchored or unclipped
+    // — a T4 break.
+    if tr_within(s[3], TL_BOTTOM_RGB, TR_CHANNEL_TOLERANCE) {
         failures.push(
-            "layout: green top marker visible at the view top — grid is not bottom-anchored / \
-             top rows not clipped"
+            "layout: magenta prompt marker visible at the view bottom — grid is not \
+             top-anchored / bottom rows not clipped"
                 .to_string(),
         );
     }
-    tr_check(&mut failures, "layout: view top clipped to interior", default_bg, s[3]);
+    tr_check(&mut failures, "layout: view bottom clipped to interior", default_bg, s[3]);
 
     if failures.is_empty() {
         eprintln!(
-            "[selftest] scenario 'term-layout': bottom-anchored + top-clipped OK \
-             (content {content_h:.1}px < grid {grid_h}px; prompt pinned at the bottom gap)"
+            "[selftest] scenario 'term-layout': top-anchored + bottom-clipped OK \
+             (content {content_h:.1}px < grid {grid_h}px; top row pinned at the view top)"
         );
         Ok(())
     } else {
@@ -3563,7 +3565,7 @@ fn term_perf_report(
 /// [`Scenario`]s here (input latency, …); `smoke` is the minimal "the window
 /// opens and paints at a sane cadence" gate, `tokens` is the design-token render
 /// gate (R2), `term-render` is the renderer's deterministic color/cursor/
-/// attribute gate, `term-layout` is the T4 bottom-anchored layout gate,
+/// attribute gate, `term-layout` is the T4 top-anchored layout gate,
 /// `term-scroll` is the scrollback scroll + park/snap gate, and `term-perf` is
 /// the streaming frame-time + memory budget gate (all R4). `input-live` /
 /// `input-shell` are the R5 live input scenarios (real CGEvents → byte-exact pty

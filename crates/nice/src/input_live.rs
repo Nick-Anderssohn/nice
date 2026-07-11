@@ -434,10 +434,9 @@ fn assert_anchor(
             };
 
             // Expected rect at the parked grid-cursor cell, computed the same way
-            // the renderer lays the grid out (bottom-anchored). If the anchor were
-            // wrong/degenerate (e.g. (0,0)), this fails loudly.
-            let metrics = TerminalMetrics::new(CELL_W, CELL_H);
-            let grid_top = grid_top_y(eb, metrics, ROWS as usize);
+            // the renderer lays the grid out (top-anchored). If the anchor were
+            // wrong/degenerate, this fails loudly.
+            let grid_top = grid_top_y(eb);
             let want_x = f32::from(eb.origin.x) + ANCHOR_COL as f32 * CELL_W;
             let want_y = grid_top + ANCHOR_ROW as f32 * CELL_H;
             let gx = f32::from(rect.origin.x);

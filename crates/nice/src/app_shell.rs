@@ -371,12 +371,16 @@ fn pane_placeholder() -> impl IntoElement {
 const CONTENT_INSET_LEADING: f32 = 20.0;
 
 /// Top gap below the toolbar band — Swift `.padding(.top, 12)`
-/// (`AppShellView.swift:1054`). The sub-row remainder still parks below this,
-/// at the top of the bottom-anchored grid, exactly as in prod.
+/// (`AppShellView.swift:1054`). The top-anchored grid (T4 revised) starts row 0
+/// flush below this, so the visual top gap is exactly this constant at every
+/// window height — a deliberate divergence from prod, whose bottom-anchored
+/// grid parks the sub-row remainder here (see `nice-term-view`'s element doc).
 const CONTENT_INSET_TOP: f32 = 12.0;
 
 /// Bottom gap under the last grid row — Swift `.padding(.bottom, 9)`
-/// (`AppShellView.swift:1062`; `TerminalContainerView.bottomInset` is 0).
+/// (`AppShellView.swift:1062`; `TerminalContainerView.bottomInset` is 0). The
+/// sub-row remainder (0..cell_h) of the top-anchored grid parks above this, so
+/// the visual bottom gap is this constant plus the remainder.
 const CONTENT_INSET_BOTTOM: f32 = 9.0;
 
 /// Trailing gap to the window's right edge. Swift adds NO trailing padding,

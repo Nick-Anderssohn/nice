@@ -43,17 +43,25 @@
 //! procedural `paint_quad → BoundsTree::insert`, dominated by ~420-column
 //! prompt `─` rules); x-structured glyphs stay per-cell.
 //!
-//! ## Row-quantized, bottom-anchored layout (T4)
+//! ## Row-quantized, top-anchored layout (T4, revised)
 //!
-//! The grid is **anchored to the bottom** of the element bounds (minus a stable
-//! [`TERMINAL_BOTTOM_GAP`]), so the bottom row's baseline is pinned regardless of
-//! the view height — during a live resize the prompt line never jitters (the
-//! origin is *computed* from `bounds`, not remembered). Any sub-row remainder
-//! falls at the **top** of the view, where it is clipped by a content mask
-//! (`with_content_mask`) so a grid taller than the view loses its topmost rows
-//! under the chrome, exactly like `TerminalContainerView` (Nice's Swift host).
-//! Scroll offset is read from the core's display offset (line-quantized; the
-//! `TerminalSessionHandle` owns the wheel/trackpad stepping).
+//! The grid is **anchored to the top** of the element bounds: row 0's top edge
+//! sits flush at `bounds.origin.y`, so the gap between the chrome and the first
+//! terminal row is a constant (the host's fixed top inset) regardless of the
+//! view height. Any sub-row remainder falls at the **bottom** of the view,
+//! above the host's bottom inset, where it is clipped by a content mask
+//! (`with_content_mask`) — a grid taller than the view loses its bottommost
+//! rows. The origin is *computed* from `bounds`, never remembered, so the top
+//! edge cannot drift during a live resize.
+//!
+//! This is a **deliberate divergence from prod** (Swift Nice's
+//! `TerminalContainerView`, which bottom-anchors so the prompt-gap at the
+//! bottom stays constant during a resize): Nick prefers a stable top edge, and
+//! accepts that the sub-row wander — up to `cell_h − 1` px — now shows below
+//! the prompt instead, jittering the bottom row's position during a live
+//! resize. Scroll offset is read from the core's display offset
+//! (line-quantized; the `TerminalSessionHandle` owns the wheel/trackpad
+//! stepping).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -106,10 +114,12 @@ pub struct ImeInput {
 /// `None` case so selection is always visible.
 const DEFAULT_SELECTION: u32 = 0x3a3a3a;
 
-/// Constant gap kept below the last grid row, in logical px — the bottom-anchor
-/// inset. Mirrors `TerminalContainerView.bottomInset` (Nice ships `0`: the grid
-/// sits flush with the content area's bottom). Exposed so a scenario can predict
-/// the pinned bottom-row position; bump it for a breathing-room inset.
+/// Constant gap reserved below the grid when fitting rows to a content height
+/// ([`fit_grid`]), in logical px. Mirrors `TerminalContainerView.bottomInset`
+/// (Nice ships `0`: the fit uses the full content height). Since the top-anchor
+/// switch this only shrinks the fit — the painted grid starts at the element's
+/// top regardless ([`grid_top_y`]); the sub-row remainder plus this gap land at
+/// the bottom.
 pub const TERMINAL_BOTTOM_GAP: f32 = 0.0;
 
 /// Underline / strikethrough decoration thickness, logical px (a hairline that
@@ -777,18 +787,20 @@ pub struct TerminalElement {
     auto_refit: bool,
 }
 
-/// Y (logical px) of the top of grid row 0 under the bottom-anchored layout (T4)
-/// for element `bounds` holding `rows` grid rows. The grid's bottom edge is
-/// pinned at `bounds.bottom − TERMINAL_BOTTOM_GAP` and the top origin derived, so
-/// the value can be negative (grid taller than the view). Shared with the view's
-/// `bounds_for_range` anchor so the candidate window lands where the row paints.
-pub fn grid_top_y(bounds: Bounds<Pixels>, metrics: TerminalMetrics, rows: usize) -> f32 {
-    let grid_h = rows as f32 * metrics.cell_h;
-    f32::from(bounds.origin.y) + f32::from(bounds.size.height) - TERMINAL_BOTTOM_GAP - grid_h
+/// Y (logical px) of the top of grid row 0 under the top-anchored layout (T4,
+/// revised): row 0 sits flush at the element's top edge, so this is simply
+/// `bounds.origin.y` — the sub-row remainder (and a grid taller than the view)
+/// falls at the bottom, where the paint-time content mask clips it. A
+/// deliberate divergence from prod's bottom-anchored `TerminalContainerView`
+/// (see the module doc). Kept as the single origin authority, shared with the
+/// view's mouse hit-testing and its `bounds_for_range` IME anchor so the
+/// candidate window lands where the row paints.
+pub fn grid_top_y(bounds: Bounds<Pixels>) -> f32 {
+    f32::from(bounds.origin.y)
 }
 
 /// Grid dimensions `(rows, cols)` that fill a content area `content_w × content_h`
-/// (logical px) at cell `metrics`, clamped to at least 1×1. The bottom-anchor gap
+/// (logical px) at cell `metrics`, clamped to at least 1×1. The bottom gap
 /// ([`TERMINAL_BOTTOM_GAP`]) is reserved from the height. This is the re-metric
 /// fit the view applies to the pty on a font change (T11): when the cell box grows
 /// or shrinks under zoom, the same window holds a different number of cells, and
@@ -987,9 +999,9 @@ impl TerminalElement {
         // time reads the freshly-published `paint_bounds`, so it fits what the
         // newest frame painted; the `last_pty_fit` guard drops sub-cell bounds
         // deltas and breaks the resize → SIGWINCH → repaint feedback loop (an
-        // unchanged-bounds repaint never even schedules). The T4 bottom-anchored
+        // unchanged-bounds repaint never even schedules). The T4 top-anchored
         // `grid_top_y` math is untouched — once the grid tracks the view, only
-        // the sub-row remainder shows at the top.
+        // the sub-row remainder shows at the bottom.
         if auto_refit && prev_bounds != Some(bounds) {
             let view = ime.view.clone();
             cx.defer(move |cx| {
@@ -1021,15 +1033,16 @@ impl TerminalElement {
         let cw = metrics.cell_w;
         let ch = metrics.cell_h;
         let ox = bounds.origin.x;
-        // Bottom-anchored (T4): pin the grid's bottom edge at `bounds.bottom −
-        // gap` and *derive* the top origin, so the prompt line cannot jitter on
-        // resize (nothing is remembered). A grid taller than the view gets a
-        // negative origin — its top rows fall above the view and the content mask
-        // below clips them; a shorter grid leaves the theme-bg remainder on top.
-        let oy = px(grid_top_y(bounds, metrics, cache.rows.len()));
+        // Top-anchored (T4, revised): row 0 starts flush at the element's top,
+        // so the top gap is constant during a resize (nothing is remembered). A
+        // grid taller than the view overruns the bottom edge and the content
+        // mask below clips it; a shorter grid leaves the theme-bg remainder at
+        // the bottom. Deliberate divergence from prod's bottom-anchored
+        // `TerminalContainerView` — see the module doc.
+        let oy = px(grid_top_y(bounds));
 
         // Clip to the element bounds so the sub-row remainder / over-tall grid is
-        // hidden at the TOP, matching `TerminalContainerView` (Nice's Swift host).
+        // hidden at the BOTTOM.
         window.with_content_mask(Some(ContentMask { bounds }), move |window| {
             // Whole viewport background (padding around the grid is theme bg too).
             window.paint_quad(fill(bounds, rgb(default_bg)));

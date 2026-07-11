@@ -46,8 +46,10 @@
 //! programmatic setter test seam), and procedural box-drawing + block elements
 //! (U+2500–259F) so line glyphs join seamlessly.
 //!
-//! It also owns the **row-quantized, bottom-anchored layout** (T4:
-//! [`TERMINAL_BOTTOM_GAP`], sub-row remainder clipped at the top), **line-stepped
+//! It also owns the **row-quantized, top-anchored layout** (T4, revised: row 0
+//! flush at the element's top, sub-row remainder clipped at the bottom — a
+//! deliberate divergence from prod's bottom-anchored `TerminalContainerView`;
+//! see [`element`]'s module doc), **line-stepped
 //! scrollback scroll** (wheel/trackpad → [`TerminalSessionHandle::scroll_lines`],
 //! clamped, core-driven auto-snap-to-bottom, float remainder kept as the deferred
 //! smooth-scroll seam), and **damage-driven present**: the session handle's drain

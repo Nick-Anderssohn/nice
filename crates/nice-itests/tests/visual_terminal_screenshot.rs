@@ -104,13 +104,11 @@ fn run() -> Result<()> {
     })?;
     let window = window.into();
 
-    // Resolve the sample points from the live content height (T4 bottom-anchored
-    // layout) so they land where the swatch row actually paints.
-    let (content_h, scale) = cx.update_window(window, |_, w, _| {
-        (f32::from(w.viewport_size().height), w.scale_factor())
-    })?;
+    // Sample points under the T4 top-anchored layout (row 0 flush at the content
+    // top) — they land where the swatch row actually paints.
+    let scale = cx.update_window(window, |_, w, _| w.scale_factor())?;
     let points: Vec<(f32, f32)> = (0..SWATCHES.len())
-        .map(|col| pixels::cell_center(content_h, ROWS as usize, metrics, SWATCH_ROW, col))
+        .map(|col| pixels::cell_center(metrics, SWATCH_ROW, col))
         .collect();
 
     // Poll: force a repaint and capture until the swatch pixels have rendered

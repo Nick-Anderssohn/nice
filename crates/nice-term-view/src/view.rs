@@ -1026,7 +1026,7 @@ impl TerminalView {
                 term.grid().display_offset(),
             )
         };
-        let grid_top = grid_top_y(bounds, self.metrics, rows);
+        let grid_top = grid_top_y(bounds);
         let rel_x = f32::from(pos.x) - f32::from(bounds.origin.x);
         let rel_y = f32::from(pos.y) - grid_top;
         let (col, vrow) = mouse::cell_from_offset(
@@ -1308,10 +1308,10 @@ impl TerminalView {
             let cols = term.columns();
             let cp = content.cursor.point;
             let vr = (cp.line.0 + display_offset).clamp(0, screen_rows.saturating_sub(1) as i32);
-            (vr as usize, cp.column.0.min(cols.saturating_sub(1)), screen_rows)
+            (vr as usize, cp.column.0.min(cols.saturating_sub(1)))
         });
-        let (row, col, rows) = cursor.unwrap_or((0, 0, 0));
-        let grid_top = grid_top_y(element_bounds, m, rows);
+        let (row, col) = cursor.unwrap_or((0, 0));
+        let grid_top = grid_top_y(element_bounds);
         let mut x = f32::from(element_bounds.origin.x) + col as f32 * m.cell_w;
         let y = grid_top + row as f32 * m.cell_h;
 
