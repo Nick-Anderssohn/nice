@@ -8,10 +8,13 @@
 //! `nice-model` dependency. The mapping from a `TabStatus` to *which* of these
 //! tokens applies — and the token → `gpui` animation/colour adaptation — lives
 //! in the `StatusDot` component downstream, which is what keeps this crate
-//! gpui-free (crates/README.md "Layering rule"). The "thinking" dot colour is
-//! the user's accent ([`crate::AccentPreset`]) and the "idle" dot colour is the
-//! active palette's `ink3` slot ([`crate::Slots::ink3`]); neither is duplicated
-//! here — only the tokens the Swift `StatusDot` hardcodes are.
+//! gpui-free (crates/README.md "Layering rule"). The "thinking" and "waiting"
+//! dot colours are both FIXED tokens the Swift `StatusDot` hardcodes
+//! ([`THINKING_DOT`], [`WAITING_DOT`]) — thinking is the fixed brand Terracotta
+//! `.niceAccent`, NOT the user's *chosen* accent, exactly as the Swift version
+//! painted it. Only the "idle" dot colour is palette-dependent (the active
+//! palette's `ink3` slot, [`crate::Slots::ink3`]), so it alone is resolved by
+//! the caller and passed in rather than duplicated here.
 
 use crate::color::Srgba;
 
@@ -23,11 +26,19 @@ pub const DOT_SIZE: f32 = 8.0;
 /// The frame is `DOT_SIZE + DOT_FRAME_PADDING` on a side.
 pub const DOT_FRAME_PADDING: f32 = 4.0;
 
+/// The "thinking" dot colour — the FIXED brand Terracotta `.niceAccent`,
+/// verbatim from `StatusDot.swift:29` (`return .niceAccent`) →
+/// `Palette.swift:59` (`Self(.sRGB, red: 0.788, green: 0.392, blue: 0.259)`).
+/// This is the static `.niceAccent`, **not** `.niceAccentDynamic` — the Swift
+/// `StatusDot` deliberately painted thinking in the fixed brand accent
+/// regardless of the user's chosen swatch, so it is a hardcoded token here (not
+/// the caller's live accent).
+pub const THINKING_DOT: Srgba = Srgba::rgb(0.788, 0.392, 0.259);
+
 /// The "waiting" dot colour — an sRGB approximation of `oklch(0.65 0.14 250)`,
 /// verbatim from `StatusDot.swift:33` (`Color(.sRGB, red: 0.48, green: 0.58,
-/// blue: 0.86)`). This is the one dot colour Swift hardcodes; "thinking" uses
-/// the user's accent and "idle" uses the palette's `ink3`, so those are not
-/// duplicated here.
+/// blue: 0.86)`). Fixed, like [`THINKING_DOT`]; only "idle" is palette-dependent
+/// (the palette's `ink3`), so that one alone is resolved by the caller.
 pub const WAITING_DOT: Srgba = Srgba::rgb(0.48, 0.58, 0.86);
 
 /// The expanding outer ring animation for one status. The ring starts at the
@@ -113,6 +124,15 @@ mod tests {
     fn dot_geometry_matches_swift() {
         assert_eq!(DOT_SIZE, 8.0); // StatusDot.swift:19
         assert_eq!(DOT_FRAME_PADDING, 4.0); // StatusDot.swift:70,93 (size + 4)
+    }
+
+    #[test]
+    fn thinking_dot_colour_matches_swift() {
+        // StatusDot.swift:29 (`return .niceAccent`) → Palette.swift:59
+        // (`Self(.sRGB, red: 0.788, green: 0.392, blue: 0.259)`) — the FIXED
+        // brand accent, not the user's chosen swatch.
+        assert_eq!(THINKING_DOT, Srgba::rgb(0.788, 0.392, 0.259));
+        assert_eq!(THINKING_DOT.a, 1.0);
     }
 
     #[test]

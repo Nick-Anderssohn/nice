@@ -23,12 +23,13 @@
 //!
 //! ## Colours (binding decision)
 //!
-//! Per-status base colour ([`status_dot_base_color`]): **thinking** = the user's
-//! accent, **waiting** = the fixed [`nice_theme::status::WAITING_DOT`] blue,
-//! **idle** = the active palette's `ink3`. The palette-dependent colours (accent,
-//! idle) are resolved by the caller and passed in, keeping this component
-//! palette-agnostic and reusable; only the one hardcoded "waiting" blue is read
-//! straight from the token.
+//! Per-status base colour ([`status_dot_base_color`]): **thinking** = the fixed
+//! [`nice_theme::status::THINKING_DOT`] brand Terracotta, **waiting** = the fixed
+//! [`nice_theme::status::WAITING_DOT`] blue, **idle** = the active palette's
+//! `ink3`. Thinking and waiting are hardcoded tokens read straight here — Swift's
+//! `StatusDot` painted thinking in the fixed `.niceAccent`, **not** the user's
+//! chosen swatch — so only the palette-dependent `idle` colour is resolved by the
+//! caller and passed in, keeping the component reusable across palettes.
 
 // The component's constructor + builder setters have no in-crate caller until
 // slice 3 (the sidebar `TabRow`) and R11 (toolbar pills) wire them; it is a
@@ -47,18 +48,19 @@ use nice_model::TabStatus;
 use nice_theme::color::Srgba;
 use nice_theme::status::{
     BreathePulse, RingPulse, BREATHE_MAX_OPACITY, DOT_FRAME_PADDING, DOT_SIZE, THINKING_BREATHE,
-    THINKING_RING, WAITING_BREATHE, WAITING_DOT, WAITING_RING,
+    THINKING_DOT, THINKING_RING, WAITING_BREATHE, WAITING_DOT, WAITING_RING,
 };
 
 use crate::theme::srgba_to_rgba;
 
 /// The base (unanimated) dot colour for `status`, given the caller-resolved
-/// palette-dependent colours. Ported from `StatusDot.baseColor`
-/// (`StatusDot.swift:27-37`): thinking → `accent`, waiting → the fixed
+/// palette-dependent `idle` colour. Ported from `StatusDot.baseColor`
+/// (`StatusDot.swift:27-37`): thinking → the fixed [`THINKING_DOT`] brand
+/// Terracotta (`.niceAccent`, NOT the user's chosen accent), waiting → the fixed
 /// [`WAITING_DOT`] blue, idle → `idle` (the palette's `ink3`).
-pub(crate) fn status_dot_base_color(status: TabStatus, accent: Srgba, idle: Srgba) -> Srgba {
+pub(crate) fn status_dot_base_color(status: TabStatus, idle: Srgba) -> Srgba {
     match status {
-        TabStatus::Thinking => accent,
+        TabStatus::Thinking => THINKING_DOT,
         TabStatus::Waiting => WAITING_DOT,
         TabStatus::Idle => idle,
     }
@@ -96,17 +98,16 @@ fn ease_out_quadratic(t: f32) -> f32 {
     1.0 - inv * inv
 }
 
-/// The status dot component. Construct with [`StatusDot::new`]; the palette
-/// colours (`accent` = thinking, `idle` = the palette's `ink3`) are resolved by
-/// the caller. See the module docs for the "reads R8, never recomputes" rule.
+/// The status dot component. Construct with [`StatusDot::new`]; only the
+/// palette-dependent `idle` colour (the palette's `ink3`) is resolved by the
+/// caller — thinking and waiting are fixed tokens. See the module docs for the
+/// "reads R8, never recomputes" rule.
 #[derive(IntoElement)]
 pub(crate) struct StatusDot {
     /// Unique element-id seed so each dot's per-layer animation state is
     /// distinct even when many dots render as siblings (one per sidebar row).
     id: ElementId,
     status: TabStatus,
-    /// Thinking colour — the user's accent (default Terracotta).
-    accent: Srgba,
     /// Idle colour — the active palette's `ink3` slot.
     idle: Srgba,
     /// Inner-dot diameter (pt). Defaults to [`DOT_SIZE`] (8).
@@ -120,20 +121,15 @@ pub(crate) struct StatusDot {
 }
 
 impl StatusDot {
-    /// A status dot for `status`, with the caller-resolved `accent` (thinking)
-    /// and `idle` (the palette's `ink3`) colours. `id` seeds the per-layer
-    /// animation element-ids and must be unique among sibling dots (e.g. the tab
-    /// id). Size defaults to [`DOT_SIZE`]; the pulse flags default off.
-    pub(crate) fn new(
-        id: impl Into<ElementId>,
-        status: TabStatus,
-        accent: Srgba,
-        idle: Srgba,
-    ) -> Self {
+    /// A status dot for `status`, with the caller-resolved `idle` (the palette's
+    /// `ink3`) colour — thinking and waiting are fixed tokens. `id` seeds the
+    /// per-layer animation element-ids and must be unique among sibling dots
+    /// (e.g. the tab id). Size defaults to [`DOT_SIZE`]; the pulse flags default
+    /// off.
+    pub(crate) fn new(id: impl Into<ElementId>, status: TabStatus, idle: Srgba) -> Self {
         Self {
             id: id.into(),
             status,
-            accent,
             idle,
             size: DOT_SIZE,
             suppress_waiting_pulse: false,
@@ -163,7 +159,7 @@ impl StatusDot {
 
 impl RenderOnce for StatusDot {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let base = status_dot_base_color(self.status, self.accent, self.idle);
+        let base = status_dot_base_color(self.status, self.idle);
         let base_rgba: Rgba = srgba_to_rgba(base);
         let size = self.size;
         // The outer frame the ring expands within — `size + 4` on a side
@@ -258,20 +254,17 @@ impl RenderOnce for StatusDot {
 mod tests {
     use super::*;
 
-    fn accent() -> Srgba {
-        Srgba::rgb(0.788, 0.392, 0.259) // Terracotta, the default accent.
-    }
-
     fn idle() -> Srgba {
         Srgba::rgb(0.460, 0.441, 0.427) // Nice/Dark ink3.
     }
 
     #[test]
     fn base_color_maps_status_per_swift() {
-        // StatusDot.swift:27-37.
-        assert_eq!(status_dot_base_color(TabStatus::Thinking, accent(), idle()), accent());
-        assert_eq!(status_dot_base_color(TabStatus::Waiting, accent(), idle()), WAITING_DOT);
-        assert_eq!(status_dot_base_color(TabStatus::Idle, accent(), idle()), idle());
+        // StatusDot.swift:27-37 — thinking is the FIXED THINKING_DOT brand
+        // accent, NOT a caller-supplied swatch.
+        assert_eq!(status_dot_base_color(TabStatus::Thinking, idle()), THINKING_DOT);
+        assert_eq!(status_dot_base_color(TabStatus::Waiting, idle()), WAITING_DOT);
+        assert_eq!(status_dot_base_color(TabStatus::Idle, idle()), idle());
     }
 
     #[test]

@@ -1223,7 +1223,6 @@ impl WindowToolbarView {
             PaneKind::Claude => StatusDot::new(
                 SharedString::from(format!("pill.{}", vm.id)),
                 vm.status,
-                accent,
                 slot_srgba(s.ink3),
             )
             .suppress_waiting_pulse(vm.waiting_ack)

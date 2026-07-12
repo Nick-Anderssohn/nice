@@ -55,7 +55,7 @@ use nice_theme::chrome_geometry::{
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette};
-use nice_theme::status::WAITING_DOT;
+use nice_theme::status::{THINKING_DOT, WAITING_DOT};
 
 use crate::app;
 use crate::platform::{self, WindowButtonFrame};
@@ -620,9 +620,9 @@ async fn restore_check(
 // ---- §4 dot colour + pulse -------------------------------------------------
 
 fn dot_checks(cx: &mut AsyncApp, view: &Entity<SidebarShellView>, failures: &mut Vec<String>) {
-    let accent = view.update(cx, |v, _| v.accent());
     // The idle-dot colour is the Nice/Dark `ink3` slot (the caller-resolved
-    // palette colour `StatusDot` maps `.idle` to).
+    // palette colour `StatusDot` maps `.idle` to). Thinking and waiting are fixed
+    // tokens (THINKING_DOT / WAITING_DOT), not palette- or accent-dependent.
     let idle: Srgba = slot_srgba(
         slots(Palette::Nice, ColorScheme::Dark)
             .expect("Nice/Dark is a valid combo")
@@ -631,7 +631,7 @@ fn dot_checks(cx: &mut AsyncApp, view: &Entity<SidebarShellView>, failures: &mut
 
     // (tab id, expected status, expected base colour, expected pulse).
     let cases: [(&str, TabStatus, Srgba, bool); 4] = [
-        (DOT_THINKING, TabStatus::Thinking, accent, true),
+        (DOT_THINKING, TabStatus::Thinking, THINKING_DOT, true),
         (DOT_WAITING_UNACK, TabStatus::Waiting, WAITING_DOT, true),
         (DOT_WAITING_ACK, TabStatus::Waiting, WAITING_DOT, false),
         (DOT_IDLE, TabStatus::Idle, idle, false),
@@ -646,7 +646,7 @@ fn dot_checks(cx: &mut AsyncApp, view: &Entity<SidebarShellView>, failures: &mut
             failures.push(format!("dot '{id}': status {status:?} != expected {exp_status:?}"));
             continue;
         }
-        let color = status_dot_base_color(status, accent, idle);
+        let color = status_dot_base_color(status, idle);
         if color != exp_color {
             failures.push(format!("dot '{id}': base colour {color:?} != token {exp_color:?}"));
         }
@@ -657,7 +657,7 @@ fn dot_checks(cx: &mut AsyncApp, view: &Entity<SidebarShellView>, failures: &mut
             ));
         }
     }
-    eprintln!("[selftest] sidebar dots: thinking→accent(pulse), waiting-unacked→blue(pulse), waiting-acked→blue(no pulse), idle→ink3(no pulse)");
+    eprintln!("[selftest] sidebar dots: thinking→terracotta(pulse), waiting-unacked→blue(pulse), waiting-acked→blue(no pulse), idle→ink3(no pulse)");
 }
 
 // ---- verdict ---------------------------------------------------------------

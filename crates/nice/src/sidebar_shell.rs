@@ -1880,7 +1880,6 @@ impl SidebarShellView {
             StatusDot::new(
                 SharedString::from(t.id.clone()),
                 t.status,
-                accent,
                 slot_srgba(s.ink3),
             )
             .suppress_waiting_pulse(t.waiting_ack)
