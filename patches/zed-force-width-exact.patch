@@ -1,0 +1,21 @@
+diff --git a/crates/gpui/src/text_system/line_layout.rs b/crates/gpui/src/text_system/line_layout.rs
+index 5e85cefb8c..f9deabb2b3 100644
+--- a/crates/gpui/src/text_system/line_layout.rs
++++ b/crates/gpui/src/text_system/line_layout.rs
+@@ -795,10 +795,12 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+             let shaped_x = glyph.position.x;
+ 
+             if shaped_x > last_base_shaped_x + force_width * 0.5 {
+-                let forced_x = glyph_pos * force_width;
+-                if (shaped_x - forced_x).abs() > px(1.) {
+-                    glyph.position.x = forced_x;
+-                }
++                // Snap unconditionally: when force_width exceeds the font's
++                // natural advance, drift accumulates across the run, and a
++                // snap-only-past-a-tolerance leaves glyph positions dependent
++                // on where the run starts — the same character then shifts
++                // when a style change (e.g. a selection) re-splits the runs.
++                glyph.position.x = glyph_pos * force_width;
+                 last_base_shaped_x = shaped_x;
+                 last_base_actual_x = glyph.position.x;
+                 glyph_pos += 1;

@@ -25,6 +25,12 @@
 #          thread parked with zero callbacks). The patch schedules a ~50 ms
 #          single-flight retry that restarts the link iff the window is still
 #          occlusion-visible, and logs the self-heal.
+#        - zed-force-width-exact.patch: make apply_force_width_to_layout snap
+#          every base glyph to its exact cell slot instead of only past a 1px
+#          tolerance. Nice's cell width is ceil-snapped above the font's
+#          natural advance, so sub-tolerance drift accumulated across a run and
+#          glyph positions depended on where the run started — selecting text
+#          (which re-splits runs on background) visibly shifted characters.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
@@ -48,6 +54,7 @@ VENDOR="$REPO_ROOT/vendor/zed"
 PATCHES=(
     "zed-bg-luminance"
     "zed-display-link-selfheal"
+    "zed-force-width-exact"
 )
 patch_file() { printf '%s/patches/%s.patch' "$REPO_ROOT" "$1"; }
 marker_file() { printf '%s/.nice-%s-applied' "$VENDOR" "${1#zed-}"; }
