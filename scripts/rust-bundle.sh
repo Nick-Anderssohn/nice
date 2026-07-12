@@ -99,10 +99,17 @@ need() { command -v "$1" >/dev/null 2>&1 || { printf '[rust-bundle] missing dep:
 need cargo
 need codesign
 need ditto
+need git
 
-if [[ ! -d "$REPO_ROOT/vendor/zed/crates/gpui" ]]; then
-    fail "vendor/zed not found — run scripts/vendor-zed.sh first"
-fi
+# Ensure the pinned + patched GPUI/zed checkout the workspace path-depends
+# on is present and at the correct revision. vendor-zed.sh is idempotent: a
+# fast no-op (a few git plumbing checks, no network) when vendor/zed is
+# already at the pin — so it materializes a fresh worktree AND re-syncs a
+# stale pin, rather than failing the build and making the caller run it.
+log "ensuring vendored zed is present + at the pin (scripts/vendor-zed.sh)"
+"$SCRIPT_DIR/vendor-zed.sh" || fail "vendor-zed.sh failed — see its output above"
+[[ -d "$REPO_ROOT/vendor/zed/crates/gpui" ]] \
+    || fail "vendor/zed still missing after vendor-zed.sh"
 
 # ── 1. build release ────────────────────────────────────────────────────
 # Deliberately WITHOUT the `selftest` feature: enabling it turns on gpui
