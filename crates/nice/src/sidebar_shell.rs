@@ -97,7 +97,8 @@ use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::file_browser::view::FileBrowserView;
 use crate::inline_rename::{
-    dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe, RenameKeyOutcome,
+    apply_rename_click, dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe,
+    RenameKeyOutcome,
 };
 use crate::session_manager::ClaudeTabPlacement;
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
@@ -873,12 +874,19 @@ impl SidebarShellView {
         cx.notify();
     }
 
-    /// Reposition the caret from a click hit-test — collapse the selection to the
-    /// clicked boundary and re-grab field focus (the click already stopped
-    /// propagation, so the tab's title-tap gate never re-trips).
-    fn place_rename_cursor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Apply a click hit-test to the rename field — single click drops the caret,
+    /// double selects the word, triple selects all ([`apply_rename_click`]) — then
+    /// re-grab field focus (the click already stopped propagation, so the tab's
+    /// title-tap gate never re-trips).
+    fn place_rename_cursor(
+        &mut self,
+        index: usize,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(editor) = self.rename_editor.as_mut() {
-            editor.place_cursor(index);
+            apply_rename_click(editor, index, click_count);
             self.rename_focus.focus(window, cx);
             cx.notify();
         }
@@ -1926,8 +1934,10 @@ impl SidebarShellView {
                 self.sidebar_pt(13.0),
                 self.rename_probe.clone(),
                 cx.listener(Self::on_rename_key),
-                move |index, window, app| {
-                    let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));
+                move |index, click_count, window, app| {
+                    let _ = weak.update(app, |this, cx| {
+                        this.place_rename_cursor(index, click_count, window, cx)
+                    });
                 },
             );
             // Wrap rather than touch the shared `rename_field`: the line height

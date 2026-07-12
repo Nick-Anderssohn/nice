@@ -109,6 +109,20 @@ pub(crate) fn dispatch_rename_key(
     }
 }
 
+/// Apply a click at char boundary `index` to the rename `editor`, honoring the
+/// platform multi-click convention the three call sites share: a single click
+/// drops the caret, a double-click selects the word under the pointer, and a
+/// triple-click (or more) selects the whole field (the single-line "line").
+/// Centralizes the policy so each call site's click handler stays a one-liner and
+/// the 1/2/3-click mapping is unit-tested in one place.
+pub(crate) fn apply_rename_click(editor: &mut TextFieldEditor, index: usize, click_count: usize) {
+    match click_count {
+        2 => editor.select_word_at(index),
+        n if n >= 3 => editor.select_all(),
+        _ => editor.place_cursor(index),
+    }
+}
+
 /// The active field's text split at its selection so the caller renders a caret
 /// (collapsed) or a highlighted range plus pre/post text.
 #[derive(Clone)]
@@ -242,8 +256,9 @@ pub(crate) fn char_boundary_x(window: &Window, text: &str, text_size: f32, index
 ///   window-x into a text-relative offset.
 /// * `on_key` is the caller's key handler (built with `cx.listener` / a weak
 ///   entity); it dispatches through [`dispatch_rename_key`] and commits/cancels.
-/// * `on_click_index` receives the hit-tested char index; the caller places the
-///   caret there ([`TextFieldEditor::place_cursor`]) and re-grabs field focus.
+/// * `on_click_index` receives the hit-tested char index and the click count; the
+///   caller applies it via [`apply_rename_click`] (single click places the caret,
+///   double selects the word, triple selects all) and re-grabs field focus.
 ///
 /// The click handler `stop_propagation`s so the press never reaches the row / tab
 /// / pill mouse handler beneath it — the fix for "a click inside the field
@@ -257,7 +272,7 @@ pub(crate) fn rename_field(
     text_size: f32,
     probe: Rc<Cell<FieldProbe>>,
     on_key: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
-    on_click_index: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_click_index: impl Fn(usize, usize, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     // Text-run probe: an absolute inset-0 canvas inside the padding-less,
     // border-less text row — taffy resolves it against the row's own box, whose
@@ -346,7 +361,7 @@ pub(crate) fn rename_field(
                 probe.get().text_left,
                 f32::from(e.position.x),
             );
-            on_click_index(idx, window, app);
+            on_click_index(idx, e.click_count, window, app);
             // Swallow the press so the row / tab / pill handler beneath never sees
             // it — otherwise the click would re-trip the begin-rename gate.
             app.stop_propagation();
@@ -439,6 +454,28 @@ mod tests {
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
+    }
+
+    #[test]
+    fn apply_rename_click_maps_click_count_to_caret_word_and_all() {
+        // Single click → caret (collapsed) at the boundary.
+        let mut e = ed("foo bar");
+        apply_rename_click(&mut e, 5, 1);
+        assert_eq!(e.selection(), (5, 5));
+        assert!(!e.has_selection());
+
+        // Double click → the word under the pointer.
+        let mut e = ed("foo bar");
+        apply_rename_click(&mut e, 5, 2);
+        assert_eq!(e.selection(), (4, 7)); // "bar"
+
+        // Triple click (and beyond) → the whole field.
+        let mut e = ed("foo bar");
+        apply_rename_click(&mut e, 5, 3);
+        assert_eq!(e.selection(), (0, 7));
+        let mut e = ed("foo bar");
+        apply_rename_click(&mut e, 5, 4);
+        assert_eq!(e.selection(), (0, 7));
     }
 
     #[test]

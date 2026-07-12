@@ -108,11 +108,44 @@ impl TextFieldEditor {
             Key::Right => self.move_right(false),
             Key::ShiftLeft => self.move_left(true),
             Key::ShiftRight => self.move_right(true),
-            Key::SelectAll => {
-                self.anchor = 0;
-                self.caret = self.chars.len();
-            }
+            Key::SelectAll => self.select_all(),
         }
+    }
+
+    /// Select the whole field — ⌘A and the triple-click "line" action (the field
+    /// is single-line, so its "line" is the entire text).
+    pub fn select_all(&mut self) {
+        self.anchor = 0;
+        self.caret = self.chars.len();
+    }
+
+    /// Select the word surrounding char boundary `pos` — the double-click action.
+    /// Characters are grouped into three classes (word = alphanumeric or `_`,
+    /// whitespace, other) and the contiguous run of the class under the pointer is
+    /// selected, so double-clicking `bar` in `foo bar.txt` selects just `bar`. A
+    /// click at the trailing edge selects the last word; an empty field leaves a
+    /// collapsed caret.
+    pub fn select_word_at(&mut self, pos: usize) {
+        let len = self.chars.len();
+        if len == 0 {
+            self.collapse_to(0);
+            return;
+        }
+        // The hit-test hands back a caret boundary in `0..=len`; the word under
+        // the pointer is the run containing the char to its right (the last char
+        // when the caret sits at the very end).
+        let i = pos.min(len - 1);
+        let class = char_class(self.chars[i]);
+        let mut start = i;
+        while start > 0 && char_class(self.chars[start - 1]) == class {
+            start -= 1;
+        }
+        let mut end = i + 1;
+        while end < len && char_class(self.chars[end]) == class {
+            end += 1;
+        }
+        self.anchor = start;
+        self.caret = end;
     }
 
     fn insert(&mut self, c: char) {
@@ -177,6 +210,29 @@ impl TextFieldEditor {
     fn collapse_to(&mut self, pos: usize) {
         self.anchor = pos;
         self.caret = pos;
+    }
+}
+
+/// The three character classes [`TextFieldEditor::select_word_at`] groups by: a
+/// double-click expands to the contiguous run of the class under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    /// Alphanumeric or `_` — the letters/digits that make up a word.
+    Word,
+    /// Any Unicode whitespace.
+    Whitespace,
+    /// Everything else (punctuation, symbols) — grouped as a run, so `...`
+    /// selects together.
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Whitespace
+    } else {
+        CharClass::Other
     }
 }
 
@@ -420,6 +476,77 @@ mod tests {
         e.apply_key(Char('X'));
         assert_eq!(e.text(), "aXbc");
         assert_eq!(e.cursor(), 2);
+    }
+
+    // MARK: - select_word_at (double-click)
+
+    #[test]
+    fn select_word_at_selects_the_word_run() {
+        // Click inside "bar" of "foo bar.txt".
+        let mut e = TextFieldEditor::new("foo bar.txt");
+        e.select_word_at(5); // caret between 'b' and 'a'
+        assert_eq!(e.selection(), (4, 7)); // "bar"
+    }
+
+    #[test]
+    fn select_word_at_selects_the_first_word() {
+        let mut e = TextFieldEditor::new("foo bar");
+        e.select_word_at(1);
+        assert_eq!(e.selection(), (0, 3)); // "foo"
+    }
+
+    #[test]
+    fn select_word_at_end_selects_the_last_word() {
+        // Caret at the very end clamps onto the last char's run.
+        let mut e = TextFieldEditor::new("foo bar");
+        e.select_word_at(7);
+        assert_eq!(e.selection(), (4, 7)); // "bar"
+    }
+
+    #[test]
+    fn select_word_at_groups_whitespace() {
+        let mut e = TextFieldEditor::new("a   b");
+        e.select_word_at(2); // inside the run of spaces
+        assert_eq!(e.selection(), (1, 4));
+    }
+
+    #[test]
+    fn select_word_at_groups_punctuation() {
+        // The '.' between base and ext is its own "other" run.
+        let mut e = TextFieldEditor::new("foo...bar");
+        e.select_word_at(4); // inside "..."
+        assert_eq!(e.selection(), (3, 6));
+    }
+
+    #[test]
+    fn select_word_at_underscore_is_part_of_the_word() {
+        let mut e = TextFieldEditor::new("my_tab_name");
+        e.select_word_at(4);
+        assert_eq!(e.selection(), (0, 11)); // whole snake_case token
+    }
+
+    #[test]
+    fn select_word_at_multibyte_is_char_indexed() {
+        let mut e = TextFieldEditor::new("café bar");
+        e.select_word_at(2);
+        assert_eq!(e.selection(), (0, 4)); // "café"
+    }
+
+    #[test]
+    fn select_word_at_empty_field_is_a_collapsed_caret() {
+        let mut e = TextFieldEditor::new("");
+        e.select_word_at(0);
+        assert_eq!(e.selection(), (0, 0));
+        assert!(!e.has_selection());
+    }
+
+    // MARK: - select_all (triple-click / ⌘A)
+
+    #[test]
+    fn select_all_method_selects_whole_field() {
+        let mut e = TextFieldEditor::new("foo bar");
+        e.select_all();
+        assert_eq!(e.selection(), (0, 7));
     }
 
     // MARK: - char_index_for_x

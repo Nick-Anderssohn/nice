@@ -56,7 +56,8 @@ use crate::app_shell::PaneHostView;
 use crate::file_browser::cwd_snapshot::build_snapshot;
 use crate::file_browser::rename::{self, ConfirmSpec, RenameCommit};
 use crate::inline_rename::{
-    dispatch_rename_key, edit_spans, EditSpans, FieldColors, FieldProbe, RenameKeyOutcome,
+    apply_rename_click, dispatch_rename_key, edit_spans, EditSpans, FieldColors, FieldProbe,
+    RenameKeyOutcome,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::Slots;
@@ -986,12 +987,19 @@ impl FileBrowserView {
         }
     }
 
-    /// Reposition the caret from a click hit-test: collapse the selection to the
-    /// clicked char boundary and re-grab field focus. The field's click handler
-    /// already `stop_propagation`ed, so the row's begin-rename gate never re-trips.
-    fn place_rename_cursor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Apply a click hit-test to the rename field — single click drops the caret,
+    /// double selects the word, triple selects all ([`apply_rename_click`]) — then
+    /// re-grab field focus. The field's click handler already `stop_propagation`ed,
+    /// so the row's begin-rename gate never re-trips.
+    fn place_rename_cursor(
+        &mut self,
+        index: usize,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(state) = self.rename.as_mut() {
-            state.editor.place_cursor(index);
+            apply_rename_click(&mut state.editor, index, click_count);
             self.rename_focus.focus(window, cx);
             cx.notify();
         }
@@ -1771,7 +1779,7 @@ impl FileBrowserView {
             self.rename_probe.get().text_left,
             window_x,
         );
-        self.place_rename_cursor(index, window, cx);
+        self.place_rename_cursor(index, 1, window, cx);
         Some(index)
     }
 
@@ -2228,8 +2236,10 @@ fn render_rename_field(
         move |e: &KeyDownEvent, window, app| {
             let _ = weak_key.update(app, |this, cx| this.on_rename_key(e, window, cx));
         },
-        move |index, window, app| {
-            let _ = weak.update(app, |this, cx| this.place_rename_cursor(index, window, cx));
+        move |index, click_count, window, app| {
+            let _ = weak.update(app, |this, cx| {
+                this.place_rename_cursor(index, click_count, window, cx)
+            });
         },
     )
     .into_any_element()
