@@ -40,6 +40,13 @@
 #   --dest PATH  Directory to install the .app into. Default: /Applications.
 #   -h, --help   Show this help.
 #
+# Environment:
+#   NICE_PROD_SIGN_IDENTITY  With --prod, the codesign identity used to re-sign
+#                            the bundle for stable TCC permissions (see step 2).
+#                            Defaults to the first "Developer ID Application"
+#                            identity in the keychain; set to "-" to force
+#                            ad-hoc. Ignored for the dev variant.
+#
 # Exit codes:
 #   0  installed
 #   1  prereq missing / bad args
@@ -101,7 +108,45 @@ fi
 SRC_APP="$BUILD_DIR/$APP_NAME.app"
 [[ -d "$SRC_APP" ]] || fail "$SRC_APP not found — run scripts/rust-bundle.sh $BUNDLE_FLAG first (or drop --no-build)"
 
-# ── 2. force-quit a running instance of THIS bundle (dev only) ──────────
+# ── 2. Developer ID re-sign (prod only) ─────────────────────────────────
+# rust-bundle.sh signs ad-hoc. An ad-hoc signature's designated requirement
+# is pinned to the binary's cdhash, which changes on every rebuild — so macOS
+# treats each prod reinstall as a new identity and TCC screen-recording /
+# accessibility grants go stale (you must re-authorize after every reinstall).
+# Re-signing with a STABLE Developer ID identity yields a cdhash-independent
+# designated requirement (team id + bundle id), so those grants persist across
+# rebuilds. This is a LOCAL-CONVENIENCE re-sign only, NOT the release
+# signature — release-rs.sh owns the hardened-runtime + notarize + staple pass
+# for shipped builds and does not go through this script.
+#
+# We sign $SRC_APP (in the user-owned build dir) as the invoking user, before
+# the staging copy below: a `sudo ditto` into a non-writable $DEST would sign
+# as root, whose keychain does not hold the Developer ID key. `ditto`
+# preserves the signature into the installed bundle.
+#
+# Identity resolution:
+#   1. $NICE_PROD_SIGN_IDENTITY if set (set it to "-" to force ad-hoc)
+#   2. else the first "Developer ID Application" identity in the keychain
+#   3. else keep the existing ad-hoc signature (warn) — a machine without the
+#      cert (fresh clone / CI) still installs fine, just without TCC persistence.
+if [[ "$PROD" -eq 1 ]]; then
+    sign_id="${NICE_PROD_SIGN_IDENTITY:-}"
+    if [[ -z "$sign_id" ]]; then
+        sign_id=$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+    fi
+    if [[ -z "$sign_id" || "$sign_id" == "-" ]]; then
+        log "prod: no Developer ID identity — keeping ad-hoc signature (TCC grants will NOT persist across rebuilds)"
+    else
+        log "prod: re-signing with stable identity: $sign_id"
+        codesign --force --sign "$sign_id" "$SRC_APP" \
+            || fail "Developer ID codesign failed (identity: $sign_id)"
+        codesign --verify --deep --strict "$SRC_APP" \
+            || fail "codesign --verify failed after Developer ID re-sign"
+    fi
+fi
+
+# ── 3. force-quit a running instance of THIS bundle (dev only) ──────────
 # CRITICAL SAFETY: for --prod we NEVER force-quit. A running prod Nice may
 # host live Claude Code sessions; the staged-swap below upgrades the bundle
 # on disk and the running process picks up the new version on next relaunch.
@@ -138,7 +183,7 @@ if [[ "$PROD" -eq 0 ]]; then
     fi
 fi
 
-# ── 3. install via staging path + atomic rename ─────────────────────────
+# ── 4. install via staging path + atomic rename ─────────────────────────
 # Same staged-swap shape as scripts/install.sh: stage the new bundle next
 # to the target, then a single `mv` swap so $DEST_APP is never observed
 # half-populated.
@@ -167,7 +212,7 @@ else
     $SUDO mv "$STAGING_APP" "$DEST_APP"
 fi
 
-# ── 4. report ─────────────────────────────────────────────────────────
+# ── 5. report ─────────────────────────────────────────────────────────
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
     "$DEST_APP/Contents/Info.plist" 2>/dev/null || echo "?")
 log "installed $APP_NAME $VERSION at $DEST_APP"
