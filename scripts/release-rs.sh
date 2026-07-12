@@ -4,9 +4,14 @@
 # Rust rewrite's PRODUCTION build ("Nice.app", dev.nickanderssohn.nice).
 #
 # Pipeline: version guard vs crates/nice/Cargo.toml → scripts/rust-bundle.sh
-# --prod (release cargo build + prod bundle assembly; its ad-hoc signature is
+# --prod --universal (per-arch release cargo builds + lipo into a universal
+# arm64+x86_64 binary + prod bundle assembly; its ad-hoc signature is
 # deliberately overwritten here) → Developer ID codesign with hardened runtime
 # → verify → ditto zip → notarize → staple → final zip → SHA256.
+#
+# Releases ship UNIVERSAL (Apple Silicon + Intel). codesign/notarize/staple all
+# operate on the fat binary as a unit, so nothing downstream of the build needs
+# to know about the second arch.
 #
 # This builds the prod "Nice.app" identity via rust-bundle.sh --prod (built in
 # ./build-rs-prod so it never collides with the dev ./build-rs bundle).
@@ -81,8 +86,10 @@ log "version=$VERSION skip_notarize=$SKIP_NOTARIZE"
 rm -f "$ZIP_PRE" "$ZIP_FINAL"
 
 # ── 2. vendor + build + assemble (rust-bundle.sh --prod ad-hoc signs; step 3 re-signs) ──
+# --universal: ship a fat arm64+x86_64 binary so releases run on both Apple
+# Silicon and Intel (rust-bundle.sh cross-compiles the non-host slice + lipos).
 [[ -d "$REPO_ROOT/vendor/zed/crates/gpui" ]] || scripts/vendor-zed.sh
-scripts/rust-bundle.sh --prod --dest "$BUILD_DIR"
+scripts/rust-bundle.sh --prod --universal --dest "$BUILD_DIR"
 [[ -d "$APP_PATH" ]] || fail "rust-bundle.sh --prod produced no bundle at $APP_PATH"
 
 # ── 3. Developer ID re-sign with hardened runtime (required by notarization) ──

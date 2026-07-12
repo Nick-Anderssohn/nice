@@ -28,7 +28,20 @@ fn main() {
     let obj = out_dir.join("nice_rs_signpost.o");
     let lib = out_dir.join("libnice_rs_signpost.a");
 
+    // Compile the shim for the TARGET arch, not `cc`'s host default. Without
+    // this, a cross-compile (e.g. the x86_64 slice of a universal build on an
+    // Apple Silicon host) silently emits an arm64 object and the final link
+    // fails with "nice_rs_signpost.o … found architecture 'arm64', required
+    // 'x86_64'". `clang` spells aarch64 as `arm64`; x86_64 maps to itself.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let clang_arch = match target_arch.as_str() {
+        "aarch64" => "arm64",
+        other => other,
+    };
+
     let status = Command::new("cc")
+        .arg("-arch")
+        .arg(clang_arch)
         .arg("-O2")
         .arg("-c")
         .arg(&src)

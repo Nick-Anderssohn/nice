@@ -63,6 +63,11 @@ brew install --cask Nick-Anderssohn/nice/nice
 
 Signed, notarized, universal (Apple Silicon + Intel). `brew upgrade --cask nice` picks up new releases; `brew uninstall --cask --zap nice` removes the app and wipes its settings.
 
-## Credits
+## Built with
 
-Terminal rendering via SwiftTerm made by [migueldeicaza](https://github.com/migueldeicaza) - currently using [my fork of it](https://github.com/Nick-Anderssohn/SwiftTerm) which has a few small tweaks to make it smoother...soon I shall open PRs targeted towards [the original SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) so that I can switch to that.
+Nice is a native Rust app rendered on a single Metal stack:
+
+- [GPUI](https://www.gpui.rs) — the GPU-accelerated UI framework from [Zed](https://github.com/zed-industries/zed). The whole app (chrome, sidebar, and terminal) is drawn GPUI-native; Nice vendors a pinned Zed checkout with a small local patch.
+- [alacritty_terminal](https://github.com/alacritty/alacritty) — the VT engine (grid, scrollback, damage tracking, and VTE parsing) behind Nice's terminal panes.
+
+Terminal themes are compatible with [Ghostty](https://ghostty.org)'s theme file format.

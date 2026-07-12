@@ -32,11 +32,15 @@
 #
 # scripts/rust-install.sh copies the assembled bundle into /Applications.
 #
-# Usage: scripts/rust-bundle.sh [--prod] [--dest DIR]
+# Usage: scripts/rust-bundle.sh [--prod] [--dest DIR] [--universal]
 #
 #   --prod       Build the production "Nice" variant. Default: "Nice Dev".
 #   --dest DIR   Directory to assemble the .app bundle into.
 #                Default: build-rs (dev) / build-rs-prod (--prod).
+#   --universal  Build a universal (arm64 + x86_64) binary via two per-target
+#                cargo builds + `lipo`. Default OFF: a plain host-arch build,
+#                which keeps dev installs fast. release-rs.sh passes this so
+#                shipped releases run on both Apple Silicon and Intel.
 #   -h, --help   Show this help.
 #
 # Exit codes:
@@ -56,20 +60,25 @@ BUNDLE_DEST=""
 
 usage() {
     cat <<EOF
-Usage: scripts/rust-bundle.sh [--prod] [--dest DIR]
+Usage: scripts/rust-bundle.sh [--prod] [--dest DIR] [--universal]
 
   --prod       Build the production "Nice" variant. Default: "Nice Dev".
   --dest DIR   Directory to assemble the .app bundle into.
                Default: build-rs (dev) / build-rs-prod (--prod).
+  --universal  Build a universal (arm64 + x86_64) binary via lipo.
+               Default OFF (host-arch build; keeps dev installs fast).
   -h, --help   Show this help.
 EOF
 }
 
+UNIVERSAL=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --prod)    PROD=1; shift;;
-        --dest)    BUNDLE_DEST="$2"; shift 2;;
-        -h|--help) usage; exit 0;;
+        --prod)      PROD=1; shift;;
+        --dest)      BUNDLE_DEST="$2"; shift 2;;
+        --universal) UNIVERSAL=1; shift;;
+        -h|--help)   usage; exit 0;;
         *) printf '[rust-bundle] unknown arg: %s\n' "$1" >&2; usage >&2; exit 1;;
     esac
 done
@@ -116,11 +125,39 @@ log "ensuring vendored zed is present + at the pin (scripts/vendor-zed.sh)"
 # test-support, which flips CAMetalLayer.framebufferOnly = false PROCESS-
 # WIDE. The shipped bundle must keep the live layer framebuffer-only. See
 # crates/nice/Cargo.toml and crates/nice-harness/src/capture.rs.
-log "building nice (release)"
-cargo build --release -p nice
-
-# Single cargo binary for both variants; copied to a per-variant exec name below.
-SRC_BIN="$REPO_ROOT/target/release/nice"
+#
+# The resulting SRC_BIN is copied to a per-variant exec name in step 3.
+if [[ "$UNIVERSAL" -eq 1 ]]; then
+    # Universal build: one cargo build per arch (cross-compiling the non-host
+    # slice — no emulation needed to BUILD), then lipo them into one fat binary.
+    # Both slices are Developer-ID re-signable as a unit downstream.
+    need lipo
+    need rustup
+    ARM_TARGET="aarch64-apple-darwin"
+    X86_TARGET="x86_64-apple-darwin"
+    for t in "$ARM_TARGET" "$X86_TARGET"; do
+        if ! rustup target list --installed | grep -qx "$t"; then
+            log "installing rust target $t"
+            rustup target add "$t" || fail "could not add rust target $t"
+        fi
+    done
+    log "building nice (release, universal: $ARM_TARGET + $X86_TARGET)"
+    cargo build --release -p nice --target "$ARM_TARGET"
+    cargo build --release -p nice --target "$X86_TARGET"
+    ARM_BIN="$REPO_ROOT/target/$ARM_TARGET/release/nice"
+    X86_BIN="$REPO_ROOT/target/$X86_TARGET/release/nice"
+    [[ -x "$ARM_BIN" ]] || fail "arm64 build finished but $ARM_BIN not found"
+    [[ -x "$X86_BIN" ]] || fail "x86_64 build finished but $X86_BIN not found"
+    SRC_BIN="$REPO_ROOT/target/nice-universal"
+    log "lipo -create → $SRC_BIN"
+    lipo -create -output "$SRC_BIN" "$ARM_BIN" "$X86_BIN" || fail "lipo failed"
+    log "lipo -archs: $(lipo -archs "$SRC_BIN")"
+else
+    log "building nice (release, host arch)"
+    cargo build --release -p nice
+    # Single cargo binary; copied to a per-variant exec name below.
+    SRC_BIN="$REPO_ROOT/target/release/nice"
+fi
 [[ -x "$SRC_BIN" ]] || fail "release build finished but $SRC_BIN not found"
 
 # ── 2. version (single source of truth: crates/nice/Cargo.toml) ────────
