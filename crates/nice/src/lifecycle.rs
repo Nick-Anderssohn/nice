@@ -243,7 +243,7 @@ mod tests {
     }
 
     fn disk_store(path: &Path) -> SessionStore {
-        SessionStore::open_with(path.to_path_buf(), None, Box::new(DiskIo), DEBOUNCE)
+        SessionStore::open_with(path.to_path_buf(), Box::new(DiskIo), DEBOUNCE)
     }
 
     struct Scratch(std::path::PathBuf);

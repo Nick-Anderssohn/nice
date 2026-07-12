@@ -887,7 +887,7 @@ impl WindowState {
         cx.notify();
     }
 
-    /// Handle a `handoff` request from the `/nice-handoff-rs` skill's helper — the
+    /// Handle a `handoff` request from the `/nice-handoff` skill's helper — the
     /// Rust twin of Swift `SessionsModel.handleHandoffRequest`
     /// (`SessionsModel.swift:1108-1156`). Opens a fresh Claude tab pre-loaded with
     /// the handoff notes: nested one indent under the originating tab, or top-level
@@ -1373,7 +1373,7 @@ impl WindowState {
     ) {
         if self.pending_modal().is_some() {
             eprintln!(
-                "nice-rs: request_close_pane({tab_id}, {pane_id}) ignored — a confirmation modal \
+                "nice: request_close_pane({tab_id}, {pane_id}) ignored — a confirmation modal \
                  is already up"
             );
             return;
@@ -1443,7 +1443,7 @@ impl WindowState {
     ) {
         if self.pending_modal().is_some() {
             eprintln!(
-                "nice-rs: request_close_tab({tab_id}) ignored — a confirmation modal is already up"
+                "nice: request_close_tab({tab_id}) ignored — a confirmation modal is already up"
             );
             return;
         }
@@ -1487,7 +1487,7 @@ impl WindowState {
     ) {
         if self.pending_modal().is_some() {
             eprintln!(
-                "nice-rs: request_close_project({project_id}) ignored — a confirmation modal is \
+                "nice: request_close_project({project_id}) ignored — a confirmation modal is \
                  already up"
             );
             return;
@@ -1574,7 +1574,7 @@ impl WindowState {
         // §T.2 — re-entrancy guard (D7).
         if self.pending_modal().is_some() {
             eprintln!(
-                "nice-rs: request_close_tabs({} tabs) ignored — a confirmation modal is already up",
+                "nice: request_close_tabs({} tabs) ignored — a confirmation modal is already up",
                 ids.len()
             );
             return;
@@ -2987,7 +2987,7 @@ mod tests {
     // ---- gating semantics ---------------------------------------------------
 
     /// Gate ON ⇒ `Some(pointer path)`, and reading it ENSURES the pointer file
-    /// exists with the exact `custom:nice-rs` bytes (Swift's ensure-on-read,
+    /// exists with the exact `custom:nice` bytes (Swift's ensure-on-read,
     /// `ClaudeThemeSync.swift:122-131`).
     #[test]
     fn gate_on_provider_is_ensure_on_read_pointer_path() {
@@ -2998,7 +2998,7 @@ mod tests {
             crate::claude_theme_sync::theme_settings_path(&home.0)
         );
         let bytes = std::fs::read(&provider).expect("pointer file ensured on read");
-        assert_eq!(bytes, b"{\n  \"theme\": \"custom:nice-rs\"\n}");
+        assert_eq!(bytes, b"{\n  \"theme\": \"custom:nice\"\n}");
     }
 
     /// Gate OFF ⇒ `None`, and nothing is written (no `~/.nice` under the home).
@@ -3022,7 +3022,7 @@ mod tests {
     }
 
     /// The PRESENT-key branch (`exists != 0`) — the path a user's `defaults write
-    /// dev.nickanderssohn.nice-rs syncClaudeTheme -bool false` actually takes, and
+    /// dev.nickanderssohn.nice syncClaudeTheme -bool false` actually takes, and
     /// the branch `read_bool_pref_absent_key_returns_default` never reaches. A key
     /// SET in the app domain wins over the passed `default` in BOTH directions, so
     /// this pins `exists != 0` AND the `value != 0` mapping: were the FFI miswired

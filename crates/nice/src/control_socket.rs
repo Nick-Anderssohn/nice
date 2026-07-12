@@ -316,7 +316,7 @@ impl NiceControlSocket {
         let handler: Handler = Arc::new(handler);
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
-            .name("nice-rs-control-socket".into())
+            .name("nice-control-socket".into())
             .spawn(move || accept_loop(listener, shared, handler, accept_poll));
         match spawned {
             Ok(_) => {
@@ -477,7 +477,7 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> libc::c_short {
 fn dispatch_client(stream: UnixStream, handler: &Handler) {
     let handler = Arc::clone(handler);
     let _ = std::thread::Builder::new()
-        .name("nice-rs-control-client".into())
+        .name("nice-control-client".into())
         .spawn(move || handle_client(stream, &handler));
 }
 

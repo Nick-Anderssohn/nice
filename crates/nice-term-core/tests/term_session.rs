@@ -13,8 +13,8 @@
 //! Cleanliness sweep hook: the **command** panes here
 //! (`marker_from_command_pane_lands_in_grid`, `command_pane_pwd_echoes_session_cwd`,
 //! `scrollback_knob_caps_history_with_bounded_memory`, and
-//! `damage_wake_fires_after_lock_released`) carry the token `NICE_RS_TEST_SENTINEL`
-//! in the child's argv (via the `sh -c '<script>' NICE_RS_TEST_SENTINEL` [`wrap`]
+//! `damage_wake_fires_after_lock_released`) carry the token `NICE_TEST_SENTINEL`
+//! in the child's argv (via the `sh -c '<script>' NICE_TEST_SENTINEL` [`wrap`]
 //! — the token becomes `$0`, so it shows in `ps -Aww -o args=` but never in the
 //! command's output). After the run,
 //! `ps -Aww -o pid=,args= | grep -c '[N]ICE_RS_TEST_SENTINEL'` must be 0.
@@ -36,7 +36,7 @@ use nice_term_core::{
 
 /// argv token the cleanliness sweep greps for. Passed as the wrapped shell's
 /// `$0`, so it lands in `ps` args without polluting command output.
-const SENTINEL: &str = "NICE_RS_TEST_SENTINEL";
+const SENTINEL: &str = "NICE_TEST_SENTINEL";
 
 /// A generous poll ceiling: a login+interactive zsh still sources the system rc
 /// and initialises ZLE before our command runs, and a loaded machine can be
@@ -57,7 +57,7 @@ const POLL: Duration = Duration::from_secs(25);
 fn zdotdir() -> &'static str {
     static DIR: OnceLock<String> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("nice-rs-zdotdir-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nice-zdotdir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create ZDOTDIR");
         for rc in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
             std::fs::write(dir.join(rc), "").expect("write empty rc");
@@ -75,7 +75,7 @@ fn test_env() -> Vec<(String, String)> {
 
 /// Wrap a shell `script` so the exec'd process carries [`SENTINEL`] in its argv
 /// (as `$0`) while producing exactly `script`'s output. Used as a command pane's
-/// command → `zsh -ilc "exec sh -c '<script>' NICE_RS_TEST_SENTINEL"`.
+/// command → `zsh -ilc "exec sh -c '<script>' NICE_TEST_SENTINEL"`.
 fn wrap(script: &str) -> String {
     format!("sh -c {} {}", shell_single_quote(script), SENTINEL)
 }
@@ -141,7 +141,7 @@ fn marker_from_command_pane_lands_in_grid() {
 fn command_pane_pwd_echoes_session_cwd() {
     // A command pane rooted at a canonical (symlink-resolved) temp dir; `pwd`
     // must print that exact path into the grid.
-    let base = std::env::temp_dir().join(format!("nice-rs-pwd-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-pwd-{}", std::process::id()));
     std::fs::create_dir_all(&base).expect("create temp cwd");
     let cwd = std::fs::canonicalize(&base).expect("canonicalize temp cwd");
     let cwd_str = cwd.to_str().expect("utf8 cwd").to_string();

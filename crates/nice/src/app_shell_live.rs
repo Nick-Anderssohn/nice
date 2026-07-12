@@ -15,8 +15,8 @@
 //!
 //! 1. **The AX anchors are exposed.** An AX-tree walk of this process
 //!    (`crate::platform::ax_find_titled_role`, the `ax-probe` pattern) finds the
-//!    sidebar-card root (`nice-rs-sidebar-root`) and the pane-strip root
-//!    (`nice-rs-pane-strip-root`) each exposed as an `AXGroup` — the exported
+//!    sidebar-card root (`nice-sidebar-root`) and the pane-strip root
+//!    (`nice-pane-strip-root`) each exposed as an `AXGroup` — the exported
 //!    shipped-surface assertion hooks (§6). The shipped shell does not drive
 //!    continuous frames, so the poll forces a repaint per tick (a `WindowState`
 //!    notify) to keep AccessKit's lazily-activated tree current.

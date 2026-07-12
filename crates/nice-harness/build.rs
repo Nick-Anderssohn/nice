@@ -35,7 +35,7 @@ fn main() {
         .arg("-o")
         .arg(&obj)
         .status()
-        .expect("failed to spawn `cc` for the nice-rs signpost shim");
+        .expect("failed to spawn `cc` for the nice signpost shim");
     assert!(status.success(), "cc failed on src/signpost.c");
 
     let status = Command::new("ar")
@@ -43,7 +43,7 @@ fn main() {
         .arg(&lib)
         .arg(&obj)
         .status()
-        .expect("failed to spawn `ar` for the nice-rs signpost shim");
+        .expect("failed to spawn `ar` for the nice signpost shim");
     assert!(status.success(), "ar failed for libnice_rs_signpost.a");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

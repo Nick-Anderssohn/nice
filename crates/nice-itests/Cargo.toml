@@ -40,7 +40,7 @@
 #     code. See `tests/visual_terminal_screenshot.rs`.
 #
 # Neither model may ever assert cadence/perf/wall-clock claims — those live only
-# in the live `NICE_RS_SELFTEST` suite (the simulated clock makes such a claim
+# in the live `NICE_SELFTEST` suite (the simulated clock makes such a claim
 # untrustworthy; a cadence/perf assertion here is a blocking review finding).
 [package]
 name = "nice-itests"

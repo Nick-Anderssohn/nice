@@ -87,7 +87,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-claude-lifecycle-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-claude-lifecycle-{}", std::process::id()));
         std::fs::create_dir_all(&base).context("create fixture base")?;
         let base = base.canonicalize().context("canonicalize fixture base")?;
 

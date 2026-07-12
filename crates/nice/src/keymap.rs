@@ -248,7 +248,7 @@ pub(crate) fn rebuild_keymap(cx: &mut App) {
                 match shortcut_binding(action, &token, mapper.as_ref()) {
                     Ok(binding) => bindings.push(binding),
                     Err(e) => eprintln!(
-                        "nice-rs: skipping unparseable shortcut token {token:?} for {action:?}: {e}"
+                        "nice: skipping unparseable shortcut token {token:?} for {action:?}: {e}"
                     ),
                 }
             }

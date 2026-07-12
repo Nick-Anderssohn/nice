@@ -69,7 +69,7 @@ const READY_MARKER: &str = "NICE_CC_READY";
 
 const ACCESSIBILITY_REMEDIATION: &str =
     "close-confirmation: Accessibility not trusted — the real-CGEvent pill-✕ close cannot be \
-     posted; grant nice-rs Accessibility and re-run";
+     posted; grant nice Accessibility and re-run";
 
 // -- fixture -----------------------------------------------------------------
 
@@ -81,7 +81,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-close-confirm-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-close-confirm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).context("create fixture base")?;
         let base = base.canonicalize().context("canonicalize fixture base")?;

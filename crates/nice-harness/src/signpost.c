@@ -10,7 +10,7 @@
 // is off.
 //
 // Contract (keep in sync with crates/README.md when the docs slice lands):
-//   subsystem: "dev.nickanderssohn.nice-rs"
+//   subsystem: "dev.nickanderssohn.nice"
 //   category : "selftest"
 //   name     : "Frame"
 //
@@ -27,7 +27,7 @@ static os_log_t nice_rs_log(void) {
     static os_log_t log;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        log = os_log_create("dev.nickanderssohn.nice-rs", "selftest");
+        log = os_log_create("dev.nickanderssohn.nice", "selftest");
     });
     return log;
 }

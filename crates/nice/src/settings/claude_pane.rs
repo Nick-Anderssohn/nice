@@ -88,8 +88,8 @@ pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
         .child(setting_row(
             "Install the Nice Handoff skill",
             Some(
-                "Adds the global /nice-handoff-rs Claude Code skill and installs \
-                 ~/.nice/nice-handoff-rs.sh. When run inside a Claude pane, the skill \
+                "Adds the global /nice-handoff Claude Code skill and installs \
+                 ~/.nice/nice-handoff.sh. When run inside a Claude pane, the skill \
                  writes a handoff file capturing the current work and opens a new tab so \
                  a fresh session can continue from where this one left off."
                     .into(),

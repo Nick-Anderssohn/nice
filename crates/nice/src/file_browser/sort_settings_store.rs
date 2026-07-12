@@ -1,5 +1,5 @@
 //! The F2 sort-preferences file store — `ui_settings.json` under
-//! `~/Library/Application Support/Nice RS Dev/`.
+//! `~/Library/Application Support/<variant>/` (`Nice` / `Nice Dev`).
 //!
 //! Swift persisted the two sort knobs (`fileBrowser.sort.criterion` /
 //! `fileBrowser.sort.ascending`) in `UserDefaults`. The rewrite deliberately does
@@ -194,7 +194,7 @@ pub(crate) fn write_ui_settings_merged(
 }
 
 /// Resolve the default `ui_settings.json` path:
-/// `<support-root>/Nice RS Dev/ui_settings.json`, where `<support-root>` is
+/// `<support-root>/<variant>/ui_settings.json`, where `<support-root>` is
 /// `NICE_APPLICATION_SUPPORT_ROOT` when set (tests / scenarios redirect state
 /// into a sandbox) else `~/Library/Application Support`. Called from `app::run`
 /// ONLY — never a test or `run_selftest` (the `session_store` convention).
@@ -206,8 +206,9 @@ pub fn default_ui_settings_path() -> PathBuf {
             PathBuf::from(home).join("Library/Application Support")
         }
     };
-    // Same folder convention as the session store (`Nice RS Dev`).
-    root.join(crate::session_store::STORE_FOLDER)
+    // Same folder convention as the session store (the per-variant
+    // Application Support folder, `Nice` / `Nice Dev`).
+    root.join(crate::session_store::store_folder())
         .join("ui_settings.json")
 }
 

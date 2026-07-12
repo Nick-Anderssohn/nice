@@ -2,13 +2,13 @@
 //! self-test scenario windows.
 //!
 //! Entry points:
-//!   * [`run`] — the shipped app: one "Nice RS Dev" window hosting a single live
+//!   * [`run`] — the shipped app: one "Nice" window hosting a single live
 //!     terminal pane running the login shell (zsh), wired to the damage-driven
 //!     present kick. Quitting closes the window, which drops the session and
-//!     tears down its child process group (no orphan zsh). Set `NICE_RS_COMMAND`
+//!     tears down its child process group (no orphan zsh). Set `NICE_COMMAND`
 //!     to run a one-off command pane instead of an interactive shell (the live
 //!     smoke feeds `ls -la` / colour tests that way).
-//!   * [`run_selftest`] — the `NICE_RS_SELFTEST` harness path: opens each
+//!   * [`run_selftest`] — the `NICE_SELFTEST` harness path: opens each
 //!     registered scenario's window in turn (see [`selftest_scenarios`]).
 //!     Scenario orchestration, the gates, capture, and the watchdog all live in
 //!     `nice_harness::selftest`; this module supplies the concrete gpui views +
@@ -81,7 +81,7 @@ impl Render for RootView {
         // A moving accent bar so each animated frame genuinely differs (real
         // per-frame compositing work, and a non-uniform screenshot capture).
         let accent_x = 40.0 + ((self.frame % 200) as f64) * 1.5;
-        let version = concat!("Nice RS Dev v", env!("CARGO_PKG_VERSION"));
+        let version = concat!("Nice v", env!("CARGO_PKG_VERSION"));
 
         let element = div()
             .size_full()
@@ -166,7 +166,7 @@ pub(crate) fn window_options_with(
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_background: WindowBackgroundAppearance::Opaque,
         titlebar: Some(TitlebarOptions {
-            title: Some("Nice RS Dev".into()),
+            title: Some(app_display_name().into()),
             // Hidden titlebar so the app draws its own chrome band; the native
             // traffic lights show through and gpui re-applies their position on
             // resize / focus / full-screen exit.
@@ -417,7 +417,7 @@ gpui::actions!(nice, [NewWindow]);
 
 // R18 (W5): the Nice-owned quit + window-close accelerators. gpui cannot veto
 // macOS terminate, so quit confirmation lives on this `Quit` action (⌘Q + the app
-// menu's "Quit Nice RS Dev") and window-close confirmation on `CloseWindow` (⌘W +
+// menu's "Quit Nice") and window-close confirmation on `CloseWindow` (⌘W +
 // File ▸ "Close Window" + the red-button `on_window_should_close` gate). Both are
 // fixed window-management actions like `NewWindow` (not rebindable).
 gpui::actions!(nice, [Quit, CloseWindow]);
@@ -444,14 +444,14 @@ fn fullscreen_menu_title(is_fullscreen: bool) -> &'static str {
 fn app_menus(is_fullscreen: bool) -> Vec<Menu> {
     vec![
         // The application menu — AppKit renders the first menu bold with the
-        // process name. R18 fills it with "Quit Nice RS Dev" (⌘Q); R23 adds
+        // process name. R18 fills it with "Quit Nice" (⌘Q); R23 adds
         // "Settings…" (⌘,, the macOS-convention app-menu slot) which dispatches the
         // `OpenSettings` action. Precedes File so AppKit renders it as the bold app
         // menu.
-        Menu::new("Nice RS Dev").items([
+        Menu::new(app_display_name()).items([
             MenuItem::action("Settings…", crate::settings::window::OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Quit Nice RS Dev", Quit),
+            MenuItem::action(format!("Quit {}", app_display_name()), Quit),
         ]),
         // File ▸ New Window (⌘N) — mints a fresh isolated window (plan: every ⌘N
         // opens a NEW window, nothing de-dups); File ▸ Close Window (⌘W) — the
@@ -496,7 +496,7 @@ pub(crate) fn install_fullscreen_command(cx: &mut App) {
                 if let Err(e) =
                     window.update(cx, |_root, window, _cx| window.toggle_fullscreen())
                 {
-                    eprintln!("nice-rs: ToggleFullScreen could not reach the active window: {e:#}");
+                    eprintln!("nice: ToggleFullScreen could not reach the active window: {e:#}");
                 }
             }
         });
@@ -515,7 +515,7 @@ pub(crate) fn install_fullscreen_command(cx: &mut App) {
 pub(crate) fn install_new_window_command(cx: &mut App) {
     cx.on_action(|_: &NewWindow, cx: &mut App| {
         if let Err(e) = open_managed_window(cx) {
-            eprintln!("nice-rs: failed to open a new window: {e:#}");
+            eprintln!("nice: failed to open a new window: {e:#}");
         }
     });
     // ⌘N — a non-rebindable window-management accelerator (like ⌃⌘F). `None`
@@ -564,18 +564,25 @@ pub(crate) fn install_lifecycle_commands(cx: &mut App) {
     .detach();
 }
 
+/// This build's user-facing variant name (`Nice` for the prod bundle,
+/// `Nice Dev` for the dev bundle) — used for the window title and the app menu.
+/// Falls back to `Nice` when unbundled (a bare `cargo run` has no `Info.plist`).
+fn app_display_name() -> String {
+    crate::platform::main_bundle_name().unwrap_or_else(|| "Nice".to_string())
+}
+
 /// L4 step 8: open the session store + install it as the process Global — from
 /// [`run`] ONLY (never [`run_selftest`], per the tranche-4 hermeticity rule: the
 /// regression suite must never resolve real `~/Library/Application Support` /
-/// `~/.claude` paths or write real state). The own store path + the one-time Swift
-/// migration source both resolve here (the `shell_inject` app::run-only
-/// convention); the migration reads the Swift file ONLY when the own store is
-/// absent and writes the OWN store only. Once installed, every persistence hook
-/// goes live; before this call they are no-ops.
+/// `~/.claude` paths or write real state). The own store path resolves the
+/// per-variant folder (`Nice` / `Nice Dev`), which is the SAME folder the retired
+/// Swift build wrote into — so a pre-existing `sessions.json` there is read as our
+/// own file (see [`crate::session_store`]'s migration note; the interim `nice-rs`
+/// folder move already ran in [`crate::rename_migration`]). Once installed, every
+/// persistence hook goes live; before this call they are no-ops.
 fn install_session_store(_cx: &mut App) {
     let own = crate::session_store::default_store_path();
-    let swift = crate::session_store::swift_migration_source();
-    let store = crate::session_store::SessionStore::open(own, Some(swift));
+    let store = crate::session_store::SessionStore::open(own);
     crate::session_store::install_global(store);
 }
 
@@ -735,7 +742,7 @@ fn request_quit(cx: &mut App) {
         });
     });
     if let Err(e) = result {
-        eprintln!("nice-rs: request_quit could not present the quit confirmation: {e:#}");
+        eprintln!("nice: request_quit could not present the quit confirmation: {e:#}");
     }
 }
 
@@ -780,7 +787,7 @@ fn present_handoff_prompt(cx: &mut App) {
         state.update(app, |ws, wcx| {
             ws.present_confirmation(
                 "Install the Nice Handoff skill?",
-                "The /nice-handoff-rs skill lets Claude hand off the current work to a fresh session in a new tab. You can change this anytime in Settings.",
+                "The /nice-handoff skill lets Claude hand off the current work to a fresh session in a new tab. You can change this anytime in Settings.",
                 "Install",
                 "Not Now",
                 false,
@@ -804,7 +811,7 @@ fn present_handoff_prompt(cx: &mut App) {
     });
     if let Err(e) = result {
         eprintln!(
-            "nice-rs: present_handoff_prompt could not present the first-launch prompt: {e:#}"
+            "nice: present_handoff_prompt could not present the first-launch prompt: {e:#}"
         );
     }
 }
@@ -842,7 +849,7 @@ fn request_close_active_window(cx: &mut App) {
         }
     });
     if let Err(e) = result {
-        eprintln!("nice-rs: request_close_active_window could not reach the active window: {e:#}");
+        eprintln!("nice: request_close_active_window could not reach the active window: {e:#}");
     }
 }
 
@@ -966,7 +973,7 @@ pub(crate) fn claude_theme_sync_gate_on(cx: &App) -> bool {
 
 /// R26's in-memory mirror of the `installHandoffSkill` CFPref — the SOURCE the
 /// Claude-pane's handoff toggle RENDERS from, so a scenario / `run_selftest`
-/// render never reads the real `dev.nickanderssohn.nice-rs` CFPrefs domain (D7
+/// render never reads the real `dev.nickanderssohn.nice` CFPrefs domain (D7
 /// render-read note). Seeded ONCE in [`run`] from the CFPref (Step 5, the
 /// bootstrap reconcile), UNSET under [`run_selftest`] — absent ⇒ OFF (default),
 /// exactly like [`ClaudeThemeSyncGate`]. The CFPref stays the persisted source
@@ -1036,6 +1043,12 @@ pub fn run() {
         // eager first-launch write flips the "own store exists" gate). app::run
         // ONLY — never `run_selftest` (hermeticity: the suite writes no real user
         // state and reads no real prod domain).
+        // nice-rs → Nice rename (2026-07): move any interim `Nice RS Dev/`
+        // Application Support state into this build's per-variant folder and
+        // delete the stale `-rs` Claude artifacts — BEFORE the settings-import
+        // gate and the store open below read the new paths. Same app::run-only
+        // hermeticity as the import; a clean no-op for a fresh install.
+        crate::rename_migration::run();
         crate::settings_import::import_prod_settings_on_first_launch();
         // R23: load the `fonts` + `advanced` sections of `ui_settings.json` into the
         // `SettingsPrefsStore` Global BEFORE `install_shortcuts`, which seeds the
@@ -1135,7 +1148,7 @@ pub fn run() {
         // panel; import fixtures are temp files). app::run ONLY.
         crate::settings::file_picker::install_production(cx);
         // R19 (F2): load the file-browser sort preferences from `ui_settings.json`
-        // (`<support-root>/Nice RS Dev/`) into their process Global (write-through
+        // (`<support-root>/<variant-folder>/`) into their process Global (write-through
         // on change). Launch-time read + default-path resolution live here in
         // app::run ONLY — `run_selftest` installs a defaults+temp-path store.
         cx.set_global(crate::file_browser::sort_settings_store::SortSettingsStore::load(
@@ -1149,7 +1162,7 @@ pub fn run() {
         // defaults+temp store + the catalog stub (no SharedThemeState, no write).
         // Slice 3 extends this boot order (OS reconcile + the R17-live wiring).
         // R22: resolve the imported-theme storage dir under the same
-        // `<support-root>/Nice RS Dev/` root (via `NICE_APPLICATION_SUPPORT_ROOT`)
+        // `<support-root>/<variant-folder>/` root (via `NICE_APPLICATION_SUPPORT_ROOT`)
         // and create it on demand, then thread it into the catalog the live theme
         // installs enumerate at boot. Path resolution + the create live in
         // app::run ONLY — `run_selftest` hands a throwaway temp dir (no write).
@@ -1189,9 +1202,9 @@ pub fn run() {
         // an update. Launch-time read + default-path resolution live here in
         // `app::run` ONLY. All BEFORE the restore fan-out opens the first window so
         // its toolbar reads a live checker. The periodic worker is started ONLY
-        // when `LAUNCH_CHECK_ENABLED` (D6: false for the `0.1.0` dev build, so it
-        // never fetches or nags against Swift Nice's tags); the feature stays fully
-        // built + wired + tested and a scenario drives `check_now` via the seam.
+        // when `LAUNCH_CHECK_ENABLED` (now on — the Rust build ships as the real
+        // `Nice` release at `0.31.0`, above the Swift `0.30.x` line); a scenario
+        // still drives `check_now` via the seam independently of the launch timer.
         crate::release_check::release_fetch::install_production(cx);
         cx.set_global(crate::release_check::UpdateCheckStore::load(
             crate::file_browser::sort_settings_store::default_ui_settings_path(),
@@ -1204,7 +1217,7 @@ pub fn run() {
         // `open_managed_window` — one window per saved slot (ghost pre-pass +
         // cwd-heal), or one fresh default window when nothing is restorable.
         if let Err(e) = run_restore_fan_out(cx) {
-            eprintln!("nice-rs: failed to start the terminal: {e:#}");
+            eprintln!("nice: failed to start the terminal: {e:#}");
             std::process::exit(1);
         }
         // R26 (D8/D9): offer the one-time first-launch handoff-skill prompt once
@@ -1273,14 +1286,14 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
     // name-pattern matching. Best-effort + synchronous; `run_selftest` never runs it.
     let reaped = crate::orphan_reaper::reap(&crate::orphan_reaper::ReaperEnv::live());
     if reaped > 0 {
-        eprintln!("nice-rs: reaped {reaped} orphan zsh shell(s) from prior runs");
+        eprintln!("nice: reaped {reaped} orphan zsh shell(s) from prior runs");
     }
     // 2. Write the ZDOTDIR stubs (overwrite-always self-heal). A write failure is
     //    non-fatal: zdotdir stays None and panes still get NICE_SOCKET.
     let zdotdir = match crate::shell_inject::write_stubs(&crate::shell_inject::default_location()) {
         Ok(path) => Some(path.to_string_lossy().into_owned()),
         Err(e) => {
-            eprintln!("nice-rs: ZDOTDIR inject failed: {e} (panes still get NICE_SOCKET)");
+            eprintln!("nice: ZDOTDIR inject failed: {e} (panes still get NICE_SOCKET)");
             None
         }
     };
@@ -1390,7 +1403,7 @@ pub(crate) fn arm_window_control_socket(
     let (tx, rx) = socket_channel();
     if let Err(e) = socket.start(move |msg| tx.post(msg)) {
         eprintln!(
-            "nice-rs: control socket failed to bind: {e:#} (shells fall back to direct claude)"
+            "nice: control socket failed to bind: {e:#} (shells fall back to direct claude)"
         );
     }
 
@@ -1423,13 +1436,13 @@ pub(crate) fn arm_window_control_socket(
 
 /// Open a managed Nice window: mint + seed this window's [`WindowState`], spawn
 /// its Main tab's terminal pane into the [`SessionManager`](crate::session_manager::SessionManager)
-/// (a login shell, or a one-off `NICE_RS_COMMAND`), and mount the R13.5 shell —
+/// (a login shell, or a one-off `NICE_COMMAND`), and mount the R13.5 shell —
 /// the pane strip + floating sidebar card + a pane-content host that follows the
 /// active pane. Used both for the first window ([`run`]) and every ⌘N window
 /// ([`install_new_window_command`]); each is fully isolated.
 ///
 /// The Main pane is spawned **here** with the full shipped spec (command + the
-/// live grid size) so the initial pane keeps its `NICE_RS_COMMAND` / geometry;
+/// live grid size) so the initial pane keeps its `NICE_COMMAND` / geometry;
 /// explicitly-added panes spawn a plain login shell through R13's deferred-spawn
 /// path (`ensure_active_pane_spawned`). The session is owned by the window's
 /// `SessionManager`, so closing the window tears its child process groups down
@@ -1452,7 +1465,7 @@ pub(crate) fn open_managed_window(
 /// [`WindowSeed`](crate::restore::WindowSeed) (L2/L3) and an optional cwd-heal
 /// `projects_root` (L3/C5). `seed = None` is the fresh / ⌘N window (a seeded
 /// Terminals+Main tree, its Main pane eagerly spawned with the shipped spec to
-/// preserve `NICE_RS_COMMAND` + grid size); `seed = Some` rebuilds a saved
+/// preserve `NICE_COMMAND` + grid size); `seed = Some` rebuilds a saved
 /// window ([`WindowState::with_seed`]) whose panes lazy-spawn on activation
 /// (never eagerly — the documented restore divergence that kills the 0×0-pty
 /// hazard), opens it at the restored frame (W6), runs the cwd-heal pass over its
@@ -1525,7 +1538,7 @@ pub(crate) fn open_managed_window_with(
     });
 
     if let Some((tab_id, pane_id)) = main {
-        let spec = match std::env::var("NICE_RS_COMMAND") {
+        let spec = match std::env::var("NICE_COMMAND") {
             // A one-off command pane (the live-smoke path: `ls -la`, colour tests).
             Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd.clone()),
             // The default: an interactive login shell (`zsh -il`).
@@ -1714,7 +1727,7 @@ fn open_selftest_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 const AX_PROBE_ELEMENT_ID: &str = "ax-probe-root";
 /// The target's `aria_label`, surfaced as the node's macOS `AXTitle`: the unique
 /// marker the AX walk matches on.
-const AX_PROBE_LABEL: &str = "nice-rs-ax-probe-root";
+const AX_PROBE_LABEL: &str = "nice-ax-probe-root";
 /// The macOS `AXRole` the target's AccessKit role maps to — accesskit_macos maps
 /// `Role::Group` to `NSAccessibilityGroupRole` (`"AXGroup"`).
 const AX_PROBE_EXPECTED_ROLE: &str = "AXGroup";
@@ -1811,7 +1824,7 @@ async fn run_ax_probe(cx: &mut AsyncApp) -> CadenceReport {
 // matches the token's sRGB value within a per-channel tolerance. This proves the
 // tokens survive the trip through gpui's fill pipeline + Metal compositing, not
 // just unit arithmetic. The pixel read-back is gated behind the app's
-// `selftest` feature (same `render_to_image` path as `NICE_RS_CAPTURE`); without
+// `selftest` feature (same `render_to_image` path as `NICE_CAPTURE`); without
 // it the read-back bails and the scenario FAILs.
 //
 // Contract note: the `Scenario` shape ({ name, open }) and the driver are
@@ -2315,7 +2328,7 @@ fn tr_mean_brightness(slice: &[[u8; 4]]) -> f32 {
 /// and the file path. Each row is positioned absolutely with CUP after a
 /// clear-screen, so any stray shell-init output cannot shift it.
 fn write_term_render_fixture() -> Result<(PathBuf, PathBuf)> {
-    let base = std::env::temp_dir().join(format!("nice-rs-term-render-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-term-render-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let fixture_path = base.join("fixture.bin");
 
@@ -2888,7 +2901,7 @@ const TL_RESIZE_SETTLE_MS: u64 = 350;
 /// Write the layout fixture (the three marker rows) and return its dir (reused as
 /// an empty `ZDOTDIR`) + path. Absolute CUP after a clear, like `term-render`.
 fn write_term_layout_fixture() -> Result<(PathBuf, PathBuf)> {
-    let base = std::env::temp_dir().join(format!("nice-rs-term-layout-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-term-layout-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let fixture_path = base.join("fixture.bin");
 
@@ -3112,7 +3125,7 @@ fn ts_ensure_absent(haystack: &str, needle: &str, ctx: &str) -> Result<()> {
 
 /// Open the `term-scroll` scenario window and spawn its scroll assertions.
 fn open_term_scroll_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let base = std::env::temp_dir().join(format!("nice-rs-term-scroll-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-term-scroll-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
     // Long-lived `cat`, tty echo OFF (see the scenario header).
@@ -3290,7 +3303,7 @@ const TP_CELL_H: f32 = 16.0;
 const TP_P50_LIMIT_MS: f64 = 17.5;
 const TP_P95_LIMIT_MS: f64 = 20.0;
 /// Absolute steady-footprint budget (Validation §5 "memory < 200 MiB"), reported
-/// for the record and validated by the dedicated `NICE_RS_SELFTEST=term-perf`
+/// for the record and validated by the dedicated `NICE_SELFTEST=term-perf`
 /// run (a fresh process — measured 142 MiB).
 const TP_MEM_LIMIT_MIB: f64 = 200.0;
 /// The **gated** memory budget: term-perf's own footprint GROWTH (delta from the
@@ -3345,7 +3358,7 @@ fn perf_window_options() -> WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_background: WindowBackgroundAppearance::Opaque,
         titlebar: Some(TitlebarOptions {
-            title: Some("Nice RS Dev — term-perf".into()),
+            title: Some("Nice — term-perf".into()),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -3363,7 +3376,7 @@ fn open_term_perf_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     // time we measure (Validation §5). Inactive windows are frame-capped ~33 ms.
     let _ = cx.update(|app| app.activate(true));
 
-    let base = std::env::temp_dir().join(format!("nice-rs-term-perf-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-term-perf-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
     // Long-lived `cat` in RAW mode: the synthetic flood carries long newline-free
@@ -3812,7 +3825,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // in-place promotion through the real zsh wrapper exec's the stub with
         // `--settings <ptr> --session-id <uuid>` argv; a session_update /branch +
         // /clear rotate on the shipped sidebar; the theme + pointer files land at the
-        // nice-rs slug; and with the gate flipped OFF a fresh typed promotion is
+        // nice slug; and with the gate flipped OFF a fresh typed promotion is
         // settings-less. Stub-`claude` via NICE_CLAUDE_OVERRIDE + PATH, sandbox HOME,
         // sandbox theme/pointer files (never the real claude / ~/.claude / ~/.nice).
         // Registered BEFORE `multiwindow`: its build_window_root only `register`s (no
@@ -4037,7 +4050,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
     ]
 }
 
-/// Run the `NICE_RS_SELFTEST` harness path inside one `Application::run`.
+/// Run the `NICE_SELFTEST` harness path inside one `Application::run`.
 pub fn run_selftest(selector: String) {
     // Match the shipped app's antialiasing (see `run`): the `term-render`
     // scenario's bg-luminance ENGAGES check depends on the CoreGraphics
@@ -4061,7 +4074,7 @@ pub fn run_selftest(selector: String) {
         // default-path resolution stay in `run`). A scenario that toggles sort
         // writes only this temp file.
         let sort_path = std::env::temp_dir().join(format!(
-            "nice-rs-selftest-ui-settings-{}.json",
+            "nice-selftest-ui-settings-{}.json",
             std::process::id()
         ));
         cx.set_global(
@@ -4073,7 +4086,7 @@ pub fn run_selftest(selector: String) {
         // scenario so a scenario's `install_shortcuts` seeds the font entities from
         // defaults, and a Font-pane slider change writes only this temp file.
         let prefs_path = std::env::temp_dir().join(format!(
-            "nice-rs-selftest-settings-prefs-{}.json",
+            "nice-selftest-settings-prefs-{}.json",
             std::process::id()
         ));
         cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::with_defaults(
@@ -4084,7 +4097,7 @@ pub fn run_selftest(selector: String) {
         // default-path resolution stay in `run`). A scenario that rebinds a shortcut
         // writes only this temp file; a fresh scenario reads all 13 defaults.
         let shortcuts_path = std::env::temp_dir().join(format!(
-            "nice-rs-selftest-shortcuts-{}.json",
+            "nice-selftest-shortcuts-{}.json",
             std::process::id()
         ));
         cx.set_global(crate::shortcuts_store::ShortcutBindings::with_defaults(
@@ -4097,14 +4110,14 @@ pub fn run_selftest(selector: String) {
         // Nice/Dark + Terracotta fallback unless one opts into live theming by
         // minting the entity itself (slice 3's `theme-fanout`).
         let theme_path = std::env::temp_dir().join(format!(
-            "nice-rs-selftest-theme-settings-{}.json",
+            "nice-selftest-theme-settings-{}.json",
             std::process::id()
         ));
         // R22: a throwaway temp terminal-themes dir — never the real
         // `terminal-themes/`. `TerminalThemeCatalog::new` enumerates it read-only
         // (it does not exist ⇒ empty imports), so there is no launch-time write.
         let terminal_themes_dir = std::env::temp_dir().join(format!(
-            "nice-rs-selftest-terminal-themes-{}",
+            "nice-selftest-terminal-themes-{}",
             std::process::id()
         ));
         crate::theme_settings::install_selftest_theme_defaults(
@@ -4123,7 +4136,7 @@ pub fn run_selftest(selector: String) {
         // worker (no launch-time network — the worker is `run`-only + gated).
         crate::release_check::release_fetch::install_recording_fake(cx);
         let update_check_path = std::env::temp_dir().join(format!(
-            "nice-rs-selftest-update-check-{}.json",
+            "nice-selftest-update-check-{}.json",
             std::process::id()
         ));
         cx.set_global(crate::release_check::UpdateCheckStore::with_defaults(

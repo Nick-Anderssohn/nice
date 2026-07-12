@@ -5,7 +5,7 @@
 //! prove — the **drag differential with pills present** — against real NSWindow
 //! frame reads, driving the synthetic halves with **real CGEvents**.
 //!
-//! It posts real CGEvents (mouse down / drag / up / click) to nice-rs's OWN pid
+//! It posts real CGEvents (mouse down / drag / up / click) to nice's OWN pid
 //! (`crate::platform`, `CGEventPostToPid` — never the global HID tap), so it
 //! preflights the Accessibility grant and FAILs loudly if it is missing. What it
 //! asserts:

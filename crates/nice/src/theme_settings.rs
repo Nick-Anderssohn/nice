@@ -393,7 +393,7 @@ impl ThemeSettingsStore {
 
 /// Resolve the theme store's `ui_settings.json` path — the **same** shared file
 /// as R19's sort store ([`crate::file_browser::sort_settings_store::default_ui_settings_path`]),
-/// so `<support-root>/Nice RS Dev/ui_settings.json` with `<support-root>` from
+/// so `<support-root>/<variant>/ui_settings.json` with `<support-root>` from
 /// `NICE_APPLICATION_SUPPORT_ROOT` when set else `~/Library/Application Support`.
 /// Called from `app::run` ONLY — never a test or `run_selftest` (hermeticity).
 pub fn default_theme_settings_path() -> PathBuf {
@@ -717,7 +717,7 @@ fn commit_appearance(cx: &mut App, appearance: Appearance) {
     let changed = match cx.global_mut::<ThemeSettingsStore>().set(appearance) {
         Ok(changed) => changed,
         Err(e) => {
-            eprintln!("nice-rs: theme store persist failed: {e}");
+            eprintln!("nice: theme store persist failed: {e}");
             // Persist failed but the in-memory selection changed — still fan out so
             // the UI reflects the pick (matches the fail-soft store discipline).
             true
@@ -1035,7 +1035,7 @@ mod tests {
         use crate::terminal_theme_catalog::TerminalThemeCatalog;
         // A hermetic catalog over a throwaway temp dir (no imports).
         let catalog = TerminalThemeCatalog::new(std::env::temp_dir().join(format!(
-            "nice-rs-theme-settings-catalog-{}",
+            "nice-theme-settings-catalog-{}",
             std::process::id()
         )));
 

@@ -35,7 +35,7 @@
 //! frames-per-second, frame-pacing percentiles, or wall-clock latency — the A/B
 //! program proved simulated/self-reported evidence is untrustworthy on exactly
 //! that class of claim. Cadence / perf / latency gates live **only** in the live
-//! `NICE_RS_SELFTEST` suite (real windowserver, real CVDisplayLink). A
+//! `NICE_SELFTEST` suite (real windowserver, real CVDisplayLink). A
 //! cadence/perf assertion in an in-process test is a blocking review finding.
 //!
 //! ## Module map

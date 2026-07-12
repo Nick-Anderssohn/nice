@@ -28,7 +28,7 @@
 //! a change, re-renders (a fresh read heals the row set — reload-on-render).
 //!
 //! The files-mode root carries `.id()` + `role(Group)` +
-//! `aria_label("nice-rs-file-browser-root")` — the shipped-surface AX anchor the
+//! `aria_label("nice-file-browser-root")` — the shipped-surface AX anchor the
 //! `file-browser` scenario walks for (`app_shell.rs:68` convention).
 
 use std::cell::Cell;
@@ -74,7 +74,7 @@ use crate::window_state::WindowState;
 
 /// The shipped-surface AX anchor label for the files-mode root (the `ax-probe` /
 /// `app-shell` convention — role + label only, no title).
-pub(crate) const FILE_BROWSER_ROOT_LABEL: &str = "nice-rs-file-browser-root";
+pub(crate) const FILE_BROWSER_ROOT_LABEL: &str = "nice-file-browser-root";
 
 // -- geometry (Swift parity) --------------------------------------------------
 

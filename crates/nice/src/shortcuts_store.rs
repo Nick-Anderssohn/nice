@@ -204,7 +204,7 @@ impl ShortcutBindings {
         }
         self.map.insert(action, combo);
         if let Err(e) = self.persist() {
-            eprintln!("nice-rs: shortcut binding persist failed: {e}");
+            eprintln!("nice: shortcut binding persist failed: {e}");
         }
         true
     }
@@ -231,7 +231,7 @@ impl ShortcutBindings {
 }
 
 /// Resolve the shortcut store's `ui_settings.json` path — the **same** shared file
-/// as R19's sort store / R21's theme store, so `<support-root>/Nice RS Dev/ui_settings.json`
+/// as R19's sort store / R21's theme store, so `<support-root>/<variant>/ui_settings.json`
 /// with `<support-root>` from `NICE_APPLICATION_SUPPORT_ROOT` when set else
 /// `~/Library/Application Support`. Called from `app::run` ONLY — never a test or
 /// `run_selftest` (hermeticity).

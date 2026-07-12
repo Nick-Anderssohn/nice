@@ -35,7 +35,7 @@ use nice_term_core::{ExitStatus, PtyProcess, SpawnSpec};
 fn zdotdir() -> &'static str {
     static DIR: OnceLock<String> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("nice-rs-zdotdir-pty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nice-zdotdir-pty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create ZDOTDIR");
         for rc in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
             std::fs::write(dir.join(rc), "").expect("write empty rc");
@@ -106,7 +106,7 @@ fn injected_env_is_visible_to_wrapped_command() {
     // A caller-injected env pair must reach the wrapped command. The command is
     // single-quoted for zsh so `$NICE_TEST_VAR` is expanded by the inner sh
     // (which inherits the pair through the exec), not by zsh.
-    let value = format!("NICE_RS_ENVOK_{}", std::process::id());
+    let value = format!("NICE_ENVOK_{}", std::process::id());
     let mut env = test_env();
     env.push(("NICE_TEST_VAR".to_string(), value.clone()));
     let spec = SpawnSpec::command("sh -c 'echo $NICE_TEST_VAR'", "/tmp").with_env(env);

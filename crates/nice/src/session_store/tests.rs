@@ -99,13 +99,13 @@ fn recorder_store(delay: Duration) -> (SessionStore, Arc<Mutex<Vec<WriteRecord>>
     // the store's path only; the OS temp dir is reaped on process exit even if
     // Drop doesn't run for a leaked handle.
     std::mem::forget(dir);
-    let store = SessionStore::open_with(path, None, Box::new(io), DEBOUNCE);
+    let store = SessionStore::open_with(path, Box::new(io), DEBOUNCE);
     (store, writes, rx)
 }
 
 /// A production-shaped store (DiskIo) at `path`.
 fn disk_store(path: &Path) -> SessionStore {
-    SessionStore::open_with(path.to_path_buf(), None, Box::new(DiskIo), DEBOUNCE)
+    SessionStore::open_with(path.to_path_buf(), Box::new(DiskIo), DEBOUNCE)
 }
 
 // ---- window/tab builders (mirror the Swift helpers) --------------------
@@ -717,7 +717,7 @@ fn flush_failure_leaves_prior_file_untouched_and_does_not_panic() {
     let dir = scratch("nice-store-writefail");
     // The store's own dir — the atomic-write temp file is created here, so
     // locking it blocks the write.
-    let nice_dir = dir.0.join(STORE_FOLDER);
+    let nice_dir = dir.0.join(store_folder());
     fs::create_dir_all(&nice_dir).unwrap();
     let path = nice_dir.join("sessions.json");
 
@@ -809,75 +809,17 @@ fn late_upsert_after_flush_does_not_resurrect_stale_state() {
     );
 }
 
-// MARK: - migration (NEW — no Swift twin)
+// MARK: - open on absent own file
 
 #[test]
-fn migration_adopts_swift_file_drops_branch_writes_own_leaves_source_untouched() {
-    let dir = scratch("nice-store-migrate");
-    let swift_dir = dir.0.join(SWIFT_STORE_FOLDER);
-    fs::create_dir_all(&swift_dir).unwrap();
-    let swift_path = swift_dir.join("sessions.json");
-    // A Swift-shaped v3 file, WITH `branch` fields (which our schema drops).
-    let swift_json = r#"{
-        "version": 3,
-        "windows": [{
-            "id": "swift-w1",
-            "activeTabId": "t1",
-            "sidebarCollapsed": true,
-            "projects": [{
-                "id": "nice", "name": "Nice", "path": "/Users/nick/Projects/nice",
-                "tabs": [{
-                    "id": "t1", "title": "Ship", "cwd": "/Users/nick/Projects/nice",
-                    "branch": "feature/x", "claudeSessionId": "sid-42",
-                    "activePaneId": "p1", "titleManuallySet": true,
-                    "panes": [{"id": "p1", "title": "Claude", "kind": "claude", "cwd": "/Users/nick/Projects/nice"}]
-                }]
-            }]
-        }]
-    }"#;
-    fs::write(&swift_path, swift_json).unwrap();
-    let swift_before = fs::read(&swift_path).unwrap();
-
-    let own_path = dir.0.join(STORE_FOLDER).join("sessions.json");
-    assert!(!own_path.exists(), "precondition: own store absent → migration runs");
-
-    let migrated_windows = {
-        let store = SessionStore::open(own_path.clone(), Some(swift_path.clone()));
-        let windows = store.load().windows;
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].id, "swift-w1");
-        assert!(windows[0].sidebar_collapsed);
-        let tab = &windows[0].projects[0].tabs[0];
-        assert_eq!(tab.claude_session_id.as_deref(), Some("sid-42"), "lossless adopt");
-        assert_eq!(tab.title_manually_set, Some(true));
-        assert!(own_path.exists(), "migration must write the OWN store");
-        windows
-    };
-
-    // A fresh store (own present, no source) reads its own file — same content.
-    {
-        let fresh = SessionStore::open(own_path.clone(), None);
-        assert_eq!(fresh.load().windows, migrated_windows);
-    }
-
-    // The Swift source bytes are untouched.
-    assert_eq!(
-        fs::read(&swift_path).unwrap(),
-        swift_before,
-        "migration must NEVER write the Swift source path"
-    );
-}
-
-#[test]
-fn migration_absent_source_and_own_yields_empty_no_file() {
-    let dir = scratch("nice-store-migrate-absent");
-    let own_path = dir.0.join(STORE_FOLDER).join("sessions.json");
-    let swift_path = dir.0.join(SWIFT_STORE_FOLDER).join("sessions.json");
-    let store = SessionStore::open(own_path.clone(), Some(swift_path));
+fn open_absent_own_yields_empty_no_file() {
+    let dir = scratch("nice-store-open-absent");
+    let own_path = dir.0.join(store_folder()).join("sessions.json");
+    let store = SessionStore::open(own_path.clone());
     assert!(store.load().windows.is_empty());
     assert!(
         !own_path.exists(),
-        "no source + no own ⇒ empty state, and no own file is written"
+        "absent own ⇒ empty state, and no own file is written"
     );
 }
 

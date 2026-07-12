@@ -2207,7 +2207,7 @@ pub(crate) fn handoff_title(originating_title: Option<&str>) -> String {
 /// Build the initial prompt seeded into a handoff session — pure port of Swift
 /// `handoffPrompt` (`SessionsModel.swift:1194-1200`). Always points Claude at the
 /// notes file; the continuation is the skill's custom `instructions` when
-/// non-blank (direct `/nice-handoff-rs <args>` invocations), else a default
+/// non-blank (direct `/nice-handoff <args>` invocations), else a default
 /// read-and-wait directive (a no-arg / model-triggered handoff must NOT
 /// auto-resume — it lands the fresh session read-and-await so the user stays in
 /// control). The default's em-dash `—` is load-bearing (byte parity with Swift).

@@ -43,7 +43,7 @@
 //! The R25 drag and the R27 pill click post through the NEW guarded global-HID
 //! seams ([`platform::post_global_left_click`] / [`platform::post_global_left_drag`])
 //! — NOT `CGEventPostToPid` — because pid-posted mouse events silently drop (hover
-//! paints, `mouseDown` never fires — the M6 record, MEMORY: nice-rs synthetic
+//! paints, `mouseDown` never fires — the M6 record, MEMORY: nice synthetic
 //! mouse). Every global post is fenced by the mandatory preflight: (1) **activate
 //! the app + raise the window**, then (2) **verify frontmost-at-point** — the
 //! shipped window MUST own the click coordinate per
@@ -51,7 +51,7 @@
 //! check). Only then does the post proceed and the leg HARD-ASSERTS the outcome; a
 //! failed preflight (another window on top / the point off ours) **DEFERS LOUDLY**
 //! — an explicit `DEFER` with remediation, no post — so an unattended
-//! `NICE_RS_SELFTEST=all` run can never send clicks into another app. A synthetic
+//! `NICE_SELFTEST=all` run can never send clicks into another app. A synthetic
 //! gesture that passes the preflight yet does not drive the real behaviour also
 //! DEFERS (the `pane_strip_live` honest-deferral discipline: a synthetic mouse
 //! event need not land on a gpui hitbox). This covers two shapes for the R25 drag:
@@ -62,7 +62,7 @@
 //! hard-asserted in-process by `nice-itests`, and the leg never reads a vacuous
 //! "order unchanged" as a pass — it DEFERS, and still hard-FAILS a reorder that
 //! commits to the wrong slot. Keyboard events (⌘,) stay `CGEventPostToPid` to
-//! nice-rs's own pid.
+//! nice's own pid.
 //!
 //! ## Hermeticity
 //!
@@ -164,7 +164,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-t6-comp-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-t6-comp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).context("create fixture base")?;
         let base = base.canonicalize().context("canonicalize fixture base")?;
@@ -731,7 +731,7 @@ async fn guarded_preflight(
         return PreflightOutcome::Deferred(format!(
             "the frontmost-at-point preflight FAILED — our window does not own the point \
              ({gx:.0},{gy:.0}) per CGWindowListCopyWindowInfo (another window is on top, or the \
-             point is off our window). DEFERRED LOUDLY; NO global post was made. Bring the nice-rs \
+             point is off our window). DEFERRED LOUDLY; NO global post was made. Bring the nice \
              window frontmost and re-run for the real assertion."
         ));
     }

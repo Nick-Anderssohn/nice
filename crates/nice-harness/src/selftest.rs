@@ -1,12 +1,12 @@
 //! Self-test driver + suite runner — the standing UI regression gate.
 //!
 //! Contract (see the plan's Exported contracts):
-//!   * `NICE_RS_SELFTEST=<scenario>` runs one named scenario, prints exactly
+//!   * `NICE_SELFTEST=<scenario>` runs one named scenario, prints exactly
 //!     `SELFTEST PASS <scenario>` and exits 0 on success, or `SELFTEST FAIL
 //!     <scenario>` + nonzero on failure.
-//!   * `NICE_RS_SELFTEST=all` runs every registered scenario sequentially,
+//!   * `NICE_SELFTEST=all` runs every registered scenario sequentially,
 //!     prints a PASS/FAIL table, and exits nonzero if any scenario fails.
-//!   * `NICE_RS_CAPTURE=<path>` additionally writes a PNG of each scenario's
+//!   * `NICE_CAPTURE=<path>` additionally writes a PNG of each scenario's
 //!     window (requires the app's `selftest` feature — see [`crate::capture`]).
 //!
 //! Scenarios are supplied by the app crate (which owns the concrete gpui views)
@@ -33,7 +33,7 @@ use crate::{frame, watchdog};
 
 /// A registered self-test scenario.
 pub struct Scenario {
-    /// Unique selector name (`NICE_RS_SELFTEST=<name>`).
+    /// Unique selector name (`NICE_SELFTEST=<name>`).
     pub name: &'static str,
     /// Open the scenario's window. The returned view must call
     /// [`crate::frame::stamp`] once per render and drive continuous repaint
@@ -103,7 +103,7 @@ fn take_gate_report() -> Option<CadenceReport> {
 /// irregular; see `frame` module docs).
 const WARMUP_SECS: f64 = 0.5;
 /// Default per-scenario measurement window (override with
-/// `NICE_RS_SELFTEST_SECS`).
+/// `NICE_SELFTEST_SECS`).
 const DEFAULT_MEASURE_SECS: f64 = 2.5;
 /// Minimum frames a scenario must sustain in the measurement window, else it
 /// never really animated.
@@ -144,8 +144,8 @@ pub fn drive(cx: &mut App, selector: &str, scenarios: Vec<Scenario>) {
         }
     };
 
-    let measure_secs = env_secs("NICE_RS_SELFTEST_SECS", DEFAULT_MEASURE_SECS);
-    let capture_path = std::env::var("NICE_RS_CAPTURE")
+    let measure_secs = env_secs("NICE_SELFTEST_SECS", DEFAULT_MEASURE_SECS);
+    let capture_path = std::env::var("NICE_CAPTURE")
         .ok()
         .filter(|s| !s.is_empty());
 
@@ -182,7 +182,7 @@ pub fn drive(cx: &mut App, selector: &str, scenarios: Vec<Scenario>) {
     let selector_for_watchdog = selector.to_string();
     watchdog::arm(
         budget,
-        "nice-rs selftest",
+        "nice selftest",
         move || {
             eprintln!(
                 "SELFTEST FAIL {selector_for_watchdog}: watchdog fired — the run wedged \
@@ -405,14 +405,14 @@ mod tests {
 
     #[test]
     fn env_secs_unset_uses_default() {
-        let key = "NICE_RS_TEST_ENV_SECS_UNSET";
+        let key = "NICE_TEST_ENV_SECS_UNSET";
         std::env::remove_var(key);
         assert_eq!(env_secs(key, 2.5), 2.5);
     }
 
     #[test]
     fn env_secs_valid_positive_is_parsed() {
-        let key = "NICE_RS_TEST_ENV_SECS_VALID";
+        let key = "NICE_TEST_ENV_SECS_VALID";
         std::env::set_var(key, "3.5");
         assert_eq!(env_secs(key, 2.5), 3.5);
         std::env::remove_var(key);
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn env_secs_unparseable_falls_back_to_default() {
-        let key = "NICE_RS_TEST_ENV_SECS_JUNK";
+        let key = "NICE_TEST_ENV_SECS_JUNK";
         std::env::set_var(key, "not-a-number");
         assert_eq!(env_secs(key, 2.5), 2.5);
         std::env::remove_var(key);
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn env_secs_zero_falls_back_to_default() {
-        let key = "NICE_RS_TEST_ENV_SECS_ZERO";
+        let key = "NICE_TEST_ENV_SECS_ZERO";
         std::env::set_var(key, "0");
         assert_eq!(env_secs(key, 2.5), 2.5);
         std::env::remove_var(key);
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn env_secs_negative_falls_back_to_default() {
-        let key = "NICE_RS_TEST_ENV_SECS_NEG";
+        let key = "NICE_TEST_ENV_SECS_NEG";
         std::env::set_var(key, "-1.0");
         assert_eq!(env_secs(key, 2.5), 2.5);
         std::env::remove_var(key);

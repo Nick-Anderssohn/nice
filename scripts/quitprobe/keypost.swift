@@ -1,6 +1,6 @@
 // keypost <keycode> [cmd] [pid] — posts keyDown+keyUp as real CGEvents.
 // With a trailing pid, posts via CGEventPostToPid to that process (the standing
-// rule for driving nice-rs — see the tranche testNotes); without one, posts
+// rule for driving Nice Dev — see the tranche testNotes); without one, posts
 // globally via the HID tap. Global posting is environment-fragile: an ACTIVE
 // third-party event tap (e.g. Wispr Flow's dictation tap, 2026-07-07) can
 // consume specific synthetic keys (Escape) system-wide while physical presses

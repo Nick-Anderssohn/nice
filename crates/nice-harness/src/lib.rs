@@ -6,14 +6,14 @@
 //! - [`clock`]     — monotonic mach clock (frame stamps, measurement timing).
 //! - [`mem`]       — `task_info(TASK_VM_INFO)` phys_footprint + RSS sampler.
 //! - [`signpost`]  — os_signpost emission on subsystem
-//!                   `dev.nickanderssohn.nice-rs` (C shim in `signpost.c`).
+//!                   `dev.nickanderssohn.nice` (C shim in `signpost.c`).
 //! - [`frame`]     — frame-stamp stream, percentile reducer, cadence gate.
 //! - [`workload`]  — deterministic synthetic "Claude-streaming" stressor (the
 //!                   `term-perf` gate's renderer workload; ported from the spike).
 //! - [`watchdog`]  — App-Nap-immune OS-thread deadline (guaranteed auto-exit).
 //! - [`capture`]   — screenshot via `Window::render_to_image()` (feature
 //!                   `capture` only; enables gpui `test-support`).
-//! - [`selftest`]  — the `NICE_RS_SELFTEST` driver + `all` suite runner, and
+//! - [`selftest`]  — the `NICE_SELFTEST` driver + `all` suite runner, and
 //!                   the [`selftest::Scenario`] registry later cycles extend.
 //!
 //! Layering rule for the rewrite: crates mirroring today's pure-Swift model

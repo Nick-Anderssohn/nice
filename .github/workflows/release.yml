@@ -1,5 +1,12 @@
 name: release
 
+# Production release for Nice (the Rust build, "Nice.app").
+# Tag vX.Y.Z → signed/notarized/stapled zip → GitHub RELEASE (non-prerelease,
+# so it appears at /releases/latest and the in-app update checker offers it) →
+# bump PR for the prod Casks/nice.rb in homebrew-nice, so `brew upgrade nice`
+# delivers it. (GitHub runs the workflow file AS IT EXISTS AT THE TAGGED COMMIT,
+# so tagging a rust-rewrite commit `vX.Y.Z` uses this file without a main merge.)
+
 on:
   push:
     tags:
@@ -7,26 +14,36 @@ on:
 
 jobs:
   release:
-    # Pinned to macos-26 so we can use Xcode 26, which matches local dev.
-    # Swift 6.0 (Xcode 16.2 on macos-14) flags several strict-concurrency
-    # patterns that Swift 6.3 (Xcode 26) has relaxed, so older images fail
-    # this repo's Release archive.
+    # macos-26 matches the Swift release job; codesign/notarytool ship with
+    # the image's Xcode.
     runs-on: macos-26
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: "26.4"
-
-      - name: Install xcodegen
-        run: brew install xcodegen
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Extract version from tag
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # The zed mirror is ~1–2 GB; cache it keyed on the pin so only the
+      # first run after a pin change pays the bare clone.
+      - name: Read zed pin
+        id: zedpin
+        run: echo "pin=$(awk -F'"' '/^ZED_PIN=/{print $2}' scripts/vendor-zed.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache zed mirror
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/nice/zed-mirror.git
+          key: zed-mirror-${{ steps.zedpin.outputs.pin }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-rs
 
       - name: Import Developer ID signing certificate
         uses: apple-actions/import-codesign-certs@v3
@@ -36,7 +53,7 @@ jobs:
 
       - name: Build, sign, notarize, staple
         id: release
-        run: scripts/release.sh --version "${{ steps.version.outputs.version }}"
+        run: scripts/release-rs.sh --version "${{ steps.version.outputs.version }}"
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
@@ -47,6 +64,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.release.outputs.zip }}
+          prerelease: false
           generate_release_notes: true
           fail_on_unmatched_files: true
 

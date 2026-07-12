@@ -502,7 +502,7 @@ mod named_pasteboard_integration_tests {
         fn new() -> Self {
             static N: AtomicU64 = AtomicU64::new(0);
             let name = format!(
-                "nice-rs-test-{}-{}",
+                "nice-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             );
@@ -536,7 +536,7 @@ mod named_pasteboard_integration_tests {
         objc2::rc::autoreleasepool(|_| {
             let named = NamedPasteboard::new();
             let mut a = named.adapter();
-            let url = tmp("nice-rs-pb-copy.txt");
+            let url = tmp("nice-pb-copy.txt");
             a.write(&[url.clone()], Intent::Copy);
             let read = a.read().expect("file URLs round-trip through the named pasteboard");
             assert_eq!(read.urls, vec![url]);
@@ -552,7 +552,7 @@ mod named_pasteboard_integration_tests {
         objc2::rc::autoreleasepool(|_| {
             let named = NamedPasteboard::new();
             let mut a = named.adapter();
-            let url = tmp("nice-rs-pb-cut.txt");
+            let url = tmp("nice-pb-cut.txt");
             a.write(&[url.clone()], Intent::Cut);
             let read = a.read().expect("file URLs round-trip");
             assert_eq!(read.urls, vec![url.clone()]);
@@ -568,7 +568,7 @@ mod named_pasteboard_integration_tests {
         objc2::rc::autoreleasepool(|_| {
             let named = NamedPasteboard::new();
             let mut a = named.adapter();
-            let urls = vec![tmp("nice-rs-pb-a.txt"), tmp("nice-rs-pb-b.txt")];
+            let urls = vec![tmp("nice-pb-a.txt"), tmp("nice-pb-b.txt")];
             a.write(&urls, Intent::Copy);
             assert_eq!(a.read().expect("round-trip").urls, urls);
             named.release();
@@ -582,10 +582,10 @@ mod named_pasteboard_integration_tests {
         objc2::rc::autoreleasepool(|_| {
             let named = NamedPasteboard::new();
             let mut a = named.adapter();
-            a.write(&[tmp("nice-rs-pb-cut.txt")], Intent::Cut);
+            a.write(&[tmp("nice-pb-cut.txt")], Intent::Cut);
             // Simulate another writer bumping the SAME real pasteboard.
             let other = unsafe { crate::platform::PasteboardRef::named(&named.name) };
-            other.write_file_urls(&[tmp("nice-rs-pb-other.txt")]);
+            other.write_file_urls(&[tmp("nice-pb-other.txt")]);
             let read = a.read().expect("round-trip");
             assert_eq!(
                 read.intent,
@@ -603,7 +603,7 @@ mod named_pasteboard_integration_tests {
         objc2::rc::autoreleasepool(|_| {
             let named = NamedPasteboard::new();
             let mut a = named.adapter();
-            let url = tmp("nice-rs-pb-cut.txt");
+            let url = tmp("nice-pb-cut.txt");
             a.write(&[url.clone()], Intent::Cut);
             assert!(a.is_cut(&url));
             a.write_text("/tmp/a.txt\n/tmp/b.txt");

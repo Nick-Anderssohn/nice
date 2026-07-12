@@ -1,5 +1,5 @@
 # nice — the Nice rewrite's GPUI application crate. Binary/process name
-# `nice-rs` (deliberately distinct from the Swift `Nice` / `Nice Dev` builds).
+# `nice` (deliberately distinct from the Swift `Nice` / `Nice Dev` builds).
 #
 # Path-dep wiring mirrors the phase-0 spike
 # (spikes/phase0-poc/aa-gamma/gpui-term-main/Cargo.toml): gpui plus its macOS
@@ -8,12 +8,12 @@
 # `scripts/vendor-zed.sh` (run that before the first build).
 [package]
 name = "nice"
-version = "0.1.4"
+version = "0.31.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "nice-rs"
+name = "nice"
 path = "src/main.rs"
 
 [dependencies]

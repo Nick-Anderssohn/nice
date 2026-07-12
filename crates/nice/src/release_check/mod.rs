@@ -24,7 +24,8 @@
 //!
 //! ## Hermeticity
 //! The worker [`start`]s only from `app::run` and only when
-//! [`LAUNCH_CHECK_ENABLED`] (D6: false for the dev build). `run_selftest` installs
+//! [`LAUNCH_CHECK_ENABLED`] (now on — the Rust build ships as the real release).
+//! `run_selftest` installs
 //! the recording fetcher + a `with_defaults` temp cache store and NEVER starts the
 //! worker; a scenario drives [`check_now`] explicitly against the fake. No
 //! launch-time network, no launch-time real-file write.
@@ -61,15 +62,15 @@ pub const REPO_SLUG: &str = "Nick-Anderssohn/nice";
 #[allow(dead_code)]
 pub const CASK_NAME: &str = "nice";
 
-/// Whether the periodic launch check runs. **Gated OFF for the not-yet-released
-/// Rust dev build (D6):** `Nice RS Dev.app` ships at crate version `0.1.0` with no
-/// published GitHub release or cask of its own, so comparing `0.1.0` against Swift
-/// Nice's `vX.Y.Z` tags would light the pill spuriously on every launch. The
-/// feature stays fully built, wired, and tested; a scenario exercises the pill via
-/// the injected seam (never the launch timer). When the Rust app ships as a real
-/// release with its own cask + tags aligned to `CARGO_PKG_VERSION`, flip this to
-/// `true` and repoint [`REPO_SLUG`] / [`CASK_NAME`] with no logic change.
-pub const LAUNCH_CHECK_ENABLED: bool = false;
+/// Whether the periodic launch check runs. **ON:** the Rust build now ships as
+/// the real `Nice` release — crate version `0.31.0` (above the Swift line's
+/// `0.30.x`), published as a non-prerelease under `v*` tags on [`REPO_SLUG`] with
+/// the [`CASK_NAME`] cask, `CFBundleShortVersionString` aligned to
+/// `CARGO_PKG_VERSION`. So the launch check compares the installed version against
+/// `/releases/latest` and lights the pill on a genuine upgrade (an existing Swift
+/// `0.30.x` user sees the first `0.31.0` Rust release as newer). The feature is
+/// exercised in tests via the injected seam, independent of this gate.
+pub const LAUNCH_CHECK_ENABLED: bool = true;
 
 /// Delay before the first check after [`start`] — keeps launch quiet (parity,
 /// `ReleaseChecker.swift:46`).
@@ -386,7 +387,8 @@ mod tests {
             // Seed the cache with a known-newer tag, then install a checker seeded
             // from it (the frame-1 path) — the flag lights immediately.
             let mut seed = UpdateCheckStore::with_defaults(path.clone());
-            seed.set_last_known_latest("v0.2.0").unwrap();
+            // A tag clearly newer than the crate version (robust to version bumps).
+            seed.set_last_known_latest("v9.9.9").unwrap();
             let bytes_before = std::fs::read(&path).unwrap();
 
             let fake = release_fetch::install_recording_fake(app);
@@ -402,7 +404,7 @@ mod tests {
 
             // The fetch failed; the cached state must not be wiped.
             assert!(checker(app).update_available());
-            assert_eq!(checker(app).latest_version(), Some("v0.2.0"));
+            assert_eq!(checker(app).latest_version(), Some("v9.9.9"));
             // And no new cache write happened (bytes identical).
             let bytes_after = std::fs::read(&path).unwrap();
             assert_eq!(bytes_before, bytes_after, "an error must not rewrite the cache");

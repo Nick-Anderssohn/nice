@@ -116,7 +116,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-shell-socket-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-shell-socket-{}", std::process::id()));
         std::fs::create_dir_all(&base).context("create fixture base")?;
         // Canonicalize so /var/folders (a symlink to /private/var/folders on macOS)
         // resolves — a spawned shell's getcwd()-derived $PWD is the physical path,

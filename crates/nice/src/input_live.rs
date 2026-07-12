@@ -1,5 +1,5 @@
 //! `input-live` / `input-shell` self-test scenarios — the R5 live input path
-//! driven by **real CGEvents** posted to nice-rs's own pid (`crate::platform`),
+//! driven by **real CGEvents** posted to nice's own pid (`crate::platform`),
 //! asserting byte-exact pty receipt through the whole edge (CGEvent → AppKit →
 //! gpui → `TerminalView` → encoder / IME → pty).
 //!
@@ -115,7 +115,7 @@ impl Render for InputTermView {
 /// Create the per-scenario temp dir (reused as an empty `ZDOTDIR` so no user rc
 /// pollutes a real-shell grid) and return it.
 fn prepare_dir(tag: &str) -> Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!("nice-rs-{tag}-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     Ok(base)
 }

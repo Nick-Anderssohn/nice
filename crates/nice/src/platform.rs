@@ -78,7 +78,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 /// the dilation, leaving the bg-luminance curve as the sole antialiasing shaping.
 ///
 /// This writes the `AppleFontSmoothing` key into this app's own preferences
-/// domain (`nice-rs`), exactly the domain + API gpui_macos's reader uses
+/// domain (`nice`), exactly the domain + API gpui_macos's reader uses
 /// (`CFPreferencesCopyAppValue(_, kCFPreferencesCurrentApplication)`), so the
 /// same-process read sees it. Mirrors the phase-0 aa-gamma spike's
 /// `set_apple_font_smoothing(false)`. Call once, before `Application::run`.
@@ -112,7 +112,7 @@ pub fn disable_font_smoothing() {
 /// not a valid boolean.
 ///
 /// R17's Claude theme-sync gate (`syncClaudeTheme`, default ON) is read through
-/// this once at bootstrap, so `defaults write dev.nickanderssohn.nice-rs
+/// this once at bootstrap, so `defaults write dev.nickanderssohn.nice
 /// syncClaudeTheme -bool false` is the dev-time escape hatch until R23 binds a
 /// Settings toggle to the same key (the `disable_font_smoothing` own-domain FFI
 /// precedent, in the read direction). Call on the main thread before the first
@@ -188,7 +188,7 @@ pub fn read_own_bool_pref(key: &str) -> Option<bool> {
 ///
 /// R23's Settings "Sync Claude Code theme" toggle persists through this to the
 /// `syncClaudeTheme` key R17 reads at boot (D4) — the single source of truth,
-/// keeping the `defaults write dev.nickanderssohn.nice-rs syncClaudeTheme` dev
+/// keeping the `defaults write dev.nickanderssohn.nice syncClaudeTheme` dev
 /// hatch valid. **Hermeticity:** this touches the REAL CFPrefs domain, so it is
 /// reachable ONLY from the live toggle handler in `app::run`-installed UI — never
 /// from `run_selftest` or a test (the scenario drives the toggle's LIVE arm via
@@ -219,22 +219,29 @@ pub fn write_bool_pref(key: &str, value: bool) {
 }
 
 // ===========================================================================
-// Settings-import — prod Swift Nice CFPreferences reader.
+// Settings-import — prod `Nice` CFPreferences reader.
 //
 // The first-launch settings import (plan: settings-import-from-prod) reads the
-// user's prod Swift `Nice` UserDefaults so a fresh Rust install comes up looking
-// like their prod instance. Those values live in a DIFFERENT CFPreferences
-// domain from this app's own (`nice-rs`) — prod's bundle id
-// `dev.nickanderssohn.nice` — so the own-domain `read_bool_pref` above cannot
-// reach them. These helpers read arbitrary typed values out of a NAMED domain
-// via `CFPreferencesCopyAppValue(key, applicationID)`, the read half of the same
-// CFPreferences API `disable_font_smoothing` / `read_bool_pref` use.
+// user's prod `Nice` UserDefaults (domain `dev.nickanderssohn.nice`, written by
+// the retired Swift build a user is upgrading from) so a fresh install comes up
+// looking like their prod instance. These helpers read arbitrary typed values
+// out of a NAMED domain via `CFPreferencesCopyAppValue(key, applicationID)` — the
+// read half of the same CFPreferences API `disable_font_smoothing` /
+// `read_bool_pref` use — so the reader works regardless of this build's OWN
+// domain:
+//   * the DEV build's own domain is `dev.nickanderssohn.nice-dev`, distinct from
+//     the prod domain, so it genuinely imports cross-domain;
+//   * the PROD build's own domain now IS `dev.nickanderssohn.nice` (it replaced
+//     the Swift `Nice`), so the three CFPref toggles are read straight from that
+//     shared domain and the toggle-copy step below is a benign no-op (present in
+//     prod ⇒ present in own ⇒ nothing to copy). The direct `ui_settings.json`
+//     import still runs, its gate being the Rust-only file, never a domain.
 //
 // HERMETICITY: the domain is a parameter, and [`prod_settings_domain`] resolves
 // the effective one from the `NICE_PROD_SETTINGS_DOMAIN` env var (falling back to
 // the real prod bundle id). That env override is the single seam every
 // settings-import test — unit and black-box — uses to point the reader at a
-// SCRATCH domain, so no test ever reads Nick's real `dev.nickanderssohn.nice`.
+// SCRATCH domain, so no test ever reads the real `dev.nickanderssohn.nice`.
 // ===========================================================================
 
 /// The prod Swift `Nice` CFPreferences domain (bundle id) the first-launch import
@@ -1057,7 +1064,7 @@ fn write_dropped_image(bytes: &[u8]) -> Option<PathBuf> {
 //
 // SAFETY INVARIANT (mirrors the phase-0 `keyinject.swift`): synthetic events are
 // posted ONLY with `CGEventPostToPid` targeting one pid — never `CGEventPost`
-// (the global HID tap). The scenarios post to nice-rs's OWN pid, so an injected
+// (the global HID tap). The scenarios post to nice's OWN pid, so an injected
 // keystroke can only ever reach this process, never whatever the user is typing
 // into elsewhere on the machine.
 //
@@ -1176,13 +1183,12 @@ pub fn accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
-/// The running app's `CFBundleName` (e.g. `"Nice RS Dev"` for the shipped
-/// bundle), or `None` when the process is not bundled — a bare `cargo run` or
-/// the test binary has no `Info.plist`. Mirrors Swift's
-/// `Bundle.main.object(forInfoDictionaryKey: "CFBundleName")`: the R14
-/// shell-inject per-variant `ZDOTDIR` path keys off this so `Nice RS Dev` never
-/// shares a self-healing stub directory with the Swift `Nice` / `Nice Dev`
-/// builds (two apps rewriting one dir with drifting stub text would fight).
+/// The running app's `CFBundleName` (`"Nice"` for the prod bundle, `"Nice Dev"`
+/// for the dev bundle), or `None` when the process is not bundled — a bare
+/// `cargo run` or the test binary has no `Info.plist`. Mirrors Swift's
+/// `Bundle.main.object(forInfoDictionaryKey: "CFBundleName")`: the per-variant
+/// Application Support folder + `ZDOTDIR` path keys off this so `Nice` and
+/// `Nice Dev` get their own directories.
 pub fn main_bundle_name() -> Option<String> {
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
@@ -1210,6 +1216,19 @@ pub fn main_bundle_name() -> Option<String> {
         let name = CFString::wrap_under_get_rule(value as CFStringRef);
         Some(name.to_string())
     }
+}
+
+/// The per-variant Application Support / `ZDOTDIR` folder name: the running app's
+/// [`main_bundle_name`] (`"Nice"` prod / `"Nice Dev"` dev), falling back to
+/// `"Nice (unbundled)"` when the process has no bundle (a bare `cargo run` or a
+/// test binary). The fallback is DELIBERATELY neither `"Nice"` nor `"Nice Dev"`:
+/// an unbundled dev run must NOT resolve to a real variant's folder, or its
+/// session-store writer would rewrite the installed app's `sessions.json` /
+/// `ui_settings.json` under `~/Library/Application Support/Nice{,` Dev`}/`. The
+/// single source of truth for the folder used by [`crate::session_store`],
+/// `sort_settings_store`, `terminal_theme_catalog`, and `shell_inject`.
+pub fn support_folder_name() -> String {
+    main_bundle_name().unwrap_or_else(|| "Nice (unbundled)".to_string())
 }
 
 /// The running app's `CFBundleShortVersionString` (e.g. `"0.17.0"`), or `None`
@@ -1654,7 +1673,7 @@ impl Future for AppNapSafeDelay {
             // promotes (no worse than the pre-T9 behaviour). It is a one-shot,
             // short-lived thread per launch.
             let _ = std::thread::Builder::new()
-                .name("nice-rs-launch-deadline".into())
+                .name("nice-launch-deadline".into())
                 .spawn(move || {
                     // Scheduler-level sleep — immune to libdispatch timer coalescing.
                     std::thread::sleep(delay);
@@ -1715,7 +1734,7 @@ pub fn wake_main_runloop() {
 // This is the foreign side of the `chrome` self-test scenario
 // (`crate::chrome_live`), the R9 sibling of the R5 CGEvent input block above: it
 // posts synthetic LEFT-mouse events (down / dragged / up, with a click-state
-// field so a double-click reaches gpui) to nice-rs's OWN pid via
+// field so a double-click reaches gpui) to nice's OWN pid via
 // `CGEventPostToPid` — never the global HID tap — so the scenario can assert the
 // real drag / double-click behavior of the chrome band, and reads the live
 // NSWindow frame + zoom/miniaturize state to ground-truth what those gestures
@@ -1960,7 +1979,7 @@ unsafe fn cf_dict_i64(dict: *const c_void, key: &str) -> Option<i64> {
 /// returns whether the FIRST normal window whose bounds contain the point is
 /// ours. `false` — the honest default — whenever another app's window is on top
 /// at that point, no window covers it, or the query fails; the caller then DEFERS
-/// LOUDLY and does NOT post, so an unattended `NICE_RS_SELFTEST=all` run can never
+/// LOUDLY and does NOT post, so an unattended `NICE_SELFTEST=all` run can never
 /// send a click into another app. The caller must ALSO activate + raise our window
 /// first (this is only the z-order check).
 #[allow(dead_code)]

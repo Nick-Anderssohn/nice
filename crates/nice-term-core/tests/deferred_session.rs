@@ -6,8 +6,8 @@
 //! both not held; and `OutputStarted` fires on the child's first output.
 //!
 //! Cleanliness sweep hook: every command session here carries the token
-//! `NICE_RS_TEST_SENTINEL` (the deferred test uses the longer
-//! `NICE_RS_TEST_SENTINEL_DEFERRED`, which still contains it) in the child's
+//! `NICE_TEST_SENTINEL` (the deferred test uses the longer
+//! `NICE_TEST_SENTINEL_DEFERRED`, which still contains it) in the child's
 //! argv, via the `sh -c '<script>' <TOKEN>` wrapper — the token becomes the
 //! wrapped shell's `$0`, so it shows in `ps -Aww -o args=` but never in the
 //! command's output. After the run,
@@ -26,11 +26,11 @@ use nice_term_core::{
 };
 
 /// Base argv token the cleanliness sweep greps for.
-const SENTINEL: &str = "NICE_RS_TEST_SENTINEL";
+const SENTINEL: &str = "NICE_TEST_SENTINEL";
 /// A per-test-unique token for the deferred `ps`-args scan. It CONTAINS
 /// [`SENTINEL`], so the global sweep still catches a leak, while no other test's
 /// child argv contains this longer string — the scan sees only this test's child.
-const SENTINEL_DEFERRED: &str = "NICE_RS_TEST_SENTINEL_DEFERRED";
+const SENTINEL_DEFERRED: &str = "NICE_TEST_SENTINEL_DEFERRED";
 
 /// A generous poll ceiling: a login+interactive zsh still sources the system rc
 /// before our command runs, and a loaded machine can be slow.
@@ -44,7 +44,7 @@ const POLL: Duration = Duration::from_secs(25);
 fn zdotdir() -> &'static str {
     static DIR: OnceLock<String> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("nice-rs-zdotdir-def-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nice-zdotdir-def-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create ZDOTDIR");
         for rc in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
             std::fs::write(dir.join(rc), "").expect("write empty rc");

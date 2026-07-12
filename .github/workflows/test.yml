@@ -2,63 +2,44 @@ name: test
 
 on:
   push:
-    branches: [main]
+    branches: [rust-rewrite]
   pull_request:
 
 jobs:
   test:
     runs-on: macos-26
-    # Job-level env so the Swift runtime backtrace dumper turns on for
-    # every child process xcodebuild forks — including the test host.
-    # On abort the runtime prints a full stack to stderr, which xctest
-    # captures into StandardOutputAndStandardError.txt inside the
-    # xcresult diagnostics bundle.
-    env:
-      SWIFT_BACKTRACE: "enable=yes,output-to=stderr,interactive=no"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The zed mirror is ~1–2 GB; cache it keyed on the pin so only the
+      # first run after a pin change pays the bare clone.
+      - name: Read zed pin
+        id: zedpin
+        run: echo "pin=$(awk -F'"' '/^ZED_PIN=/{print $2}' scripts/vendor-zed.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache zed mirror
+        uses: actions/cache@v4
         with:
-          xcode-version: "26.4"
+          path: ~/.cache/nice/zed-mirror.git
+          key: zed-mirror-${{ steps.zedpin.outputs.pin }}
 
-      - name: Install xcodegen
-        run: brew install xcodegen
-
-      # Unit and UI tests are split so a unit-host crash doesn't mask
-      # UI-test failures (and vice versa). Each step runs independently
-      # via `if: always()` so we always get a signal from both.
-      - name: Run unit tests
-        id: unit
-        run: scripts/test.sh -only-testing:NiceUnitTests
-
-      - name: Run UI tests
-        if: always()
-        id: ui
-        run: scripts/test.sh -only-testing:NiceUITests
-
-      # On any test failure, upload the xcresult bundle so we can pull
-      # the actual crash backtrace + diagnostic logs out of CI. The
-      # bundle lives under build-dev/Logs/Test/.
-      - name: Upload xcresult on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          name: xcresult-${{ github.run_id }}
-          path: build-dev/Logs/Test/*.xcresult
-          if-no-files-found: ignore
-          retention-days: 14
+          key: test
 
-      # macOS writes per-process .ips crash reports here when a process
-      # aborts. The xcresult diagnostics bundle doesn't include these,
-      # so collect them separately.
-      - name: Upload macOS crash reports on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: crash-reports-${{ github.run_id }}
-          path: |
-            ~/Library/Logs/DiagnosticReports/Nice*
-            /Library/Logs/DiagnosticReports/Nice*
-          if-no-files-found: ignore
-          retention-days: 14
+      # Materialize the pinned + patched GPUI checkout the workspace
+      # path-depends on (vendor/zed is gitignored).
+      - name: Vendor GPUI
+        run: scripts/vendor-zed.sh
+
+      # Layer 1 (per-crate unit) + everything else that runs under libtest.
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      # Layer 2: in-process gpui integration tests on the simulated clock.
+      # Runs headless; no display-bound Swift UITest skip logic here.
+      - name: Run in-process integration tests
+        run: cargo test -p nice-itests

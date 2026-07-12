@@ -2,7 +2,7 @@
 //! (R7 Validation §2).
 //!
 //! Drives the shipped ⌘+/⌘−/⌘0 zoom keybindings with **real CGEvents** posted to
-//! nice-rs's own pid (`crate::platform`, the same edge the R5 `input-*`
+//! nice's own pid (`crate::platform`, the same edge the R5 `input-*`
 //! scenarios use) over a real login shell, and asserts the whole T11 chain end
 //! to end:
 //!
@@ -83,7 +83,7 @@ impl Render for ZoomTermView {
 /// Open the `niceties-zoom` scenario window (a real `zsh -il`) and spawn the
 /// CGEvent-driven zoom + re-metric assertions (self-reported gate).
 pub fn open_niceties_zoom_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let base = std::env::temp_dir().join(format!("nice-rs-niceties-zoom-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-niceties-zoom-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
     // A real login shell, user rc suppressed via an empty ZDOTDIR so the grid is

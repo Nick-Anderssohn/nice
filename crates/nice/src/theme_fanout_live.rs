@@ -29,7 +29,7 @@
 //!   path is exercised through the scheme flip, which changes the active slot's
 //!   resolution; R22's distinct themes make a same-scheme active recolor visible.)
 //! * **(e) R17-live Claude mirror.** With the gate ON a theme change rewrites the
-//!   sandbox `nice-rs.json` colors file (byte-diff via the landed only-if-changed
+//!   sandbox `nice.json` colors file (byte-diff via the landed only-if-changed
 //!   writer); `apply_sync_claude_theme` re-sources every window's `--settings`
 //!   provider so a subsequently-spawned pane would get / lose the flag.
 //! * **(f) R22 Ghostty import end-to-end.** A fixture `.ghostty` written under the
@@ -87,7 +87,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-theme-fanout-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-theme-fanout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).context("create fixture base")?;
         let base = base.canonicalize().context("canonicalize fixture base")?;

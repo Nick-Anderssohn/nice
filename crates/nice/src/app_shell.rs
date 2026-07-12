@@ -69,11 +69,11 @@ use crate::window_state::WindowState;
 /// (`crate::platform::ax_find_titled_role`) can find it — the exported
 /// shipped-surface assertion hook (§6). Placed on [`SidebarShellView`]'s card
 /// root by the sidebar view; named here as the composition contract.
-pub(crate) const SIDEBAR_ROOT_LABEL: &str = "nice-rs-sidebar-root";
+pub(crate) const SIDEBAR_ROOT_LABEL: &str = "nice-sidebar-root";
 
 /// The AX label + element id the shipped pane-strip (toolbar) root carries — the
 /// sibling of [`SIDEBAR_ROOT_LABEL`]. Placed on [`WindowToolbarView`]'s root.
-pub(crate) const PANE_STRIP_ROOT_LABEL: &str = "nice-rs-pane-strip-root";
+pub(crate) const PANE_STRIP_ROOT_LABEL: &str = "nice-pane-strip-root";
 
 /// The per-window composition root. Renders the shipped shell (sidebar card +
 /// toolbar band + pane content) and owns the window-level peek-clear observer.

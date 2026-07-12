@@ -140,7 +140,7 @@ mod tests {
         // Unset ⇒ a cancel.
         assert_eq!(fake.pick_theme_file(), None);
         // Scripted ⇒ that path, once.
-        let p = PathBuf::from("/tmp/nice-rs-fixture.ghostty");
+        let p = PathBuf::from("/tmp/nice-fixture.ghostty");
         fake.set_next(Some(p.clone()));
         assert_eq!(fake.pick_theme_file(), Some(p));
         assert_eq!(fake.call_count(), 2, "both invocations were logged");

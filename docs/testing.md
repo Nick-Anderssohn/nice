@@ -63,7 +63,7 @@ Both execution models run on a **simulated clock**. Neither may ever assert
 frames-per-second, frame-pacing percentiles, or wall-clock latency — see
 "What in-process tests must never assert" below.
 
-### 3. Live ground truth — `NICE_RS_SELFTEST`
+### 3. Live ground truth — `NICE_SELFTEST`
 
 The `nice-harness`-driven suite (`crates/nice-harness/src/selftest.rs` +
 scenarios registered in `crates/nice/src/app.rs`'s `selftest_scenarios()`).
@@ -75,7 +75,7 @@ transitions, and CGEvent/IME round-trips are asserted — see
 table, the env-var contract, and the screenshot-capture feature gating. It
 remains the ground-truth floor for the whole test story: in-process tests
 complement it, never replace it, and every plan's `## Validation` re-runs
-`NICE_RS_SELFTEST=all` as the standing regression gate.
+`NICE_SELFTEST=all` as the standing regression gate.
 
 Every windowed live scenario now carries the **self-activation guarantee**
 (landed in this plan's second slice): before the driver measures, it drives
@@ -196,14 +196,14 @@ anything drag/click-arbitration-shaped.
 ## Environmental preconditions for live runs
 
 The live suite talks to real macOS subsystems, so a live run (a single
-scenario or `NICE_RS_SELFTEST=all`) depends on host state a purely in-process
+scenario or `NICE_SELFTEST=all`) depends on host state a purely in-process
 run never needs:
 
 - **Accessibility grant.** Any scenario that posts a real CGEvent
   (`input-live`, `input-shell`, `niceties-zoom`, `niceties-held`) preflights
   `AXIsProcessTrusted()` and FAILs loudly with remediation if the grant is
   missing — never silently skips. Grant it once to whichever build posts the
-  events (`nice-rs` under dev, or your terminal if you're driving `cargo run`
+  events (`nice` under dev, or your terminal if you're driving `cargo run`
   from one) via System Settings → Privacy & Security → Accessibility.
 - **Frontmost, focused window.** Every windowed scenario now self-activates
   (see "The self-activation guarantee" above), so a live run no longer
@@ -256,7 +256,7 @@ landed instead is a single live scenario, `ax-probe`
 
 - One stable root element (`AxProbeView`) in the app crate is tagged with a
   fixed `.id("ax-probe-root")`, `.role(gpui::Role::Group)`, and
-  `.aria_label("nice-rs-ax-probe-root")`.
+  `.aria_label("nice-ax-probe-root")`.
 - `crate::platform::ax_find_titled_role` walks this process's macOS AX tree
   (`AXUIElementCreateApplication` + a depth- and node-budget-bounded
   `AXUIElementCopyAttributeValue` traversal over `AXChildren`/`AXTitle`/

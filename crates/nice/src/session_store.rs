@@ -42,11 +42,14 @@
 //!
 //! ## Migration
 //!
-//! One-time: iff the OWN file is ABSENT, [`open`] reads the Swift app's
-//! `…/Nice/sessions.json` (source path injectable) with the same tolerance,
-//! drops `branch` (the leaf structs have no such field), and writes to the OWN
-//! store only — writing the Swift path would fight a still-installed Swift
-//! Nice's flushes.
+//! Since this build replaced the Swift app, a variant's own folder (`Nice` /
+//! `Nice Dev`) IS the folder the retired Swift build wrote `sessions.json` into,
+//! so [`open`] simply reads that pre-existing file as its OWN store on first
+//! launch — no separate Swift migration source. Swift's `branch` field decodes
+//! away (the leaf structs have no such field) and is dropped on the first
+//! rewrite. (The one-time `Nice RS Dev/` → new-folder move for users of the
+//! earlier `nice-rs` build lives in [`crate::rename_migration`], run before the
+//! stores load.)
 //!
 //! The launch-bootstrap + restore-fan-out consumers land with a later slice,
 //! hence the module-wide `dead_code` allow (the established
@@ -75,14 +78,15 @@ pub const CURRENT_VERSION: i64 = 3;
 /// cancels the pending timer).
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// Application-support subfolder for the Rust build — deliberately distinct
-/// from the Swift `Nice` / `Nice Dev` folders so it can't clobber the user's
-/// real sessions.
-pub const STORE_FOLDER: &str = "Nice RS Dev";
-
-/// The Swift app's application-support subfolder — the one-time migration
-/// SOURCE. Read only when the own store is absent; NEVER written.
-pub const SWIFT_STORE_FOLDER: &str = "Nice";
+/// Application-support subfolder for this build — the per-variant name
+/// (`Nice` prod / `Nice Dev` dev) from [`crate::platform::support_folder_name`].
+/// This build IS Nice now (having replaced the Swift app), so a variant's folder
+/// is the SAME one the retired Swift build used: the pre-existing `sessions.json`
+/// is simply read as this build's own file on first launch (no separate Swift
+/// migration source — see the module "Migration" note).
+pub fn store_folder() -> String {
+    crate::platform::support_folder_name()
+}
 
 /// On-screen frame captured at last save (Cocoa window coordinates, origin at
 /// the bottom-left of the primary screen — matches Swift `PersistedFrame`, so
@@ -247,45 +251,25 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// Open the store at `own_path`, running the one-time Swift migration when
-    /// the own file is absent and `swift_source` is given. Production
-    /// (`DiskIo`, 500 ms debounce).
-    pub fn open(own_path: PathBuf, swift_source: Option<PathBuf>) -> Self {
-        Self::open_with(own_path, swift_source, Box::new(DiskIo), DEBOUNCE)
+    /// Open the store at `own_path`. Present ⇒ read it (this includes a
+    /// `sessions.json` the retired Swift build left in the same per-variant
+    /// folder — read as our own); absent ⇒ start empty. Production (`DiskIo`,
+    /// 500 ms debounce).
+    pub fn open(own_path: PathBuf) -> Self {
+        Self::open_with(own_path, Box::new(DiskIo), DEBOUNCE)
     }
 
     /// [`SessionStore::open`] with an injected I/O seam + debounce (tests).
-    pub fn open_with(
-        own_path: PathBuf,
-        swift_source: Option<PathBuf>,
-        io: Box<dyn SessionStoreIo>,
-        debounce: Duration,
-    ) -> Self {
-        // Own file present ⇒ read it. Absent ⇒ migrate from the Swift source
-        // (branch auto-dropped: our leaf structs have no `branch` field). The
-        // Swift file is only ever READ.
-        let (cached, migrated) = if own_path.exists() {
-            (read_state(&own_path), false)
-        } else if let Some(src) = &swift_source {
-            (read_state(src), true)
+    pub fn open_with(own_path: PathBuf, io: Box<dyn SessionStoreIo>, debounce: Duration) -> Self {
+        // Own file present ⇒ read it (Swift's `branch` field decodes away — the
+        // leaf structs have no such field — and is dropped on the first rewrite).
+        // Absent ⇒ start empty.
+        let cached = if own_path.exists() {
+            read_state(&own_path)
         } else {
-            (PersistedState::empty(), false)
+            PersistedState::empty()
         };
-
-        let store = Self::build(own_path, cached, io, debounce);
-
-        // One-time migration write: persist the adopted state to the OWN store
-        // so a subsequent launch reads its own file (and never re-reads a
-        // since-changed Swift file). Never touches `swift_source`.
-        if migrated && !store.shared.inner.lock().unwrap().cached.windows.is_empty() {
-            {
-                let mut inner = store.shared.inner.lock().unwrap();
-                inner.revision += 1;
-            }
-            store.flush();
-        }
-
-        store
+        Self::build(own_path, cached, io, debounce)
     }
 
     /// Construct the store + spawn its writer thread. Creates the parent dir of
@@ -493,8 +477,9 @@ fn writer_loop(shared: Arc<Shared>) {
 /// Application-support root: `NICE_APPLICATION_SUPPORT_ROOT` when set (tests /
 /// scenarios redirect state into a sandbox), else `~/Library/Application
 /// Support`. Resolved only in `app::run` (the `shell_inject.rs` convention) —
-/// never in a test or `run_selftest`.
-fn support_root() -> PathBuf {
+/// never in a test or `run_selftest`. `pub` so [`crate::rename_migration`]
+/// resolves the same root for its one-time folder move.
+pub fn support_root() -> PathBuf {
     match env::var("NICE_APPLICATION_SUPPORT_ROOT") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
@@ -504,15 +489,9 @@ fn support_root() -> PathBuf {
     }
 }
 
-/// The OWN store path: `<support-root>/Nice RS Dev/sessions.json`.
+/// The OWN store path: `<support-root>/<variant-folder>/sessions.json`.
 pub fn default_store_path() -> PathBuf {
-    support_root().join(STORE_FOLDER).join("sessions.json")
-}
-
-/// The Swift migration SOURCE path: `<support-root>/Nice/sessions.json`. Read
-/// only when the own store is absent; never written.
-pub fn swift_migration_source() -> PathBuf {
-    support_root().join(SWIFT_STORE_FOLDER).join("sessions.json")
+    support_root().join(store_folder()).join("sessions.json")
 }
 
 // MARK: - Process Global (absent ⇒ every persistence hook is a no-op)

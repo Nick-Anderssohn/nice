@@ -42,7 +42,7 @@
 //! * **(§6) the tranche-5 final composition (Milestone 6).** Over the REAL
 //!   registered launch window (`open_managed_window` / `build_window_root`, the
 //!   exact path `run` takes — NOT a scenario host), composes the whole tranche's
-//!   board by CGEvent to nice-rs's own pid: **(6a)** a REBOUND chord dispatches on
+//!   board by CGEvent to nice's own pid: **(6a)** a REBOUND chord dispatches on
 //!   the shipped window (rebind `newTerminalPane` → ⌘Y, post it → a pane appears;
 //!   the old default ⌘T no longer does), **(6b)** the PROTECTED non-rebindable set
 //!   (⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@SidebarShell, ⌘,) survives the rebuild (a
@@ -533,7 +533,7 @@ async fn leg_d_import(cx: &mut AsyncApp, failures: &mut Vec<String>) {
         return;
     };
     // A temp fixture dir (never the real terminal-themes dir).
-    let dir = std::env::temp_dir().join(format!("nice-rs-settings-import-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("nice-settings-import-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     if std::fs::create_dir_all(&dir).is_err() {
         failures.push("could not create the temp import-fixture dir".to_string());
@@ -606,7 +606,7 @@ async fn leg_d_import(cx: &mut AsyncApp, failures: &mut Vec<String>) {
 //
 // Drives R24's shipped Shortcuts pane recorder over a dedicated host window (the
 // live settings window's active-pane state is R23-private; this renders the same
-// `shortcuts_pane` body). s1 captures a REAL chord posted to nice-rs's own pid
+// `shortcuts_pane` body). s1 captures a REAL chord posted to nice's own pid
 // (`post_key_tap`), holding a `SavedInputSource` for the whole leg (IME restore).
 async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     // Real CGEvents ⇒ the TCC grant must be live, else every injected chord is a
@@ -739,7 +739,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
 // opens R23's settings window and a live theme change repaints shipped chrome + a
 // terminal cell (R21 fan-out through the store `apply_*`), and a busy pane close
 // presents R20.5's ConfirmationModal. Real CGEvents (⌘Y / ⌘T / ⌘,) post to
-// nice-rs's OWN pid; a `SavedInputSource` is held for the whole leg (IME restore).
+// nice's OWN pid; a `SavedInputSource` is held for the whole leg (IME restore).
 
 /// A hermetic fixture for the composition window's shell (a spec-wins ZDOTDIR rc
 /// chain + a sandbox HOME + a `NICE_CLAUDE_OVERRIDE` idle stub) — never the real
@@ -753,7 +753,7 @@ struct CompFixture {
 impl CompFixture {
     fn build() -> Result<Self> {
         let base =
-            std::env::temp_dir().join(format!("nice-rs-settings-comp-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nice-settings-comp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base)?;
         let base = base.canonicalize()?;

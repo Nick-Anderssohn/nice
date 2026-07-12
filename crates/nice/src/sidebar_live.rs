@@ -4,7 +4,7 @@
 //! geometry + resize + collapsed band against AppKit reads, driving the
 //! synthetic-gesture halves with **real CGEvents**.
 //!
-//! It posts real CGEvents (mouse down / drag / up / double-click) to nice-rs's
+//! It posts real CGEvents (mouse down / drag / up / double-click) to nice's
 //! OWN pid (`crate::platform`, `CGEventPostToPid` — never the global HID tap), so
 //! it preflights the Accessibility grant and FAILs loudly if it is missing. What
 //! it asserts:

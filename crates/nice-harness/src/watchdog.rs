@@ -75,7 +75,7 @@ extern "C" fn trampoline(_ctx: *mut c_void) {
 pub fn arm(deadline: Duration, label: &'static str, on_deadline: impl FnMut() + 'static) {
     *CB.lock().unwrap() = Some(ForceSend(Box::new(on_deadline)));
     std::thread::Builder::new()
-        .name("nice-rs-selftest-watchdog".into())
+        .name("nice-selftest-watchdog".into())
         .spawn(move || {
             let t0 = Instant::now();
             // Drift-corrected sleep to the deadline in short slices.

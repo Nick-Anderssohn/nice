@@ -699,7 +699,7 @@ impl TerminalView {
             }
             // Respawn failed (catastrophic fork/openpty) — keep the held pane so
             // its output stays readable rather than blanking to a dead view.
-            Err(e) => eprintln!("nice-rs: dismiss respawn failed: {e:#}"),
+            Err(e) => eprintln!("nice: dismiss respawn failed: {e:#}"),
         }
     }
 

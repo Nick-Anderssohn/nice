@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 #
-# release-rs.sh — build a signed, notarized, stapled Nice-RS-X.Y.Z.zip of the
-# Rust rewrite ("Nice RS Dev.app") for the EXPERIMENTAL Homebrew channel.
+# release-rs.sh — build a signed, notarized, stapled Nice-X.Y.Z.zip of the
+# Rust rewrite's PRODUCTION build ("Nice.app", dev.nickanderssohn.nice).
 #
 # Pipeline: version guard vs crates/nice/Cargo.toml → scripts/rust-bundle.sh
-# (release cargo build + bundle assembly; its ad-hoc signature is deliberately
-# overwritten here) → Developer ID codesign with hardened runtime → verify →
-# ditto zip → notarize → staple → final zip → SHA256.
+# --prod (release cargo build + prod bundle assembly; its ad-hoc signature is
+# deliberately overwritten here) → Developer ID codesign with hardened runtime
+# → verify → ditto zip → notarize → staple → final zip → SHA256.
 #
-# The experimental channel ships the DEV identity on purpose ("Nice RS Dev.app",
-# dev.nickanderssohn.nice-rs-dev): it is the tested bundle, it coexists with
-# prod Nice.app, and releases are published as GitHub PRERELEASES under
-# rs-vX.Y.Z tags — invisible to prod Nice's update checker, which polls
-# /releases/latest (prereleases are excluded by the API). The identity flips
-# to "Nice.app" at parity as a deliberate, separate step.
+# This builds the prod "Nice.app" identity via rust-bundle.sh --prod (built in
+# ./build-rs-prod so it never collides with the dev ./build-rs bundle).
 #
 # Required env vars (read from scripts/.env.release if present locally):
 #   APPLE_ID                Apple ID email (not needed with --skip-notarize)
@@ -76,18 +72,18 @@ if [[ "$CARGO_VERSION" != "$VERSION" ]]; then
     fail "crates/nice/Cargo.toml is at version=\"$CARGO_VERSION\" but --version=$VERSION; commit the version bump before tagging"
 fi
 
-BUILD_DIR="$REPO_ROOT/build-rs"
-APP_PATH="$BUILD_DIR/Nice RS Dev.app"
-ZIP_PRE="$BUILD_DIR/Nice-RS-$VERSION.pre.zip"
-ZIP_FINAL="$BUILD_DIR/Nice-RS-$VERSION.zip"
+BUILD_DIR="$REPO_ROOT/build-rs-prod"
+APP_PATH="$BUILD_DIR/Nice.app"
+ZIP_PRE="$BUILD_DIR/Nice-$VERSION.pre.zip"
+ZIP_FINAL="$BUILD_DIR/Nice-$VERSION.zip"
 
 log "version=$VERSION skip_notarize=$SKIP_NOTARIZE"
 rm -f "$ZIP_PRE" "$ZIP_FINAL"
 
-# ── 2. vendor + build + assemble (rust-bundle.sh ad-hoc signs; step 3 re-signs) ──
+# ── 2. vendor + build + assemble (rust-bundle.sh --prod ad-hoc signs; step 3 re-signs) ──
 [[ -d "$REPO_ROOT/vendor/zed/crates/gpui" ]] || scripts/vendor-zed.sh
-scripts/rust-bundle.sh --dest "$BUILD_DIR"
-[[ -d "$APP_PATH" ]] || fail "rust-bundle.sh produced no bundle at $APP_PATH"
+scripts/rust-bundle.sh --prod --dest "$BUILD_DIR"
+[[ -d "$APP_PATH" ]] || fail "rust-bundle.sh --prod produced no bundle at $APP_PATH"
 
 # ── 3. Developer ID re-sign with hardened runtime (required by notarization) ──
 log "codesigning with Developer ID (hardened runtime + timestamp)"

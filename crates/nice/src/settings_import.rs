@@ -427,7 +427,7 @@ fn build_shortcuts_section(
                 by_action.insert(action, combo);
             }
             None => eprintln!(
-                "nice-rs: settings import: skipping prod shortcut action {id:?} (no Rust counterpart)"
+                "nice: settings import: skipping prod shortcut action {id:?} (no Rust counterpart)"
             ),
         }
     }
@@ -444,7 +444,7 @@ fn build_shortcuts_section(
                 Some(key) => Value::String(emit_token(combo.modifier_flags_raw, key)),
                 None => {
                     eprintln!(
-                        "nice-rs: settings import: shortcut {} has unmappable keyCode {}; keeping the Rust default",
+                        "nice: settings import: shortcut {} has unmappable keyCode {}; keeping the Rust default",
                         action.id(),
                         combo.key_code
                     );
@@ -508,7 +508,7 @@ fn import_if_first_launch(
             map.insert(key, value);
         }
     }) {
-        eprintln!("nice-rs: settings import (direct ui_settings.json) failed: {e}");
+        eprintln!("nice: settings import (direct ui_settings.json) failed: {e}");
     }
 
     // CFPref toggles → own domain, only-when-present-in-prod-AND-absent-in-own.

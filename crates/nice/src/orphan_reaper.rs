@@ -1,4 +1,4 @@
-//! Orphan shell reaper — SIGKILL every zsh a prior crashed `nice-rs` run left
+//! Orphan shell reaper — SIGKILL every zsh a prior crashed `nice` run left
 //! reparented to launchd. Rust port of Swift
 //! `Sources/Nice/Process/OrphanShellReaper.swift`.
 //!
@@ -16,7 +16,7 @@
 //! and the env contains `NICE_TAB_ID=` (the load-bearing safety guard [`reap`]
 //! applies). The env check is what keeps us from SIGKILLing a non-Nice zsh the
 //! user deliberately daemonized (nohup'd, detached from a launchd job, …).
-//! Sibling live `nice-rs` instances are filtered by PPID — their children's
+//! Sibling live `nice` instances are filtered by PPID — their children's
 //! PPID is the live instance's pid, not 1.
 //!
 //! The OS surface (libproc / sysctl / kill) is injected via [`ReaperEnv`] so the

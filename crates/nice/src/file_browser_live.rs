@@ -5,7 +5,7 @@
 //!
 //! (a) a real ⌘⇧B chord (the shipped `ToggleSidebarMode` keymap) swaps the tab
 //!     list for the tree in the live window — the AX root
-//!     `nice-rs-file-browser-root` surfaces as an `AXGroup` and a fixture row is
+//!     `nice-file-browser-root` surfaces as an `AXGroup` and a fixture row is
 //!     rendered (model-read corroboration);
 //! (b) a single click expands a fixture dir, a second single click collapses it;
 //! (c) a double click on a folder re-roots the tree (model `root_path`);
@@ -129,7 +129,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> std::io::Result<Self> {
         let root = std::env::temp_dir().join(format!(
-            "nice-rs-file-browser-{}-{}",
+            "nice-file-browser-{}-{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         ));

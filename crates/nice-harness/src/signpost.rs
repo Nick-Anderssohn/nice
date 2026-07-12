@@ -1,4 +1,4 @@
-//! os_signpost emission on subsystem `dev.nickanderssohn.nice-rs`
+//! os_signpost emission on subsystem `dev.nickanderssohn.nice`
 //! (category `selftest`, name `Frame`).
 //!
 //! The actual emission lives in the C shim `signpost.c` (linked by `build.rs`)

@@ -53,7 +53,7 @@ pub fn capture_window_png(
 /// to a device pixel by the window's `scale_factor()` — so callers lay out in
 /// logical coordinates and never hardcode the backing scale. This is the same
 /// `Window::render_to_image()` drawable read-back that [`capture_window_png`]
-/// uses (a scenario's own pixel assertions and the `NICE_RS_CAPTURE` PNG go
+/// uses (a scenario's own pixel assertions and the `NICE_CAPTURE` PNG go
 /// through one path), so it is likewise gated behind the `capture` feature.
 ///
 /// Errors if any point falls outside the captured image (a layout bug the caller

@@ -7,7 +7,7 @@
 //! rewrite splits that in two. The **value type** — criterion + direction, the
 //! defaulting rules, and the raw-string parse used to hydrate from storage —
 //! lives here in `nice-model`, gpui-free and disk-free. The **file store**
-//! (`ui_settings.json` under `Nice RS Dev/`, atomic-write, unknown-key
+//! (`ui_settings.json` under the per-variant folder, atomic-write, unknown-key
 //! preservation, process `Global`) lands in `crates/nice` and reuses this
 //! value type as its schema surface.
 //!

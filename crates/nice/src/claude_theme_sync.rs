@@ -31,11 +31,13 @@
 //! Claude renders fine with its own theme; only the sync degrades. Structurally
 //! modeled on [`crate::claude_hook_installer`].
 //!
-//! **Dev-time identity isolation.** Nick's daily-driver Swift Nice actively
-//! syncs HIS theme to `~/.claude/themes/nice.json` via pointer `custom:nice`.
-//! The Rust dev app therefore uses ITS OWN slug and pointer file so the two
-//! never collide (see [`SLUG`] / [`POINTER_FILENAME`]). Both flip to their
-//! Swift-parity names at the parity rename.
+//! **Identity is the prod slug `nice` (Swift parity).** This build IS Nice
+//! (having replaced the Swift app), so it syncs to `~/.claude/themes/nice.json`
+//! via pointer `custom:nice` — the exact files the retired Swift `Nice` wrote
+//! (see [`SLUG`] / [`POINTER_FILENAME`]). Because Swift's `nice.json` also
+//! carries `_niceManaged`, this build adopts/overwrites it cleanly on first
+//! launch — an upgrading user keeps the same managed theme with no visible
+//! change.
 //!
 //! **Hermeticity (tranche-3).** Both entry points take injectable base paths
 //! ([`write_with`], [`settings_flag_path_in`]); production [`write`] /
@@ -67,20 +69,14 @@ use nice_theme::ColorScheme;
 // MARK: - Constants
 
 /// Slug for the managed theme — drives the filename (`<slug>.json`) and the
-/// pointer value (`custom:<slug>`). `ClaudeThemeSync.swift:60`.
-///
-/// **Dev-time divergence (flips to `"nice"` at the parity rename):** the Swift
-/// app owns `nice.json` / `custom:nice` on this same machine; the Rust dev app
-/// uses `nice-rs` so it cannot clobber the Swift app's live theme sync.
-pub const SLUG: &str = "nice-rs";
+/// pointer value (`custom:<slug>`). The prod name `nice`, matching the retired
+/// Swift build (`ClaudeThemeSync.swift:60`).
+pub const SLUG: &str = "nice";
 
-/// Filename of the `--settings` pointer file under `~/.nice/`.
-///
-/// **Dev-time divergence (flips to `"claude-theme-settings.json"` at the parity
-/// rename):** distinct from the Swift app's `claude-theme-settings.json` so the
-/// two apps' pointer files never collide. Space-free (the R15 reply field and
-/// shell splice are whitespace-parsed — frozen grammar).
-pub const POINTER_FILENAME: &str = "claude-theme-settings-rs.json";
+/// Filename of the `--settings` pointer file under `~/.nice/`. The prod name,
+/// matching the retired Swift build. Space-free (the R15 reply field and shell
+/// splice are whitespace-parsed — frozen grammar).
+pub const POINTER_FILENAME: &str = "claude-theme-settings.json";
 
 /// `name` shown in Claude's `/theme` picker. `ClaudeThemeSync.swift:63`.
 pub const DISPLAY_NAME: &str = "Nice";
@@ -449,11 +445,11 @@ pub fn write_with(
 ) {
     let document = theme_json(theme, scheme, accent);
     if let Err(e) = ensure_theme_file(&document, themes_dir) {
-        eprintln!("nice-rs: ClaudeThemeSync: write failed: {e}");
+        eprintln!("nice: ClaudeThemeSync: write failed: {e}");
         return;
     }
     if let Err(e) = ensure_settings_file(settings_path) {
-        eprintln!("nice-rs: ClaudeThemeSync: write failed: {e}");
+        eprintln!("nice: ClaudeThemeSync: write failed: {e}");
     }
 }
 
@@ -474,7 +470,7 @@ pub fn settings_flag_path_in(home: &Path) -> Option<String> {
     match ensure_settings_file(&path) {
         Ok(()) => Some(path.to_string_lossy().into_owned()),
         Err(e) => {
-            eprintln!("nice-rs: ClaudeThemeSync: settings file failed: {e}");
+            eprintln!("nice: ClaudeThemeSync: settings file failed: {e}");
             None
         }
     }
@@ -527,7 +523,7 @@ fn ensure_theme_file(document: &ClaudeTheme, dir: &Path) -> io::Result<()> {
                 Ok(Value::Object(map)) => {
                     if map.get(MANAGED_MARKER).and_then(Value::as_bool) != Some(true) {
                         eprintln!(
-                            "nice-rs: ClaudeThemeSync: refusing to overwrite foreign {}",
+                            "nice: ClaudeThemeSync: refusing to overwrite foreign {}",
                             path.display()
                         );
                         return Ok(());
@@ -537,7 +533,7 @@ fn ensure_theme_file(document: &ClaudeTheme, dir: &Path) -> io::Result<()> {
                 // have hand-authored a file at our slug. Leave it intact.
                 _ => {
                     eprintln!(
-                        "nice-rs: ClaudeThemeSync: refusing to overwrite non-JSON {}",
+                        "nice: ClaudeThemeSync: refusing to overwrite non-JSON {}",
                         path.display()
                     );
                     return Ok(());
@@ -993,7 +989,7 @@ mod tests {
         let (_root, themes, settings) = sandbox("theme-pointer");
         write_once(&themes, &settings, ColorScheme::Dark);
         let v: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
-        assert_eq!(v["theme"], "custom:nice-rs");
+        assert_eq!(v["theme"], "custom:nice");
     }
 
     /// The exact pointer-file bytes (frozen contract + byte-stability).
@@ -1002,7 +998,7 @@ mod tests {
         let (_root, themes, settings) = sandbox("theme-pointer-bytes");
         write_once(&themes, &settings, ColorScheme::Dark);
         let bytes = fs::read(&settings).unwrap();
-        assert_eq!(bytes, b"{\n  \"theme\": \"custom:nice-rs\"\n}");
+        assert_eq!(bytes, b"{\n  \"theme\": \"custom:nice\"\n}");
     }
 
     #[test]
@@ -1094,7 +1090,7 @@ mod tests {
     #[test]
     fn theme_settings_path_under_nice_dir() {
         let p = theme_settings_path(Path::new("/home/u"));
-        assert_eq!(p.file_name().unwrap(), "claude-theme-settings-rs.json");
+        assert_eq!(p.file_name().unwrap(), "claude-theme-settings.json");
         assert_eq!(p.parent().unwrap().file_name().unwrap(), ".nice");
     }
 
@@ -1106,6 +1102,6 @@ mod tests {
         assert_eq!(PathBuf::from(&path), theme_settings_path(&home));
         // Ensure-on-read: the pointer file now exists with the right bytes.
         let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(v["theme"], "custom:nice-rs");
+        assert_eq!(v["theme"], "custom:nice");
     }
 }

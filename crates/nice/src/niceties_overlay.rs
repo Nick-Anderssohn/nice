@@ -176,7 +176,7 @@ fn build_pane(cx: &mut AsyncApp, spec: SpawnSpec, grace: Option<Duration>) -> Re
 /// spawn the overlay-timing assertions (self-reported gate). Case B (the instant-
 /// prompt pane) is opened + closed inside the task.
 pub fn open_niceties_overlay_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let base = std::env::temp_dir().join(format!("nice-rs-niceties-overlay-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-niceties-overlay-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
     // A slow, SILENT pane: `exec sh -c 'sleep 3; echo up'` emits nothing until the
@@ -259,7 +259,7 @@ async fn run_niceties_overlay(cx: &mut AsyncApp, pane: Pane) -> CadenceReport {
 
     // --- Case B: an instant-prompt pane never flashes the overlay ------------
     let base_b =
-        std::env::temp_dir().join(format!("nice-rs-niceties-overlay-fast-{}", std::process::id()));
+        std::env::temp_dir().join(format!("nice-niceties-overlay-fast-{}", std::process::id()));
     if std::fs::create_dir_all(&base_b).is_ok() {
         let base_b_s = base_b.to_string_lossy().to_string();
         // A normal login shell at the DEFAULT grace (0.75 s): its prompt prints

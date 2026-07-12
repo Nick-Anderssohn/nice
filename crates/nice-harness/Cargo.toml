@@ -1,7 +1,7 @@
 # nice-harness — the Nice rewrite's measurement + self-test library. Every
 # later cycle reuses it: mach-clock frame stamps, the percentile reducer, the
 # RSS/phys_footprint sampler, os_signpost emission (subsystem
-# `dev.nickanderssohn.nice-rs`), the `NICE_RS_SELFTEST` driver + suite runner,
+# `dev.nickanderssohn.nice`), the `NICE_SELFTEST` driver + suite runner,
 # the App-Nap-immune watchdog, and (feature-gated) screenshot capture.
 #
 # Layering rule for the rewrite: crates mirroring today's pure-Swift model code

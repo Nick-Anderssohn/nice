@@ -88,7 +88,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-persist-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).context("create fixture base")?;
         let base = base.canonicalize().context("canonicalize fixture base")?;
@@ -138,7 +138,7 @@ impl Fixture {
 
         // The hand-authored v3 store file (a parentTabId pair, a Claude tab with a
         // stale cwd, a Main terminal tab, a frame, sidebarCollapsed true).
-        let store_dir = support_root.join(session_store::STORE_FOLDER);
+        let store_dir = support_root.join(session_store::store_folder());
         std::fs::create_dir_all(&store_dir)?;
         let home_s = home.to_string_lossy();
         let work_s = work.to_string_lossy();
@@ -235,10 +235,9 @@ pub fn open_persistence_restore_window(cx: &mut AsyncApp) -> Result<AnyWindowHan
         // rc chain so its `print -z` tail pre-types NICE_PREFILL_COMMAND.
         crate::app::set_scenario_shell_inject_config(app, Some(zdotdir.clone()), None);
 
-        // Install the temp store Global (own path from the injected support root; no
-        // Swift migration source in this leg).
+        // Install the temp store Global (own path from the injected support root).
         let own = session_store::default_store_path();
-        session_store::install_global(SessionStore::open(own, None));
+        session_store::install_global(SessionStore::open(own));
 
         // Hydrate the one saved window + open it through the SHIPPED restore path.
         let saved = session_store::load();
@@ -429,7 +428,7 @@ async fn run_persistence_restore(
     if !cx.update(|_| platform::accessibility_trusted()) {
         failures.push(
             "(c) Accessibility not trusted — the real-close-button CGEvent cannot be posted; grant \
-             nice-rs Accessibility and re-run"
+             nice Accessibility and re-run"
                 .into(),
         );
     } else if let Err(e) = veto_leg(cx, whandle, &state, &mut failures).await {
@@ -441,11 +440,6 @@ async fn run_persistence_restore(
 
     // === (e) quit-cascade disposition (the wipe regression) =================
     quit_cascade_leg(&mut failures);
-
-    // === (f) Swift migration ================================================
-    if let Err(e) = migration_leg(&fixture) {
-        failures.push(format!("(f) migration leg error: {e}"));
-    }
 
     build_report(failures)
 }
@@ -832,64 +826,6 @@ fn quit_cascade_leg(failures: &mut Vec<String>) {
     if close_disposition(false, true) != CloseDisposition::Remove {
         failures.push("(e) a confirmed user close did not remove the slot".into());
     }
-}
-
-// -- leg (f): Swift migration ------------------------------------------------
-
-fn migration_leg(fixture: &Fixture) -> Result<()> {
-    // A Swift-shaped fixture: the source `Nice/sessions.json` carries `branch`
-    // keys the Rust schema drops. The own store is absent, so opening with the
-    // Swift source triggers the one-time migration.
-    let root = fixture.base.join("migration");
-    let own_dir = root.join(session_store::STORE_FOLDER);
-    let swift_dir = root.join(session_store::SWIFT_STORE_FOLDER);
-    std::fs::create_dir_all(&own_dir)?;
-    std::fs::create_dir_all(&swift_dir)?;
-    let own = own_dir.join("sessions.json");
-    let swift = swift_dir.join("sessions.json");
-    let swift_bytes = br#"{
-  "version": 3,
-  "windows": [
-    { "id": "swift-win", "sidebarCollapsed": false,
-      "projects": [
-        { "id": "proj", "name": "Proj", "path": "/work", "branch": "main",
-          "tabs": [
-            { "id": "t1", "title": "A", "cwd": "/work", "branch": "feature",
-              "panes": [ { "id": "p1", "title": "Claude", "kind": "claude" } ] }
-          ] }
-      ] }
-  ]
-}"#;
-    std::fs::write(&swift, swift_bytes)?;
-
-    {
-        // Open with migration; drop the store to flush + join before asserting.
-        let _store = SessionStore::open(own.clone(), Some(swift.clone()));
-    }
-
-    if !own.exists() {
-        anyhow::bail!("migration did not write the own store");
-    }
-    let adopted = session_store::read_state(&own);
-    let win = adopted
-        .windows
-        .iter()
-        .find(|w| w.id == "swift-win")
-        .context("own store did not adopt the Swift window")?;
-    if win.projects.is_empty() || win.projects[0].tabs.is_empty() {
-        anyhow::bail!("migration lost the Swift window's projects/tabs");
-    }
-    // `branch` is ignored (the Rust schema has no such field) — the round-trip is
-    // lossless minus branch, and re-serializing carries no branch key.
-    let reser = serde_json::to_string(&adopted).unwrap();
-    if reser.contains("\"branch\"") {
-        anyhow::bail!("the migrated store leaked a `branch` key (M5 drop failed)");
-    }
-    // The source bytes are untouched (migration only READS the Swift file).
-    if std::fs::read(&swift)? != swift_bytes {
-        anyhow::bail!("migration mutated the Swift source file (must be read-only)");
-    }
-    Ok(())
 }
 
 // -- shared helpers ----------------------------------------------------------

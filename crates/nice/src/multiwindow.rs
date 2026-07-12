@@ -1,7 +1,7 @@
 //! `multiwindow` self-test scenario — the R12 multi-window + shortcut-dispatch
 //! gate (Validation §2–§5), driven end-to-end against the **real**
 //! `WindowRegistry` / `WindowState` / `keymap` with **real CGEvents** posted to
-//! nice-rs's own pid (`crate::platform`, the same edge the R5 `input-*` / R7
+//! nice's own pid (`crate::platform`, the same edge the R5 `input-*` / R7
 //! `niceties-zoom` scenarios use).
 //!
 //! Where the in-process `nice-itests` `multiwindow` cases prove the routing /
@@ -109,7 +109,7 @@ impl Render for MultiWindowRoot {
 /// registry-tracked managed window) and spawn the CGEvent driver + assertions
 /// (self-reported gate).
 pub fn open_multiwindow_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let base = std::env::temp_dir().join(format!("nice-rs-multiwindow-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-multiwindow-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let cap_path = base.join("capture.bin");
     let base_s = base.to_string_lossy().to_string();

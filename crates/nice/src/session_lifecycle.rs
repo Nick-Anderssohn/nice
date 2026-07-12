@@ -111,7 +111,7 @@ impl Render for SessionLifecycleRoot {
 /// directly.
 pub fn open_session_lifecycle_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let base =
-        std::env::temp_dir().join(format!("nice-rs-session-lifecycle-{}", std::process::id()));
+        std::env::temp_dir().join(format!("nice-session-lifecycle-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let cwd = base.to_string_lossy().to_string();
 

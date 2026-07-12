@@ -1,5 +1,5 @@
 #!/bin/bash
-# quitprobe.sh — black-box acceptance test for nice-rs quit/close confirmations,
+# quitprobe.sh — black-box acceptance test for Nice Dev quit/close confirmations,
 # driven with REAL CGEvents/AX against the INSTALLED app. Keys post via
 # CGEventPostToPid to the app's own pid (the standing rule): globally-posted
 # synthetic keys can be consumed by third-party ACTIVE event taps (Wispr Flow
@@ -27,9 +27,9 @@ OUT="${TMPDIR:-/tmp}/quitprobe-$$"; mkdir -p "$OUT"
 fail=0
 say() { echo "[quitprobe] $*"; }
 assert() { if [ "$2" -eq 0 ]; then say "PASS: $1"; else say "FAIL: $1"; fail=1; fi; }
-getpid() { ps -Aww -o pid=,args= | grep -E 'Nice RS Dev\.app/Contents/MacOS/nice-rs' \
+getpid() { ps -Aww -o pid=,args= | grep -E 'Nice Dev\.app/Contents/MacOS/Nice Dev' \
   | grep -v grep | awk '{print $1}' | head -1; }
-launch_and_pid() { open -a "Nice RS Dev"; sleep 2.5; getpid; }
+launch_and_pid() { open -a "Nice Dev"; sleep 2.5; getpid; }
 diffpct() { "$H/imgdiff" "$1" "$2"; }
 shoot() { screencapture -x -o -l "$WIN" "$1"; }
 
@@ -38,10 +38,10 @@ shoot() { screencapture -x -o -l "$WIN" "$1"; }
 # earlier attempts (that exact confound produced a false diagnosis once).
 OLD=$(getpid); [ -n "${OLD}" ] && { say "killing stale instance $OLD"; kill "$OLD"; sleep 1; }
 PID=$(launch_and_pid)
-[ -z "${PID}" ] && { say "FATAL: cannot launch Nice RS Dev"; exit 2; }
+[ -z "${PID}" ] && { say "FATAL: cannot launch Nice Dev"; exit 2; }
 WIN=$("$H/winids" "$PID" | head -1 | awk '{print $1}')
 say "pid=$PID win=$WIN"
-osascript -e 'tell application "Nice RS Dev" to activate'; sleep 0.6
+osascript -e 'tell application "Nice Dev" to activate'; sleep 0.6
 
 probe_visible() { # probe_visible <name> <trigger-cmd...>
   local name="$1"; shift
@@ -61,8 +61,8 @@ probe_visible() { # probe_visible <name> <trigger-cmd...>
 }
 
 probe_visible "A-cmdq"  "$H/keypost" 12 cmd "$PID"
-probe_visible "C-redbtn" osascript -e 'tell application "System Events" to tell process "nice-rs" to click button 1 of window 1'
-probe_visible "D-menu"  osascript -e 'tell application "System Events" to tell process "nice-rs" to click (first menu item of menu 1 of menu bar item 2 of menu bar 1 whose name begins with "Quit")'
+probe_visible "C-redbtn" osascript -e 'tell application "System Events" to tell process "Nice Dev" to click button 1 of window 1'
+probe_visible "D-menu"  osascript -e 'tell application "System Events" to tell process "Nice Dev" to click (first menu item of menu 1 of menu bar item 2 of menu bar 1 whose name begins with "Quit")'
 
 # B: confirm actually quits
 "$H/keypost" 12 cmd "$PID"; sleep 1.3

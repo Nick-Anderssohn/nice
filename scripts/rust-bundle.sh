@@ -1,31 +1,42 @@
 #!/usr/bin/env bash
 #
-# rust-bundle.sh — build the Rust rewrite (crate `nice`, binary `nice-rs`) in
-# release mode and assemble it into an installable "Nice RS Dev.app" bundle.
+# rust-bundle.sh — build the Rust rewrite (crate `nice`, cargo binary `nice`)
+# in release mode and assemble it into an installable .app bundle, in one of
+# two variants that mirror the (now-retired) Swift install.sh model.
 #
 # NOTE ON SIGNING SCOPE — READ BEFORE "FIXING" THIS:
 #   Signing here is ad-hoc (`codesign -s -`) only. That is deliberate, not an
 #   oversight: R1 (this cycle) promises local installability, nothing more.
-#   Notarization and release-CI wiring are Stage 8 (R27-adjacent) work — see
-#   the R1 plan's "Binding technical decisions" / signing-scope note. Do not
-#   add notarytool/staple/Developer ID signing to this script until that
-#   stage lands; doing so early is exactly the kind of silent-reconcile this
-#   plan calls out as unwanted.
+#   Notarization and release-CI wiring are release-rs.sh's job (Developer ID
+#   re-sign + notarytool + staple, overriding this ad-hoc signature). Do not
+#   add notarytool/staple/Developer ID signing to this script.
 #
-# Produces: build-rs/Nice RS Dev.app — a self-contained bundle.
-# scripts/rust-install.sh copies it into /Applications.
+# Two variants (choose with --prod; DEFAULT is dev):
+#   default (no flag)  → Nice Dev.app, built in ./build-rs
+#                          bundle id   dev.nickanderssohn.nice-dev
+#                          app name    Nice Dev
+#                          executable  Nice Dev   (Contents/MacOS/Nice Dev)
+#   --prod             → Nice.app, built in ./build-rs-prod
+#                          bundle id   dev.nickanderssohn.nice
+#                          app name    Nice
+#                          executable  Nice       (Contents/MacOS/Nice)
 #
-# The app identity here is deliberately distinct from both Swift installs
-# (Nice.app / Nice Dev.app) so nothing collides in /Applications,
-# UserDefaults, or process-name greps:
-#   bundle id       dev.nickanderssohn.nice-rs-dev
-#   display name    Nice RS Dev
-#   executable      nice-rs
+# THREE distinct name concepts, kept separate on purpose:
+#   * cargo output binary — always `nice` (target/release/nice); the crate's
+#     [[bin]] name. `cargo build --release -p nice` builds it for BOTH variants.
+#   * bundle executable name (Contents/MacOS/<name> filename AND
+#     CFBundleExecutable) — per-variant "Nice" / "Nice Dev". The single cargo
+#     binary is copied to this per-variant name; they must match each other.
+#   * app/bundle name (.app dir + CFBundleName/CFBundleDisplayName) and bundle
+#     id — per-variant as above.
 #
-# Usage: scripts/rust-bundle.sh [--dest DIR]
+# scripts/rust-install.sh copies the assembled bundle into /Applications.
 #
+# Usage: scripts/rust-bundle.sh [--prod] [--dest DIR]
+#
+#   --prod       Build the production "Nice" variant. Default: "Nice Dev".
 #   --dest DIR   Directory to assemble the .app bundle into.
-#                Default: build-rs (relative to the repo root).
+#                Default: build-rs (dev) / build-rs-prod (--prod).
 #   -h, --help   Show this help.
 #
 # Exit codes:
@@ -34,33 +45,52 @@
 #   2  build, assembly, or codesign-verify step failed
 set -euo pipefail
 
-APP_NAME="Nice RS Dev"
-BUNDLE_ID="dev.nickanderssohn.nice-rs-dev"
-BIN_NAME="nice-rs"
 MIN_OS="14.0"
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
-BUNDLE_DEST="$REPO_ROOT/build-rs"
+PROD=0
+BUNDLE_DEST=""
 
 usage() {
     cat <<EOF
-Usage: scripts/rust-bundle.sh [--dest DIR]
+Usage: scripts/rust-bundle.sh [--prod] [--dest DIR]
 
-  --dest DIR   Directory to assemble the .app bundle into. Default: build-rs.
+  --prod       Build the production "Nice" variant. Default: "Nice Dev".
+  --dest DIR   Directory to assemble the .app bundle into.
+               Default: build-rs (dev) / build-rs-prod (--prod).
   -h, --help   Show this help.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --prod)    PROD=1; shift;;
         --dest)    BUNDLE_DEST="$2"; shift 2;;
         -h|--help) usage; exit 0;;
         *) printf '[rust-bundle] unknown arg: %s\n' "$1" >&2; usage >&2; exit 1;;
     esac
 done
+
+# ── variant identity ────────────────────────────────────────────────────
+# APP_NAME  = .app dir + CFBundleName/CFBundleDisplayName
+# EXEC_NAME = Contents/MacOS/<name> filename + CFBundleExecutable (may have a
+#             space — quote everywhere)
+# BUNDLE_ID = CFBundleIdentifier
+if [[ "$PROD" -eq 1 ]]; then
+    APP_NAME="Nice"
+    EXEC_NAME="Nice"
+    BUNDLE_ID="dev.nickanderssohn.nice"
+    DEFAULT_DEST="$REPO_ROOT/build-rs-prod"
+else
+    APP_NAME="Nice Dev"
+    EXEC_NAME="Nice Dev"
+    BUNDLE_ID="dev.nickanderssohn.nice-dev"
+    DEFAULT_DEST="$REPO_ROOT/build-rs"
+fi
+[[ -n "$BUNDLE_DEST" ]] || BUNDLE_DEST="$DEFAULT_DEST"
 
 log()  { printf '[rust-bundle] %s\n' "$*"; }
 fail() { printf '[rust-bundle] FAIL: %s\n' "$*" >&2; exit 2; }
@@ -79,10 +109,11 @@ fi
 # test-support, which flips CAMetalLayer.framebufferOnly = false PROCESS-
 # WIDE. The shipped bundle must keep the live layer framebuffer-only. See
 # crates/nice/Cargo.toml and crates/nice-harness/src/capture.rs.
-log "building nice-rs (release)"
+log "building nice (release)"
 cargo build --release -p nice
 
-SRC_BIN="$REPO_ROOT/target/release/$BIN_NAME"
+# Single cargo binary for both variants; copied to a per-variant exec name below.
+SRC_BIN="$REPO_ROOT/target/release/nice"
 [[ -x "$SRC_BIN" ]] || fail "release build finished but $SRC_BIN not found"
 
 # ── 2. version (single source of truth: crates/nice/Cargo.toml) ────────
@@ -95,7 +126,7 @@ log "assembling $APP_NAME.app v$VERSION -> ${APP_BUNDLE#$REPO_ROOT/}"
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-ditto "$SRC_BIN" "$APP_BUNDLE/Contents/MacOS/$BIN_NAME"
+ditto "$SRC_BIN" "$APP_BUNDLE/Contents/MacOS/$EXEC_NAME"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -105,7 +136,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>$BIN_NAME</string>
+	<string>$EXEC_NAME</string>
 	<key>CFBundleIdentifier</key>
 	<string>$BUNDLE_ID</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -175,5 +206,5 @@ codesign --verify --deep --strict "$APP_BUNDLE" \
     || fail "codesign --verify failed on $APP_BUNDLE"
 
 log "ok — $APP_BUNDLE"
-log "run directly:  \"$APP_BUNDLE/Contents/MacOS/$BIN_NAME\""
-log "or install:    scripts/rust-install.sh"
+log "run directly:  \"$APP_BUNDLE/Contents/MacOS/$EXEC_NAME\""
+log "or install:    scripts/rust-install.sh$([[ "$PROD" -eq 1 ]] && echo ' --prod')"

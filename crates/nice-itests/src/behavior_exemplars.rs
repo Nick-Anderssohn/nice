@@ -4,7 +4,7 @@
 //! against landed surfaces; they are proofs, not feature coverage.
 //!
 //! Neither case asserts cadence / perf / wall-clock timing — those belong only to
-//! the live `NICE_RS_SELFTEST` suite. The file-poll timeouts below are real-clock
+//! the live `NICE_SELFTEST` suite. The file-poll timeouts below are real-clock
 //! *readiness* waits on an OS-thread pty child (bounded, fail-loud), not timing
 //! assertions.
 

@@ -1,31 +1,42 @@
 #!/usr/bin/env bash
 #
-# rust-install.sh — install the Rust rewrite's dev build into /Applications.
+# rust-install.sh — install the Rust rewrite into /Applications, in one of two
+# variants that mirror the (now-retired) Swift install.sh model.
 #
 # Builds + assembles via scripts/rust-bundle.sh (pass --no-build to reuse an
-# already-assembled build-rs/Nice RS Dev.app), force-quits any running
-# `nice-rs` instance of THIS bundle, then copies the result to
-# /Applications/Nice RS Dev.app.
+# already-assembled bundle), then copies the result into /Applications.
 #
-# SAFETY: this script knows how to install exactly one thing — the Rust
-# rewrite's dev build, "Nice RS Dev.app" / dev.nickanderssohn.nice-rs-dev.
-# It never touches, quits, or even names /Applications/Nice.app (Swift prod)
-# or /Applications/Nice Dev.app (Swift dev) — there is no flag that points
-# this script at either of those paths. Do not add one; the whole point of
-# the Rust rewrite's distinct app identity is that its tooling can't collide
-# with the Swift builds' tooling.
+# Two variants (choose with --prod; DEFAULT is dev):
+#   default (no flag)  → Nice Dev.app (dev.nickanderssohn.nice-dev), built in
+#                        ./build-rs. Safe default: rebuilding cannot touch the
+#                        user's real prod sessions. A running Nice Dev is
+#                        force-quit first so the next launch is the new build.
+#   --prod             → Nice.app (dev.nickanderssohn.nice), built in
+#                        ./build-rs-prod. The production install. A running
+#                        prod Nice may host live Claude Code sessions, so this
+#                        script NEVER force-quits it — the bundle is swapped in
+#                        place via staged rename and the running process picks
+#                        up the new version on next relaunch. Run only when the
+#                        user explicitly asked to upgrade prod.
+#
+# Three distinct name concepts (see rust-bundle.sh header): cargo output binary
+# `nice`, per-variant bundle executable name (Contents/MacOS/<name> +
+# CFBundleExecutable = "Nice" / "Nice Dev"), and per-variant app name + bundle
+# id. Force-quit matching keys on the EXEC_NAME, anchored so Nice.app/.../Nice
+# and Nice Dev.app/.../Nice Dev never cross-match.
 #
 # Force-quit detection uses `ps -Aww -o pid=,args=`, never pgrep/pkill -f —
 # on macOS a GUI app's `comm` is the exec path truncated to 16 chars, so
 # pgrep/pkill -f can silently miss a running instance. Mirrors the approach
-# scripts/install.sh uses for the Swift `Nice Dev` build as of commit
-# 2c08c51 (SIGTERM, poll, SIGKILL — no AppleScript quit, which would raise a
-# quit-confirmation dialog and stall an unattended install).
+# the Swift install.sh used for its `Nice Dev` build (SIGTERM, poll, SIGKILL —
+# no AppleScript quit, which would raise a quit-confirmation dialog and stall
+# an unattended install).
 #
-# Usage: scripts/rust-install.sh [--no-build] [--dest PATH]
+# Usage: scripts/rust-install.sh [--prod] [--no-build] [--dest PATH]
 #
+#   --prod       Install the production "Nice" variant. Default: "Nice Dev".
 #   --no-build   Skip the scripts/rust-bundle.sh build step; install whatever
-#                is already at build-rs/Nice RS Dev.app.
+#                is already at the variant's build dir.
 #   --dest PATH  Directory to install the .app into. Default: /Applications.
 #   -h, --help   Show this help.
 #
@@ -35,21 +46,20 @@
 #   2  build or install step failed
 set -euo pipefail
 
-APP_NAME="Nice RS Dev"
-BIN_NAME="nice-rs"
-
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
+PROD=0
 NO_BUILD=0
 DEST="/Applications"
 
 usage() {
     cat <<EOF
-Usage: scripts/rust-install.sh [--no-build] [--dest PATH]
+Usage: scripts/rust-install.sh [--prod] [--no-build] [--dest PATH]
 
-  --no-build   Skip the build step; install the existing build-rs bundle.
+  --prod       Install the production "Nice" variant. Default: "Nice Dev".
+  --no-build   Skip the build step; install the existing bundle.
   --dest PATH  Directory to install the .app into. Default: /Applications.
   -h, --help   Show this help.
 EOF
@@ -57,6 +67,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --prod)     PROD=1; shift;;
         --no-build) NO_BUILD=1; shift;;
         --dest)     DEST="$2"; shift 2;;
         -h|--help)  usage; exit 0;;
@@ -67,42 +78,63 @@ done
 log()  { printf '[rust-install] %s\n' "$*"; }
 fail() { printf '[rust-install] FAIL: %s\n' "$*" >&2; exit 2; }
 
-# ── 1. build + assemble ─────────────────────────────────────────────────
-if [[ "$NO_BUILD" -eq 0 ]]; then
-    log "building + assembling via scripts/rust-bundle.sh"
-    "$SCRIPT_DIR/rust-bundle.sh"
+# ── variant identity (mirror rust-bundle.sh) ────────────────────────────
+if [[ "$PROD" -eq 1 ]]; then
+    APP_NAME="Nice"
+    EXEC_NAME="Nice"
+    BUILD_DIR="$REPO_ROOT/build-rs-prod"
+    BUNDLE_FLAG="--prod"
+else
+    APP_NAME="Nice Dev"
+    EXEC_NAME="Nice Dev"
+    BUILD_DIR="$REPO_ROOT/build-rs"
+    BUNDLE_FLAG=""
 fi
 
-SRC_APP="$REPO_ROOT/build-rs/$APP_NAME.app"
-[[ -d "$SRC_APP" ]] || fail "$SRC_APP not found — run scripts/rust-bundle.sh first (or drop --no-build)"
+# ── 1. build + assemble ─────────────────────────────────────────────────
+if [[ "$NO_BUILD" -eq 0 ]]; then
+    log "building + assembling via scripts/rust-bundle.sh $BUNDLE_FLAG"
+    # shellcheck disable=SC2086  # empty BUNDLE_FLAG must expand to no arg
+    "$SCRIPT_DIR/rust-bundle.sh" $BUNDLE_FLAG --dest "$BUILD_DIR"
+fi
 
-# ── 2. force-quit a running instance of THIS bundle ─────────────────────
-# Path-scoped to the installed bundle's own executable path so this only
-# ever matches a `nice-rs` launched FROM "Nice RS Dev.app" (the thing we're
-# about to overwrite) — not an ad-hoc `cargo run -p nice` / `target/release/
-# nice-rs` dev session elsewhere, which a developer may intentionally be
-# running side-by-side while testing an install.
-nice_rs_pids() {
+SRC_APP="$BUILD_DIR/$APP_NAME.app"
+[[ -d "$SRC_APP" ]] || fail "$SRC_APP not found — run scripts/rust-bundle.sh $BUNDLE_FLAG first (or drop --no-build)"
+
+# ── 2. force-quit a running instance of THIS bundle (dev only) ──────────
+# CRITICAL SAFETY: for --prod we NEVER force-quit. A running prod Nice may
+# host live Claude Code sessions; the staged-swap below upgrades the bundle
+# on disk and the running process picks up the new version on next relaunch.
+# The dev variant IS force-quit so its next launch is the new build.
+#
+# Matching is path-scoped to the installed bundle's own executable path and
+# anchored on EXEC_NAME so it only matches a binary launched FROM this
+# variant's .app — "Nice Dev.app/Contents/MacOS/Nice Dev" — and never a prod
+# "Nice.app/Contents/MacOS/Nice", nor an ad-hoc `cargo run -p nice` /
+# `target/release/nice` dev session a developer may be running side-by-side.
+nice_pids() {
     ps -Aww -o pid=,args= \
-        | grep -E "$APP_NAME"'\.app/Contents/MacOS/'"$BIN_NAME"'( |$)' \
+        | grep -E "$APP_NAME"'\.app/Contents/MacOS/'"$EXEC_NAME"'( |$)' \
         | awk '{print $1}' || true
 }
 
-pids="$(nice_rs_pids)"
-if [[ -n "$pids" ]]; then
-    log "$APP_NAME is running (pid(s): $(echo "$pids" | tr '\n' ' ')) — force-quitting"
-    # shellcheck disable=SC2086  # word-splitting the pid list is intended
-    kill $pids 2>/dev/null || true
-    for _ in 1 2 3 4 5 6; do
-        [[ -z "$(nice_rs_pids)" ]] && break
-        sleep 0.5
-    done
-    pids="$(nice_rs_pids)"
+if [[ "$PROD" -eq 0 ]]; then
+    pids="$(nice_pids)"
     if [[ -n "$pids" ]]; then
-        log "$APP_NAME survived SIGTERM — sending SIGKILL"
-        # shellcheck disable=SC2086
-        kill -9 $pids 2>/dev/null || true
-        sleep 0.5
+        log "$APP_NAME is running (pid(s): $(echo "$pids" | tr '\n' ' ')) — force-quitting"
+        # shellcheck disable=SC2086  # word-splitting the pid list is intended
+        kill $pids 2>/dev/null || true
+        for _ in 1 2 3 4 5 6; do
+            [[ -z "$(nice_pids)" ]] && break
+            sleep 0.5
+        done
+        pids="$(nice_pids)"
+        if [[ -n "$pids" ]]; then
+            log "$APP_NAME survived SIGTERM — sending SIGKILL"
+            # shellcheck disable=SC2086
+            kill -9 $pids 2>/dev/null || true
+            sleep 0.5
+        fi
     fi
 fi
 

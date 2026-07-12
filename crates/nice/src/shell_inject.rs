@@ -34,8 +34,8 @@
 //! ran longer than that, the sweep deleted the stubs out from under the live
 //! process and every new pane's zsh then sourced nothing. Application Support is
 //! never swept. Because the stub contents are static, one shared directory
-//! serves every window and every process of a variant; `Nice RS Dev` stays
-//! isolated from the Swift `Nice` / `Nice Dev` via `CFBundleName`.
+//! serves every window and every process of a variant; each variant stays
+//! isolated in its own per-variant Application Support folder via `CFBundleName`.
 //! [`write_stubs`] rewrites the stubs on every launch, so the directory
 //! self-heals if anything ever removes a file.
 //!
@@ -303,7 +303,7 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
 /// `MainTerminalShellInject.defaultLocation()`. Honors the
 /// `NICE_APPLICATION_SUPPORT_ROOT` override seam (tests redirect it into a
 /// sandbox; production leaves it unset). The folder name tracks `CFBundleName`
-/// so `Nice RS Dev` gets its own directory, never shared with the Swift builds.
+/// so each variant gets its own directory (`Nice` / `Nice Dev`).
 /// Pure — creates nothing (unlike the Swift `FileManager.url(create:true)`,
 /// which is unnecessary here because [`write_stubs`] creates the dir).
 pub fn default_location() -> PathBuf {
@@ -327,12 +327,12 @@ fn application_support_root(override_value: Option<&str>, home: Option<&str>) ->
     PathBuf::from(home.unwrap_or("/")).join("Library/Application Support")
 }
 
-/// The per-variant folder name: the running app's `CFBundleName`
-/// (`"Nice RS Dev"` for the shipped bundle), falling back to `"Nice RS Dev"`
-/// when unbundled — never `"Nice"` / `"Nice Dev"`, so an unbundled `cargo run`
-/// can never collide with the Swift builds' Application Support.
+/// The per-variant folder name: the running app's `CFBundleName` (`"Nice"` /
+/// `"Nice Dev"` for the shipped bundles), falling back to `"Nice (unbundled)"`
+/// when unbundled — so an unbundled `cargo run` gets its own directory. Delegates
+/// to [`crate::platform::support_folder_name`], the single source of truth.
 fn bundle_folder_name() -> String {
-    crate::platform::main_bundle_name().unwrap_or_else(|| "Nice RS Dev".to_string())
+    crate::platform::support_folder_name()
 }
 
 #[cfg(test)]
@@ -369,7 +369,7 @@ mod tests {
     /// Write the four stubs into a throwaway `ZDOTDIR` (auto-removed) and return
     /// it — the twin of Swift `makeIsolated()`.
     fn make_isolated() -> Scratch {
-        let dir = unique("nice-rs-zdotdir-test");
+        let dir = unique("nice-zdotdir-test");
         write_stubs(&dir).expect("write stubs");
         Scratch(dir)
     }
@@ -759,8 +759,8 @@ mod tests {
     #[test]
     fn zshrc_emitter_produces_clean_osc7_at_runtime() {
         let zdotdir = make_isolated();
-        let home = scratch("nice-rs-osc7-home");
-        let workcwd = scratch("nice-rs-osc7-work");
+        let home = scratch("nice-osc7-home");
+        let workcwd = scratch("nice-osc7-work");
 
         let out = Command::new("/bin/zsh")
             .arg("-ic")
@@ -807,7 +807,7 @@ mod tests {
     /// that point (restored BEFORE the source), not our temp dir.
     #[test]
     fn end_to_end_user_zshrc_sees_restored_zdotdir_during_init() {
-        let home = scratch("nice-rs-e2e-home");
+        let home = scratch("nice-e2e-home");
         std::fs::write(
             home.0.join(".zshrc"),
             "touch \"${ZDOTDIR:-$HOME}/.during-zshrc-marker\"\n\
@@ -831,7 +831,7 @@ mod tests {
     /// injection resolves ZDOTDIR to $HOME (unset), so tooling writes to real home.
     #[test]
     fn end_to_end_default_user_zdotdir_resolves_to_home() {
-        let home = scratch("nice-rs-e2e-home");
+        let home = scratch("nice-e2e-home");
 
         let out = run_zsh_under_injection(
             &home.0,
@@ -855,7 +855,7 @@ mod tests {
     /// injection sources that during discovery and resolves to the custom path.
     #[test]
     fn end_to_end_xdg_style_zdotdir_honored_from_zshenv() {
-        let home = scratch("nice-rs-e2e-home");
+        let home = scratch("nice-e2e-home");
         let custom = home.0.join(".config/zsh");
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(home.0.join(".zshenv"), r#"export ZDOTDIR="$HOME/.config/zsh""#).unwrap();
@@ -882,7 +882,7 @@ mod tests {
     /// `$NICE_USER_ZDOTDIR/.zprofile` so login-shell users keep their `~/.zprofile`.
     #[test]
     fn end_to_end_login_shell_sources_user_zprofile() {
-        let home = scratch("nice-rs-e2e-home");
+        let home = scratch("nice-e2e-home");
         std::fs::write(home.0.join(".zprofile"), "echo NICE-ZPROFILE-LOADED").unwrap();
 
         let out = run_zsh_under_injection(&home.0, None, "true", true);
@@ -897,7 +897,7 @@ mod tests {
     /// NICE_USER_ZDOTDIR; the shell restores that value verbatim.
     #[test]
     fn end_to_end_launchctl_style_zdotdir_honored_from_env() {
-        let home = scratch("nice-rs-e2e-home");
+        let home = scratch("nice-e2e-home");
         let custom = home.0.join("launchctl-zsh");
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join(".zshrc"), "echo NICE-LAUNCHCTL-ZSHRC-LOADED").unwrap();

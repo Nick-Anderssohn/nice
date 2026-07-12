@@ -259,7 +259,7 @@ async fn real_pill_click_leg(
         deferred.push(format!(
             "real click: the frontmost-at-point preflight FAILED — our window does not own the pill \
              point ({gx:.0},{gy:.0}) per CGWindowListCopyWindowInfo (another window is on top, or the \
-             point is off our window). DEFERRED LOUDLY; NO global click was posted. Bring the nice-rs \
+             point is off our window). DEFERRED LOUDLY; NO global click was posted. Bring the nice \
              window frontmost and re-run for the real-click assertion; the popover open + contents are \
              asserted in-process."
         ));

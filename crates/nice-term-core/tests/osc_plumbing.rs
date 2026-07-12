@@ -18,7 +18,7 @@
 //!    `ESC[?2004h` / `l` and stays consistent across scrollback churn.
 //!
 //! Cleanliness sweep hook: every command pane here carries the token
-//! `NICE_RS_TEST_SENTINEL` in the child's argv (as the wrapped shell's `$0` via
+//! `NICE_TEST_SENTINEL` in the child's argv (as the wrapped shell's `$0` via
 //! [`wrap`]), so it shows in `ps -Aww -o args=` but never in output. After the
 //! run, `ps -Aww -o pid=,args= | grep -c '[N]ICE_RS_TEST_SENTINEL'` must be 0.
 //! Every session is dropped at end of scope → its process group is torn down
@@ -34,7 +34,7 @@ use nice_term_core::{
 };
 
 /// argv token the cleanliness sweep greps for (as the wrapped shell's `$0`).
-const SENTINEL: &str = "NICE_RS_TEST_SENTINEL";
+const SENTINEL: &str = "NICE_TEST_SENTINEL";
 
 /// A generous poll ceiling: a login+interactive zsh sources rc before our
 /// command runs, and a loaded machine can be slow.
@@ -47,7 +47,7 @@ const POLL: Duration = Duration::from_secs(25);
 fn zdotdir() -> &'static str {
     static DIR: OnceLock<String> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("nice-rs-zdotdir-osc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nice-zdotdir-osc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create ZDOTDIR");
         for rc in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
             std::fs::write(dir.join(rc), "").expect("write empty rc");
@@ -63,7 +63,7 @@ fn test_env() -> Vec<(String, String)> {
 
 /// Wrap a shell `script` so the exec'd process carries [`SENTINEL`] in its argv
 /// (as `$0`) while producing exactly `script`'s output →
-/// `zsh -ilc "exec sh -c '<script>' NICE_RS_TEST_SENTINEL"`.
+/// `zsh -ilc "exec sh -c '<script>' NICE_TEST_SENTINEL"`.
 fn wrap(script: &str) -> String {
     format!("sh -c {} {}", shell_single_quote(script), SENTINEL)
 }
@@ -203,7 +203,7 @@ fn osc7_hostname_and_pwd_exact_path() {
     // The plan's literal form: emit `file://$(hostname)$PWD`. The local hostname
     // must be accepted and the path decoded exactly. Compare canonicalized on
     // both sides to absorb any symlink form of `$PWD`.
-    let base = std::env::temp_dir().join(format!("nice-rs-osc7-cwd-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-osc7-cwd-{}", std::process::id()));
     std::fs::create_dir_all(&base).expect("create temp cwd");
     let canon = std::fs::canonicalize(&base).expect("canonicalize temp cwd");
     let cwd_str = canon.to_str().expect("utf8 cwd").to_string();

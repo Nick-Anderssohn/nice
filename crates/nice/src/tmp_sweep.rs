@@ -1,7 +1,7 @@
 //! Stale `$TMPDIR` artifact sweep (R14).
 //!
 //! Ports Swift `NiceServices.cleanupStaleTempFiles` / `tempFileDecision`
-//! (`Sources/Nice/State/NiceServices.swift:448-527`). Prior nice-rs / Nice runs
+//! (`Sources/Nice/State/NiceServices.swift:448-527`). Prior nice / Nice runs
 //! that crashed or were `SIGKILL`ed without running teardown leave two kinds of
 //! debris in the process `$TMPDIR`:
 //!
@@ -13,8 +13,8 @@
 //!
 //! The sweep removes only debris whose embedded pid names a process that is
 //! **gone**. The pid-liveness rule is load-bearing for cross-app safety during
-//! the migration: running `Nice RS Dev` while a Swift `Nice` (or a second
-//! nice-rs) is open must NOT wipe the other live process's `nice-zdotdir-<pid>`
+//! the migration: running one Nice variant while a Swift `Nice` (or a second
+//! nice) is open must NOT wipe the other live process's `nice-zdotdir-<pid>`
 //! dir, or that process's zsh children suddenly source nothing and silently drop
 //! every alias in the user's `~/.zshrc`. `kill(pid, 0)` returning anything other
 //! than `ESRCH` (in particular `EPERM` — a live process owned by another user)
@@ -223,7 +223,7 @@ mod tests {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "nice-rs-sweep-test-{}-{n}",
+            "nice-sweep-test-{}-{n}",
             std::process::id()
         ))
     }

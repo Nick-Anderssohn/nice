@@ -734,7 +734,7 @@ mod tests {
     fn temp_base(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "nice-rs-appearance-{tag}-{}-{}",
+            "nice-appearance-{tag}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ))

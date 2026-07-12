@@ -177,7 +177,7 @@ impl From<io::Error> for InstallError {
 /// the session-sync feature degrades.
 pub fn install() {
     if let Err(e) = install_with(&default_script_dir(), &default_settings_path()) {
-        eprintln!("nice-rs: ClaudeHookInstaller: install failed: {e}");
+        eprintln!("nice: ClaudeHookInstaller: install failed: {e}");
     }
 }
 
@@ -353,7 +353,7 @@ fn sort_value(v: &Value) -> Value {
 }
 
 /// `~/.nice/` — a no-space dotdir so Claude's shell-based hook runner doesn't
-/// word-split the command path. Nice and `Nice RS Dev` share it because the
+/// word-split the command path. Both Nice variants (`Nice` / `Nice Dev`) share it because the
 /// script content is variant-agnostic (both write the same body).
 fn default_script_dir() -> PathBuf {
     PathBuf::from(home_dir()).join(".nice")

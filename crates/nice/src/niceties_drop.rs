@@ -54,7 +54,7 @@ const CELL_H: f32 = 16.0;
 /// The fixed path the stub image-drop provider returns — a plausible temp PNG
 /// path with a space, so the raw-image fallback also exercises escaping. Assert
 /// on its escaped, space-padded form.
-const STUB_IMAGE_PATH: &str = "/private/tmp/nice-rs-drop-image/pasted image.png";
+const STUB_IMAGE_PATH: &str = "/private/tmp/nice-drop-image/pasted image.png";
 
 /// The animated container hosting the live [`TerminalView`] (RAF each render so
 /// it keeps painting; frame stamp for the harness's per-scenario reset).
@@ -146,7 +146,7 @@ fn perform_drop(
 /// Open the `niceties-drop` scenario window (capture-tee session) and spawn the
 /// drop-handler assertions (self-reported gate).
 pub fn open_niceties_drop_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let base = std::env::temp_dir().join(format!("nice-rs-niceties-drop-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-niceties-drop-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let cap_path = base.join("capture.bin");
     let base_s = base.to_string_lossy().to_string();

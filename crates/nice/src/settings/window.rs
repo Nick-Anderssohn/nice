@@ -131,7 +131,7 @@ pub(crate) fn open_or_focus_settings(cx: &mut App) {
         cx.new(|_cx| SettingsRootView::new())
     }) {
         Ok(handle) => cx.set_global(SettingsWindow(Some(handle.into()))),
-        Err(e) => eprintln!("nice-rs: failed to open the settings window: {e:#}"),
+        Err(e) => eprintln!("nice: failed to open the settings window: {e:#}"),
     }
 }
 

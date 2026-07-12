@@ -33,9 +33,9 @@
 //!   (`parent_tab_id == None`) with the originating tab re-parented + indented
 //!   beneath it (root promotion), then a `source:"clear"` update rotates the id in
 //!   place with NO new tab (`/clear` tracking).
-//! * **(e) theme + pointer files present** — the theme file exists at the `nice-rs`
+//! * **(e) theme + pointer files present** — the theme file exists at the `nice`
 //!   slug carrying `"_niceManaged": true`, and the `--settings` pointer file has the
-//!   exact `{"theme":"custom:nice-rs"}` bytes.
+//!   exact `{"theme":"custom:nice"}` bytes.
 //! * **(f) gate-OFF parity** — with the theme-sync gate flipped OFF (a scenario
 //!   seam) and the window provider re-filled, repeating leg (c)'s typed promotion in
 //!   a fresh terminal tab yields a settings-less reply: the wrapper `exec`s the stub
@@ -112,7 +112,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-claude-e2e-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-claude-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&base).context("create fixture base")?;
         // Canonicalize so /var/folders (a symlink to /private/var/folders on macOS)
         // resolves — a spawned shell's $HOME-derived pointer path must compare equal
@@ -189,7 +189,7 @@ impl Fixture {
     fn stub_str(&self) -> String {
         self.stub.to_string_lossy().into_owned()
     }
-    /// The theme file the writer lands at the `nice-rs` slug (leg (e)).
+    /// The theme file the writer lands at the `nice` slug (leg (e)).
     fn theme_file(&self) -> PathBuf {
         crate::claude_theme_sync::themes_dir(&self.home, None)
             .join(format!("{}.json", crate::claude_theme_sync::SLUG))
@@ -231,7 +231,7 @@ pub fn open_claude_e2e_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         crate::keymap::install_shortcuts(app);
 
         // Mirror the bootstrap write against sandbox paths (leg (e)): the theme file
-        // at the `nice-rs` slug + the pointer file. `run_selftest` never runs the
+        // at the `nice` slug + the pointer file. `run_selftest` never runs the
         // real `app::run` bootstrap write, so the scenario does it hermetically.
         crate::claude_theme_sync::write_with(
             &TerminalTheme::nice_default_dark(),
@@ -407,16 +407,16 @@ async fn run_claude_e2e(
     match std::fs::read(fixture.theme_file()) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(v) if v.get("_niceManaged").and_then(|m| m.as_bool()) == Some(true) => {}
-            Ok(_) => failures.push("(e) the theme file at the nice-rs slug lacks _niceManaged:true".into()),
-            Err(_) => failures.push("(e) the theme file at the nice-rs slug is not valid JSON".into()),
+            Ok(_) => failures.push("(e) the theme file at the nice slug lacks _niceManaged:true".into()),
+            Err(_) => failures.push("(e) the theme file at the nice slug is not valid JSON".into()),
         },
         Err(_) => failures.push(format!(
-            "(e) no theme file at the nice-rs slug ({:?})",
+            "(e) no theme file at the nice slug ({:?})",
             fixture.theme_file()
         )),
     }
     match std::fs::read(fixture.pointer()) {
-        Ok(bytes) if bytes == b"{\n  \"theme\": \"custom:nice-rs\"\n}" => {}
+        Ok(bytes) if bytes == b"{\n  \"theme\": \"custom:nice\"\n}" => {}
         Ok(bytes) => failures.push(format!(
             "(e) the pointer file bytes are not the exact contract: {:?}",
             String::from_utf8_lossy(&bytes)

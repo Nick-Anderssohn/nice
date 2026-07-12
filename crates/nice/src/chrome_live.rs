@@ -4,7 +4,7 @@
 //! full-screen wiring on a real, frontmost NSWindow and ground-truths them against
 //! AppKit reads.
 //!
-//! It posts **real CGEvents** (mouse down / drag / up / double-click) to nice-rs's
+//! It posts **real CGEvents** (mouse down / drag / up / double-click) to nice's
 //! OWN pid (`crate::platform`, `CGEventPostToPid` — never the global HID tap), so
 //! it preflights the Accessibility grant and FAILs loudly if it is missing (a
 //! dropped CGEvent would silently no-op the drag/double-click checks). What it
@@ -147,7 +147,7 @@ fn make_view(handle: Entity<TerminalSessionHandle>, cx: &mut AsyncApp) -> Entity
 }
 
 fn prepare_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!("nice-rs-chrome-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-chrome-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     Ok(base)
 }
@@ -318,7 +318,7 @@ async fn fullscreen_checks(
 
     // Re-activate the app AND explicitly activate our window so `active_window()`
     // resolves to it: the global ToggleFullScreen handler toggles the ACTIVE
-    // window, and an unattended run may not make nice-rs the OS-active app.
+    // window, and an unattended run may not make nice the OS-active app.
     let _ = cx.update(|app| app.activate(true));
     let _ = window.update(cx, |_r, w, _a| w.activate_window());
     settle(cx, 500).await;
@@ -347,13 +347,13 @@ async fn fullscreen_checks(
     }
     if !via_action {
         // Full screen + the title flip work (asserted below via the direct entry),
-        // but the ACTION did not drive it: nice-rs did not register as the
+        // but the ACTION did not drive it: nice did not register as the
         // OS-active application unattended, so `App::dispatch_action` found no
         // active window to route to. NOT a code fault — ⌃⌘F works when the app is
         // genuinely active — so DEFER (do not fail) and let a human confirm.
         deferred.push(
             "full screen: the ToggleFullScreen ACTION did not drive full screen in this run (a \
-             direct window.toggle_fullscreen() did) — nice-rs was not the OS-active app \
+             direct window.toggle_fullscreen() did) — nice was not the OS-active app \
              unattended, so App::dispatch_action's active-window routing found none. The View-menu \
              title flip + geometry-after-exit BELOW were still HARD-asserted via the direct entry. \
              DEFERRED: a human confirms ⌃⌘F enters full screen."

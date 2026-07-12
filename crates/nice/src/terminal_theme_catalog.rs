@@ -2,9 +2,9 @@
 //! resolution seam. R21 shipped a two-entry stub; **R22 fills it**: the full
 //! 12-entry bundled table ([`crate::built_in_terminal_themes`]) plus the user's
 //! Ghostty-imported theme files enumerated from
-//! `<support-root>/Nice RS Dev/terminal-themes/` (the
-//! `NICE_APPLICATION_SUPPORT_ROOT` + [`session_store::STORE_FOLDER`]
-//! (`crate::session_store::STORE_FOLDER`) convention).
+//! `<support-root>/<variant>/terminal-themes/` (the
+//! `NICE_APPLICATION_SUPPORT_ROOT` + [`session_store::store_folder`]
+//! (`crate::session_store::store_folder`) per-variant convention).
 //!
 //! The fill is purely additive: **R22 replaces the built-in table and extends
 //! the lookup bodies WITHOUT changing [`TerminalThemeCatalog::resolve`] /
@@ -132,7 +132,7 @@ pub struct TerminalThemeCatalog {
     /// The user-imported themes, kept sorted by `display_name`. All scope
     /// [`ThemeScope::Either`].
     imported: Vec<ImportedTheme>,
-    /// The directory imported files live in (`<support-root>/Nice RS Dev/
+    /// The directory imported files live in (`<support-root>/<variant>/
     /// terminal-themes/`). `import_theme` writes here; `remove_imported` deletes
     /// from here. Injectable so tests / `run_selftest` point at a temp dir.
     support_dir: PathBuf,
@@ -409,11 +409,11 @@ pub fn display_name(name: &str) -> String {
         .join(" ")
 }
 
-/// Resolve the imported-theme storage dir: `<support-root>/Nice RS Dev/
+/// Resolve the imported-theme storage dir: `<support-root>/<variant>/
 /// terminal-themes`, where `<support-root>` = `NICE_APPLICATION_SUPPORT_ROOT`
 /// when set (tests / scenarios redirect state into a sandbox) else
-/// `~/Library/Application Support`. Reuses [`session_store::STORE_FOLDER`]
-/// (`crate::session_store::STORE_FOLDER`). Called from `app::run` ONLY (the
+/// `~/Library/Application Support`. Reuses [`session_store::store_folder`]
+/// (`crate::session_store::store_folder`). Called from `app::run` ONLY (the
 /// `sort_settings_store::default_ui_settings_path` convention) — never a test or
 /// `run_selftest`.
 pub fn default_terminal_themes_dir() -> PathBuf {
@@ -424,7 +424,7 @@ pub fn default_terminal_themes_dir() -> PathBuf {
             PathBuf::from(home).join("Library/Application Support")
         }
     };
-    root.join(crate::session_store::STORE_FOLDER)
+    root.join(crate::session_store::store_folder())
         .join("terminal-themes")
 }
 
@@ -439,7 +439,7 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "nice-rs-catalog-{tag}-{}-{}",
+            "nice-catalog-{tag}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ))

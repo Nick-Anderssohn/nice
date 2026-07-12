@@ -86,16 +86,16 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Result<Self> {
-        let base = std::env::temp_dir().join(format!("nice-rs-handoff-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("nice-handoff-{}", std::process::id()));
         std::fs::create_dir_all(&base).context("create fixture base")?;
         let base = base.canonicalize().context("canonicalize fixture base")?;
 
         let home = base.join("home");
         let work = base.join("work");
         // The injected installer dirs mirror the real layout but under the scratch
-        // root: `<base>/claude/skills/nice-handoff-rs` + `<base>/nice`. They are
+        // root: `<base>/claude/skills/nice-handoff` + `<base>/nice`. They are
         // NOT pre-created — the installer `create_dir_all`s them.
-        let skill_dir = base.join("claude").join("skills").join("nice-handoff-rs");
+        let skill_dir = base.join("claude").join("skills").join("nice-handoff");
         let helper_dir = base.join("nice");
         let capture_dir = base.join("argv");
         let bin = base.join("bin");
@@ -410,7 +410,7 @@ fn installer_round_trip_leg(fixture: &Fixture, failures: &mut Vec<String>) {
 
     crate::skill_installer::sync_with(false, skill_dir, helper_dir);
     if skill_dir.exists() {
-        failures.push("(a) uninstall: the nice-handoff-rs/ skill subtree must be removed".into());
+        failures.push("(a) uninstall: the nice-handoff/ skill subtree must be removed".into());
     }
     if helper_path.exists() {
         failures.push("(a) uninstall: the -rs helper FILE must be removed".into());

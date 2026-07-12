@@ -1,5 +1,5 @@
-//! nice-rs — the Nice rewrite's GPUI application binary (Path B, all-Rust
-//! single Metal stack). Process/binary name `nice-rs`, distinct from the Swift
+//! nice — the Nice rewrite's GPUI application binary (Path B, all-Rust
+//! single Metal stack). Process/binary name `nice`, distinct from the Swift
 //! `Nice` / `Nice Dev` builds.
 //!
 //! Structure (grows over later cycles):
@@ -105,7 +105,7 @@
 //!     classifier + the `nice-*.sock` / legacy `nice-zdotdir-*` sweep with an
 //!     injected `kill(pid,0)` liveness probe (keeps a live sibling app's debris).
 //!
-//! Entry dispatch: `NICE_RS_SELFTEST=<scenario>` runs the measurement harness
+//! Entry dispatch: `NICE_SELFTEST=<scenario>` runs the measurement harness
 //! (see `nice_harness::selftest`); otherwise the normal app opens its window.
 
 mod app;
@@ -143,6 +143,7 @@ mod pane_strip_live;
 mod persistence_restore_live;
 mod platform;
 mod release_check;
+mod rename_migration;
 mod restore;
 mod session_lifecycle;
 mod session_manager;
@@ -172,7 +173,7 @@ mod window_registry;
 mod window_state;
 
 fn main() {
-    match std::env::var("NICE_RS_SELFTEST") {
+    match std::env::var("NICE_SELFTEST") {
         Ok(selector) if !selector.trim().is_empty() => app::run_selftest(selector),
         _ => app::run(),
     }

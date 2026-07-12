@@ -14,7 +14,7 @@
 //! guarded by message identity so a newer message isn't clobbered by an older
 //! timer.
 //!
-//! AX: role Group + label `nice-rs-drift-banner` (the shipped-surface anchor the
+//! AX: role Group + label `nice-drift-banner` (the shipped-surface anchor the
 //! composition leg walks for).
 
 use std::time::Duration;
@@ -31,7 +31,7 @@ use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
 /// The shipped-surface AX anchor label for the drift banner (role Group + this
 /// label; no title — the `app-shell` AX convention).
-pub(crate) const DRIFT_BANNER_LABEL: &str = "nice-rs-drift-banner";
+pub(crate) const DRIFT_BANNER_LABEL: &str = "nice-drift-banner";
 
 /// How long a banner shows before it auto-dismisses (Swift's 3.5 s).
 const DISMISS_AFTER: Duration = Duration::from_millis(3500);

@@ -91,7 +91,7 @@ fn grid_text(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> Strin
 /// Open the `niceties-held` scenario window (the non-zero-exit pane) and spawn the
 /// held-pane assertions (self-reported gate).
 pub fn open_niceties_held_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
-    let base = std::env::temp_dir().join(format!("nice-rs-niceties-held-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("nice-niceties-held-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
     // A pane that prints then exits non-zero → the R3 classification holds it.
