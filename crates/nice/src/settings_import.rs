@@ -147,6 +147,29 @@ impl ToggleSink for PlatformToggleSink {
     }
 }
 
+/// Injectable PostScript-name → GPUI-family-name resolver — the Fix B hermetic
+/// seam (the [`ProdSettingsReader`] analog). Prod persists a custom terminal font
+/// as its PostScript name, but the Rust font system resolves by GPUI *family*
+/// name, so the raw imported value never matches and paints a proportional
+/// substitute in the fixed-pitch grid. Production ([`PlatformFamilyNameResolver`])
+/// translates via the CoreText helper in `platform.rs`; unit tests inject a
+/// `{name → family}` map so no test touches CoreText.
+pub trait FamilyNameResolver {
+    /// The GPUI family name for `name` (a prod PostScript name, or an
+    /// already-a-family name), or `None` when `name` is not a genuine installed
+    /// match — the caller then fails soft to the original string.
+    fn family_name(&self, name: &str) -> Option<String>;
+}
+
+/// Production [`FamilyNameResolver`] over the CoreText helper in `platform.rs`.
+struct PlatformFamilyNameResolver;
+
+impl FamilyNameResolver for PlatformFamilyNameResolver {
+    fn family_name(&self, name: &str) -> Option<String> {
+        crate::platform::postscript_to_family_name(name)
+    }
+}
+
 /// Translate the prod file-browser criterion rawValue to the Rust
 /// `file_browser_sort.criterion` rawValue: `dateModified` → `date_modified`
 /// (the Swift enum spelling → the Rust snake_case spelling); `name` and any
@@ -166,6 +189,7 @@ fn translate_criterion(raw: &str) -> String {
 /// into `ui_settings.json`.
 fn build_direct_sections(
     reader: &dyn ProdSettingsReader,
+    family_resolver: &dyn FamilyNameResolver,
 ) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::{Map, Value};
 
@@ -188,7 +212,12 @@ fn build_direct_sections(
         insert_number(&mut fonts, "sidebar_font_size", v);
     }
     if let Some(v) = reader.string(PROD_TERMINAL_FONT_FAMILY) {
-        fonts.insert("terminal_font_family".to_string(), Value::String(v));
+        // Fix B: prod stored a PostScript name for a custom font; translate it to
+        // the GPUI family name the Rust font system resolves by. Fail-soft to the
+        // original string on a non-match (not a genuine installed font) — Fix A
+        // then renders it as Menlo rather than a proportional garble.
+        let family = family_resolver.family_name(&v).unwrap_or(v);
+        fonts.insert("terminal_font_family".to_string(), Value::String(family));
     }
     if !fonts.is_empty() {
         sections.insert("fonts".to_string(), Value::Object(fonts));
@@ -478,6 +507,7 @@ fn import_if_first_launch(
     own_path: &Path,
     reader: &dyn ProdSettingsReader,
     toggle_sink: &mut dyn ToggleSink,
+    family_resolver: &dyn FamilyNameResolver,
 ) {
     // Gate: only on a genuine first launch (own store absent). Mirrors
     // `session_store`'s "own store present ⇒ never re-migrate" discipline.
@@ -488,7 +518,7 @@ fn import_if_first_launch(
     // Direct settings → write EAGERLY (even an empty set stamps `{"version":1}`),
     // so the gate flips to "present" after this launch and the import never
     // re-runs — the load-bearing one-shot guarantee (plan decision #6).
-    let mut sections = build_direct_sections(reader);
+    let mut sections = build_direct_sections(reader, family_resolver);
 
     // Keyboard shortcuts → the `shortcuts` section (plan decision #5). Decoded from
     // prod's `keyboardShortcuts` JSON `Data`; fail-soft (absent blob / malformed
@@ -533,7 +563,8 @@ pub fn import_prod_settings_on_first_launch() {
         domain: crate::platform::prod_settings_domain(),
     };
     let mut sink = PlatformToggleSink;
-    import_if_first_launch(&own_path, &reader, &mut sink);
+    let family_resolver = PlatformFamilyNameResolver;
+    import_if_first_launch(&own_path, &reader, &mut sink, &family_resolver);
 }
 
 #[cfg(test)]
@@ -632,6 +663,30 @@ mod tests {
         }
     }
 
+    /// A hermetic [`FamilyNameResolver`] that maps names via an injected
+    /// `{name → family}` table, standing in for the CoreText helper. A name with
+    /// no entry resolves to `None` — modeling both an already-installed passthrough
+    /// (map `family → family`) and a not-installed miss (leave it out), so no test
+    /// touches CoreText. `default()` is the empty map (every name → `None` →
+    /// fail-soft to the original string), which is what the pre-Fix-B tests want.
+    #[derive(Default)]
+    struct FakeResolver {
+        map: HashMap<String, String>,
+    }
+
+    impl FakeResolver {
+        fn with(mut self, name: &str, family: &str) -> Self {
+            self.map.insert(name.to_string(), family.to_string());
+            self
+        }
+    }
+
+    impl FamilyNameResolver for FakeResolver {
+        fn family_name(&self, name: &str) -> Option<String> {
+            self.map.get(name).cloned()
+        }
+    }
+
     /// A fully-populated prod domain lands every mapped direct key end-to-end:
     /// the three stores that own `ui_settings.json` decode the imported values.
     #[test]
@@ -653,7 +708,7 @@ mod tests {
             .with_bool(PROD_FB_SORT_ASCENDING, false);
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         // fonts + advanced (SettingsPrefsStore).
         let prefs = SettingsPrefsStore::load(path.clone());
@@ -689,7 +744,7 @@ mod tests {
         let path = temp_ui_settings("criterion");
         let reader = FakeReader::default().with_string(PROD_FB_SORT_CRITERION, "dateModified");
         let mut sink = FakeToggleSink::default();
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -704,7 +759,7 @@ mod tests {
         let reader = FakeReader::default();
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         // The file was written eagerly (one-shot gate flips).
         assert!(path.exists());
@@ -736,7 +791,7 @@ mod tests {
         let reader = FakeReader::default().with_number(PROD_TERMINAL_FONT_SIZE, 17.0);
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -746,6 +801,67 @@ mod tests {
         assert!(raw.get("appearance").is_none());
         assert!(raw.get("advanced").is_none());
         assert!(raw.get("file_browser_sort").is_none());
+    }
+
+    // --- Fix B: PostScript-name → family-name translation -------------------
+
+    /// Fix B: prod's stored PostScript name is translated to the GPUI family name
+    /// (the resolver seam, mocked) before it lands in `ui_settings.json` — so a
+    /// migrating custom-font user gets THEIR font, not the Menlo fallback.
+    #[test]
+    fn font_family_postscript_name_translated_to_family() {
+        let path = temp_ui_settings("font-ps-translate");
+        let reader =
+            FakeReader::default().with_string(PROD_TERMINAL_FONT_FAMILY, "MesloLGSNF-Regular");
+        let mut sink = FakeToggleSink::default();
+        let resolver = FakeResolver::default().with("MesloLGSNF-Regular", "MesloLGS NF");
+
+        import_if_first_launch(&path, &reader, &mut sink, &resolver);
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["fonts"]["terminal_font_family"], "MesloLGS NF");
+    }
+
+    /// Fix B: a value that is already a GPUI family name resolves to itself and
+    /// passes through unchanged (CoreText's PS-or-family accept, modeled by a
+    /// `family → family` map entry).
+    #[test]
+    fn font_family_already_a_family_passes_through() {
+        let path = temp_ui_settings("font-family-passthrough");
+        let reader =
+            FakeReader::default().with_string(PROD_TERMINAL_FONT_FAMILY, "MesloLGS NF");
+        let mut sink = FakeToggleSink::default();
+        let resolver = FakeResolver::default().with("MesloLGS NF", "MesloLGS NF");
+
+        import_if_first_launch(&path, &reader, &mut sink, &resolver);
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["fonts"]["terminal_font_family"], "MesloLGS NF");
+    }
+
+    /// Fix B validation branch: a name that is NOT a genuine installed match
+    /// (resolver → `None`, modeling the CoreText helper rejecting the lenient
+    /// Helvetica substitute) fails soft to the ORIGINAL string — never the
+    /// proportional substitute. Fix A then renders the original as Menlo.
+    #[test]
+    fn font_family_not_installed_falls_back_to_original_not_helvetica() {
+        let path = temp_ui_settings("font-not-installed");
+        let reader =
+            FakeReader::default().with_string(PROD_TERMINAL_FONT_FAMILY, "JetBrains Mono");
+        let mut sink = FakeToggleSink::default();
+        // Empty map ⇒ resolver returns None (the not-installed / validation-fail case).
+        let resolver = FakeResolver::default();
+
+        import_if_first_launch(&path, &reader, &mut sink, &resolver);
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Fail-soft to the original string — and explicitly NOT the lenient
+        // Helvetica substitute the naive CoreText path would have emitted.
+        assert_eq!(raw["fonts"]["terminal_font_family"], "JetBrains Mono");
+        assert_ne!(raw["fonts"]["terminal_font_family"], "Helvetica");
     }
 
     /// The pure toggle decision: copy iff present-in-prod AND absent-in-own.
@@ -774,7 +890,7 @@ mod tests {
         // The user already turned installHandoffSkill OFF in the Rust build.
         let mut sink = FakeToggleSink::default().with_own("installHandoffSkill", false);
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         // syncClaudeTheme + handoffSkillPromptSeen adopted from prod.
         assert_eq!(sink.own.get("syncClaudeTheme"), Some(&false));
@@ -806,7 +922,7 @@ mod tests {
             .with_bool("syncClaudeTheme", true);
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         // The user's edit is untouched (no re-import / clobber).
         let prefs = SettingsPrefsStore::load(path);
@@ -921,7 +1037,7 @@ mod tests {
         let reader = FakeReader::default().with_data(PROD_KEYBOARD_SHORTCUTS, &blob);
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         // A prod-only id never leaks a bogus key into the section.
         let raw: serde_json::Value =
@@ -959,7 +1075,7 @@ mod tests {
         let reader = FakeReader::default().with_number(PROD_TERMINAL_FONT_SIZE, 15.0);
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -981,7 +1097,7 @@ mod tests {
         let reader = FakeReader::default().with_data(PROD_KEYBOARD_SHORTCUTS, b"{ not json");
         let mut sink = FakeToggleSink::default();
 
-        import_if_first_launch(&path, &reader, &mut sink);
+        import_if_first_launch(&path, &reader, &mut sink, &FakeResolver::default());
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

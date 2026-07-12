@@ -1017,7 +1017,11 @@ The GPUI application. Structure (grows over later cycles):
     `ShortcutBindings::load` and the R24 divergence note above. Two
     destinations: the direct settings (fonts, smooth-scroll, appearance,
     file-browser sort — verbatim except the `dateModified`→`date_modified`
-    criterion rawValue) written through the same `write_ui_settings_merged`
+    criterion rawValue and the terminal-font-family
+    PostScript-name→GPUI-family-name translation (Fix B, via the CoreText
+    helper `platform::postscript_to_family_name` behind the injectable
+    `FamilyNameResolver` seam; fail-soft to the original string on a
+    non-match)) written through the same `write_ui_settings_merged`
     writer `shortcuts_store` uses; and the `shortcuts` section itself, which
     decodes prod's `keyboardShortcuts` JSON `Data` blob
     (`{actionId:{keyCode,modifierFlagsRaw}}`) into gpui chord tokens via an

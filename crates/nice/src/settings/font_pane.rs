@@ -233,6 +233,12 @@ const DEFAULT_FAMILY_LABEL: &str = "Default (SF Mono)";
 /// installed family alphabetized (deduped against the curated set). Pure so the
 /// ordering/dedup contract is unit-testable without a text system.
 fn family_options(installed: Vec<String>) -> Vec<(String, Option<String>)> {
+    let curated: Vec<String> = CURATED_FAMILIES
+        .iter()
+        .filter(|c| installed.iter().any(|n| n == *c))
+        .map(|s| s.to_string())
+        .collect();
+
     let mut extra: Vec<String> = installed
         .into_iter()
         .filter(|n| !CURATED_FAMILIES.iter().any(|c| c == n))
@@ -242,9 +248,8 @@ fn family_options(installed: Vec<String>) -> Vec<(String, Option<String>)> {
 
     let mut options = vec![(DEFAULT_FAMILY_LABEL.to_string(), None)];
     options.extend(
-        CURATED_FAMILIES
-            .iter()
-            .map(|s| s.to_string())
+        curated
+            .into_iter()
             .chain(extra)
             .map(|fam| (fam.clone(), Some(fam))),
     );
@@ -360,20 +365,36 @@ mod tests {
 
     #[test]
     fn family_options_lead_with_default_then_curated_then_alphabetized_extras() {
+        // Omit some curated names ("Hack", "Cascadia Code", ...) from `installed`
+        // to assert they are dropped (availability-gated), not just the extras.
         let installed = vec![
             "Zapfino".to_string(),
-            "Menlo".to_string(), // curated — must dedup, not repeat
+            "Menlo".to_string(), // curated, installed — must dedup, not repeat
             "Arial".to_string(),
             "Arial".to_string(), // installed dupe — must dedup
         ];
-        let options = family_options(installed);
+        let options = family_options(installed.clone());
         assert_eq!(options[0], (DEFAULT_FAMILY_LABEL.to_string(), None));
-        // The curated set follows, in its declared order.
-        for (i, curated) in CURATED_FAMILIES.iter().enumerate() {
+
+        // Only the installed curated families appear, in curated declared order.
+        let installed_curated: Vec<&str> = CURATED_FAMILIES
+            .iter()
+            .copied()
+            .filter(|c| installed.iter().any(|n| n == c))
+            .collect();
+        assert_eq!(installed_curated, ["Menlo"]);
+        for (i, curated) in installed_curated.iter().enumerate() {
             assert_eq!(options[1 + i].1.as_deref(), Some(*curated));
         }
+        // Curated families absent from `installed` (e.g. "Hack") must not appear.
+        assert!(
+            !options
+                .iter()
+                .any(|(_, f)| f.as_deref() == Some("Hack"))
+        );
+
         // Then the remaining installed families, alphabetized + deduped.
-        let tail: Vec<&str> = options[1 + CURATED_FAMILIES.len()..]
+        let tail: Vec<&str> = options[1 + installed_curated.len()..]
             .iter()
             .map(|(_, f)| f.as_deref().unwrap())
             .collect();

@@ -262,19 +262,18 @@ pub fn resolve_family(text_system: &Arc<TextSystem>, chain: &[SharedString]) -> 
     pick_available(chain, &available)
 }
 
-/// The first family in `chain` present in `available`, else the last candidate
-/// (GPUI's own `resolve_font` then substitutes a system font for it, so painting
-/// never fails). Pure — the testable core of [`resolve_family`].
+/// The first family in `chain` present in `available`, else a guaranteed-present
+/// monospace fallback (`Menlo`) rather than the unavailable candidate itself —
+/// returning an unresolvable family here would have GPUI's `resolve_font`
+/// substitute a *proportional* system font, breaking the terminal's fixed-pitch
+/// grid. Pure — the testable core of [`resolve_family`].
 fn pick_available(chain: &[SharedString], available: &[String]) -> SharedString {
     for family in chain {
         if available.iter().any(|name| name == family.as_ref()) {
             return family.clone();
         }
     }
-    chain
-        .last()
-        .cloned()
-        .unwrap_or_else(|| SharedString::from("Menlo"))
+    SharedString::from("Menlo")
 }
 
 /// The backing scale SwiftTerm's cell-width snap is reproduced at. Prod snaps
@@ -379,11 +378,20 @@ mod tests {
     }
 
     #[test]
-    fn chain_returns_last_candidate_when_none_available() {
-        // None of the chain is installed: return the last candidate anyway (GPUI
-        // then substitutes a system font). Never panics, never empty.
+    fn chain_falls_back_to_menlo_when_none_available() {
+        // None of the chain is installed: fall back to Menlo (never panics, never
+        // empty, never the unavailable candidate itself).
         let chain = default_font_chain();
         assert_eq!(pick_available(&chain, &names(&["Arial", "Courier"])), s("Menlo"));
+    }
+
+    #[test]
+    fn single_unavailable_family_falls_back_to_menlo_not_raw_name() {
+        // A single-entry chain (e.g. a user-selected or imported family) that
+        // isn't installed must resolve to Menlo, not the unresolvable name
+        // itself — returning the raw name here is exactly the proportional-
+        // garble regression Fix A closes.
+        assert_eq!(pick_available(&[s("Nope")], &names(&["Menlo", "Arial"])), s("Menlo"));
     }
 
     #[test]

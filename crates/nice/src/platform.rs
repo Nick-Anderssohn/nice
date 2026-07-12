@@ -332,6 +332,90 @@ pub fn read_prod_data(key: &str, domain: &str) -> Option<Vec<u8>> {
         .map(|d| d.bytes().to_vec())
 }
 
+// ===========================================================================
+// Settings-import Fix B — PostScript-name → GPUI-family-name translation.
+//
+// The Swift build persisted a CUSTOM terminal font as its PostScript name (e.g.
+// `MesloLGSNF-Regular`), but the Rust font system resolves by GPUI *family* name
+// (`MesloLGS NF`). The imported PS name never matches, so the term view can't
+// resolve it and paints a proportional substitute in the fixed-pitch grid. This
+// CoreText helper maps the stored name back to its family so the migrating user
+// gets THEIR font (settings-import: Fix B). Raw `extern "C"` against CoreText,
+// mirroring the CFPreferences FFI above (one fewer dependency than `core-text`).
+// ===========================================================================
+
+#[link(name = "CoreText", kind = "framework")]
+extern "C" {
+    /// `CTFontRef CTFontCreateWithName(CFStringRef name, CGFloat size,
+    /// const CGAffineTransform *matrix)` — resolves `name` (a PostScript OR a
+    /// family name) to a +1 `CTFont`. **Lenient**: an unmatched name is NEVER
+    /// NULL — it substitutes a default face (Helvetica), which is why the result
+    /// MUST be match-validated below.
+    fn CTFontCreateWithName(name: CfStringRef, size: f64, matrix: *const c_void) -> *const c_void;
+    /// `CFStringRef CTFontCopyFamilyName(CTFontRef)` — the +1 family name.
+    fn CTFontCopyFamilyName(font: *const c_void) -> CfStringRef;
+    /// `CFStringRef CTFontCopyPostScriptName(CTFontRef)` — the +1 PostScript name,
+    /// used to verify the resolved font genuinely IS the requested one.
+    fn CTFontCopyPostScriptName(font: *const c_void) -> CfStringRef;
+}
+
+/// Resolve the GPUI **family name** for a font `name` that may be a PostScript
+/// name (what the Swift build stored for a custom terminal font) or an
+/// already-a-family name, via CoreText. `None` when `name` is not a genuine
+/// installed match — the caller then fails soft to the original string.
+///
+/// ## Why the match MUST be validated (not merely null-checked)
+/// `CTFontCreateWithName` does *lenient* matching: for a name that resolves to
+/// nothing it does NOT return NULL — it substitutes a default installed face
+/// (Helvetica, a real **proportional** family). A naive helper that only checks
+/// for NULL would translate a not-installed prod font into `"Helvetica"`, which
+/// the term view then resolves happily → proportional glyphs in the fixed-pitch
+/// grid, reintroducing the very regression Fix A/B exist to kill (and bypassing
+/// Fix A's Menlo fallback). So we trust the result ONLY when the input actually
+/// names the font we got back: it equals the resolved PostScript name (a PS-name
+/// input) OR the resolved family name (an already-a-family input). Any other
+/// case is the lenient substitute → `None`.
+///
+/// # Threading
+/// Main thread with an active autorelease pool — `ns_string`'s contract. The
+/// settings-import call site runs on the app's main runloop before the first
+/// window, satisfying it.
+pub fn postscript_to_family_name(name: &str) -> Option<String> {
+    // SAFETY: `ns_string` yields an autoreleased NSString, toll-free bridged to
+    // the `CFStringRef` `CTFontCreateWithName` wants. The returned `CTFont` and
+    // the two copied `CFString` names are +1 (Create/Copy rule) and each released
+    // below; the family/PS text is copied into owned Rust `String`s (via
+    // `string_from_ns`) BEFORE the release. Main thread / autorelease pool per the
+    // doc contract.
+    unsafe {
+        let cfname = ns_string(name) as CfStringRef;
+        let font = CTFontCreateWithName(cfname, 0.0, std::ptr::null());
+        if font.is_null() {
+            return None;
+        }
+        let family_ref = CTFontCopyFamilyName(font);
+        let ps_ref = CTFontCopyPostScriptName(font);
+        let family = string_from_ns(family_ref as *mut AnyObject);
+        let ps = string_from_ns(ps_ref as *mut AnyObject);
+        if !family_ref.is_null() {
+            CFRelease(family_ref as *const c_void);
+        }
+        if !ps_ref.is_null() {
+            CFRelease(ps_ref as *const c_void);
+        }
+        CFRelease(font as *const c_void);
+
+        let family = family?;
+        // Genuine match iff the input names the font we actually resolved —
+        // rejecting CoreText's lenient Helvetica substitute for a miss.
+        if ps.as_deref() == Some(name) || family.as_str() == name {
+            Some(family)
+        } else {
+            None
+        }
+    }
+}
+
 /// The macOS keyCode side-channel feeding the R5 keyboard encoder.
 ///
 /// gpui's `Keystroke` on the pin carries only `{modifiers, key, key_char}` — no
