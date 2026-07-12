@@ -14,7 +14,10 @@
 //! without the terminal yanking it back the next frame. Every later move is
 //! explicit: the app calls [`TerminalView::focus`] (pane/tab activation, rename
 //! commit/cancel, menu dismissal), and a mouse-down on the view re-focuses it
-//! via gpui's tracked-focus transfer (`track_focus` on the root div).
+//! via an explicit `window.focus` in [`TerminalView::on_mouse_down`]. (gpui's
+//! `track_focus` mouse-down auto-transfer can't carry this: it runs after
+//! `on_mouse_down` in the reversed bubble order, so the `stop_propagation` on
+//! the app-mouse-reporting path would suppress it.)
 //!
 //! ## R5 input path
 //!
@@ -1071,9 +1074,19 @@ impl TerminalView {
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Clicking a terminal always grabs key focus (standard terminal
+        // behaviour), independent of whatever the click does below. We cannot
+        // lean on gpui's `track_focus` mouse-down auto-focus here: that listener
+        // runs *after* this one in the reversed bubble order, so the
+        // `cx.stop_propagation()` on the app-mouse-reporting path (Claude Code,
+        // vim, …) would suppress it and leave a terminal that had lost focus —
+        // e.g. to the file browser — unable to regain it on click. Focus first,
+        // explicitly, before any early return.
+        window.focus(&self.focus_handle, cx);
+
         let mode = self.current_mode(cx);
         let m = event.modifiers;
 
@@ -1370,7 +1383,9 @@ impl Render for TerminalView {
         // focus keeps it (the pre-M2 per-frame grab yanked it back the next
         // frame, killing rename typing). Later moves are explicit: the app's
         // focus routing calls [`TerminalView::focus`], and a click on the view
-        // re-focuses it via gpui's tracked-focus mouse-down transfer.
+        // re-focuses it via the explicit `window.focus` in `on_mouse_down`
+        // (gpui's tracked-focus mouse-down transfer can't be relied on — the
+        // app-mouse-reporting path's `stop_propagation` suppresses it).
         if !self.focused_once {
             self.focused_once = true;
             window.focus(&self.focus_handle, cx);

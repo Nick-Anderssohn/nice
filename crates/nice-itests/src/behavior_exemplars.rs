@@ -9,10 +9,11 @@
 //! assertions.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use gpui::{ExternalPaths, TestAppContext};
+use gpui::{point, px, ExternalPaths, Modifiers, TestAppContext};
 use nice_term_core::DEFAULT_SCROLLBACK_LINES;
+use nice_term_view::mouse::reporting_active;
 use nice_term_view::{TerminalMetrics, TerminalSessionHandle};
 
 use crate::{behavior, session};
@@ -150,5 +151,80 @@ fn file_browser_row_drag_payload_reaches_terminal(cx: &mut TestAppContext) {
         got, br#" /proj/a.txt /proj/b\ c.txt "#,
         "the terminal must accept a file-browser row-drag ExternalPaths payload and type the \
          space-joined, backslash-escaped, space-padded paths (T7 target reused by F9)"
+    );
+}
+
+/// **Regression:** clicking a terminal that has **app mouse reporting** enabled
+/// (Claude Code, vim, tmux, …) must grab key focus, even though the reporting
+/// path calls `cx.stop_propagation()`.
+///
+/// gpui's `track_focus` registers its click-to-focus listener *before* the
+/// view's `on_mouse_down`, so in the reversed bubble dispatch order
+/// `on_mouse_down` runs first; its `stop_propagation` on the reporting path then
+/// suppresses the auto-focus. `on_mouse_down` therefore focuses **explicitly**.
+/// Without that, a terminal that had lost focus (e.g. the user clicked a file in
+/// the sidebar file browser, which parks focus in itself) could never regain it
+/// by clicking — only a tab switch (which focuses explicitly via the pane host)
+/// would. This pins the explicit focus. (Execution model: mocked
+/// `TestAppContext`, libtest.)
+#[gpui::test]
+fn click_focuses_terminal_under_mouse_reporting(cx: &mut TestAppContext) {
+    let dir = session::temp_dir("mouse-focus").expect("temp dir");
+    // A child that turns on X10/1000 mouse reporting (DECSET ?1000h) and then
+    // stays alive, so the `Term` reports `MOUSE_MODE` when the click lands.
+    let spec = session::silent_command_spec(
+        &dir,
+        "sh -c 'printf \"\\033[?1000h\"; sleep 30'",
+        24,
+        80,
+    );
+    let handle =
+        TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES).expect("spawn session");
+    let (terminal, vcx) =
+        behavior::mount_terminal(cx, handle.clone(), TerminalMetrics::new(CELL_W, CELL_H));
+
+    // Wait for the child's DECSET-1000 to be parsed into the `Term` (the pty
+    // feeder runs on a real OS thread, so this is a bounded real-clock readiness
+    // poll, not a timing assertion).
+    let deadline = Instant::now() + CAPTURE_TIMEOUT;
+    loop {
+        vcx.run_until_parked();
+        let on = handle.read_with(vcx, |h, _| {
+            h.term().map(|t| reporting_active(*t.lock().mode())).unwrap_or(false)
+        });
+        if on {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child never enabled mouse reporting within {CAPTURE_TIMEOUT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Steal key focus away from the terminal — the stand-in for a file-browser
+    // row click, which parks focus in the browser panel. Hold the thief handle
+    // alive so focus stays off the terminal.
+    let term_fh = terminal.read_with(vcx, |v, _| v.focus_handle_ref().clone());
+    let _thief = vcx.update(|window, cx| {
+        let fh = cx.focus_handle();
+        window.focus(&fh, cx);
+        fh
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|window, _| term_fh.is_focused(window)),
+        "precondition: the terminal should have lost focus to the thief handle"
+    );
+
+    // Click the terminal body: it must re-grab key focus despite reporting +
+    // stop_propagation. (Without the explicit `window.focus` in `on_mouse_down`,
+    // this stays false — the original bug.)
+    behavior::click(vcx, point(px(20.), px(20.)), Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(|window, _| term_fh.is_focused(window)),
+        "clicking a mouse-reporting terminal must restore key focus"
     );
 }
