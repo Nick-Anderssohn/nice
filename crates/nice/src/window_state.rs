@@ -398,8 +398,9 @@ impl WindowState {
     /// The [`RoutedExit`](crate::session_manager) neighbor-refocus spawn is
     /// **composed by `PaneHostView`'s activation path**, not re-actuated here: the
     /// `cx.notify()` below re-renders the host, whose activation change re-runs
-    /// `activate_pane` (deferred-companion spawn + key focus) per the landed
-    /// M2 focus-routing. Only the every-project-empty terminus — which needs a
+    /// the activation path (`activate_pane`'s deferred-companion spawn, then the
+    /// host's own key-focus move) per the landed M2 focus-routing. Only the
+    /// every-project-empty terminus — which needs a
     /// `&mut Window` a subscription callback lacks — is actuated here, via the
     /// stashed [`window_handle`](Self::window_handle).
     pub(crate) fn subscribe_spawned_panes(&mut self, cx: &mut gpui::Context<WindowState>) {
@@ -424,9 +425,10 @@ impl WindowState {
                 // the UI-close methods above).
                 ws.prune_dissolved_file_browser_states();
                 // Re-render so `PaneHostView` re-activates: a routed pane removal
-                // shifts the active pane, and its activation change re-runs
-                // `activate_pane` (neighbor deferred-companion spawn + key focus),
-                // and pills / cwd refresh from the mutated model.
+                // shifts the active pane, and its activation change re-runs the
+                // activation path (neighbor deferred-companion spawn via
+                // `activate_pane`, then the host's own key-focus move), and pills
+                // / cwd refresh from the mutated model.
                 cx.notify();
                 // The every-project-empty terminus (close this window / quit) needs
                 // a `&mut Window`; actuate it via the stashed handle (the "composed

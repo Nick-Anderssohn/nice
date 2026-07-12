@@ -37,9 +37,10 @@
 //! on first activation, cached per pane id, and dropped when the pane leaves the
 //! model. It uses the shared theme / accent / font exactly as
 //! `open_managed_window` does today. Activation flows **only** through
-//! [`SessionManager::activate_pane`] (R13's deferred-spawn + focus preserved
-//! verbatim — no view-side spawn shortcuts), and the demand-present kick is
-//! re-pointed to the active pane's handle on every switch.
+//! [`SessionManager::activate_pane`] (R13's deferred-spawn — no view-side spawn
+//! shortcuts); this host then focuses the newly-active pane's terminal on the
+//! same activation render, and re-points the demand-present kick to the active
+//! pane's handle on every switch.
 
 // Mounted by `crate::app::build_window_root`; the AX-anchor label constants are a
 // deliberately-exported contract (the shipped-surface assertion hooks, §6) whose
@@ -633,7 +634,7 @@ impl Render for PaneHostView {
                     let settings = ws.claude_settings_path_provider();
                     let model = &mut ws.model;
                     let session = &mut ws.session;
-                    session.activate_pane(model, &tab, &pane, settings.as_deref(), window, wcx);
+                    session.activate_pane(model, &tab, &pane, settings.as_deref(), wcx);
                 });
                 // Re-point the demand-present kick to the (now-active) pane's
                 // handle so its damage kicks this window while occluded.

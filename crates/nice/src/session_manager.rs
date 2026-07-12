@@ -19,8 +19,8 @@
 //!   `&mut TabModel` and touch no gpui, so they are unit-tested with plain
 //!   `#[test]` (the `nice` binary crate never links gpui test-support — see
 //!   `crates/nice-itests`).
-//! * **The gpui spawn/focus primitives** — [`SessionManager::spawn_pane`],
-//!   [`ensure_active_pane_spawned`], [`focus_active_pane`],
+//! * **The gpui spawn primitives** — [`SessionManager::spawn_pane`],
+//!   [`ensure_active_pane_spawned`],
 //!   [`register_tab_session`], [`teardown`]. These are the building blocks the
 //!   live app composes; they compile now and are exercised by the R13 slice-3
 //!   live scenario (nothing wires an action to them yet, hence the
@@ -64,7 +64,7 @@
 //! actuator ([`apply_dissolve_terminus`](SessionManager::apply_dissolve_terminus),
 //! close-this-window-or-quit via R12's registry) — need a gpui context, so they
 //! stay separate primitives the slice-3 wiring calls (same seam pattern as slice
-//! 1's `spawn_pane` / `focus_active_pane`). [`pane_exited`] returns a
+//! 1's `spawn_pane`). [`pane_exited`] returns a
 //! [`PaneExitResolution`] telling that caller which to run.
 //!
 //! ## Deliberately deferred (later R13 slices — do not add here)
@@ -78,7 +78,6 @@
 //!   below).
 //!
 //! [`ensure_active_pane_spawned`]: SessionManager::ensure_active_pane_spawned
-//! [`focus_active_pane`]: SessionManager::focus_active_pane
 //! [`register_tab_session`]: SessionManager::register_tab_session
 //! [`teardown`]: SessionManager::teardown
 //! [`select_prev_pane`]: SessionManager::select_prev_pane
@@ -102,7 +101,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use gpui::{App, Entity, FocusHandle, Global, Window};
+use gpui::{App, Entity, Global, Window};
 
 use nice_model::{Pane, PaneKind, SidebarTabSelection, Tab, TabModel, TabStatus};
 use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
@@ -186,17 +185,19 @@ pub(crate) struct RoutedExit {
     pub(crate) terminus: DissolveTerminus,
 }
 
-/// One live pane session: the core→gpui adapter entity plus the key-focus handle
-/// the pane's terminal view tracks. Dropping the entity tears the child process
-/// group down (SIGHUP→SIGKILL via `nice_term_core::Session::drop`), so a tab
-/// entry removed from the cache leaks no zsh.
+/// One live pane session: the core→gpui adapter entity for this pane. Dropping
+/// the entity tears the child process group down (SIGHUP→SIGKILL via
+/// `nice_term_core::Session::drop`), so a tab entry removed from the cache leaks
+/// no zsh.
+///
+/// Key focus is NOT owned here. The pane's `TerminalView` mints and tracks its
+/// own focus handle, and the pane host ([`crate::app_shell::PaneHostView`]) —
+/// which owns the views — routes key focus to it on activation. An earlier
+/// design minted a focus handle on this struct for the manager to drive, but it
+/// was never wired to any view, so focusing it did nothing; it has been removed.
 struct PaneSession {
     /// The `nice-term-view` adapter entity owning this pane's `Session`.
     handle: Entity<TerminalSessionHandle>,
-    /// This pane's terminal key-focus handle — minted by the manager at spawn so
-    /// [`SessionManager::focus_active_pane`] can move focus here; the pane's
-    /// `TerminalView` tracks it (wired live in slice 3).
-    focus: FocusHandle,
 }
 
 /// The per-window pty/session manager. Tab-keyed: each tab maps to its live pane
@@ -565,13 +566,14 @@ impl SessionManager {
     /// when the tab is the one being viewed, acknowledge the newly-active pane if
     /// it was waiting.
     ///
-    /// The live app composes the two side effects Swift's `setActivePane` also
-    /// runs on top of this: [`ensure_active_pane_spawned`] (deferred spawn) and
-    /// [`focus_active_pane`] (key focus). Those need a gpui context, so they are
-    /// separate primitives the slice-3 action wiring calls right after this.
+    /// The live app composes the side effect Swift's `setActivePane` also runs
+    /// on top of this: [`ensure_active_pane_spawned`] (deferred spawn), which
+    /// needs a gpui context and so is a separate primitive the slice-3 action
+    /// wiring calls right after this. Key focus is Swift's third piece, but in
+    /// the Rust app it lives in the pane host ([`crate::app_shell::PaneHostView`],
+    /// which owns the terminal views), not here.
     ///
     /// [`ensure_active_pane_spawned`]: SessionManager::ensure_active_pane_spawned
-    /// [`focus_active_pane`]: SessionManager::focus_active_pane
     pub(crate) fn set_active_pane(&mut self, model: &mut TabModel, tab_id: &str, pane_id: &str) {
         let viewing = model.active_tab_id() == Some(tab_id);
         model.mutate_tab(tab_id, |tab| {
@@ -1310,11 +1312,10 @@ impl SessionManager {
             return Ok(());
         }
         let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
-        let focus = cx.focus_handle();
         self.tabs
             .entry(tab_id.to_string())
             .or_default()
-            .insert(pane_id.to_string(), PaneSession { handle, focus });
+            .insert(pane_id.to_string(), PaneSession { handle });
         Ok(())
     }
 
@@ -1660,49 +1661,29 @@ impl SessionManager {
         let _ = self.spawn_pane(tab_id, &pane_id, spec, cx);
     }
 
-    /// Move key focus to the active pane's terminal (the focus-follow on tab /
-    /// pane switch). No-op when the active pane has no live session (a model-only
-    /// or not-yet-spawned pane has nothing to focus yet).
-    pub(crate) fn focus_active_pane(
-        &self,
-        model: &TabModel,
-        tab_id: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let Some(tab) = model.tab_for(tab_id) else {
-            return;
-        };
-        let Some(pane_id) = tab.active_pane_id.as_deref() else {
-            return;
-        };
-        if let Some(session) = self.tabs.get(tab_id).and_then(|panes| panes.get(pane_id)) {
-            window.focus(&session.focus, cx);
-        }
-    }
-
     /// The **full** Swift `setActivePane` behavior (`SessionsModel.swift:534-546`)
     /// — the live composition the slice-3 action seams call: the model half
     /// ([`set_active_pane`](Self::set_active_pane), which acknowledges a waiting
-    /// pane on the viewed tab) plus the two gpui side effects it runs on top —
-    /// [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned) (a
-    /// deferred terminal companion spawns on first focus) and
-    /// [`focus_active_pane`](Self::focus_active_pane) (key focus follows). The
-    /// navigation steppers compose the same three pieces in the live app so the
-    /// ack + spawn + focus ride along; the pure `set_active_pane` /
-    /// `select_next_pane` methods are its unit-testable model half.
+    /// pane on the viewed tab) plus [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)
+    /// (a deferred terminal companion spawns on first focus). The navigation
+    /// steppers compose the same pieces in the live app so the ack + spawn ride
+    /// along; the pure `set_active_pane` / `select_next_pane` methods are its
+    /// unit-testable model half.
+    ///
+    /// Key focus is NOT moved here — the pane host
+    /// ([`crate::app_shell::PaneHostView`]) owns the terminal views and focuses
+    /// the newly-active one on the same activation render (right after it fills
+    /// the view cache), so the manager doesn't need a view handle it doesn't own.
     pub(crate) fn activate_pane(
         &mut self,
         model: &mut TabModel,
         tab_id: &str,
         pane_id: &str,
         settings_path: Option<&str>,
-        window: &mut Window,
         cx: &mut App,
     ) {
         self.set_active_pane(model, tab_id, pane_id);
         self.ensure_active_pane_spawned(model, tab_id, settings_path, cx);
-        self.focus_active_pane(model, tab_id, window, cx);
     }
 
     /// Tear down every session this window owns. Dropping each
