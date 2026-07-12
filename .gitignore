@@ -41,12 +41,19 @@ scripts/.env.release
 # Rust rewrite (Path B)
 # Vendored pinned zed/GPUI checkout (~1 GB) — reproduced by
 # scripts/vendor-zed.sh from patches/zed-bg-luminance.patch, never committed.
-/vendor/
+# No trailing slash: in the main checkout this is a real directory, but a
+# `claude -w` worktree gets a `vendor` SYMLINK to the main checkout (created by
+# scripts/worktree-link-vendor.sh) — a trailing-slash rule wouldn't match the
+# symlink, so it would show up as committable. This ignores both.
+/vendor
 # Cargo build output.
 /target/
 # scripts/rust-bundle.sh output (the assembled "Nice RS Dev.app" bundle,
 # staged before scripts/rust-install.sh copies it to /Applications).
 /build-rs/
+# scripts/rust-bundle.sh --prod output (the assembled prod "Nice.app"
+# bundle, staged before scripts/rust-install.sh --prod copies it).
+/build-rs-prod/
 
 # macOS
 .DS_Store
