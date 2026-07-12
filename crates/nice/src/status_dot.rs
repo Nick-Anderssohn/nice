@@ -40,8 +40,8 @@
 use std::time::Duration;
 
 use gpui::{
-    bounce, div, ease_in_out, px, App, Animation, AnimationExt, ElementId, IntoElement,
-    ParentElement, RenderOnce, Rgba, Styled, Window,
+    bounce, canvas, div, ease_in_out, point, px, App, Animation, AnimationExt, Bounds, ElementId,
+    IntoElement, ParentElement, PathBuilder, Pixels, RenderOnce, Rgba, Styled, Window,
 };
 
 use nice_model::TabStatus;
@@ -96,6 +96,56 @@ fn pulse_specs(status: TabStatus) -> (RingPulse, BreathePulse) {
 fn ease_out_quadratic(t: f32) -> f32 {
     let inv = 1.0 - t;
     1.0 - inv * inv
+}
+
+/// Paint the expanding pulse ring for one animation frame as an **antialiased
+/// filled circle** (`gpui::Window::paint_path`), centred on `bounds`.
+///
+/// Why a path and not a `rounded_full` `div`: gpui snaps every quad's edges to
+/// the device-pixel grid independently (`Window::snap_bounds` →
+/// `round_to_device_pixel`). A circle whose `left` and `width` both animate has
+/// its two edges cross pixel boundaries at different phases, so the snapped
+/// centre drifts up to a device pixel each frame — a rhythmic left/right shake.
+/// `paint_path` is **not** snapped, so the circle grows with sub-pixel
+/// antialiasing and stays visually centred: smooth, not shaky.
+///
+/// `delta` is the eased animation progress `0 → 1`: the ring scales
+/// `1.0 → max_scale` while its alpha fades `start_opacity → 0`
+/// (`StatusDot.swift:91-102`).
+fn paint_pulse_ring(
+    bounds: Bounds<Pixels>,
+    color: Rgba,
+    delta: f32,
+    ring: RingPulse,
+    window: &mut Window,
+) {
+    let alpha = ring.start_opacity * (1.0 - delta);
+    if alpha <= 0.0 {
+        return;
+    }
+    let scale = 1.0 + delta * (ring.max_scale - 1.0);
+    let center = bounds.center();
+    // `bounds` is the `frame`-sized box, so the base radius is half its width.
+    let radius = bounds.size.width * (0.5 * scale);
+    let radii = point(radius, radius);
+    let left = point(center.x - radius, center.y);
+    let right = point(center.x + radius, center.y);
+
+    // A full circle as two semicircular arcs (left → right → left).
+    let mut pb = PathBuilder::fill();
+    pb.move_to(left);
+    pb.arc_to(radii, px(0.0), false, true, right);
+    pb.arc_to(radii, px(0.0), false, true, left);
+    pb.close();
+    if let Ok(path) = pb.build() {
+        window.paint_path(
+            path,
+            Rgba {
+                a: color.a * alpha,
+                ..color
+            },
+        );
+    }
 }
 
 /// The status dot component. Construct with [`StatusDot::new`]; only the
@@ -179,30 +229,34 @@ impl RenderOnce for StatusDot {
 
             // Expanding outer ring: scale `1.0 → max_scale` (easeOut) while
             // opacity fades `start_opacity → 0`, repeating forever without
-            // autoreversing (`StatusDot.swift:91-102`).
+            // autoreversing (`StatusDot.swift:91-102`). Painted as an
+            // antialiased circle path (see [`paint_pulse_ring`]) rather than an
+            // animated `rounded_full` div, so device-pixel snapping can't make
+            // the growing ring shake left/right.
             let ring_id: ElementId = (self.id.clone(), "status-ring").into();
-            let ring_layer = div()
-                .absolute()
-                .left(px(0.0))
-                .top(px(0.0))
-                .w(px(frame))
-                .h(px(frame))
-                .rounded_full()
-                .bg(base_rgba)
-                .opacity(ring.start_opacity)
-                .with_animation(
-                    ring_id,
-                    Animation::new(Duration::from_secs_f32(ring.duration_secs))
-                        .repeat()
-                        .with_easing(ease_out_quadratic),
-                    move |el, delta| {
-                        let scale = 1.0 + delta * (ring.max_scale - 1.0);
-                        let d = frame * scale;
-                        let offset = (frame - d) / 2.0;
-                        let opacity = ring.start_opacity * (1.0 - delta);
-                        el.w(px(d)).h(px(d)).left(px(offset)).top(px(offset)).opacity(opacity)
-                    },
-                );
+            let ring_color = base_rgba;
+            let ring_layer = canvas(|_, _, _| (), |_, _, _, _| ()).with_animation(
+                ring_id,
+                Animation::new(Duration::from_secs_f32(ring.duration_secs))
+                    .repeat()
+                    .with_easing(ease_out_quadratic),
+                move |_canvas, delta| {
+                    // Rebuild the canvas each frame bound to this `delta`; the
+                    // `frame`-sized absolute box centres the ring on the dot,
+                    // and the path overflows it (no clip) as it grows.
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paint_pulse_ring(bounds, ring_color, delta, ring, window);
+                        },
+                    )
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(frame))
+                    .h(px(frame))
+                },
+            );
 
             // Breathing inner dot: opacity oscillates `min_opacity ↔ 1.0` with an
             // ease-in-out that autoreverses (`StatusDot.swift:104-113`). gpui's
