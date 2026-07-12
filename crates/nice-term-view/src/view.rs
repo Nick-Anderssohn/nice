@@ -1452,7 +1452,13 @@ impl Render for TerminalView {
             // File / image drag-drop (T7): a dropped set of file URLs (or a
             // raw-image fallback) is typed as escaped paths at the prompt. gpui
             // delivers an OS file drop as an `ExternalPaths` active-drag.
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                // Dropping files onto the terminal grabs key focus so the user
+                // can type immediately. The drag originates in the sidebar file
+                // browser (which parks focus in itself on the initiating click),
+                // and a drop is not a mouse-down, so neither `track_focus` nor
+                // the `on_mouse_down` focus grab fires — focus explicitly here.
+                window.focus(&this.focus_handle, cx);
                 this.handle_external_paths_drop(paths, cx);
             }))
             .on_any_mouse_down(cx.listener(Self::on_mouse_down))
