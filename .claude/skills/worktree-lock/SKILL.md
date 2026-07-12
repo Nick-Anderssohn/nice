@@ -1,57 +1,55 @@
 ---
 name: worktree-lock
-description: Serialize operations that can't run concurrently across this repo's git worktrees. Use BEFORE running `scripts/install.sh` (or the /nice-install command — dev or `--prod`), BEFORE running `scripts/test.sh` (or any `xcodebuild test` that drives a Nice app bundle), and BEFORE any `xcodebuild` invocation that uses shared DerivedData (i.e. no `-derivedDataPath` override). Acquire a single global lock via `scripts/worktree-lock.sh acquire <op>`, run the operation, then always release with `scripts/worktree-lock.sh release`. Also use this skill when a build/install/test fails with errors that smell like a concurrent-access race (e.g. "/Applications/Nice Dev.app is busy", Xcode module-cache corruption, XCUITest "application is not running") — those often mean another worktree is holding the resource.
+description: Serialize operations that can't run concurrently across this repo's git worktrees. Use BEFORE running `scripts/rust-install.sh` (dev or `--prod`, or the /nice-install command) and BEFORE running any live GUI self-test scenario / black-box harness that drives the installed `Nice Dev.app` bundle. Plain `cargo build` / `cargo test` do NOT need it (per-worktree `target/`). Acquire a single global lock via `scripts/worktree-lock.sh acquire <op>`, run the operation, then always release with `scripts/worktree-lock.sh release`. Also use it when an install/validation fails with a concurrent-access smell (e.g. "/Applications/Nice Dev.app is busy", or the app won't launch because another copy already holds the `dev.nickanderssohn.nice-dev` bundle ID) — that usually means another worktree holds the resource.
 ---
 
 # Nice worktree lock
 
 This repo uses git worktrees for parallel feature development (see
 `.claude/worktrees/`). A few operations can't run concurrently across worktrees
-because they touch shared, non-worktree-local state. This skill keeps them
-mutually exclusive via a single file-based lock at `~/.claude/locks/nice.lock`.
+because they touch shared, non-worktree-local state — the installed
+`/Applications` bundles, running Nice processes, and the single shared dev
+bundle ID. This skill keeps them mutually exclusive via a single file-based
+lock at `~/.claude/locks/nice.lock`.
+
+Nice is a **Rust + GPUI** app: each worktree builds into its own `target/`, so
+parallel `cargo build` / `cargo test` are fine and need no lock. What must be
+serialized is anything touching the *installed* app.
 
 ## When to acquire the lock
 
 **Always acquire before these operations:**
 
-1. **Global install** — `scripts/install.sh` (with or without `--prod`),
-   or the `/nice-install` command. Default writes `/Applications/Nice
-   Dev.app`; `--prod` writes `/Applications/Nice.app`. Both also modify
-   `project.yml` in place during the build (restored on exit) and quit
-   any matching running app. Two worktrees racing on this — even on
-   different variants — interleave `project.yml` edits and `/Applications`
-   writes.
+1. **Install** — `scripts/rust-install.sh` (with or without `--prod`), or the
+   `/nice-install` command. The dev default writes `/Applications/Nice Dev.app`
+   and **force-quits a running `Nice Dev`** first; `--prod` writes
+   `/Applications/Nice.app` (swapped in place, no force-quit). Two worktrees
+   racing on this interleave the `/Applications` writes and the force-quit.
 
-2. **Tests** — `scripts/test.sh` or any `xcodebuild test` that drives a
-   Nice app bundle (`NiceUITests`, `NiceUnitTests`). `test.sh` also
-   patches `project.yml` in place during the run. UITests drive
-   `Nice Dev.app` via XCUITest; two suites running at once fight over
-   the app window, and the shared `dev.nickanderssohn.nice-dev` bundle
-   ID across worktrees means macOS refuses to launch two copies.
-   Also conflicts with an in-flight install (install quits the running
-   app mid-test).
+2. **Live GUI validation** — any self-test scenario / black-box harness (the
+   `quitprobe`-style pixel + CGEvent checks, the live `NICE_*SELFTEST`
+   scenarios) that drives the **installed** `Nice Dev.app`. They share the
+   `dev.nickanderssohn.nice-dev` bundle ID and the one `/Applications/Nice
+   Dev.app`, so two at once fight over the app window / macOS refuses to launch
+   a second copy, and an in-flight install quits the app mid-run.
 
-3. **`xcodebuild` against shared DerivedData** — any `xcodebuild` invocation
-   that does **not** pass `-derivedDataPath` to a worktree-local path. The
-   default DerivedData lives at `~/Library/Developer/Xcode/DerivedData/` and
-   is shared across worktrees. Two builds into it will corrupt each other's
-   module cache.
-
-   **Note:** `scripts/install.sh` already uses `-derivedDataPath
-   "$REPO_ROOT/build"` (or `./build-dev` for the dev variant) and
-   `scripts/test.sh` uses `./build-dev`, so the *build step* of either
-   doesn't need the lock on DerivedData grounds — but they're still
-   gated on the `/Applications` write and `project.yml` patching, so
-   the whole script runs under the lock.
+**Hold the lock across the WHOLE install+validate window** — acquire before
+the install and release only when validation is done, not right after
+installing. Otherwise another worktree can reinstall/force-quit the shared
+`Nice Dev.app` out from under your running validation.
 
 **You do NOT need the lock for:**
 
-- `xcodegen generate` (writes inside the worktree).
-- `xcodebuild` with `-derivedDataPath` pointing into the worktree (e.g.
-  `./build` or `./build-dev`) AND no in-place `project.yml` patch AND
-  no XCUITest run.
-- Reading source files, running unit tests that don't launch a Nice app
-  bundle, editing code, etc.
+- `cargo build` / `cargo build --workspace` — per-worktree `target/`.
+- `cargo test --workspace` / `cargo test -p nice-itests` — headless, no
+  installed bundle, per-worktree `target/`.
+- `scripts/vendor-zed.sh` — writes into this worktree's `vendor/` (plus a
+  shared read-only zed mirror it manages).
+- Reading source files, editing code, etc.
+
+(A hermetic dev-bundle launch under a scratch `HOME` still runs the one
+installed `Nice Dev.app` binary, so if you're validating that way while
+another worktree might install, do it under the same lock window as above.)
 
 ## How to use it
 
@@ -64,8 +62,8 @@ scripts/worktree-lock.sh release
 ```
 
 Pick an `<op-name>` that describes what you're doing: `install`,
-`install-prod`, `test`, `xcodebuild`. It's stored in the lock metadata
-so other worktrees see what you're up to while they wait.
+`install-prod`, `validate`. It's stored in the lock metadata so other
+worktrees see what you're up to while they wait.
 
 **Always chain acquire + op + release in one shell invocation**, using `&&`
 so a failed acquire aborts, plus a trap or `||` to make release fire even on
@@ -73,16 +71,16 @@ op failure:
 
 ```
 scripts/worktree-lock.sh acquire install \
-  && { scripts/install.sh; rc=$?; scripts/worktree-lock.sh release; exit $rc; } \
+  && { scripts/rust-install.sh; rc=$?; scripts/worktree-lock.sh release; exit $rc; } \
   || scripts/worktree-lock.sh release
 ```
 
 Or, more simply, with a trap:
 
 ```
-scripts/worktree-lock.sh acquire test
+scripts/worktree-lock.sh acquire validate
 trap 'scripts/worktree-lock.sh release' EXIT
-scripts/test.sh
+scripts/rust-install.sh && ./scripts/quitprobe/quitprobe.sh
 ```
 
 If you're running the acquire + op as separate Bash tool calls, remember:
@@ -127,17 +125,17 @@ new holder is now responsibly using the lock.
 
 ## Why this exists
 
-Git worktrees give each feature branch its own working tree and its own
-`./build/` / `./build-dev/` DerivedData directory, so parallel *code
-edits* and *builds* work fine. But anything that touches:
+Git worktrees give each branch its own working tree and its own `target/`
+build cache, so parallel *code edits*, *builds*, and *headless `cargo test`*
+all work fine. But anything that touches:
 
 - `/Applications/Nice.app` or `/Applications/Nice Dev.app` (the installed
   bundles),
-- a running `Nice` / `Nice Dev` process,
-- `project.yml` in place (install.sh and test.sh sed-patch it for the dev
-  variant and restore on exit), or
-- `~/Library/Developer/Xcode/DerivedData/` (shared default DerivedData)
+- a running `Nice` / `Nice Dev` process (the dev install force-quits `Nice
+  Dev`), or
+- the shared `dev.nickanderssohn.nice-dev` bundle ID (macOS won't launch two
+  copies; live UI harnesses fight over the one app),
 
 is inherently shared across worktrees, and two of them hitting it at once
-causes corrupted installs, flaky UI tests, or broken module caches. The
-lock serializes access without requiring the user to coordinate manually.
+cause corrupted installs or flaky/failed live validation. The lock serializes
+access without requiring the user to coordinate manually.
