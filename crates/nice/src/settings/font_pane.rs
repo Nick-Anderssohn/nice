@@ -365,27 +365,26 @@ mod tests {
 
     #[test]
     fn family_options_lead_with_default_then_curated_then_alphabetized_extras() {
-        // Omit some curated names ("Hack", "Cascadia Code", ...) from `installed`
-        // to assert they are dropped (availability-gated), not just the extras.
+        // Two curated families, listed in `installed` OUT OF curated order
+        // ("Menlo" before "SF Mono"), to prove the picker emits them in
+        // CURATED_FAMILIES declared order — not in `installed` order — while
+        // omitting uninstalled curated names ("Hack", "Cascadia Code", ...) to
+        // assert those are dropped (availability-gated), not just the extras.
         let installed = vec![
             "Zapfino".to_string(),
-            "Menlo".to_string(), // curated, installed — must dedup, not repeat
+            "Menlo".to_string(),   // curated (CURATED_FAMILIES index 3)
+            "SF Mono".to_string(), // curated (CURATED_FAMILIES index 0)
             "Arial".to_string(),
-            "Arial".to_string(), // installed dupe — must dedup
+            "Arial".to_string(),   // installed dupe — must dedup
         ];
-        let options = family_options(installed.clone());
+        let options = family_options(installed);
         assert_eq!(options[0], (DEFAULT_FAMILY_LABEL.to_string(), None));
 
-        // Only the installed curated families appear, in curated declared order.
-        let installed_curated: Vec<&str> = CURATED_FAMILIES
-            .iter()
-            .copied()
-            .filter(|c| installed.iter().any(|n| n == c))
-            .collect();
-        assert_eq!(installed_curated, ["Menlo"]);
-        for (i, curated) in installed_curated.iter().enumerate() {
-            assert_eq!(options[1 + i].1.as_deref(), Some(*curated));
-        }
+        // Installed curated families appear in CURATED_FAMILIES declared order
+        // (SF Mono before Menlo), NOT the order they were listed in `installed`.
+        assert_eq!(options[1].1.as_deref(), Some("SF Mono"));
+        assert_eq!(options[2].1.as_deref(), Some("Menlo"));
+
         // Curated families absent from `installed` (e.g. "Hack") must not appear.
         assert!(
             !options
@@ -393,8 +392,8 @@ mod tests {
                 .any(|(_, f)| f.as_deref() == Some("Hack"))
         );
 
-        // Then the remaining installed families, alphabetized + deduped.
-        let tail: Vec<&str> = options[1 + installed_curated.len()..]
+        // Then the remaining (non-curated) installed families, alphabetized + deduped.
+        let tail: Vec<&str> = options[3..]
             .iter()
             .map(|(_, f)| f.as_deref().unwrap())
             .collect();

@@ -183,7 +183,14 @@ The GPUI application. Structure (grows over later cycles):
   same safety invariant as the R5 keyboard block), reads the live NSWindow
   frame + zoom/miniaturize state, maps a content-view point to CG-global
   coordinates for the posted events, and reads (never writes)
-  `AppleActionOnDoubleClick`.
+  `AppleActionOnDoubleClick`. The font-migration render fix adds a **CoreText**
+  FFI surface here (the first non-AppKit/CoreGraphics framework in this module):
+  `postscript_to_family_name` (`CTFontCreateWithName` + `CTFontCopyFamilyName` /
+  `CTFontCopyPostScriptName`) maps a prod Swift **PostScript** font name to its
+  GPUI **family** name for the first-launch settings-import, validating the match
+  (input == resolved PostScript or family name) so CoreText's lenient substitute
+  (Helvetica for an unmatched name) is rejected — returning `None` — rather than
+  silently trusted.
 - `input_live` — the R5 live input self-test scenarios (`input-live` /
   `input-shell`): real CGEvents posted to our own pid, byte-exact pty receipt,
   the item-4 candidate anchor, and the IME go/no-go probe (see the scenario
