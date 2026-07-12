@@ -88,6 +88,7 @@ pub struct DirectoryWatcherHub {
     /// Count of currently-open watch fds (NOT counting the kqueue fd). Shared
     /// with the thread so a test can clone the handle before dropping the hub
     /// and assert it returns to 0.
+    #[cfg(test)]
     open_fds: Arc<AtomicUsize>,
 }
 
@@ -154,6 +155,7 @@ impl DirectoryWatcherHub {
             control_tx,
             changes_rx,
             join: Some(join),
+            #[cfg(test)]
             open_fds,
         })
     }
@@ -185,12 +187,14 @@ impl DirectoryWatcherHub {
 
     /// The current count of open watch fds (excludes the kqueue fd). Primarily a
     /// test hook — after `set_watched(vec![])` or `Drop` it returns to 0.
+    #[cfg(test)]
     pub fn open_fd_count(&self) -> usize {
         self.open_fds.load(Ordering::SeqCst)
     }
 
     /// A clonable handle to the open-fd counter, so a test can observe it AFTER
     /// the hub is dropped (the drop closes every fd → the count reaches 0).
+    #[cfg(test)]
     pub fn open_fd_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.open_fds)
     }

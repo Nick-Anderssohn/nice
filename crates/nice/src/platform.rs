@@ -2198,13 +2198,8 @@ fn ns_window_of(window: &Window) -> Option<*mut AnyObject> {
 /// synthetic CGEvent click on the native traffic-light button does not
 /// hit-test to it under gpui's full-size-content-view window (verified
 /// on-device), so `performClose:` is the real close-button action driven through
-/// the same delegate path.
-pub fn perform_window_close(window: &Window) {
-    perform_window_close_ptr(ns_view_of(window));
-}
-
-/// [`perform_window_close`] from a raw content-`NSView` pointer (captured earlier
-/// via [`ns_view_of`]). Because `-performClose:` SYNCHRONOUSLY invokes
+/// the same delegate path. Takes a raw content-`NSView` pointer (captured
+/// earlier via [`ns_view_of`]). Because `-performClose:` SYNCHRONOUSLY invokes
 /// `windowShouldClose:` — which re-enters gpui to present the veto modal — it MUST
 /// be called with NO outstanding gpui `App`/`Window` borrow (from the scenario's
 /// task, never inside a `window.update` closure), exactly like the CGEvent posts
@@ -2987,6 +2982,7 @@ impl PasteboardRef {
     ///
     /// # Safety
     /// Main thread with an active autorelease pool.
+    #[cfg(test)]
     pub unsafe fn named(name: &str) -> Self {
         let ns_name = ns_string(name);
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), pasteboardWithName: ns_name];
@@ -3103,6 +3099,7 @@ impl PasteboardRef {
     ///
     /// # Safety
     /// Main thread; the handle must be a named pasteboard (never the general one).
+    #[cfg(test)]
     pub unsafe fn release_globally(&self) {
         if !self.pasteboard.is_null() {
             let _: () = msg_send![self.pasteboard, releaseGlobally];

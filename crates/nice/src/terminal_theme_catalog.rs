@@ -44,7 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{App, Global};
+use gpui::Global;
 use nice_term_view::TerminalTheme;
 use nice_theme::ColorScheme;
 

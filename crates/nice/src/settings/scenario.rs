@@ -78,7 +78,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use gpui::{
-    div, prelude::*, Action, AnyWindowHandle, AppContext as _, AsyncApp, Context, Entity, Keystroke,
+    div, prelude::*, Action, AnyWindowHandle, AsyncApp, Context, Entity, Keystroke,
     Render, Window, WindowHandle,
 };
 
@@ -106,7 +106,6 @@ use crate::terminal_theme_catalog::TerminalThemeCatalog;
 use crate::theme_settings::{
     self, OsSchemeSource, SharedThemeState, ThemeSettingsStore, ThemeState,
 };
-use crate::toolbar::WindowToolbarView;
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 

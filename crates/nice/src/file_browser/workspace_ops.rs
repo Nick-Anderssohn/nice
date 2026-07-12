@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use gpui::{App, AppContext, Global};
+use gpui::{App, Global};
 use nice_model::file_browser::open_with::{self, OpenWithEntry, OpenWithLookups};
 
 /// The applications that can open a target, as the `WorkspaceOps` seam reports
@@ -146,6 +146,7 @@ impl RecordingWorkspaceOps {
     }
 
     /// Preload the `choose_application` answer.
+    #[cfg(test)]
     pub fn set_chosen(&self, chosen: Option<String>) {
         self.state.lock().unwrap().chosen = chosen;
     }

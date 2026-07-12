@@ -38,7 +38,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui::Global;
-use nice_model::file_browser::{FileBrowserSortCriterion, FileBrowserSortSettings};
+use nice_model::file_browser::FileBrowserSortSettings;
 use serde::{Deserialize, Serialize};
 
 /// The on-disk `ui_settings.json` document, for DECODING R19's own keys.
@@ -103,11 +103,6 @@ impl SortSettingsStore {
     /// The current settings.
     pub fn settings(&self) -> FileBrowserSortSettings {
         self.settings
-    }
-
-    /// The injected file path (test hook).
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Apply `new` and write through to disk **only if it changed**. Returns
@@ -215,6 +210,9 @@ pub fn default_ui_settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests read the criterion enum; a top-level `use` would warn
+    // "unused import" in the non-test (`--bin nice`) build.
+    use nice_model::file_browser::FileBrowserSortCriterion;
 
     fn temp_path(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
