@@ -94,27 +94,43 @@ fn reap(session: TermSession) {
     let _ = session.wait();
 }
 
-/// Drain the event stream up to [`POLL`], returning every event received up to
-/// and including the first `Exited` (which terminates the drain).
-fn drain_until_exited(events: &Receiver<SessionEvent>) -> Vec<SessionEvent> {
-    let deadline = Instant::now() + POLL;
+/// Drain every OSC event the feeder has produced by the time the child's
+/// terminal **sync mark** renders onto the grid.
+///
+/// `mark` is the last thing each test's script prints. The feeder parses pty
+/// bytes strictly in order, so once `mark` is on the grid every preceding OSC
+/// event ([`SessionEvent::TitleChanged`] / [`SessionEvent::TitleReset`] /
+/// [`SessionEvent::CwdChanged`]) has already been sent on the channel — and
+/// nothing follows the mark but EOF. We poll the grid for the mark, then drain
+/// the whole queued backlog.
+///
+/// This deliberately does **not** key off [`SessionEvent::Exited`]: that event
+/// is emitted by a *separate* exit-watcher thread that `waitpid`s independently
+/// of the feeder, so it can land on the channel *ahead* of the feeder's final
+/// title/cwd events. Stopping at `Exited` therefore raced and could drop the
+/// tail of the OSC events (the flaky `titles_…_utf8_and_braille` failure, which
+/// saw only 3 of 5 titles). Keying off the in-order grid mark is race-free.
+fn drain_until_mark(
+    session: &Session,
+    events: &Receiver<SessionEvent>,
+    mark: &str,
+) -> Vec<SessionEvent> {
+    assert!(
+        poll_until(|| session.grid_contains(mark)),
+        "sync mark {mark:?} never rendered within {POLL:?}; last grid:\n{}",
+        session
+            .visible_snapshot()
+            .map(|s| s.text())
+            .unwrap_or_default()
+    );
+    // The mark is on the grid, so the feeder has already sent every OSC event
+    // that preceded it and there is nothing left to parse but EOF: the full
+    // backlog is queued ahead of us. Collect it.
     let mut out = Vec::new();
-    loop {
-        let remaining = match deadline.checked_duration_since(Instant::now()) {
-            Some(r) => r,
-            None => return out,
-        };
-        match events.recv_timeout(remaining) {
-            Ok(ev) => {
-                let done = matches!(ev, SessionEvent::Exited { .. });
-                out.push(ev);
-                if done {
-                    return out;
-                }
-            }
-            Err(_) => return out,
-        }
+    while let Ok(ev) = events.try_recv() {
+        out.push(ev);
     }
+    out
 }
 
 /// The `TitleChanged` payloads from a drained event list, in arrival order.
@@ -160,7 +176,7 @@ fn titles_osc0_osc2_bel_and_st_utf8_and_braille() {
     let (session, events) =
         Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn title pane");
 
-    let drained = drain_until_exited(&events);
+    let drained = drain_until_mark(&session, &events, "TITLESDONE");
     assert_eq!(
         titles(&drained),
         vec![
@@ -185,7 +201,7 @@ fn title_stack_pop_emits_reset() {
     let (session, events) =
         Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn reset pane");
 
-    let drained = drain_until_exited(&events);
+    let drained = drain_until_mark(&session, &events, "RESETDONE");
     assert!(
         drained.iter().any(|e| matches!(e, SessionEvent::TitleReset)),
         "a title-stack pop of an empty title must emit TitleReset; got {drained:?}"
@@ -213,7 +229,7 @@ fn osc7_hostname_and_pwd_exact_path() {
     let (session, events) =
         Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn cwd pane");
 
-    let drained = drain_until_exited(&events);
+    let drained = drain_until_mark(&session, &events, "CWDMARK");
     let got = cwds(&drained);
 
     // Assert BEFORE removing the temp dir (canonicalize needs it to exist).
@@ -240,7 +256,7 @@ fn osc7_percent_decode_and_empty_host() {
     let (session, events) =
         Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn pct pane");
 
-    let drained = drain_until_exited(&events);
+    let drained = drain_until_mark(&session, &events, "PCTMARK");
     assert_eq!(
         cwds(&drained),
         vec![std::path::PathBuf::from("/tmp/a b/c")],
@@ -263,7 +279,7 @@ fn osc7_split_across_two_pty_reads() {
     let (session, events) =
         Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn split pane");
 
-    let drained = drain_until_exited(&events);
+    let drained = drain_until_mark(&session, &events, "SPLITMARK");
     assert_eq!(
         cwds(&drained),
         vec![std::path::PathBuf::from("/split/path/here")],
@@ -290,20 +306,13 @@ fn osc7_malformed_dropped_without_wedging_parser() {
     let (session, events) =
         Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn malformed pane");
 
-    let drained = drain_until_exited(&events);
+    // `drain_until_mark` waits for `marker` (printed after the bad sequences) to
+    // render, which also proves the parser was not wedged by the malformed OSC 7s.
+    let drained = drain_until_mark(&session, &events, &marker);
     assert_eq!(
         cwds(&drained),
         vec![std::path::PathBuf::from("/good/dir")],
         "only the well-formed local OSC 7 must emit"
-    );
-    // The parser was not wedged: the marker after the bad sequences rendered.
-    assert!(
-        poll_until(|| session.grid_contains(&marker)),
-        "marker after malformed OSC 7 never rendered; last grid:\n{}",
-        session
-            .visible_snapshot()
-            .map(|s| s.text())
-            .unwrap_or_default()
     );
 
     drop(session);
