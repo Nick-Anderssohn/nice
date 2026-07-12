@@ -180,10 +180,11 @@ struct CursorPaint {
 
 /// Cells per batched [`GlyphRun`], max (fix round r5). zed's `BatchedTextRun`
 /// sizes for ~10-cell runs; 16 keeps the layer/`BoundsTree::insert` win intact
-/// (a 400-column uniform row is ≤25 runs, not 400 layers) while bounding, as
-/// belt-and-suspenders under the `force_width` re-snap's 1 px tolerance, how far
-/// any sub-tolerance shaping drift can extend, and keeping shape-cache keys
-/// short enough to re-hit on TUI redraws of repeated content.
+/// (a 400-column uniform row is ≤25 runs, not 400 layers) while keeping
+/// shape-cache keys short enough to re-hit on TUI redraws of repeated content.
+/// (The `force_width` re-snap places every base glyph on its exact cell slot —
+/// the vendored `zed-force-width-exact.patch` — so run length no longer bounds
+/// any shaping drift.)
 const MAX_RUN_CELLS: usize = 16;
 
 /// The cell attributes that must be equal for two adjacent cells to share one

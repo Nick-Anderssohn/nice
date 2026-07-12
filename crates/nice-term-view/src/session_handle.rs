@@ -524,10 +524,9 @@ impl TerminalSessionHandle {
             let mut term = term_arc.lock();
             let start_pt = Point::new(Line(start.0), Column(start.1));
             let end_pt = Point::new(Line(end.0), Column(end.1));
-            // Left side at the start, right side at the end => the resolved range
-            // is inclusive of both endpoint cells (see `Selection::range_simple`).
-            let mut sel = Selection::new(SelectionType::Simple, start_pt, Side::Left);
-            sel.update(end_pt, Side::Right);
+            let (start_side, end_side) = selection_sides(start_pt, end_pt);
+            let mut sel = Selection::new(SelectionType::Simple, start_pt, start_side);
+            sel.update(end_pt, end_side);
             term.selection = Some(sel);
         }
     }
@@ -596,6 +595,22 @@ impl TerminalSessionHandle {
     /// sense that offset defaults to 0, i.e. this returns `true` pre-spawn.
     pub fn is_at_bottom(&self) -> bool {
         self.display_offset() == 0
+    }
+}
+
+/// Endpoint sides for a simple `start` (anchor) → `end` (drag point) selection
+/// such that BOTH endpoint cells are included whichever direction the drag
+/// runs. alacritty's `Selection::range_simple` orders the two anchors and then
+/// trims the first cell when the ordered start's side is `Right` and the last
+/// when the ordered end's side is `Left` — so the earlier point must carry
+/// `Side::Left` and the later `Side::Right`. The old fixed `Left`/`Right`
+/// assignment got that backwards for a leftward drag, which made the dragged-to
+/// (leftmost) cell impossible to select.
+fn selection_sides(start: Point, end: Point) -> (Side, Side) {
+    if end < start {
+        (Side::Right, Side::Left)
+    } else {
+        (Side::Left, Side::Right)
     }
 }
 
@@ -1271,5 +1286,63 @@ mod tests {
         let mut accum = 0.0f32;
         assert_eq!(take_scroll_steps(&mut accum, -1.5), -1);
         assert!((accum + 0.5).abs() < 1e-6);
+    }
+
+    // ---- Selection endpoint sides (set_selection) ----------------------------
+    //
+    // These pin the fix for the leftward-drag bug: the resolved selection range
+    // must include BOTH endpoint cells whichever direction the drag runs. The
+    // end-to-end tests resolve through a real alacritty `Term`, so a change in
+    // its `range_simple` side-trimming semantics fails here, not in the GUI.
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::selection::{Selection, SelectionType};
+    use alacritty_terminal::term::{test::TermSize, Config, Term};
+
+    /// Resolve a selection built exactly the way `set_selection` builds it.
+    fn resolved_range(
+        start: (i32, usize),
+        end: (i32, usize),
+    ) -> Option<(Point, Point)> {
+        let term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        let start_pt = Point::new(Line(start.0), Column(start.1));
+        let end_pt = Point::new(Line(end.0), Column(end.1));
+        let (start_side, end_side) = super::selection_sides(start_pt, end_pt);
+        let mut sel = Selection::new(SelectionType::Simple, start_pt, start_side);
+        sel.update(end_pt, end_side);
+        sel.to_range(&term).map(|r| (r.start, r.end))
+    }
+
+    #[test]
+    fn rightward_selection_includes_both_endpoints() {
+        let range = resolved_range((0, 2), (0, 5)).expect("non-empty");
+        assert_eq!(range, (Point::new(Line(0), Column(2)), Point::new(Line(0), Column(5))));
+    }
+
+    #[test]
+    fn leftward_selection_includes_both_endpoints() {
+        // The reported bug: dragging left stopped one cell short of the
+        // leftmost dragged-to cell (and silently trimmed the anchor cell too).
+        let range = resolved_range((0, 5), (0, 0)).expect("non-empty");
+        assert_eq!(
+            range,
+            (Point::new(Line(0), Column(0)), Point::new(Line(0), Column(5))),
+            "both the col-0 drag target and the col-5 anchor are included"
+        );
+    }
+
+    #[test]
+    fn upward_selection_includes_both_endpoints() {
+        // Same ordering rule across lines: dragging up-left must include the
+        // dragged-to cell on the earlier line.
+        let range = resolved_range((3, 4), (1, 7)).expect("non-empty");
+        assert_eq!(range, (Point::new(Line(1), Column(7)), Point::new(Line(3), Column(4))));
+    }
+
+    #[test]
+    fn single_cell_click_drag_selects_that_cell() {
+        let range = resolved_range((2, 3), (2, 3)).expect("non-empty");
+        assert_eq!(range, (Point::new(Line(2), Column(3)), Point::new(Line(2), Column(3))));
     }
 }
