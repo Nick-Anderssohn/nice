@@ -415,6 +415,22 @@ impl WindowState {
             self.subscribed_panes.insert(key);
             let (t, p) = (tab_id.clone(), pane_id.clone());
             cx.subscribe(&handle, move |ws, _handle, event: &TerminalEvent, cx| {
+                // Quit freeze: once quit has begun the model is read-only.
+                // `quit_cascade` has already flushed every window's snapshot
+                // (step 2) when its teardown (step 3) kills the panes — and an
+                // intentional kill classifies `held: false` (nice-term-core
+                // `should_hold_on_exit`), the clean-exit value whose routing
+                // dissolves the tab. gpui can still deliver those `Exited`
+                // events between teardown and the `on_app_quit` re-flush, which
+                // would re-snapshot the shrunken model and overwrite the good
+                // step-2 write — losing whichever tabs' events won the race
+                // (and, via the `WindowEmptied` mint below, wiping the whole
+                // slot when every pane's event landed). The `AppQuitting`
+                // latch already makes window closes inert; pane events freeze
+                // the same way.
+                if cx.has_global::<crate::lifecycle::AppQuitting>() {
+                    return;
+                }
                 let model = &mut ws.model;
                 let selection = &mut ws.selection;
                 let routed = ws

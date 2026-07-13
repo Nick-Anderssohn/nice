@@ -33,6 +33,16 @@
 //!    drops every session, tearing each child process group down (SIGHUP→SIGKILL),
 //!    so no zsh survives the window (asserted externally by `ps` per the R3
 //!    teardown contract — Validation §5).
+//! 7. **Quit freeze** — with the [`AppQuitting`](crate::lifecycle::AppQuitting)
+//!    latch set, an `Exited { held: false }` delivered through the SHIPPED
+//!    subscription ([`WindowState::subscribe_spawned_panes`]) is dropped and the
+//!    tab survives in the model — the lost-tab quit race: `quit_cascade`'s
+//!    teardown kills classify `held: false` (intentional), and routing one
+//!    between the step-2 flush and the `on_app_quit` re-flush dissolved the tab
+//!    from the re-snapshotted model. A control phase proves the same exit
+//!    dissolves when the latch is absent (delivery works, so survival is real).
+//!
+//! [`WindowState::subscribe_spawned_panes`]: crate::window_state::WindowState::subscribe_spawned_panes
 //!
 //! ## Why no view is mounted
 //!
@@ -305,6 +315,12 @@ fn clean_exit_spec(cwd: &str) -> SpawnSpec {
     .with_size(ROWS, COLS)
 }
 
+/// Leg-7 phase-B assert window: how long to let a latched-out `Exited` NOT
+/// mutate the model before declaring survival. There is no edge to poll for on
+/// a dropped event, so a fixed settle is the assert window; the control phase
+/// proves delivery normally lands well inside it (ROUTE cadence, ~100–300 ms).
+const FREEZE_SETTLE_MS: u64 = 1_500;
+
 /// A pane that prints then exits **non-zero** (status 3 → the R3 held
 /// classification): the held-detour fixture.
 fn held_spec(cwd: &str) -> SpawnSpec {
@@ -447,11 +463,92 @@ async fn run_session_lifecycle(
         None => failures.push("held: could not add the held-detour pane".into()),
     }
 
+    // === 7. quit freeze: exits landing after quit begins must not dissolve =====
+    // Phase A (control): without the latch, a clean exit routed through the
+    // SHIPPED subscription (`subscribe_spawned_panes` — not this scenario's
+    // local closure, which deliberately mirrors it without the gate) dissolves
+    // the tab, proving event delivery works in this harness so phase B's
+    // survival assert is meaningful.
+    match create_and_spawn_shipped(cx, &state, &cwd) {
+        Some((qa_tab, qa_pane)) => {
+            if !exit_pane_cleanly(cx, &state, &qa_tab, &qa_pane).await {
+                failures
+                    .push("quit-freeze control: the pane never became ready to exit".into());
+            } else if !poll_tab_gone(cx, &state, &qa_tab).await {
+                failures.push(
+                    "quit-freeze control: a clean exit through the shipped subscription \
+                     (subscribe_spawned_panes) did not dissolve the tab"
+                        .into(),
+                );
+            }
+        }
+        None => failures.push("quit-freeze control: could not create the control tab".into()),
+    }
+    // Phase B: the same shape with `AppQuitting` set before the exit — the
+    // shipped callback must drop the event and the tab must survive (the
+    // lost-tab quit race: a teardown-kill `Exited { held: false }` routed
+    // between quit_cascade's flush and the on_app_quit re-flush dissolved the
+    // tab from the re-snapshotted model).
+    match create_and_spawn_shipped(cx, &state, &cwd) {
+        Some((qb_tab, qb_pane)) => {
+            let _ = cx.update(|app| app.set_global(crate::lifecycle::AppQuitting));
+            if !exit_pane_cleanly(cx, &state, &qb_tab, &qb_pane).await {
+                failures.push("quit-freeze: the pane never became ready to exit".into());
+            } else {
+                settle(cx, FREEZE_SETTLE_MS).await;
+                let (tab_alive, pane_alive) = state.update(cx, |s, _cx| {
+                    let pane_alive = s
+                        .model
+                        .tab_for(&qb_tab)
+                        .map(|t| t.panes.iter().any(|p| p.id == qb_pane))
+                        .unwrap_or(false);
+                    (s.model.tab_for(&qb_tab).is_some(), pane_alive)
+                });
+                if !tab_alive || !pane_alive {
+                    failures.push(format!(
+                        "quit-freeze: an Exited{{held:false}} delivered after AppQuitting \
+                         mutated the model (tab present: {tab_alive}, pane present: \
+                         {pane_alive}) — the lost-tab quit race regressed"
+                    ));
+                }
+            }
+            // Un-latch before teardown so this in-process suite's later
+            // scenarios see the normal (not-quitting) close routing.
+            let _ = cx.update(|app| {
+                let _ = app.remove_global::<crate::lifecycle::AppQuitting>();
+            });
+        }
+        None => failures.push("quit-freeze: could not create the frozen-phase tab".into()),
+    }
+
     // === teardown: drop every session so no zsh outlives the window ===========
     let _ = state.update(cx, |s, _cx| s.teardown());
     settle(cx, 150).await;
 
     build_report(failures)
+}
+
+/// Leg-7 fixture: create a terminal tab through the sidebar seam but wire its
+/// pane through the SHIPPED subscription sweep
+/// ([`WindowState::subscribe_spawned_panes`](crate::window_state::WindowState::subscribe_spawned_panes))
+/// instead of this scenario's local closure — the quit-freeze gate under test
+/// lives in the shipped callback. Spawn + sweep run in one synchronous update,
+/// so no event can outrun the subscription. Returns `(tab_id, pane_id)`.
+fn create_and_spawn_shipped(
+    cx: &mut AsyncApp,
+    state: &Entity<WindowState>,
+    cwd: &str,
+) -> Option<(String, String)> {
+    let spec = clean_exit_spec(cwd);
+    state.update(cx, |s, cx| {
+        let tab_id = s.sidebar_actions.create_terminal_tab(&mut s.model)?;
+        let pane_id = s.model.tab_for(&tab_id)?.panes.first()?.id.clone();
+        if s.session.spawn_pane(&tab_id, &pane_id, spec, cx).is_err() {
+            return None;
+        }
+        s.subscribe_spawned_panes(cx);
+        Some((tab_id, pane_id))
+    })
 }
 
 /// Add a held-detour pane to the Main tab via the manager's `add_pane` and spawn
@@ -610,8 +707,9 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      immediately (hermetic stub) while the companion stayed deferred and forked on \
                      first focus; a clean exit refocused the slot neighbor; the last-pane exit \
                      dissolved the tab and fell back to the Terminals-order Main tab; a non-zero \
-                     exit held its pane (is_alive == false, still mounted); teardown dropped every \
-                     session."
+                     exit held its pane (is_alive == false, still mounted); once AppQuitting was \
+                     set, a clean exit through the shipped subscription no longer mutated the \
+                     model (the lost-tab quit freeze); teardown dropped every session."
                 .to_string(),
         }
     } else {
