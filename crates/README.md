@@ -418,8 +418,12 @@ The GPUI application. Structure (grows over later cycles):
     binding). This is a *closer* port of Swift than the plan's wording — Swift stands
     its `KeyboardShortcutMonitor` down and installs a higher-priority local monitor
     while recording. The keymap outage is bounded to the capture interaction and torn
-    down on commit / cancel / Esc / **focus-out** (rail switch, window close,
-    click-away — the `.onDisappear` guarantee, via `Window::on_focus_out`). The pure
+    down on commit / cancel / Esc / **focus-out** (rail switch, click-away — the
+    `.onDisappear` guarantee, via `Window::on_focus_out`). Closing the Settings
+    window via the native red button fires **no** draw and no focus-out, so the
+    Settings close observer (`window.rs`) calls
+    `shortcuts_pane::stand_down_on_settings_close` — a no-op unless a recording is
+    in flight — to rebuild the keymap on that path. The pure
     capture decision (`decide_capture` → `Ignore` / `Cancel` / `Commit` / `Conflict`)
     is gpui-free and `#[test]`-covered.
   - **Live-vs-persist:** Appearance → R21 `apply_*` (persists `appearance`);
