@@ -139,11 +139,26 @@ impl WindowRegistry {
     /// otherwise (and always as a fallback) the most-recently-keyed live window,
     /// else the first registered. `None` only when no window is registered.
     pub(crate) fn active_state(cx: &App, prefer_key: bool) -> Option<Entity<WindowState>> {
+        Self::active_state_with_id(cx, prefer_key).map(|(_id, state)| state)
+    }
+
+    /// Like [`active_state`](Self::active_state) but also returns the chosen
+    /// window's [`WindowId`], so a caller — the ⌘Q MRU fallback in
+    /// [`crate::app::request_quit`] (#4 / D1) — can resolve that window's
+    /// `AnyWindowHandle` via `cx.windows()` to activate it and host the quit
+    /// confirmation there. Same MRU selection as [`active_state`](Self::active_state).
+    pub(crate) fn active_state_with_id(
+        cx: &App,
+        prefer_key: bool,
+    ) -> Option<(WindowId, Entity<WindowState>)> {
         let key = cx.active_window().map(|w| w.window_id());
         let reg = cx.try_global::<WindowRegistry>()?;
         let live: HashSet<WindowId> = reg.entries.keys().copied().collect();
         let chosen = mru::select(prefer_key, key, &reg.order, &live)?;
-        reg.entries.get(&chosen).cloned()
+        reg.entries
+            .get(&chosen)
+            .cloned()
+            .map(|state| (chosen, state))
     }
 
     /// Consumer (d): the state for a specific window id (R25 migration / direct
@@ -208,12 +223,31 @@ impl WindowRegistry {
     /// survives closing one of several windows.
     pub(crate) fn handle_window_closed(cx: &mut App, id: WindowId) {
         Self::route_close_disk_fate(cx, id);
-        let empty = cx
-            .try_global::<WindowRegistry>()
-            .map_or(true, |r| r.entries.is_empty());
-        if empty {
+        if Self::should_quit_after_close(cx, id) {
             cx.quit();
         }
+    }
+
+    /// The quit-when-empty decision for [`handle_window_closed`](Self::handle_window_closed),
+    /// split out as a testable seam (the test platform's `cx.quit()` is an
+    /// unobservable no-op). Quits only when the registry holds no live window AND no
+    /// Settings window OTHER than the one being closed is still live (#13 / D4).
+    ///
+    /// Order-independence (BUGS.md #13): two `on_window_closed` observers fire on a
+    /// Settings close — this registry's and the settings module's own
+    /// (`settings/window.rs`, which clears the `SettingsWindow` Global) — and their
+    /// install order is not a contract. So when the closing window IS the Settings
+    /// window, [`current_settings_window`](crate::settings::window::current_settings_window)
+    /// may still return its (now-closing) handle; the `window_id() != closed_id`
+    /// guard treats that as "not live" so the last window closing (terminal OR
+    /// Settings) still quits, exactly as before.
+    fn should_quit_after_close(cx: &App, closed_id: WindowId) -> bool {
+        let registry_empty = cx
+            .try_global::<WindowRegistry>()
+            .map_or(true, |r| r.entries.is_empty());
+        let settings_live = crate::settings::window::current_settings_window(cx)
+            .is_some_and(|h| h.window_id() != closed_id);
+        should_quit_on_window_close(registry_empty, settings_live)
     }
 
     /// The disk-fate + teardown half of [`handle_window_closed`], WITHOUT the
@@ -243,6 +277,15 @@ impl WindowRegistry {
             state.update(cx, |s, _cx| s.teardown());
         }
     }
+}
+
+/// Pure quit-when-empty predicate (BUGS.md #13, D4): the app quits on a window
+/// close only when the [`WindowRegistry`] holds no remaining live window AND no
+/// Settings window is still live. Split from
+/// [`WindowRegistry::should_quit_after_close`] (which reads the app to derive both
+/// inputs) so the decision is unit-testable without a window.
+pub(crate) fn should_quit_on_window_close(registry_empty: bool, settings_live: bool) -> bool {
+    registry_empty && !settings_live
 }
 
 #[cfg(test)]
@@ -330,5 +373,73 @@ mod tests {
         mru::remove(&mut order, 2);
         let l = live(&[1]);
         assert_eq!(mru::select(true, None, &order, &l), Some(1));
+    }
+
+    // ===================================================================
+    // #13 / D4 — gated quit-when-empty
+    // ===================================================================
+
+    #[test]
+    fn should_quit_only_when_registry_empty_and_no_settings_live() {
+        use super::should_quit_on_window_close as q;
+        // The only quitting combination: no registered window left AND no Settings
+        // window still open — today's single-window "close quits the app".
+        assert!(q(true, false), "empty registry, no Settings ⇒ quit");
+        // Settings still open ⇒ never quit, even with an empty registry (#13: closing
+        // the last terminal window must not take Settings down mid-use).
+        assert!(!q(true, true), "empty registry but Settings live ⇒ stay");
+        // Another registered window survives ⇒ never quit, Settings or not.
+        assert!(!q(false, false), "registered windows remain ⇒ stay");
+        assert!(!q(false, true), "registered windows remain + Settings ⇒ stay");
+    }
+
+    /// The decision seam [`super::WindowRegistry::should_quit_after_close`] derives
+    /// `registry_empty` + `settings_live` from the app and gates on the pure
+    /// predicate. Driven on a `TestAppContext` because the test platform's
+    /// `cx.quit()` is an unobservable no-op (per the plan: assert the seam, don't
+    /// build a quit-spy). Covers #13's order-independence: closing the last terminal
+    /// window while Settings is live must NOT quit, yet closing Settings itself as
+    /// the last live window still quits.
+    #[gpui::test]
+    fn should_quit_after_close_gates_on_a_live_settings_window(cx: &mut gpui::TestAppContext) {
+        use super::WindowRegistry;
+
+        // Two bare windows: one stands in for the Settings window, one for a just-
+        // closed terminal window. The registry stays EMPTY throughout (both the
+        // "last terminal closed" and "Settings closed last" cases start from empty).
+        let settings_win = cx.add_window(|_w, _cx| gpui::Empty);
+        let other_win = cx.add_window(|_w, _cx| gpui::Empty);
+
+        cx.update(|app| {
+            app.set_global(WindowRegistry::default());
+
+            // No Settings window open: closing the last window quits, as it always
+            // has (registry empty + no Settings live).
+            assert!(
+                WindowRegistry::should_quit_after_close(app, other_win.window_id()),
+                "empty registry with no Settings open still quits on the last close"
+            );
+
+            // Settings window now live (its handle stored in the SettingsWindow Global).
+            crate::settings::window::force_settings_handle_for_scenario(
+                app,
+                gpui::AnyWindowHandle::from(settings_win),
+            );
+
+            // Closing the last TERMINAL window while Settings is open must NOT quit
+            // (#13) — Settings' id differs from the closing window's id ⇒ settings_live.
+            assert!(
+                !WindowRegistry::should_quit_after_close(app, other_win.window_id()),
+                "an empty registry with Settings still open does not quit"
+            );
+
+            // Closing SETTINGS itself as the last live window still quits: the id-guard
+            // treats the window being closed as not-live regardless of whether the
+            // settings-close observer has cleared the Global yet (order-independent).
+            assert!(
+                WindowRegistry::should_quit_after_close(app, settings_win.window_id()),
+                "closing Settings as the last live window still quits"
+            );
+        });
     }
 }

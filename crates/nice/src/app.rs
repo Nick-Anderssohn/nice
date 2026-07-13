@@ -716,22 +716,51 @@ fn flush_all_window_snapshots(cx: &App) {
     crate::session_store::flush();
 }
 
+/// Resolve the window + [`WindowState`] that should host the ⌘Q confirmation
+/// (#4 / D1+D2). The active window when it is a REGISTERED Nice window — the modal
+/// is stashed on the same window that renders it. When the key window is
+/// UNREGISTERED (the Settings window, D7) or there is no active window,
+/// `state_for_window` misses, so fall back to the registry's MRU window and
+/// ACTIVATE it (D2) so the dialog is visible in front of Settings rather than
+/// buried on an occluded window. `None` only when the registry holds no window
+/// at all (⇒ [`request_quit`] quits outright).
+///
+/// Split out of [`request_quit`] so the fallback resolution — the #4 fix's core:
+/// an unregistered key window routes to the registered MRU window instead of
+/// bypassing the dialog into an immediate quit — is unit-testable without
+/// [`WindowState::present_confirmation`](crate::window_state::WindowState::present_confirmation),
+/// which panics on the headless test platform (its window has no backing `NSView`).
+fn resolve_quit_dialog_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<WindowState>)> {
+    if let Some(win) = cx.active_window() {
+        if let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) {
+            return Some((win, state));
+        }
+    }
+    // Unregistered / absent key window: fall back to the registry MRU window and
+    // bring it forward before it hosts the dialog.
+    let (id, state) = WindowRegistry::active_state_with_id(cx, true)?;
+    let win = cx.windows().into_iter().find(|w| w.window_id() == id)?;
+    // Presentation itself is occlusion-safe (`present_confirmation` fires the
+    // demand-present kick), but activating is the correct UX (D2).
+    let _ = win.update(cx, |_root, window, _app| window.activate_window());
+    Some((win, state))
+}
+
 /// ⌘Q / Quit-menu handler. Zero live panes ⇒ [`quit_cascade`] with no dialog;
 /// else present the quit confirmation in the active window (confirm ⇒ cascade,
-/// cancel ⇒ total no-op).
+/// cancel ⇒ total no-op). When the key window is the unregistered Settings window
+/// the confirmation is routed to the registry's MRU window (see
+/// [`resolve_quit_dialog_host`]) rather than bypassed (#4).
 fn request_quit(cx: &mut App) {
     let (claude, terminal) = total_live_pane_counts(cx);
     if claude + terminal == 0 {
         quit_cascade(cx);
         return;
     }
-    // Host the dialog in the active window — pull its state by id so the modal is
-    // stashed on the SAME window that renders it.
-    let Some(win) = cx.active_window() else {
-        quit_cascade(cx);
-        return;
-    };
-    let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+    // Resolve the window + state to host the confirmation. `None` ⇒ no Nice window
+    // is registered at all, so quit as today (the zero-live-panes fast path already
+    // returned above).
+    let Some((win, state)) = resolve_quit_dialog_host(cx) else {
         quit_cascade(cx);
         return;
     };
@@ -854,6 +883,16 @@ fn request_close_active_window(cx: &mut App) {
         return;
     };
     let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+        // The key window is UNREGISTERED (the Settings window, D7): ⌘W closes it
+        // directly (D3). Unregistered windows host no terminals, so there is nothing
+        // to confirm; do NOT route through `request_window_close`, which reads a
+        // `WindowState` this window doesn't have.
+        let result = win.update(cx, |_root, window, _app| window.remove_window());
+        if let Err(e) = result {
+            eprintln!(
+                "nice: request_close_active_window could not close the unregistered window: {e:#}"
+            );
+        }
         return;
     };
     // Runs deferred (see `install_lifecycle_commands`), so the window is back in
@@ -4256,5 +4295,113 @@ mod tests {
                 _ => panic!("View menu should hold exactly one action item"),
             }
         }
+    }
+
+    // ===================================================================
+    // BUGHUNT1-B — unregistered key-window lifecycle (#4 quit fallback, ⌘W close)
+    // ===================================================================
+
+    /// #4 / D1+D2: ⌘Q while an UNREGISTERED window (Settings) is key must route the
+    /// quit confirmation to the registry's MRU (registered) window — NOT bypass the
+    /// dialog into an immediate quit that tears down live terminals unwarned. The
+    /// registered window holds a live Terminal pane (`WindowState::new` seeds one)
+    /// and the unregistered window is the active/key one.
+    ///
+    /// Asserted through the [`resolve_quit_dialog_host`] seam rather than by driving
+    /// `request_quit` to `pending_modal().is_some()`: `present_confirmation` calls
+    /// `ns_view_of`, which panics on the headless test platform (no backing
+    /// `NSView`). The seam IS the #4 fix — it returns the registered window instead
+    /// of `None` (which would send `request_quit` to `quit_cascade`).
+    #[gpui::test]
+    fn quit_from_unregistered_key_window_routes_to_the_registered_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let reg_window = cx.add_window(|_w, _cx| gpui::Empty);
+        let state = cx.update(|app| {
+            WindowRegistry::install(app);
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            WindowRegistry::register(app, reg_window.window_id(), state.clone());
+            state
+        });
+
+        // An unregistered second window (stands in for Settings) becomes the key
+        // window — `state_for_window` on the active window will now miss.
+        let settings_window = cx.add_window(|_w, _cx| gpui::Empty);
+        settings_window
+            .update(cx, |_v, window, _cx| window.activate_window())
+            .unwrap();
+
+        cx.update(|app| {
+            // Preconditions: a live pane keeps ⌘Q on the confirmation path, and the
+            // active window is genuinely the unregistered one (no registered state).
+            assert_eq!(total_live_pane_counts(app), (0, 1));
+            assert_eq!(
+                app.active_window().map(|w| w.window_id()),
+                Some(settings_window.window_id())
+            );
+            assert!(
+                WindowRegistry::state_for_window(app, settings_window.window_id()).is_none(),
+                "the settings window is unregistered"
+            );
+
+            let (host, host_state) = resolve_quit_dialog_host(app)
+                .expect("an unregistered key window falls back to the registered MRU window");
+            assert_eq!(
+                host.window_id(),
+                reg_window.window_id(),
+                "⌘Q from the unregistered window hosts the confirmation on the registered \
+                 window, not an unconfirmed quit"
+            );
+            assert_eq!(
+                host_state, state,
+                "the resolved state is the registered window's state"
+            );
+            // Fallback activated the registered window (D2), so it is now key.
+            assert_eq!(
+                app.active_window().map(|w| w.window_id()),
+                Some(reg_window.window_id()),
+                "the fallback brought the registered window forward"
+            );
+        });
+    }
+
+    /// ⌘W sibling (D3): with an unregistered key window, the close request removes
+    /// THAT window (window count drops by one) and leaves the registered window and
+    /// its registration untouched.
+    #[gpui::test]
+    fn close_active_window_removes_an_unregistered_key_window(cx: &mut gpui::TestAppContext) {
+        let reg_window = cx.add_window(|_w, _cx| gpui::Empty);
+        cx.update(|app| {
+            WindowRegistry::install(app);
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            WindowRegistry::register(app, reg_window.window_id(), state.clone());
+        });
+
+        let settings_window = cx.add_window(|_w, _cx| gpui::Empty);
+        settings_window
+            .update(cx, |_v, window, _cx| window.activate_window())
+            .unwrap();
+
+        cx.update(|app| {
+            let before = app.windows().len();
+            request_close_active_window(app);
+            // `remove_window()` removes the window synchronously as its update
+            // returns (gpui `update_window` trailer), so the count drops immediately.
+            assert_eq!(
+                app.windows().len(),
+                before - 1,
+                "⌘W removed the unregistered key window"
+            );
+            assert!(
+                !app.windows()
+                    .iter()
+                    .any(|w| w.window_id() == settings_window.window_id()),
+                "the removed window is the unregistered settings window"
+            );
+            assert!(
+                WindowRegistry::state_for_window(app, reg_window.window_id()).is_some(),
+                "the registered window is untouched"
+            );
+        });
     }
 }
