@@ -346,6 +346,16 @@ impl FileOperationsService {
                 // complete.
                 for item in items {
                     check_exists(&item.destination)?;
+                    // Mirror `apply(Move)`'s destination guard: `rename(2)`
+                    // would silently clobber a file recreated at the restore
+                    // target (`item.source`) since the move. Surface that as
+                    // drift instead of overwriting it.
+                    if item.source.exists() {
+                        return Err(underlying(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("'{}' already exists", item.source.display()),
+                        )));
+                    }
                     std::fs::rename(&item.destination, &item.source).map_err(underlying)?;
                 }
                 Ok(())
@@ -354,6 +364,16 @@ impl FileOperationsService {
                 for item in items {
                     if !item.trashed.exists() {
                         return Err(FileOperationError::TrashedItemMissing(item.trashed.clone()));
+                    }
+                    // Mirror `apply(Move)`'s destination guard: `rename(2)`
+                    // would silently clobber a file recreated at the original
+                    // location since the trash. Surface that as drift instead
+                    // of overwriting it.
+                    if item.original.exists() {
+                        return Err(underlying(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("'{}' already exists", item.original.display()),
+                        )));
                     }
                     std::fs::rename(&item.trashed, &item.original).map_err(underlying)?;
                 }
@@ -771,6 +791,96 @@ mod tests {
             Err(FileOperationError::TrashedItemMissing(_)) => {}
             other => panic!("expected TrashedItemMissing, got {other:?}"),
         }
+    }
+
+    /// Bug repro: Move `A/foo.txt` → `B/`; recreate a new `A/foo.txt`; undo
+    /// must NOT silently overwrite the recreated file via `rename(2)`.
+    #[test]
+    fn undo_move_restore_target_exists_throws_leaves_both_files_intact() {
+        let t = TempTree::new();
+        let src = t.make_file("a/foo.txt", "original");
+        let dest_dir = t.make_dir("b");
+        let svc = service(&t);
+        let op = svc
+            .move_(&[src.clone()], &dest_dir, origin())
+            .unwrap();
+        let moved = match &op {
+            FileOperation::Move { items, .. } => items[0].destination.clone(),
+            _ => panic!("expected Move"),
+        };
+        assert!(moved.exists());
+        assert!(!src.exists());
+
+        // Recreate a new file at the restore target (`src`) before undoing.
+        fs::write(&src, "recreated").unwrap();
+
+        let result = svc.undo(&op);
+        assert!(result.is_err(), "undo must throw when restore target exists");
+        assert_eq!(
+            fs::read_to_string(&src).unwrap(),
+            "recreated",
+            "recreated file at the restore target must not be clobbered"
+        );
+        assert!(moved.exists(), "moved file must remain at destination");
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "original");
+    }
+
+    /// undo(Move) happy path is unchanged when the restore target is free.
+    #[test]
+    fn undo_move_restore_target_free_restores_source() {
+        let t = TempTree::new();
+        let src = t.make_file("a/foo.txt", "hi");
+        let dest_dir = t.make_dir("b");
+        let svc = service(&t);
+        let op = svc.move_(&[src.clone()], &dest_dir, origin()).unwrap();
+        assert!(!src.exists());
+        svc.undo(&op).unwrap();
+        assert!(src.exists());
+        assert_eq!(fs::read_to_string(&src).unwrap(), "hi");
+    }
+
+    /// Bug repro: trash `A/foo.txt`; recreate a new `A/foo.txt`; undo must
+    /// NOT silently overwrite the recreated file via `rename(2)`.
+    #[test]
+    fn undo_trash_restore_target_exists_throws_leaves_both_files_intact() {
+        let t = TempTree::new();
+        let src = t.make_file("a.txt", "original");
+        let trash = t.make_dir("Trash");
+        let svc = service_with_trash(&trash);
+        let op = svc.trash(&[src.clone()], origin()).unwrap();
+        let trashed = match &op {
+            FileOperation::Trash { items, .. } => items[0].trashed.clone(),
+            _ => panic!("expected Trash"),
+        };
+        assert!(!src.exists());
+        assert!(trashed.exists());
+
+        // Recreate a new file at the original location before undoing.
+        fs::write(&src, "recreated").unwrap();
+
+        let result = svc.undo(&op);
+        assert!(result.is_err(), "undo must throw when restore target exists");
+        assert_eq!(
+            fs::read_to_string(&src).unwrap(),
+            "recreated",
+            "recreated file at the original location must not be clobbered"
+        );
+        assert!(trashed.exists(), "trashed file must remain in the trash location");
+        assert_eq!(fs::read_to_string(&trashed).unwrap(), "original");
+    }
+
+    /// undo(Trash) happy path is unchanged when the original location is free.
+    #[test]
+    fn undo_trash_restore_target_free_restores_original() {
+        let t = TempTree::new();
+        let src = t.make_file("a.txt", "hi");
+        let trash = t.make_dir("Trash");
+        let svc = service_with_trash(&trash);
+        let op = svc.trash(&[src.clone()], origin()).unwrap();
+        assert!(!src.exists());
+        svc.undo(&op).unwrap();
+        assert!(src.exists());
+        assert_eq!(fs::read_to_string(&src).unwrap(), "hi");
     }
 
     // MARK: - Collision naming
