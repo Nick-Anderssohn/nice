@@ -506,8 +506,11 @@ The GPUI application. Structure (grows over later cycles):
   gated drop slot is resolved by the pure `nice-model::pane_strip_drop` resolver
   (below); an insertion line paints at the target edge; and a committed reorder
   calls `TabModel::move_pane` then persists with an **explicit `save_to_store()`**
-  (the `on_tree_mutation` observer is unwired in the shipped app, so the drop
-  saves directly). The existing select-on-press + `stop_propagation` is untouched
+  (the `on_tree_mutation` observer is now wired once per window in
+  `build_window_root` via `wire_tree_mutation_save`, BUGHUNT1-D, and `move_pane`
+  fires the did-mutate signal itself; the explicit save is retained as a harmless
+  belt-and-suspenders — the observer's save is debounced, so the duplicate
+  collapses). The existing select-on-press + `stop_propagation` is untouched
   — the drag arms alongside it. **P5 (cross-window move) + P6 (tear-off) are CUT**
   (scope fence): no `NSDraggingSource` / `LivePaneRegistry` / tear-off host, no
   `extract_pane` / `insert_pane`, and no non-`.slot` resolver destinations.
@@ -1397,9 +1400,17 @@ and **no `gpui` dependency** (it mirrors today's pure-Swift model code; see the
   document a pure value-tree; production uses `std::fs`, tests inject a fake so
   the git-root/repair/bucketing ports stay hermetic (the Swift tests planted
   real temp dirs). Swift's `onTreeMutation` closure + `@Observable` write-back
-  are consolidated into one explicit did-mutate signal whose observable
-  contract survives verbatim: **a no-op transform produces no mutation event; a
-  real change produces exactly one.**
+  are consolidated into one explicit did-mutate signal, now wired once per
+  window to the debounced session save (BUGHUNT1-D). The contract is structural:
+  **every `&mut self` method that changes persisted state fires it.** Most
+  change-guarded mutators still fire exactly once on a real change and not on a
+  no-op, but two fire without proving a change — `mutate_tab` (it cannot see
+  whether the caller's transform changed anything, so it fires whenever the tab
+  is found) and `repair_project_structure` (fires unconditionally at boot before
+  the observer is wired) — and those spurious fires are tolerated because the
+  save is debounced. The only mutation that deliberately does NOT fire is the
+  runtime-only `acknowledge_waiting_on_active_pane` (its sole write is the
+  non-persisted `waiting_acknowledged` flag).
 
 **The asymmetries are deliberate.** This model contains behaviors that look
 inconsistent and are each intentional + test-pinned (`Models.swift`,

@@ -2592,3 +2592,237 @@ fn live_pane_counts_counts_modelled_but_unspawned_panes() {
     let model = TabModel::from_parts(vec![project], Some("t1".into()), fake_fs("/home", &[]));
     assert_eq!(model.live_pane_counts(), (1, 0));
 }
+
+// =====================================================================
+// fire_mutation coverage matrix (BUGHUNT1-D)
+//
+// The once-per-window observer subsumes the enumerated per-site session saves
+// only if every `&mut self` mutator that changes persisted state fires the
+// did-mutate signal on a real change. This matrix pins that: one fresh counting
+// observer per mutator, installed AFTER fixture setup so only the mutator under
+// test is counted. Read-only / pure helpers, and change-guarded no-ops, must
+// never fire.
+// =====================================================================
+
+/// Install a fresh mutation counter on `model`, run `act`, and return how many
+/// times the observer fired. The counter is installed after the caller has
+/// finished seeding the fixture, so fixture setup is never counted.
+fn fires_for(mut model: TabModel, act: impl FnOnce(&mut TabModel)) -> u32 {
+    let counter = mutation_counter(&mut model);
+    act(&mut model);
+    counter.get()
+}
+
+/// Terminals(Main) + a non-terminals project `p` holding one claude tab `t1`
+/// (panes `t1-claude`, `t1-t1`). `active_tab_id` is the seed's Main tab, so
+/// selecting `t1` is a real change.
+fn matrix_fixture() -> TabModel {
+    let mut model = model_empty("/tmp/main");
+    seed_claude_tab(&mut model, "p", "t1", "S1", "/tmp/p", true);
+    model
+}
+
+#[test]
+fn fire_mutation_matrix_every_persisting_mutator_fires() {
+    // --- Selection ---
+    assert!(
+        fires_for(matrix_fixture(), |m| m.select_tab("t1")) >= 1,
+        "select_tab (real change) must fire"
+    );
+
+    // --- Reorder ---
+    let two_roots = {
+        let mut m = matrix_fixture();
+        m.projects[1].tabs.push(new_claude_tab("t2", "/tmp/p"));
+        m
+    };
+    assert!(
+        fires_for(two_roots, |m| m.move_tab("t2", "t1", false)) >= 1,
+        "move_tab (real reorder) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| m.move_pane("t1-t1", "t1", "t1-claude", false)) >= 1,
+        "move_pane (real reorder) must fire"
+    );
+
+    // --- Panes: insert / extract / add ---
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.insert_pane(terminal("np", "X"), "t1", None, true);
+        }) >= 1,
+        "insert_pane (real insert) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.extract_pane("t1-t1", "t1");
+        }) >= 1,
+        "extract_pane (real removal) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.add_pane("t1", "np", None);
+        }) >= 1,
+        "add_pane (real append) must fire"
+    );
+
+    // --- Titles / generic mutate ---
+    assert!(
+        fires_for(matrix_fixture(), |m| m.rename_pane("t1", "t1-claude", "Renamed")) >= 1,
+        "rename_pane (real change) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| m.rename_tab("t1", "Renamed")) >= 1,
+        "rename_tab (real change) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| m.apply_auto_title("t1", "some-generated-title")) >= 1,
+        "apply_auto_title (real change) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.mutate_tab("t1", |t| t.cwd = "/tmp/elsewhere".into());
+        }) >= 1,
+        "mutate_tab (tab found) must fire"
+    );
+
+    // --- Cwd adoption ---
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.adopt_tab_cwd("t1", "/tmp/moved");
+        }) >= 1,
+        "adopt_tab_cwd (real change) must fire"
+    );
+
+    // --- Lineage ---
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.insert_branch_parent("t1", "P1", "P1-c", "P1-t", "OLD");
+        }) >= 1,
+        "insert_branch_parent (real insert) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.insert_handoff_child(make_handoff_tab("c1", "/tmp/p"), "t1");
+        }) >= 1,
+        "insert_handoff_child (real insert) must fire"
+    );
+
+    // --- Removal + dangling sweeps ---
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            let (pi, ti) = m.project_tab_index("t1").unwrap();
+            m.remove_tab(pi, ti);
+        }) >= 1,
+        "remove_tab (always removes) must fire"
+    );
+    let child_of_t1 = {
+        let mut m = matrix_fixture();
+        let mut t2 = new_claude_tab("t2", "/tmp/p");
+        t2.parent_tab_id = Some("t1".into());
+        m.projects[1].tabs.push(t2);
+        m
+    };
+    assert!(
+        fires_for(child_of_t1, |m| m.clear_dangling_parent_references("t1")) >= 1,
+        "clear_dangling_parent_references (real clear) must fire"
+    );
+    let orphan = {
+        let mut m = matrix_fixture();
+        let mut t2 = new_claude_tab("t2", "/tmp/p");
+        t2.parent_tab_id = Some("ghost".into());
+        m.projects[1].tabs.push(t2);
+        m
+    };
+    assert!(
+        fires_for(orphan, |m| m.prune_dangling_parent_references()) >= 1,
+        "prune_dangling_parent_references (real clear) must fire"
+    );
+
+    // --- Project structure ---
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.ensure_project("p-new", "NEW", "/tmp/new");
+        }) >= 1,
+        "ensure_project (real append) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| {
+            m.ensure_project_by_path("p-new2", "NEW2", "/tmp/new2");
+        }) >= 1,
+        "ensure_project_by_path (real append) must fire"
+    );
+    let no_terminals = {
+        let proj = Project {
+            id: "p".into(),
+            name: "P".into(),
+            path: "/tmp/p".into(),
+            tabs: vec![new_claude_tab("t1", "/tmp/p")],
+        };
+        TabModel::from_parts(vec![proj], Some("t1".into()), fake_fs("/home", &[]))
+    };
+    assert!(
+        fires_for(no_terminals, |m| m.ensure_terminals_project_seeded(|_| {})) >= 1,
+        "ensure_terminals_project_seeded (synthesize) must fire"
+    );
+    let repo_fs = model_with("/tmp/main", &["/tmp/repo", "/tmp/repo/.git"]);
+    assert!(
+        fires_for(repo_fs, |m| {
+            m.add_tab_to_projects(new_claude_tab("tz", "/tmp/repo"), "/tmp/repo");
+        }) >= 1,
+        "add_tab_to_projects (always adds) must fire"
+    );
+    assert!(
+        fires_for(matrix_fixture(), |m| m.repair_project_structure()) >= 1,
+        "repair_project_structure fires unconditionally (D4/D5)"
+    );
+}
+
+#[test]
+fn fire_mutation_matrix_reads_and_no_ops_never_fire() {
+    // Pure reads never fire.
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| {
+            let _ = m.tab_for("t1");
+            let _ = m.project_tab_index("t1");
+            let _ = m.navigable_sidebar_tab_ids();
+            let _ = m.live_pane_counts();
+            let _ = m.would_move_tab("t1", "t1", false);
+            let _ = m.would_move_pane("t1-t1", "t1", "t1-claude", false);
+            let _ = m.is_terminals_project_tab("t1");
+            let _ = m.tab_id_owning("t1-claude");
+        }),
+        0,
+        "pure reads must never fire the did-mutate signal"
+    );
+
+    // Change-guarded mutators that changed nothing do not fire.
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| {
+            m.mutate_tab("ghost", |_| {});
+        }),
+        0,
+        "mutate_tab on an unknown tab (not found) must not fire"
+    );
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| {
+            m.adopt_tab_cwd("t1", "/tmp/p");
+        }),
+        0,
+        "adopt_tab_cwd to the same cwd is a no-op and must not fire"
+    );
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| m.rename_tab("t1", "   ")),
+        0,
+        "rename_tab with empty input is a no-op and must not fire"
+    );
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| m.select_tab(TabModel::MAIN_TERMINAL_TAB_ID)),
+        0,
+        "re-selecting the already-active tab must not fire"
+    );
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| m.clear_dangling_parent_references("t1")),
+        0,
+        "clear_dangling_parent_references with nothing pointing at the id must not fire"
+    );
+}
