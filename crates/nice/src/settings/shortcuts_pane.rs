@@ -276,6 +276,29 @@ fn teardown(cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Stand the recorder down when the Settings window closes mid-capture (D2/D3).
+///
+/// The keymap stand-down that [`enter_record`] performs (`clear_key_bindings`) is
+/// App-global, and the only restore paths are `teardown` off commit / cancel / Esc /
+/// focus-out. Closing the Settings window (native red button) tears it down with no
+/// draw, so [`Window::on_focus_out`] never fires — leaving the keymap empty for the
+/// rest of the session in every window. This is the missing restore trigger: the
+/// Settings close observer calls it, and it runs `teardown` (which rebuilds the full
+/// keymap) iff a recording is actually in flight.
+///
+/// A no-op when nothing is recording — it must not spuriously rebuild the keymap or
+/// install `RecorderState`.
+pub(crate) fn stand_down_on_settings_close(cx: &mut App) {
+    if recording_action(cx).is_some() {
+        teardown(cx);
+        // `teardown`'s contract leaves the focus-out subscription in place (re-armed
+        // by the next `enter_record`), but that subscription was bound to the now-dead
+        // Settings window — drop it here so it does not linger on a closed window (D4).
+        // Safe: `recording_action(..).is_some()` implies `RecorderState` is installed.
+        cx.global_mut::<RecorderState>().blur_sub = None;
+    }
+}
+
 /// The live `(action, Option<combo>)` map (for the conflict check). Empty when no
 /// store Global is installed (no conflicts).
 fn current_bindings(cx: &App) -> Vec<(ShortcutAction, Option<OwnedCombo>)> {
@@ -1083,6 +1106,129 @@ mod tests {
             );
         });
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================================================================
+    // Settings-window close mid-record (the wedge regression pin, BUGHUNT1-C)
+    // ===================================================================
+
+    /// The regression pin: closing the Settings window (native red button) while a
+    /// recorder field is mid-capture must restore the app-global keymap. Closing the
+    /// window fires no draw, so `on_focus_out` never runs — only the Settings close
+    /// observer's `stand_down_on_settings_close` call can rescue the keymap. Here we
+    /// drive that exact path: install the settings command (registers the
+    /// `on_window_closed` observer), point the singleton at this window, `enter_record`
+    /// (keymap stands down), then `remove_window()` — NOT a focus change, which is
+    /// precisely the shape the focus-out net misses. The window is deliberately NOT
+    /// activated, so an inactive-window focus-out cannot fire and mask the fix: only
+    /// the close observer restores the keymap.
+    #[gpui::test]
+    fn closing_settings_window_mid_record_restores_keymap(cx: &mut gpui::TestAppContext) {
+        use gpui::{Action, Keystroke};
+
+        let path = unique_temp_ui_settings("settings-close");
+        let dir = path.parent().unwrap().to_path_buf();
+        let window = cx.add_window(|_window, cx| FocusOutHost {
+            other: cx.focus_handle(),
+        });
+
+        cx.update(|app| {
+            app.set_global(ShortcutBindings::with_defaults(path));
+            crate::keymap::rebuild_keymap(app);
+            assert!(
+                app.key_bindings().borrow().bindings().len() > 0,
+                "the seeded keymap starts populated"
+            );
+            // Register the close observer and make this window the singleton Settings
+            // window, so its removal matches the observer's `is_settings` arm.
+            crate::settings::window::install_open_settings_command(app);
+            crate::settings::window::force_settings_handle_for_scenario(app, window.into());
+        });
+
+        // Enter capture: keymap stands down (D3). No window activation — the point is
+        // that the focus-out net is unavailable on close.
+        window
+            .update(cx, |_host, window, cx| {
+                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|app| {
+            assert_eq!(
+                recording_action(app),
+                Some(ShortcutAction::NewTerminalPane),
+                "enter_record put the pane into capture mode"
+            );
+            assert_eq!(
+                app.key_bindings().borrow().bindings().len(),
+                0,
+                "enter_record stands the whole keymap down while recording"
+            );
+        });
+
+        // Close the window (native red button shape): no draw, no focus-out. The
+        // close observer must stand the recorder down and restore the keymap.
+        window
+            .update(cx, |_host, window, _cx| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|app| {
+            assert_eq!(
+                recording_action(app),
+                None,
+                "the window close tore the abandoned capture down"
+            );
+
+            let keymap = app.key_bindings();
+            let keymap = keymap.borrow();
+            let bound = |action: &dyn Action, chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .bindings_for_action(action)
+                    .any(|b| matches!(b.match_keystrokes(std::slice::from_ref(&ks)), Some(false)))
+            };
+            // The full board is back, including every PROTECTED non-rebindable — the
+            // wedge (a session-long empty app-global keymap) is closed.
+            assert!(bound(&crate::app::Quit, "cmd-q"), "⌘Q restored");
+            assert!(bound(&crate::app::CloseWindow, "cmd-w"), "⌘W restored");
+            assert!(bound(&crate::app::NewWindow, "cmd-n"), "⌘N restored");
+            assert!(
+                bound(&crate::settings::window::OpenSettings, "cmd-,"),
+                "⌘, restored"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Idempotence: `stand_down_on_settings_close` with NO recording in flight is a
+    /// pure no-op — it must not rebuild the keymap or install `RecorderState`. A
+    /// Settings window that closes without any recorder field focused (the common
+    /// case) must not perturb the keymap.
+    #[gpui::test]
+    fn settings_close_with_no_recording_is_a_noop(cx: &mut gpui::TestAppContext) {
+        let path = unique_temp_ui_settings("settings-close-noop");
+        let dir = path.parent().unwrap().to_path_buf();
+        cx.update(|app| {
+            app.set_global(ShortcutBindings::with_defaults(path));
+            // Nothing recording, keymap deliberately NOT seeded (stays empty).
+            assert!(recording_action(app).is_none());
+            assert!(app.try_global::<RecorderState>().is_none());
+
+            stand_down_on_settings_close(app);
+
+            assert!(
+                app.try_global::<RecorderState>().is_none(),
+                "a no-recording close must not install RecorderState"
+            );
+            assert_eq!(
+                app.key_bindings().borrow().bindings().len(),
+                0,
+                "a no-recording close must not rebuild the keymap"
+            );
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

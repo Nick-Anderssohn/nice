@@ -1101,9 +1101,11 @@ impl SidebarShellView {
     /// [`TabModel::move_tab`] synchronously — gpui clears `active_drag` itself
     /// after this listener, so prod's next-runloop-tick deferral
     /// (`SidebarView.swift:897-915`) has no analog to port — then persists
-    /// explicitly via `WindowState::save_to_store` (the R25 D5 rule:
-    /// `on_tree_mutation` is wired nowhere, so a reorder would not otherwise
-    /// save). A drop with no resolved slot just clears the field.
+    /// explicitly via `WindowState::save_to_store`. The once-per-window
+    /// `on_tree_mutation` observer (BUGHUNT1-D) now also fires from `move_tab`, so
+    /// this explicit save is belt-and-suspenders (a duplicate debounced upsert is
+    /// harmless — kept per that plan's D2). A drop with no resolved slot just
+    /// clears the field.
     fn on_tab_drop(&mut self, group_id: &str, payload: &TabDragPayload, cx: &mut Context<Self>) {
         if let Some(target) = self.drag_target.take() {
             if target.project_id == group_id {

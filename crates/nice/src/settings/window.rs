@@ -164,6 +164,13 @@ pub(crate) fn install_open_settings_command(cx: &mut App) {
         let is_settings =
             current_settings_window(cx).is_some_and(|h| h.window_id() == id);
         if is_settings {
+            // Restore the app-global keymap if a shortcut recorder field was
+            // mid-capture: closing the window fires no draw, so the recorder's
+            // focus-out teardown never runs and the `clear_key_bindings()` stand-down
+            // would strand every window's shortcuts empty for the session. A no-op
+            // when nothing is recording; it reads only `RecorderState` + the shortcut
+            // store, so it is order-independent from the Global clear below.
+            crate::settings::shortcuts_pane::stand_down_on_settings_close(cx);
             cx.set_global(SettingsWindow::default());
         }
     })

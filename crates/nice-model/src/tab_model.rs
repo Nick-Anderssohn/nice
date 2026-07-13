@@ -14,17 +14,20 @@
 //! ## The did-mutate signal (`onTreeMutation` port)
 //!
 //! Swift's `onTreeMutation` closure + `@Observable` write-back are consolidated
-//! here into one explicit "did-mutate" signal (`set_on_tree_mutation`). Its
-//! observable contract survives verbatim: **a no-op transform produces no
-//! mutation event; a real change produces exactly one.** The signal fires from
-//! the same methods Swift fired `onTreeMutation` from — selection, reorder
-//! ([`TabModel::move_tab`]/[`TabModel::move_pane`]), pane insert/extract, and
-//! the rename/auto-title paths. The methods Swift deliberately routes through
-//! the caller instead — [`TabModel::adopt_tab_cwd`] (returns a did-change bool),
-//! [`TabModel::insert_branch_parent`]/[`TabModel::insert_handoff_child`] (caller
-//! fires after spawning the pty), [`TabModel::remove_tab`] (the dissolve
-//! cascade owns the save), [`TabModel::add_pane`], and the
-//! bucketing/repair/ensure helpers — do **not** fire the signal.
+//! here into one explicit "did-mutate" signal (`set_on_tree_mutation`). The
+//! observer is wired once per window to the debounced session save (BUGHUNT1-D),
+//! so the rule is now structural: **every `&mut self` method that changes
+//! persisted state fires it**, and read-only / pure helpers never do. Most
+//! change-guarded mutators still fire exactly once on a real change and not at
+//! all on a no-op. Two mutators fire without proving a change:
+//! [`TabModel::mutate_tab`] (it cannot see whether the caller's transform
+//! actually changed anything, so it fires whenever the tab is found) and
+//! [`TabModel::repair_project_structure`] (it runs at boot before the observer
+//! is wired, so its unconditional fire costs nothing in practice). Those
+//! spurious fires are tolerated — the save is debounced. The only mutation that
+//! deliberately does NOT fire is the selection-side
+//! `acknowledge_waiting_on_active_pane`, whose sole write is the runtime-only,
+//! non-persisted `waiting_acknowledged` flag.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -221,11 +224,27 @@ impl TabModel {
     }
 
     /// Mutate the tab identified by `id` in place; returns true if the tab was
-    /// found (`TabModel.swift:120-128`). Does **not** fire the did-mutate
-    /// signal — callers that need the event track their own change flag (the
-    /// SwiftUI byte-equality write-back skip has no analog here; its observable
-    /// contract lives in the callers).
+    /// found (`TabModel.swift:120-128`). Fires the did-mutate signal whenever
+    /// the tab is found: this is the generic mutation path (it carries the OSC
+    /// cwd/title changes), and it cannot see whether the caller's transform
+    /// actually changed anything, so it fires unconditionally on a hit. A
+    /// spurious fire on an unchanged re-delivery is tolerated — the save is
+    /// debounced (BUGHUNT1-D, D4).
     pub fn mutate_tab(&mut self, id: &str, transform: impl FnOnce(&mut Tab)) -> bool {
+        let found = self.mutate_tab_silent(id, transform);
+        if found {
+            self.fire_mutation();
+        }
+        found
+    }
+
+    /// [`TabModel::mutate_tab`] without firing the did-mutate signal — the
+    /// internal path for a mutation that is not a persisted-state change. The
+    /// only caller is `acknowledge_waiting_on_active_pane`, whose sole write is
+    /// the runtime-only `waiting_acknowledged` flag (dropped from the persisted
+    /// snapshot); the selection change that triggers it already fires via
+    /// [`TabModel::set_active_tab_id`]. Returns true if the tab was found.
+    fn mutate_tab_silent(&mut self, id: &str, transform: impl FnOnce(&mut Tab)) -> bool {
         match self.project_tab_index(id) {
             Some((pi, ti)) => {
                 transform(&mut self.projects[pi].tabs[ti]);
@@ -322,7 +341,10 @@ impl TabModel {
     /// `tab_id` — the `active_tab_id` `didSet` side effect
     /// (`TabModel.swift:468-475`).
     fn acknowledge_waiting_on_active_pane(&mut self, tab_id: &str) {
-        self.mutate_tab(tab_id, |tab| {
+        // Silent: the only write is the runtime-only `waiting_acknowledged`
+        // flag (not persisted), and the selection that triggers this already
+        // fired via `set_active_tab_id`.
+        self.mutate_tab_silent(tab_id, |tab| {
             if let Some(pane_id) = tab.active_pane_id.clone() {
                 if let Some(p) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
                     p.mark_acknowledged_if_waiting();
@@ -535,9 +557,9 @@ impl TabModel {
     /// unconditionally (an explicit title consumes the slot too), and only
     /// terminal-kind panes are constructible through this method — the
     /// ≤1-running-Claude creation edge (`SessionsModel.swift:603-626`).
-    /// Returns the new pane id, or `None` when the tab isn't found. Does not
-    /// fire the did-mutate signal (the save is the caller's concern, mirroring
-    /// the Swift `SessionsModel`/`@Observable` path).
+    /// Returns the new pane id, or `None` when the tab isn't found. Fires the
+    /// did-mutate signal on a real append (BUGHUNT1-D) so the new pane persists
+    /// by construction.
     pub fn add_pane(
         &mut self,
         tab_id: &str,
@@ -553,6 +575,7 @@ impl TabModel {
             .push(Pane::new(new_pane_id.clone(), resolved_title, PaneKind::Terminal));
         tab.active_pane_id = Some(new_pane_id.clone());
         tab.next_terminal_index = n + 1;
+        self.fire_mutation();
         Some(new_pane_id)
     }
 
@@ -679,9 +702,12 @@ impl TabModel {
             if idx != 0 {
                 let project = self.projects.remove(idx);
                 self.projects.insert(0, project);
+                // Reordering the pinned group changes the persisted layout.
+                self.fire_mutation();
             }
             if self.active_tab_id.is_none() {
                 if let Some(first_id) = self.projects[0].tabs.first().map(|t| t.id.clone()) {
+                    // `set_active_tab_id` fires the did-mutate signal itself.
                     self.set_active_tab_id(Some(first_id));
                 }
             }
@@ -703,6 +729,10 @@ impl TabModel {
             tabs: vec![main_tab.clone()],
         };
         self.projects.insert(0, project);
+        // Synthesizing the pinned Terminals project is a persisted change.
+        // (`set_active_tab_id` below fires again when it sets selection; the
+        // duplicate schedule is harmless — the save is debounced.)
+        self.fire_mutation();
         if self.active_tab_id.is_none() {
             self.set_active_tab_id(Some(main_tab_id.to_string()));
         }
@@ -722,6 +752,8 @@ impl TabModel {
             path: path.into(),
             tabs: vec![],
         });
+        // Appending a new project grouping is a persisted change.
+        self.fire_mutation();
         self.projects.len() - 1
     }
 
@@ -752,6 +784,8 @@ impl TabModel {
             path: path.into(),
             tabs: vec![],
         });
+        // Appending a new project grouping is a persisted change.
+        self.fire_mutation();
         self.projects.len() - 1
     }
 
@@ -763,6 +797,8 @@ impl TabModel {
         let normalized = self.expand_tilde(cwd);
         if let Some(git_root) = self.find_git_root(&normalized) {
             self.append_or_insert(tab, &git_root);
+            // Adding a tab always changes persisted state.
+            self.fire_mutation();
             return;
         }
         // No git root: legacy longest-prefix, excluding the pinned Terminals
@@ -787,6 +823,8 @@ impl TabModel {
             Some((idx, _)) => self.projects[idx].tabs.push(tab),
             None => self.append_new_project(&normalized, tab),
         }
+        // Adding a tab always changes persisted state.
+        self.fire_mutation();
     }
 
     /// Append `tab` to the existing non-Terminals project rooted at `path`, or
@@ -910,6 +948,13 @@ impl TabModel {
         // Pass 4: drop empty non-Terminals projects.
         self.projects
             .retain(|p| p.id == Self::TERMINALS_PROJECT_ID || !p.tabs.is_empty());
+
+        // Fire unconditionally: repair may have rewritten the tree, and tracking
+        // a change flag across four passes buys nothing. In production repair
+        // runs at boot BEFORE the observer is wired (D5), so this fire is a
+        // no-op there; a later explicit call persists any real repair. The
+        // spurious-fire case is tolerated — the save is debounced (D4).
+        self.fire_mutation();
     }
 
     // MARK: - Cwd resolution
@@ -963,8 +1008,8 @@ impl TabModel {
     /// Update `tab.cwd` to `new_cwd` and pull along any pane whose `cwd` was
     /// `None` or still tracking the old `tab.cwd` (diverged panes stay put —
     /// asymmetry 4, per-pane not all-or-nothing). Returns `true` iff anything
-    /// changed. Does **not** fire the did-mutate signal — the caller fires the
-    /// save (`TabModel.swift:1052-1067`).
+    /// changed. Fires the did-mutate signal on a real change (BUGHUNT1-D) so an
+    /// OSC 7 cwd adoption persists by construction (`TabModel.swift:1052-1067`).
     pub fn adopt_tab_cwd(&mut self, tab_id: &str, new_cwd: &str) -> bool {
         let mut changed = false;
         if let Some((pi, ti)) = self.project_tab_index(tab_id) {
@@ -979,6 +1024,9 @@ impl TabModel {
                 }
                 changed = true;
             }
+        }
+        if changed {
+            self.fire_mutation();
         }
         changed
     }
@@ -1047,6 +1095,9 @@ impl TabModel {
             }
         }
 
+        // Inserting the branch parent (+ any root re-parenting) is a persisted
+        // change (BUGHUNT1-D). The caller still spawns the pty afterward.
+        self.fire_mutation();
         Some(parent)
     }
 
@@ -1068,6 +1119,8 @@ impl TabModel {
         let mut child = tab;
         child.parent_tab_id = Some(originating_parent.unwrap_or_else(|| under_tab_id.to_string()));
         self.projects[pi].tabs.insert(ti + 1, child);
+        // Nesting the handoff child is a persisted change (BUGHUNT1-D).
+        self.fire_mutation();
         true
     }
 
@@ -1076,22 +1129,33 @@ impl TabModel {
     /// Remove the tab at `(project_index, tab_index)` and sweep any sibling
     /// `parent_tab_id` references that pointed at it, atomically. The single
     /// removal entry point — every removal path must funnel through here so the
-    /// parent-pointer sweep can't be skipped (`TabModel.swift:237-241`).
+    /// parent-pointer sweep can't be skipped (`TabModel.swift:237-241`). Fires
+    /// the did-mutate signal (BUGHUNT1-D) — a removal always changes persisted
+    /// state — so the ctrl+d / pty-exit dissolve persists by construction.
     pub fn remove_tab(&mut self, project_index: usize, tab_index: usize) -> Tab {
         let removed = self.projects[project_index].tabs.remove(tab_index);
+        // The sweep fires its own signal only when it actually clears a
+        // reference; the removal itself always warrants a fire.
         self.clear_dangling_parent_references(&removed.id);
+        self.fire_mutation();
         removed
     }
 
     /// Clear `parent_tab_id` on every tab that pointed at `removed_tab_id`
-    /// (`TabModel.swift:249-257`).
+    /// (`TabModel.swift:249-257`). Fires the did-mutate signal when it clears at
+    /// least one reference (BUGHUNT1-D).
     pub fn clear_dangling_parent_references(&mut self, removed_tab_id: &str) {
+        let mut changed = false;
         for pi in 0..self.projects.len() {
             for ti in 0..self.projects[pi].tabs.len() {
                 if self.projects[pi].tabs[ti].parent_tab_id.as_deref() == Some(removed_tab_id) {
                     self.projects[pi].tabs[ti].parent_tab_id = None;
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.fire_mutation();
         }
     }
 
@@ -1099,21 +1163,29 @@ impl TabModel {
     /// any dangling one. Called after a full-tree restore so a hand-edited or
     /// partially-corrupt snapshot can't leave a child indented under a tab that
     /// doesn't exist. Pure cleanup — safe to call repeatedly
-    /// (`TabModel.swift:427-442`).
+    /// (`TabModel.swift:427-442`). Fires the did-mutate signal when it clears at
+    /// least one dangling reference (BUGHUNT1-D). In production this runs during
+    /// restore, before the observer is wired (D5), so it self-heals silently
+    /// there; a stray later call persists any real cleanup.
     pub fn prune_dangling_parent_references(&mut self) {
         let valid: HashSet<String> = self
             .projects
             .iter()
             .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
             .collect();
+        let mut changed = false;
         for pi in 0..self.projects.len() {
             for ti in 0..self.projects[pi].tabs.len() {
                 if let Some(parent) = &self.projects[pi].tabs[ti].parent_tab_id {
                     if !valid.contains(parent) {
                         self.projects[pi].tabs[ti].parent_tab_id = None;
+                        changed = true;
                     }
                 }
             }
+        }
+        if changed {
+            self.fire_mutation();
         }
     }
 

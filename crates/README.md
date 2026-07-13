@@ -356,9 +356,13 @@ The GPUI application. Structure (grows over later cycles):
     Installed from `app::run` only.
   - **Unregistered by design (D7).** The settings window is NOT in the
     `WindowRegistry`: shortcut dispatch ignores it for free and it never hits the
-    `WindowState` teardown path (it has no such state). Quit-when-empty counts
-    REGISTERED windows only, so closing the last MAIN window while settings is open
-    still quits — the documented Swift divergence.
+    `WindowState` teardown path (it has no such state). Quit-when-empty still counts
+    REGISTERED windows for emptiness, but a live (unregistered) Settings window now
+    ALSO keeps the app alive: closing the last MAIN window while Settings is open no
+    longer quits, so Settings survives (BUGS.md #13 / D4). Only closing the truly-last
+    live window — the last terminal OR Settings itself — quits. This is a deliberate
+    departure from the old Swift-divergence behavior (which quit on the last main-window
+    close and tore Settings down with it).
   - `root` — `SettingsRootView` (`active` slug, default `"appearance"`); the fixed
     `settings_rail_sections()` (six slugs in order) + the `render_section` dispatch;
     the shared `setting_title` / `setting_subtitle` / `setting_row` building blocks.
@@ -414,8 +418,12 @@ The GPUI application. Structure (grows over later cycles):
     binding). This is a *closer* port of Swift than the plan's wording — Swift stands
     its `KeyboardShortcutMonitor` down and installs a higher-priority local monitor
     while recording. The keymap outage is bounded to the capture interaction and torn
-    down on commit / cancel / Esc / **focus-out** (rail switch, window close,
-    click-away — the `.onDisappear` guarantee, via `Window::on_focus_out`). The pure
+    down on commit / cancel / Esc / **focus-out** (rail switch, click-away — the
+    `.onDisappear` guarantee, via `Window::on_focus_out`). Closing the Settings
+    window via the native red button fires **no** draw and no focus-out, so the
+    Settings close observer (`window.rs`) calls
+    `shortcuts_pane::stand_down_on_settings_close` — a no-op unless a recording is
+    in flight — to rebuild the keymap on that path. The pure
     capture decision (`decide_capture` → `Ignore` / `Cancel` / `Commit` / `Conflict`)
     is gpui-free and `#[test]`-covered.
   - **Live-vs-persist:** Appearance → R21 `apply_*` (persists `appearance`);
@@ -498,8 +506,11 @@ The GPUI application. Structure (grows over later cycles):
   gated drop slot is resolved by the pure `nice-model::pane_strip_drop` resolver
   (below); an insertion line paints at the target edge; and a committed reorder
   calls `TabModel::move_pane` then persists with an **explicit `save_to_store()`**
-  (the `on_tree_mutation` observer is unwired in the shipped app, so the drop
-  saves directly). The existing select-on-press + `stop_propagation` is untouched
+  (the `on_tree_mutation` observer is now wired once per window in
+  `build_window_root` via `wire_tree_mutation_save`, BUGHUNT1-D, and `move_pane`
+  fires the did-mutate signal itself; the explicit save is retained as a harmless
+  belt-and-suspenders — the observer's save is debounced, so the duplicate
+  collapses). The existing select-on-press + `stop_propagation` is untouched
   — the drag arms alongside it. **P5 (cross-window move) + P6 (tear-off) are CUT**
   (scope fence): no `NSDraggingSource` / `LivePaneRegistry` / tear-off host, no
   `extract_pane` / `insert_pane`, and no non-`.slot` resolver destinations.
@@ -1389,9 +1400,17 @@ and **no `gpui` dependency** (it mirrors today's pure-Swift model code; see the
   document a pure value-tree; production uses `std::fs`, tests inject a fake so
   the git-root/repair/bucketing ports stay hermetic (the Swift tests planted
   real temp dirs). Swift's `onTreeMutation` closure + `@Observable` write-back
-  are consolidated into one explicit did-mutate signal whose observable
-  contract survives verbatim: **a no-op transform produces no mutation event; a
-  real change produces exactly one.**
+  are consolidated into one explicit did-mutate signal, now wired once per
+  window to the debounced session save (BUGHUNT1-D). The contract is structural:
+  **every `&mut self` method that changes persisted state fires it.** Most
+  change-guarded mutators still fire exactly once on a real change and not on a
+  no-op, but two fire without proving a change — `mutate_tab` (it cannot see
+  whether the caller's transform changed anything, so it fires whenever the tab
+  is found) and `repair_project_structure` (fires unconditionally at boot before
+  the observer is wired) — and those spurious fires are tolerated because the
+  save is debounced. The only mutation that deliberately does NOT fire is the
+  runtime-only `acknowledge_waiting_on_active_pane` (its sole write is the
+  non-persisted `waiting_acknowledged` flag).
 
 **The asymmetries are deliberate.** This model contains behaviors that look
 inconsistent and are each intentional + test-pinned (`Models.swift`,
@@ -1897,8 +1916,10 @@ rebuild** (`clear_key_bindings()` + re-`bind_keys` of the live 13 PLUS the PROTE
 non-rebindable set) rather than an `NSEvent` monitor (on the DO-NOT-PORT list — gpui
 has no per-binding remove at the pin, R24 D2); the persisted write form is the FULL
 13-entry map with explicit JSON `null` for unbound (load-equivalent to Swift's
-omit-unbound, R24 schema); the unregistered Settings window **quits-when-empty per
-R23 D7**; R23 ships an **inert smooth-scroll** toggle (the handoff-skill toggle it
+omit-unbound, R24 schema); a live unregistered Settings window now **BLOCKS
+quit-when-empty** (the app stays open while Settings is open — closing the last main
+window no longer quits it, BUGS.md #13 / D4, revising R23 D7); R23 ships an **inert
+smooth-scroll** toggle (the handoff-skill toggle it
 deferred **landed in R26**); and R22 does **not auto-select an imported theme into the active
 slot** (Swift auto-selects) — import enters the catalog latent, the user picks it.
 Two dev-time carryovers: the managed Claude theme slug stays `nice` (never

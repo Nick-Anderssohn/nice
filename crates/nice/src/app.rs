@@ -716,22 +716,51 @@ fn flush_all_window_snapshots(cx: &App) {
     crate::session_store::flush();
 }
 
+/// Resolve the window + [`WindowState`] that should host the ⌘Q confirmation
+/// (#4 / D1+D2). The active window when it is a REGISTERED Nice window — the modal
+/// is stashed on the same window that renders it. When the key window is
+/// UNREGISTERED (the Settings window, D7) or there is no active window,
+/// `state_for_window` misses, so fall back to the registry's MRU window and
+/// ACTIVATE it (D2) so the dialog is visible in front of Settings rather than
+/// buried on an occluded window. `None` only when the registry holds no window
+/// at all (⇒ [`request_quit`] quits outright).
+///
+/// Split out of [`request_quit`] so the fallback resolution — the #4 fix's core:
+/// an unregistered key window routes to the registered MRU window instead of
+/// bypassing the dialog into an immediate quit — is unit-testable without
+/// [`WindowState::present_confirmation`](crate::window_state::WindowState::present_confirmation),
+/// which panics on the headless test platform (its window has no backing `NSView`).
+fn resolve_quit_dialog_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<WindowState>)> {
+    if let Some(win) = cx.active_window() {
+        if let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) {
+            return Some((win, state));
+        }
+    }
+    // Unregistered / absent key window: fall back to the registry MRU window and
+    // bring it forward before it hosts the dialog.
+    let (id, state) = WindowRegistry::active_state_with_id(cx, true)?;
+    let win = cx.windows().into_iter().find(|w| w.window_id() == id)?;
+    // Presentation itself is occlusion-safe (`present_confirmation` fires the
+    // demand-present kick), but activating is the correct UX (D2).
+    let _ = win.update(cx, |_root, window, _app| window.activate_window());
+    Some((win, state))
+}
+
 /// ⌘Q / Quit-menu handler. Zero live panes ⇒ [`quit_cascade`] with no dialog;
 /// else present the quit confirmation in the active window (confirm ⇒ cascade,
-/// cancel ⇒ total no-op).
+/// cancel ⇒ total no-op). When the key window is the unregistered Settings window
+/// the confirmation is routed to the registry's MRU window (see
+/// [`resolve_quit_dialog_host`]) rather than bypassed (#4).
 fn request_quit(cx: &mut App) {
     let (claude, terminal) = total_live_pane_counts(cx);
     if claude + terminal == 0 {
         quit_cascade(cx);
         return;
     }
-    // Host the dialog in the active window — pull its state by id so the modal is
-    // stashed on the SAME window that renders it.
-    let Some(win) = cx.active_window() else {
-        quit_cascade(cx);
-        return;
-    };
-    let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+    // Resolve the window + state to host the confirmation. `None` ⇒ no Nice window
+    // is registered at all, so quit as today (the zero-live-panes fast path already
+    // returned above).
+    let Some((win, state)) = resolve_quit_dialog_host(cx) else {
         quit_cascade(cx);
         return;
     };
@@ -854,6 +883,16 @@ fn request_close_active_window(cx: &mut App) {
         return;
     };
     let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) else {
+        // The key window is UNREGISTERED (the Settings window, D7): ⌘W closes it
+        // directly (D3). Unregistered windows host no terminals, so there is nothing
+        // to confirm; do NOT route through `request_window_close`, which reads a
+        // `WindowState` this window doesn't have.
+        let result = win.update(cx, |_root, window, _app| window.remove_window());
+        if let Err(e) = result {
+            eprintln!(
+                "nice: request_close_active_window could not close the unregistered window: {e:#}"
+            );
+        }
         return;
     };
     // Runs deferred (see `install_lifecycle_commands`), so the window is back in
@@ -1585,6 +1624,59 @@ pub(crate) fn open_managed_window_with(
     Ok(handle)
 }
 
+/// BUGHUNT1-D: wire this window's [`TabModel`](nice_model::TabModel) did-mutate
+/// observer to the debounced session save, once per window.
+///
+/// Every model mutation runs inside `state.update(cx, |ws, _| ws.model.…)`, so
+/// the observer fires SYNCHRONOUSLY while the [`WindowState`] entity is leased.
+/// It therefore MUST NOT call back into the entity synchronously — that is the
+/// gpui double-lease `SIGABRT` class (watchlist #3, fixed once in `908f217`). The
+/// callback only signals: an `unbounded_send` on an
+/// [`futures::channel::mpsc`](futures::channel::mpsc) channel. A held per-window
+/// foreground drain task runs `state.update(.., |ws, _| ws.save_to_store())`
+/// OUTSIDE the lease. The channel + drain also coalesces a burst of mutations in
+/// one turn into a single snapshot upsert, ahead of the store's own 500 ms
+/// debounce (`save_to_store` is a no-op when no store Global is installed, so a
+/// storeless test / scenario pays nothing).
+///
+/// D5 (restore/boot ordering): the caller wires this only from
+/// [`build_window_root`], which runs AFTER the window's model is fully
+/// constructed — `WindowState::with_seed`'s `repair_project_structure` +
+/// `prune_dangling_parent_references` + active-tab re-apply, and
+/// `open_managed_window_with`'s cwd-heal pass, all land BEFORE the observer
+/// exists — so boot never self-saves a half-built snapshot. Restore's single
+/// explicit `save_to_store` (which persists that healed, repaired shape) is a
+/// direct call, not a model mutation, so it does not route through this observer.
+pub(crate) fn wire_tree_mutation_save(state: &Entity<WindowState>, cx: &mut App) {
+    let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+    // The model's `FnMut()` observer: signal only — NEVER re-enter the leased
+    // entity here (D1). A dropped receiver (window gone) just makes the send fail.
+    state.update(cx, |ws, _cx| {
+        ws.model.set_on_tree_mutation(move || {
+            let _ = tx.unbounded_send(());
+        });
+    });
+    let drain = cx.spawn({
+        // Weak, NOT strong: the task is stored ON the `WindowState` (`save_drain`),
+        // so a strong capture would be a reference cycle that leaks the window (the
+        // exact reason the socket drain also downgrades). A dropped entity ends the
+        // drain.
+        let weak = state.downgrade();
+        async move |acx: &mut AsyncApp| {
+            use futures::StreamExt;
+            while rx.next().await.is_some() {
+                // Coalesce every signal already queued this turn, so N mutations
+                // in one update schedule at most one upsert(snapshot).
+                while rx.try_recv().is_ok() {}
+                if weak.update(acx, |ws, _cx| ws.save_to_store()).is_err() {
+                    return; // window entity gone
+                }
+            }
+        }
+    });
+    state.update(cx, |ws, _cx| ws.set_save_drain(drain));
+}
+
 /// Build a managed window's root view over its per-window [`WindowState`] entity
 /// — the R13.5 shipped shell. Registers the state in the [`WindowRegistry`],
 /// tracks activation for the registry's MRU (Swift's `didBecomeKey` role), mounts
@@ -1622,6 +1714,13 @@ fn build_window_root(
     // RoutedExit's every-project-empty terminus (close/quit) — a `&mut Window` a
     // subscription callback otherwise lacks.
     state.update(cx, |ws, _cx| ws.set_window_handle(window.window_handle()));
+    // BUGHUNT1-D: wire the model's did-mutate observer to the debounced session
+    // save, once per window. Runs here — after `open_managed_window_with` has
+    // finished constructing/restoring/cwd-healing the model — so restore never
+    // self-saves a half-built snapshot (D5). Every live mutation from now on
+    // (rename, add/remove pane or tab, OSC cwd/title, dissolve, …) persists by
+    // construction, retiring the fragile per-site enumeration.
+    wire_tree_mutation_save(&state, cx);
     state.update(cx, |_state, cx| {
         cx.observe_window_activation(window, |_state, window, cx| {
             if window.is_window_active() {
@@ -4256,5 +4355,428 @@ mod tests {
                 _ => panic!("View menu should hold exactly one action item"),
             }
         }
+    }
+
+    // ===================================================================
+    // BUGHUNT1-B — unregistered key-window lifecycle (#4 quit fallback, ⌘W close)
+    // ===================================================================
+
+    /// #4 / D1+D2: ⌘Q while an UNREGISTERED window (Settings) is key must route the
+    /// quit confirmation to the registry's MRU (registered) window — NOT bypass the
+    /// dialog into an immediate quit that tears down live terminals unwarned. The
+    /// registered window holds a live Terminal pane (`WindowState::new` seeds one)
+    /// and the unregistered window is the active/key one.
+    ///
+    /// Asserted through the [`resolve_quit_dialog_host`] seam rather than by driving
+    /// `request_quit` to `pending_modal().is_some()`: `present_confirmation` calls
+    /// `ns_view_of`, which panics on the headless test platform (no backing
+    /// `NSView`). The seam IS the #4 fix — it returns the registered window instead
+    /// of `None` (which would send `request_quit` to `quit_cascade`).
+    #[gpui::test]
+    fn quit_from_unregistered_key_window_routes_to_the_registered_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let reg_window = cx.add_window(|_w, _cx| gpui::Empty);
+        let state = cx.update(|app| {
+            WindowRegistry::install(app);
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            WindowRegistry::register(app, reg_window.window_id(), state.clone());
+            state
+        });
+
+        // An unregistered second window (stands in for Settings) becomes the key
+        // window — `state_for_window` on the active window will now miss.
+        let settings_window = cx.add_window(|_w, _cx| gpui::Empty);
+        settings_window
+            .update(cx, |_v, window, _cx| window.activate_window())
+            .unwrap();
+
+        cx.update(|app| {
+            // Preconditions: a live pane keeps ⌘Q on the confirmation path, and the
+            // active window is genuinely the unregistered one (no registered state).
+            assert_eq!(total_live_pane_counts(app), (0, 1));
+            assert_eq!(
+                app.active_window().map(|w| w.window_id()),
+                Some(settings_window.window_id())
+            );
+            assert!(
+                WindowRegistry::state_for_window(app, settings_window.window_id()).is_none(),
+                "the settings window is unregistered"
+            );
+
+            let (host, host_state) = resolve_quit_dialog_host(app)
+                .expect("an unregistered key window falls back to the registered MRU window");
+            assert_eq!(
+                host.window_id(),
+                reg_window.window_id(),
+                "⌘Q from the unregistered window hosts the confirmation on the registered \
+                 window, not an unconfirmed quit"
+            );
+            assert_eq!(
+                host_state, state,
+                "the resolved state is the registered window's state"
+            );
+            // Fallback activated the registered window (D2), so it is now key.
+            assert_eq!(
+                app.active_window().map(|w| w.window_id()),
+                Some(reg_window.window_id()),
+                "the fallback brought the registered window forward"
+            );
+        });
+    }
+
+    /// ⌘W sibling (D3): with an unregistered key window, the close request removes
+    /// THAT window (window count drops by one) and leaves the registered window and
+    /// its registration untouched.
+    #[gpui::test]
+    fn close_active_window_removes_an_unregistered_key_window(cx: &mut gpui::TestAppContext) {
+        let reg_window = cx.add_window(|_w, _cx| gpui::Empty);
+        cx.update(|app| {
+            WindowRegistry::install(app);
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            WindowRegistry::register(app, reg_window.window_id(), state.clone());
+        });
+
+        let settings_window = cx.add_window(|_w, _cx| gpui::Empty);
+        settings_window
+            .update(cx, |_v, window, _cx| window.activate_window())
+            .unwrap();
+
+        cx.update(|app| {
+            let before = app.windows().len();
+            request_close_active_window(app);
+            // `remove_window()` removes the window synchronously as its update
+            // returns (gpui `update_window` trailer), so the count drops immediately.
+            assert_eq!(
+                app.windows().len(),
+                before - 1,
+                "⌘W removed the unregistered key window"
+            );
+            assert!(
+                !app.windows()
+                    .iter()
+                    .any(|w| w.window_id() == settings_window.window_id()),
+                "the removed window is the unregistered settings window"
+            );
+            assert!(
+                WindowRegistry::state_for_window(app, reg_window.window_id()).is_some(),
+                "the registered window is untouched"
+            );
+        });
+    }
+
+    // ===================================================================
+    // BUGHUNT1-D — the once-per-window did-mutate → debounced-save wiring
+    //
+    // Each test wires the observer via `wire_tree_mutation_save` (the exact seam
+    // `build_window_root` uses), performs a live model mutation INSIDE the
+    // `WindowState` entity lease (`state.update`), drains the foreground executor
+    // (`run_until_parked`), and asserts the temp session store now holds the
+    // mutated shape — one representative per acceptance-list class (plan §"The
+    // five verified missed-save sites"). The mutation-inside-a-lease shape is the
+    // whole point: if the observer re-entered the entity synchronously (a D1
+    // violation) the `state.update` below would `SIGABRT` (the gpui double-lease
+    // class); every test here is therefore also a double-lease guard, and
+    // `mutation_inside_the_lease_does_not_double_lease_abort` names it explicitly.
+    // ===================================================================
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Serializes the store-Global-touching acceptance tests: the session store is
+    /// a process-wide singleton, so two running in parallel would clobber each
+    /// other's temp store. Poison-tolerant (a panicking test still frees it).
+    static STORE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Install a fresh temp-path session store as the process Global (Hermeticity:
+    /// never the real `~/Library/Application Support/…/sessions.json`). Returns the
+    /// live handle + its temp dir; the caller uninstalls + removes both at the end.
+    fn install_temp_store(
+        tag: &str,
+    ) -> (std::sync::Arc<crate::session_store::SessionStore>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nice-bughunt1d-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::session_store::install_global(
+            crate::session_store::SessionStore::open(dir.join("sessions.json")),
+        );
+        (store, dir)
+    }
+
+    /// Uninstall the process store (dropping the last `Arc` flushes + joins its
+    /// writer) and remove the temp dir.
+    fn teardown_temp_store(dir: PathBuf) {
+        crate::session_store::clear_global();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The persisted tab with `tab_id` across the store's one window, if any.
+    fn persisted_tab(
+        store: &crate::session_store::SessionStore,
+        tab_id: &str,
+    ) -> Option<nice_model::PersistedTab> {
+        store
+            .load()
+            .windows
+            .iter()
+            .flat_map(|w| w.projects.clone())
+            .flat_map(|p| p.tabs)
+            .find(|t| t.id == tab_id)
+    }
+
+    /// Acceptance #1 (BUGS.md #8 site 1 — `sidebar_shell.rs` `commit_rename`): a
+    /// `rename_tab` inside the lease persists the new title through the observer
+    /// (no explicit per-site save).
+    #[gpui::test]
+    fn tab_rename_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = install_temp_store("tab-rename");
+
+        let (state, tab_id) = cx.update(|app| {
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            wire_tree_mutation_save(&state, app);
+            let tab_id = state.read(app).model.active_tab_id().unwrap().to_string();
+            (state, tab_id)
+        });
+
+        cx.update(|app| {
+            state.update(app, |ws, _cx| ws.model.rename_tab(&tab_id, "Renamed Tab"));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            persisted_tab(&store, &tab_id).map(|t| t.title),
+            Some("Renamed Tab".to_string()),
+            "the tab rename persisted through the wired observer, not a per-site save"
+        );
+
+        teardown_temp_store(dir);
+    }
+
+    /// Acceptance #2 (BUGS.md #8 site 2 — `toolbar.rs` `commit_rename`): a
+    /// `rename_pane` persists both the label AND the `next_terminal_index`
+    /// never-reuse counter. A non-empty rename locks the label; a follow-up
+    /// empty-submit resets it and CONSUMES a counter slot — the increment bug #2
+    /// specifically called out. Both land in the store via the observer.
+    #[gpui::test]
+    fn pane_rename_persists_label_and_next_terminal_index(cx: &mut gpui::TestAppContext) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = install_temp_store("pane-rename");
+
+        let (state, tab_id, pane_id) = cx.update(|app| {
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            wire_tree_mutation_save(&state, app);
+            let (tab_id, pane_id) = {
+                let ws = state.read(app);
+                let tab_id = ws.model.active_tab_id().unwrap().to_string();
+                let pane_id = ws
+                    .model
+                    .tab_for(&tab_id)
+                    .and_then(|t| t.panes.first())
+                    .map(|p| p.id.clone())
+                    .unwrap();
+                (tab_id, pane_id)
+            };
+            (state, tab_id, pane_id)
+        });
+
+        // Non-empty rename: label locks; counter unchanged (baseline 2 persisted).
+        cx.update(|app| {
+            state.update(app, |ws, _cx| {
+                ws.model.rename_pane(&tab_id, &pane_id, "Deploy")
+            });
+        });
+        cx.run_until_parked();
+        {
+            let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
+            let pane = tab.panes.iter().find(|p| p.id == pane_id).expect("pane persisted");
+            assert_eq!(pane.title, "Deploy", "the custom pane label persisted");
+            assert_eq!(pane.title_manually_set, Some(true), "the rename lock persisted");
+            assert_eq!(
+                tab.next_terminal_index,
+                Some(2),
+                "the never-reuse counter rides the snapshot"
+            );
+        }
+
+        // Empty submit: reset to the per-kind auto-default + consume a slot.
+        cx.update(|app| {
+            state.update(app, |ws, _cx| ws.model.rename_pane(&tab_id, &pane_id, ""));
+        });
+        cx.run_until_parked();
+        {
+            let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
+            let pane = tab.panes.iter().find(|p| p.id == pane_id).expect("pane persisted");
+            assert_eq!(pane.title, "Terminal 2", "empty submit reset to the auto-default");
+            assert_eq!(
+                tab.next_terminal_index,
+                Some(3),
+                "the never-reuse counter INCREMENT (site 2's lost mutation) persisted"
+            );
+        }
+
+        teardown_temp_store(dir);
+    }
+
+    /// Acceptance #3 (BUGS.md #8 site 3 — OSC 7 cwd via `route_terminal_event`):
+    /// a `pane_cwd_changed` (which routes through `TabModel::mutate_tab`) persists
+    /// the pane's new cwd through the observer.
+    #[gpui::test]
+    fn osc_cwd_change_persists_through_mutate_tab(cx: &mut gpui::TestAppContext) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = install_temp_store("osc-cwd");
+
+        let (state, tab_id, pane_id) = cx.update(|app| {
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            wire_tree_mutation_save(&state, app);
+            let (tab_id, pane_id) = {
+                let ws = state.read(app);
+                let tab_id = ws.model.active_tab_id().unwrap().to_string();
+                let pane_id = ws
+                    .model
+                    .tab_for(&tab_id)
+                    .and_then(|t| t.panes.first())
+                    .map(|p| p.id.clone())
+                    .unwrap();
+                (tab_id, pane_id)
+            };
+            (state, tab_id, pane_id)
+        });
+
+        cx.update(|app| {
+            state.update(app, |ws, _cx| {
+                let WindowState { session, model, .. } = ws;
+                let changed = session.pane_cwd_changed(model, &tab_id, &pane_id, "/tmp/newcwd");
+                assert!(changed, "the cwd genuinely changed");
+            });
+        });
+        cx.run_until_parked();
+
+        let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
+        let pane = tab.panes.iter().find(|p| p.id == pane_id).expect("pane persisted");
+        assert_eq!(
+            pane.cwd.as_deref(),
+            Some("/tmp/newcwd"),
+            "the OSC 7 cwd (routed through mutate_tab) persisted through the observer"
+        );
+
+        teardown_temp_store(dir);
+    }
+
+    /// Acceptance #4 (BUGS.md #8 site 4 — ctrl+d / clean pty-exit dissolve): a
+    /// `remove_tab` persists the tab's disappearance through the observer, so a
+    /// crash after a dissolve cannot resurrect the closed tab.
+    #[gpui::test]
+    fn remove_tab_dissolve_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = install_temp_store("remove-tab");
+
+        let state = cx.update(|app| {
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            wire_tree_mutation_save(&state, app);
+            state
+        });
+
+        // Add a second tab, then confirm it persisted (add_tab_to_projects fires
+        // the observer too).
+        cx.update(|app| {
+            state.update(app, |ws, _cx| {
+                let mut tab = nice_model::Tab::new("tab-dissolve", "Doomed", "/tmp");
+                tab.panes
+                    .push(nice_model::Pane::new("tab-dissolve-p0", "Terminal 1", nice_model::PaneKind::Terminal));
+                tab.active_pane_id = Some("tab-dissolve-p0".to_string());
+                ws.model.add_tab_to_projects(tab, "/tmp");
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            persisted_tab(&store, "tab-dissolve").is_some(),
+            "precondition: the added tab persisted"
+        );
+
+        // Dissolve it through the single removal entry point.
+        cx.update(|app| {
+            state.update(app, |ws, _cx| {
+                let (pi, ti) = ws.model.project_tab_index("tab-dissolve").expect("tab present");
+                ws.model.remove_tab(pi, ti);
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            persisted_tab(&store, "tab-dissolve").is_none(),
+            "the dissolve persisted — the closed tab is gone from the store"
+        );
+
+        teardown_temp_store(dir);
+    }
+
+    /// Acceptance #5 (BUGS.md #8 site 5 — tab/pane creation seams): an `add_pane`
+    /// persists the new pane through the observer.
+    #[gpui::test]
+    fn add_pane_creation_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = install_temp_store("add-pane");
+
+        let (state, tab_id) = cx.update(|app| {
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            wire_tree_mutation_save(&state, app);
+            let tab_id = state.read(app).model.active_tab_id().unwrap().to_string();
+            (state, tab_id)
+        });
+
+        cx.update(|app| {
+            state.update(app, |ws, _cx| {
+                ws.model.add_pane(&tab_id, "new-pane-id", None);
+            });
+        });
+        cx.run_until_parked();
+
+        let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
+        assert!(
+            tab.panes.iter().any(|p| p.id == "new-pane-id"),
+            "the newly-created pane persisted through the observer"
+        );
+        assert_eq!(
+            tab.next_terminal_index,
+            Some(3),
+            "add_pane consumed a counter slot and the increment persisted"
+        );
+
+        teardown_temp_store(dir);
+    }
+
+    /// The named double-lease pin (plan §"What to build" #4): the observer fires
+    /// SYNCHRONOUSLY inside the `WindowState` entity lease, and the drain saves
+    /// OUTSIDE it (D1). A D1 violation — re-entering the leased entity from the
+    /// observer callback — would `SIGABRT` at the `state.update` below (the gpui
+    /// double-lease class, watchlist #3). This test passing (no abort) plus the
+    /// save landing pins that the deferral holds.
+    #[gpui::test]
+    fn mutation_inside_the_lease_does_not_double_lease_abort(cx: &mut gpui::TestAppContext) {
+        let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, dir) = install_temp_store("double-lease");
+
+        let (state, tab_id) = cx.update(|app| {
+            let state = app.new(|_cx| WindowState::new("/tmp"));
+            wire_tree_mutation_save(&state, app);
+            let tab_id = state.read(app).model.active_tab_id().unwrap().to_string();
+            (state, tab_id)
+        });
+
+        // The mutation runs while the entity is leased — the observer fires here.
+        // If it re-entered `state` synchronously, this line would abort the process.
+        cx.update(|app| {
+            state.update(app, |ws, _cx| {
+                ws.model.rename_tab(&tab_id, "Lease Safe");
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            persisted_tab(&store, &tab_id).map(|t| t.title),
+            Some("Lease Safe".to_string()),
+            "the deferred drain saved outside the lease — no double-lease abort"
+        );
+
+        teardown_temp_store(dir);
     }
 }

@@ -8,7 +8,7 @@
 # `scripts/vendor-zed.sh` (run that before the first build).
 [package]
 name = "nice"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2021"
 publish = false
 
@@ -80,6 +80,12 @@ serde_json = "1"
 # derives Serialize/Deserialize for the on-disk `sessions.json`. Already in the
 # workspace lock (nice-model pulls the same version); no new fetch.
 serde = { version = "1", features = ["derive"] }
+# BUGHUNT1-D: the once-per-window did-mutate save signal is an
+# `futures::channel::mpsc::unbounded` channel — the model's synchronous mutation
+# observer only `unbounded_send`s (never re-entering the leased entity), and a
+# per-window foreground drain (`StreamExt::next`) runs the debounced save outside
+# the lease. gpui already pins futures 0.3 in the workspace lock; no new fetch.
+futures = "0.3"
 
 [dev-dependencies]
 # `gpui/test-support` for THIS crate's own `#[gpui::test]` unit cases ONLY — the

@@ -151,6 +151,17 @@ pub(crate) struct WindowState {
     /// detached) so dropping it — on teardown or when the window entity drops —
     /// cancels the drain rather than leaking a parked task.
     socket_drain: Option<gpui::Task<()>>,
+    /// BUGHUNT1-D: the gpui foreground task draining the model's did-mutate signal
+    /// into the debounced session save. The `TabModel` mutation observer
+    /// ([`TabModel::set_on_tree_mutation`](nice_model::TabModel::set_on_tree_mutation),
+    /// wired once per window at [`crate::app::build_window_root`]) fires
+    /// SYNCHRONOUSLY inside this entity's lease, so it may only signal (an unbounded
+    /// send); this task drains those signals and runs
+    /// [`save_to_store`](Self::save_to_store) OUTSIDE the lease — the mandatory
+    /// deferral that keeps the observer clear of the gpui double-lease SIGABRT
+    /// class (D1). Held (not detached) so dropping it on teardown / entity drop
+    /// cancels the drain.
+    save_drain: Option<gpui::Task<()>>,
     /// R15: the injectable Claude theme-sync `--settings` pointer provider (Swift
     /// `themeCache.syncClaudeTheme ? ClaudeThemeSync.settingsFlagPath() : nil`).
     /// `None` in R15 — R17 fills it from the live theme; the socket reply and the
@@ -275,6 +286,7 @@ impl WindowState {
             recorded_socket_messages: Vec::new(),
             control_socket: None,
             socket_drain: None,
+            save_drain: None,
             claude_settings_path: None,
             window_handle: None,
             subscribed_panes: HashSet::new(),
@@ -521,6 +533,14 @@ impl WindowState {
         }
         self.control_socket = Some(socket);
         self.socket_drain = Some(drain);
+    }
+
+    /// BUGHUNT1-D: take ownership of this window's did-mutate save-drain task
+    /// (spawned by [`crate::app::wire_tree_mutation_save`] when the observer is
+    /// wired). Held so dropping the window cancels it; replacing any prior task
+    /// keeps a re-wire idempotent.
+    pub(crate) fn set_save_drain(&mut self, drain: gpui::Task<()>) {
+        self.save_drain = Some(drain);
     }
 
     /// Test seam: install just the control socket (no gpui drain task, which needs
@@ -1715,6 +1735,9 @@ impl WindowState {
         // `controlSocket?.stop()`). Dropping the held drain task cancels the
         // foreground drain so no parked task lingers past the window.
         self.socket_drain = None;
+        // BUGHUNT1-D: drop the did-mutate save-drain likewise — no parked task
+        // lingers past the window (the entity drop would cancel it anyway).
+        self.save_drain = None;
         if let Some(socket) = self.control_socket.take() {
             socket.stop();
         }

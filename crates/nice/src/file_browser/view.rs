@@ -216,10 +216,6 @@ pub(crate) struct FileBrowserView {
     /// terminal (`refocus_terminal_after_rename` parity). Pushed down by
     /// [`SidebarShellView`](crate::sidebar_shell::SidebarShellView).
     pane_host: Option<Entity<PaneHostView>>,
-    /// R20 (F9): the in-tree drag session — the dragged paths — distinguishing an
-    /// internal drag (session non-empty) from a Finder-inbound drop (empty
-    /// session).
-    drag: FileBrowserDragState,
     /// The rename field's painted geometry (text-run + field-box left edges,
     /// window coordinates), written by the field's layout probes each paint and
     /// read by its click handler to turn a click-x into a caret position.
@@ -232,16 +228,6 @@ struct RenameState {
     path: String,
     is_dir: bool,
     editor: TextFieldEditor,
-}
-
-/// The per-browser drag session (F9), the Rust twin of Swift's
-/// `FileBrowserDragState`: `session` is the dragged path set (non-empty ⇒ an
-/// internal drag; rules run on it). The accent drag-target highlight is NOT
-/// tracked here — it comes from gpui's `drag_over::<ExternalPaths>` style
-/// closure on directory rows.
-#[derive(Default)]
-struct FileBrowserDragState {
-    session: Vec<String>,
 }
 
 impl FileBrowserView {
@@ -298,7 +284,6 @@ impl FileBrowserView {
             rename_click_gen: 0,
             sole_activated: None,
             pane_host: None,
-            drag: FileBrowserDragState::default(),
             rename_probe: Rc::new(Cell::new(FieldProbe::default())),
         }
     }
@@ -1245,23 +1230,25 @@ impl FileBrowserView {
             .collect()
     }
 
-    /// Begin an in-tree drag of `path`: the whole selection when `path` is
-    /// selected, else just `path` (Finder's select-then-drag). Records the drag
-    /// session so a drop onto a directory row is treated as internal.
+    /// The in-tree drag source set for `path`: the whole selection when `path` is
+    /// selected, else just `path` (Finder's select-then-drag) — the same set the
+    /// row's `on_drag` [`gpui::ExternalPaths`] payload carries. Pure; no state is
+    /// recorded (the payload is authoritative at the drop seam).
     fn begin_row_drag(&mut self, path: &str, cx: &mut Context<Self>) -> Vec<String> {
         let selection = self.ordered_selection(cx);
-        let sources = if selection.iter().any(|p| p == path) {
+        if selection.iter().any(|p| p == path) {
             selection
         } else {
             vec![path.to_string()]
-        };
-        self.drag.session = sources.clone();
-        sources
+        }
     }
 
-    /// Handle a drop onto directory `dest`. Internal (a live drag session) uses the
-    /// session paths; a Finder-inbound drop uses the dropped [`gpui::ExternalPaths`].
-    /// Rejected by the pure `can_drop` rule ⇒ no-op.
+    /// Handle a drop onto directory `dest`, moving/copying exactly the dropped
+    /// [`gpui::ExternalPaths`] payload. Internal drags and Finder-inbound drops are
+    /// indistinguishable here: the in-tree drag source carries the same
+    /// `ExternalPaths` set (select-then-drag), so the payload is always the source
+    /// of truth — no stale in-tree drag can redirect a later drop. Rejected by the
+    /// pure `can_drop` rule ⇒ no-op.
     fn handle_drop(
         &mut self,
         dropped: &gpui::ExternalPaths,
@@ -1269,16 +1256,11 @@ impl FileBrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session = std::mem::take(&mut self.drag.session);
-        let sources: Vec<String> = if session.is_empty() {
-            dropped
-                .paths()
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect()
-        } else {
-            session
-        };
+        let sources: Vec<String> = dropped
+            .paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         self.perform_internal_drop(&sources, dest, window, cx);
     }
 
@@ -1853,11 +1835,13 @@ impl FileBrowserView {
     }
 
     /// Drive an in-tree drag of the current selection (or just `path`) onto the
-    /// directory `dest` — the DnD commit seam (the real `on_drop` path constructs
-    /// the same [`gpui::ExternalPaths`] payload).
+    /// directory `dest` — the DnD commit seam. Goes through the real `handle_drop`
+    /// path with the same [`gpui::ExternalPaths`] payload the row's `on_drag`
+    /// constructs, so the drop moves exactly the dragged set.
     pub(crate) fn drive_drag_drop(&mut self, path: &str, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
         let sources = self.begin_row_drag(path, cx);
-        self.perform_internal_drop(&sources, dest, window, cx);
+        let payload = ExternalPaths(sources.iter().map(PathBuf::from).collect());
+        self.handle_drop(&payload, dest, window, cx);
     }
 
     /// Whether a drag of the current selection (or just `path`) onto `dest` would
@@ -2118,29 +2102,16 @@ fn render_row(
         });
 
     // R20 (F9): drag source — the payload IS `gpui::ExternalPaths` (the app's
-    // first `on_drag` consumer). One payload type means a directory row's drop
-    // handler serves both internal drags and Finder-inbound drops, AND dragging a
-    // row onto a terminal feeds T7's target for free. Suppressed while editing.
+    // first `on_drag` consumer), carrying the select-then-drag set (`drag_paths`).
+    // One payload type means a directory row's drop handler serves both internal
+    // drags and Finder-inbound drops, AND dragging a row onto a terminal feeds T7's
+    // target for free. Suppressed while editing.
     if row.editing.is_none() {
         let drag_paths = row.drag_paths.clone();
-        let weak_drag = weak.clone();
-        let start_path = row.path.clone();
         el = el.on_drag(
             ExternalPaths(drag_paths.iter().map(PathBuf::from).collect()),
             move |paths: &ExternalPaths, _offset, _window, app| {
-                let sources: Vec<String> = paths
-                    .paths()
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-                let count = sources.len();
-                let start = start_path.clone();
-                let _ = weak_drag.update(app, |this, cx| {
-                    // Record the internal drag session (select-then-drag the row if
-                    // it wasn't part of the selection).
-                    this.begin_row_drag(&start, cx);
-                    cx.notify();
-                });
+                let count = paths.paths().len();
                 app.new(|_| DragPreview { count })
             },
         );
@@ -2344,5 +2315,104 @@ fn icon_symbol(path: &str, is_dir: bool, is_expanded: bool) -> &'static str {
         "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" => "doc.zipper",
         "sh" | "zsh" | "bash" | "fish" => "terminal",
         _ => "doc",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_browser::history::FileOperationHistory;
+    use crate::file_browser::ops::{FakeTrasher, FileOperationsService};
+
+    /// A throwaway temp tree for the DnD commit-seam tests: `A.txt` + `B.txt` at
+    /// the root and an empty directory `D`. Dropped ⇒ the tree is removed.
+    struct DropFixture {
+        root: PathBuf,
+    }
+
+    impl DropFixture {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "nice-fb-drop-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(root.join("D")).unwrap();
+            std::fs::write(root.join("A.txt"), b"A\n").unwrap();
+            std::fs::write(root.join("B.txt"), b"B\n").unwrap();
+            Self { root }
+        }
+
+        fn p(&self, rel: &str) -> String {
+            self.root.join(rel).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for DropFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn exists(p: &str) -> bool {
+        Path::new(p).exists()
+    }
+
+    /// Install the file-op history Global over a temp-dir `FakeTrasher` (hermetic —
+    /// never the production Trash). No focus-follow seam (single-view test).
+    fn install_history(cx: &mut gpui::TestAppContext, trash_root: PathBuf) {
+        cx.update(|app| {
+            let service = FileOperationsService::new(Box::new(FakeTrasher::new(trash_root)));
+            let history = app.new(|_| FileOperationHistory::new(service, None));
+            app.set_global(FileOperationHistoryGlobal(history));
+        });
+    }
+
+    /// Bug 2 regression pin (BUGS.md #3, repro: drag A out of the browser, abandon
+    /// it, then drop B from Finder onto folder D). An in-tree drag that never lands
+    /// on a directory row must NOT redirect the next drop. Pre-fix, `begin_row_drag`
+    /// stashed the dragged set in `drag.session` and `handle_drop` preferred that
+    /// leftover over the actual payload, so dropping B moved the previously-dragged
+    /// A. With the session mechanism removed, `handle_drop` moves exactly its
+    /// `ExternalPaths` payload — here B moves into D and A stays put.
+    #[gpui::test]
+    fn drop_after_abandoned_drag_moves_only_the_dropped_payload(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("abandoned-drag");
+        let trash_root = fx.root.join(".fake-trash");
+        std::fs::create_dir_all(&trash_root).unwrap();
+        install_history(cx, trash_root);
+
+        let root_str = fx.root.to_string_lossy().into_owned();
+        let state = cx.update(|app| app.new(|_| WindowState::new(root_str)));
+        let accent = Srgba::rgb(0.2, 0.4, 0.9);
+        let window = cx.add_window(|_window, cx| FileBrowserView::new(state, accent, cx));
+
+        let a = fx.p("A.txt");
+        let b = fx.p("B.txt");
+        let d = fx.p("D");
+
+        window
+            .update(cx, |view, window, cx| {
+                // Simulate an abandoned in-tree drag of A: it computes the drag set
+                // but records nothing (pre-fix this poisoned `drag.session`).
+                let _ = view.begin_row_drag(&a, cx);
+                // A separate Finder-inbound drop of B onto directory D.
+                let payload = ExternalPaths([PathBuf::from(&b)].into_iter().collect());
+                view.handle_drop(&payload, &d, window, cx);
+            })
+            .unwrap();
+
+        // Exactly B moved into D; A is untouched at the root and never entered D.
+        assert!(exists(&fx.p("D/B.txt")), "the dropped B must move into D");
+        assert!(!exists(&b), "B must no longer be at the root");
+        assert!(exists(&a), "the abandoned-drag A must stay put");
+        assert!(
+            !exists(&fx.p("D/A.txt")),
+            "the stale A must NOT be redirected into D"
+        );
     }
 }

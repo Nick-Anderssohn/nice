@@ -1072,9 +1072,11 @@ impl WindowToolbarView {
     /// `on_drag_move` resolved (D9). Reads the stored `drag_target` (the mouse-up
     /// carries no position), calls [`TabModel::move_pane`] synchronously — gpui
     /// clears `active_drag` itself after this listener, so no deferral is needed —
-    /// then persists explicitly via [`WindowState::save_to_store`] (D5: the
-    /// `on_tree_mutation` observer is wired nowhere, so a reorder would not
-    /// otherwise save). Selection/focus are untouched (`move_pane` never touches
+    /// then persists explicitly via [`WindowState::save_to_store`]. The
+    /// once-per-window `on_tree_mutation` observer (BUGHUNT1-D) now also fires from
+    /// `move_pane`, so this explicit save is belt-and-suspenders (a duplicate
+    /// debounced upsert is harmless — kept per that plan's D2).
+    /// Selection/focus are untouched (`move_pane` never touches
     /// `active_pane_id`). A drop resolving to `None` (a horizontal inter-pill gap,
     /// or a no-op slot) just clears the field.
     fn on_pill_drop(&mut self, payload: &PaneDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
