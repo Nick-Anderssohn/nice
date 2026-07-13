@@ -693,9 +693,25 @@ fn total_live_pane_counts(cx: &App) -> (usize, usize) {
 /// Snapshot + upsert every registered window into the session store, then flush.
 /// The idempotent persistence half shared by [`quit_cascade`] and the
 /// `on_app_quit` handler. A no-op when no store Global is installed.
+///
+/// A window still registered here with `user_initiated_close` set is a confirmed
+/// user close whose window removal never ran — the emptied-window dissolve
+/// terminus quits directly (`apply_dissolve_terminus` → `cx.quit()`), and gpui's
+/// `shutdown` clears windows WITHOUT firing `on_window_closed`, so
+/// [`WindowRegistry::route_close_disk_fate`] never routes its `Remove`. Honor the
+/// intent here instead: drop its slot (upserting — or even skipping — would leave
+/// the emptied snapshot on disk and restore a broken empty window next launch).
 fn flush_all_window_snapshots(cx: &App) {
     for state in WindowRegistry::all_states(cx) {
-        crate::session_store::upsert(state.read(cx).persisted_snapshot());
+        let (user_initiated, snapshot) = {
+            let s = state.read(cx);
+            (s.user_initiated_close(), s.persisted_snapshot())
+        };
+        if user_initiated {
+            crate::session_store::remove(&snapshot.id);
+        } else {
+            crate::session_store::upsert(snapshot);
+        }
     }
     crate::session_store::flush();
 }

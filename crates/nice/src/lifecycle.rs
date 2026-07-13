@@ -323,6 +323,44 @@ mod tests {
         );
     }
 
+    /// The single-window emptied-dissolve quit (ctrl+d exits the last pane):
+    /// `apply_dissolve_terminus` → `cx.quit()` bypasses the window-close trail
+    /// (gpui `shutdown` clears windows without firing `on_window_closed`), so the
+    /// `on_app_quit` flush is the slot's last word. `flush_all_window_snapshots`
+    /// routes each still-registered window on its `user_initiated_close` flag:
+    /// flagged ⇒ remove (upserting — or even skipping — would leave the emptied
+    /// snapshot on disk and restore a broken empty window next launch);
+    /// unflagged ⇒ the usual quit-preserve upsert.
+    #[test]
+    fn quit_flush_drops_user_closed_slot_keeps_the_rest() {
+        let dir = scratch();
+        let path = dir.0.join("sessions.json");
+        let store = disk_store(&path);
+
+        // Runtime `save_to_store` upserts left both slots on disk — the emptied
+        // window's latest save being its (now-broken) emptied snapshot.
+        store.upsert(window("win-emptied"));
+        store.upsert(window("win-open"));
+        store.flush();
+
+        // The quit flush, the way `flush_all_window_snapshots` routes it: the
+        // emptied window was flagged at the terminus mint site, the other wasn't.
+        for (snapshot, user_initiated) in [(window("win-emptied"), true), (window("win-open"), false)] {
+            if user_initiated {
+                store.remove(&snapshot.id);
+            } else {
+                store.upsert(snapshot);
+            }
+        }
+        store.flush();
+
+        assert_eq!(
+            read_state(&path).windows.iter().map(|w| w.id.clone()).collect::<Vec<_>>(),
+            vec!["win-open"],
+            "the user-closed window's slot is dropped at quit; the open window survives"
+        );
+    }
+
     /// A willClose without the intent flag (the belt-and-suspenders path) must
     /// preserve — never remove.
     #[test]
