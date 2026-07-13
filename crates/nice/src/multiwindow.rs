@@ -25,7 +25,15 @@
 //!    bytes.
 //! 5. **Live peek (§5)** — with A's sidebar collapsed, ⌘⌥↓ floats the peek; a
 //!    modifiers-release clears it (the window-level `on_modifiers_changed` observer).
-//! 6. **Close / deregister / fallback (§3)** — closing B deregisters it (count
+//! 6. **Last-pane shell exit closes only its window (§3.5, regression)** — with
+//!    A + B live, a fresh window C's Main pane exits cleanly; C dissolves and
+//!    `remove_window`s while A + B stay registered and the process survives.
+//!    Guards two fix-crash regressions: (a) the ctrl+d-quits-the-whole-app crash
+//!    (a re-entrant window teardown from inside the live pty-exit subscription),
+//!    and (b) the follow-up where the dissolved window's slot was PRESERVED in the
+//!    session store and restored as a broken empty window next launch — C's slot
+//!    must be REMOVED. A temp store is installed for the leg (cleared after).
+//! 7. **Close / deregister / fallback (§3)** — closing B deregisters it (count
 //!    drops, real `NSWindow` count drops) and a window-scoped action then falls
 //!    back to the surviving window A.
 //!
@@ -70,6 +78,13 @@ const KC_DOWN: u16 = 125; // ⌘⌥↓ — next sidebar tab
 const KC_EQUAL: u16 = 24; // ⌘= — increase font
 const KC_ZERO: u16 = 29; // ⌘0 — reset font
 const KC_X: u16 = 7; // plain x — the pass-through control char
+
+/// A controlled Main-pane command (via `NICE_COMMAND`) that prints a marker, then
+/// blocks on one line of stdin, then exits **cleanly** (`exit 0`). Feeding a
+/// newline drives a deterministic `Exited { held: false }` down the live
+/// subscription — where a bare login shell's exit behaviour (held vs clean) varies
+/// by environment. Mirrors the `session-lifecycle` scenario's clean-exit spec.
+const EXIT_ON_LINE_CMD: &str = "sh -c 'echo NICE_EXIT_READY; read _line; exit 0'";
 
 /// Accessibility-grant remediation (shared wording with the other CGEvent
 /// scenarios): without the TCC grant `CGEventPostToPid` is silently dropped, so
@@ -194,6 +209,128 @@ pub fn open_multiwindow_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     .detach();
 
     Ok(window)
+}
+
+// -- §3.5 fix-crash regression helpers --------------------------------------
+
+/// Open a fresh managed window whose Main pane runs the controlled clean-exit
+/// command ([`EXIT_ON_LINE_CMD`], via `NICE_COMMAND`), returning its handle once
+/// registered. `existing` is the set of window ids already open, so the new one is
+/// identified by difference. `None` on failure. The env var is set/removed around
+/// the synchronous open so only this window's pane inherits it.
+async fn open_controlled_window(
+    cx: &mut AsyncApp,
+    existing: &[gpui::WindowId],
+) -> Option<AnyWindowHandle> {
+    // `unsafe` per the sibling scenarios' convention (forward-compat with the
+    // edition-2024 `set_var` signature); read synchronously inside the open below.
+    unsafe { std::env::set_var("NICE_COMMAND", EXIT_ON_LINE_CMD) };
+    let opened = cx.update(|app| crate::app::open_managed_window(app).is_ok());
+    unsafe { std::env::remove_var("NICE_COMMAND") };
+    if !opened {
+        return None;
+    }
+    settle(cx, 800).await;
+    cx.update(|app| {
+        app.windows()
+            .into_iter()
+            .find(|w| !existing.contains(&w.window_id()))
+    })
+}
+
+async fn wait_pane_live(cx: &mut AsyncApp, state: &Entity<WindowState>) {
+    for _ in 0..40 {
+        if state.update(cx, |s, _| !s.session.live_pane_keys().is_empty()) {
+            return;
+        }
+        settle(cx, 100).await;
+    }
+}
+
+/// Poll until the registry returns to `target` (a window finished closing), or a
+/// bounded timeout elapses.
+async fn wait_registry_count(cx: &mut AsyncApp, target: usize) {
+    for _ in 0..40 {
+        if registry_count(cx) == target {
+            return;
+        }
+        settle(cx, 100).await;
+    }
+}
+
+/// Shared §3.5 assertions after a NON-last window's last pane was closed: the
+/// registry is back to `reg_before` (exactly that window closed), the app is alive
+/// with A + B intact (no over-teardown / abort), and the closed window's disk slot
+/// `sid` was REMOVED (not preserved to restore as a broken empty window).
+fn assert_closed_and_slot_removed(
+    cx: &mut AsyncApp,
+    reg_before: usize,
+    a_id: gpui::WindowId,
+    b_id: Option<gpui::WindowId>,
+    sid: &str,
+    label: &str,
+    failures: &mut Vec<String>,
+) {
+    let reg_after = registry_count(cx);
+    if reg_after != reg_before {
+        failures.push(format!(
+            "fix-crash {label}: did not close exactly that window (registry {reg_after} != \
+             {reg_before})"
+        ));
+    }
+    if state_for(cx, a_id).is_none() {
+        failures.push(format!("fix-crash {label}: window A vanished (over-teardown)"));
+    }
+    if let Some(b) = b_id {
+        if state_for(cx, b).is_none() {
+            failures.push(format!("fix-crash {label}: window B vanished (over-teardown)"));
+        }
+    }
+    crate::session_store::flush();
+    if crate::session_store::load().windows.iter().any(|w| w.id == sid) {
+        failures.push(format!(
+            "fix-crash {label}(disk): the dissolved window's slot was PRESERVED in the session \
+             store — it would restore as a broken empty window next launch (expected Remove)"
+        ));
+    }
+}
+
+async fn wait_output_started(cx: &mut AsyncApp, state: &Entity<WindowState>) {
+    let pane = state.update(cx, |s, _| {
+        s.session
+            .live_pane_keys()
+            .first()
+            .and_then(|(t, p)| s.session.pane_handle(t, p))
+    });
+    if let Some(h) = pane {
+        for _ in 0..50 {
+            if h.update(cx, |th, _| th.output_started()) {
+                return;
+            }
+            settle(cx, 100).await;
+        }
+    }
+}
+
+/// Persist `state`'s slot to the store as a normal debounced save would, and
+/// verify it actually landed (so the later "slot removed" disk assertion can't
+/// pass vacuously against an id that was never stored). `sid` is `state`'s
+/// session id.
+fn persist_slot(
+    cx: &mut AsyncApp,
+    state: &Entity<WindowState>,
+    sid: &str,
+    label: &str,
+    failures: &mut Vec<String>,
+) {
+    let snap = state.update(cx, |s, _| s.persisted_snapshot());
+    crate::session_store::upsert(snap);
+    crate::session_store::flush();
+    if !crate::session_store::load().windows.iter().any(|w| w.id == sid) {
+        failures.push(format!(
+            "fix-crash {label}: precondition — slot '{sid}' was not persisted before the close"
+        ));
+    }
 }
 
 // -- small async / io helpers ----------------------------------------------
@@ -339,6 +476,28 @@ fn is_uuid_v4(id: &str) -> bool {
         }
     }
     true
+}
+
+/// Write raw bytes into the first live pane's pty of the window `state` owns —
+/// the ⌘N-window twin of the capture-tee readiness probe (which writes A's pty
+/// directly). Reaches the pane through the window's own `SessionManager`, so it
+/// needs no Accessibility grant (unlike a synthetic key tap). Returns `false`
+/// when the window has no live pane yet (its Main pane hasn't forked), so the
+/// caller can poll until the login shell is up.
+fn write_to_first_pane(cx: &mut AsyncApp, state: &Entity<WindowState>, bytes: &[u8]) -> bool {
+    let handle = state.update(cx, |s, _cx| {
+        s.session
+            .live_pane_keys()
+            .first()
+            .and_then(|(t, p)| s.session.pane_handle(t, p))
+    });
+    match handle {
+        Some(h) => {
+            let _ = h.update(cx, |th, _| th.session().write_input(bytes));
+            true
+        }
+        None => false,
+    }
 }
 
 async fn run_multiwindow(
@@ -575,6 +734,116 @@ async fn run_multiwindow(
                 );
             }
         }
+    }
+
+    // === §3.5 — closing the last pane of a NON-last window closes ONLY that
+    // window (never quitting/crashing the app) AND drops its disk slot ==========
+    // Guards two fix-crash regressions, over BOTH actuation paths:
+    //
+    //   (a) CRASH — closing the last pane of a window while a SECOND window is live
+    //       used to abort the whole app. The terminus actuator (`remove_window()`)
+    //       drives gpui's close trail → `route_close_disk_fate` →
+    //       `state.update(.., teardown)` on the closing window's `WindowState`;
+    //       when actuated while that entity is LEASED (the pty-exit `cx.subscribe`
+    //       callback, or the UI-close handlers mid-`update`) it re-entered the
+    //       leased entity and panicked. The single-window case took `cx.quit()` and
+    //       never re-entered, so it only showed with a second window open.
+    //
+    //   (b) DISK — the dissolved (now-empty) window's snapshot was PRESERVED to
+    //       `sessions.json` (its close was neither user-initiated nor app-quitting),
+    //       so it restored as a broken empty window next launch.
+    //
+    // Two windows are driven to empty here with A + B live: window C via a clean
+    // PTY exit (the deferred subscription path), and window D via the toolbar ✕
+    // `request_close_pane` handler (the leased-mid-update path). Each runs a
+    // CONTROLLED clean-exit command as its Main pane (`NICE_COMMAND`), so no
+    // synthetic key / Accessibility is needed and the exit is deterministic. A temp
+    // session store is installed for the leg (cleared after) so the disk fate is
+    // observable.
+    {
+        let b_id = b_handle.map(|h| h.window_id());
+        let store_dir =
+            std::env::temp_dir().join(format!("nice-mw-store-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&store_dir);
+        crate::session_store::install_global(crate::session_store::SessionStore::open(
+            store_dir.join("sessions.json"),
+        ));
+
+        // -- (i) pty-exit path (window C): clean `Exited { held: false }` down the
+        //        live subscription, actuated from the deferred callback.
+        let reg_before = registry_count(cx);
+        let existing: Vec<gpui::WindowId> =
+            cx.update(|app| app.windows().iter().map(|w| w.window_id()).collect());
+        match open_controlled_window(cx, &existing).await {
+            None => failures.push("fix-crash pty-exit(C): could not open window C".to_string()),
+            Some(c) => {
+                if let Some(cs) = state_for(cx, c.window_id()) {
+                    wait_pane_live(cx, &cs).await;
+                    let sid = session_id_of(cx, &cs);
+                    persist_slot(cx, &cs, &sid, "pty-exit(C)", &mut failures);
+                    wait_output_started(cx, &cs).await;
+                    // Wire C's pane as `PaneHostView::render` does (the harness may
+                    // not repaint C), then feed a newline: `read` returns → exit 0.
+                    cs.update(cx, |ws, wcx| ws.subscribe_spawned_panes(wcx));
+                    settle(cx, 200).await;
+                    let _ = write_to_first_pane(cx, &cs, b"\n");
+                    wait_registry_count(cx, reg_before).await;
+                    assert_closed_and_slot_removed(
+                        cx, reg_before, a_id, b_id, &sid, "pty-exit(C)", &mut failures,
+                    );
+                } else {
+                    failures.push("fix-crash pty-exit(C): window C not registered".to_string());
+                }
+            }
+        }
+        let _ = window_a.update(cx, |_v, window, _app| window.activate_window());
+        let _ = cx.update(|app| app.activate(true));
+        settle(cx, 200).await;
+
+        // -- (ii) UI ✕ path (window D): the toolbar `request_close_pane` handler,
+        //         which actuates the terminus WHILE `WindowState` is leased.
+        let reg_before = registry_count(cx);
+        let existing: Vec<gpui::WindowId> =
+            cx.update(|app| app.windows().iter().map(|w| w.window_id()).collect());
+        match open_controlled_window(cx, &existing).await {
+            None => failures.push("fix-crash UI-✕(D): could not open window D".to_string()),
+            Some(d) => {
+                if let Some(ds) = state_for(cx, d.window_id()) {
+                    wait_pane_live(cx, &ds).await;
+                    let sid = session_id_of(cx, &ds);
+                    persist_slot(cx, &ds, &sid, "UI-✕(D)", &mut failures);
+                    // Drive the real toolbar-✕ handler with `WindowState` LEASED and
+                    // a live `&mut Window` — the exact shape that re-leases + aborts
+                    // if the terminus actuator touches this entity.
+                    let key = ds.update(cx, |s, _| s.session.live_pane_keys().first().cloned());
+                    if let Some((tab, pane)) = key {
+                        let _ = d.update(cx, |_root, window, app| {
+                            ds.update(app, |ws, wcx| {
+                                ws.request_close_pane(&tab, &pane, window, wcx)
+                            });
+                        });
+                        wait_registry_count(cx, reg_before).await;
+                        assert_closed_and_slot_removed(
+                            cx, reg_before, a_id, b_id, &sid, "UI-✕(D)", &mut failures,
+                        );
+                    } else {
+                        failures.push("fix-crash UI-✕(D): window D had no live pane".to_string());
+                    }
+                } else {
+                    failures.push("fix-crash UI-✕(D): window D not registered".to_string());
+                }
+            }
+        }
+
+        // Uninstall the temp store so the close-B leg below routes storeless as
+        // before (dropping the last Arc flushes + joins its writer thread), and
+        // remove its temp dir.
+        crate::session_store::clear_global();
+        let _ = std::fs::remove_dir_all(&store_dir);
+        // Re-assert A frontmost/key for the close-B leg below.
+        let _ = window_a.update(cx, |_v, window, _app| window.activate_window());
+        let _ = cx.update(|app| app.activate(true));
+        settle(cx, 250).await;
     }
 
     // === §3 — close B: deregister + fallback to the surviving window A =======

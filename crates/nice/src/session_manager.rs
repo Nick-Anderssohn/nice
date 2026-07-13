@@ -1153,6 +1153,25 @@ impl SessionManager {
     /// every-project-empty terminus — live-wired slice 3): close this window when
     /// another live window remains, else quit the app. A no-op for
     /// [`DissolveTerminus::None`]. Mirrors `AppState.finalizeDissolvedTab:359-372`.
+    ///
+    /// LEASE CONTRACT: `remove_window()` drives gpui's window-removal trail, which
+    /// synchronously fires the `on_window_closed` observer →
+    /// [`WindowRegistry::route_close_disk_fate`] → `state.update(.., teardown)` on
+    /// the closing window's [`WindowState`]. So this is safe to call while a
+    /// `WindowState` is being updated ONLY when `window` IS that same window (the
+    /// trail runs at the outermost `update_window_id` unwind, after the lease
+    /// releases) — e.g. the UI-close action handlers. It is NOT safe to call from
+    /// inside a `WindowState` entity lease via a *nested* `handle.update` on that
+    /// same window (a `cx.subscribe` callback): the teardown would re-enter the
+    /// still-leased entity and abort. Such callers MUST `cx.defer` this out of the
+    /// lease first (see [`WindowState::subscribe_spawned_panes`]).
+    ///
+    /// This actuator does NOT touch the closing window's [`WindowState`] (that
+    /// would re-lease it on the UI-close paths that call this mid-update). The
+    /// disk-fate intent — dropping an emptied window's slot so it doesn't restore
+    /// as a broken empty window — is instead set at the terminus MINT sites, on
+    /// the already-held `&mut WindowState`, via
+    /// [`WindowState::mark_removed_if_window_emptied`].
     pub(crate) fn apply_dissolve_terminus(
         terminus: DissolveTerminus,
         window: &mut Window,

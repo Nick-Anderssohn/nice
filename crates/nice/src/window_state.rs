@@ -433,10 +433,31 @@ impl WindowState {
                 // The every-project-empty terminus (close this window / quit) needs
                 // a `&mut Window`; actuate it via the stashed handle (the "composed
                 // by the live window root" obligation).
+                //
+                // It MUST be deferred out of this subscription callback: we are
+                // still inside the `WindowState` entity's lease (`ws: &mut Self`)
+                // while delivering the pane's `Exited` event. When another window
+                // is live, `apply_dissolve_terminus` → `window.remove_window()`
+                // drives gpui's synchronous window-removal trail, which fires the
+                // `on_window_closed` observer → `WindowRegistry::route_close_disk_fate`
+                // → `state.update(.., teardown)` on THIS same leased entity — a
+                // re-entrant update that aborts the process. (The single-window
+                // case took `cx.quit()` and never re-entered, which is why the crash
+                // only showed with a second window open.) `cx.defer` (App-level; the
+                // `Context` derefs to `App`) runs the actuation at the end of the
+                // current effect cycle, once this lease is released.
                 if routed.terminus == DissolveTerminus::WindowEmptied {
+                    // Drop this emptied window's disk slot (else it restores as a
+                    // broken empty window next launch). Set on the leased `ws` HERE,
+                    // before the defer — never inside `apply_dissolve_terminus`,
+                    // which would re-lease this entity on the UI-close paths.
+                    ws.mark_removed_if_window_emptied(routed.terminus);
                     if let Some(handle) = ws.window_handle {
-                        let _ = handle.update(cx, |_root, window, app| {
-                            SessionManager::apply_dissolve_terminus(routed.terminus, window, app);
+                        let terminus = routed.terminus;
+                        cx.defer(move |app| {
+                            let _ = handle.update(app, |_root, window, app| {
+                                SessionManager::apply_dissolve_terminus(terminus, window, app);
+                            });
                         });
                     }
                 }
@@ -1030,6 +1051,22 @@ impl WindowState {
         self.user_initiated_close = value;
     }
 
+    /// When a close scope emptied the WHOLE window ([`DissolveTerminus::WindowEmptied`]),
+    /// mark it `user_initiated_close` so the close observer DROPS its disk slot
+    /// rather than preserving an empty snapshot that would restore as a broken
+    /// empty window next launch (mirrors the no-live-panes ⌘W close in
+    /// [`crate::app::request_window_close`]). Called at every terminus-MINT site —
+    /// the `close_*_via_session` methods and the pty-exit subscription — on the
+    /// already-held `&mut self`. It must be set HERE, never from
+    /// [`SessionManager::apply_dissolve_terminus`]: that actuator runs mid-update
+    /// on the UI-close paths, so touching this `WindowState` there would re-lease
+    /// the entity and abort (the crash this whole change removed).
+    pub(crate) fn mark_removed_if_window_emptied(&mut self, terminus: DissolveTerminus) {
+        if terminus == DissolveTerminus::WindowEmptied {
+            self.user_initiated_close = true;
+        }
+    }
+
     /// The persisted snapshot of this window for the session store — id from the
     /// window's [`session_id`](Self::session_id) (the persisted window id; a fresh
     /// / ⌘N window mints a UUID, a restored one keeps its saved id),
@@ -1203,6 +1240,7 @@ impl WindowState {
             .session
             .close_tab(&mut self.model, &mut self.selection, tab_id);
         self.prune_dissolved_file_browser_states();
+        self.mark_removed_if_window_emptied(terminus);
         self.save_to_store();
         terminus
     }
@@ -1215,6 +1253,7 @@ impl WindowState {
             terminus = terminus.or(self.session.close_tab(&mut self.model, &mut self.selection, id));
         }
         self.prune_dissolved_file_browser_states();
+        self.mark_removed_if_window_emptied(terminus);
         self.save_to_store();
         terminus
     }
@@ -1265,6 +1304,7 @@ impl WindowState {
             terminus
         };
         self.prune_dissolved_file_browser_states();
+        self.mark_removed_if_window_emptied(terminus);
         self.save_to_store();
         terminus
     }
@@ -1287,6 +1327,7 @@ impl WindowState {
                 .dissolve_tab_if_empty(&mut self.model, &mut self.selection, tab_id)
         };
         self.prune_dissolved_file_browser_states();
+        self.mark_removed_if_window_emptied(terminus);
         self.save_to_store();
         terminus
     }
