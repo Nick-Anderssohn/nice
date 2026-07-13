@@ -71,14 +71,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::Processor;
 use gpui::{
-    div, point, prelude::*, px, rgb, size, App, Bounds, ClipboardItem, Context, Entity,
-    ExternalPaths, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, KeyDownEvent,
-    KeyUpEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, Rgba, ScrollWheelEvent, SharedString, Subscription,
-    TextRun, Window,
+    div, point, prelude::*, px, rgb, size, App, Bounds, ClipboardItem, Context, CursorStyle,
+    Entity, ExternalPaths, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight,
+    KeyDownEvent, KeyUpEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, ScrollWheelEvent, SharedString,
+    Subscription, TextRun, Window,
 };
 
 use nice_term_core::ExitStatus;
@@ -190,9 +191,12 @@ pub struct TerminalView {
     pending_refit_scheduled: bool,
     /// An in-progress local selection drag, anchored at the **buffer** cell
     /// `(line, column)` the left button went down on (`line` negative in
-    /// scrollback). `Some` between mouse-down and the ending mouse-up; each drag
-    /// move rewrites the selection from this anchor to the current cell.
-    drag_anchor: Option<(i32, usize)>,
+    /// scrollback), plus the selection granularity the click count chose
+    /// (single = `Simple`, double = `Semantic`/word, triple+ = `Lines`).
+    /// `Some` between mouse-down and the ending mouse-up; each drag move
+    /// rewrites the selection from this anchor to the current cell at that
+    /// granularity.
+    drag_anchor: Option<(i32, usize, SelectionType)>,
     /// The last cell a mouse **report** was emitted for, to de-duplicate motion
     /// reports (an app gets one report per cell crossed, not per pixel moved).
     last_report_cell: Option<(usize, usize)>,
@@ -1102,12 +1106,27 @@ impl TerminalView {
             return;
         }
 
-        // Local selection: only the left button starts one. A bare click collapses
-        // any prior selection; a subsequent drag rebuilds it from this anchor.
+        // Local selection: only the left button starts one. The click count picks
+        // the granularity — single-click collapses any prior selection and arms a
+        // cell-wise drag from this anchor; double-click selects the word under
+        // the pointer (alacritty `Semantic`, expanded by the Term's
+        // semantic-escape chars); triple-click selects the whole line. A drag
+        // that follows a multi-click extends by that same granularity.
         if event.button == MouseButton::Left {
             if let Some(hit) = self.hit_cell(event.position, cx) {
-                self.drag_anchor = Some((hit.buffer_line, hit.col));
-                self.handle.read(cx).clear_selection();
+                let kind = match event.click_count {
+                    0 | 1 => SelectionType::Simple,
+                    2 => SelectionType::Semantic,
+                    _ => SelectionType::Lines,
+                };
+                self.drag_anchor = Some((hit.buffer_line, hit.col, kind));
+                let handle = self.handle.read(cx);
+                if kind == SelectionType::Simple {
+                    handle.clear_selection();
+                } else {
+                    let anchor = (hit.buffer_line, hit.col);
+                    handle.set_selection_typed(kind, anchor, anchor);
+                }
                 cx.notify();
             }
         }
@@ -1120,7 +1139,7 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((anchor_line, anchor_col)) = self.drag_anchor {
+        if let Some((anchor_line, anchor_col, kind)) = self.drag_anchor {
             // The button was released (possibly outside the pane, so no mouse-up
             // reached us) — stop extending the selection.
             if event.pressed_button != Some(MouseButton::Left) {
@@ -1128,9 +1147,11 @@ impl TerminalView {
                 return;
             }
             if let Some(hit) = self.hit_cell(event.position, cx) {
-                self.handle
-                    .read(cx)
-                    .set_selection((anchor_line, anchor_col), (hit.buffer_line, hit.col));
+                self.handle.read(cx).set_selection_typed(
+                    kind,
+                    (anchor_line, anchor_col),
+                    (hit.buffer_line, hit.col),
+                );
                 cx.notify();
             }
             return;
@@ -1449,6 +1470,10 @@ impl Render for TerminalView {
         div()
             .track_focus(&self.focus_handle)
             .size_full()
+            // Text-style I-beam pointer over the grid (standard terminal
+            // behaviour, matching Terminal.app / iTerm even while the app has
+            // mouse reporting on).
+            .cursor(CursorStyle::IBeam)
             // File / image drag-drop (T7): a dropped set of file URLs (or a
             // raw-image fallback) is typed as escaped paths at the prompt. gpui
             // delivers an OS file drop as an `ExternalPaths` active-drag.

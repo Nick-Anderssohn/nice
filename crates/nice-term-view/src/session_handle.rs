@@ -520,12 +520,27 @@ impl TerminalSessionHandle {
     /// caller should `cx.notify()` after calling it to repaint. No-op if the
     /// session has not spawned.
     pub fn set_selection(&self, start: (i32, usize), end: (i32, usize)) {
+        self.set_selection_typed(SelectionType::Simple, start, end);
+    }
+
+    /// [`set_selection`](Self::set_selection) with an explicit alacritty
+    /// [`SelectionType`]: `Semantic` expands both endpoints to word boundaries
+    /// (the double-click gesture) and `Lines` to whole lines (triple-click).
+    /// The expansion itself lives in alacritty's `Selection::to_range`, driven
+    /// by the `Term`'s `semantic_escape_chars`; this just anchors the typed
+    /// selection at `start` and updates it to `end`.
+    pub fn set_selection_typed(
+        &self,
+        ty: SelectionType,
+        start: (i32, usize),
+        end: (i32, usize),
+    ) {
         if let Some(term_arc) = self.session.term() {
             let mut term = term_arc.lock();
             let start_pt = Point::new(Line(start.0), Column(start.1));
             let end_pt = Point::new(Line(end.0), Column(end.1));
             let (start_side, end_side) = selection_sides(start_pt, end_pt);
-            let mut sel = Selection::new(SelectionType::Simple, start_pt, start_side);
+            let mut sel = Selection::new(ty, start_pt, start_side);
             sel.update(end_pt, end_side);
             term.selection = Some(sel);
         }
@@ -1344,5 +1359,66 @@ mod tests {
     fn single_cell_click_drag_selects_that_cell() {
         let range = resolved_range((2, 3), (2, 3)).expect("non-empty");
         assert_eq!(range, (Point::new(Line(2), Column(3)), Point::new(Line(2), Column(3))));
+    }
+
+    // ---- Typed selections (set_selection_typed) -------------------------------
+    //
+    // Double-click = `Semantic` (word), triple-click = `Lines`. These resolve
+    // through a real `Term` fed real content, so they pin the whole gesture
+    // contract: anchoring a typed selection at the clicked cell expands to the
+    // word / line, and a drag update extends at that granularity.
+
+    use alacritty_terminal::vte::ansi::Processor;
+
+    /// A term showing `text` on its top row.
+    fn term_with(text: &str) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, text.as_bytes());
+        term
+    }
+
+    /// Resolve a selection built exactly the way `set_selection_typed` builds it.
+    fn resolved_range_typed(
+        term: &Term<VoidListener>,
+        ty: SelectionType,
+        start: (i32, usize),
+        end: (i32, usize),
+    ) -> Option<(Point, Point)> {
+        let start_pt = Point::new(Line(start.0), Column(start.1));
+        let end_pt = Point::new(Line(end.0), Column(end.1));
+        let (start_side, end_side) = super::selection_sides(start_pt, end_pt);
+        let mut sel = Selection::new(ty, start_pt, start_side);
+        sel.update(end_pt, end_side);
+        sel.to_range(term).map(|r| (r.start, r.end))
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        // Click mid-"world" (col 8): the selection expands to the full word,
+        // stopping at the space (a semantic-escape char) on both sides.
+        let term = term_with("hello world again");
+        let range = resolved_range_typed(&term, SelectionType::Semantic, (0, 8), (0, 8))
+            .expect("non-empty");
+        assert_eq!(range, (Point::new(Line(0), Column(6)), Point::new(Line(0), Column(10))));
+    }
+
+    #[test]
+    fn semantic_drag_extends_word_by_word() {
+        // Double-click in "hello", drag into "world": both words are covered
+        // end to end, not just the dragged cells.
+        let term = term_with("hello world again");
+        let range = resolved_range_typed(&term, SelectionType::Semantic, (0, 2), (0, 8))
+            .expect("non-empty");
+        assert_eq!(range, (Point::new(Line(0), Column(0)), Point::new(Line(0), Column(10))));
+    }
+
+    #[test]
+    fn triple_click_selects_the_whole_line() {
+        // Click anywhere in the row: the selection covers the full grid line.
+        let term = term_with("hello world again");
+        let range = resolved_range_typed(&term, SelectionType::Lines, (0, 8), (0, 8))
+            .expect("non-empty");
+        assert_eq!(range, (Point::new(Line(0), Column(0)), Point::new(Line(0), Column(79))));
     }
 }
