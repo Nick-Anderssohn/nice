@@ -40,26 +40,42 @@ gear in the footer.
   EXACT stroke SVGs (chrome icon set from plan 1, verbatim from
   `docs/design/restyle-mocks.html` `.sb-footer`): tabs mode = three
   horizontal lines (14×12, 1.4 stroke, round caps), files mode = outline
-  folder (14×12, 1px stroke). Active mode in `ink` with a faint fill (the
-  glass-line alpha family), inactive `ink3`. The gear stays at the trailing
-  edge but is redrawn as a NEW thin-stroke gear matching the set's style —
-  the mock's gear was a Unicode font glyph (`⚙︎`), deliberately not shipped
-  (font-dependent rendering); match its visual weight, don't reuse SF_GEAR.
-  The footer is the only non-content chrome the sidebar keeps.
+  folder (14×12, 1px stroke). Active mode in `ink` with a faint fill using
+  the mock's `--fill-active` values — **white 6% alpha dark / `ink` 5%
+  alpha light** (NOT the glass-line 8%/10% family; add a companion helper
+  next to `glass_line`, e.g. `glass_fill(scheme)`), inactive `ink3`. The
+  gear stays at the trailing edge but is redrawn as a NEW thin-stroke gear
+  matching the set's style — the mock's gear was a Unicode font glyph
+  (`⚙︎`), deliberately not shipped (font-dependent rendering); match its
+  visual weight, don't reuse SF_GEAR.
+  The footer is the only non-content chrome the sidebar keeps. Its current
+  1pt TOP RULE (theme `line` slot, in `build_footer`) is **removed** — the
+  mock's footer has no rule; it sits flush on the sidebar surface.
 - **Typography**: session rows and project headers render in the terminal's
   resolved mono family (`nice-term-view::font` chain — SF Mono default), not
-  the UI sans. Row text ~12px-range (match the mock's density); project
-  headers stay small uppercase `ink3`.
+  the UI sans. Only the FAMILY changes: row text SIZE continues to come from
+  the existing user-settable sidebar font size
+  (`crates/nice/src/settings/sidebar_font.rs`, default
+  `DEFAULT_SIDEBAR_FONT_PX` 12 — which matches the mock's density) with its
+  proportional zoom intact. Project headers stay small uppercase `ink3`.
 - **Active row**: accent-colored text (`active_chrome_accent`), NO fill, no
-  bar. Hover: faint fill only (glass alpha), normal text color. The old
-  selected-row fill/`user_bubble` treatment goes away.
+  bar. Hover: faint fill only (`--fill-active`: white 6% dark / `ink` 5%
+  light — the same `glass_fill` helper as the footer buttons), normal text
+  color. The old active-row `selection_tint` fill goes away.
+- **Multi-selected non-active rows**: keep a visible marker — the same faint
+  `glass_fill` (6%/5%) persists on selected rows (replacing today's fainter
+  `selection_tint` fill), normal text color. The ACTIVE row stays fill-less
+  (accent text is its marker), so active vs merely-selected remains
+  distinguishable.
 - **Status dots** in rows: same `StatusDot` component, colors + pulse
   untouched, rendered small (**5pt** in rows; plan 1 set 6pt in tabs).
 - **Peek overlay** (collapsed-sidebar hover peek): behavior unchanged. It
-  floats OVER terminal content, so unlike the docked sidebar it may keep an
-  opaque panel fill + shadow for readability — restyle its contents to match
-  the new flat typography, but elevation styling for the overlay itself is
-  allowed and expected.
+  floats OVER terminal content, so unlike the docked sidebar it keeps an
+  elevated panel treatment for readability: its fill becomes the **theme
+  background at FULL alpha** (replacing the current `s.chrome` 0.70-alpha
+  fill — the last chrome-slot consumer after plans 1–2; an opaque fill also
+  avoids double-alpha stacking once plan 3 makes the window translucent) +
+  shadow. Restyle its contents to match the new flat typography.
 - Resize handle, width persistence, min/max widths: unchanged
   (`SIDEBAR_*` constants stay).
 - Rename-in-place, context menus, drag/reorder, file-browser mode behavior:
@@ -92,8 +108,10 @@ gear in the footer.
     schemes; single 1px hairline at the edge (white-alpha dark / ink-alpha
     light), starting below the titlebar;
   - rows render in the terminal mono; active row is accent text with no
-    fill; hover shows faint fill;
+    fill; hover shows faint fill; multi-selected non-active rows show the
+    faint persistent fill;
   - mode toggle works from the footer (tabs ↔ files), gear opens settings;
+    the footer has no top rule;
   - collapse (titlebar toggle) → peek overlay still appears on hover and is
     readable over busy terminal content;
   - resize handle still drags within min/max.
