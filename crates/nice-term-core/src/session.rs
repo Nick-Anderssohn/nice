@@ -26,7 +26,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -60,10 +60,14 @@ pub type DamageCallback = Box<dyn Fn() + Send + 'static>;
 ///
 /// Teardown (explicit [`TermSession::teardown`] or drop) kills the child's
 /// process group so the pty slave closes; the feeder's blocking read then hits
-/// EOF and the thread ends. Drop joins the feeder **before** the pty's master fd
-/// closes, so the feeder never reads a stale fd and no thread is left detached.
+/// EOF and the thread ends. Drop never blocks the calling thread: if the
+/// feeder has not yet finished, the join is handed to a janitor thread that
+/// holds the `Arc`'d pty — so the master fd stays open until the feeder exits
+/// and is never read stale — and closes it there.
 pub struct TermSession {
-    pty: PtyProcess,
+    /// `Arc` so Drop can hand the pty (and thus the master fd's lifetime) to
+    /// the janitor thread that joins a still-running feeder off-thread.
+    pty: Arc<PtyProcess>,
     term: SharedTerm,
     feeder: Option<JoinHandle<()>>,
     scrollback_lines: usize,
@@ -152,7 +156,7 @@ impl TermSession {
         osc7_tee: bool,
         events: Option<Sender<SessionEvent>>,
     ) -> io::Result<TermSession> {
-        let pty = PtyProcess::spawn(spec)?;
+        let pty = Arc::new(PtyProcess::spawn(spec)?);
         let fd = pty.master_fd();
 
         let size = TermSize {
@@ -342,9 +346,10 @@ impl TermSession {
         self.pty.wait_timeout(timeout)
     }
 
-    /// Force the child's process group to exit (SIGHUP, then SIGKILL after a
-    /// grace) so no orphaned zsh survives. Idempotent; delegates to the pty. The
-    /// feeder is joined on drop (once the closed slave EOFs its read).
+    /// Force the child's process group to exit (SIGHUP, then SIGKILL from the
+    /// pty's detached escalation thread after a grace) so no orphaned zsh
+    /// survives. Never blocks; idempotent; delegates to the pty. The feeder is
+    /// joined on drop (inline when already finished, else on the janitor).
     pub fn teardown(&self) {
         self.pty.teardown();
     }
@@ -353,12 +358,40 @@ impl TermSession {
 impl Drop for TermSession {
     fn drop(&mut self) {
         // Kill the child's group so the pty slave closes; the feeder's blocking
-        // read then returns EOF/EIO and the thread ends. Join it here, while
-        // `pty` (and the master fd the feeder reads) is still alive — the `pty`
-        // field is dropped, closing the master, only after this body returns.
+        // read then returns EOF/EIO and the thread ends. The feeder may only be
+        // joined while the master fd it reads is still open (a stale/reused fd
+        // read is the hazard), but joining inline would block this (main)
+        // thread until the child dies — up to the SIGKILL grace for a
+        // SIGHUP-immune child, forever for one in uninterruptible sleep. So:
+        // join inline only when the feeder is already done; otherwise hand the
+        // join AND the Arc'd pty to a janitor thread, which keeps the master
+        // open until the feeder exits and closes it there.
         self.pty.teardown();
         if let Some(handle) = self.feeder.take() {
-            let _ = handle.join();
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // The slot lets the rare janitor-spawn failure recover the
+                // handle and fall back to the old blocking join — never
+                // detach the feeder while this frame's pty (and master fd)
+                // is about to drop.
+                let slot = Arc::new(Mutex::new(Some(handle)));
+                let janitor_slot = Arc::clone(&slot);
+                let pty = Arc::clone(&self.pty);
+                let janitor = std::thread::Builder::new()
+                    .name("nice-term-janitor".to_string())
+                    .spawn(move || {
+                        if let Some(h) = janitor_slot.lock().unwrap().take() {
+                            let _ = h.join();
+                        }
+                        drop(pty);
+                    });
+                if janitor.is_err() {
+                    if let Some(h) = slot.lock().unwrap().take() {
+                        let _ = h.join();
+                    }
+                }
+            }
         }
     }
 }

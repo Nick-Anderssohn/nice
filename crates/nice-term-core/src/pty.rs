@@ -19,15 +19,24 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::spawn::{build_argv, build_env, expand_tilde, SpawnSpec, ZSH_PATH};
 
-/// How long teardown waits for a hung-up child to die before escalating from
-/// SIGHUP to SIGKILL (mirrors `TabPtySession.terminatePane`'s 0.5s grace).
+/// How long the detached escalation thread gives a hung-up child to die before
+/// escalating from SIGHUP to SIGKILL (mirrors `TabPtySession.terminatePane`'s
+/// 0.5s grace). The wait happens OFF the calling thread — see
+/// [`PtyProcess::teardown`].
 const TEARDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// Test-only fault injection: forces the next [`PtyProcess::spawn`]'s reaper
+/// thread spawn to fail, exercising the cleanup arm that must kill + reap the
+/// already-forked child. In-crate unit tests only.
+#[cfg(test)]
+static FORCE_REAPER_SPAWN_FAIL: AtomicBool = AtomicBool::new(false);
 
 /// How a child terminated, recorded by the reaper.
 ///
@@ -148,9 +157,11 @@ impl ExitWaiter {
 }
 
 /// One pane's child process behind a real pty. Owns the master fd, the child
-/// pid, and the reaper thread. Teardown (explicit or on drop) SIGHUPs — then,
-/// after a grace, SIGKILLs — the child's process group and joins the reaper, so
-/// no orphaned zsh or feeder thread survives.
+/// pid, and the reaper thread. Teardown (explicit or on drop) SIGHUPs the
+/// child's process group and arms a detached escalation thread that SIGKILLs
+/// the group if the child has not died within the grace — teardown itself
+/// never blocks the calling thread (it runs on the app's main thread), yet no
+/// orphaned zsh survives.
 pub struct PtyProcess {
     master: OwnedFd,
     /// The child pid. Because the child calls `setsid` (via `login_tty`) it is
@@ -159,6 +170,10 @@ pub struct PtyProcess {
     pid: libc::pid_t,
     exit: Arc<ExitCell>,
     reaper: Option<JoinHandle<()>>,
+    /// Latched by the first [`teardown`](PtyProcess::teardown): the SIGHUP is
+    /// sent and the SIGKILL escalation armed exactly once, no matter how many
+    /// times teardown runs (explicit close + the layered drops all call it).
+    teardown_started: AtomicBool,
 }
 
 impl PtyProcess {
@@ -278,13 +293,43 @@ impl PtyProcess {
         let master = unsafe { OwnedFd::from_raw_fd(master) };
 
         let exit = Arc::new(ExitCell::new());
-        let reaper = spawn_reaper(pid, Arc::clone(&exit))?;
+        #[cfg(test)]
+        let reaper_spawned = if FORCE_REAPER_SPAWN_FAIL.load(Ordering::SeqCst) {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "forced reaper spawn failure (test)",
+            ))
+        } else {
+            spawn_reaper(pid, Arc::clone(&exit))
+        };
+        #[cfg(not(test))]
+        let reaper_spawned = spawn_reaper(pid, Arc::clone(&exit));
+        let reaper = match reaper_spawned {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The child is already forked and exec'd, but no `PtyProcess`
+                // exists yet — so no Drop/teardown would ever signal or reap
+                // it: it would run unowned and turn zombie on exit. Mirror the
+                // fork-failure arm's cleanup: kill the group and reap the
+                // child synchronously before surfacing the error. The master
+                // `OwnedFd` closes on return.
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+                let mut status: libc::c_int = 0;
+                while unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+                    if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break;
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         Ok(PtyProcess {
             master,
             pid,
             exit: Arc::clone(&exit),
             reaper: Some(reaper),
+            teardown_started: AtomicBool::new(false),
         })
     }
 
@@ -371,21 +416,52 @@ impl PtyProcess {
 
     /// Force the child (and its whole process group) to exit. Sends SIGHUP —
     /// the traditional "your tty is gone" signal an interactive zsh handles by
-    /// exiting cleanly and hanging up its own jobs — then, if the child has not
-    /// died within [`TEARDOWN_GRACE`], escalates to SIGKILL. Signals the
-    /// **process group** (`killpg`) so a `exec`'d command and any children go
-    /// together; no orphaned zsh survives.
+    /// exiting cleanly and hanging up its own jobs — and arms a detached
+    /// escalation thread that SIGKILLs the group if the child has not died
+    /// within [`TEARDOWN_GRACE`]. Signals the **process group** (`killpg`) so
+    /// an `exec`'d command and any children go together; no orphaned zsh
+    /// survives.
+    ///
+    /// **Never blocks the caller.** Teardown runs on the app's main thread
+    /// (Cmd+W, quit, drop): a synchronous grace wait froze the UI for 500 ms
+    /// per pane whenever the direct child ignored SIGHUP (an `exec`'d command
+    /// trapping HUP), and indefinitely for a child stuck in uninterruptible
+    /// sleep (whose `waitpid` cannot return) — the escalation therefore waits
+    /// on its own thread.
     ///
     /// Idempotent and safe to call after the child already exited: it first
     /// checks the recorded status and skips signaling entirely if the child is
-    /// already reaped (which also avoids racing a reused pid).
+    /// already reaped (which also avoids racing a reused pid), and the
+    /// SIGHUP + escalation fire only on the first call.
     pub fn teardown(&self) {
         if self.exit.get().is_some() {
             return; // already exited and reaped — nothing to signal.
         }
+        if self.teardown_started.swap(true, Ordering::SeqCst) {
+            return; // already signaled — the escalation thread takes it from here.
+        }
         self.signal_group(libc::SIGHUP);
-        if self.wait_timeout(TEARDOWN_GRACE).is_none() {
-            self.signal_group(libc::SIGKILL);
+        let exit = Arc::clone(&self.exit);
+        let pid = self.pid;
+        let escalation = std::thread::Builder::new()
+            .name("nice-term-sigkill".to_string())
+            .spawn(move || {
+                if exit
+                    .wait_until(Some(Instant::now() + TEARDOWN_GRACE))
+                    .is_none()
+                {
+                    // pgid == pid (session leader); ESRCH (group already gone)
+                    // is expected and ignored.
+                    unsafe { libc::killpg(pid, libc::SIGKILL) };
+                }
+            });
+        if escalation.is_err() {
+            // Could not arm the async escalation (thread exhaustion): fall
+            // back to the old synchronous grace rather than skip the SIGKILL
+            // and risk an orphan.
+            if self.wait_timeout(TEARDOWN_GRACE).is_none() {
+                self.signal_group(libc::SIGKILL);
+            }
         }
     }
 
@@ -400,12 +476,18 @@ impl PtyProcess {
 
 impl Drop for PtyProcess {
     fn drop(&mut self) {
-        // Kill the child's group so nothing is orphaned, then join the reaper
-        // (its waitpid returns once the child dies) so no detached thread
-        // lingers. The OwnedFd master is closed after.
+        // Kill the child's group so nothing is orphaned. Join the reaper only
+        // when the child is already reaped (the join is then immediate);
+        // otherwise detach it — it exits on its own once its waitpid returns,
+        // after the escalation thread's SIGKILL at the latest. Joining
+        // unconditionally would re-block the main thread for the grace on a
+        // SIGHUP-immune child, and forever on a child in uninterruptible
+        // sleep. The OwnedFd master is closed after.
         self.teardown();
         if let Some(handle) = self.reaper.take() {
-            let _ = handle.join();
+            if self.exit.get().is_some() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -457,4 +539,49 @@ fn set_cloexec(fd: libc::c_int) {
 /// returns `Err` instead of panicking on a pathological command/env/cwd.
 fn cstr(s: &str) -> io::Result<CString> {
     CString::new(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hermetic `ZDOTDIR` (empty rc files) so the spawned zsh never reads the
+    /// developer's real `~/.zshrc` — same pattern as the integration suites.
+    fn test_env() -> Vec<(String, String)> {
+        let dir = std::env::temp_dir().join(format!("nice-zdotdir-ptyunit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create ZDOTDIR");
+        for rc in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+            std::fs::write(dir.join(rc), "").expect("write empty rc");
+        }
+        vec![("ZDOTDIR".to_string(), dir.to_str().expect("utf8").to_string())]
+    }
+
+    #[test]
+    fn reaper_spawn_failure_kills_and_reaps_the_forked_child() {
+        // When the reaper thread fails to spawn, the child is already forked
+        // and exec'd but no `PtyProcess` exists — the error arm must kill and
+        // reap it synchronously, or it runs unowned (and zombies on exit).
+        // The command's unique sleep duration doubles as a ps-scan marker.
+        let marker = format!("sleep {}", 200_000 + std::process::id());
+        let spec = SpawnSpec::command(&marker, "/tmp").with_env(test_env());
+
+        FORCE_REAPER_SPAWN_FAIL.store(true, Ordering::SeqCst);
+        let result = PtyProcess::spawn(&spec);
+        FORCE_REAPER_SPAWN_FAIL.store(false, Ordering::SeqCst);
+
+        assert!(result.is_err(), "spawn must surface the reaper-spawn failure");
+        // The cleanup killpg+waitpid is synchronous, so by the time spawn
+        // returned no process carrying the marker may exist — neither the
+        // wrapper zsh (whose argv holds the command string) nor an exec'd
+        // sleep, and no zombie either (a zombie is reaped, not listed).
+        let ps = std::process::Command::new("ps")
+            .args(["-Aww", "-o", "args="])
+            .output()
+            .expect("run ps");
+        let listing = String::from_utf8_lossy(&ps.stdout);
+        assert!(
+            !listing.contains(&marker),
+            "child carrying `{marker}` survived the failed spawn"
+        );
+    }
 }

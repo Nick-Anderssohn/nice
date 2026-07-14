@@ -176,8 +176,9 @@ fn teardown_of_sleep_leaves_no_orphan() {
     assert!(pty.try_status().is_none(), "sleep should not have exited yet");
 
     pty.teardown();
-    // teardown blocks until the reaper records the exit, so the zombie is
-    // already reaped and the drain's slave has closed.
+    // teardown returns immediately (the SIGKILL escalation waits off-thread);
+    // `sleep` dies on the SIGHUP itself, the reaper reaps it, and the drain's
+    // read EOFs once the slave closes.
     let _ = drain.join();
 
     // The pid must no longer exist. Poll briefly to be robust against reap lag.
@@ -189,8 +190,63 @@ fn teardown_of_sleep_leaves_no_orphan() {
         !pid_alive(pid),
         "child pid {pid} still exists after teardown — orphan / group kill failed"
     );
+    // The reaper records the status right after its waitpid returns; give it
+    // the same brief poll.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pty.try_status().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         pty.try_status().is_some(),
         "teardown should have recorded an exit status"
     );
+}
+
+#[test]
+fn teardown_does_not_block_on_a_sighup_immune_child() {
+    // The direct child ignores SIGHUP (`trap "" HUP` carries into the exec'd
+    // sleep as an ignored disposition), so only the SIGKILL escalation can
+    // kill it. teardown runs on the app's main thread: the old synchronous
+    // grace froze the UI for 500 ms per pane on exactly this child — and
+    // indefinitely for one in uninterruptible sleep — so it must return
+    // immediately and leave the escalation to its detached thread.
+    let spec = SpawnSpec::command("sh -c 'trap \"\" HUP; echo TRAPPED; exec sleep 300'", "/tmp")
+        .with_env(test_env());
+    let pty = PtyProcess::spawn(&spec).expect("spawn HUP-immune pane");
+    let drain = Drain::start(pty.master_fd());
+    let pid = pty.child_pid();
+
+    // Wait until the trap is provably installed (the marker prints after it),
+    // so the SIGHUP below is deterministically ignored.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if String::from_utf8_lossy(&drain.output.lock().unwrap()).contains("TRAPPED") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "trap marker never rendered on the pty"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let t0 = Instant::now();
+    pty.teardown();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "teardown blocked for {elapsed:?} — it must not wait out the SIGKILL grace inline"
+    );
+
+    // The detached escalation SIGKILLs the group after the grace; the child
+    // dies and is reaped (kill(pid, 0) fails only once it is reaped).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !pid_alive(pid),
+        "SIGHUP-immune child {pid} was never SIGKILLed by the escalation thread"
+    );
+    let _ = drain.join();
 }

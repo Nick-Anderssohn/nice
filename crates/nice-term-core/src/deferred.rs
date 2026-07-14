@@ -55,8 +55,13 @@
 //! from the feeder thread by wrapping the caller's [`DamageCallback`] — the wrap
 //! fires the event on the first parsed chunk, then delegates, so it honours the
 //! damage-wake contract (non-blocking, never under the `Term` lock). Dropping a
-//! `Session` is a deliberate teardown: it latches intentional, kills the child's
-//! process group, and joins the watcher, so no thread or zsh is left behind.
+//! `Session` is a deliberate teardown: it latches intentional and kills the
+//! child's process group. The watcher is joined inline only when it has already
+//! finished; otherwise it is detached — it parks on the [`ExitWaiter`] and ends
+//! on its own once the child is reaped (the pty's escalation thread SIGKILLs a
+//! stubborn child after the grace), because joining it would block the calling
+//! (main) thread on the child's death. A detached watcher holds only `Arc`s and
+//! a channel `Sender`, so firing after the drop is harmless.
 
 use std::io;
 use std::path::PathBuf;
@@ -522,16 +527,28 @@ impl Drop for Session {
         // Dropping the session is a deliberate teardown (like Nice's Cmd+W /
         // terminatePane): latch intentional so the forced process-group kill
         // classifies as not-held, then kill the child so the exit watcher
-        // unblocks, and join the watcher so no detached thread lingers.
+        // unblocks. Join the watcher only when it has already finished (the
+        // join is then immediate); otherwise detach it — it parks on the
+        // ExitWaiter and ends once the child is reaped (SIGKILLed by the pty's
+        // escalation thread after the grace at the latest), while joining here
+        // would block the (main) thread on the child's death — for the full
+        // grace on a SIGHUP-immune child, forever on one in uninterruptible
+        // sleep. Detached, it holds only Arcs and a Sender whose Receiver may
+        // be gone (the send error is ignored), and the DrainWake contract is
+        // a fire-any-time signal, so a late fire is harmless.
         self.intentional.store(true, Ordering::SeqCst);
         if let State::Spawned(ts) = &self.state {
             ts.teardown();
         }
         if let Some(h) = self.watcher.take() {
-            let _ = h.join();
+            if h.is_finished() {
+                let _ = h.join();
+            }
         }
         // `state` drops after this body: TermSession::drop tears down again
-        // (idempotent) and joins the feeder before the pty master fd closes.
+        // (idempotent) and joins the feeder (inline when already finished,
+        // else on its janitor thread, which keeps the master fd open until
+        // the feeder exits).
     }
 }
 
