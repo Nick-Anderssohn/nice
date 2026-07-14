@@ -2111,9 +2111,9 @@ fn render_row(
         let drag_paths = row.drag_paths.clone();
         el = el.on_drag(
             ExternalPaths(drag_paths.iter().map(PathBuf::from).collect()),
-            move |paths: &ExternalPaths, _offset, _window, app| {
+            move |paths: &ExternalPaths, offset, _window, app| {
                 let count = paths.paths().len();
-                app.new(|_| DragPreview { count })
+                app.new(|_| DragPreview { count, offset })
             },
         );
     }
@@ -2244,6 +2244,11 @@ fn sources_share_volume(sources: &[String], dest: &str) -> bool {
 /// at the pin, so this floating chip is the only drag affordance.
 struct DragPreview {
     count: usize,
+    /// The pointer's position within the dragged row, captured at drag-arm time.
+    /// gpui lays the preview out at `mouse - offset`, so we re-add it (plus a
+    /// small lead) as leading padding below to net the chip to `pointer + 12`,
+    /// mirroring zed's project panel (`DraggedProjectEntryView`).
+    offset: gpui::Point<gpui::Pixels>,
 }
 
 impl gpui::Render for DragPreview {
@@ -2254,16 +2259,20 @@ impl gpui::Render for DragPreview {
         } else {
             format!("{} items", self.count)
         };
-        div()
-            .px(px(8.0))
-            .py(px(3.0))
-            .rounded(px(4.0))
-            .bg(slot_to_rgba(s.panel))
-            .border_1()
-            .border_color(slot_to_rgba(s.line))
-            .text_size(px(NAME_SIZE))
-            .text_color(slot_to_rgba(s.ink))
-            .child(SharedString::from(label))
+        // Outer wrapper carries the offset compensation as padding so the visible
+        // chip's own background box isn't inflated.
+        div().pl(self.offset.x + px(12.0)).pt(self.offset.y + px(12.0)).child(
+            div()
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .bg(slot_to_rgba(s.panel))
+                .border_1()
+                .border_color(slot_to_rgba(s.line))
+                .text_size(px(NAME_SIZE))
+                .text_color(slot_to_rgba(s.ink))
+                .child(SharedString::from(label)),
+        )
     }
 }
 

@@ -433,46 +433,55 @@ struct TabDragPayload {
 
 /// The drag ghost that follows the cursor: a simplified row chip (title only,
 /// reduced opacity) — the R25 `PaneDragGhost` pattern, not a bitmap snapshot.
-/// gpui positions it under the cursor automatically. A parent dragging its
-/// child block appends a dim `+N` so the chip reads as the whole group.
+/// gpui lays it out at `mouse - offset` each frame, so it compensates by
+/// re-adding `offset` (plus a small lead) as leading padding. A parent dragging
+/// its child block appends a dim `+N` so the chip reads as the whole group.
 struct TabRowDragGhost {
     title: SharedString,
     /// Depth-1 children coming along with the drag (0 for a childless row).
     child_count: usize,
+    /// The pointer's position within the dragged row, captured at drag-arm time.
+    /// gpui lays the ghost out at `mouse - offset`, so we re-add it (plus a small
+    /// lead) as leading padding to net the ghost to `pointer + 12`.
+    offset: Point<Pixels>,
 }
 
 impl Render for TabRowDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = active_slots(cx);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(24.0))
-            .max_w(px(200.0))
-            .px(px(10.0))
-            .rounded(px(4.0))
-            .bg(slot_to_rgba(s.panel))
-            .border_1()
-            .border_color(slot_to_rgba(s.line))
-            .opacity(0.85)
-            .text_size(px(13.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(slot_to_rgba(s.ink))
-            .whitespace_nowrap()
-            .truncate()
-            .child(self.title.clone())
-            .when(self.child_count > 0, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(slot_to_rgba(s.ink3))
-                        .child(SharedString::from(format!("+{}", self.child_count))),
-                )
-            })
+        // Outer wrapper carries the offset compensation as padding so the visible
+        // chip's own background box isn't inflated.
+        div().pl(self.offset.x + px(12.0)).pt(self.offset.y + px(12.0)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(24.0))
+                .max_w(px(200.0))
+                .px(px(10.0))
+                .rounded(px(4.0))
+                .bg(slot_to_rgba(s.panel))
+                .border_1()
+                .border_color(slot_to_rgba(s.line))
+                .opacity(0.85)
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(slot_to_rgba(s.ink))
+                .whitespace_nowrap()
+                .truncate()
+                .child(self.title.clone())
+                .when(self.child_count > 0, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(slot_to_rgba(s.ink3))
+                            .child(SharedString::from(format!("+{}", self.child_count))),
+                    )
+                }),
+        )
     }
 }
 
@@ -2063,11 +2072,12 @@ impl SidebarShellView {
             .child(frame_probe)
             .child(leading)
             .child(title)
-            .on_drag(drag_payload, move |_payload, _offset, _window, app| {
+            .on_drag(drag_payload, move |_payload, offset, _window, app| {
                 let title = ghost_title.clone();
                 app.new(|_| TabRowDragGhost {
                     title,
                     child_count: ghost_child_count,
+                    offset,
                 })
             })
             .on_mouse_down(

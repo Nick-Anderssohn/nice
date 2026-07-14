@@ -328,33 +328,41 @@ struct PaneDragPayload {
 
 /// The drag "ghost" that follows the cursor: a simplified pill chip (icon-less
 /// title at the pill's radius/height, reduced opacity), NOT a bitmap snapshot
-/// (D4). gpui positions it under the cursor automatically, so it does not
-/// position itself.
+/// (D4). gpui lays the ghost out at `mouse - offset` each frame, so it
+/// compensates by re-adding `offset` (plus a small lead) as leading padding.
 struct PaneDragGhost {
     title: SharedString,
+    /// The pointer's position within the dragged pill, captured at drag-arm time.
+    /// gpui lays the ghost out at `mouse - offset`, so we re-add it (plus a small
+    /// lead) as leading padding to net the ghost to `pointer + 12`.
+    offset: Point<Pixels>,
 }
 
 impl Render for PaneDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = active_slots(cx);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(PILL_HEIGHT))
-            .max_w(px(PILL_MAX_WIDTH))
-            .pl(px(PILL_LEADING_PAD))
-            .pr(px(PILL_TRAILING_PAD))
-            .rounded(px(PILL_RADIUS))
-            .bg(slot_to_rgba(s.panel))
-            .border_1()
-            .border_color(slot_to_rgba(s.line))
-            .opacity(0.85)
-            .text_size(px(PILL_TEXT_SIZE))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(slot_to_rgba(s.ink))
-            .whitespace_nowrap()
-            .child(self.title.clone())
+        // Outer wrapper carries the offset compensation as padding so the visible
+        // pill's own background box isn't inflated.
+        div().pl(self.offset.x + px(12.0)).pt(self.offset.y + px(12.0)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(PILL_HEIGHT))
+                .max_w(px(PILL_MAX_WIDTH))
+                .pl(px(PILL_LEADING_PAD))
+                .pr(px(PILL_TRAILING_PAD))
+                .rounded(px(PILL_RADIUS))
+                .bg(slot_to_rgba(s.panel))
+                .border_1()
+                .border_color(slot_to_rgba(s.line))
+                .opacity(0.85)
+                .text_size(px(PILL_TEXT_SIZE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(slot_to_rgba(s.ink))
+                .whitespace_nowrap()
+                .child(self.title.clone()),
+        )
     }
 }
 
@@ -1386,15 +1394,17 @@ impl WindowToolbarView {
             .child(title)
             .child(close)
             // The pill carries `.id()` + `on_drag` ONLY — `on_drag_move` / `on_drop`
-            // live on the scroll row (the tracked viewport, D8). The ghost follows
-            // the cursor (gpui positions it), so it ignores the constructor's
-            // `Point` offset. Coexists with the mouse-down select below: gpui's
+            // live on the scroll row (the tracked viewport, D8). gpui subtracts the
+            // constructor's `Point` offset (the grab point within the pill) when it
+            // lays the ghost out (`window.rs` `mouse - cursor_offset`), so the ghost
+            // captures that offset and re-adds it as padding to net to `pointer + 12`
+            // (see `PaneDragGhost`). Coexists with the mouse-down select below: gpui's
             // drag-arming recorder is a separate window-level listener keyed on the
             // hitbox hover, not this element's handler (D6, proven by the F9 file
             // drag).
-            .on_drag(drag_payload, move |_payload, _offset, _window, app| {
+            .on_drag(drag_payload, move |_payload, offset, _window, app| {
                 let title = ghost_title.clone();
-                app.new(|_| PaneDragGhost { title })
+                app.new(|_| PaneDragGhost { title, offset })
             })
             .on_mouse_down(
                 MouseButton::Left,
