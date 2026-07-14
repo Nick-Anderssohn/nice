@@ -783,6 +783,29 @@ impl TerminalView {
         }
     }
 
+    /// Typed input snaps a scrolled-up viewport back to the bottom — the
+    /// standard terminal behavior: keystrokes headed for the pty first jump
+    /// the view back to the live screen so the user can see what they type.
+    /// Callers are the typed-input paths only ([`dispatch_key`], the IME
+    /// preedit/commit, ⌘V paste) — NOT ⌘C copy (not pty input, and it must
+    /// not yank a scrolled selection out of view), key-up release reports, or
+    /// bare-modifier reports (holding Shift is not typing).
+    ///
+    /// Notify discipline (r5c lever B): only an actual snap notifies — via the
+    /// session handle's context, the same repaint path wheel scrolling uses —
+    /// so the common parked-at-bottom case stays a pure pty write with no
+    /// per-key redraw.
+    ///
+    /// [`dispatch_key`]: Self::dispatch_key
+    fn snap_to_bottom_on_input(&mut self, cx: &mut Context<Self>) {
+        self.handle.update(cx, |handle, hcx| {
+            if !handle.is_at_bottom() {
+                handle.scroll_to_bottom();
+                hcx.notify();
+            }
+        });
+    }
+
     /// gpui key-down: the terminal's typed-input entry point.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
@@ -860,8 +883,11 @@ impl TerminalView {
         // is Claude-side and deliberately not fixed here.)
         if m.platform && !m.control && !m.alt {
             if keystroke.key == "v" {
-                // No notify: the paste is a pty write — its echo comes back
-                // through damage → drain → throttled notify (see `dispatch_key`).
+                // Paste is typed input: snap a scrolled-up viewport first.
+                // Otherwise no notify: the paste is a pty write — its echo comes
+                // back through damage → drain → throttled notify (see
+                // `dispatch_key`).
+                self.snap_to_bottom_on_input(cx);
                 self.paste_clipboard(cx);
                 cx.stop_propagation();
                 return;
@@ -946,9 +972,15 @@ impl TerminalView {
             // Plain / shift printable, a ⌘ shortcut in legacy mode, or an
             // ⌥-composing key: let it propagate to the platform (NSTextInputClient
             // → IME compose or `insertText` commit) or to app keybindings. The pty
-            // is not touched here.
+            // is not touched here — a printable that commits snaps at `ime_commit`
+            // instead, and an app shortcut must not snap at all.
             return;
         }
+
+        // Terminal-owned typed input: snap a scrolled-up viewport back to the
+        // bottom. Deliberately not gated on the encoder producing bytes — a
+        // legacy modified-key *repeat* encodes nothing but is still typing.
+        self.snap_to_bottom_on_input(cx);
 
         let keycode = self.keycode_probe.as_ref().and_then(|probe| probe());
         let Some(mut input) = build_key_input(keystroke, event, keycode, false) else {
@@ -980,13 +1012,15 @@ impl TerminalView {
         // immediate-mode draw ON TOP of the echo's own throttled frame: the
         // 2026-07-10 5 s sample during a 120 cps typing flood counted ~335
         // main-thread samples inside that pre-dispatch `Window::draw`. Nothing
-        // else in this handler mutates visual state: scroll state is untouched
-        // (no snap-to-bottom exists on key input — wheel scrolling notifies via
-        // the session handle), composing/preedit transitions happen only in the
-        // input-handler callbacks (which notify themselves), and the caret/
-        // focus visuals are driven by focus + window-activation edges, not
-        // keystrokes. Any future key side effect that DOES change what paint
-        // reads must notify at its own site, like `dismiss_held` does.
+        // else in this handler mutates visual state: the one key side effect
+        // that can change what paint reads — the snap-to-bottom above — notifies
+        // at its own site (via the session handle, like wheel scrolling) and
+        // only when it actually moves the viewport, composing/preedit
+        // transitions happen only in the input-handler callbacks (which notify
+        // themselves), and the caret/focus visuals are driven by focus +
+        // window-activation edges, not keystrokes. Any future key side effect
+        // that DOES change what paint reads must notify at its own site, like
+        // `dismiss_held` and the snap do.
         cx.stop_propagation();
     }
 
@@ -1298,6 +1332,9 @@ impl TerminalView {
         sel: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        // Starting/updating a composition is typing: snap so the preedit
+        // overlay (anchored at the grid cursor) is actually on screen.
+        self.snap_to_bottom_on_input(cx);
         self.ime.set_marked_text(range, text, sel);
         cx.notify();
     }
@@ -1312,6 +1349,9 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         let outcome = self.ime.commit_text(range, text);
+        // Plain printables arrive here (via `insertText:`), not `dispatch_key` —
+        // this is the snap-to-bottom site for ordinary typing.
+        self.snap_to_bottom_on_input(cx);
         self.write_pty(outcome.pty_text.as_bytes(), cx);
         if outcome.was_composing {
             // End-of-native-key-cycle disarm: runs after any synchronous
