@@ -8,7 +8,12 @@ Status legend: 🔴 open · 🟡 open (family/tracked together) · ⚪ open (low
 
 > **Fix round 1 (2026-07-13, dev-cycle run `bughunt-round1`):** #1–#4, #8, and #13
 > are FIXED and merged to main — see the "Recently fixed" table for their SHAs.
-> Remaining open: #5–#7, #9–#12, #14–#17.
+>
+> **Fix round 2 (2026-07-13, hand fixes + per-plan subagent implementers):** #5–#7
+> and the six user-reported bugs from the vault list (scrolled-selection drift,
+> cursor-glyph occlusion, rename select-all + caps lock, drag-ghost offset,
+> option+arrow word-skip) are FIXED and merged to main — see "Recently fixed".
+> Remaining open: #9–#12, #14–#17.
 
 ---
 
@@ -19,27 +24,6 @@ _None open — all four HIGH bugs (#1–#4) fixed in round 1; see "Recently fixe
 ---
 
 ## Medium
-
-### 5. 🔴 Bracketed-paste injection guard is bypassable by marker-overlap reconstruction `[MEDIUM]` (security)
-- **Where:** `crates/nice-term-input/src/paste.rs:31` (`strip_end_marker`); reached via `crates/nice-term-view/src/view.rs:1216` (⌘V `paste_clipboard`).
-- **What:** `wrap_bracketed_paste(data, true)` is supposed to guarantee the pasted body can't contain the paste-end marker `ESC[201~`. `strip_end_marker` does a single left-to-right pass that removes each literal marker but **never re-scans the spliced neighbours**, so removing an embedded marker can fuse the left/right remnants into a *new* `ESC[201~`. Verified byte trace: input `ESC[20` + `ESC[201~` + `1~` → output `ESC[201~`, a live end marker surviving inside the frame. The ⌘V path feeds raw clipboard bytes with no `< 0x20` filter (the drag-drop path at `drop.rs:78` *is* filtered by `is_safe_path`, so it's unaffected). A crafted clipboard payload can break out of the paste frame and inject shell/TUI input.
-- **Repro:** Clipboard = `ESC[20` `ESC[201~` `1~; rm -rf ~\n`; ⌘V into a terminal with DECSET 2004 on → the trailing command is delivered as typed input.
-- **Verifier note:** exploit-only (needs a crafted raw-ESC payload + the exact overlap); can't happen by accident. Medium held, high defensible as "broken security feature."
-- **Fix:** Iterate `strip_end_marker` to a fixed point (loop until a pass removes nothing), or scan right-to-left with re-check. Add the overlap regression test.
-- _findings: termio-1_
-
-### 6. 🔴 Synchronous pty teardown blocks the main thread (bounded 500 ms/pane; unbounded for a D-state child) `[MEDIUM]`
-- **Where:** `crates/nice-term-core/src/pty.rs:387` (`teardown`); called inline from `Session::close`/`Session::drop` (`deferred.rs`) and `TermSession::drop` (`session.rs`) — all on the gpui main thread.
-- **What:** `teardown` sends SIGHUP then **synchronously blocks the calling thread** on `wait_timeout(500ms)` before escalating to SIGKILL; `Session::drop` additionally `join()`s the exit-watcher with no timeout. A foreground **direct** child that traps/ignores SIGHUP (e.g. a command pane running `exec vim`, or `trap '' HUP`) forces the full 500 ms freeze per pane — serial across panes on ⌘Q. Worse, a command pane whose *direct* child is in uninterruptible sleep (`exec cat /Volumes/deadnfs/file` on a hung mount) blocks the reaper's `waitpid` → the main thread hangs **indefinitely** = whole-app freeze. This is the ec0b8f3 "quit looks dead" family.
-- **Verifier note:** the finder's flagship *interactive* `cat` scenario is a misread (interactive `cat` is a grandchild in its own pgroup, not what the reaper waits on). The real triggers are `exec`-style command panes (direct child) and any SIGHUP-immune direct child. Normal interactive shells exit on SIGHUP fast.
-- **Fix:** Make the grace async — SIGHUP immediately, then schedule SIGKILL from a detached thread after the grace; detach rather than join the watcher/feeder when the child hasn't died within a short bound.
-- _findings: deep-3, termcore-2 (duplicates)_
-
-### 7. 🔴 Reaper-thread spawn failure orphans an already-forked child `[MEDIUM]`
-- **Where:** `crates/nice-term-core/src/pty.rs:281` (`let reaper = spawn_reaper(pid, …)?;`).
-- **What:** `PtyProcess::spawn` forks + `execve`s the child, then spawns the reaper thread with `?`. If the thread spawn fails (EAGAIN under thread/FD/`RLIMIT_NPROC`/memory pressure), the `?` returns `Err` **before any `PtyProcess` is constructed**, so no `Drop`/`teardown` ever runs: the forked zsh has no reaper (becomes a zombie on exit, status never collected) and nothing ever `killpg`s it (possible surviving orphan). The fork-*failure* arm (lines 244-251) explicitly closes both fds; the reaper-failure arm has no equivalent child cleanup.
-- **Fix:** On `spawn_reaper` error, best-effort `killpg(pid, SIGKILL)` + synchronous `waitpid(pid, …, 0)` before returning `Err`, mirroring the fork-failure cleanup.
-- _findings: termcore-1_
 
 ### 9. 🔴 Toolbar pane pills never track hover — dead highlight, inactive pills' close "×" is unreachable `[MEDIUM]`
 - **Where:** `crates/nice/src/toolbar.rs:381` (field `hovered_pane_id`), read at `:529/:1324/:1329`.
@@ -122,8 +106,8 @@ Classes with at least one confirmed member since the rewrite — new code should
 5. **Cross-thread channel ordering** — consumers assuming order across producer threads. Fixed: 9072144.
 6. **Wake/drain starvation** — edge-gated wakes that swallow the only signal. Fixed: ec0b8f3.
 7. **Presentation gating** — `cx.notify()` doesn't paint while a window's CVDisplayLink is stopped. Fixed: ec0b8f3, dcb7670.
-8. **Synchronous work on the main thread** — teardown grace waits + unbounded joins freeze the UI (#6).
-9. **Single-pass sanitizers** — non-re-scanning removal fuses neighbours into a new marker (#5).
+8. **Synchronous work on the main thread** — teardown grace waits + unbounded joins freeze the UI (#6). Fixed: 9da1426.
+9. **Single-pass sanitizers** — non-re-scanning removal fuses neighbours into a new marker (#5). Fixed: 2ef4044.
 10. **Forward-guard without inverse-guard** — `apply` guards clobber, `undo` doesn't (#2). Fixed: e01a08e.
 11. **Focus/selection off-by-ones & orphaned handles.** Fixed: 0ae0744, 4616768, 0108a6c, 7a44c17, 1008500.
 
@@ -131,6 +115,14 @@ Classes with at least one confirmed member since the rewrite — new code should
 
 | Commit | Bug |
 |---|---|
+| 2ef4044 | **#5** bracketed-paste marker-overlap reconstruction: `strip_end_marker` now iterates to a fixed point |
+| 9da1426 | **#6 + #7** pty teardown off the main thread (SIGHUP + detached SIGKILL escalation, finished-only joins, janitor holds the master fd for the feeder) + reaper-spawn-failure child cleanup |
+| e589e0f | **#7 follow-up**: the cleanup's `killpg` raced the child's `setsid` (lost SIGKILL → `waitpid` hang); now also `kill(pid)` directly |
+| 4484af1 | user-reported: legacy Option+←/→ printed `D`/`C`; now send `ESC b`/`ESC f` word-skip (kitty mode unchanged) |
+| 63b6080 | user-reported: drag-selection anchor drifted downward while scrolled up with streaming output; anchor now tracks the viewport row |
+| 99eef37 | user-reported: solid block cursor hid the glyph; now reverse-video over the accent with a WCAG contrast fallback |
+| 9b0666d | user-reported: tab/pill rename now selects the whole title on entry; all three rename surfaces respect Caps Lock |
+| 52bf3fc | user-reported: drag ghosts (file rows, pane pills, tab rows) drifted left of the pointer; now ride at pointer+12px |
 | b08e991 | **#8** persistence save-trigger gaps (family, all 5 sites): `TabModel` tree-mutation observer now fired from every mutator and wired to the debounced session save |
 | bd27e0c | **#1** shortcut-recorder wedge: keymap restored when Settings closes mid-record |
 | f197b35 | **#4 + #13** quit/close lifecycle with unregistered key windows (Settings): MRU quit fallback, ⌘W close, gated quit-when-empty |
