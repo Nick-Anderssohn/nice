@@ -28,8 +28,9 @@
 //!   see [`plan_row`]). Each run still carries `background_color` so the
 //!   patched bg-luminance composition curve engages (the whole reason Path B
 //!   was gated on this renderer);
-//! * a **block cursor** in the accent color — solid when focused, hollow when
-//!   not.
+//! * a **block cursor** — focused is a solid block with an xterm/Alacritty-style
+//!   fg/bg swap (the block takes the cell's own resolved foreground, the covered
+//!   glyph its resolved background); unfocused is a hollow accent outline.
 //!
 //! It covers the full per-cell paint model: the color model — 16 themed ANSI,
 //! 256 computed cube/ramp, 24-bit truecolor (see [`crate::color`]) — plus text
@@ -84,7 +85,7 @@ use gpui::{
 use nice_theme::Srgba;
 
 use crate::boxdraw::{self, apple_approx_coverage, Prim, Segment};
-use crate::color::{cursor_text_color, resolve_color};
+use crate::color::resolve_color;
 use crate::input::TermInputHandler;
 use crate::session_handle::TerminalSessionHandle;
 use crate::theme::TerminalTheme;
@@ -425,9 +426,10 @@ fn plan_row(
             flush_proc(&mut proc_batch, &mut items);
             continue;
         }
-        // A solid cursor covers its cell; skip the glyph so it does not paint
-        // over the block (inverse-video caret text is a later slice). The skip
-        // is also a run break — the cells on either side are not contiguous.
+        // A solid cursor covers its cell; skip the glyph here so it does not
+        // paint under the block in its normal fg — the cursor paint redraws it on
+        // top in the swapped (cell-bg) color. The skip is also a run break — the
+        // cells on either side are not contiguous.
         if solid_cursor_col == Some(c) {
             flush(&mut batch, &mut items);
             flush_proc(&mut proc_batch, &mut items);
@@ -846,8 +848,12 @@ impl TerminalElement {
     ) -> Self {
         let default_bg = theme.background.to_u32();
         let foreground = theme.foreground.to_u32();
-        // Caret color: the theme's cursor override, else the accent token (R2)
-        // — exactly `TerminalTheme.swift`'s "nil => caret follows accent".
+        // Caret accent: the theme's cursor override, else the accent token (R2)
+        // — exactly `TerminalTheme.swift`'s "nil => caret follows accent". Now
+        // used only for the HOLLOW (unfocused) outline; the solid block does an
+        // xterm/Alacritty fg/bg swap and no longer wears the accent. The override
+        // plumbing stays wired so a theme-set cursor color still tints the hollow
+        // outline.
         let accent_rgba = match theme.cursor {
             Some(c) => Rgba {
                 r: c.r as f32 / 255.0,
@@ -1107,38 +1113,47 @@ impl TerminalElement {
                     let x = ox + px(cur.col as f32 * cw);
                     let y = oy + px(cur.row as f32 * ch);
                     if cur.solid {
+                        // xterm/Alacritty-style fg/bg swap: the block takes the
+                        // cursor cell's OWN resolved foreground, and the covered
+                        // glyph its resolved background (below). The pair is
+                        // self-contrasting by construction — it reads exactly as
+                        // well as the cell's text normally does, inverted — so the
+                        // caret deliberately drops its fixed accent identity (the
+                        // user's explicit choice after two contrast-guard passes
+                        // over the accent block still read muddy; see
+                        // plans/vault/06). Reverse-video (ESC[7m) cells cache
+                        // post-inverse fg/bg, so this composes as a clean
+                        // double-reverse with no special-casing.
+                        let cell =
+                            cache.rows.get(cur.row).and_then(|r| r.get(cur.col)).copied();
+                        // Block color = the cell's resolved fg; an empty prompt
+                        // cell (or a caret past the cached rows) has none, so fall
+                        // back to the theme's default foreground.
+                        let block_u32 = cell.map(|c| c.fg).unwrap_or(foreground);
                         window.paint_quad(fill(
                             Bounds {
                                 origin: point(x, y),
                                 size: size(px(cw), px(ch)),
                             },
-                            accent,
+                            rgb(block_u32),
                         ));
-                        // Reverse-video: `plan_row` skipped this cell's normal-fg
-                        // glyph (it would paint under the block in the wrong
-                        // color), so draw the character back on top of the block
-                        // in a color chosen to read against the accent — the
-                        // covered char stays visible (see plans/vault/02). The
-                        // hollow (unfocused) caret leaves the glyph in `plan_row`,
-                        // so this runs for `solid` carets only.
-                        if let Some(cell) =
-                            cache.rows.get(cur.row).and_then(|r| r.get(cur.col)).copied()
-                        {
+                        // `plan_row` skipped this cell's normal-fg glyph (it would
+                        // paint under the block in the wrong color), so draw the
+                        // character back on top of the block in the cell's resolved
+                        // background — the other half of the swap. The hollow
+                        // (unfocused) caret leaves the glyph in `plan_row`, so this
+                        // runs for `solid` carets only.
+                        if let Some(cell) = cell {
                             // Blank cells (space / wide-glyph spacer) have no ink
-                            // to reveal — the block alone is the caret.
+                            // to reveal — the fg-colored block alone is the caret.
                             if cell.ch != ' ' && !cell.wide_spacer {
-                                // Accent as `0xRRGGBB` for the contrast math and
-                                // the run's `background_color`.
-                                let accent_u32 = (((accent.r * 255.0).round() as u32) << 16)
-                                    | (((accent.g * 255.0).round() as u32) << 8)
-                                    | ((accent.b * 255.0).round() as u32);
-                                let text_color = cursor_text_color(accent_u32);
+                                let glyph_color = cell.bg.unwrap_or(default_bg);
                                 let cell_x_px =
                                     (ox_f * scale).round() + cur.col as f32 * cw_px;
                                 let cell_y_px =
                                     ((oy_f + cur.row as f32 * ch) * scale).round();
                                 paint_cursor_glyph(
-                                    window, cx, &cell, text_color, accent_u32, &font_family,
+                                    window, cx, &cell, glyph_color, block_u32, &font_family,
                                     font_px, cw, ch, x, y, cell_x_px, cell_y_px, scale, cw_px_i,
                                     ch_px_i, light_px,
                                 );
@@ -1466,14 +1481,15 @@ fn paint_glyph_run(
     let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
 }
 
-/// Paint the cursor cell's glyph reverse-video over the solid accent block: the
-/// character in `text_color` (chosen by [`cursor_text_color`]) on the `accent`
-/// block, honoring the cell's bold / italic. Box-drawing / block-element chars
-/// route through the procedural path (recolored) so their line joins still tile
-/// exactly — a plain font glyph could misalign against the neighbours.
+/// Paint the cursor cell's glyph over the solid block as the fg/bg swap's second
+/// half: the character in `glyph_color` (the cell's resolved background) on the
+/// `block_color` block (the cell's resolved foreground), honoring the cell's
+/// bold / italic. Box-drawing / block-element chars route through the procedural
+/// path (recolored) so their line joins still tile exactly — a plain font glyph
+/// could misalign against the neighbours.
 ///
 /// The single most important detail (see [`paint_glyph_run`]): the run carries
-/// `background_color = Some(accent)` so the vendored bg-luminance patch
+/// `background_color = Some(block_color)` so the vendored bg-luminance patch
 /// composites the glyph's antialiasing against the block, not the page — else
 /// its edges fringe against the wrong luminance.
 #[allow(clippy::too_many_arguments)]
@@ -1481,8 +1497,8 @@ fn paint_cursor_glyph(
     window: &mut Window,
     cx: &mut App,
     cell: &PaintCell,
-    text_color: u32,
-    accent: u32,
+    glyph_color: u32,
+    block_color: u32,
     font_family: &SharedString,
     font_px: f32,
     cw: f32,
@@ -1497,9 +1513,9 @@ fn paint_cursor_glyph(
     light_px: i32,
 ) {
     // Box-drawing / block elements: the procedural geometry, recolored to
-    // `text_color` over the accent block (bg drives the shade coverage curve).
+    // `glyph_color` over the block (bg drives the shade coverage curve).
     if let Some(glyph) = boxdraw::procedural_glyph(cell.ch as u32, cw_px_i, ch_px_i, light_px) {
-        paint_procedural(window, &glyph, cell_x_px, cell_y_px, scale, text_color, accent);
+        paint_procedural(window, &glyph, cell_x_px, cell_y_px, scale, glyph_color, block_color);
         return;
     }
     let mut buf = [0u8; 4];
@@ -1507,8 +1523,8 @@ fn paint_cursor_glyph(
     let text_run = TextRun {
         len: text.len(),
         font: cell_font(font_family.clone(), cell.bold, cell.italic),
-        color: rgb(text_color).into(),
-        background_color: Some(rgb(accent).into()),
+        color: rgb(glyph_color).into(),
+        background_color: Some(rgb(block_color).into()),
         underline: None,
         strikethrough: None,
     };

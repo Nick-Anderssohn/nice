@@ -86,45 +86,6 @@ pub fn resolve_color(color: Color, theme: &TerminalTheme, is_fg: bool) -> u32 {
     }
 }
 
-/// WCAG 2.0 relative luminance of an `0xRRGGBB` color: linearize each sRGB
-/// channel (`c/255`, then `c/12.92` below 0.03928 else `((c+0.055)/1.055)^2.4`)
-/// and weight `0.2126 R + 0.7152 G + 0.0722 B`. Ranges `0.0` (black) to `1.0`
-/// (white).
-pub fn relative_luminance(rgb: u32) -> f32 {
-    let channel = |shift: u32| {
-        let c = ((rgb >> shift) & 0xff) as f32 / 255.0;
-        if c <= 0.03928 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
-}
-
-/// WCAG 2.0 contrast ratio between two `0xRRGGBB` colors: `(Lmax + 0.05) /
-/// (Lmin + 0.05)` over their relative luminances, in `1.0..=21.0`.
-pub fn contrast_ratio(a: u32, b: u32) -> f32 {
-    let la = relative_luminance(a);
-    let lb = relative_luminance(b);
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
-}
-
-/// The color to draw the cursor cell's glyph in, reverse-video over an opaque
-/// `accent` block: whichever of black / white contrasts more with `accent`.
-/// Deliberately NOT the cell's own background (the zed-style "punched hole"):
-/// a dark page color over a mid-tone accent clears WCAG thresholds yet still
-/// reads muddy at cell size. Max-contrast black/white keeps the glyph crisp
-/// against any accent — the worst case, a mid-gray accent, is still ≈4.5:1.
-pub fn cursor_text_color(accent: u32) -> u32 {
-    if contrast_ratio(0xFFFFFF, accent) >= contrast_ratio(0x000000, accent) {
-        0xFFFFFF
-    } else {
-        0x000000
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,48 +144,5 @@ mod tests {
             resolve_color(Color::Named(NamedColor::Background), &theme, false),
             theme.background.to_u32()
         );
-    }
-
-    #[test]
-    fn contrast_ratio_black_white_is_21() {
-        assert!((contrast_ratio(0x000000, 0xffffff) - 21.0).abs() < 1e-3);
-        // Order-independent, and identical colors have ratio 1.0.
-        assert!((contrast_ratio(0xffffff, 0x000000) - 21.0).abs() < 1e-3);
-        assert!((contrast_ratio(0x123456, 0x123456) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn relative_luminance_is_monotonic() {
-        assert!((relative_luminance(0x000000) - 0.0).abs() < 1e-6);
-        assert!((relative_luminance(0xffffff) - 1.0).abs() < 1e-6);
-        let mid = relative_luminance(0x808080);
-        assert!(mid > 0.0 && mid < 1.0);
-    }
-
-    #[test]
-    fn cursor_text_color_is_white_on_dark_accents() {
-        assert_eq!(cursor_text_color(0x000000), 0xffffff);
-        assert_eq!(cursor_text_color(0x090705), 0xffffff);
-        assert_eq!(cursor_text_color(0x2030a0), 0xffffff);
-    }
-
-    #[test]
-    fn cursor_text_color_is_black_on_light_accents() {
-        assert_eq!(cursor_text_color(0xffffff), 0x000000);
-        assert_eq!(cursor_text_color(0xf0f0f0), 0x000000);
-        // The reported readability case: over a mid salmon accent the old
-        // cell-bg choice kept the theme's dark page color (muddy); the
-        // max-contrast rule picks pure black.
-        assert_eq!(cursor_text_color(0xe08070), 0x000000);
-    }
-
-    #[test]
-    fn cursor_text_color_midgray_accent_stays_legible() {
-        // Worst case for black-or-white: a mid-gray accent. Whichever side is
-        // picked must still clear WCAG AA for large text (3.0).
-        let accent = 0x777777;
-        let chosen = cursor_text_color(accent);
-        assert!(chosen == 0xffffff || chosen == 0x000000);
-        assert!(contrast_ratio(chosen, accent) >= 3.0);
     }
 }
