@@ -28,10 +28,23 @@ pub fn wrap_bracketed_paste(data: &[u8], active: bool) -> Vec<u8> {
 }
 
 /// Remove every occurrence of the paste-end marker from `data`.
+///
+/// Iterates to a fixed point: removing an embedded marker splices its left and
+/// right neighbours together, and the spliced bytes can themselves form a new
+/// marker (`ESC[20` + `ESC[201~` + `1~` fuses into `ESC[201~`) — a single pass
+/// would let that reconstructed marker terminate the paste frame early. Each
+/// pass that finds a marker shrinks the buffer, so the loop terminates.
 fn strip_end_marker(data: &[u8]) -> Vec<u8> {
-    if !contains_subslice(data, PASTE_END) {
-        return data.to_vec();
+    let mut out = data.to_vec();
+    while contains_subslice(&out, PASTE_END) {
+        out = strip_end_marker_once(&out);
     }
+    out
+}
+
+/// One left-to-right removal pass (see [`strip_end_marker`] for why a single
+/// pass is not enough on its own).
+fn strip_end_marker_once(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
@@ -91,5 +104,61 @@ mod tests {
     fn multiline_paste_preserved() {
         let out = wrap_bracketed_paste(b"line1\nline2", true);
         assert_eq!(out, b"\x1b[200~line1\nline2\x1b[201~".to_vec());
+    }
+
+    /// The body of a wrapped paste (between the frame markers).
+    fn body(out: &[u8]) -> &[u8] {
+        assert!(out.starts_with(PASTE_START) && out.ends_with(PASTE_END));
+        &out[PASTE_START.len()..out.len() - PASTE_END.len()]
+    }
+
+    #[test]
+    fn overlap_cannot_reconstruct_end_marker() {
+        // Removing the embedded marker splices "ESC[20" and "1~" into a NEW
+        // end marker; a single-pass strip shipped exactly that (the classic
+        // sanitizer-overlap injection). The trailing command must stay inside
+        // the frame.
+        let mut payload = b"\x1b[20".to_vec();
+        payload.extend_from_slice(PASTE_END);
+        payload.extend_from_slice(b"1~; rm -rf ~\n");
+        let out = wrap_bracketed_paste(&payload, true);
+        assert!(
+            !contains_subslice(body(&out), PASTE_END),
+            "end marker survived inside the paste frame: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // Pass 1 removes the literal marker (fusing a new one); pass 2 removes
+        // the fused marker. What remains is inert body text.
+        assert_eq!(body(&out), b"; rm -rf ~\n");
+    }
+
+    #[test]
+    fn nested_overlap_needs_multiple_passes() {
+        // Two stacked overlaps: pass 1 removes the two literal markers and
+        // fuses a new one, pass 2 removes that. No depth of nesting may
+        // survive.
+        let mut payload = b"\x1b[20".to_vec();
+        payload.extend_from_slice(PASTE_END);
+        payload.extend_from_slice(b"\x1b[20");
+        payload.extend_from_slice(PASTE_END);
+        payload.extend_from_slice(b"1~");
+        payload.extend_from_slice(PASTE_END);
+        payload.extend_from_slice(b"1~");
+        let out = wrap_bracketed_paste(&payload, true);
+        assert!(
+            !contains_subslice(body(&out), PASTE_END),
+            "nested overlap reconstructed a live end marker: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn start_marker_and_partial_sequences_pass_through() {
+        // Only the END marker terminates the frame; start markers and partial
+        // end markers are legitimate bytes and must survive sanitizing.
+        let mut payload = b"keep \x1b[200~ and \x1b[201".to_vec();
+        payload.extend_from_slice(b" tails");
+        let out = wrap_bracketed_paste(&payload, true);
+        assert_eq!(body(&out), payload.as_slice());
     }
 }
