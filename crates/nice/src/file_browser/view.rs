@@ -1015,6 +1015,7 @@ impl FileBrowserView {
                 ks.modifiers.shift,
                 ks.modifiers.platform,
                 ks.modifiers.control,
+                window.capslock().on,
             )
         };
         match outcome {

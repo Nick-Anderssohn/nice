@@ -643,8 +643,10 @@ impl WindowToolbarView {
         else {
             return;
         };
-        // Cursor at the end (typing appends) — the prior char-append behaviour.
-        self.rename_editor = Some(TextFieldEditor::new(&title));
+        // Select the whole title on entry (a pane title is not a filename, so the
+        // whole name — not base-minus-extension — is the replace target): the
+        // first keystroke replaces it.
+        self.rename_editor = Some(TextFieldEditor::with_selection(&title, title.chars().count()));
         self.editing_pane = Some((tab_id.to_string(), pane_id.to_string()));
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
@@ -732,6 +734,7 @@ impl WindowToolbarView {
                 ks.modifiers.shift,
                 ks.modifiers.platform,
                 ks.modifiers.control,
+                window.capslock().on,
             )
         };
         match outcome {

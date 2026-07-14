@@ -842,8 +842,10 @@ impl SidebarShellView {
             return;
         };
         self.editing_tab_id = Some(tab_id.to_string());
-        // Cursor at the end (typing appends) — the prior char-append behaviour.
-        self.rename_editor = Some(TextFieldEditor::new(&title));
+        // Select the whole title on entry (a tab title is not a filename, so the
+        // whole name — not base-minus-extension — is the replace target): the
+        // first keystroke replaces it.
+        self.rename_editor = Some(TextFieldEditor::with_selection(&title, title.chars().count()));
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
         // Replacing any prior subscription here drops it OUTSIDE its callback.
@@ -920,6 +922,7 @@ impl SidebarShellView {
                 ks.modifiers.shift,
                 ks.modifiers.platform,
                 ks.modifiers.control,
+                window.capslock().on,
             )
         };
         match outcome {

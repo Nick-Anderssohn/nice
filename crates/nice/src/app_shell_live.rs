@@ -570,12 +570,25 @@ async fn rename_focus_checks(
     }
 
     let draft_before = toolbar.update(cx, |v, _| v.scenario_rename_draft());
+    // BUG A: the whole title must be preselected on entry (a pane title is not a
+    // filename — the entire name is the replace target), so the first keystroke
+    // replaces it rather than appending.
+    let sel_on_entry = toolbar.update(cx, |v, _| v.scenario_rename_selection());
+    let want_sel = Some((0, draft_before.chars().count()));
+    if sel_on_entry != want_sel {
+        failures.push(format!(
+            "rename-focus: pill rename must preselect the whole title {want_sel:?} on entry, got \
+             {sel_on_entry:?} — the first keystroke would append instead of replace (BUG A)"
+        ));
+    }
     tap(cx, pid, KC_X, 0).await;
     let draft_after = toolbar.update(cx, |v, _| v.scenario_rename_draft());
-    if draft_after != format!("{draft_before}x") {
+    // With the whole title preselected, the typed 'x' REPLACES it (draft becomes
+    // "x"), not appends.
+    if draft_after != "x" {
         failures.push(format!(
-            "rename-focus: typed 'x' but the draft went '{draft_before}' → '{draft_after}' — the key \
-             did not land in the rename field (did it reach the pty instead?)"
+            "rename-focus: typed 'x' over the preselected title '{draft_before}' should replace it \
+             ('x'), got '{draft_after}' — the key did not land / the preselection was lost"
         ));
     }
 
@@ -687,11 +700,23 @@ async fn rename_focus_checks(
         return;
     }
     let draft_before = sidebar.update(cx, |v, _| v.scenario_tab_rename_draft());
+    // BUG A: the whole tab title must be preselected on entry, so the first
+    // keystroke replaces it (a tab title is not a filename).
+    let sel_on_entry = sidebar.update(cx, |v, _| v.scenario_tab_rename_selection());
+    let want_sel = Some((0, draft_before.chars().count()));
+    if sel_on_entry != want_sel {
+        failures.push(format!(
+            "rename-focus: sidebar tab rename must preselect the whole title {want_sel:?} on entry, \
+             got {sel_on_entry:?} — the first keystroke would append instead of replace (BUG A)"
+        ));
+    }
     tap(cx, pid, KC_X, 0).await;
     let draft_after = sidebar.update(cx, |v, _| v.scenario_tab_rename_draft());
-    if draft_after != format!("{draft_before}x") {
+    // Preselected whole title → the typed 'x' REPLACES it ("x"), not appends.
+    if draft_after != "x" {
         failures.push(format!(
-            "rename-focus: typed 'x' but the tab-rename draft went '{draft_before}' → '{draft_after}'"
+            "rename-focus: typed 'x' over the preselected tab title '{draft_before}' should replace it \
+             ('x'), got '{draft_after}'"
         ));
     }
 

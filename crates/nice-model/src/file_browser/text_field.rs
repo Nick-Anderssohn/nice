@@ -313,6 +313,16 @@ mod tests {
     }
 
     #[test]
+    fn with_selection_whole_title_selects_all() {
+        // The tab/pane-pill rename seed: passing the char count selects the WHOLE
+        // title (not base-minus-extension), so the first keystroke replaces it.
+        let title = "my session tab";
+        let e = TextFieldEditor::with_selection(title, title.chars().count());
+        assert_eq!(e.selection(), (0, title.chars().count()));
+        assert!(e.has_selection());
+    }
+
+    #[test]
     fn printable_replaces_selection() {
         // Preselect "foo" of "foo.txt", type 'b' → "b.txt".
         let mut e = TextFieldEditor::with_selection("foo.txt", 3);

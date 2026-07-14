@@ -57,6 +57,13 @@ pub(crate) enum RenameKeyOutcome {
 /// * ⌘A → select all.
 /// * a bare printable char (no ⌘/⌃, a non-control `key_char`) → insert at the caret.
 /// * anything else (Escape, ⌘-chords) → [`RenameKeyOutcome::Ignored`].
+///
+/// `capslock` is the live Caps-Lock state (read from `window.capslock().on` — it
+/// is NOT carried in `keystroke.modifiers`). GPUI's macOS backend builds
+/// `key_char` without the alphaLock bit, so an ASCII letter arrives
+/// un-capslocked; when Caps Lock is on we flip that letter's case here, on top of
+/// any Shift the `key_char` already reflects (so Shift+Caps nets lowercase).
+/// Digits, punctuation, and non-ASCII characters are unaffected.
 pub(crate) fn dispatch_rename_key(
     editor: &mut TextFieldEditor,
     key: &str,
@@ -64,6 +71,7 @@ pub(crate) fn dispatch_rename_key(
     shift: bool,
     platform_mod: bool,
     control_mod: bool,
+    capslock: bool,
 ) -> RenameKeyOutcome {
     match key {
         "enter" | "return" => RenameKeyOutcome::Commit,
@@ -99,6 +107,20 @@ pub(crate) fn dispatch_rename_key(
             if !platform_mod && !control_mod {
                 if let Some(ch) = key_char.and_then(|s| s.chars().next()) {
                     if !ch.is_control() {
+                        // Caps Lock toggles letter case on top of Shift (which
+                        // key_char already applied): no-shift lowercase → upper,
+                        // shift upper → lower. Scoped to ASCII letters — Caps Lock
+                        // doesn't touch digits/punct, and Unicode case-mapping is
+                        // out of scope (see the plan's Risks).
+                        let ch = if capslock && ch.is_ascii_alphabetic() {
+                            if ch.is_ascii_lowercase() {
+                                ch.to_ascii_uppercase()
+                            } else {
+                                ch.to_ascii_lowercase()
+                            }
+                        } else {
+                            ch
+                        };
                         editor.apply_key(TextFieldKey::Char(ch));
                         return RenameKeyOutcome::Edited;
                     }
@@ -380,7 +402,7 @@ mod tests {
     fn enter_requests_a_commit_without_touching_the_editor() {
         let mut e = ed("hello");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "enter", None, false, false, false),
+            dispatch_rename_key(&mut e, "enter", None, false, false, false, false),
             RenameKeyOutcome::Commit
         ));
         assert_eq!(e.text(), "hello");
@@ -389,9 +411,9 @@ mod tests {
     #[test]
     fn a_bare_printable_char_inserts_at_the_caret() {
         let mut e = ed("ac");
-        dispatch_rename_key(&mut e, "left", None, false, false, false); // caret between a,c
+        dispatch_rename_key(&mut e, "left", None, false, false, false, false); // caret between a,c
         assert!(matches!(
-            dispatch_rename_key(&mut e, "b", Some("b"), false, false, false),
+            dispatch_rename_key(&mut e, "b", Some("b"), false, false, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "abc");
@@ -400,21 +422,21 @@ mod tests {
     #[test]
     fn backspace_and_forward_delete_edit_at_the_caret() {
         let mut e = ed("abc");
-        dispatch_rename_key(&mut e, "backspace", None, false, false, false);
+        dispatch_rename_key(&mut e, "backspace", None, false, false, false, false);
         assert_eq!(e.text(), "ab");
-        dispatch_rename_key(&mut e, "left", None, false, false, false);
-        dispatch_rename_key(&mut e, "delete", None, false, false, false);
+        dispatch_rename_key(&mut e, "left", None, false, false, false, false);
+        dispatch_rename_key(&mut e, "delete", None, false, false, false, false);
         assert_eq!(e.text(), "a");
     }
 
     #[test]
     fn left_right_move_and_shift_extends() {
         let mut e = ed("abc"); // caret at 3
-        dispatch_rename_key(&mut e, "left", None, false, false, false);
+        dispatch_rename_key(&mut e, "left", None, false, false, false, false);
         assert_eq!(e.cursor(), 2);
-        dispatch_rename_key(&mut e, "left", None, true, false, false); // shift+left extends
+        dispatch_rename_key(&mut e, "left", None, true, false, false, false); // shift+left extends
         assert_eq!(e.selection(), (1, 2));
-        dispatch_rename_key(&mut e, "right", None, false, false, false); // collapse to right edge
+        dispatch_rename_key(&mut e, "right", None, false, false, false, false); // collapse to right edge
         assert_eq!(e.cursor(), 2);
         assert!(!e.has_selection());
     }
@@ -423,14 +445,14 @@ mod tests {
     fn command_a_selects_all_but_command_other_is_ignored() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, true, false),
+            dispatch_rename_key(&mut e, "a", Some("a"), false, true, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.selection(), (0, 4));
 
         let mut e2 = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e2, "c", Some("c"), false, true, false),
+            dispatch_rename_key(&mut e2, "c", Some("c"), false, true, false, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e2.text(), "name");
@@ -440,7 +462,7 @@ mod tests {
     fn escape_is_ignored_so_the_owner_binding_cancels() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "escape", None, false, false, false),
+            dispatch_rename_key(&mut e, "escape", None, false, false, false, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
@@ -450,10 +472,41 @@ mod tests {
     fn a_control_chord_is_ignored() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, false, true),
+            dispatch_rename_key(&mut e, "a", Some("a"), false, false, true, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
+    }
+
+    #[test]
+    fn caps_lock_on_uppercases_a_typed_letter() {
+        // key_char arrives lowercase (GPUI drops the alphaLock bit); Caps Lock on
+        // must flip it to upper.
+        let mut e = ed("");
+        assert!(matches!(
+            dispatch_rename_key(&mut e, "a", Some("a"), false, false, false, true),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.text(), "A");
+    }
+
+    #[test]
+    fn caps_lock_with_shift_lowercases_a_letter() {
+        // Shift already made key_char "A"; Caps Lock on top cancels it back to "a".
+        let mut e = ed("");
+        assert!(matches!(
+            dispatch_rename_key(&mut e, "a", Some("A"), true, false, false, true),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.text(), "a");
+    }
+
+    #[test]
+    fn caps_lock_leaves_digits_and_punctuation_unchanged() {
+        let mut e = ed("");
+        dispatch_rename_key(&mut e, "7", Some("7"), false, false, false, true);
+        dispatch_rename_key(&mut e, "-", Some("-"), false, false, false, true);
+        assert_eq!(e.text(), "7-");
     }
 
     #[test]
