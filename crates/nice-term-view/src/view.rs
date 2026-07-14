@@ -189,14 +189,19 @@ pub struct TerminalView {
     /// (the fork's semantics): a sustained drag lands once per window rather
     /// than never.
     pending_refit_scheduled: bool,
-    /// An in-progress local selection drag, anchored at the **buffer** cell
-    /// `(line, column)` the left button went down on (`line` negative in
-    /// scrollback), plus the selection granularity the click count chose
-    /// (single = `Simple`, double = `Semantic`/word, triple+ = `Lines`).
+    /// An in-progress local selection drag, anchored at the **viewport row** and
+    /// column the left button went down on, plus the selection granularity the
+    /// click count chose (single = `Simple`, double = `Semantic`/word, triple+ =
+    /// `Lines`). The row is stored rather than a grid `Line` so the anchor stays
+    /// glued to the clicked content while output streams in: a scrolled-up
+    /// viewport stays parked on the same rows, so re-deriving `anchor_row -
+    /// display_offset` against the *current* offset on each move tracks the
+    /// content, whereas a frozen grid line would drift downward as the offset
+    /// grows (each move re-derives the end point the same way).
     /// `Some` between mouse-down and the ending mouse-up; each drag move
     /// rewrites the selection from this anchor to the current cell at that
     /// granularity.
-    drag_anchor: Option<(i32, usize, SelectionType)>,
+    drag_anchor: Option<(usize, usize, SelectionType)>,
     /// The last cell a mouse **report** was emitted for, to de-duplicate motion
     /// reports (an app gets one report per cell crossed, not per pixel moved).
     last_report_cell: Option<(usize, usize)>,
@@ -1119,11 +1124,17 @@ impl TerminalView {
                     2 => SelectionType::Semantic,
                     _ => SelectionType::Lines,
                 };
-                self.drag_anchor = Some((hit.buffer_line, hit.col, kind));
+                // Store the click-time viewport row (not the grid line) so the
+                // anchor tracks the clicked content while streaming output grows
+                // the display offset (see the `drag_anchor` field docs).
+                self.drag_anchor = Some((hit.vrow, hit.col, kind));
                 let handle = self.handle.read(cx);
                 if kind == SelectionType::Simple {
                     handle.clear_selection();
                 } else {
+                    // At mouse-down `display_offset` hasn't moved yet, so
+                    // `hit.buffer_line == hit.vrow - display_offset`: the initial
+                    // word/line selection anchors at the clicked cell as before.
                     let anchor = (hit.buffer_line, hit.col);
                     handle.set_selection_typed(kind, anchor, anchor);
                 }
@@ -1139,7 +1150,7 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((anchor_line, anchor_col, kind)) = self.drag_anchor {
+        if let Some((anchor_vrow, anchor_col, kind)) = self.drag_anchor {
             // The button was released (possibly outside the pane, so no mouse-up
             // reached us) — stop extending the selection.
             if event.pressed_button != Some(MouseButton::Left) {
@@ -1147,6 +1158,14 @@ impl TerminalView {
                 return;
             }
             if let Some(hit) = self.hit_cell(event.position, cx) {
+                // Re-derive the anchor's grid line against the *current* display
+                // offset, the same way `hit.buffer_line` derives the end point —
+                // so a scrolled-up viewport streaming output keeps the anchor on
+                // the clicked content instead of drifting downward. The offset is
+                // recovered from the end hit (`vrow - buffer_line`) to avoid a
+                // second `Term` lock.
+                let display_offset = hit.vrow as i32 - hit.buffer_line;
+                let anchor_line = anchor_vrow as i32 - display_offset;
                 self.handle.read(cx).set_selection_typed(
                     kind,
                     (anchor_line, anchor_col),

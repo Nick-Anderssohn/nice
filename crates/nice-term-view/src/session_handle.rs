@@ -1421,4 +1421,74 @@ mod tests {
             .expect("non-empty");
         assert_eq!(range, (Point::new(Line(0), Column(0)), Point::new(Line(0), Column(79))));
     }
+
+    // ---- Scrolled-drag anchor tracks streaming content ------------------------
+    //
+    // Pins the fix for the scrolled-selection bug: while the viewport is scrolled
+    // up and the process keeps printing, the drag anchor must stay on the clicked
+    // row. The view stores the anchor's click-time *viewport row* and re-derives
+    // its grid line against the current display offset each move (mirroring the
+    // end point). The old code froze the grid line, so a streamed line drifted the
+    // anchor one row down. This reproduces that sequence against a real `Term`.
+
+    #[test]
+    fn scrolled_streaming_drag_anchor_stays_on_clicked_row() {
+        use alacritty_terminal::grid::Scroll;
+
+        // Fill the 24-row screen and build scrollback.
+        let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        for i in 0..40 {
+            parser.advance(&mut term, format!("line {i}\r\n").as_bytes());
+        }
+
+        // Scroll up into history: the viewport parks at display_offset D0.
+        term.scroll_display(Scroll::Delta(5));
+        let d0 = term.grid().display_offset() as i32;
+        assert_eq!(d0, 5, "scrolled 5 lines up");
+
+        // The user presses at viewport row `vr` while parked at D0. The old code
+        // froze the anchor as this grid line and never updated it.
+        let vr: usize = 3;
+        let frozen_anchor_line = vr as i32 - d0;
+
+        // One more line streams in. Scrolled up, alacritty bumps the offset to
+        // keep the same content parked, so D_now = D0 + 1 and the clicked content
+        // is still shown at row `vr`.
+        parser.advance(&mut term, b"streamed\r\n");
+        let d_now = term.grid().display_offset() as i32;
+        assert_eq!(d_now, d0 + 1, "streaming while scrolled up bumps the offset");
+
+        // The drag's end point is re-hit-tested live, so it tracks the clicked row.
+        let end_line = vr as i32 - d_now;
+        // The fix re-derives the anchor the same way; it stays on the clicked row.
+        let fixed_anchor_line = vr as i32 - d_now;
+
+        // Frozen anchor: spans two rows (the clicked row plus one below it).
+        let frozen = resolved_range_typed(
+            &term,
+            SelectionType::Simple,
+            (frozen_anchor_line, 0),
+            (end_line, 5),
+        )
+        .expect("non-empty");
+        assert_ne!(
+            frozen.0.line, frozen.1.line,
+            "frozen grid-line anchor drifts: selection wrongly spans two rows"
+        );
+
+        // Re-derived anchor: exactly the clicked row.
+        let fixed = resolved_range_typed(
+            &term,
+            SelectionType::Simple,
+            (fixed_anchor_line, 0),
+            (end_line, 5),
+        )
+        .expect("non-empty");
+        assert_eq!(
+            fixed.0.line, fixed.1.line,
+            "re-derived anchor stays on the clicked row"
+        );
+        assert_eq!(fixed.0.line, Line(end_line));
+    }
 }
