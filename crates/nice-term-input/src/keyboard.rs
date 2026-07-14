@@ -202,6 +202,18 @@ impl KeyEncoder {
         events: bool,
         alternates: bool,
     ) -> Option<Vec<u8>> {
+        // macOS Option-as-Meta word motion. In legacy mode, Option+Left /
+        // Option+Right map to Meta-b / Meta-f (ESC b / ESC f) — the backward-word
+        // / forward-word bindings default zsh & bash honor — matching Terminal.app
+        // / Ghostty and Nice's own Option-as-Meta printable path (Option+b already
+        // emits ESC b). The kitty CSI 1;3D / 1;3C form is reserved for
+        // protocol-aware apps (disambiguate on).
+        if !disambiguate {
+            if let Some(byte) = legacy_alt_word_motion(key, input.modifiers) {
+                return Some(vec![cc::ESC, byte]);
+            }
+        }
+
         let mut mod_bits = input.modifiers.kitty_bits();
         // Modifier keys carry their own bit, set on press / cleared on release
         // (kitty applies the modifier state by keysym, not the post-event state).
@@ -477,6 +489,19 @@ fn legacy_special(key: NamedKey, input: &KeyInput, backspace_sends_control_h: bo
         Some(out)
     } else {
         Some(seq)
+    }
+}
+
+/// Option-only (no shift/ctrl/super) Left/Right → Meta-b / Meta-f byte, the
+/// macOS word-skip motion for the legacy line editor. `None` otherwise.
+fn legacy_alt_word_motion(key: NamedKey, mods: Modifiers) -> Option<u8> {
+    if !(mods.alt && !mods.shift && !mods.ctrl && !mods.super_) {
+        return None;
+    }
+    match key {
+        NamedKey::ArrowLeft => Some(b'b'),
+        NamedKey::ArrowRight => Some(b'f'),
+        _ => None,
     }
 }
 
@@ -1025,5 +1050,88 @@ mod tests {
             Modifiers::new(false, true, false, false),
         ));
         assert_eq!(out, Some(vec![0x1b, 0x0d]));
+    }
+
+    // ---- legacy Option+Left/Right word motion (ESC b / ESC f) ---------------
+
+    #[test]
+    fn legacy_option_left_is_esc_b() {
+        let out = KeyEncoder::default().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowLeft),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(out, Some(b"\x1bb".to_vec()));
+    }
+
+    #[test]
+    fn legacy_option_right_is_esc_f() {
+        let out = KeyEncoder::default().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowRight),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(out, Some(b"\x1bf".to_vec()));
+    }
+
+    #[test]
+    fn legacy_option_left_repeats() {
+        // Holding Option+Left repeats the word jump (no event-type gate).
+        let mut input = KeyInput::press(
+            Key::Named(NamedKey::ArrowLeft),
+            Modifiers::new(false, true, false, false),
+        );
+        input.event = KeyEventType::Repeat;
+        assert_eq!(KeyEncoder::default().encode(&input), Some(b"\x1bb".to_vec()));
+    }
+
+    #[test]
+    fn legacy_option_arrow_ignores_app_cursor() {
+        // Meta-b/Meta-f are line-editor bindings, not cursor-mode sequences:
+        // application-cursor mode does not switch them to an SS3 `ESC O` form.
+        let enc = KeyEncoder { app_cursor: true, ..KeyEncoder::default() };
+        let out = enc.encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowLeft),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(out, Some(b"\x1bb".to_vec()));
+    }
+
+    #[test]
+    fn kitty_option_left_stays_csi_1_3d() {
+        // Legacy-only redirect: disambiguate keeps the CSI 1;3D / 1;3C fidelity.
+        let left = disamb().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowLeft),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(left, Some(b"\x1b[1;3D".to_vec()));
+        let right = disamb().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowRight),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(right, Some(b"\x1b[1;3C".to_vec()));
+    }
+
+    #[test]
+    fn legacy_shift_option_left_stays_csi() {
+        // Only pure Option is redirected: shift+alt stays on the CSI 1;4D path.
+        let out = KeyEncoder::default().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowLeft),
+            Modifiers::new(true, true, false, false),
+        ));
+        assert_eq!(out, Some(b"\x1b[1;4D".to_vec()));
+    }
+
+    #[test]
+    fn legacy_option_up_down_unchanged() {
+        // Deliberate vertical scope-out: Option+Up/Down keep their CSI form.
+        let up = KeyEncoder::default().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowUp),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(up, Some(b"\x1b[1;3A".to_vec()));
+        let down = KeyEncoder::default().encode(&KeyInput::press(
+            Key::Named(NamedKey::ArrowDown),
+            Modifiers::new(false, true, false, false),
+        ));
+        assert_eq!(down, Some(b"\x1b[1;3B".to_vec()));
     }
 }
