@@ -8,7 +8,7 @@
 # `scripts/vendor-zed.sh` (run that before the first build).
 [package]
 name = "nice"
-version = "0.37.0"
+version = "0.38.0"
 edition = "2021"
 publish = false
 
