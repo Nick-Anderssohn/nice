@@ -84,7 +84,7 @@ use gpui::{
 use nice_theme::Srgba;
 
 use crate::boxdraw::{self, apple_approx_coverage, Prim, Segment};
-use crate::color::resolve_color;
+use crate::color::{cursor_text_color, resolve_color};
 use crate::input::TermInputHandler;
 use crate::session_handle::TerminalSessionHandle;
 use crate::theme::TerminalTheme;
@@ -1114,6 +1114,37 @@ impl TerminalElement {
                             },
                             accent,
                         ));
+                        // Reverse-video: `plan_row` skipped this cell's normal-fg
+                        // glyph (it would paint under the block in the wrong
+                        // color), so draw the character back on top of the block
+                        // in a color chosen to read against the accent — the
+                        // covered char stays visible (see plans/vault/02). The
+                        // hollow (unfocused) caret leaves the glyph in `plan_row`,
+                        // so this runs for `solid` carets only.
+                        if let Some(cell) =
+                            cache.rows.get(cur.row).and_then(|r| r.get(cur.col)).copied()
+                        {
+                            // Blank cells (space / wide-glyph spacer) have no ink
+                            // to reveal — the block alone is the caret.
+                            if cell.ch != ' ' && !cell.wide_spacer {
+                                // Accent as `0xRRGGBB` for the contrast math and
+                                // the run's `background_color`.
+                                let accent_u32 = (((accent.r * 255.0).round() as u32) << 16)
+                                    | (((accent.g * 255.0).round() as u32) << 8)
+                                    | ((accent.b * 255.0).round() as u32);
+                                let text_color =
+                                    cursor_text_color(cell.bg.unwrap_or(default_bg), accent_u32);
+                                let cell_x_px =
+                                    (ox_f * scale).round() + cur.col as f32 * cw_px;
+                                let cell_y_px =
+                                    ((oy_f + cur.row as f32 * ch) * scale).round();
+                                paint_cursor_glyph(
+                                    window, cx, &cell, text_color, accent_u32, &font_family,
+                                    font_px, cw, ch, x, y, cell_x_px, cell_y_px, scale, cw_px_i,
+                                    ch_px_i, light_px,
+                                );
+                            }
+                        }
                     } else {
                         paint_hollow_cursor(window, x, y, cw, ch, accent);
                     }
@@ -1433,6 +1464,58 @@ fn paint_glyph_run(
         .text_system()
         .shape_line(text, px(font_px), &[text_run], Some(px(cw)));
     let x = ox + px(run.start_col as f32 * cw);
+    let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
+}
+
+/// Paint the cursor cell's glyph reverse-video over the solid accent block: the
+/// character in `text_color` (chosen by [`cursor_text_color`]) on the `accent`
+/// block, honoring the cell's bold / italic. Box-drawing / block-element chars
+/// route through the procedural path (recolored) so their line joins still tile
+/// exactly — a plain font glyph could misalign against the neighbours.
+///
+/// The single most important detail (see [`paint_glyph_run`]): the run carries
+/// `background_color = Some(accent)` so the vendored bg-luminance patch
+/// composites the glyph's antialiasing against the block, not the page — else
+/// its edges fringe against the wrong luminance.
+#[allow(clippy::too_many_arguments)]
+fn paint_cursor_glyph(
+    window: &mut Window,
+    cx: &mut App,
+    cell: &PaintCell,
+    text_color: u32,
+    accent: u32,
+    font_family: &SharedString,
+    font_px: f32,
+    cw: f32,
+    ch: f32,
+    x: Pixels,
+    y: Pixels,
+    cell_x_px: f32,
+    cell_y_px: f32,
+    scale: f32,
+    cw_px_i: i32,
+    ch_px_i: i32,
+    light_px: i32,
+) {
+    // Box-drawing / block elements: the procedural geometry, recolored to
+    // `text_color` over the accent block (bg drives the shade coverage curve).
+    if let Some(glyph) = boxdraw::procedural_glyph(cell.ch as u32, cw_px_i, ch_px_i, light_px) {
+        paint_procedural(window, &glyph, cell_x_px, cell_y_px, scale, text_color, accent);
+        return;
+    }
+    let mut buf = [0u8; 4];
+    let text: SharedString = SharedString::from(cell.ch.encode_utf8(&mut buf).to_string());
+    let text_run = TextRun {
+        len: text.len(),
+        font: cell_font(font_family.clone(), cell.bold, cell.italic),
+        color: rgb(text_color).into(),
+        background_color: Some(rgb(accent).into()),
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, px(font_px), &[text_run], Some(px(cw)));
     let _ = shaped.paint(point(x, y), px(ch), TextAlign::Left, None, window, cx);
 }
 

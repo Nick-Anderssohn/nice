@@ -86,6 +86,55 @@ pub fn resolve_color(color: Color, theme: &TerminalTheme, is_fg: bool) -> u32 {
     }
 }
 
+/// Minimum WCAG 2.0 contrast ratio the reverse-video cursor glyph must clear
+/// against the cursor block before it falls back to black/white. 3.0 is WCAG AA
+/// for large text / UI components — enough to keep the glyph legible over the
+/// accent block; below it a theme whose accent ≈ its background would wash the
+/// glyph out (the edge case [`cursor_text_color`] guards).
+pub const MIN_CURSOR_CONTRAST: f32 = 3.0;
+
+/// WCAG 2.0 relative luminance of an `0xRRGGBB` color: linearize each sRGB
+/// channel (`c/255`, then `c/12.92` below 0.03928 else `((c+0.055)/1.055)^2.4`)
+/// and weight `0.2126 R + 0.7152 G + 0.0722 B`. Ranges `0.0` (black) to `1.0`
+/// (white).
+pub fn relative_luminance(rgb: u32) -> f32 {
+    let channel = |shift: u32| {
+        let c = ((rgb >> shift) & 0xff) as f32 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// WCAG 2.0 contrast ratio between two `0xRRGGBB` colors: `(Lmax + 0.05) /
+/// (Lmin + 0.05)` over their relative luminances, in `1.0..=21.0`.
+pub fn contrast_ratio(a: u32, b: u32) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// The color to draw the cursor cell's glyph in, reverse-video over an opaque
+/// `accent` block. Ideally the cell's own resolved background `cell_bg` — the
+/// glyph then reads as a punched hole the color of the page behind the block —
+/// but when that would not clear [`MIN_CURSOR_CONTRAST`] against `accent` (a
+/// theme whose accent ≈ its background, where plain reverse-video vanishes into
+/// the block), fall back to whichever of black / white contrasts more with
+/// `accent`, guaranteeing the glyph stays legible against any mid-tone accent.
+pub fn cursor_text_color(cell_bg: u32, accent: u32) -> u32 {
+    if contrast_ratio(cell_bg, accent) >= MIN_CURSOR_CONTRAST {
+        cell_bg
+    } else if contrast_ratio(0xFFFFFF, accent) >= contrast_ratio(0x000000, accent) {
+        0xFFFFFF
+    } else {
+        0x000000
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +193,49 @@ mod tests {
             resolve_color(Color::Named(NamedColor::Background), &theme, false),
             theme.background.to_u32()
         );
+    }
+
+    #[test]
+    fn contrast_ratio_black_white_is_21() {
+        assert!((contrast_ratio(0x000000, 0xffffff) - 21.0).abs() < 1e-3);
+        // Order-independent, and identical colors have ratio 1.0.
+        assert!((contrast_ratio(0xffffff, 0x000000) - 21.0).abs() < 1e-3);
+        assert!((contrast_ratio(0x123456, 0x123456) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn relative_luminance_is_monotonic() {
+        assert!((relative_luminance(0x000000) - 0.0).abs() < 1e-6);
+        assert!((relative_luminance(0xffffff) - 1.0).abs() < 1e-6);
+        let mid = relative_luminance(0x808080);
+        assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn cursor_text_color_keeps_bg_when_contrast_ok() {
+        // Dark default bg against a light accent already clears the threshold,
+        // so the glyph reads as the page-colored hole (unchanged `cell_bg`).
+        let bg = 0x090705;
+        let accent = 0xffffff;
+        assert!(contrast_ratio(bg, accent) >= MIN_CURSOR_CONTRAST);
+        assert_eq!(cursor_text_color(bg, accent), bg);
+    }
+
+    #[test]
+    fn cursor_text_color_falls_back_when_accent_near_bg() {
+        // Accent ≈ dark background: reverse-video would vanish → flip to white.
+        assert_eq!(cursor_text_color(0x090705, 0x090705), 0xffffff);
+        // Accent ≈ light background: flip to black instead.
+        assert_eq!(cursor_text_color(0xf0f0f0, 0xf0f0f0), 0x000000);
+    }
+
+    #[test]
+    fn cursor_text_color_midgray_accent_clears_threshold() {
+        // Mid-gray accent with an equal cell bg forces the fallback; whichever
+        // of black/white is picked must clear the guard.
+        let accent = 0x777777;
+        let chosen = cursor_text_color(accent, accent);
+        assert!(chosen == 0xffffff || chosen == 0x000000);
+        assert!(contrast_ratio(chosen, accent) >= MIN_CURSOR_CONTRAST);
     }
 }
