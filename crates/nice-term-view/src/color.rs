@@ -111,11 +111,19 @@ pub fn contrast_ratio(a: u32, b: u32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// Minimum WCAG contrast the accent must clear — against both the covered
-/// character and the cell background — to serve as the focused block color.
-/// This is WCAG AA for large text / UI components; below it the block falls
-/// back to the self-contrasting fg/bg swap.
+/// Minimum WCAG contrast the accent must clear against the covered
+/// character's own color to serve as the focused block color. WCAG AA for
+/// large text / UI components; below it the block falls back to the
+/// self-contrasting fg/bg swap.
 pub const SMART_CURSOR_MIN_CONTRAST: f32 = 3.0;
+
+/// Minimum contrast the accent must clear against the cell BACKGROUND for the
+/// block itself to read against the page. Deliberately looser than
+/// [`SMART_CURSOR_MIN_CONTRAST`]: that bar suits thin glyph strokes, but a
+/// solid block is visible well below it — and mid-tone accents (Claude coral
+/// on the light theme is ≈2.5–2.9:1 vs the page) sit just under 3.0, which
+/// made the resting caret lose its accent everywhere on light themes.
+pub const SMART_CURSOR_MIN_BLOCK_CONTRAST: f32 = 2.0;
 
 /// `(block_color, glyph_color)` for the focused solid block cursor over a cell.
 /// `has_ink == false` ⇒ `glyph_color` is unused by the caller (blank cell).
@@ -125,10 +133,11 @@ pub const SMART_CURSOR_MIN_CONTRAST: f32 = 3.0;
 /// self-contrasting **swap** only when the accent would clash with the glyph
 /// underneath:
 ///
-/// * **Inked cell** (`has_ink`): use the `accent` as the block iff it contrasts
-///   (≥ [`SMART_CURSOR_MIN_CONTRAST`]) with BOTH the character's own color
-///   (`cell_fg`) and the cell background (`cell_bg`) — so the accent block is
-///   legible and the glyph redrawn over it can still reach contrast. The glyph
+/// * **Inked cell** (`has_ink`): use the `accent` as the block iff it clears
+///   [`SMART_CURSOR_MIN_CONTRAST`] against the character's own color
+///   (`cell_fg`) and [`SMART_CURSOR_MIN_BLOCK_CONTRAST`] against the cell
+///   background (`cell_bg`) — so the accent block is legible and the glyph
+///   redrawn over it can still reach contrast. The glyph
 ///   then takes whichever of `{cell_bg, 0x000000, 0xFFFFFF}` has the highest
 ///   `contrast_ratio` against the chosen block. Otherwise FALL BACK TO THE
 ///   SWAP: block = `cell_fg`, glyph = `cell_bg` (the reverse-video pair — the
@@ -152,7 +161,7 @@ pub fn smart_cursor_colors(cell_fg: u32, cell_bg: u32, accent: u32, has_ink: boo
         // No glyph under the caret. Keep the accent when it reads against the
         // page, else the cell foreground so the caret is always visible. The
         // glyph value is unused by the caller — return the swap glyph.
-        let block = if contrast_ratio(accent, cell_bg) >= SMART_CURSOR_MIN_CONTRAST {
+        let block = if contrast_ratio(accent, cell_bg) >= SMART_CURSOR_MIN_BLOCK_CONTRAST {
             accent
         } else {
             cell_fg
@@ -164,7 +173,7 @@ pub fn smart_cursor_colors(cell_fg: u32, cell_bg: u32, accent: u32, has_ink: boo
     // glyph and the cell background — else the redrawn glyph (or the block
     // against its surroundings) would muddy.
     if contrast_ratio(accent, cell_fg) >= SMART_CURSOR_MIN_CONTRAST
-        && contrast_ratio(accent, cell_bg) >= SMART_CURSOR_MIN_CONTRAST
+        && contrast_ratio(accent, cell_bg) >= SMART_CURSOR_MIN_BLOCK_CONTRAST
     {
         let block = accent;
         // Glyph = whichever candidate reads best over the accent block. The
@@ -284,9 +293,9 @@ mod tests {
     #[test]
     fn smart_cursor_dark_blue_over_light_fg_on_dark_bg() {
         // Honest math: contrast(blue, fg=0xd8d8d8) ≈ 7.40 ≥ 3.0 PASSES, but
-        // contrast(blue, bg=0x090705) ≈ 1.91 < 3.0 FAILS — the accent must clear
-        // BOTH, so this falls back to the swap (the accent would vanish into the
-        // dark page around the block).
+        // contrast(blue, bg=0x090705) ≈ 1.91 < 2.0 (the block bar) FAILS — the
+        // accent must clear both, so this falls back to the swap (the accent
+        // would vanish into the dark page around the block).
         let (block, glyph) = smart_cursor_colors(0xd8d8d8, 0x090705, 0x2030a0, true);
         assert_eq!(block, 0xd8d8d8); // swap: block == cell_fg
         assert_eq!(glyph, 0x090705); // swap: glyph == cell_bg
@@ -301,6 +310,22 @@ mod tests {
         let (block, glyph) = smart_cursor_colors(0xd8d8d8, 0xffffff, accent, true);
         assert_eq!(block, accent);
         // white (or cell_bg == white) beats black over the dark-blue block.
+        assert!(contrast_ratio(glyph, block) >= SMART_CURSOR_MIN_CONTRAST);
+    }
+
+    #[test]
+    fn smart_cursor_coral_on_light_theme_keeps_accent() {
+        // The light (Claude-sync) theme regression: coral vs the light page is
+        // ≈2.8–3.0:1 — under the 3.0 glyph bar but well over the 2.0 block bar.
+        // The resting caret must stay coral, not fall back to the near-black fg.
+        let (fg, bg, coral) = (0x3d3929, 0xfaf9f5, 0xd97757);
+        let (block, _glyph) = smart_cursor_colors(fg, bg, coral, false);
+        assert_eq!(block, coral);
+        // Inked: contrast(coral, dark fg) ≥ 3.0 and the block bar passes too,
+        // so text under the caret also keeps the coral block, with a
+        // max-contrast glyph on top.
+        let (block, glyph) = smart_cursor_colors(fg, bg, coral, true);
+        assert_eq!(block, coral);
         assert!(contrast_ratio(glyph, block) >= SMART_CURSOR_MIN_CONTRAST);
     }
 
