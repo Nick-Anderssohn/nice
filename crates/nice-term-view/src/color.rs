@@ -86,13 +86,6 @@ pub fn resolve_color(color: Color, theme: &TerminalTheme, is_fg: bool) -> u32 {
     }
 }
 
-/// Minimum WCAG 2.0 contrast ratio the reverse-video cursor glyph must clear
-/// against the cursor block before it falls back to black/white. 3.0 is WCAG AA
-/// for large text / UI components — enough to keep the glyph legible over the
-/// accent block; below it a theme whose accent ≈ its background would wash the
-/// glyph out (the edge case [`cursor_text_color`] guards).
-pub const MIN_CURSOR_CONTRAST: f32 = 3.0;
-
 /// WCAG 2.0 relative luminance of an `0xRRGGBB` color: linearize each sRGB
 /// channel (`c/255`, then `c/12.92` below 0.03928 else `((c+0.055)/1.055)^2.4`)
 /// and weight `0.2126 R + 0.7152 G + 0.0722 B`. Ranges `0.0` (black) to `1.0`
@@ -119,16 +112,13 @@ pub fn contrast_ratio(a: u32, b: u32) -> f32 {
 }
 
 /// The color to draw the cursor cell's glyph in, reverse-video over an opaque
-/// `accent` block. Ideally the cell's own resolved background `cell_bg` — the
-/// glyph then reads as a punched hole the color of the page behind the block —
-/// but when that would not clear [`MIN_CURSOR_CONTRAST`] against `accent` (a
-/// theme whose accent ≈ its background, where plain reverse-video vanishes into
-/// the block), fall back to whichever of black / white contrasts more with
-/// `accent`, guaranteeing the glyph stays legible against any mid-tone accent.
-pub fn cursor_text_color(cell_bg: u32, accent: u32) -> u32 {
-    if contrast_ratio(cell_bg, accent) >= MIN_CURSOR_CONTRAST {
-        cell_bg
-    } else if contrast_ratio(0xFFFFFF, accent) >= contrast_ratio(0x000000, accent) {
+/// `accent` block: whichever of black / white contrasts more with `accent`.
+/// Deliberately NOT the cell's own background (the zed-style "punched hole"):
+/// a dark page color over a mid-tone accent clears WCAG thresholds yet still
+/// reads muddy at cell size. Max-contrast black/white keeps the glyph crisp
+/// against any accent — the worst case, a mid-gray accent, is still ≈4.5:1.
+pub fn cursor_text_color(accent: u32) -> u32 {
+    if contrast_ratio(0xFFFFFF, accent) >= contrast_ratio(0x000000, accent) {
         0xFFFFFF
     } else {
         0x000000
@@ -212,30 +202,29 @@ mod tests {
     }
 
     #[test]
-    fn cursor_text_color_keeps_bg_when_contrast_ok() {
-        // Dark default bg against a light accent already clears the threshold,
-        // so the glyph reads as the page-colored hole (unchanged `cell_bg`).
-        let bg = 0x090705;
-        let accent = 0xffffff;
-        assert!(contrast_ratio(bg, accent) >= MIN_CURSOR_CONTRAST);
-        assert_eq!(cursor_text_color(bg, accent), bg);
+    fn cursor_text_color_is_white_on_dark_accents() {
+        assert_eq!(cursor_text_color(0x000000), 0xffffff);
+        assert_eq!(cursor_text_color(0x090705), 0xffffff);
+        assert_eq!(cursor_text_color(0x2030a0), 0xffffff);
     }
 
     #[test]
-    fn cursor_text_color_falls_back_when_accent_near_bg() {
-        // Accent ≈ dark background: reverse-video would vanish → flip to white.
-        assert_eq!(cursor_text_color(0x090705, 0x090705), 0xffffff);
-        // Accent ≈ light background: flip to black instead.
-        assert_eq!(cursor_text_color(0xf0f0f0, 0xf0f0f0), 0x000000);
+    fn cursor_text_color_is_black_on_light_accents() {
+        assert_eq!(cursor_text_color(0xffffff), 0x000000);
+        assert_eq!(cursor_text_color(0xf0f0f0), 0x000000);
+        // The reported readability case: over a mid salmon accent the old
+        // cell-bg choice kept the theme's dark page color (muddy); the
+        // max-contrast rule picks pure black.
+        assert_eq!(cursor_text_color(0xe08070), 0x000000);
     }
 
     #[test]
-    fn cursor_text_color_midgray_accent_clears_threshold() {
-        // Mid-gray accent with an equal cell bg forces the fallback; whichever
-        // of black/white is picked must clear the guard.
+    fn cursor_text_color_midgray_accent_stays_legible() {
+        // Worst case for black-or-white: a mid-gray accent. Whichever side is
+        // picked must still clear WCAG AA for large text (3.0).
         let accent = 0x777777;
-        let chosen = cursor_text_color(accent, accent);
+        let chosen = cursor_text_color(accent);
         assert!(chosen == 0xffffff || chosen == 0x000000);
-        assert!(contrast_ratio(chosen, accent) >= MIN_CURSOR_CONTRAST);
+        assert!(contrast_ratio(chosen, accent) >= 3.0);
     }
 }

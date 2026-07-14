@@ -1132,8 +1132,7 @@ impl TerminalElement {
                                 let accent_u32 = (((accent.r * 255.0).round() as u32) << 16)
                                     | (((accent.g * 255.0).round() as u32) << 8)
                                     | ((accent.b * 255.0).round() as u32);
-                                let text_color =
-                                    cursor_text_color(cell.bg.unwrap_or(default_bg), accent_u32);
+                                let text_color = cursor_text_color(accent_u32);
                                 let cell_x_px =
                                     (ox_f * scale).round() + cur.col as f32 * cw_px;
                                 let cell_y_px =
