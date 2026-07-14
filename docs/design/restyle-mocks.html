@@ -1,0 +1,769 @@
+<title>Nice Restyle Mocks</title>
+<style>
+  /* ────────────────────────────────────────────────────────────────────
+     Page tokens — deliberately single-theme (dark): we are judging dark,
+     translucent terminal windows; a light surround would distort every
+     transparency judgment. The page ground borrows Nice's warm dark
+     neutral family so the mocks sit in their native world.
+     ──────────────────────────────────────────────────────────────────── */
+  :root {
+    /* page */
+    --pg-bg: #0d0b09;
+    --pg-panel: #14110e;
+    --pg-ink: #f4f1ef;
+    --pg-ink2: #b1adaa;
+    --pg-ink3: #75706d;
+    --pg-line: #2c2825;
+    --pg-accent: #c96442;
+
+    /* Nice terminal theme (niceDefaultDark, verbatim) */
+    --term-bg-rgb: 9, 7, 5;          /* #090705 */
+    --term-fg: #f4f0ef;
+    --ansi-red: #c23621;
+    --ansi-green: #25bc24;
+    --ansi-yellow: #adad27;
+    --ansi-blue: #496ee1;
+    --ansi-magenta: #d338d3;
+    --ansi-cyan: #33bbc8;
+    --ansi-brblack: #818383;
+    --ansi-brred: #fc5b47;
+
+    /* chrome slots (NICE_DARK, verbatim) */
+    --ink: #f4f1ef;
+    --ink2: #b1adaa;
+    --ink3: #75706d;
+    --accent: #c96442;
+
+    /* over-glass hairlines + fills (scheme-scoped, not theme slots) */
+    --hairline: rgba(255,255,255,.08);
+    --hairline-strong: rgba(255,255,255,.09);
+    --fill-active: rgba(255,255,255,.06);
+    --fill-x: rgba(255,255,255,.08);
+    --win-ring: rgba(255,255,255,.14);
+
+    /* live controls */
+    --win-alpha: 0.80;
+    --win-blur: 30px;
+
+    --mono: ui-monospace, "SF Mono", "Menlo", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  }
+
+  /* Light scheme for the WINDOWS only (page chrome stays dark so transparency
+     judgments aren't distorted): niceDefaultLight terminal theme + NICE_LIGHT
+     chrome slots, verbatim. Hairlines flip to ink-alpha — white-alpha
+     disappears on a near-white surface. */
+  body[data-scheme="light"] {
+    --term-bg-rgb: 255, 252, 252;    /* #fffcfc */
+    --term-fg: #17130f;
+    --ansi-red: #b74020;
+    --ansi-green: #308130;
+    --ansi-yellow: #a6710d;
+    --ansi-blue: #2860af;
+    --ansi-magenta: #9b3b98;
+    --ansi-cyan: #23859b;
+    --ansi-brblack: #5c5348;
+    --ansi-brred: #d44c25;
+
+    --ink: #17130f;
+    --ink2: #46423e;
+    --ink3: #7e7976;
+
+    --hairline: rgba(23,19,15,.10);
+    --hairline-strong: rgba(23,19,15,.12);
+    --fill-active: rgba(23,19,15,.05);
+    --fill-x: rgba(23,19,15,.08);
+    --win-ring: rgba(0,0,0,.14);
+  }
+
+  html { color-scheme: dark; }
+  body {
+    background: var(--pg-bg);
+    color: var(--pg-ink2);
+    font: 14px/1.6 var(--sans);
+    padding: 0 0 96px;
+  }
+
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 28px; }
+
+  /* ── header ─────────────────────────────────────────────────────── */
+  header.page { padding: 52px 0 8px; }
+  .eyebrow {
+    font: 600 11px/1 var(--mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--pg-accent);
+  }
+  h1 {
+    font: 600 28px/1.2 var(--sans);
+    color: var(--pg-ink);
+    margin: 10px 0 8px;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  .lede { max-width: 62ch; color: var(--pg-ink2); }
+  .lede b { color: var(--pg-ink); font-weight: 600; }
+
+  /* ── control strip ──────────────────────────────────────────────── */
+  .controls {
+    position: sticky; top: 0; z-index: 50;
+    background: color-mix(in srgb, var(--pg-bg) 88%, transparent);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--pg-line);
+    margin-top: 28px;
+  }
+  .controls-inner {
+    max-width: 1060px; margin: 0 auto; padding: 12px 28px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 22px;
+  }
+  .ctl { display: flex; align-items: center; gap: 10px; }
+  .ctl-label {
+    font: 600 10px/1 var(--mono);
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--pg-ink3);
+  }
+  .ctl output {
+    font: 500 12px/1 var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--pg-ink);
+    min-width: 44px;
+  }
+  input[type="range"] {
+    appearance: none; -webkit-appearance: none;
+    width: 140px; height: 3px; border-radius: 2px;
+    background: var(--pg-line); outline-offset: 4px;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    appearance: none; -webkit-appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--pg-ink); border: none;
+    box-shadow: 0 1px 4px rgba(0,0,0,.5);
+    cursor: pointer;
+  }
+  input[type="range"]:focus-visible { outline: 2px solid var(--pg-accent); }
+  .wall-btns { display: flex; gap: 6px; }
+  .wall-btn {
+    font: 500 12px/1 var(--sans);
+    color: var(--pg-ink2);
+    background: transparent;
+    border: 1px solid var(--pg-line);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  .wall-btn:hover { color: var(--pg-ink); border-color: var(--pg-ink3); }
+  .wall-btn:focus-visible { outline: 2px solid var(--pg-accent); outline-offset: 2px; }
+  .wall-btn[aria-pressed="true"] {
+    color: var(--pg-ink);
+    border-color: var(--pg-accent);
+    background: color-mix(in srgb, var(--pg-accent) 14%, transparent);
+  }
+
+  /* ── sections ───────────────────────────────────────────────────── */
+  section.style-group { margin-top: 64px; }
+  .style-head { display: flex; align-items: baseline; gap: 14px; }
+  .style-kicker {
+    font: 600 11px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--pg-ink3);
+  }
+  h2 { font: 600 20px/1.3 var(--sans); color: var(--pg-ink); margin: 6px 0 6px; }
+  .style-note { max-width: 68ch; color: var(--pg-ink2); margin-bottom: 22px; }
+
+  figure.mock { margin: 34px 0 0; }
+  figcaption {
+    font: 500 12px/1.5 var(--mono);
+    color: var(--pg-ink3);
+    margin: 12px 2px 0;
+  }
+  figcaption b { color: var(--pg-ink2); font-weight: 600; }
+
+  /* ── the desk (wallpaper backdrop) ──────────────────────────────── */
+  .desk-scroll { overflow-x: auto; border-radius: 14px; }
+  .desk {
+    position: relative;
+    min-width: 980px;
+    padding: 44px 40px;
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  /* wallpapers */
+  body[data-wall="ember"] .desk {
+    background:
+      radial-gradient(42% 55% at 18% 8%,  rgba(224, 82, 30, .85) 0%, transparent 70%),
+      radial-gradient(38% 48% at 78% 6%,  rgba(206, 32, 41, .75) 0%, transparent 70%),
+      radial-gradient(46% 60% at 55% 38%, rgba(232, 146, 34, .55) 0%, transparent 72%),
+      radial-gradient(60% 70% at 8% 85%,  rgba(112, 44, 118, .8) 0%, transparent 75%),
+      radial-gradient(55% 65% at 92% 80%, rgba(58, 34, 120, .8) 0%, transparent 72%),
+      linear-gradient(160deg, #2c1a3e 0%, #38204a 48%, #241636 100%);
+  }
+  body[data-wall="ocean"] .desk {
+    background:
+      radial-gradient(48% 60% at 20% 12%, rgba(38, 132, 168, .8) 0%, transparent 70%),
+      radial-gradient(42% 55% at 82% 18%, rgba(24, 74, 158, .75) 0%, transparent 72%),
+      radial-gradient(52% 66% at 60% 88%, rgba(20, 128, 110, .6) 0%, transparent 74%),
+      linear-gradient(165deg, #0e2236 0%, #12304a 55%, #0b1c2e 100%);
+  }
+  body[data-wall="mono"] .desk {
+    background:
+      radial-gradient(50% 62% at 25% 15%, rgba(255,255,255,.10) 0%, transparent 70%),
+      radial-gradient(46% 58% at 80% 82%, rgba(255,255,255,.06) 0%, transparent 72%),
+      linear-gradient(160deg, #23211f 0%, #191715 60%, #12100e 100%);
+  }
+
+  /* Sharp detail layer — the high-frequency content the blur slider acts on.
+     Smooth gradients alone barely change under blur; these specks, streaks,
+     and hairlines are what a real wallpaper's edges give the window blur to
+     dissolve. Sits under the window (z-order: desk bg → detail → window). */
+  .desk::before {
+    content: "";
+    position: absolute; inset: 0;
+    pointer-events: none;
+    background-image:
+      radial-gradient(circle 2px at 12% 22%,  rgba(255,255,255,.95) 98%, transparent),
+      radial-gradient(circle 1px at 23% 64%,  rgba(255,255,255,.8)  98%, transparent),
+      radial-gradient(circle 2px at 31% 38%,  rgba(255,255,255,.9)  98%, transparent),
+      radial-gradient(circle 1px at 44% 78%,  rgba(255,255,255,.75) 98%, transparent),
+      radial-gradient(circle 3px at 52% 18%,  rgba(255,255,255,.85) 98%, transparent),
+      radial-gradient(circle 1px at 63% 52%,  rgba(255,255,255,.8)  98%, transparent),
+      radial-gradient(circle 2px at 71% 84%,  rgba(255,255,255,.9)  98%, transparent),
+      radial-gradient(circle 1px at 79% 30%,  rgba(255,255,255,.75) 98%, transparent),
+      radial-gradient(circle 2px at 88% 62%,  rgba(255,255,255,.95) 98%, transparent),
+      radial-gradient(circle 1px at 94% 12%,  rgba(255,255,255,.8)  98%, transparent),
+      radial-gradient(circle 1px at 8% 88%,   rgba(255,255,255,.7)  98%, transparent),
+      radial-gradient(circle 2px at 39% 8%,   rgba(255,255,255,.85) 98%, transparent),
+      repeating-linear-gradient(115deg,
+        transparent 0px, transparent 46px,
+        rgba(255,255,255,.20) 46px, rgba(255,255,255,.20) 47px,
+        transparent 47px, transparent 120px),
+      repeating-linear-gradient(25deg,
+        transparent 0px, transparent 83px,
+        rgba(255,255,255,.12) 83px, rgba(255,255,255,.12) 84px,
+        transparent 84px, transparent 210px);
+  }
+
+  /* ── the window ─────────────────────────────────────────────────── */
+  .window {
+    position: relative;
+    width: 900px; margin: 0 auto;
+    border-radius: 12px;
+    background: rgba(var(--term-bg-rgb), var(--win-alpha));
+    backdrop-filter: blur(var(--win-blur)) saturate(1.15);
+    -webkit-backdrop-filter: blur(var(--win-blur)) saturate(1.15);
+    box-shadow:
+      0 0 0 0.5px var(--win-ring),
+      0 22px 60px rgba(0,0,0,.55),
+      0 4px 14px rgba(0,0,0,.35);
+    overflow: hidden;
+    font-family: var(--mono);
+  }
+
+  /* titlebar — no fill, no rule; just content floating on the surface */
+  .titlebar { display: flex; align-items: center; }
+  .window[data-bar="28"] .titlebar { height: 28px; }
+  .window[data-bar="38"] .titlebar { height: 38px; }
+
+  .lights { display: flex; gap: 10px; padding: 0 14px 0 12px; flex: none; }
+  .light { width: 13px; height: 13px; border-radius: 50%; box-shadow: inset 0 0 1px rgba(0,0,0,.3); }
+  .light.r { background: #ff5f57; }
+  .light.y { background: #febc2e; }
+  .light.g { background: #28c840; }
+
+  .tabs { display: flex; align-items: stretch; flex: 1; min-width: 0; height: 100%; }
+
+  .tab {
+    position: relative;
+    display: flex; align-items: center; gap: 7px;
+    padding: 0 12px;
+    max-width: 200px;
+    color: var(--ink3);
+    font-size: 12px;
+    cursor: default;
+    user-select: none;
+  }
+  /* Status dots — real StatusDot COLORS (nice-theme/src/status.rs): thinking =
+     fixed brand Terracotta (not the chosen accent), waiting = rgb(.48,.58,.86),
+     idle = palette ink3. Sized down for the mock's density (app token is 8pt);
+     static here; the app keeps the ring + breathe pulse animations. */
+  .tab .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .dot.idle { background: var(--ink3); }
+  .dot.think { background: #c96442; }
+  .dot.wait { background: #7a94db; }
+  .tab .t {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-width: 0;
+  }
+  .tab .x {
+    flex: none; width: 14px; height: 14px; border-radius: 4px;
+    display: grid; place-items: center;
+    font-size: 11px; line-height: 1;
+    color: var(--ink3);
+  }
+  .tab.active { color: var(--ink); }
+  .tab.active .x { color: var(--ink2); background: var(--fill-x); }
+
+  /* style A — text + accent underline */
+  .window[data-tabs="underline"] .tab.active::after {
+    content: "";
+    position: absolute; left: 11px; right: 11px; bottom: 0;
+    height: 2px; border-radius: 1px;
+    background: var(--accent);
+  }
+
+  /* style B — full-height divided tabs */
+  .window[data-tabs="divided"] .tab {
+    border-right: 1px solid var(--hairline-strong);
+  }
+  .window[data-tabs="divided"] .tabs .tab:first-child {
+    border-left: 1px solid var(--hairline-strong);
+  }
+  .window[data-tabs="divided"] .tab.active {
+    background: var(--fill-active);
+  }
+
+  .bar-tail { display: flex; align-items: center; gap: 2px; padding: 0 10px; flex: none; margin-left: auto; }
+  .bar-btn {
+    width: 22px; height: 22px; border-radius: 6px;
+    display: grid; place-items: center;
+    color: var(--ink3); font-size: 14px;
+  }
+  .bar-btn.hover-demo { color: var(--ink2); }
+
+  /* body: flat sidebar + terminal, one surface */
+  .win-body { display: flex; }
+  .window[data-bar="28"] .win-body { height: 384px; }
+  .window[data-bar="38"] .win-body { height: 374px; }
+
+  .sidebar {
+    width: 208px; flex: none;
+    display: flex; flex-direction: column;
+    border-right: 1px solid var(--hairline);
+    padding: 6px 0 10px;
+    font-size: 12px;
+    overflow: hidden;
+  }
+  .sb-footer {
+    margin-top: auto;
+    display: flex; align-items: center; gap: 4px;
+    padding: 8px 12px 2px;
+  }
+  .sb-ico {
+    width: 22px; height: 22px; border-radius: 5px;
+    display: grid; place-items: center;
+    color: var(--ink3);
+  }
+  .sb-ico.active { color: var(--ink); background: var(--fill-active); }
+  .sb-ico.gear { margin-left: auto; font-size: 13px; }
+
+  /* titlebar sidebar-collapse toggle (Finder/Safari position) */
+  .tb-btn {
+    flex: none;
+    width: 24px; height: 22px; border-radius: 5px;
+    display: grid; place-items: center;
+    color: var(--ink3);
+    margin-right: 4px;
+  }
+  .sb-proj {
+    padding: 10px 14px 4px;
+    color: var(--ink3);
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  .sb-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 14px;
+    color: var(--ink2);
+    white-space: nowrap; overflow: hidden;
+  }
+  .sb-row .t { overflow: hidden; text-overflow: ellipsis; }
+  .sb-row .dot { width: 5px; height: 5px; border-radius: 50%; flex: none; }
+  .sb-row.active { color: var(--accent); }
+
+  .term {
+    flex: 1; min-width: 0;
+    padding: 8px 16px 14px;
+    font-size: 12.5px; line-height: 1.55;
+    color: var(--term-fg);
+    white-space: pre;
+    overflow: hidden;
+  }
+  .term .p  { color: var(--ansi-green); }
+  .term .dir{ color: var(--ansi-blue); }
+  .term .mut{ color: var(--ansi-brblack); }
+  .term .y  { color: var(--ansi-yellow); }
+  .term .c  { color: var(--ansi-cyan); }
+  .term .m  { color: var(--ansi-magenta); }
+  .term .r  { color: var(--ansi-brred); }
+  .term .cursor {
+    display: inline-block; width: 7px; height: 14px;
+    background: var(--accent); vertical-align: text-bottom;
+    border-radius: 1px;
+  }
+
+  /* ── notes / spec ───────────────────────────────────────────────── */
+  .notes { margin-top: 72px; border-top: 1px solid var(--pg-line); padding-top: 40px; }
+  .notes h2 { margin-bottom: 4px; }
+  .notes-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 28px; margin-top: 24px;
+  }
+  .note-card h3 {
+    font: 600 13px/1.4 var(--sans); color: var(--pg-ink);
+    margin-bottom: 8px;
+  }
+  .note-card p, .note-card li { font-size: 13px; color: var(--pg-ink2); }
+  .note-card ul { padding-left: 18px; display: grid; gap: 6px; }
+  .note-card code {
+    font: 500 11.5px/1 var(--mono);
+    background: var(--pg-panel);
+    border: 1px solid var(--pg-line);
+    border-radius: 4px; padding: 2px 5px;
+    color: var(--pg-ink);
+    white-space: nowrap;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .wall-btn, .window { transition: background .25s ease, border-color .15s ease; }
+  }
+</style>
+
+<body data-wall="ember" data-scheme="dark">
+
+<div class="wrap">
+  <header class="page">
+    <div class="eyebrow">Nice · Restyle</div>
+    <h1>Transparent, unified-surface window mocks</h1>
+    <p class="lede">
+      Four variants of the same window: <b>two tab styles × two titlebar heights</b>,
+      rendered with the shipped tokens — <b>niceDefaultDark</b> terminal theme, NICE_DARK
+      chrome inks, Terracotta accent. The sidebar is flat (terminal font, colors, and
+      background; active session in accent text; 1px hairline at its edge). No titlebar
+      fill, no separator rule — one translucent surface, ~80% opaque with window blur.
+      Tab two on every strip is deliberately over-long to exercise truncation.
+      The <b>Scheme</b> toggle swaps every window to NICE_LIGHT + niceDefaultLight
+      (hairlines flip to ink-alpha). Sidebar controls live in their decided homes:
+      collapse toggle in the titlebar beside the traffic lights; tabs/files mode
+      switcher and the gear in the sidebar footer. Status dots use the real
+      StatusDot tokens — idle = ink3, thinking = brand Terracotta, waiting = blue —
+      shown static here; the app keeps its ring + breathe pulse animations.
+    </p>
+  </header>
+</div>
+
+<div class="controls">
+  <div class="controls-inner">
+    <div class="ctl">
+      <span class="ctl-label">Scheme</span>
+      <div class="wall-btns" role="group" aria-label="Color scheme">
+        <button class="wall-btn scheme-btn" data-scheme="dark" aria-pressed="true">Dark</button>
+        <button class="wall-btn scheme-btn" data-scheme="light" aria-pressed="false">Light</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <span class="ctl-label">Wallpaper</span>
+      <div class="wall-btns" role="group" aria-label="Wallpaper">
+        <button class="wall-btn" data-wall="ember" aria-pressed="true">Ember</button>
+        <button class="wall-btn" data-wall="ocean" aria-pressed="false">Ocean</button>
+        <button class="wall-btn" data-wall="mono" aria-pressed="false">Graphite</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <label class="ctl-label" for="alpha">Opacity</label>
+      <input type="range" id="alpha" min="55" max="100" value="80">
+      <output id="alpha-out">80%</output>
+    </div>
+    <div class="ctl">
+      <label class="ctl-label" for="blur">Blur</label>
+      <input type="range" id="blur" min="0" max="60" value="30">
+      <output id="blur-out">30px</output>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <!-- ═══════════════ STYLE A — text + accent underline ═══════════════ -->
+  <section class="style-group">
+    <div class="style-kicker">Style A</div>
+    <h2>Text + accent underline</h2>
+    <p class="style-note">
+      Tab titles are plain text — inactive tabs in tertiary ink, the active tab in full
+      ink with a 2px Terracotta underline seated on the bar's bottom edge. A truncated
+      title reads as text, not a cramped box. The ✕ is shown on the active tab the way
+      it would appear on hover.
+    </p>
+
+    <figure class="mock">
+      <div class="desk-scroll"><div class="desk">
+        <div class="window" data-tabs="underline" data-bar="28">
+          <div class="titlebar">
+            <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
+            <div class="tb-btn" title="Toggle sidebar"><svg width="15" height="12" viewBox="0 0 15 12" fill="none" stroke="currentColor"><rect x="0.5" y="0.5" width="14" height="11" rx="2.5"/><line x1="5.5" y1="0.5" x2="5.5" y2="11.5"/></svg></div>
+            <div class="tabs">
+              <div class="tab active"><span class="dot idle"></span><span class="t">restyle-work</span><span class="x">✕</span></div>
+              <div class="tab" style="max-width:150px"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="tab"><span class="t">scratch</span></div>
+            </div>
+            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+          </div>
+          <div class="win-body">
+            <aside class="sidebar">
+              <div class="sb-proj">nice</div>
+              <div class="sb-row active"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+              <div class="sb-row"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="sb-row"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="sb-proj">dotfiles</div>
+              <div class="sb-row"><span class="t">config-tweaks</span></div>
+              <div class="sb-row"><span class="t">scratch</span></div>
+              <div class="sb-footer">
+                <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
+                <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
+                <span class="sb-ico gear" title="Settings">⚙︎</span>
+              </div>
+            </aside>
+            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> cargo test -p nice-theme
+<span class="mut">   Compiling nice-theme v0.38.0</span>
+<span class="p">    Finished</span> test profile in 2.41s
+<span class="p">test result: ok.</span> 41 passed; 0 failed
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> git log --oneline -4
+<span class="y">e5f3d42</span> Bump nice to 0.38.0 for the v0.38.0 release
+<span class="y">57a53e5</span> term: snap a scrolled-up viewport on typed input
+<span class="y">f5e9ad6</span> Bump nice to 0.37.0 for the v0.37.0 release
+<span class="y">85da768</span> cursor: loosen the block-visibility bar
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> <span class="cursor"></span></div>
+          </div>
+        </div>
+      </div></div>
+      <figcaption><b>A · 28pt bar</b> — true macOS standard height; traffic lights at native position; terminal text starts 8px under the bar.</figcaption>
+    </figure>
+
+    <figure class="mock">
+      <div class="desk-scroll"><div class="desk">
+        <div class="window" data-tabs="underline" data-bar="38">
+          <div class="titlebar">
+            <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
+            <div class="tb-btn" title="Toggle sidebar"><svg width="15" height="12" viewBox="0 0 15 12" fill="none" stroke="currentColor"><rect x="0.5" y="0.5" width="14" height="11" rx="2.5"/><line x1="5.5" y1="0.5" x2="5.5" y2="11.5"/></svg></div>
+            <div class="tabs">
+              <div class="tab active"><span class="dot idle"></span><span class="t">restyle-work</span><span class="x">✕</span></div>
+              <div class="tab" style="max-width:150px"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="tab"><span class="t">scratch</span></div>
+            </div>
+            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+          </div>
+          <div class="win-body">
+            <aside class="sidebar">
+              <div class="sb-proj">nice</div>
+              <div class="sb-row active"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+              <div class="sb-row"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="sb-row"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="sb-proj">dotfiles</div>
+              <div class="sb-row"><span class="t">config-tweaks</span></div>
+              <div class="sb-row"><span class="t">scratch</span></div>
+              <div class="sb-footer">
+                <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
+                <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
+                <span class="sb-ico gear" title="Settings">⚙︎</span>
+              </div>
+            </aside>
+            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> nvim crates/nice-theme/src/chrome_geometry.rs
+<span class="mut">──────────────────────────────────────────────</span>
+<span class="m">pub const</span> <span class="c">TOP_BAR_HEIGHT</span>: <span class="c">f32</span> = <span class="r">38.0</span>;
+<span class="m">pub const</span> <span class="c">SIDEBAR_DEFAULT_WIDTH</span>: <span class="c">f32</span> = <span class="r">240.0</span>;
+<span class="mut">──────────────────────────────────────────────</span>
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> rg "CARD_" --files-with-matches | wc -l
+<span class="c">0</span>   <span class="mut"># the floating card is gone</span>
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> <span class="cursor"></span></div>
+          </div>
+        </div>
+      </div></div>
+      <figcaption><b>A · 38pt bar</b> — macOS compact-toolbar height; same style with more air around the tab row.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ═══════════════ STYLE B — full-height divided tabs ═══════════════ -->
+  <section class="style-group">
+    <div class="style-kicker">Style B</div>
+    <h2>Full-height divided tabs</h2>
+    <p class="style-note">
+      The native macOS titlebar-tabs shape: each tab spans the bar's full height,
+      separated by 1px hairlines, and the active tab carries a faint translucent fill.
+      More visible structure than Style A — the tab region reads as a control strip
+      rather than floating labels.
+    </p>
+
+    <figure class="mock">
+      <div class="desk-scroll"><div class="desk">
+        <div class="window" data-tabs="divided" data-bar="28">
+          <div class="titlebar">
+            <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
+            <div class="tb-btn" title="Toggle sidebar"><svg width="15" height="12" viewBox="0 0 15 12" fill="none" stroke="currentColor"><rect x="0.5" y="0.5" width="14" height="11" rx="2.5"/><line x1="5.5" y1="0.5" x2="5.5" y2="11.5"/></svg></div>
+            <div class="tabs">
+              <div class="tab active"><span class="dot idle"></span><span class="t">restyle-work</span><span class="x">✕</span></div>
+              <div class="tab" style="max-width:150px"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="tab"><span class="t">scratch</span></div>
+            </div>
+            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+          </div>
+          <div class="win-body">
+            <aside class="sidebar">
+              <div class="sb-proj">nice</div>
+              <div class="sb-row active"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+              <div class="sb-row"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="sb-row"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="sb-proj">dotfiles</div>
+              <div class="sb-row"><span class="t">config-tweaks</span></div>
+              <div class="sb-row"><span class="t">scratch</span></div>
+              <div class="sb-footer">
+                <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
+                <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
+                <span class="sb-ico gear" title="Settings">⚙︎</span>
+              </div>
+            </aside>
+            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> cargo test -p nice-theme
+<span class="mut">   Compiling nice-theme v0.38.0</span>
+<span class="p">    Finished</span> test profile in 2.41s
+<span class="p">test result: ok.</span> 41 passed; 0 failed
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> git log --oneline -4
+<span class="y">e5f3d42</span> Bump nice to 0.38.0 for the v0.38.0 release
+<span class="y">57a53e5</span> term: snap a scrolled-up viewport on typed input
+<span class="y">f5e9ad6</span> Bump nice to 0.37.0 for the v0.37.0 release
+<span class="y">85da768</span> cursor: loosen the block-visibility bar
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> <span class="cursor"></span></div>
+          </div>
+        </div>
+      </div></div>
+      <figcaption><b>B · 28pt bar</b> — hairline-divided segments at standard height; the active fill spans the full bar.</figcaption>
+    </figure>
+
+    <figure class="mock">
+      <div class="desk-scroll"><div class="desk">
+        <div class="window" data-tabs="divided" data-bar="38">
+          <div class="titlebar">
+            <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
+            <div class="tb-btn" title="Toggle sidebar"><svg width="15" height="12" viewBox="0 0 15 12" fill="none" stroke="currentColor"><rect x="0.5" y="0.5" width="14" height="11" rx="2.5"/><line x1="5.5" y1="0.5" x2="5.5" y2="11.5"/></svg></div>
+            <div class="tabs">
+              <div class="tab active"><span class="dot idle"></span><span class="t">restyle-work</span><span class="x">✕</span></div>
+              <div class="tab" style="max-width:150px"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="tab"><span class="t">scratch</span></div>
+            </div>
+            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+          </div>
+          <div class="win-body">
+            <aside class="sidebar">
+              <div class="sb-proj">nice</div>
+              <div class="sb-row active"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+              <div class="sb-row"><span class="dot think"></span><span class="t">nick@Nicks-MacBook-Air-2.local</span></div>
+              <div class="sb-row"><span class="dot wait"></span><span class="t">api-server</span></div>
+              <div class="sb-proj">dotfiles</div>
+              <div class="sb-row"><span class="t">config-tweaks</span></div>
+              <div class="sb-row"><span class="t">scratch</span></div>
+              <div class="sb-footer">
+                <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
+                <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
+                <span class="sb-ico gear" title="Settings">⚙︎</span>
+              </div>
+            </aside>
+            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> nvim crates/nice-theme/src/chrome_geometry.rs
+<span class="mut">──────────────────────────────────────────────</span>
+<span class="m">pub const</span> <span class="c">TOP_BAR_HEIGHT</span>: <span class="c">f32</span> = <span class="r">38.0</span>;
+<span class="m">pub const</span> <span class="c">SIDEBAR_DEFAULT_WIDTH</span>: <span class="c">f32</span> = <span class="r">240.0</span>;
+<span class="mut">──────────────────────────────────────────────</span>
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> rg "CARD_" --files-with-matches | wc -l
+<span class="c">0</span>   <span class="mut"># the floating card is gone</span>
+
+<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
+<span class="y">❯</span> <span class="cursor"></span></div>
+          </div>
+        </div>
+      </div></div>
+      <figcaption><b>B · 38pt bar</b> — the divided style at compact-toolbar height, closest to native Safari tabs.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ═══════════════ notes ═══════════════ -->
+  <section class="notes">
+    <h2>What changes under the hood</h2>
+    <div class="notes-grid">
+      <div class="note-card">
+        <h3>Chrome geometry</h3>
+        <ul>
+          <li><code>TOP_BAR_HEIGHT</code> 52 → 28 or 38; traffic-light placer follows (native default at 28).</li>
+          <li>Card constants (<code>CARD_INSET</code>, radius, border, shadow) retire with the floating sidebar.</li>
+          <li>Titlebar band + 1px <code>line</code> rule removed — no fill from window top.</li>
+        </ul>
+      </div>
+      <div class="note-card">
+        <h3>Sidebar</h3>
+        <ul>
+          <li>Same surface as the terminal — no separate fill, so transparency is uniform.</li>
+          <li>Typography switches to <code>NICE_MONO</code> at terminal size.</li>
+          <li>Active row: accent-colored text, no fill; hairline at the right edge, starting below the bar.</li>
+        </ul>
+      </div>
+      <div class="note-card">
+        <h3>Transparency</h3>
+        <ul>
+          <li>Terminal + chrome background alpha from a new opacity slider (default ~80%).</li>
+          <li><code>WindowBackgroundAppearance::Blurred</code>; blur radius via a small vendored-gpui patch to unlock a slider.</li>
+          <li>Truncation: tabs get a max width and ellipsize; full title on hover tooltip.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+  const root = document.documentElement;
+  const alpha = document.getElementById('alpha');
+  const blur = document.getElementById('blur');
+  const alphaOut = document.getElementById('alpha-out');
+  const blurOut = document.getElementById('blur-out');
+
+  alpha.addEventListener('input', () => {
+    root.style.setProperty('--win-alpha', alpha.value / 100);
+    alphaOut.textContent = alpha.value + '%';
+  });
+  blur.addEventListener('input', () => {
+    root.style.setProperty('--win-blur', blur.value + 'px');
+    blurOut.textContent = blur.value + 'px';
+  });
+
+  document.querySelectorAll('.wall-btn:not(.scheme-btn)').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.body.dataset.wall = btn.dataset.wall;
+      document.querySelectorAll('.wall-btn:not(.scheme-btn)').forEach(b =>
+        b.setAttribute('aria-pressed', String(b === btn)));
+    });
+  });
+
+  document.querySelectorAll('.scheme-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.body.dataset.scheme = btn.dataset.scheme;
+      document.querySelectorAll('.scheme-btn').forEach(b =>
+        b.setAttribute('aria-pressed', String(b === btn)));
+    });
+  });
+</script>
+</body>
