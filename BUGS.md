@@ -122,7 +122,8 @@ Classes with at least one confirmed member since the rewrite — new code should
 | 63b6080 | user-reported: drag-selection anchor drifted downward while scrolled up with streaming output; anchor now tracks the viewport row |
 | 99eef37 | user-reported: solid block cursor hid the glyph; now reverse-video over the accent with a WCAG contrast fallback |
 | cdb4360 | 99eef37 follow-up: cell-bg glyph read muddy on a mid-tone accent; glyph is now always max-contrast black/white |
-| 9be7152 | cursor final form: Alacritty-style true fg/bg swap (block = cell fg, glyph = cell bg; accent kept for the hollow unfocused outline; contrast helpers removed) |
+| 9be7152 | cursor iteration 3: Alacritty-style true fg/bg swap (readable, but lost the accent identity) |
+| 9db06b0 | cursor final form: smart color — accent block when it contrasts with both the covered char and the cell bg (incl. blank cells at rest), self-contrasting swap otherwise |
 | 9b0666d | user-reported: tab/pill rename now selects the whole title on entry; all three rename surfaces respect Caps Lock |
 | 52bf3fc | user-reported: drag ghosts (file rows, pane pills, tab rows) drifted left of the pointer; now ride at pointer+12px |
 | b08e991 | **#8** persistence save-trigger gaps (family, all 5 sites): `TabModel` tree-mutation observer now fired from every mutator and wired to the debounced session save |
