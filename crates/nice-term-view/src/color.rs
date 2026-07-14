@@ -86,6 +86,104 @@ pub fn resolve_color(color: Color, theme: &TerminalTheme, is_fg: bool) -> u32 {
     }
 }
 
+/// WCAG 2.0 relative luminance of an `0xRRGGBB` color: linearize each sRGB
+/// channel (`c/255`, then `c/12.92` below 0.03928 else `((c+0.055)/1.055)^2.4`)
+/// and weight `0.2126 R + 0.7152 G + 0.0722 B`. Ranges `0.0` (black) to `1.0`
+/// (white).
+pub fn relative_luminance(rgb: u32) -> f32 {
+    let channel = |shift: u32| {
+        let c = ((rgb >> shift) & 0xff) as f32 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// WCAG 2.0 contrast ratio between two `0xRRGGBB` colors: `(Lmax + 0.05) /
+/// (Lmin + 0.05)` over their relative luminances, in `1.0..=21.0`.
+pub fn contrast_ratio(a: u32, b: u32) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Minimum WCAG contrast the accent must clear — against both the covered
+/// character and the cell background — to serve as the focused block color.
+/// This is WCAG AA for large text / UI components; below it the block falls
+/// back to the self-contrasting fg/bg swap.
+pub const SMART_CURSOR_MIN_CONTRAST: f32 = 3.0;
+
+/// `(block_color, glyph_color)` for the focused solid block cursor over a cell.
+/// `has_ink == false` ⇒ `glyph_color` is unused by the caller (blank cell).
+///
+/// An iTerm2-style *smart* cursor color: the caret keeps its fixed **accent
+/// identity** whenever the accent is readable in context, and degrades to a
+/// self-contrasting **swap** only when the accent would clash with the glyph
+/// underneath:
+///
+/// * **Inked cell** (`has_ink`): use the `accent` as the block iff it contrasts
+///   (≥ [`SMART_CURSOR_MIN_CONTRAST`]) with BOTH the character's own color
+///   (`cell_fg`) and the cell background (`cell_bg`) — so the accent block is
+///   legible and the glyph redrawn over it can still reach contrast. The glyph
+///   then takes whichever of `{cell_bg, 0x000000, 0xFFFFFF}` has the highest
+///   `contrast_ratio` against the chosen block. Otherwise FALL BACK TO THE
+///   SWAP: block = `cell_fg`, glyph = `cell_bg` (the reverse-video pair — the
+///   9be7152 behavior — self-contrasting by construction, so it reads exactly
+///   as the cell's text does, inverted).
+/// * **Blank cell** (`!has_ink`): no glyph to reveal, so block = `accent` when
+///   it contrasts with `cell_bg`, else `cell_fg` (the caret never vanishes into
+///   the page). `glyph_color` is irrelevant; the swap glyph is returned for
+///   consistency.
+///
+/// Net effect: the cursor keeps its accent identity whenever the accent is
+/// readable in context — notably on EMPTY cells, the most common resting
+/// state — and degrades to the self-contrasting swap when the accent would
+/// clash with the character under it (e.g. a mid-salmon accent over the
+/// theme's light default foreground).
+pub fn smart_cursor_colors(cell_fg: u32, cell_bg: u32, accent: u32, has_ink: bool) -> (u32, u32) {
+    // The self-contrasting fallback: xterm/Alacritty reverse video.
+    let swap = (cell_fg, cell_bg);
+
+    if !has_ink {
+        // No glyph under the caret. Keep the accent when it reads against the
+        // page, else the cell foreground so the caret is always visible. The
+        // glyph value is unused by the caller — return the swap glyph.
+        let block = if contrast_ratio(accent, cell_bg) >= SMART_CURSOR_MIN_CONTRAST {
+            accent
+        } else {
+            cell_fg
+        };
+        return (block, swap.1);
+    }
+
+    // Inked cell: the accent is usable only if it stands out from BOTH the
+    // glyph and the cell background — else the redrawn glyph (or the block
+    // against its surroundings) would muddy.
+    if contrast_ratio(accent, cell_fg) >= SMART_CURSOR_MIN_CONTRAST
+        && contrast_ratio(accent, cell_bg) >= SMART_CURSOR_MIN_CONTRAST
+    {
+        let block = accent;
+        // Glyph = whichever candidate reads best over the accent block. The
+        // cell's own background wins when it can (a "punched hole"); pure
+        // black/white guarantee a legible floor for any accent.
+        let glyph = [cell_bg, 0x000000, 0xFFFFFF]
+            .into_iter()
+            .max_by(|&a, &b| {
+                contrast_ratio(a, block)
+                    .partial_cmp(&contrast_ratio(b, block))
+                    .expect("finite WCAG contrast ratios are always comparable")
+            })
+            .expect("candidate list is non-empty");
+        (block, glyph)
+    } else {
+        swap
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +242,74 @@ mod tests {
             resolve_color(Color::Named(NamedColor::Background), &theme, false),
             theme.background.to_u32()
         );
+    }
+
+    #[test]
+    fn contrast_ratio_black_white_is_21() {
+        assert!((contrast_ratio(0x000000, 0xffffff) - 21.0).abs() < 1e-3);
+        // Order-independent, and identical colors have ratio 1.0.
+        assert!((contrast_ratio(0xffffff, 0x000000) - 21.0).abs() < 1e-3);
+        assert!((contrast_ratio(0x123456, 0x123456) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn relative_luminance_is_monotonic() {
+        assert!((relative_luminance(0x000000) - 0.0).abs() < 1e-6);
+        assert!((relative_luminance(0xffffff) - 1.0).abs() < 1e-6);
+        let mid = relative_luminance(0x808080);
+        assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn smart_cursor_salmon_over_light_fg_falls_back_to_swap() {
+        // The user's reported case: a mid-salmon accent over the theme's light
+        // default foreground on the dark page. contrast(salmon, fg) ≈ 1.97 < 3.0,
+        // so the accent clashes with the character — fall back to the swap.
+        let (block, glyph) = smart_cursor_colors(0xd8d8d8, 0x090705, 0xe08070, true);
+        assert_eq!(block, 0xd8d8d8); // block == cell_fg (the swap)
+        assert_eq!(glyph, 0x090705); // glyph == cell_bg (self-contrasting)
+    }
+
+    #[test]
+    fn smart_cursor_salmon_blank_cell_keeps_accent() {
+        // Blank cell on the dark page: contrast(salmon, bg) ≈ 7.17 ≥ 3.0, so the
+        // caret keeps its accent identity at rest.
+        let accent = 0xe08070;
+        let (block, glyph) = smart_cursor_colors(0xd8d8d8, 0x090705, accent, false);
+        assert_eq!(block, accent);
+        // Accent branch taken — the returned glyph must clear the threshold too.
+        assert!(contrast_ratio(glyph, block) >= SMART_CURSOR_MIN_CONTRAST);
+    }
+
+    #[test]
+    fn smart_cursor_dark_blue_over_light_fg_on_dark_bg() {
+        // Honest math: contrast(blue, fg=0xd8d8d8) ≈ 7.40 ≥ 3.0 PASSES, but
+        // contrast(blue, bg=0x090705) ≈ 1.91 < 3.0 FAILS — the accent must clear
+        // BOTH, so this falls back to the swap (the accent would vanish into the
+        // dark page around the block).
+        let (block, glyph) = smart_cursor_colors(0xd8d8d8, 0x090705, 0x2030a0, true);
+        assert_eq!(block, 0xd8d8d8); // swap: block == cell_fg
+        assert_eq!(glyph, 0x090705); // swap: glyph == cell_bg
+    }
+
+    #[test]
+    fn smart_cursor_inked_accent_branch_picks_max_contrast_glyph() {
+        // Dark-blue accent that DOES clear both: over a light glyph on a white
+        // cell bg. contrast(blue, fg) ≈ 7.40 and contrast(blue, white) ≈ 10.54,
+        // both ≥ 3.0 → accent block. The glyph is the max-contrast candidate.
+        let accent = 0x2030a0;
+        let (block, glyph) = smart_cursor_colors(0xd8d8d8, 0xffffff, accent, true);
+        assert_eq!(block, accent);
+        // white (or cell_bg == white) beats black over the dark-blue block.
+        assert!(contrast_ratio(glyph, block) >= SMART_CURSOR_MIN_CONTRAST);
+    }
+
+    #[test]
+    fn smart_cursor_blank_accent_near_bg_uses_fg() {
+        // Accent ≈ cell background (identical here): contrast(accent, bg) == 1.0
+        // < 3.0, so the blank caret uses the cell foreground and never vanishes
+        // into the page.
+        let (block, _glyph) = smart_cursor_colors(0xd8d8d8, 0x090705, 0x090705, false);
+        assert_eq!(block, 0xd8d8d8); // block == cell_fg
     }
 }
