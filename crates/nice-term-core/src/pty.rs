@@ -313,7 +313,16 @@ impl PtyProcess {
                 // fork-failure arm's cleanup: kill the group and reap the
                 // child synchronously before surfacing the error. The master
                 // `OwnedFd` closes on return.
-                unsafe { libc::killpg(pid, libc::SIGKILL) };
+                //
+                // Signal the pid directly as well as the group: this races the
+                // child's `setsid` (via `login_tty`), and until that runs no
+                // process group `pid` exists — `killpg` alone fails ESRCH, the
+                // SIGKILL is lost, and the `waitpid` below blocks forever on a
+                // live child. `kill(pid)` reaches the child in either ordering.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::killpg(pid, libc::SIGKILL);
+                }
                 let mut status: libc::c_int = 0;
                 while unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
                     if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
