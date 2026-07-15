@@ -308,7 +308,7 @@
   .window[data-tabs="underline"] .tab.active::after {
     content: "";
     position: absolute; left: 11px; right: 11px; bottom: 0;
-    height: 1.5px; border-radius: 1px;
+    height: 1px; border-radius: 0.5px;
     background: var(--accent);
   }
 
@@ -325,7 +325,7 @@
   body[data-afford="underline"] .window[data-tabs="underline"] .tab:not(.active)::after {
     content: "";
     position: absolute; left: 11px; right: 11px; bottom: 0;
-    height: 1.5px; border-radius: 1px;
+    height: 1px; border-radius: 0.5px;
     background: var(--tab-underline-idle);
   }
   body[data-afford="divider"] .window[data-tabs="underline"] .tab + .tab::before {
@@ -554,7 +554,7 @@
     <h2>Text + accent underline</h2>
     <p class="style-note">
       Tab titles are plain text — inactive tabs in tertiary ink, the active tab in full
-      ink with a 1.5px Terracotta underline seated on the bar's bottom edge. A truncated
+      ink with a 1px Terracotta underline seated on the bar's bottom edge. A truncated
       title reads as text, not a cramped box. The ✕ is shown on the active tab the way
       it would appear on hover.
     </p>
