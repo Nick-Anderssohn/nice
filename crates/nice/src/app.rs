@@ -858,115 +858,31 @@ fn restyle_prior_presence() -> bool {
     settings.exists() || sessions.exists() || variant_dir.exists()
 }
 
-/// Restyle 3/3: the SYNCHRONOUS half of the one-time defaults-flip migration —
-/// gate on the persisted `restyle_popup_shown` flag (absent ⇒ first time), then for
-/// an EXISTING user pin their pre-flip look into explicit keys (appearance +
-/// line-height) so the defaults-flip does not silently restyle a user riding the
-/// old defaults and declining the popup changes nothing. Runs INLINE in [`run`]
-/// before the restore fan-out so restored windows paint the pinned look from birth
-/// (no new-look flash + grid reflow). A genuine fresh install is already on the new
-/// defaults, so it only records the flag and shows nothing. Returns `true` when the
-/// deferred popup should still be presented (existing user, first time); `false`
-/// otherwise — including when the theme store is absent (`run_selftest`).
-#[must_use]
-fn run_restyle_pinning(cx: &mut App, existing_user: bool) -> bool {
-    match cx
+/// Restyle plan 06: the one-time defaults-flip THEME migration for an EXISTING
+/// user — pin their pre-flip THEME look (palette / accent / OS-sync) into explicit
+/// keys so the flipped fresh-install theme defaults do not silently restyle a user
+/// riding the old palette. The NEW comfort defaults (opacity / blur / line-height)
+/// are INTENTIONALLY not pinned: an existing user's absent comfort keys resolve to
+/// the shipped 80/90 · 30 · 1.3 defaults exactly like a fresh install (Nick's
+/// decision — everyone gets the new transparent/blurred look). Runs INLINE in
+/// [`run`] before the restore fan-out so restored windows paint the pinned theme
+/// from birth (no palette flash). Idempotent on a later launch: once pinned the
+/// theme keys are explicit, so pin-then-commit finds nothing changed and no-ops —
+/// no persisted flag needed. A genuine fresh install is already on the new defaults
+/// and is skipped. No-op when the theme store is absent (`run_selftest`).
+fn run_restyle_pinning(cx: &mut App, existing_user: bool) {
+    if cx
         .try_global::<crate::theme_settings::ThemeSettingsStore>()
-        .map(|s| s.restyle_popup_shown())
+        .is_none()
     {
-        None => return false,       // no theme store — the hermetic `run_selftest` path
-        Some(true) => return false, // already shown once — never again
-        Some(false) => {}
+        return; // no theme store — the hermetic `run_selftest` path
     }
     if !existing_user {
-        // Fresh install: already on the new defaults. Mark the flag so the popup
-        // never appears on a later launch (once prior presence exists on disk).
-        crate::theme_settings::apply_restyle_popup_shown(cx, true);
-        return false;
+        return; // fresh install: already on the new defaults, nothing to pin
     }
-    // Pin the existing user's pre-flip look (so restored windows show their old look
-    // from the first frame and "Keep my setup" is a true no-op). The popup itself is
-    // deferred by the caller until after the restore fan-out (it must host on an open
-    // window). Idempotent on a later launch: the keys are already present, so
-    // pin-then-commit finds nothing changed and no-ops.
+    // Pin the existing user's pre-flip THEME (palette/accent/sync); their absent
+    // comfort keys (opacity/blur/line-height) keep resolving to the new defaults.
     crate::theme_settings::pin_legacy_appearance(cx);
-    pin_legacy_line_height(cx);
-    true
-}
-
-/// Restyle 3/3: pin the LEGACY `1.0` terminal line-height for an existing user who
-/// never set one (the key is absent), so the flipped `1.3` default does not change
-/// their grid. A user who explicitly set a line-height keeps it. Applies live
-/// through the shared `FontSettings` + persists (the Font pane's live-apply path).
-fn pin_legacy_line_height(cx: &mut App) {
-    let absent = cx
-        .try_global::<crate::settings::prefs_store::SettingsPrefsStore>()
-        .is_some_and(|s| s.terminal_line_height().is_none());
-    if absent {
-        crate::settings::font_pane::apply_terminal_line_height(cx, 1.0);
-    }
-}
-
-/// Restyle 3/3: present the one-time "try the new look" popup on the boot window
-/// (the existing confirmation-modal pattern). "Try the new look" writes the new
-/// defaults for every appearance axis EXCEPT terminal font family/size (Nick's
-/// carve-out) and sets line-height to 1.3; "Keep my setup" changes nothing beyond
-/// the pinning already done. Either answer sets `restyle_popup_shown`, so the popup
-/// never reappears.
-///
-/// Hosts through [`resolve_modal_host`] (the ⌘Q resolver), NOT a bare
-/// `cx.active_window()`: this runs `cx.defer`-ed at the tail of boot, and on a cold
-/// Finder/Dock launch the just-restored window has not become the OS key window
-/// yet, so `cx.active_window()` is `None` and a naive early-return would silently
-/// drop the popup (the observed failure). The registry MRU fallback resolves +
-/// activates the restored window regardless.
-///
-/// SKIPS (leaving `restyle_popup_shown` UNSET) when the resolved host already shows
-/// a modal — on a launch where the first-launch handoff prompt was also deferred
-/// (just before this) and resolved to the SAME window, its modal is already up.
-/// `present_confirmation` REPLACES `pending_modal` unconditionally without emitting
-/// the previous modal's `DismissEvent` or running its completion, so presenting here
-/// would drop the handoff prompt (its `handoffSkillPromptSeen` flag never written,
-/// never seen that launch). Skipping instead re-offers the restyle popup on the next
-/// launch — by then the pinning is idempotent and the handoff prompt has been
-/// answered — so both prompts get shown, just on consecutive launches.
-fn present_restyle_popup(cx: &mut App) {
-    let Some((win, state)) = resolve_modal_host(cx) else {
-        return;
-    };
-    // Do not clobber a modal already hosted on this window (see the doc above).
-    if state.read(cx).pending_modal().is_some() {
-        return;
-    }
-    let result = win.update(cx, |_root, window, app| {
-        state.update(app, |ws, wcx| {
-            ws.present_confirmation(
-                "Nice has a new default look",
-                "Nice has a new default look — transparent, blurred, and restyled. Try it?",
-                "Try the new look",
-                "Keep my setup",
-                false,
-                move |confirmed, _window, app| {
-                    if confirmed {
-                        // Yes: the new defaults for every appearance axis (terminal
-                        // font family/size untouched), line-height to the shipped 1.3.
-                        crate::theme_settings::apply_restyle_new_look(app);
-                        crate::settings::font_pane::apply_terminal_line_height(
-                            app,
-                            nice_term_view::DEFAULT_TERMINAL_LINE_HEIGHT,
-                        );
-                    }
-                    // Both answers mark the popup seen so it never reappears.
-                    crate::theme_settings::apply_restyle_popup_shown(app, true);
-                },
-                window,
-                wcx,
-            );
-        });
-    });
-    if let Err(e) = result {
-        eprintln!("nice: present_restyle_popup could not present the restyle popup: {e:#}");
-    }
 }
 
 /// The confirmed-quit cascade (Swift's ordered terminate path). Order is
@@ -1226,8 +1142,8 @@ pub fn run() {
         // loads + the terminal-themes dir create (further down) materialize these
         // paths. This slot — after the rename, before the import — is the only correct
         // one. Belt-and-braces: a prior settings file OR the session store OR the
-        // per-variant Application Support folder. Consumed by the restyle pinning
-        // below (synchronous, pre-fan-out) + the deferred one-time popup.
+        // per-variant Application Support folder. Consumed by the restyle theme
+        // pinning below (synchronous, pre-fan-out).
         let restyle_existing_user = restyle_prior_presence();
         crate::settings_import::import_prod_settings_on_first_launch();
         // R23: load the `fonts` + `advanced` sections of `ui_settings.json` into the
@@ -1361,19 +1277,17 @@ pub fn run() {
         // inside). Replaces the removed fixed-triple write above; app::run ONLY
         // (never `run_selftest`, which mints no `SharedThemeState` and no gate).
         crate::theme_settings::claude_sync_if_gated(cx);
-        // Restyle 3/3: pin an existing user's pre-flip look SYNCHRONOUSLY now —
+        // Restyle plan 06: pin an existing user's pre-flip THEME SYNCHRONOUSLY now —
         // BEFORE the restore fan-out opens any window — so restored windows paint the
-        // pinned legacy appearance + line-height from their FIRST frame instead of
-        // flashing the flipped new look (translucent/blurred/Nice/Terracotta/1.3) and
-        // then visibly snapping back (a whole-window restyle + a grid reflow). Both
-        // globals the pinning writes are live by now: the `ThemeSettingsStore`
-        // (install_live_theme, just above) and the shared `FontSettings`
-        // (install_shortcuts, earlier). A genuine fresh install only records the flag
-        // here; an existing user is pinned and the returned bool defers the one-time
-        // popup until after the fan-out (it must host on an open window). Gated inside
-        // on the persisted `restyle_popup_shown`; `run`-only — `run_selftest` mints no
-        // theme store, so it is a no-op returning `false` (hermeticity).
-        let restyle_show_popup = run_restyle_pinning(cx, restyle_existing_user);
+        // pinned legacy palette/accent from their FIRST frame instead of flashing the
+        // flipped new theme (Nice/Terracotta) and then visibly snapping back. The
+        // `ThemeSettingsStore` the pinning writes is live by now (install_live_theme,
+        // just above). The NEW comfort defaults (opacity/blur/line-height) are NOT
+        // pinned — an existing user gains the transparent/blurred look like a fresh
+        // install. A genuine fresh install is already on the new defaults and is
+        // skipped; `run`-only — `run_selftest` mints no theme store, so this no-ops
+        // (hermeticity).
+        run_restyle_pinning(cx, restyle_existing_user);
         // R20 (F5–F7): the process-wide file-operation history (over the shipped
         // objc2 `ProductionTrasher` → real Trash) as a gpui `Entity` in a Global —
         // ⌘Z/⌘⇧Z and the browser menu handlers drive it, per-window drift banners
@@ -1424,18 +1338,6 @@ pub fn run() {
             && !crate::platform::read_bool_pref("handoffSkillPromptSeen", false)
         {
             cx.defer(|cx| present_handoff_prompt(cx));
-        }
-        // Restyle 3/3: the one-time "try the new look" popup, offered once to an
-        // existing user (the pre-flip pinning already ran synchronously above; fresh
-        // installs are already on the new defaults and set no popup). Deferred like
-        // the handoff prompt so the just-opened active window hosts the modal. It runs
-        // AFTER the handoff defer (FIFO), and `present_restyle_popup` SKIPS — leaving
-        // `restyle_popup_shown` unset so the popup re-offers next launch — when the
-        // resolved host already shows the handoff modal, because `present_confirmation`
-        // would otherwise REPLACE that modal without running its completion (the
-        // handoff flag would never be written and the user would never see it).
-        if restyle_show_popup {
-            cx.defer(|cx| present_restyle_popup(cx));
         }
     });
 }

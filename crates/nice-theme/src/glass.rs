@@ -42,6 +42,20 @@ pub fn glass_fill(scheme: ColorScheme) -> Srgba {
     }
 }
 
+/// The stronger over-glass control-track fill for `scheme` — the flat-control
+/// track behind a toggle switch / slider (round-2 restyle plan 6's flat
+/// settings controls). A companion to [`glass_line`]/[`glass_fill`] in the same
+/// over-glass family (scheme-scoped white/ink alpha, not a palette slot), one
+/// step stronger than [`glass_fill`] so an unfilled track still reads on the
+/// translucent surface. Cites `docs/design/restyle-mocks.html`'s `--fill-x`:
+/// `rgba(255,255,255,.08)` (dark) / `rgba(23,19,15,.08)` (light).
+pub fn glass_fill_x(scheme: ColorScheme) -> Srgba {
+    match scheme {
+        ColorScheme::Dark => Srgba::new(1.0, 1.0, 1.0, 0.08),
+        ColorScheme::Light => Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.08),
+    }
+}
+
 /// The idle (inactive) tab-underline color for `scheme` — the grey underline
 /// every inactive tab wears so it reads as clickable (round-2 restyle plan 4's
 /// "Inactive-tab underline" decision; grammar: underline = tab, color = state).
@@ -72,6 +86,17 @@ mod tests {
         assert_eq!(
             glass_line(ColorScheme::Light),
             Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.10)
+        );
+    }
+
+    #[test]
+    fn glass_fill_x_matches_the_mock_fill_x() {
+        // docs/design/restyle-mocks.html: --fill-x: rgba(255,255,255,.08) (dark).
+        assert_eq!(glass_fill_x(ColorScheme::Dark), Srgba::new(1.0, 1.0, 1.0, 0.08));
+        // docs/design/restyle-mocks.html: --fill-x: rgba(23,19,15,.08) (light).
+        assert_eq!(
+            glass_fill_x(ColorScheme::Light),
+            Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.08)
         );
     }
 

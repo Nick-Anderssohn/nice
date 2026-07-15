@@ -94,8 +94,14 @@ use crate::window_state::WindowState;
 
 // ---- Geometry / behaviour constants (Swift provenance) ----------------------
 
-/// Toolbar trailing inset (`WindowToolbarView.swift:57`).
-const TOOLBAR_TRAILING_PAD: f32 = 20.0;
+/// Toolbar trailing inset — the mock's `.bar-tail { padding: 0 10px }`
+/// (`docs/design/restyle-mocks.html`), so the `+` button's right edge sits
+/// 10pt off the window corner like the mock. Was 20 (the Swift-era
+/// `WindowToolbarView.swift:57` inset, sized for the retired 52pt bar), which
+/// left the `+` visibly adrift of the corner — the round-2 feel-check's
+/// "plus not aligned like the mock" finding: the offset was HORIZONTAL, not
+/// vertical (the glyph's ink center measures level with the title text).
+pub(crate) const TOOLBAR_TRAILING_PAD: f32 = 10.0;
 
 /// Tab box: full-height (the bar), so the active-tab underline seats on the bar's
 /// bottom edge (`docs/design/restyle-mocks.html`, `.tabs { height: 100% }`; plan
@@ -166,18 +172,18 @@ const CLOSE_BTN_RADIUS: f32 = 4.0;
 const CLOSE_GLYPH_SIZE: f32 = 9.0;
 
 /// The overflow chevron / new-tab button box (`WindowToolbarView.swift:1048,1137`).
-const SQUARE_BTN_SIZE: f32 = 22.0;
+pub(crate) const SQUARE_BTN_SIZE: f32 = 22.0;
 const SQUARE_BTN_RADIUS: f32 = 5.0;
 const CHEVRON_GLYPH_SIZE: f32 = 10.0;
 const PLUS_GLYPH_SIZE: f32 = 11.0;
 /// The chevron / new-tab leading pad inside their slot (`.padding(.leading, 4)`,
 /// `WindowToolbarView.swift:238,245`).
-const SQUARE_BTN_LEADING_PAD: f32 = 4.0;
+pub(crate) const SQUARE_BTN_LEADING_PAD: f32 = 4.0;
 /// Width of the chevron slot and the `+` slot — each **always** reserved in the
 /// tracked scroll layout so the pill viewport is a fixed width and the overflow
 /// decision never depends on the chevron's own visibility (the reservation rule,
 /// `PaneStripOverflowEstimator.swift:59-65`: 22 button + 4 lead + 2 gap ≈ 28).
-const SQUARE_SLOT_WIDTH: f32 = SQUARE_BTN_LEADING_PAD + SQUARE_BTN_SIZE + PILL_ROW_GAP;
+pub(crate) const SQUARE_SLOT_WIDTH: f32 = SQUARE_BTN_LEADING_PAD + SQUARE_BTN_SIZE + PILL_ROW_GAP;
 
 /// The chevron's 6pt attention badge (`WindowToolbarView.swift:1061`).
 const ATTENTION_BADGE_SIZE: f32 = 6.0;
@@ -1702,6 +1708,8 @@ impl WindowToolbarView {
     /// `items_center` centers that box in the full-height bar — so NO optical
     /// nudge is applied (one would de-center it, and the plan forbids a magic
     /// offset absent a genuine metric need). Same construction for the chevron.
+    /// The drift the feel-check actually saw was HORIZONTAL — see
+    /// [`TOOLBAR_TRAILING_PAD`] (20 → the mock's 10).
     fn render_new_tab_slot(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = ink_alpha(s, SQUARE_BTN_HOVER_INK_ALPHA);
         // 11pt semibold `plus`, ink2 (`WindowToolbarView.swift:1134-1136`).

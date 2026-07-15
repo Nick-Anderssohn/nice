@@ -85,10 +85,15 @@ const REORDER_BEFORE_MARGIN: f64 = 15.0;
 /// chevron shows (comfortably past the ~780pt viewport with ~130pt pills).
 const OVERFLOW_ADDS: usize = 8;
 /// The chevron button's centre, measured from the window's trailing edge:
-/// trailing pad (20) + the `+` slot (28) + the chevron slot's leading pad (4) +
-/// half the 22pt button = 20 + 28 + 28 − 4 − 11 → `vw − 61`
-/// (`toolbar.rs` `TOOLBAR_TRAILING_PAD` / `SQUARE_SLOT_WIDTH`).
-const CHEVRON_FROM_RIGHT: f64 = 61.0;
+/// trailing pad + the `+` slot + the chevron slot minus its leading pad and
+/// half the button (currently 10 + 28 + 28 − 4 − 11 → `vw − 51`). DERIVED from
+/// the `toolbar.rs` constants so a pad/slot change cannot silently walk the
+/// scenario's click off the button (the 20→10 trailing-pad fix did exactly
+/// that to the old hard-coded 61).
+const CHEVRON_FROM_RIGHT: f64 = (crate::toolbar::TOOLBAR_TRAILING_PAD
+    + 2.0 * crate::toolbar::SQUARE_SLOT_WIDTH
+    - crate::toolbar::SQUARE_BTN_LEADING_PAD
+    - crate::toolbar::SQUARE_BTN_SIZE / 2.0) as f64;
 
 /// Accessibility-grant remediation, shared verbatim with the other CGEvent
 /// scenarios.
@@ -661,7 +666,8 @@ fn pick_empty_band_x(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, vw: f6
         let off = v.scenario_scroll_offset_x();
         Some((f32::from(b.origin.x) + off + f32::from(b.size.width)) as f64)
     });
-    // Keep clear of the trailing pad + chevron + `+` cluster (~90pt).
+    // Keep clear of the trailing pad + chevron + `+` cluster (~66pt since the
+    // trailing pad went 20→10; 90 keeps the old, more conservative margin).
     let trailing_limit = vw - 90.0;
     match last_right {
         Some(r) if r + 30.0 < trailing_limit => r + 30.0,

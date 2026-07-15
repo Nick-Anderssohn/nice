@@ -35,23 +35,22 @@ use gpui::{
 use crate::context_menu::ContextMenuItem;
 use crate::settings::root::SettingsRootView;
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
-use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::theme::{slot_to_rgba, srgba_to_rgba};
 use crate::theme_settings;
 
 // -- toggle switch ------------------------------------------------------------
 
-/// Switch geometry (the macOS NSSwitch look: a 38×22 track, an 18pt thumb).
-const SWITCH_TRACK_WIDTH: f32 = 38.0;
-const SWITCH_TRACK_HEIGHT: f32 = 22.0;
-const SWITCH_THUMB_SIZE: f32 = 18.0;
-/// The off-state track: `ink` at this alpha (reads gray on both schemes).
-const SWITCH_OFF_TRACK_INK_ALPHA: f32 = 0.18;
+/// Switch geometry — the mock's flat toggle (`docs/design/restyle-mocks.html`
+/// `.toggle`: a 32×18 track, radius 9, a 14pt thumb inset 2px).
+const SWITCH_TRACK_WIDTH: f32 = 32.0;
+const SWITCH_TRACK_HEIGHT: f32 = 18.0;
+const SWITCH_THUMB_SIZE: f32 = 14.0;
 
-/// A macOS-style track+thumb toggle switch: accent track with the thumb right
-/// when `on`, dimmed-ink track with the thumb left when off. Carries the caller's
-/// a11y `id` + a Switch role + an "On"/"Off" aria label (the old pill's labels);
-/// the click runs `on_click` on `&mut App` — the call site keeps its exact
-/// mutator wiring.
+/// A flat track+thumb toggle switch (restyle plan 6): accent track with a white
+/// thumb right when `on`, an over-glass `--fill-x` track with an `ink3` thumb
+/// left when off (the mock's `.toggle` / `.toggle.on`). Carries the caller's
+/// a11y `id` + a Switch role + an "On"/"Off" aria label; the click runs
+/// `on_click` on `&mut App` — the call site keeps its exact mutator wiring.
 pub(crate) fn toggle_switch(
     id: impl Into<SharedString>,
     on: bool,
@@ -60,10 +59,16 @@ pub(crate) fn toggle_switch(
 ) -> impl IntoElement {
     let accent = srgba_to_rgba(theme_settings::active_chrome_accent(cx));
     let slots = theme_settings::active_chrome_slots(cx);
-    let off_track = srgba_to_rgba(srgba_with_alpha(
-        crate::theme::slot_srgba(slots.ink),
-        SWITCH_OFF_TRACK_INK_ALPHA,
-    ));
+    let scheme = theme_settings::active_chrome_scheme(cx);
+    // Flat off-track: the over-glass `--fill-x` value (reads on the translucent
+    // surface without an opaque fill), not a palette slot.
+    let off_track = srgba_to_rgba(nice_theme::glass::glass_fill_x(scheme));
+    // The thumb: white when on (accent track), the dimmed `ink3` slot when off.
+    let thumb = if on {
+        gpui::rgb(0xff_ff_ff)
+    } else {
+        slot_to_rgba(slots.ink3)
+    };
     div()
         .id(id.into())
         .role(gpui::Role::Switch)
@@ -79,12 +84,10 @@ pub(crate) fn toggle_switch(
         .when(!on, |d| d.bg(off_track).justify_start())
         .cursor_pointer()
         .child(
-            // The thumb — white in both schemes (the NSSwitch knob).
             div()
                 .size(px(SWITCH_THUMB_SIZE))
                 .rounded(px(SWITCH_THUMB_SIZE / 2.0))
-                .bg(gpui::white())
-                .shadow_sm(),
+                .bg(thumb),
         )
         .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
             on_click(cx);

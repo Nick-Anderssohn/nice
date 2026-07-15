@@ -139,10 +139,6 @@ pub struct Appearance {
     /// Background-blur radius in px (0–60) applied when the window is translucent
     /// and `scheme == Dark`.
     pub blur_radius_dark: u16,
-    /// The one-time restyle-popup flag (plan 3 migration). Set once the popup has
-    /// been shown; this slice only persists/round-trips it — slice 5 owns the
-    /// migration + popup logic that reads and writes it.
-    pub restyle_popup_shown: bool,
 }
 
 impl Default for Appearance {
@@ -165,7 +161,6 @@ impl Default for Appearance {
             window_opacity_dark: DEFAULT_WINDOW_OPACITY_DARK_PCT,
             blur_radius_light: DEFAULT_BLUR_RADIUS,
             blur_radius_dark: DEFAULT_BLUR_RADIUS,
-            restyle_popup_shown: false,
         }
     }
 }
@@ -302,9 +297,11 @@ fn scheme_raw(scheme: ColorScheme) -> &'static str {
 /// The on-disk `"appearance"` section shape. Every field is optional so a
 /// missing / unknown field falls through to the [`Appearance`] default (tolerant
 /// decode). Serialized with the current selection; decoded permissively. The
-/// legacy `chrome_light_palette` / `chrome_dark_palette` keys (round-1) are NOT
+/// legacy `chrome_light_palette` / `chrome_dark_palette` keys (round-1) and the
+/// legacy `restyle_popup_shown` key (round-2 plan 06 removed the popup) are NOT
 /// fields here, so serde ignores them on read and never writes them — the
-/// round-2 merge folded the chrome selection into the terminal theme.
+/// round-2 merge folded the chrome selection into the terminal theme, and the
+/// one-time popup is gone.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AppearanceSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,8 +322,6 @@ struct AppearanceSection {
     blur_radius_light: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blur_radius_dark: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    restyle_popup_shown: Option<bool>,
 }
 
 /// Just the `appearance` key of the shared doc, for tolerant decode. Other
@@ -351,7 +346,6 @@ impl AppearanceSection {
             window_opacity_dark: Some(a.window_opacity_dark),
             blur_radius_light: Some(a.blur_radius_light),
             blur_radius_dark: Some(a.blur_radius_dark),
-            restyle_popup_shown: Some(a.restyle_popup_shown),
         }
     }
 
@@ -402,50 +396,51 @@ impl AppearanceSection {
                 .blur_radius_dark
                 .map(clamp_blur_radius)
                 .unwrap_or(d.blur_radius_dark),
-            restyle_popup_shown: self.restyle_popup_shown.unwrap_or(d.restyle_popup_shown),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Restyle plan 3 — existing-user migration (the one-time popup's pinning step).
-// The defaults-flip above changes what an ABSENT key resolves to, so an existing
-// user riding the old defaults would be silently restyled. Before offering the
-// new look we materialize their pre-flip look into explicit keys, writing the
-// LEGACY defaults as LITERAL values wherever a key is absent — NEVER derived from
-// `Appearance::default()` or the `DEFAULT_TERMINAL_THEME_*` constants (this plan
-// flipped those). Keys the user explicitly set are left untouched.
+// Restyle plan 06 — existing-user THEME migration (no popup). The defaults-flip
+// above changed what an ABSENT key resolves to for both the THEME axes (palette /
+// accent / OS-sync) AND the comfort axes (opacity / blur). Round-2 plan 06 keeps
+// an existing user's THEME (pin the pre-flip palette/accent/sync literals into
+// explicit keys wherever absent) but INTENTIONALLY lets the comfort axes ride the
+// NEW shipped defaults — so an existing user keeps their Catppuccin/Ocean look yet
+// gains the transparent/blurred comfort defaults just like a fresh install. The
+// theme pins are LITERAL values, NEVER derived from the (flipped) `DEFAULT_*`
+// constants; keys the user explicitly set are left untouched.
 // ---------------------------------------------------------------------------
 
-/// The LEGACY (pre-restyle-flip) appearance defaults, as LITERAL values. These are
-/// the exact fresh-install values BEFORE this plan flipped them, so pinning an
-/// absent key to one of these reproduces an existing user's pre-flip look. Kept
-/// separate from [`Appearance::default`] on purpose: that function now returns the
-/// NEW defaults, so deriving the pins from it would restyle the very users this
-/// step protects. `scheme` is NOT pinned from here — the caller preserves the live
+/// The migration defaults an existing user's ABSENT appearance keys resolve to:
+/// the LEGACY (pre-flip) THEME literals — Catppuccin palette, Ocean accent, OS-sync
+/// on — layered OVER the NEW comfort defaults from [`Appearance::default`]
+/// (opacity 90/80, blur 30/30). Pinning an absent key to one of these keeps the
+/// user's pre-flip THEME look while adopting the shipped transparent/blurred
+/// comfort defaults. The theme literals are kept separate from
+/// [`Appearance::default`] on purpose: that function now returns the flipped NEW
+/// theme, so deriving the theme pins from it would restyle the very users this step
+/// protects. `scheme` is NOT pinned from here — the caller preserves the live
 /// OS-reconciled scheme (the flip does not change the scheme axis).
 fn legacy_appearance_defaults() -> Appearance {
     Appearance {
-        scheme: ColorScheme::Dark,
-        sync_with_os: true,
         accent: AccentPreset::Ocean,
         terminal_theme_light_id: "catppuccin-latte".to_string(),
         terminal_theme_dark_id: "catppuccin-mocha".to_string(),
-        window_opacity_light: 100,
-        window_opacity_dark: 100,
-        blur_radius_light: 0,
-        blur_radius_dark: 0,
-        restyle_popup_shown: false,
+        // Comfort axes (opacity/blur) and scheme/sync come from the NEW defaults —
+        // an absent comfort key resolves to the shipped transparent/blurred look,
+        // NOT the pre-flip opaque one (plan 06: everyone gets the new comfort look).
+        ..Appearance::default()
     }
 }
 
-/// Materialize an existing user's ABSENT appearance keys as the LEGACY (pre-flip)
-/// literal defaults, leaving explicitly-set keys untouched, so declining the
-/// restyle popup changes nothing. Reads the RAW `appearance` section (absent-ness
-/// survives — the loaded store already filled absents with the NEW defaults, so it
-/// can't be used here). `current_scheme` fills an absent `scheme` (the flip does
-/// not touch the scheme axis, so the live OS-reconciled scheme is preserved rather
-/// than pinned to a stale literal).
+/// Materialize an existing user's ABSENT THEME keys as the LEGACY (pre-flip)
+/// literals while their absent comfort keys adopt the NEW defaults (via
+/// [`legacy_appearance_defaults`]), leaving explicitly-set keys untouched. Reads
+/// the RAW `appearance` section (absent-ness survives — the loaded store already
+/// filled absents with the NEW defaults, so it can't be used here). `current_scheme`
+/// fills an absent `scheme` (the flip does not touch the scheme axis, so the live
+/// OS-reconciled scheme is preserved rather than pinned to a stale literal).
 fn legacy_pinned_appearance(bytes: &[u8], current_scheme: ColorScheme) -> Appearance {
     let mut defaults = legacy_appearance_defaults();
     defaults.scheme = current_scheme;
@@ -538,11 +533,6 @@ impl ThemeSettingsStore {
     /// The [`WindowBackgroundAppearance`] to paint for the active scheme.
     pub fn active_window_appearance(&self) -> WindowBackgroundAppearance {
         self.appearance.active_window_appearance()
-    }
-
-    /// The one-time restyle-popup flag (slice 5 reads/writes it; stored here).
-    pub fn restyle_popup_shown(&self) -> bool {
-        self.appearance.restyle_popup_shown
     }
 
     /// Replace the selection and persist the `appearance` section through the
@@ -960,25 +950,15 @@ pub fn apply_blur_radius(cx: &mut App, scheme: ColorScheme, radius: u16) {
     commit_appearance(cx, appearance);
 }
 
-/// Persist the one-time restyle-popup flag (slice 5's migration owns the WHEN;
-/// this slice owns the stored key + the setter). Routes through the shared commit
-/// so it round-trips like any other appearance key; the redundant fan-out it
-/// triggers is a cheap repaint with no visual change.
-pub fn apply_restyle_popup_shown(cx: &mut App, shown: bool) {
-    let Some(mut appearance) = current_appearance(cx) else {
-        return;
-    };
-    appearance.restyle_popup_shown = shown;
-    commit_appearance(cx, appearance);
-}
-
-/// Pin an existing user's pre-flip appearance look into explicit keys (restyle
-/// plan 3 migration step 1). Reads the store's on-disk `appearance` section RAW,
-/// materializes every ABSENT key to the LEGACY literal default (via
-/// [`legacy_pinned_appearance`]), and commits it — so the defaults-flip does not
-/// silently restyle a user riding the old defaults, and declining the popup
-/// changes nothing. Keys the user explicitly set survive untouched; the live
-/// OS-reconciled scheme is preserved. No-op when the store Global is absent.
+/// Pin an existing user's pre-flip THEME look into explicit keys (restyle plan 06
+/// migration). Reads the store's on-disk `appearance` section RAW, materializes
+/// every ABSENT THEME key (palette/accent/sync) to the LEGACY literal while absent
+/// comfort keys (opacity/blur) adopt the NEW defaults (via
+/// [`legacy_pinned_appearance`]), and commits it — so the theme defaults-flip does
+/// not silently restyle a user riding the old palette, while everyone still gains
+/// the new transparent/blurred comfort look. Keys the user explicitly set survive
+/// untouched; the live OS-reconciled scheme is preserved. No-op when the store
+/// Global is absent.
 pub fn pin_legacy_appearance(cx: &mut App) {
     let Some(store) = cx.try_global::<ThemeSettingsStore>() else {
         return;
@@ -989,35 +969,6 @@ pub fn pin_legacy_appearance(cx: &mut App) {
     let bytes = std::fs::read(store.path()).unwrap_or_default();
     let pinned = legacy_pinned_appearance(&bytes, current_scheme);
     commit_appearance(cx, pinned);
-}
-
-/// Apply the restyle NEW-look defaults to every appearance axis (restyle plan 3
-/// migration, the popup's "Try the new look" answer): Terracotta accent, the
-/// nice-default terminal themes (which now drive the chrome too), the 80/90
-/// opacity + 30px blur slider defaults, and OS-sync ON (reconciling the scheme
-/// to the OS now).
-/// Terminal FONT family/size and terminal LINE-HEIGHT live in the prefs store —
-/// the caller sets line-height to 1.3 and never touches font family/size (Nick's
-/// carve-out). No-op when the store Global is absent.
-pub fn apply_restyle_new_look(cx: &mut App) {
-    let Some(mut appearance) = current_appearance(cx) else {
-        return;
-    };
-    let nu = Appearance::default();
-    appearance.accent = nu.accent;
-    appearance.terminal_theme_light_id = nu.terminal_theme_light_id;
-    appearance.terminal_theme_dark_id = nu.terminal_theme_dark_id;
-    appearance.window_opacity_light = nu.window_opacity_light;
-    appearance.window_opacity_dark = nu.window_opacity_dark;
-    appearance.blur_radius_light = nu.blur_radius_light;
-    appearance.blur_radius_dark = nu.blur_radius_dark;
-    // OS-sync ON is a new default; reconcile the scheme to the OS now so the flip
-    // is visible immediately (not only after the next launch's boot reconcile).
-    appearance.sync_with_os = true;
-    if let Some(os) = current_os_scheme(cx) {
-        appearance.scheme = os;
-    }
-    commit_appearance(cx, appearance);
 }
 
 /// Turn OS-appearance sync on or off. Turning it ON reconciles the scheme to the
@@ -1142,16 +1093,15 @@ pub fn apply_theme_fanout(cx: &mut App) {
 /// `build_window_root`) and when the live theme entity is absent.
 ///
 /// The per-window pushes are `cx.defer`-ed so they run OUTSIDE any in-flight
-/// window update. The restyle popup's "Try the new look" answer runs its
-/// completion — and thus `commit_appearance` → this fanout — from inside the
-/// modal's mouse handler, i.e. while the host window is mid-update (gpui `take`s
-/// the window out of its slot for the duration). A reentrant `cx.update_window`
-/// for that same window would hit the "window already taken" guard and get
-/// silently dropped (`let _ =`), so the pre-existing opaque window only flipped
-/// to Blurred after a relaunch. The settings-stepper path never hit this because
-/// its fanout targets terminal windows other than the settings window it runs
-/// inside. Deferring makes both paths apply the NSWindow-level appearance
-/// uniformly, on the next effect flush, once the update stack has unwound.
+/// window update. A `commit_appearance` → this fanout can fire from INSIDE a host
+/// window's update — e.g. a modal's mouse handler committing an appearance change
+/// while gpui has `take`n that window out of its slot for the duration. A reentrant
+/// `cx.update_window` for that same window would hit the "window already taken"
+/// guard and get silently dropped (`let _ =`), leaving a pre-existing opaque window
+/// opaque until relaunch. The settings-stepper path never hit this because its
+/// fanout targets terminal windows other than the settings window it runs inside.
+/// Deferring makes both paths apply the NSWindow-level appearance uniformly, on the
+/// next effect flush, once the update stack has unwound.
 fn apply_window_transparency_fanout(cx: &mut App) {
     let (appearance, radius) = match cx.try_global::<SharedThemeState>() {
         Some(shared) => {
@@ -1160,10 +1110,17 @@ fn apply_window_transparency_fanout(cx: &mut App) {
         }
         None => return,
     };
-    let handles: Vec<AnyWindowHandle> = crate::window_registry::WindowRegistry::all_states(cx)
+    let mut handles: Vec<AnyWindowHandle> = crate::window_registry::WindowRegistry::all_states(cx)
         .into_iter()
         .filter_map(|ws| ws.read(cx).window_handle())
         .collect();
+    // Restyle plan 06: the Settings window is UNREGISTERED (D7) — never in the
+    // `WindowRegistry` — but it now mirrors the main window's translucency, so a
+    // slider/scheme change must re-push the appearance to it too. Its singleton
+    // handle rides the same deferred per-window fanout below.
+    if let Some(settings) = crate::settings::window::current_settings_window(cx) {
+        handles.push(settings);
+    }
     cx.defer(move |cx| {
         for handle in handles {
             let _ = cx.update_window(handle, |_root, window, _cx| {
@@ -1175,16 +1132,16 @@ fn apply_window_transparency_fanout(cx: &mut App) {
     });
 }
 
-/// Selftest/test instrumentation (restyle-popup reentrancy pin): the
+/// Selftest/test instrumentation (in-window-update reentrancy pin): the
 /// `(appearance, radius, generation)` most recently pushed to a live window by
 /// [`apply_window_transparency_fanout`]'s deferred per-window closure —
 /// `generation` is a monotonic counter bumped on each push. The `theme-fanout`
 /// scenario commits a `Blurred` appearance FROM INSIDE a window update
-/// (reproducing the migration "Try the new look" answer, whose confirm callback
-/// runs `commit_appearance` during the host window's update) and asserts the
-/// generation advanced afterwards — i.e. the DEFERRED fanout actually reached the
-/// window instead of being silently dropped by gpui's reentrant-`update_window`
-/// guard (the bug left the pre-existing opaque window opaque until relaunch).
+/// (reproducing a `commit_appearance` that runs during the host window's own
+/// update) and asserts the generation advanced afterwards — i.e. the DEFERRED
+/// fanout actually reached the window instead of being silently dropped by gpui's
+/// reentrant-`update_window` guard (the bug left the pre-existing opaque window
+/// opaque until relaunch).
 #[cfg(any(test, feature = "selftest"))]
 static TRANSPARENCY_FANOUT_APPLIED: std::sync::Mutex<
     Option<(WindowBackgroundAppearance, u32, u64)>,
@@ -1281,12 +1238,11 @@ mod tests {
         assert_eq!(a.terminal_theme_light_id, "nice-default-light");
         assert_eq!(a.terminal_theme_dark_id, "nice-default-dark");
         // Restyle plan 3 new-install defaults: dark 80% / light 90% opacity, blur
-        // 30 px both schemes, popup not yet shown.
+        // 30 px both schemes.
         assert_eq!(a.window_opacity_dark, 80);
         assert_eq!(a.window_opacity_light, 90);
         assert_eq!(a.blur_radius_dark, 30);
         assert_eq!(a.blur_radius_light, 30);
-        assert!(!a.restyle_popup_shown);
     }
 
     /// Appearance-selection rules (plan Rendering §): opacity 100% ⇒ Opaque;
@@ -1378,9 +1334,9 @@ mod tests {
         assert_eq!(a.blur_radius_light, 0, "0 is in range");
     }
 
-    /// The transparency keys + the one-time popup flag round-trip through the store.
+    /// The transparency keys round-trip through the store.
     #[test]
-    fn transparency_and_popup_flag_round_trip() {
+    fn transparency_keys_round_trip() {
         let path = temp_path("transparency-roundtrip");
         let mut store = ThemeSettingsStore::load(path.clone());
         let target = Appearance {
@@ -1388,60 +1344,96 @@ mod tests {
             window_opacity_dark: 66,
             blur_radius_light: 12,
             blur_radius_dark: 44,
-            restyle_popup_shown: true,
             ..Appearance::default()
         };
         assert!(store.set(target.clone()).unwrap());
         let reloaded = ThemeSettingsStore::load(path);
         assert_eq!(*reloaded.appearance(), target);
-        assert!(reloaded.restyle_popup_shown());
     }
 
-    /// Restyle plan 3 migration: pinning an existing user's ABSENT appearance keys
-    /// materializes the LEGACY (pre-flip) literals, so pin-then-resolve reproduces
-    /// the PRE-flip resolution exactly — the defaults-flip cannot silently restyle
-    /// a user who was riding the old defaults. Explicitly-set keys survive.
+    /// A legacy `restyle_popup_shown` key in a stored file is IGNORED on read
+    /// (round-2 plan 06 removed the popup) — it never breaks the decode, and the
+    /// store never writes it back.
     #[test]
-    fn legacy_pin_reproduces_pre_flip_resolution() {
+    fn legacy_restyle_popup_shown_key_is_ignored_and_never_written() {
+        let path = temp_path("legacy-popup-key");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"appearance":{
+                "scheme":"dark",
+                "restyle_popup_shown":true,
+                "terminal_theme_dark_id":"dracula"
+            }}"#,
+        )
+        .unwrap();
+        // Decodes without error; the sibling key is honored, the popup key gone.
+        let mut store = ThemeSettingsStore::load(path.clone());
+        assert_eq!(store.appearance().terminal_theme_dark_id, "dracula");
+        // A write never re-emits the legacy popup key.
+        store
+            .set(Appearance {
+                accent: AccentPreset::Fern,
+                ..store.appearance().clone()
+            })
+            .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            raw["appearance"].get("restyle_popup_shown").is_none(),
+            "the legacy restyle_popup_shown key must never be written back"
+        );
+    }
+
+    /// Restyle plan 06 migration: pinning an existing user's ABSENT keys keeps their
+    /// pre-flip THEME (Catppuccin palette / Ocean accent / OS-sync) but adopts the
+    /// NEW comfort defaults (opacity 90/80, blur 30) — so the theme defaults-flip
+    /// cannot silently restyle them, yet everyone gains the transparent/blurred
+    /// comfort look. Explicitly-set keys survive. No `restyle_popup_shown` exists.
+    #[test]
+    fn legacy_pin_keeps_theme_but_adopts_new_comfort_defaults() {
         // An existing user with the WHOLE appearance section absent (rode every old
         // default). Pin with the live OS-reconciled scheme (Dark here — no OS source
         // in a unit test).
         let empty = br#"{"version":1,"file_browser_sort":{"criterion":"name","ascending":true}}"#;
         let pinned = legacy_pinned_appearance(empty, ColorScheme::Dark);
 
-        // Every field pins to the LEGACY literal — NOT the flipped fresh-install
-        // default (Terracotta / nice-default-* / 80-90 / 30).
+        // THEME axes pin to the LEGACY literal — NOT the flipped fresh-install theme
+        // (Terracotta / nice-default-*).
         assert_eq!(pinned, legacy_appearance_defaults());
         assert_eq!(pinned.accent, AccentPreset::Ocean);
         assert_eq!(pinned.terminal_theme_light_id, "catppuccin-latte");
         assert_eq!(pinned.terminal_theme_dark_id, "catppuccin-mocha");
-        assert_eq!(pinned.window_opacity_light, 100);
-        assert_eq!(pinned.window_opacity_dark, 100);
-        assert_eq!(pinned.blur_radius_light, 0);
-        assert_eq!(pinned.blur_radius_dark, 0);
+        assert!(pinned.sync_with_os, "OS-sync stays pinned on");
+        // COMFORT axes adopt the NEW shipped defaults (90/80 opacity, 30px blur) —
+        // NOT the pre-flip opaque 100/0 look.
+        assert_eq!(pinned.window_opacity_light, 90);
+        assert_eq!(pinned.window_opacity_dark, 80);
+        assert_eq!(pinned.blur_radius_light, 30);
+        assert_eq!(pinned.blur_radius_dark, 30);
 
-        // The RESOLVED active look equals the PRE-flip resolution: opaque, unblurred,
-        // the Catppuccin-Mocha terminal id on the Dark scheme (which now also drives
-        // the chrome — see `legacy_mismatched_pair_resolves_to_terminal_derived_chrome`
-        // for the chrome-derivation half over a catalog).
+        // The RESOLVED active look: the Catppuccin-Mocha terminal id on the Dark
+        // scheme (which now also drives the chrome — see
+        // `legacy_mismatched_pair_resolves_to_terminal_derived_chrome` for the
+        // chrome-derivation half over a catalog), at the NEW dark comfort defaults
+        // (80% opacity, 30px blur ⇒ Blurred).
         assert_eq!(pinned.active_terminal_id(), "catppuccin-mocha");
-        assert_eq!(pinned.active_window_opacity(), 1.0);
-        assert_eq!(pinned.active_blur_radius(), 0);
+        assert_eq!(pinned.active_window_opacity(), 0.8);
+        assert_eq!(pinned.active_blur_radius(), 30);
         assert_eq!(
             pinned.active_window_appearance(),
-            WindowBackgroundAppearance::Opaque
+            WindowBackgroundAppearance::Blurred
         );
 
-        // A user who EXPLICITLY set a couple of keys keeps them; the rest still pin
-        // to the legacy literals.
+        // A user who EXPLICITLY set a couple of keys keeps them; the rest still take
+        // the legacy theme / new comfort defaults.
         let partial = br#"{"appearance":{"accent":"iris","window_opacity_dark":70}}"#;
         let pinned = legacy_pinned_appearance(partial, ColorScheme::Light);
         assert_eq!(pinned.accent, AccentPreset::Iris, "explicit accent survives");
         assert_eq!(pinned.window_opacity_dark, 70, "explicit opacity survives");
-        // Absent keys still legacy — never the flipped fresh-install default.
+        // Absent THEME keys still legacy; absent COMFORT keys take the new defaults.
         assert_eq!(pinned.terminal_theme_light_id, "catppuccin-latte");
-        assert_eq!(pinned.window_opacity_light, 100);
-        assert_eq!(pinned.blur_radius_dark, 0);
+        assert_eq!(pinned.window_opacity_light, 90);
+        assert_eq!(pinned.blur_radius_dark, 30);
         // The absent scheme is preserved from the caller (the live OS-reconciled
         // scheme), not pinned to the legacy literal.
         assert_eq!(pinned.scheme, ColorScheme::Light);
@@ -1471,7 +1463,6 @@ mod tests {
             window_opacity_dark: 75,
             blur_radius_light: 20,
             blur_radius_dark: 40,
-            restyle_popup_shown: true,
         };
         assert!(store.set(target.clone()).unwrap(), "changing the value writes");
 

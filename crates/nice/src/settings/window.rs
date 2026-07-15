@@ -56,11 +56,17 @@ struct OpenSettingsInstalled;
 
 impl Global for OpenSettingsInstalled {}
 
-/// A FRESH [`WindowOptions`] for the Settings window — deliberately NOT
-/// [`crate::app::window_options_with`] (the MAIN window's hidden-titlebar band +
-/// custom drag + repositioned traffic lights). Settings keeps STANDARD macOS
-/// chrome: a real, movable title bar with the native traffic lights, resizable,
-/// minimizable, min 560×380 / ideal 640×440.
+/// A FRESH [`WindowOptions`] for the Settings window. Restyle plan 06: the
+/// Settings window now MIRRORS the main window's translucent chrome — a hidden
+/// (transparent) titlebar so the single translucent body surface bleeds edge to
+/// edge, with the native traffic lights showing through at their OS-native
+/// position (at the 28pt bar the OS centers them, so no reposition). Still a
+/// standard MOVABLE window (dragged by the transparent titlebar region, unlike
+/// the main window's custom drag band): resizable, minimizable, min 560×380 /
+/// ideal 640×440. The genuine NSWindow non-opacity + blur radius are pushed AFTER
+/// the window exists (see [`open_or_focus_settings`]), reading the same per-scheme
+/// opacity/blur as every other window — so `window_background` stays `Opaque`
+/// here (the pre-paint default; `apply_window_transparency` flips it).
 pub(crate) fn settings_window_options() -> WindowOptions {
     let bounds = Bounds {
         origin: point(px(200.0), px(200.0)),
@@ -68,18 +74,20 @@ pub(crate) fn settings_window_options() -> WindowOptions {
     };
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        // Standard chrome: `appears_transparent: false` + no custom traffic-light
-        // position ⇒ AppKit draws its own opaque titlebar (the Settings scene look,
-        // not the main window's band).
+        // Hidden titlebar (like the main window's `window_options_with`) so the
+        // translucent body reaches the top edge; the native traffic lights show
+        // through at their OS-native position, and the root view draws the centered
+        // "Settings" title in the 28pt bar.
         titlebar: Some(TitlebarOptions {
             title: Some("Settings".into()),
-            appears_transparent: false,
+            appears_transparent: true,
             traffic_light_position: None,
         }),
         window_background: WindowBackgroundAppearance::Opaque,
         kind: WindowKind::Normal,
-        // A standard window the user drags by the real titlebar (unlike the main
-        // window, which draws its own drag band and sets `is_movable: false`).
+        // A standard window the user drags by the (transparent) titlebar region —
+        // the root view's title bar carries no mouse listeners, so AppKit owns the
+        // drag (unlike the main window, which draws its own band + `is_movable:false`).
         is_movable: true,
         is_resizable: true,
         is_minimizable: true,
@@ -126,8 +134,14 @@ pub(crate) fn open_or_focus_settings(cx: &mut App) {
     }
 
     // Else open a fresh Settings window (bare `open_window`, no registry) and store
-    // its handle as the singleton.
-    match cx.open_window(settings_window_options(), |_window, cx| {
+    // its handle as the singleton. Restyle plan 06: push the active-scheme
+    // transparency (WindowBackgroundAppearance + numeric blur radius) into the fresh
+    // NSWindow BEFORE its first paint — same as the main window's `build_window_root`
+    // — so it opens translucent at the stored per-scheme opacity/blur (no
+    // Opaque→translucent flash). Runtime slider/scheme changes reach it through the
+    // theme fanout (`apply_window_transparency_fanout` includes this window's handle).
+    match cx.open_window(settings_window_options(), |window, cx| {
+        crate::theme_settings::apply_window_transparency(cx, window);
         cx.new(|_cx| SettingsRootView::new())
     }) {
         Ok(handle) => cx.set_global(SettingsWindow(Some(handle.into()))),
@@ -182,21 +196,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_window_options_use_standard_movable_chrome() {
+    fn settings_window_options_use_translucent_movable_chrome() {
         let opts = settings_window_options();
-        // Standard macOS chrome: a real (opaque) titlebar, user-movable, resizable
-        // — the deliberate divergence from the main window's hidden band.
+        // Restyle plan 06: a hidden (transparent) titlebar so the translucent body
+        // reaches the top edge (mirroring the main window), with the native traffic
+        // lights at their OS-native position — still a user-movable, resizable window.
         let titlebar = opts.titlebar.expect("settings window has a titlebar");
         assert!(
-            !titlebar.appears_transparent,
-            "settings keeps standard opaque chrome, not the hidden band"
+            titlebar.appears_transparent,
+            "settings mirrors the main window's hidden translucent titlebar"
         );
         assert!(
             titlebar.traffic_light_position.is_none(),
-            "standard chrome ⇒ AppKit places the traffic lights"
+            "the native traffic lights sit at their OS-native position (28pt bar)"
         );
         assert_eq!(titlebar.title.as_deref(), Some("Settings"));
-        assert!(opts.is_movable, "the real titlebar drags the window");
+        assert!(opts.is_movable, "the titlebar region drags the window");
         assert!(opts.is_resizable);
     }
 

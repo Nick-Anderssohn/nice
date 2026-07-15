@@ -14,19 +14,33 @@
 //! Import… outcome — rides the [`ImportFeedback`] Global (rendered as an inline
 //! error row), so the pane stays a pure builder.
 //!
-//! Fidelity (D8): gpui has no native `Picker`/segmented control, so the chrome /
-//! terminal-theme pickers render as in-house NSPopUpButton-style dropdowns
-//! ([`crate::settings::controls::dropdown`] — trigger + anchored popup), the
-//! Sync toggle as a track+thumb switch, and the scheme control as a two-segment
-//! toggle — a faithful port of the prod look. The contract each control keeps is
-//! "selection → the exact `apply_*` call + the exact a11y id" (the option ids are
-//! the old chip ids, now menu-item ids).
+//! Round-2 restyle (plan 06, revised at the round-2 feel-check): the pane is
+//! regrouped into scheme-independent controls on top (OS-sync toggle, the
+//! manual Scheme flip — a flat segmented Light|Dark control, locked while
+//! syncing with the OS — then accent swatches), then a per-scheme subsection headed by
+//! Light/Dark text tabs (titlebar-tab grammar: mono text, `ink` active / `ink3`
+//! inactive, a 1px accent underline under the active tab, seated on a
+//! `glass_line` hairline). The tab defaults to the live scheme and, once
+//! picked, becomes the editing target for the subsection's THEME dropdown,
+//! OPACITY slider, and BLUR slider — writing THAT scheme's stored slot
+//! regardless of which scheme is live (the tab, not the OS, picks the target).
+//! The custom-themes import section sits below the tabbed subsection. The tab
+//! selection lives in the [`AppearanceSchemeTab`] Global (like [`ImportFeedback`])
+//! so the pane stays a stateless free function.
+//!
+//! Fidelity (D8): gpui has no native `Picker`/slider, so the merged theme picker
+//! is the in-house [`dropdown`] (full display names, no color chips — the
+//! feel-check killed the card grid for truncating theme names), and the
+//! opacity/blur sliders port to `−`/readout/`+` steppers (the Font pane's
+//! precedent). The contract each control keeps is "selection → the exact
+//! `apply_*` call + the exact a11y id".
 
 use gpui::{
     div, prelude::*, px, AnyElement, App, Context, FontWeight, MouseButton, Rgba, SharedString,
     Window,
 };
 
+use nice_theme::glass::{glass_fill_x, glass_line};
 use nice_theme::palette::ColorScheme;
 use nice_theme::AccentPreset;
 
@@ -34,7 +48,7 @@ use crate::ghostty_theme_parser::GhosttyParseError;
 use crate::settings::controls::{dropdown, stepper, toggle_switch, DropdownItem};
 use crate::settings::root::{setting_row, setting_subtitle, setting_title, SettingsRootView};
 use crate::terminal_theme_catalog::{CatalogEntry, TerminalThemeCatalog, ThemeImportError};
-use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::theme::{slot_to_rgba, srgba_to_rgba};
 use crate::theme_settings::{self, ThemeSettingsStore};
 
 // ===========================================================================
@@ -115,6 +129,43 @@ pub(crate) fn last_import_feedback(cx: &App) -> Option<ImportErrorCopy> {
 
 fn set_import_feedback(cx: &mut App, feedback: Option<ImportErrorCopy>) {
     cx.set_global(ImportFeedback(feedback));
+    cx.refresh_windows();
+}
+
+// ===========================================================================
+// Scheme-tab selection (which scheme the per-scheme subsection is editing)
+// ===========================================================================
+
+/// The Light/Dark scheme tab currently selected in the Appearance pane —
+/// `None` (the default) means "follow the live scheme". A gpui `Global` (like
+/// [`ImportFeedback`]) so the stateless pane can read it and the tab click can
+/// write it without threading state through the root view. Once the user picks a
+/// tab it stays put, so editing the INACTIVE scheme's theme/opacity/blur is
+/// possible regardless of which scheme is live (plan 06: "the tab, not the OS,
+/// now picks the target").
+#[derive(Default)]
+pub(crate) struct AppearanceSchemeTab(pub Option<ColorScheme>);
+
+impl gpui::Global for AppearanceSchemeTab {}
+
+/// The scheme the per-scheme subsection is editing: the explicitly-picked tab,
+/// or (before any pick) the live `active` scheme. Pulled out as a pure function
+/// so the tab-targeting resolution is unit-testable without a gpui window.
+pub(crate) fn appearance_tab_scheme(tab: Option<ColorScheme>, active: ColorScheme) -> ColorScheme {
+    tab.unwrap_or(active)
+}
+
+/// The currently-selected scheme tab, resolved against the live `active` scheme.
+fn current_scheme_tab(cx: &App, active: ColorScheme) -> ColorScheme {
+    let tab = cx.try_global::<AppearanceSchemeTab>().and_then(|g| g.0);
+    appearance_tab_scheme(tab, active)
+}
+
+/// Select the scheme tab (the editing target for the per-scheme subsection) and
+/// repaint. Does NOT change the live scheme — only which scheme's slots the
+/// subsection reads/writes.
+fn set_scheme_tab(cx: &mut App, scheme: ColorScheme) {
+    cx.set_global(AppearanceSchemeTab(Some(scheme)));
     cx.refresh_windows();
 }
 
@@ -203,12 +254,19 @@ fn accent_label(accent: AccentPreset) -> &'static str {
     }
 }
 
-/// The Appearance pane body (The spec §Appearance).
+/// The Appearance pane body (The spec §Appearance) — round-2 restyle plan 06
+/// regroup: scheme-independent controls on top (OS-sync + accent + the manual
+/// Scheme flip), a per-scheme subsection headed by Light/Dark tabs (theme
+/// dropdown + opacity + blur, targeting the selected tab's scheme), then the
+/// custom-themes import section.
 pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     let slots = theme_settings::active_chrome_slots(cx);
     let accent_color = theme_settings::active_chrome_accent(cx);
-    let selected_bg = srgba_to_rgba(srgba_with_alpha(accent_color, 0.18));
-    let selected_border = srgba_to_rgba(accent_color);
+    let accent = srgba_to_rgba(accent_color);
+    // The live scheme drives the pane's own chrome (over-glass hairlines, the
+    // default tab); the scheme TAB (below) is a separate editing target.
+    let active_scheme = theme_settings::active_chrome_scheme(cx);
+    let tab_scheme = current_scheme_tab(cx, active_scheme);
 
     let appearance = cx
         .try_global::<ThemeSettingsStore>()
@@ -228,6 +286,9 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     let ink3 = slot_to_rgba(slots.ink3);
     let line = slot_to_rgba(slots.line);
     let panel = slot_to_rgba(slots.panel);
+    // Over-glass hairline (scheme-scoped, not a palette slot) — the tab-row rule,
+    // matching the flattened chrome (plan 02/04).
+    let hairline = srgba_to_rgba(glass_line(active_scheme));
 
     let mut col = div()
         .flex()
@@ -236,10 +297,10 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
         .min_w(px(0.0))
         .child(setting_title("Appearance", cx));
 
-    // --- Sync with OS ------------------------------------------------------
+    // --- Sync with OS (scheme-independent) ---------------------------------
     let sync_on = appearance.sync_with_os;
     col = col.child(setting_row(
-        "Sync with OS theme",
+        "Sync with OS appearance",
         Some("Match Nice's light / dark mode to the system setting.".into()),
         toggle_switch("settings.theme.sync", sync_on, cx, move |cx| {
             theme_settings::apply_sync_with_os(cx, !sync_on);
@@ -247,96 +308,82 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
         cx,
     ));
 
-    // --- Scheme (disabled while sync is on) --------------------------------
-    let scheme = appearance.scheme;
+    // --- Scheme (the manual light/dark flip; locked while sync is on) ------
+    // Restored at the round-2 feel-check (the regroup had dropped it, leaving
+    // no manual flip with OS-sync off). Sits directly below the OS-sync
+    // toggle, above Accent (Nick flipped the two at the round-2.5 check).
+    let stored_scheme = appearance.scheme;
+    let fill_x = srgba_to_rgba(glass_fill_x(active_scheme));
     col = col.child(setting_row(
         "Scheme",
         Some("The active light / dark mode (locked while syncing with the OS).".into()),
-        scheme_control(scheme, sync_on, selected_bg, selected_border, ink),
+        scheme_control(stored_scheme, sync_on, fill_x, ink, ink3, hairline),
         cx,
     ));
 
-    // --- Accent ------------------------------------------------------------
+    // --- Accent (scheme-independent) ---------------------------------------
     col = col.child(setting_row(
         "Accent",
         Some("The caret / selection / logo tint.".into()),
-        accent_control(appearance.accent, selected_border),
+        accent_control(appearance.accent, ink),
         cx,
     ));
 
-    // --- Window opacity / blur (the ACTIVE scheme) --------------------------
-    // Scheme-synced like Scheme/Accent above: one control edits whichever
-    // scheme's slot is currently active, labeled with that scheme's name
-    // (plan: "Opacity (Dark)"). Flipping the active scheme (or the OS, while
-    // syncing) swaps which slot these controls read/write — mirroring how the
-    // per-scheme Chrome/Terminal-theme dropdowns below key off `scheme`, just
-    // surfaced once instead of in a Light/Dark pair.
-    let scheme_label = match scheme {
-        ColorScheme::Light => "Light",
-        ColorScheme::Dark => "Dark",
+    // --- Per-scheme subsection: Light/Dark tabs ----------------------------
+    // The tabs head the subsection (same text + accent-underline grammar as the
+    // titlebar tabs) and pick which scheme the theme dropdown + opacity + blur
+    // edit, regardless of which scheme is live.
+    col = col.child(scheme_tabs(tab_scheme, accent, ink, ink3, hairline));
+
+    // The merged Theme dropdown for the selected tab's scheme (plan 05: ONE
+    // theme drives both terminal colors AND chrome; the feel-check swapped the
+    // card grid back to a dropdown so long names never truncate). The trigger
+    // and options keep the terminal picker's a11y ids so the selection contract
+    // is unchanged.
+    let (tab_entries, tab_a11y): (&[CatalogEntry], &'static str) = match tab_scheme {
+        ColorScheme::Light => (&light_themes, "settings.terminal.lightPicker"),
+        ColorScheme::Dark => (&dark_themes, "settings.terminal.darkPicker"),
     };
+    let tab_theme_id = appearance.terminal_theme_id_for(tab_scheme).to_string();
+    let tab_theme_label = theme_display_name(tab_entries, &tab_theme_id);
     col = col.child(setting_row(
-        SharedString::from(format!("Opacity ({scheme_label})")),
-        Some("Translucency of the window body for the active scheme.".into()),
-        opacity_stepper(scheme, appearance.active_window_opacity_pct(), ink, ink3, line),
+        "Theme",
+        None,
+        dropdown(
+            tab_a11y,
+            tab_theme_label,
+            terminal_theme_dropdown_items(tab_a11y, tab_scheme, &tab_theme_id, tab_entries),
+            window,
+            cx,
+        ),
+        cx,
+    ));
+
+    // Opacity / blur for the SELECTED TAB's scheme (not the live one).
+    col = col.child(setting_row(
+        "Opacity",
+        Some("Translucency of the window body for this scheme.".into()),
+        opacity_stepper(
+            tab_scheme,
+            appearance.window_opacity_pct_for(tab_scheme),
+            ink,
+            ink3,
+            line,
+        ),
         cx,
     ));
     col = col.child(setting_row(
-        SharedString::from(format!("Blur ({scheme_label})")),
+        "Blur",
         Some("Background blur radius behind the translucent window (0 = no blur).".into()),
-        blur_stepper(scheme, appearance.active_blur_radius(), ink, ink3, line),
+        blur_stepper(
+            tab_scheme,
+            appearance.blur_radius_for(tab_scheme),
+            ink,
+            ink3,
+            line,
+        ),
         cx,
     ));
-
-    // --- Light mode group --------------------------------------------------
-    // Round-2 restyle plan 5: ONE "Theme" dropdown per scheme drives both the
-    // terminal colors and the chrome (the old separate "Chrome" + "Terminal
-    // theme" rows are merged). The a11y id stays the terminal picker's so the
-    // selection self-tests keep working.
-    let light_theme_id = appearance.terminal_theme_id_for(ColorScheme::Light).to_string();
-    let light_theme_label = theme_display_name(&light_themes, &light_theme_id);
-    col = col
-        .child(setting_subtitle("Light mode", cx))
-        .child(setting_row(
-            "Theme",
-            None,
-            dropdown(
-                "settings.terminal.lightPicker",
-                light_theme_label,
-                terminal_theme_dropdown_items(
-                    "settings.terminal.lightPicker",
-                    ColorScheme::Light,
-                    &light_theme_id,
-                    &light_themes,
-                ),
-                window,
-                cx,
-            ),
-            cx,
-        ));
-
-    // --- Dark mode group ---------------------------------------------------
-    let dark_theme_id = appearance.terminal_theme_id_for(ColorScheme::Dark).to_string();
-    let dark_theme_label = theme_display_name(&dark_themes, &dark_theme_id);
-    col = col
-        .child(setting_subtitle("Dark mode", cx))
-        .child(setting_row(
-            "Theme",
-            None,
-            dropdown(
-                "settings.terminal.darkPicker",
-                dark_theme_label,
-                terminal_theme_dropdown_items(
-                    "settings.terminal.darkPicker",
-                    ColorScheme::Dark,
-                    &dark_theme_id,
-                    &dark_themes,
-                ),
-                window,
-                cx,
-            ),
-            cx,
-        ));
 
     // --- Custom themes (Import + deletable imports) ------------------------
     col = col.child(setting_subtitle("Custom themes", cx));
@@ -360,7 +407,7 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
                     div()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(selected_border)
+                        .text_color(accent)
                         .child(SharedString::from(feedback.title)),
                 )
                 .child(
@@ -389,89 +436,244 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     col.into_any_element()
 }
 
-/// The whole-control opacity of the Scheme picker while "Sync with OS theme"
-/// is on — the gpui analogue of prod's SwiftUI `.disabled(tweaks.syncWithOS)`
-/// dimming on the segmented Picker (`SettingsView.swift:318`), which renders
-/// the entire control (labels AND the selected segment's highlight) grayed out.
-const DISABLED_CONTROL_OPACITY: f32 = 0.4;
-
-/// The Light | Dark segmented control (a11y `settings.appearance.scheme`).
-/// Disabled while `sync_on`: no click handlers / pointer cursor, and the whole
-/// control renders at [`DISABLED_CONTROL_OPACITY`] so it visibly reads as
-/// locked (prod `.disabled()` parity).
-fn scheme_control(
-    scheme: ColorScheme,
-    sync_on: bool,
-    selected_bg: Rgba,
-    selected_border: Rgba,
+/// The Light/Dark scheme tabs heading the per-scheme subsection (a11y
+/// `settings.appearance.schemeTab.{light,dark}`). Same grammar as the titlebar
+/// tabs: mono text, `ink` active / `ink3` inactive, a 1px accent underline under
+/// the active tab (inset per the mock's `.scheme-tab`), the whole row seated on a
+/// `glass_line` hairline rule. Per plan 06 the INACTIVE tab wears NO underline
+/// (the pair reads self-evidently as tabs). Click → [`set_scheme_tab`] (the
+/// editing target; it does not flip the live scheme).
+fn scheme_tabs(
+    selected: ColorScheme,
+    accent: Rgba,
     ink: Rgba,
+    ink3: Rgba,
+    hairline: Rgba,
 ) -> impl IntoElement {
-    let seg = |label: &'static str, value: ColorScheme| {
-        let is_active = scheme == value;
+    let tab = move |label: &'static str, key: &'static str, value: ColorScheme| {
+        let is_active = selected == value;
         let mut d = div()
-            .id(SharedString::from(format!("settings.appearance.scheme.{label}")))
+            .id(SharedString::from(format!("settings.appearance.schemeTab.{key}")))
             .role(gpui::Role::Button)
             .aria_label(label)
+            .relative()
             .px(px(12.0))
-            .py(px(4.0))
-            .rounded(px(5.0))
+            .py(px(6.0))
             .text_size(px(12.0))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(ink)
-            .child(label);
+            .text_color(if is_active { ink } else { ink3 })
+            .cursor_pointer()
+            .child(label)
+            .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
+                set_scheme_tab(cx, value);
+            });
         if is_active {
-            d = d.bg(selected_bg).border_1().border_color(selected_border);
-        }
-        if !sync_on {
-            d = d
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-                    theme_settings::apply_scheme(cx, value);
-                });
+            // The 1px accent underline, inset 11px per side and dropped 1px onto
+            // the row's hairline rule (mock `.scheme-tab.active::after`).
+            d = d.child(
+                div()
+                    .absolute()
+                    .bottom(px(-1.0))
+                    .left(px(11.0))
+                    .right(px(11.0))
+                    .h(px(1.0))
+                    .bg(accent),
+            );
         }
         d
     };
     div()
-        .id("settings.appearance.scheme")
         .flex()
         .flex_row()
-        .gap(px(4.0))
-        .when(sync_on, |d| d.opacity(DISABLED_CONTROL_OPACITY))
-        .child(seg("Light", ColorScheme::Light))
-        .child(seg("Dark", ColorScheme::Dark))
+        .gap(px(2.0))
+        .mt(px(16.0))
+        .mb(px(6.0))
+        .border_b_1()
+        .border_color(hairline)
+        .child(tab("Light mode", "light", ColorScheme::Light))
+        .child(tab("Dark mode", "dark", ColorScheme::Dark))
 }
 
 /// The five accent swatches (a11y `settings.appearance.accent`); the selected one
-/// carries an accent-border ring. Click → `apply_accent`.
-fn accent_control(selected: AccentPreset, selected_border: Rgba) -> impl IntoElement {
+/// carries an `ink` ring offset 2px off the swatch (mock `.swatch.sel`). Every
+/// cell reserves the ring's footprint (a transparent border when unselected) so
+/// selection never shifts the row. Click → `apply_accent`.
+fn accent_control(selected: AccentPreset, ink: Rgba) -> impl IntoElement {
     let mut row = div()
         .id("settings.appearance.accent")
         .flex()
         .flex_row()
+        .items_center()
         .gap(px(8.0));
     for preset in AccentPreset::ALL {
         let is_selected = preset == selected;
+        let swatch = div()
+            .id(SharedString::from(format!(
+                "settings.appearance.accent.{}",
+                preset.raw_value()
+            )))
+            .role(gpui::Role::Button)
+            .aria_label(accent_label(preset))
+            .size(px(16.0))
+            .rounded(px(8.0))
+            .bg(srgba_to_rgba(preset.color()))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
+                theme_settings::apply_accent(cx, preset);
+            });
+        // The offset ring: a same-size cell across all swatches (transparent
+        // border unselected) so the selected ink ring adds no layout shift.
         row = row.child(
             div()
-                .id(SharedString::from(format!(
-                    "settings.appearance.accent.{}",
-                    preset.raw_value()
-                )))
-                .role(gpui::Role::Button)
-                .aria_label(accent_label(preset))
-                .size(px(22.0))
+                .flex_none()
+                .p(px(2.0))
                 .rounded(px(11.0))
-                .bg(srgba_to_rgba(preset.color()))
-                .cursor_pointer()
-                .when(is_selected, |d| {
-                    d.border_2().border_color(selected_border)
+                .border_1()
+                .border_color(if is_selected {
+                    ink
+                } else {
+                    // A transparent ring reserves the selected footprint so
+                    // selection adds no layout shift.
+                    Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
                 })
-                .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-                    theme_settings::apply_accent(cx, preset);
-                }),
+                .child(swatch),
         );
     }
     row
+}
+
+// --- Scheme control (the manual light/dark flip) ----------------------------
+
+/// The whole-control opacity of the Scheme picker while "Sync with OS
+/// appearance" is on — the gpui analogue of prod's SwiftUI `.disabled()`
+/// dimming, so the control visibly reads as locked.
+const DISABLED_CONTROL_OPACITY: f32 = 0.4;
+
+/// One segment of the Scheme control: its a11y `id`, display `label`, target
+/// `value`, whether it is the current pick, and whether clicking is enabled
+/// (OS-sync off). Carries the selection contract — [`SchemeSegment::select`] is
+/// the exact path the segment's click runs — so the label→value→`apply_scheme`
+/// mapping and the sync lock are unit-testable without a window (the
+/// [`DropdownItem`]/`ThemeGridItem` precedent).
+pub(crate) struct SchemeSegment {
+    id: SharedString,
+    label: &'static str,
+    value: ColorScheme,
+    active: bool,
+    enabled: bool,
+}
+
+impl SchemeSegment {
+    /// Run the segment's click contract: `apply_scheme(value)` — flipping the
+    /// LIVE scheme — unless the control is sync-locked (then a no-op, exactly
+    /// like the render path, which attaches no handler).
+    pub(crate) fn select(&self, cx: &mut App) {
+        if self.enabled {
+            theme_settings::apply_scheme(cx, self.value);
+        }
+    }
+}
+
+/// The two segments of the Scheme control for the stored `scheme`, click-locked
+/// while `sync_on` (a11y `settings.appearance.scheme.{Light,Dark}`).
+fn scheme_segments(scheme: ColorScheme, sync_on: bool) -> [SchemeSegment; 2] {
+    let seg = |label: &'static str, value: ColorScheme| SchemeSegment {
+        id: SharedString::from(format!("settings.appearance.scheme.{label}")),
+        label,
+        value,
+        active: scheme == value,
+        enabled: !sync_on,
+    };
+    [seg("Light", ColorScheme::Light), seg("Dark", ColorScheme::Dark)]
+}
+
+/// The Light | Dark segmented control (a11y `settings.appearance.scheme`),
+/// restyled flat per the mock's `.scheme-seg`: a hairline-bordered rounded
+/// group, the selected cell filled with the over-glass `fill_x` in `ink` text,
+/// the other cell bare in `ink3`. Disabled while `sync_on`: no click handlers /
+/// pointer cursor, and the whole control renders at
+/// [`DISABLED_CONTROL_OPACITY`]. Click → `apply_scheme` (flips the LIVE scheme
+/// — unlike the subsection tabs below, which only pick the editing target).
+fn scheme_control(
+    scheme: ColorScheme,
+    sync_on: bool,
+    fill_x: Rgba,
+    ink: Rgba,
+    ink3: Rgba,
+    hairline: Rgba,
+) -> impl IntoElement {
+    let mut group = div()
+        .id("settings.appearance.scheme")
+        .flex_none()
+        .flex()
+        .flex_row()
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(hairline)
+        .overflow_hidden()
+        .when(sync_on, |d| d.opacity(DISABLED_CONTROL_OPACITY));
+    for segment in scheme_segments(scheme, sync_on) {
+        let mut d = div()
+            .id(segment.id.clone())
+            .role(gpui::Role::Button)
+            .aria_label(segment.label)
+            .px(px(12.0))
+            .py(px(4.0))
+            .text_size(px(12.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if segment.active { ink } else { ink3 })
+            .child(segment.label);
+        if segment.active {
+            d = d.bg(fill_x);
+        }
+        if segment.enabled {
+            d = d
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
+                    segment.select(cx);
+                });
+        }
+        group = group.child(d);
+    }
+    group
+}
+
+// --- Merged theme dropdown (plan 05: ONE theme drives terminal + chrome) ----
+
+/// The selected terminal theme's display label — the dropdown trigger text.
+/// Falls back to the raw id when the selection is not in `entries` (a transiently
+/// dangling slot).
+fn theme_display_name(entries: &[CatalogEntry], id: &str) -> String {
+    entries
+        .iter()
+        .find(|e| e.id == id)
+        .map(|e| e.display_name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// The per-scheme theme dropdown options over `entries` (built-ins AND imports,
+/// exactly the old chip list; option a11y ids `{a11y}.{theme id}`). Selection →
+/// `apply_terminal_theme_id(scheme, id)` (which, post-merge, drives the chrome
+/// too).
+fn terminal_theme_dropdown_items(
+    a11y: &'static str,
+    scheme: ColorScheme,
+    selected_id: &str,
+    entries: &[CatalogEntry],
+) -> Vec<DropdownItem> {
+    entries
+        .iter()
+        .map(|entry| {
+            let id = entry.id.clone();
+            let click_id = id.clone();
+            DropdownItem::new(
+                format!("{a11y}.{id}"),
+                entry.display_name.clone(),
+                id == selected_id,
+                move |cx: &mut App| theme_settings::apply_terminal_theme_id(cx, scheme, &click_id),
+            )
+        })
+        .collect()
 }
 
 // --- Window opacity / blur steppers (D8: gpui has no native slider — same
@@ -557,41 +759,6 @@ fn blur_stepper(scheme: ColorScheme, radius: u16, ink: Rgba, ink3: Rgba, line: R
             theme_settings::apply_blur_radius(cx, scheme, v.round() as u16);
         },
     )
-}
-
-/// The selected terminal theme's display label — the dropdown trigger text.
-/// Falls back to the raw id when the selection is not in `entries` (a transiently
-/// dangling slot).
-fn theme_display_name(entries: &[CatalogEntry], id: &str) -> String {
-    entries
-        .iter()
-        .find(|e| e.id == id)
-        .map(|e| e.display_name.clone())
-        .unwrap_or_else(|| id.to_string())
-}
-
-/// The per-scheme terminal-theme dropdown options over `themes(for: scheme)` —
-/// built-ins AND imports, exactly the old chip list (option a11y ids
-/// `{a11y}.{theme id}`). Selection → `apply_terminal_theme_id(scheme, id)`.
-fn terminal_theme_dropdown_items(
-    a11y: &'static str,
-    scheme: ColorScheme,
-    selected_id: &str,
-    entries: &[CatalogEntry],
-) -> Vec<DropdownItem> {
-    entries
-        .iter()
-        .map(|entry| {
-            let id = entry.id.clone();
-            let click_id = id.clone();
-            DropdownItem::new(
-                format!("{a11y}.{id}"),
-                entry.display_name.clone(),
-                id == selected_id,
-                move |cx: &mut App| theme_settings::apply_terminal_theme_id(cx, scheme, &click_id),
-            )
-        })
-        .collect()
 }
 
 /// The Import… button (a11y `settings.terminal.import`).
@@ -716,7 +883,34 @@ mod tests {
         assert_eq!(neg.message, "Line 9 uses palette index -1; valid indices are 0–15.");
     }
 
-    // --- the dropdown option lists (the old chip contract, now menu items) ----
+    // --- the dropdown option list (the old chip contract, now menu items) -----
+
+    #[test]
+    fn theme_dropdown_items_carry_ids_labels_and_selection() {
+        let entries = vec![
+            CatalogEntry {
+                id: "nice-default-dark".to_string(),
+                display_name: "Nice Dark".to_string(),
+                scope: crate::terminal_theme_catalog::ThemeScope::Dark,
+            },
+            CatalogEntry {
+                id: "cool-import".to_string(),
+                display_name: "Cool Import".to_string(),
+                scope: crate::terminal_theme_catalog::ThemeScope::Either,
+            },
+        ];
+        let items = terminal_theme_dropdown_items(
+            "settings.terminal.darkPicker",
+            ColorScheme::Dark,
+            "cool-import",
+            &entries,
+        );
+        assert_eq!(items[0].id.as_ref(), "settings.terminal.darkPicker.nice-default-dark");
+        assert_eq!(items[0].label.as_ref(), "Nice Dark");
+        assert!(!items[0].selected);
+        assert_eq!(items[1].id.as_ref(), "settings.terminal.darkPicker.cool-import");
+        assert!(items[1].selected, "the selected id's option is checkmarked");
+    }
 
     #[test]
     fn theme_display_name_resolves_the_selected_entry_or_falls_back_to_the_id() {
@@ -727,6 +921,25 @@ mod tests {
         }];
         assert_eq!(theme_display_name(&entries, "cool-import"), "Cool Import");
         assert_eq!(theme_display_name(&entries, "gone-theme"), "gone-theme");
+    }
+
+    // --- appearance_tab_scheme (the tab-targeting resolution) -----------------
+
+    #[test]
+    fn appearance_tab_scheme_defaults_to_active_then_follows_the_explicit_tab() {
+        // No explicit tab ⇒ the live scheme (the default: the tab tracks it).
+        assert_eq!(appearance_tab_scheme(None, ColorScheme::Dark), ColorScheme::Dark);
+        assert_eq!(appearance_tab_scheme(None, ColorScheme::Light), ColorScheme::Light);
+        // An explicit tab overrides the live scheme (the tab, not the OS, picks
+        // the editing target — including the scheme that is NOT live).
+        assert_eq!(
+            appearance_tab_scheme(Some(ColorScheme::Light), ColorScheme::Dark),
+            ColorScheme::Light
+        );
+        assert_eq!(
+            appearance_tab_scheme(Some(ColorScheme::Dark), ColorScheme::Light),
+            ColorScheme::Dark
+        );
     }
 
     // --- perform_remove_imported (the delete-imported-theme flow) -------------
@@ -860,23 +1073,73 @@ mod tests {
     fn dropdown_selection_drives_the_exact_apply_calls(cx: &mut TestAppContext) {
         let base = setup_with_import(cx, "dropdown-apply");
         cx.update(|app| {
-            // The single Theme dropdown: selecting the imported theme's option
+            // The merged Theme dropdown: selecting the imported theme's option
             // applies its id to the Dark scheme slot (the old chip's exact
             // apply_terminal_theme_id) — and, post-merge, that one id now drives
             // the chrome too.
             let entries = app.global::<TerminalThemeCatalog>().themes(ColorScheme::Dark);
-            let themes = terminal_theme_dropdown_items(
+            let items = terminal_theme_dropdown_items(
                 "settings.terminal.darkPicker",
                 ColorScheme::Dark,
                 &dark_slot_id(app),
                 &entries,
             );
-            themes
+            items
                 .iter()
                 .find(|i| i.id.as_ref() == "settings.terminal.darkPicker.cool-import")
                 .expect("the imported theme is offered")
                 .select(app);
             assert_eq!(dark_slot_id(app), "cool-import");
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Tab targeting (plan 06 Validation): a dropdown selection on the Light tab
+    /// writes the LIGHT slot while Dark is the live scheme — the tab, not the OS,
+    /// picks the target, and the live slot is untouched.
+    #[gpui::test]
+    fn dropdown_selection_targets_the_tab_scheme_not_the_live_scheme(cx: &mut TestAppContext) {
+        let base = setup_with_import(cx, "dropdown-tab-target");
+        cx.update(|app| {
+            // Live scheme is the store default (Dark); the Light tab is selected.
+            let live = app.global::<ThemeSettingsStore>().appearance().scheme;
+            assert_eq!(live, ColorScheme::Dark);
+            let target = appearance_tab_scheme(Some(ColorScheme::Light), live);
+            assert_eq!(target, ColorScheme::Light);
+
+            let light_before = app
+                .global::<ThemeSettingsStore>()
+                .appearance()
+                .terminal_theme_id_for(ColorScheme::Light)
+                .to_string();
+            let dark_before = dark_slot_id(app);
+
+            // Select the imported theme's option on the (non-live) Light tab.
+            let entries = app.global::<TerminalThemeCatalog>().themes(ColorScheme::Light);
+            let items = terminal_theme_dropdown_items(
+                "settings.terminal.lightPicker",
+                target,
+                &light_before,
+                &entries,
+            );
+            items
+                .iter()
+                .find(|i| i.id.as_ref() == "settings.terminal.lightPicker.cool-import")
+                .expect("the imported theme is offered in the light tab too")
+                .select(app);
+
+            let a = app.global::<ThemeSettingsStore>().appearance().clone();
+            assert_eq!(
+                a.terminal_theme_id_for(ColorScheme::Light),
+                "cool-import",
+                "the Light tab wrote the Light slot"
+            );
+            assert_eq!(
+                a.terminal_theme_id_for(ColorScheme::Dark),
+                dark_before,
+                "the live (Dark) slot is untouched by a Light-tab edit"
+            );
+            assert_eq!(a.scheme, live, "editing a tab never flips the live scheme");
         });
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -973,6 +1236,90 @@ mod tests {
                     .appearance()
                     .blur_radius_for(ColorScheme::Dark),
                 30
+            );
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Tab targeting (plan 06 Validation): moving the opacity/blur steppers on
+    /// the tab writes the TAB scheme's slots while the OTHER scheme is live —
+    /// edit Dark while Light is live, and vice versa; the live scheme never flips.
+    #[gpui::test]
+    fn opacity_and_blur_steppers_target_the_tab_scheme_not_the_live_scheme(
+        cx: &mut TestAppContext,
+    ) {
+        let base = setup_theme_store(cx, "opacity-blur-tab-target");
+        cx.update(|app| {
+            // (a) Live scheme = Light, edit the Dark tab.
+            theme_settings::apply_scheme(app, ColorScheme::Light);
+            let live = app.global::<ThemeSettingsStore>().appearance().scheme;
+            assert_eq!(live, ColorScheme::Light);
+            let target = appearance_tab_scheme(Some(ColorScheme::Dark), live);
+            assert_eq!(target, ColorScheme::Dark);
+
+            theme_settings::apply_window_opacity(app, target, 70);
+            theme_settings::apply_blur_radius(app, target, 10);
+            let a = app.global::<ThemeSettingsStore>().appearance().clone();
+            assert_eq!(a.window_opacity_pct_for(ColorScheme::Dark), 70, "Dark tab wrote Dark opacity");
+            assert_eq!(a.blur_radius_for(ColorScheme::Dark), 10, "Dark tab wrote Dark blur");
+            assert_eq!(a.window_opacity_pct_for(ColorScheme::Light), 90, "the live Light opacity is untouched");
+            assert_eq!(a.blur_radius_for(ColorScheme::Light), 30, "the live Light blur is untouched");
+            assert_eq!(a.scheme, ColorScheme::Light, "editing the Dark tab never flips the live scheme");
+
+            // (b) Now the reverse: with Dark live, edit the Light tab.
+            theme_settings::apply_scheme(app, ColorScheme::Dark);
+            let live = app.global::<ThemeSettingsStore>().appearance().scheme;
+            assert_eq!(live, ColorScheme::Dark);
+            let target = appearance_tab_scheme(Some(ColorScheme::Light), live);
+            assert_eq!(target, ColorScheme::Light);
+
+            theme_settings::apply_window_opacity(app, target, 65);
+            theme_settings::apply_blur_radius(app, target, 45);
+            let a = app.global::<ThemeSettingsStore>().appearance().clone();
+            assert_eq!(a.window_opacity_pct_for(ColorScheme::Light), 65, "Light tab wrote Light opacity");
+            assert_eq!(a.blur_radius_for(ColorScheme::Light), 45, "Light tab wrote Light blur");
+            // Dark keeps the values written in step (a) — the Light-tab edit did not touch them.
+            assert_eq!(a.window_opacity_pct_for(ColorScheme::Dark), 70, "the live Dark opacity is untouched");
+            assert_eq!(a.blur_radius_for(ColorScheme::Dark), 10, "the live Dark blur is untouched");
+            assert_eq!(a.scheme, ColorScheme::Dark, "editing the Light tab never flips the live scheme");
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The Scheme control's selection contract (round-2.5): segment click →
+    /// `apply_scheme` flips the LIVE scheme; the sync lock makes it a no-op —
+    /// the same pinning `dropdown_selection_drives_the_exact_apply_calls` gives
+    /// the theme picker.
+    #[gpui::test]
+    fn scheme_segment_selection_flips_the_live_scheme_and_respects_the_sync_lock(
+        cx: &mut TestAppContext,
+    ) {
+        let base = setup_theme_store(cx, "scheme-segments");
+        cx.update(|app| {
+            // Fresh defaults: Dark stored. Segments carry the a11y ids, the
+            // right active flag, and are enabled with sync off.
+            let segs = scheme_segments(ColorScheme::Dark, false);
+            assert_eq!(segs[0].id.as_ref(), "settings.appearance.scheme.Light");
+            assert_eq!(segs[1].id.as_ref(), "settings.appearance.scheme.Dark");
+            assert!(!segs[0].active && segs[1].active);
+
+            // Clicking "Light" flips the LIVE scheme.
+            segs[0].select(app);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>().appearance().scheme,
+                ColorScheme::Light,
+                "the Light segment's select applied apply_scheme(Light)"
+            );
+
+            // Sync-locked segments are select no-ops (the render path attaches
+            // no handler; the contract path must refuse too).
+            let locked = scheme_segments(ColorScheme::Light, true);
+            assert!(!locked[1].enabled);
+            locked[1].select(app);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>().appearance().scheme,
+                ColorScheme::Light,
+                "a sync-locked segment never flips the scheme"
             );
         });
         let _ = std::fs::remove_dir_all(&base);

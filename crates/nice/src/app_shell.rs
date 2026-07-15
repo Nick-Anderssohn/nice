@@ -435,7 +435,12 @@ const CONTENT_INSET_TRAILING: f32 = 17.0;
 /// SKIPS its own default-bg fill when translucent, so this backing is the ONLY
 /// default-background surface (no double-applied alpha under the grid). At
 /// `opacity == 1.0` the fill is fully opaque, identical to the pre-restyle window.
-fn terminal_backing_color(theme: &TerminalTheme, opacity: f32) -> Rgba {
+///
+/// Restyle plan 06: `pub(crate)` so the Settings window
+/// ([`crate::settings::root`]) paints THE SAME single translucent surface (the
+/// mock's `.window` background = terminal bg × window alpha), visually matching
+/// the main window.
+pub(crate) fn terminal_backing_color(theme: &TerminalTheme, opacity: f32) -> Rgba {
     let base = rgb(theme.background.to_u32());
     Rgba {
         a: opacity.clamp(0.0, 1.0),

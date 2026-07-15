@@ -25,18 +25,21 @@ use gpui::{
     Pixels, Render, SharedString, Subscription, Window,
 };
 
+use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 use nice_theme::color::Srgba;
-use nice_theme::palette::Slots;
+use nice_theme::glass::{glass_fill, glass_line};
+use nice_theme::palette::{ColorScheme, Slots};
 
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::settings::controls::{self, DropdownItem};
-use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
+use crate::theme::{slot_to_rgba, srgba_to_rgba};
 
 /// Left-rail width (Swift `SettingsView.swift:113`).
 const RAIL_WIDTH: f32 = 160.0;
-/// Active rail-row background: the accent at this alpha (a faithful stand-in for
-/// Swift's `niceSel(scheme, accent:)` selection tint).
-const RAIL_ACTIVE_ALPHA: f32 = 0.18;
+/// Titlebar centered-title edge inset (per side). Matches the mock's `.win-title`
+/// (`left: 90px; right: 90px`) and the main window's `SINGLE_TAB_EDGE_INSET` — so
+/// the centered "Settings" label clears the native traffic-light cluster on the left.
+const SETTINGS_TITLE_EDGE_INSET: f32 = 90.0;
 
 /// The six settings sections in rail order — `(slug, rail label)`. This is the
 /// Swift `SettingsSection` declaration order (`SettingsView.swift:31-58`) **minus
@@ -173,18 +176,21 @@ impl SettingsRootView {
     }
 
     /// One rail button: a11y id `settings.section.<slug>` + [`gpui::Role::Button`]
-    /// + label; active row accent-selected + semibold ink, inactive medium ink2
-    /// (Swift `SettingsSectionRow`, `SettingsView.swift:182-217`).
+    /// + label. Restyle plan 06 flat nav (mock `.set-nav .row`): NO panel/selection
+    /// fill — the active row is accent-colored text (semibold), inactive is medium
+    /// `ink2`; the only fill is a faint `glass_fill` on hover. Mock geometry: 5×16
+    /// padding, no rounded pill.
     fn rail_row(
         slug: &'static str,
         label: &'static str,
         is_active: bool,
         slots: Slots,
         accent: Srgba,
+        scheme: ColorScheme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let text_color = if is_active {
-            slot_to_rgba(slots.ink)
+            srgba_to_rgba(accent)
         } else {
             slot_to_rgba(slots.ink2)
         };
@@ -193,21 +199,19 @@ impl SettingsRootView {
         } else {
             gpui::FontWeight::MEDIUM
         };
+        let hover_fill = srgba_to_rgba(glass_fill(scheme));
         div()
             .id(SharedString::from(format!("settings.section.{slug}")))
             .role(gpui::Role::Button)
             .aria_label(SharedString::from(label))
             .w_full()
-            .px(px(10.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
+            .px(px(16.0))
+            .py(px(5.0))
             .text_size(px(12.5))
             .font_weight(weight)
             .text_color(text_color)
             .cursor_pointer()
-            .when(is_active, |d| {
-                d.bg(srgba_to_rgba(srgba_with_alpha(accent, RAIL_ACTIVE_ALPHA)))
-            })
+            .hover(move |d| d.bg(hover_fill))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -222,31 +226,66 @@ impl SettingsRootView {
 impl Render for SettingsRootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let slots = crate::theme_settings::active_chrome_slots(cx);
+        let scheme = crate::theme_settings::active_chrome_scheme(cx);
         let accent = crate::theme_settings::active_chrome_accent(cx);
-        let panel = slot_to_rgba(slots.panel);
+        // Restyle plan 06: the Settings window mirrors the main window's ONE
+        // translucent surface — the active terminal theme's background at the
+        // active-scheme opacity (identical to `app_shell::terminal_backing_color`,
+        // the mock's `.window` background). The genuine NSWindow non-opacity + OS
+        // blur are pushed separately (window.rs open + the transparency fanout), so
+        // at opacity < 1.0 the desktop shows through this fill. No opaque panel
+        // fills anywhere in the body.
+        let (theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
+        let opacity = crate::theme_settings::active_window_opacity(cx);
+        let surface = crate::app_shell::terminal_backing_color(&theme, opacity);
+        // Over-glass hairline (scheme-scoped, not a palette slot) — the flat nav's
+        // right edge, the same grammar as the flattened sidebar (plan 02).
+        let hairline = srgba_to_rgba(glass_line(scheme));
+        // Terminal-resolved mono family throughout (parity with the main window).
+        let mono = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
 
-        // 160pt left rail (Swift's floating-card treatment), one button per section.
+        // The 28pt titlebar: native traffic lights sit at their OS position (left);
+        // the centered "Settings" label is inset both edges to clear them. Pure
+        // painted text — no mouse listeners — so AppKit's titlebar drag passes
+        // straight through (the window is `is_movable`).
+        let titlebar = div()
+            .flex_none()
+            .w_full()
+            .h(px(TOP_BAR_HEIGHT))
+            .px(px(SETTINGS_TITLE_EDGE_INSET))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(slot_to_rgba(slots.ink2))
+                    .child(SharedString::from("Settings")),
+            );
+
+        // Flat left nav (mock `.set-nav`): no card/panel fill, a `glass_line`
+        // hairline at the right edge, one button per section.
         let mut rail = div()
             .flex()
             .flex_col()
             .flex_none()
             .gap(px(1.0))
             .w(px(RAIL_WIDTH))
-            .p(px(6.0))
-            .bg(slot_to_rgba(slots.background2))
+            .py(px(8.0))
             .border_r_1()
-            .border_color(slot_to_rgba(slots.line));
+            .border_color(hairline);
         for &(slug, label) in settings_rail_sections() {
             let is_active = self.active.as_ref() == slug;
-            rail = rail.child(Self::rail_row(slug, label, is_active, slots, accent, cx));
+            rail = rail.child(Self::rail_row(slug, label, is_active, slots, accent, scheme, cx));
         }
 
-        // The scrollable content area (18/24 pad), dispatching per active slug.
+        // The scrollable content area (18/24 pad), dispatching per active slug. No
+        // fill — the root's translucent surface shows through.
         let content = div()
             .id("settings.content")
             .flex_1()
+            .min_w(px(0.0))
             .overflow_y_scroll()
-            .bg(panel)
             .child(
                 div()
                     .flex()
@@ -260,14 +299,25 @@ impl Render for SettingsRootView {
                     .child(render_section(self.active.clone(), window, cx)),
             );
 
+        // Rail + content below the titlebar; the body row fills the remaining height
+        // (`min_h(0)` lets the scroll container size correctly).
+        let body = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_row()
+            .child(rail)
+            .child(content);
+
         div()
             .key_context("SettingsRoot")
             .size_full()
             .flex()
-            .flex_row()
-            .bg(panel)
-            .child(rail)
-            .child(content)
+            .flex_col()
+            .bg(surface)
+            .when_some(mono, |d, fam| d.font_family(fam))
+            .child(titlebar)
+            .child(body)
             // The open dropdown menu (if any) — its own render defers + anchors
             // itself at window coords, so root-level placement is layout-neutral.
             .children(self.open_dropdown.as_ref().map(|open| open.menu.clone()))

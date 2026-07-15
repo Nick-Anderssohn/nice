@@ -1,9 +1,10 @@
-# Restyle feel-check round 2 — pending changes (NOT yet planned/implemented)
+# Restyle feel-check round 2 — decisions (plans 04/05/06 implemented)
 
 Collected from Nick's feel-check of the merged restyle (worktree-restyle,
 2026-07-15). Mock updates for these are committed in
-`docs/design/restyle-mocks.html` (source of record); implementation plans are
-NOT yet authored. Keep this list until the round-2 plans exist.
+`docs/design/restyle-mocks.html` (source of record). Implemented as plans
+04/05/06; §5 records the round-2.5 revisions from Nick's feel-check OF that
+implementation.
 
 ## 1. Kill the one-time restyle popup (replaces plan 3's migration design)
 
@@ -62,3 +63,27 @@ NOT yet authored. Keep this list until the round-2 plans exist.
   geometry, stroke ~1px at 14px) — shipped sun-like gear is superseded.
 - `+` button vertical alignment in the titlebar is off in the shipped
   build — implementation bug; the mock (flex-centered bar-tail) is correct.
+  *(Superseded by §5: the drift measured HORIZONTAL, not vertical — fixed
+  via `TOOLBAR_TRAILING_PAD` 20→10.)*
+
+## 5. Round-2.5 revisions (Nick's feel-check of the 06 build, 2026-07-15)
+
+- **Manual Scheme control RESTORED** — dropping it in the plan-06 regroup was
+  a mock miss (Nick's own words): with OS-sync off there was no light/dark
+  flip left in the UI. It returns as a flat segmented Light|Dark control
+  (mock `.scheme-seg`: hairline border, radius 7, selected cell over-glass
+  `--fill-x` + ink), placed directly BELOW the OS-sync toggle and ABOVE the
+  Accent row (Nick flipped Scheme/Accent at the round-2.5 check; both sit
+  above the Light/Dark edit-target tabs); still disabled (0.4 opacity, no
+  handlers) while OS-sync is on. It flips the LIVE scheme — distinct from
+  the tabs, which only pick the editing target.
+- **Theme picker back to a DROPDOWN, no color chips** — the 3-column card
+  grid truncated nearly every theme name at real pane widths. One "Theme"
+  row per scheme tab with the in-house dropdown (full display names); the
+  `settings.terminal.{light,dark}Picker` a11y ids and the
+  `apply_terminal_theme_id` selection contract are unchanged.
+- **`+` alignment root-caused as HORIZONTAL, not vertical** — pixel
+  measurement of the shipped build: the glyph's ink center is level with the
+  title text; the drift was `TOOLBAR_TRAILING_PAD` still at the Swift-era
+  20pt, vs the mock's 10px `.bar-tail` inset. Now 10pt (the `+` right edge
+  sits 10pt off the window corner, matching the mock).
