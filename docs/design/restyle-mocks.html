@@ -875,10 +875,10 @@
       Scheme-specific settings group under <b>Light / Dark tabs</b> (same
       text + accent-underline grammar as the titlebar): the tab picks which
       scheme you're editing — its theme, opacity, and blur. Scheme-independent
-      settings sit above the tabs: OS sync, accent, and a manual <b>Scheme</b>
-      control (segmented Light/Dark; the flip used when OS sync is off) right
-      below the accent row. The tabs are clickable in this mock; the Scheme
-      row flips what the whole window renders as.
+      settings sit above the tabs: OS sync, then a manual <b>Scheme</b>
+      control (segmented Light/Dark; the flip used when OS sync is off)
+      directly below it, then the accent row. The tabs are clickable in this
+      mock; the Scheme row flips what the whole window renders as.
     </p>
 
     <figure class="mock">
@@ -901,6 +901,10 @@
                 <span class="toggle on"><i></i></span>
               </div>
               <div class="set-row">
+                <span>Scheme</span>
+                <span class="scheme-seg"><span>Light</span><span class="sel">Dark</span></span>
+              </div>
+              <div class="set-row">
                 <span>Accent</span>
                 <span class="accent-swatches">
                   <span class="swatch sel" style="background:#c96442"></span>
@@ -909,10 +913,6 @@
                   <span class="swatch" style="background:#d338d3"></span>
                   <span class="swatch" style="background:#33bbc8"></span>
                 </span>
-              </div>
-              <div class="set-row">
-                <span>Scheme</span>
-                <span class="scheme-seg"><span>Light</span><span class="sel">Dark</span></span>
               </div>
 
               <div class="scheme-tabs">
@@ -953,7 +953,7 @@
           </div>
         </div>
       </div></div>
-      <figcaption><b>Settings · Appearance</b> — translucent like the main window; one merged theme list in a plain dropdown (full names, no chips); a manual Scheme control below the accent row for when OS sync is off; Light/Dark tabs scope the per-scheme settings (theme, opacity, blur). Dark-only themes appear in the light tab's dropdown too — a scheme picks its theme freely.</figcaption>
+      <figcaption><b>Settings · Appearance</b> — translucent like the main window; one merged theme list in a plain dropdown (full names, no chips); a manual Scheme control between OS-sync and the accent row for when OS sync is off; Light/Dark tabs scope the per-scheme settings (theme, opacity, blur). Dark-only themes appear in the light tab's dropdown too — a scheme picks its theme freely.</figcaption>
     </figure>
   </section>
 
