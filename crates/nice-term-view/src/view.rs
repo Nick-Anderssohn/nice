@@ -117,6 +117,15 @@ pub struct TerminalView {
     handle: Entity<TerminalSessionHandle>,
     theme: TerminalTheme,
     accent: Srgba,
+    /// The surface-fill alpha (0.55–1.0) the grid paints its DEFAULT background at
+    /// (restyle plan 3 transparency). `1.0` (the default) paints the whole-viewport
+    /// default-bg fill fully opaque, exactly as before; below `1.0` the grid SKIPS
+    /// that fill so the translucent window-body backing behind it shows through as
+    /// the single surface (see [`crate::element::TerminalElement`]'s paint). Cells
+    /// with an explicit background, selection, cursor, and glyphs stay opaque on
+    /// top regardless. The app pushes this from `SharedThemeState`; this crate
+    /// never observes an app entity.
+    background_opacity: f32,
     /// The shared, app-level terminal font state (family chain + size + cell
     /// metrics) this view observes (T11). Owned at the app root in `crates/nice`;
     /// every pane shares one entity, so a ⌘+/⌘−/⌘0 zoom fans out to all of them.
@@ -309,6 +318,7 @@ impl TerminalView {
             handle,
             theme,
             accent,
+            background_opacity: 1.0,
             font,
             font_family,
             font_px,
@@ -480,6 +490,17 @@ impl TerminalView {
     pub fn set_theme(&mut self, theme: TerminalTheme, accent: Srgba, cx: &mut Context<Self>) {
         self.theme = theme;
         self.accent = accent;
+        cx.notify();
+    }
+
+    /// Live-set the surface-fill opacity (restyle plan 3 transparency fan-out):
+    /// the alpha the grid paints its DEFAULT background at. Clamped to `[0, 1]`.
+    /// `1.0` restores the fully-opaque whole-viewport fill; below `1.0` the grid
+    /// skips it so the translucent window-body backing shows through. Repaints
+    /// without a rebuild; boundary-legal (plain `f32`), a companion to
+    /// [`set_theme`](Self::set_theme).
+    pub fn set_background_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
+        self.background_opacity = opacity.clamp(0.0, 1.0);
         cx.notify();
     }
 
@@ -1524,6 +1545,7 @@ impl Render for TerminalView {
             self.paint_bounds.clone(),
             self.auto_refit,
             self.grid_cache.clone(),
+            self.background_opacity,
         );
 
         div()

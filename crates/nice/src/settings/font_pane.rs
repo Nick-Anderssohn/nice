@@ -21,7 +21,7 @@ use gpui::{
     Window,
 };
 
-use nice_term_view::DEFAULT_TERMINAL_FONT_PX;
+use nice_term_view::{clamp_line_height, DEFAULT_TERMINAL_FONT_PX, DEFAULT_TERMINAL_LINE_HEIGHT};
 
 use crate::settings::controls::{dropdown, DropdownItem};
 use crate::settings::prefs_store::SettingsPrefsStore;
@@ -76,6 +76,20 @@ pub(crate) fn apply_terminal_px(cx: &mut App, px: f32) {
     cx.refresh_windows();
 }
 
+/// Apply the terminal line-height multiplier LIVE (fan out through the shared
+/// `FontSettings`, which re-metrics every grid) and persist the clamped value.
+pub(crate) fn apply_terminal_line_height(cx: &mut App, multiplier: f32) {
+    let Some(font) = crate::keymap::try_shared_font_settings(cx) else {
+        return;
+    };
+    font.update(cx, |f, cx| f.set_line_height(multiplier, cx));
+    let clamped = font.read(cx).line_height();
+    persist(cx, |s| s.set_terminal_line_height(clamped));
+    // Repaint the Settings window's own readout (the pane does not observe the
+    // shared `FontSettings` — same discipline as `apply_terminal_px`).
+    cx.refresh_windows();
+}
+
 /// Apply a terminal font family LIVE (`None` ⇒ the default chain) and persist it.
 pub(crate) fn apply_terminal_family(cx: &mut App, family: Option<SharedString>) {
     let Some(font) = crate::keymap::try_shared_font_settings(cx) else {
@@ -117,6 +131,9 @@ pub(crate) fn reset_fonts(cx: &mut App) {
     persist(cx, |s| {
         s.set_sidebar_font_px(sidebar_font::DEFAULT_SIDEBAR_FONT_PX)
     });
+    persist(cx, |s| {
+        s.set_terminal_line_height(DEFAULT_TERMINAL_LINE_HEIGHT)
+    });
     cx.refresh_windows();
 }
 
@@ -124,10 +141,10 @@ pub(crate) fn reset_fonts(cx: &mut App) {
 // Rendering
 // ===========================================================================
 
-/// The current terminal size + family-override (the family shown selected) from the
-/// shared `FontSettings`, and the sidebar size.
-fn current_state(cx: &App) -> (f32, Option<String>, f32) {
-    let (px, family) = match crate::keymap::try_shared_font_settings(cx) {
+/// The current terminal size + family-override (the family shown selected) +
+/// line-height from the shared `FontSettings`, and the sidebar size.
+fn current_state(cx: &App) -> (f32, Option<String>, f32, f32) {
+    let (px, family, line_height) = match crate::keymap::try_shared_font_settings(cx) {
         Some(font) => {
             let f = font.read(cx);
             let chain = f.chain();
@@ -137,12 +154,12 @@ fn current_state(cx: &App) -> (f32, Option<String>, f32) {
             } else {
                 None
             };
-            (f.px(), family)
+            (f.px(), family, f.line_height())
         }
-        None => (DEFAULT_TERMINAL_FONT_PX, None),
+        None => (DEFAULT_TERMINAL_FONT_PX, None, DEFAULT_TERMINAL_LINE_HEIGHT),
     };
     let sidebar_px = sidebar_font::current_sidebar_px(cx);
-    (px, family, sidebar_px)
+    (px, family, sidebar_px, line_height)
 }
 
 /// The Font pane body (The spec §Font).
@@ -152,7 +169,7 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     let ink3 = slot_to_rgba(slots.ink3);
     let line = slot_to_rgba(slots.line);
 
-    let (terminal_px, family, sidebar_px) = current_state(cx);
+    let (terminal_px, family, sidebar_px, line_height) = current_state(cx);
 
     let mut col = div()
         .flex()
@@ -210,6 +227,21 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
             ink3,
             line,
             apply_sidebar_px,
+        ),
+        cx,
+    ));
+
+    // --- Terminal line height ---------------------------------------------
+    col = col.child(setting_row(
+        "Line height",
+        Some("Vertical spacing between terminal rows. Higher is roomier.".into()),
+        line_height_stepper(
+            "settings.font.lineHeight",
+            line_height,
+            ink,
+            ink3,
+            line,
+            apply_terminal_line_height,
         ),
         cx,
     ));
@@ -295,6 +327,73 @@ fn size_stepper(
     let readout = SharedString::from(format!("{} pt", value.round() as i32));
     let dec_value = value - 1.0;
     let inc_value = value + 1.0;
+
+    let button = |id: SharedString, glyph: &'static str, target: f32| {
+        div()
+            .id(id)
+            .role(gpui::Role::Button)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.0))
+            .py(px(3.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(line)
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ink)
+            .cursor_pointer()
+            .child(glyph)
+            .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
+                apply(cx, target);
+            })
+    };
+
+    div()
+        .id(a11y)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .child(button(dec_id, "−", dec_value))
+        .child(
+            div()
+                .w(px(44.0))
+                .flex()
+                .justify_center()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ink3)
+                .child(readout),
+        )
+        .child(button(inc_id, "+", inc_value))
+}
+
+/// The line-height stepper step (matches the 0.05 slider granularity in the
+/// plan). `−` / `<n.nn>` readout / `+`, each clamped by [`clamp_line_height`].
+const LINE_HEIGHT_STEP: f32 = 0.05;
+
+/// A discrete line-height stepper: `−` / `<n.nn>` readout / `+`, stepping by
+/// [`LINE_HEIGHT_STEP`] and clamped to
+/// `[MIN_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_LINE_HEIGHT]`. `a11y` names the
+/// container; the buttons are `<a11y>.dec` / `<a11y>.inc`.
+fn line_height_stepper(
+    a11y: &'static str,
+    value: f32,
+    ink: Rgba,
+    ink3: Rgba,
+    line: Rgba,
+    apply: fn(&mut App, f32),
+) -> impl IntoElement {
+    let dec_id = SharedString::from(format!("{a11y}.dec"));
+    let inc_id = SharedString::from(format!("{a11y}.inc"));
+    let readout = SharedString::from(format!("{value:.2}"));
+    // Snap to the step grid so repeated clicks land on clean values (e.g.
+    // 1.30 → 1.35, not 1.2999…), then clamp to the allowed range.
+    let snapped = (value / LINE_HEIGHT_STEP).round() * LINE_HEIGHT_STEP;
+    let dec_value = clamp_line_height(snapped - LINE_HEIGHT_STEP);
+    let inc_value = clamp_line_height(snapped + LINE_HEIGHT_STEP);
 
     let button = |id: SharedString, glyph: &'static str, target: f32| {
         div()

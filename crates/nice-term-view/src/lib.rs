@@ -86,8 +86,9 @@ pub use element::{
     fit_grid, grid_top_y, ImeInput, TerminalElement, TerminalMetrics, TERMINAL_BOTTOM_GAP,
 };
 pub use font::{
-    cell_metrics, clamp_px, default_font_chain, resolve_family, FontSettings, FontZoom,
-    DEFAULT_TERMINAL_FONT_PX, MAX_TERMINAL_FONT_PX, MIN_TERMINAL_FONT_PX,
+    cell_metrics, clamp_line_height, clamp_px, default_font_chain, resolve_family, FontSettings,
+    FontZoom, DEFAULT_TERMINAL_FONT_PX, DEFAULT_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_FONT_PX,
+    MAX_TERMINAL_LINE_HEIGHT, MIN_TERMINAL_FONT_PX, MIN_TERMINAL_LINE_HEIGHT,
 };
 pub use input::{KeyCodeProbe, TermInputHandler};
 pub use overlay::{

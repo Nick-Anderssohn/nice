@@ -515,12 +515,12 @@ async fn leg_b_accent_fanout(
 
     // Restore the baseline accent so no theme state leaks to a later scenario (the
     // `multiwindow`/font-leg discipline). Re-apply whichever preset the baseline
-    // pixel color came from, falling back to the fresh-install default (Ocean).
+    // pixel color came from, falling back to the fresh-install default (Terracotta).
     let baseline = AccentPreset::ALL
         .iter()
         .copied()
         .find(|p| p.color() == before)
-        .unwrap_or(AccentPreset::Ocean);
+        .unwrap_or(AccentPreset::Terracotta);
     cx.update(|app| theme_settings::apply_accent(app, baseline));
     settle(cx, 100).await;
 }

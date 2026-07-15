@@ -1167,6 +1167,15 @@ impl WindowToolbarView {
         // viewport-fixed host for the reorder insertion line (D10): `scroll_wrap`'s
         // origin is the viewport left, and `pane_frames` are viewport-relative, so
         // the line's x is directly the target frame edge.
+        // Restyle plan 3: the edge fade dissolves the fill-less scrolling tabs into
+        // the WINDOW-BODY surface (the terminal theme background at the active
+        // window opacity), not the `chrome` slot — see `edge_fade`. Computed once
+        // here (needs `cx`) and moved into the fade builders.
+        let (term_theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
+        let fade = Rgba {
+            a: crate::theme_settings::active_window_opacity(cx),
+            ..gpui::rgb(term_theme.background.to_u32())
+        };
         let scroll_wrap = div()
             .relative()
             .flex_1()
@@ -1174,10 +1183,10 @@ impl WindowToolbarView {
             .h(px(PILL_HEIGHT))
             .child(row)
             .when(geometry.can_scroll_leading(), |el| {
-                el.child(self.edge_fade(false, s))
+                el.child(self.edge_fade(false, fade))
             })
             .when(geometry.can_scroll_trailing(), |el| {
-                el.child(self.edge_fade(true, s))
+                el.child(self.edge_fade(true, fade))
             })
             .children(self.insertion_line(cx));
 
@@ -1192,12 +1201,23 @@ impl WindowToolbarView {
             .child(self.render_new_tab_slot(s, cx))
     }
 
-    /// A 16pt gradient from the chrome fill (opaque) to transparent, at the
-    /// viewport's leading (`trailing == false`) or trailing edge. Never hit-tests.
-    fn edge_fade(&self, trailing: bool, s: &Slots) -> impl IntoElement {
-        let chrome = slot_srgba(s.chrome);
-        let opaque = srgba_to_rgba(chrome);
-        let clear = srgba_to_rgba(srgba_with_alpha(chrome, 0.0));
+    /// A 16pt gradient from the window-body surface color (`fade`) to transparent,
+    /// at the viewport's leading (`trailing == false`) or trailing edge. Never
+    /// hit-tests.
+    ///
+    /// Restyle-plan-3 conformance (drift `chrome-fill-survivor`): the opaque stop
+    /// is the WINDOW-BODY surface — the terminal theme background at the active
+    /// window opacity, computed by the caller — NOT the `chrome` slot
+    /// (`background @ CHROME_OPACITY 0.70`). Plans 1–2 made the titlebar band
+    /// fill-less, so the fill-less tabs scroll directly over the (now possibly
+    /// translucent) window body; fading to `chrome @ 0.70` composited a FIXED
+    /// 0.70-alpha, wrong-color band over the translucent surface (a double-applied,
+    /// differently-tinted stripe at the tab-strip edges). Fading to the same
+    /// surface color/alpha the body already paints keeps the edges consistent with
+    /// the body at every per-scheme opacity.
+    fn edge_fade(&self, trailing: bool, fade: Rgba) -> impl IntoElement {
+        let opaque = fade;
+        let clear = Rgba { a: 0.0, ..fade };
         // angle 90° points right (opaque→clear, leading fade); 270° points left
         // (opaque→clear from the trailing edge).
         let angle = if trailing { 270.0 } else { 90.0 };

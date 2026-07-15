@@ -179,9 +179,14 @@ impl Render for AppShellView {
         // live `SharedThemeState`, so the R21 fan-out's `refresh_windows()`
         // repaints it on any theme / scheme change.
         let (terminal_theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
+        // Restyle plan 3: the backing carries the active-scheme surface-fill
+        // opacity (1.0 when no live theme is installed — scenarios / tests stay
+        // opaque). `refresh_windows()` in the theme fan-out re-runs this render on
+        // any opacity / scheme change.
+        let opacity = crate::theme_settings::active_window_opacity(cx);
         div()
             .size_full()
-            .bg(terminal_backing_color(&terminal_theme))
+            .bg(terminal_backing_color(&terminal_theme, opacity))
             // R12: the window-level peek clear (moved here from `WindowChromeView`
             // when the shell replaced the bare chrome band as the window root). A
             // sidebar-tab cycle on a collapsed sidebar floats the peek overlay; this
@@ -218,6 +223,11 @@ pub(crate) struct PaneHostView {
     theme: TerminalTheme,
     /// The user's accent (Terracotta default) — the caret / launch overlay tint.
     accent: Srgba,
+    /// The active-scheme surface-fill opacity (0.55–1.0) each hosted terminal
+    /// paints its DEFAULT background at (restyle plan 3). Seeded from the live
+    /// theme at construction and refreshed by the theme fan-out, so a pane built
+    /// later inherits it too. `1.0` ⇒ the opaque pre-restyle grid.
+    background_opacity: f32,
     /// The process-level shared [`FontSettings`] every pane observes, so a
     /// ⌘=/⌘−/⌘0 zoom fans out across panes and windows.
     font: Entity<FontSettings>,
@@ -238,6 +248,7 @@ impl PaneHostView {
         state: Entity<WindowState>,
         theme: TerminalTheme,
         accent: Srgba,
+        background_opacity: f32,
         font: Entity<FontSettings>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -247,6 +258,7 @@ impl PaneHostView {
             _state_sub: sub,
             theme,
             accent,
+            background_opacity,
             font,
             cache: HashMap::new(),
             last_active: None,
@@ -265,9 +277,14 @@ impl PaneHostView {
     ) -> Entity<TerminalView> {
         let theme = self.theme.clone();
         let accent = self.accent;
+        let background_opacity = self.background_opacity;
         let font = self.font.clone();
         cx.new(|tcx| {
             let mut view = TerminalView::new(handle, theme, accent, font, tcx);
+            // Seed the surface-fill opacity so a pane built after a slider change
+            // (or on window open) inherits the current translucency, not the 1.0
+            // default (restyle plan 3).
+            view.set_background_opacity(background_opacity, tcx);
             view.set_keycode_probe(Arc::new(crate::platform::current_event_keycode));
             view.set_image_drop_provider(Arc::new(crate::platform::read_dropped_image_to_temp));
             view.set_launch_deadline(crate::platform::launch_deadline());
@@ -291,6 +308,19 @@ impl PaneHostView {
         self.accent = accent;
         for view in self.cache.values() {
             view.update(cx, |v, vcx| v.set_theme(theme.clone(), accent, vcx));
+        }
+    }
+
+    /// Push a live surface-fill opacity into every hosted pane (restyle plan 3
+    /// transparency fan-out). Updates the host's own `background_opacity` so panes
+    /// built LATER seed with it too, then pushes into each cached
+    /// [`TerminalView`] via [`TerminalView::set_background_opacity`]. The theme
+    /// fan-out ([`crate::theme_settings::apply_theme_fanout`]) calls this per window
+    /// alongside [`set_theme`](Self::set_theme).
+    pub(crate) fn set_background_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
+        self.background_opacity = opacity;
+        for view in self.cache.values() {
+            view.update(cx, |v, vcx| v.set_background_opacity(opacity, vcx));
         }
     }
 
@@ -393,12 +423,24 @@ const CONTENT_INSET_TRAILING: f32 = 17.0;
 // (same placement rule as the host logic above).
 // ---------------------------------------------------------------------------
 
-/// The window-body backing fill — the ACTIVE terminal theme's background (8-bit
-/// sRGB, implicit alpha `1.0`), bled across the WHOLE window (top edge included,
-/// now that the titlebar paints no fill) so the sidebar card's gutter and every
-/// other unpainted region match the terminal instead of revealing black.
-fn terminal_backing_color(theme: &TerminalTheme) -> Rgba {
-    rgb(theme.background.to_u32())
+/// The window-body backing fill — the ACTIVE terminal theme's background bled
+/// across the WHOLE window (top edge included, now that the titlebar paints no
+/// fill) so the sidebar card's gutter and every other unpainted region match the
+/// terminal instead of revealing black.
+///
+/// Restyle plan 3: this is THE single translucent surface. `opacity` (0.55–1.0)
+/// is applied as the fill alpha; the window is made genuinely non-opaque via
+/// `WindowBackgroundAppearance` (see `crate::app::build_window_root`), so at
+/// `opacity < 1.0` the OS blur / desktop shows through here. The terminal grid
+/// SKIPS its own default-bg fill when translucent, so this backing is the ONLY
+/// default-background surface (no double-applied alpha under the grid). At
+/// `opacity == 1.0` the fill is fully opaque, identical to the pre-restyle window.
+fn terminal_backing_color(theme: &TerminalTheme, opacity: f32) -> Rgba {
+    let base = rgb(theme.background.to_u32());
+    Rgba {
+        a: opacity.clamp(0.0, 1.0),
+        ..base
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -527,14 +569,24 @@ mod tests {
     }
 
     #[test]
-    fn terminal_backing_is_the_active_themes_opaque_background() {
+    fn terminal_backing_is_the_active_theme_background_at_the_given_opacity() {
         let light = nice_term_view::TerminalTheme::nice_default_light();
-        let c = super::terminal_backing_color(&light);
-        assert_eq!(c.a, 1.0, "terminal backgrounds are opaque by construction");
+        // Opacity 1.0: the pre-restyle opaque backing (unchanged look).
+        let opaque = super::terminal_backing_color(&light, 1.0);
+        assert_eq!(opaque.a, 1.0, "opacity 1.0 is a fully opaque backing");
         assert_eq!(
-            (c.r, c.g, c.b),
+            (opaque.r, opaque.g, opaque.b),
             (1.0, 252.0 / 255.0, 252.0 / 255.0),
             "niceDefaultLight background (0xfffcfc)"
+        );
+        // Restyle plan 3: a translucent opacity is applied as the fill alpha, the
+        // rgb channels unchanged, so the OS blur / desktop shows through.
+        let translucent = super::terminal_backing_color(&light, 0.8);
+        assert_eq!(translucent.a, 0.8, "opacity is carried as the fill alpha");
+        assert_eq!(
+            (translucent.r, translucent.g, translucent.b),
+            (opaque.r, opaque.g, opaque.b),
+            "opacity leaves the theme rgb channels untouched"
         );
     }
 }

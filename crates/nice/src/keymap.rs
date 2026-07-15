@@ -150,14 +150,15 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
     // `run_selftest`). Values are copied out first so the store borrow ends before
     // `cx.new`. Applying them inside the constructor (before any subscriber exists)
     // means the seed emits no observable `FontZoom` to the sidebar.
-    let (seed_px, seed_family, seed_sidebar_px) =
+    let (seed_px, seed_family, seed_sidebar_px, seed_line_height) =
         match cx.try_global::<crate::settings::prefs_store::SettingsPrefsStore>() {
             Some(store) => (
                 store.terminal_font_px(),
                 store.terminal_font_family(),
                 store.sidebar_font_px(),
+                store.terminal_line_height(),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
     let font = cx.new(|cx| {
         let mut f = FontSettings::resolved_default(cx);
@@ -166,6 +167,11 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
         }
         if let Some(fam) = &seed_family {
             f.set_family(Some(fam.clone().into()), cx);
+        }
+        // Absent line-height ⇒ leave the shipped default (1.3); a stored value
+        // (the existing-user migration pins the legacy 1.0) overrides it.
+        if let Some(lh) = seed_line_height {
+            f.set_line_height(lh, cx);
         }
         f
     });

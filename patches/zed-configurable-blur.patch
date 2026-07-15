@@ -1,0 +1,143 @@
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 5765fd80af..bd24e60c6c 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -645,6 +645,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn background_appearance(&self) -> WindowBackgroundAppearance;
+     fn set_title(&mut self, title: &str);
+     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
++    /// Nice patch (configurable-blur): set the numeric window-background blur
++    /// radius used when the appearance is `Blurred`. Default no-op; only the
++    /// macOS backend honors it (routing through the WindowServer blur API).
++    fn set_background_blur_radius(&self, _radius: u32) {}
+     fn minimize(&self);
+     fn zoom(&self);
+     fn toggle_fullscreen(&self);
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index e225b9bc52..16cc13afcf 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2378,6 +2378,14 @@ impl Window {
+             .set_background_appearance(background_appearance);
+     }
+ 
++    /// Nice patch (configurable-blur): set the numeric background blur radius
++    /// applied when the appearance is `Blurred`. On macOS this routes through
++    /// the WindowServer's `CGSSetWindowBackgroundBlurRadius` on all versions;
++    /// on other backends it is a no-op. A radius of 0 disables the blur.
++    pub fn set_background_blur_radius(&self, radius: u32) {
++        self.platform_window.set_background_blur_radius(radius);
++    }
++
+     /// Mark the window as dirty at the platform level.
+     pub fn set_window_edited(&mut self, edited: bool) {
+         self.platform_window.set_edited(edited);
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index d1898e1891..b5b7973c18 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -9,7 +9,7 @@ use anyhow::Result;
+ use block::ConcreteBlock;
+ use cocoa::{
+     appkit::{
+-        NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
++        NSApplication, NSBackingStoreBuffered,
+         NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard, NSScreen,
+         NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
+         NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
+@@ -488,6 +488,12 @@ struct MacWindowState {
+     native_view: NonNull<Object>,
+     blurred_view: Option<id>,
+     background_appearance: WindowBackgroundAppearance,
++    // Nice patch (configurable-blur): numeric WindowServer blur radius applied
++    // when `background_appearance == Blurred`. Routed through
++    // `CGSSetWindowBackgroundBlurRadius` on ALL macOS versions (the stock
++    // modern path uses a fixed-material NSVisualEffectView with no numeric
++    // radius). Set via `set_background_blur_radius`; defaults to the legacy 80.
++    blur_radius: u32,
+     cursor_style: CursorStyle,
+     cursor_visible: Arc<AtomicBool>,
+     display_link: Option<DisplayLink>,
+@@ -911,6 +917,7 @@ impl MacWindow {
+                 native_view: NonNull::new_unchecked(native_view),
+                 blurred_view: None,
+                 background_appearance: WindowBackgroundAppearance::Opaque,
++                blur_radius: 80,
+                 cursor_style: CursorStyle::Arrow,
+                 cursor_visible,
+                 display_link: None,
+@@ -1549,43 +1556,39 @@ impl PlatformWindow for MacWindow {
+             };
+             this.native_window.setBackgroundColor_(background_color);
+ 
+-            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 {
+-                // Whether `-[NSVisualEffectView respondsToSelector:@selector(_updateProxyLayer)]`.
+-                // On macOS Catalina/Big Sur `NSVisualEffectView` doesn’t own concrete sublayers
+-                // but uses a `CAProxyLayer`. Use the legacy WindowServer API.
+-                let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
+-                    80
+-                } else {
+-                    0
+-                };
+-
+-                let window_number = this.native_window.windowNumber();
+-                CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, blur_radius);
++            // Nice patch (configurable-blur): route `Blurred` through the
++            // WindowServer's `CGSSetWindowBackgroundBlurRadius` on ALL macOS
++            // versions using the per-window numeric `blur_radius`, instead of
++            // the stock modern path's fixed-material `NSVisualEffectView`
++            // (which exposes no numeric radius). A non-`Blurred` appearance —
++            // or radius 0 — clears the blur, degrading to plain transparency.
++            //
++            // Tear down any effect view a prior (unpatched) code path may have
++            // installed, so the two mechanisms never stack.
++            if let Some(blur_view) = this.blurred_view.take() {
++                NSView::removeFromSuperview(blur_view);
++            }
++            let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
++                this.blur_radius as i64
+             } else {
+-                // On newer macOS `NSVisualEffectView` manages the effect layer directly. Using it
+-                // could have a better performance (it downsamples the backdrop) and more control
+-                // over the effect layer.
+-                if background_appearance != WindowBackgroundAppearance::Blurred {
+-                    if let Some(blur_view) = this.blurred_view {
+-                        NSView::removeFromSuperview(blur_view);
+-                        this.blurred_view = None;
+-                    }
+-                } else if this.blurred_view.is_none() {
+-                    let content_view = this.native_window.contentView();
+-                    let frame = NSView::bounds(content_view);
+-                    let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+-                    blur_view = NSView::initWithFrame_(blur_view, frame);
+-                    blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
++                0
++            };
++            let window_number = this.native_window.windowNumber();
++            CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, blur_radius);
++        }
++    }
+ 
+-                    let _: () = msg_send![
+-                        content_view,
+-                        addSubview: blur_view
+-                        positioned: NSWindowOrderingMode::NSWindowBelow
+-                        relativeTo: nil
+-                    ];
+-                    this.blurred_view = Some(blur_view.autorelease());
+-                }
+-            }
++    // Nice patch (configurable-blur): set the numeric WindowServer blur radius
++    // and re-apply it live if the window is currently `Blurred`, so a settings
++    // slider updates the effect without a full appearance round-trip.
++    fn set_background_blur_radius(&self, radius: u32) {
++        {
++            let mut this = self.0.as_ref().lock();
++            this.blur_radius = radius;
++        }
++        let appearance = self.background_appearance();
++        if appearance == WindowBackgroundAppearance::Blurred {
++            self.set_background_appearance(appearance);
+         }
+     }
+ 

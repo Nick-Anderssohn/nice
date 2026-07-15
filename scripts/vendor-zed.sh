@@ -31,6 +31,15 @@
 #          natural advance, so sub-tolerance drift accumulated across a run and
 #          glyph positions depended on where the run started — selecting text
 #          (which re-splits runs on background) visibly shifted characters.
+#        - zed-configurable-blur.patch: give the window-background blur a
+#          NUMERIC radius on modern macOS. Stock gpui only routes `Blurred`
+#          through CGSSetWindowBackgroundBlurRadius on pre-Monterey macOS; on
+#          every version Nice targets it instead inserts a fixed-material
+#          NSVisualEffectView with no numeric knob. The patch routes `Blurred`
+#          through CGSSetWindowBackgroundBlurRadius on ALL versions (bypassing
+#          the effect view) with a per-window radius, exposed as
+#          `Window::set_background_blur_radius(u32)` (default-noop on non-mac
+#          backends). Lets Nice's per-scheme blur slider drive a real radius.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
@@ -55,6 +64,7 @@ PATCHES=(
     "zed-bg-luminance"
     "zed-display-link-selfheal"
     "zed-force-width-exact"
+    "zed-configurable-blur"
 )
 patch_file() { printf '%s/patches/%s.patch' "$REPO_ROOT" "$1"; }
 marker_file() { printf '%s/.nice-%s-applied' "$VENDOR" "${1#zed-}"; }

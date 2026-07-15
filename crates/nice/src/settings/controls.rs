@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, prelude::*, px, AnyElement, App, Bounds, Context, FontWeight, MouseButton,
-    Pixels, SharedString, Window,
+    Pixels, Rgba, SharedString, Window,
 };
 
 use crate::context_menu::ContextMenuItem;
@@ -89,6 +89,73 @@ pub(crate) fn toggle_switch(
         .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
             on_click(cx);
         })
+}
+
+// -- stepper --------------------------------------------------------------------
+
+/// A discrete `−` / readout / `+` stepper (gpui has no native slider — D8's
+/// Font-pane precedent ports the Swift slider as a stepper: "step → the exact
+/// setter call + the exact a11y id"). `a11y` names the container; the buttons
+/// are `<a11y>.dec` / `<a11y>.inc`. Click → `apply(cx, target)`; the caller's
+/// mutator does the clamping, so `dec_target`/`inc_target` may be handed in
+/// already-out-of-range (e.g. at the slider floor/ceiling) with no ill effect.
+pub(crate) fn stepper(
+    a11y: impl Into<SharedString>,
+    readout: impl Into<SharedString>,
+    dec_target: f32,
+    inc_target: f32,
+    ink: Rgba,
+    ink3: Rgba,
+    line: Rgba,
+    apply: impl Fn(&mut App, f32) + Clone + 'static,
+) -> impl IntoElement {
+    let a11y = a11y.into();
+    let dec_id = SharedString::from(format!("{a11y}.dec"));
+    let inc_id = SharedString::from(format!("{a11y}.inc"));
+
+    let dec_apply = apply.clone();
+    let inc_apply = apply;
+
+    let button = move |id: SharedString, glyph: &'static str, target: f32, apply: Box<dyn Fn(&mut App, f32)>| {
+        div()
+            .id(id)
+            .role(gpui::Role::Button)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.0))
+            .py(px(3.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(line)
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ink)
+            .cursor_pointer()
+            .child(glyph)
+            .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
+                apply(cx, target);
+            })
+    };
+
+    div()
+        .id(a11y)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .child(button(dec_id, "−", dec_target, Box::new(dec_apply)))
+        .child(
+            div()
+                .w(px(48.0))
+                .flex()
+                .justify_center()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ink3)
+                .child(readout.into()),
+        )
+        .child(button(inc_id, "+", inc_target, Box::new(inc_apply)))
 }
 
 // -- dropdown -------------------------------------------------------------------

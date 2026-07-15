@@ -364,6 +364,14 @@ impl WindowState {
         self.window_handle = Some(handle);
     }
 
+    /// This window's stashed handle (present after
+    /// [`crate::app::build_window_root`]). Read by the R21 theme fan-out's
+    /// window-transparency pass so it can reach each live `Window` to set its
+    /// `WindowBackgroundAppearance` + blur radius.
+    pub(crate) fn window_handle(&self) -> Option<AnyWindowHandle> {
+        self.window_handle
+    }
+
     /// R21: stash this window's mounted pane host (the shipped builder calls it at
     /// [`crate::app::build_window_root`]) so the process theme fan-out can push
     /// recolors into its terminal panes.

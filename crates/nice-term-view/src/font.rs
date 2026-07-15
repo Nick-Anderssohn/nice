@@ -49,6 +49,15 @@ pub const MIN_TERMINAL_FONT_PX: f32 = 8.0;
 /// `FontSettings.swift`'s `maxSize`.
 pub const MAX_TERMINAL_FONT_PX: f32 = 32.0;
 
+/// The shipped default terminal line-height multiplier (restyle 3/3). Fresh
+/// installs get this roomier grid; the existing-user migration pins the legacy
+/// `1.0` explicitly so declining the restyle leaves the grid unchanged.
+pub const DEFAULT_TERMINAL_LINE_HEIGHT: f32 = 1.3;
+/// Tightest allowed line-height (no extra leading — the classic terminal grid).
+pub const MIN_TERMINAL_LINE_HEIGHT: f32 = 1.0;
+/// Loosest allowed line-height.
+pub const MAX_TERMINAL_LINE_HEIGHT: f32 = 1.8;
+
 /// The default terminal font family chain, tried in order for availability.
 ///
 /// Ported exactly from `TabPtySession.terminalFont(named:size:)`
@@ -99,7 +108,13 @@ pub struct FontSettings {
     family: SharedString,
     /// Current point size, clamped to `[MIN, MAX]`.
     px: f32,
-    /// Cell box for `family` at `px` (derived or pinned per `mode`).
+    /// Terminal line-height multiplier, clamped to
+    /// `[MIN_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_LINE_HEIGHT]`. Multiplies the
+    /// cell HEIGHT only (width untouched); the natural glyph height is preserved
+    /// as `TerminalMetrics::glyph_h` for cursor centering.
+    line_height: f32,
+    /// Cell box for `family` at `px` and `line_height` (derived or pinned per
+    /// `mode`).
     metrics: TerminalMetrics,
     mode: MetricsMode,
 }
@@ -115,11 +130,13 @@ impl FontSettings {
         let ts = cx.text_system().clone();
         let family = resolve_family(&ts, &chain);
         let px = DEFAULT_TERMINAL_FONT_PX;
-        let metrics = cell_metrics(&ts, &family, px);
+        let line_height = DEFAULT_TERMINAL_LINE_HEIGHT;
+        let metrics = cell_metrics(&ts, &family, px, line_height);
         Self {
             chain,
             family,
             px,
+            line_height,
             metrics,
             mode: MetricsMode::Derived,
         }
@@ -135,6 +152,9 @@ impl FontSettings {
             chain: vec![family.clone()],
             family,
             px,
+            // The deterministic renderer self-tests pin their pixel pitch and
+            // want the cursor to fill the whole cell — line-height 1.0.
+            line_height: MIN_TERMINAL_LINE_HEIGHT,
             metrics,
             mode: MetricsMode::Fixed {
                 base_px: px,
@@ -158,6 +178,11 @@ impl FontSettings {
     /// The current point size.
     pub fn px(&self) -> f32 {
         self.px
+    }
+
+    /// The current terminal line-height multiplier.
+    pub fn line_height(&self) -> f32 {
+        self.line_height
     }
 
     /// The current cell metrics for `family` at `px`.
@@ -195,6 +220,24 @@ impl FontSettings {
         cx.notify();
     }
 
+    /// Set the terminal line-height multiplier (restyle 3/3's Font-pane control).
+    /// The input is **clamped** to `[MIN_TERMINAL_LINE_HEIGHT,
+    /// MAX_TERMINAL_LINE_HEIGHT]` ([`clamp_line_height`]); a value that does not
+    /// actually move is a no-op (never notifies). On a real change: recompute the
+    /// cell metrics (only the cell HEIGHT changes) and `notify` so every view
+    /// re-metrics its grid. Deliberately does NOT emit [`FontZoom`] — the point
+    /// size is unchanged, so the sidebar's proportional subscriber must not
+    /// rescale off a line-height change.
+    pub fn set_line_height(&mut self, multiplier: f32, cx: &mut Context<Self>) {
+        let new_lh = clamp_line_height(multiplier);
+        if new_lh == self.line_height {
+            return;
+        }
+        self.line_height = new_lh;
+        self.recompute_metrics(cx);
+        cx.notify();
+    }
+
     /// Override the terminal font family (R23's Font-pane family picker). `Some(f)`
     /// makes `f` the sole chain entry (resolved through the text system, GPUI
     /// substituting a system font if it is unavailable); `None` restores the shipped
@@ -225,6 +268,7 @@ impl FontSettings {
         let ts = cx.text_system().clone();
         self.family = resolve_family(&ts, &self.chain);
         self.px = DEFAULT_TERMINAL_FONT_PX;
+        self.line_height = DEFAULT_TERMINAL_LINE_HEIGHT;
         self.recompute_metrics(cx);
         cx.notify();
     }
@@ -236,12 +280,15 @@ impl FontSettings {
         self.metrics = match self.mode {
             MetricsMode::Derived => {
                 let ts = cx.text_system().clone();
-                cell_metrics(&ts, &self.family, self.px)
+                cell_metrics(&ts, &self.family, self.px, self.line_height)
             }
             MetricsMode::Fixed {
                 base_px,
                 base_metrics,
-            } => scale_metrics(base_metrics, self.px / base_px),
+            } => {
+                let scaled = scale_metrics(base_metrics, self.px / base_px);
+                apply_line_height(scaled, self.line_height)
+            }
         };
     }
 }
@@ -249,6 +296,29 @@ impl FontSettings {
 /// Clamp a point size into `[MIN, MAX]` (`FontSettings.swift`'s `clamp`).
 pub fn clamp_px(v: f32) -> f32 {
     v.clamp(MIN_TERMINAL_FONT_PX, MAX_TERMINAL_FONT_PX)
+}
+
+/// Clamp a line-height multiplier into
+/// `[MIN_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_LINE_HEIGHT]`.
+pub fn clamp_line_height(v: f32) -> f32 {
+    v.clamp(MIN_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_LINE_HEIGHT)
+}
+
+/// The padded cell height for a natural glyph height under a line-height
+/// multiplier — the single source of truth the whole grid keys off. Rounded to
+/// whole logical px **once** (never per-glyph) so every rect below computes from
+/// the same integer height (no sub-row seams). At multiplier 1.0 this is
+/// `glyph_h` unchanged (`round` of an already-whole value), so the classic grid
+/// is bit-identical.
+pub(crate) fn padded_cell_h(glyph_h: f32, line_height: f32) -> f32 {
+    (glyph_h * line_height).round().max(1.0)
+}
+
+/// Re-derive a padded cell box from an existing box treated as the natural glyph
+/// height (the [`MetricsMode::Fixed`] line-height path). Width is untouched.
+fn apply_line_height(base: TerminalMetrics, line_height: f32) -> TerminalMetrics {
+    let glyph_h = base.cell_h;
+    TerminalMetrics::with_glyph_h(base.cell_w, padded_cell_h(glyph_h, line_height), glyph_h)
 }
 
 /// Resolve a font family from `chain`, tried in order, against the families the
@@ -317,6 +387,7 @@ pub fn cell_metrics(
     text_system: &Arc<TextSystem>,
     family: &SharedString,
     px_size: f32,
+    line_height: f32,
 ) -> TerminalMetrics {
     let font = Font {
         family: family.clone(),
@@ -334,8 +405,13 @@ pub fn cell_metrics(
     let cell_w = (advance * METRICS_SNAP_SCALE).ceil() / METRICS_SNAP_SCALE;
     let ascent = f32::from(text_system.ascent(font_id, size));
     let descent = f32::from(text_system.descent(font_id, size));
-    let cell_h = (ascent + descent.abs()).ceil();
-    TerminalMetrics::new(cell_w.max(1.0), cell_h.max(1.0))
+    // The natural glyph box (today's cell height). The padded cell height is
+    // `round(glyph_h * line_height)` — the extra leading is split half above /
+    // half below the glyph at paint time (gpui's `paint_line` centers the run in
+    // `cell_h`; the cursor is centered in `element.rs`).
+    let glyph_h = (ascent + descent.abs()).ceil().max(1.0);
+    let cell_h = padded_cell_h(glyph_h, line_height);
+    TerminalMetrics::with_glyph_h(cell_w.max(1.0), cell_h, glyph_h)
 }
 
 /// Scale a cell box by `ratio` (used only by [`MetricsMode::Fixed`] zoom).
@@ -421,5 +497,43 @@ mod tests {
         // base, so there is no accumulated drift).
         assert_eq!(scale_metrics(base, 2.0), TerminalMetrics::new(16.0, 32.0));
         assert_eq!(scale_metrics(base, 0.5), TerminalMetrics::new(4.0, 8.0));
+    }
+
+    #[test]
+    fn clamp_line_height_bounds() {
+        assert_eq!(clamp_line_height(1.3), 1.3);
+        assert_eq!(clamp_line_height(0.5), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(clamp_line_height(3.0), MAX_TERMINAL_LINE_HEIGHT);
+        assert_eq!(clamp_line_height(MIN_TERMINAL_LINE_HEIGHT), 1.0);
+        assert_eq!(clamp_line_height(MAX_TERMINAL_LINE_HEIGHT), 1.8);
+    }
+
+    #[test]
+    fn padded_cell_h_rounds_once_and_is_identity_at_1x() {
+        // A representative natural glyph height (SF Mono 13pt ≈ 16 logical px).
+        let glyph_h = 16.0;
+        // 1.0 is bit-identical to the classic grid (round of an already-whole
+        // value): existing users pinned to 1.0 see no change.
+        assert_eq!(padded_cell_h(glyph_h, 1.0), 16.0);
+        // 1.3 → round(20.8) = 21; 1.8 → round(28.8) = 29. Rounded ONCE.
+        assert_eq!(padded_cell_h(glyph_h, 1.3), 21.0);
+        assert_eq!(padded_cell_h(glyph_h, 1.8), 29.0);
+        // A fractional glyph height still yields a whole padded cell.
+        assert_eq!(padded_cell_h(17.0, 1.3), 22.0); // round(22.1)
+    }
+
+    #[test]
+    fn apply_line_height_pads_height_keeps_width_and_glyph_box() {
+        // The Fixed-mode line-height path: the base box is the natural glyph box;
+        // width is untouched, glyph_h is preserved for cursor centering, cell_h
+        // is the padded height.
+        let base = TerminalMetrics::new(8.0, 20.0);
+        let m = apply_line_height(base, 1.5);
+        assert_eq!(m.cell_w, 8.0, "width is never multiplied");
+        assert_eq!(m.glyph_h, 20.0, "natural glyph height is preserved");
+        assert_eq!(m.cell_h, 30.0, "cell height is round(20 * 1.5)");
+        // 1.0 is a full no-op (glyph_h == cell_h, the classic single-height box).
+        let same = apply_line_height(base, 1.0);
+        assert_eq!(same, TerminalMetrics::new(8.0, 20.0));
     }
 }

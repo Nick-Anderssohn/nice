@@ -354,8 +354,82 @@ async fn run_theme_fanout(
     terminal_id_latency_leg(cx, any, &pane_host, &main_pane, &mut failures).await;
     claude_sync_leg(cx, &state, fixture, &mut failures).await;
     imported_theme_leg(cx, any, &pane_host, &main_pane, fixture, &mut failures).await;
+    restyle_reentrancy_leg(cx, any, &mut failures).await;
 
     build_report(failures)
+}
+
+// -- leg (g): restyle-popup reentrancy — a transparency commit from INSIDE a -----
+//    window update still reaches the window ------------------------------------
+
+/// The migration "Try the new look" answer runs `commit_appearance` from inside
+/// the confirmation modal's confirm mouse-handler — i.e. while the host window is
+/// mid-`update` (gpui `take`s the window out of its slot). The window-transparency
+/// fanout's reentrant `cx.update_window` for that same window hit the
+/// "window already taken" guard and was silently dropped (`let _ =`), so a
+/// pre-existing OPAQUE window only flipped to Blurred after a relaunch. The fix
+/// `cx.defer`s the per-window push so it lands once the update stack unwinds.
+///
+/// This leg reproduces exactly that: it makes the active-scheme window Opaque
+/// (outside any update), then flips it to translucent+blurred FROM INSIDE a
+/// `cx.update_window` on the shipped window, and asserts the deferred fanout still
+/// reached the window (the instrumented push generation advanced to a `Blurred`
+/// look). Pre-fix this generation never advanced — the regression this pins.
+async fn restyle_reentrancy_leg(
+    cx: &mut AsyncApp,
+    handle: AnyWindowHandle,
+    failures: &mut Vec<String>,
+) {
+    use gpui::WindowBackgroundAppearance;
+
+    // Baseline: make the active-scheme window Opaque (outside any window update),
+    // so the reentrant flip below is a guaranteed change, not a no-op commit.
+    let scheme = store_scheme(cx);
+    cx.update(|app| theme_settings::apply_window_opacity(app, scheme, 100));
+    settle(cx, 150).await;
+    let gen_before = cx
+        .update(|_| theme_settings::transparency_fanout_applied())
+        .map(|(_, _, g)| g)
+        .unwrap_or(0);
+
+    // Flip to translucent+blurred FROM INSIDE the host window's update — the exact
+    // context the migration popup's confirm callback runs `commit_appearance` in.
+    let inside = cx.update_window(handle, |_root, _window, app| {
+        theme_settings::apply_window_opacity(app, scheme, 70);
+        theme_settings::transparency_fanout_applied()
+            .map(|(_, _, g)| g)
+            .unwrap_or(0)
+    });
+    // The push is DEFERRED, not synchronous: while still inside the update (window
+    // taken out of its slot), the fanout must not have landed yet.
+    if let Ok(inside_gen) = inside {
+        if inside_gen != gen_before {
+            failures.push(
+                "(g) the transparency fanout applied SYNCHRONOUSLY inside the window update (expected a defer past the update)".into(),
+            );
+        }
+    } else if let Err(e) = inside {
+        failures.push(format!("(g) the reentrant window update itself failed: {e}"));
+    }
+
+    settle(cx, 250).await; // flush the deferred per-window push
+    match cx.update(|_| theme_settings::transparency_fanout_applied()) {
+        Some((appearance, radius, gen_after)) if gen_after > gen_before => {
+            if appearance != WindowBackgroundAppearance::Blurred || radius != 30 {
+                failures.push(format!(
+                    "(g) the deferred fanout reached the window but pushed the wrong look ({appearance:?}, radius {radius}); want Blurred/30"
+                ));
+            } else {
+                eprintln!("[selftest] theme-fanout (g): a transparency commit from inside a window update reached the window via the deferred fanout (Blurred/30)");
+            }
+        }
+        Some((_, _, gen_after)) => failures.push(format!(
+            "(g) the transparency fanout did NOT reach the window when committed inside a window update (generation {gen_after} <= {gen_before}) — the restyle-popup reentrancy regression"
+        )),
+        None => failures.push(
+            "(g) the transparency fanout never recorded a push (instrumentation missing)".into(),
+        ),
+    }
 }
 
 // -- leg (a/d): OS-sync scheme flip fans chrome + terminal -------------------
@@ -472,7 +546,7 @@ async fn accent_leg(
         failures.push("(b) baseline: Main pane TerminalView vanished".into());
         return;
     };
-    // Pick an accent that differs from the current one (default is Ocean).
+    // Pick an accent that differs from the current one (default is Terracotta).
     let target = AccentPreset::Fern;
     cx.update(|app| theme_settings::apply_accent(app, target));
     settle(cx, 200).await;
@@ -722,7 +796,9 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      (e) the gate ON re-sourced the --settings provider + wrote the colors file, a gate-ON \
                      theme change rewrote it (byte-diff), and the gate OFF cleared the provider; \
                      (f) an imported Ghostty theme parsed → persisted as <slug>.ghostty under the temp \
-                     support root → entered the catalog → resolved → recolored the live terminal pane"
+                     support root → entered the catalog → resolved → recolored the live terminal pane; \
+                     (g) a transparency commit from INSIDE a window update (the migration popup's confirm \
+                     callback context) still reached the window via the deferred fanout (Blurred/30)"
                 .to_string(),
         }
     } else {

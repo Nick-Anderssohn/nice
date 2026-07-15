@@ -31,6 +31,11 @@ struct FontsSection {
     terminal_font_family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sidebar_font_size: Option<f32>,
+    /// The terminal line-height multiplier (restyle 3/3). `None` ⇒ the shipped
+    /// default (see `nice_term_view::DEFAULT_TERMINAL_LINE_HEIGHT`); the
+    /// existing-user migration pins the legacy `1.0` here explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_line_height: Option<f32>,
 }
 
 /// The `advanced` object — the persisted-inert smooth-scroll toggle (D2).
@@ -102,6 +107,12 @@ impl SettingsPrefsStore {
         self.fonts.sidebar_font_size
     }
 
+    /// The persisted terminal line-height multiplier (`None` ⇒ the shipped
+    /// default). Fans out via `FontSettings` (not the theme fanout).
+    pub fn terminal_line_height(&self) -> Option<f32> {
+        self.fonts.terminal_line_height
+    }
+
     /// The persisted smooth-scroll toggle (default OFF).
     pub fn smooth_scroll(&self) -> bool {
         self.advanced.smooth_scroll
@@ -139,6 +150,17 @@ impl SettingsPrefsStore {
             return Ok(false);
         }
         self.fonts.sidebar_font_size = Some(px);
+        self.write()?;
+        Ok(true)
+    }
+
+    /// Persist a new terminal line-height multiplier, write-through
+    /// only-if-changed.
+    pub fn set_terminal_line_height(&mut self, mult: f32) -> std::io::Result<bool> {
+        if self.fonts.terminal_line_height == Some(mult) {
+            return Ok(false);
+        }
+        self.fonts.terminal_line_height = Some(mult);
         self.write()?;
         Ok(true)
     }
@@ -203,6 +225,7 @@ mod tests {
         assert_eq!(store.terminal_font_px(), None);
         assert_eq!(store.terminal_font_family(), None);
         assert_eq!(store.sidebar_font_px(), None);
+        assert_eq!(store.terminal_line_height(), None);
         assert!(!store.smooth_scroll());
     }
 
@@ -216,6 +239,7 @@ mod tests {
             .set_terminal_font_family(Some("JetBrains Mono".to_string()))
             .unwrap());
         assert!(store.set_sidebar_font_px(14.0).unwrap());
+        assert!(store.set_terminal_line_height(1.3).unwrap());
         assert!(store.set_smooth_scroll(true).unwrap());
 
         let reloaded = SettingsPrefsStore::load(path);
@@ -225,7 +249,21 @@ mod tests {
             Some("JetBrains Mono".to_string())
         );
         assert_eq!(reloaded.sidebar_font_px(), Some(14.0));
+        assert_eq!(reloaded.terminal_line_height(), Some(1.3));
         assert!(reloaded.smooth_scroll());
+    }
+
+    /// only-if-changed for line-height: setting the same value twice performs no
+    /// second write.
+    #[test]
+    fn set_same_line_height_does_not_rewrite() {
+        let path = temp_path("lh-noop");
+        let mut store = SettingsPrefsStore::load(path);
+        assert!(store.set_terminal_line_height(1.3).unwrap(), "first set writes");
+        assert!(
+            !store.set_terminal_line_height(1.3).unwrap(),
+            "re-setting the identical line-height must not rewrite"
+        );
     }
 
     /// only-if-changed: setting the same value twice performs no write.
@@ -279,6 +317,7 @@ mod tests {
         assert_eq!(store.terminal_font_px(), Some(20.0));
         assert_eq!(store.terminal_font_family(), None);
         assert_eq!(store.sidebar_font_px(), None);
+        assert_eq!(store.terminal_line_height(), None, "absent line-height ⇒ None");
         assert!(!store.smooth_scroll(), "absent advanced ⇒ smooth-scroll OFF");
     }
 

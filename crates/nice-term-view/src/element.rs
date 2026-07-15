@@ -136,14 +136,41 @@ const DECORATION_THICKNESS: f32 = 1.0;
 pub struct TerminalMetrics {
     /// Cell advance width, logical px.
     pub cell_w: f32,
-    /// Cell (line) height, logical px.
+    /// Cell (line) height, logical px. At line-height > 1.0 this is the PADDED
+    /// height (`round(glyph_h * multiplier)`): the grid row pitch, the cell
+    /// background/selection fill height, and the box-drawing sprite box all
+    /// derive from it, so TUI panels tile edge-to-edge and box borders stay
+    /// continuous.
     pub cell_h: f32,
+    /// Natural glyph (font) height = `ceil(ascent + |descent|)`, logical px —
+    /// equal to `cell_h` at line-height 1.0. The block/beam cursor is drawn at
+    /// THIS height, centered in the (taller) cell, so it never reads as a slab;
+    /// gpui's `paint_line` independently centers the glyph run in `cell_h`
+    /// (`padding_top = (line_height − ascent − descent) / 2`), so the block and
+    /// the character it covers line up.
+    pub glyph_h: f32,
 }
 
 impl TerminalMetrics {
-    /// Construct metrics from an explicit cell box.
+    /// Construct metrics from an explicit cell box. `glyph_h` defaults to
+    /// `cell_h` (line-height 1.0) — the fixed-metrics renderer self-tests want
+    /// the cursor to fill the whole pinned cell, exactly as before.
     pub const fn new(cell_w: f32, cell_h: f32) -> Self {
-        Self { cell_w, cell_h }
+        Self {
+            cell_w,
+            cell_h,
+            glyph_h: cell_h,
+        }
+    }
+
+    /// Construct metrics with a distinct natural glyph height (the line-height
+    /// path: `cell_h` is padded, `glyph_h` is the font's own box).
+    pub const fn with_glyph_h(cell_w: f32, cell_h: f32, glyph_h: f32) -> Self {
+        Self {
+            cell_w,
+            cell_h,
+            glyph_h,
+        }
     }
 }
 
@@ -791,6 +818,12 @@ pub struct TerminalElement {
     /// view (M2 Item E). Mirrors `TerminalView::auto_refit`; when false (the
     /// fixed-grid scenario embeddings) paint only publishes the bounds.
     auto_refit: bool,
+    /// The surface-fill alpha (0.55–1.0) for the DEFAULT background (restyle plan
+    /// 3). At `>= 1.0` the whole-viewport default-bg fill is painted fully opaque
+    /// (unchanged). Below `1.0` that fill is SKIPPED so the translucent window-body
+    /// backing behind the grid shows through as the single surface — only
+    /// explicit-bg cells, selection, cursor, and glyphs paint (all opaque) on top.
+    background_opacity: f32,
 }
 
 /// Y (logical px) of the top of grid row 0 under the top-anchored layout (T4,
@@ -848,6 +881,7 @@ impl TerminalElement {
         paint_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
         auto_refit: bool,
         cache: Rc<RefCell<GridCache>>,
+        background_opacity: f32,
     ) -> Self {
         let default_bg = theme.background.to_u32();
         let foreground = theme.foreground.to_u32();
@@ -969,6 +1003,7 @@ impl TerminalElement {
             ime,
             paint_bounds,
             auto_refit,
+            background_opacity,
         }
     }
 
@@ -989,6 +1024,7 @@ impl TerminalElement {
             ime,
             paint_bounds,
             auto_refit,
+            background_opacity,
         } = self;
         // Exclusive for the whole paint: `ensure_plans` below re-plans the rows
         // `new`'s reconcile marked dirty, then the paint loops read the plans.
@@ -1044,6 +1080,12 @@ impl TerminalElement {
 
         let cw = metrics.cell_w;
         let ch = metrics.cell_h;
+        // The block/beam cursor stays the font's natural height, centered in the
+        // (possibly taller) line-height cell — `cursor_pad` is the half-gap above
+        // the glyph box. At line-height 1.0 `glyph_h == cell_h` so `cursor_pad`
+        // is 0 and the cursor fills the cell exactly as before.
+        let gh = metrics.glyph_h.min(ch);
+        let cursor_pad = ((ch - gh) * 0.5).max(0.0);
         let ox = bounds.origin.x;
         // Top-anchored (T4, revised): row 0 starts flush at the element's top,
         // so the top gap is constant during a resize (nothing is remembered). A
@@ -1056,8 +1098,18 @@ impl TerminalElement {
         // Clip to the element bounds so the sub-row remainder / over-tall grid is
         // hidden at the BOTTOM.
         window.with_content_mask(Some(ContentMask { bounds }), move |window| {
-            // Whole viewport background (padding around the grid is theme bg too).
-            window.paint_quad(fill(bounds, rgb(default_bg)));
+            // Whole-viewport DEFAULT background (padding around the grid is theme bg
+            // too). Restyle plan 3: at full opacity this paints the opaque theme bg
+            // exactly as before. When the window is translucent (`background_opacity
+            // < 1.0`) the grid SKIPS this fill entirely, so the single translucent
+            // window-body backing behind the grid shows through uniformly across the
+            // grid and its padding — painting a translucent fill HERE too would
+            // double-apply the alpha over that backing (a darker patch under the
+            // grid). Explicit-bg cells, selection, cursor, and glyphs still paint
+            // opaque on top below, regardless of opacity.
+            if background_opacity >= 1.0 {
+                window.paint_quad(fill(bounds, rgb(default_bg)));
+            }
 
             // Pixel-snapped cell geometry for procedural glyphs, mirroring the
             // spike's block-element path: integer device px so aliased line fills
@@ -1149,8 +1201,8 @@ impl TerminalElement {
                             smart_cursor_colors(cell_fg, cell_bg, accent_u32, has_ink);
                         window.paint_quad(fill(
                             Bounds {
-                                origin: point(x, y),
-                                size: size(px(cw), px(ch)),
+                                origin: point(x, y + px(cursor_pad)),
+                                size: size(px(cw), px(gh)),
                             },
                             rgb(block_color),
                         ));
@@ -1174,7 +1226,7 @@ impl TerminalElement {
                             }
                         }
                     } else {
-                        paint_hollow_cursor(window, x, y, cw, ch, accent);
+                        paint_hollow_cursor(window, x, y + px(cursor_pad), cw, gh, accent);
                     }
                 }
             }
@@ -1323,8 +1375,10 @@ impl TerminalElement {
                 let caret_x = cur_x + shaped.x_for_index(start);
                 window.paint_quad(fill(
                     Bounds {
-                        origin: point(caret_x, cur_y),
-                        size: size(px(2.0), px(ch)),
+                        // Font-height, centered — the composition caret is a
+                        // cursor, so it follows the same rule as the block/beam.
+                        origin: point(caret_x, cur_y + px(cursor_pad)),
+                        size: size(px(2.0), px(gh)),
                     },
                     deco,
                 ));
@@ -1759,6 +1813,56 @@ fn viewport_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_metrics_new_defaults_glyph_h_to_cell_h() {
+        // The fixed-metrics constructor (renderer self-tests) keeps the cursor
+        // filling the whole pinned cell: glyph_h == cell_h ⇒ zero cursor pad.
+        let m = TerminalMetrics::new(8.0, 16.0);
+        assert_eq!(m.glyph_h, 16.0);
+        assert_eq!(m.glyph_h, m.cell_h);
+    }
+
+    #[test]
+    fn colored_bg_rows_tile_with_no_stripe_at_every_line_height() {
+        // Reproduce the paint loop's per-row background geometry: row r's quad
+        // has origin y = oy + r*ch and height ch. Two stacked rows must abut
+        // EXACTLY — row r's bottom == row (r+1)'s top — at every cell height, so
+        // a colored TUI panel shows no horizontal stripe between rows (the exact
+        // iTerm 3.5 regression). `ch` stands in for the padded cell height under
+        // multipliers 1.0 / 1.3 / 1.8 (round(16·m) = 16 / 21 / 29).
+        let oy = 3.5_f32; // a fractional grid-top offset, as in a real layout
+        for ch in [16.0_f32, 21.0, 29.0] {
+            for r in 0..8u32 {
+                let bottom = oy + r as f32 * ch + ch;
+                let next_top = oy + (r + 1) as f32 * ch;
+                assert!(
+                    (bottom - next_top).abs() < 1e-4,
+                    "row {r} bottom {bottom} must meet row {} top {next_top} at ch {ch}",
+                    r + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_is_centered_at_font_height_in_a_taller_cell() {
+        // The block/beam cursor is glyph-height, vertically centered: the pad
+        // splits the extra leading half above / half below the glyph box. This
+        // mirrors the `cursor_pad` computation in `paint`.
+        // 1.0 (glyph_h == cell_h): pad 0, cursor fills the cell.
+        let m = TerminalMetrics::new(8.0, 16.0);
+        let gh = m.glyph_h.min(m.cell_h);
+        let pad = ((m.cell_h - gh) * 0.5).max(0.0);
+        assert_eq!(pad, 0.0);
+        // A padded cell: 6px of extra leading ⇒ 3px above, block spans [3, 19]
+        // inside the 22px cell.
+        let m = TerminalMetrics::with_glyph_h(8.0, 22.0, 16.0);
+        let gh = m.glyph_h.min(m.cell_h);
+        let pad = ((m.cell_h - gh) * 0.5).max(0.0);
+        assert_eq!(pad, 3.0);
+        assert!(pad >= 0.0 && pad + gh <= m.cell_h, "cursor block stays inside the cell");
+    }
 
     #[test]
     fn invert_is_exact_per_channel() {

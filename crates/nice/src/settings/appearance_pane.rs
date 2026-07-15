@@ -31,7 +31,7 @@ use nice_theme::palette::{ColorScheme, Palette};
 use nice_theme::AccentPreset;
 
 use crate::ghostty_theme_parser::GhosttyParseError;
-use crate::settings::controls::{dropdown, toggle_switch, DropdownItem};
+use crate::settings::controls::{dropdown, stepper, toggle_switch, DropdownItem};
 use crate::settings::root::{setting_row, setting_subtitle, setting_title, SettingsRootView};
 use crate::terminal_theme_catalog::{CatalogEntry, TerminalThemeCatalog, ThemeImportError};
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -245,6 +245,7 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
 
     let ink = slot_to_rgba(slots.ink);
     let ink2 = slot_to_rgba(slots.ink2);
+    let ink3 = slot_to_rgba(slots.ink3);
     let line = slot_to_rgba(slots.line);
     let panel = slot_to_rgba(slots.panel);
 
@@ -280,6 +281,30 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
         "Accent",
         Some("The caret / selection / logo tint.".into()),
         accent_control(appearance.accent, selected_border),
+        cx,
+    ));
+
+    // --- Window opacity / blur (the ACTIVE scheme) --------------------------
+    // Scheme-synced like Scheme/Accent above: one control edits whichever
+    // scheme's slot is currently active, labeled with that scheme's name
+    // (plan: "Opacity (Dark)"). Flipping the active scheme (or the OS, while
+    // syncing) swaps which slot these controls read/write — mirroring how the
+    // per-scheme Chrome/Terminal-theme dropdowns below key off `scheme`, just
+    // surfaced once instead of in a Light/Dark pair.
+    let scheme_label = match scheme {
+        ColorScheme::Light => "Light",
+        ColorScheme::Dark => "Dark",
+    };
+    col = col.child(setting_row(
+        SharedString::from(format!("Opacity ({scheme_label})")),
+        Some("Translucency of the window body for the active scheme.".into()),
+        opacity_stepper(scheme, appearance.active_window_opacity_pct(), ink, ink3, line),
+        cx,
+    ));
+    col = col.child(setting_row(
+        SharedString::from(format!("Blur ({scheme_label})")),
+        Some("Background blur radius behind the translucent window (0 = no blur).".into()),
+        blur_stepper(scheme, appearance.active_blur_radius(), ink, ink3, line),
         cx,
     ));
 
@@ -489,6 +514,91 @@ fn accent_control(selected: AccentPreset, selected_border: Rgba) -> impl IntoEle
         );
     }
     row
+}
+
+// --- Window opacity / blur steppers (D8: gpui has no native slider — same
+// stepper substitution the Font pane's line-height control uses) -----------
+//
+// The slider bounds/step are mirrored here as plain constants rather than
+// imported from `theme_settings` (whose clamp constants are private): this
+// slice only wires the pane's UI, and every target value still passes through
+// `apply_window_opacity` / `apply_blur_radius`, which re-clamp authoritatively
+// — an out-of-range target here is harmless, never stored as-is.
+
+/// Opacity stepper step, in percentage points.
+const OPACITY_STEP_PCT: i32 = 5;
+/// Opacity slider floor (mirrors `theme_settings::MIN_WINDOW_OPACITY_PCT`).
+const OPACITY_MIN_PCT: i32 = 55;
+/// Opacity slider ceiling (100% ⇒ fully opaque).
+const OPACITY_MAX_PCT: i32 = 100;
+
+/// Blur-radius stepper step, in px.
+const BLUR_STEP_PX: i32 = 5;
+/// Blur slider floor (0 ⇒ no blur).
+const BLUR_MIN_PX: i32 = 0;
+/// Blur slider ceiling (mirrors `theme_settings::MAX_BLUR_RADIUS`).
+const BLUR_MAX_PX: i32 = 60;
+
+/// The dec/inc targets for the opacity stepper at the current `pct`, clamped to
+/// `[OPACITY_MIN_PCT, OPACITY_MAX_PCT]` — pulled out of [`opacity_stepper`] so
+/// the floor/ceiling clamping is unit-testable without a gpui window.
+fn opacity_step_targets(pct: u8) -> (i32, i32) {
+    let pct = i32::from(pct);
+    (
+        (pct - OPACITY_STEP_PCT).clamp(OPACITY_MIN_PCT, OPACITY_MAX_PCT),
+        (pct + OPACITY_STEP_PCT).clamp(OPACITY_MIN_PCT, OPACITY_MAX_PCT),
+    )
+}
+
+/// The dec/inc targets for the blur stepper at the current `radius`, clamped to
+/// `[BLUR_MIN_PX, BLUR_MAX_PX]` — pulled out of [`blur_stepper`] for the same
+/// reason as [`opacity_step_targets`].
+fn blur_step_targets(radius: u16) -> (i32, i32) {
+    let radius = i32::from(radius);
+    (
+        (radius - BLUR_STEP_PX).clamp(BLUR_MIN_PX, BLUR_MAX_PX),
+        (radius + BLUR_STEP_PX).clamp(BLUR_MIN_PX, BLUR_MAX_PX),
+    )
+}
+
+/// The Opacity stepper for `scheme` (a11y `settings.appearance.opacity`).
+/// Steps by [`OPACITY_STEP_PCT`]; live-applies through
+/// [`theme_settings::apply_window_opacity`], which fans out through the
+/// window's `WindowBackgroundAppearance` on every drag step.
+fn opacity_stepper(scheme: ColorScheme, pct: u8, ink: Rgba, ink3: Rgba, line: Rgba) -> impl IntoElement {
+    let (dec, inc) = opacity_step_targets(pct);
+    stepper(
+        "settings.appearance.opacity",
+        format!("{pct}%"),
+        dec as f32,
+        inc as f32,
+        ink,
+        ink3,
+        line,
+        move |cx: &mut App, v: f32| {
+            theme_settings::apply_window_opacity(cx, scheme, v.round() as u8);
+        },
+    )
+}
+
+/// The Blur stepper for `scheme` (a11y `settings.appearance.blur`). Steps by
+/// [`BLUR_STEP_PX`]; live-applies through
+/// [`theme_settings::apply_blur_radius`], which re-applies the numeric
+/// CGS radius (or degrades to `Transparent` at 0) on every drag step.
+fn blur_stepper(scheme: ColorScheme, radius: u16, ink: Rgba, ink3: Rgba, line: Rgba) -> impl IntoElement {
+    let (dec, inc) = blur_step_targets(radius);
+    stepper(
+        "settings.appearance.blur",
+        format!("{radius}px"),
+        dec as f32,
+        inc as f32,
+        ink,
+        ink3,
+        line,
+        move |cx: &mut App, v: f32| {
+            theme_settings::apply_blur_radius(cx, scheme, v.round() as u16);
+        },
+    )
 }
 
 /// The selected terminal theme's display label — the dropdown trigger text.
@@ -882,6 +992,103 @@ mod tests {
                 .expect("the imported theme is offered")
                 .select(app);
             assert_eq!(dark_slot_id(app), "cool-import");
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- Opacity/blur steppers (slice 4: the appearance-pane sliders) ---------
+
+    #[test]
+    fn opacity_step_targets_clamp_at_the_slider_floor_and_ceiling() {
+        // Mid-range: both directions step cleanly by OPACITY_STEP_PCT.
+        assert_eq!(opacity_step_targets(80), (75, 85));
+        // At the floor (55): decrementing stays pinned, not below 55.
+        assert_eq!(opacity_step_targets(55), (55, 60));
+        // At the ceiling (100): incrementing stays pinned, not above 100.
+        assert_eq!(opacity_step_targets(100), (95, 100));
+    }
+
+    #[test]
+    fn blur_step_targets_clamp_at_the_slider_floor_and_ceiling() {
+        assert_eq!(blur_step_targets(30), (25, 35));
+        // At the floor (0): decrementing stays pinned, not negative.
+        assert_eq!(blur_step_targets(0), (0, 5));
+        // At the ceiling (60): incrementing stays pinned, not above 60.
+        assert_eq!(blur_step_targets(60), (55, 60));
+    }
+
+    /// A fresh-defaults store so the opacity/blur mutators have a `Global` to
+    /// mutate (`current_appearance`/`commit_appearance` no-op without one).
+    fn setup_theme_store(cx: &mut TestAppContext, tag: &str) -> PathBuf {
+        let base = temp_base(tag);
+        cx.update(|app| {
+            app.set_global(ThemeSettingsStore::with_defaults(base.join("ui_settings.json")));
+        });
+        base
+    }
+
+    #[gpui::test]
+    fn opacity_stepper_dec_and_inc_call_apply_window_opacity_for_the_given_scheme(
+        cx: &mut TestAppContext,
+    ) {
+        let base = setup_theme_store(cx, "opacity-stepper");
+        cx.update(|app| {
+            // Dark starts at the plan default (80%); step down then up and assert
+            // the exact stored value each time (the click handler's wiring, not
+            // just the pure target math already covered above).
+            theme_settings::apply_window_opacity(app, ColorScheme::Dark, 80);
+            let (dec, inc) = opacity_step_targets(80);
+            theme_settings::apply_window_opacity(app, ColorScheme::Dark, dec as u8);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .window_opacity_pct_for(ColorScheme::Dark),
+                75
+            );
+            theme_settings::apply_window_opacity(app, ColorScheme::Dark, inc as u8);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .window_opacity_pct_for(ColorScheme::Dark),
+                85
+            );
+            // The Light slot is untouched by a Dark-scheme step.
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .window_opacity_pct_for(ColorScheme::Light),
+                90
+            );
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[gpui::test]
+    fn blur_stepper_dec_and_inc_call_apply_blur_radius_for_the_given_scheme(cx: &mut TestAppContext) {
+        let base = setup_theme_store(cx, "blur-stepper");
+        cx.update(|app| {
+            let (dec, inc) = blur_step_targets(30); // the plan default
+            theme_settings::apply_blur_radius(app, ColorScheme::Light, dec as u16);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .blur_radius_for(ColorScheme::Light),
+                25
+            );
+            theme_settings::apply_blur_radius(app, ColorScheme::Light, inc as u16);
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .blur_radius_for(ColorScheme::Light),
+                35
+            );
+            // The Dark slot is untouched by a Light-scheme step.
+            assert_eq!(
+                app.global::<ThemeSettingsStore>()
+                    .appearance()
+                    .blur_radius_for(ColorScheme::Dark),
+                30
+            );
         });
         let _ = std::fs::remove_dir_all(&base);
     }

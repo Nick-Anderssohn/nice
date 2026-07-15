@@ -1095,4 +1095,68 @@ mod tests {
         let c = apple_approx_coverage(0.5, 0xffffff, 0x000000);
         assert!(c > 0.5 && c <= 1.0, "{c}");
     }
+
+    // ---- line-height: procedural sprites fill the padded cell ----------------
+    //
+    // The device-px cell heights below stand in for line-height multipliers
+    // 1.0 / 1.3 / 1.8 over a 16-logical-px (32-device-px) glyph at 2× scale:
+    // round(32·1.0)=32, round(32·1.3)=42, round(32·1.8)=58. The sprites are laid
+    // out to whatever `ch_px` the caller passes (the padded cell), so these are
+    // exactly the heights the paint path feeds them at each multiplier.
+    const LINE_HEIGHT_CELLS: [i32; 5] = [32, 42, 58, 21, 61];
+
+    #[test]
+    fn vertical_rule_and_full_block_reach_both_cell_edges_at_every_line_height() {
+        // │ (U+2502) and █ (U+2588) must touch the cell top (y0 == 0) AND the
+        // cell bottom (y1 == ch_px) at every cell height. Stacking rows at
+        // `ch_px` pitch then makes row N's bottom edge coincide with row N+1's
+        // top edge — zero gap in vertical box lines, no horizontal stripe across
+        // a colored panel. (The two light arms of │ overlap across the centre,
+        // so the span is continuous, not just top+bottom.)
+        for ch_px in LINE_HEIGHT_CELLS {
+            for cp in [0x2502u32, 0x2588] {
+                let g = procedural_glyph(cp, CW, ch_px, LIGHT).unwrap();
+                assert!(
+                    g.fills.iter().any(|p| p.y0 == 0),
+                    "U+{cp:04X} at ch {ch_px}: a fill must reach the cell top"
+                );
+                assert!(
+                    g.fills.iter().any(|p| p.y1 == ch_px),
+                    "U+{cp:04X} at ch {ch_px}: a fill must reach the cell bottom"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_block_is_gapless_top_to_bottom_at_every_line_height() {
+        // █ is a single full-cell fill at any height — the union has no interior
+        // scanline gap, so a colored-bg run painted from it shows no stripes.
+        for ch_px in LINE_HEIGHT_CELLS {
+            let g = procedural_glyph(0x2588, CW, ch_px, LIGHT).unwrap();
+            assert_eq!(g.fills.len(), 1, "█ is one fill at ch {ch_px}");
+            let f = g.fills[0];
+            assert_eq!((f.y0, f.y1), (0, ch_px), "█ spans the whole cell at ch {ch_px}");
+            assert_eq!((f.x0, f.x1), (0, CW), "█ spans the whole width at ch {ch_px}");
+        }
+    }
+
+    #[test]
+    fn vertical_rule_stroke_width_is_decoupled_from_cell_height() {
+        // A taller line-height must NOT fatten vertical rules: the stroke width
+        // comes from `light_px`, never the cell height.
+        let widest = |ch_px: i32| -> i32 {
+            procedural_glyph(0x2502, CW, ch_px, LIGHT)
+                .unwrap()
+                .fills
+                .iter()
+                .map(|p| p.x1 - p.x0)
+                .max()
+                .unwrap()
+        };
+        let baseline = widest(32);
+        for ch_px in LINE_HEIGHT_CELLS {
+            assert_eq!(widest(ch_px), baseline, "│ stroke width changed at ch {ch_px}");
+        }
+    }
 }

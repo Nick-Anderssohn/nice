@@ -4,8 +4,10 @@ Nice is a **Rust + GPUI** macOS app (Cargo workspace at the repo root;
 crates `nice`, `nice-term-core`, `nice-term-input`, `nice-term-view`,
 `nice-model`, `nice-theme`, `nice-harness`, `nice-itests`). GPUI/zed is
 vendored — `scripts/vendor-zed.sh` produces `vendor/zed/` (a pinned zed
-checkout + `patches/zed-bg-luminance.patch`), which the `nice` crates
-path-depend into. There is **no Xcode project**: the old `scripts/install.sh`
+checkout + the `patches/*.patch` set — currently 4: `zed-bg-luminance`,
+`zed-configurable-blur` (restyle plan 3's modern-macOS blur radius),
+`zed-display-link-selfheal`, `zed-force-width-exact`), which the `nice`
+crates path-depend into. There is **no Xcode project**: the old `scripts/install.sh`
 / `scripts/test.sh` / `xcodebuild` / `project.yml` / `UITests/` are gone.
 
 ## Two Nice builds — which one Claude can touch

@@ -696,21 +696,32 @@ fn flush_all_window_snapshots(cx: &App) {
     crate::session_store::flush();
 }
 
-/// Resolve the window + [`WindowState`] that should host the ⌘Q confirmation
-/// (#4 / D1+D2). The active window when it is a REGISTERED Nice window — the modal
-/// is stashed on the same window that renders it. When the key window is
-/// UNREGISTERED (the Settings window, D7) or there is no active window,
-/// `state_for_window` misses, so fall back to the registry's MRU window and
-/// ACTIVATE it (D2) so the dialog is visible in front of Settings rather than
-/// buried on an occluded window. `None` only when the registry holds no window
-/// at all (⇒ [`request_quit`] quits outright).
+/// Resolve the window + [`WindowState`] that should host an app-level modal — the
+/// ⌘Q confirmation (#4 / D1+D2) and the one-time restyle popup share this. Prefer
+/// the active window when it is a REGISTERED Nice window — the modal is stashed on
+/// the same window that renders it. Otherwise `state_for_window` misses, either
+/// because the key window is UNREGISTERED (the Settings window, D7) OR because
+/// there is no active window yet — a window just opened by the boot restore
+/// fan-out has NOT become the OS key window by the time a `cx.defer`-ed presenter
+/// runs on a cold Finder/Dock launch, so `cx.active_window()` is `None`. In both
+/// cases fall back to the registry's MRU window and ACTIVATE it (D2) so the modal
+/// is visible in front rather than buried on an occluded window. `None` only when
+/// the registry holds no window at all (⇒ [`request_quit`] quits outright; the
+/// restyle popup silently skips).
+///
+/// Routing through the registry (not a bare `cx.active_window()` early-return) is
+/// load-bearing for the startup-deferred presenters: without it the restyle popup
+/// (and the first-launch handoff prompt) drop whenever the just-opened window is
+/// not yet key at defer time — the exact gap that hid the popup under a detached
+/// bundle launch, while the ⌘Q dialog (which already used this fallback) presented
+/// fine.
 ///
 /// Split out of [`request_quit`] so the fallback resolution — the #4 fix's core:
-/// an unregistered key window routes to the registered MRU window instead of
-/// bypassing the dialog into an immediate quit — is unit-testable without
+/// an unregistered / absent key window routes to the registered MRU window instead
+/// of dropping the modal — is unit-testable without
 /// [`WindowState::present_confirmation`](crate::window_state::WindowState::present_confirmation),
 /// which panics on the headless test platform (its window has no backing `NSView`).
-fn resolve_quit_dialog_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<WindowState>)> {
+fn resolve_modal_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<WindowState>)> {
     if let Some(win) = cx.active_window() {
         if let Some(state) = WindowRegistry::state_for_window(cx, win.window_id()) {
             return Some((win, state));
@@ -730,7 +741,7 @@ fn resolve_quit_dialog_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Win
 /// else present the quit confirmation in the active window (confirm ⇒ cascade,
 /// cancel ⇒ total no-op). When the key window is the unregistered Settings window
 /// the confirmation is routed to the registry's MRU window (see
-/// [`resolve_quit_dialog_host`]) rather than bypassed (#4).
+/// [`resolve_modal_host`]) rather than bypassed (#4).
 fn request_quit(cx: &mut App) {
     let (claude, terminal) = total_live_pane_counts(cx);
     if claude + terminal == 0 {
@@ -740,7 +751,7 @@ fn request_quit(cx: &mut App) {
     // Resolve the window + state to host the confirmation. `None` ⇒ no Nice window
     // is registered at all, so quit as today (the zero-live-panes fast path already
     // returned above).
-    let Some((win, state)) = resolve_quit_dialog_host(cx) else {
+    let Some((win, state)) = resolve_modal_host(cx) else {
         quit_cascade(cx);
         return;
     };
@@ -838,6 +849,132 @@ fn present_handoff_prompt(cx: &mut App) {
         eprintln!(
             "nice: present_handoff_prompt could not present the first-launch prompt: {e:#}"
         );
+    }
+}
+
+/// Restyle 3/3: does this user have any PRIOR Nice presence? Belt-and-braces
+/// existing-user detection for the one-time defaults-flip migration — a prior
+/// `ui_settings.json`, the session store, or the per-variant Application Support
+/// folder already on disk (the settings file alone can miss a user who never
+/// touched settings). MUST be read at the very top of the boot sequence, before
+/// any store load / settings-import / dir-create writes these paths. `app::run`
+/// ONLY (the path-resolution convention).
+fn restyle_prior_presence() -> bool {
+    let settings = crate::file_browser::sort_settings_store::default_ui_settings_path();
+    let sessions = crate::session_store::default_store_path();
+    let variant_dir =
+        crate::session_store::support_root().join(crate::session_store::store_folder());
+    settings.exists() || sessions.exists() || variant_dir.exists()
+}
+
+/// Restyle 3/3: the SYNCHRONOUS half of the one-time defaults-flip migration —
+/// gate on the persisted `restyle_popup_shown` flag (absent ⇒ first time), then for
+/// an EXISTING user pin their pre-flip look into explicit keys (appearance +
+/// line-height) so the defaults-flip does not silently restyle a user riding the
+/// old defaults and declining the popup changes nothing. Runs INLINE in [`run`]
+/// before the restore fan-out so restored windows paint the pinned look from birth
+/// (no new-look flash + grid reflow). A genuine fresh install is already on the new
+/// defaults, so it only records the flag and shows nothing. Returns `true` when the
+/// deferred popup should still be presented (existing user, first time); `false`
+/// otherwise — including when the theme store is absent (`run_selftest`).
+#[must_use]
+fn run_restyle_pinning(cx: &mut App, existing_user: bool) -> bool {
+    match cx
+        .try_global::<crate::theme_settings::ThemeSettingsStore>()
+        .map(|s| s.restyle_popup_shown())
+    {
+        None => return false,       // no theme store — the hermetic `run_selftest` path
+        Some(true) => return false, // already shown once — never again
+        Some(false) => {}
+    }
+    if !existing_user {
+        // Fresh install: already on the new defaults. Mark the flag so the popup
+        // never appears on a later launch (once prior presence exists on disk).
+        crate::theme_settings::apply_restyle_popup_shown(cx, true);
+        return false;
+    }
+    // Pin the existing user's pre-flip look (so restored windows show their old look
+    // from the first frame and "Keep my setup" is a true no-op). The popup itself is
+    // deferred by the caller until after the restore fan-out (it must host on an open
+    // window). Idempotent on a later launch: the keys are already present, so
+    // pin-then-commit finds nothing changed and no-ops.
+    crate::theme_settings::pin_legacy_appearance(cx);
+    pin_legacy_line_height(cx);
+    true
+}
+
+/// Restyle 3/3: pin the LEGACY `1.0` terminal line-height for an existing user who
+/// never set one (the key is absent), so the flipped `1.3` default does not change
+/// their grid. A user who explicitly set a line-height keeps it. Applies live
+/// through the shared `FontSettings` + persists (the Font pane's live-apply path).
+fn pin_legacy_line_height(cx: &mut App) {
+    let absent = cx
+        .try_global::<crate::settings::prefs_store::SettingsPrefsStore>()
+        .is_some_and(|s| s.terminal_line_height().is_none());
+    if absent {
+        crate::settings::font_pane::apply_terminal_line_height(cx, 1.0);
+    }
+}
+
+/// Restyle 3/3: present the one-time "try the new look" popup on the boot window
+/// (the existing confirmation-modal pattern). "Try the new look" writes the new
+/// defaults for every appearance axis EXCEPT terminal font family/size (Nick's
+/// carve-out) and sets line-height to 1.3; "Keep my setup" changes nothing beyond
+/// the pinning already done. Either answer sets `restyle_popup_shown`, so the popup
+/// never reappears.
+///
+/// Hosts through [`resolve_modal_host`] (the ⌘Q resolver), NOT a bare
+/// `cx.active_window()`: this runs `cx.defer`-ed at the tail of boot, and on a cold
+/// Finder/Dock launch the just-restored window has not become the OS key window
+/// yet, so `cx.active_window()` is `None` and a naive early-return would silently
+/// drop the popup (the observed failure). The registry MRU fallback resolves +
+/// activates the restored window regardless.
+///
+/// SKIPS (leaving `restyle_popup_shown` UNSET) when the resolved host already shows
+/// a modal — on a launch where the first-launch handoff prompt was also deferred
+/// (just before this) and resolved to the SAME window, its modal is already up.
+/// `present_confirmation` REPLACES `pending_modal` unconditionally without emitting
+/// the previous modal's `DismissEvent` or running its completion, so presenting here
+/// would drop the handoff prompt (its `handoffSkillPromptSeen` flag never written,
+/// never seen that launch). Skipping instead re-offers the restyle popup on the next
+/// launch — by then the pinning is idempotent and the handoff prompt has been
+/// answered — so both prompts get shown, just on consecutive launches.
+fn present_restyle_popup(cx: &mut App) {
+    let Some((win, state)) = resolve_modal_host(cx) else {
+        return;
+    };
+    // Do not clobber a modal already hosted on this window (see the doc above).
+    if state.read(cx).pending_modal().is_some() {
+        return;
+    }
+    let result = win.update(cx, |_root, window, app| {
+        state.update(app, |ws, wcx| {
+            ws.present_confirmation(
+                "Nice has a new default look",
+                "Nice has a new default look — transparent, blurred, and restyled. Try it?",
+                "Try the new look",
+                "Keep my setup",
+                false,
+                move |confirmed, _window, app| {
+                    if confirmed {
+                        // Yes: the new defaults for every appearance axis (terminal
+                        // font family/size untouched), line-height to the shipped 1.3.
+                        crate::theme_settings::apply_restyle_new_look(app);
+                        crate::settings::font_pane::apply_terminal_line_height(
+                            app,
+                            nice_term_view::DEFAULT_TERMINAL_LINE_HEIGHT,
+                        );
+                    }
+                    // Both answers mark the popup seen so it never reappears.
+                    crate::theme_settings::apply_restyle_popup_shown(app, true);
+                },
+                window,
+                wcx,
+            );
+        });
+    });
+    if let Err(e) = result {
+        eprintln!("nice: present_restyle_popup could not present the restyle popup: {e:#}");
     }
 }
 
@@ -1086,6 +1223,21 @@ pub fn run() {
         // gate and the store open below read the new paths. Same app::run-only
         // hermeticity as the import; a clean no-op for a fresh install.
         crate::rename_migration::run();
+        // Restyle 3/3 migration: capture whether this user has any PRIOR Nice
+        // presence NOW — AFTER `rename_migration`, which only MOVES an interim
+        // `Nice RS Dev/` upgrader's data into this build's per-variant folder
+        // (creating nothing for a genuine fresh install). Reading it BEFORE the
+        // rename would miss that upgrader — their `ui_settings.json` / session store /
+        // variant dir still live under `Nice RS Dev/` at probe time, so all three
+        // probes would miss and they'd be misdetected as a fresh install and silently
+        // restyled. Reading it any LATER would false-positive every launch, because
+        // `settings_import` writes `ui_settings.json` on a first launch and the store
+        // loads + the terminal-themes dir create (further down) materialize these
+        // paths. This slot — after the rename, before the import — is the only correct
+        // one. Belt-and-braces: a prior settings file OR the session store OR the
+        // per-variant Application Support folder. Consumed by the restyle pinning
+        // below (synchronous, pre-fan-out) + the deferred one-time popup.
+        let restyle_existing_user = restyle_prior_presence();
         crate::settings_import::import_prod_settings_on_first_launch();
         // R23: load the `fonts` + `advanced` sections of `ui_settings.json` into the
         // `SettingsPrefsStore` Global BEFORE `install_shortcuts`, which seeds the
@@ -1218,6 +1370,19 @@ pub fn run() {
         // inside). Replaces the removed fixed-triple write above; app::run ONLY
         // (never `run_selftest`, which mints no `SharedThemeState` and no gate).
         crate::theme_settings::claude_sync_if_gated(cx);
+        // Restyle 3/3: pin an existing user's pre-flip look SYNCHRONOUSLY now —
+        // BEFORE the restore fan-out opens any window — so restored windows paint the
+        // pinned legacy appearance + line-height from their FIRST frame instead of
+        // flashing the flipped new look (translucent/blurred/Nice/Terracotta/1.3) and
+        // then visibly snapping back (a whole-window restyle + a grid reflow). Both
+        // globals the pinning writes are live by now: the `ThemeSettingsStore`
+        // (install_live_theme, just above) and the shared `FontSettings`
+        // (install_shortcuts, earlier). A genuine fresh install only records the flag
+        // here; an existing user is pinned and the returned bool defers the one-time
+        // popup until after the fan-out (it must host on an open window). Gated inside
+        // on the persisted `restyle_popup_shown`; `run`-only — `run_selftest` mints no
+        // theme store, so it is a no-op returning `false` (hermeticity).
+        let restyle_show_popup = run_restyle_pinning(cx, restyle_existing_user);
         // R20 (F5–F7): the process-wide file-operation history (over the shipped
         // objc2 `ProductionTrasher` → real Trash) as a gpui `Entity` in a Global —
         // ⌘Z/⌘⇧Z and the browser menu handlers drive it, per-window drift banners
@@ -1268,6 +1433,18 @@ pub fn run() {
             && !crate::platform::read_bool_pref("handoffSkillPromptSeen", false)
         {
             cx.defer(|cx| present_handoff_prompt(cx));
+        }
+        // Restyle 3/3: the one-time "try the new look" popup, offered once to an
+        // existing user (the pre-flip pinning already ran synchronously above; fresh
+        // installs are already on the new defaults and set no popup). Deferred like
+        // the handoff prompt so the just-opened active window hosts the modal. It runs
+        // AFTER the handoff defer (FIFO), and `present_restyle_popup` SKIPS — leaving
+        // `restyle_popup_shown` unset so the popup re-offers next launch — when the
+        // resolved host already shows the handoff modal, because `present_confirmation`
+        // would otherwise REPLACE that modal without running its completion (the
+        // handoff flag would never be written and the user would never see it).
+        if restyle_show_popup {
+            cx.defer(|cx| present_restyle_popup(cx));
         }
     });
 }
@@ -1738,8 +1915,13 @@ fn build_window_root(
     // scenario driving `build_window_root` without live theming), so the shipped
     // pre-R21 look is unchanged for those paths.
     let (theme, accent) = crate::theme_settings::active_terminal_theme_and_accent(cx);
-    let pane_host =
-        cx.new(|cx| crate::app_shell::PaneHostView::new(state.clone(), theme, accent, font, cx));
+    // Restyle plan 3: seed the pane host with the active-scheme surface-fill
+    // opacity so this window's first-built panes paint their default background at
+    // the stored translucency (1.0 — opaque — when no live theme is installed).
+    let opacity = crate::theme_settings::active_window_opacity(cx);
+    let pane_host = cx.new(|cx| {
+        crate::app_shell::PaneHostView::new(state.clone(), theme, accent, opacity, font, cx)
+    });
     // R21: stash the pane host on the window state so the process theme fan-out
     // (`apply_theme_fanout`) can reach this window's terminal panes through
     // `WindowRegistry::all_states`.
@@ -1753,6 +1935,11 @@ fn build_window_root(
     // `OsSchemeSource` (production reads gpui's window appearance; a scenario reads
     // its stub) so no leg reads the real system appearance. One observer per window;
     // whichever fires reconciles the process-wide store.
+    // Restyle plan 3: make this window genuinely non-opaque per the stored
+    // per-scheme opacity/blur BEFORE its first paint (no Opaque→translucent flash),
+    // pushing the resolved `WindowBackgroundAppearance` + numeric blur radius into
+    // the NSWindow. A no-op (Opaque, radius 0) when no live theme is installed.
+    crate::theme_settings::apply_window_transparency(cx, window);
     window
         .observe_window_appearance(|_window, cx| {
             // Defer the reconcile to the end of the current effect cycle: the
@@ -4335,7 +4522,7 @@ mod tests {
     /// registered window holds a live Terminal pane (`WindowState::new` seeds one)
     /// and the unregistered window is the active/key one.
     ///
-    /// Asserted through the [`resolve_quit_dialog_host`] seam rather than by driving
+    /// Asserted through the [`resolve_modal_host`] seam rather than by driving
     /// `request_quit` to `pending_modal().is_some()`: `present_confirmation` calls
     /// `ns_view_of`, which panics on the headless test platform (no backing
     /// `NSView`). The seam IS the #4 fix — it returns the registered window instead
@@ -4372,7 +4559,7 @@ mod tests {
                 "the settings window is unregistered"
             );
 
-            let (host, host_state) = resolve_quit_dialog_host(app)
+            let (host, host_state) = resolve_modal_host(app)
                 .expect("an unregistered key window falls back to the registered MRU window");
             assert_eq!(
                 host.window_id(),
