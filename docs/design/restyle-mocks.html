@@ -40,6 +40,7 @@
     --fill-active: rgba(255,255,255,.06);
     --fill-x: rgba(255,255,255,.08);
     --win-ring: rgba(255,255,255,.14);
+    --tab-underline-idle: rgba(255,255,255,.16);
 
     /* live controls */
     --win-alpha: 0.80;
@@ -74,6 +75,7 @@
     --fill-active: rgba(23,19,15,.05);
     --fill-x: rgba(23,19,15,.08);
     --win-ring: rgba(0,0,0,.14);
+    --tab-underline-idle: rgba(23,19,15,.17);
   }
 
   html { color-scheme: dark; }
@@ -259,7 +261,7 @@
   }
 
   /* titlebar — no fill, no rule; just content floating on the surface */
-  .titlebar { display: flex; align-items: center; }
+  .titlebar { display: flex; align-items: center; position: relative; }
   .window[data-bar="28"] .titlebar { height: 28px; }
   .window[data-bar="38"] .titlebar { height: 38px; }
 
@@ -310,6 +312,48 @@
     background: var(--accent);
   }
 
+  /* Inactive-tab affordance candidates (control-switched, Style A only).
+     Problem being solved: a lone inactive title reads as static text, not
+     a clickable tab. Three candidates:
+     - "underline": same 2px underline geometry as the active tab, in a
+       grey (--tab-underline-idle) — shape says "tab", color says state.
+     - "divider":  1px hairline separators between adjacent tabs — the row
+       reads as segmented cells without adding a second underline weight.
+     - "chip":     the hover glass fill rendered at rest behind inactive
+       tabs (soft inset chip) — reads as buttons; closest to the retired
+       pill look. */
+  body[data-afford="underline"] .window[data-tabs="underline"] .tab:not(.active)::after {
+    content: "";
+    position: absolute; left: 11px; right: 11px; bottom: 0;
+    height: 2px; border-radius: 1px;
+    background: var(--tab-underline-idle);
+  }
+  body[data-afford="divider"] .window[data-tabs="underline"] .tab + .tab::before {
+    content: "";
+    position: absolute; left: 0; top: 50%; height: 13px; width: 1px;
+    transform: translateY(-50%);
+    background: var(--hairline-strong);
+  }
+  body[data-afford="chip"] .window[data-tabs="underline"] .tab:not(.active)::before {
+    content: "";
+    position: absolute; inset: 3px 2px; border-radius: 6px;
+    background: var(--fill-active);
+  }
+
+  /* Single-tab mode — one session: no tab chrome at all; the title renders
+     as the window's centered titlebar text (macOS window-title convention),
+     status dot included, no underline, no ✕, overflow chevron hidden. */
+  .tab-single { display: none; }
+  body[data-tabcount="single"] .tabs,
+  body[data-tabcount="single"] .bar-btn.chev { display: none; }
+  body[data-tabcount="single"] .tab-single {
+    position: absolute; left: 90px; right: 90px; top: 0; height: 100%;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+    font-size: 12px; color: var(--ink);
+  }
+  .tab-single .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .tab-single .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   /* style B — full-height divided tabs */
   .window[data-tabs="divided"] .tab {
     border-right: 1px solid var(--hairline-strong);
@@ -353,7 +397,7 @@
     color: var(--ink3);
   }
   .sb-ico.active { color: var(--ink); background: var(--fill-active); }
-  .sb-ico.gear { margin-left: auto; font-size: 13px; }
+  .sb-ico.gear { margin-left: auto; }
 
   /* titlebar sidebar-collapse toggle (Finder/Safari position) */
   .tb-btn {
@@ -426,7 +470,7 @@
   }
 </style>
 
-<body data-wall="ember" data-scheme="dark">
+<body data-wall="ember" data-scheme="dark" data-afford="underline" data-tabcount="multi">
 
 <div class="wrap">
   <header class="page">
@@ -445,6 +489,13 @@
       switcher and the gear in the sidebar footer. Status dots use the real
       StatusDot tokens — idle = ink3, thinking = brand Terracotta, waiting = blue —
       shown static here; the app keeps its ring + breathe pulse animations.
+      <b>2026-07-15 feel-check round:</b> the <b>Inactive tabs</b> control compares
+      three candidate affordances for making unselected tabs read as clickable
+      (grey underline / hairline dividers / faint rest chip); the <b>Tabs</b>
+      control previews the single-session state — one tab renders as the
+      window's centered titlebar text, no tab chrome, no overflow chevron;
+      and the footer gear is now a real stroke cog (source-of-record geometry;
+      the shipped sun-like gear is superseded).
     </p>
   </header>
 </div>
@@ -464,6 +515,22 @@
         <button class="wall-btn" data-wall="ember" aria-pressed="true">Ember</button>
         <button class="wall-btn" data-wall="ocean" aria-pressed="false">Ocean</button>
         <button class="wall-btn" data-wall="mono" aria-pressed="false">Graphite</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <span class="ctl-label">Inactive tabs</span>
+      <div class="wall-btns" role="group" aria-label="Inactive tab affordance">
+        <button class="wall-btn afford-btn" data-afford="none" aria-pressed="false">Plain</button>
+        <button class="wall-btn afford-btn" data-afford="underline" aria-pressed="true">Grey underline</button>
+        <button class="wall-btn afford-btn" data-afford="divider" aria-pressed="false">Dividers</button>
+        <button class="wall-btn afford-btn" data-afford="chip" aria-pressed="false">Faint chip</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <span class="ctl-label">Tabs</span>
+      <div class="wall-btns" role="group" aria-label="Tab count">
+        <button class="wall-btn count-btn" data-count="multi" aria-pressed="true">Multiple</button>
+        <button class="wall-btn count-btn" data-count="single" aria-pressed="false">Single</button>
       </div>
     </div>
     <div class="ctl">
@@ -504,7 +571,8 @@
               <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
               <div class="tab"><span class="t">scratch</span></div>
             </div>
-            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+            <div class="tab-single"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+            <div class="bar-tail"><span class="bar-btn chev">›</span><span class="bar-btn">+</span></div>
           </div>
           <div class="win-body">
             <aside class="sidebar">
@@ -518,7 +586,7 @@
               <div class="sb-footer">
                 <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
                 <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
-                <span class="sb-ico gear" title="Settings">⚙︎</span>
+                <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
             <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
@@ -554,7 +622,8 @@
               <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
               <div class="tab"><span class="t">scratch</span></div>
             </div>
-            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+            <div class="tab-single"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+            <div class="bar-tail"><span class="bar-btn chev">›</span><span class="bar-btn">+</span></div>
           </div>
           <div class="win-body">
             <aside class="sidebar">
@@ -568,7 +637,7 @@
               <div class="sb-footer">
                 <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
                 <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
-                <span class="sb-ico gear" title="Settings">⚙︎</span>
+                <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
             <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
@@ -614,7 +683,8 @@
               <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
               <div class="tab"><span class="t">scratch</span></div>
             </div>
-            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+            <div class="tab-single"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+            <div class="bar-tail"><span class="bar-btn chev">›</span><span class="bar-btn">+</span></div>
           </div>
           <div class="win-body">
             <aside class="sidebar">
@@ -628,7 +698,7 @@
               <div class="sb-footer">
                 <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
                 <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
-                <span class="sb-ico gear" title="Settings">⚙︎</span>
+                <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
             <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
@@ -664,7 +734,8 @@
               <div class="tab"><span class="dot wait"></span><span class="t">api-server</span></div>
               <div class="tab"><span class="t">scratch</span></div>
             </div>
-            <div class="bar-tail"><span class="bar-btn">›</span><span class="bar-btn">+</span></div>
+            <div class="tab-single"><span class="dot idle"></span><span class="t">restyle-work</span></div>
+            <div class="bar-tail"><span class="bar-btn chev">›</span><span class="bar-btn">+</span></div>
           </div>
           <div class="win-body">
             <aside class="sidebar">
@@ -678,7 +749,7 @@
               <div class="sb-footer">
                 <span class="sb-ico active" title="Claude tabs"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg></span>
                 <span class="sb-ico" title="File explorer"><svg width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg></span>
-                <span class="sb-ico gear" title="Settings">⚙︎</span>
+                <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
             <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
@@ -750,10 +821,26 @@
     blurOut.textContent = blur.value + 'px';
   });
 
-  document.querySelectorAll('.wall-btn:not(.scheme-btn)').forEach(btn => {
+  document.querySelectorAll('.wall-btn[data-wall]').forEach(btn => {
     btn.addEventListener('click', () => {
       document.body.dataset.wall = btn.dataset.wall;
-      document.querySelectorAll('.wall-btn:not(.scheme-btn)').forEach(b =>
+      document.querySelectorAll('.wall-btn[data-wall]').forEach(b =>
+        b.setAttribute('aria-pressed', String(b === btn)));
+    });
+  });
+
+  document.querySelectorAll('.afford-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.body.dataset.afford = btn.dataset.afford;
+      document.querySelectorAll('.afford-btn').forEach(b =>
+        b.setAttribute('aria-pressed', String(b === btn)));
+    });
+  });
+
+  document.querySelectorAll('.count-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.body.dataset.tabcount = btn.dataset.count;
+      document.querySelectorAll('.count-btn').forEach(b =>
         b.setAttribute('aria-pressed', String(b === btn)));
     });
   });
