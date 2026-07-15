@@ -19,6 +19,10 @@
 //!   from `WindowChrome.swift` and `AppShellView.swift`.
 //! * [`status`] — status-dot visual tokens (the 8pt dot, the "waiting" blue,
 //!   the ring/breathe pulse constants), from `StatusDot.swift`.
+//! * [`glass`] — the "line over glass" / "fill over glass" hairline and
+//!   active-fill primitives for surfaces that share the window body instead
+//!   of floating as their own panel, from the 2026-07 restyle mock's
+//!   `--hairline` / `--fill-active` custom properties (`docs/plans/restyle/02-sidebar-flatten.md`).
 //!
 //! The tiny adapter from these plain types into gpui color types lives
 //! downstream (crates/nice, R9), NOT here — that is what keeps this crate
@@ -27,12 +31,14 @@
 pub mod accent;
 pub mod chrome_geometry;
 pub mod color;
+pub mod glass;
 pub mod palette;
 pub mod status;
 pub mod typography;
 
 pub use accent::AccentPreset;
 pub use color::Srgba;
+pub use glass::{glass_fill, glass_line};
 pub use palette::{ColorScheme, Palette, SlotColor, Slots, SystemColor};
 pub use status::{BreathePulse, RingPulse};
 pub use typography::TypographyAlias;

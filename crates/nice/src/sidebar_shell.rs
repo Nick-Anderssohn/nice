@@ -85,13 +85,13 @@ use gpui::{
 use nice_model::file_browser::TextFieldEditor;
 use nice_model::{InlineRenameClickGate, SidebarMode, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
-    CARD_BORDER_OPACITY, CARD_BORDER_WIDTH, CARD_CORNER_RADIUS, CARD_INSET, CARD_SHADOW_OPACITY,
-    CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET, INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH,
-    TOP_BAR_HEIGHT,
+    CARD_CORNER_RADIUS, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET,
+    INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, TOP_BAR_HEIGHT,
 };
 use nice_theme::color::Srgba;
-use nice_theme::palette::Slots;
+use nice_theme::glass::{glass_fill, glass_line};
+use nice_theme::palette::{ColorScheme, Slots};
 
 use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
@@ -123,27 +123,15 @@ const ROW_INDENT_CHILD: f32 = 38.0;
 /// became active — the macOS `NSEvent.doubleClickInterval` default analog
 /// (`SidebarView.swift:440`). R12 could inject the user's real value.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-/// Hover-tier row fill: 6% ink (`SidebarView.swift:452`).
-const HOVER_INK_ALPHA: f32 = 0.06;
-/// Dimmed multi-select tier: the active-row selection tint at half alpha
-/// (`SidebarView.swift:451` — `niceSel(...).opacity(0.5)`).
-const SELECTED_DIM_FACTOR: f32 = 0.5;
-/// Dark-scheme selection tint alpha applied to the accent (`Palette.swift:225`).
+/// Dark-scheme selection tint alpha applied to the accent (`Palette.swift:225`)
+/// — the inline-rename field's text-selection highlight (the flattened rows no
+/// longer tint with it; hover / multi-select use the over-glass
+/// [`glass_fill`] instead).
 const SEL_ALPHA_DARK: f32 = 0.22;
 /// Count-pill background: 7% ink (`SidebarView.swift:360`).
 const COUNT_PILL_INK_ALPHA: f32 = 0.07;
 /// Group `+` button hover fill: 10% ink (`SidebarView.swift:387`).
 const ADD_BUTTON_HOVER_ALPHA: f32 = 0.10;
-/// Icon-button (mode / collapse / footer) hover fill: 8% ink
-/// (`SidebarView.swift:1037`, `AppShellView.swift:1112,1159`).
-const ICON_BUTTON_HOVER_ALPHA: f32 = 0.08;
-/// The mode toggles' top offset inside the slim [`TOP_BAR_HEIGHT`] strip, centering
-/// each 24pt button vertically ((28 − 24) / 2 = 2) after the restyle shrank the
-/// band (was 8 at the old 52pt height; re-centered per plan
-/// `docs/plans/restyle/01-titlebar-restyle.md`).
-const TOP_STRIP_CONTROLS_TOP: f32 = 2.0;
-/// The mode toggles' trailing offset (`AppShellView.swift:813`).
-const TOP_STRIP_CONTROLS_TRAILING: f32 = 10.0;
 
 // ---- Text line heights (AppKit parity) --------------------------------------
 //
@@ -175,9 +163,6 @@ const ICON_CHEVRON_CLOSED: &str = "\u{25B8}"; // ▸ fallback for SF_CHEVRON_CLO
 const ICON_CHEVRON_OPEN: &str = "\u{25BE}"; // ▾ fallback for SF_CHEVRON_OPEN
 const ICON_TERMINAL: &str = "\u{276F}"; // ❯ fallback for SF_TERMINAL
 const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
-const ICON_MODE_TABS: &str = "\u{2630}"; // ☰ fallback for SF_MODE_TABS
-const ICON_MODE_FILES: &str = "\u{25A4}"; // ▤ fallback for SF_MODE_FILES
-const ICON_GEAR: &str = "\u{2699}"; // ⚙ fallback for SF_GEAR
 
 /// Group-header disclosure, closed (`SidebarView.swift:289` — prod rotates
 /// this one symbol; we swap in `chevron.down` for the open state instead).
@@ -188,12 +173,16 @@ const SF_CHEVRON_OPEN: &str = "chevron.down";
 const SF_TERMINAL: &str = "terminal";
 /// Group-header add button (`SidebarView.swift:379`).
 const SF_PLUS: &str = "plus";
-/// Sidebar mode toggle: tabs (`AppShellView.swift`'s `SidebarModeIconButton`).
-const SF_MODE_TABS: &str = "list.bullet";
-/// Sidebar mode toggle: files.
-const SF_MODE_FILES: &str = "folder";
-/// Footer Settings gear (`SidebarView.swift`'s footer `SidebarIconButton`).
-const SF_GEAR: &str = "gearshape";
+
+// The footer mode-switcher (tabs / files) and settings gear now render the
+// 2026-07 restyle's stroke SVGs from `crate::chrome_icons` (`MODE_TABS` /
+// `MODE_FILES` / `MODE_GEAR`), not SF Symbols — see [`SidebarShellView::build_footer`].
+
+/// Sidebar row status-dot size (pt). The restyle renders row dots smaller than
+/// the default 8pt (plan 1 set 6pt in the tab strip); only the size parameter
+/// changes — the dot's colours + pulse are untouched
+/// (`docs/plans/restyle/02-sidebar-flatten.md`).
+const SIDEBAR_ROW_DOT_SIZE: f32 = 5.0;
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 
@@ -342,23 +331,40 @@ fn active_slots(cx: &App) -> Slots {
     crate::theme_settings::active_chrome_slots(cx)
 }
 
-/// The `SidebarBackground` palette-switch seam (`SidebarBackground.swift:21-46`).
-/// R21 (S9): the sidebar column paints the ACTIVE palette's `background2` slot as
-/// a flat panel — Nice reads as the flat `niceBg2` panel, Catppuccin as its flat
-/// tinted `background2` (real vibrancy + the macOS arm are deferred with the macOS
-/// palette). Because `s` is now the active palette's slots (via
-/// [`active_slots`]), this seam follows the live theme with no extra branch.
-fn sidebar_background(s: &Slots) -> Rgba {
-    slot_to_rgba(s.background2)
+/// The resolved terminal mono family (SF Mono default) the flattened sidebar
+/// renders its text in — read from the process `SharedFontSettings` (the same
+/// source the tab strip's titles use). Shared by the tabs-mode
+/// [`SidebarShellView`] and the files-mode
+/// [`FileBrowserView`](crate::file_browser::view::FileBrowserView) so both flat
+/// surfaces use one family seam (plan `docs/plans/restyle/02-sidebar-flatten.md`).
+/// `None` before the keymap wires that global (the isolated `sidebar` scenario),
+/// which leaves gpui's default UI family. Only the FAMILY comes from here; text
+/// SIZE stays proportional off each view's own sizing.
+pub(crate) fn resolved_mono_family(cx: &App) -> Option<SharedString> {
+    crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family())
 }
 
-/// The floating-card border colour — the `line` slot at [`CARD_BORDER_OPACITY`]
-/// (`AppShellView.swift:829`).
-fn card_border_color(s: &Slots) -> Rgba {
-    srgba_to_rgba(srgba_with_alpha(slot_srgba(s.line), CARD_BORDER_OPACITY))
+/// The over-glass hairline colour for the flat sidebar's trailing divider — the
+/// scheme-scoped [`glass_line`] value (white 8% dark / ink 10% light), converted
+/// to gpui's `Rgba`. NOT the opaque theme `line` slot: the flattened sidebar
+/// shares the window-body surface, so its divider must read correctly over that
+/// shared (later translucent) surface (plan `docs/plans/restyle/02-sidebar-flatten.md`).
+fn glass_line_rgba(scheme: ColorScheme) -> Rgba {
+    srgba_to_rgba(glass_line(scheme))
 }
 
-/// The floating-card drop shadow (`AppShellView.swift:838`).
+/// The over-glass active / hover fill for the flat sidebar's rows and footer
+/// mode buttons — the scheme-scoped [`glass_fill`] value (white 6% dark / ink 5%
+/// light), converted to gpui's `Rgba`. Replaces the old accent `selection_tint`
+/// row fills.
+fn glass_fill_rgba(scheme: ColorScheme) -> Rgba {
+    srgba_to_rgba(glass_fill(scheme))
+}
+
+/// The elevated peek-overlay drop shadow — the last surviving sidebar panel
+/// shadow after the docked card flattened (`AppShellView.swift:838`; plan
+/// `docs/plans/restyle/02-sidebar-flatten.md` keeps the peek elevated for
+/// readability over live terminal content).
 fn card_shadow() -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: Rgba {
@@ -684,6 +690,17 @@ impl SidebarShellView {
         crate::settings::sidebar_font::sidebar_size(self.sidebar_font_px, base)
     }
 
+    /// The resolved terminal mono family (SF Mono default) the flattened sidebar's
+    /// session rows + project headers render in — read from the process
+    /// `SharedFontSettings` (the same source the tab strip's titles use). `None`
+    /// before the keymap wires that global (the isolated `sidebar` scenario),
+    /// which leaves gpui's default UI family. Only the FAMILY comes from here; the
+    /// row text SIZE stays proportional off [`sidebar_pt`](Self::sidebar_pt)
+    /// (plan `docs/plans/restyle/02-sidebar-flatten.md`).
+    fn mono_family(&self, cx: &App) -> Option<SharedString> {
+        resolved_mono_family(cx)
+    }
+
     /// Wire the window's pane host (called once by `build_window_root`) so the
     /// shell can return key focus to the active terminal (M2 Item D).
     pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
@@ -956,6 +973,13 @@ impl SidebarShellView {
         self.state.update(cx, |ws, _| {
             if ws.sidebar.mode() != mode {
                 ws.sidebar.toggle_sidebar_mode();
+                // Persist the new per-window sidebar mode so it restores — mirrors
+                // the ⌘⇧B `ToggleSidebarMode` handler (`keymap.rs`). Without this,
+                // a footer mode switch wouldn't persist until some later unrelated
+                // tree-mutation save happened to fire (quit/crash before then and
+                // the window restored in the old mode). A no-op when no store
+                // Global is installed.
+                ws.save_to_store();
             }
         });
     }
@@ -1353,7 +1377,7 @@ impl SidebarShellView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.build_sidebar_card(&groups, true, false, mode, cx))
+                    .child(self.build_sidebar_card(&groups, mode, cx))
                     .child(self.build_main_body(cx)),
             )
     }
@@ -1395,153 +1419,127 @@ impl SidebarShellView {
         }
     }
 
-    /// The 240pt (or `sidebar_width`) floating card: the top strip, the body
-    /// (tab list or files placeholder), and the footer, over a flat `niceBg2`
-    /// panel. `resizable` adds the trailing resize handle. `peeking` forces the
-    /// body to the tabs list — it is the same effective-peek predicate that
-    /// gates the overlay's visibility, so the overlay's body and its presence
-    /// never disagree (peek overlays always show tabs, even in files mode).
+    /// The flat docked sidebar column: the body (tab list or file browser) over
+    /// the footer (mode switcher + gear), sharing the window-body / terminal
+    /// surface — no card inset, fill, border, rounding, or shadow. A single 1px
+    /// over-glass hairline sits at the trailing edge; because the column itself
+    /// starts below the titlebar row, the hairline begins at the titlebar's
+    /// bottom. The trailing resize handle straddles that edge (plan
+    /// `docs/plans/restyle/02-sidebar-flatten.md`).
     fn build_sidebar_card(
         &self,
         groups: &[GroupVm],
-        resizable: bool,
+        mode: SidebarMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let s = active_slots(cx);
+        let scheme = crate::theme_settings::active_chrome_scheme(cx);
+        let handle = self.build_resize_handle(cx);
+        div()
+            // Exported shipped-surface AX anchor (§6): the sidebar column root,
+            // found by an AX walk on role + label. gpui exposes an element to the
+            // macOS AX tree only with both an `.id()` and a non-generic `.role()`;
+            // the `aria_label` becomes its `AXTitle`.
+            .id(SIDEBAR_ROOT_LABEL)
+            .role(gpui::Role::Group)
+            .aria_label(SIDEBAR_ROOT_LABEL)
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .w(px(self.sidebar_width))
+            .h_full()
+            // No fill: the flattened column shows the shared window-body backing
+            // (the terminal-theme background app_shell paints), so the sidebar and
+            // pane surfaces are one continuous surface.
+            .child(self.build_body(groups, &s, false, mode, cx))
+            .child(self.build_footer(&s, mode, cx))
+            // The 1px over-glass hairline at the trailing edge, full column height.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(glass_line_rgba(scheme)),
+            )
+            .child(handle)
+    }
+
+    /// The elevated peek-overlay panel (collapsed-sidebar hover peek): the same
+    /// flat body + footer as the docked column, but on an OPAQUE theme-background
+    /// fill with a rounded corner + drop shadow — it floats over live terminal
+    /// content, so it keeps the panel treatment for readability (and the opaque
+    /// fill avoids double-alpha stacking once plan 3 makes the window
+    /// translucent). Fixed [`SIDEBAR_PEEK_WIDTH`], never resizable, no hairline.
+    /// `peeking` forces the body to the tabs list — the same effective-peek
+    /// predicate that gates the overlay's visibility, so the body and its presence
+    /// never disagree (peek overlays always show tabs, even in files mode).
+    fn build_peek_card(
+        &self,
+        groups: &[GroupVm],
         peeking: bool,
         mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let s = active_slots(cx);
-        let card_width = if resizable {
-            self.sidebar_width
-        } else {
-            SIDEBAR_PEEK_WIDTH
-        };
-        let handle = resizable.then(|| self.build_resize_handle(cx));
-        let inner = div()
-            // Exported shipped-surface AX anchor (§6): the sidebar card root, found
-            // by an AX walk on role + label. gpui exposes an element to the macOS
-            // AX tree only with both an `.id()` and a non-generic `.role()`; the
-            // `aria_label` becomes its `AXTitle`.
+        div()
             .id(SIDEBAR_ROOT_LABEL)
             .role(gpui::Role::Group)
             .aria_label(SIDEBAR_ROOT_LABEL)
             .relative()
+            .flex_none()
             .flex()
             .flex_col()
-            .w(px(card_width))
+            .w(px(SIDEBAR_PEEK_WIDTH))
             .h_full()
-            .bg(sidebar_background(&s))
+            .bg(slot_to_rgba(s.background))
             .rounded(px(CARD_CORNER_RADIUS))
-            .border(px(CARD_BORDER_WIDTH))
-            .border_color(card_border_color(&s))
             .shadow(card_shadow())
-            .child(self.build_top_strip(&s, mode, cx))
             .child(self.build_body(groups, &s, peeking, mode, cx))
-            .child(self.build_footer(&s, cx))
-            .children(handle);
-        div()
-            .flex_none()
-            .h_full()
-            .pl(px(CARD_INSET))
-            .pt(px(CARD_INSET))
-            .pb(px(CARD_INSET))
-            .child(inner)
+            .child(self.build_footer(&s, mode, cx))
     }
 
-    /// The sidebar card's top strip — an INTERIM home for the tabs/files mode
-    /// toggles after the 2026-07 restyle moved the drag region + traffic-light
-    /// reservation + the sidebar-collapse toggle into the titlebar (plan 2 removes
-    /// this strip entirely). The buttons are re-centered for the reduced
-    /// [`TOP_BAR_HEIGHT`] band; the strip no longer drags the window.
-    fn build_top_strip(&self, s: &Slots, mode: SidebarMode, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = crate::theme_settings::active_chrome_accent(cx);
-        let tabs_active = mode == SidebarMode::Tabs;
-        let files_active = mode == SidebarMode::Files;
-        div()
-            .relative()
-            .flex_none()
-            .w_full()
-            .h(px(TOP_BAR_HEIGHT))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(TOP_STRIP_CONTROLS_TOP))
-                    .right(px(TOP_STRIP_CONTROLS_TRAILING))
-                    .flex()
-                    .flex_row()
-                    .gap(px(4.0))
-                    .child(self.mode_button(
-                        "sidebar.mode.tabs",
-                        SF_MODE_TABS,
-                        ICON_MODE_TABS,
-                        tabs_active,
-                        accent,
-                        s,
-                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.set_mode(SidebarMode::Tabs, cx);
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
-                        cx,
-                    ))
-                    .child(self.mode_button(
-                        "sidebar.mode.files",
-                        SF_MODE_FILES,
-                        ICON_MODE_FILES,
-                        files_active,
-                        accent,
-                        s,
-                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.set_mode(SidebarMode::Files, cx);
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
-                        cx,
-                    )),
-            )
-    }
-
-    /// A 24pt header icon button (mode toggle): accent-tinted when active, hover
-    /// fill otherwise (`AppShellView.swift:1097-1134`). The 13pt symbol is
-    /// semibold + ink when active, regular + ink2 otherwise — each tint its own
-    /// [`sf_symbol_icon`] cache entry.
+    /// A footer mode-switcher icon button rendering one of the restyle's stroke
+    /// SVGs (`crate::chrome_icons`). Active: `ink` tint + a faint over-glass
+    /// [`glass_fill`] box. Inactive: `ink3` tint, no fill, an over-glass hover
+    /// fill (plan `docs/plans/restyle/02-sidebar-flatten.md`).
     #[allow(clippy::too_many_arguments)]
     fn mode_button(
         &self,
-        _id: &str,
-        symbol: &'static str,
-        fallback_glyph: &'static str,
+        id: &'static str,
+        icon_path: &'static str,
+        icon_w: f32,
+        icon_h: f32,
         active: bool,
-        accent: Srgba,
+        scheme: ColorScheme,
         s: &Slots,
         on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let ink = slot_to_rgba(s.ink);
-        let ink2 = slot_to_rgba(s.ink2);
-        let hover = ink_alpha(s, ICON_BUTTON_HOVER_ALPHA);
-        let icon = sf_symbol_icon(
-            symbol,
-            fallback_glyph,
-            13.0,
-            if active {
-                SymbolWeight::Semibold
-            } else {
-                SymbolWeight::Regular
-            },
-            if active { ink } else { ink2 },
-            self.window_scale,
-            cx,
-        );
+        let ink3 = slot_to_rgba(s.ink3);
+        let fill = glass_fill_rgba(scheme);
         div()
+            .id(id)
+            .group(id)
             .flex()
             .items_center()
             .justify_center()
             .w(px(24.0))
             .h(px(24.0))
             .rounded(px(INNER_CORNER_RADIUS))
-            .when(active, |el| el.bg(selection_tint(accent, 1.0)))
-            .when(!active, |el| el.hover(move |st| st.bg(hover)))
-            .child(icon)
+            .when(active, |el| el.bg(fill))
+            .when(!active, |el| el.hover(move |st| st.bg(fill)))
+            .child(
+                // gpui tints the SVG's alpha mask with the element's own text
+                // colour; set it explicitly (active `ink`, else `ink3`).
+                gpui::svg()
+                    .path(icon_path)
+                    .w(px(icon_w))
+                    .h(px(icon_h))
+                    .text_color(if active { ink } else { ink3 }),
+            )
             .on_mouse_down(MouseButton::Left, on_down)
     }
 
@@ -1614,6 +1612,7 @@ impl SidebarShellView {
     fn build_project_group(&self, g: &GroupVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
+        let family = self.mono_family(cx);
         let show_add = g.is_terminals || g.hovered;
         let gid = g.id.clone();
 
@@ -1684,7 +1683,8 @@ impl SidebarShellView {
                     .text_size(px(self.sidebar_pt(12.0)))
                     .line_height(px(self.sidebar_pt(LINE_HEIGHT_12)))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(ink2)
+                    .text_color(ink3)
+                    .when_some(family.clone(), |el, fam| el.font_family(fam))
                     .child(SharedString::from(g.name.to_uppercase()))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1786,20 +1786,27 @@ impl SidebarShellView {
 
     fn build_tab_row(&self, t: &TabVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = crate::theme_settings::active_chrome_accent(cx);
+        let scheme = crate::theme_settings::active_chrome_scheme(cx);
         let ink = slot_to_rgba(s.ink);
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
-        let hover = ink_alpha(s, HOVER_INK_ALPHA);
+        let family = self.mono_family(cx);
+        // Hover / multi-select fill: the over-glass faint fill (replacing the old
+        // accent `selection_tint`), on the flat shared surface.
+        let glass = glass_fill_rgba(scheme);
         let indent = row_indent(t.indented);
 
         // Leading icon: the status dot for a Claude tab, else the `terminal`
         // symbol — 12pt regular ink3 in a 16pt box (`SidebarView.swift:602-607`).
+        // Row dots render small (5pt) — only the size parameter changes; colours
+        // + pulse are untouched.
         let leading = if t.has_claude {
             StatusDot::new(
                 SharedString::from(t.id.clone()),
                 t.status,
                 slot_srgba(s.ink3),
             )
+            .size(SIDEBAR_ROW_DOT_SIZE)
             .suppress_waiting_pulse(t.waiting_ack)
             .into_any_element()
         } else {
@@ -1885,7 +1892,14 @@ impl SidebarShellView {
                 } else {
                     FontWeight::NORMAL
                 })
-                .text_color(if is_active { ink } else { ink2 })
+                // Active row: accent text is its marker (no fill, no bar). Others
+                // in normal `ink2`.
+                .text_color(if is_active {
+                    srgba_to_rgba(accent)
+                } else {
+                    ink2
+                })
+                .when_some(family.clone(), |el, fam| el.font_family(fam))
                 .child(SharedString::from(t.title.clone()))
                 .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                     let mods = e.modifiers();
@@ -1958,12 +1972,12 @@ impl SidebarShellView {
             .pr(px(10.0))
             .py(px(4.0))
             .rounded(px(4.0))
-            .when(is_active, |el| el.bg(selection_tint(accent, 1.0)))
-            .when(!is_active && is_selected, |el| {
-                el.bg(selection_tint(accent, SELECTED_DIM_FACTOR))
-            })
+            // Active row has NO fill (accent text is its marker). A multi-selected
+            // non-active row keeps a persistent faint over-glass fill; a plain
+            // non-active row shows the same fill only on hover.
+            .when(!is_active && is_selected, |el| el.bg(glass))
             .when(!is_active && !is_selected, |el| {
-                el.hover(move |st| st.bg(hover))
+                el.hover(move |st| st.bg(glass))
             })
             .child(frame_probe)
             .child(leading)
@@ -2015,74 +2029,101 @@ impl SidebarShellView {
         div().px(px(6.0)).w_full().child(inner).into_any_element()
     }
 
-    /// The footer: a trailing Settings gear over a 1pt top rule. The gear
-    /// dispatches R23's [`OpenSettings`](crate::settings::window::OpenSettings)
-    /// — the same action the "Settings…" app-menu item and ⌘, fire — so all
-    /// three routes share the singleton open-or-focus handler.
-    fn build_footer(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
-        // 14pt regular `gearshape`, ink2 like the other icon buttons.
-        let gear = sf_symbol_icon(
-            SF_GEAR,
-            ICON_GEAR,
-            14.0,
-            SymbolWeight::Regular,
-            slot_to_rgba(s.ink2),
-            self.window_scale,
-            cx,
-        );
-        let hover = ink_alpha(s, ICON_BUTTON_HOVER_ALPHA);
+    /// The footer: the tabs/files mode switcher at the leading edge and the
+    /// Settings gear at the trailing edge, sitting flush on the flat sidebar
+    /// surface (no top rule — the 2026-07 restyle removed it). The mode buttons
+    /// and gear render the restyle's stroke SVGs (`crate::chrome_icons`). The
+    /// gear dispatches R23's [`OpenSettings`](crate::settings::window::OpenSettings)
+    /// — the same action the "Settings…" app-menu item and ⌘, fire — so all three
+    /// routes share the singleton open-or-focus handler.
+    fn build_footer(&self, s: &Slots, mode: SidebarMode, cx: &mut Context<Self>) -> impl IntoElement {
+        let scheme = crate::theme_settings::active_chrome_scheme(cx);
+        let tabs_active = mode == SidebarMode::Tabs;
+        let files_active = mode == SidebarMode::Files;
+        let gear_ink3 = slot_to_rgba(s.ink3);
+        let gear_ink = slot_to_rgba(s.ink);
+        let gear_hover = glass_fill_rgba(scheme);
         div()
-            .relative()
             .flex()
             .flex_row()
-            .justify_center()
+            .justify_between()
             .items_center()
             .w_full()
             .px(px(8.0))
             .py(px(6.0))
             .child(
-                // 1pt top rule.
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w_full()
-                    .h(px(1.0))
-                    .bg(slot_to_rgba(s.line)),
-            )
-            .child(
+                // Leading: the tabs ↔ files mode switcher.
                 div()
                     .flex()
                     .flex_row()
-                    .justify_end()
-                    .w_full()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(self.mode_button(
+                        "sidebar.mode.tabs",
+                        crate::chrome_icons::MODE_TABS,
+                        crate::chrome_icons::MODE_TABS_W,
+                        crate::chrome_icons::MODE_TABS_H,
+                        tabs_active,
+                        scheme,
+                        s,
+                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                            this.set_mode(SidebarMode::Tabs, cx);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(self.mode_button(
+                        "sidebar.mode.files",
+                        crate::chrome_icons::MODE_FILES,
+                        crate::chrome_icons::MODE_FILES_W,
+                        crate::chrome_icons::MODE_FILES_H,
+                        files_active,
+                        scheme,
+                        s,
+                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                            this.set_mode(SidebarMode::Files, cx);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )),
+            )
+            .child(
+                // Trailing: the Settings gear — opens (or focuses) the singleton
+                // Settings window through the shared `OpenSettings` action.
+                // `.id()` + `Role::Button` expose it to the macOS AX tree (the
+                // settings scenario's anchor idiom).
+                div()
+                    .id("sidebar.settings")
+                    .group("sidebar.settings")
+                    .role(gpui::Role::Button)
+                    .aria_label("Settings")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .rounded(px(INNER_CORNER_RADIUS))
+                    .hover(move |st| st.bg(gear_hover))
                     .child(
-                        // The Settings gear: opens (or focuses) the singleton
-                        // Settings window through the shared `OpenSettings`
-                        // action. `.id()` + `Role::Button` expose it to the
-                        // macOS AX tree (the settings scenario's anchor idiom).
-                        div()
-                            .id("sidebar.settings")
-                            .role(gpui::Role::Button)
-                            .aria_label("Settings")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .rounded(px(INNER_CORNER_RADIUS))
-                            .hover(move |st| st.bg(hover))
-                            .child(gear)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_this, _e: &MouseDownEvent, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::settings::window::OpenSettings),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            ),
+                        // The new thin-stroke gear SVG (not SF_GEAR / a font
+                        // glyph); gpui tints the alpha mask with the element's
+                        // text colour — `ink3` at rest, `ink` on hover.
+                        gpui::svg()
+                            .path(crate::chrome_icons::MODE_GEAR)
+                            .w(px(crate::chrome_icons::MODE_GEAR_W))
+                            .h(px(crate::chrome_icons::MODE_GEAR_H))
+                            .text_color(gear_ink3)
+                            .group_hover("sidebar.settings", move |st| st.text_color(gear_ink)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _e: &MouseDownEvent, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::settings::window::OpenSettings),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
                     ),
             )
     }
@@ -2149,7 +2190,7 @@ impl SidebarShellView {
                 this.peek_mouse_pinned = *hovering;
                 cx.notify();
             }))
-            .child(self.build_sidebar_card(groups, false, peeking, mode, cx))
+            .child(self.build_peek_card(groups, peeking, mode, cx))
     }
 }
 
@@ -2350,8 +2391,9 @@ pub(crate) fn install_sidebar_key_bindings(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    // `ColorScheme` + the `glass_*` helpers come through the `super::*` glob (the
+    // crate-top imports); only `AccentPreset` is test-local.
     use super::*;
-    use nice_theme::palette::{slots, ColorScheme, Palette};
     use nice_theme::AccentPreset;
 
     #[test]
@@ -2391,18 +2433,6 @@ mod tests {
             (SF_CHEVRON_CLOSED, ICON_CHEVRON_CLOSED)
         );
         assert_ne!(disclosure_icon(true), disclosure_icon(false));
-    }
-
-    #[test]
-    fn sidebar_background_is_flat_nice_bg2() {
-        // The SidebarBackground seam paints the active palette's `background2` as a
-        // flat panel; with the Nice/Dark reference table it is the flat niceBg2
-        // panel (SidebarBackground.swift:26-27).
-        let s = slots(Palette::Nice, ColorScheme::Dark)
-            .expect("Nice + Dark is a valid palette/scheme combo");
-        let bg = sidebar_background(&s);
-        let want = slot_srgba(s.background2);
-        assert_eq!((bg.r, bg.g, bg.b), (want.r, want.g, want.b));
     }
 
     // ---- tab_drop_target (mirrors Tests/NiceUnitTests/SidebarDropResolverTests.swift)
@@ -2526,12 +2556,37 @@ mod tests {
 
     #[test]
     fn selection_tint_dims_by_factor() {
+        // `selection_tint` now survives only as the inline-rename field's
+        // text-selection highlight (the flattened rows use the over-glass
+        // `glass_fill` instead). The factor math is still exercised here.
         let accent = AccentPreset::Terracotta.color();
         let active = selection_tint(accent, 1.0);
-        let dimmed = selection_tint(accent, SELECTED_DIM_FACTOR);
+        let dimmed = selection_tint(accent, 0.5);
         assert_eq!(active.a, SEL_ALPHA_DARK);
         assert_eq!(dimmed.a, SEL_ALPHA_DARK * 0.5);
         // Same hue, different alpha (rgb carried straight from the accent).
         assert_eq!((active.r, active.g, active.b), (dimmed.r, dimmed.g, dimmed.b));
+    }
+
+    #[test]
+    fn glass_fill_and_line_convert_the_scheme_scoped_primitives() {
+        // The flat sidebar's row / footer fills + trailing hairline resolve the
+        // over-glass primitives (plan docs/plans/restyle/02-sidebar-flatten.md),
+        // not palette slots. The gpui `Rgba` is a lossless field copy of the
+        // nice-theme `Srgba`.
+        for scheme in [ColorScheme::Dark, ColorScheme::Light] {
+            let fill = glass_fill_rgba(scheme);
+            let want_fill = glass_fill(scheme);
+            assert_eq!(
+                (fill.r, fill.g, fill.b, fill.a),
+                (want_fill.r, want_fill.g, want_fill.b, want_fill.a)
+            );
+            let line = glass_line_rgba(scheme);
+            let want_line = glass_line(scheme);
+            assert_eq!(
+                (line.r, line.g, line.b, line.a),
+                (want_line.r, want_line.g, want_line.b, want_line.a)
+            );
+        }
     }
 }

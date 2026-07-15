@@ -42,7 +42,7 @@ use gpui::{prelude::*, AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_model::{Pane, PaneKind, Tab, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
-    CARD_INSET, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette};
@@ -302,15 +302,17 @@ async fn resize_checks(
     }
 }
 
-/// The content-view x of the resize handle's hot zone for a given card width: the
-/// handle straddles the inner card's trailing edge (`CARD_INSET + width`); a press
-/// 2pt inside that edge lands on the handle and left of the content-area boundary.
+/// The content-view x of the resize handle's hot zone for a given sidebar width:
+/// the flattened sidebar column's leading edge sits at window-x 0 (the 2026-07
+/// restyle dropped the old `CARD_INSET` gutter), so the handle straddles the
+/// trailing edge at `width`; a press 2pt inside that edge lands on the handle and
+/// left of the content-area boundary.
 fn handle_x(width: f32) -> f64 {
-    (CARD_INSET + width - 2.0) as f64
+    (width - 2.0) as f64
 }
 
-/// A y comfortably inside the card body (below the top strip), for the handle
-/// drag / double-click.
+/// A y comfortably inside the sidebar body (below the titlebar row), for the
+/// handle drag / double-click.
 const HANDLE_DRAG_Y: f64 = 200.0;
 
 /// Post a synthetic left press-drag of `dx` pt starting on the resize handle.

@@ -111,7 +111,8 @@ The GPUI application. Structure (grows over later cycles):
   the band acts only on the remainder — is the reusable pattern the shell composes
   with.
 - `app_shell` — the R13.5 **per-window composition root**. `AppShellView` renders the
-  shell subtree (sidebar card + toolbar band + pane content), carries the window-level
+  shell subtree (flat sidebar column + toolbar band + pane content — the 2026-07
+  restyle flattened the sidebar card into the shared window-body surface), carries the window-level
   peek-clear modifier observer (moved off `WindowChromeView`), and observes the shared
   `WindowState`, the toolbar, and the sidebar — re-rendering the whole subtree on any
   notify, so a pill/row click (which notifies only its own view) still switches the
@@ -149,7 +150,7 @@ The GPUI application. Structure (grows over later cycles):
   mutation flows through the `sidebar_actions` / `pane_strip_actions` / `session` seams.
   Exports the AX-anchor label constants `nice-sidebar-root` / `nice-pane-strip-root`
   (the §6 shipped-surface assertion hooks), placed as `.id()` + `.role(Group)` +
-  `.aria_label(..)` on the sidebar-card root (`sidebar_shell`) and the pane-strip root
+  `.aria_label(..)` on the flat sidebar-column root (`sidebar_shell`) and the pane-strip root
   (`toolbar`).
 - `app_shell_live` — the R13.5 live app-shell composition self-test scenario
   (`app-shell`, see the table below). Opens through the SHIPPED builder
@@ -480,10 +481,12 @@ The GPUI application. Structure (grows over later cycles):
     restyle restructured the expanded shell to `column(titlebar row, row(sidebar,
     content))`, so the toolbar rides a full-width `build_titlebar_row` at the top in
     BOTH shell states — replacing the old per-mode top-bar-accessory / main-column
-    slots). Renders the whole shell (expanded floating card / collapsed full-width
-    body — the M2 design; the floating cap is gone / peek overlay / resize handle) + card
+    slots). Renders the whole shell (expanded flat sidebar column — the 2026-07 restyle
+    flattened the floating card into the shared terminal surface, leaving a single
+    over-glass right-edge hairline / collapsed full-width body — the M2 design; the
+    floating cap is gone / peek overlay / resize handle) + the column contents
     (project groups, tab rows, footer, toggles), and carries the exported
-    `nice-sidebar-root` AX anchor on the card root. The DO-NOT-PORT SwiftUI seams are
+    `nice-sidebar-root` AX anchor on the sidebar-column root. The DO-NOT-PORT SwiftUI seams are
     replaced per the plan: the Esc `NSEvent` monitor → a `CollapseSidebarSelection` gpui
     key **binding** (dispatched before key listeners; collapses a >1 selection, else
     `cx.propagate()`s so Esc still reaches the terminal), and the rename click-away
@@ -1544,9 +1547,25 @@ and pinned by literal-equality tests that cite their Swift provenance (see
   once: top-bar height (28 after the 2026-07 restyle slimmed the 52pt band),
   sidebar default 240 + resize clamp 160–480, the native macOS-26 traffic-light
   leadings + the titlebar's leading reserve (the old custom placer offsets are
-  retired — the OS now positions the buttons), card corner radii / inset / shadow.
+  retired — the OS now positions the buttons), and the peek-overlay corner
+  radius + drop shadow (the 2026-07 restyle flattened the docked sidebar card
+  into the shared surface, retiring `CARD_INSET` / the `CARD_BORDER_*` constants
+  and their provenance test; only the corner-radius + shadow constants survive,
+  now scoped to the collapsed-sidebar peek overlay).
   The titlebar constants cite `docs/design/restyle-mocks.html` + the restyle plan
-  set; the surviving sidebar / card constants still cite `AppShellView.swift`.
+  set; the surviving peek-overlay constants still cite `AppShellView.swift`.
+- `glass` — the 2026-07 restyle's "line over glass" / "fill over glass" color
+  primitives (`glass_line` / `glass_fill`, scheme-scoped `Srgba`). The flattened
+  sidebar shares the window-body surface, so its hairline divider and its
+  hover/selection fills can't be the opaque theme `line` slot; these scale a
+  scheme-fixed white/ink value by alpha (white 8% dark / `ink` 10% light for the
+  line; white 6% dark / `ink` 5% light for the fill) so they read correctly over
+  the shared — and, in plan 3, translucent — surface. Cited verbatim from the
+  mock's `--hairline` / `--fill-active` custom properties.
+- `status` — the `StatusDot` visual tokens ported from `StatusDot.swift`: the
+  base dot size, the fixed "thinking" (brand Terracotta) and "waiting" (blue)
+  colours, and the pulse-animation constants. The idle dot's `ink3` colour is
+  palette-dependent, so it alone is resolved by the caller and passed in.
 
 The tiny adapter from these plain types into gpui color types lives downstream
 (`crates/nice`, R9), NOT here — that is what keeps this crate gpui-free and

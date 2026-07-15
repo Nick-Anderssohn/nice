@@ -468,6 +468,18 @@ pub fn active_chrome_slots(cx: &App) -> Slots {
     }
 }
 
+/// The active color scheme chrome views resolve over-glass primitives against
+/// this frame (the flat sidebar's [`glass_line`](nice_theme::glass_line) /
+/// [`glass_fill`](nice_theme::glass_fill)): the live [`SharedThemeState`] when
+/// installed, else the shipped Nice/Dark fallback scheme (so scenarios / tests
+/// without the global resolve the dark over-glass values).
+pub fn active_chrome_scheme(cx: &App) -> ColorScheme {
+    match cx.try_global::<SharedThemeState>() {
+        Some(shared) => shared.0.read(cx).scheme,
+        None => ColorScheme::Dark,
+    }
+}
+
 /// The accent color chrome views tint with this frame: the live
 /// [`SharedThemeState`] when installed, else the shipped Terracotta fallback.
 pub fn active_chrome_accent(cx: &App) -> Srgba {

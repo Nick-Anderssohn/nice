@@ -94,32 +94,32 @@ pub const MACOS26_TRAFFIC_LIGHT_LEADINGS: [f32; 3] = [9.0, 32.0, 55.0];
 /// the rendered pitch against it; see the block comment above.
 pub const MACOS26_TRAFFIC_LIGHT_PITCH: f32 = 23.0;
 
-// ---- Cards (sidebar) ---------------------------------------------------------
+// ---- Peek overlay (the only surviving elevated sidebar panel) ----------------
+//
+// The 2026-07 restyle (plan `docs/plans/restyle/02-sidebar-flatten.md`) flattened
+// the DOCKED sidebar into the shared window-body surface: its card inset, border,
+// distinct fill, and rounding are gone (a single over-glass hairline replaces the
+// chrome). The collapsed-sidebar PEEK overlay is the last surface that still reads
+// as an elevated floating panel — it floats over live terminal content and needs
+// the rounded corner + drop shadow for readability — so only the corner-radius and
+// shadow constants below survive, now cited for the peek overlay. The retired
+// `CARD_INSET` / `CARD_BORDER_*` constants (and their `card_constants_match_swift`
+// provenance test) went with the flattened docked card.
 
-/// Corner radius (pt) of the floating sidebar card. `AppShellView.swift:825`.
+/// Corner radius (pt) of the elevated peek overlay panel. `AppShellView.swift:825`.
 pub const CARD_CORNER_RADIUS: f32 = 8.0;
 
-/// Corner radius (pt) of inner chrome elements (pills, etc.).
+/// Corner radius (pt) of inner chrome elements (pills, footer icon buttons).
 /// `AppShellView.swift:1124,1158`.
 pub const INNER_CORNER_RADIUS: f32 = 6.0;
 
-/// Inset (pt) of the card from the window edges; the card's leading edge sits
-/// at window-x 6 (`WindowChrome.swift:37`). `AppShellView.swift:839`.
-pub const CARD_INSET: f32 = 6.0;
-
-/// Card border stroke width (pt). `AppShellView.swift:830`.
-pub const CARD_BORDER_WIDTH: f32 = 0.5;
-
-/// Card border color = the `line` slot at this opacity. `AppShellView.swift:829`.
-pub const CARD_BORDER_OPACITY: f32 = 0.5;
-
-/// Card drop-shadow blur radius (pt). `AppShellView.swift:838`.
+/// Peek-overlay drop-shadow blur radius (pt). `AppShellView.swift:838`.
 pub const CARD_SHADOW_RADIUS: f32 = 4.0;
 
-/// Card drop-shadow vertical offset (pt). `AppShellView.swift:838`.
+/// Peek-overlay drop-shadow vertical offset (pt). `AppShellView.swift:838`.
 pub const CARD_SHADOW_Y_OFFSET: f32 = 2.0;
 
-/// Card drop-shadow color = black at this opacity. `AppShellView.swift:838`.
+/// Peek-overlay drop-shadow color = black at this opacity. `AppShellView.swift:838`.
 pub const CARD_SHADOW_OPACITY: f32 = 0.15;
 
 // The COLLAPSED_CAP_* constants are gone with the cap itself (M2 feel-check
@@ -173,12 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn card_constants_match_swift() {
+    fn peek_overlay_constants_match_swift() {
+        // The surviving elevated-panel constants after the docked sidebar
+        // flattened (plan docs/plans/restyle/02-sidebar-flatten.md) — the peek
+        // overlay keeps the rounded corner + drop shadow for readability over
+        // live terminal content.
         assert_eq!(CARD_CORNER_RADIUS, 8.0); // AppShellView.swift:825
         assert_eq!(INNER_CORNER_RADIUS, 6.0); // AppShellView.swift:1124,1158
-        assert_eq!(CARD_INSET, 6.0); // AppShellView.swift:839
-        assert_eq!(CARD_BORDER_WIDTH, 0.5); // AppShellView.swift:830
-        assert_eq!(CARD_BORDER_OPACITY, 0.5); // AppShellView.swift:829
         assert_eq!(CARD_SHADOW_RADIUS, 4.0); // AppShellView.swift:838
         assert_eq!(CARD_SHADOW_Y_OFFSET, 2.0); // AppShellView.swift:838
         assert_eq!(CARD_SHADOW_OPACITY, 0.15); // AppShellView.swift:838

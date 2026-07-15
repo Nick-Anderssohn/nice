@@ -60,6 +60,7 @@ use crate::inline_rename::{
     RenameKeyOutcome,
 };
 use nice_theme::color::Srgba;
+use nice_theme::glass::glass_fill;
 use nice_theme::palette::Slots;
 
 use crate::context_menu::{ContextMenu, ContextMenuItem};
@@ -70,7 +71,7 @@ use crate::file_browser::sort_settings_store::SortSettingsStore;
 use crate::file_browser::watcher::DirectoryWatcherHub;
 use crate::file_browser::workspace_ops::{open_with_entries, WorkspaceOpsGlobal};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
-use crate::theme::{slot_to_rgba, slot_srgba, srgba_to_rgba, srgba_with_alpha};
+use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::window_state::WindowState;
 
 /// The shipped-surface AX anchor label for the files-mode root (the `ax-probe` /
@@ -93,9 +94,9 @@ const NAME_SIZE: f32 = 13.0;
 const ICON_SIZE: f32 = 13.0;
 /// Control-strip icon-button frame (the 20 pt landed idiom).
 const STRIP_BUTTON: f32 = 20.0;
-/// Row hover fill: 6% ink (the sidebar row convention).
-const HOVER_INK_ALPHA: f32 = 0.06;
-/// Selection tint alpha on the accent.
+/// Accent alpha for the inline-rename field's selected-text highlight (kept
+/// strong so the selection reads inside the field — the 2026-07 restyle moved
+/// the ROW hover / selection fill to the faint over-glass `glass_fill`).
 const SEL_ALPHA: f32 = 0.22;
 /// Drag-hover highlight alpha on the accent (F9 — the target folder's tint).
 const DRAG_HOVER_ALPHA: f32 = 0.30;
@@ -1370,6 +1371,10 @@ impl FileBrowserView {
     // MARK: - Rendering
 
     fn build_header(&self, snap: &Snapshot, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+        // The flat restyle renders sidebar text in the terminal mono family (the
+        // same seam the tabs-mode rows / project headers use); only the family
+        // changes — the size stays `NAME_SIZE`.
+        let family = crate::sidebar_shell::resolved_mono_family(cx);
         div()
             .id("file-browser.header")
             .w_full()
@@ -1379,6 +1384,7 @@ impl FileBrowserView {
             .text_size(px(NAME_SIZE))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(slot_to_rgba(s.ink))
+            .when_some(family, |el, fam| el.font_family(fam))
             .cursor_pointer()
             .child(SharedString::from(snap.header.clone()))
             .on_mouse_down(
@@ -1486,7 +1492,7 @@ impl FileBrowserView {
         } else {
             slot_to_rgba(s.ink2)
         };
-        let hover = srgba_to_rgba(srgba_with_alpha(slot_srgba(s.ink), HOVER_INK_ALPHA));
+        let hover = srgba_to_rgba(glass_fill(crate::theme_settings::active_chrome_scheme(cx)));
         let mut btn = div()
             .id(id)
             .flex()
@@ -1537,9 +1543,15 @@ impl FileBrowserView {
         }
         let rows = snap.rows.clone();
         let scale = self.window_scale;
+        let scheme = crate::theme_settings::active_chrome_scheme(cx);
         let colors = RowColors {
+            // Hovered / selected rows share the faint over-glass fill (the flat
+            // restyle skin — matches the tabs-mode rows), replacing the old accent
+            // row tint and the ink hover.
+            glass: srgba_to_rgba(glass_fill(scheme)),
+            // Kept accent-based: the rename FIELD's selected-text highlight (a
+            // strong tint reads inside the field; the row fill is now `glass`).
             sel_bg: srgba_to_rgba(srgba_with_alpha(self.accent, SEL_ALPHA)),
-            hover: srgba_to_rgba(srgba_with_alpha(slot_srgba(s.ink), HOVER_INK_ALPHA)),
             drag_hover: srgba_to_rgba(srgba_with_alpha(self.accent, DRAG_HOVER_ALPHA)),
             ink: slot_to_rgba(s.ink),
             ink2: slot_to_rgba(s.ink2),
@@ -1548,6 +1560,10 @@ impl FileBrowserView {
             field_border: slot_to_rgba(s.line_strong),
             caret: srgba_to_rgba(self.accent),
         };
+        // The flat restyle renders row names in the terminal mono family (same
+        // seam as the tabs-mode rows); only the family changes — size stays
+        // `NAME_SIZE`.
+        let family = crate::sidebar_shell::resolved_mono_family(cx);
         let count = rows.len();
         let weak = cx.weak_entity();
         let rename_focus = self.rename_focus.clone();
@@ -1560,6 +1576,7 @@ impl FileBrowserView {
                         weak.clone(),
                         colors,
                         scale,
+                        family.clone(),
                         &rename_focus,
                         probe.clone(),
                         app,
@@ -1984,21 +2001,26 @@ fn chrome_slots(cx: &gpui::App) -> Slots {
 /// Row colours resolved once per render and copied into each row.
 #[derive(Clone, Copy)]
 struct RowColors {
-    sel_bg: Rgba,
-    hover: Rgba,
+    /// The faint over-glass fill for a hovered OR selected row (`glass_fill`
+    /// 6%/5% — the 2026-07 flat restyle skin, matching the tabs-mode rows;
+    /// replaces the old accent selection tint and the separate ink hover).
+    glass: Rgba,
     drag_hover: Rgba,
     ink: Rgba,
     ink2: Rgba,
     ink3: Rgba,
     /// Rename-field chrome — the same slots the sidebar tab / pane pill
     /// `rename_field` uses (background3 fill + line_strong border), so the
-    /// editor reads as a field against the accent-tinted selected row instead
-    /// of vanishing into it.
+    /// editor reads as a field against the row instead of vanishing into it.
     field_bg: Rgba,
     field_border: Rgba,
     /// Full-alpha accent for the collapsed caret bar (sel_bg's 22% tint is
     /// invisible at 1px).
     caret: Rgba,
+    /// Accent text-selection highlight inside the rename field (kept strong so
+    /// the selection reads against the field fill — distinct from the row's
+    /// faint `glass` fill).
+    sel_bg: Rgba,
 }
 
 /// Render one tree row (free fn so the `uniform_list` `'static` closure builds it
@@ -2009,6 +2031,7 @@ fn render_row(
     weak: gpui::WeakEntity<FileBrowserView>,
     c: RowColors,
     scale: f32,
+    family: Option<SharedString>,
     rename_focus: &FocusHandle,
     probe: Rc<Cell<FieldProbe>>,
     app: &mut App,
@@ -2032,9 +2055,9 @@ fn render_row(
         .gap(px(4.0))
         .cursor_pointer();
     if row.is_selected {
-        el = el.bg(c.sel_bg);
+        el = el.bg(c.glass);
     } else {
-        let hover = c.hover;
+        let hover = c.glass;
         el = el.hover(move |st| st.bg(hover));
     }
     // R20 (F7): a cut row is ghosted at 0.45 opacity until the cut is pasted or
@@ -2098,6 +2121,7 @@ fn render_row(
                 .text_ellipsis_middle()
                 .text_size(px(NAME_SIZE))
                 .text_color(c.ink)
+                .when_some(family, |el, fam| el.font_family(fam))
                 .child(SharedString::from(row.name.clone()))
                 .into_any_element(),
         });
