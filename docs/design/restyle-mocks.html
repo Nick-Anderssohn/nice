@@ -501,22 +501,24 @@
   .window.settings[data-stab="light"] .pane-dark  { display: none; }
   .window.settings[data-stab="dark"]  .pane-light { display: none; }
 
-  .theme-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
-    margin: 12px 0 4px;
+  /* manual scheme flip (used when OS sync is off) — flat segmented control */
+  .scheme-seg {
+    flex: none; display: inline-flex;
+    border: 1px solid var(--hairline); border-radius: 7px;
+    overflow: hidden;
   }
-  .theme-card {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    padding: 7px 10px;
-    border: 1px solid var(--hairline);
-    border-radius: 7px;
-    color: var(--ink2);
-    white-space: nowrap; overflow: hidden;
+  .scheme-seg span { padding: 4px 12px; color: var(--ink3); cursor: default; }
+  .scheme-seg span.sel { background: var(--fill-x); color: var(--ink); }
+
+  /* merged theme picker — plain dropdown, no color chips */
+  .dropdown {
+    flex: none; display: inline-flex; align-items: center; gap: 10px;
+    padding: 5px 12px;
+    border: 1px solid var(--hairline); border-radius: 7px;
+    color: var(--ink);
+    white-space: nowrap;
   }
-  .theme-card .t { overflow: hidden; text-overflow: ellipsis; }
-  .theme-card .chips { display: flex; gap: 3px; flex: none; }
-  .chip { width: 10px; height: 10px; border-radius: 3px; box-shadow: inset 0 0 0 0.5px var(--hairline-strong); }
-  .theme-card.sel { color: var(--ink); border-color: var(--accent); }
+  .dropdown .chev { color: var(--ink3); font-size: 10px; }
   .mini-slider {
     flex: none; position: relative;
     width: 170px; height: 3px; border-radius: 2px;
@@ -868,12 +870,15 @@
       same translucent surface, blur, mono type, hairlines, and centered
       titlebar text (the single-tab convention). Chrome palette and terminal
       theme merge into <b>one theme</b> — each entry drives both, so the old
-      separate pickers collapse into a single grid. Scheme-specific settings
-      group under <b>Light / Dark tabs</b> (same text + accent-underline
-      grammar as the titlebar): the tab picks which scheme you're editing —
-      its theme, opacity, and blur. Scheme-independent settings (OS sync,
-      accent) sit above the tabs. The tabs are clickable in this mock; the
-      global Scheme control still flips what the whole window renders as.
+      separate pickers collapse into a single <b>Theme dropdown</b> (plain
+      names, no color chips — long theme names must not truncate).
+      Scheme-specific settings group under <b>Light / Dark tabs</b> (same
+      text + accent-underline grammar as the titlebar): the tab picks which
+      scheme you're editing — its theme, opacity, and blur. Scheme-independent
+      settings sit above the tabs: OS sync, accent, and a manual <b>Scheme</b>
+      control (segmented Light/Dark; the flip used when OS sync is off) right
+      below the accent row. The tabs are clickable in this mock; the Scheme
+      row flips what the whole window renders as.
     </p>
 
     <figure class="mock">
@@ -905,6 +910,10 @@
                   <span class="swatch" style="background:#33bbc8"></span>
                 </span>
               </div>
+              <div class="set-row">
+                <span>Scheme</span>
+                <span class="scheme-seg"><span>Light</span><span class="sel">Dark</span></span>
+              </div>
 
               <div class="scheme-tabs">
                 <span class="scheme-tab" data-stab="light">Light mode</span>
@@ -912,15 +921,9 @@
               </div>
 
               <div class="pane-dark">
-                <div class="theme-grid">
-                  <div class="theme-card sel"><span class="t">Nice Dark</span><span class="chips"><span class="chip" style="background:#090705"></span><span class="chip" style="background:#c96442"></span><span class="chip" style="background:#496ee1"></span></span></div>
-                  <div class="theme-card"><span class="t">Solarized Dark</span><span class="chips"><span class="chip" style="background:#002b36"></span><span class="chip" style="background:#b58900"></span><span class="chip" style="background:#268bd2"></span></span></div>
-                  <div class="theme-card"><span class="t">Dracula</span><span class="chips"><span class="chip" style="background:#282a36"></span><span class="chip" style="background:#bd93f9"></span><span class="chip" style="background:#50fa7b"></span></span></div>
-                  <div class="theme-card"><span class="t">Nord</span><span class="chips"><span class="chip" style="background:#2e3440"></span><span class="chip" style="background:#88c0d0"></span><span class="chip" style="background:#a3be8c"></span></span></div>
-                  <div class="theme-card"><span class="t">Gruvbox Dark</span><span class="chips"><span class="chip" style="background:#282828"></span><span class="chip" style="background:#fabd2f"></span><span class="chip" style="background:#b8bb26"></span></span></div>
-                  <div class="theme-card"><span class="t">Catppuccin Mocha</span><span class="chips"><span class="chip" style="background:#1e1e2e"></span><span class="chip" style="background:#cba6f7"></span><span class="chip" style="background:#a6e3a1"></span></span></div>
-                  <div class="theme-card"><span class="t">Tokyo Night</span><span class="chips"><span class="chip" style="background:#1a1b26"></span><span class="chip" style="background:#7aa2f7"></span><span class="chip" style="background:#bb9af7"></span></span></div>
-                  <div class="theme-card"><span class="t">One Dark</span><span class="chips"><span class="chip" style="background:#282c34"></span><span class="chip" style="background:#61afef"></span><span class="chip" style="background:#98c379"></span></span></div>
+                <div class="set-row">
+                  <span>Theme</span>
+                  <span class="dropdown">Nice Dark <span class="chev">▾</span></span>
                 </div>
                 <div class="set-row">
                   <span>Opacity</span>
@@ -933,15 +936,9 @@
               </div>
 
               <div class="pane-light">
-                <div class="theme-grid">
-                  <div class="theme-card sel"><span class="t">Nice Light</span><span class="chips"><span class="chip" style="background:#fffcfc"></span><span class="chip" style="background:#c96442"></span><span class="chip" style="background:#2860af"></span></span></div>
-                  <div class="theme-card"><span class="t">Solarized Light</span><span class="chips"><span class="chip" style="background:#fdf6e3"></span><span class="chip" style="background:#b58900"></span><span class="chip" style="background:#268bd2"></span></span></div>
-                  <div class="theme-card"><span class="t">Gruvbox Light</span><span class="chips"><span class="chip" style="background:#fbf1c7"></span><span class="chip" style="background:#d79921"></span><span class="chip" style="background:#98971a"></span></span></div>
-                  <div class="theme-card"><span class="t">Catppuccin Latte</span><span class="chips"><span class="chip" style="background:#eff1f5"></span><span class="chip" style="background:#8839ef"></span><span class="chip" style="background:#40a02b"></span></span></div>
-                  <div class="theme-card"><span class="t">Dracula</span><span class="chips"><span class="chip" style="background:#282a36"></span><span class="chip" style="background:#bd93f9"></span><span class="chip" style="background:#50fa7b"></span></span></div>
-                  <div class="theme-card"><span class="t">Nord</span><span class="chips"><span class="chip" style="background:#2e3440"></span><span class="chip" style="background:#88c0d0"></span><span class="chip" style="background:#a3be8c"></span></span></div>
-                  <div class="theme-card"><span class="t">Tokyo Night</span><span class="chips"><span class="chip" style="background:#1a1b26"></span><span class="chip" style="background:#7aa2f7"></span><span class="chip" style="background:#bb9af7"></span></span></div>
-                  <div class="theme-card"><span class="t">One Dark</span><span class="chips"><span class="chip" style="background:#282c34"></span><span class="chip" style="background:#61afef"></span><span class="chip" style="background:#98c379"></span></span></div>
+                <div class="set-row">
+                  <span>Theme</span>
+                  <span class="dropdown">Nice Light <span class="chev">▾</span></span>
                 </div>
                 <div class="set-row">
                   <span>Opacity</span>
@@ -956,7 +953,7 @@
           </div>
         </div>
       </div></div>
-      <figcaption><b>Settings · Appearance</b> — translucent like the main window; one merged theme list; Light/Dark tabs scope the per-scheme settings (theme, opacity, blur). Dark-only themes appear in the light tab too — a scheme picks its theme freely.</figcaption>
+      <figcaption><b>Settings · Appearance</b> — translucent like the main window; one merged theme list in a plain dropdown (full names, no chips); a manual Scheme control below the accent row for when OS sync is off; Light/Dark tabs scope the per-scheme settings (theme, opacity, blur). Dark-only themes appear in the light tab's dropdown too — a scheme picks its theme freely.</figcaption>
     </figure>
   </section>
 
