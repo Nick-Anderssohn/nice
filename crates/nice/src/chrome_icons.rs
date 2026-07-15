@@ -64,18 +64,19 @@ pub(crate) const MODE_FILES_H: f32 = 12.0;
 const MODE_FILES_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="#000" stroke-width="1"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h2.6l1.4 1.8h5A1.5 1.5 0 0 1 13 5.3v4.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 1 9.5v-6z"/></svg>"##;
 
 /// The sidebar footer's settings-gear icon. The mock renders this slot with a
-/// Unicode font glyph (`⚙︎`), deliberately not shipped verbatim (font-dependent
-/// rendering — see `docs/plans/restyle/02-sidebar-flatten.md`'s Mode-switcher
-/// decision). This is a NEW thin-stroke gear authored to match the mode icons'
-/// weight (round-capped strokes, no fill) rather than reusing `SF_GEAR` or any
-/// font glyph: a 14×14 viewBox, a center ring (`circle` r=2.3) with six radial
-/// teeth at 60° spacing, 1.3 stroke width with round caps — the same
-/// stroke-linecap treatment as [`MODE_TABS_SVG`].
+/// Unicode font glyph (`⚙︎`) at authoring time, but round-2 restyle plan 4
+/// promotes the footer to the mock's real stroke cog (superseding the shipped
+/// sun-like radial-ray gear). Verbatim geometry from
+/// `docs/design/restyle-mocks.html` (`.sb-ico.gear`): a 24×24 viewBox, 1.7
+/// stroke, round caps + joins, `<circle cx=12 cy=12 r=3.2>` plus the classic
+/// toothed-cog outline path. The element size stays 14×14 (the mock's own
+/// `width`/`height`), so the 1.7 stroke over the 24-unit viewBox lands ≈1px at
+/// render — matching the mode icons' weight.
 pub(crate) const MODE_GEAR: &str = "chrome/mode-gear.svg";
 pub(crate) const MODE_GEAR_W: f32 = 14.0;
 pub(crate) const MODE_GEAR_H: f32 = 14.0;
 
-const MODE_GEAR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#000" stroke-width="1.3" stroke-linecap="round"><circle cx="7" cy="7" r="2.3"/><path d="M11.3 7L13 7M9.15 10.72L10 12.2M4.85 10.72L4 12.2M2.7 7L1 7M4.85 3.28L4 1.8M9.15 3.28L10 1.8"/></svg>"##;
+const MODE_GEAR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>"##;
 
 /// The embedded [`AssetSource`] serving the restyle's chrome icons. Stateless;
 /// registered once via `gpui::Application::with_assets` in `crate::app`.
@@ -149,11 +150,15 @@ mod tests {
         let assets = ChromeIconAssets;
         let bytes = assets.load(MODE_GEAR).unwrap().expect("icon present");
         let svg = std::str::from_utf8(&bytes).unwrap();
-        // A real stroke-SVG shape (center ring + six teeth), not the Unicode
-        // glyph the mock uses as a placeholder, and not SF_GEAR.
-        assert!(svg.contains("viewBox=\"0 0 14 14\""));
-        assert!(svg.contains("<circle cx=\"7\" cy=\"7\" r=\"2.3\""));
-        assert!(svg.contains("stroke-linecap=\"round\""));
+        // The mock's real stroke cog (docs/design/restyle-mocks.html .sb-ico.gear):
+        // 24×24 viewBox, 1.7 stroke, round caps + joins, a center ring
+        // (circle r=3.2) plus the toothed-cog outline path — not the Unicode glyph
+        // the mock uses as a placeholder, and not SF_GEAR.
+        assert!(svg.contains("viewBox=\"0 0 24 24\""));
+        assert!(svg.contains("stroke-width=\"1.7\""));
+        assert!(svg.contains("stroke-linejoin=\"round\""));
+        assert!(svg.contains("<circle cx=\"12\" cy=\"12\" r=\"3.2\""));
+        assert!(svg.contains("M19.4 15a1.65 1.65 0 0 0 .33 1.82"));
         assert!(!svg.contains('\u{2699}')); // ⚙ — must not embed the font glyph.
     }
 

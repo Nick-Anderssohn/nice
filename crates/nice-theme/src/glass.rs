@@ -42,6 +42,21 @@ pub fn glass_fill(scheme: ColorScheme) -> Srgba {
     }
 }
 
+/// The idle (inactive) tab-underline color for `scheme` — the grey underline
+/// every inactive tab wears so it reads as clickable (round-2 restyle plan 4's
+/// "Inactive-tab underline" decision; grammar: underline = tab, color = state).
+/// A companion to [`glass_line`]/[`glass_fill`] in the same over-glass family
+/// (scheme-scoped white/ink alpha, not a palette slot). Cites
+/// `docs/design/restyle-mocks.html`'s `--tab-underline-idle`:
+/// `rgba(255,255,255,.16)` (dark) / `rgba(23,19,15,.17)` (light — the same rgb
+/// as the `ink` slot, at 17% alpha).
+pub fn tab_underline_idle(scheme: ColorScheme) -> Srgba {
+    match scheme {
+        ColorScheme::Dark => Srgba::new(1.0, 1.0, 1.0, 0.16),
+        ColorScheme::Light => Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.17),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Literal-equality fixtures citing the mock's `--hairline` /
@@ -69,6 +84,30 @@ mod tests {
             glass_fill(ColorScheme::Light),
             Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.05)
         );
+    }
+
+    #[test]
+    fn tab_underline_idle_matches_the_mock_token() {
+        // docs/design/restyle-mocks.html: --tab-underline-idle:
+        // rgba(255,255,255,.16) (dark).
+        assert_eq!(
+            tab_underline_idle(ColorScheme::Dark),
+            Srgba::new(1.0, 1.0, 1.0, 0.16)
+        );
+        // docs/design/restyle-mocks.html: --tab-underline-idle:
+        // rgba(23,19,15,.17) (light).
+        assert_eq!(
+            tab_underline_idle(ColorScheme::Light),
+            Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.17)
+        );
+    }
+
+    #[test]
+    fn tab_underline_idle_light_shares_the_ink_slot_rgb() {
+        // Light --tab-underline-idle tints the ink rgb (#17130f == 23,19,15) at
+        // its own 17% alpha, same family as glass_line / glass_fill.
+        let u = tab_underline_idle(ColorScheme::Light);
+        assert_eq!((u.r, u.g, u.b), (23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0));
     }
 
     #[test]

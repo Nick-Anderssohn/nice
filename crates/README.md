@@ -529,8 +529,11 @@ The GPUI application. Structure (grows over later cycles):
   restyle dropped the brand block (logo + "Nice" + separator) entirely and turned
   the pills into fill-less **text + accent-underline tabs** (leading status dot /
   terminal glyph, truncating title, hover/active ✕ with an always-reserved 16pt
-  slot, active tab in `ink` with a 2px accent underline / inactive in `ink3`,
-  inline rename, per-kind context menus), the overflow chevron with its 6pt
+  slot, active tab in `ink` with a 1px accent underline / inactive tabs in
+  `ink3` with a 1px grey (`tab_underline_idle`) underline so they read as
+  clickable, inline rename, per-kind context menus; single-tab mode renders the
+  sole pane's title as centered titlebar text with no tab chrome), the overflow
+  chevron with its 6pt
   attention badge, the 16pt edge fades, the leading sidebar-collapse toggle, and
   the trailing `+`. The toolbar is now the fill-less full-width 28pt titlebar in
   both shell states (no R9 chrome band / rule), driving the R8 model through an

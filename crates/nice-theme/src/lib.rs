@@ -38,7 +38,7 @@ pub mod typography;
 
 pub use accent::AccentPreset;
 pub use color::Srgba;
-pub use glass::{glass_fill, glass_line};
+pub use glass::{glass_fill, glass_line, tab_underline_idle};
 pub use palette::{ColorScheme, Palette, SlotColor, Slots, SystemColor};
 pub use status::{BreathePulse, RingPulse};
 pub use typography::TypographyAlias;

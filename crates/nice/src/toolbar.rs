@@ -5,8 +5,11 @@
 //! `docs/plans/restyle/01-titlebar-restyle.md`) into the fill-less 28pt titlebar: the
 //! leading sidebar-collapse toggle (an embedded stroke SVG, right of the native
 //! traffic lights), then the horizontally-scrolling row of tabs — plain
-//! text + a 2px accent underline on the active tab, no pills — with the overflow
-//! chevron (attention badge + edge fades) and the trailing `+` intact. It is the
+//! text + a 1px accent underline on the active tab and a 1px grey underline on
+//! every inactive tab, no pills — with the overflow
+//! chevron (attention badge + edge fades) and the trailing `+` intact. When the
+//! strip holds exactly one pane, single-tab mode renders the sole pane's title as
+//! centered titlebar text (no tab chrome) instead. It is the
 //! full-width titlebar row in both shell states, carries the window drag region,
 //! and drives the R8 model through the injected [`PaneStripActions`] seam. The
 //! brand block was removed.
@@ -112,12 +115,25 @@ const PILL_ICON_SIZE: f32 = 12.0;
 /// [`StatusDot`] component's 8pt default stays elsewhere — only its size
 /// parameter changes here, colours + pulse untouched).
 const TAB_STATUS_DOT_SIZE: f32 = 6.0;
-/// Active-tab accent underline: 2px tall, seated on the bar's bottom edge, inset
-/// 11px from the tab's outer edges, 1px corner radius (mock Style A
-/// `.tab.active::after`).
-const TAB_UNDERLINE_HEIGHT: f32 = 2.0;
+/// Tab underline: 1px tall, seated on the bar's bottom edge, inset 11px from the
+/// tab's outer edges, 0.5px corner radius (mock Style A `.tab::after` /
+/// `.tab.active::after` — round-2 thinned both underlines from 2px to 1px). The
+/// active tab wears it in the accent; every inactive tab wears it in a grey
+/// ([`nice_theme::tab_underline_idle`]) so it reads as clickable (round-2 plan 4
+/// "Inactive-tab underline": grammar underline = tab, color = state).
+const TAB_UNDERLINE_HEIGHT: f32 = 1.0;
 const TAB_UNDERLINE_INSET: f32 = 11.0;
-const TAB_UNDERLINE_RADIUS: f32 = 1.0;
+const TAB_UNDERLINE_RADIUS: f32 = 0.5;
+
+/// Single-tab mode: when the strip holds exactly one pane, its title + status
+/// dot render as the window's centered titlebar text (macOS window-title
+/// convention) instead of a tab box. The centered text is an absolute overlay
+/// inset this far from BOTH window edges (symmetric, so it stays centered on the
+/// window's true center) — enough to clear the traffic-light cluster on the left
+/// and the trailing `+` on the right (mock `.tab-single { left: 90px; right:
+/// 90px }`; round-2 plan 4 "Single-tab mode"). The title clamps/ellipsizes
+/// within this box so it never collides with either.
+const SINGLE_TAB_EDGE_INSET: f32 = 90.0;
 
 /// The sidebar-collapse toggle box in the titlebar (mock `.tb-btn`: 24×22, 5px
 /// radius, 4px trailing margin before the tabs).
@@ -1131,6 +1147,13 @@ impl WindowToolbarView {
     /// The pill strip: a horizontally-scrolling row of pills (flex-filling), then
     /// the always-reserved chevron slot, then the always-visible `+`.
     fn render_strip(&self, panes: &[PaneVm], s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+        // Single-tab mode (round-2 plan 4): with EXACTLY one pane the strip draws
+        // no tab boxes — the title renders as the window's centered titlebar text
+        // (the overlay built in `render`), and the overflow chevron is hidden (it
+        // cannot be needed; `show_chevron` already reports false below one overflow,
+        // but the slot itself is dropped here so the tail is just the `+`). The
+        // trailing `+` stays.
+        let single = panes.len() == 1;
         let geometry = self.strip_geometry(cx);
         let show_chevron = self.show_chevron(cx);
         let has_attention = self.has_offscreen_attention(cx);
@@ -1158,8 +1181,11 @@ impl WindowToolbarView {
             .size_full()
             .on_drag_move(cx.listener(Self::on_pill_drag_move))
             .on_drop(cx.listener(Self::on_pill_drop));
-        for vm in panes {
-            row = row.child(self.render_pill(vm, &tab_id, s, cx));
+        // No pills in single-tab mode — the centered title overlay replaces them.
+        if !single {
+            for vm in panes {
+                row = row.child(self.render_pill(vm, &tab_id, s, cx));
+            }
         }
 
         // The scroll wrapper carries the two edge fades as absolute overlays so
@@ -1190,15 +1216,19 @@ impl WindowToolbarView {
             })
             .children(self.insertion_line(cx));
 
-        div()
+        let mut tail = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_row()
             .items_center()
-            .child(scroll_wrap)
-            .child(self.render_chevron_slot(show_chevron, has_attention, s, cx))
-            .child(self.render_new_tab_slot(s, cx))
+            .child(scroll_wrap);
+        // Hide the overflow chevron slot entirely in single-tab mode (it cannot be
+        // needed with one pane) — the tail is then just the `+`.
+        if !single {
+            tail = tail.child(self.render_chevron_slot(show_chevron, has_attention, s, cx));
+        }
+        tail.child(self.render_new_tab_slot(s, cx))
     }
 
     /// A 16pt gradient from the window-body surface color (`fade`) to transparent,
@@ -1243,24 +1273,12 @@ impl WindowToolbarView {
         }
     }
 
-    fn render_pill(&self, vm: &PaneVm, tab_id: &str, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let accent = crate::theme_settings::active_chrome_accent(cx);
-        let is_active = vm.is_active;
-        let ink = slot_to_rgba(s.ink);
-        let ink2 = slot_to_rgba(s.ink2);
-        let ink3 = slot_to_rgba(s.ink3);
-        // The tab's text tint: active → `ink`, inactive → `ink3` (mock Style A
-        // `.tab` / `.tab.active`). The leading glyph tracks the same tint.
-        let tab_ink = if is_active { ink } else { ink3 };
-        // Tab titles use the terminal font family (not the UI sans), read from the
-        // shared font settings; `None` before the keymap wires it (isolated
-        // scenarios) leaves the default font.
-        let tab_family = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
-
-        // Leading icon: per-pane StatusDot for Claude (6pt in the strip — only the
-        // size parameter changes; colours + pulse untouched), else the `terminal`
-        // symbol tinted like the title.
-        let leading = match vm.kind {
+    /// The tab's leading indicator: a per-pane [`StatusDot`] (6pt) for a Claude
+    /// pane (only the size parameter changes here — colours + pulse untouched),
+    /// else the `terminal` SF symbol tinted `tab_ink`. Shared by the pill and the
+    /// single-tab centered title so both read the same per-kind glyph.
+    fn tab_leading(&self, vm: &PaneVm, tab_ink: Rgba, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match vm.kind {
             PaneKind::Claude => StatusDot::new(
                 SharedString::from(format!("pill.{}", vm.id)),
                 vm.status,
@@ -1285,7 +1303,82 @@ impl WindowToolbarView {
                     cx,
                 ))
                 .into_any_element(),
-        };
+        }
+    }
+
+    /// The single-tab centered titlebar text (round-2 plan 4 "Single-tab mode"):
+    /// when the strip holds EXACTLY one pane, its title + leading status dot
+    /// render as the window's centered titlebar text (macOS window-title
+    /// convention) instead of a tab box. It is an absolute overlay spanning the
+    /// FULL window width (inset [`SINGLE_TAB_EDGE_INSET`] from both edges so it
+    /// clears the traffic-light cluster on the left and the tail `+` on the
+    /// right), mono 12px in `ink`, a 6pt status dot leading the title — the sole
+    /// pane is always active, so both wear the active tint. Display-only: no
+    /// underline, no ✕, no hover fill (activation is meaningless with one pane;
+    /// close/rename stay available in the sidebar). It is a pure painted overlay
+    /// — no mouse listeners and no `occlude()` — so the empty-band window drag /
+    /// double-click-zoom pass straight through it (it stays in the titlebar drag
+    /// region). The title clamps + ellipsizes within the inset box and wears the
+    /// same full-title hover tooltip a tab does (plan 1) when clamped.
+    fn render_single_tab_title(&self, vm: &PaneVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ink = slot_to_rgba(s.ink);
+        let leading = self.tab_leading(vm, ink, s, cx);
+        // Tab titles use the terminal font family (parity with the pill).
+        let tab_family = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
+        let full_title = SharedString::from(vm.title.clone());
+        let tooltip_title = full_title.clone();
+        div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .left(px(SINGLE_TAB_EDGE_INSET))
+            .right(px(SINGLE_TAB_EDGE_INSET))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(PILL_GAP))
+            .when_some(tab_family, |el, fam| el.font_family(fam))
+            .child(leading)
+            .child(
+                // The title span shrinks + tail-ellipsizes (`min_w_0` + `truncate`)
+                // within the centered group so it never overruns the inset box; the
+                // `.id()` is only the tooltip's hover anchor — it carries no mouse
+                // listener and never occludes, so clicks/drag pass through to the
+                // band below (parity with the mock's `.tab-single .t`).
+                div()
+                    .id("toolbar.singleTabTitle")
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .text_size(px(PILL_TEXT_SIZE))
+                    .text_color(ink)
+                    .child(full_title)
+                    .tooltip(move |_window, cx| {
+                        let title = tooltip_title.clone();
+                        cx.new(|_| TabTooltip { title }).into()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_pill(&self, vm: &PaneVm, tab_id: &str, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let accent = crate::theme_settings::active_chrome_accent(cx);
+        let is_active = vm.is_active;
+        let ink = slot_to_rgba(s.ink);
+        let ink2 = slot_to_rgba(s.ink2);
+        let ink3 = slot_to_rgba(s.ink3);
+        // The tab's text tint: active → `ink`, inactive → `ink3` (mock Style A
+        // `.tab` / `.tab.active`). The leading glyph tracks the same tint.
+        let tab_ink = if is_active { ink } else { ink3 };
+        // Tab titles use the terminal font family (not the UI sans), read from the
+        // shared font settings; `None` before the keymap wires it (isolated
+        // scenarios) leaves the default font.
+        let tab_family = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
+
+        // Leading icon: per-pane StatusDot for Claude (6pt in the strip), else the
+        // `terminal` symbol tinted like the title (shared with the single-tab title).
+        let leading = self.tab_leading(vm, tab_ink, s, cx);
 
         // Title: the shared inline-rename field while editing, else the label.
         let title: gpui::AnyElement = if vm.is_editing {
@@ -1376,9 +1469,23 @@ impl WindowToolbarView {
         };
         let ghost_title = SharedString::from(vm.title.clone());
 
+        // The underline color: accent on the active tab, a scheme-scoped grey
+        // ([`nice_theme::tab_underline_idle`]) on every inactive tab so it reads
+        // as clickable (round-2 plan 4 "Inactive-tab underline"). Same geometry
+        // for both (inset 11px, 1px tall, on the bar's bottom edge — mock Style A
+        // `.tab::after` / `.tab.active::after`).
+        let underline = if is_active {
+            srgba_to_rgba(accent)
+        } else {
+            srgba_to_rgba(nice_theme::tab_underline_idle(
+                crate::theme_settings::active_chrome_scheme(cx),
+            ))
+        };
+
         // The tab is fill-less (no pill background, border, rounding, or shadow —
-        // mock Style A): just the dot / title / ✕ row, full bar height, with a 2px
-        // accent underline seated on the bar's bottom edge marking the active tab.
+        // mock Style A): just the dot / title / ✕ row, full bar height, with a 1px
+        // underline seated on the bar's bottom edge (accent on the active tab,
+        // grey on inactive tabs).
         let pill = div()
             .id(pill_id)
             .relative()
@@ -1393,20 +1500,19 @@ impl WindowToolbarView {
             .child(leading)
             .child(title)
             .child(close)
-            // Active-tab accent underline (inset 11px from the tab's outer edges,
-            // 2px tall, on the bar's bottom edge — mock `.tab.active::after`).
-            .when(is_active, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .left(px(TAB_UNDERLINE_INSET))
-                        .right(px(TAB_UNDERLINE_INSET))
-                        .h(px(TAB_UNDERLINE_HEIGHT))
-                        .rounded(px(TAB_UNDERLINE_RADIUS))
-                        .bg(srgba_to_rgba(accent)),
-                )
-            })
+            // Tab underline (inset 11px from the tab's outer edges, 1px tall, on
+            // the bar's bottom edge — mock `.tab::after` / `.tab.active::after`).
+            // Every tab wears one: accent when active, grey when inactive.
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left(px(TAB_UNDERLINE_INSET))
+                    .right(px(TAB_UNDERLINE_INSET))
+                    .h(px(TAB_UNDERLINE_HEIGHT))
+                    .rounded(px(TAB_UNDERLINE_RADIUS))
+                    .bg(underline),
+            )
             // The pill carries `.id()` + `on_drag` ONLY — `on_drag_move` / `on_drop`
             // live on the scroll row (the tracked viewport, D8). gpui subtracts the
             // constructor's `Point` offset (the grab point within the pill) when it
@@ -1586,6 +1692,16 @@ impl WindowToolbarView {
     }
 
     /// The trailing "+" — always visible, pinned in its own reserved slot.
+    ///
+    /// Round-2 restyle plan 4 flagged the `+`/chevron as "visibly off-center" and
+    /// asked for a vertical-centering fix. Direct pixel measurement of the shipped
+    /// build (retina, scale 2) found the glyph already centered: the `+` ink
+    /// mid-line lands within ~0.5pt of the 28pt bar's center and aligns with the
+    /// tab-title text. The SF `plus`/`chevron.down` bitmaps are themselves
+    /// vertically symmetric (ink mid == box center), and this slot's
+    /// `items_center` centers that box in the full-height bar — so NO optical
+    /// nudge is applied (one would de-center it, and the plan forbids a magic
+    /// offset absent a genuine metric need). Same construction for the chevron.
     fn render_new_tab_slot(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = ink_alpha(s, SQUARE_BTN_HOVER_INK_ALPHA);
         // 11pt semibold `plus`, ink2 (`WindowToolbarView.swift:1134-1136`).
@@ -1782,6 +1898,32 @@ impl Render for WindowToolbarView {
         let s = active_slots(cx);
         let panes = self.snapshot_panes(cx);
 
+        // The single-pane centered title (round-2 plan 4). Built here because it is
+        // an absolute overlay spanning the FULL window width — not a child of the
+        // padded content row (whose residual strip space is off-center). `None`
+        // unless the strip holds exactly one pane.
+        let single_tab_title =
+            (panes.len() == 1).then(|| self.render_single_tab_title(&panes[0], &s, cx));
+
+        // The padded content row: the collapse toggle, the pane strip, and the
+        // conditional trailing update pill. Its leading reserve clears the native
+        // traffic-light cluster before the collapse toggle (the titlebar is now
+        // full-width in both shell states, so its left edge sits under the lights).
+        let content = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .size_full()
+            .pl(px(traffic_light_reserved_width()))
+            .pr(px(TOOLBAR_TRAILING_PAD))
+            .child(self.render_collapse_toggle(&s, cx))
+            .child(self.render_strip(&panes, &s, cx))
+            // Trailing update-pill slot (R27, P7): the conditional update pill,
+            // inserted after the strip. It renders ONLY when a newer release is
+            // available — absent, it emits nothing, so the toolbar with no update is
+            // byte-identical to today.
+            .children(self.render_update_pill(&s, cx));
+
         div()
             // Exported shipped-surface AX anchor (§6): the pane-strip (toolbar)
             // root, found by an AX walk on role + label. `.id()` + a non-generic
@@ -1790,33 +1932,26 @@ impl Render for WindowToolbarView {
             .id(PANE_STRIP_ROOT_LABEL)
             .role(gpui::Role::Group)
             .aria_label(PANE_STRIP_ROOT_LABEL)
+            // Unpadded (the padding lives on `content`) + `relative` so the
+            // single-tab title overlay + popups position against the full window
+            // width. No fill and no bottom rule — the fill-less restyle titlebar;
+            // the window-body backing shows through (plan
+            // `docs/plans/restyle/01-titlebar-restyle.md`).
             .relative()
             .track_focus(&self.focus_handle)
             .key_context("WindowToolbar")
-            .flex()
-            .flex_row()
-            .items_center()
             .w_full()
             .h(px(TOP_BAR_HEIGHT))
-            // Leading reserve so the native traffic-light cluster clears before the
-            // collapse toggle (the titlebar is now full-width in both shell states,
-            // so its left edge sits under the lights). No fill and no bottom rule —
-            // the fill-less restyle titlebar; the window-body backing shows through
-            // (plan `docs/plans/restyle/01-titlebar-restyle.md`).
-            .pl(px(traffic_light_reserved_width()))
-            .pr(px(TOOLBAR_TRAILING_PAD))
-            // Empty-band drag / double-click (the tabs + buttons stop_propagation
-            // so only the empty titlebar reaches these — the R9 differential pair).
+            // Empty-band drag / double-click on the whole bar (the tabs + buttons
+            // stop_propagation so only the empty titlebar reaches these — the R9
+            // differential pair; the single-tab title overlay passes clicks through).
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_band_mouse_down))
             .on_mouse_move(cx.listener(Self::on_band_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
-            .child(self.render_collapse_toggle(&s, cx))
-            .child(self.render_strip(&panes, &s, cx))
-            // Trailing update-pill slot (R27, P7): the conditional update pill,
-            // inserted between the strip and the popup layer. It renders ONLY when
-            // a newer release is available — absent, it emits nothing, so the
-            // toolbar with no update is byte-identical to today.
-            .children(self.render_update_pill(&s, cx))
+            .child(content)
+            // The single-pane centered title overlay (absolute, full window width,
+            // click pass-through) — painted above the pill-less strip, below the popups.
+            .children(single_tab_title)
             .children(self.context_menu.clone())
             // The update popover (D9), rendered as a deferred child while open.
             .children(self.update_popover.clone())
@@ -1853,6 +1988,20 @@ impl WindowToolbarView {
     /// Whether the overflow chevron currently renders.
     pub(crate) fn scenario_show_chevron(&self, cx: &App) -> bool {
         self.show_chevron(cx)
+    }
+
+    /// Whether the strip is in single-tab mode — exactly one pane, so the tab
+    /// boxes are replaced by the centered titlebar title (round-2 plan 4). The
+    /// `pane-strip` scenario reads this after closing the strip down to one pane.
+    pub(crate) fn scenario_single_tab_active(&self, cx: &App) -> bool {
+        self.active_tab(cx).map(|t| t.panes.len() == 1).unwrap_or(false)
+    }
+
+    /// The single-tab centered title (the sole pane's title) when in single-tab
+    /// mode, else `None` — the scenario asserts it reads the surviving pane's name.
+    pub(crate) fn scenario_single_tab_title(&self, cx: &App) -> Option<String> {
+        let tab = self.active_tab(cx)?;
+        (tab.panes.len() == 1).then(|| tab.panes[0].title.clone())
     }
 
     /// Whether the overflow (or a pill) context menu is currently open — the live
@@ -2107,6 +2256,26 @@ mod tests {
         assert!(!band_drag_threshold_crossed(1.0, 1.0)); // 2 < 4
         assert!(band_drag_threshold_crossed(2.0, 0.0)); // 4 >= 4
         assert!(band_drag_threshold_crossed(0.0, 3.0)); // 9 >= 4
+    }
+
+    #[test]
+    fn tab_underline_is_the_round2_thin_1px_geometry() {
+        // Round-2 restyle plan 4 thinned both the active (accent) and inactive
+        // (grey) tab underline from 2px to 1px, tracking the updated mock Style A
+        // `.tab::after` / `.tab.active::after` (supersedes plan 1's 2px). The
+        // inset from the tab's outer edges is unchanged at 11px.
+        assert_eq!(TAB_UNDERLINE_HEIGHT, 1.0);
+        assert_eq!(TAB_UNDERLINE_RADIUS, 0.5);
+        assert_eq!(TAB_UNDERLINE_INSET, 11.0);
+    }
+
+    #[test]
+    fn single_tab_edge_inset_matches_the_mock() {
+        // Round-2 plan 4 "Single-tab mode": the centered titlebar title is inset
+        // this far from BOTH window edges (symmetric, keeping it centered on the
+        // window's true center) so it clears the traffic lights on the left and the
+        // tail `+` on the right — mock `.tab-single { left: 90px; right: 90px }`.
+        assert_eq!(SINGLE_TAB_EDGE_INSET, 90.0);
     }
 
     #[test]

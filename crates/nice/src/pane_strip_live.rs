@@ -45,6 +45,12 @@
 //!     synthetic click missed the 22pt chevron. The menu's *contents* ("lists every
 //!     pane", "checkmark on active") are pinned by `toolbar.rs`'s unit tests + the
 //!     in-process cases, the sidebar-scenario precedent for menu classification.
+//!   * **§3 single-tab mode (round-2 plan 4).** Closing the strip down to ONE pane
+//!     (through the real close path) replaces the tab boxes with the centered
+//!     titlebar title (the view reports single-tab active + the surviving pane's
+//!     name) and HIDES the overflow chevron — all HARD-asserted from the live
+//!     view's model/layout reads. The centered title's drag pass-through is the one
+//!     part left to the human black-box pass.
 //!
 //! Neither this nor any in-process test asserts cadence / perf (this is
 //! `Gate::SelfReported`).
@@ -184,6 +190,10 @@ async fn run_pane_strip(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarVi
 
     // §3 — overflow chevron (real layout) + centering + menu-opens.
     overflow_checks(cx, whandle, &view, pid, &mut failures, &mut deferred).await;
+
+    // §3 — single-tab mode (round-2 plan 4): close the strip down to one pane and
+    // assert the tab boxes give way to the centered titlebar title + the chevron hides.
+    single_tab_leg(cx, whandle, &view, &mut failures).await;
 
     build_report(failures, deferred)
 }
@@ -532,6 +542,77 @@ async fn overflow_checks(
             );
         }
     }
+}
+
+// ---- §3 single-tab mode (round-2 plan 4) -----------------------------------
+
+/// Close the strip down to exactly one pane through the real close path, then
+/// hard-assert single-tab mode on the live view: the strip reports single-tab
+/// active, the centered title reads the surviving pane's name, and the overflow
+/// chevron is hidden. Pure model/layout reads (no synthetic events), so these
+/// are deterministic hard assertions — the drag-through of the centered title
+/// (the overlay stays in the titlebar drag region) is the one part left to the
+/// human black-box pass.
+async fn single_tab_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<WindowToolbarView>,
+    view: &Entity<WindowToolbarView>,
+    failures: &mut Vec<String>,
+) {
+    // Close the leading pane repeatedly (the seeded terminal panes have no shell
+    // foreground child, so the busy-close gate closes each immediately) until one
+    // remains. Bounded so a stuck close can never spin forever.
+    for _ in 0..64 {
+        let ids = read_order(cx, view);
+        if ids.len() <= 1 {
+            break;
+        }
+        let victim = ids[0].clone();
+        let _ = whandle.update(cx, |v, window, cx| v.drive_close_pane(&victim, window, cx));
+        settle(cx, 120).await;
+    }
+    settle(cx, 300).await;
+
+    let ids = read_order(cx, view);
+    if ids.len() != 1 {
+        failures.push(format!(
+            "single-tab: expected to reduce the strip to one pane but it reads {ids:?} \
+             — cannot assert single-tab mode"
+        ));
+        return;
+    }
+    let sole = ids[0].clone();
+
+    let (single_active, title) = view.update(cx, |v, cx| {
+        (v.scenario_single_tab_active(cx), v.scenario_single_tab_title(cx))
+    });
+    if !single_active {
+        failures.push(
+            "single-tab: the strip holds one pane but scenario_single_tab_active is false \
+             — the centered-title branch did not engage"
+                .to_string(),
+        );
+    }
+    match &title {
+        Some(t) if !t.is_empty() => eprintln!(
+            "[selftest] pane-strip single-tab: one pane ({sole}) renders the centered titlebar \
+             title {t:?} instead of a tab box"
+        ),
+        other => failures.push(format!(
+            "single-tab: the centered title read {other:?} — with one pane it must be the sole \
+             pane's title"
+        )),
+    }
+    if read_bool(cx, view, |v, cx| v.scenario_show_chevron(cx)) {
+        failures.push(
+            "single-tab: the overflow chevron still shows with one pane — it must be hidden"
+                .to_string(),
+        );
+    } else {
+        eprintln!("[selftest] pane-strip single-tab: the overflow chevron is hidden (one pane)");
+    }
+    let _ = cx.update(|app| app.activate(true));
+    settle(cx, 200).await;
 }
 
 // ---- view / window reads ---------------------------------------------------
