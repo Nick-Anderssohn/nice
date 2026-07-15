@@ -45,10 +45,40 @@ The settings:
   added height **half above / half below the glyph** (re-derive the baseline
   in `cell_metrics`) — otherwise text rides the cell top. Grid geometry
   (rows-per-window, selection rects, scrollback math) must follow the cell
-  height, not the raw font metrics. Box-drawing glyphs are drawn
-  procedurally to the CELL box (`nice-term-view/src/boxdraw.rs`), not from
-  font metrics — route them off the padded cell so TUI borders stay
-  continuous at multipliers > 1.0.
+  height, not the raw font metrics.
+  **TUI-correctness checklist** (from a survey of how Kitty/Ghostty/
+  WezTerm/foot/VS Code handle line height — every known gap bug in the
+  wild comes from missing one of these; the single source of truth is the
+  final post-multiplier cell height):
+  - Round the CELL height once (`round(font_height * multiplier)`) and
+    compute every rect below from it — never round per-glyph.
+  - Box-drawing/block sprites (`nice-term-view/src/boxdraw.rs`,
+    U+2500–259F) are drawn procedurally to the CELL box — verify they draw
+    to the new padded cell height, not the raw font height, so TUI borders
+    stay continuous at multipliers > 1.0.
+  - **Cell BACKGROUND and selection rects must fill the ENTIRE taller
+    cell** edge-to-edge with adjacent rows — if the sprite fills the cell
+    but the bg doesn't, colored TUI panels show horizontal stripes
+    between rows (this exact regression hit iTerm 3.5).
+  - Cursor: block/beam cursor stays FONT-height (centered on the glyph),
+    not stretched to the tall cell — a full-cell block cursor reads as a
+    slab at 1.3+.
+  - Underline/strikethrough positions are recomputed from the new cell
+    metrics/baseline so they stay inside the cell at every multiplier.
+  - Stroke thickness of box glyphs stays decoupled from cell HEIGHT
+    (boxdraw derives from font/width metrics today — keep it that way so
+    vertical rules don't fatten at 1.3).
+  - Do NOT stretch other glyph classes to the cell: pictographic symbols
+    (arrows, Nerd Font icons, emoji) keep their natural size, centered.
+    Known accepted limitation: powerline (U+E0B0–) and braille (U+2800–)
+    glyphs come from the FONT in Nice (boxdraw covers only U+2500–259F),
+    so powerline status-line separators may not reach the full cell
+    height at multipliers > 1.0 — accept for this plan (do NOT add new
+    procedural renderers); note it as a follow-up if visible in
+    validation.
+  - Unit/golden test: rows of `│` and `█` (and a run of colored-bg
+    cells) stacked at multipliers 1.0 / 1.3 / 1.8 → assert zero gap
+    pixels between rows and no background stripes.
 - The appearance pane sliders edit the ACTIVE scheme's opacity/blur values
   (label them with the scheme, e.g. "Opacity (Dark)"), consistent with how
   scheme-synced settings behave elsewhere.
@@ -203,7 +233,10 @@ The settings:
     on both schemes — the bg-luminance glyph composition must not produce
     artifacts (the risk is composition, not alpha);
   - line-height slider changes row pitch live; TUI apps (run `htop` or
-    Claude Code) still render their boxes correctly at 1.0 and 1.3;
+    Claude Code) still render their boxes correctly at 1.0 and 1.3 —
+    check specifically: no gaps in vertical box lines, no horizontal
+    stripes across colored panel backgrounds, cursor not stretched to
+    the tall cell, underline still inside the cell;
   - migration: seed a scratch store mimicking an existing user (some keys
     absent), launch → popup shows once; "Keep my setup" → pixel-identical
     look afterwards (compare before/after screenshots), grid unchanged
