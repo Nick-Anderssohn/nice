@@ -13,8 +13,8 @@ NOT yet authored. Keep this list until the round-2 plans exist.
   no defaults-flip is applied to existing stores, no pinning prompt.
 - Everyone AUTOMATICALLY gets the new opacity/blur defaults applied:
   dark 80% / blur 30, light 90% / blur 30 (confirmed by Nick).
-- OPEN QUESTION (asked, awaiting answer): does line-height 1.3 also
-  auto-apply to existing users, or do they keep 1.0 (grid-affecting)?
+- DECIDED (Nick 2026-07-15): line-height 1.3 ALSO auto-applies to existing
+  users (they can slide back to 1.0).
 - Fresh installs: unchanged from plan 3 (Nice defaults, Terracotta, etc.).
 
 ## 2. Merge chrome palette + terminal theme into ONE theme setting
@@ -26,10 +26,16 @@ NOT yet authored. Keep this list until the round-2 plans exist.
   solarized-light, solarized-dark, dracula, nord, gruvbox-light,
   gruvbox-dark, tokyo-night, one-dark — colors are well-known, look up
   canonical values on the web.
-- OPEN QUESTION (asked): fate of the MacOs chrome palette (no terminal
-  counterpart) — retire, or keep as a special case?
+- DECIDED (Nick 2026-07-15): "Nice" chrome pairs with the "Nice" terminal
+  theme (nice-default-light/dark per scheme). The MacOs chrome palette is
+  already excluded from the settings picker (`chrome_palettes_for` filters
+  it out, appearance_pane.rs) — it retires with the merge.
 - Scheme scoping: each scheme's picker lists themes valid for that scheme
   (dark themes usable in the light tab per the mock caption).
+- DECIDED (Nick 2026-07-15): imported Ghostty "Custom themes" DERIVE their
+  chrome half from the imported theme's own colors (background → window
+  surface, foreground → ink family) so the whole window matches the
+  imported theme.
 
 ## 3. Settings window restyle + appearance regrouping
 
@@ -44,9 +50,9 @@ NOT yet authored. Keep this list until the round-2 plans exist.
 
 ## 4. Round-1 items (mocked, awaiting implementation round)
 
-- Inactive-tab affordance: candidates in the mock (grey underline /
-  dividers / faint chip). Nick's pick: PENDING (leaning grey underline —
-  the mock default).
+- Inactive-tab affordance: DECIDED (Nick 2026-07-15) — **grey underline**
+  (the mock default): same 1px geometry as the active underline, in
+  --tab-underline-idle (white 16% dark / ink 17% light).
 - Tab underlines (active accent + inactive grey) are now **1px** (plan 1
   said 2px — mock supersedes).
 - Single-tab mode: with one tab, render NO tab chrome — the title (with
