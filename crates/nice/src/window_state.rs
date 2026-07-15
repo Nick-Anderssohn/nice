@@ -392,6 +392,23 @@ impl WindowState {
         self.selection.sync_active_tab_id(self.model.active_tab_id());
     }
 
+    /// The single seam for "toggle the sidebar collapsed flag": flips it,
+    /// clears any peek when expanding (`AppShellView`: expand clears peek), and
+    /// notifies the `WindowState` entity so every `cx.observe(&state)` seam fires
+    /// — the ⌘B keymap action, the titlebar collapse toggle
+    /// ([`crate::toolbar::WindowToolbarView`]), and the sidebar view
+    /// ([`crate::sidebar_shell::SidebarShellView`]) all route through here so the
+    /// state mutation + peek cleanup stay identical across entry points. (The
+    /// sidebar view additionally drops its view-local hover pin off the resulting
+    /// state notification; see its state observer.)
+    pub(crate) fn toggle_sidebar_collapsed(&mut self, cx: &mut gpui::Context<WindowState>) {
+        self.sidebar.toggle_sidebar();
+        if !self.sidebar.collapsed() {
+            self.sidebar.end_sidebar_peek();
+        }
+        cx.notify();
+    }
+
     /// R15 subscription lift — the shipped-window twin of the
     /// `session-lifecycle` scenario's `spawn_and_subscribe` (the tranche's known
     /// integration gap: `route_terminal_event` was wired ONLY in that scenario, so
@@ -1821,6 +1838,39 @@ mod tests {
             state.selection.contains(TabModel::MAIN_TERMINAL_TAB_ID),
             "selection is seeded with the active tab"
         );
+    }
+
+    /// The one collapse seam ([`WindowState::toggle_sidebar_collapsed`]) that the
+    /// ⌘B keymap action, the titlebar collapse control
+    /// ([`crate::toolbar::WindowToolbarView`]), and the sidebar view all route
+    /// through: it flips the collapsed flag and clears any peek on EXPAND. This
+    /// pins the shipped collapse behavior at the shared seam (the titlebar control
+    /// otherwise had no test).
+    #[gpui::test]
+    fn toggle_sidebar_collapsed_flips_flag_and_clears_peek_on_expand(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+
+        // Fresh window starts expanded.
+        state.update(cx, |ws, _| assert!(!ws.sidebar.collapsed(), "starts expanded"));
+
+        // First toggle collapses.
+        state.update(cx, |ws, cx| ws.toggle_sidebar_collapsed(cx));
+        state.update(cx, |ws, _| assert!(ws.sidebar.collapsed(), "first toggle collapses"));
+
+        // A collapsed sidebar-tab cycle would begin a peek; expanding must clear it.
+        state.update(cx, |ws, _| ws.sidebar.begin_sidebar_peek());
+        state.update(cx, |ws, _| {
+            assert!(ws.sidebar.peeking(), "peek is active while collapsed")
+        });
+
+        // Second toggle expands AND clears the peek (the seam's expand-side cleanup).
+        state.update(cx, |ws, cx| ws.toggle_sidebar_collapsed(cx));
+        state.update(cx, |ws, _| {
+            assert!(!ws.sidebar.collapsed(), "second toggle expands");
+            assert!(!ws.sidebar.peeking(), "expanding clears the peek");
+        });
     }
 
     #[test]

@@ -11,9 +11,11 @@
 //! asserts:
 //!
 //!   * **§1 traffic-light geometry** via `platform::standard_window_button_frames`:
-//!     all three buttons exist, the close button's visual centre sits on the y-26
-//!     row and its x-origin at 17, and the three are equally pitched (pitch read
-//!     from the live frames, not hardcoded) — re-asserted after a resize, a focus
+//!     all three buttons exist, the close button's visual centre sits within the
+//!     slim 28pt titlebar and its x-origin at the native macOS-26 default (9), and
+//!     the three are equally pitched at the native pitch (read from the live
+//!     frames) — the restyle stopped repositioning them; re-asserted after a resize,
+//!     a focus
 //!     bounce, and a full-screen enter+exit (the BUG-B stale-capture guard).
 //!   * **§2 drag differential:** a CGEvent press-drag on the empty band vs the same
 //!     drag in the terminal content area, judged by real NSWindow frame reads
@@ -43,7 +45,9 @@ use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
 use nice_term_view::{
     FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
 };
-use nice_theme::chrome_geometry::TRAFFIC_LIGHT_CENTER_FROM_TOP;
+use nice_theme::chrome_geometry::{
+    MACOS26_TRAFFIC_LIGHT_LEADINGS, MACOS26_TRAFFIC_LIGHT_PITCH, TOP_BAR_HEIGHT,
+};
 use nice_theme::AccentPreset;
 
 use crate::app::{self, ToggleFullScreen, WindowChromeView};
@@ -58,11 +62,13 @@ const FONT_PX: f32 = 13.0;
 const CELL_W: f32 = 8.0;
 const CELL_H: f32 = 16.0;
 
-/// The R9 absolute close-button leading x (`MACOS26_TRAFFIC_LIGHT_LEADINGS[0]` +
-/// `TRAFFIC_LIGHT_NUDGE_X` = 17). Asserted against the RENDERED close-button frame.
-const EXPECTED_CLOSE_X: f32 = 17.0;
-/// Tolerance (pt) for the close-button centre / x assertions (plan §1: ±0.5).
-const GEOMETRY_TOL: f32 = 0.5;
+/// The native macOS-26 close-button leading x (`MACOS26_TRAFFIC_LIGHT_LEADINGS[0]`
+/// = 9). Since the 2026-07 restyle stopped repositioning the buttons
+/// (`traffic_light_position: None`), the OS places them here; asserted against the
+/// RENDERED close-button frame.
+const EXPECTED_CLOSE_X: f32 = MACOS26_TRAFFIC_LIGHT_LEADINGS[0];
+/// Tolerance (pt) for the close-button centre / x assertions.
+const GEOMETRY_TOL: f32 = 1.0;
 /// Tolerance (pt) for "the three buttons are equally pitched".
 const PITCH_TOL: f32 = 0.6;
 /// Horizontal drag distance (pt) for the §2 differential (~40pt, clear of the
@@ -261,27 +267,34 @@ fn check_geometry(frames: &[WindowButtonFrame; 3]) -> std::result::Result<String
         }
     }
 
-    // Close-button visual centre on the y-26 row.
+    // Close-button visual centre vertically within the slim titlebar — the OS
+    // centers it now that the restyle leaves the buttons at their native position
+    // (no repositioning), so we bound it to the bar rather than a fixed row.
     let cy = close.center_from_top();
-    if (cy - TRAFFIC_LIGHT_CENTER_FROM_TOP).abs() > GEOMETRY_TOL {
+    if cy <= 0.0 || cy >= TOP_BAR_HEIGHT {
         errs.push(format!(
-            "close centre y={cy:.2} not within ±{GEOMETRY_TOL} of {TRAFFIC_LIGHT_CENTER_FROM_TOP}"
+            "close centre y={cy:.2} not within the {TOP_BAR_HEIGHT}pt titlebar"
         ));
     }
-    // Close-button leading x at the absolute 17 (the documented divergence).
+    // Close-button leading x at the native macOS-26 default (9).
     if (close.x - EXPECTED_CLOSE_X).abs() > GEOMETRY_TOL {
         errs.push(format!(
-            "close x={:.2} not within ±{GEOMETRY_TOL} of {EXPECTED_CLOSE_X}",
+            "close x={:.2} not within ±{GEOMETRY_TOL} of the native {EXPECTED_CLOSE_X}",
             close.x
         ));
     }
-    // Equal pitch, read from the LIVE frames (gpui derives it from the OS).
+    // Equal pitch, read from the LIVE frames, at the native macOS-26 pitch.
     let p1 = mini.x - close.x;
     let p2 = zoom.x - mini.x;
     if (p1 - p2).abs() > PITCH_TOL {
         errs.push(format!(
             "unequal pitch: close→min {p1:.2} vs min→zoom {p2:.2} (Δ {:.2} > {PITCH_TOL})",
             (p1 - p2).abs()
+        ));
+    }
+    if (p1 - MACOS26_TRAFFIC_LIGHT_PITCH).abs() > PITCH_TOL {
+        errs.push(format!(
+            "pitch {p1:.2} not within ±{PITCH_TOL} of the native {MACOS26_TRAFFIC_LIGHT_PITCH}"
         ));
     }
 
@@ -472,10 +485,10 @@ async fn drag_differential(
     deferred: &mut Vec<String>,
 ) {
     let (vw, vh) = read_viewport(cx, window);
-    // Empty band: clear of the traffic-light cluster on the left, on the y-26 row.
+    // Empty band: clear of the traffic-light cluster on the left, centered in the bar.
     let band_x = (vw * 0.6) as f64;
-    let band_y = TRAFFIC_LIGHT_CENTER_FROM_TOP as f64;
-    // Terminal content: mid-window, well below the 52pt band.
+    let band_y = (TOP_BAR_HEIGHT / 2.0) as f64;
+    // Terminal content: mid-window, well below the titlebar.
     let content_x = (vw * 0.5) as f64;
     let content_y = (vh * 0.6) as f64;
 
@@ -573,7 +586,7 @@ async fn double_click_check(
     let action = platform::apple_action_on_double_click();
     let (vw, _vh) = read_viewport(cx, window);
     let band_x = (vw * 0.6) as f64;
-    let band_y = TRAFFIC_LIGHT_CENTER_FROM_TOP as f64;
+    let band_y = (TOP_BAR_HEIGHT / 2.0) as f64;
 
     let zoomed_before = read_bool(cx, window, platform::window_is_zoomed);
     let frame_before = read_frame(cx, window);
@@ -660,7 +673,7 @@ async fn double_click_check(
 async fn post_double_click_on_band(cx: &mut AsyncApp, window: AnyWindowHandle, pid: i32) {
     let (vw, _vh) = read_viewport(cx, window);
     let band_x = (vw * 0.6) as f64;
-    let band_y = TRAFFIC_LIGHT_CENTER_FROM_TOP as f64;
+    let band_y = (TOP_BAR_HEIGHT / 2.0) as f64;
     post_double_click_on_band_at(cx, window, pid, band_x, band_y).await;
 }
 

@@ -159,60 +159,8 @@ pub(crate) fn sf_symbol_icon(
     }
 }
 
-/// Cache key name for the brand logo mark — an impossible SF Symbol name, so
-/// it can never collide with a real symbol's cache entries.
-const LOGO_MARK_KEY: &str = "nice.logo.mark";
-
-/// The brand logo mark (fix round r6): the white chevron + underline stroke
-/// from `Logo.swift`, rasterized by [`platform::rasterize_logo_mark`] on the
-/// exact prod path geometry and cached/tinted through the same pipeline as the
-/// SF Symbols above. The element is the full 22×22pt logo canvas
-/// ([`platform::LOGO_MARK_CANVAS_PT`]) — the caller overlays it on its accent
-/// square, which occupies the same viewBox (rect x=1 y=1 20×20).
-///
-/// `fallback_glyph` renders 11pt-bold in `color` when rasterization fails (the
-/// toolbar's pre-r6 `❯` stand-in look), so the brand slot never goes blank.
-pub(crate) fn logo_mark_icon(
-    fallback_glyph: &'static str,
-    color: Rgba,
-    scale: f32,
-    cx: &mut App,
-) -> AnyElement {
-    let key = SymbolKey::new(
-        LOGO_MARK_KEY,
-        platform::LOGO_MARK_CANVAS_PT,
-        SymbolWeight::Regular,
-        color,
-        scale,
-    );
-    let cached = cx.default_global::<SfSymbolCache>().0.get(&key).cloned();
-    let entry = match cached {
-        Some(entry) => entry,
-        None => {
-            let rendered =
-                platform::rasterize_logo_mark(scale).map(|bitmap| tint_symbol(&bitmap, color, scale));
-            cx.default_global::<SfSymbolCache>()
-                .0
-                .insert(key, rendered.clone());
-            rendered
-        }
-    };
-
-    match entry {
-        Some(icon) => img(icon.image)
-            .w(px(icon.width_pt))
-            .h(px(icon.height_pt))
-            .flex_none()
-            .into_any_element(),
-        None => div()
-            .flex_none()
-            .text_size(px(11.0))
-            .font_weight(FontWeight::BOLD)
-            .text_color(color)
-            .child(SharedString::from(fallback_glyph))
-            .into_any_element(),
-    }
-}
+// The brand logo mark (`logo_mark_icon` / `rasterize_logo_mark`) was retired
+// with the toolbar brand block in the 2026-07 restyle (no logo replaces it).
 
 /// Tint a coverage mask into a BGRA straight-alpha [`RenderImage`] frame. The
 /// colour channels carry the tint everywhere (also under zero coverage) so

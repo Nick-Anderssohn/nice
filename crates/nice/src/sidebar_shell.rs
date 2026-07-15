@@ -85,10 +85,10 @@ use gpui::{
 use nice_model::file_browser::TextFieldEditor;
 use nice_model::{InlineRenameClickGate, SidebarMode, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
-    traffic_light_reserved_width, CARD_BORDER_OPACITY, CARD_BORDER_WIDTH, CARD_CORNER_RADIUS,
-    CARD_INSET, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET,
-    INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, TOP_BAR_HEIGHT,
+    CARD_BORDER_OPACITY, CARD_BORDER_WIDTH, CARD_CORNER_RADIUS, CARD_INSET, CARD_SHADOW_OPACITY,
+    CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET, INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH,
+    TOP_BAR_HEIGHT,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::Slots;
@@ -123,9 +123,6 @@ const ROW_INDENT_CHILD: f32 = 38.0;
 /// became active — the macOS `NSEvent.doubleClickInterval` default analog
 /// (`SidebarView.swift:440`). R12 could inject the user's real value.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-/// Window-drag start threshold on the top strip, in pt — parity with the R9
-/// band (`ChromeEventRouter.swift:218`, `crate::app`'s `BAND_DRAG_THRESHOLD_PX`).
-const BAND_DRAG_THRESHOLD_PX: f32 = 2.0;
 /// Hover-tier row fill: 6% ink (`SidebarView.swift:452`).
 const HOVER_INK_ALPHA: f32 = 0.06;
 /// Dimmed multi-select tier: the active-row selection tint at half alpha
@@ -140,10 +137,12 @@ const ADD_BUTTON_HOVER_ALPHA: f32 = 0.10;
 /// Icon-button (mode / collapse / footer) hover fill: 8% ink
 /// (`SidebarView.swift:1037`, `AppShellView.swift:1112,1159`).
 const ICON_BUTTON_HOVER_ALPHA: f32 = 0.08;
-/// The mode/collapse toggles' top offset inside the 52pt strip, placing each
-/// 24pt button's centre on the y-26 row (`AppShellView.swift:812`).
-const TOP_STRIP_CONTROLS_TOP: f32 = 8.0;
-/// The mode/collapse toggles' trailing offset (`AppShellView.swift:813`).
+/// The mode toggles' top offset inside the slim [`TOP_BAR_HEIGHT`] strip, centering
+/// each 24pt button vertically ((28 − 24) / 2 = 2) after the restyle shrank the
+/// band (was 8 at the old 52pt height; re-centered per plan
+/// `docs/plans/restyle/01-titlebar-restyle.md`).
+const TOP_STRIP_CONTROLS_TOP: f32 = 2.0;
+/// The mode toggles' trailing offset (`AppShellView.swift:813`).
 const TOP_STRIP_CONTROLS_TRAILING: f32 = 10.0;
 
 // ---- Text line heights (AppKit parity) --------------------------------------
@@ -178,7 +177,6 @@ const ICON_TERMINAL: &str = "\u{276F}"; // ❯ fallback for SF_TERMINAL
 const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
 const ICON_MODE_TABS: &str = "\u{2630}"; // ☰ fallback for SF_MODE_TABS
 const ICON_MODE_FILES: &str = "\u{25A4}"; // ▤ fallback for SF_MODE_FILES
-const ICON_SIDEBAR: &str = "\u{25A8}"; // ▨ fallback for SF_SIDEBAR
 const ICON_GEAR: &str = "\u{2699}"; // ⚙ fallback for SF_GEAR
 
 /// Group-header disclosure, closed (`SidebarView.swift:289` — prod rotates
@@ -194,8 +192,6 @@ const SF_PLUS: &str = "plus";
 const SF_MODE_TABS: &str = "list.bullet";
 /// Sidebar mode toggle: files.
 const SF_MODE_FILES: &str = "folder";
-/// Collapse / restore toggle (`AppShellView.swift:1153`).
-const SF_SIDEBAR: &str = "sidebar.left";
 /// Footer Settings gear (`SidebarView.swift`'s footer `SidebarIconButton`).
 const SF_GEAR: &str = "gearshape";
 
@@ -536,8 +532,6 @@ pub(crate) struct SidebarShellView {
     /// True while the cursor pins an open peek overlay (the view's own hover
     /// pin, OR'd with `SidebarModel::peeking` which R12 drives).
     peek_mouse_pinned: bool,
-    /// Top-strip window-drag press origin (R9 band pattern), not yet a drag.
-    band_press: Option<Point<Pixels>>,
 
     /// Projects whose disclosure is collapsed (absent == open, the default).
     collapsed_projects: HashSet<String>,
@@ -627,7 +621,17 @@ impl SidebarShellView {
     /// Terracotta accent. Observing the state re-renders the shell when a sibling
     /// holder (the keymap) mutates it.
     pub(crate) fn new(state: Entity<WindowState>, cx: &mut Context<Self>) -> Self {
-        let state_sub = cx.observe(&state, |_this, _state, cx| cx.notify());
+        let state_sub = cx.observe(&state, |this, state, cx| {
+            // Any sidebar expand — from ⌘B, the titlebar collapse toggle, or this
+            // view's own toggle — routes through `WindowState::toggle_sidebar_collapsed`,
+            // which notifies here. Drop the view-local hover pin whenever the
+            // sidebar is not collapsed so a later collapse doesn't render a stale
+            // peek overlay (`build_collapsed_shell`: `peeking_model || peek_mouse_pinned`).
+            if !state.read(cx).sidebar.collapsed() {
+                this.peek_mouse_pinned = false;
+            }
+            cx.notify();
+        });
         // R23 (D3): observe the app-level sidebar-font entity so a Font-pane size
         // change repaints the sidebar chrome. Absent in isolated scenarios.
         let sidebar_font = crate::settings::sidebar_font::shared_sidebar_font(cx);
@@ -646,7 +650,6 @@ impl SidebarShellView {
             drag_start_width: None,
             resize_origin_x: None,
             peek_mouse_pinned: false,
-            band_press: None,
             collapsed_projects: HashSet::new(),
             hovered_project: None,
             row_frames: Rc::new(RefCell::new(HashMap::new())),
@@ -957,21 +960,14 @@ impl SidebarShellView {
         });
     }
 
-    /// Toggle the collapsed flag. Expanding also clears any peek state
-    /// (`AppShellView`: expand clears peek).
+    /// Toggle the collapsed flag through the one
+    /// [`WindowState::toggle_sidebar_collapsed`] seam (expanding also clears any
+    /// peek). The seam notifies the state entity, which fires this view's state
+    /// observer — and that observer drops the view-local hover pin on expand, so
+    /// the cleanup is identical whether the toggle came from here, ⌘B, or the
+    /// titlebar control.
     fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
-        let now_collapsed = self.state.update(cx, |ws, _| {
-            ws.sidebar.toggle_sidebar();
-            let collapsed = ws.sidebar.collapsed();
-            if !collapsed {
-                ws.sidebar.end_sidebar_peek();
-            }
-            collapsed
-        });
-        if !now_collapsed {
-            self.peek_mouse_pinned = false;
-        }
-        cx.notify();
+        self.state.update(cx, |ws, wcx| ws.toggle_sidebar_collapsed(wcx));
     }
 
     fn add_tab_in_group(&mut self, group_id: &str, is_terminals: bool, cx: &mut Context<Self>) {
@@ -1279,50 +1275,8 @@ impl SidebarShellView {
         cx.notify();
     }
 
-    // MARK: - Top-strip window drag (R9 band pattern)
-
-    fn on_strip_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.band_press = None;
-        if window.is_fullscreen() {
-            return;
-        }
-        if event.click_count >= 2 {
-            window.titlebar_double_click();
-            cx.stop_propagation();
-            return;
-        }
-        self.band_press = Some(event.position);
-    }
-
-    fn on_strip_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        let Some(origin) = self.band_press else {
-            return;
-        };
-        if event.pressed_button != Some(MouseButton::Left) {
-            self.band_press = None;
-            return;
-        }
-        let dx = f32::from(event.position.x - origin.x);
-        let dy = f32::from(event.position.y - origin.y);
-        if dx * dx + dy * dy >= BAND_DRAG_THRESHOLD_PX * BAND_DRAG_THRESHOLD_PX {
-            self.band_press = None;
-            window.start_window_move();
-        }
-    }
-
-    fn on_strip_mouse_up(&mut self, _e: &MouseUpEvent, _w: &mut Window, _cx: &mut Context<Self>) {
-        self.band_press = None;
-    }
+    // The sidebar top strip no longer drags the window: the 2026-07 restyle moved
+    // the R9 band drag / double-click-zoom to the titlebar (`WindowToolbarView`).
 
     // MARK: - Resize handle (root-level move/up so the drag survives cursor drift)
 
@@ -1380,22 +1334,28 @@ impl SidebarShellView {
         mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let s = active_slots(cx);
-        // `flex_row_reverse` keeps the LAYOUT exactly as before — the first
-        // child sits at the main-end, so the main column still fills the right
-        // and the card still docks left — while flipping the PAINT order to
-        // main column → divider → card. That order is what the Item C hairline
-        // needs: drawn over the toolbar band's opaque chrome, but under the
-        // floating card, which overlaps it by design (the line stays visible
-        // in the gutters).
+        // The 2026-07 restyle restructures the expanded shell to
+        // `column(titlebar, row(sidebar, content))`: the titlebar (the injected
+        // `WindowToolbarView`) is a full-width row at the top, and the floating
+        // sidebar card begins BELOW it (the traffic lights + drag region now live
+        // in the titlebar, not over the sidebar's top strip). No fill-band divider
+        // — the titlebar is fill-less (plan `docs/plans/restyle/01-titlebar-restyle.md`).
         div()
             .relative()
             .flex()
-            .flex_row_reverse()
+            .flex_col()
             .size_full()
-            .child(self.build_main_column(cx))
-            .child(self.build_top_bar_divider(&s))
-            .child(self.build_sidebar_card(&groups, true, false, mode, cx))
+            .child(self.build_titlebar_row(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.build_sidebar_card(&groups, true, false, mode, cx))
+                    .child(self.build_main_body(cx)),
+            )
     }
 
     fn build_collapsed_shell(
@@ -1405,53 +1365,34 @@ impl SidebarShellView {
         peeking_model: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let s = active_slots(cx);
         let peeking = peeking_model || self.peek_mouse_pinned;
         let peek = peeking.then(|| self.build_peek_overlay(&groups, peeking, mode, cx));
+        // Collapsed: the full-width titlebar row over the full-width pane body —
+        // no cap card, no restore button, no fill, no divider. The
+        // sidebar-collapse toggle in the titlebar (a `WindowToolbarView` control)
+        // restores the sidebar (plan `docs/plans/restyle/01-titlebar-restyle.md`).
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
-            .child(
-                // Top row: one full-width 52pt title-bar band (M2 feel-check
-                // Item B — the floating collapsed cap is GONE, an approved
-                // divergence from the Swift parity design): a spacer reserving
-                // the native traffic-light zone, the bare restore button (no
-                // card, border, rounding, or shadow behind it), then the
-                // toolbar accessory; in the isolated scenario the accessory is
-                // the R9/R11 chrome filler. The pane content extends
-                // full-width beneath.
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .w_full()
-                    .h(px(TOP_BAR_HEIGHT))
-                    .bg(slot_to_rgba(s.chrome))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(traffic_light_reserved_width()))
-                            .h_full(),
-                    )
-                    .child(self.icon_button(
-                        SF_SIDEBAR,
-                        ICON_SIDEBAR,
-                        &s,
-                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.toggle_collapsed(cx);
-                            cx.stop_propagation();
-                        }),
-                        cx,
-                    ))
-                    .child(self.build_collapsed_top_accessory(&s)),
-            )
+            .child(self.build_titlebar_row(cx))
             .child(self.build_main_body(cx))
-            // The Item C divider paints over the band chrome but under the
-            // peek overlay (emitted next).
-            .child(self.build_top_bar_divider(&s))
             .children(peek)
+    }
+
+    /// The full-width titlebar row atop both shell states: the injected
+    /// `WindowToolbarView` (the shipped/composed shell), else a bare
+    /// titlebar-height row in the isolated `sidebar` scenario (no toolbar wired).
+    /// Fill-less — the window-body backing shows through (the restyle titlebar).
+    fn build_titlebar_row(&self, cx: &App) -> gpui::AnyElement {
+        let row = div().flex_none().w_full().h(px(TOP_BAR_HEIGHT));
+        let _ = cx;
+        if let Some(toolbar) = &self.main_toolbar {
+            row.child(toolbar.clone()).into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
     /// The 240pt (or `sidebar_width`) floating card: the top strip, the body
@@ -1506,10 +1447,11 @@ impl SidebarShellView {
             .child(inner)
     }
 
-    /// The 52pt drag strip reserving the traffic-light row, with the mode +
-    /// collapse toggles at its trailing edge. The strip is the R9 band (drag to
-    /// move, double-click zoom); the buttons consume their own presses so the
-    /// band passes them through.
+    /// The sidebar card's top strip — an INTERIM home for the tabs/files mode
+    /// toggles after the 2026-07 restyle moved the drag region + traffic-light
+    /// reservation + the sidebar-collapse toggle into the titlebar (plan 2 removes
+    /// this strip entirely). The buttons are re-centered for the reduced
+    /// [`TOP_BAR_HEIGHT`] band; the strip no longer drags the window.
     fn build_top_strip(&self, s: &Slots, mode: SidebarMode, cx: &mut Context<Self>) -> impl IntoElement {
         let accent = crate::theme_settings::active_chrome_accent(cx);
         let tabs_active = mode == SidebarMode::Tabs;
@@ -1519,9 +1461,6 @@ impl SidebarShellView {
             .flex_none()
             .w_full()
             .h(px(TOP_BAR_HEIGHT))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_strip_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_strip_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_strip_mouse_up))
             .child(
                 div()
                     .absolute()
@@ -1554,16 +1493,6 @@ impl SidebarShellView {
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
                             this.set_mode(SidebarMode::Files, cx);
                             cx.notify();
-                            cx.stop_propagation();
-                        }),
-                        cx,
-                    ))
-                    .child(self.icon_button(
-                        SF_SIDEBAR,
-                        ICON_SIDEBAR,
-                        s,
-                        cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.toggle_collapsed(cx);
                             cx.stop_propagation();
                         }),
                         cx,
@@ -1612,39 +1541,6 @@ impl SidebarShellView {
             .rounded(px(INNER_CORNER_RADIUS))
             .when(active, |el| el.bg(selection_tint(accent, 1.0)))
             .when(!active, |el| el.hover(move |st| st.bg(hover)))
-            .child(icon)
-            .on_mouse_down(MouseButton::Left, on_down)
-    }
-
-    /// A plain 24pt icon button (the `sidebar.left` collapse / restore toggle):
-    /// hover fill only, 14pt regular ink2 (`SidebarView.swift:1018-1044`,
-    /// `AppShellView.swift:1145-1166`).
-    fn icon_button(
-        &self,
-        symbol: &'static str,
-        fallback_glyph: &'static str,
-        s: &Slots,
-        on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let hover = ink_alpha(s, ICON_BUTTON_HOVER_ALPHA);
-        let icon = sf_symbol_icon(
-            symbol,
-            fallback_glyph,
-            14.0,
-            SymbolWeight::Regular,
-            slot_to_rgba(s.ink2),
-            self.window_scale,
-            cx,
-        );
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(24.0))
-            .h(px(24.0))
-            .rounded(px(INNER_CORNER_RADIUS))
-            .hover(move |st| st.bg(hover))
             .child(icon)
             .on_mouse_down(MouseButton::Left, on_down)
     }
@@ -2205,28 +2101,10 @@ impl SidebarShellView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_resize_mouse_down))
     }
 
-    /// The full-width 1px title-bar divider (M2 feel-check Item C): one
-    /// hairline (`s.line`) spanning the whole window at the bottom of the 52pt
-    /// band, in both shell states — it replaces the toolbar's old local bottom
-    /// border, which stopped at the sidebar edge. The callers order it OVER the
-    /// band/body chrome but UNDER the floating sidebar card / peek overlay, so
-    /// the expanded card deliberately overlaps it (the line stays visible in
-    /// the gutters). Pure paint: no id, no listeners, no hitbox.
-    fn build_top_bar_divider(&self, s: &Slots) -> impl IntoElement {
-        div()
-            .absolute()
-            .left_0()
-            .top(px(TOP_BAR_HEIGHT - 1.0))
-            .w_full()
-            .h(px(1.0))
-            .bg(slot_to_rgba(s.line))
-    }
-
-    /// The content column to the right of (expanded) or beneath (collapsed) the
-    /// sidebar. A plain background when no content is injected (the isolated
-    /// `sidebar` scenario); R13.5's composed shell replaces it with the toolbar
-    /// band + pane-content host via the [`main_toolbar`](Self::main_toolbar) /
-    /// [`main_body`](Self::main_body) slots.
+    /// The content column beside (expanded) or beneath (collapsed) the sidebar.
+    /// A plain background when no content is injected (the isolated `sidebar`
+    /// scenario); the composed shell replaces it with the pane-content host via
+    /// the [`main_body`](Self::main_body) slot.
     fn build_content(&self, cx: &App) -> impl IntoElement {
         div()
             .flex_1()
@@ -2235,43 +2113,7 @@ impl SidebarShellView {
             .bg(slot_to_rgba(active_slots(cx).background))
     }
 
-    /// The expanded shell's right column: the toolbar band stacked over the pane
-    /// body (Swift's `VStack { WindowToolbarView ; mainContent }`). When no
-    /// content is injected this is the placeholder [`build_content`](Self::build_content)
-    /// verbatim, so the isolated `sidebar` scenario's layout is unchanged.
-    fn build_main_column(&self, cx: &App) -> gpui::AnyElement {
-        if self.main_toolbar.is_none() && self.main_body.is_none() {
-            return self.build_content(cx).into_any_element();
-        }
-        let mut col = div().flex().flex_col().flex_1().min_w_0().h_full();
-        if let Some(toolbar) = &self.main_toolbar {
-            col = col.child(toolbar.clone());
-        }
-        col.child(self.build_main_body(cx)).into_any_element()
-    }
-
-    /// The collapsed shell's top-row accessory beside the cap: the toolbar band
-    /// when composed (as a flex-filling wrapper so the toolbar's own `w_full`
-    /// resolves against the remaining row width), else the R9/R11 chrome filler
-    /// the isolated scenario shows.
-    fn build_collapsed_top_accessory(&self, s: &Slots) -> gpui::AnyElement {
-        if let Some(toolbar) = &self.main_toolbar {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .child(toolbar.clone())
-                .into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .h_full()
-                .bg(slot_to_rgba(s.chrome))
-                .into_any_element()
-        }
-    }
-
-    /// The pane content fill below the toolbar / cap row: the injected pane-host
+    /// The pane content fill below the titlebar row: the injected pane-host
     /// when composed, else the placeholder [`build_content`](Self::build_content).
     fn build_main_body(&self, cx: &App) -> gpui::AnyElement {
         if let Some(body) = &self.main_body {
@@ -2315,9 +2157,12 @@ impl SidebarShellView {
 //
 // Read/drive surface the live `sidebar` self-test scenario (`crate::sidebar_live`)
 // uses to ground-truth the shell against AppKit reads. All `pub(crate)` and
-// side-effect-free except the collapse driver, which routes through the real
-// [`SidebarShellView::toggle_collapsed`] path (peek-clear included) so the
-// scenario exercises the shipped toggle, not a shortcut.
+// side-effect-free except the collapse driver, which routes through
+// [`SidebarShellView::toggle_collapsed`] into the shared
+// [`WindowState::toggle_sidebar_collapsed`] seam — the SAME seam the shipped
+// titlebar collapse control ([`crate::toolbar::WindowToolbarView`]) drives — so
+// the scenario exercises the shipped collapse behavior (state flip + peek-clear
+// on expand), not a bypass.
 impl SidebarShellView {
     /// The current docked sidebar width (the resize target the scenario clamps).
     pub(crate) fn sidebar_width(&self) -> f32 {
@@ -2329,8 +2174,9 @@ impl SidebarShellView {
         self.state.read(cx).sidebar.collapsed()
     }
 
-    /// Drive the real collapse toggle (used to enter / leave the collapsed
-    /// full-width-band state in the scenario).
+    /// Drive the shipped collapse behavior (used to enter / leave the collapsed
+    /// full-width state in the scenario) via the shared
+    /// [`WindowState::toggle_sidebar_collapsed`] seam the titlebar control also drives.
     pub(crate) fn drive_toggle_collapsed(&mut self, cx: &mut Context<Self>) {
         self.toggle_collapsed(cx);
     }

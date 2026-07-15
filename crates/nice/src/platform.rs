@@ -725,21 +725,7 @@ extern "C" {
     fn CGBitmapContextGetBytesPerRow(ctx: *mut c_void) -> usize;
     fn CGContextRelease(ctx: *mut c_void);
     fn CGContextScaleCTM(ctx: *mut c_void, sx: f64, sy: f64);
-    // Path stroking for the brand logo mark (fix round r6).
-    fn CGContextTranslateCTM(ctx: *mut c_void, tx: f64, ty: f64);
-    fn CGContextSetLineWidth(ctx: *mut c_void, width: f64);
-    fn CGContextSetLineCap(ctx: *mut c_void, cap: i32);
-    fn CGContextSetLineJoin(ctx: *mut c_void, join: i32);
-    fn CGContextSetRGBStrokeColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
-    fn CGContextBeginPath(ctx: *mut c_void);
-    fn CGContextMoveToPoint(ctx: *mut c_void, x: f64, y: f64);
-    fn CGContextAddLineToPoint(ctx: *mut c_void, x: f64, y: f64);
-    fn CGContextStrokePath(ctx: *mut c_void);
 }
-
-/// `kCGLineCapRound` / `kCGLineJoinRound` (CoreGraphics enums).
-const CG_LINE_CAP_ROUND: i32 = 1;
-const CG_LINE_JOIN_ROUND: i32 = 1;
 
 /// `kCGImageAlphaPremultipliedLast` — RGBA with premultiplied alpha, the only
 /// 32-bit-with-alpha layout CGBitmapContext supports for drawing. Only the
@@ -936,74 +922,10 @@ unsafe fn read_coverage_and_release(
     })
 }
 
-/// The Nice logo mark's canvas, in points — `Logo.swift`'s 22×22 viewBox (the
-/// brand slot the toolbar reserves).
-pub const LOGO_MARK_CANVAS_PT: f32 = 22.0;
-
-/// Rasterize the brand logo mark — the white chevron + underline stroke from
-/// `Logo.swift:44-61` — into a coverage mask at `scale` device pixels per
-/// point. The exact prod geometry, in the 22×22 viewBox the accent square also
-/// lives in (rect x=1 y=1 20×20 r=6; the square itself stays a gpui `div` —
-/// only the stroked path needs CoreGraphics):
-///
-///   chevron   M 7 8.5  L 10.5 11.5  L 7 14.5
-///   underline M 11.5 14  L 15.5 14
-///   stroke: white, lineWidth 1.6, round caps + joins, no fill
-///
-/// gpui's `Path` is fill-only (no stroker), so the stroke is rendered here and
-/// tinted/cached by `crate::sf_symbols` exactly like an SF Symbol mask.
-/// `None` when any CG step fails — the caller keeps its `❯` text stand-in.
-pub fn rasterize_logo_mark(scale: f32) -> Option<SymbolBitmap> {
-    let scale = f64::from(scale.max(1.0));
-    let canvas = f64::from(LOGO_MARK_CANVAS_PT);
-    let px_dim = (canvas * scale).ceil() as usize;
-    if px_dim == 0 {
-        return None;
-    }
-
-    // SAFETY: the CG colour space / bitmap context are +1 handles released by
-    // `read_coverage_and_release` (or on the early-return path); all drawing
-    // happens on this thread into that private context.
-    unsafe {
-        let space = CGColorSpaceCreateDeviceRGB();
-        let ctx = CGBitmapContextCreate(
-            std::ptr::null_mut(),
-            px_dim,
-            px_dim,
-            8,
-            px_dim * 4,
-            space,
-            CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
-        );
-        CGColorSpaceRelease(space);
-        if ctx.is_null() {
-            return None;
-        }
-        // Point coordinates onto the device-pixel bitmap, then flip: the path
-        // is authored in the SVG's top-left-origin space (+y down), CG's is
-        // bottom-left (+y up).
-        CGContextScaleCTM(ctx, scale, scale);
-        CGContextTranslateCTM(ctx, 0.0, canvas);
-        CGContextScaleCTM(ctx, 1.0, -1.0);
-
-        CGContextSetLineWidth(ctx, 1.6);
-        CGContextSetLineCap(ctx, CG_LINE_CAP_ROUND);
-        CGContextSetLineJoin(ctx, CG_LINE_JOIN_ROUND);
-        // The mask is colour-independent (only alpha is read back); stroke
-        // opaque so coverage is the anti-aliased stroke alpha.
-        CGContextSetRGBStrokeColor(ctx, 1.0, 1.0, 1.0, 1.0);
-
-        CGContextBeginPath(ctx);
-        CGContextMoveToPoint(ctx, 7.0, 8.5);
-        CGContextAddLineToPoint(ctx, 10.5, 11.5);
-        CGContextAddLineToPoint(ctx, 7.0, 14.5);
-        CGContextMoveToPoint(ctx, 11.5, 14.0);
-        CGContextAddLineToPoint(ctx, 15.5, 14.0);
-        CGContextStrokePath(ctx);
-
-        read_coverage_and_release(ctx, px_dim, px_dim)
-    }
-}
+// The brand logo mark rasterizer (`rasterize_logo_mark`) was retired with the
+// toolbar brand block in the 2026-07 restyle; the restyle's stroke chrome icons
+// render through gpui's `svg()` from an embedded `AssetSource`
+// (`crate::chrome_icons`) instead of CoreGraphics path stroking.
 
 // ===========================================================================
 // R7 drag-drop — raw-image pasteboard fallback.

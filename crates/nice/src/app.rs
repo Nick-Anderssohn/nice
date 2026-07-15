@@ -38,10 +38,7 @@ use nice_term_core::SpawnSpec;
 use nice_term_view::{
     FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
 };
-use nice_theme::chrome_geometry::{
-    MACOS26_TRAFFIC_LIGHT_LEADINGS, TOP_BAR_HEIGHT, TRAFFIC_LIGHT_CENTER_FROM_TOP,
-    TRAFFIC_LIGHT_NUDGE_X,
-};
+use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 use nice_theme::color::Srgba;
 use nice_theme::palette::SlotColor;
 use nice_theme::AccentPreset;
@@ -114,24 +111,14 @@ impl Render for RootView {
     }
 }
 
-/// macOS-26 standard window-button (traffic-light) frame height, in points.
-/// Measured live (`standardWindowButton(.closeButton).frame` → 14×14 on macOS
-/// 26; matches `WindowChrome.swift:71`'s "14pt diameter each"). gpui sizes the
-/// titlebar container as `button_height + 2·y` and places the close button's
-/// origin at our `y`, so the button center lands `y + button_height/2` below the
-/// window top; [`window_options`] picks `y` so that equals
-/// [`TRAFFIC_LIGHT_CENTER_FROM_TOP`] (26) — and the derived container height is
-/// exactly [`TOP_BAR_HEIGHT`] (52). The R9 live scenario asserts the RENDERED
-/// center from the real button frame ([`crate::platform::standard_window_button_frames`]),
-/// so a future macOS button-height change surfaces there instead of drifting.
-const TRAFFIC_LIGHT_BUTTON_HEIGHT: f32 = 14.0;
-
-/// Fixed, sensible default window geometry + Nice's window chrome (R9): a hidden
-/// (transparent) titlebar with the native traffic lights repositioned onto the
-/// y-26 row, and `is_movable: false` so the band's own drag handlers own window
-/// movement. Shared by the shipped window and every self-test scenario window
-/// (including the R5 live-input scenarios in [`crate::input_live`]); only the
-/// shipped live window wraps its content in the [`WindowChromeView`] band.
+/// Fixed, sensible default window geometry + Nice's window chrome: a hidden
+/// (transparent) titlebar with the native traffic lights at their OS-native
+/// position (the 2026-07 restyle stopped repositioning them — at the 28pt
+/// [`TOP_BAR_HEIGHT`] the OS centers them itself), and `is_movable: false` so the
+/// titlebar's own drag handlers own window movement. Shared by the shipped window
+/// and every self-test scenario window (including the R5 live-input scenarios in
+/// [`crate::input_live`]); only the shipped live window wraps its content in the
+/// [`WindowChromeView`] band.
 pub(crate) fn window_options() -> WindowOptions {
     window_options_with(None, None)
 }
@@ -153,25 +140,18 @@ pub(crate) fn window_options_with(
         origin: point(px(160.0), px(160.0)),
         size: size(px(960.0), px(640.0)),
     });
-    // Traffic-light target — the DOCUMENTED divergence from Swift's captured-
-    // default-plus-8: gpui takes an ABSOLUTE close-button origin, so x is the
-    // macOS-26 native close leading (9, `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]`) + the
-    // 8pt nudge = 17, making the documentary token load-bearing. y puts the button
-    // center on the y-26 row (see [`TRAFFIC_LIGHT_BUTTON_HEIGHT`]).
-    let traffic_light_position = point(
-        px(MACOS26_TRAFFIC_LIGHT_LEADINGS[0] + TRAFFIC_LIGHT_NUDGE_X),
-        px(TRAFFIC_LIGHT_CENTER_FROM_TOP - TRAFFIC_LIGHT_BUTTON_HEIGHT / 2.0),
-    );
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_background: WindowBackgroundAppearance::Opaque,
         titlebar: Some(TitlebarOptions {
             title: Some(app_display_name().into()),
-            // Hidden titlebar so the app draws its own chrome band; the native
-            // traffic lights show through and gpui re-applies their position on
-            // resize / focus / full-screen exit.
+            // Hidden titlebar so the app draws its own chrome; the native traffic
+            // lights show through at their OS-native position. `None` leaves them
+            // where AppKit places them (gpui's `move_traffic_light` no-ops on
+            // `None`) — the restyle no longer repositions them (the 28pt bar is the
+            // standard titlebar height, so the OS already centers them).
             appears_transparent: true,
-            traffic_light_position: Some(traffic_light_position),
+            traffic_light_position: None,
         }),
         kind: WindowKind::Normal,
         // The band implements its own drag (`start_window_move`); the gpui doc
@@ -1062,7 +1042,9 @@ pub fn run() {
     // before any glyph rasterizes, so the bg-luminance curve is the sole text
     // AA shaping (see `platform::disable_font_smoothing`).
     crate::platform::disable_font_smoothing();
-    gpui_platform::application().run(|cx: &mut App| {
+    gpui_platform::application()
+        .with_assets(crate::chrome_icons::ChromeIconAssets)
+        .run(|cx: &mut App| {
         cx.activate(true);
         // R12: the process-wide window registry + its single close observer
         // (deregister → per-window teardown → quit-when-empty). This REPLACES the
@@ -4172,7 +4154,9 @@ pub fn run_selftest(selector: String) {
     // smoothing dilation being off so the curve is the only AA shaping.
     crate::platform::disable_font_smoothing();
     let scenarios = selftest_scenarios();
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui_platform::application()
+        .with_assets(crate::chrome_icons::ChromeIconAssets)
+        .run(move |cx: &mut App| {
         // R19 hermeticity: install the RECORDING `WorkspaceOps` fake process-wide
         // BEFORE any scenario runs — no scenario may launch a real app, reveal in
         // the real Finder, or query live Launch Services; the fake's log is the
@@ -4305,22 +4289,6 @@ mod tests {
         assert!(band_drag_threshold_crossed(0.0, 2.0));
         assert!(band_drag_threshold_crossed(-2.0, 0.0));
         assert!(band_drag_threshold_crossed(1.5, 1.5)); // 4.5 >= 4
-    }
-
-    #[test]
-    fn traffic_light_target_centers_on_the_y26_row() {
-        // gpui centers the close button at `y + button_height/2`; our chosen y
-        // must land that on the y-26 row, and the container gpui derives
-        // (`button_height + 2·y`) must equal the 52pt band.
-        let y = TRAFFIC_LIGHT_CENTER_FROM_TOP - TRAFFIC_LIGHT_BUTTON_HEIGHT / 2.0;
-        assert_eq!(
-            y + TRAFFIC_LIGHT_BUTTON_HEIGHT / 2.0,
-            TRAFFIC_LIGHT_CENTER_FROM_TOP
-        );
-        assert_eq!(TRAFFIC_LIGHT_BUTTON_HEIGHT + 2.0 * y, TOP_BAR_HEIGHT);
-        // x is the absolute macOS-26 close leading + the 8pt nudge = 17 (the
-        // documented divergence from Swift's captured-default-plus-8).
-        assert_eq!(MACOS26_TRAFFIC_LIGHT_LEADINGS[0] + TRAFFIC_LIGHT_NUDGE_X, 17.0);
     }
 
     #[test]

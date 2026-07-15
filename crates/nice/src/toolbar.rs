@@ -1,10 +1,15 @@
-//! The window toolbar's pane strip — ported from
+//! The window's slim titlebar + pane strip — originally ported from
 //! `Sources/Nice/Views/WindowToolbarView.swift` (`WindowToolbarView`,
 //! `InlinePaneStrip`, `InlinePanePill`, `CloseXButton`, `OverflowMenuButton`,
-//! `NewTabBtn`) and `Logo.swift`. The brand block, the horizontally-scrolling row
-//! of pane pills, the overflow chevron with its attention badge and edge fades,
-//! and the trailing `+` — all riding the R9 chrome band and driving the R8 model
-//! through the injected [`PaneStripActions`] seam.
+//! `NewTabBtn`). The 2026-07 restyle reshaped it (plan
+//! `docs/plans/restyle/01-titlebar-restyle.md`) into the fill-less 28pt titlebar: the
+//! leading sidebar-collapse toggle (an embedded stroke SVG, right of the native
+//! traffic lights), then the horizontally-scrolling row of tabs — plain
+//! text + a 2px accent underline on the active tab, no pills — with the overflow
+//! chevron (attention badge + edge fades) and the trailing `+` intact. It is the
+//! full-width titlebar row in both shell states, carries the window drag region,
+//! and drives the R8 model through the injected [`PaneStripActions`] seam. The
+//! brand block was removed.
 //!
 //! ## Real layout replaces the width estimator (binding decision)
 //!
@@ -58,7 +63,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, linear_color_stop, linear_gradient, point, prelude::*, px, App, Bounds, BoxShadow,
+    div, linear_color_stop, linear_gradient, point, prelude::*, px, App, Bounds,
     ClickEvent, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable, FontWeight,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle,
     SharedString, Subscription, Window,
@@ -69,7 +74,7 @@ use nice_model::{
     center_offset_x, resolve, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry,
     Tab, TabStatus,
 };
-use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
+use nice_theme::chrome_geometry::{traffic_light_reserved_width, TOP_BAR_HEIGHT};
 use nice_theme::palette::Slots;
 
 use crate::app_shell::{PaneHostView, PANE_STRIP_ROOT_LABEL};
@@ -78,7 +83,7 @@ use crate::inline_rename::{
     apply_rename_click, dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe,
     RenameKeyOutcome,
 };
-use crate::sf_symbols::{logo_mark_icon, sf_symbol_icon, SymbolWeight};
+use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 use crate::update_popover::UpdatePopover;
@@ -86,36 +91,42 @@ use crate::window_state::WindowState;
 
 // ---- Geometry / behaviour constants (Swift provenance) ----------------------
 
-/// Toolbar leading inset (`WindowToolbarView.swift:56`).
-const TOOLBAR_LEADING_PAD: f32 = 14.0;
 /// Toolbar trailing inset (`WindowToolbarView.swift:57`).
 const TOOLBAR_TRAILING_PAD: f32 = 20.0;
-/// Brand-block inter-element spacing (the outer `HStack(spacing: 10)`,
-/// `WindowToolbarView.swift:31`).
-const BRAND_GAP: f32 = 10.0;
-/// The brand mark's box (`Logo` default size, `Logo.swift:24`).
-const LOGO_SIZE: f32 = 22.0;
-/// The brand mark's inner rounded square (`Logo.swift:39-41`).
-const LOGO_SQUARE: f32 = 20.0;
-const LOGO_SQUARE_RADIUS: f32 = 6.0;
-/// The vertical brand/strip separator (`WindowToolbarView.swift:42-45`).
-const SEPARATOR_HEIGHT: f32 = 20.0;
-const SEPARATOR_MARGIN_X: f32 = 6.0;
 
-/// Pill box (`WindowToolbarView.swift:777-778`).
-const PILL_HEIGHT: f32 = 28.0;
-const PILL_MAX_WIDTH: f32 = 220.0;
-/// Pill leading / trailing padding (`WindowToolbarView.swift:775-776`).
-const PILL_LEADING_PAD: f32 = 10.0;
-const PILL_TRAILING_PAD: f32 = 6.0;
-/// Pill inner spacing (`HStack(spacing: 7)`, `WindowToolbarView.swift:759`).
+/// Tab box: full-height (the bar), so the active-tab underline seats on the bar's
+/// bottom edge (`docs/design/restyle-mocks.html`, `.tabs { height: 100% }`; plan
+/// `docs/plans/restyle/01-titlebar-restyle.md`). Equals [`TOP_BAR_HEIGHT`].
+const PILL_HEIGHT: f32 = TOP_BAR_HEIGHT;
+/// Tab max width before tail-ellipsis (mock `.tab { max-width: 200px }`; was 220).
+const PILL_MAX_WIDTH: f32 = 200.0;
+/// Tab horizontal padding (mock `.tab { padding: 0 12px }`).
+const TAB_PAD_X: f32 = 12.0;
+/// Tab inner spacing — dot ↔ title ↔ ✕ (mock `.tab { gap: 7px }`).
 const PILL_GAP: f32 = 7.0;
-/// Pill corner radius (`WindowToolbarView.swift:780`).
-const PILL_RADIUS: f32 = 7.0;
-/// Pill title / icon text size (`WindowToolbarView.swift:860,904`).
+/// Tab title text size (mock `.tab { font-size: 12px }`).
 const PILL_TEXT_SIZE: f32 = 12.0;
-/// Leading terminal-glyph box (`WindowToolbarView.swift:906`).
+/// Leading terminal-glyph box for a Terminal pane's tab.
 const PILL_ICON_SIZE: f32 = 12.0;
+/// Status-dot diameter inside a tab (mock `.tab .dot { width: 6px }`; the
+/// [`StatusDot`] component's 8pt default stays elsewhere — only its size
+/// parameter changes here, colours + pulse untouched).
+const TAB_STATUS_DOT_SIZE: f32 = 6.0;
+/// Active-tab accent underline: 2px tall, seated on the bar's bottom edge, inset
+/// 11px from the tab's outer edges, 1px corner radius (mock Style A
+/// `.tab.active::after`).
+const TAB_UNDERLINE_HEIGHT: f32 = 2.0;
+const TAB_UNDERLINE_INSET: f32 = 11.0;
+const TAB_UNDERLINE_RADIUS: f32 = 1.0;
+
+/// The sidebar-collapse toggle box in the titlebar (mock `.tb-btn`: 24×22, 5px
+/// radius, 4px trailing margin before the tabs).
+const COLLAPSE_BTN_W: f32 = 24.0;
+const COLLAPSE_BTN_H: f32 = 22.0;
+const COLLAPSE_BTN_RADIUS: f32 = 5.0;
+const COLLAPSE_BTN_TRAILING_MARGIN: f32 = 4.0;
+/// The collapse toggle's hover fill: 8% ink (the chrome icon-button tier).
+const COLLAPSE_BTN_HOVER_INK_ALPHA: f32 = 0.08;
 /// Inter-pill spacing inside the scroll row (`HStack(spacing: 2)`,
 /// `WindowToolbarView.swift:292`).
 const PILL_ROW_GAP: f32 = 2.0;
@@ -166,23 +177,20 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// band (`ChromeEventRouter.swift:218`).
 const BAND_DRAG_THRESHOLD_PX: f32 = 2.0;
 
-/// Pill hover fill: 5% ink (`WindowToolbarView.swift:715`).
+/// Update-pill hover fill: 5% ink (`WindowToolbarView.swift:715`).
 const PILL_HOVER_INK_ALPHA: f32 = 0.05;
 /// Close-"×" hover fill: 10% ink (`WindowToolbarView.swift:992`).
 const CLOSE_HOVER_INK_ALPHA: f32 = 0.10;
 /// Chevron / new-tab hover fill: 8% ink (`WindowToolbarView.swift:1054,1143`).
 const SQUARE_BTN_HOVER_INK_ALPHA: f32 = 0.08;
-/// Active-pill drop shadow (`WindowToolbarView.swift:787-792`).
-const PILL_SHADOW_ALPHA: f32 = 0.04;
 
 // ---- Icons (SF Symbols + Unicode fallbacks / stand-ins) ----------------------
 //
-// The pill/chevron/plus/close icons are real SF Symbols rendered through
+// The tab/chevron/plus/close icons are real SF Symbols rendered through
 // `crate::sf_symbols` (M2 feel-check Item A); each ICON_* glyph remains as the
 // never-blank fallback. The overflow-menu rows keep their glyph stand-ins (the
-// pinned `ContextMenu` is plain-label). The logo mark is `Logo.swift`'s exact
-// chevron+underline stroke, rasterized through the same pipeline
-// (`sf_symbols::logo_mark_icon`, fix round r6).
+// pinned `ContextMenu` is plain-label). The leading sidebar-collapse toggle is
+// the restyle's stroke SVG (`crate::chrome_icons`), not an SF Symbol.
 
 const ICON_TERMINAL: &str = "\u{276F}"; // ❯  fallback for SF_TERMINAL + menu rows
 const ICON_CLOSE: &str = "\u{2715}"; // ✕  fallback for SF_CLOSE
@@ -190,9 +198,6 @@ const ICON_CHEVRON_DOWN: &str = "\u{25BE}"; // ▾  fallback for SF_CHEVRON_DOWN
 const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
 const ICON_CHECK: &str = "\u{2713}"; // ✓  (menu-row stand-in, SF "checkmark")
 const ICON_CLAUDE_DOT: &str = "\u{25CF}"; // ●  (menu-row stand-in for the StatusDot)
-/// Fallback for the brand mark when the CoreGraphics rasterization fails
-/// (`sf_symbols::logo_mark_icon`) — the pre-r6 `❯` stand-in, never blank.
-const ICON_LOGO_MARK: &str = "\u{276F}"; // ❯
 
 /// Pill leading icon (`WindowToolbarView.swift:903-906`).
 const SF_TERMINAL: &str = "terminal";
@@ -270,33 +275,6 @@ fn ink_alpha(s: &Slots, a: f32) -> Rgba {
     srgba_to_rgba(srgba_with_alpha(slot_srgba(s.ink), a))
 }
 
-/// Opaque white (the brand mark's stroke colour).
-fn white() -> Rgba {
-    Rgba {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 1.0,
-    }
-}
-
-/// The active-pill drop shadow (`WindowToolbarView.swift:787-792`).
-fn pill_shadow() -> Vec<BoxShadow> {
-    vec![BoxShadow {
-        color: Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: PILL_SHADOW_ALPHA,
-        }
-        .into(),
-        offset: point(px(0.0), px(1.0)),
-        blur_radius: px(1.0),
-        spread_radius: px(0.0),
-        inset: false,
-    }]
-}
-
 // ---- View-model snapshot (decouples rendering from model borrows) -----------
 
 /// A per-render snapshot of one pane pill.
@@ -350,9 +328,8 @@ impl Render for PaneDragGhost {
                 .items_center()
                 .h(px(PILL_HEIGHT))
                 .max_w(px(PILL_MAX_WIDTH))
-                .pl(px(PILL_LEADING_PAD))
-                .pr(px(PILL_TRAILING_PAD))
-                .rounded(px(PILL_RADIUS))
+                .px(px(TAB_PAD_X))
+                .rounded(px(6.0))
                 .bg(slot_to_rgba(s.panel))
                 .border_1()
                 .border_color(slot_to_rgba(s.line))
@@ -366,12 +343,38 @@ impl Render for PaneDragGhost {
     }
 }
 
+// ---- Tab full-title tooltip -------------------------------------------------
+
+/// The hover tooltip showing a tab's full title (NEW work for the restyle — a
+/// tab tail-ellipsizes at [`PILL_MAX_WIDTH`], so the tooltip surfaces the rest).
+/// A small themed label box built through gpui's `div::tooltip` seam.
+struct TabTooltip {
+    title: SharedString,
+}
+
+impl Render for TabTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = active_slots(cx);
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .bg(slot_to_rgba(s.panel))
+            .border_1()
+            .border_color(slot_to_rgba(s.line))
+            .text_size(px(PILL_TEXT_SIZE))
+            .text_color(slot_to_rgba(s.ink))
+            .whitespace_nowrap()
+            .child(self.title.clone())
+    }
+}
+
 // ---- The view ---------------------------------------------------------------
 
-/// The per-window toolbar (brand block + pane strip). Construct with
-/// [`WindowToolbarView::new`] over the window's shared [`WindowState`] entity; it
-/// renders the shared `model`'s active-tab panes and mutates them through the
-/// `pane_strip_actions` seam.
+/// The per-window toolbar (the leading sidebar-collapse toggle + the pane
+/// strip). Construct with [`WindowToolbarView::new`] over the window's shared
+/// [`WindowState`] entity; it renders the shared `model`'s active-tab panes and
+/// mutates them through the `pane_strip_actions` seam.
 pub(crate) struct WindowToolbarView {
     /// The shared per-window state (the single [`TabModel`] plus the pane-strip
     /// select/close/add seam). This view renders the active tab's panes from it
@@ -966,69 +969,58 @@ impl WindowToolbarView {
 
     // MARK: - Rendering
 
-    fn render_brand(&self, s: &Slots, cx: &mut App) -> impl IntoElement {
-        let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
+    /// The leading sidebar-collapse toggle (mock's `.tb-btn`, Finder/Safari
+    /// position): the restyle's exact stroke icon rendered via gpui's `svg()`
+    /// (tinted `ink3`, hover `ink` + faint fill), sitting right of the native
+    /// traffic lights (whose cluster the toolbar's leading reserve clears). It
+    /// toggles the shared [`WindowState`]'s collapsed flag — present in both
+    /// collapsed and expanded states, replacing the old collapsed-band restore
+    /// button + the sidebar strip's collapse toggle.
+    fn render_collapse_toggle(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = ink_alpha(s, COLLAPSE_BTN_HOVER_INK_ALPHA);
+        let ink = slot_to_rgba(s.ink);
+        let ink3 = slot_to_rgba(s.ink3);
         div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(BRAND_GAP))
+            .id("toolbar.collapseSidebar")
+            .group("toolbar.collapseSidebar")
             .flex_none()
-            // Brand mark (`Logo.swift`): the accent rounded square (rect x=1
-            // y=1 20×20 r=6 of the 22×22 viewBox) as a centered div, with the
-            // white chevron+underline stroke rasterized on the exact prod path
-            // overlaid across the full 22pt canvas — the shared viewBox keeps
-            // the two layers registered.
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(COLLAPSE_BTN_W))
+            .h(px(COLLAPSE_BTN_H))
+            .mr(px(COLLAPSE_BTN_TRAILING_MARGIN))
+            .rounded(px(COLLAPSE_BTN_RADIUS))
+            .hover(move |st| st.bg(hover))
             .child(
-                div()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(LOGO_SIZE))
-                    .h(px(LOGO_SIZE))
-                    .child(
-                        div()
-                            .w(px(LOGO_SQUARE))
-                            .h(px(LOGO_SQUARE))
-                            .rounded(px(LOGO_SQUARE_RADIUS))
-                            .bg(accent),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .w(px(LOGO_SIZE))
-                            .h(px(LOGO_SIZE))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(logo_mark_icon(
-                                ICON_LOGO_MARK,
-                                white(),
-                                self.window_scale,
-                                cx,
-                            )),
-                    ),
+                // gpui tints the SVG's alpha mask with the element's own text
+                // colour, so it must be set explicitly (`ink3` at rest); the
+                // group-hover swaps it to `ink` when the button box is hovered,
+                // matching the box's faint fill exactly.
+                gpui::svg()
+                    .path(crate::chrome_icons::SIDEBAR_TOGGLE)
+                    .w(px(crate::chrome_icons::SIDEBAR_TOGGLE_W))
+                    .h(px(crate::chrome_icons::SIDEBAR_TOGGLE_H))
+                    .text_color(ink3)
+                    .group_hover("toolbar.collapseSidebar", move |st| st.text_color(ink)),
             )
-            // Wordmark.
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(slot_to_rgba(s.ink))
-                    .child(SharedString::from("Nice")),
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                    this.toggle_sidebar_collapsed(cx);
+                    cx.stop_propagation();
+                }),
             )
-            // Vertical separator (1×20, 6pt side margins).
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(1.0))
-                    .h(px(SEPARATOR_HEIGHT))
-                    .mx(px(SEPARATOR_MARGIN_X))
-                    .bg(slot_to_rgba(s.line)),
-            )
+    }
+
+    /// Toggle the shared sidebar collapsed flag via the one
+    /// [`WindowState::toggle_sidebar_collapsed`] seam (expanding also clears any
+    /// peek). The state entity notifies from inside that seam, so this view's own
+    /// `cx.observe(&state)` subscription re-renders the titlebar and the sibling
+    /// shell's observer re-renders the sidebar — no separate `cx.notify()` here.
+    /// The collapse control now lives in the titlebar.
+    fn toggle_sidebar_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, wcx| ws.toggle_sidebar_collapsed(wcx));
     }
 
     // MARK: - Pill reorder (R25)
@@ -1237,15 +1229,24 @@ impl WindowToolbarView {
         let ink = slot_to_rgba(s.ink);
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
+        // The tab's text tint: active → `ink`, inactive → `ink3` (mock Style A
+        // `.tab` / `.tab.active`). The leading glyph tracks the same tint.
+        let tab_ink = if is_active { ink } else { ink3 };
+        // Tab titles use the terminal font family (not the UI sans), read from the
+        // shared font settings; `None` before the keymap wires it (isolated
+        // scenarios) leaves the default font.
+        let tab_family = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
 
-        // Leading icon: per-pane StatusDot for Claude, else the `terminal`
-        // symbol — 12pt regular in a 12pt box (`WindowToolbarView.swift:903-906`).
+        // Leading icon: per-pane StatusDot for Claude (6pt in the strip — only the
+        // size parameter changes; colours + pulse untouched), else the `terminal`
+        // symbol tinted like the title.
         let leading = match vm.kind {
             PaneKind::Claude => StatusDot::new(
                 SharedString::from(format!("pill.{}", vm.id)),
                 vm.status,
                 slot_srgba(s.ink3),
             )
+            .size(TAB_STATUS_DOT_SIZE)
             .suppress_waiting_pulse(vm.waiting_ack)
             .into_any_element(),
             PaneKind::Terminal => div()
@@ -1259,7 +1260,7 @@ impl WindowToolbarView {
                     ICON_TERMINAL,
                     PILL_ICON_SIZE,
                     SymbolWeight::Regular,
-                    if is_active { ink2 } else { ink3 },
+                    tab_ink,
                     self.window_scale,
                     cx,
                 ))
@@ -1298,6 +1299,8 @@ impl WindowToolbarView {
             .into_any_element()
         } else {
             let pid = vm.id.clone();
+            let full_title = SharedString::from(vm.title.clone());
+            let tooltip_title = full_title.clone();
             // The title tap is a CLICK (mouse-up with no drag), not a mouse-down
             // — prod's `.onTapGesture` on `titleView`
             // (`WindowToolbarView.swift:883-888`) and the same fix the sidebar
@@ -1316,13 +1319,13 @@ impl WindowToolbarView {
                 .whitespace_nowrap()
                 .truncate()
                 .text_size(px(PILL_TEXT_SIZE))
-                .font_weight(if is_active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
+                .text_color(tab_ink)
+                .child(full_title)
+                // Full-title hover tooltip (the tail-ellipsized name in full).
+                .tooltip(move |_window, cx| {
+                    let title = tooltip_title.clone();
+                    cx.new(|_| TabTooltip { title }).into()
                 })
-                .text_color(if is_active { ink } else { ink2 })
-                .child(SharedString::from(vm.title.clone()))
                 .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
                     this.handle_title_tap(&pid, window, cx);
                     // Consume so the pill's own click listener doesn't also
@@ -1333,32 +1336,9 @@ impl WindowToolbarView {
         };
 
         // Trailing close "×" — its 16pt slot is always reserved (visibility
-        // toggled) so the pill width never jumps on hover.
+        // toggled) so the tab width never jumps on hover.
         let show_close = vm.is_hovered || is_active;
         let close = self.render_close_button(&vm.id, show_close, s, cx);
-
-        let bg = if is_active {
-            slot_to_rgba(s.panel)
-        } else if vm.is_hovered {
-            ink_alpha(s, PILL_HOVER_INK_ALPHA)
-        } else {
-            Rgba {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }
-        };
-        let border = if is_active {
-            slot_to_rgba(s.line)
-        } else {
-            Rgba {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }
-        };
 
         let pid_select = vm.id.clone();
         let pid_down = vm.id.clone();
@@ -1376,23 +1356,37 @@ impl WindowToolbarView {
         };
         let ghost_title = SharedString::from(vm.title.clone());
 
-        let mut pill = div()
+        // The tab is fill-less (no pill background, border, rounding, or shadow —
+        // mock Style A): just the dot / title / ✕ row, full bar height, with a 2px
+        // accent underline seated on the bar's bottom edge marking the active tab.
+        let pill = div()
             .id(pill_id)
+            .relative()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(PILL_GAP))
-            .pl(px(PILL_LEADING_PAD))
-            .pr(px(PILL_TRAILING_PAD))
+            .px(px(TAB_PAD_X))
             .h(px(PILL_HEIGHT))
             .max_w(px(PILL_MAX_WIDTH))
-            .rounded(px(PILL_RADIUS))
-            .bg(bg)
-            .border_1()
-            .border_color(border)
+            .when_some(tab_family, |el, fam| el.font_family(fam))
             .child(leading)
             .child(title)
             .child(close)
+            // Active-tab accent underline (inset 11px from the tab's outer edges,
+            // 2px tall, on the bar's bottom edge — mock `.tab.active::after`).
+            .when(is_active, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(TAB_UNDERLINE_INSET))
+                        .right(px(TAB_UNDERLINE_INSET))
+                        .h(px(TAB_UNDERLINE_HEIGHT))
+                        .rounded(px(TAB_UNDERLINE_RADIUS))
+                        .bg(srgba_to_rgba(accent)),
+                )
+            })
             // The pill carries `.id()` + `on_drag` ONLY — `on_drag_move` / `on_drop`
             // live on the scroll row (the tracked viewport, D8). gpui subtracts the
             // constructor's `Point` offset (the grab point within the pill) when it
@@ -1453,9 +1447,6 @@ impl WindowToolbarView {
                     cx.stop_propagation();
                 }),
             );
-        if is_active {
-            pill = pill.shadow(pill_shadow());
-        }
         pill.into_any_element()
     }
 
@@ -1650,9 +1641,8 @@ impl WindowToolbarView {
                 .items_center()
                 .gap(px(PILL_GAP))
                 .h(px(PILL_HEIGHT))
-                .pl(px(PILL_LEADING_PAD))
-                .pr(px(PILL_TRAILING_PAD))
-                .rounded(px(PILL_RADIUS))
+                .px(px(TAB_PAD_X))
+                .rounded(px(6.0))
                 .cursor_pointer()
                 .hover(move |st| st.bg(hover))
                 // A zero-visual probe recording the pill's painted window-content
@@ -1788,23 +1778,24 @@ impl Render for WindowToolbarView {
             .items_center()
             .w_full()
             .h(px(TOP_BAR_HEIGHT))
-            .pl(px(TOOLBAR_LEADING_PAD))
+            // Leading reserve so the native traffic-light cluster clears before the
+            // collapse toggle (the titlebar is now full-width in both shell states,
+            // so its left edge sits under the lights). No fill and no bottom rule —
+            // the fill-less restyle titlebar; the window-body backing shows through
+            // (plan `docs/plans/restyle/01-titlebar-restyle.md`).
+            .pl(px(traffic_light_reserved_width()))
             .pr(px(TOOLBAR_TRAILING_PAD))
-            .bg(slot_to_rgba(s.chrome))
-            // Empty-band drag / double-click (the pills + buttons stop_propagation
-            // so only the empty chrome reaches these — the R9 differential pair).
+            // Empty-band drag / double-click (the tabs + buttons stop_propagation
+            // so only the empty titlebar reaches these — the R9 differential pair).
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_band_mouse_down))
             .on_mouse_move(cx.listener(Self::on_band_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
-            .child(self.render_brand(&s, cx))
+            .child(self.render_collapse_toggle(&s, cx))
             .child(self.render_strip(&panes, &s, cx))
             // Trailing update-pill slot (R27, P7): the conditional update pill,
             // inserted between the strip and the popup layer. It renders ONLY when
             // a newer release is available — absent, it emits nothing, so the
-            // toolbar with no update is byte-identical to today. The toolbar's old
-            // local bottom hairline is gone — the shell paints one full-width
-            // title-bar divider at window level instead
-            // (`SidebarShellView::build_top_bar_divider`, M2 Item C).
+            // toolbar with no update is byte-identical to today.
             .children(self.render_update_pill(&s, cx))
             .children(self.context_menu.clone())
             // The update popover (D9), rendered as a deferred child while open.
@@ -1935,17 +1926,17 @@ impl WindowToolbarView {
 
     /// The on-screen content-view centre of `pane_id`'s trailing "×" close square,
     /// as `(x, y_from_top)` — the R20.5 `close-confirmation` scenario's real-CGEvent
-    /// target. The `×` is the pill's last child: `PILL_TRAILING_PAD` in from the
-    /// right edge, `CLOSE_BTN_SIZE` wide, so its centre sits `PILL_TRAILING_PAD +
-    /// CLOSE_BTN_SIZE/2` left of the pill's right edge. The offset-free pill bounds
-    /// get the live scroll offset applied (matching `scenario_pill_bounds`'s
-    /// coordinate convention). `None` when the pane is not laid out. NB the `×` is
-    /// only hit-testable while the pane is hovered/active — select it first.
+    /// target. The `×` is the tab's last child: `TAB_PAD_X` in from the right edge,
+    /// `CLOSE_BTN_SIZE` wide, so its centre sits `TAB_PAD_X + CLOSE_BTN_SIZE/2` left
+    /// of the tab's right edge. The offset-free pill bounds get the live scroll
+    /// offset applied (matching `scenario_pill_bounds`'s coordinate convention).
+    /// `None` when the pane is not laid out. NB the `×` is only hit-testable while
+    /// the pane is hovered/active — select it first.
     pub(crate) fn scenario_close_button_center(&self, pane_id: &str, cx: &App) -> Option<(f32, f32)> {
         let b = self.scenario_pill_bounds(pane_id, cx)?;
         let off = f32::from(self.scroll.offset().x);
         let right = f32::from(b.origin.x) + off + f32::from(b.size.width);
-        let x = right - PILL_TRAILING_PAD - CLOSE_BTN_SIZE / 2.0;
+        let x = right - TAB_PAD_X - CLOSE_BTN_SIZE / 2.0;
         let y = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
         Some((x, y))
     }

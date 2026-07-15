@@ -113,6 +113,7 @@ mod app_shell;
 mod app_shell_live;
 mod atomic_file;
 mod built_in_terminal_themes;
+mod chrome_icons;
 mod chrome_live;
 mod claude_e2e_live;
 mod claude_hook_installer;

@@ -352,7 +352,9 @@ fn register_window_scoped_actions(cx: &mut App) {
         });
     });
     cx.on_action(|_: &ToggleSidebar, cx: &mut App| {
-        with_active_state(cx, |s, _cx| s.sidebar.toggle_sidebar());
+        // Route through the shared WindowState seam so ⌘B gets the same
+        // peek-clear-on-expand + state notification as the titlebar toggle.
+        with_active_state(cx, |s, cx| s.toggle_sidebar_collapsed(cx));
     });
     cx.on_action(|_: &ToggleSidebarMode, cx: &mut App| {
         with_active_state(cx, |s, _cx| {

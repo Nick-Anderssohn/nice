@@ -1,18 +1,23 @@
-//! Chrome geometry constants, ported verbatim from `WindowChrome.swift` and
-//! `AppShellView.swift` — every magic number the chrome plans (R9–R11) will
-//! need, named once. Values are logical points (SwiftUI/AppKit points, which
-//! equal gpui px at scale 1).
+//! Chrome geometry constants. Values are logical points (SwiftUI/AppKit points,
+//! which equal gpui px at scale 1).
 //!
-//! Provenance is cited per constant. One block ([`MACOS26_TRAFFIC_LIGHT_LEADINGS`]
-//! / [`MACOS26_TRAFFIC_LIGHT_PITCH`]) is documentary and cites a project-memory
-//! note rather than a Swift line, because the Swift code deliberately does not
-//! hardcode those OS-owned values — see that block's doc comment.
+//! Provenance: the 2026-07 restyle rebased the titlebar constants on
+//! `docs/design/restyle-mocks.html` (approved variant Style A, 28pt bar) and its
+//! plan set (`docs/plans/restyle/`), which supersede the earlier Swift-parity
+//! citations for the top-bar height and the traffic-light layout. The remaining
+//! sidebar / card constants still cite their `AppShellView.swift` origins. One
+//! block ([`MACOS26_TRAFFIC_LIGHT_LEADINGS`] / [`MACOS26_TRAFFIC_LIGHT_PITCH`])
+//! is documentary and cites a project-memory note, because the OS owns those
+//! values — see that block's doc comment.
 
 // ---- Top bar ----------------------------------------------------------------
 
-/// Height (pt) of the custom hidden-title-bar top band — the row the traffic
-/// lights, toolbar pills, and sidebar icons all center on. `WindowChrome.swift:26`.
-pub const TOP_BAR_HEIGHT: f32 = 52.0;
+/// Height (pt) of the slim unified titlebar — the true macOS-standard titlebar
+/// height, at which the native traffic lights center without repositioning. The
+/// 2026-07 restyle dropped it from the old 52pt band to 28pt
+/// (`docs/design/restyle-mocks.html`, Style A / 28pt bar; plan
+/// `docs/plans/restyle/01-titlebar-restyle.md`).
+pub const TOP_BAR_HEIGHT: f32 = 28.0;
 
 // ---- Sidebar ----------------------------------------------------------------
 
@@ -34,78 +39,59 @@ pub const SIDEBAR_PEEK_WIDTH: f32 = 240.0;
 pub const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
 
 // ---- Traffic lights ---------------------------------------------------------
+//
+// The 2026-07 restyle stopped repositioning the native window buttons: at the
+// true 28pt titlebar the OS centers them itself, so `crate::app::window_options`
+// now passes `traffic_light_position: None` and the placer constants
+// (nudge / absolute-center / cluster-width) are retired. Only the DOCUMENTARY
+// native-defaults block below survives, plus the leading reserve the titlebar
+// keeps before the sidebar-collapse toggle so it clears the button cluster.
 
-/// Uniform inward x-nudge applied to each native window button's OWN live
-/// default leading x (preserves the OS-native inter-button pitch). 8pt clears
-/// the sidebar card's 8pt rounded corner. `WindowChrome.swift:38`.
-pub const TRAFFIC_LIGHT_NUDGE_X: f32 = 8.0;
+/// Native diameter (pt) of a standard macOS window button (close / minimize /
+/// zoom). Measured live on macOS 26 (14×14). Feeds only the
+/// [`traffic_light_reserved_width`] reserve bound now that the buttons sit at
+/// their OS-native position. Provenance: project-memory note
+/// `reference_traffic_light_geometry_macos26`.
+pub const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
 
-/// Legacy documentary y-nudge (pt), superseded by the absolute
-/// [`TRAFFIC_LIGHT_CENTER_FROM_TOP`]. On macOS 26 they agree exactly. Kept so
-/// the relationship stays discoverable. `WindowChrome.swift:48`.
-pub const TRAFFIC_LIGHT_NUDGE_Y: f32 = -10.0;
+/// Gap (pt) the titlebar leaves between the traffic-light cluster's trailing
+/// edge and the sidebar-collapse toggle that follows it (the Finder/Safari
+/// spacing in `docs/design/restyle-mocks.html`, `.lights` right pad + `.tb-btn`
+/// leading).
+pub const TRAFFIC_LIGHT_TRAILING_GAP: f32 = 14.0;
 
-/// Window-y (pt) of the traffic-light visual centers, measured from the window
-/// top; equals `TOP_BAR_HEIGHT / 2`. The placer targets this absolutely
-/// (OS-version-independent). `WindowChrome.swift:56`.
-pub const TRAFFIC_LIGHT_CENTER_FROM_TOP: f32 = 26.0;
-
-/// macOS ≤ 15 default close-button leading x (pt). NO LONGER read for button
-/// placement (the placer captures each button's live default); feeds only the
-/// [`traffic_light_reserved_width`] reserve bound. `WindowChrome.swift:66`.
-pub const TRAFFIC_LIGHT_DEFAULT_LEADING: f32 = 20.0;
-
-/// Span (pt) of the three standard window buttons, close-leading →
-/// zoom-trailing. `WindowChrome.swift:72`.
-pub const TRAFFIC_LIGHT_CLUSTER_WIDTH: f32 = 54.0;
-
-/// Leading width (pt) the collapsed shell's full-width title-bar band reserves
-/// for the nudged traffic lights: `default_leading + nudge_x + cluster_width`
-/// = 82. A conservative stale-macOS upper bound, decoupled from the OS-robust
-/// placer. `WindowChrome.swift:85-87`.
+/// Leading width (pt) the titlebar reserves before its first control so the
+/// native traffic-light cluster clears: the zoom button's leading
+/// (`MACOS26_TRAFFIC_LIGHT_LEADINGS[2]`) + one [`TRAFFIC_LIGHT_DIAMETER`] +
+/// [`TRAFFIC_LIGHT_TRAILING_GAP`] = 83. Re-derived from the native macOS-26
+/// leadings (no nudge) after the restyle retired the old placer formula. Cites
+/// `docs/design/restyle-mocks.html` + plan `docs/plans/restyle/01-titlebar-restyle.md`.
 pub const fn traffic_light_reserved_width() -> f32 {
-    TRAFFIC_LIGHT_DEFAULT_LEADING + TRAFFIC_LIGHT_NUDGE_X + TRAFFIC_LIGHT_CLUSTER_WIDTH
+    MACOS26_TRAFFIC_LIGHT_LEADINGS[2] + TRAFFIC_LIGHT_DIAMETER + TRAFFIC_LIGHT_TRAILING_GAP
 }
 
 // ---- macOS 26 native traffic-light defaults ---------------------------------
 //
 // The live per-button leading origins observed on macOS 26 — 9 / 32 / 55 pt at
-// a 23pt inter-button pitch. R9 promoted the FIRST of these from "documentary
-// only" to LOAD-BEARING, and the split now matters:
-//
-//   * `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]` (9, the close leading) is a real input
-//     to placement. Swift's `TrafficLightPlacer` read each button's OWN live
-//     native default and added the 8pt nudge (captured-default-plus-8,
-//     `WindowChrome.swift:60-66`); GPUI instead takes an ABSOLUTE close-button
-//     origin, so R9 sets the close leading to `MACOS26_TRAFFIC_LIGHT_LEADINGS[0]
-//     + TRAFFIC_LIGHT_NUDGE_X` = 17 (`crate::app::window_options` in the `nice`
-//     crate). That is the documented divergence from the Swift approach, and it
-//     makes this token load-bearing for the first time: if a future macOS shifts
-//     its native close leading, THIS value is what changes — the R9 `chrome` live
-//     scenario asserts the RENDERED close-button x from
-//     `standard_window_button_frames()`, so any drift from the shipped geometry
-//     surfaces there rather than silently.
-//   * `MACOS26_TRAFFIC_LIGHT_LEADINGS[1..3]` (32 / 55) and
-//     `MACOS26_TRAFFIC_LIGHT_PITCH` (23) stay DOCUMENTARY sanity-check values.
-//     GPUI derives the minimize/zoom x-positions from the live button widths +
-//     system padding and preserves the OS-native pitch with no code of ours, so
-//     these are only the expected values the live scenario checks the queried
-//     frames against — never inputs to placement.
+// a 23pt inter-button pitch. Since the restyle no longer repositions the
+// buttons (`traffic_light_position: None`), these are the values the OS places
+// them at; the `chrome` / `sidebar` live scenarios assert the RENDERED frames
+// (from `standard_window_button_frames()`) against them, so any OS drift
+// surfaces there. `[2]` (the zoom leading) also feeds
+// [`traffic_light_reserved_width`].
 //
 // Provenance: project-memory note `reference_traffic_light_geometry_macos26`
 // (there is deliberately NO Swift source line — the Swift code does not
-// hardcode them). This is the one documented exception to the
-// fixture-provenance "cite a Swift line" convention (see crates/README.md).
+// hardcode them). See crates/README.md.
 
 /// Observed macOS 26 native leading origins (pt) of the close / minimize / zoom
-/// buttons. `[0]` (the close leading) is LOAD-BEARING — R9's absolute close-x is
-/// `[0] + TRAFFIC_LIGHT_NUDGE_X` (see the block comment above); `[1]` / `[2]` are
-/// documentary sanity-check values (GPUI derives the minimize/zoom x from the
-/// live buttons).
+/// buttons, now that the app leaves them at their OS-native position. `[2]` (the
+/// zoom leading) feeds [`traffic_light_reserved_width`]; all three are the
+/// expected values the live scenarios check the queried frames against.
 pub const MACOS26_TRAFFIC_LIGHT_LEADINGS: [f32; 3] = [9.0, 32.0, 55.0];
 
-/// Observed macOS 26 native inter-button pitch (pt). Documentary only — GPUI
-/// preserves the OS-native pitch itself; see the block comment above.
+/// Observed macOS 26 native inter-button pitch (pt). The live scenarios assert
+/// the rendered pitch against it; see the block comment above.
 pub const MACOS26_TRAFFIC_LIGHT_PITCH: f32 = 23.0;
 
 // ---- Cards (sidebar) ---------------------------------------------------------
@@ -147,8 +133,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn top_bar_and_sidebar_match_swift() {
-        assert_eq!(TOP_BAR_HEIGHT, 52.0); // WindowChrome.swift:26
+    fn top_bar_is_the_restyle_slim_titlebar() {
+        // docs/design/restyle-mocks.html (Style A / 28pt bar); plan
+        // docs/plans/restyle/01-titlebar-restyle.md.
+        assert_eq!(TOP_BAR_HEIGHT, 28.0);
+    }
+
+    #[test]
+    fn sidebar_constants_match_swift() {
         assert_eq!(SIDEBAR_DEFAULT_WIDTH, 240.0); // AppShellView.swift:129
         assert_eq!(SIDEBAR_MIN_WIDTH, 160.0); // AppShellView.swift:882
         assert_eq!(SIDEBAR_MAX_WIDTH, 480.0); // AppShellView.swift:882
@@ -157,38 +149,27 @@ mod tests {
     }
 
     #[test]
-    fn traffic_light_constants_match_swift() {
-        assert_eq!(TRAFFIC_LIGHT_NUDGE_X, 8.0); // WindowChrome.swift:38
-        assert_eq!(TRAFFIC_LIGHT_NUDGE_Y, -10.0); // WindowChrome.swift:48
-        assert_eq!(TRAFFIC_LIGHT_CENTER_FROM_TOP, 26.0); // WindowChrome.swift:56
-        assert_eq!(TRAFFIC_LIGHT_DEFAULT_LEADING, 20.0); // WindowChrome.swift:66
-        assert_eq!(TRAFFIC_LIGHT_CLUSTER_WIDTH, 54.0); // WindowChrome.swift:72
-    }
-
-    #[test]
-    fn reserved_width_matches_swift_derivation() {
-        // trafficLightDefaultLeading + trafficLightNudgeX + trafficLightClusterWidth
-        // = 20 + 8 + 54 = 82 (WindowChrome.swift:85-87).
-        assert_eq!(traffic_light_reserved_width(), 82.0);
-    }
-
-    #[test]
-    fn center_is_half_the_top_bar() {
-        // WindowChrome.swift:52-56 — the center equals topBarHeight / 2.
-        assert_eq!(TRAFFIC_LIGHT_CENTER_FROM_TOP, TOP_BAR_HEIGHT / 2.0);
+    fn reserved_width_is_derived_from_the_native_leadings() {
+        // zoom leading (55) + one button diameter (14) + trailing gap (14) = 83.
+        // Re-derived from MACOS26_TRAFFIC_LIGHT_LEADINGS after the restyle retired
+        // the old placer formula (docs/design/restyle-mocks.html; plan
+        // docs/plans/restyle/01-titlebar-restyle.md).
+        assert_eq!(traffic_light_reserved_width(), 83.0);
+        assert_eq!(
+            traffic_light_reserved_width(),
+            MACOS26_TRAFFIC_LIGHT_LEADINGS[2] + TRAFFIC_LIGHT_DIAMETER + TRAFFIC_LIGHT_TRAILING_GAP
+        );
     }
 
     #[test]
     fn macos26_native_defaults_recorded() {
-        // Project-memory note reference_traffic_light_geometry_macos26. `[0]` is
-        // load-bearing (R9's absolute close-x = `[0] + TRAFFIC_LIGHT_NUDGE_X`,
-        // consumed by `crate::app::window_options` in `nice`); `[1]`/`[2]`/pitch
-        // stay documentary. The load-bearing derivation is pinned in `nice`'s own
-        // `traffic_light_target_centers_on_the_y26_row` test.
+        // Project-memory note reference_traffic_light_geometry_macos26 — the
+        // OS-native positions the buttons sit at now that the app passes
+        // `traffic_light_position: None`. The live `chrome` / `sidebar` scenarios
+        // assert the rendered frames against these.
         assert_eq!(MACOS26_TRAFFIC_LIGHT_LEADINGS, [9.0, 32.0, 55.0]);
         assert_eq!(MACOS26_TRAFFIC_LIGHT_PITCH, 23.0);
-        // The close leading feeds R9's absolute close-button x of 17.
-        assert_eq!(MACOS26_TRAFFIC_LIGHT_LEADINGS[0] + TRAFFIC_LIGHT_NUDGE_X, 17.0);
+        assert_eq!(TRAFFIC_LIGHT_DIAMETER, 14.0);
     }
 
     #[test]

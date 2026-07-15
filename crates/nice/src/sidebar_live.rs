@@ -16,20 +16,12 @@
 //!     invisible zone a synthetic press may miss, an unregistered drag is a
 //!     **DEFERRED HUMAN PASS**, not a fail (the same honest-deferral
 //!     `chrome_live` uses for effects a synthetic CGEvent provably can't drive).
-//!   * **§3 collapsed band geometry** — collapsing removes the leading column
-//!     entirely (the M2 design: no cap card; `scenario_leading_column_width`
-//!     reports 0). In the full-width band, the 82pt traffic-light spacer clears
-//!     the LIVE zoom button's trailing edge and the bare restore button's rect
-//!     has zero x-overlap with any traffic light (drift assertions over R9's
-//!     [`standard_window_button_frames`]), and the R9 close-x / y-26 /
-//!     equal-pitch geometry is **re-asserted** (the BUG-B stale-capture guard).
-//!     Restoring returns the column.
-//!   * **§3 drag differential** — a CGEvent press-drag on the sidebar top strip
-//!     (R9 band pattern) vs the same drag inside the card body (a tab-row
-//!     region), judged by real NSWindow frame reads: the strip drag moves the
-//!     window (DEFERRED — `performWindowDragWithEvent:` tracks the physical
-//!     cursor `CGEventPostToPid` does not move), the body drag must leave the
-//!     frame put (hard).
+//!   * **§3 collapse** — collapsing removes the leading column entirely (the
+//!     2026-07 restyle keeps the M2 design: no cap card; the full-width titlebar
+//!     row over the full-width body, so `scenario_leading_column_width` reports
+//!     0). Restoring returns the column. (The window-drag region + traffic-light
+//!     geometry now live in the titlebar, not the sidebar strip; `chrome_live` and
+//!     `pane_strip_live` own those.)
 //!   * **§4 dots** — with the model driven into all four dot states
 //!     (thinking / waiting-unacked / waiting-acked / idle), the dot colour per
 //!     token and the pulse-presence rule are asserted at the state level off the
@@ -50,15 +42,14 @@ use gpui::{prelude::*, AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_model::{Pane, PaneKind, Tab, TabModel, TabStatus};
 use nice_theme::chrome_geometry::{
-    traffic_light_reserved_width, CARD_INSET, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH,
-    SIDEBAR_MIN_WIDTH, TRAFFIC_LIGHT_CENTER_FROM_TOP,
+    CARD_INSET, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette};
 use nice_theme::status::{THINKING_DOT, WAITING_DOT};
 
 use crate::app;
-use crate::platform::{self, WindowButtonFrame};
+use crate::platform;
 use crate::sidebar_shell::SidebarShellView;
 use crate::status_dot::{status_dot_base_color, status_dot_should_pulse};
 use crate::theme::slot_srgba;
@@ -66,26 +57,14 @@ use crate::window_state::WindowState;
 
 // -- fixed geometry / tolerances --------------------------------------------
 
-/// The R9 absolute close-button leading x (`MACOS26_TRAFFIC_LIGHT_LEADINGS[0]` +
-/// `TRAFFIC_LIGHT_NUDGE_X` = 17), re-asserted against the RENDERED close frame.
-const EXPECTED_CLOSE_X: f32 = 17.0;
-/// Tolerance (pt) for the close-button centre / x assertions.
+/// Tolerance (pt) for the expanded-width assertion.
 const GEOMETRY_TOL: f32 = 0.5;
-/// Tolerance (pt) for "the three buttons are equally pitched".
-const PITCH_TOL: f32 = 0.6;
 /// Tolerance (pt) for a width-clamp / reset assertion (`clamp` is exact; this
 /// only absorbs the CGEvent content↔global round-trip).
 const WIDTH_TOL: f32 = 1.0;
-/// The restore button's diameter (pt) in the collapsed full-width band — the
-/// 24pt icon button `SidebarShellView::icon_button` mints (`sidebar_shell.rs`).
-const RESTORE_BUTTON_W: f32 = 24.0;
 /// A resize drag distance (pt) large enough to force the clamp from any start in
 /// [160, 480] (min−max span is 320, so ±400 always overshoots the bound).
 const RESIZE_OVERSHOOT: f64 = 400.0;
-/// Horizontal drag distance (pt) for the §3 window-move differential.
-const DRAG_DX: f64 = 48.0;
-/// A frame delta (pt) below which the window is considered "unchanged".
-const FRAME_EPS: f64 = 4.0;
 
 /// Accessibility-grant remediation, shared verbatim with the other CGEvent
 /// scenarios.
@@ -213,12 +192,8 @@ async fn run_sidebar(cx: &mut AsyncApp, whandle: WindowHandle<SidebarShellView>)
     // §3 — resize clamp + double-click reset (attempt / defer).
     resize_checks(cx, whandle, &view, pid, &mut failures, &mut deferred).await;
 
-    // §3 — the drag differential (strip moves the window; body drag does not).
-    drag_differential(cx, whandle, pid, &mut failures, &mut deferred).await;
-
-    // §3 — collapsed band geometry (no leading column + drift assertions + R9
-    // re-assert), then restore.
-    collapse_checks(cx, whandle, &view, &mut failures).await;
+    // §3 — collapse removes the leading column, then restore returns it.
+    collapse_checks(cx, &view, &mut failures).await;
     restore_check(cx, &view, &mut failures).await;
 
     // §4 — dot colour + pulse per state (state-level, off the view's predicates).
@@ -245,23 +220,6 @@ fn drive_collapse(cx: &mut AsyncApp, view: &Entity<SidebarShellView>) {
     let _ = view.update(cx, |v, cx| v.drive_toggle_collapsed(cx));
 }
 
-fn read_button_frames(
-    cx: &mut AsyncApp,
-    whandle: WindowHandle<SidebarShellView>,
-) -> Option<[WindowButtonFrame; 3]> {
-    whandle
-        .update(cx, |_v, w, _a| platform::standard_window_button_frames(w))
-        .ok()
-        .flatten()
-}
-
-fn read_frame(cx: &mut AsyncApp, whandle: WindowHandle<SidebarShellView>) -> Option<[f64; 4]> {
-    whandle
-        .update(cx, |_v, w, _a| platform::window_screen_frame(w))
-        .ok()
-        .flatten()
-}
-
 fn to_global(
     cx: &mut AsyncApp,
     whandle: WindowHandle<SidebarShellView>,
@@ -274,44 +232,6 @@ fn to_global(
         })
         .ok()
         .flatten()
-}
-
-// ---- §3 geometry predicate (R9 re-assert) ----------------------------------
-
-/// The pure R9 traffic-light geometry predicate over the three live frames
-/// (mirror of `chrome_live::check_geometry`): all three exist, the close button's
-/// visual centre sits on the y-26 row and its x-origin at 17, equal pitch.
-fn check_geometry(frames: &[WindowButtonFrame; 3]) -> std::result::Result<String, String> {
-    let [close, mini, zoom] = frames;
-    let mut errs: Vec<String> = Vec::new();
-
-    for (name, f) in [("close", close), ("minimize", mini), ("zoom", zoom)] {
-        if f.width <= 0.0 || f.height <= 0.0 {
-            errs.push(format!("{name} button has a degenerate frame {f:?}"));
-        }
-    }
-    let cy = close.center_from_top();
-    if (cy - TRAFFIC_LIGHT_CENTER_FROM_TOP).abs() > GEOMETRY_TOL {
-        errs.push(format!(
-            "close centre y={cy:.2} not within ±{GEOMETRY_TOL} of {TRAFFIC_LIGHT_CENTER_FROM_TOP}"
-        ));
-    }
-    if (close.x - EXPECTED_CLOSE_X).abs() > GEOMETRY_TOL {
-        errs.push(format!("close x={:.2} not within ±{GEOMETRY_TOL} of {EXPECTED_CLOSE_X}", close.x));
-    }
-    let p1 = mini.x - close.x;
-    let p2 = zoom.x - mini.x;
-    if (p1 - p2).abs() > PITCH_TOL {
-        errs.push(format!(
-            "unequal pitch: close→min {p1:.2} vs min→zoom {p2:.2} (Δ {:.2} > {PITCH_TOL})",
-            (p1 - p2).abs()
-        ));
-    }
-    if errs.is_empty() {
-        Ok(format!("close(x={:.2}, centre_y={cy:.2}), equal pitch {p1:.2}≈{p2:.2}", close.x))
-    } else {
-        Err(errs.join("; "))
-    }
 }
 
 // ---- §3 resize clamp + double-click reset ----------------------------------
@@ -389,7 +309,7 @@ fn handle_x(width: f32) -> f64 {
     (CARD_INSET + width - 2.0) as f64
 }
 
-/// A y comfortably inside the card body (below the 52pt strip), for the handle
+/// A y comfortably inside the card body (below the top strip), for the handle
 /// drag / double-click.
 const HANDLE_DRAG_Y: f64 = 200.0;
 
@@ -433,102 +353,10 @@ async fn cg_double_click_handle(
     settle(cx, 200).await;
 }
 
-// ---- §3 drag differential (strip vs card body) -----------------------------
-
-async fn drag_differential(
-    cx: &mut AsyncApp,
-    whandle: WindowHandle<SidebarShellView>,
-    pid: i32,
-    failures: &mut Vec<String>,
-    deferred: &mut Vec<String>,
-) {
-    // Top strip: the leading part of the 52pt strip, clear of the trailing
-    // mode/collapse buttons, on the y-26 row (card is inset by CARD_INSET).
-    let strip_x = 100.0f64;
-    let strip_y = (CARD_INSET + TRAFFIC_LIGHT_CENTER_FROM_TOP) as f64;
-
-    let before = read_frame(cx, whandle);
-    do_cg_drag(cx, whandle, pid, strip_x, strip_y).await;
-    settle(cx, 400).await;
-    let after = read_frame(cx, whandle);
-    match (before, after) {
-        (Some(b), Some(a)) => {
-            let dx = a[0] - b[0];
-            let dy = a[1] - b[1];
-            if (dx - DRAG_DX).abs() <= 10.0 && dy.abs() <= 10.0 {
-                eprintln!("[selftest] sidebar strip drag: window moved by ({dx:.1},{dy:.1}) ≈ the {DRAG_DX}pt drag");
-            } else {
-                deferred.push(
-                    "strip drag: the NSWindow frame did not follow the synthetic drag — \
-                     performWindowDragWithEvent: tracks the PHYSICAL cursor, which CGEventPostToPid \
-                     does not move. DEFERRED to a human drag; the card-body-drag half below IS \
-                     asserted."
-                        .to_string(),
-                );
-            }
-            let _ = whandle.update(cx, |_v, w, _a| platform::set_window_frame(w, b));
-            settle(cx, 250).await;
-        }
-        _ => failures.push("strip drag: could not read the NSWindow frame".to_string()),
-    }
-    let _ = cx.update(|app| app.activate(true));
-    settle(cx, 250).await;
-
-    // Card body (a tab-row region): well below the 52pt strip, inside the card
-    // (x=100 < the min 160pt card width). The strip's band handlers are confined
-    // to the strip, so a body press — on a row or the list gap — never arms a
-    // window drag: the frame must not move.
-    let body_x = 100.0f64;
-    let body_y = 250.0f64;
-    let before = read_frame(cx, whandle);
-    do_cg_drag(cx, whandle, pid, body_x, body_y).await;
-    settle(cx, 400).await;
-    let after = read_frame(cx, whandle);
-    match (before, after) {
-        (Some(b), Some(a)) => {
-            let dx = a[0] - b[0];
-            let dy = a[1] - b[1];
-            if dx.abs() > FRAME_EPS || dy.abs() > FRAME_EPS {
-                failures.push(format!(
-                    "card-body drag MOVED the window by ({dx:.1},{dy:.1}) — a drag below the top \
-                     strip must leave the window frame unchanged (the band only owns the strip)"
-                ));
-            } else {
-                eprintln!("[selftest] sidebar card-body drag: window frame unchanged (correct — the strip did not claim a body press)");
-            }
-        }
-        _ => failures.push("card-body drag: could not read the NSWindow frame".to_string()),
-    }
-}
-
-/// Post a synthetic left press-drag of `DRAG_DX` pt (rightward) starting at the
-/// content point `(cx_pt, cy_pt)` — the down is posted, allowed to arm, then the
-/// drag steps + release burst so a modal window-drag loop can consume them.
-async fn do_cg_drag(
-    cx: &mut AsyncApp,
-    whandle: WindowHandle<SidebarShellView>,
-    pid: i32,
-    cx_pt: f64,
-    cy_pt: f64,
-) {
-    let Some((gx, gy)) = to_global(cx, whandle, cx_pt, cy_pt) else {
-        return;
-    };
-    platform::post_left_mouse_down(pid, gx, gy, 1);
-    settle(cx, 90).await;
-    let steps = 8;
-    for i in 1..=steps {
-        let t = i as f64 / steps as f64;
-        platform::post_left_mouse_dragged(pid, gx + DRAG_DX * t, gy);
-    }
-    platform::post_left_mouse_up(pid, gx + DRAG_DX, gy, 1);
-}
-
-// ---- §3 collapsed band geometry + restore -----------------------------------
+// ---- §3 collapse (no leading column) + restore ------------------------------
 
 async fn collapse_checks(
     cx: &mut AsyncApp,
-    whandle: WindowHandle<SidebarShellView>,
     view: &Entity<SidebarShellView>,
     failures: &mut Vec<String>,
 ) {
@@ -539,60 +367,18 @@ async fn collapse_checks(
         return;
     }
 
-    // M2 Item B pin: the collapsed shell reserves NO leading column — the old
-    // floating cap card is gone, replaced by one full-width title-bar band.
+    // The collapsed shell reserves NO leading column — the full-width titlebar row
+    // over the full-width body (no cap card; the 2026-07 restyle kept the M2
+    // no-column design and dropped the collapsed band's restore button + fill).
     let lead = view.update(cx, |v, cx| v.scenario_leading_column_width(cx));
     if lead != 0.0 {
         failures.push(format!(
-            "collapse: leading column width {lead:.1} while collapsed — the M2 design renders a \
-             full-width band with no reserved column (expected 0)"
+            "collapse: leading column width {lead:.1} while collapsed — expected 0 (the full-width \
+             titlebar row + body has no reserved column)"
         ));
     } else {
-        eprintln!("[selftest] sidebar collapse: no leading column (full-width band; the cap card is gone)");
+        eprintln!("[selftest] sidebar collapse: no leading column (full-width titlebar over body)");
     }
-
-    // The native buttons survive the collapse untouched — re-assert R9 geometry
-    // (the BUG-B stale-capture guard).
-    let Some(frames) = read_button_frames(cx, whandle) else {
-        failures.push("collapse: standard_window_button_frames returned None".to_string());
-        return;
-    };
-    match check_geometry(&frames) {
-        Ok(d) => eprintln!("[selftest] sidebar collapsed-band geometry (R9 re-assert): {d}"),
-        Err(e) => failures.push(format!("collapse band geometry: {e}")),
-    }
-
-    // The band's 82pt traffic-light spacer must clear the LIVE zoom button's
-    // trailing edge, and the bare restore button — which sits immediately
-    // after the spacer, so its rect starts at content x = the reserve — must
-    // have zero x-overlap with any light.
-    let reserve = traffic_light_reserved_width();
-    let restore_x_min = reserve;
-    let restore_x_max = restore_x_min + RESTORE_BUTTON_W;
-
-    let [close, mini, zoom] = &frames;
-    let zoom_trailing = zoom.x + zoom.width;
-    if reserve + GEOMETRY_TOL < zoom_trailing {
-        failures.push(format!(
-            "collapse band: the {reserve:.1}pt traffic-light spacer does not clear the live zoom \
-             button trailing edge {zoom_trailing:.1} — the restore button would sit over the lights"
-        ));
-    } else {
-        eprintln!("[selftest] sidebar band spacer {reserve:.1}pt clears the live zoom trailing edge {zoom_trailing:.1}pt");
-    }
-    for (name, f) in [("close", close), ("minimize", mini), ("zoom", zoom)] {
-        let light_trailing = f.x + f.width;
-        if restore_x_min + GEOMETRY_TOL < light_trailing {
-            failures.push(format!(
-                "collapse band: restore button rect [{restore_x_min:.1},{restore_x_max:.1}] overlaps \
-                 the {name} light [{:.1},{light_trailing:.1}] (must have zero overlap)",
-                f.x
-            ));
-        }
-    }
-    eprintln!(
-        "[selftest] sidebar collapse: restore button at x≥{restore_x_min:.1}pt, zero overlap with the traffic lights"
-    );
 }
 
 async fn restore_check(
@@ -674,11 +460,10 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: format!(
-                "all hard sidebar assertions passed (expanded width, collapsed band: no leading \
-                 column + R9 re-assert + spacer/overlap drift guards, restore, card-body drag \
-                 no-move, dot colour/pulse per state); the resize clamps + double-click reset and \
-                 the strip window-move hard-assert when the synthetic gesture drives the real \
-                 behaviour, else DEFER; {} item(s) DEFERRED to a human pass",
+                "all hard sidebar assertions passed (expanded width, collapse: no leading column, \
+                 restore, dot colour/pulse per state); the resize clamps + double-click reset \
+                 hard-assert when the synthetic gesture drives the real behaviour, else DEFER; {} \
+                 item(s) DEFERRED to a human pass",
                 deferred.len()
             ),
         }

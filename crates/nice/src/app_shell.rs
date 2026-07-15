@@ -56,11 +56,7 @@ use gpui::{
 };
 
 use nice_term_view::{FontSettings, TerminalSessionHandle, TerminalTheme, TerminalView};
-use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 use nice_theme::color::Srgba;
-use nice_theme::palette::Slots;
-
-use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
 use crate::sidebar_shell::SidebarShellView;
 use crate::toolbar::WindowToolbarView;
@@ -171,18 +167,17 @@ impl Render for AppShellView {
         // lives on the shared `WindowState` (so the app-level quit/close paths can
         // present it) and renders as a deferred overlay above the whole shell.
         let modal = self.state.read(cx).pending_modal();
-        // The window-level background layer (Swift `windowBackground` —
-        // `AppShellView.swift:323,988-1023`): an opaque backing behind the whole
+        // The window-level background layer: an opaque backing behind the whole
         // shell. The active terminal theme's background fills the window body
-        // (including the 6pt gutter around the floating sidebar card), under an
-        // edge-to-edge opaque 52pt chrome band + 1pt rule. The toolbar band and
-        // sidebar strips keep compositing their translucent `chrome` fills OVER
-        // this base (the Swift stack). Without it, unpainted regions fell
-        // through to gpui's Metal clear color — opaque black — invisible in
-        // dark mode but wrong everywhere in light mode. Both fills read the
+        // (including the gutter around the floating sidebar card) AND the full
+        // window height up to the top edge — the 2026-07 restyle removed the
+        // separate opaque chrome band + 1pt rule that used to cap the top 52pt
+        // (plan `docs/plans/restyle/01-titlebar-restyle.md`: the titlebar is fill-less, so
+        // the body backing simply extends to the top). Without this backing,
+        // unpainted regions fell through to gpui's Metal clear color (opaque
+        // black) — invisible in dark mode but wrong in light mode. It reads the
         // live `SharedThemeState`, so the R21 fan-out's `refresh_windows()`
-        // repaints them on any theme / scheme change.
-        let slots = crate::theme_settings::active_chrome_slots(cx);
+        // repaints it on any theme / scheme change.
         let (terminal_theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
         div()
             .size_full()
@@ -196,7 +191,6 @@ impl Render for AppShellView {
             .on_modifiers_changed(|event, _window, cx| {
                 crate::keymap::on_window_modifiers_changed(event, cx)
             })
-            .child(window_backing_band(&slots))
             .child(self.sidebar.clone())
             // R20 (F6): the drift banner floats as a bottom overlay above the shell
             // (below any presented modal).
@@ -392,51 +386,19 @@ const CONTENT_INSET_BOTTOM: f32 = 9.0;
 const CONTENT_INSET_TRAILING: f32 = 17.0;
 
 // ---------------------------------------------------------------------------
-// Window-level backing layer (Swift `windowBackground`,
-// `AppShellView.swift:988-1023`) — the opaque base every per-window surface
-// composites over. Pure color resolvers are split out so they are unit-testable
-// off-view (same placement rule as the host logic above).
+// Window-level backing layer — the opaque base every per-window surface
+// composites over. The 2026-07 restyle removed the separate opaque chrome band +
+// 1pt rule (the fill-less titlebar), so only the full-height terminal-theme fill
+// remains. The pure color resolver is split out so it is unit-testable off-view
+// (same placement rule as the host logic above).
 // ---------------------------------------------------------------------------
 
-/// The opaque chrome-base fill of the backing layer's top band — the
-/// `background` slot with its alpha forced to `1.0`. Every shipped table's
-/// `background` is already opaque; the force guarantees the backing never
-/// inherits a translucent slot, because everything beneath it is gpui's Metal
-/// clear color (opaque black).
-fn backing_band_color(s: &Slots) -> Rgba {
-    srgba_to_rgba(srgba_with_alpha(slot_srgba(s.background), 1.0))
-}
-
 /// The window-body backing fill — the ACTIVE terminal theme's background (8-bit
-/// sRGB, implicit alpha `1.0`), bled across the whole window body so the sidebar
-/// card's gutter and every other unpainted region match the terminal instead of
-/// revealing black (Swift's `terminalBackgroundColor`).
+/// sRGB, implicit alpha `1.0`), bled across the WHOLE window (top edge included,
+/// now that the titlebar paints no fill) so the sidebar card's gutter and every
+/// other unpainted region match the terminal instead of revealing black.
 fn terminal_backing_color(theme: &TerminalTheme) -> Rgba {
     rgb(theme.background.to_u32())
-}
-
-/// The backing layer's edge-to-edge top band: [`backing_band_color`] with the
-/// 1pt `line` rule at its bottom — Swift's `windowBackground` top slice. 52pt
-/// matches the toolbar's fixed height, so the gutter around the sidebar card's
-/// top edge shows the same band the toolbar paints to its right. Pure paint:
-/// no id, no listeners, no hitbox.
-fn window_backing_band(s: &Slots) -> impl IntoElement {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .w_full()
-        .h(px(TOP_BAR_HEIGHT))
-        .bg(backing_band_color(s))
-        .child(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .w_full()
-                .h(px(1.0))
-                .bg(slot_to_rgba(s.line)),
-        )
 }
 
 // ---------------------------------------------------------------------------
@@ -562,17 +524,6 @@ mod tests {
             .into_iter()
             .collect();
         assert!(stale_cache_ids(cached.iter(), &live).is_empty());
-    }
-
-    #[test]
-    fn backing_band_is_the_opaque_background_slot() {
-        use nice_theme::palette::{slots, ColorScheme, Palette};
-        let s = slots(Palette::Nice, ColorScheme::Light).unwrap();
-        let band = super::backing_band_color(&s);
-        assert_eq!(band.a, 1.0, "the backing band never inherits translucency");
-        // NICE_LIGHT.background (the opaque chrome base) — NOT the 70%-alpha
-        // `chrome` slot, which composites over this band instead.
-        assert_eq!((band.r, band.g, band.b), (0.989, 0.978, 0.970));
     }
 
     #[test]
