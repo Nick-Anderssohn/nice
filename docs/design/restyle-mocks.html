@@ -443,6 +443,93 @@
     border-radius: 1px;
   }
 
+  /* ── settings window mock ───────────────────────────────────────── */
+  .win-title {
+    position: absolute; left: 90px; right: 90px; top: 0; height: 100%;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+    font-size: 12px; color: var(--ink2);
+    pointer-events: none;
+  }
+  .window.settings { width: 780px; }
+  .set-body { display: flex; height: 460px; font-size: 12px; }
+  .set-nav {
+    width: 148px; flex: none;
+    display: flex; flex-direction: column; gap: 1px;
+    border-right: 1px solid var(--hairline);
+    padding: 8px 0;
+  }
+  .set-nav .row { padding: 5px 16px; color: var(--ink2); }
+  .set-nav .row.active { color: var(--accent); }
+  .set-pane { flex: 1; min-width: 0; padding: 14px 24px 18px; overflow: hidden; }
+  .set-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 9px 0;
+    color: var(--ink2);
+  }
+  .set-row .val { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .toggle {
+    flex: none; position: relative;
+    width: 32px; height: 18px; border-radius: 9px;
+    background: var(--fill-x);
+  }
+  .toggle i {
+    position: absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--ink3);
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle.on i { left: auto; right: 2px; background: #fff; }
+  .accent-swatches { display: flex; gap: 8px; }
+  .swatch { width: 16px; height: 16px; border-radius: 50%; }
+  .swatch.sel { outline: 1.5px solid var(--ink); outline-offset: 2px; }
+
+  /* per-scheme subsection: Light/Dark tabs as the group header, same
+     text+accent-underline grammar as the titlebar tabs */
+  .scheme-tabs {
+    display: flex; gap: 2px;
+    border-bottom: 1px solid var(--hairline);
+    margin: 16px 0 6px;
+  }
+  .scheme-tab { position: relative; padding: 6px 12px; color: var(--ink3); cursor: pointer; }
+  .scheme-tab.active { color: var(--ink); }
+  .scheme-tab.active::after {
+    content: "";
+    position: absolute; left: 11px; right: 11px; bottom: -1px;
+    height: 1px; border-radius: 0.5px;
+    background: var(--accent);
+  }
+  .window.settings[data-stab="light"] .pane-dark  { display: none; }
+  .window.settings[data-stab="dark"]  .pane-light { display: none; }
+
+  .theme-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+    margin: 12px 0 4px;
+  }
+  .theme-card {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 10px;
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    color: var(--ink2);
+    white-space: nowrap; overflow: hidden;
+  }
+  .theme-card .t { overflow: hidden; text-overflow: ellipsis; }
+  .theme-card .chips { display: flex; gap: 3px; flex: none; }
+  .chip { width: 10px; height: 10px; border-radius: 3px; box-shadow: inset 0 0 0 0.5px var(--hairline-strong); }
+  .theme-card.sel { color: var(--ink); border-color: var(--accent); }
+  .mini-slider {
+    flex: none; position: relative;
+    width: 170px; height: 3px; border-radius: 2px;
+    background: var(--fill-x);
+  }
+  .mini-slider i {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--ink);
+    box-shadow: 0 1px 3px rgba(0,0,0,.4);
+  }
+  .slider-group { display: flex; align-items: center; gap: 12px; }
+
   /* ── notes / spec ───────────────────────────────────────────────── */
   .notes { margin-top: 72px; border-top: 1px solid var(--pg-line); padding-top: 40px; }
   .notes h2 { margin-bottom: 4px; }
@@ -772,6 +859,107 @@
     </figure>
   </section>
 
+  <!-- ═══════════════ SETTINGS — appearance pane ═══════════════ -->
+  <section class="style-group">
+    <div class="style-kicker">Settings</div>
+    <h2>Appearance pane — merged themes, per-scheme tabs</h2>
+    <p class="style-note">
+      The settings window drops its opaque chrome and mirrors the main window:
+      same translucent surface, blur, mono type, hairlines, and centered
+      titlebar text (the single-tab convention). Chrome palette and terminal
+      theme merge into <b>one theme</b> — each entry drives both, so the old
+      separate pickers collapse into a single grid. Scheme-specific settings
+      group under <b>Light / Dark tabs</b> (same text + accent-underline
+      grammar as the titlebar): the tab picks which scheme you're editing —
+      its theme, opacity, and blur. Scheme-independent settings (OS sync,
+      accent) sit above the tabs. The tabs are clickable in this mock; the
+      global Scheme control still flips what the whole window renders as.
+    </p>
+
+    <figure class="mock">
+      <div class="desk-scroll"><div class="desk">
+        <div class="window settings" data-bar="28" data-stab="dark">
+          <div class="titlebar">
+            <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
+            <div class="win-title"><span class="t">Settings</span></div>
+          </div>
+          <div class="set-body">
+            <aside class="set-nav">
+              <div class="row">General</div>
+              <div class="row active">Appearance</div>
+              <div class="row">Fonts</div>
+              <div class="row">Shortcuts</div>
+            </aside>
+            <div class="set-pane">
+              <div class="set-row">
+                <span>Sync with OS appearance</span>
+                <span class="toggle on"><i></i></span>
+              </div>
+              <div class="set-row">
+                <span>Accent</span>
+                <span class="accent-swatches">
+                  <span class="swatch sel" style="background:#c96442"></span>
+                  <span class="swatch" style="background:#496ee1"></span>
+                  <span class="swatch" style="background:#25bc24"></span>
+                  <span class="swatch" style="background:#d338d3"></span>
+                  <span class="swatch" style="background:#33bbc8"></span>
+                </span>
+              </div>
+
+              <div class="scheme-tabs">
+                <span class="scheme-tab" data-stab="light">Light mode</span>
+                <span class="scheme-tab active" data-stab="dark">Dark mode</span>
+              </div>
+
+              <div class="pane-dark">
+                <div class="theme-grid">
+                  <div class="theme-card sel"><span class="t">Nice Dark</span><span class="chips"><span class="chip" style="background:#090705"></span><span class="chip" style="background:#c96442"></span><span class="chip" style="background:#496ee1"></span></span></div>
+                  <div class="theme-card"><span class="t">Solarized Dark</span><span class="chips"><span class="chip" style="background:#002b36"></span><span class="chip" style="background:#b58900"></span><span class="chip" style="background:#268bd2"></span></span></div>
+                  <div class="theme-card"><span class="t">Dracula</span><span class="chips"><span class="chip" style="background:#282a36"></span><span class="chip" style="background:#bd93f9"></span><span class="chip" style="background:#50fa7b"></span></span></div>
+                  <div class="theme-card"><span class="t">Nord</span><span class="chips"><span class="chip" style="background:#2e3440"></span><span class="chip" style="background:#88c0d0"></span><span class="chip" style="background:#a3be8c"></span></span></div>
+                  <div class="theme-card"><span class="t">Gruvbox Dark</span><span class="chips"><span class="chip" style="background:#282828"></span><span class="chip" style="background:#fabd2f"></span><span class="chip" style="background:#b8bb26"></span></span></div>
+                  <div class="theme-card"><span class="t">Catppuccin Mocha</span><span class="chips"><span class="chip" style="background:#1e1e2e"></span><span class="chip" style="background:#cba6f7"></span><span class="chip" style="background:#a6e3a1"></span></span></div>
+                  <div class="theme-card"><span class="t">Tokyo Night</span><span class="chips"><span class="chip" style="background:#1a1b26"></span><span class="chip" style="background:#7aa2f7"></span><span class="chip" style="background:#bb9af7"></span></span></div>
+                  <div class="theme-card"><span class="t">One Dark</span><span class="chips"><span class="chip" style="background:#282c34"></span><span class="chip" style="background:#61afef"></span><span class="chip" style="background:#98c379"></span></span></div>
+                </div>
+                <div class="set-row">
+                  <span>Opacity</span>
+                  <span class="slider-group"><span class="mini-slider"><i style="left:56%"></i></span><span class="val">80%</span></span>
+                </div>
+                <div class="set-row">
+                  <span>Blur</span>
+                  <span class="slider-group"><span class="mini-slider"><i style="left:50%"></i></span><span class="val">30px</span></span>
+                </div>
+              </div>
+
+              <div class="pane-light">
+                <div class="theme-grid">
+                  <div class="theme-card sel"><span class="t">Nice Light</span><span class="chips"><span class="chip" style="background:#fffcfc"></span><span class="chip" style="background:#c96442"></span><span class="chip" style="background:#2860af"></span></span></div>
+                  <div class="theme-card"><span class="t">Solarized Light</span><span class="chips"><span class="chip" style="background:#fdf6e3"></span><span class="chip" style="background:#b58900"></span><span class="chip" style="background:#268bd2"></span></span></div>
+                  <div class="theme-card"><span class="t">Gruvbox Light</span><span class="chips"><span class="chip" style="background:#fbf1c7"></span><span class="chip" style="background:#d79921"></span><span class="chip" style="background:#98971a"></span></span></div>
+                  <div class="theme-card"><span class="t">Catppuccin Latte</span><span class="chips"><span class="chip" style="background:#eff1f5"></span><span class="chip" style="background:#8839ef"></span><span class="chip" style="background:#40a02b"></span></span></div>
+                  <div class="theme-card"><span class="t">Dracula</span><span class="chips"><span class="chip" style="background:#282a36"></span><span class="chip" style="background:#bd93f9"></span><span class="chip" style="background:#50fa7b"></span></span></div>
+                  <div class="theme-card"><span class="t">Nord</span><span class="chips"><span class="chip" style="background:#2e3440"></span><span class="chip" style="background:#88c0d0"></span><span class="chip" style="background:#a3be8c"></span></span></div>
+                  <div class="theme-card"><span class="t">Tokyo Night</span><span class="chips"><span class="chip" style="background:#1a1b26"></span><span class="chip" style="background:#7aa2f7"></span><span class="chip" style="background:#bb9af7"></span></span></div>
+                  <div class="theme-card"><span class="t">One Dark</span><span class="chips"><span class="chip" style="background:#282c34"></span><span class="chip" style="background:#61afef"></span><span class="chip" style="background:#98c379"></span></span></div>
+                </div>
+                <div class="set-row">
+                  <span>Opacity</span>
+                  <span class="slider-group"><span class="mini-slider"><i style="left:78%"></i></span><span class="val">90%</span></span>
+                </div>
+                <div class="set-row">
+                  <span>Blur</span>
+                  <span class="slider-group"><span class="mini-slider"><i style="left:50%"></i></span><span class="val">30px</span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div></div>
+      <figcaption><b>Settings · Appearance</b> — translucent like the main window; one merged theme list; Light/Dark tabs scope the per-scheme settings (theme, opacity, blur). Dark-only themes appear in the light tab too — a scheme picks its theme freely.</figcaption>
+    </figure>
+  </section>
+
   <!-- ═══════════════ notes ═══════════════ -->
   <section class="notes">
     <h2>What changes under the hood</h2>
@@ -842,6 +1030,15 @@
       document.body.dataset.tabcount = btn.dataset.count;
       document.querySelectorAll('.count-btn').forEach(b =>
         b.setAttribute('aria-pressed', String(b === btn)));
+    });
+  });
+
+  document.querySelectorAll('.scheme-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      const win = tab.closest('.window.settings');
+      win.dataset.stab = tab.dataset.stab;
+      win.querySelectorAll('.scheme-tab').forEach(t =>
+        t.classList.toggle('active', t === tab));
     });
   });
 
