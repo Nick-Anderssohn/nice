@@ -464,7 +464,8 @@ async fn scheme_flip_leg(
     if store_scheme(cx) != ColorScheme::Light {
         failures.push("(a/d) sync_with_os ON: an OS Light switch did NOT flip the scheme".into());
     }
-    // Chrome half: the active Slots changed (Mocha dark table → Latte light table).
+    // Chrome half: the active Slots changed (the dark theme's chrome → the light
+    // theme's chrome; post-merge both are keyed off the active terminal theme).
     let slots_after = active_slots(cx);
     if slots_after == slots_before {
         failures.push("(a) chrome fan-out: the active Slots did not change on the scheme flip".into());

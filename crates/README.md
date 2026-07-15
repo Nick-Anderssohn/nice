@@ -229,18 +229,21 @@ The GPUI application. Structure (grows over later cycles):
   with no view rebuild, plus the R17-live Claude mirror.
   - `theme_settings` — the app-crate theme store + the live state:
     - **The persisted `Appearance`** (pure value type): `scheme` (light|dark) ×
-      TWO per-scheme chrome-palette slots × `sync_with_os` × TWO per-scheme
-      terminal-theme-id slots × `accent` × TWO per-scheme `window_opacity_*` (u8
-      pct) × TWO per-scheme `blur_radius_*` (u16 px) × the one-time
-      `restyle_popup_shown` flag (restyle plan 3), with fresh-install defaults
-      **flipped to the Nice look by restyle plan 3** (`scheme = OS at first
-      launch`, `sync_with_os = true`, Nice light / Nice dark palettes,
-      `terracotta`, `nice-default-light`/`nice-default-dark`, opacity `dark 80` /
-      `light 90`, blur `30` both schemes; line-height 1.3 lives in `prefs_store`),
-      tolerant decode (absent section / field / unknown
-      rawValue ⇒ default; malformed ⇒ full defaults), and the active-view
-      derivations incl. the **macOS → Nice substitution** so no selectable palette
-      ever routes through the `SlotColor::System` black fallback (OQ6).
+      `sync_with_os` × TWO per-scheme terminal-theme-id slots × `accent` × TWO
+      per-scheme `window_opacity_*` (u8 pct) × TWO per-scheme `blur_radius_*`
+      (u16 px) × the one-time `restyle_popup_shown` flag (restyle plan 3), with
+      fresh-install defaults **flipped to the Nice look by restyle plan 3**
+      (`scheme = OS at first launch`, `sync_with_os = true`, `terracotta`,
+      `nice-default-light`/`nice-default-dark`, opacity `dark 80` / `light 90`,
+      blur `30` both schemes; line-height 1.3 lives in `prefs_store`), tolerant
+      decode (absent section / field / unknown rawValue ⇒ default; malformed ⇒
+      full defaults), and the active-view derivations. **Restyle plan 5 merged
+      chrome into the terminal theme**: there is no separate chrome-palette
+      selection anymore — chrome is derived from the active terminal-theme id
+      (hand-tuned tables for `nice-default-*` / `catppuccin-*`, procedural
+      derivation for every other built-in and imported theme), and
+      `Palette::MacOs` / `SlotColor::System` are gone (no System black-fallback
+      substitution remains).
     - **`ThemeSettingsStore`** (gpui `Global`) — `load(path)` fail-soft; the
       `appearance` section persisted through the shared `ui_settings`
       read-merge-write writer (`file_browser::sort_settings_store::write_ui_settings_merged`)
@@ -248,11 +251,14 @@ The GPUI application. Structure (grows over later cycles):
       shares the sort store's `ui_settings.json` (per-variant folder,
       `NICE_APPLICATION_SUPPORT_ROOT`-honoring), resolved from `app::run` ONLY.
       The persisted **`appearance`** schema (R23 + settings-import read/write it):
-      `scheme`, `sync_with_os`, `chrome_light_palette`, `chrome_dark_palette`,
-      `accent`, `terminal_theme_light_id`, `terminal_theme_dark_id`, plus the
-      restyle-plan-3 keys `window_opacity_light`/`window_opacity_dark`,
+      `scheme`, `sync_with_os`, `accent`, `terminal_theme_light_id`,
+      `terminal_theme_dark_id`, plus the restyle-plan-3 keys
+      `window_opacity_light`/`window_opacity_dark`,
       `blur_radius_light`/`blur_radius_dark`, and `restyle_popup_shown`
-      (snake_case, rawValues).
+      (snake_case, rawValues). The legacy `chrome_light_palette` /
+      `chrome_dark_palette` keys are decode-only: ignored on read (never
+      written), and no longer imported from prod, per the terminal-theme merge
+      (restyle plan 5).
     - **`ThemeState` / `SharedThemeState`** — the resolved active view (active
       `Slots`/scheme/palette/accent-`Srgba`/`TerminalTheme`, plus the
       restyle-plan-3 window-transparency triple `background_opacity` (f32
@@ -265,7 +271,7 @@ The GPUI application. Structure (grows over later cycles):
       byte-identically).
     - **The `apply_*` mutators** (Exported; R23 builds pickers over them):
       `apply_scheme` (a manual pick contradicting the OS turns `sync_with_os` off —
-      the `userPicked` analog), `apply_chrome_palette`, `apply_accent`,
+      the `userPicked` analog), `apply_accent`,
       `apply_terminal_theme_id` (an INACTIVE-scheme slot change is latent),
       `apply_sync_with_os` (on ⇒ reconcile now), and the restyle-plan-3 window
       mutators `apply_window_opacity(scheme, pct)` / `apply_blur_radius(scheme,
@@ -1561,15 +1567,22 @@ and pinned by literal-equality tests that cite their Swift provenance (see
   tables use (`f32` channels, same representation gpui's `Rgba` uses so the R9
   adapter converts losslessly).
 - `palette` — the chrome palettes from `Sources/Nice/Theme/Palette.swift`.
-  Structured exactly as today's model has them (no invented variants): `Nice`
-  and `MacOs` accept either scheme; `CatppuccinLatte` is light-only and
+  `Nice` accepts either scheme; `CatppuccinLatte` is light-only and
   `CatppuccinMocha` dark-only (`Palette.matches(scheme:)`). Slot names mirror
   `Palette.swift`'s slots (`background`, `ink`, `line`, …), not SwiftUI view
-  names. Nice/Catppuccin slots carry precomputed sRGB literals; the `MacOs`
-  table carries `SystemColor` NSColor roles that resolve dynamically against
-  the pinned `NSApp.appearance` at paint time (so it has one scheme-independent
-  literal table). `slots(palette, scheme)` returns the table for a valid pair
-  or `None` for the two off-scheme Catppuccin combos.
+  names. Every slot is now a `SlotColor::Srgb` literal (Nice + the two
+  Catppuccin tables); restyle plan 5 retired `Palette::MacOs`, the
+  `SlotColor::System` NSColor slot, and the `SystemColor` type (and its
+  re-export) along with the paint-time system-color plumbing — a merged theme
+  without a hand-tuned chrome half derives its slots procedurally instead (see
+  `derive`). `slots(palette, scheme)` returns the table for a valid pair or
+  `None` for the two off-scheme Catppuccin combos.
+- `derive` — `derive_chrome(fg, bg)`: the full chrome `Slots` computed
+  procedurally from a terminal theme's foreground/background for a merged theme
+  that has no hand-tuned chrome half (the 8 muted built-ins + every imported
+  Ghostty theme). Blend factors are measured from the hand-tuned Nice palettes
+  (not invented) so deriving from Nice's own fg/bg reproduces the Nice ramp —
+  the core of restyle plan 5. The accent slot is not derived.
 - `accent` — `AccentPreset` (terracotta / ocean / fern / iris / graphite) from
   `Sources/Nice/State/Tweaks.swift`. The `#rrggbb` hex is the source of record;
   `.color()` derives sRGB from it the way Swift's `Color(hex:)` does. Also the

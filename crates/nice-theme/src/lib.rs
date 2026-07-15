@@ -9,8 +9,11 @@
 //! Modules:
 //!
 //! * [`color`] — [`Srgba`], the plain sRGB value type the palette tables use.
-//! * [`palette`] — the chrome palettes (sRGB literals + macOS system-semantic
-//!   slots), from `Sources/Nice/Theme/Palette.swift`.
+//! * [`palette`] — the hand-tuned chrome palettes (sRGB literals), from
+//!   `Sources/Nice/Theme/Palette.swift`.
+//! * [`derive`] — procedural chrome derivation ([`derive::derive_chrome`]): a
+//!   full chrome [`Slots`] table computed from a terminal theme's fg/bg, for
+//!   merged themes without a hand-tuned chrome half (round-2 restyle plan 5).
 //! * [`accent`] — [`AccentPreset`] (five swatches), from
 //!   `Sources/Nice/State/Tweaks.swift`.
 //! * [`typography`] — the three font aliases, from
@@ -31,6 +34,7 @@
 pub mod accent;
 pub mod chrome_geometry;
 pub mod color;
+pub mod derive;
 pub mod glass;
 pub mod palette;
 pub mod status;
@@ -38,7 +42,8 @@ pub mod typography;
 
 pub use accent::AccentPreset;
 pub use color::Srgba;
+pub use derive::derive_chrome;
 pub use glass::{glass_fill, glass_line, tab_underline_idle};
-pub use palette::{ColorScheme, Palette, SlotColor, Slots, SystemColor};
+pub use palette::{ColorScheme, Palette, SlotColor, Slots};
 pub use status::{BreathePulse, RingPulse};
 pub use typography::TypographyAlias;

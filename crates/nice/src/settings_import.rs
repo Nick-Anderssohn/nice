@@ -66,8 +66,6 @@ const PROD_TERMINAL_FONT_FAMILY: &str = "terminalFontFamily";
 const PROD_SMOOTH_SCROLLING: &str = "smoothScrolling";
 const PROD_SCHEME: &str = "scheme";
 const PROD_SYNC_WITH_OS: &str = "syncWithOS";
-const PROD_CHROME_LIGHT_PALETTE: &str = "chromeLightPalette";
-const PROD_CHROME_DARK_PALETTE: &str = "chromeDarkPalette";
 const PROD_ACCENT: &str = "accent";
 const PROD_TERMINAL_THEME_LIGHT_ID: &str = "terminalThemeLightId";
 const PROD_TERMINAL_THEME_DARK_ID: &str = "terminalThemeDarkId";
@@ -230,19 +228,16 @@ fn build_direct_sections(
         sections.insert("advanced".to_string(), Value::Object(advanced));
     }
 
-    // appearance (scheme / sync / palettes / accent / theme ids — all verbatim)
+    // appearance (scheme / sync / accent / theme ids — all verbatim). The
+    // round-2 merge dropped the standalone chrome-palette selection (the terminal
+    // theme now drives the chrome), so the prod `chromeLightPalette` /
+    // `chromeDarkPalette` keys are no longer imported.
     let mut appearance = Map::new();
     if let Some(v) = reader.string(PROD_SCHEME) {
         appearance.insert("scheme".to_string(), Value::String(v));
     }
     if let Some(v) = reader.boolean(PROD_SYNC_WITH_OS) {
         appearance.insert("sync_with_os".to_string(), Value::Bool(v));
-    }
-    if let Some(v) = reader.string(PROD_CHROME_LIGHT_PALETTE) {
-        appearance.insert("chrome_light_palette".to_string(), Value::String(v));
-    }
-    if let Some(v) = reader.string(PROD_CHROME_DARK_PALETTE) {
-        appearance.insert("chrome_dark_palette".to_string(), Value::String(v));
     }
     if let Some(v) = reader.string(PROD_ACCENT) {
         appearance.insert("accent".to_string(), Value::String(v));
@@ -576,7 +571,7 @@ mod tests {
 
     use nice_model::file_browser::FileBrowserSortCriterion;
     use nice_model::shortcuts::{default_bindings, Modifiers, OwnedCombo};
-    use nice_theme::palette::{ColorScheme, Palette};
+    use nice_theme::palette::ColorScheme;
     use nice_theme::AccentPreset;
 
     use crate::file_browser::sort_settings_store::SortSettingsStore;
@@ -699,8 +694,6 @@ mod tests {
             .with_bool(PROD_SMOOTH_SCROLLING, true)
             .with_string(PROD_SCHEME, "light")
             .with_bool(PROD_SYNC_WITH_OS, false)
-            .with_string(PROD_CHROME_LIGHT_PALETTE, "nice")
-            .with_string(PROD_CHROME_DARK_PALETTE, "nice")
             .with_string(PROD_ACCENT, "iris")
             .with_string(PROD_TERMINAL_THEME_LIGHT_ID, "solarized-light")
             .with_string(PROD_TERMINAL_THEME_DARK_ID, "dracula")
@@ -722,8 +715,6 @@ mod tests {
         let a = theme.appearance();
         assert_eq!(a.scheme, ColorScheme::Light);
         assert!(!a.sync_with_os);
-        assert_eq!(a.chrome_light_palette, Palette::Nice);
-        assert_eq!(a.chrome_dark_palette, Palette::Nice);
         assert_eq!(a.accent, AccentPreset::Iris);
         assert_eq!(a.terminal_theme_light_id, "solarized-light");
         assert_eq!(a.terminal_theme_dark_id, "dracula");

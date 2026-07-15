@@ -27,7 +27,7 @@ use gpui::{
     Window,
 };
 
-use nice_theme::palette::{ColorScheme, Palette};
+use nice_theme::palette::ColorScheme;
 use nice_theme::AccentPreset;
 
 use crate::ghostty_theme_parser::GhosttyParseError;
@@ -192,16 +192,6 @@ fn default_terminal_id_for(cx: &App, scheme: ColorScheme) -> String {
 // Rendering
 // ===========================================================================
 
-/// A user-facing label for a chrome [`Palette`] (Swift picker labels).
-fn palette_label(palette: Palette) -> &'static str {
-    match palette {
-        Palette::Nice => "Nice",
-        Palette::MacOs => "macOS",
-        Palette::CatppuccinLatte => "Catppuccin Latte",
-        Palette::CatppuccinMocha => "Catppuccin Mocha",
-    }
-}
-
 /// A user-facing label for an [`AccentPreset`].
 fn accent_label(accent: AccentPreset) -> &'static str {
     match accent {
@@ -211,16 +201,6 @@ fn accent_label(accent: AccentPreset) -> &'static str {
         AccentPreset::Iris => "Iris",
         AccentPreset::Graphite => "Graphite",
     }
-}
-
-/// The per-scheme chrome-palette set: `Palette::ALL.filter(matches(scheme)) − MacOs`
-/// (Light = `[Nice, CatppuccinLatte]`, Dark = `[Nice, CatppuccinMocha]`) — MacOs is
-/// excluded because it would paint an opaque-black table (r21 contract / OQ6).
-fn chrome_palettes_for(scheme: ColorScheme) -> Vec<Palette> {
-    Palette::ALL
-        .into_iter()
-        .filter(|p| p.matches(scheme) && *p != Palette::MacOs)
-        .collect()
 }
 
 /// The Appearance pane body (The spec §Appearance).
@@ -309,25 +289,16 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     ));
 
     // --- Light mode group --------------------------------------------------
-    let light_chrome = appearance.chrome_palette_for(ColorScheme::Light);
+    // Round-2 restyle plan 5: ONE "Theme" dropdown per scheme drives both the
+    // terminal colors and the chrome (the old separate "Chrome" + "Terminal
+    // theme" rows are merged). The a11y id stays the terminal picker's so the
+    // selection self-tests keep working.
     let light_theme_id = appearance.terminal_theme_id_for(ColorScheme::Light).to_string();
     let light_theme_label = theme_display_name(&light_themes, &light_theme_id);
     col = col
         .child(setting_subtitle("Light mode", cx))
         .child(setting_row(
-            "Chrome",
-            None,
-            dropdown(
-                "settings.appearance.chromeLight",
-                palette_label(light_chrome),
-                chrome_dropdown_items("settings.appearance.chromeLight", ColorScheme::Light, light_chrome),
-                window,
-                cx,
-            ),
-            cx,
-        ))
-        .child(setting_row(
-            "Terminal theme",
+            "Theme",
             None,
             dropdown(
                 "settings.terminal.lightPicker",
@@ -345,25 +316,12 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
         ));
 
     // --- Dark mode group ---------------------------------------------------
-    let dark_chrome = appearance.chrome_palette_for(ColorScheme::Dark);
     let dark_theme_id = appearance.terminal_theme_id_for(ColorScheme::Dark).to_string();
     let dark_theme_label = theme_display_name(&dark_themes, &dark_theme_id);
     col = col
         .child(setting_subtitle("Dark mode", cx))
         .child(setting_row(
-            "Chrome",
-            None,
-            dropdown(
-                "settings.appearance.chromeDark",
-                palette_label(dark_chrome),
-                chrome_dropdown_items("settings.appearance.chromeDark", ColorScheme::Dark, dark_chrome),
-                window,
-                cx,
-            ),
-            cx,
-        ))
-        .child(setting_row(
-            "Terminal theme",
+            "Theme",
             None,
             dropdown(
                 "settings.terminal.darkPicker",
@@ -612,27 +570,6 @@ fn theme_display_name(entries: &[CatalogEntry], id: &str) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-/// The per-scheme chrome-palette dropdown options (option a11y ids
-/// `{a11y}.{palette.raw_value()}` — the old chip ids). Selection →
-/// `apply_chrome_palette(scheme, palette)`.
-fn chrome_dropdown_items(
-    a11y: &'static str,
-    scheme: ColorScheme,
-    selected: Palette,
-) -> Vec<DropdownItem> {
-    chrome_palettes_for(scheme)
-        .into_iter()
-        .map(|palette| {
-            DropdownItem::new(
-                format!("{a11y}.{}", palette.raw_value()),
-                palette_label(palette),
-                palette == selected,
-                move |cx: &mut App| theme_settings::apply_chrome_palette(cx, scheme, palette),
-            )
-        })
-        .collect()
-}
-
 /// The per-scheme terminal-theme dropdown options over `themes(for: scheme)` —
 /// built-ins AND imports, exactly the old chip list (option a11y ids
 /// `{a11y}.{theme id}`). Selection → `apply_terminal_theme_id(scheme, id)`.
@@ -779,42 +716,7 @@ mod tests {
         assert_eq!(neg.message, "Line 9 uses palette index -1; valid indices are 0–15.");
     }
 
-    // --- the per-scheme chrome set (r21 contract) ----------------------------
-
-    #[test]
-    fn chrome_palette_set_is_nice_plus_scheme_catppuccin_minus_macos() {
-        assert_eq!(
-            chrome_palettes_for(ColorScheme::Light),
-            vec![Palette::Nice, Palette::CatppuccinLatte]
-        );
-        assert_eq!(
-            chrome_palettes_for(ColorScheme::Dark),
-            vec![Palette::Nice, Palette::CatppuccinMocha]
-        );
-        // macOS is never offered (it would paint black — OQ6).
-        assert!(!chrome_palettes_for(ColorScheme::Light).contains(&Palette::MacOs));
-        assert!(!chrome_palettes_for(ColorScheme::Dark).contains(&Palette::MacOs));
-    }
-
     // --- the dropdown option lists (the old chip contract, now menu items) ----
-
-    #[test]
-    fn chrome_dropdown_items_keep_the_chip_ids_labels_and_selection() {
-        let items =
-            chrome_dropdown_items("settings.appearance.chromeDark", ColorScheme::Dark, Palette::Nice);
-        let ids: Vec<&str> = items.iter().map(|i| i.id.as_ref()).collect();
-        assert_eq!(
-            ids,
-            [
-                "settings.appearance.chromeDark.nice",
-                "settings.appearance.chromeDark.catppuccinMocha",
-            ]
-        );
-        let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
-        assert_eq!(labels, ["Nice", "Catppuccin Mocha"]);
-        let selected: Vec<bool> = items.iter().map(|i| i.selected).collect();
-        assert_eq!(selected, [true, false], "exactly the current palette is checkmarked");
-    }
 
     #[test]
     fn theme_display_name_resolves_the_selected_entry_or_falls_back_to_the_id() {
@@ -958,27 +860,10 @@ mod tests {
     fn dropdown_selection_drives_the_exact_apply_calls(cx: &mut TestAppContext) {
         let base = setup_with_import(cx, "dropdown-apply");
         cx.update(|app| {
-            // Chrome: selecting the Catppuccin Mocha option applies that palette
-            // to the Dark scheme slot (the old chip's exact apply_chrome_palette).
-            let chrome = chrome_dropdown_items(
-                "settings.appearance.chromeDark",
-                ColorScheme::Dark,
-                Palette::Nice,
-            );
-            chrome
-                .iter()
-                .find(|i| i.id.as_ref() == "settings.appearance.chromeDark.catppuccinMocha")
-                .expect("the mocha option is offered")
-                .select(app);
-            assert_eq!(
-                app.global::<ThemeSettingsStore>()
-                    .appearance()
-                    .chrome_palette_for(ColorScheme::Dark),
-                Palette::CatppuccinMocha
-            );
-
-            // Terminal theme: selecting the imported theme's option applies its id
-            // to the Dark scheme slot (the old chip's exact apply_terminal_theme_id).
+            // The single Theme dropdown: selecting the imported theme's option
+            // applies its id to the Dark scheme slot (the old chip's exact
+            // apply_terminal_theme_id) — and, post-merge, that one id now drives
+            // the chrome too.
             let entries = app.global::<TerminalThemeCatalog>().themes(ColorScheme::Dark);
             let themes = terminal_theme_dropdown_items(
                 "settings.terminal.darkPicker",

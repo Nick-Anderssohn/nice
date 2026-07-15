@@ -24,18 +24,13 @@ pub(crate) fn srgba_to_rgba(c: Srgba) -> Rgba {
     }
 }
 
-/// Resolve a [`SlotColor`] to a concrete [`Srgba`]. The sRGB-literal arm (every
-/// slot of the Nice / Catppuccin tables, and the R10 chrome's Nice/Dark table)
-/// passes straight through; a macOS system-semantic slot — which resolves
-/// against `NSColor` at paint time and so has no literal here — is unreached by
-/// the Nice/Dark chrome and falls back to opaque black rather than panicking, so
-/// a future palette swap that introduces one shows a visible wrong colour rather
-/// than silently vanishing.
+/// Resolve a [`SlotColor`] to a concrete [`Srgba`]. Every chrome slot is an sRGB
+/// literal after the round-2 merge (hand-tuned or derived), so this is a plain
+/// unwrap — the paint-time `NSColor` system slots that used to need a fallback
+/// here are gone.
 pub(crate) fn slot_srgba(slot: SlotColor) -> Srgba {
-    match slot {
-        SlotColor::Srgb(c) => c,
-        SlotColor::System { .. } => Srgba::rgb(0.0, 0.0, 0.0),
-    }
+    let SlotColor::Srgb(c) = slot;
+    c
 }
 
 /// Resolve a [`SlotColor`] straight to a `gpui` [`Rgba`] — [`slot_srgba`] then
@@ -66,15 +61,6 @@ mod tests {
     fn slot_srgba_passes_through_literals() {
         let c = Srgba::rgb(0.5, 0.6, 0.7);
         assert_eq!(slot_srgba(SlotColor::Srgb(c)), c);
-    }
-
-    #[test]
-    fn slot_srgba_falls_back_for_system_slots() {
-        use nice_theme::palette::SystemColor;
-        assert_eq!(
-            slot_srgba(SlotColor::system(SystemColor::Label)),
-            Srgba::rgb(0.0, 0.0, 0.0)
-        );
     }
 
     #[test]

@@ -1,18 +1,21 @@
-//! The chrome palettes, ported verbatim from `Sources/Nice/Theme/Palette.swift`.
+//! The hand-tuned chrome palettes, ported verbatim from
+//! `Sources/Nice/Theme/Palette.swift`.
 //!
-//! Structure mirrors today's model exactly — no invented variants:
+//! Round-2 restyle plan 5 merged the chrome selection into the terminal-theme
+//! selection, so the only chrome halves that stay HAND-TUNED are the ones whose
+//! terminal ids pair with them; every other theme derives its chrome from the
+//! terminal colors ([`crate::derive`]). What survives here is exactly that
+//! hand-tuned set:
 //!
 //! * [`Palette::Nice`] — light & dark literal tables ([`NICE_LIGHT`],
 //!   [`NICE_DARK`]).
-//! * [`Palette::MacOs`] — a single system-semantic table ([`MACOS`], NSColor
-//!   names). The Swift `case .macOS:` arms carry **no scheme branch**
-//!   (`Palette.swift:78,120,…`): the NSColor values resolve dynamically against
-//!   the pinned `NSApp.appearance` at paint time (`Palette.swift:18-23`), so
-//!   both schemes are valid inputs but share one literal table. Emitting a
-//!   redundant `MACOS_DARK` would invent a variant the Swift model doesn't
-//!   have, which the plan forbids.
 //! * [`Palette::CatppuccinLatte`] — light-only ([`CATPPUCCIN_LATTE`]).
 //! * [`Palette::CatppuccinMocha`] — dark-only ([`CATPPUCCIN_MOCHA`]).
+//!
+//! The old `.macOS` system-semantic palette (and the [`SlotColor::System`]
+//! `NSColor` plumbing behind it) retired with the merge — every chrome slot is
+//! now a concrete sRGB literal or a derived sRGB value, never a paint-time
+//! system color.
 //!
 //! Latte/Mocha's single-scheme nature is [`Palette::matches`], ported from
 //! `Palette.matches(scheme:)` (`Tweaks.swift:51-57`).
@@ -38,8 +41,6 @@ pub enum ColorScheme {
 pub enum Palette {
     /// The custom oklch-derived Nice literals.
     Nice,
-    /// System semantic colors (`NSColor.windowBackgroundColor`, …).
-    MacOs,
     /// Catppuccin Latte — light-only.
     CatppuccinLatte,
     /// Catppuccin Mocha — dark-only.
@@ -49,9 +50,8 @@ pub enum Palette {
 impl Palette {
     /// Every palette, in declaration order. Ports `CaseIterable`
     /// (`Tweaks.swift:33`).
-    pub const ALL: [Palette; 4] = [
+    pub const ALL: [Palette; 3] = [
         Palette::Nice,
-        Palette::MacOs,
         Palette::CatppuccinLatte,
         Palette::CatppuccinMocha,
     ];
@@ -61,19 +61,18 @@ impl Palette {
     pub const fn raw_value(self) -> &'static str {
         match self {
             Palette::Nice => "nice",
-            Palette::MacOs => "macOS",
             Palette::CatppuccinLatte => "catppuccinLatte",
             Palette::CatppuccinMocha => "catppuccinMocha",
         }
     }
 
     /// Whether this palette belongs in the chrome picker for `scheme`.
-    /// `.nice` / `.macOS` adapt to either scheme; the Catppuccin variants are
+    /// `.nice` adapts to either scheme; the Catppuccin variants are
     /// single-scheme by design (Latte light-only, Mocha dark-only). Verbatim
     /// from `Palette.matches(scheme:)` (`Tweaks.swift:51-57`).
     pub const fn matches(self, scheme: ColorScheme) -> bool {
         match self {
-            Palette::Nice | Palette::MacOs => true,
+            Palette::Nice => true,
             Palette::CatppuccinLatte => match scheme {
                 ColorScheme::Light => true,
                 ColorScheme::Dark => false,
@@ -86,57 +85,13 @@ impl Palette {
     }
 }
 
-/// A macOS system semantic color — an `NSColor` class property. These carry no
-/// literal value here: they resolve dynamically against the pinned
-/// `NSApp.appearance` at paint time (`Palette.swift:18-23`). The downstream R9
-/// adapter maps each to its `NSColor`; the mapped Swift arm is cited per
-/// variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SystemColor {
-    /// `NSColor.windowBackgroundColor` (`Palette.swift:78,120`).
-    WindowBackground,
-    /// `NSColor.underPageBackgroundColor` (`Palette.swift:92`).
-    UnderPageBackground,
-    /// `NSColor.textBackgroundColor` (`Palette.swift:106`).
-    TextBackground,
-    /// `NSColor.labelColor` (`Palette.swift:136`).
-    Label,
-    /// `NSColor.secondaryLabelColor` (`Palette.swift:150`).
-    SecondaryLabel,
-    /// `NSColor.tertiaryLabelColor` (`Palette.swift:164`).
-    TertiaryLabel,
-    /// `NSColor.separatorColor` (`Palette.swift:179`).
-    Separator,
-    /// `NSColor.gridColor` (`Palette.swift:194`).
-    Grid,
-    /// `NSColor.controlBackgroundColor` (`Palette.swift:231`).
-    ControlBackground,
-}
-
-/// A palette slot's value: a concrete sRGB literal (Nice / Catppuccin) or a
-/// deferred macOS system semantic color resolved at paint time.
+/// A palette slot's value: a concrete sRGB literal (Nice / Catppuccin, or the
+/// [`crate::derive`] output). Every slot resolves to a literal after the round-2
+/// merge retired the paint-time `NSColor` system slots.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SlotColor {
     /// A precomputed sRGB literal.
     Srgb(Srgba),
-    /// A system semantic color at the given straight alpha (`1.0` except the
-    /// translucent `chrome` slot, which uses [`CHROME_OPACITY`]).
-    System {
-        /// Which `NSColor` semantic role.
-        color: SystemColor,
-        /// Straight alpha applied to the resolved system color.
-        opacity: f32,
-    },
-}
-
-impl SlotColor {
-    /// An opaque system-color slot (`opacity == 1.0`).
-    pub const fn system(color: SystemColor) -> Self {
-        SlotColor::System {
-            color,
-            opacity: 1.0,
-        }
-    }
 }
 
 /// Alpha the translucent `chrome` slot applies to the `background` color: CSS
@@ -206,26 +161,6 @@ pub const NICE_DARK: Slots = Slots {
     chrome: SlotColor::Srgb(Srgba::new(0.080, 0.066, 0.055, CHROME_OPACITY)), // Palette.swift:250
 };
 
-/// macOS palette — system semantic slots (scheme-independent literal table;
-/// resolves per-scheme at paint time). Verbatim from the `.macOS` arms of
-/// `Palette.swift`.
-pub const MACOS: Slots = Slots {
-    background: SlotColor::system(SystemColor::WindowBackground), // Palette.swift:78
-    background2: SlotColor::system(SystemColor::UnderPageBackground), // Palette.swift:92
-    background3: SlotColor::system(SystemColor::TextBackground),  // Palette.swift:106
-    panel: SlotColor::system(SystemColor::WindowBackground),      // Palette.swift:120
-    ink: SlotColor::system(SystemColor::Label),                   // Palette.swift:136
-    ink2: SlotColor::system(SystemColor::SecondaryLabel),         // Palette.swift:150
-    ink3: SlotColor::system(SystemColor::TertiaryLabel),          // Palette.swift:164
-    line: SlotColor::system(SystemColor::Separator),              // Palette.swift:179
-    line_strong: SlotColor::system(SystemColor::Grid),            // Palette.swift:194
-    user_bubble: SlotColor::system(SystemColor::ControlBackground), // Palette.swift:231
-    chrome: SlotColor::System {
-        color: SystemColor::WindowBackground,
-        opacity: CHROME_OPACITY,
-    }, // Palette.swift:247
-};
-
 /// Catppuccin Latte (light-only). Literals verbatim from the `.catppuccinLatte`
 /// arms of `Palette.swift`.
 pub const CATPPUCCIN_LATTE: Slots = Slots {
@@ -260,14 +195,11 @@ pub const CATPPUCCIN_MOCHA: Slots = Slots {
 
 /// The literal slot table for a valid `(palette, scheme)` pair, or `None` for
 /// the two single-scheme Catppuccin combos [`Palette::matches`] rejects
-/// (Latte+dark, Mocha+light). `MacOs` returns the one [`MACOS`] table for
-/// either scheme (see the module docs — the NSColor slots resolve per-scheme at
-/// paint time, so there is no separate dark literal table).
+/// (Latte+dark, Mocha+light).
 pub const fn slots(palette: Palette, scheme: ColorScheme) -> Option<Slots> {
     match (palette, scheme) {
         (Palette::Nice, ColorScheme::Light) => Some(NICE_LIGHT),
         (Palette::Nice, ColorScheme::Dark) => Some(NICE_DARK),
-        (Palette::MacOs, _) => Some(MACOS),
         (Palette::CatppuccinLatte, ColorScheme::Light) => Some(CATPPUCCIN_LATTE),
         (Palette::CatppuccinLatte, ColorScheme::Dark) => None,
         (Palette::CatppuccinMocha, ColorScheme::Dark) => Some(CATPPUCCIN_MOCHA),
@@ -283,12 +215,10 @@ mod tests {
     //! build. See crates/README.md "Fixture-provenance convention".
     use super::*;
 
-    /// Unwrap an sRGB slot; panics on a system slot (test-only helper).
+    /// Unwrap an sRGB slot (test-only helper).
     fn srgb(slot: SlotColor) -> Srgba {
-        match slot {
-            SlotColor::Srgb(s) => s,
-            SlotColor::System { .. } => panic!("expected an sRGB slot, got a system slot"),
-        }
+        let SlotColor::Srgb(s) = slot;
+        s
     }
 
     #[test]
@@ -364,28 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_slots_are_system_semantic() {
-        // No literals — each slot names an NSColor role resolved at paint time.
-        assert_eq!(MACOS.background, SlotColor::system(SystemColor::WindowBackground)); // Palette.swift:78
-        assert_eq!(MACOS.background2, SlotColor::system(SystemColor::UnderPageBackground)); // Palette.swift:92
-        assert_eq!(MACOS.background3, SlotColor::system(SystemColor::TextBackground)); // Palette.swift:106
-        assert_eq!(MACOS.panel, SlotColor::system(SystemColor::WindowBackground)); // Palette.swift:120
-        assert_eq!(MACOS.ink, SlotColor::system(SystemColor::Label)); // Palette.swift:136
-        assert_eq!(MACOS.ink2, SlotColor::system(SystemColor::SecondaryLabel)); // Palette.swift:150
-        assert_eq!(MACOS.ink3, SlotColor::system(SystemColor::TertiaryLabel)); // Palette.swift:164
-        assert_eq!(MACOS.line, SlotColor::system(SystemColor::Separator)); // Palette.swift:179
-        assert_eq!(MACOS.line_strong, SlotColor::system(SystemColor::Grid)); // Palette.swift:194
-        assert_eq!(MACOS.user_bubble, SlotColor::system(SystemColor::ControlBackground)); // Palette.swift:231
-        assert_eq!(
-            MACOS.chrome,
-            SlotColor::System {
-                color: SystemColor::WindowBackground,
-                opacity: 0.70
-            }
-        ); // Palette.swift:247
-    }
-
-    #[test]
     fn chrome_slot_is_background_at_chrome_opacity() {
         // niceChrome == niceBg with alpha dropped to 0.70 (Palette.swift:245).
         for slots in [NICE_LIGHT, NICE_DARK, CATPPUCCIN_LATTE, CATPPUCCIN_MOCHA] {
@@ -401,8 +309,6 @@ mod tests {
         // Tweaks.swift:51-57.
         assert!(Palette::Nice.matches(ColorScheme::Light));
         assert!(Palette::Nice.matches(ColorScheme::Dark));
-        assert!(Palette::MacOs.matches(ColorScheme::Light));
-        assert!(Palette::MacOs.matches(ColorScheme::Dark));
         assert!(Palette::CatppuccinLatte.matches(ColorScheme::Light));
         assert!(!Palette::CatppuccinLatte.matches(ColorScheme::Dark));
         assert!(!Palette::CatppuccinMocha.matches(ColorScheme::Light));
@@ -415,8 +321,6 @@ mod tests {
         // return None (mirrors matches()).
         assert_eq!(slots(Palette::Nice, ColorScheme::Light), Some(NICE_LIGHT));
         assert_eq!(slots(Palette::Nice, ColorScheme::Dark), Some(NICE_DARK));
-        assert_eq!(slots(Palette::MacOs, ColorScheme::Light), Some(MACOS));
-        assert_eq!(slots(Palette::MacOs, ColorScheme::Dark), Some(MACOS));
         assert_eq!(
             slots(Palette::CatppuccinLatte, ColorScheme::Light),
             Some(CATPPUCCIN_LATTE)
@@ -440,7 +344,6 @@ mod tests {
     fn palette_raw_values_match_swift() {
         // Tweaks.swift:33-34 — enum String rawValues.
         assert_eq!(Palette::Nice.raw_value(), "nice");
-        assert_eq!(Palette::MacOs.raw_value(), "macOS");
         assert_eq!(Palette::CatppuccinLatte.raw_value(), "catppuccinLatte");
         assert_eq!(Palette::CatppuccinMocha.raw_value(), "catppuccinMocha");
     }

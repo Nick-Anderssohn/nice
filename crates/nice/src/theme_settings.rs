@@ -4,11 +4,14 @@
 //! ## What lives here (R21 slice 1)
 //!
 //! * [`Appearance`] — the pure value type: `scheme` (light|dark), `sync_with_os`,
-//!   the two per-scheme chrome-palette slots, `accent`, and the two per-scheme
-//!   terminal-theme-id slots. Its fresh-install defaults, its tolerant decode
-//!   (Swift/`SortSettingsStore` fail-soft parity), and its active-view
-//!   derivations (`active_chrome_palette` with the **macOS → Nice substitution**,
-//!   `active_terminal_id`) are all pure functions with unit tables below.
+//!   `accent`, and the two per-scheme terminal-theme-id slots. Round-2 restyle
+//!   plan 5 merged the chrome selection into the terminal theme, so there are no
+//!   separate chrome-palette fields any more — the chrome half is resolved from
+//!   the active terminal-theme id in [`ThemeState::from_stores`] (hand-tuned
+//!   tables for the nice-default / catppuccin ids, derived from the terminal
+//!   colors for every other theme). Its fresh-install defaults, its tolerant
+//!   decode (Swift/`SortSettingsStore` fail-soft parity), and `active_terminal_id`
+//!   are all pure functions with unit tables below.
 //! * [`ThemeSettingsStore`] — the gpui `Global` wrapping an [`Appearance`] + the
 //!   injected file path. `load(path)` is fail-soft to defaults; `set` persists
 //!   the `appearance` section through the **shared read-merge-write writer**
@@ -30,9 +33,10 @@
 //! (alongside R19's `file_browser_sort`; every OTHER top-level key is preserved
 //! by read-merge-write). Snake_case keys; values are the `nice-theme` rawValues.
 //! Tolerance: an absent section / field / unknown rawValue ⇒ that field's
-//! default; malformed JSON ⇒ full defaults; a persisted `"macOS"` palette is
-//! tolerated but substituted to Nice at derivation so nothing ever paints black
-//! (OQ6). `syncClaudeTheme` is NOT here — it stays the R17 CFPref.
+//! default; malformed JSON ⇒ full defaults; the legacy `chrome_light_palette` /
+//! `chrome_dark_palette` keys (including a `"macOS"` value) are ignored on read
+//! (the merge dropped them — the terminal theme now drives the chrome).
+//! `syncClaudeTheme` is NOT here — it stays the R17 CFPref.
 
 #![allow(dead_code)] // Slice 2/3 (ThemeState + apply_* mutators) consume these.
 
@@ -41,8 +45,11 @@ use std::path::PathBuf;
 use gpui::{
     AnyWindowHandle, App, AppContext, Entity, Global, WindowAppearance, WindowBackgroundAppearance,
 };
+use nice_term_view::{TerminalColor, TerminalTheme};
 use nice_theme::color::Srgba;
-use nice_theme::palette::{slots, ColorScheme, Palette, Slots};
+use nice_theme::palette::{
+    ColorScheme, Slots, CATPPUCCIN_LATTE, CATPPUCCIN_MOCHA, NICE_DARK, NICE_LIGHT,
+};
 use nice_theme::AccentPreset;
 use serde::{Deserialize, Serialize};
 
@@ -113,10 +120,6 @@ pub struct Appearance {
     pub scheme: ColorScheme,
     /// Whether `scheme` follows the OS appearance.
     pub sync_with_os: bool,
-    /// The chrome palette active when `scheme == Light`.
-    pub chrome_light_palette: Palette,
-    /// The chrome palette active when `scheme == Dark`.
-    pub chrome_dark_palette: Palette,
     /// The accent swatch (palette-agnostic).
     pub accent: AccentPreset,
     /// The terminal-theme id active when `scheme == Light` (resolved via the
@@ -155,8 +158,6 @@ impl Default for Appearance {
         Self {
             scheme: ColorScheme::Dark,
             sync_with_os: true,
-            chrome_light_palette: Palette::Nice,
-            chrome_dark_palette: Palette::Nice,
             accent: AccentPreset::Terracotta,
             terminal_theme_light_id: DEFAULT_TERMINAL_THEME_LIGHT_ID.to_string(),
             terminal_theme_dark_id: DEFAULT_TERMINAL_THEME_DARK_ID.to_string(),
@@ -170,33 +171,6 @@ impl Default for Appearance {
 }
 
 impl Appearance {
-    /// The chrome palette the user picked for `scheme` (the RAW slot, before the
-    /// macOS→Nice substitution). `active_chrome_palette = scheme==Light ? light :
-    /// dark` (`Tweaks.swift:286-288`).
-    pub fn chrome_palette_for(&self, scheme: ColorScheme) -> Palette {
-        match scheme {
-            ColorScheme::Light => self.chrome_light_palette,
-            ColorScheme::Dark => self.chrome_dark_palette,
-        }
-    }
-
-    /// The chrome palette active for the current `scheme`, **macOS-substituted**:
-    /// a palette that would resolve to a System-only (None/black) table for the
-    /// active scheme — `MacOs` (deferred, OQ6) or an off-scheme Catppuccin — is
-    /// replaced by [`Palette::Nice`] so nothing ever paints black. Every other
-    /// palette passes through unchanged.
-    pub fn active_chrome_palette(&self) -> Palette {
-        substitute_unpaintable(self.chrome_palette_for(self.scheme), self.scheme)
-    }
-
-    /// The concrete slot table for the active (substituted) chrome palette. Always
-    /// resolves (the substitution guarantees a valid, non-System table).
-    pub fn active_slots(&self) -> Slots {
-        let palette = self.active_chrome_palette();
-        slots(palette, self.scheme)
-            .expect("the macOS/off-scheme substitution always yields a resolvable palette")
-    }
-
     /// The active scheme.
     pub fn active_scheme(&self) -> ColorScheme {
         self.scheme
@@ -260,25 +234,46 @@ impl Appearance {
     }
 }
 
-/// Substitute [`Palette::Nice`] for any palette that cannot paint the active
-/// `scheme`: `MacOs` (its slots are System-semantic — deferred, would resolve to
-/// opaque black, OQ6) or an off-scheme single-scheme Catppuccin (no table for
-/// this scheme). Everything resolvable passes through. This is the tripwire that
-/// keeps a stray persisted pref from ever shipping a black UI.
-fn substitute_unpaintable(palette: Palette, scheme: ColorScheme) -> Palette {
-    if palette == Palette::MacOs {
-        return Palette::Nice;
-    }
-    match slots(palette, scheme) {
-        Some(_) => palette,
-        None => Palette::Nice,
-    }
+/// Convert a terminal-theme [`TerminalColor`] (8-bit sRGB) to the nice-theme
+/// [`Srgba`] the chrome-derivation seam consumes — the app-boundary conversion
+/// the crate layering keeps out of `nice-theme` (`nice-theme` must not depend on
+/// `nice-term-view`). Alpha is implicitly opaque.
+fn terminal_color_to_srgba(c: TerminalColor) -> Srgba {
+    Srgba::rgb(
+        f32::from(c.r) / 255.0,
+        f32::from(c.g) / 255.0,
+        f32::from(c.b) / 255.0,
+    )
 }
 
-/// Map a persisted palette rawValue to a [`Palette`]. Unknown ⇒ `None` (the
-/// caller defaults). RawValues: `Tweaks.swift:33-34` / `palette.rs:61-68`.
-fn palette_from_raw(raw: &str) -> Option<Palette> {
-    Palette::ALL.into_iter().find(|p| p.raw_value() == raw)
+/// The chrome [`Slots`] for a merged theme (round-2 restyle plan 5): the chrome
+/// half is keyed off the active terminal-theme `id`, resolved against the
+/// active `scheme` and the already-resolved [`TerminalTheme`].
+///
+/// * `nice-default-light` / `nice-default-dark` → the hand-tuned
+///   [`NICE_LIGHT`] / [`NICE_DARK`] tables ("Nice pairs with Nice").
+/// * `catppuccin-latte` / `catppuccin-mocha` → the hand-tuned
+///   [`CATPPUCCIN_LATTE`] / [`CATPPUCCIN_MOCHA`] tables.
+/// * every OTHER built-in (solarized/dracula/nord/gruvbox/tokyo-night/one-dark)
+///   AND every imported Ghostty theme → chrome DERIVED from the resolved
+///   terminal theme's foreground/background via
+///   [`nice_theme::derive_chrome`].
+///
+/// The four hand-tuned ids are matched together with their natural scheme, so a
+/// slot holding a scheme-mismatched hand-tuned id (which the terminal catalog
+/// resolves via its own scheme fallback) falls through to derivation from the
+/// theme that actually resolved — never a hand-tuned table for the wrong scheme.
+fn chrome_slots_for_theme(id: &str, scheme: ColorScheme, terminal: &TerminalTheme) -> Slots {
+    match (id, scheme) {
+        ("nice-default-light", ColorScheme::Light) => NICE_LIGHT,
+        ("nice-default-dark", ColorScheme::Dark) => NICE_DARK,
+        ("catppuccin-latte", ColorScheme::Light) => CATPPUCCIN_LATTE,
+        ("catppuccin-mocha", ColorScheme::Dark) => CATPPUCCIN_MOCHA,
+        _ => nice_theme::derive_chrome(
+            terminal_color_to_srgba(terminal.foreground),
+            terminal_color_to_srgba(terminal.background),
+        ),
+    }
 }
 
 /// Map a persisted accent rawValue to an [`AccentPreset`]. Unknown ⇒ `None`.
@@ -306,17 +301,16 @@ fn scheme_raw(scheme: ColorScheme) -> &'static str {
 
 /// The on-disk `"appearance"` section shape. Every field is optional so a
 /// missing / unknown field falls through to the [`Appearance`] default (tolerant
-/// decode). Serialized with the current selection; decoded permissively.
+/// decode). Serialized with the current selection; decoded permissively. The
+/// legacy `chrome_light_palette` / `chrome_dark_palette` keys (round-1) are NOT
+/// fields here, so serde ignores them on read and never writes them — the
+/// round-2 merge folded the chrome selection into the terminal theme.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AppearanceSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sync_with_os: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chrome_light_palette: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chrome_dark_palette: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,8 +344,6 @@ impl AppearanceSection {
         Self {
             scheme: Some(scheme_raw(a.scheme).to_string()),
             sync_with_os: Some(a.sync_with_os),
-            chrome_light_palette: Some(a.chrome_light_palette.raw_value().to_string()),
-            chrome_dark_palette: Some(a.chrome_dark_palette.raw_value().to_string()),
             accent: Some(a.accent.raw_value().to_string()),
             terminal_theme_light_id: Some(a.terminal_theme_light_id.clone()),
             terminal_theme_dark_id: Some(a.terminal_theme_dark_id.clone()),
@@ -383,16 +375,6 @@ impl AppearanceSection {
                 .and_then(scheme_from_raw)
                 .unwrap_or(d.scheme),
             sync_with_os: self.sync_with_os.unwrap_or(d.sync_with_os),
-            chrome_light_palette: self
-                .chrome_light_palette
-                .as_deref()
-                .and_then(palette_from_raw)
-                .unwrap_or(d.chrome_light_palette),
-            chrome_dark_palette: self
-                .chrome_dark_palette
-                .as_deref()
-                .and_then(palette_from_raw)
-                .unwrap_or(d.chrome_dark_palette),
             accent: self
                 .accent
                 .as_deref()
@@ -446,8 +428,6 @@ fn legacy_appearance_defaults() -> Appearance {
     Appearance {
         scheme: ColorScheme::Dark,
         sync_with_os: true,
-        chrome_light_palette: Palette::CatppuccinLatte,
-        chrome_dark_palette: Palette::CatppuccinMocha,
         accent: AccentPreset::Ocean,
         terminal_theme_light_id: "catppuccin-latte".to_string(),
         terminal_theme_dark_id: "catppuccin-mocha".to_string(),
@@ -533,16 +513,6 @@ impl ThemeSettingsStore {
     /// The active color scheme.
     pub fn active_scheme(&self) -> ColorScheme {
         self.appearance.active_scheme()
-    }
-
-    /// The active chrome palette (macOS-substituted).
-    pub fn active_chrome_palette(&self) -> Palette {
-        self.appearance.active_chrome_palette()
-    }
-
-    /// The active chrome slot table.
-    pub fn active_slots(&self) -> Slots {
-        self.appearance.active_slots()
     }
 
     /// The active accent.
@@ -643,13 +613,12 @@ pub fn default_theme_settings_path() -> PathBuf {
 /// consumer never touches an unpaintable palette or an unknown terminal id.
 #[derive(Clone)]
 pub struct ThemeState {
-    /// The active chrome slot table (macOS-substituted — never a System/black
-    /// table).
+    /// The active chrome slot table — every slot a concrete sRGB literal
+    /// (hand-tuned for the nice-default / catppuccin ids, otherwise derived from
+    /// the terminal theme's fg/bg via [`nice_theme::derive_chrome`]).
     pub slots: Slots,
     /// The active color scheme.
     pub scheme: ColorScheme,
-    /// The active chrome palette (macOS-substituted).
-    pub palette: Palette,
     /// The active accent as a concrete sRGB color (the caret / selection / logo
     /// tint).
     pub accent: Srgba,
@@ -675,12 +644,16 @@ impl ThemeState {
     /// [`SharedThemeState`] entity, then fan out.
     pub fn from_stores(store: &ThemeSettingsStore, catalog: &TerminalThemeCatalog) -> Self {
         let scheme = store.active_scheme();
+        let terminal_id = store.active_terminal_id();
+        // Resolve the terminal half once, then key the chrome half off the same
+        // id + resolved theme (round-2 merge: one theme drives both halves).
+        let terminal_theme = catalog.resolve(terminal_id, scheme);
+        let slots = chrome_slots_for_theme(terminal_id, scheme, &terminal_theme);
         Self {
-            slots: store.active_slots(),
+            slots,
             scheme,
-            palette: store.active_chrome_palette(),
             accent: store.active_accent().color(),
-            terminal_theme: catalog.resolve(store.active_terminal_id(), scheme),
+            terminal_theme,
             background_opacity: store.active_window_opacity(),
             blur_radius: store.active_blur_radius(),
             window_appearance: store.active_window_appearance(),
@@ -789,11 +762,10 @@ pub fn apply_window_transparency(cx: &App, window: &mut gpui::Window) {
 }
 
 /// The shipped Nice/Dark chrome table — the fallback when [`SharedThemeState`] is
-/// absent. Kept out of the chrome files so no live render path hardcodes
-/// `slots(Palette::Nice, ColorScheme::Dark)` (Validation §3 hardcode grep).
+/// absent. Kept out of the chrome files so no live render path hardcodes the
+/// literal [`NICE_DARK`] table (Validation §3 hardcode grep).
 fn fallback_chrome_slots() -> Slots {
-    slots(Palette::Nice, ColorScheme::Dark)
-        .expect("Nice + Dark is a valid palette/scheme combo")
+    NICE_DARK
 }
 
 /// Install the live theme globals for the shipped app (`app::run` ONLY, before
@@ -930,20 +902,6 @@ pub fn apply_scheme(cx: &mut App, scheme: ColorScheme) {
     commit_appearance(cx, appearance);
 }
 
-/// Set the chrome palette for one scheme's slot (the picker is per-scheme). A
-/// change to the INACTIVE scheme's slot is latent (no active repaint) until a
-/// scheme flip makes it active.
-pub fn apply_chrome_palette(cx: &mut App, scheme: ColorScheme, palette: Palette) {
-    let Some(mut appearance) = current_appearance(cx) else {
-        return;
-    };
-    match scheme {
-        ColorScheme::Light => appearance.chrome_light_palette = palette,
-        ColorScheme::Dark => appearance.chrome_dark_palette = palette,
-    }
-    commit_appearance(cx, appearance);
-}
-
 /// Set the accent (palette-agnostic): recolors the caret on cursor-None terminal
 /// themes plus the chrome / selection / logo tint.
 pub fn apply_accent(cx: &mut App, accent: AccentPreset) {
@@ -1034,9 +992,10 @@ pub fn pin_legacy_appearance(cx: &mut App) {
 }
 
 /// Apply the restyle NEW-look defaults to every appearance axis (restyle plan 3
-/// migration, the popup's "Try the new look" answer): Nice palette both schemes,
-/// Terracotta accent, the nice-default terminal themes, the 80/90 opacity + 30px
-/// blur slider defaults, and OS-sync ON (reconciling the scheme to the OS now).
+/// migration, the popup's "Try the new look" answer): Terracotta accent, the
+/// nice-default terminal themes (which now drive the chrome too), the 80/90
+/// opacity + 30px blur slider defaults, and OS-sync ON (reconciling the scheme
+/// to the OS now).
 /// Terminal FONT family/size and terminal LINE-HEIGHT live in the prefs store —
 /// the caller sets line-height to 1.3 and never touches font family/size (Nick's
 /// carve-out). No-op when the store Global is absent.
@@ -1045,8 +1004,6 @@ pub fn apply_restyle_new_look(cx: &mut App) {
         return;
     };
     let nu = Appearance::default();
-    appearance.chrome_light_palette = nu.chrome_light_palette;
-    appearance.chrome_dark_palette = nu.chrome_dark_palette;
     appearance.accent = nu.accent;
     appearance.terminal_theme_light_id = nu.terminal_theme_light_id;
     appearance.terminal_theme_dark_id = nu.terminal_theme_dark_id;
@@ -1312,15 +1269,14 @@ mod tests {
         dir.join("ui_settings.json")
     }
 
-    /// Fresh-install defaults (restyle plan 3 flip): Nice palette both schemes,
-    /// Terracotta accent, the nice-default terminal themes.
+    /// Fresh-install defaults (restyle plan 3 flip): Terracotta accent, the
+    /// nice-default terminal themes (which drive the chrome after the round-2
+    /// merge).
     #[test]
     fn fresh_install_defaults() {
         let a = Appearance::default();
         assert_eq!(a.scheme, ColorScheme::Dark);
         assert!(a.sync_with_os);
-        assert_eq!(a.chrome_light_palette, Palette::Nice);
-        assert_eq!(a.chrome_dark_palette, Palette::Nice);
         assert_eq!(a.accent, AccentPreset::Terracotta);
         assert_eq!(a.terminal_theme_light_id, "nice-default-light");
         assert_eq!(a.terminal_theme_dark_id, "nice-default-dark");
@@ -1454,10 +1410,8 @@ mod tests {
         let pinned = legacy_pinned_appearance(empty, ColorScheme::Dark);
 
         // Every field pins to the LEGACY literal — NOT the flipped fresh-install
-        // default (Nice / Terracotta / nice-default-* / 80-90 / 30).
+        // default (Terracotta / nice-default-* / 80-90 / 30).
         assert_eq!(pinned, legacy_appearance_defaults());
-        assert_eq!(pinned.chrome_light_palette, Palette::CatppuccinLatte);
-        assert_eq!(pinned.chrome_dark_palette, Palette::CatppuccinMocha);
         assert_eq!(pinned.accent, AccentPreset::Ocean);
         assert_eq!(pinned.terminal_theme_light_id, "catppuccin-latte");
         assert_eq!(pinned.terminal_theme_dark_id, "catppuccin-mocha");
@@ -1467,9 +1421,9 @@ mod tests {
         assert_eq!(pinned.blur_radius_dark, 0);
 
         // The RESOLVED active look equals the PRE-flip resolution: opaque, unblurred,
-        // Catppuccin-Mocha chrome + terminal id on the Dark scheme.
-        assert_eq!(pinned.active_chrome_palette(), Palette::CatppuccinMocha);
-        assert_eq!(pinned.active_slots(), nice_theme::palette::CATPPUCCIN_MOCHA);
+        // the Catppuccin-Mocha terminal id on the Dark scheme (which now also drives
+        // the chrome — see `legacy_mismatched_pair_resolves_to_terminal_derived_chrome`
+        // for the chrome-derivation half over a catalog).
         assert_eq!(pinned.active_terminal_id(), "catppuccin-mocha");
         assert_eq!(pinned.active_window_opacity(), 1.0);
         assert_eq!(pinned.active_blur_radius(), 0);
@@ -1485,7 +1439,6 @@ mod tests {
         assert_eq!(pinned.accent, AccentPreset::Iris, "explicit accent survives");
         assert_eq!(pinned.window_opacity_dark, 70, "explicit opacity survives");
         // Absent keys still legacy — never the flipped fresh-install default.
-        assert_eq!(pinned.chrome_dark_palette, Palette::CatppuccinMocha);
         assert_eq!(pinned.terminal_theme_light_id, "catppuccin-latte");
         assert_eq!(pinned.window_opacity_light, 100);
         assert_eq!(pinned.blur_radius_dark, 0);
@@ -1511,8 +1464,6 @@ mod tests {
         let target = Appearance {
             scheme: ColorScheme::Light,
             sync_with_os: false,
-            chrome_light_palette: Palette::Nice,
-            chrome_dark_palette: Palette::Nice,
             accent: AccentPreset::Iris,
             terminal_theme_light_id: "solarized-light".to_string(),
             terminal_theme_dark_id: "dracula".to_string(),
@@ -1558,8 +1509,9 @@ mod tests {
         assert_eq!(*store.appearance(), Appearance::default());
     }
 
-    /// Tolerance: an unknown palette / accent / scheme rawValue and a missing
-    /// field all fall back to that field's default; known fields still decode.
+    /// Tolerance: an unknown accent / scheme rawValue and a missing field all fall
+    /// back to that field's default; a legacy `chrome_light_palette` key is
+    /// ignored (round-2 merge dropped it); known fields still decode.
     #[test]
     fn unknown_and_missing_fields_default() {
         let path = temp_path("tolerant");
@@ -1578,33 +1530,37 @@ mod tests {
         let d = Appearance::default();
         // Unknown rawValues → defaults.
         assert_eq!(a.scheme, d.scheme);
-        assert_eq!(a.chrome_light_palette, d.chrome_light_palette);
         assert_eq!(a.accent, d.accent);
         // Missing fields → defaults.
         assert!(a.sync_with_os);
-        assert_eq!(a.chrome_dark_palette, d.chrome_dark_palette);
         assert_eq!(a.terminal_theme_light_id, d.terminal_theme_light_id);
-        // A known field still decodes.
+        // A known field still decodes (and the ignored legacy chrome key did not
+        // break the decode).
         assert_eq!(a.terminal_theme_dark_id, "gruvbox-dark");
     }
 
-    /// Tolerance: a persisted `"macOS"` palette rawValue decodes as `MacOs` (shape
-    /// tolerance) but the ACTIVE derivation substitutes Nice — never black (OQ6).
+    /// Round-2 migration: the legacy `chrome_dark_palette` key (including a
+    /// `"macOS"` value) is ignored on read — it never breaks the decode, and the
+    /// terminal-theme selection alone survives (the terminal drives the chrome).
     #[test]
-    fn macos_palette_tolerated_but_substituted() {
-        let path = temp_path("macos");
+    fn legacy_chrome_keys_including_macos_are_ignored_on_read() {
+        let path = temp_path("legacy-chrome");
         std::fs::write(
             &path,
-            br#"{"version":1,"appearance":{"scheme":"dark","chrome_dark_palette":"macOS"}}"#,
+            br#"{"version":1,"appearance":{
+                "scheme":"dark",
+                "chrome_light_palette":"catppuccinLatte",
+                "chrome_dark_palette":"macOS",
+                "terminal_theme_dark_id":"dracula"
+            }}"#,
         )
         .unwrap();
+        // Decodes without error; the terminal id is honored, the chrome keys gone.
         let store = ThemeSettingsStore::load(path);
-        // Shape-tolerated: the raw slot really is MacOs.
-        assert_eq!(store.appearance().chrome_dark_palette, Palette::MacOs);
-        // Derived: substituted to Nice, and the slot table is the Nice dark table
-        // (a concrete literal, NOT a System/black slot).
-        assert_eq!(store.active_chrome_palette(), Palette::Nice);
-        assert_eq!(store.active_slots(), nice_theme::palette::NICE_DARK);
+        let a = store.appearance();
+        assert_eq!(a.scheme, ColorScheme::Dark);
+        assert_eq!(a.terminal_theme_dark_id, "dracula");
+        assert_eq!(a.active_terminal_id(), "dracula");
     }
 
     /// Malformed JSON is fail-soft: full defaults, no crash.
@@ -1616,72 +1572,164 @@ mod tests {
         assert_eq!(*store.appearance(), Appearance::default());
     }
 
-    /// Active-palette derivation across schemes, including the macOS→Nice and
-    /// off-scheme-Catppuccin→Nice substitutions.
+    /// A hermetic builtins-only catalog over a throwaway (nonexistent) temp dir.
+    fn hermetic_catalog(tag: &str) -> TerminalThemeCatalog {
+        TerminalThemeCatalog::new(std::env::temp_dir().join(format!(
+            "nice-theme-settings-{tag}-{}",
+            std::process::id()
+        )))
+    }
+
+    /// The merged chrome resolution ([`chrome_slots_for_theme`]): the four
+    /// hand-tuned ids map to their hand-tuned tables; every OTHER built-in derives
+    /// chrome from the resolved terminal theme's fg/bg (never a hand-tuned table).
     #[test]
-    fn active_chrome_palette_derivation() {
-        // Nice both schemes: passes through, resolves to the Nice tables.
-        let nice = Appearance {
-            chrome_light_palette: Palette::Nice,
-            chrome_dark_palette: Palette::Nice,
-            ..Appearance::default()
-        };
-        let light = Appearance {
-            scheme: ColorScheme::Light,
-            ..nice.clone()
-        };
-        assert_eq!(light.active_chrome_palette(), Palette::Nice);
-        assert_eq!(light.active_slots(), nice_theme::palette::NICE_LIGHT);
-        let dark = Appearance {
-            scheme: ColorScheme::Dark,
-            ..nice
-        };
-        assert_eq!(dark.active_chrome_palette(), Palette::Nice);
-        assert_eq!(dark.active_slots(), nice_theme::palette::NICE_DARK);
+    fn chrome_slots_key_off_the_merged_theme_id() {
+        let catalog = hermetic_catalog("chrome-slots");
 
-        // Catppuccin slots pass through for their own scheme (explicitly set — the
-        // fresh-install default is now Nice after the restyle plan 3 flip).
-        let latte = Appearance {
-            scheme: ColorScheme::Light,
-            chrome_light_palette: Palette::CatppuccinLatte,
-            ..Appearance::default()
-        };
-        assert_eq!(latte.active_chrome_palette(), Palette::CatppuccinLatte);
-        assert_eq!(latte.active_slots(), nice_theme::palette::CATPPUCCIN_LATTE);
-        let mocha = Appearance {
-            scheme: ColorScheme::Dark,
-            chrome_dark_palette: Palette::CatppuccinMocha,
-            ..Appearance::default()
-        };
-        assert_eq!(mocha.active_chrome_palette(), Palette::CatppuccinMocha);
-        assert_eq!(mocha.active_slots(), nice_theme::palette::CATPPUCCIN_MOCHA);
+        // The four hand-tuned ids (each with its natural scheme) → their tables.
+        for (id, scheme, expected) in [
+            ("nice-default-light", ColorScheme::Light, NICE_LIGHT),
+            ("nice-default-dark", ColorScheme::Dark, NICE_DARK),
+            ("catppuccin-latte", ColorScheme::Light, CATPPUCCIN_LATTE),
+            ("catppuccin-mocha", ColorScheme::Dark, CATPPUCCIN_MOCHA),
+        ] {
+            let theme = catalog.resolve(id, scheme);
+            assert_eq!(chrome_slots_for_theme(id, scheme, &theme), expected, "{id}");
+        }
 
-        // macOS → Nice for the active scheme (both schemes).
-        let macos = Appearance {
-            chrome_light_palette: Palette::MacOs,
-            chrome_dark_palette: Palette::MacOs,
-            ..Appearance::default()
-        };
-        let ml = Appearance {
-            scheme: ColorScheme::Light,
-            ..macos.clone()
-        };
-        assert_eq!(ml.active_chrome_palette(), Palette::Nice);
-        let md = Appearance {
-            scheme: ColorScheme::Dark,
-            ..macos
-        };
-        assert_eq!(md.active_chrome_palette(), Palette::Nice);
+        // A derived built-in (Dracula): chrome == derive_chrome(fg, bg), the
+        // background slot is the terminal background verbatim, and NOT a hand-tuned
+        // table.
+        let dracula = catalog.resolve("dracula", ColorScheme::Dark);
+        let derived = chrome_slots_for_theme("dracula", ColorScheme::Dark, &dracula);
+        assert_eq!(
+            derived,
+            nice_theme::derive_chrome(
+                terminal_color_to_srgba(dracula.foreground),
+                terminal_color_to_srgba(dracula.background),
+            )
+        );
+        assert_eq!(
+            derived.background,
+            nice_theme::palette::SlotColor::Srgb(terminal_color_to_srgba(dracula.background))
+        );
+        assert_ne!(derived, NICE_DARK);
+        assert_ne!(derived, CATPPUCCIN_MOCHA);
+    }
 
-        // An off-scheme single-scheme Catppuccin (Latte pinned to the dark slot)
-        // has no table for Dark → substituted Nice, never black.
-        let off = Appearance {
-            scheme: ColorScheme::Dark,
-            chrome_dark_palette: Palette::CatppuccinLatte,
-            ..Appearance::default()
-        };
-        assert_eq!(off.active_chrome_palette(), Palette::Nice);
-        assert_eq!(off.active_slots(), nice_theme::palette::NICE_DARK);
+    /// Legibility floor over the ACTUAL built-in catalog (plan 5 Validation +
+    /// the `derive.rs` deferral at `ink_ramp_clears_the_nice_contrast_floor`,
+    /// which pins only the Nice reference and defers "the per-catalog contrast
+    /// checks over the actual built-ins" to the consumer wiring — this test).
+    ///
+    /// For every built-in id the catalog exposes, resolve its chrome via
+    /// [`chrome_slots_for_theme`] (the 8 muted themes derive, the 4 hand-tuned
+    /// ids use their tables) and assert the whole ink ramp (`ink`/`ink2`/`ink3`)
+    /// clears a readable contrast floor against the resolved background. The
+    /// floors are DELIBERATELY below what `NICE_DARK`/`NICE_LIGHT` achieve: real
+    /// terminal themes carry lower intrinsic fg/bg contrast than Nice (Solarized
+    /// is intentionally low-contrast), so the derivation can only preserve the
+    /// theme's own legibility, not manufacture Nice's. Grounded floors —
+    /// `ink >= 4.0` (~WCAG AA body), `ink2 >= 2.5`, `ink3 >= 1.8` (muted but
+    /// distinguishable) — with margin under the observed minima (ink 4.13 /
+    /// ink2 2.93 / ink3 1.95, both from Solarized), so a real collapse (a slot
+    /// routing to the wrong color, or a factor regressing the muted ramp toward
+    /// invisibility) fails here while the intended derivation passes.
+    #[test]
+    fn every_built_in_ink_ramp_is_legible_over_its_derived_surface() {
+        use crate::built_in_terminal_themes::built_in_terminal_themes;
+        use crate::terminal_theme_catalog::ThemeScope;
+        use nice_theme::palette::SlotColor;
+
+        // WCAG 2.1 relative luminance + contrast ratio over `Srgba`, matching the
+        // formula `nice-theme::derive` uses for scheme detection.
+        fn relative_luminance(c: Srgba) -> f32 {
+            fn linearize(ch: f32) -> f32 {
+                if ch <= 0.039_28 {
+                    ch / 12.92
+                } else {
+                    ((ch + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * linearize(c.r) + 0.7152 * linearize(c.g) + 0.0722 * linearize(c.b)
+        }
+        fn contrast(a: Srgba, b: Srgba) -> f32 {
+            let (la, lb) = (relative_luminance(a), relative_luminance(b));
+            let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        fn slot(s: SlotColor) -> Srgba {
+            let SlotColor::Srgb(c) = s;
+            c
+        }
+
+        let catalog = hermetic_catalog("ink-legibility");
+        for built_in in built_in_terminal_themes() {
+            // Built-ins are single-scheme (never `Either`); resolve in that scheme.
+            let scheme = match built_in.scope {
+                ThemeScope::Light => ColorScheme::Light,
+                ThemeScope::Dark => ColorScheme::Dark,
+                ThemeScope::Either => ColorScheme::Dark,
+            };
+            let terminal = catalog.resolve(built_in.id, scheme);
+            let chrome = chrome_slots_for_theme(built_in.id, scheme, &terminal);
+            let bg = slot(chrome.background);
+            for (name, ink, floor) in [
+                ("ink", slot(chrome.ink), 4.0_f32),
+                ("ink2", slot(chrome.ink2), 2.5),
+                ("ink3", slot(chrome.ink3), 1.8),
+            ] {
+                let ratio = contrast(ink, bg);
+                assert!(
+                    ratio >= floor,
+                    "{} {name} contrast {ratio:.3} below legibility floor {floor:.3}",
+                    built_in.id
+                );
+            }
+        }
+    }
+
+    /// Migration (plan Validation): a legacy store with a MISMATCHED pair
+    /// (chrome = Catppuccin Mocha, terminal = Dracula) resolves — after the merge
+    /// drops the chrome key — to Dracula everywhere. The terminal colors are
+    /// byte-identical to the catalog's Dracula, and the chrome is Dracula-derived
+    /// (NOT the Catppuccin Mocha table). "The terminal theme wins."
+    #[test]
+    fn legacy_mismatched_pair_resolves_to_terminal_derived_chrome() {
+        let path = temp_path("legacy-mismatch");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"appearance":{
+                "scheme":"dark",
+                "chrome_dark_palette":"catppuccinMocha",
+                "terminal_theme_dark_id":"dracula"
+            }}"#,
+        )
+        .unwrap();
+        let store = ThemeSettingsStore::load(path);
+        assert_eq!(store.active_terminal_id(), "dracula");
+
+        let catalog = hermetic_catalog("legacy-mismatch");
+        let state = ThemeState::from_stores(&store, &catalog);
+
+        // Terminal half: byte-identical to the catalog's Dracula (unchanged look).
+        let dracula = catalog.resolve("dracula", ColorScheme::Dark);
+        assert_eq!(state.terminal_theme, dracula);
+
+        // Chrome half: Dracula-DERIVED — the Catppuccin Mocha table is NOT used.
+        assert_eq!(
+            state.slots,
+            nice_theme::derive_chrome(
+                terminal_color_to_srgba(dracula.foreground),
+                terminal_color_to_srgba(dracula.background),
+            )
+        );
+        assert_ne!(state.slots, CATPPUCCIN_MOCHA);
+        assert_eq!(
+            state.slots.background,
+            nice_theme::palette::SlotColor::Srgb(terminal_color_to_srgba(dracula.background))
+        );
     }
 
     /// `active_terminal_id` selects the per-scheme slot; the (explicitly-set)

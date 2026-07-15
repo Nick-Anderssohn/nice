@@ -199,24 +199,15 @@ fn band_rule_color(cx: &App) -> Rgba {
 }
 
 /// Adapt a nice-theme [`SlotColor`] to a gpui [`Rgba`] (the app owns this token →
-/// gpui adapter, per the crates/README Layering rule). Only the sRGB-literal arm
-/// is reachable for the Nice/Dark chrome + line slots the band paints; a
-/// (currently unreached) system-color slot falls back to opaque so the band can
-/// never silently vanish.
+/// gpui adapter, per the crates/README Layering rule). Every chrome slot is an
+/// sRGB literal after the round-2 merge, so this is a plain field copy.
 fn slot_rgba(slot: SlotColor) -> Rgba {
-    match slot {
-        SlotColor::Srgb(c) => Rgba {
-            r: c.r,
-            g: c.g,
-            b: c.b,
-            a: c.a,
-        },
-        SlotColor::System { .. } => Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 1.0,
-        },
+    let SlotColor::Srgb(c) = slot;
+    Rgba {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: c.a,
     }
 }
 
@@ -2193,15 +2184,7 @@ fn tokens_swatches(cx: &App) -> Vec<Swatch> {
 
     let mut swatches = Vec::with_capacity(palette_slots.len() + AccentPreset::ALL.len());
     for (label, slot) in palette_slots {
-        let color = match slot {
-            SlotColor::Srgb(c) => c,
-            // Nice/Dark carries no system slots; guard so a future palette swap
-            // that introduces one fails loudly instead of asserting a colour we
-            // cannot resolve here without NSColor.
-            SlotColor::System { .. } => {
-                panic!("tokens scenario expects only sRGB slots; '{label}' is a system slot")
-            }
-        };
+        let SlotColor::Srgb(color) = slot;
         swatches.push(Swatch { label, color });
     }
     for preset in AccentPreset::ALL {
