@@ -1539,7 +1539,7 @@ impl FileBrowserView {
 
     fn build_tree(&self, snap: &Snapshot, s: &Slots, cx: &mut Context<Self>) -> AnyElement {
         if !snap.root_exists {
-            return self.build_missing_state(snap, s);
+            return self.build_missing_state(snap, s, cx);
         }
         let rows = snap.rows.clone();
         let scale = self.window_scale;
@@ -1590,7 +1590,7 @@ impl FileBrowserView {
         .into_any_element()
     }
 
-    fn build_missing_state(&self, snap: &Snapshot, s: &Slots) -> AnyElement {
+    fn build_missing_state(&self, snap: &Snapshot, s: &Slots, cx: &App) -> AnyElement {
         div()
             .flex_1()
             .w_full()
@@ -1600,6 +1600,11 @@ impl FileBrowserView {
             .justify_center()
             .gap(px(8.0))
             .py(px(24.0))
+            // The chrome family — the empty states carry their own text, off any
+            // family-setting row.
+            .when_some(crate::sidebar_shell::resolved_mono_family(cx), |d, fam| {
+                d.font_family(fam)
+            })
             .child(
                 div()
                     .text_size(px(22.0))
@@ -1623,7 +1628,7 @@ impl FileBrowserView {
             .into_any_element()
     }
 
-    fn build_empty_panel(&self, s: &Slots) -> AnyElement {
+    fn build_empty_panel(&self, s: &Slots, cx: &App) -> AnyElement {
         div()
             .flex_1()
             .w_full()
@@ -1631,6 +1636,9 @@ impl FileBrowserView {
             .items_center()
             .justify_center()
             .text_size(px(12.0))
+            .when_some(crate::sidebar_shell::resolved_mono_family(cx), |d, fam| {
+                d.font_family(fam)
+            })
             .text_color(slot_to_rgba(s.ink3))
             .child(SharedString::from("No active tab"))
             .into_any_element()
@@ -1926,7 +1934,7 @@ impl gpui::Render for FileBrowserView {
                 .role(gpui::Role::Group)
                 .aria_label(FILE_BROWSER_ROOT_LABEL)
                 .size_full()
-                .child(self.build_empty_panel(&s));
+                .child(self.build_empty_panel(&s, cx));
         };
 
         // Scroll resets to the top on a root change (re-root / up-nav / tab
@@ -2294,6 +2302,11 @@ impl gpui::Render for DragPreview {
                 .border_1()
                 .border_color(slot_to_rgba(s.line))
                 .text_size(px(NAME_SIZE))
+                // The chrome family — the drag chip mounts in the drag layer, so
+                // it never inherits a row font.
+                .when_some(crate::sidebar_shell::resolved_mono_family(cx), |d, fam| {
+                    d.font_family(fam)
+                })
                 .text_color(slot_to_rgba(s.ink))
                 .child(SharedString::from(label)),
         )

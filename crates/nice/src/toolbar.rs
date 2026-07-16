@@ -357,6 +357,11 @@ impl Render for PaneDragGhost {
                 .border_color(slot_to_rgba(s.line))
                 .opacity(0.85)
                 .text_size(px(PILL_TEXT_SIZE))
+                // The chrome family — the ghost mounts in the drag layer, so it
+                // never inherits the pill's font.
+                .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                    d.font_family(fam)
+                })
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(slot_to_rgba(s.ink))
                 .whitespace_nowrap()
@@ -385,6 +390,11 @@ impl Render for TabTooltip {
             .border_1()
             .border_color(slot_to_rgba(s.line))
             .text_size(px(PILL_TEXT_SIZE))
+            // The chrome family — a tooltip mounts in the overlay layer, so it
+            // never inherits the pill's font.
+            .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                d.font_family(fam)
+            })
             .text_color(slot_to_rgba(s.ink))
             .whitespace_nowrap()
             .child(self.title.clone())
@@ -1336,7 +1346,7 @@ impl WindowToolbarView {
         let ink = slot_to_rgba(s.ink);
         let leading = self.tab_leading(vm, ink, s, cx);
         // Tab titles use the terminal font family (parity with the pill).
-        let tab_family = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
+        let tab_family = crate::theme_settings::chrome_font_family(cx);
         let full_title = SharedString::from(vm.title.clone());
         let tooltip_title = full_title.clone();
         div()
@@ -1386,7 +1396,7 @@ impl WindowToolbarView {
         // Tab titles use the terminal font family (not the UI sans), read from the
         // shared font settings; `None` before the keymap wires it (isolated
         // scenarios) leaves the default font.
-        let tab_family = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
+        let tab_family = crate::theme_settings::chrome_font_family(cx);
 
         // Leading icon: per-pane StatusDot for Claude (6pt in the strip), else the
         // `terminal` symbol tinted like the title (shared with the single-tab title).
@@ -1813,6 +1823,11 @@ impl WindowToolbarView {
                 .child(
                     div()
                         .text_size(px(PILL_TEXT_SIZE))
+                        // The chrome family — the tab pills render in it; without
+                        // it this pill alone reads in the system font.
+                        .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                            d.font_family(fam)
+                        })
                         .text_color(accent)
                         .child(SharedString::from(UPDATE_PILL_LABEL)),
                 )

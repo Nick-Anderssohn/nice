@@ -691,6 +691,15 @@ pub fn active_chrome_accent(cx: &App) -> Srgba {
     }
 }
 
+/// The font family chrome text renders in this frame: the user's terminal
+/// family (the restyle renders ALL chrome — settings, toolbar tabs, sidebar
+/// rows — in it), or `None` when the shared font settings global is absent
+/// (unit tests / bare scenarios), in which case callers fall through to the
+/// window default via `when_some`.
+pub fn chrome_font_family(cx: &App) -> Option<gpui::SharedString> {
+    crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family())
+}
+
 /// The `(terminal theme, accent)` a freshly-built terminal pane is seeded with —
 /// read by `build_window_root` / the pane host. Live [`SharedThemeState`] when
 /// installed, else the shipped `nice_default_dark` + Terracotta pair (unchanged

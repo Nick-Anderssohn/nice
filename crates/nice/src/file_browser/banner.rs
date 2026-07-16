@@ -179,6 +179,11 @@ impl Render for DriftBannerView {
                     .py(px(8.0))
                     .rounded(px(8.0))
                     .bg(panel_bg)
+                    // The chrome family — the banner is an absolute layer, so it
+                    // never inherits a row font.
+                    .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                        d.font_family(fam)
+                    })
                     // undo glyph
                     .child(
                         div()

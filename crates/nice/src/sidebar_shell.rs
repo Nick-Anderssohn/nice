@@ -338,7 +338,7 @@ fn active_slots(cx: &App) -> Slots {
 /// which leaves gpui's default UI family. Only the FAMILY comes from here; text
 /// SIZE stays proportional off each view's own sizing.
 pub(crate) fn resolved_mono_family(cx: &App) -> Option<SharedString> {
-    crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family())
+    crate::theme_settings::chrome_font_family(cx)
 }
 
 /// The over-glass hairline colour for the flat sidebar's trailing divider — the
@@ -464,6 +464,11 @@ impl Render for TabRowDragGhost {
                 .border_color(slot_to_rgba(s.line))
                 .opacity(0.85)
                 .text_size(px(13.0))
+                // The chrome family — the ghost mounts in the drag layer, so it
+                // never inherits the row's font.
+                .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                    d.font_family(fam)
+                })
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(slot_to_rgba(s.ink))
                 .whitespace_nowrap()

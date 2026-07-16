@@ -29,9 +29,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, px, App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    anchored, deferred, div, prelude::*, px, App, Context, DismissEvent, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
+    Point, Render, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
@@ -378,6 +378,11 @@ impl Render for ContextMenu {
             .text_size(px(menu_text_px(
                 crate::settings::sidebar_font::current_sidebar_px(cx),
             )))
+            // The chrome family (the restyle's mono chrome look) — otherwise
+            // rows inherit the system-font window default.
+            .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                d.font_family(fam)
+            })
             .bg(slot_to_rgba(s.panel))
             .border_1()
             .border_color(slot_to_rgba(s.line))

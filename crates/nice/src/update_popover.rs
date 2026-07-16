@@ -36,9 +36,10 @@
 use std::time::Duration;
 
 use gpui::{
-    anchored, deferred, div, px, App, ClipboardItem, Context, DismissEvent, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    anchored, deferred, div, prelude::*, px, App, ClipboardItem, Context, DismissEvent,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
+    Styled, Window,
 };
 
 use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
@@ -50,7 +51,7 @@ use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
 /// Fixed popover width (pt) — wide enough that the combined brew command sits on
-/// one 12pt-Menlo line next to its Copy button at the default chrome font.
+/// one 12pt mono line next to its Copy button at the default chrome font.
 const POPOVER_WIDTH: f32 = 400.0;
 /// Card padding (pt) — the confirmation-modal card padding.
 const POPOVER_PAD: f32 = 16.0;
@@ -66,9 +67,6 @@ const HOVER_INK_ALPHA: f32 = 0.08;
 const BODY_TEXT_PT: f32 = 12.0;
 /// Header title point size at the 12pt anchor — the context-menu / NSMenu base.
 const HEADER_TEXT_PT: f32 = 13.0;
-/// A stock, always-present macOS monospace family for the command text (the same
-/// choice the term-render fixture makes for a font-independent monospace).
-const COMMAND_FONT: &str = "Menlo";
 /// The accent header glyph — the same SF Symbol the pill leads with, one step
 /// larger.
 const HEADER_ICON_SF: &str = "arrow.up.circle.fill";
@@ -242,7 +240,6 @@ impl UpdatePopover {
                     // Let the command wrap instead of widening the card when the
                     // chrome font is scaled up.
                     .min_w(px(0.0))
-                    .font_family(COMMAND_FONT)
                     .text_size(px(sidebar_size(chrome_px, BODY_TEXT_PT)))
                     .text_color(slot_to_rgba(s.ink))
                     .child(command),
@@ -318,9 +315,15 @@ impl Render for UpdatePopover {
             .items_start()
             .w(px(POPOVER_WIDTH))
             .p(px(POPOVER_PAD))
-            // The chrome text size — the Copy button label and footer inherit it;
-            // without it the card reads at the 16px window default.
+            // The chrome text size + family — the command, Copy button label,
+            // and footer inherit them; without them the card reads at the 16px
+            // window default in the system font, off the restyled chrome. (The
+            // chrome family is the user's terminal mono, so the command row
+            // needs no separate monospace override.)
             .text_size(px(sidebar_size(chrome_px, BODY_TEXT_PT)))
+            .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                d.font_family(fam)
+            })
             .bg(slot_to_rgba(s.panel))
             .border_1()
             .border_color(slot_to_rgba(s.line))

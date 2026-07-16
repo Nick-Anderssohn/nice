@@ -1648,16 +1648,33 @@ impl TerminalView {
         }
     }
 
-    /// The centred "Launching…" overlay (T9) — a faithful port of
-    /// `LaunchingOverlay.swift`: a status dot + title, plus the dimmed command
-    /// line when the app set one. Non-interactive (no listeners), so mouse events
-    /// pass through to the terminal below. The dot sits on the window's vertical
-    /// centre line (a single centred flex row), which the self-test's pixel probe
-    /// keys on.
+    /// Chrome slots derived from this view's terminal theme (the app's
+    /// `derive_chrome` idiom) — the overlays' card colors. This crate never
+    /// observes the app's `SharedThemeState`; deriving from the theme it was
+    /// handed keeps the overlay consistent with the chrome the app derives from
+    /// the same theme.
+    fn overlay_slots(&self) -> nice_theme::Slots {
+        let to_srgba = |c: crate::theme::TerminalColor| {
+            Srgba::rgb(
+                c.r as f32 / 255.0,
+                c.g as f32 / 255.0,
+                c.b as f32 / 255.0,
+            )
+        };
+        nice_theme::derive_chrome(to_srgba(self.theme.foreground), to_srgba(self.theme.background))
+    }
+
+    /// The centred "Launching…" overlay (T9): a status dot + title, plus the
+    /// dimmed command line when the app set one. Non-interactive (no listeners),
+    /// so mouse events pass through to the terminal below. The dot sits on the
+    /// window's vertical centre line (a single centred flex row), which the
+    /// self-test's pixel probe keys on. Text renders in the terminal font at the
+    /// chrome point sizes (the restyle look — the old Helvetica was Swift
+    /// parity, retired).
     fn render_launch_overlay(&self) -> impl IntoElement {
         let ink = self.theme.foreground.to_u32();
         // A dimmed subtitle colour: the theme's bright-black (ANSI 8), a muted grey
-        // (mirrors Swift's `niceInk3` under the command line).
+        // (mirrors the chrome's `ink3` under the command line).
         let ink3 = self.theme.ansi[8].to_u32();
         let title: SharedString = match &self.overlay_command {
             Some(cmd) => format!("Launching {cmd}…").into(),
@@ -1676,9 +1693,8 @@ impl TerminalView {
             .child(div().w(px(8.0)))
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.0))
                     .text_color(rgb(ink))
-                    .font_family("Helvetica")
                     .child(title),
             );
 
@@ -1686,13 +1702,13 @@ impl TerminalView {
             .flex()
             .flex_col()
             .items_center()
+            .font_family(self.font_family.clone())
             .child(heading)
             .when_some(self.overlay_command.clone(), |card, cmd| {
                 card.child(div().h(px(6.0))).child(
                     div()
-                        .text_xs()
+                        .text_size(px(12.0))
                         .text_color(rgb(ink3))
-                        .font_family("Helvetica")
                         .child(cmd),
                 )
             });
@@ -1709,7 +1725,10 @@ impl TerminalView {
     /// that frees the held term). Deliberately unobtrusive; Stage 2's tab-dissolve
     /// replaces it.
     fn render_held_affordance(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ink = self.theme.foreground.to_u32();
+        // Chrome-card colors derived from the theme (the hardcoded warm-dark
+        // Swift fill read wrong on light themes) + the terminal font at the
+        // chrome point size — the restyle card idiom.
+        let slots = self.overlay_slots();
         let pill = div()
             .w(px(240.0))
             .h(px(28.0))
@@ -1717,10 +1736,12 @@ impl TerminalView {
             .items_center()
             .justify_center()
             .rounded(px(8.0))
-            .bg(rgb(0x2a2521))
-            .text_xs()
-            .text_color(rgb(ink))
-            .font_family("Helvetica")
+            .bg(slot_rgba(slots.panel))
+            .border_1()
+            .border_color(slot_rgba(slots.line))
+            .text_size(px(12.0))
+            .text_color(slot_rgba(slots.ink))
+            .font_family(self.font_family.clone())
             .child("press \u{23ce} or click to start a new shell")
             .on_mouse_down(
                 MouseButton::Left,
@@ -1739,6 +1760,18 @@ impl TerminalView {
             .justify_end()
             .child(pill)
             .child(div().h(px(24.0)))
+    }
+}
+
+/// A chrome slot as a gpui [`Rgba`] — this crate has no dependency on the app's
+/// slot adapter, so the derive→Rgba hop lives here (overlay use only).
+fn slot_rgba(slot: nice_theme::SlotColor) -> Rgba {
+    let nice_theme::SlotColor::Srgb(s) = slot;
+    Rgba {
+        r: s.r,
+        g: s.g,
+        b: s.b,
+        a: s.a,
     }
 }
 

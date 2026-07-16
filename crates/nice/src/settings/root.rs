@@ -308,7 +308,7 @@ impl Render for SettingsRootView {
         // right edge, the same grammar as the flattened sidebar (plan 02).
         let hairline = srgba_to_rgba(glass_line(scheme));
         // Terminal-resolved mono family throughout (parity with the main window).
-        let mono = crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family());
+        let mono = crate::theme_settings::chrome_font_family(cx);
 
         // The 28pt titlebar: native traffic lights sit at their OS position (left);
         // the centered "Settings" label is inset both edges to clear them. Pure
@@ -453,6 +453,11 @@ impl Render for SettingTooltip {
             .border_color(slot_to_rgba(slots.line))
             .max_w(px(320.0))
             .text_size(px(11.5))
+            // The chrome family — a tooltip mounts in the overlay layer, so it
+            // never inherits the settings root's font.
+            .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
+                d.font_family(fam)
+            })
             .text_color(slot_to_rgba(slots.ink))
             .child(self.text.clone())
     }

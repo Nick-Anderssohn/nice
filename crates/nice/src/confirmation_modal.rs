@@ -38,14 +38,15 @@
 use std::rc::Rc;
 
 use gpui::{
-    deferred, div, px, App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, Role,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    deferred, div, prelude::*, px, App, Context, DismissEvent, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    Role, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
 use nice_theme::palette::Slots;
 
+use crate::settings::sidebar_font::{current_sidebar_px, sidebar_size};
 use crate::theme::{slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
 /// Selftest instrumentation (Bug B pin): the confirmation-modal backdrop's last
@@ -97,6 +98,12 @@ const HOVER_INK_ALPHA: f32 = 0.10;
 /// Destructive-confirm fill (a warm red) — used only when `destructive_confirm`
 /// is set (R20's "Use .<new>" / "Rename Anyway"). R18's dialogs pass `false`.
 const DESTRUCTIVE_RGBA: u32 = 0xC0_39_2B;
+/// Chrome text point size at the 12pt anchor — the message and button labels
+/// (the popup discipline: without an explicit size the card inherits the 16px
+/// window default and reads far larger than the chrome around it).
+const BODY_TEXT_PT: f32 = 12.0;
+/// Title point size at the 12pt anchor — the context-menu / NSMenu base.
+const TITLE_TEXT_PT: f32 = 13.0;
 
 /// The confirmation completion: `completion(confirmed, window, cx)`, run once
 /// before dismissal. `Rc` so the two button handlers + the key handler can each
@@ -192,6 +199,10 @@ impl Render for ConfirmationModal {
             crate::theme::slot_srgba(s.ink),
             HOVER_INK_ALPHA,
         ));
+        // The chrome (sidebar) font setting — text sizes scale with it, and the
+        // card renders in the chrome family (the restyle's mono chrome look).
+        let chrome_px = current_sidebar_px(cx);
+        let chrome_family = crate::theme_settings::chrome_font_family(cx);
 
         // Cancel button — subtle (ink on transparent, hover highlight).
         let cancel = div()
@@ -264,6 +275,11 @@ impl Render for ConfirmationModal {
             .gap_3()
             .w(px(MODAL_WIDTH))
             .p_4()
+            // The chrome text size + family — the message and buttons inherit
+            // them; without them the card reads at the 16px window default in
+            // the system font, off the restyled chrome.
+            .text_size(px(sidebar_size(chrome_px, BODY_TEXT_PT)))
+            .when_some(chrome_family, |d, fam| d.font_family(fam))
             .bg(slot_to_rgba(s.panel))
             .border_1()
             .border_color(slot_to_rgba(s.line))
@@ -271,6 +287,7 @@ impl Render for ConfirmationModal {
             .shadow_lg()
             .child(
                 div()
+                    .text_size(px(sidebar_size(chrome_px, TITLE_TEXT_PT)))
                     .text_color(slot_to_rgba(s.ink))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(self.title.clone()),
