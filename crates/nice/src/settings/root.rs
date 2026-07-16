@@ -302,7 +302,7 @@ impl Render for SettingsRootView {
         // at opacity < 1.0 the desktop shows through this fill. No opaque panel
         // fills anywhere in the body.
         let (theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
-        let opacity = crate::theme_settings::active_window_opacity(cx);
+        let opacity = crate::theme_settings::effective_window_opacity(window, cx);
         let surface = crate::app_shell::terminal_backing_color(&theme, opacity);
         // Over-glass hairline (scheme-scoped, not a palette slot) — the flat nav's
         // right edge, the same grammar as the flattened sidebar (plan 02).

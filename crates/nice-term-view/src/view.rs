@@ -1573,6 +1573,16 @@ impl Render for TerminalView {
             preedit,
         };
 
+        // Native full screen forces the grid opaque: macOS draws a plain black
+        // backdrop (not the wallpaper) behind a full-screen Space, so at < 1.0
+        // the skip-own-fill rule would reveal a black-composited backing instead
+        // of the desktop. The enter/exit resize redraws the tree, so this
+        // reverts to the stored translucency on exit without an observer.
+        let background_opacity = if window.is_fullscreen() {
+            1.0
+        } else {
+            self.background_opacity
+        };
         let element = TerminalElement::new(
             self.handle.read(cx),
             &self.theme,
@@ -1585,7 +1595,7 @@ impl Render for TerminalView {
             self.paint_bounds.clone(),
             self.auto_refit,
             self.grid_cache.clone(),
-            self.background_opacity,
+            background_opacity,
         );
 
         div()

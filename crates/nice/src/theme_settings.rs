@@ -719,6 +719,25 @@ pub fn active_window_opacity(cx: &App) -> f32 {
     }
 }
 
+/// The surface-fill opacity `window` should actually paint:
+/// [`active_window_opacity`], forced to `1.0` while the window is in native
+/// full screen. macOS never draws the desktop wallpaper behind a full-screen
+/// Space — the system backdrop there is plain black — so a translucent fill
+/// composites toward black instead of showing the desktop (the same reason
+/// Ghostty disables background opacity in native full screen). Every
+/// render-time consumer of the window opacity (the window backing, the
+/// terminal grid's skip-own-fill rule, the tab-strip edge fade) reads this so
+/// a full-screen window paints the exact opaque theme background and reverts
+/// to the stored translucency on exit (the enter/exit resize redraws the
+/// tree; no explicit observer is needed).
+pub fn effective_window_opacity(window: &gpui::Window, cx: &App) -> f32 {
+    if window.is_fullscreen() {
+        1.0
+    } else {
+        active_window_opacity(cx)
+    }
+}
+
 /// The active-scheme [`WindowBackgroundAppearance`] each window should paint: the
 /// live [`SharedThemeState`] when installed, else `Opaque` (the pre-restyle
 /// window).

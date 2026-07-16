@@ -1152,7 +1152,13 @@ impl WindowToolbarView {
 
     /// The pill strip: a horizontally-scrolling row of pills (flex-filling), then
     /// the always-reserved chevron slot, then the always-visible `+`.
-    fn render_strip(&self, panes: &[PaneVm], s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_strip(
+        &self,
+        panes: &[PaneVm],
+        s: &Slots,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Single-tab mode (round-2 plan 4): with EXACTLY one pane the strip draws
         // no tab boxes — the title renders as the window's centered titlebar text
         // (the overlay built in `render`), and the overflow chevron is hidden (it
@@ -1205,7 +1211,7 @@ impl WindowToolbarView {
         // here (needs `cx`) and moved into the fade builders.
         let (term_theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
         let fade = Rgba {
-            a: crate::theme_settings::active_window_opacity(cx),
+            a: crate::theme_settings::effective_window_opacity(window, cx),
             ..gpui::rgb(term_theme.background.to_u32())
         };
         let scroll_wrap = div()
@@ -1925,7 +1931,7 @@ impl Render for WindowToolbarView {
             .pl(px(traffic_light_reserved_width()))
             .pr(px(TOOLBAR_TRAILING_PAD))
             .child(self.render_collapse_toggle(&s, cx))
-            .child(self.render_strip(&panes, &s, cx))
+            .child(self.render_strip(&panes, &s, window, cx))
             // Trailing update-pill slot (R27, P7): the conditional update pill,
             // inserted after the strip. It renders ONLY when a newer release is
             // available — absent, it emits nothing, so the toolbar with no update is

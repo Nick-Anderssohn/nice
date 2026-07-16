@@ -162,7 +162,7 @@ impl AppShellView {
 }
 
 impl Render for AppShellView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // W5/R18: the confirmation dialog presented over this window, if any. It
         // lives on the shared `WindowState` (so the app-level quit/close paths can
         // present it) and renders as a deferred overlay above the whole shell.
@@ -181,9 +181,10 @@ impl Render for AppShellView {
         let (terminal_theme, _) = crate::theme_settings::active_terminal_theme_and_accent(cx);
         // Restyle plan 3: the backing carries the active-scheme surface-fill
         // opacity (1.0 when no live theme is installed — scenarios / tests stay
-        // opaque). `refresh_windows()` in the theme fan-out re-runs this render on
-        // any opacity / scheme change.
-        let opacity = crate::theme_settings::active_window_opacity(cx);
+        // opaque; 1.0 also while full screen, where macOS puts a black backdrop
+        // behind the window instead of the wallpaper). `refresh_windows()` in the
+        // theme fan-out re-runs this render on any opacity / scheme change.
+        let opacity = crate::theme_settings::effective_window_opacity(window, cx);
         div()
             .size_full()
             .bg(terminal_backing_color(&terminal_theme, opacity))
