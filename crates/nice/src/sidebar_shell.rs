@@ -178,11 +178,12 @@ const SF_PLUS: &str = "plus";
 // 2026-07 restyle's stroke SVGs from `crate::chrome_icons` (`MODE_TABS` /
 // `MODE_FILES` / `MODE_GEAR`), not SF Symbols — see [`SidebarShellView::build_footer`].
 
-/// Sidebar row status-dot size (pt). The restyle renders row dots smaller than
-/// the default 8pt (plan 1 set 6pt in the tab strip); only the size parameter
+/// Sidebar row status-dot size (pt). Matches the tab-strip dot
+/// (`toolbar::TAB_STATUS_DOT_SIZE`, 7pt) so the sidebar and title-bar status
+/// dots read the same size; the default is 8pt. Only the size parameter
 /// changes — the dot's colours + pulse are untouched
 /// (`docs/plans/restyle/02-sidebar-flatten.md`).
-const SIDEBAR_ROW_DOT_SIZE: f32 = 5.0;
+const SIDEBAR_ROW_DOT_SIZE: f32 = 7.0;
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 

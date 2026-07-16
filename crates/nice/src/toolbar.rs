@@ -117,10 +117,10 @@ const PILL_GAP: f32 = 7.0;
 const PILL_TEXT_SIZE: f32 = 12.0;
 /// Leading terminal-glyph box for a Terminal pane's tab.
 const PILL_ICON_SIZE: f32 = 12.0;
-/// Status-dot diameter inside a tab (mock `.tab .dot { width: 6px }`; the
-/// [`StatusDot`] component's 8pt default stays elsewhere — only its size
-/// parameter changes here, colours + pulse untouched).
-const TAB_STATUS_DOT_SIZE: f32 = 6.0;
+/// Status-dot diameter inside a tab (the [`StatusDot`] component's 8pt default
+/// stays elsewhere — only its size parameter changes here, colours + pulse
+/// untouched).
+const TAB_STATUS_DOT_SIZE: f32 = 7.0;
 /// Tab underline: 1px tall, seated on the bar's bottom edge, inset 11px from the
 /// tab's outer edges, 0.5px corner radius (mock Style A `.tab::after` /
 /// `.tab.active::after` — round-2 thinned both underlines from 2px to 1px). The
