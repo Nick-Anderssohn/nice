@@ -334,6 +334,10 @@ impl WindowState {
         // survive.
         model.repair_project_structure();
         model.prune_dangling_parent_references();
+        // Re-mint any duplicate pane ids a pre-fix save left behind (the old
+        // reset-at-launch minter could persist two panes sharing one id, which
+        // double-lights the strip and makes rename edit both).
+        model.dedupe_pane_ids();
         // Re-apply the saved active tab iff it still exists after the repairs,
         // else fall back to the first navigable tab (Swift re-applies `activeTabId`
         // only when the tab survived).
@@ -2119,6 +2123,30 @@ mod tests {
         // The saved active tab is re-applied and the selection re-seeded from it.
         assert_eq!(ws.model.active_tab_id(), Some("t-b"));
         assert!(ws.selection.contains("t-b"));
+    }
+
+    #[test]
+    fn with_seed_heals_duplicate_pane_ids_from_a_pre_fix_save() {
+        // A pre-fix save could carry two panes sharing one id (the strip's
+        // reset-at-launch minter re-issued a persisted "pane-N"), which
+        // double-lights the strip and makes rename edit both pills. Restore
+        // must re-mint the later duplicate.
+        let mut seed = restore_seed("w-dup", None, false);
+        seed.projects[0].tabs[0]
+            .panes
+            .push(Pane::new("dup-id", "Moldavite", PaneKind::Terminal));
+        seed.projects[0].tabs[0]
+            .panes
+            .push(Pane::new("dup-id", "Terminal 15", PaneKind::Terminal));
+
+        let ws = WindowState::with_seed(seed);
+
+        let tab = ws.model.tab_for(TabModel::MAIN_TERMINAL_TAB_ID).unwrap();
+        let mut ids: Vec<&str> = tab.panes.iter().map(|p| p.id.as_str()).collect();
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "restore must leave no duplicate pane ids: {ids:?}");
     }
 
     #[test]

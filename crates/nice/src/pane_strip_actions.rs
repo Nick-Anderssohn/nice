@@ -25,6 +25,8 @@
 
 use nice_model::TabModel;
 
+use crate::session_manager::default_mint_id;
+
 /// The select / close / add-terminal actions the toolbar pill strip invokes. The
 /// toolbar view owns a boxed instance; R13 swaps the implementation to drive real
 /// sessions. Keeping it a single trait is what makes R13's rewiring mechanical.
@@ -59,26 +61,21 @@ pub(crate) trait PaneStripActions {
     fn select_prev_pane(&mut self, model: &mut TabModel);
 }
 
-/// The R11 model-only [`PaneStripActions`] implementation. Holds a monotonic id
-/// counter so the panes it mints get unique ids without a UUID dependency
-/// (nothing here is persisted this cycle — R18 owns persistence). R13 replaces
-/// this whole type with the session-spawning implementation.
+/// The R11 model-only [`PaneStripActions`] implementation. Pane ids come from
+/// the process-global time+counter minter
+/// ([`crate::session_manager::default_mint_id`]) so a mint can never collide
+/// with a pane id restored from a previous launch. (The original per-instance
+/// counter restarted at 0 every launch while restored panes kept their persisted
+/// ids verbatim — the first `+` press after a relaunch re-minted an existing
+/// `pane-N` id, and every id-keyed strip affordance then matched both panes:
+/// double-selected pills, click-inert select, rename editing both.)
 #[derive(Default)]
-pub(crate) struct ModelPaneStripActions {
-    /// Monotonic counter feeding minted pane ids.
-    next_id: u64,
-}
+pub(crate) struct ModelPaneStripActions;
 
 impl ModelPaneStripActions {
     /// A fresh instance.
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    /// Mint a unique id with the given prefix.
-    fn mint(&mut self, prefix: &str) -> String {
-        self.next_id += 1;
-        format!("{prefix}-{}", self.next_id)
     }
 
     /// Wrapping step of the active tab's `active_pane_id` by `offset` panes. A
@@ -128,7 +125,7 @@ impl PaneStripActions for ModelPaneStripActions {
     }
 
     fn add_terminal_pane(&mut self, model: &mut TabModel, tab_id: &str) -> Option<String> {
-        let pane_id = self.mint("pane");
+        let pane_id = default_mint_id("pane-");
         model.add_pane(tab_id, pane_id, None)
     }
 
@@ -176,6 +173,34 @@ mod tests {
             "the new pane is focused"
         );
         assert_eq!(tab.next_terminal_index, 3, "the monotonic counter advanced");
+    }
+
+    #[test]
+    fn add_terminal_pane_never_collides_with_a_restored_pane_id() {
+        // The relaunch bug: a previous launch minted "pane-1", persisted it, and
+        // a fresh instance's first mint re-issued "pane-1" — two panes sharing
+        // one id (double-selected pills, rename editing both). Simulate the
+        // restored save, then mint from fresh instances (a new instance per
+        // launch) and require every id on the tab to stay unique.
+        let mut model = seeded();
+        let (pi, ti) = model.project_tab_index(main_tab_id()).unwrap();
+        model.projects[pi].tabs[ti]
+            .panes
+            .push(Pane::new("pane-1", "Moldavite", PaneKind::Terminal));
+
+        ModelPaneStripActions::new()
+            .add_terminal_pane(&mut model, main_tab_id())
+            .unwrap();
+        ModelPaneStripActions::new()
+            .add_terminal_pane(&mut model, main_tab_id())
+            .unwrap();
+
+        let tab = model.tab_for(main_tab_id()).unwrap();
+        let mut ids: Vec<&str> = tab.panes.iter().map(|p| p.id.as_str()).collect();
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "no two panes may share an id: {ids:?}");
     }
 
     #[test]

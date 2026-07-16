@@ -37,6 +37,8 @@
 
 use nice_model::{Pane, PaneKind, Tab, TabModel};
 
+use crate::session_manager::default_mint_id;
+
 /// The create / close / select actions the sidebar UI invokes. The per-window
 /// state owns a boxed instance ([`crate::sidebar_shell::SidebarShellView`]); R13
 /// swaps the implementation to spawn/close real sessions. Keeping this a single
@@ -64,26 +66,21 @@ pub(crate) trait SidebarActions {
     fn close_project(&mut self, model: &mut TabModel, project_id: &str);
 }
 
-/// The R10 model-only [`SidebarActions`] implementation. Holds a monotonic id
-/// counter so the tabs/panes it mints get unique ids without a UUID dependency
-/// (nothing here is persisted this cycle — R18 owns persistence). R13 replaces
-/// this whole type with the session-spawning implementation.
+/// The R10 model-only [`SidebarActions`] implementation. Tab/pane ids come from
+/// the process-global time+counter minter
+/// ([`crate::session_manager::default_mint_id`]) so a mint can never collide
+/// with an id restored from a previous launch, nor with a pane the strip's
+/// [`crate::pane_strip_actions::ModelPaneStripActions`] minted this launch.
+/// (The original per-instance counter restarted at 0 every launch and both
+/// action structs counted independently under the same `pane-` prefix — either
+/// path could re-mint an id already live in the model.)
 #[derive(Default)]
-pub(crate) struct ModelSidebarActions {
-    /// Monotonic counter feeding minted tab/pane ids.
-    next_id: u64,
-}
+pub(crate) struct ModelSidebarActions;
 
 impl ModelSidebarActions {
     /// A fresh instance.
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    /// Mint a unique id with the given prefix.
-    fn mint(&mut self, prefix: &str) -> String {
-        self.next_id += 1;
-        format!("{prefix}-{}", self.next_id)
     }
 
     /// Remove the tab with id `tab_id` via the single removal entry point (which
@@ -117,8 +114,8 @@ impl SidebarActions for ModelSidebarActions {
             .projects
             .iter()
             .position(|p| p.id == TabModel::TERMINALS_PROJECT_ID)?;
-        let tab_id = self.mint("term-tab");
-        let pane_id = self.mint("pane");
+        let tab_id = default_mint_id("term-tab-");
+        let pane_id = default_mint_id("pane-");
         let path = model.projects[ti].path.clone();
         let mut tab = Tab::new(tab_id.clone(), "Terminal", path);
         tab.panes = vec![Pane::new(pane_id.clone(), "Terminal 1", PaneKind::Terminal)];
@@ -306,6 +303,25 @@ mod tests {
                 .any(|p| p.id == TabModel::TERMINALS_PROJECT_ID),
             "the pinned Terminals group can never be closed"
         );
+    }
+
+    #[test]
+    fn sidebar_and_strip_minters_never_share_a_pane_id() {
+        // Both action structs mint under the "pane-" prefix; with the old
+        // independent per-instance counters each minted "pane-1" first, so a
+        // sidebar-created tab's pane could collide with a strip-added pane in
+        // the same launch. The shared process-global minter makes them disjoint.
+        use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
+
+        let mut model = seeded();
+        let tab_id = ModelSidebarActions::new().create_terminal_tab(&mut model).unwrap();
+        ModelPaneStripActions::new()
+            .add_terminal_pane(&mut model, &tab_id)
+            .unwrap();
+
+        let tab = model.tab_for(&tab_id).unwrap();
+        assert_eq!(tab.panes.len(), 2);
+        assert_ne!(tab.panes[0].id, tab.panes[1].id, "sidebar/strip mints must not collide");
     }
 
     #[test]

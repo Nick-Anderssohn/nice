@@ -2317,6 +2317,104 @@ fn prune_dangling_parent_references_clears_orphans() {
     assert!(model.tab_for("child-orphan").unwrap().parent_tab_id.is_none(), "dangling parent cleared");
 }
 
+// =====================================================================
+// dedupe_pane_ids — the restore-time heal for pre-fix saves where the
+// reset-at-launch minter persisted two panes sharing one id (the
+// double-selected / rename-edits-both strip glitch).
+// =====================================================================
+
+#[test]
+fn dedupe_pane_ids_renames_later_duplicate_and_keeps_active_on_first() {
+    let mut model = model_empty("/tmp/main");
+    // The shape of the real corrupt save: "Moldavite" (pane-1) restored from a
+    // previous launch, "Terminal 15" (pane-1) minted by the fresh counter.
+    let mut tab = Tab::new("t-dup", "Main", "/tmp");
+    tab.panes = vec![
+        terminal("pane-1", "Moldavite"),
+        terminal("keep-2", "Vault"),
+        terminal("pane-1", "Terminal 15"),
+    ];
+    tab.active_pane_id = Some("pane-1".into());
+    model.projects[0].tabs.push(tab);
+
+    model.dedupe_pane_ids();
+
+    let tab = model.tab_for("t-dup").unwrap();
+    assert_eq!(tab.panes[0].id, "pane-1", "first occurrence keeps its id");
+    assert_eq!(tab.panes[1].id, "keep-2", "unique ids untouched");
+    assert_eq!(tab.panes[2].id, "pane-1-dup2", "later duplicate is re-minted");
+    assert_eq!(
+        tab.active_pane_id.as_deref(),
+        Some("pane-1"),
+        "active resolves unambiguously to the kept first pane"
+    );
+}
+
+#[test]
+fn dedupe_pane_ids_repoints_active_when_cross_tab_duplicate_renamed() {
+    let mut model = model_empty("/tmp/main");
+    let mut a = Tab::new("t-a", "A", "/tmp");
+    a.panes = vec![terminal("pane-1", "First")];
+    a.active_pane_id = Some("pane-1".into());
+    let mut b = Tab::new("t-b", "B", "/tmp");
+    b.panes = vec![terminal("pane-1", "Second")];
+    b.active_pane_id = Some("pane-1".into());
+    model.projects[0].tabs.push(a);
+    model.projects[0].tabs.push(b);
+
+    model.dedupe_pane_ids();
+
+    assert_eq!(model.tab_for("t-a").unwrap().panes[0].id, "pane-1");
+    let b = model.tab_for("t-b").unwrap();
+    assert_eq!(b.panes[0].id, "pane-1-dup2");
+    assert_eq!(
+        b.active_pane_id.as_deref(),
+        Some("pane-1-dup2"),
+        "the orphaned active pointer follows the renamed pane"
+    );
+}
+
+#[test]
+fn dedupe_pane_ids_suffix_skips_an_id_already_in_the_tree() {
+    let mut model = model_empty("/tmp/main");
+    // A pane literally named "pane-1-dup2" already exists, so the rename must
+    // step past it to the next unused suffix.
+    let mut tab = Tab::new("t-dup", "Main", "/tmp");
+    tab.panes = vec![
+        terminal("pane-1-dup2", "Squatter"),
+        terminal("pane-1", "First"),
+        terminal("pane-1", "Second"),
+    ];
+    model.projects[0].tabs.push(tab);
+
+    model.dedupe_pane_ids();
+
+    let ids: Vec<&str> = model
+        .tab_for("t-dup")
+        .unwrap()
+        .panes
+        .iter()
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["pane-1-dup2", "pane-1", "pane-1-dup3"]);
+}
+
+#[test]
+fn dedupe_pane_ids_is_a_noop_on_unique_ids() {
+    let mut model = model_empty("/tmp/main");
+    let mut tab = Tab::new("t-ok", "OK", "/tmp");
+    tab.panes = vec![terminal("a", "A"), terminal("b", "B")];
+    tab.active_pane_id = Some("b".into());
+    model.projects[0].tabs.push(tab);
+    let before = model.tab_for("t-ok").unwrap().clone();
+
+    model.dedupe_pane_ids();
+    // Idempotent: a second pass over the healed tree changes nothing either.
+    model.dedupe_pane_ids();
+
+    assert_eq!(*model.tab_for("t-ok").unwrap(), before, "unique ids are untouched");
+}
+
 // R16: test_branch_resumeWithIdChange_createsParentTab (classification →
 // materializeBranchParent) — the parent SHAPE it produces is pinned by
 // insert_branch_parent_creates_parent_shape above.
@@ -2737,6 +2835,17 @@ fn fire_mutation_matrix_every_persisting_mutator_fires() {
         fires_for(orphan, |m| m.prune_dangling_parent_references()) >= 1,
         "prune_dangling_parent_references (real clear) must fire"
     );
+    let dup_pane_ids = {
+        let mut m = matrix_fixture();
+        let mut t2 = new_claude_tab("t2", "/tmp/p");
+        t2.panes = vec![terminal("d", "A"), terminal("d", "B")];
+        m.projects[1].tabs.push(t2);
+        m
+    };
+    assert!(
+        fires_for(dup_pane_ids, |m| m.dedupe_pane_ids()) >= 1,
+        "dedupe_pane_ids (real rename) must fire"
+    );
 
     // --- Project structure ---
     assert!(
@@ -2824,5 +2933,10 @@ fn fire_mutation_matrix_reads_and_no_ops_never_fire() {
         fires_for(matrix_fixture(), |m| m.clear_dangling_parent_references("t1")),
         0,
         "clear_dangling_parent_references with nothing pointing at the id must not fire"
+    );
+    assert_eq!(
+        fires_for(matrix_fixture(), |m| m.dedupe_pane_ids()),
+        0,
+        "dedupe_pane_ids with all-unique ids is a no-op and must not fire"
     );
 }

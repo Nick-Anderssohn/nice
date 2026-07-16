@@ -1753,7 +1753,7 @@ fn clip_title(title: &str, max: usize) -> String {
 /// suffix closes (`SessionsModel.swift:175-179`), here made exact rather than
 /// probabilistic (distinct counter ⇒ distinct `(ms, suffix)` at human creation
 /// rates; the 16-bit space only wraps after 65536 mints inside one ms).
-fn default_mint_id(prefix: &str) -> String {
+pub(crate) fn default_mint_id(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

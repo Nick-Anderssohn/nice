@@ -1189,6 +1189,62 @@ impl TabModel {
         }
     }
 
+    /// Sweep every pane id in the tree for duplicates and re-mint any repeat —
+    /// first occurrence (in project/tab/pane order) keeps the id, later ones get
+    /// the lowest unused `<id>-dup<n>` suffix. Restore-time self-heal: a
+    /// pre-fix launch could persist two panes sharing one id (the strip/sidebar
+    /// minters restarted their counter at 0 every launch while restored panes
+    /// kept their persisted ids verbatim), and every id-keyed strip affordance
+    /// then matches both panes (double-selected pills, click-inert select,
+    /// rename editing both). When a rename orphans a tab's `active_pane_id`
+    /// (the duplicate lived on another tab), the pointer follows the renamed
+    /// pane. Pure cleanup — safe to call repeatedly. Fires the did-mutate
+    /// signal when it renamed at least one pane; in production this runs during
+    /// restore, before the observer is wired, so it self-heals silently there.
+    pub fn dedupe_pane_ids(&mut self) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut changed = false;
+        for project in &mut self.projects {
+            for tab in &mut project.tabs {
+                // (old, new) renames on this tab, for active_pane_id repair.
+                let mut renames: Vec<(String, String)> = Vec::new();
+                for pane in &mut tab.panes {
+                    if seen.insert(pane.id.clone()) {
+                        continue;
+                    }
+                    let old = pane.id.clone();
+                    let mut n = 2u32;
+                    let new_id = loop {
+                        let candidate = format!("{old}-dup{n}");
+                        if seen.insert(candidate.clone()) {
+                            break candidate;
+                        }
+                        n += 1;
+                    };
+                    pane.id = new_id.clone();
+                    renames.push((old, new_id));
+                    changed = true;
+                }
+                // Re-point active_pane_id only when the rename left it dangling
+                // (no pane on this tab retains the old id — the duplicate that
+                // kept it lives on another tab). When a pane on this tab kept
+                // the id, the pointer already resolves unambiguously to it.
+                if let Some(active) = tab.active_pane_id.clone() {
+                    if !tab.panes.iter().any(|p| p.id == active) {
+                        if let Some((_, new_id)) =
+                            renames.iter().find(|(old, _)| *old == active)
+                        {
+                            tab.active_pane_id = Some(new_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            self.fire_mutation();
+        }
+    }
+
     // MARK: - Filesystem-seam helpers
 
     /// Tilde-expand a path using the [`FsProbe`] home (`TabModel.swift:1071-1077`).
