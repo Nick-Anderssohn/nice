@@ -28,6 +28,10 @@
     --ansi-brblack: #818383;
     --ansi-brred: #fc5b47;
 
+    /* fixed prompt blue — same rgb(.48,.58,.86) as the StatusDot "waiting"
+       token above; scheme-independent, like --accent */
+    --prompt-blue: #7a94db;
+
     /* chrome slots (NICE_DARK, verbatim) */
     --ink: #f4f1ef;
     --ink2: #b1adaa;
@@ -431,8 +435,10 @@
     overflow: hidden;
   }
   .term .p  { color: var(--ansi-green); }
-  .term .dir{ color: var(--ansi-blue); }
+  .term .dir{ color: var(--accent); }
   .term .mut{ color: var(--ansi-brblack); }
+  .term .br { color: var(--prompt-blue); }
+  .term .pr { color: var(--prompt-blue); }
   .term .y  { color: var(--ansi-yellow); }
   .term .c  { color: var(--ansi-cyan); }
   .term .m  { color: var(--ansi-magenta); }
@@ -678,21 +684,21 @@
                 <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
-            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> cargo test -p nice-theme
+            <div class="term"><span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> cargo test -p nice-theme
 <span class="mut">   Compiling nice-theme v0.38.0</span>
 <span class="p">    Finished</span> test profile in 2.41s
 <span class="p">test result: ok.</span> 41 passed; 0 failed
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> git log --oneline -4
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> git log --oneline -4
 <span class="y">e5f3d42</span> Bump nice to 0.38.0 for the v0.38.0 release
 <span class="y">57a53e5</span> term: snap a scrolled-up viewport on typed input
 <span class="y">f5e9ad6</span> Bump nice to 0.37.0 for the v0.37.0 release
 <span class="y">85da768</span> cursor: loosen the block-visibility bar
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> <span class="cursor"></span></div>
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> <span class="cursor"></span></div>
           </div>
         </div>
       </div></div>
@@ -729,19 +735,19 @@
                 <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
-            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> nvim crates/nice-theme/src/chrome_geometry.rs
+            <div class="term"><span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> nvim crates/nice-theme/src/chrome_geometry.rs
 <span class="mut">──────────────────────────────────────────────</span>
 <span class="m">pub const</span> <span class="c">TOP_BAR_HEIGHT</span>: <span class="c">f32</span> = <span class="r">38.0</span>;
 <span class="m">pub const</span> <span class="c">SIDEBAR_DEFAULT_WIDTH</span>: <span class="c">f32</span> = <span class="r">240.0</span>;
 <span class="mut">──────────────────────────────────────────────</span>
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> rg "CARD_" --files-with-matches | wc -l
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> rg "CARD_" --files-with-matches | wc -l
 <span class="c">0</span>   <span class="mut"># the floating card is gone</span>
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> <span class="cursor"></span></div>
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> <span class="cursor"></span></div>
           </div>
         </div>
       </div></div>
@@ -790,21 +796,21 @@
                 <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
-            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> cargo test -p nice-theme
+            <div class="term"><span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> cargo test -p nice-theme
 <span class="mut">   Compiling nice-theme v0.38.0</span>
 <span class="p">    Finished</span> test profile in 2.41s
 <span class="p">test result: ok.</span> 41 passed; 0 failed
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> git log --oneline -4
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> git log --oneline -4
 <span class="y">e5f3d42</span> Bump nice to 0.38.0 for the v0.38.0 release
 <span class="y">57a53e5</span> term: snap a scrolled-up viewport on typed input
 <span class="y">f5e9ad6</span> Bump nice to 0.37.0 for the v0.37.0 release
 <span class="y">85da768</span> cursor: loosen the block-visibility bar
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> <span class="cursor"></span></div>
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> <span class="cursor"></span></div>
           </div>
         </div>
       </div></div>
@@ -841,19 +847,19 @@
                 <span class="sb-ico gear" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
               </div>
             </aside>
-            <div class="term"><span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> nvim crates/nice-theme/src/chrome_geometry.rs
+            <div class="term"><span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> nvim crates/nice-theme/src/chrome_geometry.rs
 <span class="mut">──────────────────────────────────────────────</span>
 <span class="m">pub const</span> <span class="c">TOP_BAR_HEIGHT</span>: <span class="c">f32</span> = <span class="r">38.0</span>;
 <span class="m">pub const</span> <span class="c">SIDEBAR_DEFAULT_WIDTH</span>: <span class="c">f32</span> = <span class="r">240.0</span>;
 <span class="mut">──────────────────────────────────────────────</span>
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> rg "CARD_" --files-with-matches | wc -l
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> rg "CARD_" --files-with-matches | wc -l
 <span class="c">0</span>   <span class="mut"># the floating card is gone</span>
 
-<span class="p">nick@mba</span> <span class="dir">~/Projects/nice</span> <span class="mut">(main)</span>
-<span class="y">❯</span> <span class="cursor"></span></div>
+<span class="dir">~/Projects/nice</span> <span class="br">main</span>
+<span class="pr">❯</span> <span class="cursor"></span></div>
           </div>
         </div>
       </div></div>
