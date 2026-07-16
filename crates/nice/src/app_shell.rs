@@ -187,6 +187,20 @@ impl Render for AppShellView {
         div()
             .size_full()
             .bg(terminal_backing_color(&terminal_theme, opacity))
+            // App-wide font family: the (single) terminal font-family setting drives
+            // the WHOLE app, not just the terminal grid. Set on the shell root so
+            // every chrome descendant (sidebar, tab strip, settings, buttons,
+            // overlays) inherits it via gpui's text-style cascade unless it sets its
+            // own family. Only the family cascades — chrome text SIZES stay per-view,
+            // and the terminal grid is unaffected (it shapes glyphs with an explicit
+            // font, not the inherited style). `None` before the keymap wires the
+            // `SharedFontSettings` global (isolated scenarios), leaving gpui's default
+            // UI family. Re-runs on any family change via the font pane's
+            // `refresh_windows()`.
+            .when_some(
+                crate::sidebar_shell::resolved_mono_family(cx),
+                |el, fam| el.font_family(fam),
+            )
             // R12: the window-level peek clear (moved here from `WindowChromeView`
             // when the shell replaced the bare chrome band as the window root). A
             // sidebar-tab cycle on a collapsed sidebar floats the peek overlay; this

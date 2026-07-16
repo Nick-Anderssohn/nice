@@ -178,17 +178,17 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
         .min_w(px(0.0))
         .child(setting_title("Font", cx));
 
-    // --- Terminal font family ---------------------------------------------
+    // --- App font family (drives the whole app: chrome + terminal) --------
     let installed = cx.text_system().all_font_names();
     let family_label: SharedString = match family.as_deref() {
         Some(fam) => SharedString::from(fam.to_string()),
         None => DEFAULT_FAMILY_LABEL.into(),
     };
     col = col.child(setting_row(
-        "Terminal font",
+        "Font",
         Some(
-            "Typeface for every terminal and Claude pane. Lists every font installed on \
-             this Mac; monospace works best."
+            "Typeface for the whole app — the interface as well as every terminal and \
+             Claude pane. Lists every font installed on this Mac; monospace works best."
                 .into(),
         ),
         dropdown(
