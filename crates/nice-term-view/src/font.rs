@@ -419,6 +419,32 @@ fn scale_metrics(base: TerminalMetrics, ratio: f32) -> TerminalMetrics {
     TerminalMetrics::new((base.cell_w * ratio).max(1.0), (base.cell_h * ratio).max(1.0))
 }
 
+/// Snap a cell box's WIDTH up to the device-pixel grid of the display a window
+/// is actually on (`ceil(cell_w·scale)/scale` — the same ceil-snap
+/// [`cell_metrics`] applies at derive time, re-done at the LIVE backing scale;
+/// SwiftTerm prod snapped to `backingScaleFactor()` the same way).
+///
+/// The derive-time snap is pinned to [`METRICS_SNAP_SCALE`] (2×) for
+/// determinism, so on a 2× display this is exactly idempotent (no change on
+/// Retina). On a 1× display a half-px width (e.g. `7.5`) widens to whole
+/// device px (`8.0`); without this, the box-drawing/procedural glyphs (whose
+/// sprite pitch is `round(cell_w·scale)` device px) drift off the exact
+/// text/background grid by up to 0.5 px **per column** — a visible
+/// misalignment mid-row on a 1× ultrawide.
+///
+/// Heights are untouched: `cell_h`/`glyph_h` are already whole logical px
+/// ([`padded_cell_h`] / the ceil'd glyph box), hence whole device px at any
+/// integer scale.
+///
+/// The small epsilon guards float error from re-snapping an already-exact
+/// width up a full pixel (`ceil` is exact-hostile); a genuinely fractional
+/// width still rounds up.
+pub fn snap_metrics_to_scale(m: TerminalMetrics, scale: f32) -> TerminalMetrics {
+    let scale = if scale > 0.0 { scale } else { METRICS_SNAP_SCALE };
+    let cell_w = ((m.cell_w * scale - 1e-3).ceil().max(1.0)) / scale;
+    TerminalMetrics::with_glyph_h(cell_w, m.cell_h, m.glyph_h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +546,37 @@ mod tests {
         assert_eq!(padded_cell_h(glyph_h, 1.8), 29.0);
         // A fractional glyph height still yields a whole padded cell.
         assert_eq!(padded_cell_h(17.0, 1.3), 22.0); // round(22.1)
+    }
+
+    #[test]
+    fn snap_to_2x_is_idempotent_with_the_derive_time_snap() {
+        // Derive-time widths are already ceil-snapped at 2× (k/2 logical px):
+        // re-snapping at 2× must not move them (Retina behaviour unchanged).
+        for w in [7.0, 7.5, 8.0, 13.5] {
+            let m = TerminalMetrics::with_glyph_h(w, 21.0, 16.0);
+            assert_eq!(snap_metrics_to_scale(m, 2.0), m, "width {w} moved at 2×");
+        }
+    }
+
+    #[test]
+    fn snap_to_1x_widens_half_px_cells_to_whole_device_px() {
+        let m = TerminalMetrics::with_glyph_h(7.5, 21.0, 16.0);
+        let snapped = snap_metrics_to_scale(m, 1.0);
+        assert_eq!(snapped.cell_w, 8.0, "7.5 logical px is fractional at 1×");
+        // Heights are already whole logical px — untouched.
+        assert_eq!(snapped.cell_h, 21.0);
+        assert_eq!(snapped.glyph_h, 16.0);
+        // An already-whole width stays put at 1×.
+        let whole = TerminalMetrics::with_glyph_h(8.0, 21.0, 16.0);
+        assert_eq!(snap_metrics_to_scale(whole, 1.0), whole);
+    }
+
+    #[test]
+    fn snap_guards_degenerate_scale() {
+        // A zero/negative scale (no window yet) falls back to the derive-time
+        // 2× snap — idempotent on derive-time widths.
+        let m = TerminalMetrics::with_glyph_h(7.5, 21.0, 16.0);
+        assert_eq!(snap_metrics_to_scale(m, 0.0), m);
     }
 
     #[test]

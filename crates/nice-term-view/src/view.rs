@@ -91,7 +91,7 @@ use nice_theme::Srgba;
 
 use crate::drop::{drop_bytes, ImageDropProvider};
 use crate::element::{fit_grid, grid_top_y, GridCache, ImeInput, TerminalElement, TerminalMetrics};
-use crate::font::FontSettings;
+use crate::font::{snap_metrics_to_scale, FontSettings};
 use crate::input::{
     build_key_input, build_modifier_input, encoder_config, kitty_forwards_super, named_key_for,
     KeyCodeProbe,
@@ -139,6 +139,18 @@ pub struct TerminalView {
     font_family: SharedString,
     font_px: f32,
     metrics: TerminalMetrics,
+    /// The window backing-scale factor observed on the last render. Seeded at
+    /// the derive-time snap scale (2× — Retina), where the snap below is a
+    /// no-op; corrected on the first render, before the first paint/fit.
+    display_scale: f32,
+    /// [`metrics`](Self::metrics) with the cell WIDTH re-snapped to
+    /// `display_scale`'s device-pixel grid ([`snap_metrics_to_scale`]) — THE
+    /// cell box every geometry consumer uses: the painted element, the pty
+    /// fit, mouse hit-testing, and the IME anchor. On a 2× display it equals
+    /// `metrics` exactly; on a 1× display it widens a half-px cell to whole
+    /// device px, so the text / background / box-drawing grids share one
+    /// device-aligned pitch instead of drifting 0.5 px per column apart.
+    effective_metrics: TerminalMetrics,
     focus_handle: FocusHandle,
     /// Whether the first-render focus grab has run (M2 Item D focus-once). Set
     /// on the first [`Render::render`]; never cleared. All later focus moves are
@@ -323,6 +335,10 @@ impl TerminalView {
             font_family,
             font_px,
             metrics,
+            // 2× (Retina) until the first render reads the real window scale;
+            // the snap is exactly idempotent there, so this equals `metrics`.
+            display_scale: 2.0,
+            effective_metrics: snap_metrics_to_scale(metrics, 2.0),
             focus_handle: cx.focus_handle(),
             focused_once: false,
             ime: ImeState::new(),
@@ -359,10 +375,12 @@ impl TerminalView {
         &self.font
     }
 
-    /// The cell metrics this view is currently painting at (the cache refreshed
-    /// on every font change). Read by the niceties-zoom self-test.
+    /// The cell metrics this view is currently painting at: the shared
+    /// [`FontSettings`] box with the cell width re-snapped to the live window
+    /// backing scale (equal to it on 2× displays). This is what the element,
+    /// pty fit, hit-testing, and IME anchor all use.
     pub fn metrics(&self) -> TerminalMetrics {
-        self.metrics
+        self.effective_metrics
     }
 
     /// Refresh the cached font from the shared [`FontSettings`] and **re-metric**:
@@ -382,6 +400,7 @@ impl TerminalView {
         self.font_family = family;
         self.font_px = px_size;
         self.metrics = metrics;
+        self.effective_metrics = snap_metrics_to_scale(metrics, self.display_scale);
         self.resize_pty_to_fit(cx);
         cx.notify();
     }
@@ -407,7 +426,9 @@ impl TerminalView {
             let (rows, cols) = fit_grid(
                 f32::from(bounds.size.width),
                 f32::from(bounds.size.height),
-                self.metrics,
+                // The device-snapped box the element actually paints at — the
+                // fit must count the columns that box tiles into the window.
+                self.effective_metrics,
             );
             if self.last_pty_fit == Some((rows, cols)) {
                 return; // no rows/cols delta — nothing to push (loop guard)
@@ -1099,8 +1120,8 @@ impl TerminalView {
         let (col, vrow) = mouse::cell_from_offset(
             rel_x,
             rel_y,
-            self.metrics.cell_w,
-            self.metrics.cell_h,
+            self.effective_metrics.cell_w,
+            self.effective_metrics.cell_h,
             cols,
             rows,
         );
@@ -1409,7 +1430,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Bounds<Pixels> {
-        let m = self.metrics;
+        let m = self.effective_metrics;
         // The grid cursor cell in viewport coordinates (row honours the scroll/
         // display offset, clamped on-screen). A full-screen TUI that parks or
         // hides the hardware cursor still has a grid cursor point, so this is
@@ -1492,6 +1513,25 @@ impl Render for TerminalView {
             window.focus(&self.focus_handle, cx);
         }
 
+        // Re-snap the cell box to THIS window's backing scale when it changes
+        // (first render, or the window migrated displays — 2× Retina ↔ 1×
+        // external): the painted grid pitch must be whole device px on the
+        // live display, or the box-drawing sprite grid drifts off the exact
+        // text grid (up to 0.5 logical px PER COLUMN at 1×). A real change
+        // re-fits the pty too — the new cell box tiles the same window into a
+        // different (rows, cols).
+        let scale = window.scale_factor();
+        if scale != self.display_scale {
+            self.display_scale = scale;
+            let snapped = snap_metrics_to_scale(self.metrics, scale);
+            if snapped != self.effective_metrics {
+                self.effective_metrics = snapped;
+                if self.auto_refit {
+                    self.schedule_refit(cx);
+                }
+            }
+        }
+
         let caret_solid = self.focus_handle.is_focused(window) && window.is_window_active();
 
         // DECSET-1004 focus in/out rides the same predicate as the caret: emit a
@@ -1539,7 +1579,7 @@ impl Render for TerminalView {
             self.accent,
             self.font_family.clone(),
             self.font_px,
-            self.metrics,
+            self.effective_metrics,
             caret_solid,
             ime,
             self.paint_bounds.clone(),

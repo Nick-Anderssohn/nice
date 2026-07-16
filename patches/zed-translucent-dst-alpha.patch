@@ -1,0 +1,36 @@
+diff --git a/crates/gpui_macos/src/metal_renderer.rs b/crates/gpui_macos/src/metal_renderer.rs
+index 5a72e23e14..8088398f14 100644
+--- a/crates/gpui_macos/src/metal_renderer.rs
++++ b/crates/gpui_macos/src/metal_renderer.rs
+@@ -1621,7 +1621,16 @@ fn build_pipeline_state(
+     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
++    // Nice patch (translucent-dst-alpha): source-over in the ALPHA channel too
++    // (stock gpui blends alpha additively, One/One). The rgb factors already
++    // produce the premultiplied source-over result; additive alpha overshoots
++    // coverage (a_out = a_src + a_dst instead of a_src + a_dst*(1 - a_src)).
++    // Invisible while the window is opaque (alpha is ignored), but on a
++    // translucent window it over-masks the WindowServer blur/desktop at every
++    // antialiased edge - a dark fringe around glyph AA, glaring on 1x displays.
++    color_attachment.set_destination_alpha_blend_factor(
++        metal::MTLBlendFactor::OneMinusSourceAlpha,
++    );
+ 
+     device
+         .new_render_pipeline_state(&descriptor)
+@@ -1655,7 +1664,12 @@ fn build_path_sprite_pipeline_state(
+     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
++    // Nice patch (translucent-dst-alpha): same alpha-channel source-over fix as
++    // build_pipeline_state above (path sprites are premultiplied; only the
++    // alpha factor was wrong for translucent windows).
++    color_attachment.set_destination_alpha_blend_factor(
++        metal::MTLBlendFactor::OneMinusSourceAlpha,
++    );
+ 
+     device
+         .new_render_pipeline_state(&descriptor)

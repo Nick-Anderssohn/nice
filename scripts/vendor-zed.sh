@@ -40,6 +40,13 @@
 #          the effect view) with a per-window radius, exposed as
 #          `Window::set_background_blur_radius(u32)` (default-noop on non-mac
 #          backends). Lets Nice's per-scheme blur slider drive a real radius.
+#        - zed-translucent-dst-alpha.patch: source-over (One / 1−srcA) instead
+#          of additive (One / One) DESTINATION-ALPHA blending in the Metal
+#          renderer's main + path-sprite pipelines. Additive alpha overshoots
+#          coverage; invisible on an opaque window, but on the restyle's
+#          translucent window it over-masks the WindowServer blur/desktop at
+#          every antialiased edge — a dark fringe around glyphs, glaring on 1×
+#          displays at background opacity < 1.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
@@ -65,6 +72,7 @@ PATCHES=(
     "zed-display-link-selfheal"
     "zed-force-width-exact"
     "zed-configurable-blur"
+    "zed-translucent-dst-alpha"
 )
 patch_file() { printf '%s/patches/%s.patch' "$REPO_ROOT" "$1"; }
 marker_file() { printf '%s/.nice-%s-applied' "$VENDOR" "${1#zed-}"; }

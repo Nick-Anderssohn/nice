@@ -32,7 +32,8 @@ use gpui::{
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
 use nice_term_view::{
-    fit_grid, FontSettings, TerminalMetrics, TerminalSessionHandle, TerminalTheme, TerminalView,
+    fit_grid, snap_metrics_to_scale, FontSettings, TerminalMetrics, TerminalSessionHandle,
+    TerminalTheme, TerminalView,
     DEFAULT_TERMINAL_FONT_PX,
 };
 use nice_theme::AccentPreset;
@@ -159,14 +160,18 @@ fn read_dims(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> Optio
     handle.update(cx, |h, _| h.session().dimensions())
 }
 
-/// The window's content viewport size in logical px — the reference the view's
-/// re-metric fit uses (its element fills the content area), so [`fit_grid`] over
-/// it reproduces the grid the view resized the pty to.
-fn read_viewport(cx: &mut AsyncApp, window: AnyWindowHandle) -> Option<(f32, f32)> {
+/// The window's content viewport size in logical px + its backing scale — the
+/// reference the view's re-metric fit uses (its element fills the content
+/// area), so [`fit_grid`] over it reproduces the grid the view resized the pty
+/// to. The scale matters because the view fits at the DEVICE-SNAPPED cell box
+/// ([`snap_metrics_to_scale`]); on a 2× display the snap is a no-op, but on a
+/// 1× display the shared `FontSettings` box alone would predict too many
+/// columns.
+fn read_viewport(cx: &mut AsyncApp, window: AnyWindowHandle) -> Option<(f32, f32, f32)> {
     window
         .update(cx, |_root, window, _app| {
             let vp = window.viewport_size();
-            (f32::from(vp.width), f32::from(vp.height))
+            (f32::from(vp.width), f32::from(vp.height), window.scale_factor())
         })
         .ok()
 }
@@ -219,7 +224,7 @@ async fn run_niceties_zoom(
 
     // --- Baseline (default size) ------------------------------------------
     let (px0, m0) = read_font(cx, &font);
-    let Some((vp_w, vp_h)) = read_viewport(cx, window) else {
+    let Some((vp_w, vp_h, win_scale)) = read_viewport(cx, window) else {
         return CadenceReport::error(
             "niceties-zoom: could not read the window viewport".to_string(),
         );
@@ -241,7 +246,7 @@ async fn run_niceties_zoom(
             "niceties-zoom: session not spawned (no grid dimensions) after zoom".to_string(),
         );
     };
-    let expect1 = fit_grid(vp_w, vp_h, m1);
+    let expect1 = fit_grid(vp_w, vp_h, snap_metrics_to_scale(m1, win_scale));
 
     // Size stepped up by exactly ZOOM_IN_STEPS points.
     let want_px1 = px0 + ZOOM_IN_STEPS as f32;
@@ -293,7 +298,7 @@ async fn run_niceties_zoom(
     settle(cx, 300).await;
     let (px2, m2) = read_font(cx, &font);
     let dims2 = read_dims(cx, &handle).unwrap_or((0, 0));
-    let expect2 = fit_grid(vp_w, vp_h, m0);
+    let expect2 = fit_grid(vp_w, vp_h, snap_metrics_to_scale(m0, win_scale));
 
     if px2 != px0 {
         failures.push(format!(
