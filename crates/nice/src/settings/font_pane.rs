@@ -25,7 +25,7 @@ use nice_term_view::{clamp_line_height, DEFAULT_TERMINAL_FONT_PX, DEFAULT_TERMIN
 
 use crate::settings::controls::{dropdown, DropdownItem};
 use crate::settings::prefs_store::SettingsPrefsStore;
-use crate::settings::root::{setting_row, setting_title, SettingsRootView};
+use crate::settings::root::{setting_row, SettingsRootView};
 use crate::settings::sidebar_font;
 use crate::theme::slot_to_rgba;
 use crate::theme_settings;
@@ -171,12 +171,7 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
 
     let (terminal_px, family, sidebar_px, line_height) = current_state(cx);
 
-    let mut col = div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .min_w(px(0.0))
-        .child(setting_title("Font", cx));
+    let mut col = div().flex().flex_col().w_full().min_w(px(0.0));
 
     // --- App font family (drives the whole app: chrome + terminal) --------
     let installed = cx.text_system().all_font_names();
@@ -186,11 +181,6 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     };
     col = col.child(setting_row(
         "Font",
-        Some(
-            "Typeface for the whole app — the interface as well as every terminal and \
-             Claude pane. Lists every font installed on this Mac; monospace works best."
-                .into(),
-        ),
         dropdown(
             "settings.font.terminalFamily",
             family_label,
@@ -204,7 +194,6 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     // --- Terminal size ----------------------------------------------------
     col = col.child(setting_row(
         "Terminal size",
-        Some("Monospace font size for every terminal and Claude pane.".into()),
         size_stepper(
             "settings.font.terminalSize",
             terminal_px,
@@ -219,7 +208,6 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     // --- Sidebar size -----------------------------------------------------
     col = col.child(setting_row(
         "Sidebar size",
-        Some("Base size for the sidebar. Other sidebar text scales proportionally.".into()),
         size_stepper(
             "settings.font.sidebarSize",
             sidebar_px,
@@ -234,7 +222,6 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     // --- Terminal line height ---------------------------------------------
     col = col.child(setting_row(
         "Line height",
-        Some("Vertical spacing between terminal rows. Higher is roomier.".into()),
         line_height_stepper(
             "settings.font.lineHeight",
             line_height,
@@ -247,12 +234,7 @@ pub(crate) fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>)
     ));
 
     // --- Reset ------------------------------------------------------------
-    col = col.child(setting_row(
-        "Reset",
-        None,
-        reset_button(ink, line),
-        cx,
-    ));
+    col = col.child(setting_row("Reset", reset_button(ink, line), cx));
 
     col.into_any_element()
 }

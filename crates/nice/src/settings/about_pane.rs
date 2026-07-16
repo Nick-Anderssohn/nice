@@ -5,7 +5,6 @@
 
 use gpui::{div, prelude::*, px, AnyElement, App, FontWeight, SharedString, Window};
 
-use crate::settings::root::setting_title;
 use crate::theme::slot_to_rgba;
 use crate::theme_settings;
 
@@ -26,7 +25,6 @@ pub(crate) fn about_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
         .w_full()
         .min_w(px(0.0))
         .gap(px(4.0))
-        .child(setting_title("About", cx))
         .child(
             div()
                 .text_size(px(13.0))

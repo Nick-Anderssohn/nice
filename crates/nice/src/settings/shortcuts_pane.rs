@@ -55,7 +55,7 @@ use gpui::{
 
 use nice_model::shortcuts::{conflicting_action, Modifiers, OwnedCombo, ShortcutAction};
 
-use crate::settings::root::{setting_row, setting_title};
+use crate::settings::root::setting_row;
 use crate::shortcuts_store::ShortcutBindings;
 use crate::theme::slot_to_rgba;
 
@@ -360,7 +360,6 @@ pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
         .flex_col()
         .w_full()
         .min_w(px(0.0))
-        .child(setting_title("Shortcuts", cx))
         .child(
             div()
                 .pb(px(8.0))
@@ -381,12 +380,7 @@ pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
                 .unwrap_or(true);
             resting_control(action, combo, at_default, colors)
         };
-        col = col.child(setting_row(
-            SharedString::from(action.label()),
-            None,
-            control,
-            cx,
-        ));
+        col = col.child(setting_row(SharedString::from(action.label()), control, cx));
     }
 
     col.into_any_element()

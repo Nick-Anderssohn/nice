@@ -7,7 +7,7 @@ use gpui::{px, div, prelude::*, AnyElement, App, Window};
 
 use crate::settings::controls::toggle_switch;
 use crate::settings::prefs_store::SettingsPrefsStore;
-use crate::settings::root::{setting_row, setting_title};
+use crate::settings::root::setting_row;
 
 /// The persisted smooth-scroll value (default OFF; absent store ⇒ OFF).
 fn smooth_scroll_on(cx: &App) -> bool {
@@ -35,10 +35,8 @@ pub(crate) fn advanced_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
         .flex_col()
         .w_full()
         .min_w(px(0.0))
-        .child(setting_title("Advanced", cx))
         .child(setting_row(
             "Smooth scrolling",
-            Some("Animates terminal scrolling.".into()),
             toggle_switch("settings.advanced.smoothScrolling", on, cx, move |cx| {
                 toggle_smooth_scroll(cx, !on);
             }),

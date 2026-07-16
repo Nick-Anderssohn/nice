@@ -32,9 +32,11 @@ use crate::settings::root::SettingsRootView;
 // (`nice_model::shortcuts`), so it lives here rather than in the defaults table.
 gpui::actions!(nice, [OpenSettings]);
 
-/// Ideal opening size (Swift `NiceApp.swift:204-210` mirror).
-const IDEAL_WIDTH: f32 = 640.0;
-const IDEAL_HEIGHT: f32 = 440.0;
+/// Ideal opening size — hand-tuned at the 2026-07 feel-check (the mock's
+/// 780×520 read too wide, the old 640×440 too small; Nick resized to taste and
+/// this is that footprint).
+const IDEAL_WIDTH: f32 = 700.0;
+const IDEAL_HEIGHT: f32 = 470.0;
 /// Minimum size — the rail (160pt) + a legible pane; a resize drag cannot shrink
 /// below it.
 const MIN_WIDTH: f32 = 560.0;

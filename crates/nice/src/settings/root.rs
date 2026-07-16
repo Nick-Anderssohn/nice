@@ -1,6 +1,6 @@
 //! The Settings window root view (R23 What-to-build items 2 + 8): the 160pt
 //! section rail over a scrollable content area, the per-slug content dispatch, the
-//! shared `SettingTitle` / `SettingSubtitle` / `SettingRow` building blocks, and
+//! shared `SettingSubtitle` / `SettingRow` / `SettingTooltip` building blocks, and
 //! the `shortcuts_pane` placeholder R24 fills.
 //!
 //! ## The pane-hosting seam (Exported contract — R24 fills the Shortcuts pane)
@@ -20,9 +20,11 @@
 //! The Appearance / Font / Claude / Advanced / About pane bodies are stubs in
 //! slice 1 ([`pane_placeholder`]); later slices of this cycle replace them.
 
+use std::rc::Rc;
+
 use gpui::{
     div, prelude::*, px, AnyElement, App, Bounds, Context, DismissEvent, Entity, MouseButton,
-    Pixels, Render, SharedString, Subscription, Window,
+    MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Subscription, Window,
 };
 
 use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
@@ -100,6 +102,20 @@ pub(crate) struct SettingsRootView {
     /// so the one open menu (trigger id + [`ContextMenu`] entity) lives here (the
     /// toolbar's `present_context_menu` owner pattern).
     open_dropdown: Option<OpenDropdown>,
+    /// The in-flight slider drag, if any (armed by a [`controls::slider`]
+    /// mouse-down; tracked by the root's mouse-move/up listeners — the
+    /// sidebar-resize pattern, so the drag survives leaving the track).
+    active_slider: Option<ActiveSliderDrag>,
+}
+
+/// A slider drag in flight: the track's window-space geometry, the value range,
+/// and the live `apply` mutator to run at each pointer position.
+struct ActiveSliderDrag {
+    track_x: f32,
+    track_w: f32,
+    min: f32,
+    max: f32,
+    apply: Rc<dyn Fn(&mut App, f32)>,
 }
 
 /// The one open dropdown menu: which trigger opened it, the popup entity, and the
@@ -115,6 +131,56 @@ impl SettingsRootView {
         Self {
             active: SharedString::from("appearance"),
             open_dropdown: None,
+            active_slider: None,
+        }
+    }
+
+    /// Arm a slider drag (a [`controls::slider`] track mouse-down): jump the
+    /// value to the pressed `x` immediately (click-to-jump), then keep applying
+    /// as the root's mouse-move listener tracks the pointer until release.
+    pub(crate) fn begin_slider_drag(
+        &mut self,
+        track: Bounds<Pixels>,
+        min: f32,
+        max: f32,
+        apply: Rc<dyn Fn(&mut App, f32)>,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let track_x = f32::from(track.origin.x);
+        let track_w = f32::from(track.size.width);
+        apply(cx, controls::slider_value_at(f32::from(x), track_x, track_w, min, max));
+        self.active_slider = Some(ActiveSliderDrag { track_x, track_w, min, max, apply });
+        cx.notify();
+    }
+
+    /// Root mouse-move: while a slider drag is armed and the button is still
+    /// down, apply the value under the pointer; a move with the button released
+    /// (missed mouse-up) just disarms.
+    fn on_root_mouse_move(&mut self, e: &MouseMoveEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = &self.active_slider else {
+            return;
+        };
+        if e.pressed_button == Some(MouseButton::Left) {
+            let value = controls::slider_value_at(
+                f32::from(e.position.x),
+                drag.track_x,
+                drag.track_w,
+                drag.min,
+                drag.max,
+            );
+            let apply = drag.apply.clone();
+            apply(cx, value);
+        } else {
+            self.active_slider = None;
+            cx.notify();
+        }
+    }
+
+    /// Root mouse-up: the slider drag (if any) ends.
+    fn on_root_mouse_up(&mut self, _e: &MouseUpEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.active_slider.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -316,6 +382,10 @@ impl Render for SettingsRootView {
             .flex_col()
             .bg(surface)
             .when_some(mono, |d, fam| d.font_family(fam))
+            // Slider-drag tracking (armed by a track mouse-down) — root-level so
+            // the drag keeps applying when the pointer leaves the 170px track.
+            .on_mouse_move(cx.listener(Self::on_root_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
             .child(titlebar)
             .child(body)
             // The open dropdown menu (if any) — its own render defers + anchors
@@ -344,27 +414,11 @@ pub(crate) fn render_section(
     }
 }
 
-// -- shared building blocks (Swift SettingsView.swift:648-737) ----------------
+// -- shared building blocks (mock `.set-row` / `.set-nav`, restyle plan 06) ----
 
-/// `SettingTitle` (`SettingsView.swift:651-664`) — a 16pt bold pane heading in
-/// primary ink with a 14pt bottom margin. Reused by every pane + R24's Shortcuts
-/// pane.
-pub(crate) fn setting_title(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
-    let slots = crate::theme_settings::active_chrome_slots(cx);
-    div()
-        .text_size(px(16.0))
-        .font_weight(gpui::FontWeight::BOLD)
-        .text_color(slot_to_rgba(slots.ink))
-        .pb(px(14.0))
-        .child(text.into())
-}
-
-/// `SettingSubtitle` (`SettingsView.swift:672-693`) — a 14pt bold subgroup header
-/// in primary ink with extra top breathing room and a hairline rule below.
-///
-/// Exported for the Appearance / Font panes (slices 2/3) + R24's Shortcuts pane;
-/// no in-crate caller until those land (the deliberately-exported-block pattern).
-#[allow(dead_code)]
+/// A section header — a 14pt bold sub-header in primary ink with a hairline rule
+/// below. Horizontal rules ONLY appear on section boundaries like this one (and
+/// the Appearance pane's Light/Dark tab row); the per-row rules are gone.
 pub(crate) fn setting_subtitle(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let slots = crate::theme_settings::active_chrome_slots(cx);
     div()
@@ -379,51 +433,104 @@ pub(crate) fn setting_subtitle(text: impl Into<SharedString>, cx: &App) -> impl 
         .child(text.into())
 }
 
-/// `SettingRow` (`SettingsView.swift:697-737`) — a flex label (with an optional
-/// hint) on the left, ONE compact content-width control right-aligned on the
-/// shared right edge (label/hint `flex_1`, control `flex_none`, vertically
-/// centered), 10pt vertical padding and a 1pt `niceLine` bottom rule. Reused by
-/// every pane + R24's recorder rows.
-///
-/// Exported for the panes (slices 2/3) + R24's Shortcuts pane; no in-crate caller
-/// until those land (the deliberately-exported-block pattern).
-#[allow(dead_code)]
+/// The hover tooltip for a setting that keeps non-obvious info after the
+/// description purge (mock feel-check: rows carry NO hint text). A themed
+/// wrapping label box built through gpui's `div::tooltip` seam (the toolbar's
+/// `TabTooltip` pattern).
+pub(crate) struct SettingTooltip {
+    pub(crate) text: SharedString,
+}
+
+impl Render for SettingTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let slots = crate::theme_settings::active_chrome_slots(cx);
+        div()
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .bg(slot_to_rgba(slots.panel))
+            .border_1()
+            .border_color(slot_to_rgba(slots.line))
+            .max_w(px(320.0))
+            .text_size(px(11.5))
+            .text_color(slot_to_rgba(slots.ink))
+            .child(self.text.clone())
+    }
+}
+
+/// A `SettingRow` per the mock's `.set-row`: a 12px `ink2` label left, ONE
+/// compact content-width control right-aligned on the shared right edge, 9pt
+/// vertical padding, and NO bottom rule (rules mark sections, not rows). Reused
+/// by every pane + the Shortcuts recorder rows.
 pub(crate) fn setting_row(
     label: impl Into<SharedString>,
-    hint: Option<SharedString>,
+    control: impl IntoElement,
+    cx: &App,
+) -> impl IntoElement {
+    setting_row_impl(label.into(), None, control, cx)
+}
+
+/// [`setting_row`] plus a small ⓘ info glyph after the label whose hover
+/// tooltip carries the setting's non-obvious info (the only survivor of the
+/// description purge — most rows have none).
+pub(crate) fn setting_row_info(
+    label: impl Into<SharedString>,
+    info: impl Into<SharedString>,
+    control: impl IntoElement,
+    cx: &App,
+) -> impl IntoElement {
+    setting_row_impl(label.into(), Some(info.into()), control, cx)
+}
+
+fn setting_row_impl(
+    label: SharedString,
+    info: Option<SharedString>,
     control: impl IntoElement,
     cx: &App,
 ) -> impl IntoElement {
     let slots = crate::theme_settings::active_chrome_slots(cx);
     // `min_w(0)` lets the label column shrink below its text's natural width
-    // (the hint then wraps) instead of pushing the control past the right edge.
-    let mut label_col = div().flex().flex_col().flex_1().min_w(px(0.0)).gap(px(2.0)).child(
-        div()
-            .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(slot_to_rgba(slots.ink))
-            .child(label.into()),
-    );
-    if let Some(hint) = hint {
+    // instead of pushing the control past the right edge.
+    let mut label_col = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_1()
+        .min_w(px(0.0))
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(slot_to_rgba(slots.ink2))
+                .child(label.clone()),
+        );
+    if let Some(info) = info {
+        // The ⓘ glyph is the tooltip's hover anchor (a11y
+        // `settings.rowInfo.<label>`) — a plain text glyph in dimmed ink, no
+        // click behavior.
         label_col = label_col.child(
             div()
-                .text_size(px(11.5))
+                .id(SharedString::from(format!("settings.rowInfo.{label}")))
+                .flex_none()
+                .text_size(px(11.0))
                 .text_color(slot_to_rgba(slots.ink3))
-                .child(hint),
+                .child("ⓘ")
+                .tooltip(move |_window, cx| {
+                    let text = info.clone();
+                    cx.new(|_| SettingTooltip { text }).into()
+                }),
         );
     }
     div()
         .flex()
         .flex_row()
-        // Fill the pane column and never let the row's own min-content (long
-        // hint text) widen it past the window (`min_w(0)` kills the floor).
+        // Fill the pane column and never let the row's own min-content widen it
+        // past the window (`min_w(0)` kills the floor).
         .w_full()
         .min_w(px(0.0))
         .items_center()
-        .gap(px(12.0))
-        .py(px(10.0))
-        .border_b_1()
-        .border_color(slot_to_rgba(slots.line))
+        .gap(px(16.0))
+        .py(px(9.0))
         .child(label_col)
         .child(div().flex_none().child(control))
 }

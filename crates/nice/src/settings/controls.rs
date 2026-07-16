@@ -1,6 +1,14 @@
-//! Shared Settings-pane controls: the macOS-style [`toggle_switch`] and the
-//! NSPopUpButton-style [`dropdown`] — the two compact right-aligned controls the
-//! prod (Swift) settings window renders with native AppKit widgets.
+//! Shared Settings-pane controls: the macOS-style [`toggle_switch`], the
+//! NSPopUpButton-style [`dropdown`], and the continuous [`slider`] — the compact
+//! right-aligned controls the prod (Swift) settings window rendered with native
+//! AppKit widgets.
+//!
+//! ## Slider
+//! The mock's `.mini-slider`: a flat 170×3 track with a round `ink` thumb and a
+//! value readout on the right. Mouse-down jumps to the pressed position and arms
+//! a drag on the owning [`SettingsRootView`], whose root-level mouse listeners
+//! keep applying the value under the pointer until release (live preview); the
+//! caller's `apply_*` mutator clamps and persists every position.
 //!
 //! ## Toggle switch
 //! A track + thumb switch (accent track / thumb right when on, dimmed-ink track /
@@ -29,7 +37,7 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, prelude::*, px, AnyElement, App, Bounds, Context, FontWeight, MouseButton,
-    Pixels, Rgba, SharedString, Window,
+    Pixels, SharedString, Window,
 };
 
 use crate::context_menu::ContextMenuItem;
@@ -94,71 +102,119 @@ pub(crate) fn toggle_switch(
         })
 }
 
-// -- stepper --------------------------------------------------------------------
+// -- slider ---------------------------------------------------------------------
 
-/// A discrete `−` / readout / `+` stepper (gpui has no native slider — D8's
-/// Font-pane precedent ports the Swift slider as a stepper: "step → the exact
-/// setter call + the exact a11y id"). `a11y` names the container; the buttons
-/// are `<a11y>.dec` / `<a11y>.inc`. Click → `apply(cx, target)`; the caller's
-/// mutator does the clamping, so `dec_target`/`inc_target` may be handed in
-/// already-out-of-range (e.g. at the slider floor/ceiling) with no ill effect.
-pub(crate) fn stepper(
+/// Slider geometry — the mock's `.mini-slider` (a 170×3 track, a 12pt round
+/// thumb) inside a taller invisible hit strip so the 3px track is clickable.
+const SLIDER_TRACK_WIDTH: f32 = 170.0;
+const SLIDER_TRACK_HEIGHT: f32 = 3.0;
+const SLIDER_THUMB_SIZE: f32 = 12.0;
+const SLIDER_HIT_HEIGHT: f32 = 16.0;
+
+/// Map a window-space `x` on a slider track to the value it picks — the pure
+/// half of the drag math (clamped to the track, linear across `[min, max]`).
+pub(crate) fn slider_value_at(x: f32, track_x: f32, track_w: f32, min: f32, max: f32) -> f32 {
+    let t = ((x - track_x) / track_w).clamp(0.0, 1.0);
+    min + t * (max - min)
+}
+
+/// A continuous drag slider (the mock's `.mini-slider` + `.val` readout): a flat
+/// `--fill-x` track with an `ink` thumb at the current value and the readout in
+/// `ink` to the right. Mouse-down anywhere on the track jumps there and arms a
+/// drag on the owning [`SettingsRootView`] (whose root-level mouse listeners
+/// track the pointer until release — the sidebar-resize pattern); every position
+/// change runs `apply(cx, value)` live. The caller's mutator clamps/rounds
+/// authoritatively, so raw f32 track values are handed over as-is.
+pub(crate) fn slider(
     a11y: impl Into<SharedString>,
     readout: impl Into<SharedString>,
-    dec_target: f32,
-    inc_target: f32,
-    ink: Rgba,
-    ink3: Rgba,
-    line: Rgba,
-    apply: impl Fn(&mut App, f32) + Clone + 'static,
-) -> impl IntoElement {
+    value: f32,
+    min: f32,
+    max: f32,
+    cx: &mut Context<SettingsRootView>,
+    apply: impl Fn(&mut App, f32) + 'static,
+) -> AnyElement {
     let a11y = a11y.into();
-    let dec_id = SharedString::from(format!("{a11y}.dec"));
-    let inc_id = SharedString::from(format!("{a11y}.inc"));
+    let readout: SharedString = readout.into();
+    let slots = theme_settings::active_chrome_slots(cx);
+    let scheme = theme_settings::active_chrome_scheme(cx);
+    let ink = slot_to_rgba(slots.ink);
+    let track_fill = srgba_to_rgba(nice_theme::glass::glass_fill_x(scheme));
+    let apply: Rc<dyn Fn(&mut App, f32)> = Rc::new(apply);
 
-    let dec_apply = apply.clone();
-    let inc_apply = apply;
+    // Thumb center at `t` of the track width (the mock's `left: N%` +
+    // `translate(-50%)` — the thumb may overhang the track ends by half).
+    let t = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
+    let thumb_left = t * SLIDER_TRACK_WIDTH - SLIDER_THUMB_SIZE / 2.0;
 
-    let button = move |id: SharedString, glyph: &'static str, target: f32, apply: Box<dyn Fn(&mut App, f32)>| {
-        div()
-            .id(id)
-            .role(gpui::Role::Button)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(24.0))
-            .py(px(3.0))
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(line)
-            .text_size(px(13.0))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(ink)
-            .cursor_pointer()
-            .child(glyph)
-            .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-                apply(cx, target);
-            })
-    };
+    // The track's window-space bounds, refreshed every prepaint (the dropdown
+    // trigger's canvas pattern) — mouse-down reads it to seed the drag.
+    let track_bounds: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
+    let write_bounds = track_bounds.clone();
 
     div()
         .id(a11y)
+        .role(gpui::Role::Slider)
+        .aria_label(readout.clone())
+        .flex_none()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
-        .child(button(dec_id, "−", dec_target, Box::new(dec_apply)))
+        .gap(px(12.0))
         .child(
             div()
-                .w(px(48.0))
+                .relative()
+                .flex_none()
+                .w(px(SLIDER_TRACK_WIDTH))
+                .h(px(SLIDER_HIT_HEIGHT))
                 .flex()
-                .justify_center()
-                .text_size(px(12.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(ink3)
-                .child(readout.into()),
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(SLIDER_TRACK_HEIGHT))
+                        .rounded(px(SLIDER_TRACK_HEIGHT / 2.0))
+                        .bg(track_fill),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px((SLIDER_HIT_HEIGHT - SLIDER_THUMB_SIZE) / 2.0))
+                        .left(px(thumb_left))
+                        .size(px(SLIDER_THUMB_SIZE))
+                        .rounded(px(SLIDER_THUMB_SIZE / 2.0))
+                        .bg(ink),
+                )
+                .child(
+                    canvas(move |bounds, _window, _cx| write_bounds.set(bounds), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &gpui::MouseDownEvent, _window, cx| {
+                        this.begin_slider_drag(
+                            track_bounds.get(),
+                            min,
+                            max,
+                            apply.clone(),
+                            e.position.x,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }),
+                ),
         )
-        .child(button(inc_id, "+", inc_target, Box::new(inc_apply)))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(ink)
+                .child(readout),
+        )
+        .into_any_element()
 }
 
 // -- dropdown -------------------------------------------------------------------
@@ -328,6 +384,18 @@ mod tests {
         assert_eq!(row.label(), Some("Option"));
         assert_eq!(row.selected(), Some(true));
         assert!(row.is_enabled());
+    }
+
+    #[test]
+    fn slider_value_at_maps_linearly_and_clamps_to_the_track() {
+        // Track from x=100, 170 wide, mapping to [55, 100] (the opacity range).
+        let v = |x: f32| slider_value_at(x, 100.0, 170.0, 55.0, 100.0);
+        assert_eq!(v(100.0), 55.0, "track left edge picks min");
+        assert_eq!(v(270.0), 100.0, "track right edge picks max");
+        assert_eq!(v(185.0), 77.5, "track midpoint picks the range midpoint");
+        // Off-track positions clamp — a drag past either end pins the value.
+        assert_eq!(v(0.0), 55.0);
+        assert_eq!(v(1000.0), 100.0);
     }
 
     #[test]

@@ -28,11 +28,11 @@
 //! selection lives in the [`AppearanceSchemeTab`] Global (like [`ImportFeedback`])
 //! so the pane stays a stateless free function.
 //!
-//! Fidelity (D8): gpui has no native `Picker`/slider, so the merged theme picker
-//! is the in-house [`dropdown`] (full display names, no color chips — the
-//! feel-check killed the card grid for truncating theme names), and the
-//! opacity/blur sliders port to `−`/readout/`+` steppers (the Font pane's
-//! precedent). The contract each control keeps is "selection → the exact
+//! Fidelity (D8, revised at the 2026-07 production feel-check): the merged theme
+//! picker is the in-house [`dropdown`] (full display names, no color chips — the
+//! feel-check killed the card grid for truncating theme names), and opacity/blur
+//! are the in-house continuous [`slider`]s (live preview while dragging;
+//! click-to-jump). The contract each control keeps is "selection → the exact
 //! `apply_*` call + the exact a11y id".
 
 use gpui::{
@@ -45,8 +45,10 @@ use nice_theme::palette::ColorScheme;
 use nice_theme::AccentPreset;
 
 use crate::ghostty_theme_parser::GhosttyParseError;
-use crate::settings::controls::{dropdown, stepper, toggle_switch, DropdownItem};
-use crate::settings::root::{setting_row, setting_subtitle, setting_title, SettingsRootView};
+use crate::settings::controls::{dropdown, slider, toggle_switch, DropdownItem};
+use crate::settings::root::{
+    setting_row, setting_row_info, setting_subtitle, SettingTooltip, SettingsRootView,
+};
 use crate::terminal_theme_catalog::{CatalogEntry, TerminalThemeCatalog, ThemeImportError};
 use crate::theme::{slot_to_rgba, srgba_to_rgba};
 use crate::theme_settings::{self, ThemeSettingsStore};
@@ -290,18 +292,12 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     // matching the flattened chrome (plan 02/04).
     let hairline = srgba_to_rgba(glass_line(active_scheme));
 
-    let mut col = div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .min_w(px(0.0))
-        .child(setting_title("Appearance", cx));
+    let mut col = div().flex().flex_col().w_full().min_w(px(0.0));
 
     // --- Sync with OS (scheme-independent) ---------------------------------
     let sync_on = appearance.sync_with_os;
     col = col.child(setting_row(
         "Sync with OS appearance",
-        Some("Match Nice's light / dark mode to the system setting.".into()),
         toggle_switch("settings.theme.sync", sync_on, cx, move |cx| {
             theme_settings::apply_sync_with_os(cx, !sync_on);
         }),
@@ -316,18 +312,12 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     let fill_x = srgba_to_rgba(glass_fill_x(active_scheme));
     col = col.child(setting_row(
         "Scheme",
-        Some("The active light / dark mode (locked while syncing with the OS).".into()),
         scheme_control(stored_scheme, sync_on, fill_x, ink, ink3, hairline),
         cx,
     ));
 
     // --- Accent (scheme-independent) ---------------------------------------
-    col = col.child(setting_row(
-        "Accent",
-        Some("The caret / selection / logo tint.".into()),
-        accent_control(appearance.accent, ink),
-        cx,
-    ));
+    col = col.child(setting_row("Accent", accent_control(appearance.accent, ink), cx));
 
     // --- Per-scheme subsection: Light/Dark tabs ----------------------------
     // The tabs head the subsection (same text + accent-underline grammar as the
@@ -348,7 +338,6 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     let tab_theme_label = theme_display_name(tab_entries, &tab_theme_id);
     col = col.child(setting_row(
         "Theme",
-        None,
         dropdown(
             tab_a11y,
             tab_theme_label,
@@ -362,34 +351,20 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     // Opacity / blur for the SELECTED TAB's scheme (not the live one).
     col = col.child(setting_row(
         "Opacity",
-        Some("Translucency of the window body for this scheme.".into()),
-        opacity_stepper(
-            tab_scheme,
-            appearance.window_opacity_pct_for(tab_scheme),
-            ink,
-            ink3,
-            line,
-        ),
+        opacity_slider(tab_scheme, appearance.window_opacity_pct_for(tab_scheme), cx),
         cx,
     ));
     col = col.child(setting_row(
         "Blur",
-        Some("Background blur radius behind the translucent window (0 = no blur).".into()),
-        blur_stepper(
-            tab_scheme,
-            appearance.blur_radius_for(tab_scheme),
-            ink,
-            ink3,
-            line,
-        ),
+        blur_slider(tab_scheme, appearance.blur_radius_for(tab_scheme), cx),
         cx,
     ));
 
     // --- Custom themes (Import + deletable imports) ------------------------
     col = col.child(setting_subtitle("Custom themes", cx));
-    col = col.child(setting_row(
+    col = col.child(setting_row_info(
         "Import theme",
-        Some("Load a Ghostty `.ghostty` / `.conf` theme file into Nice's library.".into()),
+        "Loads a Ghostty .ghostty / .conf theme file into Nice's library.",
         import_button("settings.terminal.import", ink, line),
         cx,
     ));
@@ -422,12 +397,8 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     // The deletable imported-theme rows (only when there are imports).
     for entry in imported {
         let id = entry.id.clone();
-        let name = entry.display_name.clone();
         col = col.child(setting_row(
             SharedString::from(entry.display_name.clone()),
-            Some(SharedString::from(format!(
-                "Remove {name} from Nice's theme library."
-            ))),
             remove_button(&id, panel, ink, line),
             cx,
         ));
@@ -591,9 +562,10 @@ fn scheme_segments(scheme: ColorScheme, sync_on: bool) -> [SchemeSegment; 2] {
 /// restyled flat per the mock's `.scheme-seg`: a hairline-bordered rounded
 /// group, the selected cell filled with the over-glass `fill_x` in `ink` text,
 /// the other cell bare in `ink3`. Disabled while `sync_on`: no click handlers /
-/// pointer cursor, and the whole control renders at
-/// [`DISABLED_CONTROL_OPACITY`]. Click → `apply_scheme` (flips the LIVE scheme
-/// — unlike the subsection tabs below, which only pick the editing target).
+/// pointer cursor, the whole control renders at [`DISABLED_CONTROL_OPACITY`],
+/// and hovering it explains the lock in a tooltip (the description purge left
+/// no visible copy for it). Click → `apply_scheme` (flips the LIVE scheme —
+/// unlike the subsection tabs below, which only pick the editing target).
 fn scheme_control(
     scheme: ColorScheme,
     sync_on: bool,
@@ -611,7 +583,14 @@ fn scheme_control(
         .border_1()
         .border_color(hairline)
         .overflow_hidden()
-        .when(sync_on, |d| d.opacity(DISABLED_CONTROL_OPACITY));
+        .when(sync_on, |d| {
+            d.opacity(DISABLED_CONTROL_OPACITY).tooltip(|_window, cx| {
+                cx.new(|_| SettingTooltip {
+                    text: "Disabled while \"Sync with OS\" is enabled".into(),
+                })
+                .into()
+            })
+        });
     for segment in scheme_segments(scheme, sync_on) {
         let mut d = div()
             .id(segment.id.clone())
@@ -676,85 +655,54 @@ fn terminal_theme_dropdown_items(
         .collect()
 }
 
-// --- Window opacity / blur steppers (D8: gpui has no native slider — same
-// stepper substitution the Font pane's line-height control uses) -----------
+// --- Window opacity / blur sliders (continuous, live preview) --------------
 //
-// The slider bounds/step are mirrored here as plain constants rather than
-// imported from `theme_settings` (whose clamp constants are private): this
-// slice only wires the pane's UI, and every target value still passes through
-// `apply_window_opacity` / `apply_blur_radius`, which re-clamp authoritatively
-// — an out-of-range target here is harmless, never stored as-is.
+// The slider bounds are mirrored here as plain constants rather than imported
+// from `theme_settings` (whose clamp constants are private): this pane only
+// wires the UI, and every value still passes through `apply_window_opacity` /
+// `apply_blur_radius`, which re-clamp authoritatively — an out-of-range value
+// here is harmless, never stored as-is.
 
-/// Opacity stepper step, in percentage points.
-const OPACITY_STEP_PCT: i32 = 5;
 /// Opacity slider floor (mirrors `theme_settings::MIN_WINDOW_OPACITY_PCT`).
-const OPACITY_MIN_PCT: i32 = 55;
+const OPACITY_MIN_PCT: f32 = 55.0;
 /// Opacity slider ceiling (100% ⇒ fully opaque).
-const OPACITY_MAX_PCT: i32 = 100;
+const OPACITY_MAX_PCT: f32 = 100.0;
 
-/// Blur-radius stepper step, in px.
-const BLUR_STEP_PX: i32 = 5;
 /// Blur slider floor (0 ⇒ no blur).
-const BLUR_MIN_PX: i32 = 0;
+const BLUR_MIN_PX: f32 = 0.0;
 /// Blur slider ceiling (mirrors `theme_settings::MAX_BLUR_RADIUS`).
-const BLUR_MAX_PX: i32 = 60;
+const BLUR_MAX_PX: f32 = 60.0;
 
-/// The dec/inc targets for the opacity stepper at the current `pct`, clamped to
-/// `[OPACITY_MIN_PCT, OPACITY_MAX_PCT]` — pulled out of [`opacity_stepper`] so
-/// the floor/ceiling clamping is unit-testable without a gpui window.
-fn opacity_step_targets(pct: u8) -> (i32, i32) {
-    let pct = i32::from(pct);
-    (
-        (pct - OPACITY_STEP_PCT).clamp(OPACITY_MIN_PCT, OPACITY_MAX_PCT),
-        (pct + OPACITY_STEP_PCT).clamp(OPACITY_MIN_PCT, OPACITY_MAX_PCT),
-    )
-}
-
-/// The dec/inc targets for the blur stepper at the current `radius`, clamped to
-/// `[BLUR_MIN_PX, BLUR_MAX_PX]` — pulled out of [`blur_stepper`] for the same
-/// reason as [`opacity_step_targets`].
-fn blur_step_targets(radius: u16) -> (i32, i32) {
-    let radius = i32::from(radius);
-    (
-        (radius - BLUR_STEP_PX).clamp(BLUR_MIN_PX, BLUR_MAX_PX),
-        (radius + BLUR_STEP_PX).clamp(BLUR_MIN_PX, BLUR_MAX_PX),
-    )
-}
-
-/// The Opacity stepper for `scheme` (a11y `settings.appearance.opacity`).
-/// Steps by [`OPACITY_STEP_PCT`]; live-applies through
+/// The Opacity slider for `scheme` (a11y `settings.appearance.opacity`).
+/// Continuous drag; every position live-applies through
 /// [`theme_settings::apply_window_opacity`], which fans out through the
-/// window's `WindowBackgroundAppearance` on every drag step.
-fn opacity_stepper(scheme: ColorScheme, pct: u8, ink: Rgba, ink3: Rgba, line: Rgba) -> impl IntoElement {
-    let (dec, inc) = opacity_step_targets(pct);
-    stepper(
+/// window's `WindowBackgroundAppearance` as the thumb moves.
+fn opacity_slider(scheme: ColorScheme, pct: u8, cx: &mut Context<SettingsRootView>) -> AnyElement {
+    slider(
         "settings.appearance.opacity",
         format!("{pct}%"),
-        dec as f32,
-        inc as f32,
-        ink,
-        ink3,
-        line,
+        f32::from(pct),
+        OPACITY_MIN_PCT,
+        OPACITY_MAX_PCT,
+        cx,
         move |cx: &mut App, v: f32| {
             theme_settings::apply_window_opacity(cx, scheme, v.round() as u8);
         },
     )
 }
 
-/// The Blur stepper for `scheme` (a11y `settings.appearance.blur`). Steps by
-/// [`BLUR_STEP_PX`]; live-applies through
-/// [`theme_settings::apply_blur_radius`], which re-applies the numeric
-/// CGS radius (or degrades to `Transparent` at 0) on every drag step.
-fn blur_stepper(scheme: ColorScheme, radius: u16, ink: Rgba, ink3: Rgba, line: Rgba) -> impl IntoElement {
-    let (dec, inc) = blur_step_targets(radius);
-    stepper(
+/// The Blur slider for `scheme` (a11y `settings.appearance.blur`). Continuous
+/// drag; every position live-applies through
+/// [`theme_settings::apply_blur_radius`], which re-applies the numeric CGS
+/// radius (or degrades to `Transparent` at 0) as the thumb moves.
+fn blur_slider(scheme: ColorScheme, radius: u16, cx: &mut Context<SettingsRootView>) -> AnyElement {
+    slider(
         "settings.appearance.blur",
         format!("{radius}px"),
-        dec as f32,
-        inc as f32,
-        ink,
-        ink3,
-        line,
+        f32::from(radius),
+        BLUR_MIN_PX,
+        BLUR_MAX_PX,
+        cx,
         move |cx: &mut App, v: f32| {
             theme_settings::apply_blur_radius(cx, scheme, v.round() as u16);
         },
@@ -1144,26 +1092,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // --- Opacity/blur steppers (slice 4: the appearance-pane sliders) ---------
-
-    #[test]
-    fn opacity_step_targets_clamp_at_the_slider_floor_and_ceiling() {
-        // Mid-range: both directions step cleanly by OPACITY_STEP_PCT.
-        assert_eq!(opacity_step_targets(80), (75, 85));
-        // At the floor (55): decrementing stays pinned, not below 55.
-        assert_eq!(opacity_step_targets(55), (55, 60));
-        // At the ceiling (100): incrementing stays pinned, not above 100.
-        assert_eq!(opacity_step_targets(100), (95, 100));
-    }
-
-    #[test]
-    fn blur_step_targets_clamp_at_the_slider_floor_and_ceiling() {
-        assert_eq!(blur_step_targets(30), (25, 35));
-        // At the floor (0): decrementing stays pinned, not negative.
-        assert_eq!(blur_step_targets(0), (0, 5));
-        // At the ceiling (60): incrementing stays pinned, not above 60.
-        assert_eq!(blur_step_targets(60), (55, 60));
-    }
+    // --- Opacity/blur sliders (production feel-check: continuous drag) --------
 
     /// A fresh-defaults store so the opacity/blur mutators have a `Global` to
     /// mutate (`current_appearance`/`commit_appearance` no-op without one).
@@ -1175,32 +1104,42 @@ mod tests {
         base
     }
 
+    /// The slider wiring: a track position maps through `slider_value_at` over
+    /// the pane's `[min, max]` range into the exact `apply_*` call — including
+    /// the off-track clamp pinning to the range ends.
     #[gpui::test]
-    fn opacity_stepper_dec_and_inc_call_apply_window_opacity_for_the_given_scheme(
+    fn opacity_slider_positions_drive_apply_window_opacity_for_the_given_scheme(
         cx: &mut TestAppContext,
     ) {
-        let base = setup_theme_store(cx, "opacity-stepper");
+        let base = setup_theme_store(cx, "opacity-slider");
         cx.update(|app| {
-            // Dark starts at the plan default (80%); step down then up and assert
-            // the exact stored value each time (the click handler's wiring, not
-            // just the pure target math already covered above).
-            theme_settings::apply_window_opacity(app, ColorScheme::Dark, 80);
-            let (dec, inc) = opacity_step_targets(80);
-            theme_settings::apply_window_opacity(app, ColorScheme::Dark, dec as u8);
+            // Track at x=100, 170 wide. Midpoint ⇒ the range midpoint (77.5 →
+            // rounds to 78); a drag far past the left edge pins to the floor.
+            let at = |x: f32| {
+                crate::settings::controls::slider_value_at(
+                    x,
+                    100.0,
+                    170.0,
+                    OPACITY_MIN_PCT,
+                    OPACITY_MAX_PCT,
+                )
+            };
+            theme_settings::apply_window_opacity(app, ColorScheme::Dark, at(185.0).round() as u8);
             assert_eq!(
                 app.global::<ThemeSettingsStore>()
                     .appearance()
                     .window_opacity_pct_for(ColorScheme::Dark),
-                75
+                78
             );
-            theme_settings::apply_window_opacity(app, ColorScheme::Dark, inc as u8);
+            theme_settings::apply_window_opacity(app, ColorScheme::Dark, at(-500.0).round() as u8);
             assert_eq!(
                 app.global::<ThemeSettingsStore>()
                     .appearance()
                     .window_opacity_pct_for(ColorScheme::Dark),
-                85
+                55,
+                "an off-track drag pins to the slider floor"
             );
-            // The Light slot is untouched by a Dark-scheme step.
+            // The Light slot is untouched by a Dark-scheme drag.
             assert_eq!(
                 app.global::<ThemeSettingsStore>()
                     .appearance()
@@ -1212,25 +1151,31 @@ mod tests {
     }
 
     #[gpui::test]
-    fn blur_stepper_dec_and_inc_call_apply_blur_radius_for_the_given_scheme(cx: &mut TestAppContext) {
-        let base = setup_theme_store(cx, "blur-stepper");
+    fn blur_slider_positions_drive_apply_blur_radius_for_the_given_scheme(
+        cx: &mut TestAppContext,
+    ) {
+        let base = setup_theme_store(cx, "blur-slider");
         cx.update(|app| {
-            let (dec, inc) = blur_step_targets(30); // the plan default
-            theme_settings::apply_blur_radius(app, ColorScheme::Light, dec as u16);
+            let at = |x: f32| {
+                crate::settings::controls::slider_value_at(x, 100.0, 170.0, BLUR_MIN_PX, BLUR_MAX_PX)
+            };
+            theme_settings::apply_blur_radius(app, ColorScheme::Light, at(185.0).round() as u16);
             assert_eq!(
                 app.global::<ThemeSettingsStore>()
                     .appearance()
                     .blur_radius_for(ColorScheme::Light),
-                25
+                30,
+                "the track midpoint picks the range midpoint"
             );
-            theme_settings::apply_blur_radius(app, ColorScheme::Light, inc as u16);
+            theme_settings::apply_blur_radius(app, ColorScheme::Light, at(9999.0).round() as u16);
             assert_eq!(
                 app.global::<ThemeSettingsStore>()
                     .appearance()
                     .blur_radius_for(ColorScheme::Light),
-                35
+                60,
+                "an off-track drag pins to the slider ceiling"
             );
-            // The Dark slot is untouched by a Light-scheme step.
+            // The Dark slot is untouched by a Light-scheme drag.
             assert_eq!(
                 app.global::<ThemeSettingsStore>()
                     .appearance()
@@ -1241,11 +1186,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Tab targeting (plan 06 Validation): moving the opacity/blur steppers on
+    /// Tab targeting (plan 06 Validation): moving the opacity/blur sliders on
     /// the tab writes the TAB scheme's slots while the OTHER scheme is live —
     /// edit Dark while Light is live, and vice versa; the live scheme never flips.
     #[gpui::test]
-    fn opacity_and_blur_steppers_target_the_tab_scheme_not_the_live_scheme(
+    fn opacity_and_blur_sliders_target_the_tab_scheme_not_the_live_scheme(
         cx: &mut TestAppContext,
     ) {
         let base = setup_theme_store(cx, "opacity-blur-tab-target");

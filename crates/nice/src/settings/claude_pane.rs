@@ -15,7 +15,7 @@
 use gpui::{px, div, prelude::*, AnyElement, App, Window};
 
 use crate::settings::controls::toggle_switch;
-use crate::settings::root::{setting_row, setting_title};
+use crate::settings::root::setting_row_info;
 use crate::theme_settings;
 
 /// The full toggle handler (the shipped click path): persist the new value to the
@@ -72,28 +72,21 @@ pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
         .flex_col()
         .w_full()
         .min_w(px(0.0))
-        .child(setting_title("Claude", cx))
-        .child(setting_row(
+        .child(setting_row_info(
             "Sync Claude Code theme",
-            Some(
-                "Match Claude Code's colors to Nice's current terminal theme, and update \
-                 them live when you change it."
-                    .into(),
-            ),
+            "Matches Claude Code's colors to Nice's current terminal theme, and updates \
+             them live when you change it.",
             toggle_switch("settings.claude.syncClaudeTheme", on, cx, move |cx| {
                 perform_toggle_sync_claude(cx, !on);
             }),
             cx,
         ))
-        .child(setting_row(
+        .child(setting_row_info(
             "Install the Nice Handoff skill",
-            Some(
-                "Adds the global /nice-handoff Claude Code skill and installs \
-                 ~/.nice/nice-handoff.sh. When run inside a Claude pane, the skill \
-                 writes a handoff file capturing the current work and opens a new tab so \
-                 a fresh session can continue from where this one left off."
-                    .into(),
-            ),
+            "Adds the global /nice-handoff Claude Code skill and installs \
+             ~/.nice/nice-handoff.sh. Run inside a Claude pane, the skill writes a \
+             handoff file capturing the current work and opens a new tab so a fresh \
+             session can continue from where this one left off.",
             toggle_switch(
                 "settings.claude.installHandoffSkill",
                 handoff_on,
