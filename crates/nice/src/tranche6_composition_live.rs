@@ -17,7 +17,7 @@
 //!     `check_now` on the shipped window → the trailing pill appears on the SHIPPED
 //!     toolbar (AX `"toolbar.updateAvailable"`, an `AXButton`); a real guarded-HID
 //!     click on it (behind the mandatory preflight) opens the popover showing
-//!     `brew update` + `brew upgrade --cask nice`.
+//!     `brew update && brew upgrade --cask nice`.
 //!   * **(b) R25 — pill drag-reorder on the shipped strip.** With ≥2 panes in the
 //!     active tab, a real guarded-HID drag of the trailing pill leftward past the
 //!     leading pill's midpoint should reorder it BEFORE the leader — a COMMITTED
@@ -106,9 +106,8 @@ use crate::window_state::WindowState;
 /// The newer tag the recording fetcher reports for leg (a) (clearly `> 0.1.0`, the
 /// unbundled `CARGO_PKG_VERSION` the checker compares against under `cargo run`).
 const NEWER_TAG: &str = "v9.9.9";
-/// The two exact brew commands the popover must show (leg a).
-const BREW_UPDATE: &str = "brew update";
-const BREW_UPGRADE: &str = "brew upgrade --cask nice";
+/// The exact combined brew command the popover must show (leg a).
+const BREW_COMMAND: &str = "brew update && brew upgrade --cask nice";
 /// The pill's AX title (`aria_label`) + expected role.
 const PILL_AX_TITLE: &str = "Update available";
 const PILL_AX_ROLE: &str = "AXButton";
@@ -397,9 +396,9 @@ async fn leg_a_update_pill(
             platform::post_global_left_click(gx, gy, 1);
             let opened = poll_view(cx, toolbar, POLL_TIMEOUT, |v| v.scenario_update_popover_open()).await;
             if opened {
-                let cmds = toolbar.update(cx, |v, cx| v.scenario_update_popover_commands(cx));
-                assert_two_commands(cmds, failures, "a real guarded-HID click");
-                eprintln!("[selftest] tranche6-composition (a): a real guarded-HID click on the shipped pill opened the popover ({BREW_UPDATE} + {BREW_UPGRADE})");
+                let cmd = toolbar.update(cx, |v, cx| v.scenario_update_popover_command(cx));
+                assert_command(cmd, failures, "a real guarded-HID click");
+                eprintln!("[selftest] tranche6-composition (a): a real guarded-HID click on the shipped pill opened the popover ({BREW_COMMAND})");
                 let _ = whandle.update(cx, |_r, _w, app| {
                     toolbar.update(app, |v, cx| v.drive_dismiss_update_popover(cx))
                 });
@@ -420,7 +419,7 @@ async fn leg_a_update_pill(
     }
 }
 
-/// Open the popover in-process and assert its two exact brew commands (the
+/// Open the popover in-process and assert its exact combined brew command (the
 /// deterministic fallback when the real click DEFERs — the `update_check_live`
 /// content-pin precedent).
 async fn assert_popover_contents_in_process(
@@ -433,22 +432,21 @@ async fn assert_popover_contents_in_process(
         toolbar.update(app, |v, cx| v.drive_open_update_popover(window, cx))
     });
     settle(cx, 200).await;
-    let cmds = toolbar.update(cx, |v, cx| v.scenario_update_popover_commands(cx));
-    assert_two_commands(cmds, failures, "the in-process popover");
+    let cmd = toolbar.update(cx, |v, cx| v.scenario_update_popover_command(cx));
+    assert_command(cmd, failures, "the in-process popover");
     let _ = whandle.update(cx, |_r, _w, app| {
         toolbar.update(app, |v, cx| v.drive_dismiss_update_popover(cx))
     });
     settle(cx, 150).await;
 }
 
-fn assert_two_commands(cmds: Option<Vec<String>>, failures: &mut Vec<String>, via: &str) {
-    match cmds {
-        Some(cmds)
-            if cmds.len() == 2 && cmds[0] == BREW_UPDATE && cmds[1] == BREW_UPGRADE => {}
-        Some(cmds) => failures.push(format!(
-            "(a) {via}: the popover commands were {cmds:?}, not exactly ['{BREW_UPDATE}', '{BREW_UPGRADE}']"
+fn assert_command(cmd: Option<String>, failures: &mut Vec<String>, via: &str) {
+    match cmd {
+        Some(cmd) if cmd == BREW_COMMAND => {}
+        Some(cmd) => failures.push(format!(
+            "(a) {via}: the popover command was {cmd:?}, not exactly '{BREW_COMMAND}'"
         )),
-        None => failures.push(format!("(a) {via}: the popover was not open when reading its commands")),
+        None => failures.push(format!("(a) {via}: the popover was not open when reading its command")),
     }
 }
 
@@ -1045,8 +1043,8 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             detail: format!(
                 "tranche6-composition OK (on the REAL shipped launch window): (a) a newer tag flips \
                  update_available + exposes the trailing pill as an AXButton on the shipped toolbar, \
-                 and a real guarded-HID click (or the in-process fallback) shows both exact brew \
-                 commands; (b) a real guarded-HID drag committed a pill reorder on the shipped strip \
+                 and a real guarded-HID click (or the in-process fallback) shows the exact combined \
+                 brew command; (b) a real guarded-HID drag committed a pill reorder on the shipped strip \
                  (hard-asserted when the drag armed, else DEFERRED — a synthetic press does not \
                  arm gpui's drag-and-drop; the deterministic reorder is pinned by nice-itests); \
                  (c) a socket `handoff` opened a nested \

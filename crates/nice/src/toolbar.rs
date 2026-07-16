@@ -2064,20 +2064,20 @@ impl WindowToolbarView {
         self.update_popover.is_some()
     }
 
-    /// The open popover's two brew command strings, or `None` when it is closed —
-    /// the scenario asserts both exact commands are present, in order.
-    pub(crate) fn scenario_update_popover_commands(&self, cx: &App) -> Option<Vec<String>> {
+    /// The open popover's combined brew command string, or `None` when it is
+    /// closed — the scenario asserts the exact command.
+    pub(crate) fn scenario_update_popover_command(&self, cx: &App) -> Option<String> {
         self.update_popover
             .as_ref()
-            .map(|p| p.read(cx).scenario_commands())
+            .map(|p| p.read(cx).scenario_command())
     }
 
-    /// Drive one Copy in the open popover (writes command `index` to the
-    /// clipboard) — the scenario then asserts the clipboard holds that command. A
-    /// no-op when the popover is closed.
-    pub(crate) fn drive_copy_update_command(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Drive the popover's Copy (writes the command to the clipboard) — the
+    /// scenario then asserts the clipboard holds it. A no-op when the popover is
+    /// closed.
+    pub(crate) fn drive_copy_update_command(&mut self, cx: &mut Context<Self>) {
         if let Some(popover) = self.update_popover.clone() {
-            popover.update(cx, |p, cx| p.copy_command(index, cx));
+            popover.update(cx, |p, cx| p.copy_command(cx));
         }
     }
 

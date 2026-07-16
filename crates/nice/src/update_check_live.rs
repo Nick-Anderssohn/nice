@@ -15,10 +15,10 @@
 //!     guarded-HID click on the pill (behind the mandatory preflight: activate +
 //!     raise + `CGWindowListCopyWindowInfo` frontmost-at-point) opens the popover —
 //!     hard-asserted when the preflight passes, else DEFERRED LOUDLY (never a blind
-//!     global post). The popover's contents (`brew update` + `brew upgrade --cask
-//!     nice` + a Copy per row) and one Copy → clipboard write are asserted
-//!     deterministically in-process, so a DEFERRED real click never weakens the
-//!     content coverage.
+//!     global post). The popover's contents (the combined `brew update && brew
+//!     upgrade --cask nice` command + its Copy) and the Copy → clipboard write are
+//!     asserted deterministically in-process, so a DEFERRED real click never
+//!     weakens the content coverage.
 //!   * **Error leg.** Reset the checker to a clean state, script a fetch ERROR,
 //!     drive `check_now`, and assert `update_available` STAYS false and NO pill
 //!     renders — the silent-error + layout-stability contract
@@ -45,10 +45,9 @@ use crate::window_state::WindowState;
 /// The newer tag the recording fetcher reports (clearly `> 0.1.0`, the unbundled
 /// `CARGO_PKG_VERSION` the checker compares against under `cargo run`).
 const NEWER_TAG: &str = "v9.9.9";
-/// The first popover command — the clipboard assertion target.
-const BREW_UPDATE: &str = "brew update";
-/// The second popover command (`brew upgrade --cask <cask>`, the frozen cask).
-const BREW_UPGRADE: &str = "brew upgrade --cask nice";
+/// The combined popover command (the frozen cask) — also the clipboard
+/// assertion target.
+const BREW_COMMAND: &str = "brew update && brew upgrade --cask nice";
 /// The pill's AX title (`aria_label`) + expected role.
 const PILL_AX_TITLE: &str = "Update available";
 const PILL_AX_ROLE: &str = "AXButton";
@@ -205,8 +204,8 @@ async fn run_update_check(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbar
     // preflight passes; DEFER LOUDLY otherwise — never a blind global post).
     real_pill_click_leg(cx, whandle, &view, &mut failures, &mut deferred).await;
 
-    // Deterministic content: open the popover in-process and assert the two exact
-    // brew commands + one Copy → clipboard (so a DEFERRED real click never weakens
+    // Deterministic content: open the popover in-process and assert the exact
+    // brew command + the Copy → clipboard (so a DEFERRED real click never weakens
     // the content coverage — the pane-strip in-process-pins-content precedent).
     content_leg(cx, whandle, &view, &mut failures).await;
 
@@ -282,7 +281,7 @@ async fn real_pill_click_leg(
 }
 
 /// Assert the popover's contents deterministically: open it in-process, read the
-/// two exact brew commands (a Copy per row), and drive one Copy → clipboard.
+/// exact combined brew command, and drive its Copy → clipboard.
 async fn content_leg(
     cx: &mut AsyncApp,
     whandle: WindowHandle<WindowToolbarView>,
@@ -294,31 +293,26 @@ async fn content_leg(
     let _ = whandle.update(cx, |v, window, cx| v.drive_open_update_popover(window, cx));
     settle(cx, 200).await;
 
-    let commands = view.update(cx, |v, cx| v.scenario_update_popover_commands(cx));
-    match commands {
-        Some(cmds) => {
-            let has_update = cmds.iter().any(|c| c == BREW_UPDATE);
-            let has_upgrade = cmds.iter().any(|c| c == BREW_UPGRADE);
-            if cmds.len() == 2 && has_update && has_upgrade && cmds[0] == BREW_UPDATE && cmds[1] == BREW_UPGRADE {
-                eprintln!("[selftest] update-check: the popover shows '{BREW_UPDATE}' then '{BREW_UPGRADE}' (two Copy rows)");
-            } else {
-                failures.push(format!(
-                    "content: the popover commands were {cmds:?}, not exactly ['{BREW_UPDATE}', '{BREW_UPGRADE}']"
-                ));
-            }
+    let command = view.update(cx, |v, cx| v.scenario_update_popover_command(cx));
+    match command {
+        Some(cmd) if cmd == BREW_COMMAND => {
+            eprintln!("[selftest] update-check: the popover shows '{BREW_COMMAND}'");
         }
+        Some(cmd) => failures.push(format!(
+            "content: the popover command was {cmd:?}, not exactly '{BREW_COMMAND}'"
+        )),
         None => failures.push("content: the popover was not open after drive_open_update_popover".to_string()),
     }
 
-    // Drive one Copy (row 0) and assert the clipboard holds the command.
-    let _ = view.update(cx, |v, cx| v.drive_copy_update_command(0, cx));
+    // Drive the Copy and assert the clipboard holds the command.
+    let _ = view.update(cx, |v, cx| v.drive_copy_update_command(cx));
     settle(cx, 100).await;
     let clip = cx.update(|app| app.read_from_clipboard().and_then(|it| it.text()));
-    if clip.as_deref() == Some(BREW_UPDATE) {
-        eprintln!("[selftest] update-check: Copy on row 0 wrote '{BREW_UPDATE}' to the clipboard");
+    if clip.as_deref() == Some(BREW_COMMAND) {
+        eprintln!("[selftest] update-check: Copy wrote '{BREW_COMMAND}' to the clipboard");
     } else {
         failures.push(format!(
-            "content: after Copy on row 0 the clipboard held {clip:?}, not Some(\"{BREW_UPDATE}\")"
+            "content: after Copy the clipboard held {clip:?}, not Some(\"{BREW_COMMAND}\")"
         ));
     }
     let _ = view.update(cx, |v, cx| v.drive_dismiss_update_popover(cx));
@@ -421,8 +415,8 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             stats: IntervalStats::default(),
             detail: format!(
                 "all hard update-check assertions passed (a newer tag flips update_available + exposes \
-                 the pill as an AXButton; the popover shows both exact brew commands + a Copy per row, \
-                 one Copy writes to the clipboard; a fetch error stays silent with no pill); the real \
+                 the pill as an AXButton; the popover shows the exact combined brew command, \
+                 its Copy writes to the clipboard; a fetch error stays silent with no pill); the real \
                  guarded-HID pill click hard-asserts when its preflight passes, else DEFERS; {} item(s) \
                  DEFERRED to a human pass",
                 deferred.len()

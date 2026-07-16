@@ -1,6 +1,5 @@
 //! The trailing update-pill's popover (R27, P7 / D9) — a small dedicated anchored
-//! card that renders the two Homebrew commands a user runs to upgrade, ported from
-//! `Sources/Nice/Views/UpdateAvailablePill.swift` (the popover half, `:76-171`).
+//! card that renders the Homebrew command a user runs to upgrade.
 //!
 //! None of the three existing popup components is a drop-in (dossier surprise #9):
 //! [`crate::context_menu`] renders label rows only and its item enum is closed;
@@ -8,19 +7,25 @@
 //! those two build their popups from gpui primitives — this is a small
 //! [`gpui::ManagedView`] (`Focusable + EventEmitter<DismissEvent> + Render`)
 //! presented via `deferred(anchored().position(..).anchor(..).child(card))`
-//! anchored under the pill (Swift `arrowEdge: .bottom`), with click-away + Esc
-//! dismissal. The toolbar owns the `Option<Entity<UpdatePopover>>` and subscribes
-//! to [`gpui::DismissEvent`] to drop it (the `context_menu` field pattern).
+//! anchored under the pill, with click-away + Esc dismissal. The toolbar owns the
+//! `Option<Entity<UpdatePopover>>` and subscribes to [`gpui::DismissEvent`] to
+//! drop it (the `context_menu` field pattern).
 //!
-//! ## The frozen copy (parity depends on these strings)
+//! ## The copy (the strings the scenarios pin)
 //! * Header: the accent up-arrow glyph + `"Update available: <version>"` where
 //!   `<version>` is the latest tag with a leading `v`/`V` stripped; a nil/empty
 //!   version renders the bare `"Update available"`.
-//! * Two command rows, EXACT strings in order: `brew update`, then
-//!   `brew upgrade --cask <cask>` (the cask from [`crate::release_check::CASK_NAME`]).
-//!   Each row is monospace command text + a Copy button; Copy writes the command to
-//!   the clipboard and flips its label to `"Copied"` for 1.5 s (D8) then back.
+//! * One command row, the EXACT string
+//!   `brew update && brew upgrade --cask <cask>` (the cask from
+//!   [`crate::release_check::CASK_NAME`]): monospace command text + a Copy button.
+//!   Copy writes the command to the clipboard and flips its label to `"Copied"`
+//!   for 1.5 s (D8) then back.
 //! * Footer: `"Restart Nice after upgrading."` (secondary ink).
+//!
+//! Text sizes follow the [`crate::context_menu`] discipline: the chrome point
+//! sizes at the 12pt anchor, scaled by the user's sidebar-font setting —
+//! otherwise the card would inherit the 16px window default and read far larger
+//! than the chrome around it.
 
 // Presented by `WindowToolbarView`; rendered as its child while open. The
 // component's constructor / `Render` have no in-crate caller until the toolbar
@@ -40,42 +45,47 @@ use nice_theme::chrome_geometry::{CARD_CORNER_RADIUS, INNER_CORNER_RADIUS};
 use nice_theme::palette::Slots;
 
 use crate::release_check::CASK_NAME;
+use crate::settings::sidebar_font::{current_sidebar_px, sidebar_size};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
 
-/// Fixed popover width (pt) — `UpdateAvailablePill.swift:78`.
-const POPOVER_WIDTH: f32 = 320.0;
-/// Card padding (pt) — `UpdateAvailablePill.swift:79`.
+/// Fixed popover width (pt) — wide enough that the combined brew command sits on
+/// one 12pt-Menlo line next to its Copy button at the default chrome font.
+const POPOVER_WIDTH: f32 = 400.0;
+/// Card padding (pt) — the confirmation-modal card padding.
 const POPOVER_PAD: f32 = 16.0;
 /// Deferred draw priority — above the context menu (1000) so the popover is never
 /// occluded by a stray menu layer, below the confirmation modal (2000).
 const POPOVER_PRIORITY: usize = 1500;
-/// How long the Copy button reads `"Copied"` before reverting (D8,
-/// `UpdateAvailablePill.swift:160`).
+/// How long the Copy button reads `"Copied"` before reverting (D8).
 const COPY_REVERT: Duration = Duration::from_millis(1500);
 /// Copy-button hover fill: the `ink` slot at this alpha (the chrome row idiom).
 const HOVER_INK_ALPHA: f32 = 0.08;
-/// Command text point size (`UpdateAvailablePill.swift:128`).
-const COMMAND_TEXT_SIZE: f32 = 12.0;
+/// Chrome text point size at the 12pt anchor (the toolbar-pill / settings-row
+/// size) — the Copy button label, the command text, and the footer.
+const BODY_TEXT_PT: f32 = 12.0;
+/// Header title point size at the 12pt anchor — the context-menu / NSMenu base.
+const HEADER_TEXT_PT: f32 = 13.0;
 /// A stock, always-present macOS monospace family for the command text (the same
 /// choice the term-render fixture makes for a font-independent monospace).
 const COMMAND_FONT: &str = "Menlo";
 /// The accent header glyph — the same SF Symbol the pill leads with, one step
-/// larger (`UpdateAvailablePill.swift:96`).
+/// larger.
 const HEADER_ICON_SF: &str = "arrow.up.circle.fill";
 const HEADER_ICON_FALLBACK: &str = "\u{2191}"; // ↑
-const HEADER_ICON_SIZE: f32 = 14.0;
+/// Header glyph point size at the 12pt anchor (scaled with the text).
+const HEADER_ICON_PT: f32 = 14.0;
 
 /// The Copy button's resting label.
 pub(crate) const COPY_LABEL: &str = "Copy";
 /// The Copy button's post-click label (reverts after [`COPY_REVERT`]).
 pub(crate) const COPIED_LABEL: &str = "Copied";
-/// The popover footer (secondary ink) — `UpdateAvailablePill.swift:86`.
+/// The popover footer (secondary ink).
 const FOOTER_TEXT: &str = "Restart Nice after upgrading.";
 
 /// The header title for `latest_version`: `"Update available: <version>"` with a
 /// leading `v`/`V` stripped from `<version>`; a `None`/empty version yields the
-/// bare `"Update available"` (`UpdateAvailablePill.swift:104-112`).
+/// bare `"Update available"`.
 fn header_title(latest_version: Option<&str>) -> String {
     let stripped = latest_version
         .map(str::trim)
@@ -87,12 +97,10 @@ fn header_title(latest_version: Option<&str>) -> String {
     }
 }
 
-/// The two brew commands, EXACT strings in order (`UpdateAvailablePill.swift:80-83`).
-fn brew_commands() -> Vec<String> {
-    vec![
-        "brew update".to_string(),
-        format!("brew upgrade --cask {CASK_NAME}"),
-    ]
+/// The single combined upgrade command, EXACT string (the `update-check`
+/// scenario pins it).
+fn brew_command() -> String {
+    format!("brew update && brew upgrade --cask {CASK_NAME}")
 }
 
 /// The small anchored popover under the update pill. Construct with
@@ -104,12 +112,12 @@ pub(crate) struct UpdatePopover {
     position: Point<Pixels>,
     /// The header title line (already resolved from `latest_version`).
     title: SharedString,
-    /// The two brew command strings, in order.
-    commands: Vec<SharedString>,
-    /// Which command row currently reads `"Copied"` (D8), if any.
-    copied: Option<usize>,
-    /// Monotonic copy id — a later copy invalidates an earlier row's pending
-    /// revert so a stale timer can't wipe a fresh `"Copied"`.
+    /// The combined brew command string.
+    command: SharedString,
+    /// Whether the Copy button currently reads `"Copied"` (D8).
+    copied: bool,
+    /// Monotonic copy id — a later copy invalidates an earlier pending revert so
+    /// a stale timer can't wipe a fresh `"Copied"`.
     copy_gen: u64,
     focus_handle: FocusHandle,
 }
@@ -131,8 +139,8 @@ impl UpdatePopover {
         Self {
             position,
             title: header_title(latest_version).into(),
-            commands: brew_commands().into_iter().map(Into::into).collect(),
-            copied: None,
+            command: brew_command().into(),
+            copied: false,
             copy_gen: 0,
             focus_handle,
         }
@@ -143,19 +151,16 @@ impl UpdatePopover {
         cx.emit(DismissEvent);
     }
 
-    /// Copy command row `index` to the clipboard and flash its Copy button to
-    /// `"Copied"` for [`COPY_REVERT`] (D8). The clipboard write is the mandatory
-    /// half; the timed revert is a parity nicety. `pub(crate)` so the
-    /// `update-check` scenario drives a Copy deterministically (the clipboard
-    /// assertion) without a synthetic click on the button.
-    pub(crate) fn copy_command(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(cmd) = self.commands.get(index).cloned() else {
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(cmd.to_string()));
+    /// Copy the command to the clipboard and flash the Copy button to `"Copied"`
+    /// for [`COPY_REVERT`] (D8). The clipboard write is the mandatory half; the
+    /// timed revert is a nicety. `pub(crate)` so the `update-check` scenario
+    /// drives a Copy deterministically (the clipboard assertion) without a
+    /// synthetic click on the button.
+    pub(crate) fn copy_command(&mut self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(self.command.to_string()));
         self.copy_gen = self.copy_gen.wrapping_add(1);
         let gen = self.copy_gen;
-        self.copied = Some(index);
+        self.copied = true;
         cx.notify();
         // Revert the label after 1.5 s — nap-safe so an occluded window still
         // fires it. A newer copy bumps `copy_gen`, so this revert is a no-op if it
@@ -164,7 +169,7 @@ impl UpdatePopover {
             crate::platform::nap_safe_delay(COPY_REVERT).await;
             let _ = this.update(acx, |this, cx| {
                 if this.copy_gen == gen {
-                    this.copied = None;
+                    this.copied = false;
                     cx.notify();
                 }
             });
@@ -172,10 +177,10 @@ impl UpdatePopover {
         .detach();
     }
 
-    /// The two brew command strings — a read seam the `update-check` scenario
-    /// asserts against (both exact commands present, in order).
-    pub(crate) fn scenario_commands(&self) -> Vec<String> {
-        self.commands.iter().map(ToString::to_string).collect()
+    /// The combined brew command string — a read seam the `update-check` scenario
+    /// asserts against (the exact command present).
+    pub(crate) fn scenario_command(&self) -> String {
+        self.command.to_string()
     }
 
     /// The header title — a read seam for the scenario / diagnostics.
@@ -189,24 +194,19 @@ impl UpdatePopover {
         crate::theme_settings::active_chrome_slots(cx)
     }
 
-    /// Build one command row: monospace command text (leading, selectable) + a
-    /// trailing Copy button. Associated (not `&self`) so the caller can borrow
-    /// `cx` mutably for `cx.listener` without also holding a borrow of `self`.
-    fn render_command_row(
-        &self,
-        index: usize,
-        s: &Slots,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let command = self.commands[index].clone();
+    /// Build the command row: monospace command text (leading, wrapping when the
+    /// chrome font is scaled up) + a trailing Copy button. Associated (not
+    /// `&self`-render-inline) so the caller can borrow `cx` mutably for
+    /// `cx.listener` without also holding a borrow of `self`.
+    fn render_command_row(&self, s: &Slots, chrome_px: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let command = self.command.clone();
         let hover = srgba_to_rgba(srgba_with_alpha(slot_srgba(s.ink), HOVER_INK_ALPHA));
-        let copied = self.copied == Some(index);
-        let button_label = if copied { COPIED_LABEL } else { COPY_LABEL };
-        // Copy-button AX label: `"Copy <command>"` (`UpdateAvailablePill.swift:150`).
+        let button_label = if self.copied { COPIED_LABEL } else { COPY_LABEL };
+        // Copy-button AX label: `"Copy <command>"`.
         let copy_ax = format!("Copy {command}");
 
         let copy_button = div()
-            .id(SharedString::from(format!("update.copy.{index}")))
+            .id("update.copy")
             .role(gpui::Role::Button)
             .aria_label(SharedString::from(copy_ax))
             .flex_none()
@@ -222,7 +222,7 @@ impl UpdatePopover {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _e: &gpui::MouseDownEvent, _window, cx| {
-                    this.copy_command(index, cx);
+                    this.copy_command(cx);
                     // Keep the press inside the popover — never fall through to the
                     // click-away / band behind.
                     cx.stop_propagation();
@@ -239,8 +239,11 @@ impl UpdatePopover {
             .child(
                 div()
                     .flex_1()
+                    // Let the command wrap instead of widening the card when the
+                    // chrome font is scaled up.
+                    .min_w(px(0.0))
                     .font_family(COMMAND_FONT)
-                    .text_size(px(COMMAND_TEXT_SIZE))
+                    .text_size(px(sidebar_size(chrome_px, BODY_TEXT_PT)))
                     .text_color(slot_to_rgba(s.ink))
                     .child(command),
             )
@@ -262,6 +265,9 @@ impl Render for UpdatePopover {
         let s = Self::chrome_slots(cx);
         let scale = window.scale_factor();
         let accent = srgba_to_rgba(crate::theme_settings::active_chrome_accent(cx));
+        // The chrome (sidebar) font setting — every text size scales with it, the
+        // context-menu discipline.
+        let chrome_px = current_sidebar_px(cx);
 
         let header = div()
             .flex()
@@ -271,7 +277,7 @@ impl Render for UpdatePopover {
             .child(sf_symbol_icon(
                 HEADER_ICON_SF,
                 HEADER_ICON_FALLBACK,
-                HEADER_ICON_SIZE,
+                sidebar_size(chrome_px, HEADER_ICON_PT),
                 SymbolWeight::Semibold,
                 accent,
                 scale,
@@ -279,14 +285,13 @@ impl Render for UpdatePopover {
             ))
             .child(
                 div()
+                    .text_size(px(sidebar_size(chrome_px, HEADER_TEXT_PT)))
                     .text_color(slot_to_rgba(s.ink))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(self.title.clone()),
             );
 
-        let rows: Vec<gpui::AnyElement> = (0..self.commands.len())
-            .map(|i| self.render_command_row(i, &s, cx))
-            .collect();
+        let row = self.render_command_row(&s, chrome_px, cx);
 
         let footer = div()
             .text_color(slot_to_rgba(s.ink2))
@@ -313,13 +318,16 @@ impl Render for UpdatePopover {
             .items_start()
             .w(px(POPOVER_WIDTH))
             .p(px(POPOVER_PAD))
+            // The chrome text size — the Copy button label and footer inherit it;
+            // without it the card reads at the 16px window default.
+            .text_size(px(sidebar_size(chrome_px, BODY_TEXT_PT)))
             .bg(slot_to_rgba(s.panel))
             .border_1()
             .border_color(slot_to_rgba(s.line))
             .rounded(px(CARD_CORNER_RADIUS))
             .shadow_lg()
             .child(header)
-            .children(rows)
+            .child(row)
             .child(footer);
 
         // Anchor under the pill click point (flipping to stay on-screen), and
@@ -355,11 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn brew_commands_are_the_two_exact_strings_in_order() {
-        let cmds = brew_commands();
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0], "brew update");
+    fn brew_command_is_the_exact_combined_string() {
         // The cask comes from the frozen constant.
-        assert_eq!(cmds[1], "brew upgrade --cask nice");
+        assert_eq!(brew_command(), "brew update && brew upgrade --cask nice");
     }
 }

@@ -4157,8 +4157,8 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // timer): a newer tag flips update_available + exposes the trailing pill as
         // an AXButton; a real guarded-HID click (behind the activate + raise +
         // CGWindowListCopyWindowInfo frontmost-at-point preflight — DEFER LOUDLY on
-        // a miss, never a blind global post) opens the popover; its two exact brew
-        // commands + a Copy → clipboard are asserted in-process; and a fetch error
+        // a miss, never a blind global post) opens the popover; its exact combined
+        // brew command + the Copy → clipboard are asserted in-process; and a fetch error
         // stays silent with no pill (layout stability). Registered BEFORE
         // `multiwindow`: it registers no WindowRegistry (no quit-when-empty close
         // observer), so its window never trips the terminus `multiwindow` owns last.
