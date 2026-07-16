@@ -128,8 +128,6 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// longer tint with it; hover / multi-select use the over-glass
 /// [`glass_fill`] instead).
 const SEL_ALPHA_DARK: f32 = 0.22;
-/// Count-pill background: 7% ink (`SidebarView.swift:360`).
-const COUNT_PILL_INK_ALPHA: f32 = 0.07;
 /// Group `+` button hover fill: 10% ink (`SidebarView.swift:387`).
 const ADD_BUTTON_HOVER_ALPHA: f32 = 0.10;
 
@@ -148,8 +146,6 @@ const ADD_BUTTON_HOVER_ALPHA: f32 = 0.10;
 const LINE_HEIGHT_13: f32 = 16.0;
 /// Line height for the 12pt group-header name.
 const LINE_HEIGHT_12: f32 = 15.0;
-/// Line height for the 10pt chevron glyph / count-pill text.
-const LINE_HEIGHT_10: f32 = 12.0;
 /// Fixed width of the group-header disclosure slot — `chevron.right`'s natural
 /// layout box at the 10pt symbol size (8×11pt canvas). Prod gives the chevron
 /// no frame and rotates it, which keeps this same closed-state box
@@ -415,7 +411,6 @@ struct GroupVm {
     id: String,
     name: String,
     is_terminals: bool,
-    count: usize,
     is_open: bool,
     hovered: bool,
     tabs: Vec<TabVm>,
@@ -762,7 +757,6 @@ impl SidebarShellView {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     is_terminals: p.id == TabModel::TERMINALS_PROJECT_ID,
-                    count: p.tabs.len(),
                     is_open,
                     hovered: self.hovered_project.as_deref() == Some(p.id.as_str()),
                     tabs,
@@ -1614,11 +1608,10 @@ impl SidebarShellView {
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
         let family = self.mono_family(cx);
-        let show_add = g.is_terminals || g.hovered;
+        let show_add = g.hovered;
         let gid = g.id.clone();
 
-        // Header: chevron + uppercase name (both toggle disclosure), count pill,
-        // add button.
+        // Header: chevron + uppercase name (both toggle disclosure), add button.
         let gid_chevron = gid.clone();
         let gid_name = gid.clone();
         let gid_add = gid.clone();
@@ -1694,19 +1687,6 @@ impl SidebarShellView {
                             cx.stop_propagation();
                         }),
                     ),
-            )
-            .child(
-                // Count pill.
-                div()
-                    .px(px(6.0))
-                    .py(px(1.0))
-                    .rounded_full()
-                    .bg(ink_alpha(s, COUNT_PILL_INK_ALPHA))
-                    .text_size(px(self.sidebar_pt(10.0)))
-                    .line_height(px(self.sidebar_pt(LINE_HEIGHT_10)))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ink3)
-                    .child(SharedString::from(g.count.to_string())),
             );
 
         // The add button is ALWAYS laid out — prod hover-hides it with
