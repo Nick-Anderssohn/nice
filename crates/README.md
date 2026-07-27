@@ -916,7 +916,11 @@ The GPUI application. Structure (grows over later cycles):
       the whole selection in `RowVm.drag_paths` (Finder's select-then-drag);
       arming a drag drops the deferral (gpui suppresses the click, and the
       `on_drag` constructor clears `pending_press` belt-and-braces) so the
-      multi-selection survives the drag, successful or abandoned. Every other
+      multi-selection survives the drag, successful or abandoned. The row's
+      `on_drag` is still the arm hook after the OS drag-out landed (**DnD** below)
+      — the OS session starts from inside that same constructor, so both of these
+      duties are unchanged; dropping the registration would re-break the deferred
+      press, since Nice owns no movement-threshold tracking of its own. Every other
       press — ⌘, ⇧, or plain on an unselected or sole-selected row — still
       routes at mouse-down exactly as before, which is what keeps the
       slow-second-click rename gate untouched; both
@@ -1004,15 +1008,52 @@ The GPUI application. Structure (grows over later cycles):
         rule (one tab-anchor entry + one per `is_alive` OSC-7 pane; the per-tab
         projection is pure + table-tested).
       - **DnD (F9)** — the in-tree drag's payload IS `gpui::ExternalPaths` (the app's
-        first `on_drag` consumer): rows drag their selection (else select-then-drag)
-        with an "N items" preview; directory rows are `on_drop`/`can_drop`/`drag_over`
+        first `on_drag` consumer): rows drag their selection (else select-then-drag);
+        directory rows are `on_drop`/`can_drop`/`drag_over`
         targets with the accent hover highlight; move-vs-copy resolves from the Option
         modifier + same-volume (`MetadataExt::dev`, unreadable ⇒ defensive copy) at
-        drop time. One payload type means a row dragged onto a terminal feeds T7's
-        `handle_external_paths_drop` for free (pinned in `nice-itests`). **Divergences
-        (reviewers must not flag):** highlight-only drag cues (no gpui drag-cursor API
-        at the pin) and **no drag-out to Finder** (no drag-source API; Copy+Paste
-        covers the interop).
+        drop time — and that Option read is the LIVE hardware flag
+        (`platform::option_key_held`, `+[NSEvent modifierFlags]`), NOT
+        `Window::modifiers()`: gpui's `FileDropEvent` arm updates only
+        `mouse_position`, never `self.modifiers` (`gpui/src/window.rs`, the
+        `PlatformInput::FileDrop` match arm — the `Modifiers::default()` it stamps
+        rides on the synthesized `MouseMoveEvent`/`MouseUpEvent`, and
+        `dispatch_mouse_event` never feeds it back into the cache), and an OS drag
+        session delivers no real mouse/flags events while AppKit tracks it. So
+        `Window::modifiers()` at a drop is STALE — frozen at whatever the last
+        pre-drag input event set: false for a Finder-inbound drop, and blind to an
+        Option pressed after our own drag armed (see below).
+        One payload type means a row dragged onto a terminal feeds T7's
+        `handle_external_paths_drop` for free (pinned in `nice-itests`).
+        **Drag-OUT to other apps** rides the same arm: the `on_drag` constructor
+        also calls `Window::begin_external_paths_drag` (the `zed-external-drag-out`
+        vendor patch — stock gpui is a drag DESTINATION only), which starts a real
+        `NSDraggingSession` over the row's `drag_paths` as file URLs. AppKit paints
+        that session's drag image (per-file icons, stacked with a count), so gpui's
+        armed drag renders an empty `HiddenDragPreview` — it would otherwise freeze
+        a second ghost at the arm point, since gpui gets no mouse moves while AppKit
+        tracks the session. Dropping that session on our OWN window comes back in
+        through the unchanged destination path (`FileDropEvent`, which only seeds
+        `active_drag` when none is armed), so in-tree targets and `handle_drop`'s
+        move-vs-copy are origin-agnostic — one `ExternalPaths` payload type,
+        whoever initiated the drag. The live-modifier read above is a separate
+        fact: it is what keeps Option-forces-copy correct for a drop arriving
+        from our own OS session (gpui's cached modifiers stay frozen at the
+        arming mouse-down for the session's whole duration).
+        **Divergence (reviewers must not flag):** during an in-app drag the
+        cursor carries AppKit's session drag image AND its drag-OPERATION badge,
+        which Nice does not control — gpui's `dragging_entered`/`dragging_updated`
+        hardcode `NSDragOperationCopy`, so the badge can read COPY on a
+        same-volume drop Nice resolves as a MOVE. The in-app target cue remains
+        the destination-row highlight.
+        **Coverage caveat:** the drag SOURCE is observed only up to ARMING (the
+        view's drag-arm counter — it lets the real-event `(e′)` leg fail hard
+        when a drag armed but the in-app drop was lost, and defer only when the
+        synthetic press never armed: no AppKit mouse grab for a synthetic
+        press). What lands on another app's pasteboard is not automated:
+        drag-out and the deferred-press-survives-a-drag behavior are manual
+        gates. The in-process tests and the live `(e)` leg drive the
+        begin-drag / handle-drop seam directly.
     - **Wiring (this cycle):** the per-window `FileBrowserStore` lives on
       `WindowState` (`Tab.id → FileBrowserState`, in-memory only); a dissolved
       tab's state is dropped via the `SessionManager` dissolved-id accumulator
@@ -1853,9 +1894,10 @@ gpui_macos    = { path = "../../vendor/zed/crates/gpui_macos" }
 ```
 
 **Pin:** zed main revision `10b07951838e422722e34641f4a9c0bfec9037ff`, plus
-the bg-luminance patch (`../patches/zed-bg-luminance.patch` — the phase-0
-spike's closure patch that makes GPUI text anti-aliasing match SwiftTerm on
-pixels; 65+/7− across 6 zed files). The patch file was copied byte-identical
+the committed `patches/*.patch` set (six today — `scripts/vendor-zed.sh`'s
+header comment is the per-patch source of truth). One patch carries an extra
+rule: `zed-bg-luminance.patch` (the phase-0 spike's closure patch that makes
+GPUI text anti-aliasing match SwiftTerm on pixels) was copied byte-identical
 (sha256-verified) from
 `../spikes/phase0-poc/aa-gamma/bg-luminance-applied.patch` and must never be
 hand-edited — regenerate and re-copy it from the spike if it ever needs to
@@ -1863,8 +1905,9 @@ change.
 
 `crates.io` publishes `gpui 0.2.2`; that crate is **spike-only** and must
 never be used for production code in this workspace — the pin above is the
-only source of truth. **Changing the pin or dropping the patch is a human
-decision, not something a later cycle or the reconciler should do silently.**
+only source of truth. **Changing the pin or dropping any of the patches is a
+human decision, not something a later cycle or the reconciler should do
+silently.**
 
 **Reproducing the checkout:** run `../scripts/vendor-zed.sh` (idempotent —
 safe to re-run; a second run with the pin already checked out and patched is
@@ -1875,8 +1918,8 @@ a fast no-op). It:
    missing — override the mirror path with `NICE_ZED_MIRROR`).
 2. Local-clones (hardlinked objects, cheap) the mirror into `vendor/zed`.
 3. Checks out the pinned revision (detached).
-4. Applies `patches/zed-bg-luminance.patch`, using a marker file
-   (`vendor/zed/.nice-bg-luminance-applied`) plus `git apply --check` so a
+4. Applies each patch in the script's `PATCHES` order, each behind its own
+   `vendor/zed/.nice-<name>-applied` marker file plus `git apply --check` so a
    second run doesn't try to re-apply an already-patched tree.
 
 Add `exclude = ["vendor"]` to the root `Cargo.toml` is **load-bearing**:
@@ -1977,9 +2020,11 @@ closure (`file_browser::focus_route`) — asserts the claim on the shipped surfa
 `NICE_SELFTEST=all`, release + selftest, strictly serial, `multiwindow` last)
 lives in this final slice and only here — no earlier tranche-4 cycle runs the full
 suite. **Deliberate divergences** (reviewers must not "fix"): ⌘Z / ⌘⇧Z are app-wide
-unconditional (R24 owns rebinding); highlight-only drag cues + **no drag-out to
-Finder** (no gpui drag-cursor / drag-source API at the pin — Copy+Paste covers the
-interop); a plain row click parks focus in the browser panel (Swift's browser never
+unconditional (R24 owns rebinding); the in-app drag cursor carries AppKit's
+session drag image + operation badge, and the badge can read COPY on a drop Nice
+resolves as a MOVE (gpui's destination path hardcodes `NSDragOperationCopy`;
+drag-out itself works through the `zed-external-drag-out` vendor patch, and the
+in-app target cue is the destination-row highlight); a plain row click parks focus in the browser panel (Swift's browser never
 takes first responder) so **Return** can begin rename; slow-second-click rename is
 files-only (a folder's slow second click stays expand/collapse, preserving R19's
 contract — folders rename via the menu / Return); R19's two-stage Open With ▸ instead

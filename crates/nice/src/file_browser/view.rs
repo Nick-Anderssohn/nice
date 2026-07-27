@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -232,6 +233,17 @@ pub(crate) struct FileBrowserView {
     /// [`on_row_release`](FileBrowserView::on_row_release); cleared by every
     /// left press, by a drag arming, and by a right press.
     pending_press: Option<String>,
+    /// The live Option-key read used by the drop's move-vs-copy resolution.
+    /// Defaults to a pure `|| false` so in-process tests never touch AppKit
+    /// (`+[NSEvent modifierFlags]` off the main thread, in a process with no
+    /// NSApplication); the shell injects [`crate::platform::option_key_held`]
+    /// at construction, mirroring the terminal view's keycode probe.
+    option_probe: Arc<dyn Fn() -> bool>,
+    /// Scenario seam: how many times a row drag has ARMED (the `on_drag`
+    /// constructor ran). Lets the live (e′) leg distinguish "the synthetic
+    /// press never armed a drag" (benign platform limitation → defer) from
+    /// "the drag armed and the drop was lost" (a real regression → fail).
+    drag_arm_count: usize,
 }
 
 /// The active inline-rename edit session (F8): the pure editing model plus the
@@ -298,7 +310,16 @@ impl FileBrowserView {
             pane_host: None,
             rename_probe: field_probe_cell(),
             pending_press: None,
+            option_probe: Arc::new(|| false),
+            drag_arm_count: 0,
         }
+    }
+
+    /// Inject the live Option-key read (see the [`option_probe`](Self::option_probe)
+    /// field). Called by the shell right after construction; tests keep the pure
+    /// `|| false` default so no AppKit call reaches the unit-test process.
+    pub(crate) fn set_option_probe(&mut self, probe: Arc<dyn Fn() -> bool>) {
+        self.option_probe = probe;
     }
 
     /// Push down the window's pane host so a rename exit hands key focus back to
@@ -1328,44 +1349,31 @@ impl FileBrowserView {
         }
     }
 
-    /// Handle a drop onto directory `dest`, moving/copying exactly the dropped
+    /// Handle a drop onto directory `dest`: resolve move-vs-copy (live Option
+    /// read + same/cross-volume) and commit exactly the dropped
     /// [`gpui::ExternalPaths`] payload. Internal drags and Finder-inbound drops are
     /// indistinguishable here: the in-tree drag source carries the same
     /// `ExternalPaths` set (select-then-drag), so the payload is always the source
     /// of truth — no stale in-tree drag can redirect a later drop. Rejected by the
     /// pure `can_drop` rule ⇒ no-op.
-    fn handle_drop(
-        &mut self,
-        dropped: &gpui::ExternalPaths,
-        dest: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_drop(&mut self, dropped: &gpui::ExternalPaths, dest: &str, cx: &mut Context<Self>) {
         let sources: Vec<String> = dropped
             .paths()
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        self.perform_internal_drop(&sources, dest, window, cx);
-    }
-
-    /// Resolve move-vs-copy (Option modifier read at drop time + same/cross-volume)
-    /// and commit the drop. Rejected drops are dropped silently by the pure rule.
-    fn perform_internal_drop(
-        &mut self,
-        sources: &[String],
-        dest: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
         if !nice_model::file_browser::can_drop(&refs, dest) {
             return;
         }
-        let option_held = window.modifiers().alt;
-        let same_volume = sources_share_volume(sources, dest);
+        // The injected probe reads the LIVE hardware Option state —
+        // `window.modifiers()` is stale at any drop arriving through the OS drag
+        // destination path; see `platform::option_key_held` for the gpui/AppKit
+        // mechanics.
+        let option_held = (self.option_probe)();
+        let same_volume = sources_share_volume(&sources, dest);
         let op = nice_model::file_browser::drop_operation(option_held, same_volume);
-        self.move_or_copy(sources, dest, op, cx);
+        self.move_or_copy(&sources, dest, op, cx);
     }
 
     /// Commit a resolved drop into `dest` (the pasteboard is skipped — a drag is
@@ -1746,6 +1754,11 @@ impl FileBrowserView {
         self.rendered_paths.clone()
     }
 
+    /// How many row drags have ARMED (see [`drag_arm_count`](Self::drag_arm_count)).
+    pub(crate) fn scenario_drag_arm_count(&self) -> usize {
+        self.drag_arm_count
+    }
+
     /// Whether `path` is currently expanded for the active tab.
     pub(crate) fn scenario_is_expanded(&self, path: &str, cx: &App) -> bool {
         let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
@@ -1968,10 +1981,10 @@ impl FileBrowserView {
     /// directory `dest` — the DnD commit seam. Goes through the real `handle_drop`
     /// path with the same [`gpui::ExternalPaths`] payload the row's `on_drag`
     /// constructs, so the drop moves exactly the dragged set.
-    pub(crate) fn drive_drag_drop(&mut self, path: &str, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn drive_drag_drop(&mut self, path: &str, dest: &str, cx: &mut Context<Self>) {
         let sources = self.begin_row_drag(path, cx);
         let payload = ExternalPaths(sources.iter().map(PathBuf::from).collect());
-        self.handle_drop(&payload, dest, window, cx);
+        self.handle_drop(&payload, dest, cx);
     }
 
     /// Whether a drag of the current selection (or just `path`) onto `dest` would
@@ -2295,19 +2308,43 @@ fn render_row(
     // One payload type means a directory row's drop handler serves both internal
     // drags and Finder-inbound drops, AND dragging a row onto a terminal feeds T7's
     // target for free. Suppressed while editing.
+    //
+    // The `on_drag` registration stays because it is the ONLY drag-arm hook Nice
+    // has and it is load-bearing three times over: gpui takes over its own pending
+    // mouse-down when a drag arms (that is what suppresses the release click behind
+    // a drag), the constructor closure clears the deferred press, and the closure is
+    // the one place that runs synchronously inside the mouse-dragged event AppKit
+    // needs to root a drag session in. That last duty is what Plan 3 adds — the arm
+    // now ALSO starts an OS-native session (the `zed-external-drag-out` vendor
+    // patch) over the same paths, so rows can be dropped on Finder and other apps.
+    // The in-app half is unchanged: a session dropped on our own window arrives
+    // through the drag DESTINATION path as `ExternalPaths` exactly like a
+    // Finder-inbound drop, and gpui keeps the already-armed drag (its
+    // `FileDropEvent::Entered` only seeds `active_drag` when there isn't one), so
+    // `can_drop` / `drag_over` / `on_drop` see one payload with the same paths
+    // either way.
     if row.editing.is_none() {
         let drag_paths = row.drag_paths.clone();
         let weak_drag = weak.clone();
         el = el.on_drag(
             ExternalPaths(drag_paths.iter().map(PathBuf::from).collect()),
-            move |paths: &ExternalPaths, offset, _window, app| {
+            move |paths: &ExternalPaths, _offset, window, app| {
                 // The press became a drag: drop its deferred collapse so the
                 // multi-selection survives the drag (Finder parity), successful
                 // or abandoned. gpui already suppresses the click here, so this
                 // is belt-and-braces against a stuck pending state.
-                let _ = weak_drag.update(app, |this, _cx| this.clear_pending_press());
-                let count = paths.paths().len();
-                app.new(|_| DragPreview { count, offset })
+                let _ = weak_drag.update(app, |this, _cx| {
+                    this.clear_pending_press();
+                    // Scenario observable: the drag ARMED (whatever happens next).
+                    this.drag_arm_count += 1;
+                });
+                // AppKit roots the session in the mouse event it is dispatching,
+                // which is exactly this closure's caller. A `false` return (a
+                // non-macOS backend, or no live mouse event — the test window)
+                // just leaves the in-app gpui drag as the only mechanism, which
+                // still serves every in-tree target.
+                window.begin_external_paths_drag(paths.paths());
+                app.new(|_| HiddenDragPreview)
             },
         );
     }
@@ -2336,9 +2373,9 @@ fn render_row(
                     })
                     .unwrap_or(false)
             })
-            .on_drop::<ExternalPaths>(move |paths: &ExternalPaths, window, app| {
+            .on_drop::<ExternalPaths>(move |paths: &ExternalPaths, _window, app| {
                 let _ = weak_drop.update(app, |this, cx| {
-                    this.handle_drop(paths, &dest_drop, window, cx);
+                    this.handle_drop(paths, &dest_drop, cx);
                 });
             });
     }
@@ -2452,44 +2489,21 @@ fn sources_share_volume(sources: &[String], dest: &str) -> bool {
     })
 }
 
-/// The small "N items" drag preview (F9) — gpui has no drag-cursor operation cue
-/// at the pin, so this floating chip is the only drag affordance.
-struct DragPreview {
-    count: usize,
-    /// The pointer's position within the dragged row, captured at drag-arm time.
-    /// gpui lays the preview out at `mouse - offset`, so we re-add it (plus a
-    /// small lead) as leading padding below to net the chip to `pointer + 12`,
-    /// mirroring zed's project panel (`DraggedProjectEntryView`).
-    offset: gpui::Point<gpui::Pixels>,
-}
+/// The armed gpui drag's view — deliberately empty. The drag IMAGE is the OS
+/// session's now (`Window::begin_external_paths_drag`, the `zed-external-drag-out`
+/// vendor patch): AppKit paints the file icons, stacked with a count for a
+/// multi-file drag. gpui's in-app drag stays armed for its payload + click-
+/// suppression duties, but must paint NOTHING — while AppKit tracks the session
+/// gpui receives no mouse moves, so any gpui preview would freeze at the arm
+/// point and sit under the pointer as a second, stationary ghost.
+///
+/// (This replaces R20's "N items" chip, which existed only because there was no
+/// drag image at all before the OS session.)
+struct HiddenDragPreview;
 
-impl gpui::Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = chrome_slots(cx);
-        let label = if self.count == 1 {
-            "1 item".to_string()
-        } else {
-            format!("{} items", self.count)
-        };
-        // Outer wrapper carries the offset compensation as padding so the visible
-        // chip's own background box isn't inflated.
-        div().pl(self.offset.x + px(12.0)).pt(self.offset.y + px(12.0)).child(
-            div()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded(px(4.0))
-                .bg(slot_to_rgba(s.panel))
-                .border_1()
-                .border_color(slot_to_rgba(s.line))
-                .text_size(px(NAME_SIZE))
-                // The chrome family — the drag chip mounts in the drag layer, so
-                // it never inherits a row font.
-                .when_some(crate::sidebar_shell::resolved_mono_family(cx), |d, fam| {
-                    d.font_family(fam)
-                })
-                .text_color(slot_to_rgba(s.ink))
-                .child(SharedString::from(label)),
-        )
+impl gpui::Render for HiddenDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
     }
 }
 
@@ -2909,13 +2923,13 @@ mod tests {
         let d = fx.p("D");
 
         window
-            .update(cx, |view, window, cx| {
+            .update(cx, |view, _window, cx| {
                 // Simulate an abandoned in-tree drag of A: it computes the drag set
                 // but records nothing (pre-fix this poisoned `drag.session`).
                 let _ = view.begin_row_drag(&a, cx);
                 // A separate Finder-inbound drop of B onto directory D.
                 let payload = ExternalPaths([PathBuf::from(&b)].into_iter().collect());
-                view.handle_drop(&payload, &d, window, cx);
+                view.handle_drop(&payload, &d, cx);
             })
             .unwrap();
 

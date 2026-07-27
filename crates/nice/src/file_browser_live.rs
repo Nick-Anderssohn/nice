@@ -972,8 +972,8 @@ async fn r20_legs(
         );
     }
     whandle
-        .update(cx, |_r, window, app| {
-            fb.update(app, |v, cx| v.drive_drag_drop(&drag_a, &src, window, cx))
+        .update(cx, |_r, _window, app| {
+            fb.update(app, |v, cx| v.drive_drag_drop(&drag_a, &src, cx))
         })
         .ok();
     settle(cx, 150).await;
@@ -1657,6 +1657,7 @@ async fn multi_select_press_leg(
                 );
                 return;
             };
+            let arms_before = fb.update(cx, |v, _| v.scenario_drag_arm_count());
             platform::post_global_left_down(gx0, gy0);
             settle(cx, 150).await;
             let steps = 10;
@@ -1673,12 +1674,26 @@ async fn multi_select_press_leg(
             let moved_b = exists(&fixture.path("multidrag/multi2.txt"));
             let src_a = exists(&a);
             let src_b = exists(&b);
-            // Exactly three readings: the drag armed and moved the whole selection
-            // (pass), the drag never armed at all (defer — the platform limitation),
-            // or something else committed (hard fail — a wrong outcome is never a
-            // deferral, e.g. only the pressed row travelled).
+            // Four readings: the drag armed and moved the whole selection (pass);
+            // nothing moved AND the drag never armed (defer — the platform
+            // limitation); nothing moved but the drag DID arm (hard fail — the
+            // armed OS session swallowed the gesture and the in-app drop was
+            // lost, exactly the regression shape the drag-out change could
+            // introduce); or something else committed (hard fail — a wrong
+            // outcome is never a deferral, e.g. only the pressed row travelled).
+            let armed = fb.update(cx, |v, _| v.scenario_drag_arm_count()) > arms_before;
             let both_moved = moved_a && !src_a && moved_b && !src_b;
             let nothing_happened = !moved_a && !moved_b && src_a && src_b;
+            if nothing_happened && armed {
+                failures.push(
+                    "(e′) the drag ARMED (on_drag ran — the OS drag session started) but nothing \
+                     moved and both sources are still in place: the drop back onto our own window \
+                     was lost. This is NOT the never-armed platform limitation — suspect the \
+                     NSDraggingSession in-app destination path (enter/exit/perform plumbing)."
+                        .to_string(),
+                );
+                return;
+            }
             match (both_moved, nothing_happened) {
                 (true, _) => {
                     // The model must agree with the disk: both source rows are gone
@@ -1705,13 +1720,13 @@ async fn multi_select_press_leg(
                     }
                 }
                 (_, true) => deferred.push(
-                    "(e′) the real end-to-end drag did not arm: nothing moved and both sources are \
-                     still in place. macOS does not establish AppKit's implicit mouse grab for a \
-                     synthetic press, so the held moves are never delivered as `mouseDragged:` and \
-                     gpui's on_drag/on_drop never arm (the recorded in-tree finding). DEFERRED to a \
-                     human drag of a 2-file selection onto a folder; the multi-path move itself \
-                     stays hard-pinned by r20 leg (e)'s `drive_drag_drop` seam and the in-process \
-                     view tests."
+                    "(e′) the real end-to-end drag did not arm (corroborated: the drag-arm counter \
+                     never moved): nothing moved and both sources are still in place. macOS does \
+                     not establish AppKit's implicit mouse grab for a synthetic press, so the held \
+                     moves are never delivered as `mouseDragged:` and gpui's on_drag/on_drop never \
+                     arm (the recorded in-tree finding). DEFERRED to a human drag of a 2-file \
+                     selection onto a folder; the multi-path move itself stays hard-pinned by r20 \
+                     leg (e)'s `drive_drag_drop` seam and the in-process view tests."
                         .to_string(),
                 ),
                 _ => failures.push(format!(

@@ -5,8 +5,10 @@
 //! cross-volume-as-copy.
 //!
 //! The Swift `operation(modifierFlags:sameVolume:)` reads
-//! `NSEvent.ModifierFlags`; the modifier is read at drop time in the view
-//! layer (`window.modifiers()`), so this pure rule takes a plain `option_held`
+//! `NSEvent.ModifierFlags`; the Rust view layer reads the live hardware flag at
+//! drop time (`platform::option_key_held`, `+[NSEvent modifierFlags]` — NOT
+//! `Window::modifiers()`, which is stale across an OS drag session), so this pure
+//! rule takes a plain `option_held`
 //! bool. `areOnSameVolume` (the `URLResourceValues` volume probe) touches the
 //! filesystem and stays in the `crates/nice` DnD slice; `same_volume` is
 //! hoisted to a parameter here exactly as Swift hoists it for its unit tests.

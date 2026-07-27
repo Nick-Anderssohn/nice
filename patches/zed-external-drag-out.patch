@@ -1,0 +1,217 @@
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -649,6 +649,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     /// radius used when the appearance is `Blurred`. Default no-op; only the
+     /// macOS backend honors it (routing through the WindowServer blur API).
+     fn set_background_blur_radius(&self, _radius: u32) {}
++    /// Nice patch (external-drag-out): begin an OS-native drag session that
++    /// carries `paths` as file URLs, so OTHER applications (Finder, mail
++    /// clients, …) can receive the drop. Must be called synchronously while
++    /// the mouse event that arms the drag is being dispatched — AppKit builds
++    /// the session from the event currently in flight. Returns true iff a
++    /// session started. Default no-op returning false; only macOS implements it.
++    fn begin_external_paths_drag(&self, _paths: &[PathBuf]) -> bool {
++        false
++    }
+     fn minimize(&self);
+     fn zoom(&self);
+     fn toggle_fullscreen(&self);
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2386,6 +2386,22 @@ impl Window {
+         self.platform_window.set_background_blur_radius(radius);
+     }
+ 
++    /// Nice patch (external-drag-out): start an OS-native drag session carrying
++    /// `paths` as file URLs, so the drag can be dropped on OTHER applications
++    /// (gpui's own `on_drag` is an in-app-only construct). A session dropped on
++    /// our own window still arrives through the normal file-drop destination
++    /// path as `ExternalPaths`.
++    ///
++    /// AppKit builds the session from the mouse event it is currently
++    /// dispatching, so this only works when called synchronously from within
++    /// mouse-event handling (e.g. the closure that arms a drag) while the
++    /// button is held. Returns true iff a session actually started: false on
++    /// non-macOS backends, for empty `paths`, or when no usable mouse event is
++    /// in flight.
++    pub fn begin_external_paths_drag(&self, paths: &[std::path::PathBuf]) -> bool {
++        self.platform_window.begin_external_paths_drag(paths)
++    }
++
+     /// Mark the window as dirty at the platform level.
+     pub fn set_window_edited(&mut self, edited: bool) {
+         self.platform_window.set_edited(edited);
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -108,6 +108,20 @@ type NSDragOperation = NSUInteger;
+ const NSDragOperationNone: NSDragOperation = 0;
+ #[allow(non_upper_case_globals)]
+ const NSDragOperationCopy: NSDragOperation = 1;
++// Nice patch (external-drag-out): source-side drag constants.
++// https://developer.apple.com/documentation/appkit/nsdraggingcontext
++#[allow(non_upper_case_globals)]
++const NSDragOperationGeneric: NSDragOperation = 4;
++#[allow(non_upper_case_globals)]
++const NSDraggingContextOutsideApplication: NSInteger = 0;
++// NSEventType raw values (cocoa's enum is only safe for the values AppKit
++// actually documents; we compare raw discriminants like `events.rs` does).
++#[allow(non_upper_case_globals)]
++const NSEventTypeLeftMouseDown: u64 = 1;
++#[allow(non_upper_case_globals)]
++const NSEventTypeLeftMouseDragged: u64 = 6;
++// Edge length of the per-file drag image, in points.
++const EXTERNAL_DRAG_ICON_SIZE: f64 = 32.0;
+ #[derive(PartialEq)]
+ pub enum UserTabbingPreference {
+     Never,
+@@ -292,6 +306,19 @@ unsafe fn build_classes() {
+                 sel!(characterIndexForPoint:),
+                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+             );
++
++            // Nice patch (external-drag-out): the view doubles as the
++            // NSDraggingSource for sessions started by
++            // `begin_external_paths_drag`. Stock gpui registers the WINDOW as a
++            // drag DESTINATION only; nothing here was ever a drag source.
++            if let Some(protocol) = Protocol::get("NSDraggingSource") {
++                decl.add_protocol(protocol);
++            }
++            decl.add_method(
++                sel!(draggingSession:sourceOperationMaskForDraggingContext:),
++                dragging_session_source_operation_mask
++                    as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
++            );
+             decl.register()
+         };
+         BLURRED_VIEW_CLASS = {
+@@ -1592,6 +1619,30 @@ impl PlatformWindow for MacWindow {
+         }
+     }
+ 
++    // Nice patch (external-drag-out): start a real NSDraggingSession carrying
++    // one file URL per path, with the GPUIView as the NSDraggingSource.
++    //
++    // AppKit requires the NSEvent that armed the drag; we take it from
++    // `[NSApp currentEvent]`, which during synchronous mouse-event dispatch IS
++    // the left-mouse-down/dragged event being handled. Calling this outside
++    // that window (a deferred task, a key handler) leaves a non-mouse or stale
++    // current event — we detect that and refuse instead of letting AppKit
++    // raise. The session is delivered to our own window through the existing
++    // drag DESTINATION path (`draggingEntered:` … `performDragOperation:`)
++    // exactly like a Finder-initiated drop.
++    fn begin_external_paths_drag(&self, paths: &[PathBuf]) -> bool {
++        if paths.is_empty() {
++            return false;
++        }
++        let native_view = self.0.as_ref().lock().native_view.as_ptr();
++        unsafe {
++            let pool = NSAutoreleasePool::new(nil);
++            let began = begin_external_paths_drag_on_view(native_view, paths);
++            let _: () = msg_send![pool, release];
++            began
++        }
++    }
++
+     fn background_appearance(&self) -> WindowBackgroundAppearance {
+         self.0.as_ref().lock().background_appearance
+     }
+@@ -2922,6 +2973,96 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
+     point(px(window_x as f32), px(window_y as f32))
+ }
+ 
++// Nice patch (external-drag-out): build one NSDraggingItem per path (file URL
++// pasteboard writer + the Finder icon as the drag image) and hand them to
++// AppKit as a real drag session rooted at the event currently being dispatched.
++//
++// Returns false — rather than raising — when there is no usable triggering
++// event, which is what happens if this is called outside synchronous mouse
++// handling. Caller supplies the autorelease pool.
++unsafe fn begin_external_paths_drag_on_view(native_view: id, paths: &[PathBuf]) -> bool {
++    unsafe {
++        let app = NSApplication::sharedApplication(nil);
++        let event: id = msg_send![app, currentEvent];
++        if event == nil {
++            return false;
++        }
++        // AppKit only accepts a mouse-down/dragged event as the session's
++        // trigger; anything else means we are not inside a live drag gesture.
++        let event_type = NSEvent::eventType(event) as u64;
++        if event_type != NSEventTypeLeftMouseDown && event_type != NSEventTypeLeftMouseDragged {
++            return false;
++        }
++
++        let location: NSPoint = msg_send![event, locationInWindow];
++        let center: NSPoint = msg_send![native_view, convertPoint: location fromView: nil];
++        let frame = NSRect::new(
++            NSPoint::new(
++                center.x - EXTERNAL_DRAG_ICON_SIZE / 2.0,
++                center.y - EXTERNAL_DRAG_ICON_SIZE / 2.0,
++            ),
++            NSSize::new(EXTERNAL_DRAG_ICON_SIZE, EXTERNAL_DRAG_ICON_SIZE),
++        );
++        let icon_size = NSSize::new(EXTERNAL_DRAG_ICON_SIZE, EXTERNAL_DRAG_ICON_SIZE);
++
++        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
++        let items: id = msg_send![class!(NSMutableArray), array];
++        for path in paths {
++            let Some(path) = path.to_str() else { continue };
++            let ns_path: id = NSString::alloc(nil).init_str(path);
++            let ns_path: id = msg_send![ns_path, autorelease];
++            let url: id = msg_send![class!(NSURL), fileURLWithPath: ns_path];
++            if url == nil {
++                continue;
++            }
++            let item: id = msg_send![class!(NSDraggingItem), alloc];
++            let item: id = msg_send![item, initWithPasteboardWriter: url];
++            if item == nil {
++                continue;
++            }
++            let item: id = msg_send![item, autorelease];
++            let icon: id = msg_send![workspace, iconForFile: ns_path];
++            if icon != nil {
++                let _: () = msg_send![icon, setSize: icon_size];
++            }
++            // Every item shares one frame, so a multi-file drag renders as
++            // AppKit's stacked-with-count image instead of a spread of icons.
++            let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
++            let _: () = msg_send![items, addObject: item];
++        }
++
++        let count: NSUInteger = msg_send![items, count];
++        if count == 0 {
++            return false;
++        }
++
++        let session: id = msg_send![
++            native_view,
++            beginDraggingSessionWithItems: items
++            event: event
++            source: native_view
++        ];
++        session != nil
++    }
++}
++
++// Nice patch (external-drag-out): NSDraggingSource operation mask. Outside the
++// app we only ever offer a copy (we never hand ownership of the files away);
++// inside it we permit copy + generic so Nice's own drop targets keep deciding
++// move-vs-copy from the modifier keys and the volume check.
++extern "C" fn dragging_session_source_operation_mask(
++    _: &Object,
++    _: Sel,
++    _session: id,
++    context: NSInteger,
++) -> NSDragOperation {
++    if context == NSDraggingContextOutsideApplication {
++        NSDragOperationCopy
++    } else {
++        NSDragOperationCopy | NSDragOperationGeneric
++    }
++}
++
+ extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+     let window_state = unsafe { get_window_state(this) };
+     let position = drag_event_position(&window_state, dragging_info);

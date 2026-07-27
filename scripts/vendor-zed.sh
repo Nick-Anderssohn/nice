@@ -47,6 +47,19 @@
 #          translucent window it over-masks the WindowServer blur/desktop at
 #          every antialiased edge — a dark fringe around glyphs, glaring on 1×
 #          displays at background opacity < 1.
+#        - zed-external-drag-out.patch: make gpui windows a drag SOURCE for the
+#          OS. Stock gpui registers the window as a drag DESTINATION only
+#          (Finder → Nice drops arrive as `ExternalPaths`), and `div.on_drag`
+#          is in-app-only, so nothing could ever be dragged OUT of the app. The
+#          patch adds `Window::begin_external_paths_drag(&[PathBuf]) -> bool`
+#          (default-noop on non-mac backends) and implements it in gpui_macos
+#          with a real `beginDraggingSessionWithItems:event:source:` — one
+#          `NSDraggingItem` per path (file-URL pasteboard writer + the Finder
+#          icon as the drag image) with GPUIView as the `NSDraggingSource`
+#          (copy outside the app, copy+generic inside so our own drop targets
+#          still decide move-vs-copy). The triggering `NSEvent` comes from
+#          `[NSApp currentEvent]`, so it only starts from inside synchronous
+#          mouse-event dispatch; it refuses instead of raising otherwise.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
@@ -73,6 +86,7 @@ PATCHES=(
     "zed-force-width-exact"
     "zed-configurable-blur"
     "zed-translucent-dst-alpha"
+    "zed-external-drag-out"
 )
 patch_file() { printf '%s/patches/%s.patch' "$REPO_ROOT" "$1"; }
 marker_file() { printf '%s/.nice-%s-applied' "$VENDOR" "${1#zed-}"; }

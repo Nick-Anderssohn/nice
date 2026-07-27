@@ -2357,6 +2357,12 @@ impl Render for SidebarShellView {
             let state = self.state.clone();
             let accent = crate::theme_settings::active_chrome_accent(cx);
             let fb = cx.new(|cx| FileBrowserView::new(state, accent, cx));
+            // Inject the live Option-key read for drop move-vs-copy (the AppKit
+            // call stays out of the unit-test process, whose views keep the pure
+            // `|| false` default — the keycode-probe pattern).
+            fb.update(cx, |fb, _| {
+                fb.set_option_probe(std::sync::Arc::new(crate::platform::option_key_held));
+            });
             // R20 (F8): push the pane host down so a rename exit hands key focus
             // back to the active terminal (set_pane_host runs before first render).
             if let Some(host) = self.pane_host.clone() {

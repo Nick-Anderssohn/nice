@@ -416,6 +416,45 @@ pub fn postscript_to_family_name(name: &str) -> Option<String> {
     }
 }
 
+/// Whether the Option (Alt) key is physically held RIGHT NOW, read from AppKit's
+/// process-wide `+[NSEvent modifierFlags]`.
+///
+/// The DnD drop seam (`FileBrowserView::handle_drop`, via the view's injected
+/// option probe) must read the
+/// modifier here rather than from `Window::modifiers()`, because gpui's cached
+/// modifiers are STALE at a file drop. `dispatch_event`'s
+/// `PlatformInput::FileDrop` arm (`gpui/src/window.rs`) updates only
+/// `mouse_position` — it never writes `self.modifiers`. The `Modifiers::default()`
+/// it stamps onto the synthesized events (`Entered`/`Pending` → `MouseMoveEvent`,
+/// `Submit` → `MouseUpEvent`) rides on the EVENT, and `dispatch_mouse_event` never
+/// feeds it back into the cache. So `window.modifiers().alt` is whatever the last
+/// real mouse/flags event left there before the drag, and no such event arrives
+/// while a drag session is in flight: false for a Finder-inbound drop (no
+/// pre-drag input at all), and — since the drag-out session — frozen at the
+/// arming mouse-down for Nice's OWN row drags, blind to an Option pressed after
+/// the drag armed, because AppKit owns mouse tracking for the whole session and
+/// gpui sees no real mouse events until it ends.
+/// Reading the live flags is what keeps Option-forces-copy working.
+///
+/// This is the same read gpui_macos performs in its own
+/// `PlatformWindow::modifiers()`, and the same state AppKit itself consults for
+/// the drag-operation badge on the cursor.
+///
+/// Tests: this read is NOT called directly by the drop seam — the shell injects
+/// it into `FileBrowserView` (`set_option_probe`, the keycode-probe pattern),
+/// and in-process tests keep the view's pure `|| false` default, so no AppKit
+/// call reaches the unit-test process (off the main thread, no NSApplication)
+/// and no ambient held Option key can flip a test's MOVE into a COPY.
+pub fn option_key_held() -> bool {
+    // NSEventModifierFlags.option (AppKit's `NSAlternateKeyMask`), 1 << 19.
+    const NS_EVENT_MODIFIER_FLAG_OPTION: u64 = 1 << 19;
+    // SAFETY: `+[NSEvent modifierFlags]` is a pure class-method read of the
+    // current hardware modifier state — it needs no window, no live event, and
+    // allocates nothing. Called on the main thread from the drop handler.
+    let flags: u64 = unsafe { msg_send![class!(NSEvent), modifierFlags] };
+    flags & NS_EVENT_MODIFIER_FLAG_OPTION != 0
+}
+
 /// The macOS keyCode side-channel feeding the R5 keyboard encoder.
 ///
 /// gpui's `Keystroke` on the pin carries only `{modifiers, key, key_char}` — no

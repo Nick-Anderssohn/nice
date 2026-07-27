@@ -67,7 +67,7 @@ Signed, notarized, universal (Apple Silicon + Intel). `brew upgrade --cask nice`
 
 Nice is a native Rust app rendered on a single Metal stack:
 
-- [GPUI](https://www.gpui.rs) — the GPU-accelerated UI framework from [Zed](https://github.com/zed-industries/zed). The whole app (chrome, sidebar, and terminal) is drawn GPUI-native; Nice vendors a pinned Zed checkout with a small local patch.
+- [GPUI](https://www.gpui.rs) — the GPU-accelerated UI framework from [Zed](https://github.com/zed-industries/zed). The whole app (chrome, sidebar, and terminal) is drawn GPUI-native; Nice vendors a pinned Zed checkout with a small set of local patches.
 - [alacritty_terminal](https://github.com/alacritty/alacritty) — the VT engine (grid, scrollback, damage tracking, and VTE parsing) behind Nice's terminal panes.
 
 Terminal themes are compatible with [Ghostty](https://ghostty.org)'s theme file format.
