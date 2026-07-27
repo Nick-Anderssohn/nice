@@ -62,6 +62,48 @@ pub enum ClickAction {
     DoubleActivate { path: String },
 }
 
+/// When a row press applies its routing effect: at mouse-DOWN, or deferred to
+/// the release. See [`press_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressDisposition {
+    /// Route the press at mouse-DOWN, exactly as the router always has.
+    Immediate,
+    /// Leave the selection alone at mouse-DOWN and route the press at mouse-UP
+    /// — but only if no drag armed in between.
+    DeferToRelease,
+}
+
+/// Decide whether a row press routes at mouse-down or at release.
+///
+/// Finder's select-then-drag convention: pressing an ALREADY-selected row while
+/// a multi-selection is live must not collapse that selection at mouse-down,
+/// because the press may be the start of a drag that carries the whole set.
+/// The collapse happens on mouse-UP-without-drag instead. Every other press
+/// keeps today's immediate behavior: ⌘/⇧ presses (which adjust the selection
+/// and never start the collapse), and plain presses on an unselected row or on
+/// a row that is already the sole selection.
+///
+/// `selection_count` is the size of the live selection the row belongs to (the
+/// same on-screen-ordered set the drag payload is built from).
+///
+/// **Invariant the rename gate depends on:** a plain press on a SOLE-selected
+/// row stays [`PressDisposition::Immediate`]. The slow-second-click rename gate
+/// keys off "this row was already the sole selection" plus the activation
+/// stamps, and `DeferToRelease` requires `selection_count > 1`, which makes
+/// "was sole" false by construction — so deferral can never reach the rename
+/// gate. `sole_selected_plain_press_stays_immediate` pins this.
+pub fn press_disposition(
+    modifier: ClickModifier,
+    is_selected: bool,
+    selection_count: usize,
+) -> PressDisposition {
+    if modifier == ClickModifier::Plain && is_selected && selection_count > 1 {
+        PressDisposition::DeferToRelease
+    } else {
+        PressDisposition::Immediate
+    }
+}
+
 /// The hand-rolled detector (see the module docs). Construct with
 /// [`FileBrowserClickRouter::new`]; drive it with [`FileBrowserClickRouter::route`].
 #[derive(Debug, Default)]
@@ -214,6 +256,100 @@ mod tests {
             r.route("/b", ClickModifier::Plain, second),
             ClickAction::SingleActivate { path: "/b".into() },
             "a fast second click on a DIFFERENT row is a single, not a double"
+        );
+    }
+
+    #[test]
+    fn press_disposition_table() {
+        use ClickModifier::*;
+        use PressDisposition::*;
+        // (modifier, is_selected, selection_count) -> disposition, why
+        let cases: &[(ClickModifier, bool, usize, PressDisposition, &str)] = &[
+            (
+                Plain,
+                true,
+                2,
+                DeferToRelease,
+                "the bug: a plain press inside a multi-selection must not collapse it at down",
+            ),
+            (
+                Plain,
+                true,
+                5,
+                DeferToRelease,
+                "any multi-selection defers, not just a pair",
+            ),
+            (
+                Plain,
+                false,
+                2,
+                Immediate,
+                "a plain press on an UNSELECTED row replaces the selection at down and drags alone",
+            ),
+            (
+                Plain,
+                false,
+                0,
+                Immediate,
+                "nothing selected: a plain press is an ordinary immediate select",
+            ),
+            (
+                Plain,
+                true,
+                1,
+                Immediate,
+                "the sole-selected row keeps the immediate path the rename gate rides on",
+            ),
+            (
+                Command,
+                true,
+                2,
+                Immediate,
+                "⌘ toggles at down — unchanged",
+            ),
+            (
+                Command,
+                false,
+                2,
+                Immediate,
+                "⌘ on an unselected row toggles it in at down — unchanged",
+            ),
+            (
+                Shift,
+                true,
+                2,
+                Immediate,
+                "⇧ range-extends at down — unchanged",
+            ),
+            (
+                Shift,
+                false,
+                3,
+                Immediate,
+                "⇧ on an unselected row range-extends at down — unchanged",
+            ),
+        ];
+        for (modifier, is_selected, count, want, why) in cases {
+            assert_eq!(
+                press_disposition(*modifier, *is_selected, *count),
+                *want,
+                "press_disposition({modifier:?}, is_selected={is_selected}, count={count}): {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn sole_selected_plain_press_stays_immediate() {
+        // The slow-second-click rename gate keys off `was_sole` + the activation
+        // stamp, and it is only reachable from the IMMEDIATE path. Deferral
+        // requires `selection_count > 1`, which makes `was_sole` false by
+        // construction — so the rename gate is untouched by the deferred path.
+        // This is the invariant that pins that reasoning.
+        assert_eq!(
+            press_disposition(ClickModifier::Plain, true, 1),
+            PressDisposition::Immediate,
+            "a plain press on the sole selection MUST route at mouse-down, or the \
+             slow-second-click rename gate stops arming"
         );
     }
 

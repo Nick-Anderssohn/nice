@@ -44,9 +44,9 @@ use gpui::{
 use nice_model::file_browser::listing::{path_is_dir, visible_order};
 use nice_model::file_browser::menu::FileBrowserContextMenuItem;
 use nice_model::file_browser::{
-    file_browser_header_title, preselect_len, ClickModifier, FileBrowserClickRouter,
-    FileBrowserContextMenuModel, FileBrowserSortCriterion, FileBrowserSortSettings, TextFieldEditor,
-    TextFieldKey, DOUBLE_CLICK_WINDOW,
+    file_browser_header_title, preselect_len, press_disposition, ClickModifier,
+    FileBrowserClickRouter, FileBrowserContextMenuModel, FileBrowserSortCriterion,
+    FileBrowserSortSettings, PressDisposition, TextFieldEditor, TextFieldKey, DOUBLE_CLICK_WINDOW,
 };
 use nice_model::InlineRenameClickGate;
 
@@ -98,6 +98,12 @@ const STRIP_BUTTON: f32 = 20.0;
 const SEL_ALPHA: f32 = 0.22;
 /// Drag-hover highlight alpha on the accent (F9 — the target folder's tint).
 const DRAG_HOVER_ALPHA: f32 = 0.30;
+/// How far in from the list's left edge a live scenario aims a real mouse press
+/// at a row ([`FileBrowserView::scenario_row_center`]): past the 6 pt row padding,
+/// the disclosure slot and the icon frame at the depths the fixture trees reach,
+/// i.e. on the row's name run. Any x inside the row hits it (the whole row is the
+/// click target); this one just reads as the obvious press point.
+const ROW_PRESS_INSET: f32 = 60.0;
 /// The trailing quiet-window poll cadence for the watcher drain (nap-safe: a
 /// background-executor timer runs on an OS thread, never the App-Nap-deferred
 /// runloop — the watcher's own `wake_main_runloop` keeps latency tight).
@@ -219,6 +225,13 @@ pub(crate) struct FileBrowserView {
     /// field's paint and read by its click handler to turn a click-x into a
     /// caret position.
     rename_probe: FieldProbeCell,
+    /// The row whose plain press deferred its routing to the release
+    /// ([`PressDisposition::DeferToRelease`] — a press inside a live
+    /// multi-selection, which must not collapse it at mouse-down or the drag
+    /// would carry a single path). Consumed by
+    /// [`on_row_release`](FileBrowserView::on_row_release); cleared by every
+    /// left press, by a drag arming, and by a right press.
+    pending_press: Option<String>,
 }
 
 /// The active inline-rename edit session (F8): the pure editing model plus the
@@ -284,6 +297,7 @@ impl FileBrowserView {
             sole_activated: None,
             pane_host: None,
             rename_probe: field_probe_cell(),
+            pending_press: None,
         }
     }
 
@@ -476,6 +490,60 @@ impl FileBrowserView {
             settings.criterion,
             settings.ascending,
         )
+    }
+
+    /// Route a row's left mouse-DOWN.
+    ///
+    /// Most presses route immediately, exactly as they always have. The one
+    /// exception is the Finder select-then-drag case ([`press_disposition`]): a
+    /// plain press on a row that is already part of a live multi-selection must
+    /// NOT collapse that selection at mouse-down, because the press may be the
+    /// start of a drag and the drag payload (`RowVm.drag_paths`) is computed
+    /// from the selection at arm time. Such a press only records `path` as
+    /// pending and lets [`on_row_release`](Self::on_row_release) route it.
+    ///
+    /// The disposition reads the LIVE selection (not the render-time row), so a
+    /// stale frame can never defer a press it shouldn't.
+    fn on_row_press(&mut self, path: &str, modifier: ClickModifier, cx: &mut Context<Self>) {
+        // Every press invalidates any earlier deferral. gpui drops a pending
+        // click when the pointer leaves the row before mouse-up (div.rs's
+        // MouseUp capture arm), so a deferral can outlive its gesture; resetting
+        // here keeps a stale one from ever routing on a later, unrelated click.
+        self.pending_press = None;
+        let selection = self.ordered_selection(cx);
+        let is_selected = selection.iter().any(|p| p == path);
+        match press_disposition(modifier, is_selected, selection.len()) {
+            PressDisposition::Immediate => self.on_row_click(path, modifier, cx),
+            PressDisposition::DeferToRelease => self.pending_press = Some(path.to_string()),
+        }
+    }
+
+    /// Route a row's left mouse-UP for a press that deferred.
+    ///
+    /// Driven by gpui's `on_click`, which is the correct "release without a
+    /// drag" hook: arming a drag calls `pending_mouse_down.take()` and an active
+    /// drag clears it outright, so no click fires once a drag started
+    /// (`vendor/zed/crates/gpui/src/elements/div.rs`, the MouseMove drag arm and
+    /// the MouseUp capture arm). A drag therefore keeps the multi-selection,
+    /// successful or abandoned, which is what Finder does.
+    ///
+    /// This routes the FULL [`on_row_click`](Self::on_row_click), not just its
+    /// `SingleActivate` arm: the 280 ms double-click detector lives inside
+    /// [`FileBrowserClickRouter::route`], so inlining the arm would leave the
+    /// deferred press unrouted and a double-click on a multi-selected row would
+    /// need a third click to open the file.
+    fn on_row_release(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.pending_press.as_deref() != Some(path) {
+            return; // an immediate press already routed at mouse-down
+        }
+        self.pending_press = None;
+        self.on_row_click(path, ClickModifier::Plain, cx);
+    }
+
+    /// Drop a deferred press without routing it — the gesture turned into
+    /// something else (a drag armed, or a right press opened the row menu).
+    fn clear_pending_press(&mut self) {
+        self.pending_press = None;
     }
 
     /// Route a row click through the 280 ms detector and apply its effect. Any
@@ -1930,6 +1998,58 @@ impl FileBrowserView {
         self.with_active_fb_state(cx, |st| st.selection_mut().toggle(path));
     }
 
+    /// The active-tab selection in on-screen order — the read the (e′) live leg
+    /// asserts a real press against (it must NOT collapse a multi-selection).
+    pub(crate) fn scenario_selected_paths(&self, cx: &App) -> Vec<String> {
+        self.ordered_selection(cx)
+    }
+
+    /// The WINDOW-coordinate centre `(x, y)` of `path`'s row as the tree last
+    /// PAINTED it — the point a live scenario aims a REAL CG-global mouse press
+    /// at. `None` when the row is not in the projection, when the list has not
+    /// been laid out yet, or when the row does not lie fully inside the list's
+    /// painted viewport: an off-screen row must never be aimed at (the rename
+    /// probe's discipline — geometry that was not drawn is not a target).
+    ///
+    /// The list is a [`uniform_list`], so item `ix` is painted at
+    /// `viewport.top + scroll_offset.y + ix * ROW_HEIGHT` (every row pins its own
+    /// height to `ROW_HEIGHT`), and the tracked scroll handle carries both the
+    /// viewport bounds and the live offset.
+    pub(crate) fn scenario_row_center(&self, path: &str) -> Option<(f32, f32)> {
+        let ix = self.rendered_paths.iter().position(|p| p == path)?;
+        let (viewport, offset_y) = {
+            let st = self.scroll.0.borrow();
+            (st.base_handle.bounds(), f32::from(st.base_handle.offset().y))
+        };
+        let (vp_left, vp_top) = (f32::from(viewport.origin.x), f32::from(viewport.origin.y));
+        let (vp_w, vp_h) = (
+            f32::from(viewport.size.width),
+            f32::from(viewport.size.height),
+        );
+        if vp_w <= 0.0 || vp_h <= 0.0 {
+            return None; // never laid out
+        }
+        let top = vp_top + offset_y + ix as f32 * ROW_HEIGHT;
+        if top < vp_top || top + ROW_HEIGHT > vp_top + vp_h {
+            return None; // scrolled out of the painted viewport
+        }
+        // Horizontally: inside the name run for every indent level the fixture
+        // trees reach, clamped to the viewport for a very narrow sidebar.
+        let x = vp_left + ROW_PRESS_INSET.min(vp_w / 2.0);
+        Some((x, top + ROW_HEIGHT / 2.0))
+    }
+
+    /// Scroll `path`'s row into view (centred) so a live scenario can aim real
+    /// mouse events at it. Returns whether the row is in the projection at all.
+    pub(crate) fn drive_scroll_row_into_view(&mut self, path: &str, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.rendered_paths.iter().position(|p| p == path) else {
+            return false;
+        };
+        self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        cx.notify();
+        true
+    }
+
     // MARK: - Render body (called by SidebarShellView::build_body)
 }
 
@@ -2177,9 +2297,15 @@ fn render_row(
     // target for free. Suppressed while editing.
     if row.editing.is_none() {
         let drag_paths = row.drag_paths.clone();
+        let weak_drag = weak.clone();
         el = el.on_drag(
             ExternalPaths(drag_paths.iter().map(PathBuf::from).collect()),
             move |paths: &ExternalPaths, offset, _window, app| {
+                // The press became a drag: drop its deferred collapse so the
+                // multi-selection survives the drag (Finder parity), successful
+                // or abandoned. gpui already suppresses the click here, so this
+                // is belt-and-braces against a stuck pending state.
+                let _ = weak_drag.update(app, |this, _cx| this.clear_pending_press());
                 let count = paths.paths().len();
                 app.new(|_| DragPreview { count, offset })
             },
@@ -2218,6 +2344,8 @@ fn render_row(
     }
 
     let weak_left = weak.clone();
+    let weak_release = weak.clone();
+    let path_for_release = row.path.clone();
     el.on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, app| {
         let modifier = if e.modifiers.platform {
             ClickModifier::Command
@@ -2228,16 +2356,28 @@ fn render_row(
         };
         let p = path_for_click.clone();
         let _ = weak_left.update(app, |this, cx| {
-            this.on_row_click(&p, modifier, cx);
+            this.on_row_press(&p, modifier, cx);
             // Parking focus in the browser panel makes Return-to-rename work and
             // fires commit-on-blur when the user later clicks away / switches tabs.
             this.focus_handle.focus(window, cx);
             cx.stop_propagation();
         });
     })
+    // The release half of a deferred press. gpui records its own pending
+    // mouse-down in a listener registered AFTER the row's (bubble dispatch runs
+    // registration order reversed), so the `stop_propagation` above does not
+    // suppress it — and gpui drops that pending down when a drag arms, so this
+    // fires only on a release WITHOUT a drag. A press that already routed at
+    // mouse-down leaves no pending path and this is a no-op.
+    .on_click(move |_e, _window, app| {
+        let p = path_for_release.clone();
+        let _ = weak_release.update(app, |this, cx| this.on_row_release(&p, cx));
+    })
     .on_mouse_down(MouseButton::Right, move |e: &MouseDownEvent, window, app| {
         let p = path_for_menu.clone();
         let _ = weak.update(app, |this, cx| {
+            // A right press ends any deferred left press without routing it.
+            this.clear_pending_press();
             this.open_row_menu(&p, is_dir, is_root, e.position, window, cx);
             cx.stop_propagation();
         });
@@ -2410,9 +2550,13 @@ mod tests {
     use super::*;
     use crate::file_browser::history::FileOperationHistory;
     use crate::file_browser::ops::{FakeTrasher, FileOperationsService};
+    use crate::file_browser::workspace_ops::{
+        install_recording_fake, RecordingWorkspaceOps, WorkspaceCall,
+    };
 
-    /// A throwaway temp tree for the DnD commit-seam tests: `A.txt` + `B.txt` at
-    /// the root and an empty directory `D`. Dropped ⇒ the tree is removed.
+    /// A throwaway temp tree for the DnD commit-seam tests: `A.txt`, `B.txt` and
+    /// `C.txt` at the root and an empty directory `D`. Dropped ⇒ the tree is
+    /// removed.
     struct DropFixture {
         root: PathBuf,
     }
@@ -2431,6 +2575,7 @@ mod tests {
             std::fs::create_dir_all(root.join("D")).unwrap();
             std::fs::write(root.join("A.txt"), b"A\n").unwrap();
             std::fs::write(root.join("B.txt"), b"B\n").unwrap();
+            std::fs::write(root.join("C.txt"), b"C\n").unwrap();
             Self { root }
         }
 
@@ -2457,6 +2602,287 @@ mod tests {
             let history = app.new(|_| FileOperationHistory::new(service, None));
             app.set_global(FileOperationHistoryGlobal(history));
         });
+    }
+
+    /// Mount a `FileBrowserView` over `fx`'s root with the file-op history and a
+    /// recording `WorkspaceOps` installed — the shared setup for the deferred-press
+    /// behavior tests. The returned fake logs `open` calls, which is how "a press
+    /// routed twice and read as a double-click" is caught.
+    fn mount(
+        cx: &mut gpui::TestAppContext,
+        fx: &DropFixture,
+    ) -> (gpui::WindowHandle<FileBrowserView>, RecordingWorkspaceOps) {
+        let trash_root = fx.root.join(".fake-trash");
+        std::fs::create_dir_all(&trash_root).unwrap();
+        install_history(cx, trash_root);
+        let ops = cx.update(install_recording_fake);
+        let root_str = fx.root.to_string_lossy().into_owned();
+        let state = cx.update(|app| app.new(|_| WindowState::new(root_str)));
+        let accent = Srgba::rgb(0.2, 0.4, 0.9);
+        let window = cx.add_window(|_window, cx| FileBrowserView::new(state, accent, cx));
+        (window, ops)
+    }
+
+    /// The live selection, sorted — these tests assert membership, not the visible
+    /// order (which the sort settings own and other tests cover).
+    fn selection_of(view: &FileBrowserView, cx: &App) -> Vec<String> {
+        let mut s = view.ordered_selection(cx);
+        s.sort();
+        s
+    }
+
+    /// The drag payload the row for `path` would carry if a drag armed right now —
+    /// read off the render snapshot, i.e. the exact `RowVm.drag_paths` production
+    /// hands to `on_drag`.
+    fn drag_payload_of(
+        view: &mut FileBrowserView,
+        path: &str,
+        cx: &mut Context<FileBrowserView>,
+    ) -> Vec<String> {
+        let snap = view.snapshot(cx).expect("the fixture root has an active tab");
+        let mut paths = snap
+            .rows
+            .iter()
+            .find(|r| r.path == path)
+            .unwrap_or_else(|| panic!("row {path} must be on screen"))
+            .drag_paths
+            .clone();
+        paths.sort();
+        paths
+    }
+
+    /// The bug (BUGS.md: "dragging one of several selected files drags only that
+    /// file"). A plain press on a row inside a live multi-selection must leave the
+    /// selection alone at mouse-DOWN; the collapse belongs to the release. Finder
+    /// parity, and the reason the drag payload can still be the whole set.
+    #[gpui::test]
+    fn plain_press_inside_a_multi_selection_defers_its_collapse_to_the_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("defer-collapse");
+        let (window, _ops) = mount(cx, &fx);
+        let (a, b) = (fx.p("A.txt"), fx.p("B.txt"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+                assert_eq!(selection_of(view, cx), vec![a.clone(), b.clone()]);
+
+                view.on_row_press(&a, ClickModifier::Plain, cx);
+                assert_eq!(
+                    selection_of(view, cx),
+                    vec![a.clone(), b.clone()],
+                    "mouse-down on an already-selected row must NOT collapse the selection"
+                );
+
+                view.on_row_release(&a, cx);
+                assert_eq!(
+                    selection_of(view, cx),
+                    vec![a.clone()],
+                    "a release without a drag runs the full SingleActivate effect"
+                );
+                assert!(
+                    view.pending_press.is_none(),
+                    "the deferral is consumed by the release"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The payload consequence of the deferral: with the collapse held back, the
+    /// pressed row is still selected when gpui arms the drag, so `RowVm.drag_paths`
+    /// — what `on_drag` actually carries — is the whole selection. Pre-fix this was
+    /// a single path.
+    #[gpui::test]
+    fn press_inside_a_multi_selection_still_drags_the_whole_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("drag-payload");
+        let (window, _ops) = mount(cx, &fx);
+        let (a, b) = (fx.p("A.txt"), fx.p("B.txt"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+                view.on_row_press(&a, ClickModifier::Plain, cx);
+
+                assert_eq!(
+                    drag_payload_of(view, &a, cx),
+                    vec![a.clone(), b.clone()],
+                    "the pressed row's drag payload must carry BOTH selected files"
+                );
+
+                // The drag arms: the row's `on_drag` constructor drops the deferral
+                // (gpui also suppresses the click from here on).
+                view.clear_pending_press();
+                assert_eq!(
+                    selection_of(view, cx),
+                    vec![a.clone(), b.clone()],
+                    "a drag keeps the multi-selection (Finder parity)"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Unchanged behavior: a plain press on an UNSELECTED row replaces the
+    /// selection at mouse-down and drags that row alone.
+    #[gpui::test]
+    fn plain_press_on_an_unselected_row_replaces_the_selection_at_mouse_down(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("unselected-press");
+        let (window, _ops) = mount(cx, &fx);
+        let (a, b, c) = (fx.p("A.txt"), fx.p("B.txt"), fx.p("C.txt"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+
+                view.on_row_press(&c, ClickModifier::Plain, cx);
+                assert_eq!(
+                    selection_of(view, cx),
+                    vec![c.clone()],
+                    "an unselected row replaces the selection immediately, at DOWN"
+                );
+                assert!(view.pending_press.is_none(), "nothing was deferred");
+                assert_eq!(
+                    drag_payload_of(view, &c, cx),
+                    vec![c.clone()],
+                    "and it drags alone"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Unchanged behavior: ⌘ and ⇧ presses inside a multi-selection still apply at
+    /// mouse-down — only the PLAIN press defers.
+    #[gpui::test]
+    fn command_and_shift_presses_stay_immediate(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("modifier-press");
+        let (window, _ops) = mount(cx, &fx);
+        let (a, b, c) = (fx.p("A.txt"), fx.p("B.txt"), fx.p("C.txt"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+
+                // ⌘ on a selected row toggles it straight out, at DOWN.
+                view.on_row_press(&a, ClickModifier::Command, cx);
+                assert_eq!(selection_of(view, cx), vec![b.clone()]);
+                assert!(view.pending_press.is_none(), "⌘ never defers");
+
+                // ⇧ range-extends at DOWN (anchor is B, the last-clicked row).
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+                view.on_row_press(&c, ClickModifier::Shift, cx);
+                assert!(
+                    selection_of(view, cx).contains(&c),
+                    "⇧ extends the range at DOWN, not at release"
+                );
+                assert!(view.pending_press.is_none(), "⇧ never defers");
+            })
+            .unwrap();
+    }
+
+    /// Full `SingleActivate` parity at the release: a deferred press on a FOLDER
+    /// collapses the selection AND toggles the folder's expansion, exactly as the
+    /// immediate path does. This is why the release routes the whole `on_row_click`
+    /// rather than an inlined arm.
+    #[gpui::test]
+    fn deferred_press_on_a_folder_collapses_and_toggles_expansion_on_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("folder-release");
+        let (window, _ops) = mount(cx, &fx);
+        let (a, d) = (fx.p("A.txt"), fx.p("D"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&d, cx);
+                view.drive_add_to_selection(&a, cx);
+                assert!(!view.scenario_is_expanded(&d, cx), "D starts collapsed");
+
+                view.on_row_press(&d, ClickModifier::Plain, cx);
+                assert_eq!(selection_of(view, cx).len(), 2, "nothing happens at DOWN");
+                assert!(!view.scenario_is_expanded(&d, cx), "not even the expansion");
+
+                view.on_row_release(&d, cx);
+                assert_eq!(selection_of(view, cx), vec![d.clone()]);
+                assert!(
+                    view.scenario_is_expanded(&d, cx),
+                    "the release runs the folder's primary action too"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The stuck-pending failure mode this state machine has to guard (plan Risks):
+    /// after a drag arms, the deferral is dropped, so a later release cannot collapse
+    /// the selection the drag was supposed to keep. Abandoned drags included — gpui
+    /// fires no click after a drag, and even if one arrived it is a no-op.
+    #[gpui::test]
+    fn abandoned_drag_keeps_the_multi_selection_and_drops_the_deferral(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("abandoned-defer");
+        let (window, _ops) = mount(cx, &fx);
+        let (a, b) = (fx.p("A.txt"), fx.p("B.txt"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+                view.on_row_press(&a, ClickModifier::Plain, cx);
+
+                // The drag arms and is then abandoned (dropped on nothing).
+                view.clear_pending_press();
+                let _ = view.begin_row_drag(&a, cx);
+
+                view.on_row_release(&a, cx);
+                assert_eq!(
+                    selection_of(view, cx),
+                    vec![a.clone(), b.clone()],
+                    "an abandoned drag keeps the multi-selection; no late collapse"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A deferral whose release never arrives (gpui drops the pending click when the
+    /// pointer leaves the row before mouse-up) must not survive into the NEXT press.
+    /// If it did, that press would route once at down and again at its click —
+    /// inside the 280 ms window, i.e. a phantom double-click that OPENS the file.
+    #[gpui::test]
+    fn a_stale_deferral_cannot_double_route_a_later_press(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("stale-defer");
+        let (window, ops) = mount(cx, &fx);
+        let (a, b) = (fx.p("A.txt"), fx.p("B.txt"));
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.drive_select(&a, cx);
+                view.drive_add_to_selection(&b, cx);
+                view.on_row_press(&a, ClickModifier::Plain, cx); // defers…
+                                                                 // …and no release ever comes.
+
+                // A later, ordinary press on A — now the sole selection, so immediate.
+                view.drive_select(&a, cx);
+                view.on_row_press(&a, ClickModifier::Plain, cx);
+                view.on_row_release(&a, cx);
+                assert_eq!(selection_of(view, cx), vec![a.clone()]);
+            })
+            .unwrap();
+
+        assert!(
+            !ops.calls().contains(&WorkspaceCall::Open(a.clone())),
+            "the press must route exactly once — a second route would read as a \
+             double-click and open the file: {:?}",
+            ops.calls()
+        );
     }
 
     /// Bug 2 regression pin (BUGS.md #3, repro: drag A out of the browser, abandon

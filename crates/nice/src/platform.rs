@@ -1079,8 +1079,9 @@ fn write_dropped_image(bytes: &[u8]) -> Option<PathBuf> {
 // [`post_global_left_click`] / [`post_global_left_drag`] /
 // [`post_global_left_down`] / [`post_global_left_up`] below, ONLY from
 // selftest / scenario code — the sanctioned call sites are an explicit
-// allowlist: the R27 §6 close-out composition leg (`input_live`) and the
-// `file-browser` scenario's rename drag-select leg (`file_browser_live`) —
+// allowlist: the R27 §6 close-out composition leg (`input_live`), the
+// `file-browser` scenario's rename drag-select leg, and that same scenario's
+// (e′) multi-selection press / drag leg (both `file_browser_live`) —
 // and ONLY after the caller's REQUIRED preflight has verified our window owns
 // the target point (activate + raise + `CGWindowListCopyWindowInfo`
 // frontmost-at-point z-order check); on preflight failure the caller DEFERS
@@ -1893,7 +1894,8 @@ pub fn post_global_left_drag(x: f64, y: f64) {
 /// button HELD so the drag steps track. Same carve-out discipline: the caller MUST
 /// run the §6 preflight (activate + raise + frontmost-at-point) BEFORE it and DEFER
 /// LOUDLY when our window does not own the point — never a blind post. Callers: the
-/// §6 pill-reorder drag and the `file-browser` rename drag-select leg.
+/// §6 pill-reorder drag, the `file-browser` rename drag-select leg, and the same
+/// scenario's (e′) multi-selection press / drag leg.
 #[allow(dead_code)]
 pub fn post_global_left_down(x: f64, y: f64) {
     post_global_mouse_event(CG_EVENT_LEFT_MOUSE_DOWN, x, y, 1);

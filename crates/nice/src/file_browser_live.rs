@@ -19,6 +19,12 @@
 //! (g) the sort-direction toggle reorders rows; the hidden toggle + a real ⌘⇧.
 //!     chord hide/show a dotfile; a real ⌘⇧B still flips modes.
 //!
+//! Plan-2 leg: (e′) with TWO files selected, a REAL left press on one of them
+//! must not collapse the selection and a REAL release in place must — the
+//! select-then-drag contract the multi-selection drag payload rides on; the full
+//! real drag onto a folder row is attempted and defers loudly when it does not
+//! arm (see [`multi_select_press_leg`]).
+//!
 //! Inline-rename legs (on top of R20's (d) / (d′)): (d-word) real ⌥/⌘ editing
 //! chords (⌥←/⌥→/⌥⇧←/⌘←/⌘→/⌘⇧←/⌥⌫) walk a fixed caret/selection table in the
 //! open field; (d-drag) a press at one painted char boundary and a move to
@@ -184,6 +190,12 @@ impl Fixture {
         std::fs::write(root.join("comp1.txt"), b"1\n")?;
         std::fs::write(root.join("comp2.txt"), b"2\n")?;
         std::fs::write(root.join("comprename.txt"), b"n\n")?;
+        // Plan-2 (e′) real-event multi-selection leg: two files pressed with REAL
+        // CGEvents plus their own drop target, all disjoint from every other leg's
+        // fixtures so the leg's fs outcome is unambiguous.
+        std::fs::create_dir_all(root.join("multidrag"))?;
+        std::fs::write(root.join("multi1.txt"), b"1\n")?;
+        std::fs::write(root.join("multi2.txt"), b"2\n")?;
         Ok(Fixture { root })
     }
 
@@ -330,6 +342,12 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
     // focus routed back. Runs here while window A's root is still the fixture tree
     // (before `reroot_check` re-roots it) and its sidebar is still in Files mode.
     composition_leg(cx, whandle, &fb, &fixture, &state, &main_tab, pid, &mut failures).await;
+
+    // (e′) plan-2: REAL press / release inside a 2-file selection (the press must
+    // not collapse it; the release must), plus an attempted real end-to-end drag.
+    // Runs after the composition leg (which leaves window A frontmost) and before
+    // the re-root below, so the tree is still the fixture and its rows are painted.
+    multi_select_press_leg(cx, whandle, &fb, &fixture, &mut failures, &mut deferred).await;
 
     // (c) double-click a folder re-roots (done late — it changes the root).
     reroot_check(cx, &fb, &fixture.path("src"), &mut failures).await;
@@ -1421,33 +1439,14 @@ async fn real_drag_gesture(
     x_to: f32,
     y: f32,
 ) -> Result<(Option<(usize, usize)>, Option<(usize, usize)>), String> {
-    let _ = cx.update(|app| app.activate(true));
-    let _ = whandle.update(cx, |_v, w, _a| w.activate_window());
-    settle(cx, 300).await;
-    let to_global = |cx: &mut AsyncApp, x: f32| {
-        whandle
-            .update(cx, |_v, w, _a| {
-                platform::content_point_to_cg_global(w, x as f64, y as f64)
-            })
-            .ok()
-            .flatten()
-    };
-    let (Some((gx0, gy)), Some((gx1, _))) = (to_global(cx, x_from), to_global(cx, x_to)) else {
+    let (gx0, gy) = guarded_global_point(cx, whandle, x_from, y, "the field's press point").await?;
+    let Some((gx1, _)) = content_to_global(cx, whandle, x_to, y) else {
         return Err(
-            "could not convert the field's press/release points to CG-global coords — DEFERRED, \
+            "could not convert the field's release point to CG-global coords — DEFERRED, \
              no global post was made"
                 .to_string(),
         );
     };
-    if !platform::frontmost_window_owns_point(gx0, gy) {
-        return Err(format!(
-            "the frontmost-at-point preflight FAILED — our window does not own the press point \
-             ({gx0:.0},{gy0:.0}) per CGWindowListCopyWindowInfo (another window is on top, or the \
-             point is off our window). DEFERRED LOUDLY; NO global post was made. Bring the nice \
-             window frontmost and re-run for the real-gesture assertion.",
-            gy0 = gy
-        ));
-    }
 
     platform::post_global_left_down(gx0, gy);
     settle(cx, 150).await;
@@ -1463,6 +1462,295 @@ async fn real_drag_gesture(
     platform::post_global_left_up(gx1, gy);
     settle(cx, 150).await;
     Ok((pressed, dragged))
+}
+
+/// The MANDATORY preflight before any guarded global-HID post: activate the app +
+/// raise the window, convert the content point `(x, y)` to CG-global, then verify
+/// our window owns that point per `CGWindowListCopyWindowInfo`. `Ok` carries the
+/// coordinates to post at; `Err(reason)` means the caller must DEFER LOUDLY — NO
+/// post was made. `what` names the point in that reason.
+async fn guarded_global_point(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    x: f32,
+    y: f32,
+    what: &str,
+) -> Result<(f64, f64), String> {
+    let _ = cx.update(|app| app.activate(true));
+    let _ = whandle.update(cx, |_v, w, _a| w.activate_window());
+    settle(cx, 300).await;
+    let Some((gx, gy)) = content_to_global(cx, whandle, x, y) else {
+        return Err(format!(
+            "could not convert {what} to CG-global coords — DEFERRED, no global post was made"
+        ));
+    };
+    if !platform::frontmost_window_owns_point(gx, gy) {
+        return Err(format!(
+            "the frontmost-at-point preflight FAILED — our window does not own {what} \
+             ({gx:.0},{gy:.0}) per CGWindowListCopyWindowInfo (another window is on top, or the \
+             point is off our window). DEFERRED LOUDLY; NO global post was made. Bring the nice \
+             window frontmost and re-run for the real-gesture assertion."
+        ));
+    }
+    Ok((gx, gy))
+}
+
+/// Convert a window content point to CG-global coordinates (no preflight — the
+/// caller fences the gesture at its press point).
+fn content_to_global(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    x: f32,
+    y: f32,
+) -> Option<(f64, f64)> {
+    whandle
+        .update(cx, |_v, w, _a| {
+            platform::content_point_to_cg_global(w, x as f64, y as f64)
+        })
+        .ok()
+        .flatten()
+}
+
+// ---- (e′) real-event press / drag inside a multi-selection ------------------
+
+/// Plan-2's live gate. With TWO files selected, a REAL left press on one of them
+/// must NOT collapse the selection — the bug was that the collapse happened at
+/// mouse-DOWN, so by the time gpui armed the drag the pressed row's payload was a
+/// single path — and a REAL release in place (no movement) must then collapse it
+/// to that row alone (Finder's select-then-drag).
+///
+/// How the 2-selection is BUILT is immaterial to the bug (which is a plain,
+/// unmodified press on an already-multi-selected row), so it is built through the
+/// scenario drive seams: the sanctioned global-HID mouse seams are modifier-less
+/// by construction (they stamp only the click-state field; nothing in the platform
+/// layer puts ⌘/⇧ on a global mouse post), and a keyboard synthetic cannot supply
+/// flags to a separately-posted mouse event. The real events are spent where the
+/// bug lives — the press and the release.
+///
+/// The full drag (press → held moves onto a folder row → release) is ATTEMPTED and
+/// DEFERS LOUDLY when it does not arm: macOS does not establish AppKit's implicit
+/// mouse grab for a synthetic press, so the trailing moves are never delivered as
+/// `mouseDragged:` and gpui's `on_drag` / `on_drop` never arm (established twice
+/// in-tree — the `tranche6-composition` reorder leg and the (d-drag) leg above). A
+/// drag that DOES arm and commits the WRONG outcome hard-FAILS. The non-deferrable
+/// gate for "the whole selection travels" is r20 leg (e)'s `drive_drag_drop` seam
+/// plus the in-process `view.rs` behaviour tests — never this leg's drag half.
+async fn multi_select_press_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    fb: &Entity<FileBrowserView>,
+    fixture: &Fixture,
+    failures: &mut Vec<String>,
+    deferred: &mut Vec<String>,
+) {
+    const A_NAME: &str = "multi1.txt";
+    const B_NAME: &str = "multi2.txt";
+    const DIR_NAME: &str = "multidrag";
+    let a = fixture.path(A_NAME);
+    let b = fixture.path(B_NAME);
+    let dir = fixture.path(DIR_NAME);
+    let start = failures.len();
+
+    rekey(cx, whandle).await;
+    // Collapse `src` (the watcher leg expanded it) so the two rows and the drop
+    // target share one viewport — the drag half needs both on screen at once.
+    if fb.update(cx, |v, cx| v.scenario_is_expanded(&fixture.path("src"), cx)) {
+        fb.update(cx, |v, cx| v.drive_single_click(&fixture.path("src"), cx));
+        settle(cx, 400).await;
+    }
+
+    let both = vec![a.clone(), b.clone()];
+    let select_both = |cx: &mut AsyncApp| {
+        fb.update(cx, |v, cx| v.drive_select(&a, cx));
+        fb.update(cx, |v, cx| v.drive_add_to_selection(&b, cx));
+    };
+    let selection = |cx: &mut AsyncApp| fb.update(cx, |v, cx| v.scenario_selected_paths(cx));
+
+    select_both(cx);
+    settle(cx, 120).await;
+    let selected = selection(cx);
+    if selected != both {
+        failures.push(format!(
+            "(e′) setup: the two fixture rows did not become the selection (got {selected:?}, \
+             want {both:?})"
+        ));
+        return;
+    }
+
+    // --- press / release on an already-selected row, for REAL -----------------
+    let Some((ax, ay)) = row_center(cx, fb, &a).await else {
+        failures.push(format!(
+            "(e′) the tree never painted a row box for {A_NAME} inside the list viewport — there \
+             is no drawn geometry to aim a real press at"
+        ));
+        return;
+    };
+    match guarded_global_point(cx, whandle, ax, ay, &format!("the {A_NAME} row press point")).await {
+        Err(reason) => deferred.push(format!("(e′) real press on a selected row: {reason}")),
+        Ok((gx, gy)) => {
+            platform::post_global_left_down(gx, gy);
+            settle(cx, 250).await;
+            let after_press = selection(cx);
+            platform::post_global_left_up(gx, gy);
+            settle(cx, 300).await;
+            let after_release = selection(cx);
+            if after_release != vec![a.clone()] {
+                // The release is also the landed-gate: a gesture that never reached
+                // the row leaves the selection untouched, and that must not read as
+                // a green press assertion.
+                failures.push(format!(
+                    "(e′) a real press+release in place on the already-selected row {A_NAME} must \
+                     collapse the selection to it alone at the RELEASE; selection after the \
+                     release is {after_release:?} (aimed at window ({ax:.0},{ay:.0}) / CG-global \
+                     ({gx:.0},{gy:.0}); if the selection is still both files, the synthetic \
+                     press/release never reached the row at all)"
+                ));
+            } else if after_press != both {
+                failures.push(format!(
+                    "(e′) the real left-press on the already-selected row {A_NAME} COLLAPSED the \
+                     multi-selection at MOUSE-DOWN (selection right after the press: \
+                     {after_press:?}, want {both:?}) — exactly the regression the deferred-collapse \
+                     fix exists for: the row's drag payload would be a single path by the time \
+                     gpui armed the drag"
+                ));
+            } else {
+                eprintln!(
+                    "[selftest] file-browser (e′): a real press on a row inside a 2-selection kept \
+                     the whole selection, and the real release in place collapsed it to that row"
+                );
+            }
+        }
+    }
+
+    // --- the full real drag onto a folder row (attempt; defers if it never arms) -
+    select_both(cx);
+    // Beyond the router's 280 ms double-click window, so the drag's press reads as
+    // a fresh first click and not a double-click on the row above.
+    settle(cx, 400).await;
+    if !fb.update(cx, |v, cx| v.scenario_can_drop(&a, &dir, cx))
+        || fb.update(cx, |v, cx| v.scenario_can_drop(&a, &a, cx))
+    {
+        failures.push(format!(
+            "(e′) drag highlight: can_drop must accept the folder target {DIR_NAME} and reject a \
+             self-drop (this is the predicate that paints the accent hover highlight)"
+        ));
+    }
+    let from = fb.update(cx, |v, _| v.scenario_row_center(&a));
+    let to = fb.update(cx, |v, _| v.scenario_row_center(&dir));
+    let (Some((sx, sy)), Some((tx, ty))) = (from, to) else {
+        deferred.push(format!(
+            "(e′) real multi-selection drag: {A_NAME} and the folder {DIR_NAME} are not \
+             simultaneously inside the painted list viewport (row boxes {from:?} / {to:?}), so \
+             there is no drawn geometry to drag between. DEFERRED; the multi-path move stays \
+             pinned by the `drive_drag_drop` seam leg and the in-process tests."
+        ));
+        return;
+    };
+    match guarded_global_point(cx, whandle, sx, sy, "the multi-selection drag's press point").await {
+        Err(reason) => deferred.push(format!("(e′) real multi-selection drag: {reason}")),
+        Ok((gx0, gy0)) => {
+            let Some((gx1, gy1)) = content_to_global(cx, whandle, tx, ty) else {
+                deferred.push(
+                    "(e′) real multi-selection drag: could not convert the folder row's drop point \
+                     to CG-global coords — DEFERRED, NO global post was made"
+                        .to_string(),
+                );
+                return;
+            };
+            platform::post_global_left_down(gx0, gy0);
+            settle(cx, 150).await;
+            let steps = 10;
+            for i in 1..=steps {
+                let t = f64::from(i) / f64::from(steps);
+                platform::post_global_left_drag(gx0 + (gx1 - gx0) * t, gy0 + (gy1 - gy0) * t);
+                settle(cx, 40).await;
+            }
+            settle(cx, 120).await;
+            platform::post_global_left_up(gx1, gy1);
+            settle(cx, 400).await;
+
+            let moved_a = exists(&fixture.path("multidrag/multi1.txt"));
+            let moved_b = exists(&fixture.path("multidrag/multi2.txt"));
+            let src_a = exists(&a);
+            let src_b = exists(&b);
+            // Exactly three readings: the drag armed and moved the whole selection
+            // (pass), the drag never armed at all (defer — the platform limitation),
+            // or something else committed (hard fail — a wrong outcome is never a
+            // deferral, e.g. only the pressed row travelled).
+            let both_moved = moved_a && !src_a && moved_b && !src_b;
+            let nothing_happened = !moved_a && !moved_b && src_a && src_b;
+            match (both_moved, nothing_happened) {
+                (true, _) => {
+                    // The model must agree with the disk: both source rows are gone
+                    // from the tree's projection.
+                    let mut gone = false;
+                    for _ in 0..20 {
+                        settle(cx, 100).await;
+                        let rows = fb.update(cx, |v, _| v.scenario_rendered_paths());
+                        gone = !rows.iter().any(|p| p == &a) && !rows.iter().any(|p| p == &b);
+                        if gone {
+                            break;
+                        }
+                    }
+                    if gone {
+                        eprintln!(
+                            "[selftest] file-browser (e′): a REAL end-to-end drag armed and moved \
+                             BOTH selected files into {DIR_NAME} (disk + model)"
+                        );
+                    } else {
+                        failures.push(format!(
+                            "(e′) the real drag moved both files on disk but the tree still renders \
+                             {A_NAME}/{B_NAME} at the old location"
+                        ));
+                    }
+                }
+                (_, true) => deferred.push(
+                    "(e′) the real end-to-end drag did not arm: nothing moved and both sources are \
+                     still in place. macOS does not establish AppKit's implicit mouse grab for a \
+                     synthetic press, so the held moves are never delivered as `mouseDragged:` and \
+                     gpui's on_drag/on_drop never arm (the recorded in-tree finding). DEFERRED to a \
+                     human drag of a 2-file selection onto a folder; the multi-path move itself \
+                     stays hard-pinned by r20 leg (e)'s `drive_drag_drop` seam and the in-process \
+                     view tests."
+                        .to_string(),
+                ),
+                _ => failures.push(format!(
+                    "(e′) the real drag COMMITTED A WRONG OUTCOME: multi1 in {DIR_NAME}={moved_a} \
+                     (source left={src_a}), multi2 in {DIR_NAME}={moved_b} (source left={src_b}) — \
+                     a drag that arms must carry the WHOLE selection, so a single-file move means \
+                     the multi-selection was collapsed before the drag armed"
+                )),
+            }
+        }
+    }
+
+    if failures.len() == start {
+        eprintln!("[selftest] file-browser (e′): the real-event multi-selection press leg held");
+    }
+}
+
+/// The window-coordinate centre of `path`'s PAINTED row, scrolling it into view
+/// once if the tree has not drawn it inside the list viewport. `None` when the row
+/// never lands in the viewport within the poll budget — a row that was not drawn is
+/// never aimed at.
+async fn row_center(
+    cx: &mut AsyncApp,
+    fb: &Entity<FileBrowserView>,
+    path: &str,
+) -> Option<(f32, f32)> {
+    if let Some(c) = fb.update(cx, |v, _| v.scenario_row_center(path)) {
+        return Some(c);
+    }
+    if !fb.update(cx, |v, cx| v.drive_scroll_row_into_view(path, cx)) {
+        return None; // not in the projection at all
+    }
+    for _ in 0..20 {
+        settle(cx, 60).await;
+        if let Some(c) = fb.update(cx, |v, _| v.scenario_row_center(path)) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 // ---- R20 extension-change confirmation-modal orchestration -----------------
@@ -1796,9 +2084,10 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
                  live watcher surfaced a created row, sort-direction + hidden toggle + ⌘⇧. \
                  worked, ⌘⇧B still flips modes, the R20 legs (copy/paste, cut-ghost-move, \
                  trash+⌘Z, rename, drag, drift) passed, the rename field's real ⌥/⌘ editing \
-                 chords walked the word table and a press-drag selected a range, and the §6 \
+                 chords walked the word table and a press-drag selected a range, the §6 \
                  composition leg (⌘N second window, CGEvent ⌘Z in B undoing A's op with focus \
-                 routed back) held; {} item(s) DEFERRED to a human pass",
+                 routed back) held, and a REAL press inside a 2-file selection kept it (the \
+                 release collapsed it); {} item(s) DEFERRED to a human pass",
                 deferred.len()
             ),
         }
