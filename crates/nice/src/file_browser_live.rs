@@ -19,6 +19,13 @@
 //! (g) the sort-direction toggle reorders rows; the hidden toggle + a real ⌘⇧.
 //!     chord hide/show a dotfile; a real ⌘⇧B still flips modes.
 //!
+//! Inline-rename legs (on top of R20's (d) / (d′)): (d-word) real ⌥/⌘ editing
+//! chords (⌥←/⌥→/⌥⇧←/⌘←/⌘→/⌘⇧←/⌥⌫) walk a fixed caret/selection table in the
+//! open field; (d-drag) a press at one painted char boundary and a move to
+//! another selects that range and typing replaces it — attempted as a REAL
+//! guarded global-HID gesture and, either way, hard-asserted through the
+//! production hit-test over the geometry the field painted.
+//!
 //! Hermeticity: the fixture tree lives under a per-run temp dir; the recording
 //! `WorkspaceOps` fake is installed process-wide by `run_selftest` before any
 //! scenario, so no real app launches / Finder reveal / Launch-Services query
@@ -57,6 +64,13 @@ const KC_B: u16 = 11;
 const KC_N: u16 = 45;
 /// ⌘Z — UndoFileOperation (`CGKeyCode` for `z`; the §6 cross-window undo chord).
 const KC_Z: u16 = 6;
+/// ← / → / ⌫ (`kVK_LeftArrow` / `kVK_RightArrow` / `kVK_Delete`) — the (d-word)
+/// leg's real ⌥/⌘ editing chords. Arrows and Backspace are FUNCTIONAL keys: their
+/// meaning comes from the keycode alone, so they are posted with no unicode
+/// override (layout-independent, unlike the character-matched chords).
+const KC_LEFT: u16 = 123;
+const KC_RIGHT: u16 = 124;
+const KC_BACKSPACE: u16 = 51;
 
 /// The macOS `AXRole` a `gpui::Role::Group` maps to (as the `ax-probe` /
 /// `app-shell` anchors assert).
@@ -147,6 +161,13 @@ impl Fixture {
         std::fs::create_dir_all(root.join("restoredir"))?;
         std::fs::write(root.join("restoredir/gone.txt"), b"g\n")?;
         std::fs::write(root.join("renameme.txt"), b"r\n")?;
+        // Plan-1 inline-rename legs: a MULTI-WORD name for the (d-word) ⌥/⌘
+        // motion table (word runs "alpha" / "beta_gamma" / "txt" separated by a
+        // space and a dot — the two separator classes motion treats alike), and a
+        // single-run name for the (d-drag) gesture. Both are cancelled, never
+        // committed, so they stay on disk for the leg's own untouched-check.
+        std::fs::write(root.join("alpha beta_gamma.txt"), b"w\n")?;
+        std::fs::write(root.join("dragselect.txt"), b"d\n")?;
         std::fs::write(root.join("escme.txt"), b"e\n")?;
         std::fs::write(root.join("slashme.txt"), b"s\n")?;
         // Extension-change confirmation-modal targets (disjoint from every other
@@ -257,10 +278,16 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
 
     let pid = std::process::id() as i32;
     let mut failures: Vec<String> = Vec::new();
+    // Items the PLATFORM refused to let us drive for real (a synthetic press the
+    // OS never delivered), reported loudly and handed to a human pass — never a
+    // silent pass, and never in place of a hard assertion: every deferring leg
+    // still pins its behaviour deterministically (the `update-check` /
+    // `tranche6-composition` discipline).
+    let mut deferred: Vec<String> = Vec::new();
 
     // (a) ⌘⇧B → files mode; the tree replaces the tab list.
     let Some(fb) = enter_files_mode(cx, whandle, &sidebar, pid, &mut failures).await else {
-        return build_report(failures); // nothing else can run without the view
+        return build_report(failures, deferred); // nothing else can run without the view
     };
     ax_anchor_check(cx, &state, pid, &mut failures).await;
     assert_row_rendered(cx, &fb, &fixture.path("README.md"), &mut failures);
@@ -285,6 +312,14 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
     // (that Milestone-5 leg is the close-out slice's).
     r20_legs(cx, whandle, &fb, &fixture, &mut failures).await;
 
+    // Plan-1 rename-field legs (Bugs A + B), on the SAME shared field the R20
+    // rename legs above drive: (d-word) real ⌥/⌘ editing chords, (d-drag) a real
+    // press-drag selection. Both run while window A is still the only window and
+    // the tree is still rooted at the fixture (before the §6 second window and
+    // the re-root below).
+    rename_word_keys_leg(cx, whandle, &fb, &fixture, pid, &mut failures).await;
+    rename_drag_select_leg(cx, whandle, &fb, &fixture, &mut failures, &mut deferred).await;
+
     // R20 headline: the extension-change confirmation modal END TO END (the
     // `run_rename_modals` present → confirm → apply and present → cancel → abort
     // wiring the extension-preserving `r20_legs` renames never reach).
@@ -302,7 +337,7 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
     // (g cont.) ⌘⇧B still flips modes.
     mode_flip_check(cx, whandle, &state, pid, &mut failures).await;
 
-    build_report(failures)
+    build_report(failures, deferred)
 }
 
 // ---- (a) enter files mode --------------------------------------------------
@@ -817,73 +852,89 @@ async fn r20_legs(
     //      coordinates through the production probe path: the text's left pixel
     //      edge → caret 0, the left half of glyph 3 → caret 3 (before it), just
     //      right of glyph 3's midpoint → caret 4 (after it).
-    let clickme = fixture.path("slashme.txt"); // "slashme.txt" — base "slashme" [0,7)
+    // The target must be a row the `uniform_list` actually RENDERS: only a
+    // painted field publishes a boundary table, and this leg clicks at painted
+    // geometry. `alpha.txt` sorts near the top of the fixture (dirs first, then
+    // README.md / "alpha beta_gamma.txt" / this), so it is inside the viewport;
+    // the leg used to name `slashme.txt`, ~20 rows down and never rendered, and
+    // "passed" only because the per-view probe still held the LAST painted
+    // field's table — the click math and the hit-test were then the same stale
+    // numbers, i.e. circular. Rename-begin now resets that cell, so an
+    // off-screen target fails loudly instead.
+    const CLICK_NAME: &str = "alpha.txt"; // base "alpha" [0,5)
+    let clickme = fixture.path(CLICK_NAME);
+    // An inactive window does not redraw at all — raise before waiting on a paint.
+    rekey(cx, whandle).await;
     begin_rename(cx, whandle, fb, &clickme).await;
-    settle(cx, 250).await; // let a paint run so the layout probes record
-    let sel0 = fb.update(cx, |v, _| v.scenario_rename_selection());
-    let (field_left, text_left) = fb.update(cx, |v, _| v.scenario_rename_probe());
-    // (1) probe cross-check: the text run sits at field box + 6px padding (the
-    // taffy absolute-inset origin excludes the 1px border). A ~0 delta is the
-    // recorded-the-field-box bug that biased every click one glyph right.
-    let delta = text_left - field_left;
-    if !(5.0..=8.0).contains(&delta) {
+    if !await_rename_paint(cx, fb, CLICK_NAME.chars().count()).await {
         failures.push(format!(
-            "rename click: probe cross-check failed — text_left({text_left}) - field_left({field_left}) \
-             = {delta}, expected ≈6px (the field padding); the text probe is not on the text run"
-        ));
-    }
-    // (2) half-glyph convention at window coordinates, through the real probe math.
-    let checks: Vec<(String, f32, usize)> = whandle
-        .update(cx, |_r, window, app| {
-            fb.update(app, |v, _| {
-                let b3 = v.scenario_rename_x_for_index(3, window).unwrap_or(0.0);
-                let b4 = v.scenario_rename_x_for_index(4, window).unwrap_or(0.0);
-                vec![
-                    ("text left edge → caret 0".to_string(), text_left + 0.5, 0),
-                    ("left half of glyph 3 → caret 3".to_string(), text_left + b3 + 1.0, 3),
-                    (
-                        "right of glyph 3's midpoint → caret 4".to_string(),
-                        text_left + (b3 + b4) / 2.0 + 1.0,
-                        4,
-                    ),
-                ]
-            })
-        })
-        .unwrap_or_default();
-    for (what, x, want) in checks {
-        let (mapped, sel_after, still) = whandle
-            .update(cx, |_r, window, app| {
-                fb.update(app, |v, cx| {
-                    let placed = v.drive_rename_click_at_window_x(x, window, cx);
-                    (placed, v.scenario_rename_selection(), v.scenario_is_renaming())
-                })
-            })
-            .unwrap_or((None, None, false));
-        if !still {
-            failures.push(format!(
-                "rename click ({what}): the click ended / restarted the edit (edit mode dropped)"
-            ));
-            break;
-        }
-        if mapped != Some(want) || sel_after != Some((want, want)) {
-            failures.push(format!(
-                "rename click ({what}): clicked window-x {x:.1}, expected caret {want}; \
-                 got mapped={mapped:?} sel={sel_after:?}"
-            ));
-        }
-    }
-    let sel_final = fb.update(cx, |v, _| v.scenario_rename_selection());
-    if sel_final == sel0 {
-        failures.push(format!(
-            "rename click: the caret never moved — selection stayed at the preselection {sel0:?} \
-             (clicks likely re-tripped begin-rename instead of repositioning)"
+            "rename click: the open field never painted a boundary table describing \
+             '{CLICK_NAME}' — there is no drawn geometry to click at"
         ));
     } else {
-        eprintln!(
-            "[selftest] file-browser R20: rename-field clicks repositioned the caret at real \
-             window coordinates (probe delta {delta:.1}px; left-edge→0, glyph-3 left half→3, \
-             past midpoint→4) without restarting the edit"
-        );
+        let sel0 = fb.update(cx, |v, _| v.scenario_rename_selection());
+        let (field_left, text_left) = fb.update(cx, |v, _| v.scenario_rename_probe());
+        // (1) probe cross-check: the text run sits at field box + 6px padding (the
+        // taffy absolute-inset origin excludes the 1px border). A ~0 delta is the
+        // recorded-the-field-box bug that biased every click one glyph right.
+        let delta = text_left - field_left;
+        if !(5.0..=8.0).contains(&delta) {
+            failures.push(format!(
+                "rename click: probe cross-check failed — text_left({text_left}) - field_left({field_left}) \
+                 = {delta}, expected ≈6px (the field padding); the text probe is not on the text run"
+            ));
+        }
+        // (2) half-glyph convention at window coordinates, through the real probe
+        //     math — the boundary xs now come from the field's own last paint (no
+        //     window needed), so the click targets are the glyphs that were drawn.
+        let checks: Vec<(String, f32, usize)> = fb.update(cx, |v, _| {
+            let b3 = v.scenario_rename_x_for_index(3).unwrap_or(0.0);
+            let b4 = v.scenario_rename_x_for_index(4).unwrap_or(0.0);
+            vec![
+                ("text left edge → caret 0".to_string(), text_left + 0.5, 0),
+                ("left half of glyph 3 → caret 3".to_string(), text_left + b3 + 1.0, 3),
+                (
+                    "right of glyph 3's midpoint → caret 4".to_string(),
+                    text_left + (b3 + b4) / 2.0 + 1.0,
+                    4,
+                ),
+            ]
+        });
+        for (what, x, want) in checks {
+            let (mapped, sel_after, still) = whandle
+                .update(cx, |_r, window, app| {
+                    fb.update(app, |v, cx| {
+                        let placed = v.drive_rename_click_at_window_x(x, window, cx);
+                        (placed, v.scenario_rename_selection(), v.scenario_is_renaming())
+                    })
+                })
+                .unwrap_or((None, None, false));
+            if !still {
+                failures.push(format!(
+                    "rename click ({what}): the click ended / restarted the edit (edit mode dropped)"
+                ));
+                break;
+            }
+            if mapped != Some(want) || sel_after != Some((want, want)) {
+                failures.push(format!(
+                    "rename click ({what}): clicked window-x {x:.1}, expected caret {want}; \
+                     got mapped={mapped:?} sel={sel_after:?}"
+                ));
+            }
+        }
+        let sel_final = fb.update(cx, |v, _| v.scenario_rename_selection());
+        if sel_final == sel0 {
+            failures.push(format!(
+                "rename click: the caret never moved — selection stayed at the preselection {sel0:?} \
+                 (clicks likely re-tripped begin-rename instead of repositioning)"
+            ));
+        } else {
+            eprintln!(
+                "[selftest] file-browser R20: rename-field clicks repositioned the caret at real \
+                 window coordinates (probe delta {delta:.1}px; left-edge→0, glyph-3 left half→3, \
+                 past midpoint→4) without restarting the edit"
+            );
+        }
     }
     cancel_rename(cx, whandle, fb).await;
 
@@ -971,6 +1022,32 @@ async fn begin_rename(
     settle(cx, 100).await;
 }
 
+/// Wait (up to ~2s) for the OPEN rename field to publish a boundary table that
+/// describes a name of `chars` chars — i.e. for THIS field to have painted.
+///
+/// Every leg that aims a click at painted geometry has to call this. Rename-begin
+/// resets the per-view probe cell, so an unpainted field reads as an empty table
+/// instead of quietly handing back the PREVIOUS field's numbers (which is how the
+/// click leg used to "pass": it re-renamed the same file, so the stale table
+/// happened to match). The table is pinned, not merely non-empty: boundary
+/// `chars` must exist and `chars + 1` must not, so a table left by a field with a
+/// different name can never satisfy it.
+async fn await_rename_paint(cx: &mut AsyncApp, fb: &Entity<FileBrowserView>, chars: usize) -> bool {
+    for _ in 0..40 {
+        let (last, past_end) = fb.update(cx, |v, _| {
+            (
+                v.scenario_rename_x_for_index(chars),
+                v.scenario_rename_x_for_index(chars + 1),
+            )
+        });
+        if last.is_some() && past_end.is_none() {
+            return true;
+        }
+        settle(cx, 50).await;
+    }
+    false
+}
+
 async fn commit_rename(
     cx: &mut AsyncApp,
     whandle: WindowHandle<AppShellView>,
@@ -995,6 +1072,397 @@ async fn cancel_rename(
         })
         .ok();
     settle(cx, 100).await;
+}
+
+/// Snapshot the live window while the rename field is OPEN, for the visual
+/// spot-check.
+///
+/// The driver's `NICE_CAPTURE` shot is taken after the scenario reports its
+/// verdict, by which point the window has been torn down — a rename field, which
+/// exists only for a few hundred ms mid-run, cannot appear in it. This writes
+/// `<NICE_CAPTURE base>-<stage>.png` at the moment the state is on screen
+/// instead, and is a no-op when no capture was requested (the standing gate run
+/// takes no screenshots). A capture that was ASKED for and then failed is a
+/// scenario failure, exactly as it is in the driver — never a silent skip.
+async fn capture_rename_stage(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    stage: &str,
+    failures: &mut Vec<String>,
+) {
+    if nice_harness::capture::requested_path().is_none() {
+        return;
+    }
+    settle(cx, 200).await; // let the state paint before the drawable read-back
+    match nice_harness::capture::capture_stage(whandle.into(), cx, stage) {
+        Ok(Some(path)) => eprintln!(
+            "[selftest] file-browser: wrote a mid-rename capture ({stage}) -> {}",
+            path.display()
+        ),
+        Ok(None) => {}
+        Err(e) => failures.push(format!(
+            "rename capture ({stage}): NICE_CAPTURE was requested but the mid-scenario \
+             snapshot failed: {e}"
+        )),
+    }
+}
+
+// ---- (d-word) real ⌥/⌘ editing chords in the rename field ------------------
+
+/// Bug A's live gate. With a rename open on a MULTI-WORD fixture name, post the
+/// real ⌥/⌘ editing chords as CGEvents and assert the model's caret/selection
+/// after each one against a fixed table.
+///
+/// The mapping itself is unit-tested (`inline_rename`'s dispatch tests) and the
+/// motion semantics are table-tested in the model; what only a live run can
+/// prove is the wiring the bug actually was — the chords reaching the FOCUSED
+/// field as `alt`/`platform` modifiers on a real keystroke (`dispatch_rename_key`
+/// had no `alt` parameter at all, so ⌥← arrived as a bare ←). Arrows and ⌫ are
+/// functional keys, so `post_key_tap` posts them by keycode with no unicode
+/// override — no `SavedInputSource` and none of the character-matching
+/// divergence that keeps `⌘⇧.` out of the CGEvent path elsewhere in this file.
+///
+/// The rename is CANCELLED at the end: this leg asserts the field model, never a
+/// filesystem outcome, so the fixture must be untouched afterwards.
+async fn rename_word_keys_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    fb: &Entity<FileBrowserView>,
+    fixture: &Fixture,
+    pid: i32,
+    failures: &mut Vec<String>,
+) {
+    // "alpha beta_gamma.txt" — word runs [0,5) "alpha", [6,16) "beta_gamma"
+    // (`_` is a word char), [17,20) "txt"; len 20.
+    const NAME: &str = "alpha beta_gamma.txt";
+    let path = fixture.path(NAME);
+    let start = failures.len();
+
+    rekey(cx, whandle).await;
+    begin_rename(cx, whandle, fb, &path).await;
+    let opened = fb.update(cx, |v, _| v.scenario_rename_text());
+    if opened.as_deref() != Some(NAME) {
+        failures.push(format!(
+            "rename ⌥/⌘ keys: the rename never opened on '{NAME}' (field text {opened:?})"
+        ));
+        // A wrong-row edit may be open; close it so this failure can't cascade
+        // into the later legs (matches the other early-outs in this function).
+        cancel_rename(cx, whandle, fb).await;
+        return;
+    }
+
+    // ⌘→ first: it parks the caret at the end (the table's deterministic start)
+    // AND doubles as the reach-the-field gate. If a real CGEvent never lands on
+    // the focused field, every row below would report the same thing — so fail
+    // once, with the actionable reason, and stop.
+    tap(cx, pid, KC_RIGHT, platform::FLAG_COMMAND).await;
+    let after_cmd_right = fb.update(cx, |v, _| v.scenario_rename_selection());
+    if after_cmd_right != Some((20, 20)) {
+        failures.push(format!(
+            "rename ⌥/⌘ keys: a real ⌘→ did not move the caret to the end of the open field \
+             (selection {after_cmd_right:?}, expected (20,20)) — the chord never reached the \
+             focused rename field (window not key, focus elsewhere, or the arrow chords are not \
+             dispatched to it)"
+        ));
+        cancel_rename(cx, whandle, fb).await;
+        return;
+    }
+
+    // (what, keycode, flags, expected selection after the chord).
+    let table: [(&str, u16, u64, (usize, usize)); 8] = [
+        ("⌥← from the end → start of \"txt\"", KC_LEFT, platform::FLAG_OPTION, (17, 17)),
+        ("⌥← → start of \"beta_gamma\"", KC_LEFT, platform::FLAG_OPTION, (6, 6)),
+        (
+            "⌥⇧← extends a word left (anchor fixed)",
+            KC_LEFT,
+            platform::FLAG_OPTION | platform::FLAG_SHIFT,
+            (0, 6),
+        ),
+        (
+            "⌥→ out of the selection's end → end of \"beta_gamma\"",
+            KC_RIGHT,
+            platform::FLAG_OPTION,
+            (16, 16),
+        ),
+        (
+            "⌘⇧← extends to the text start",
+            KC_LEFT,
+            platform::FLAG_COMMAND | platform::FLAG_SHIFT,
+            (0, 16),
+        ),
+        ("⌘← collapses to the text start", KC_LEFT, platform::FLAG_COMMAND, (0, 0)),
+        ("⌥→ → end of \"alpha\"", KC_RIGHT, platform::FLAG_OPTION, (5, 5)),
+        ("⌥→ → end of \"beta_gamma\"", KC_RIGHT, platform::FLAG_OPTION, (16, 16)),
+    ];
+    for (what, keycode, flags, want) in table {
+        tap(cx, pid, keycode, flags).await;
+        let got = fb.update(cx, |v, _| v.scenario_rename_selection());
+        if got != Some(want) {
+            failures.push(format!(
+                "rename ⌥/⌘ keys ({what}): expected selection {want:?}, got {got:?}"
+            ));
+        }
+    }
+
+    // Visual spot-check material (Validation step 4): the field is open on a
+    // row that is ON SCREEN, with a bare caret parked mid-text at the end of
+    // "beta_gamma" — the state the driver's own capture can never show, since it
+    // runs after the scenario has torn the window down.
+    capture_rename_stage(cx, whandle, "rename-caret", failures).await;
+
+    // ⌥⌫ deletes the word before the caret (caret at 16 = the end of
+    // "beta_gamma") — the delete half of Bug A.
+    tap(cx, pid, KC_BACKSPACE, platform::FLAG_OPTION).await;
+    let text = fb.update(cx, |v, _| v.scenario_rename_text());
+    let sel = fb.update(cx, |v, _| v.scenario_rename_selection());
+    if text.as_deref() != Some("alpha .txt") || sel != Some((6, 6)) {
+        failures.push(format!(
+            "rename ⌥/⌘ keys (⌥⌫ deletes the previous word): expected 'alpha .txt' with the caret \
+             at 6, got text {text:?} selection {sel:?}"
+        ));
+    }
+
+    cancel_rename(cx, whandle, fb).await;
+    if !exists(&path) || exists(&fixture.path("alpha .txt")) {
+        failures.push(format!(
+            "rename ⌥/⌘ keys: Esc must leave '{NAME}' untouched on disk (no 'alpha .txt')"
+        ));
+    }
+    if failures.len() == start {
+        eprintln!(
+            "[selftest] file-browser (d-word): real ⌥←/⌥→/⌥⇧←/⌘←/⌘→/⌘⇧←/⌥⌫ CGEvents walked the \
+             word table in the open rename field, and Esc left the file untouched"
+        );
+    }
+}
+
+// ---- (d-drag) press-and-drag selection in the rename field -----------------
+
+/// Bug B's live gate: with a rename open, drag from char boundary 2 to boundary
+/// 6 and assert the field selected `(2, 6)` — then type one char and assert it
+/// REPLACED that range.
+///
+/// The gesture is attempted for real first (guarded global-HID DOWN → DRAG steps
+/// → UP, behind the mandatory activate + raise + frontmost-at-point preflight —
+/// never a blind post; pid-posted mouse events silently drop, hence the R27
+/// carve-out seams). macOS does not establish the implicit mouse grab for a
+/// synthetic press, so `mouseDragged:` delivery is not guaranteed (the
+/// `tranche6-composition` reorder leg's recorded finding); when the moves do not
+/// arrive the real half DEFERS LOUDLY to a human pass and the leg still HARD
+/// asserts the same gesture through the production hit-test + `extend_to` path
+/// over the very geometry the field PAINTED. Nothing is weakened by a deferral:
+/// the assertions below run either way.
+async fn rename_drag_select_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    fb: &Entity<FileBrowserView>,
+    fixture: &Fixture,
+    failures: &mut Vec<String>,
+    deferred: &mut Vec<String>,
+) {
+    const NAME: &str = "dragselect.txt";
+    const FROM: usize = 2;
+    const TO: usize = 6;
+    let path = fixture.path(NAME);
+    let start = failures.len();
+
+    rekey(cx, whandle).await;
+    begin_rename(cx, whandle, fb, &path).await;
+    // Wait for THIS field's paint to record the boundary table + field box. The
+    // wait is pinned to the name, so a table left by an earlier rename (the probe
+    // cell is per-view; begin resets it, but a leg must still not race the paint)
+    // can never stand in for it.
+    let painted = await_rename_paint(cx, fb, NAME.chars().count()).await;
+    let opened = fb.update(cx, |v, _| v.scenario_rename_text());
+    if opened.as_deref() != Some(NAME) {
+        failures.push(format!(
+            "rename drag-select: the rename never opened on '{NAME}' (field text {opened:?})"
+        ));
+        // A wrong-row edit may be open; close it so this failure can't cascade
+        // into the later legs (matches the other early-outs in this function).
+        cancel_rename(cx, whandle, fb).await;
+        return;
+    }
+
+    // Window coordinates of the two boundaries, from the field's OWN last paint:
+    // the text run's left edge plus the painted boundary offset, nudged 1px right
+    // so the half-glyph rounding lands on the boundary itself (the (d′) leg's
+    // convention). The y is the painted field box's vertical centre.
+    let (_field_left, text_left) = fb.update(cx, |v, _| v.scenario_rename_probe());
+    let geom = fb.update(cx, |v, _| {
+        (
+            v.scenario_rename_x_for_index(FROM),
+            v.scenario_rename_x_for_index(TO),
+            v.scenario_rename_field_center_y(),
+        )
+    });
+    let (Some(b_from), Some(b_to), Some(y)) = geom else {
+        failures.push(format!(
+            "rename drag-select: the open field never painted its boundary table / box \
+             (boundaries {:?}/{:?}, box centre {:?}) — nothing to aim at",
+            geom.0, geom.1, geom.2
+        ));
+        cancel_rename(cx, whandle, fb).await;
+        return;
+    };
+    // The wait above is what pins the table to THIS name (one boundary per char
+    // plus the trailing one, no more); re-read it here so the failure message
+    // names the numbers the clicks would otherwise have been measured against.
+    let n = NAME.chars().count();
+    let (last, past_end) = fb.update(cx, |v, _| {
+        (
+            v.scenario_rename_x_for_index(n),
+            v.scenario_rename_x_for_index(n + 1),
+        )
+    });
+    if !painted || last.is_none() || past_end.is_some() {
+        failures.push(format!(
+            "rename drag-select: the painted boundary table does not describe '{NAME}' ({n} chars) \
+             — boundary {n} is {last:?} and boundary {} is {past_end:?} (expected Some / None), so \
+             the field's last paint was a DIFFERENT field and every click target below would be \
+             measured against stale geometry",
+            n + 1
+        ));
+        cancel_rename(cx, whandle, fb).await;
+        return;
+    }
+    let x_from = text_left + b_from + 1.0;
+    let x_to = text_left + b_to + 1.0;
+
+    // --- the real gesture (guarded; DEFERS rather than failing) ---------------
+    match real_drag_gesture(cx, whandle, fb, x_from, x_to, y).await {
+        Ok((pressed, dragged)) if pressed == Some((FROM, FROM)) && dragged == Some((FROM, TO)) => {
+            eprintln!(
+                "[selftest] file-browser (d-drag): a real guarded-HID press-drag selected \
+                 [{FROM},{TO}) in the rename field"
+            );
+        }
+        Ok((pressed, dragged)) if pressed == Some((FROM, FROM)) => {
+            deferred.push(format!(
+                "rename drag-select: the real guarded-HID press LANDED (caret at boundary {FROM}), \
+                 but the held mouse-moves did not extend the selection (got {dragged:?}, want \
+                 {:?}) — macOS does not establish the implicit mouse grab for a synthetic press, \
+                 so `mouseDragged:` is not delivered (the tranche6 reorder leg's recorded finding). \
+                 DEFERRED to a human drag; the same gesture is HARD-asserted below through the \
+                 production hit-test over the painted geometry.",
+                Some((FROM, TO))
+            ));
+        }
+        Ok((pressed, _)) => {
+            deferred.push(format!(
+                "rename drag-select: the real guarded-HID press at window x {x_from:.1}, y {y:.1} \
+                 did not place the caret at boundary {FROM} (selection {pressed:?}) — the \
+                 synthetic press did not land on the field. DEFERRED to a human drag; the gesture \
+                 is HARD-asserted below through the production hit-test."
+            ));
+        }
+        Err(reason) => deferred.push(format!("rename drag-select: {reason}")),
+    }
+
+    // --- the hard assertion: press → move → selection, through production -----
+    let pressed = whandle
+        .update(cx, |_r, window, app| {
+            fb.update(app, |v, cx| {
+                v.drive_rename_click_at_window_x(x_from, window, cx);
+                v.scenario_rename_selection()
+            })
+        })
+        .unwrap_or(None);
+    let dragged = fb.update(cx, |v, cx| {
+        v.drive_rename_drag_to_window_x(x_to, cx);
+        v.scenario_rename_selection()
+    });
+    if pressed != Some((FROM, FROM)) || dragged != Some((FROM, TO)) {
+        failures.push(format!(
+            "rename drag-select: a press at the painted x of boundary {FROM} then a move to \
+             boundary {TO} must select [{FROM},{TO}) — got press {pressed:?}, drag {dragged:?}"
+        ));
+    }
+    // Visual spot-check material (Validation step 4), taken BEFORE the typing
+    // below collapses it: the selection highlight over [FROM,TO) of the live
+    // field.
+    capture_rename_stage(cx, whandle, "rename-selection", failures).await;
+    // Typing replaces the dragged range ("dragselect.txt" minus [2,6) = "agse").
+    fb.update(cx, |v, cx| v.drive_rename_type('z', cx));
+    settle(cx, 60).await;
+    let text = fb.update(cx, |v, _| v.scenario_rename_text());
+    if text.as_deref() != Some("drzlect.txt") {
+        failures.push(format!(
+            "rename drag-select: typing over the dragged selection should yield 'drzlect.txt'; \
+             got {text:?}"
+        ));
+    }
+
+    cancel_rename(cx, whandle, fb).await;
+    if !exists(&path) {
+        failures.push(format!(
+            "rename drag-select: Esc must leave '{NAME}' untouched on disk"
+        ));
+    }
+    if failures.len() == start {
+        eprintln!(
+            "[selftest] file-browser (d-drag): press at boundary {FROM} + move to boundary {TO} \
+             selected the range over the PAINTED geometry, and typing replaced it"
+        );
+    }
+}
+
+/// Post a REAL left press-drag-release across the open rename field, behind the
+/// mandatory guarded-HID preflight (activate + raise + `CGWindowListCopyWindowInfo`
+/// frontmost-at-point). Returns the field's selection right after the press and
+/// right before the release, or `Err(reason)` when the preflight refused (NO post
+/// was made). The release is always posted once the press is — the button must
+/// never be left held.
+async fn real_drag_gesture(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    fb: &Entity<FileBrowserView>,
+    x_from: f32,
+    x_to: f32,
+    y: f32,
+) -> Result<(Option<(usize, usize)>, Option<(usize, usize)>), String> {
+    let _ = cx.update(|app| app.activate(true));
+    let _ = whandle.update(cx, |_v, w, _a| w.activate_window());
+    settle(cx, 300).await;
+    let to_global = |cx: &mut AsyncApp, x: f32| {
+        whandle
+            .update(cx, |_v, w, _a| {
+                platform::content_point_to_cg_global(w, x as f64, y as f64)
+            })
+            .ok()
+            .flatten()
+    };
+    let (Some((gx0, gy)), Some((gx1, _))) = (to_global(cx, x_from), to_global(cx, x_to)) else {
+        return Err(
+            "could not convert the field's press/release points to CG-global coords — DEFERRED, \
+             no global post was made"
+                .to_string(),
+        );
+    };
+    if !platform::frontmost_window_owns_point(gx0, gy) {
+        return Err(format!(
+            "the frontmost-at-point preflight FAILED — our window does not own the press point \
+             ({gx0:.0},{gy0:.0}) per CGWindowListCopyWindowInfo (another window is on top, or the \
+             point is off our window). DEFERRED LOUDLY; NO global post was made. Bring the nice \
+             window frontmost and re-run for the real-gesture assertion.",
+            gy0 = gy
+        ));
+    }
+
+    platform::post_global_left_down(gx0, gy);
+    settle(cx, 150).await;
+    let pressed = fb.update(cx, |v, _| v.scenario_rename_selection());
+    let steps = 8;
+    for i in 1..=steps {
+        let t = f64::from(i) / f64::from(steps);
+        platform::post_global_left_drag(gx0 + (gx1 - gx0) * t, gy);
+        settle(cx, 40).await;
+    }
+    settle(cx, 100).await;
+    let dragged = fb.update(cx, |v, _| v.scenario_rename_selection());
+    platform::post_global_left_up(gx1, gy);
+    settle(cx, 150).await;
+    Ok((pressed, dragged))
 }
 
 // ---- R20 extension-change confirmation-modal orchestration -----------------
@@ -1309,20 +1777,30 @@ fn renamed_committed(original: &str, renamed: &str) -> bool {
 
 // ---- verdict ---------------------------------------------------------------
 
-fn build_report(failures: Vec<String>) -> CadenceReport {
+fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
+    if !deferred.is_empty() {
+        eprintln!("[selftest] file-browser DEFERRED HUMAN PASS checklist:");
+        for d in &deferred {
+            eprintln!("  - {d}");
+        }
+    }
     if failures.is_empty() {
         CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
-            detail: "file-browser OK (through the shipped builder): ⌘⇧B swapped in the tree \
-                     (AX root exposed + fixture row rendered), single-click expand/collapse, \
-                     double-click re-root, double-click file recorded one open (nothing launched), \
-                     right-click menus (file vs folder) + two-stage Open With default-first, the \
-                     live watcher surfaced a created row, sort-direction + hidden toggle + ⌘⇧. \
-                     worked, ⌘⇧B still flips modes, the R20 legs (copy/paste, cut-ghost-move, \
-                     trash+⌘Z, rename, drag, drift) passed, and the §6 composition leg (⌘N second \
-                     window, CGEvent ⌘Z in B undoing A's op with focus routed back) held."
-                .to_string(),
+            detail: format!(
+                "file-browser OK (through the shipped builder): ⌘⇧B swapped in the tree \
+                 (AX root exposed + fixture row rendered), single-click expand/collapse, \
+                 double-click re-root, double-click file recorded one open (nothing launched), \
+                 right-click menus (file vs folder) + two-stage Open With default-first, the \
+                 live watcher surfaced a created row, sort-direction + hidden toggle + ⌘⇧. \
+                 worked, ⌘⇧B still flips modes, the R20 legs (copy/paste, cut-ghost-move, \
+                 trash+⌘Z, rename, drag, drift) passed, the rename field's real ⌥/⌘ editing \
+                 chords walked the word table and a press-drag selected a range, and the §6 \
+                 composition leg (⌘N second window, CGEvent ⌘Z in B undoing A's op with focus \
+                 routed back) held; {} item(s) DEFERRED to a human pass",
+                deferred.len()
+            ),
         }
     } else {
         CadenceReport {

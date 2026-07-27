@@ -311,6 +311,22 @@ plan's binding technical decisions):**
   `crates/nice-itests/tests/visual_terminal_screenshot.rs` — worked
   examples of both execution models; each doc comment states which future
   test class it templates.
+- `crates/nice-itests/tests/visual_rename_caret.rs` — the second visual
+  binary, and the precedent for pixel-testing a widget that lives in the
+  `nice` BINARY crate: a dev/test crate cannot depend on a binary, so it
+  `#[path]`-includes the real source file
+  (`crates/nice/src/inline_rename.rs`) rather than mirroring the element.
+  Reach for that only when a mirror would defeat the test's purpose — the
+  claim there is precisely that the SHIPPED element's paint and hit-test
+  agree, which a copy cannot show. Where a mirrored probe IS enough, keep
+  following `chrome_band` / `sidebar_multiselect`.
+- `crates/nice-itests/tests/behavior_rename_drag.rs` — the same `#[path]`
+  include on the BEHAVIOR side (a libtest target on the mocked context, not
+  a `harness = false` binary): press → move → release drag-select through
+  the real field, including the teardown case (end the edit mid-drag; a
+  leaked window listener fails the case). Note the tradeoff of a `#[path]`
+  include in a libtest target: `cfg(test)` is on, so the included module's
+  own unit tests are compiled and run there a second time.
 - `notes/chrome-pain-catalog-20260702.md` — the source of the
   differential-pair convention, and the fuller catalog of the seam-y
   failure patterns (press arbitration, drag-session lifecycle, hit-test

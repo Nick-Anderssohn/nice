@@ -1075,17 +1075,21 @@ fn write_dropped_image(bytes: &[u8]) -> Option<PathBuf> {
 // into elsewhere on the machine.
 //
 // R27 CARVE-OUT (the ONLY exception, narrowly fenced): a global `CGEventPost`
-// (the HID tap) is permitted ONLY through the two named seams
-// [`post_global_left_click`] / [`post_global_left_drag`] below, ONLY from
-// selftest / scenario code (the R27 §6 close-out composition leg), and ONLY
-// after that leg's REQUIRED preflight has verified our window owns the target
-// point (activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point
-// z-order check); on preflight failure the caller DEFERS LOUDLY and does NOT
-// post. The carve-out exists because pid-posted MOUSE events silently drop
-// (hover paints, `mouseDown` never fires — the M6 record), so the composed
-// leg's real clicks/drags MUST go through the global tap. **Keyboard synthetic
-// events remain `CGEventPostToPid`-only, unchanged.** No other call site may use
-// the global seams.
+// (the HID tap) is permitted ONLY through the four named seams
+// [`post_global_left_click`] / [`post_global_left_drag`] /
+// [`post_global_left_down`] / [`post_global_left_up`] below, ONLY from
+// selftest / scenario code — the sanctioned call sites are an explicit
+// allowlist: the R27 §6 close-out composition leg (`input_live`) and the
+// `file-browser` scenario's rename drag-select leg (`file_browser_live`) —
+// and ONLY after the caller's REQUIRED preflight has verified our window owns
+// the target point (activate + raise + `CGWindowListCopyWindowInfo`
+// frontmost-at-point z-order check); on preflight failure the caller DEFERS
+// LOUDLY and does NOT post. The carve-out exists because pid-posted MOUSE
+// events silently drop (hover paints, `mouseDown` never fires — the M6
+// record), so real clicks/drags MUST go through the global tap. **Keyboard
+// synthetic events remain `CGEventPostToPid`-only, unchanged.** No call site
+// outside that allowlist may use the global seams; extending the allowlist
+// means amending THIS block, not just a per-fn doc comment.
 // ===========================================================================
 
 // Opaque CoreFoundation / CoreGraphics / Carbon handles. All are pointer-width;
@@ -1767,9 +1771,10 @@ const CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
 // `NSPoint` (== `CGPoint`, two `CGFloat`/`f64`): it is `repr(C)` for the extern
 // CGEvent call AND implements objc2's `Encode` for the `msg_send!` conversions.
 
-/// `kCGHIDEventTap` — the global hardware-input event tap. Used ONLY by the R27
-/// carve-out seams below (`post_global_left_click` / `post_global_left_drag`); the
-/// pid-posted family above never touches it.
+/// `kCGHIDEventTap` — the global hardware-input event tap. Used ONLY by the four
+/// R27 carve-out seams below (`post_global_left_click` / `post_global_left_drag` /
+/// `post_global_left_down` / `post_global_left_up`, all via
+/// `post_global_mouse_event`); the pid-posted family above never touches it.
 const CG_HID_EVENT_TAP: u32 = 0;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -1887,7 +1892,8 @@ pub fn post_global_left_drag(x: f64, y: f64) {
 /// [`post_global_left_click`], which fires DOWN+UP together (a tap), this leaves the
 /// button HELD so the drag steps track. Same carve-out discipline: the caller MUST
 /// run the §6 preflight (activate + raise + frontmost-at-point) BEFORE it and DEFER
-/// LOUDLY when our window does not own the point — never a blind post.
+/// LOUDLY when our window does not own the point — never a blind post. Callers: the
+/// §6 pill-reorder drag and the `file-browser` rename drag-select leg.
 #[allow(dead_code)]
 pub fn post_global_left_down(x: f64, y: f64) {
     post_global_mouse_event(CG_EVENT_LEFT_MOUSE_DOWN, x, y, 1);

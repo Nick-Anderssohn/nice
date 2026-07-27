@@ -70,7 +70,7 @@
 // this module's unit tests.
 #![allow(dead_code)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -97,8 +97,8 @@ use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::file_browser::view::FileBrowserView;
 use crate::inline_rename::{
-    apply_rename_click, dispatch_rename_key, edit_spans, rename_field, FieldColors, FieldProbe,
-    RenameKeyOutcome,
+    apply_rename_click, dispatch_rename_key, field_probe_cell, field_text, rename_field,
+    reset_field_probe, FieldColors, FieldProbeCell, RenameKeyOutcome,
 };
 use crate::session_manager::ClaudeTabPlacement;
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
@@ -564,10 +564,10 @@ pub(crate) struct SidebarShellView {
     editing_tab_id: Option<String>,
     /// The in-flight rename editor (cursor + selection; `None` when not editing).
     rename_editor: Option<TextFieldEditor>,
-    /// The rename field's painted geometry (text-run + field-box left edges,
-    /// window coords), written by the field's layout probes each paint and read
-    /// by its click-to-position handler.
-    rename_probe: Rc<Cell<FieldProbe>>,
+    /// The rename field's painted geometry (text-run + field-box left edges and
+    /// the shaped char-boundary table, window coords), written by the field's
+    /// paint and read by its click-to-position handler.
+    rename_probe: FieldProbeCell,
     /// When the current active tab became active — the rename gate reference.
     activated_at: Option<Instant>,
     /// Focus for the inline-rename field (grabbed on begin, released on commit).
@@ -663,7 +663,7 @@ impl SidebarShellView {
             drag_target: None,
             editing_tab_id: None,
             rename_editor: None,
-            rename_probe: Rc::new(Cell::new(FieldProbe::default())),
+            rename_probe: field_probe_cell(),
             activated_at: Some(Instant::now()),
             rename_focus: cx.focus_handle(),
             rename_blur_sub: None,
@@ -871,6 +871,10 @@ impl SidebarShellView {
             return;
         };
         self.editing_tab_id = Some(tab_id.to_string());
+        // The probe cell is per-view and outlives every field it has measured:
+        // drop the previous edit's boundary table and, crucially, any drag arm
+        // it left behind (see `reset_field_probe`).
+        reset_field_probe(&self.rename_probe);
         // Select the whole title on entry (a tab title is not a filename, so the
         // whole name — not base-minus-extension — is the replace target): the
         // first keystroke replaces it.
@@ -923,6 +927,17 @@ impl SidebarShellView {
         }
     }
 
+    /// The drag-select half of [`Self::place_rename_cursor`]: the press placed
+    /// the anchor, and each mouse-move while the button is held moves the caret
+    /// to `index` and KEEPS that anchor. No focus call — the press already took
+    /// focus, and a drag must not re-take it.
+    fn extend_rename_selection(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(editor) = self.rename_editor.as_mut() {
+            editor.extend_to(index);
+            cx.notify();
+        }
+    }
+
     /// Swift's rename end paths call `sessions.focusActiveTerminal()` so the
     /// terminal regains first responder (dossier G10). Here the window's
     /// [`PaneHostView`] owns the hosted terminal views, so focus routes back
@@ -949,6 +964,7 @@ impl SidebarShellView {
                 &ks.key,
                 ks.key_char.as_deref(),
                 ks.modifiers.shift,
+                ks.modifiers.alt,
                 ks.modifiers.platform,
                 ks.modifiers.control,
                 window.capslock().on,
@@ -1816,11 +1832,11 @@ impl SidebarShellView {
 
         // Title view: the inline-rename field while editing, else the label.
         let title: gpui::AnyElement = if t.is_editing {
-            let spans = self
+            let text = self
                 .rename_editor
                 .as_ref()
-                .map(edit_spans)
-                .unwrap_or_else(|| edit_spans(&TextFieldEditor::new("")));
+                .map(field_text)
+                .unwrap_or_else(|| field_text(&TextFieldEditor::new("")));
             let colors = FieldColors {
                 bg: slot_to_rgba(s.background3),
                 border: slot_to_rgba(s.line_strong),
@@ -1829,9 +1845,10 @@ impl SidebarShellView {
                 selection: selection_tint(accent, 1.0),
             };
             let weak = cx.weak_entity();
+            let weak_drag = cx.weak_entity();
             let field = rename_field(
                 &self.rename_focus,
-                &spans,
+                &text,
                 "SidebarRename",
                 colors,
                 self.sidebar_pt(13.0),
@@ -1841,6 +1858,10 @@ impl SidebarShellView {
                     let _ = weak.update(app, |this, cx| {
                         this.place_rename_cursor(index, click_count, window, cx)
                     });
+                },
+                move |index, _window, app| {
+                    let _ = weak_drag
+                        .update(app, |this, cx| this.extend_rename_selection(index, cx));
                 },
             );
             // Wrap rather than touch the shared `rename_field`: the line height

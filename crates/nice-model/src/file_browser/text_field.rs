@@ -40,6 +40,28 @@ pub enum Key {
     ShiftLeft,
     /// Extend the selection one char right (shift+right).
     ShiftRight,
+    /// Move the caret to the start of the previous word (⌥←).
+    WordLeft,
+    /// Move the caret to the end of the next word (⌥→).
+    WordRight,
+    /// Extend the selection to the start of the previous word (⌥⇧←).
+    ShiftWordLeft,
+    /// Extend the selection to the end of the next word (⌥⇧→).
+    ShiftWordRight,
+    /// Move the caret to the start of the text (⌘←; the field is single-line).
+    LineStart,
+    /// Move the caret to the end of the text (⌘→).
+    LineEnd,
+    /// Extend the selection to the start of the text (⌘⇧←).
+    ShiftLineStart,
+    /// Extend the selection to the end of the text (⌘⇧→).
+    ShiftLineEnd,
+    /// Delete the selection if any, else back to the start of the previous
+    /// word (⌥⌫).
+    DeleteWordBackward,
+    /// Delete the selection if any, else forward to the end of the next word
+    /// (⌥⌦).
+    DeleteWordForward,
     /// Select the whole field (⌘A).
     SelectAll,
 }
@@ -108,6 +130,16 @@ impl TextFieldEditor {
             Key::Right => self.move_right(false),
             Key::ShiftLeft => self.move_left(true),
             Key::ShiftRight => self.move_right(true),
+            Key::WordLeft => self.move_word_left(false),
+            Key::WordRight => self.move_word_right(false),
+            Key::ShiftWordLeft => self.move_word_left(true),
+            Key::ShiftWordRight => self.move_word_right(true),
+            Key::LineStart => self.move_to_line_edge(0, false),
+            Key::LineEnd => self.move_to_line_edge(self.chars.len(), false),
+            Key::ShiftLineStart => self.move_to_line_edge(0, true),
+            Key::ShiftLineEnd => self.move_to_line_edge(self.chars.len(), true),
+            Key::DeleteWordBackward => self.delete_word_backward(),
+            Key::DeleteWordForward => self.delete_word_forward(),
             Key::SelectAll => self.select_all(),
         }
     }
@@ -198,6 +230,102 @@ impl TextFieldEditor {
         }
     }
 
+    /// The word-left target from char boundary `pos`: skip left over the
+    /// non-word chars immediately before it, then over the word run, and land at
+    /// that run's START. From the end of `"foo.bar"`: 7 → 4 → 0. Only the
+    /// [`CharClass::Word`] class counts as "word" here — whitespace and
+    /// punctuation are both separators for motion (NSTextField parity), unlike
+    /// [`select_word_at`](Self::select_word_at) which treats each as its own run.
+    fn word_left(&self, pos: usize) -> usize {
+        let mut i = pos.min(self.chars.len());
+        while i > 0 && char_class(self.chars[i - 1]) != CharClass::Word {
+            i -= 1;
+        }
+        while i > 0 && char_class(self.chars[i - 1]) == CharClass::Word {
+            i -= 1;
+        }
+        i
+    }
+
+    /// The word-right target from char boundary `pos`: skip right over the
+    /// non-word chars at it, then over the word run, and land at that run's END.
+    /// From the start of `"foo.bar"`: 0 → 3 → 7.
+    fn word_right(&self, pos: usize) -> usize {
+        let len = self.chars.len();
+        let mut i = pos.min(len);
+        while i < len && char_class(self.chars[i]) != CharClass::Word {
+            i += 1;
+        }
+        while i < len && char_class(self.chars[i]) == CharClass::Word {
+            i += 1;
+        }
+        i
+    }
+
+    /// ⌥← / ⌥⇧←. Extending moves the caret only (anchor fixed). Plain motion
+    /// with a selection starts from the selection's START and then moves —
+    /// macOS moves a word rather than merely collapsing (contrast plain ←).
+    fn move_word_left(&mut self, extend: bool) {
+        if extend {
+            self.caret = self.word_left(self.caret);
+        } else {
+            let from = if self.has_selection() {
+                self.selection().0
+            } else {
+                self.caret
+            };
+            self.collapse_to(self.word_left(from));
+        }
+    }
+
+    /// ⌥→ / ⌥⇧→ — the mirror of [`move_word_left`](Self::move_word_left).
+    fn move_word_right(&mut self, extend: bool) {
+        if extend {
+            self.caret = self.word_right(self.caret);
+        } else {
+            let from = if self.has_selection() {
+                self.selection().1
+            } else {
+                self.caret
+            };
+            self.collapse_to(self.word_right(from));
+        }
+    }
+
+    /// ⌘← / ⌘→ (+ shift). The field is single-line, so its "line" edges are `0`
+    /// and `len`.
+    fn move_to_line_edge(&mut self, pos: usize, extend: bool) {
+        if extend {
+            self.caret = pos;
+        } else {
+            self.collapse_to(pos);
+        }
+    }
+
+    fn delete_word_backward(&mut self) {
+        let (start, end) = self.selection();
+        if start != end {
+            self.chars.drain(start..end);
+            self.collapse_to(start);
+            return;
+        }
+        let target = self.word_left(self.caret);
+        self.chars.drain(target..self.caret);
+        self.collapse_to(target);
+    }
+
+    fn delete_word_forward(&mut self) {
+        let (start, end) = self.selection();
+        if start != end {
+            self.chars.drain(start..end);
+            self.collapse_to(start);
+            return;
+        }
+        let target = self.word_right(self.caret);
+        self.chars.drain(self.caret..target);
+        self.collapse_to(self.caret);
+    }
+
     /// Collapse the selection to a caret at `pos` (clamped to the text length) —
     /// the click-to-position action. The pointer picks a boundary via
     /// [`char_index_for_x`]; this drops the caret there and clears any selection,
@@ -205,6 +333,15 @@ impl TextFieldEditor {
     /// the whole field.
     pub fn place_cursor(&mut self, pos: usize) {
         self.collapse_to(pos.min(self.chars.len()));
+    }
+
+    /// Move the caret to `pos` (clamped) while KEEPING the anchor — the
+    /// extend-selection primitive. This is what a click-drag calls on every
+    /// mouse-move after the press placed the anchor, and what a shift-click
+    /// would call; unlike [`place_cursor`](Self::place_cursor) it never
+    /// collapses.
+    pub fn extend_to(&mut self, pos: usize) {
+        self.caret = pos.min(self.chars.len());
     }
 
     fn collapse_to(&mut self, pos: usize) {
@@ -434,6 +571,222 @@ mod tests {
         assert_eq!(e.selection(), (0, 4));
         e.apply_key(Char('x'));
         assert_eq!(e.text(), "x.txt");
+    }
+
+    // MARK: - word motion (⌥←/⌥→)
+
+    #[test]
+    fn word_left_lands_on_word_run_starts() {
+        // "foo.bar", caret at the end: 7 → 4 ("bar" start) → 0 ("foo" start).
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.apply_key(WordLeft);
+        assert_eq!(e.cursor(), 4);
+        e.apply_key(WordLeft);
+        assert_eq!(e.cursor(), 0);
+        // Clamped at the start.
+        e.apply_key(WordLeft);
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn word_right_lands_on_word_run_ends() {
+        // "foo.bar" from 0: → 3 ("foo" end) → 7 ("bar" end).
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.place_cursor(0);
+        e.apply_key(WordRight);
+        assert_eq!(e.cursor(), 3);
+        e.apply_key(WordRight);
+        assert_eq!(e.cursor(), 7);
+        e.apply_key(WordRight);
+        assert_eq!(e.cursor(), 7);
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn word_motion_treats_whitespace_and_punctuation_alike() {
+        // Motion classes are word / not-word, so "alpha beta_gamma.txt" walks
+        // its word runs regardless of which separator sits between them.
+        let mut e = TextFieldEditor::new("alpha beta_gamma.txt");
+        assert_eq!(e.cursor(), 20);
+        e.apply_key(WordLeft);
+        assert_eq!(e.cursor(), 17); // start of "txt"
+        e.apply_key(WordLeft);
+        assert_eq!(e.cursor(), 6); // start of "beta_gamma" (underscore is a word char)
+        e.apply_key(WordLeft);
+        assert_eq!(e.cursor(), 0); // start of "alpha"
+    }
+
+    #[test]
+    fn plain_word_motion_moves_from_the_selection_edge() {
+        // macOS moves a whole word out of a selection (unlike plain ←/→, which
+        // only collapse). "foo.bar" fully selected: ⌥← from start 0 → 0,
+        // ⌥→ from end 7 → 7; use an interior selection to see the move.
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.place_cursor(4);
+        e.apply_key(ShiftRight); // selection (4,5)
+        assert_eq!(e.selection(), (4, 5));
+        e.apply_key(WordLeft); // from selection start 4 → 0
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+
+        let mut e2 = TextFieldEditor::new("foo.bar");
+        e2.place_cursor(1);
+        e2.apply_key(ShiftRight); // selection (1,2)
+        e2.apply_key(WordRight); // from selection end 2 → 3
+        assert_eq!(e2.cursor(), 3);
+        assert!(!e2.has_selection());
+    }
+
+    #[test]
+    fn shift_word_motion_extends_with_a_fixed_anchor() {
+        let mut e = TextFieldEditor::new("foo.bar"); // caret at 7
+        e.apply_key(ShiftWordLeft);
+        assert_eq!(e.selection(), (4, 7));
+        e.apply_key(ShiftWordLeft);
+        assert_eq!(e.selection(), (0, 7));
+        // Shrinking back the other way keeps the anchor at 7.
+        e.apply_key(ShiftWordRight);
+        assert_eq!(e.selection(), (3, 7));
+    }
+
+    #[test]
+    fn word_motion_is_char_indexed_for_multibyte() {
+        let mut e = TextFieldEditor::new("café bar");
+        e.place_cursor(0);
+        e.apply_key(WordRight);
+        assert_eq!(e.cursor(), 4); // after "café", not a byte offset
+    }
+
+    // MARK: - line motion (⌘←/⌘→)
+
+    #[test]
+    fn line_start_and_end_jump_to_the_text_edges() {
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.apply_key(LineStart);
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+        e.apply_key(LineEnd);
+        assert_eq!(e.cursor(), 7);
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn line_motion_collapses_an_existing_selection() {
+        let mut e = TextFieldEditor::with_selection("foo.bar", 3);
+        e.apply_key(LineEnd);
+        assert_eq!(e.selection(), (7, 7));
+    }
+
+    #[test]
+    fn shift_line_motion_extends_to_the_edges() {
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.place_cursor(3);
+        e.apply_key(ShiftLineStart);
+        assert_eq!(e.selection(), (0, 3));
+        assert_eq!(e.cursor(), 0);
+
+        let mut e2 = TextFieldEditor::new("foo.bar");
+        e2.place_cursor(3);
+        e2.apply_key(ShiftLineEnd);
+        assert_eq!(e2.selection(), (3, 7));
+        assert_eq!(e2.cursor(), 7);
+    }
+
+    // MARK: - word delete (⌥⌫ / ⌥⌦)
+
+    #[test]
+    fn delete_word_backward_removes_the_previous_word() {
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.apply_key(DeleteWordBackward);
+        assert_eq!(e.text(), "foo.");
+        assert_eq!(e.cursor(), 4);
+        e.apply_key(DeleteWordBackward);
+        assert_eq!(e.text(), "");
+        assert_eq!(e.cursor(), 0);
+        // At the start it is a no-op.
+        e.apply_key(DeleteWordBackward);
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn delete_word_backward_removes_the_selection_when_there_is_one() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3);
+        e.apply_key(DeleteWordBackward);
+        assert_eq!(e.text(), ".txt");
+        assert_eq!(e.selection(), (0, 0));
+    }
+
+    #[test]
+    fn delete_word_forward_removes_the_next_word() {
+        let mut e = TextFieldEditor::new("foo.bar");
+        e.place_cursor(0);
+        e.apply_key(DeleteWordForward);
+        assert_eq!(e.text(), ".bar");
+        assert_eq!(e.cursor(), 0);
+        e.apply_key(DeleteWordForward);
+        assert_eq!(e.text(), "");
+        assert_eq!(e.cursor(), 0);
+        e.apply_key(DeleteWordForward);
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn delete_word_forward_removes_the_selection_when_there_is_one() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3);
+        e.apply_key(DeleteWordForward);
+        assert_eq!(e.text(), ".txt");
+        assert_eq!(e.selection(), (0, 0));
+    }
+
+    #[test]
+    fn delete_word_backward_is_char_indexed_for_multibyte() {
+        let mut e = TextFieldEditor::new("café bar");
+        e.apply_key(DeleteWordBackward);
+        assert_eq!(e.text(), "café ");
+    }
+
+    // MARK: - extend_to (drag-select)
+
+    #[test]
+    fn extend_to_moves_the_caret_and_keeps_the_anchor() {
+        let mut e = TextFieldEditor::new("foo bar baz");
+        e.place_cursor(2); // anchor + caret at 2
+        e.extend_to(6);
+        assert_eq!(e.selection(), (2, 6));
+        assert_eq!(e.cursor(), 6);
+        assert!(e.has_selection());
+        // Dragging back past the anchor flips the ordered range, anchor fixed.
+        e.extend_to(0);
+        assert_eq!(e.selection(), (0, 2));
+        assert_eq!(e.cursor(), 0);
+    }
+
+    #[test]
+    fn extend_to_clamps_past_the_end() {
+        let mut e = TextFieldEditor::new("abc");
+        e.place_cursor(1);
+        e.extend_to(99);
+        assert_eq!(e.selection(), (1, 3));
+    }
+
+    #[test]
+    fn extend_to_back_onto_the_anchor_collapses_the_selection() {
+        let mut e = TextFieldEditor::new("abc");
+        e.place_cursor(1);
+        e.extend_to(3);
+        e.extend_to(1);
+        assert_eq!(e.selection(), (1, 1));
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn extend_to_then_type_replaces_the_dragged_range() {
+        let mut e = TextFieldEditor::new("foo bar");
+        e.place_cursor(0);
+        e.extend_to(3);
+        e.apply_key(Char('X'));
+        assert_eq!(e.text(), "X bar");
     }
 
     // MARK: - preselect_len

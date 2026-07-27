@@ -7,7 +7,9 @@
 //! Every field is backed by the pure [`nice_model::file_browser::TextFieldEditor`]
 //! (`{text, cursor, selection}` over char offsets): printable input inserts at the
 //! caret, Backspace/Delete edit at the caret, Left/Right move it, Shift+Arrow
-//! extends the selection, ⌘A selects all, and a click repositions the caret. The
+//! extends the selection, ⌥Arrow moves by word and ⌘Arrow to the text edges
+//! (both composing with Shift), ⌥Delete deletes a word, ⌘A selects all, a
+//! click repositions the caret, and a press-and-drag selects a range. The
 //! *commit* semantics differ per caller ([`nice_model::TabModel::rename_tab`] vs
 //! [`nice_model::TabModel::rename_pane`] vs the file-browser's validate+modal
 //! path), so the key handler and the click handler are injected — this module
@@ -22,12 +24,15 @@
 //! Esc action; the pill's own key listener), the replacement for the DO-NOT-PORT
 //! `NSEvent` cancel monitor. That must still fire, so the field never consumes it.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, px, App, FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Rgba, SharedString, Styled, TextRun, Window,
+    canvas, div, fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId,
+    FocusHandle, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    ParentElement, Pixels, Rgba, ShapedLine, SharedString, Style, Styled, TextAlign, TextRun,
+    Window,
 };
 
 use nice_model::file_browser::{char_index_for_x, TextFieldEditor, TextFieldKey};
@@ -52,11 +57,19 @@ pub(crate) enum RenameKeyOutcome {
 /// rule is unit-tested in [`nice_model::file_browser::text_field`]:
 ///
 /// * Return/Enter → [`RenameKeyOutcome::Commit`] (editor untouched).
-/// * Backspace / Delete → delete at the caret (or the selection).
-/// * Left / Right (with Shift → extend) → move / extend the caret.
+/// * Backspace / Delete → delete at the caret (or the selection);
+///   with ⌥ → delete the previous / next word.
+/// * Left / Right (with Shift → extend) → move / extend the caret;
+///   with ⌥ → by a word, with ⌘ → to the start / end of the text.
 /// * ⌘A → select all.
 /// * a bare printable char (no ⌘/⌃, a non-control `key_char`) → insert at the caret.
 /// * anything else (Escape, ⌘-chords) → [`RenameKeyOutcome::Ignored`].
+///
+/// `alt` is the Option modifier. ⌘ wins over ⌥ on the arrows (a ⌘⌥ chord jumps
+/// to the line edge), and Shift composes with either. ⌥ is deliberately NOT part
+/// of the printable-insert gate below: Option+letter arrives as a composed
+/// `key_char` (⌥a → `å`) and must keep inserting — only the arrow/delete chords
+/// above are intercepted.
 ///
 /// `capslock` is the live Caps-Lock state (read from `window.capslock().on` — it
 /// is NOT carried in `keystroke.modifiers`). GPUI's macOS backend builds
@@ -69,6 +82,7 @@ pub(crate) fn dispatch_rename_key(
     key: &str,
     key_char: Option<&str>,
     shift: bool,
+    alt: bool,
     platform_mod: bool,
     control_mod: bool,
     capslock: bool,
@@ -76,26 +90,40 @@ pub(crate) fn dispatch_rename_key(
     match key {
         "enter" | "return" => RenameKeyOutcome::Commit,
         "backspace" => {
-            editor.apply_key(TextFieldKey::Backspace);
+            editor.apply_key(if alt {
+                TextFieldKey::DeleteWordBackward
+            } else {
+                TextFieldKey::Backspace
+            });
             RenameKeyOutcome::Edited
         }
         "delete" => {
-            editor.apply_key(TextFieldKey::ForwardDelete);
+            editor.apply_key(if alt {
+                TextFieldKey::DeleteWordForward
+            } else {
+                TextFieldKey::ForwardDelete
+            });
             RenameKeyOutcome::Edited
         }
         "left" => {
-            editor.apply_key(if shift {
-                TextFieldKey::ShiftLeft
-            } else {
-                TextFieldKey::Left
+            editor.apply_key(match (platform_mod, alt, shift) {
+                (true, _, true) => TextFieldKey::ShiftLineStart,
+                (true, _, false) => TextFieldKey::LineStart,
+                (false, true, true) => TextFieldKey::ShiftWordLeft,
+                (false, true, false) => TextFieldKey::WordLeft,
+                (false, false, true) => TextFieldKey::ShiftLeft,
+                (false, false, false) => TextFieldKey::Left,
             });
             RenameKeyOutcome::Edited
         }
         "right" => {
-            editor.apply_key(if shift {
-                TextFieldKey::ShiftRight
-            } else {
-                TextFieldKey::Right
+            editor.apply_key(match (platform_mod, alt, shift) {
+                (true, _, true) => TextFieldKey::ShiftLineEnd,
+                (true, _, false) => TextFieldKey::LineEnd,
+                (false, true, true) => TextFieldKey::ShiftWordRight,
+                (false, true, false) => TextFieldKey::WordRight,
+                (false, false, true) => TextFieldKey::ShiftRight,
+                (false, false, false) => TextFieldKey::Right,
             });
             RenameKeyOutcome::Edited
         }
@@ -145,32 +173,27 @@ pub(crate) fn apply_rename_click(editor: &mut TextFieldEditor, index: usize, cli
     }
 }
 
-/// The active field's text split at its selection so the caller renders a caret
-/// (collapsed) or a highlighted range plus pre/post text.
+/// The active field's text plus its selection, as the render pass needs them:
+/// ONE string (shaped once at paint) and the selected range as char offsets.
+///
+/// This deliberately is not a pre/sel/post split anymore. The field used to
+/// render three sibling text divs and measure clicks against a fourth,
+/// separately-shaped copy of the string — two measurements that could (and did)
+/// disagree. See [`rename_field`].
 #[derive(Clone)]
-pub(crate) struct EditSpans {
-    pub(crate) pre: String,
-    pub(crate) sel: String,
-    pub(crate) post: String,
-    pub(crate) collapsed: bool,
+pub(crate) struct FieldText {
+    /// The full field text.
+    pub(crate) text: String,
+    /// The selection as `(start, end)` char offsets, `start <= end`. A collapsed
+    /// range (`start == end`) is the caret.
+    pub(crate) sel: (usize, usize),
 }
 
-impl EditSpans {
-    /// The full field text (pre + sel + post) — what the click hit-test shapes.
-    fn full_text(&self) -> String {
-        format!("{}{}{}", self.pre, self.sel, self.post)
-    }
-}
-
-/// Split an editor's text at its selection for rendering.
-pub(crate) fn edit_spans(editor: &TextFieldEditor) -> EditSpans {
-    let text: Vec<char> = editor.text().chars().collect();
-    let (s, e) = editor.selection();
-    EditSpans {
-        pre: text[..s].iter().collect(),
-        sel: text[s..e].iter().collect(),
-        post: text[e..].iter().collect(),
-        collapsed: s == e,
+/// The editor's text + selection, ready to render.
+pub(crate) fn field_text(editor: &TextFieldEditor) -> FieldText {
+    FieldText {
+        text: editor.text(),
+        sel: editor.selection(),
     }
 }
 
@@ -187,179 +210,419 @@ pub(crate) struct FieldColors {
     pub(crate) selection: Rgba,
 }
 
-/// The field's painted geometry, written by two layout probes each paint:
+/// The field's painted geometry, written by the field's own paint pass. It is
+/// the ONE measurement of the field's text: the caret bar, the selection
+/// highlight, and the click hit-test all read it, so they cannot disagree.
 ///
-/// * `text_left` — the TEXT RUN's left edge in window coordinates. The probe
-///   sits inside the padding-less, border-less text row, so its box left IS the
-///   x that glyph offsets are measured from. This is what the click hit-test
-///   subtracts. (Probing the outer FIELD box here was the click off-by-one bug:
-///   taffy positions an `absolute().inset_0()` child relative to its direct
-///   parent's box inside the border, so a probe on the field recorded
-///   `text_left − 6px` — the field's horizontal padding — and every click read
-///   ~6px right, one narrow glyph.)
-/// * `field_left` — the outer field box's probe, kept so scenarios can
-///   cross-check the two probes against each other: `text_left − field_left`
-///   must equal the field's horizontal padding (6px), which catches a
-///   regression to the field-box bias without trusting either probe alone.
-#[derive(Clone, Copy, Default)]
+/// * `text_left` — the TEXT RUN's left edge in window coordinates: the bounds
+///   the text element was actually laid out at, so its left IS the x glyph
+///   offsets are measured from. This is what the click hit-test subtracts.
+///   (Probing the outer FIELD box here was the click off-by-one bug: taffy
+///   positions an `absolute().inset_0()` child relative to its direct parent's
+///   box inside the border, so a probe on the field recorded `text_left − 6px`
+///   — the field's horizontal padding — and every click read ~6px right, one
+///   narrow glyph.)
+/// * `boundaries` — the x-offset (from `text_left`) of every char boundary
+///   `0..=n`, measured by shaping the field text ONCE during paint with the text
+///   style resolved at the element (`Window::text_style()` inside prepaint), the
+///   very style the glyphs are then painted with.
+/// * `field_left` / `field_top` / `field_height` — the outer field box's probe.
+///   `field_left` is kept so scenarios can cross-check the two probes against
+///   each other: `text_left − field_left` must equal the field's horizontal
+///   padding (6px), which catches a regression to the field-box bias without
+///   trusting either probe alone. `field_top` + `field_height` give the box's
+///   vertical band, which is what a live scenario needs to aim a REAL
+///   (CG-global) mouse press at the field: the boundary table supplies the x,
+///   this supplies the y.
+/// * `drag` — the live drag-select (Bug B), `Some(index)` between the press
+///   that armed it and the release that ends it, holding the boundary the last
+///   mouse-move extended to (so a move within the same glyph re-notifies
+///   nobody). This is state, not geometry, but it belongs in the same cell: it
+///   is the one thing that has to survive from the press (a mouse handler) to
+///   the moves (window listeners re-registered by the NEXT paint), and the cell
+///   is exactly the per-field paint↔mouse channel that outlives both.
+///
+/// Empty `boundaries` means "not painted yet" — every reader treats that as
+/// boundary 0, since no click can reach a field that has never been drawn.
+#[derive(Clone, Default)]
 pub(crate) struct FieldProbe {
     pub(crate) field_left: f32,
+    pub(crate) field_top: f32,
+    pub(crate) field_height: f32,
     pub(crate) text_left: f32,
+    pub(crate) boundaries: Vec<f32>,
+    pub(crate) drag: Option<usize>,
 }
 
-/// Map a click at window-x `click_x` to a char-boundary index into `text`, using
-/// the window's text system to measure each glyph advance at `text_size`.
-/// `text_left` is the text's left edge in window coordinates (captured by the
-/// field's layout probe). Rounds to the nearest boundary via the pure
-/// [`char_index_for_x`]; a click past the trailing edge lands the caret at the
-/// end.
-pub(crate) fn char_index_for_click(
-    window: &Window,
-    text: &str,
-    text_size: f32,
-    text_left: f32,
-    click_x: f32,
-) -> usize {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return 0;
-    }
-    // Shape the field text with the window's base font at the field's size (color
-    // is irrelevant to advances). One run: the field is single-font, single-size.
-    let run = TextRun {
-        len: text.len(),
-        font: window.text_style().font(),
-        color: Hsla::default(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let line = window
-        .text_system()
-        .shape_line(SharedString::from(text.to_string()), px(text_size), &[run], None);
-    // Boundary x for each char index 0..=n (byte offset → x). `x_for_index` takes
-    // a UTF-8 byte offset, so accumulate byte lengths for multi-byte names.
-    let mut boundaries: Vec<f32> = Vec::with_capacity(chars.len() + 1);
-    boundaries.push(0.0);
-    let mut byte = 0usize;
-    for ch in &chars {
-        byte += ch.len_utf8();
-        boundaries.push(f32::from(line.x_for_index(byte)));
-    }
-    char_index_for_x(&boundaries, click_x - text_left)
+/// The shared per-field paint→mouse channel: the field's paint writes it, the
+/// field's mouse handler and the scenario seams read it.
+pub(crate) type FieldProbeCell = Rc<RefCell<FieldProbe>>;
+
+/// A fresh, unpainted probe cell (one per rename-capable view).
+pub(crate) fn field_probe_cell() -> FieldProbeCell {
+    Rc::new(RefCell::new(FieldProbe::default()))
+}
+
+/// Put the cell back to "not painted yet". Every rename-BEGIN must call this,
+/// because the cell is per-VIEW, not per-edit: it outlives every field it has
+/// ever measured, so without a reset a new edit starts on the PREVIOUS edit's
+/// numbers.
+///
+/// The arm that makes this a correctness fix rather than tidiness is
+/// [`FieldProbe::drag`]. Ending an edit while the button is still held (Escape
+/// mid-drag) kills the window listeners with the field, so the release is never
+/// observed and `drag` stays `Some(stale)`. The move handler's self-heal only
+/// disarms on a move with the button NOT pressed; if the next edit in the same
+/// view begins from a press the user is still holding, the new field's first
+/// paint registers its move listener over that stale arm and the very next
+/// held-button move extends the fresh editor — clobbering the basename
+/// preselection with a drag nobody started. Resetting at begin removes the
+/// window entirely. The stale `boundaries` are the same story one step milder:
+/// a click before the new field's first paint would hit-test against the old
+/// name's glyph table.
+pub(crate) fn reset_field_probe(probe: &FieldProbeCell) {
+    *probe.borrow_mut() = FieldProbe::default();
+}
+
+/// Map a click at window-x `click_x` to a char-boundary index, against the
+/// boundary table the field's last paint recorded. Rounds to the nearest
+/// boundary via the pure [`char_index_for_x`]; a click past the trailing edge
+/// lands the caret at the end.
+pub(crate) fn char_index_for_click(probe: &FieldProbe, click_x: f32) -> usize {
+    char_index_for_x(&probe.boundaries, click_x - probe.text_left)
 }
 
 /// The x-offset (from the text's left edge, in pixels) of char-boundary `index`
-/// in `text` at `text_size` — the inverse of [`char_index_for_click`]. Used by
-/// self-test scenarios to synthesize a click at a known boundary and assert the
-/// hit-test round-trips.
-pub(crate) fn char_boundary_x(window: &Window, text: &str, text_size: f32, index: usize) -> f32 {
-    let run = TextRun {
-        len: text.len(),
-        font: window.text_style().font(),
-        color: Hsla::default(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let line = window
-        .text_system()
-        .shape_line(SharedString::from(text.to_string()), px(text_size), &[run], None);
-    let byte: usize = text.chars().take(index).map(char::len_utf8).sum();
-    f32::from(line.x_for_index(byte))
+/// as the field last PAINTED it — the inverse of [`char_index_for_click`], and
+/// the same numbers the caret and selection are drawn from. `None` when the
+/// field has not painted yet or `index` is past the end. Used by self-test
+/// scenarios to synthesize a click at a known boundary.
+pub(crate) fn char_boundary_x(probe: &FieldProbe, index: usize) -> Option<f32> {
+    probe.boundaries.get(index).copied()
+}
+
+/// The field's text run: shapes the whole name ONCE per paint with the text
+/// style resolved at this point in the element tree, paints those glyphs, and
+/// paints the caret bar / selection highlight as overlays measured from that
+/// same shaping — then publishes the boundary table into [`FieldProbe`] so the
+/// click hit-test reads the very numbers that were drawn.
+///
+/// This replaced a pre/sel/post split across three sibling text divs whose
+/// clicks were hit-tested against a FOURTH shaping done in the mouse handler
+/// with the WINDOW BASE style. Measured on the real element (the
+/// `visual_rename_caret` pixel gate, `WWWWiiiimmmm-1234567890.txt` at 14pt):
+/// with an ancestor font family set — the toolbar pill and sidebar tab
+/// configuration — the painted caret sat 2.9px off the clicked x at boundary 9
+/// and 10.1px off at boundary 23 (avg advance 8.3px), i.e. the error grew with
+/// the prefix, exactly the reported drift. Shaping once at paint makes both
+/// numbers a sub-pixel rounding difference.
+struct RenameTextElement {
+    text: SharedString,
+    /// Selection as char offsets (collapsed ⇒ caret).
+    sel: (usize, usize),
+    color: Rgba,
+    caret: Rgba,
+    selection: Rgba,
+    probe: FieldProbeCell,
+}
+
+/// What [`RenameTextElement`]'s prepaint hands to its paint: the shaped line and
+/// the caret/selection quads measured from it.
+struct RenameTextPrepaint {
+    line: Option<ShapedLine>,
+    selection: Option<PaintQuad>,
+    caret: Option<PaintQuad>,
+}
+
+impl IntoElement for RenameTextElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for RenameTextElement {
+    type RequestLayoutState = ();
+    type PrepaintState = RenameTextPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        // The row is one line tall in the INHERITED line height — what the three
+        // text divs used to resolve to, so the sidebar tab's line-height wrapper
+        // (`sidebar_shell.rs`) still sizes the editing row exactly as before.
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        // THE measurement: the style resolved right here, mid-paint — family,
+        // weight, features and size as the glyphs below will be drawn with, not
+        // the window base style a mouse handler would have seen.
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let run = TextRun {
+            len: self.text.len(),
+            font: style.font(),
+            color: Hsla::from(self.color),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(self.text.clone(), font_size, &[run], None);
+
+        // Boundary x for each char index 0..=n. `x_for_index` takes a UTF-8 byte
+        // offset, so accumulate byte lengths for multi-byte names.
+        let mut boundaries: Vec<f32> = Vec::with_capacity(self.text.chars().count() + 1);
+        boundaries.push(0.0);
+        let mut byte = 0usize;
+        for ch in self.text.chars() {
+            byte += ch.len_utf8();
+            boundaries.push(f32::from(line.x_for_index(byte)));
+        }
+        {
+            let mut probe = self.probe.borrow_mut();
+            probe.text_left = f32::from(bounds.origin.x);
+            probe.boundaries.clone_from(&boundaries);
+        }
+        let boundary_x = |i: usize| px(boundaries.get(i).copied().unwrap_or(0.0));
+
+        let (start, end) = self.sel;
+        let (selection, caret) = if start == end {
+            // Caret: a thin full-alpha accent bar at the cursor (a selection tint
+            // is invisible at 1px), centred on the line box like the glyphs.
+            let h = font_size + px(1.0);
+            let y = bounds.origin.y + (bounds.size.height - h) / 2.0;
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.origin.x + boundary_x(start), y),
+                        size(px(1.0), h),
+                    ),
+                    self.caret,
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(bounds.origin.x + boundary_x(start), bounds.origin.y),
+                        point(
+                            bounds.origin.x + boundary_x(end),
+                            bounds.origin.y + bounds.size.height,
+                        ),
+                    ),
+                    self.selection,
+                )),
+                None,
+            )
+        };
+        RenameTextPrepaint {
+            line: Some(line),
+            selection,
+            caret,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Highlight first (behind the glyphs), then the text, then the caret bar
+        // on top of it.
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        if let Some(line) = prepaint.line.take() {
+            let _ = line.paint(
+                bounds.origin,
+                bounds.size.height,
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
+        if let Some(caret) = prepaint.caret.take() {
+            window.paint_quad(caret);
+        }
+    }
 }
 
 /// The shared inline-rename field element: a focused, bordered box rendering the
-/// editor's `spans` (pre text, then a caret or a highlighted selection, then post
-/// text), wired to `on_key` and to a click handler that repositions the caret.
+/// editor's `text` with a caret or a selection highlight, wired to `on_key` and
+/// to a click handler that repositions the caret.
 ///
-/// * `probe` is a per-field cell two layout probes write each paint (see
-///   [`FieldProbe`]); the click handler reads `text_left` from it to turn a
-///   window-x into a text-relative offset.
+/// * `probe` is a per-field cell the field's paint writes (see [`FieldProbe`]);
+///   the click handler reads `text_left` + `boundaries` back out of it, so the
+///   hit-test measures the glyphs that were actually drawn.
 /// * `on_key` is the caller's key handler (built with `cx.listener` / a weak
 ///   entity); it dispatches through [`dispatch_rename_key`] and commits/cancels.
 /// * `on_click_index` receives the hit-tested char index and the click count; the
 ///   caller applies it via [`apply_rename_click`] (single click places the caret,
 ///   double selects the word, triple selects all) and re-grabs field focus.
+/// * `on_click_index`'s drag-select sibling `on_drag_index` receives the char
+///   index each mouse-move lands on while a drag-select is live; the caller
+///   `extend_to`s the editor and `cx.notify()`s (see the drag-select section
+///   below). It is a separate callback precisely so the click contract above
+///   stays a single click policy: a drag never re-runs the 1/2/3-click mapping.
 ///
 /// The click handler `stop_propagation`s so the press never reaches the row / tab
 /// / pill mouse handler beneath it — the fix for "a click inside the field
-/// restarts the edit". The pointer shows the text I-beam over the whole field.
+/// restarts the edit", and what keeps a drag-select from arming the row's / tab's
+/// / pill's own drag: a press those handlers never see arms nothing (the
+/// file-browser row's `on_drag` file-drag source is additionally suppressed
+/// outright while editing). The pointer shows the text I-beam over the whole
+/// field.
+///
+/// ## Drag-select (press, move with the button held, release)
+///
+/// A single press arms the drag by recording the pressed boundary in
+/// [`FieldProbe::drag`]; every subsequent mouse-move hit-tests against the SAME
+/// paint-recorded boundary table the press used and hands the new index to
+/// `on_drag_index`. The move/up listeners are registered at WINDOW level (not on
+/// the field's own div, whose `on_mouse_move` fires only while the pointer is
+/// inside its bounds) so the selection keeps extending when the pointer leaves
+/// the small field horizontally — the gpui `input.rs` example's `is_selecting`
+/// pattern, with the window-level registration it needs because this field is a
+/// leaf element the size of one row.
+///
+/// Teardown is structural: window mouse listeners live for exactly one frame, so
+/// they are re-registered by every paint of the field and simply cease to exist
+/// the frame after the field stops being rendered (commit / cancel / blur). No
+/// handler outlives the edit, which is why ending an edit mid-drag cannot mutate
+/// a model that is no longer being shown.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rename_field(
     focus: &FocusHandle,
-    spans: &EditSpans,
+    text: &FieldText,
     key_context: &'static str,
     colors: FieldColors,
     text_size: f32,
-    probe: Rc<Cell<FieldProbe>>,
+    probe: FieldProbeCell,
     on_key: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
     on_click_index: impl Fn(usize, usize, &mut Window, &mut App) + 'static,
+    on_drag_index: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    // Text-run probe: an absolute inset-0 canvas inside the padding-less,
-    // border-less text row — taffy resolves it against the row's own box, whose
-    // left edge IS the first glyph's x origin (see [`FieldProbe::text_left`]).
-    let text_capture = probe.clone();
-    let text_probe = canvas(
-        |_, _, _| (),
-        move |bounds, _, _, _| {
-            text_capture.set(FieldProbe {
-                text_left: f32::from(bounds.origin.x),
-                ..text_capture.get()
-            })
-        },
-    )
-    .absolute()
-    .inset_0();
-
-    let mut text_row = div()
-        .relative()
+    let text_row = div()
         .flex()
         .flex_row()
         .items_center()
-        .child(text_probe)
-        .child(
-            div()
-                .text_size(px(text_size))
-                .text_color(colors.text)
-                .child(SharedString::from(spans.pre.clone())),
-        );
-    if spans.collapsed {
-        // Caret: a thin full-alpha accent bar at the cursor (a selection tint is
-        // invisible at 1px).
-        text_row = text_row.child(div().w(px(1.0)).h(px(text_size + 1.0)).bg(colors.caret));
-    } else {
-        text_row = text_row.child(
-            div()
-                .bg(colors.selection)
-                .text_size(px(text_size))
-                .text_color(colors.text)
-                .child(SharedString::from(spans.sel.clone())),
-        );
-    }
-    text_row = text_row.child(
-        div()
-            .text_size(px(text_size))
-            .text_color(colors.text)
-            .child(SharedString::from(spans.post.clone())),
-    );
+        .flex_1()
+        // The field pins its own size and colour; family / weight / line height
+        // still cascade from the call site (the pill and the sidebar tab set the
+        // terminal family on an ancestor), and the element below shapes with
+        // whatever this resolves to.
+        .text_size(px(text_size))
+        .text_color(colors.text)
+        .child(RenameTextElement {
+            text: SharedString::from(text.text.clone()),
+            sel: text.sel,
+            color: colors.text,
+            caret: colors.caret,
+            selection: colors.selection,
+            probe: probe.clone(),
+        });
 
-    // Field-box probe: the scenario's independent cross-check anchor (see
-    // [`FieldProbe::field_left`]). NOT used by the click hit-test.
-    let field_capture = probe.clone();
-    let field_probe = canvas(
+    // Two things that can only happen in the PAINT phase, on one zero-cost
+    // overlay: the field-box probe (the scenario's independent cross-check
+    // anchor — see [`FieldProbe::field_left`]; NOT used by the click hit-test),
+    // and the window-level drag-select tracking. `Window::on_mouse_event` is
+    // paint-only and its listeners are cleared after the next frame, so
+    // registering here means they exist for exactly as long as the field is
+    // drawn — that IS the teardown on commit/cancel/blur.
+    let overlay_probe = probe.clone();
+    let paint_overlay = canvas(
         |_, _, _| (),
-        move |bounds, _, _, _| {
-            field_capture.set(FieldProbe {
-                field_left: f32::from(bounds.origin.x),
-                ..field_capture.get()
-            })
+        move |bounds, _, window, _| {
+            // 1. Scenario probe: the field-box geometry cross-check anchor.
+            {
+                let mut p = overlay_probe.borrow_mut();
+                p.field_left = f32::from(bounds.origin.x);
+                p.field_top = f32::from(bounds.origin.y);
+                p.field_height = f32::from(bounds.size.height);
+            }
+
+            // 2. Drag-select tracking (PRODUCTION behavior — do not remove with
+            // the probe above). Extend the selection while the button is held.
+            // Capture phase, so a bubble-phase handler that consumes the move
+            // cannot starve the drag; it never consumes the event itself (hover
+            // keeps working).
+            let move_probe = overlay_probe.clone();
+            window.on_mouse_event(
+                move |e: &MouseMoveEvent, phase, window: &mut Window, app: &mut App| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let mut p = move_probe.borrow_mut();
+                    let Some(last) = p.drag else {
+                        return;
+                    };
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        // The press ended somewhere this field never saw (the
+                        // edit closed mid-drag, say). Self-heal so a stale arm
+                        // can never extend a LATER edit's selection.
+                        p.drag = None;
+                        return;
+                    }
+                    let idx = char_index_for_click(&p, f32::from(e.position.x));
+                    if idx == last {
+                        return;
+                    }
+                    p.drag = Some(idx);
+                    drop(p);
+                    on_drag_index(idx, window, app);
+                },
+            );
+
+            // Any left release ends the drag, wherever it lands — capture phase
+            // for the same reason: disarming must not depend on the release
+            // surviving to the bubble phase.
+            let up_probe = overlay_probe.clone();
+            window.on_mouse_event(
+                move |e: &MouseUpEvent, phase, _window: &mut Window, _app: &mut App| {
+                    if phase == DispatchPhase::Capture && e.button == MouseButton::Left {
+                        up_probe.borrow_mut().drag = None;
+                    }
+                },
+            );
         },
     )
     .absolute()
     .inset_0();
 
-    let full_text = spans.full_text();
     div()
         .track_focus(focus)
         .key_context(key_context)
@@ -373,16 +636,19 @@ pub(crate) fn rename_field(
         .border_color(colors.border)
         .cursor_text()
         .child(text_row)
-        .child(field_probe)
+        .child(paint_overlay)
         .on_key_down(on_key)
         .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, app| {
-            let idx = char_index_for_click(
-                window,
-                &full_text,
-                text_size,
-                probe.get().text_left,
-                f32::from(e.position.x),
-            );
+            let idx = {
+                let mut p = probe.borrow_mut();
+                let idx = char_index_for_click(&p, f32::from(e.position.x));
+                // Only a SINGLE press arms a drag-select. Extending from a
+                // double/triple click would collapse the word / select-all the
+                // moment the pointer twitched, and word-wise extension from a
+                // double-click is deliberately out of scope.
+                p.drag = (e.click_count == 1).then_some(idx);
+                idx
+            };
             on_click_index(idx, e.click_count, window, app);
             // Swallow the press so the row / tab / pill handler beneath never sees
             // it — otherwise the click would re-trip the begin-rename gate.
@@ -394,6 +660,9 @@ pub(crate) fn rename_field(
 mod tests {
     use super::*;
 
+    // In every `dispatch_rename_key` call below the trailing bools are, in
+    // order: `shift, alt, platform_mod, control_mod, capslock`.
+
     fn ed(text: &str) -> TextFieldEditor {
         TextFieldEditor::new(text)
     }
@@ -402,7 +671,7 @@ mod tests {
     fn enter_requests_a_commit_without_touching_the_editor() {
         let mut e = ed("hello");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "enter", None, false, false, false, false),
+            dispatch_rename_key(&mut e, "enter", None, false, false, false, false, false),
             RenameKeyOutcome::Commit
         ));
         assert_eq!(e.text(), "hello");
@@ -411,9 +680,9 @@ mod tests {
     #[test]
     fn a_bare_printable_char_inserts_at_the_caret() {
         let mut e = ed("ac");
-        dispatch_rename_key(&mut e, "left", None, false, false, false, false); // caret between a,c
+        dispatch_rename_key(&mut e, "left", None, false, false, false, false, false); // caret between a,c
         assert!(matches!(
-            dispatch_rename_key(&mut e, "b", Some("b"), false, false, false, false),
+            dispatch_rename_key(&mut e, "b", Some("b"), false, false, false, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "abc");
@@ -422,37 +691,117 @@ mod tests {
     #[test]
     fn backspace_and_forward_delete_edit_at_the_caret() {
         let mut e = ed("abc");
-        dispatch_rename_key(&mut e, "backspace", None, false, false, false, false);
+        dispatch_rename_key(&mut e, "backspace", None, false, false, false, false, false);
         assert_eq!(e.text(), "ab");
-        dispatch_rename_key(&mut e, "left", None, false, false, false, false);
-        dispatch_rename_key(&mut e, "delete", None, false, false, false, false);
+        dispatch_rename_key(&mut e, "left", None, false, false, false, false, false);
+        dispatch_rename_key(&mut e, "delete", None, false, false, false, false, false);
         assert_eq!(e.text(), "a");
     }
 
     #[test]
     fn left_right_move_and_shift_extends() {
         let mut e = ed("abc"); // caret at 3
-        dispatch_rename_key(&mut e, "left", None, false, false, false, false);
+        dispatch_rename_key(&mut e, "left", None, false, false, false, false, false);
         assert_eq!(e.cursor(), 2);
-        dispatch_rename_key(&mut e, "left", None, true, false, false, false); // shift+left extends
+        dispatch_rename_key(&mut e, "left", None, true, false, false, false, false); // shift+left extends
         assert_eq!(e.selection(), (1, 2));
-        dispatch_rename_key(&mut e, "right", None, false, false, false, false); // collapse to right edge
+        dispatch_rename_key(&mut e, "right", None, false, false, false, false, false); // collapse to right edge
         assert_eq!(e.cursor(), 2);
         assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn option_arrows_move_by_word_and_shift_extends() {
+        let mut e = ed("foo.bar"); // caret at 7
+        assert!(matches!(
+            dispatch_rename_key(&mut e, "left", None, false, true, false, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.cursor(), 4);
+        dispatch_rename_key(&mut e, "left", None, false, true, false, false, false);
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+
+        dispatch_rename_key(&mut e, "right", None, false, true, false, false, false);
+        assert_eq!(e.cursor(), 3);
+
+        // ⌥⇧ extends instead of moving.
+        dispatch_rename_key(&mut e, "right", None, true, true, false, false, false);
+        assert_eq!(e.selection(), (3, 7));
+        dispatch_rename_key(&mut e, "left", None, true, true, false, false, false);
+        assert_eq!(e.selection(), (3, 4));
+    }
+
+    #[test]
+    fn command_arrows_jump_to_the_text_edges_and_shift_extends() {
+        let mut e = ed("foo.bar");
+        dispatch_rename_key(&mut e, "left", None, false, false, true, false, false);
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+        dispatch_rename_key(&mut e, "right", None, false, false, true, false, false);
+        assert_eq!(e.cursor(), 7);
+
+        let mut e2 = ed("foo.bar");
+        dispatch_rename_key(&mut e2, "left", None, true, false, true, false, false);
+        assert_eq!(e2.selection(), (0, 7));
+
+        let mut e3 = ed("foo.bar");
+        dispatch_rename_key(&mut e3, "left", None, false, false, true, false, false);
+        dispatch_rename_key(&mut e3, "right", None, true, false, true, false, false);
+        assert_eq!(e3.selection(), (0, 7));
+    }
+
+    #[test]
+    fn command_wins_over_option_on_the_arrows() {
+        // A ⌘⌥← chord jumps to the line start, not one word left.
+        let mut e = ed("foo.bar");
+        dispatch_rename_key(&mut e, "left", None, false, true, true, false, false);
+        assert_eq!(e.cursor(), 0);
+    }
+
+    #[test]
+    fn option_delete_keys_delete_by_word() {
+        let mut e = ed("foo.bar"); // caret at 7
+        assert!(matches!(
+            dispatch_rename_key(&mut e, "backspace", None, false, true, false, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.text(), "foo.");
+
+        let mut e2 = ed("foo.bar");
+        dispatch_rename_key(&mut e2, "left", None, false, false, true, false, false); // caret to 0
+        dispatch_rename_key(&mut e2, "delete", None, false, true, false, false, false);
+        assert_eq!(e2.text(), ".bar");
+    }
+
+    #[test]
+    fn option_composed_characters_still_insert() {
+        // ⌥a arrives as key "a" with a composed key_char "å" — the alt chords
+        // above must not swallow it (the printable fall-through gates on ⌘/⌃
+        // only).
+        let mut e = ed("");
+        assert!(matches!(
+            dispatch_rename_key(&mut e, "a", Some("å"), false, true, false, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.text(), "å");
+        // ⌥⇧o → "Ø", likewise.
+        dispatch_rename_key(&mut e, "o", Some("Ø"), true, true, false, false, false);
+        assert_eq!(e.text(), "åØ");
     }
 
     #[test]
     fn command_a_selects_all_but_command_other_is_ignored() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, true, false, false),
+            dispatch_rename_key(&mut e, "a", Some("a"), false, false, true, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.selection(), (0, 4));
 
         let mut e2 = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e2, "c", Some("c"), false, true, false, false),
+            dispatch_rename_key(&mut e2, "c", Some("c"), false, false, true, false, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e2.text(), "name");
@@ -462,7 +811,7 @@ mod tests {
     fn escape_is_ignored_so_the_owner_binding_cancels() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "escape", None, false, false, false, false),
+            dispatch_rename_key(&mut e, "escape", None, false, false, false, false, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
@@ -472,7 +821,7 @@ mod tests {
     fn a_control_chord_is_ignored() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, false, true, false),
+            dispatch_rename_key(&mut e, "a", Some("a"), false, false, false, true, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
@@ -484,7 +833,7 @@ mod tests {
         // must flip it to upper.
         let mut e = ed("");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, false, false, true),
+            dispatch_rename_key(&mut e, "a", Some("a"), false, false, false, false, true),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "A");
@@ -495,7 +844,7 @@ mod tests {
         // Shift already made key_char "A"; Caps Lock on top cancels it back to "a".
         let mut e = ed("");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("A"), true, false, false, true),
+            dispatch_rename_key(&mut e, "a", Some("A"), true, false, false, false, true),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "a");
@@ -504,8 +853,8 @@ mod tests {
     #[test]
     fn caps_lock_leaves_digits_and_punctuation_unchanged() {
         let mut e = ed("");
-        dispatch_rename_key(&mut e, "7", Some("7"), false, false, false, true);
-        dispatch_rename_key(&mut e, "-", Some("-"), false, false, false, true);
+        dispatch_rename_key(&mut e, "7", Some("7"), false, false, false, false, true);
+        dispatch_rename_key(&mut e, "-", Some("-"), false, false, false, false, true);
         assert_eq!(e.text(), "7-");
     }
 
@@ -532,16 +881,42 @@ mod tests {
     }
 
     #[test]
-    fn edit_spans_split_a_selection() {
+    fn field_text_carries_the_whole_string_and_the_selection() {
+        // ONE string plus char offsets — the render pass shapes that string once
+        // and measures the highlight from those offsets (no pre/sel/post split).
         let mut e = TextFieldEditor::with_selection("foo.txt", 3);
-        let s = edit_spans(&e);
-        assert_eq!((s.pre.as_str(), s.sel.as_str(), s.post.as_str()), ("", "foo", ".txt"));
-        assert!(!s.collapsed);
-        assert_eq!(s.full_text(), "foo.txt");
+        let s = field_text(&e);
+        assert_eq!(s.text, "foo.txt");
+        assert_eq!(s.sel, (0, 3));
 
         e.place_cursor(2);
-        let c = edit_spans(&e);
-        assert!(c.collapsed);
-        assert_eq!((c.pre.as_str(), c.post.as_str()), ("fo", "o.txt"));
+        let c = field_text(&e);
+        assert_eq!(c.text, "foo.txt");
+        assert_eq!(c.sel, (2, 2));
+    }
+
+    #[test]
+    fn clicks_hit_test_against_the_paint_recorded_boundaries() {
+        // The probe stands in for a painted field: text at x=100 with four 10px
+        // glyph advances. Clicks round to the nearest boundary and clamp at both
+        // ends; `char_boundary_x` reads the same table back.
+        let probe = FieldProbe {
+            field_left: 94.0,
+            text_left: 100.0,
+            boundaries: vec![0.0, 10.0, 20.0, 30.0, 40.0],
+            ..FieldProbe::default()
+        };
+        assert_eq!(char_index_for_click(&probe, 100.0), 0);
+        assert_eq!(char_index_for_click(&probe, 124.0), 2);
+        assert_eq!(char_index_for_click(&probe, 126.0), 3);
+        assert_eq!(char_index_for_click(&probe, 0.0), 0); // left of the field
+        assert_eq!(char_index_for_click(&probe, 999.0), 4); // past the end
+        assert_eq!(char_boundary_x(&probe, 3), Some(30.0));
+        assert_eq!(char_boundary_x(&probe, 9), None);
+
+        // An unpainted field has no table: every click is boundary 0, no panic.
+        let blank = FieldProbe::default();
+        assert_eq!(char_index_for_click(&blank, 42.0), 0);
+        assert_eq!(char_boundary_x(&blank, 0), None);
     }
 }

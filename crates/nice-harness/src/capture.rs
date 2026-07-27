@@ -13,11 +13,18 @@
 //! scheduling) and would invalidate the live cadence assertions the same
 //! scenarios make. Capture runs against the REAL on-screen window.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpui::{AnyWindowHandle, AsyncApp};
 
 /// Capture the current rendered frame of `handle` to a PNG at `path`.
+///
+/// The encoding is PNG — that is the documented `NICE_CAPTURE` contract — and
+/// it does NOT depend on `path` carrying a recognised extension: `image`'s
+/// extension sniffing would otherwise fail an extensionless path with "The
+/// image format could not be determined", turning a capture request into a
+/// scenario FAILURE. A path whose extension names a different encoder the
+/// `image` build supports still gets that encoder.
 ///
 /// Without the `capture` feature the facility is not compiled, so this returns
 /// an actionable error instead of silently doing nothing.
@@ -28,7 +35,8 @@ pub fn capture_window_png(
     path: &Path,
 ) -> anyhow::Result<()> {
     let image = handle.update(cx, |_view, window, _app| window.render_to_image())??;
-    image.save(path)?;
+    let format = image::ImageFormat::from_path(path).unwrap_or(image::ImageFormat::Png);
+    image.save_with_format(path, format)?;
     Ok(())
 }
 
@@ -44,6 +52,55 @@ pub fn capture_window_png(
         "screenshot capture requires the `selftest` feature (gpui test-support); \
          rebuild crates/nice with `--features selftest`"
     )
+}
+
+/// The `NICE_CAPTURE` path requested for this run, if any.
+///
+/// The driver reads the same variable for its end-of-scenario capture; a
+/// scenario asks through here so a mid-scenario capture happens only when the
+/// operator actually requested one.
+pub fn requested_path() -> Option<PathBuf> {
+    std::env::var("NICE_CAPTURE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Capture a frame MID-scenario, while a transient UI state is still on screen.
+///
+/// The driver's own capture runs *after* a scenario's verdict, when the window
+/// shows its torn-down end state — so a state that exists only during the run
+/// (an open rename field, a menu, a drag) can never be spot-checked from it.
+/// A scenario calls this at the moment it wants recorded, and the frame lands
+/// beside the requested `NICE_CAPTURE` path as `<base>-<stage>.png`.
+///
+/// Returns `Ok(None)` when no capture was requested (the normal gate run) and
+/// `Ok(Some(path))` with what was written otherwise. A requested capture that
+/// fails is a scenario failure — report the error, exactly as the driver does.
+pub fn capture_stage(
+    handle: AnyWindowHandle,
+    cx: &mut AsyncApp,
+    stage: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(base) = requested_path() else {
+        return Ok(None);
+    };
+    let path = stage_path(&base, stage);
+    capture_window_png(handle, cx, &path)?;
+    Ok(Some(path))
+}
+
+/// `<base without its extension>-<stage>.png`, beside `base`.
+fn stage_path(base: &Path, stage: &str) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nice-capture");
+    let file = format!("{stem}-{stage}.png");
+    match base.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(file),
+        _ => PathBuf::from(file),
+    }
 }
 
 /// Read back straight `[r, g, b, a]` bytes at each given **logical** point of
@@ -100,4 +157,29 @@ pub fn sample_window_pixels(
         "pixel readback requires the `selftest` feature (gpui test-support); \
          rebuild crates/nice with `--features selftest`"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_path_appends_the_stage_and_always_ends_in_png() {
+        // The documented `NICE_CAPTURE=/tmp/nice-smoke.png` shape.
+        assert_eq!(
+            stage_path(Path::new("/tmp/nice-smoke.png"), "rename-caret"),
+            PathBuf::from("/tmp/nice-smoke-rename-caret.png")
+        );
+        // An EXTENSIONLESS base is legal (the driver's own capture PNG-encodes
+        // it) — the stage file still gets a .png so viewers open it.
+        assert_eq!(
+            stage_path(Path::new("/tmp/nice-plan1-capture"), "rename-selection"),
+            PathBuf::from("/tmp/nice-plan1-capture-rename-selection.png")
+        );
+        // A bare relative name has no parent directory to join onto.
+        assert_eq!(
+            stage_path(Path::new("shot.png"), "x"),
+            PathBuf::from("shot-x.png")
+        );
+    }
 }

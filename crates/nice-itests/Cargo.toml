@@ -66,12 +66,20 @@ anyhow = "1"
 # test-support for THIS crate's own exemplars only (never a normal dep — see the
 # header). Turns on `TestAppContext`/`VisualTestAppContext` + `render_to_image`.
 gpui = { path = "../../vendor/zed/crates/gpui", features = ["test-support"] }
-# The R10 pure sidebar state (selection / rename-gate / tab tree) the in-process
-# multi-select classification tests drive through simulated events. gpui-free +
-# used ONLY by this crate's own `#[cfg(test)]` `sidebar_multiselect` module (the
-# real `SidebarShellView` routing it mirrors lives in the `nice` binary, which a
-# dev/test crate cannot import — the same constraint the R9 `chrome_band` probe
-# has), so it is a dev-dependency, never a normal one.
+# The pure, gpui-free model half. Three test-only consumers, all of them here:
+#
+#   * this crate's own `#[cfg(test)]` `sidebar_multiselect` module — the R10
+#     sidebar state (selection / rename-gate / tab tree) the in-process
+#     multi-select classification tests drive through simulated events;
+#   * the `behavior_rename_drag` and `visual_rename_caret` test targets below,
+#     which `#[path]`-include the real `crates/nice/src/inline_rename.rs` (itself
+#     a `nice-model` consumer: `char_index_for_x` / `TextFieldEditor` /
+#     `TextFieldKey`) and name `TextFieldEditor` directly in their own fixtures.
+#
+# In every case the production code being pinned lives in the `nice` BINARY
+# crate, which a dev/test crate cannot depend on (the same constraint the R9
+# `chrome_band` probe has). Nothing in this crate's LIB needs it — so it is a
+# dev-dependency, never a normal one.
 nice-model = { path = "../nice-model" }
 # The real MacPlatform the visual exemplar wraps in a `VisualTestAppContext`
 # (`gpui_platform::current_platform(false)`), plus the `test-support` half that
@@ -94,4 +102,24 @@ test-support = ["gpui/test-support"]
 [[test]]
 name = "visual_terminal_screenshot"
 path = "tests/visual_terminal_screenshot.rs"
+harness = false
+
+# Bug B's regression gate: press → move → release drag-select driven through the
+# real field on the MOCKED context. An ordinary libtest target (default harness,
+# unlike its visual sibling below); listed explicitly only so the two rename
+# gates sit together. It `#[path]`-includes the same real
+# `crates/nice/src/inline_rename.rs` source, for the same reason.
+[[test]]
+name = "behavior_rename_drag"
+path = "tests/behavior_rename_drag.rs"
+
+# Bug C's regression gate: a real-window pixel check that the inline-rename
+# field's painted caret lands where the click landed. Same `harness = false`
+# main-thread shape as the exemplar above; it `#[path]`-includes the real
+# `crates/nice/src/inline_rename.rs` source (a dev/test crate cannot depend on
+# the `nice` BINARY crate, and gating a mirrored copy would prove nothing for
+# this bug — see the binary's header).
+[[test]]
+name = "visual_rename_caret"
+path = "tests/visual_rename_caret.rs"
 harness = false
