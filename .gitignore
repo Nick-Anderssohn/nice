@@ -48,6 +48,10 @@ scripts/.env.release
 /vendor
 # Cargo build output.
 /target/
+# Worktree-only cargo config written by scripts/worktree-link-vendor.sh:
+# redirects the worktree's target-dir to the main checkout's target/ so fresh
+# worktrees never cold-compile vendored gpui. The main checkout has no .cargo.
+/.cargo/
 # scripts/rust-bundle.sh output (the assembled "Nice RS Dev.app" bundle,
 # staged before scripts/rust-install.sh copies it to /Applications).
 /build-rs/

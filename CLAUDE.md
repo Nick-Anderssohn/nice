@@ -42,8 +42,15 @@ what tooling; both are now the Rust build.
 
 ## Running builds and tests
 
-- **Build:** `cargo build --workspace`. Uses the per-worktree `target/`
-  (no shared DerivedData), so a plain build needs no worktree lock.
+- **Build:** `cargo build --workspace`. Worktrees share the MAIN checkout's
+  `target/` (a gitignored `.cargo/config.toml` written by
+  `scripts/worktree-link-vendor.sh` redirects `target-dir` there), so a fresh
+  worktree reuses the already-built vendored gpui + registry deps instead of
+  cold-compiling ~10 min. A plain build still needs no worktree lock —
+  cargo's own build-dir lock serializes concurrent builds (a second build
+  blocks with "waiting for file lock", it doesn't fail). Corollary: two
+  trees whose `nice-*` sources differ rebuild those crates when you
+  alternate builds between them; the heavy deps stay warm regardless.
 
 - **Tests:** `cargo test --workspace` (unit + in-process scenarios) and
   `cargo test -p nice-itests` (integration). Plain `cargo test` touches

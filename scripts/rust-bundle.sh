@@ -110,6 +110,14 @@ need codesign
 need ditto
 need git
 
+# Where cargo actually puts artifacts. NOT always $REPO_ROOT/target: a linked
+# worktree's .cargo/config.toml redirects target-dir to the main checkout's
+# target/ (scripts/worktree-link-vendor.sh — shared dep cache), and callers
+# may set CARGO_TARGET_DIR. `cargo metadata` resolves config + env + flags.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[[ -n "$TARGET_DIR" ]] || fail "could not resolve cargo target_directory"
+
 # Ensure the pinned + patched GPUI/zed checkout the workspace path-depends
 # on is present and at the correct revision. vendor-zed.sh is idempotent: a
 # fast no-op (a few git plumbing checks, no network) when vendor/zed is
@@ -144,11 +152,11 @@ if [[ "$UNIVERSAL" -eq 1 ]]; then
     log "building nice (release, universal: $ARM_TARGET + $X86_TARGET)"
     cargo build --release -p nice --target "$ARM_TARGET"
     cargo build --release -p nice --target "$X86_TARGET"
-    ARM_BIN="$REPO_ROOT/target/$ARM_TARGET/release/nice"
-    X86_BIN="$REPO_ROOT/target/$X86_TARGET/release/nice"
+    ARM_BIN="$TARGET_DIR/$ARM_TARGET/release/nice"
+    X86_BIN="$TARGET_DIR/$X86_TARGET/release/nice"
     [[ -x "$ARM_BIN" ]] || fail "arm64 build finished but $ARM_BIN not found"
     [[ -x "$X86_BIN" ]] || fail "x86_64 build finished but $X86_BIN not found"
-    SRC_BIN="$REPO_ROOT/target/nice-universal"
+    SRC_BIN="$TARGET_DIR/nice-universal"
     log "lipo -create → $SRC_BIN"
     lipo -create -output "$SRC_BIN" "$ARM_BIN" "$X86_BIN" || fail "lipo failed"
     log "lipo -archs: $(lipo -archs "$SRC_BIN")"
@@ -156,7 +164,7 @@ else
     log "building nice (release, host arch)"
     cargo build --release -p nice
     # Single cargo binary; copied to a per-variant exec name below.
-    SRC_BIN="$REPO_ROOT/target/release/nice"
+    SRC_BIN="$TARGET_DIR/release/nice"
 fi
 [[ -x "$SRC_BIN" ]] || fail "release build finished but $SRC_BIN not found"
 
