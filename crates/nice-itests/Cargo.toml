@@ -71,10 +71,11 @@ gpui = { path = "../../vendor/zed/crates/gpui", features = ["test-support"] }
 #   * this crate's own `#[cfg(test)]` `sidebar_multiselect` module — the R10
 #     sidebar state (selection / rename-gate / tab tree) the in-process
 #     multi-select classification tests drive through simulated events;
-#   * the `behavior_rename_drag` and `visual_rename_caret` test targets below,
-#     which `#[path]`-include the real `crates/nice/src/inline_rename.rs` (itself
-#     a `nice-model` consumer: `char_index_for_x` / `TextFieldEditor` /
-#     `TextFieldKey`) and name `TextFieldEditor` directly in their own fixtures.
+#   * the `behavior_rename_drag`, `behavior_rename_clipboard` and
+#     `visual_rename_caret` test targets below, which `#[path]`-include the real
+#     `crates/nice/src/inline_rename.rs` (itself a `nice-model` consumer:
+#     `char_index_for_x` / `TextFieldEditor` / `TextFieldKey`) and name
+#     `TextFieldEditor` directly in their own fixtures.
 #
 # In every case the production code being pinned lives in the `nice` BINARY
 # crate, which a dev/test crate cannot depend on (the same constraint the R9
@@ -112,6 +113,18 @@ harness = false
 [[test]]
 name = "behavior_rename_drag"
 path = "tests/behavior_rename_drag.rs"
+
+# The clipboard bug's in-process gate: ⌘A/⌘C/⌘X/⌘V driven through the real
+# field's key dispatch on the MOCKED context, asserted against the real `App`
+# clipboard from the driver side. Same libtest shape and same `#[path]` include
+# as its drag sibling above. It is the grant-free half of the clipboard
+# evidence: the live `file-browser` (d-clip) leg proves a REAL CGEvent chord
+# reaches the field, but needs the Accessibility grant to run at all, so this
+# target carries the wiring claim (chord → focused field → production
+# `RenameClipboard for App`) on every host.
+[[test]]
+name = "behavior_rename_clipboard"
+path = "tests/behavior_rename_clipboard.rs"
 
 # Bug C's regression gate: a real-window pixel check that the inline-rename
 # field's painted caret lands where the click landed. Same `harness = false`

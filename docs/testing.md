@@ -327,6 +327,20 @@ plan's binding technical decisions):**
   leaked window listener fails the case). Note the tradeoff of a `#[path]`
   include in a libtest target: `cfg(test)` is on, so the included module's
   own unit tests are compiled and run there a second time.
+- `crates/nice-itests/tests/behavior_rename_clipboard.rs` — the same shape
+  again (⌘A/⌘C/⌘X/⌘V through the real field's key dispatch, asserted against
+  the real `App` clipboard from the driver side), and the precedent for
+  **splitting a claim whose live gate needs a grant**. Its live half
+  (`file-browser`'s (d-clip) leg) posts real CGEvents, so it cannot run at
+  all without the Accessibility (TCC) grant — which means it must not be the
+  only evidence for a fix. Rule 2 still puts "a real OS key event reaches
+  this field" at layer 3; but everything *downstream* of the keystroke (the
+  chord reaching the focused field rather than falling through as `Ignored`,
+  the production `App` impl talking to the same clipboard the rest of the app
+  does, the call sites' `&mut **cx` deref not panicking mid-update) is rule-4
+  work and belongs here, where it runs on every host with no grant. When you
+  add a live leg for a bug, ask which part of it a mocked-context case can
+  carry, and put that part here too.
 - `notes/chrome-pain-catalog-20260702.md` — the source of the
   differential-pair convention, and the fuller catalog of the seam-y
   failure patterns (press arbitration, drag-session lifecycle, hit-test

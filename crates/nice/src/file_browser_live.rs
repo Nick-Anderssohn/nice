@@ -1277,11 +1277,20 @@ async fn rename_word_keys_leg(
 /// must round-trip the field text through the REAL system clipboard.
 ///
 /// The chord→outcome rule is unit-tested against an in-memory fake
-/// (`inline_rename`'s dispatch tests); what only a live run can prove is the
-/// wiring the bug actually was — the chords reaching the FOCUSED field at all
-/// (they used to fall through to `Ignored`, so ⌘C/⌘V in a rename did nothing)
-/// and the production `RenameClipboard for App` impl talking to the same
-/// pasteboard the rest of the system does.
+/// (`inline_rename`'s dispatch tests); what only a live run can prove is that a
+/// REAL OS key event carrying the ⌘ chord reaches this process's focused rename
+/// field and comes back out on the REAL system pasteboard — the ground-truth
+/// half of the wiring the bug actually was.
+///
+/// This leg posts CGEvents, so like every other leg in this scenario it cannot
+/// run without the Accessibility (TCC) grant, and it is therefore NOT the only
+/// gate on the fix: the grant-free half of the same wiring claim (the chord
+/// reaching the focused field rather than falling through as `Ignored`, the
+/// production `RenameClipboard for App` impl reading/writing the same clipboard
+/// the rest of the app does, and the call sites' `&mut **cx` deref surviving the
+/// entity update it runs inside) lives in
+/// `crates/nice-itests/tests/behavior_rename_clipboard.rs`, which drives the
+/// SHIPPED field on the mocked context and runs on any host under `cargo test`.
 ///
 /// Four steps: ⌘A ⌘C copies the whole name out; ⌘V pastes it back over the
 /// still-selected field (text unchanged — a paste that dropped or doubled
