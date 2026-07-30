@@ -576,7 +576,9 @@ The GPUI application. Structure (grows over later cycles):
   - `inline_rename` — the shared inline-rename field (the `TextFieldEditor`-backed
     editor + caret/selection overlays + the pure `dispatch_rename_key` editing
     rule: printable input, ⌥/⌘ word- and line-motion arrows, ⌥⌫/⌥⌦ word delete,
-    plus press-and-drag range selection over the paint-published boundary table)
+    ⌘C/⌘X/⌘V over an injected `RenameClipboard` seam (paste flattened to one
+    line), plus press-and-drag range selection over the paint-published boundary
+    table)
     extracted from the R10 sidebar so the sidebar row and the toolbar pill mount
     the *same* field (R11's H2 pre-work); the rename *gate* stays R10's
     `InlineRenameClickGate`.

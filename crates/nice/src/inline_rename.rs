@@ -8,14 +8,23 @@
 //! (`{text, cursor, selection}` over char offsets): printable input inserts at the
 //! caret, Backspace/Delete edit at the caret, Left/Right move it, Shift+Arrow
 //! extends the selection, ⌥Arrow moves by word and ⌘Arrow to the text edges
-//! (both composing with Shift), ⌥Delete deletes a word, ⌘A selects all, a
-//! click repositions the caret, and a press-and-drag selects a range. The
+//! (both composing with Shift), ⌥Delete deletes a word, ⌘A selects all,
+//! ⌘C/⌘X/⌘V copy / cut / paste through the system clipboard, a click
+//! repositions the caret, and a press-and-drag selects a range. The
 //! *commit* semantics differ per caller ([`nice_model::TabModel::rename_tab`] vs
 //! [`nice_model::TabModel::rename_pane`] vs the file-browser's validate+modal
 //! path), so the key handler and the click handler are injected — this module
 //! owns only the chrome, the caret/selection rendering, the pure key→editor
 //! dispatch ([`dispatch_rename_key`]), and the click-x→char-index hit-test
 //! ([`char_index_for_click`]).
+//!
+//! ## The clipboard is injected, not reached for
+//!
+//! [`dispatch_rename_key`] takes a [`RenameClipboard`] rather than an
+//! [`App`]-shaped context, so the ⌘C/⌘X/⌘V rule stays exactly as unit-testable as
+//! the rest of the dispatch (the tests pass an in-memory fake; production passes
+//! the `App` the three call sites already hold). Pasted text is flattened to one
+//! line — a tab title / pane name / filename cannot hold a newline or a tab.
 //!
 //! ## Escape is the owner's, not the field's
 //!
@@ -28,11 +37,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId,
-    FocusHandle, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    ParentElement, Pixels, Rgba, ShapedLine, SharedString, Style, Styled, TextAlign, TextRun,
-    Window,
+    canvas, div, fill, point, px, relative, size, App, Bounds, ClipboardItem, DispatchPhase,
+    Element, ElementId, FocusHandle, GlobalElementId, Hsla, InspectorElementId, InteractiveElement,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, ParentElement, Pixels, Rgba, ShapedLine, SharedString, Style, Styled, TextAlign,
+    TextRun, Window,
 };
 
 use nice_model::file_browser::{char_index_for_x, TextFieldEditor, TextFieldKey};
@@ -43,18 +52,61 @@ use nice_theme::chrome_geometry::INNER_CORNER_RADIUS;
 pub(crate) enum RenameKeyOutcome {
     /// Return/Enter — the caller commits the draft (its own `rename_*` model call).
     Commit,
-    /// The editor was mutated (insert / delete / caret move / selection change):
-    /// the caller should `cx.notify()` and consume the key.
+    /// The editor was mutated (insert / delete / caret move / selection change)
+    /// **or a clipboard chord was handled**: the caller should `cx.notify()` and
+    /// consume the key. A ⌘C notifies nothing new (it only reads the editor), but
+    /// reusing this outcome keeps the three call sites' match arms untouched and a
+    /// spurious repaint is harmless.
     Edited,
-    /// A key this field does not handle (Escape, a ⌘/⌃ chord that isn't ⌘A, …):
-    /// the caller leaves it to propagate. **Escape is intentionally Ignored** so
-    /// the owner's Esc binding cancels the rename.
+    /// A key this field does not handle (Escape, a ⌘/⌃ chord that is none of ⌘A /
+    /// ⌘C / ⌘X / ⌘V, …): the caller leaves it to propagate. **Escape is
+    /// intentionally Ignored** so the owner's Esc binding cancels the rename.
     Ignored,
 }
 
+/// The clipboard seam the ⌘C/⌘X/⌘V arms of [`dispatch_rename_key`] go through.
+/// Production is [`App`] (the three call sites already hold one); the dispatch
+/// tests pass a tiny in-memory fake, which is what keeps the whole key→editor
+/// rule unit-testable without a window or a real pasteboard.
+pub(crate) trait RenameClipboard {
+    /// The system clipboard's text, or `None` when it is empty or holds
+    /// something that is not text.
+    fn read_text(&mut self) -> Option<String>;
+    /// Replace the system clipboard's contents with `text`.
+    fn write_text(&mut self, text: String);
+}
+
+impl RenameClipboard for App {
+    fn read_text(&mut self) -> Option<String> {
+        self.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    fn write_text(&mut self, text: String) {
+        self.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+}
+
+/// Flatten pasted clipboard text to the ONE line this field can hold (a tab
+/// title, a pane name, or a filename — none of which may contain a newline or a
+/// tab).
+///
+/// Splits on control characters (`char::is_control`, which covers `\n`, `\r` and
+/// `\t`), drops the empty segments adjacent controls produce, and joins what is
+/// left with a single space: `"foo\r\n\tbar"` → `"foo bar"`. Ordinary spaces
+/// inside a segment are preserved, so `"my file.txt"` pastes verbatim. An
+/// all-control clipboard flattens to `""`, which the dispatch treats as "insert
+/// nothing" (rather than as "delete the selection").
+fn sanitize_pasted_text(text: &str) -> String {
+    text.split(char::is_control)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Apply one keystroke to the in-flight rename `editor`, returning what the caller
-/// should do. Pure over the editor model (no gpui state) so the exact editing
-/// rule is unit-tested in [`nice_model::file_browser::text_field`]:
+/// should do. Pure over the editor model plus the injected `clipboard` (no gpui
+/// state) so the exact editing rule is unit-tested here and in
+/// [`nice_model::file_browser::text_field`]:
 ///
 /// * Return/Enter → [`RenameKeyOutcome::Commit`] (editor untouched).
 /// * Backspace / Delete → delete at the caret (or the selection);
@@ -62,8 +114,13 @@ pub(crate) enum RenameKeyOutcome {
 /// * Left / Right (with Shift → extend) → move / extend the caret;
 ///   with ⌥ → by a word, with ⌘ → to the start / end of the text.
 /// * ⌘A → select all.
+/// * ⌘C / ⌘X → write the selection to `clipboard` (⌘X also deletes it); with a
+///   COLLAPSED selection both write nothing at all — the chord is still consumed.
+/// * ⌘V → replace the selection (or insert at the caret) with the clipboard text,
+///   flattened to one line by [`sanitize_pasted_text`]. Consumed even when the
+///   clipboard is empty or holds no text.
 /// * a bare printable char (no ⌘/⌃, a non-control `key_char`) → insert at the caret.
-/// * anything else (Escape, ⌘-chords) → [`RenameKeyOutcome::Ignored`].
+/// * anything else (Escape, the other ⌘/⌃ chords) → [`RenameKeyOutcome::Ignored`].
 ///
 /// `alt` is the Option modifier. ⌘ wins over ⌥ on the arrows (a ⌘⌥ chord jumps
 /// to the line edge), and Shift composes with either. ⌥ is deliberately NOT part
@@ -77,8 +134,10 @@ pub(crate) enum RenameKeyOutcome {
 /// un-capslocked; when Caps Lock is on we flip that letter's case here, on top of
 /// any Shift the `key_char` already reflects (so Shift+Caps nets lowercase).
 /// Digits, punctuation, and non-ASCII characters are unaffected.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_rename_key(
     editor: &mut TextFieldEditor,
+    clipboard: &mut impl RenameClipboard,
     key: &str,
     key_char: Option<&str>,
     shift: bool,
@@ -129,6 +188,32 @@ pub(crate) fn dispatch_rename_key(
         }
         "a" if platform_mod => {
             editor.apply_key(TextFieldKey::SelectAll);
+            RenameKeyOutcome::Edited
+        }
+        // The clipboard chords, guarded exactly like ⌘A above so a ⌃-chord (and
+        // every other modifier combination) still falls through to Ignored.
+        "c" | "x" | "v" if platform_mod => {
+            if key == "v" {
+                let pasted = clipboard
+                    .read_text()
+                    .map(|text| sanitize_pasted_text(&text))
+                    .unwrap_or_default();
+                // An empty / non-text / all-control clipboard inserts NOTHING —
+                // it must not silently delete the selection the user is holding.
+                // The chord is consumed either way (below), so it never leaks to
+                // the app keymap mid-rename.
+                if !pasted.is_empty() {
+                    editor.insert_str(&pasted);
+                }
+            } else if let Some(selected) = editor.selected_text() {
+                // ⌘C / ⌘X. A COLLAPSED selection writes nothing at all —
+                // `NSTextField` leaves the clipboard alone rather than clobbering
+                // whatever the user copied a moment ago with an empty string.
+                clipboard.write_text(selected);
+                if key == "x" {
+                    editor.apply_key(TextFieldKey::Backspace);
+                }
+            }
             RenameKeyOutcome::Edited
         }
         _ => {
@@ -667,11 +752,42 @@ mod tests {
         TextFieldEditor::new(text)
     }
 
+    /// The in-memory stand-in for `gpui::App`'s pasteboard — the whole reason
+    /// [`RenameClipboard`] exists, so the ⌘C/⌘X/⌘V rule is asserted with no
+    /// window and no real system clipboard.
+    #[derive(Default)]
+    struct FakeClipboard {
+        text: Option<String>,
+    }
+
+    impl RenameClipboard for FakeClipboard {
+        fn read_text(&mut self) -> Option<String> {
+            self.text.clone()
+        }
+
+        fn write_text(&mut self, text: String) {
+            self.text = Some(text);
+        }
+    }
+
+    /// A throwaway empty clipboard for the calls that are not about the
+    /// clipboard at all (most of them). The clipboard tests bind their own.
+    fn clip() -> FakeClipboard {
+        FakeClipboard::default()
+    }
+
+    /// A clipboard pre-seeded with `text` — what the ⌘V tests paste from.
+    fn seeded(text: &str) -> FakeClipboard {
+        FakeClipboard {
+            text: Some(text.to_string()),
+        }
+    }
+
     #[test]
     fn enter_requests_a_commit_without_touching_the_editor() {
         let mut e = ed("hello");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "enter", None, false, false, false, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "enter", None, false, false, false, false, false),
             RenameKeyOutcome::Commit
         ));
         assert_eq!(e.text(), "hello");
@@ -680,9 +796,9 @@ mod tests {
     #[test]
     fn a_bare_printable_char_inserts_at_the_caret() {
         let mut e = ed("ac");
-        dispatch_rename_key(&mut e, "left", None, false, false, false, false, false); // caret between a,c
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, false, false, false, false, false); // caret between a,c
         assert!(matches!(
-            dispatch_rename_key(&mut e, "b", Some("b"), false, false, false, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "b", Some("b"), false, false, false, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "abc");
@@ -691,21 +807,21 @@ mod tests {
     #[test]
     fn backspace_and_forward_delete_edit_at_the_caret() {
         let mut e = ed("abc");
-        dispatch_rename_key(&mut e, "backspace", None, false, false, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "backspace", None, false, false, false, false, false);
         assert_eq!(e.text(), "ab");
-        dispatch_rename_key(&mut e, "left", None, false, false, false, false, false);
-        dispatch_rename_key(&mut e, "delete", None, false, false, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, false, false, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "delete", None, false, false, false, false, false);
         assert_eq!(e.text(), "a");
     }
 
     #[test]
     fn left_right_move_and_shift_extends() {
         let mut e = ed("abc"); // caret at 3
-        dispatch_rename_key(&mut e, "left", None, false, false, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, false, false, false, false, false);
         assert_eq!(e.cursor(), 2);
-        dispatch_rename_key(&mut e, "left", None, true, false, false, false, false); // shift+left extends
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, true, false, false, false, false); // shift+left extends
         assert_eq!(e.selection(), (1, 2));
-        dispatch_rename_key(&mut e, "right", None, false, false, false, false, false); // collapse to right edge
+        dispatch_rename_key(&mut e, &mut clip(), "right", None, false, false, false, false, false); // collapse to right edge
         assert_eq!(e.cursor(), 2);
         assert!(!e.has_selection());
     }
@@ -714,40 +830,40 @@ mod tests {
     fn option_arrows_move_by_word_and_shift_extends() {
         let mut e = ed("foo.bar"); // caret at 7
         assert!(matches!(
-            dispatch_rename_key(&mut e, "left", None, false, true, false, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "left", None, false, true, false, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.cursor(), 4);
-        dispatch_rename_key(&mut e, "left", None, false, true, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, false, true, false, false, false);
         assert_eq!(e.cursor(), 0);
         assert!(!e.has_selection());
 
-        dispatch_rename_key(&mut e, "right", None, false, true, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "right", None, false, true, false, false, false);
         assert_eq!(e.cursor(), 3);
 
         // ⌥⇧ extends instead of moving.
-        dispatch_rename_key(&mut e, "right", None, true, true, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "right", None, true, true, false, false, false);
         assert_eq!(e.selection(), (3, 7));
-        dispatch_rename_key(&mut e, "left", None, true, true, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, true, true, false, false, false);
         assert_eq!(e.selection(), (3, 4));
     }
 
     #[test]
     fn command_arrows_jump_to_the_text_edges_and_shift_extends() {
         let mut e = ed("foo.bar");
-        dispatch_rename_key(&mut e, "left", None, false, false, true, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, false, false, true, false, false);
         assert_eq!(e.cursor(), 0);
         assert!(!e.has_selection());
-        dispatch_rename_key(&mut e, "right", None, false, false, true, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "right", None, false, false, true, false, false);
         assert_eq!(e.cursor(), 7);
 
         let mut e2 = ed("foo.bar");
-        dispatch_rename_key(&mut e2, "left", None, true, false, true, false, false);
+        dispatch_rename_key(&mut e2, &mut clip(), "left", None, true, false, true, false, false);
         assert_eq!(e2.selection(), (0, 7));
 
         let mut e3 = ed("foo.bar");
-        dispatch_rename_key(&mut e3, "left", None, false, false, true, false, false);
-        dispatch_rename_key(&mut e3, "right", None, true, false, true, false, false);
+        dispatch_rename_key(&mut e3, &mut clip(), "left", None, false, false, true, false, false);
+        dispatch_rename_key(&mut e3, &mut clip(), "right", None, true, false, true, false, false);
         assert_eq!(e3.selection(), (0, 7));
     }
 
@@ -755,7 +871,7 @@ mod tests {
     fn command_wins_over_option_on_the_arrows() {
         // A ⌘⌥← chord jumps to the line start, not one word left.
         let mut e = ed("foo.bar");
-        dispatch_rename_key(&mut e, "left", None, false, true, true, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "left", None, false, true, true, false, false);
         assert_eq!(e.cursor(), 0);
     }
 
@@ -763,14 +879,14 @@ mod tests {
     fn option_delete_keys_delete_by_word() {
         let mut e = ed("foo.bar"); // caret at 7
         assert!(matches!(
-            dispatch_rename_key(&mut e, "backspace", None, false, true, false, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "backspace", None, false, true, false, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "foo.");
 
         let mut e2 = ed("foo.bar");
-        dispatch_rename_key(&mut e2, "left", None, false, false, true, false, false); // caret to 0
-        dispatch_rename_key(&mut e2, "delete", None, false, true, false, false, false);
+        dispatch_rename_key(&mut e2, &mut clip(), "left", None, false, false, true, false, false); // caret to 0
+        dispatch_rename_key(&mut e2, &mut clip(), "delete", None, false, true, false, false, false);
         assert_eq!(e2.text(), ".bar");
     }
 
@@ -781,12 +897,12 @@ mod tests {
         // only).
         let mut e = ed("");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("å"), false, true, false, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "a", Some("å"), false, true, false, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "å");
         // ⌥⇧o → "Ø", likewise.
-        dispatch_rename_key(&mut e, "o", Some("Ø"), true, true, false, false, false);
+        dispatch_rename_key(&mut e, &mut clip(), "o", Some("Ø"), true, true, false, false, false);
         assert_eq!(e.text(), "åØ");
     }
 
@@ -794,24 +910,151 @@ mod tests {
     fn command_a_selects_all_but_command_other_is_ignored() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, false, true, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "a", Some("a"), false, false, true, false, false),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.selection(), (0, 4));
 
+        // A ⌘-chord the field does NOT claim still propagates (⌘K here — ⌘C/⌘X/⌘V
+        // are the field's own, and have their own tests below).
         let mut e2 = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e2, "c", Some("c"), false, false, true, false, false),
+            dispatch_rename_key(&mut e2, &mut clip(), "k", Some("k"), false, false, true, false, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e2.text(), "name");
+    }
+
+    // MARK: - clipboard chords (⌘C / ⌘X / ⌘V)
+
+    /// ⌘C on a selection writes exactly the selected text and does not touch the
+    /// editor.
+    #[test]
+    fn command_c_copies_the_selection_without_editing() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3); // "foo" selected
+        let mut cb = clip();
+        assert!(matches!(
+            dispatch_rename_key(&mut e, &mut cb, "c", Some("c"), false, false, true, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(cb.text.as_deref(), Some("foo"));
+        assert_eq!(e.text(), "foo.txt");
+        assert_eq!(e.selection(), (0, 3));
+    }
+
+    /// ⌘C with a COLLAPSED selection leaves the clipboard exactly as it was —
+    /// NSTextField never clobbers it with an empty string — while still
+    /// consuming the chord.
+    #[test]
+    fn command_c_with_no_selection_leaves_the_clipboard_alone() {
+        let mut e = ed("name"); // collapsed caret at the end
+        let mut cb = seeded("previously copied");
+        assert!(matches!(
+            dispatch_rename_key(&mut e, &mut cb, "c", Some("c"), false, false, true, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(cb.text.as_deref(), Some("previously copied"));
+        assert_eq!(e.text(), "name");
+    }
+
+    /// ⌘X copies AND deletes, leaving a collapsed caret where the selection was.
+    #[test]
+    fn command_x_copies_the_selection_and_deletes_it() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3);
+        let mut cb = clip();
+        assert!(matches!(
+            dispatch_rename_key(&mut e, &mut cb, "x", Some("x"), false, false, true, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(cb.text.as_deref(), Some("foo"));
+        assert_eq!(e.text(), ".txt");
+        assert_eq!(e.selection(), (0, 0));
+    }
+
+    /// ⌘X with nothing selected deletes nothing (it is not a Backspace) and
+    /// writes nothing.
+    #[test]
+    fn command_x_with_no_selection_is_inert() {
+        let mut e = ed("name");
+        let mut cb = seeded("previously copied");
+        dispatch_rename_key(&mut e, &mut cb, "x", Some("x"), false, false, true, false, false);
+        assert_eq!(cb.text.as_deref(), Some("previously copied"));
+        assert_eq!(e.text(), "name");
+    }
+
+    /// ⌘V over a selection replaces it; at a collapsed caret it inserts.
+    #[test]
+    fn command_v_replaces_a_selection_and_inserts_at_a_caret() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3);
+        let mut cb = seeded("bar");
+        assert!(matches!(
+            dispatch_rename_key(&mut e, &mut cb, "v", Some("v"), false, false, true, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.text(), "bar.txt");
+        assert_eq!(e.selection(), (3, 3));
+
+        // Caret between "bar" and ".txt": a second paste inserts there.
+        dispatch_rename_key(&mut e, &mut cb, "v", Some("v"), false, false, true, false, false);
+        assert_eq!(e.text(), "barbar.txt");
+        assert_eq!(e.cursor(), 6);
+    }
+
+    /// Multi-line / tabbed clipboard content flattens to the single line the
+    /// field can hold, with ordinary spaces preserved.
+    #[test]
+    fn command_v_flattens_multiline_clipboard_content() {
+        let mut e = ed("");
+        let mut cb = seeded("foo\r\n\tbar baz");
+        dispatch_rename_key(&mut e, &mut cb, "v", Some("v"), false, false, true, false, false);
+        assert_eq!(e.text(), "foo bar baz");
+    }
+
+    /// An empty clipboard pastes NOTHING — in particular it must not delete the
+    /// selection — but the chord is still consumed.
+    #[test]
+    fn command_v_with_an_empty_clipboard_leaves_the_editor_untouched() {
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3);
+        let mut cb = clip(); // read_text() -> None
+        assert!(matches!(
+            dispatch_rename_key(&mut e, &mut cb, "v", Some("v"), false, false, true, false, false),
+            RenameKeyOutcome::Edited
+        ));
+        assert_eq!(e.text(), "foo.txt");
+        assert_eq!(e.selection(), (0, 3));
+    }
+
+    /// A ⌃-chord is NOT a clipboard chord: the guard is `platform_mod`, so ⌃V
+    /// still falls through to Ignored (and pastes nothing).
+    #[test]
+    fn a_control_v_chord_is_still_ignored() {
+        let mut e = ed("name");
+        let mut cb = seeded("nope");
+        assert!(matches!(
+            dispatch_rename_key(&mut e, &mut cb, "v", Some("v"), false, false, false, true, false),
+            RenameKeyOutcome::Ignored
+        ));
+        assert_eq!(e.text(), "name");
+    }
+
+    #[test]
+    fn sanitize_pasted_text_flattens_controls_to_single_spaces() {
+        assert_eq!(sanitize_pasted_text("foo\r\n\tbar"), "foo bar");
+        // Ordinary spaces inside a segment survive verbatim.
+        assert_eq!(sanitize_pasted_text("my file.txt"), "my file.txt");
+        // Leading / trailing controls produce empty segments, which are dropped
+        // rather than turning into stray spaces.
+        assert_eq!(sanitize_pasted_text("\nfoo\n"), "foo");
+        // Nothing but controls flattens to "" (the dispatch's "insert nothing").
+        assert_eq!(sanitize_pasted_text("\r\n\t"), "");
+        assert_eq!(sanitize_pasted_text(""), "");
     }
 
     #[test]
     fn escape_is_ignored_so_the_owner_binding_cancels() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "escape", None, false, false, false, false, false),
+            dispatch_rename_key(&mut e, &mut clip(), "escape", None, false, false, false, false, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
@@ -821,7 +1064,7 @@ mod tests {
     fn a_control_chord_is_ignored() {
         let mut e = ed("name");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, false, false, true, false),
+            dispatch_rename_key(&mut e, &mut clip(), "a", Some("a"), false, false, false, true, false),
             RenameKeyOutcome::Ignored
         ));
         assert_eq!(e.text(), "name");
@@ -833,7 +1076,7 @@ mod tests {
         // must flip it to upper.
         let mut e = ed("");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("a"), false, false, false, false, true),
+            dispatch_rename_key(&mut e, &mut clip(), "a", Some("a"), false, false, false, false, true),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "A");
@@ -844,7 +1087,7 @@ mod tests {
         // Shift already made key_char "A"; Caps Lock on top cancels it back to "a".
         let mut e = ed("");
         assert!(matches!(
-            dispatch_rename_key(&mut e, "a", Some("A"), true, false, false, false, true),
+            dispatch_rename_key(&mut e, &mut clip(), "a", Some("A"), true, false, false, false, true),
             RenameKeyOutcome::Edited
         ));
         assert_eq!(e.text(), "a");
@@ -853,8 +1096,8 @@ mod tests {
     #[test]
     fn caps_lock_leaves_digits_and_punctuation_unchanged() {
         let mut e = ed("");
-        dispatch_rename_key(&mut e, "7", Some("7"), false, false, false, false, true);
-        dispatch_rename_key(&mut e, "-", Some("-"), false, false, false, false, true);
+        dispatch_rename_key(&mut e, &mut clip(), "7", Some("7"), false, false, false, false, true);
+        dispatch_rename_key(&mut e, &mut clip(), "-", Some("-"), false, false, false, false, true);
         assert_eq!(e.text(), "7-");
     }
 
