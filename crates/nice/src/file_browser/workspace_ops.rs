@@ -191,16 +191,20 @@ impl WorkspaceOps for RecordingWorkspaceOps {
 
 // MARK: - The process Global (SharedFontSettings pattern) -----------------------
 
-/// The installed `WorkspaceOps` — a boxed trait object. `app::run` installs the
-/// production impl; `run_selftest` installs the recording fake. Absent ⇒ the
-/// caller (the view / menu actions) treats every OS action as unavailable.
-pub struct WorkspaceOpsGlobal(pub Box<dyn WorkspaceOps>);
+/// The installed `WorkspaceOps` — an `Arc` so a caller can clone the ops OUT of
+/// a `cx` borrow and invoke them borrow-free (the modal `choose_application`
+/// spins a nested run loop that drains gpui foreground tasks — calling it while
+/// the App is borrowed panics; the view's "Other…" handler relies on this).
+/// `app::run` installs the production impl; `run_selftest` installs the
+/// recording fake. Absent ⇒ the caller (the view / menu actions) treats every
+/// OS action as unavailable.
+pub struct WorkspaceOpsGlobal(pub Arc<dyn WorkspaceOps>);
 
 impl Global for WorkspaceOpsGlobal {}
 
 /// Install the production impl as the Global — `app::run` ONLY.
 pub fn install_production(cx: &mut App) {
-    cx.set_global(WorkspaceOpsGlobal(Box::new(ProductionWorkspaceOps)));
+    cx.set_global(WorkspaceOpsGlobal(Arc::new(ProductionWorkspaceOps)));
 }
 
 /// Install a fresh recording fake as the Global AND stash a shared clone in the
@@ -208,7 +212,7 @@ pub fn install_production(cx: &mut App) {
 /// `run_selftest` seam, called before any scenario runs. Returns the fake handle.
 pub fn install_recording_fake(cx: &mut App) -> RecordingWorkspaceOps {
     let fake = RecordingWorkspaceOps::new();
-    cx.set_global(WorkspaceOpsGlobal(Box::new(fake.clone())));
+    cx.set_global(WorkspaceOpsGlobal(Arc::new(fake.clone())));
     *selftest_slot().lock().unwrap() = Some(fake.clone());
     fake
 }

@@ -2499,28 +2499,67 @@ unsafe fn app_display_name(app_url: *mut AnyObject) -> String {
     file.strip_suffix(".app").unwrap_or(&file).to_string()
 }
 
-/// `-[NSWorkspace openURL:]` — open `path` with the OS default handler.
+// Raw libdispatch: enqueue a plain C callback on the main queue.
+// (`dispatch_get_main_queue()` is a C macro over `&_dispatch_main_q`.)
+#[repr(C)]
+struct DispatchQueueS {
+    _priv: [u8; 0],
+}
+unsafe extern "C" {
+    static _dispatch_main_q: DispatchQueueS;
+    fn dispatch_async_f(
+        queue: *const DispatchQueueS,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
+}
+
+/// Run `f` on its own main-queue turn, OUTSIDE the current call stack.
 ///
-/// # Safety
-/// Main thread with an autorelease pool.
-pub fn workspace_open(path: &str) {
-    unsafe {
-        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let url = file_url(path);
-        let _: Bool = msg_send![ws, openURL: url];
+/// The NSWorkspace actions below (`openURL:`, `activateFileViewerSelectingURLs:`,
+/// …) go through AppKit machinery that spins a NESTED run loop while waiting on
+/// the target app (reveal routes through `NSServicesMenuHandler
+/// _performServiceFromEntry:…`). A nested run loop drains the main dispatch
+/// queue — so any gpui foreground task that wakes during the wait calls
+/// `AppCell::borrow_mut` and PANICS if the caller is still inside a
+/// `cx.update` (the context-menu click handler is: 2026-07-30 Reveal-in-Finder
+/// abort). Deferring the OS call to a fresh main-queue turn releases the App
+/// borrow first, making the nested drain harmless.
+fn defer_to_main(f: impl FnOnce() + 'static) {
+    extern "C" fn run(ctx: *mut c_void) {
+        // SAFETY: `ctx` is the `Box<Box<dyn FnOnce()>>` leaked below, executed
+        // exactly once. dispatch's main-queue callout may sit outside any
+        // autorelease pool boundary we control — push one explicitly.
+        let f = unsafe { Box::from_raw(ctx as *mut Box<dyn FnOnce()>) };
+        objc2::rc::autoreleasepool(|_| f());
     }
+    let boxed: Box<Box<dyn FnOnce()>> = Box::new(Box::new(f));
+    unsafe {
+        dispatch_async_f(&raw const _dispatch_main_q, Box::into_raw(boxed) as *mut c_void, run);
+    }
+}
+
+/// `-[NSWorkspace openURL:]` — open `path` with the OS default handler.
+/// Deferred to its own main-queue turn (see [`defer_to_main`]).
+pub fn workspace_open(path: &str) {
+    let path = path.to_string();
+    defer_to_main(move || unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let url = file_url(&path);
+        let _: Bool = msg_send![ws, openURL: url];
+    });
 }
 
 /// `-[NSWorkspace openURLs:withApplicationAtURL:configuration:completionHandler:]`
 /// — open `path` with the application at `app_path` (nil completion handler).
-///
-/// # Safety
-/// Main thread with an autorelease pool.
+/// Deferred to its own main-queue turn (see [`defer_to_main`]).
 pub fn workspace_open_with(path: &str, app_path: &str) {
-    unsafe {
+    let path = path.to_string();
+    let app_path = app_path.to_string();
+    defer_to_main(move || unsafe {
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let url = file_url(path);
-        let app_url = file_url(app_path);
+        let url = file_url(&path);
+        let app_url = file_url(&app_path);
         let urls: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: url];
         let config: *mut AnyObject =
             msg_send![class!(NSWorkspaceOpenConfiguration), configuration];
@@ -2535,20 +2574,21 @@ pub fn workspace_open_with(path: &str, app_path: &str) {
             configuration: config,
             completionHandler: null_handler
         ];
-    }
+    });
 }
 
 /// `-[NSWorkspace activateFileViewerSelectingURLs:]` — reveal `path` in Finder.
-///
-/// # Safety
-/// Main thread with an autorelease pool.
+/// Deferred to its own main-queue turn (see [`defer_to_main`]) — reveal is THE
+/// proven crasher: it performs a Finder service and spins a nested run loop
+/// until Finder responds.
 pub fn workspace_reveal(path: &str) {
-    unsafe {
+    let path = path.to_string();
+    defer_to_main(move || unsafe {
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let url = file_url(path);
+        let url = file_url(&path);
         let urls: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: url];
         let _: () = msg_send![ws, activateFileViewerSelectingURLs: urls];
-    }
+    });
 }
 
 /// `-[NSWorkspace URLsForApplicationsToOpenURL:]` + `URLForApplicationToOpenURL:`

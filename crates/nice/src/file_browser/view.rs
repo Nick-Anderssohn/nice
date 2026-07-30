@@ -830,18 +830,28 @@ impl FileBrowserView {
             }));
         }
         // Trailing "Other…" — the NSOpenPanel chooser through the same seam.
+        // The modal chooser spins a nested run loop that drains gpui foreground
+        // tasks, so it must run with NO App borrow held (the same
+        // double-borrow abort as Reveal in Finder): clone the ops Arc out,
+        // snap inside the borrow, then run the chooser from a spawned task.
         let e = weak.clone();
         let p = path.to_string();
         items.push(ContextMenuItem::entry("Other\u{2026}", move |_w, app| {
-            let _ = e.update(app, |this, cx| {
-                let chosen = cx
-                    .try_global::<WorkspaceOpsGlobal>()
-                    .and_then(|g| g.0.choose_application());
-                if let Some(app_path) = chosen {
-                    this.snap_and_resolve(&p, cx);
-                    this.workspace_open_with(&p, &app_path, cx);
+            let Some(ops) = app.try_global::<WorkspaceOpsGlobal>().map(|g| g.0.clone()) else {
+                return;
+            };
+            let e = e.clone();
+            let p = p.clone();
+            app.spawn(async move |acx| {
+                // Borrow-free while the modal runs; a cancel snaps nothing.
+                if let Some(app_path) = ops.choose_application() {
+                    let _ = e.update(acx, |this, cx| {
+                        this.snap_and_resolve(&p, cx);
+                    });
+                    ops.open_with(&p, &app_path);
                 }
-            });
+            })
+            .detach();
         }));
         self.present_menu(items, position, window, cx);
     }
