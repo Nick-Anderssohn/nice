@@ -6,7 +6,7 @@
 //! the pure-installer round-trip against injected scratch dirs. Four legs:
 //!
 //! * **(a) installer round-trip (hermetic, injected dirs)** — `sync_with(true, …)`
-//!   lays both `-rs` files down (helper at 0o755), a re-run leaves their mtimes
+//!   lays both handoff-pair files down (helper at 0o755), a re-run leaves their mtimes
 //!   stable (idempotent), and `sync_with(false, …)` removes the skill subtree +
 //!   helper file while the shared helper dir survives. NEVER the real `~/.claude`
 //!   / `~/.nice`.
@@ -81,6 +81,9 @@ struct Fixture {
     base: PathBuf,
     home: PathBuf,
     work: PathBuf,
+    /// The injected skills PARENT the installer hangs every pair's dir off.
+    skills_root: PathBuf,
+    /// The handoff pair's own dir inside [`Fixture::skills_root`].
     skill_dir: PathBuf,
     helper_dir: PathBuf,
     capture_dir: PathBuf,
@@ -97,9 +100,11 @@ impl Fixture {
         let home = base.join("home");
         let work = base.join("work");
         // The injected installer dirs mirror the real layout but under the scratch
-        // root: `<base>/claude/skills/nice-handoff` + `<base>/nice`. They are
-        // NOT pre-created — the installer `create_dir_all`s them.
-        let skill_dir = base.join("claude").join("skills").join("nice-handoff");
+        // root: `<base>/claude/skills` (the root every installed pair hangs off,
+        // here the `nice-handoff` one) + `<base>/nice`. They are NOT pre-created —
+        // the installer `create_dir_all`s them.
+        let skills_root = base.join("claude").join("skills");
+        let skill_dir = skills_root.join("nice-handoff");
         let helper_dir = base.join("nice");
         let capture_dir = base.join("argv");
         let bin = base.join("bin");
@@ -139,6 +144,7 @@ impl Fixture {
             base,
             home,
             work,
+            skills_root,
             skill_dir,
             helper_dir,
             capture_dir,
@@ -409,14 +415,17 @@ async fn run_handoff(
     build_report(failures)
 }
 
-/// Leg (a): install lands both `-rs` files (helper 0o755), re-install is
+/// Leg (a): install lands both handoff-pair files (helper 0o755), re-install is
 /// mtime-stable, uninstall removes the skill subtree + helper FILE while the
 /// shared helper dir survives. Injected scratch dirs only.
 fn installer_round_trip_leg(fixture: &Fixture, failures: &mut Vec<String>) {
+    // The installer is driven at its skills-ROOT seam (it installs a table of
+    // pairs); this leg asserts on the handoff pair's own dir inside it.
+    let skills_root = &fixture.skills_root;
     let skill_dir = &fixture.skill_dir;
     let helper_dir = &fixture.helper_dir;
 
-    crate::skill_installer::sync_with(true, skill_dir, helper_dir);
+    crate::skill_installer::sync_with(true, skills_root, helper_dir);
     let skill_path = skill_dir.join(SKILL_FILENAME);
     let helper_path = helper_dir.join(HELPER_FILENAME);
     if !skill_path.exists() {
@@ -437,7 +446,7 @@ fn installer_round_trip_leg(fixture: &Fixture, failures: &mut Vec<String>) {
 
     // Idempotent: a re-run over identical files leaves both mtimes stable.
     let m1 = (mtime(&skill_path), mtime(&helper_path));
-    crate::skill_installer::sync_with(true, skill_dir, helper_dir);
+    crate::skill_installer::sync_with(true, skills_root, helper_dir);
     let m2 = (mtime(&skill_path), mtime(&helper_path));
     if m1.0 != m2.0 || m1.1 != m2.1 {
         failures.push("(a) idempotent: a re-run rewrote an unchanged file (mtime churned)".into());
@@ -447,7 +456,7 @@ fn installer_round_trip_leg(fixture: &Fixture, failures: &mut Vec<String>) {
     let sibling = helper_dir.join("nice-claude-hook.sh");
     let _ = std::fs::write(&sibling, b"#!/usr/bin/env bash\nexit 0");
 
-    crate::skill_installer::sync_with(false, skill_dir, helper_dir);
+    crate::skill_installer::sync_with(false, skills_root, helper_dir);
     if skill_dir.exists() {
         failures.push("(a) uninstall: the nice-handoff/ skill subtree must be removed".into());
     }

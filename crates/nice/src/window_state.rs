@@ -598,14 +598,16 @@ impl WindowState {
     /// The R14 control-socket routing point (the Rust mirror of Swift
     /// `SessionsModel.startSocketListener`'s handler dispatch,
     /// `SessionsModel.swift:257-309`): each [`SocketMessage`] variant is routed
-    /// to a named window-local handler. The message enum + parser are finished
-    /// business after R14 — R15/R16/R26 replace only the handler BODIES below,
-    /// never this routing shape. Called on the gpui foreground by the socket
-    /// drain task (wired by the R14 env-injection slice's `open_managed_window`).
+    /// to a named window-local handler. The three FROZEN actions' shapes are
+    /// finished business after R14 — R15/R16/R26 replaced only the handler BODIES;
+    /// the later `dispatch` action added a fourth arm without reshaping the rest.
+    /// Called on the gpui foreground by the socket drain task (wired by the R14
+    /// env-injection slice's `open_managed_window`).
     ///
     /// Takes the window's `&mut Context` (R15): the `claude` newtab decision spawns
-    /// a Claude pane, which needs a gpui context. The `handoff` sub-handler (R26)
-    /// likewise takes `cx` — like the `claude` arm, it spawns a fresh Claude tab.
+    /// a Claude pane, which needs a gpui context. The `handoff` (R26) and
+    /// `dispatch` sub-handlers likewise take `cx` — like the `claude` arm, each
+    /// spawns a fresh Claude tab.
     /// `session_update`'s handler is context-free (the pure rotation flow),
     /// returning a deferred-resume [`BranchParentSpawn`] the router fulfils here
     /// with `cx` when the rotation was a `/branch` (R16).
@@ -644,6 +646,28 @@ impl WindowState {
             } => self.handle_handoff(
                 cwd,
                 handoff_file,
+                instructions,
+                model,
+                effort,
+                tab_id,
+                pane_id,
+                reply,
+                cx,
+            ),
+            SocketMessage::Dispatch {
+                cwd,
+                worktree_name,
+                task_file,
+                instructions,
+                model,
+                effort,
+                tab_id,
+                pane_id,
+                reply,
+            } => self.handle_dispatch(
+                cwd,
+                worktree_name,
+                task_file,
                 instructions,
                 model,
                 effort,
@@ -989,10 +1013,10 @@ impl WindowState {
     /// (unlike the `claude` in-place-promotion path, where a miss opens a newtab
     /// too but never nests). Mirrors the `claude` arm's spawn shape (D6): borrow
     /// settings/model/session, build + spawn through
-    /// [`create_handoff_tab`](crate::session_manager::SessionManager::create_handoff_tab),
+    /// [`create_nested_claude_tab`](crate::session_manager::SessionManager::create_nested_claude_tab),
     /// then `cx.notify()`.
     ///
-    /// **Focus (D7): the new tab opens UNSELECTED.** `create_handoff_tab` does not
+    /// **Focus (D7): the new tab opens UNSELECTED.** `create_nested_claude_tab` does not
     /// select it, so the originating tab stays active and keyboard focus never
     /// moves — a handoff is background continuation prep, not a context switch.
     /// That is the ONE behavioral split from
@@ -1053,17 +1077,18 @@ impl WindowState {
         // already key off the resolved tab).
         let under = originating_id.unwrap_or_default();
 
+        // (D5) --model/--effort (each omitted when empty) then the prompt LAST.
+        let extra_args = crate::session_manager::handoff_extra_args(&model, &effort, &prompt);
+
         let settings = self.claude_settings_path.clone();
         let model_doc = &mut self.model;
         let session = &mut self.session;
-        let created = session.create_handoff_tab(
+        let created = session.create_nested_claude_tab(
             model_doc,
             &under,
             &spawn_cwd,
             title,
-            prompt,
-            &model,
-            &effort,
+            &extra_args,
             settings.as_deref(),
             cx,
         );
@@ -1076,6 +1101,108 @@ impl WindowState {
         }
         // The tab opened (nested or top-level) — ALWAYS reply `ok`. Swift's only
         // hard error ("no window") cannot occur for a live WindowState.
+        reply.send("ok");
+    }
+
+    /// Handle a `dispatch` request from the `/nice-dispatch` skill's helper: open
+    /// a fresh Claude tab that creates + enters a git worktree
+    /// (`claude --worktree <name>`) and starts working from the task file the
+    /// dispatcher wrote. Modelled on [`handle_handoff`](Self::handle_handoff) —
+    /// nested one indent under the originating tab, opened UNSELECTED, ALWAYS
+    /// replying `ok` — with two deliberate deltas:
+    ///
+    /// * **The spawn cwd is ALWAYS the payload `cwd`** (the MAIN checkout root the
+    ///   helper resolved via `--git-common-dir`), never the originating tab's live
+    ///   cwd. A dispatcher running inside a worktree must still create the new
+    ///   worktree from the canonical checkout. The originating tab is resolved
+    ///   purely for NESTING; a miss (Main Terminals tab, stale id, a pane the tab
+    ///   doesn't own) is NOT an error — the tab opens top-level.
+    /// * **Model/effort are NOT inherited.** They arrive empty unless the user
+    ///   explicitly asked for an override, and
+    ///   [`dispatch_extra_args`](crate::session_manager::dispatch_extra_args) then
+    ///   omits the flags so the child runs on the configured default.
+    ///
+    /// Nesting nuance (the existing depth-1 invariant, deliberately unchanged):
+    /// `insert_handoff_child` re-parents to the originating tab's PARENT when the
+    /// dispatcher is itself a nested child, so dispatching from a handoff-born
+    /// dispatcher yields siblings under that parent, not grandchildren.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_dispatch(
+        &mut self,
+        cwd: String,
+        worktree_name: String,
+        task_file: String,
+        instructions: String,
+        model: String,
+        effort: String,
+        tab_id: String,
+        pane_id: String,
+        reply: Reply,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        self.record_socket_message(RecordedSocketMessage::Dispatch {
+            cwd: cwd.clone(),
+            worktree_name: worktree_name.clone(),
+            task_file: task_file.clone(),
+            instructions: instructions.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+        });
+
+        // Resolve the originating tab for NESTING ONLY (owned clone so the
+        // immutable model borrow ends before the mutable spawn borrow). Same
+        // predicate as `handle_handoff`: non-empty id, not the Terminals group,
+        // present in the model, and owning the sending pane.
+        let originating_id = {
+            let originating =
+                if !tab_id.is_empty() && !self.model.is_terminals_project_tab(&tab_id) {
+                    self.model
+                        .tab_for(&tab_id)
+                        .filter(|t| t.panes.iter().any(|p| p.id == pane_id))
+                } else {
+                    None
+                };
+            originating.map(|t| t.id.clone())
+        };
+        // On a miss, "" makes `insert_handoff_child` reject the anchor and the tab
+        // opens top-level.
+        let under = originating_id.unwrap_or_default();
+
+        let title = crate::session_manager::dispatch_title(&worktree_name);
+        let prompt = crate::session_manager::dispatch_prompt(&task_file, &instructions);
+        let extra_args = crate::session_manager::dispatch_extra_args(
+            &worktree_name,
+            &task_file,
+            &model,
+            &effort,
+            &prompt,
+        );
+
+        let settings = self.claude_settings_path.clone();
+        let model_doc = &mut self.model;
+        let session = &mut self.session;
+        // The payload cwd, NOT the originating tab's: worktrees are always created
+        // from the main checkout. The tab then follows Claude into the worktree via
+        // the existing `session_update` cwd-follow.
+        let created = session.create_nested_claude_tab(
+            model_doc,
+            &under,
+            &cwd,
+            title,
+            &extra_args,
+            settings.as_deref(),
+            cx,
+        );
+        if created.is_some() {
+            // Re-render only: the dispatch tab opens UNSELECTED, so the active tab
+            // is untouched and the "selection ⊇ {active tab}" invariant holds.
+            cx.notify();
+        }
+        // ALWAYS `ok` — as for handoff, no hard error can occur on a live
+        // WindowState (the `error: …` reply shape belongs to the helper's own
+        // no-reply / socket-failure paths).
         reply.send("ok");
     }
 
@@ -2425,6 +2552,170 @@ mod tests {
 
         // Drop every session container so no pty (however short-lived) outlives
         // the test.
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    /// The handler-level facts of `dispatch` that no pure helper can carry:
+    /// nesting under the RESOLVED originating tab, the top-level fallback on a
+    /// stale `tabId`, the locked `[DISPATCH] …` title, the background (unselected)
+    /// open, and — the one real split from `handoff` — that the new tab's cwd is
+    /// the PAYLOAD cwd (the main checkout root) even though the dispatcher tab
+    /// itself sits in a worktree.
+    ///
+    /// Same containment as the handoff test above: only MODEL-level state is
+    /// asserted (both constructors swallow the pty spawn with `let _ =`), the
+    /// resolved-`claude` global is pinned to `None`, and every cwd is a path that
+    /// does not exist so a forked child `_exit`s at its `chdir`.
+    #[gpui::test]
+    fn dispatch_nests_from_payload_cwd_without_stealing_focus(cx: &mut gpui::TestAppContext) {
+        // The dispatcher tab has followed claude into a worktree; the payload cwd
+        // is the main checkout the helper resolved. They must not be confused.
+        const MAIN_ROOT: &str = "/nice-unit-test-no-such-dir/main";
+        const DISPATCHER_CWD: &str = "/nice-unit-test-no-such-dir/main/.claude/worktrees/other";
+        const TASK_FILE: &str = "/nice-unit-test-no-such-dir/main/.claude/dispatch/fix-tabs-1.md";
+        cx.update(|app| app.set_global(crate::session_manager::ResolvedClaudePath(None)));
+
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+
+        let orig_pane = state.update(cx, |ws, _cx| {
+            let pane_id = "t-orig-claude".to_string();
+            let mut claude = Pane::new(&pane_id, "Claude", PaneKind::Claude);
+            claude.is_claude_running = true;
+            let mut tab = Tab::new("t-orig", "dispatcher", DISPATCHER_CWD);
+            tab.panes = vec![
+                claude,
+                Pane::new("t-orig-t1", "Terminal 1", PaneKind::Terminal),
+            ];
+            tab.active_pane_id = Some(pane_id.clone());
+            tab.claude_session_id = Some("orig-session".into());
+            tab.next_terminal_index = 2;
+            ws.model.ensure_project("p", "P", DISPATCHER_CWD);
+            let pi = ws.model.projects.iter().position(|p| p.id == "p").unwrap();
+            ws.model.projects[pi].tabs.push(tab);
+            ws.model.select_tab("t-orig");
+            ws.selection.sync_active_tab_id(ws.model.active_tab_id());
+            pane_id
+        });
+
+        // ---- resolved originating tab ⇒ nested, payload cwd, locked title -----
+        let before = state.update(cx, |ws, _cx| tab_ids(&ws.model));
+        let (client, server) = UnixStream::pair().unwrap();
+        state.update(cx, |ws, cx| {
+            ws.handle_dispatch(
+                MAIN_ROOT.to_string(),
+                "fix-tabs".to_string(),
+                TASK_FILE.to_string(),
+                String::new(),
+                // The default dispatch inherits NOTHING from the dispatcher.
+                String::new(),
+                String::new(),
+                "t-orig".to_string(),
+                orig_pane.clone(),
+                Reply::for_test(server),
+                cx,
+            )
+        });
+        assert_eq!(read_reply(client), "ok\n", "a dispatch always replies ok");
+
+        state.update(cx, |ws, _cx| {
+            let id = new_tab_id(&ws.model, &before).expect("the dispatch opened a tab");
+            let tab = ws.model.tab_for(&id).expect("the new tab is in the model");
+            assert_eq!(
+                tab.parent_tab_id.as_deref(),
+                Some("t-orig"),
+                "the dispatch tab nests under the originating tab"
+            );
+            assert_eq!(
+                tab.cwd, MAIN_ROOT,
+                "the dispatch spawns from the PAYLOAD cwd (main checkout), never \
+                 the dispatcher tab's worktree cwd"
+            );
+            assert_eq!(tab.title, "[DISPATCH] fix-tabs");
+            assert!(
+                tab.title_manually_set,
+                "the [DISPATCH] label is locked against Claude's OSC auto-title"
+            );
+            assert_eq!(
+                ws.model.active_tab_id(),
+                Some("t-orig"),
+                "the dispatch must NOT steal the active tab"
+            );
+            assert!(
+                !ws.selection.contains(&id),
+                "the background dispatch tab is not selected"
+            );
+        });
+
+        // ---- stale tabId ⇒ top-level open, still not an error ------------------
+        let before = state.update(cx, |ws, _cx| tab_ids(&ws.model));
+        let (client, server) = UnixStream::pair().unwrap();
+        state.update(cx, |ws, cx| {
+            ws.handle_dispatch(
+                MAIN_ROOT.to_string(),
+                "other-task".to_string(),
+                TASK_FILE.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "t-gone".to_string(),
+                orig_pane.clone(),
+                Reply::for_test(server),
+                cx,
+            )
+        });
+        assert_eq!(read_reply(client), "ok\n", "a resolution miss is not an error");
+
+        state.update(cx, |ws, _cx| {
+            let id = new_tab_id(&ws.model, &before).expect("the dispatch still opened a tab");
+            let tab = ws.model.tab_for(&id).expect("the new tab is in the model");
+            assert!(
+                tab.parent_tab_id.is_none(),
+                "an unresolvable tabId opens the dispatch tab top-level"
+            );
+            assert_eq!(tab.title, "[DISPATCH] other-task");
+            assert_eq!(
+                ws.model.active_tab_id(),
+                Some("t-orig"),
+                "the top-level fallback still steals no focus"
+            );
+        });
+
+        // ---- live tabId but a paneId the tab does NOT own ⇒ top-level too ------
+        // The pane-ownership `.filter(...)` guard: without it a payload carrying
+        // a real tab id plus a foreign/closed pane id would nest under the wrong
+        // parent.
+        let before = state.update(cx, |ws, _cx| tab_ids(&ws.model));
+        let (client, server) = UnixStream::pair().unwrap();
+        state.update(cx, |ws, cx| {
+            ws.handle_dispatch(
+                MAIN_ROOT.to_string(),
+                "third-task".to_string(),
+                TASK_FILE.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "t-orig".to_string(),
+                "not-a-pane-of-t-orig".to_string(),
+                Reply::for_test(server),
+                cx,
+            )
+        });
+        assert_eq!(read_reply(client), "ok\n", "a pane-ownership miss is not an error");
+
+        state.update(cx, |ws, _cx| {
+            let id = new_tab_id(&ws.model, &before).expect("the dispatch still opened a tab");
+            let tab = ws.model.tab_for(&id).expect("the new tab is in the model");
+            assert!(
+                tab.parent_tab_id.is_none(),
+                "a paneId the resolved tab does not own opens the tab top-level"
+            );
+            assert_eq!(
+                ws.model.active_tab_id(),
+                Some("t-orig"),
+                "the pane-ownership fallback still steals no focus"
+            );
+        });
+
         state.update(cx, |ws, _cx| ws.teardown());
     }
 

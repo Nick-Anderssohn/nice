@@ -1429,9 +1429,13 @@ impl SessionManager {
         Some(tab_id)
     }
 
-    /// The handoff-flavored Claude-tab constructor — the Rust twin of Swift
-    /// `SessionsModel.createHandoffTab` (`SessionsModel.swift:1246-1303`). Modelled
-    /// on [`create_claude_tab`](Self::create_claude_tab) (the same
+    /// The nested-child Claude-tab constructor shared by the `handoff` and
+    /// `dispatch` socket handlers — the Rust twin of Swift
+    /// `SessionsModel.createHandoffTab` (`SessionsModel.swift:1246-1303`). The two
+    /// flavors differ ONLY in the `title` / `extra_args` their handlers build
+    /// (`handoff_title` + [`handoff_extra_args`] vs [`dispatch_title`] +
+    /// [`dispatch_extra_args`]), so the tab-construction half lives here once.
+    /// Modelled on [`create_claude_tab`](Self::create_claude_tab) (the same
     /// `[Claude, Terminal 1]` shape, Claude focused + `is_claude_running = true`
     /// from creation, the deferred companion terminal, a pre-minted v4 session
     /// UUID passed as `--session-id`, `next_terminal_index = 2`, its session
@@ -1456,33 +1460,31 @@ impl SessionManager {
     ///   activation, as before.
     /// * **(D4) the title is fixed AND locked** — set to `title` up front with
     ///   `title_manually_set = true`, so Claude's OSC auto-title cannot overwrite
-    ///   the `[HANDOFF] …` label once the fresh session names itself (unlike an
-    ///   ordinary claude tab, which keeps auto-title).
+    ///   the `[HANDOFF] …` / `[DISPATCH] …` label once the fresh session names
+    ///   itself (unlike an ordinary claude tab, which keeps auto-title).
     /// * **(D3) placement nests one indent under the originating tab** — via
     ///   [`TabModel::insert_handoff_child`] (depth-1 lineage, the invariant
     ///   `/branch` uses), falling back to [`TabModel::add_tab_to_projects`] (cwd
     ///   bucketing) when the anchor is empty / unknown / in the Terminals group,
     ///   so a top-level handoff (Main Terminal, or a stale id) still opens.
-    /// * **(D5) the seeded `prompt` is the FINAL positional arg**, preceded by the
-    ///   optional `--model`/`--effort` flags ([`handoff_extra_args`]), so the
-    ///   launch line becomes
-    ///   `claude --session-id <id> [--model <m>] [--effort <e>] '<prompt>'`, which
-    ///   auto-runs the prompt matched to the originating session's model/effort.
+    /// * **(D5) `extra_args` are emitted verbatim after `--session-id`** — each
+    ///   flavor's builder already ends them with the seeded prompt as the FINAL
+    ///   positional arg, so the launch line becomes
+    ///   `claude --session-id <id> <extra args…> '<prompt>'`, which auto-runs the
+    ///   prompt. This constructor never reorders or appends to them.
     ///
     /// `settings_path` threads the R17 theme-sync pointer exactly as
     /// [`create_claude_tab`] does. Returns the new tab id (placement here never
     /// fails — the fallback always buckets — but the signature mirrors
     /// [`create_claude_tab`] for symmetry).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_handoff_tab(
+    pub(crate) fn create_nested_claude_tab(
         &mut self,
         model: &mut TabModel,
         under_tab_id: &str,
         cwd: &str,
         title: String,
-        prompt: String,
-        model_id: &str,
-        effort: &str,
+        extra_args: &[String],
         settings_path: Option<&str>,
         cx: &mut App,
     ) -> Option<String> {
@@ -1502,31 +1504,31 @@ impl SessionManager {
         ];
         tab.active_pane_id = Some(claude_pane_id.clone());
         tab.claude_session_id = Some(session_id.clone());
-        // (D4) Lock the "[HANDOFF] …" title against Claude's OSC auto-title.
+        // (D4) Lock the "[HANDOFF] …" / "[DISPATCH] …" title against Claude's OSC
+        // auto-title.
         tab.title_manually_set = true;
         tab.next_terminal_index = 2;
 
         // (D3) Nest under the originating tab; else bucket at top level so a
-        // Main-Terminal (or stale-id) handoff still opens. `insert_handoff_child`
+        // Main-Terminal (or stale-id) request still opens. `insert_handoff_child`
         // consumes `tab` on the success path, so clone for the attempt and hand
         // the original to the bucketing fallback (Swift passes a value type twice).
         if !model.insert_handoff_child(tab.clone(), under_tab_id) {
             model.add_tab_to_projects(tab, cwd);
         }
-        // (D7) Deliberately NO `model.select_tab(&tab_id)`: the handoff tab opens
+        // (D7) Deliberately NO `model.select_tab(&tab_id)`: the nested tab opens
         // in the background so the originating tab keeps selection + key focus.
         // The (empty) session container so the deferred companion's later
         // `ensure_active_pane_spawned` precondition ("the tab has a session") holds.
         self.register_tab_session(&tab_id);
 
-        // (D5) --model/--effort (each omitted when empty) then the prompt LAST.
-        let extra_args = handoff_extra_args(model_id, effort, &prompt);
+        // (D5) The caller's args verbatim — already prompt-last.
         let _ = self.spawn_claude_pane(
             &tab_id,
             &claude_pane_id,
             cwd,
             &ClaudeSessionMode::New(session_id),
-            &extra_args,
+            extra_args,
             settings_path,
             cx,
         );
@@ -2250,6 +2252,90 @@ pub(crate) fn handoff_prompt(handoff_file: &str, instructions: &str) -> String {
 /// `claude --session-id <id> [--model <m>] [--effort <e>] '<prompt>'`.
 pub(crate) fn handoff_extra_args(model: &str, effort: &str, prompt: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
+    if !model.is_empty() {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if !effort.is_empty() {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
+/// The prefix on every dispatch-tab title. Unlike [`HANDOFF_TITLE_PREFIX`] there
+/// is no stripping rule: a dispatch title is built from the WORKTREE NAME, not
+/// from another tab's title, so it can never stack.
+const DISPATCH_TITLE_PREFIX: &str = "[DISPATCH] ";
+
+/// Build the locked `[DISPATCH] <worktree-name>` title for a dispatch tab. The
+/// locked title keeps the sidebar's tab→worktree mapping stable against Claude's
+/// OSC auto-title. Trims and falls back to `Session` on a blank name exactly as
+/// [`handoff_title`] does, so a whitespace-only name can't render a ragged
+/// `[DISPATCH]    ` (the socket parser only rejects a truly empty
+/// `worktreeName`).
+pub(crate) fn dispatch_title(worktree_name: &str) -> String {
+    let trimmed = worktree_name.trim();
+    let base = if trimmed.is_empty() { "Session" } else { trimmed };
+    format!("{DISPATCH_TITLE_PREFIX}{base}")
+}
+
+/// Build the initial prompt seeded into a dispatched session. Unlike
+/// [`handoff_prompt`] (which lands the fresh session read-and-WAIT), a dispatch
+/// child is meant to start working immediately from the task file the dispatcher
+/// wrote. Extra `instructions` are appended as a second sentence when non-blank,
+/// same concatenation style as [`handoff_prompt`].
+pub(crate) fn dispatch_prompt(task_file: &str, instructions: &str) -> String {
+    let base = format!(
+        "Read the dispatch task file at {task_file}, then start working on the task it describes."
+    );
+    let trimmed = instructions.trim();
+    if trimmed.is_empty() {
+        base
+    } else {
+        format!("{base} {trimmed}")
+    }
+}
+
+/// Build the `extra_claude_args` for a dispatched session. **The argument order
+/// is load-bearing:**
+///
+/// 1. `--add-dir <dirname(task_file)>` — the task file lives in the MAIN
+///    checkout's `.claude/dispatch/`, outside the child's eventual worktree cwd,
+///    so without this the child's very first action (reading the brief) stalls
+///    on an out-of-cwd read permission prompt.
+/// 2. `--worktree <name>` — `--add-dir` is a VARIADIC option that swallows every
+///    following non-flag token, so a single-token option MUST follow it. Were
+///    the prompt the next non-flag token (the default dispatch, where model and
+///    effort are omitted) it would be eaten as a second directory and the child
+///    would launch with NO prompt.
+/// 3. `--model` / `--effort`, each omitted when empty. Dispatch deliberately does
+///    NOT inherit the dispatcher's model/effort (the opposite of handoff): an
+///    empty value means the child runs on the user's configured default.
+/// 4. the `prompt`, LAST — the single positional arg claude auto-runs.
+///
+/// Long forms throughout, for launch-line greppability. `--add-dir` is dropped
+/// when `task_file` has no parent directory component (a bare relative name),
+/// which also keeps `--worktree` first and the variadic hazard moot.
+pub(crate) fn dispatch_extra_args(
+    worktree_name: &str,
+    task_file: &str,
+    model: &str,
+    effort: &str,
+    prompt: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(dir) = std::path::Path::new(task_file)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--add-dir".to_string());
+        args.push(dir.to_string());
+    }
+    args.push("--worktree".to_string());
+    args.push(worktree_name.to_string());
     if !model.is_empty() {
         args.push("--model".to_string());
         args.push(model.to_string());

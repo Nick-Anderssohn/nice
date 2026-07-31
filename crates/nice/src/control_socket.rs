@@ -3,9 +3,9 @@
 //! Ports Swift `NiceControlSocket` (`Sources/Nice/Process/NiceControlSocket.swift`)
 //! — a tiny AF_UNIX listener that lets Nice's shell helpers and Claude Code
 //! skills talk to the app. One newline-delimited JSON object per client, then
-//! close. Three FROZEN actions (installed helpers on user disks already speak
-//! this protocol byte-for-byte — see the plan's "wire protocol is FROZEN"
-//! decision):
+//! close. Four actions (the first three are FROZEN — installed helpers on user
+//! disks already speak that protocol byte-for-byte, see the plan's "wire protocol
+//! is FROZEN" decision):
 //!
 //!   * `claude`         — the shadowed `claude()` zsh function asking Nice to
 //!                        open a new tab or promote a pane in place.
@@ -13,6 +13,9 @@
 //!                        rotations (fire-and-forget, no reply).
 //!   * `handoff`        — the `/nice-handoff` skill's helper asking Nice to open
 //!                        a nested handoff tab.
+//!   * `dispatch`       — the `/nice-dispatch` skill's helper asking Nice to open
+//!                        a nested tab running `claude --worktree <name> …` on a
+//!                        task file the dispatcher wrote.
 //!
 //! ## What differs from Swift (deliberately — plan "do not port the Swift
 //! structure")
@@ -51,12 +54,13 @@
 //! [`Reply`] owns the accepted [`UnixStream`] and is **consumed on use**
 //! ([`Reply::send`] takes `self`): at-most-once by construction, stronger than
 //! Swift's closure convention. `session_update` drops the stream BEFORE dispatch
-//! (fire-and-forget); `claude` / `handoff` carry a `Reply` and answer once from
-//! the foreground.
+//! (fire-and-forget); `claude` / `handoff` / `dispatch` carry a `Reply` and
+//! answer once from the foreground.
 //!
-//! The window-side routing point + the three stub handlers live on
+//! The window-side routing point + the four handlers live on
 //! [`crate::window_state::WindowState`] (`route_socket_message`); R15/R16/R26
-//! fill their bodies without reshaping this socket. The `app::run` bootstrap
+//! filled the first three's bodies and `dispatch` added a fourth arm, all
+//! without reshaping this socket. The `app::run` bootstrap
 //! (mint before the Main pane's spawn, start the listener, spawn the foreground
 //! drain, stop in teardown) is wired by the R14 env-injection slice — this
 //! module only provides the mechanism, hence the module-wide `dead_code` allow
@@ -153,6 +157,27 @@ pub(crate) enum SocketMessage {
         pane_id: String,
         reply: Reply,
     },
+    /// `/nice-dispatch` skill asking Nice to open a fresh Claude session nested
+    /// under the originating tab, running `claude --worktree <name>` on a task
+    /// file the dispatcher wrote. `cwd` (the MAIN checkout root, resolved by the
+    /// helper — the handler spawns from it, NOT from the originating tab's live
+    /// cwd), `worktree_name`, `task_file` and `pane_id` are required non-empty;
+    /// `instructions` / `model` / `effort` / `tab_id` normalize to `""`. Unlike
+    /// `handoff`, empty `model` / `effort` mean "omit the flag entirely" (the
+    /// child runs on the user's configured default) — dispatch deliberately does
+    /// NOT inherit the dispatcher's. The handler replies once with `ok` /
+    /// `error: …`.
+    Dispatch {
+        cwd: String,
+        worktree_name: String,
+        task_file: String,
+        instructions: String,
+        model: String,
+        effort: String,
+        tab_id: String,
+        pane_id: String,
+        reply: Reply,
+    },
 }
 
 /// Consume-on-use reply capability owning the accepted client [`UnixStream`].
@@ -218,6 +243,16 @@ pub(crate) enum RecordedSocketMessage {
     Handoff {
         cwd: String,
         handoff_file: String,
+        instructions: String,
+        model: String,
+        effort: String,
+        tab_id: String,
+        pane_id: String,
+    },
+    Dispatch {
+        cwd: String,
+        worktree_name: String,
+        task_file: String,
         instructions: String,
         model: String,
         effort: String,
@@ -533,9 +568,9 @@ fn read_framed_line(stream: &mut UnixStream) -> Option<Vec<u8>> {
 
 /// Parse one request line into a [`SocketMessage`], taking ownership of the
 /// client `stream` so `session_update` can close it before dispatch and
-/// `claude` / `handoff` can carry it in a [`Reply`]. Returns `None` (dropping the
-/// stream → silent close, no reply) for malformed JSON, a non-object, a
-/// missing/unknown `action`, or a missing required field.
+/// `claude` / `handoff` / `dispatch` can carry it in a [`Reply`]. Returns `None`
+/// (dropping the stream → silent close, no reply) for malformed JSON, a
+/// non-object, a missing/unknown `action`, or a missing required field.
 ///
 /// Every rule below is the FROZEN contract shared with installed helpers
 /// (Swift `readClient`, `NiceControlSocket.swift:382-511`):
@@ -546,6 +581,10 @@ fn read_framed_line(stream: &mut UnixStream) -> Option<Vec<u8>> {
 ///   * `handoff`: `cwd` + `handoffFile` required non-empty; `instructions` /
 ///     `model` / `effort` / `tabId` / `paneId` normalize to `""` (an older
 ///     helper omitting `model`/`effort` must still dispatch, not drop).
+///   * `dispatch`: `cwd` + `worktreeName` + `taskFile` + `paneId` required
+///     non-empty (unlike `handoff`, a dispatch without a sending pane cannot
+///     nest and is dropped); `instructions` / `model` / `effort` / `tabId`
+///     normalize to `""`.
 fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
     let value: serde_json::Value = serde_json::from_slice(line).ok()?;
     let obj = value.as_object()?; // non-object → drop
@@ -591,6 +630,27 @@ fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
             Some(SocketMessage::Handoff {
                 cwd,
                 handoff_file,
+                instructions,
+                model,
+                effort,
+                tab_id,
+                pane_id,
+                reply: Reply::new(stream),
+            })
+        }
+        "dispatch" => {
+            let cwd = non_empty(obj, "cwd")?;
+            let worktree_name = non_empty(obj, "worktreeName")?;
+            let task_file = non_empty(obj, "taskFile")?;
+            let pane_id = non_empty(obj, "paneId")?;
+            let tab_id = str_or_empty(obj, "tabId");
+            let instructions = str_or_empty(obj, "instructions");
+            let model = str_or_empty(obj, "model");
+            let effort = str_or_empty(obj, "effort");
+            Some(SocketMessage::Dispatch {
+                cwd,
+                worktree_name,
+                task_file,
                 instructions,
                 model,
                 effort,
@@ -969,6 +1029,7 @@ mod tests {
         match msg {
             SocketMessage::Claude { reply, .. } => reply.send("newtab"),
             SocketMessage::Handoff { reply, .. } => reply.send("ok"),
+            SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
             SocketMessage::SessionUpdate { .. } => {}
         }
     }
@@ -991,6 +1052,7 @@ mod tests {
                 } => items.lock().unwrap().push((pane_id, session_id, source, cwd)),
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
                 SocketMessage::Handoff { reply, .. } => reply.send("ok"),
+                SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
             }
         }
         fn count(&self) -> usize {
@@ -1354,6 +1416,7 @@ mod tests {
                     });
                 }
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
+                SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
                 SocketMessage::SessionUpdate { .. } => {}
             }
         }
@@ -1550,6 +1613,213 @@ mod tests {
             r#"{"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"t1","paneId":"p1","model":"","effort":""}"#,
         );
         let got = captured.wait_one().expect("dispatch");
+        assert_eq!(got.model, "");
+        assert_eq!(got.effort, "");
+    }
+
+    // ---- `dispatch` PARSE tests ---------------------------------------------
+    //
+    // Mirrors the handoff set with dispatch's own required-field list: `cwd`,
+    // `worktreeName`, `taskFile` AND `paneId` are all required non-empty. The
+    // handler's behavior (nesting, payload-cwd spawn, locked title, always-`ok`)
+    // lives in `window_state`; these assert PARSE + normalization only.
+
+    /// A minimal VALID dispatch payload (every required field present).
+    const DISPATCH_PAYLOAD: &str = r#"{"action":"dispatch","cwd":"/repo","worktreeName":"fix-tabs","taskFile":"/repo/.claude/dispatch/fix-tabs-1.md","tabId":"t1","paneId":"p1"}"#;
+
+    #[derive(Clone, Default)]
+    struct CapturedDispatches {
+        items: Arc<Mutex<Vec<Dispatch>>>,
+    }
+    #[derive(Clone)]
+    struct Dispatch {
+        cwd: String,
+        worktree_name: String,
+        task_file: String,
+        instructions: String,
+        model: String,
+        effort: String,
+        tab_id: String,
+        pane_id: String,
+    }
+    impl CapturedDispatches {
+        fn handler(&self) -> impl Fn(SocketMessage) + Send + Sync + 'static {
+            let items = Arc::clone(&self.items);
+            move |msg| match msg {
+                SocketMessage::Dispatch {
+                    cwd,
+                    worktree_name,
+                    task_file,
+                    instructions,
+                    model,
+                    effort,
+                    tab_id,
+                    pane_id,
+                    reply,
+                } => {
+                    reply.send("ok"); // drain the fd; the real handler is window-side
+                    items.lock().unwrap().push(Dispatch {
+                        cwd,
+                        worktree_name,
+                        task_file,
+                        instructions,
+                        model,
+                        effort,
+                        tab_id,
+                        pane_id,
+                    });
+                }
+                SocketMessage::Claude { reply, .. } => reply.send("newtab"),
+                SocketMessage::Handoff { reply, .. } => reply.send("ok"),
+                SocketMessage::SessionUpdate { .. } => {}
+            }
+        }
+        fn count(&self) -> usize {
+            self.items.lock().unwrap().len()
+        }
+        fn wait_one(&self) -> Option<Dispatch> {
+            wait_for(Duration::from_secs(1), || self.count() >= 1);
+            self.items.lock().unwrap().first().cloned()
+        }
+    }
+
+    /// Assert a payload never reaches the handler (missing/empty required field).
+    fn assert_dispatch_drops(payload: &str, what: &str) {
+        let captured = CapturedDispatches::default();
+        let socket = socket_with(captured.handler());
+        send_raw(socket.path(), payload);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(captured.count(), 0, "{what} must drop");
+    }
+
+    #[test]
+    fn dispatch_valid_payload_dispatches_all_fields() {
+        let captured = CapturedDispatches::default();
+        let socket = socket_with(captured.handler());
+
+        send_and_read(
+            socket.path(),
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"fix-tabs","taskFile":"/repo/.claude/dispatch/fix-tabs-1.md","tabId":"tab1","paneId":"pane1","instructions":"Only touch the parser","model":"opus","effort":"xhigh"}"#,
+        );
+
+        let got = captured
+            .wait_one()
+            .expect("dispatch with all fields must dispatch");
+        assert_eq!(got.cwd, "/repo");
+        assert_eq!(got.worktree_name, "fix-tabs");
+        assert_eq!(got.task_file, "/repo/.claude/dispatch/fix-tabs-1.md");
+        assert_eq!(got.instructions, "Only touch the parser");
+        assert_eq!(got.tab_id, "tab1");
+        assert_eq!(got.pane_id, "pane1");
+        assert_eq!(got.model, "opus");
+        assert_eq!(got.effort, "xhigh");
+    }
+
+    #[test]
+    fn dispatch_valid_payload_reply_round_trips() {
+        let socket = socket_with(|msg| {
+            if let SocketMessage::Dispatch { reply, .. } = msg {
+                reply.send("ok");
+            }
+        });
+        let reply = send_and_read(socket.path(), DISPATCH_PAYLOAD);
+        assert_eq!(reply.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn dispatch_missing_cwd_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","worktreeName":"w","taskFile":"/repo/t.md","tabId":"t1","paneId":"p1"}"#,
+            "missing cwd",
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_cwd_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"","worktreeName":"w","taskFile":"/repo/t.md","tabId":"t1","paneId":"p1"}"#,
+            "empty cwd",
+        );
+    }
+
+    #[test]
+    fn dispatch_missing_worktree_name_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"/repo","taskFile":"/repo/t.md","tabId":"t1","paneId":"p1"}"#,
+            "missing worktreeName",
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_worktree_name_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"","taskFile":"/repo/t.md","tabId":"t1","paneId":"p1"}"#,
+            "empty worktreeName",
+        );
+    }
+
+    #[test]
+    fn dispatch_missing_task_file_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","tabId":"t1","paneId":"p1"}"#,
+            "missing taskFile",
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_task_file_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"","tabId":"t1","paneId":"p1"}"#,
+            "empty taskFile",
+        );
+    }
+
+    #[test]
+    fn dispatch_missing_pane_id_drops_silently() {
+        // Unlike handoff (whose paneId is optional), a dispatch without a sending
+        // pane cannot resolve an originating tab to nest under.
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","tabId":"t1"}"#,
+            "missing paneId",
+        );
+    }
+
+    #[test]
+    fn dispatch_empty_pane_id_drops_silently() {
+        assert_dispatch_drops(
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","tabId":"t1","paneId":""}"#,
+            "empty paneId",
+        );
+    }
+
+    #[test]
+    fn dispatch_absent_optional_fields_normalize_to_empty_strings() {
+        // The DEFAULT dispatch: the helper omits model/effort entirely so the
+        // child launches on the user's configured default (no inheritance).
+        let captured = CapturedDispatches::default();
+        let socket = socket_with(captured.handler());
+        send_and_read(
+            socket.path(),
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","paneId":"p1"}"#,
+        );
+        let got = captured.wait_one().expect("dispatch");
+        assert_eq!(got.tab_id, "", "absent tabId → \"\"");
+        assert_eq!(got.instructions, "", "absent instructions → \"\"");
+        assert_eq!(got.model, "", "absent model → \"\"");
+        assert_eq!(got.effort, "", "absent effort → \"\"");
+    }
+
+    #[test]
+    fn dispatch_empty_optional_fields_normalize_to_empty_strings() {
+        let captured = CapturedDispatches::default();
+        let socket = socket_with(captured.handler());
+        send_and_read(
+            socket.path(),
+            r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","tabId":"","paneId":"p1","instructions":"","model":"","effort":""}"#,
+        );
+        let got = captured.wait_one().expect("dispatch");
+        assert_eq!(got.tab_id, "");
+        assert_eq!(got.instructions, "");
         assert_eq!(got.model, "");
         assert_eq!(got.effort, "");
     }

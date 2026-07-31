@@ -125,6 +125,7 @@ mod confirmation_modal;
 mod context_menu;
 mod control_socket;
 mod cwd_heal;
+mod dispatch_live;
 mod file_browser;
 mod file_browser_live;
 mod ghostty_theme_parser;

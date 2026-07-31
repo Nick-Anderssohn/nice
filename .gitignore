@@ -38,6 +38,13 @@ scripts/.env.release
 # never meant to be committed.
 .claude/scheduled_tasks.lock
 
+# Task briefs the /nice-dispatch skill writes before opening a dispatched
+# worktree session. They always land in the MAIN checkout (the dispatched
+# session's cwd becomes the worktree, so the brief has to live outside it)
+# and accumulate with no cleanup story — ignore them so they never pollute
+# `git status`.
+/.claude/dispatch/
+
 # Rust rewrite (Path B)
 # Vendored pinned zed/GPUI checkout (~1 GB) — reproduced by
 # scripts/vendor-zed.sh from patches/zed-bg-luminance.patch, never committed.

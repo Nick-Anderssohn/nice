@@ -795,10 +795,11 @@ fn should_offer_handoff_prompt_from(support_root_set: bool, force_prompt_set: bo
 }
 
 /// R26 (D8/D9): present the one-time first-launch prompt offering to install the
-/// handoff skill, hosted on the active window via the same resolve pattern as
+/// Nice Claude skills (handoff + dispatch — one toggle installs both), hosted on
+/// the active window via the same resolve pattern as
 /// [`request_quit`]. Both buttons persist `handoffSkillPromptSeen = true` so the
-/// prompt never reappears regardless of the answer; "Install" installs the `-rs`
-/// skill, "Not Now" ensures it removed (both idempotent through
+/// prompt never reappears regardless of the answer; "Install" installs the
+/// skills, "Not Now" ensures they are removed (both idempotent through
 /// [`crate::skill_installer::sync`]). Fired deferred from [`run`] (D9 re-entrancy)
 /// so the just-opened active window is fully in `cx.windows` when this `update`
 /// runs. `run`-only — [`run_selftest`] never reaches this path (hermeticity: the
@@ -813,8 +814,8 @@ fn present_handoff_prompt(cx: &mut App) {
     let result = win.update(cx, |_root, window, app| {
         state.update(app, |ws, wcx| {
             ws.present_confirmation(
-                "Install the Nice Handoff skill?",
-                "The /nice-handoff skill lets Claude hand off the current work to a fresh session in a new tab. You can change this anytime in Settings.",
+                "Install the Nice Claude skills?",
+                "The /nice-handoff skill lets Claude hand off the current work to a fresh session in a new tab, and /nice-dispatch sends a task to a fresh session working in its own worktree. You can change this anytime in Settings.",
                 "Install",
                 "Not Now",
                 false,
@@ -1193,20 +1194,19 @@ pub fn run() {
         // above) and before the first pane spawns — it touches no ptys. Failures
         // are logged and swallowed (the feature degrades, the app still runs).
         crate::claude_hook_installer::install();
-        // R26: reconcile the on-disk Nice Handoff skill to the persisted
-        // `installHandoffSkill` CFPref, then seed the render gate. Read the flag
-        // once (default OFF) and `skill_installer::sync` HEALS the on-disk state
-        // to it at launch — installing (or removing) the `-rs` SKILL.md + helper
-        // if the user toggled while the app was closed, or a prior write was
-        // partial. Seed `HandoffSkillGate` from the SAME value so the Claude
+        // R26: reconcile the on-disk Nice Claude skills (handoff AND dispatch —
+        // one CFPref covers every pair `skill_installer` installs) to the
+        // persisted `installHandoffSkill` flag, then seed the render gate. Read
+        // the flag once (default OFF) and `skill_installer::sync` HEALS the
+        // on-disk state to it at launch — installing (or removing) each SKILL.md
+        // + helper if the user toggled while the app was closed, or a prior write
+        // was partial. Seed `HandoffSkillGate` from the SAME value so the Claude
         // pane's toggle renders the persisted state without touching CFPrefs at
-        // render time. Both the skill files and the flag are the dev build's
-        // `-rs` identity — the unsuffixed prod `/nice-handoff` is never touched
-        // (D2). app::run ONLY (never run_selftest, per tranche-3 hermeticity: the
-        // regression suite must not write the real ~/.claude / ~/.nice, and a
-        // suite render sees the absent gate ⇒ OFF). Failures are logged and
-        // swallowed inside `sync` (the app runs fine; only the handoff feature
-        // degrades).
+        // render time. app::run ONLY (never run_selftest, per tranche-3
+        // hermeticity: the regression suite must not write the real ~/.claude /
+        // ~/.nice, and a suite render sees the absent gate ⇒ OFF). Failures are
+        // logged and swallowed inside `sync` (the app runs fine; only the
+        // handoff/dispatch skills degrade).
         let install_handoff_skill = crate::platform::read_bool_pref("installHandoffSkill", false);
         crate::skill_installer::sync(install_handoff_skill);
         cx.set_global(HandoffSkillGate(install_handoff_skill));
@@ -4148,6 +4148,32 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
                 // recording its argv, a miss fallback, and a flags-omit spawn — each
                 // on the real socket / pty clock; generous headroom.
                 budget: Duration::from_secs(75),
+            },
+            activate: true,
+        },
+        // The dispatch gate — the `/nice-dispatch` twin of `handoff`, likewise on
+        // the SHIPPED window over a real control socket + real ptys with a stub
+        // `claude` (never the real one) and a sandboxed HOME. Two legs: a raw
+        // `dispatch` message opens a nested, UNSELECTED `[DISPATCH] <worktree>` tab
+        // (locked title, parented under the seeded dispatcher, spawned from the
+        // PAYLOAD cwd — never the dispatcher's own) whose argv carries
+        // `--add-dir <brief dir>` immediately followed by `--worktree <name>` then
+        // `--model`/`--effort` then the prompt last; and the INSTALLED
+        // `nice-dispatch.sh` (laid into the fixture's injected dirs, never the real
+        // `~/.nice`) is RUN for real from a subdirectory of a `git init`-ed scratch
+        // repo, proving its `--git-common-dir` main-root resolution and that a
+        // default dispatch omits both flags. Registered BEFORE `multiwindow`: its
+        // build_window_root only `register`s (no WindowRegistry close observer), so
+        // its window never trips the quit-when-empty terminus.
+        Scenario {
+            name: "dispatch",
+            open: crate::dispatch_live::open_dispatch_window,
+            gate: Gate::SelfReported {
+                // A socket round-trip + a spawned stub recording its argv, then the
+                // installer plus a REAL helper subprocess (which itself waits on the
+                // window's socket reply) and a second spawn — all on the real socket
+                // / pty / process clock; generous headroom.
+                budget: Duration::from_secs(90),
             },
             activate: true,
         },

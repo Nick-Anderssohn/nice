@@ -39,14 +39,16 @@ pub(crate) fn sync_claude_live_arm(cx: &mut App, on: bool) {
     cx.refresh_windows();
 }
 
-/// The handoff-skill toggle handler (R26, D10) — the shipped click path. Persist
+/// The Claude-skills toggle handler (R26, D10) — the shipped click path. Persist
 /// the new value to the `installHandoffSkill` CFPref (the boot-reconcile gate's
-/// single source of truth), update the in-memory `HandoffSkillGate` so the
-/// re-render reflects it, sync the on-disk `-rs` skill files to the new state,
-/// then repaint. Unlike the sync-theme toggle there is NO unit-observable
-/// live-arm split: the toggle's ONLY effect is real filesystem writes (tested
-/// hermetically at the installer's `sync_with` seam against scratch dirs), so a
-/// split would buy no hermetic coverage (YAGNI). Reaches the REAL CFPrefs domain
+/// single source of truth — the key keeps its handoff-era name now that the
+/// dispatch pair rides the same toggle), update the in-memory `HandoffSkillGate`
+/// so the re-render reflects it, sync EVERY installed skill/helper pair on disk
+/// to the new state, then repaint. Unlike the sync-theme toggle there is NO
+/// unit-observable live-arm split: the toggle's ONLY effect is real filesystem
+/// writes (tested hermetically at the installer's `sync_with` seam against
+/// scratch dirs), so a split would buy no hermetic coverage (YAGNI). Reaches
+/// the REAL CFPrefs domain
 /// AND the real `~/.claude` / `~/.nice`, so it is called ONLY from the live UI
 /// handler in an `app::run`-installed window — NEVER `run_selftest`, never a test.
 pub(crate) fn perform_toggle_install_handoff(cx: &mut App, on: bool) {
@@ -82,11 +84,13 @@ pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
             cx,
         ))
         .child(setting_row_info(
-            "Install the Nice Handoff skill",
-            "Adds the global /nice-handoff Claude Code skill and installs \
-             ~/.nice/nice-handoff.sh. Run inside a Claude pane, the skill writes a \
-             handoff file capturing the current work and opens a new tab so a fresh \
-             session can continue from where this one left off.",
+            "Install the Nice Claude skills",
+            "Adds the global /nice-handoff and /nice-dispatch Claude Code skills and \
+             installs their helpers in ~/.nice. Run inside a Claude pane, /nice-handoff \
+             writes a handoff file capturing the current work and opens a new tab so a \
+             fresh session can continue from where this one left off; /nice-dispatch \
+             writes a task brief and opens a background tab running it in its own \
+             worktree.",
             toggle_switch(
                 "settings.claude.installHandoffSkill",
                 handoff_on,

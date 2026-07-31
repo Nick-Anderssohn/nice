@@ -18,7 +18,8 @@ use nice_term_view::TerminalEvent;
 use super::{
     build_claude_exec_command, build_claude_extra_env, build_claude_prefill_command,
     claude_launch_display_command, claude_tab_title_from_args, claude_worktree_cwd, clip_title,
-    compose_claude_reply, default_mint_id, handoff_extra_args, handoff_prompt, handoff_title,
+    compose_claude_reply, default_mint_id, dispatch_extra_args, dispatch_prompt, dispatch_title,
+    handoff_extra_args, handoff_prompt, handoff_title,
     merge_env_spec_wins, mint_session_uuid, parse_claude_title, ClaudeReplyDecision,
     ClaudeSessionMode, DissolveTerminus, PaneLaunchStatus, SessionManager, WindowShellEnv,
     PANE_TITLE_MAX,
@@ -2471,5 +2472,123 @@ fn handoff_extra_args_model_and_effort_then_prompt_last() {
     assert_eq!(
         handoff_extra_args("m", "xhigh", "P"),
         vec!["--model", "m", "--effort", "xhigh", "P"]
+    );
+}
+
+// dispatch_title — the locked "[DISPATCH] <worktree-name>" label.
+
+#[test]
+fn dispatch_title_prefixes_the_worktree_name() {
+    assert_eq!(dispatch_title("fix-tabs"), "[DISPATCH] fix-tabs");
+}
+
+#[test]
+fn dispatch_title_trims_surrounding_whitespace() {
+    assert_eq!(dispatch_title("  fix-tabs  "), "[DISPATCH] fix-tabs");
+}
+
+#[test]
+fn dispatch_title_blank_name_falls_back_to_session() {
+    // The socket parser rejects an EMPTY worktreeName, but " " gets through and
+    // would otherwise render a ragged "[DISPATCH]  ".
+    assert_eq!(dispatch_title("   "), "[DISPATCH] Session");
+}
+
+// dispatch_prompt — always points at the task file and tells the child to START
+// (the opposite of handoff's read-and-wait); instructions append when non-blank.
+
+#[test]
+fn dispatch_prompt_empty_instructions_is_the_read_and_start_directive() {
+    assert_eq!(
+        dispatch_prompt("/repo/.claude/dispatch/w-1.md", ""),
+        "Read the dispatch task file at /repo/.claude/dispatch/w-1.md, then start \
+         working on the task it describes."
+    );
+}
+
+#[test]
+fn dispatch_prompt_appends_non_empty_instructions() {
+    assert_eq!(
+        dispatch_prompt("/t/w.md", "Only touch the parser."),
+        "Read the dispatch task file at /t/w.md, then start working on the task it \
+         describes. Only touch the parser."
+    );
+}
+
+#[test]
+fn dispatch_prompt_whitespace_only_instructions_are_dropped() {
+    assert_eq!(
+        dispatch_prompt("/t/w.md", "  \n\t "),
+        "Read the dispatch task file at /t/w.md, then start working on the task it \
+         describes."
+    );
+}
+
+// dispatch_extra_args — the load-bearing order: --add-dir, then --worktree
+// (which terminates --add-dir's VARIADIC list), then optional --model/--effort,
+// then the prompt LAST.
+
+#[test]
+fn dispatch_extra_args_default_order_is_add_dir_worktree_then_prompt() {
+    // The default dispatch (no model, no effort) is exactly the case where a
+    // prompt placed right after `--add-dir` would be swallowed as a second
+    // directory — `--worktree` must sit between them.
+    assert_eq!(
+        dispatch_extra_args("wt", "/repo/.claude/dispatch/wt-1.md", "", "", "P"),
+        vec![
+            "--add-dir",
+            "/repo/.claude/dispatch",
+            "--worktree",
+            "wt",
+            "P"
+        ]
+    );
+}
+
+#[test]
+fn dispatch_extra_args_model_only() {
+    assert_eq!(
+        dispatch_extra_args("wt", "/d/t.md", "opus", "", "P"),
+        vec!["--add-dir", "/d", "--worktree", "wt", "--model", "opus", "P"]
+    );
+}
+
+#[test]
+fn dispatch_extra_args_effort_only() {
+    assert_eq!(
+        dispatch_extra_args("wt", "/d/t.md", "", "xhigh", "P"),
+        vec![
+            "--add-dir", "/d", "--worktree", "wt", "--effort", "xhigh", "P"
+        ]
+    );
+}
+
+#[test]
+fn dispatch_extra_args_model_and_effort_then_prompt_last() {
+    let args = dispatch_extra_args("wt", "/d/t.md", "opus", "xhigh", "P");
+    assert_eq!(
+        args,
+        vec![
+            "--add-dir",
+            "/d",
+            "--worktree",
+            "wt",
+            "--model",
+            "opus",
+            "--effort",
+            "xhigh",
+            "P"
+        ]
+    );
+    assert_eq!(args.last().map(String::as_str), Some("P"), "prompt stays last");
+}
+
+#[test]
+fn dispatch_extra_args_bare_task_file_name_omits_add_dir() {
+    // No parent directory component ⇒ nothing to add; `--worktree` leads, so the
+    // variadic hazard cannot arise.
+    assert_eq!(
+        dispatch_extra_args("wt", "t.md", "", "", "P"),
+        vec!["--worktree", "wt", "P"]
     );
 }
