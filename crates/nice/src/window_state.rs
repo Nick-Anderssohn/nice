@@ -990,7 +990,16 @@ impl WindowState {
     /// too but never nests). Mirrors the `claude` arm's spawn shape (D6): borrow
     /// settings/model/session, build + spawn through
     /// [`create_handoff_tab`](crate::session_manager::SessionManager::create_handoff_tab),
-    /// then `sync_active_tab_id` + `cx.notify()`.
+    /// then `cx.notify()`.
+    ///
+    /// **Focus (D7): the new tab opens UNSELECTED.** `create_handoff_tab` does not
+    /// select it, so the originating tab stays active and keyboard focus never
+    /// moves — a handoff is background continuation prep, not a context switch.
+    /// That is the ONE behavioral split from
+    /// [`handle_claude_socket_request`](Self::handle_claude_socket_request), whose
+    /// terminal-`claude` newtab still selects (and still syncs the active id).
+    /// Only `cx.notify()` is needed here: nothing changed the active tab, so the
+    /// selection needs no re-sync.
     #[allow(clippy::too_many_arguments)]
     fn handle_handoff(
         &mut self,
@@ -1059,9 +1068,10 @@ impl WindowState {
             cx,
         );
         if created.is_some() {
-            // Keep the "selection ⊇ {active tab}" invariant: the new tab is now
-            // active. Re-render so the nested / top-level tab appears.
-            self.selection.sync_active_tab_id(self.model.active_tab_id());
+            // Re-render so the nested / top-level tab appears in the sidebar.
+            // Deliberately NO `sync_active_tab_id` (unlike the `claude` arm): the
+            // handoff tab opens UNSELECTED (D7), so the active tab is untouched
+            // and the "selection ⊇ {active tab}" invariant already holds.
             cx.notify();
         }
         // The tab opened (nested or top-level) — ALWAYS reply `ok`. Swift's only
@@ -2280,7 +2290,143 @@ mod tests {
     // the locked title, the `--session-id`/`--model`/`--effort`/prompt argv, and
     // the always-`ok` reply) is pinned end-to-end by the `handoff` self-test
     // scenario (`crate::handoff_live`), and its pure title/prompt/arg helpers are
-    // unit-tested in `session_manager`.
+    // unit-tested in `session_manager`. Its SELECTION behavior (D7) is pinned by
+    // the `#[gpui::test]` below, which drives both handlers under
+    // `gpui/test-support`.
+
+    /// Every tab id in the model, in tree order — the before/after diff the
+    /// selection-contrast test uses to name the tab a handler just opened.
+    fn tab_ids(model: &TabModel) -> Vec<String> {
+        model
+            .projects
+            .iter()
+            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .collect()
+    }
+
+    /// The first tab id present in `model` but absent from `before`.
+    fn new_tab_id(model: &TabModel, before: &[String]) -> Option<String> {
+        tab_ids(model).into_iter().find(|id| !before.contains(id))
+    }
+
+    /// The ONE behavioral split between the two socket paths that open a tab
+    /// (D7): a terminal `claude` newtab SELECTS the tab it opens; a
+    /// `/nice-handoff` does NOT — the originating tab keeps selection and key
+    /// focus, because a handoff is background continuation prep, not a context
+    /// switch. Both handlers need a gpui `Context` (each spawns a Claude pane),
+    /// hence `#[gpui::test]`.
+    ///
+    /// Only MODEL-level facts are asserted, so the pty spawn's fate is
+    /// irrelevant (both constructors swallow it with `let _ =`). It is also made
+    /// harmless: the resolved-`claude` global is pinned to `None` (the real
+    /// binary is never reached) and every cwd is a path that does not exist, so
+    /// the forked child `_exit`s at its `chdir` and no login shell is ever
+    /// sourced.
+    #[gpui::test]
+    fn handoff_opens_unselected_while_claude_newtab_selects(cx: &mut gpui::TestAppContext) {
+        const NO_SPAWN_CWD: &str = "/nice-unit-test-no-such-dir";
+        cx.update(|app| app.set_global(crate::session_manager::ResolvedClaudePath(None)));
+
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+
+        // Seed the originating Claude tab and make it active — the sidebar state
+        // a real `/nice-handoff` is invoked from.
+        let orig_pane = state.update(cx, |ws, _cx| {
+            let pane_id = "t-orig-claude".to_string();
+            let mut claude = Pane::new(&pane_id, "Claude", PaneKind::Claude);
+            claude.is_claude_running = true;
+            let mut tab = Tab::new("t-orig", "my-project", NO_SPAWN_CWD);
+            tab.panes = vec![
+                claude,
+                Pane::new("t-orig-t1", "Terminal 1", PaneKind::Terminal),
+            ];
+            tab.active_pane_id = Some(pane_id.clone());
+            tab.claude_session_id = Some("orig-session".into());
+            tab.next_terminal_index = 2;
+            ws.model.ensure_project("p", "P", NO_SPAWN_CWD);
+            let pi = ws.model.projects.iter().position(|p| p.id == "p").unwrap();
+            ws.model.projects[pi].tabs.push(tab);
+            ws.model.select_tab("t-orig");
+            ws.selection.sync_active_tab_id(ws.model.active_tab_id());
+            pane_id
+        });
+
+        // ---- `handoff`: opens a nested tab and leaves selection alone ---------
+        let before_handoff = state.update(cx, |ws, _cx| tab_ids(&ws.model));
+        let (client, server) = UnixStream::pair().unwrap();
+        state.update(cx, |ws, cx| {
+            ws.handle_handoff(
+                NO_SPAWN_CWD.to_string(),
+                "/tmp/handoff.md".to_string(),
+                "keep going".to_string(),
+                "claude-opus-4-8".to_string(),
+                "high".to_string(),
+                "t-orig".to_string(),
+                orig_pane.clone(),
+                Reply::for_test(server),
+                cx,
+            )
+        });
+        assert_eq!(read_reply(client), "ok\n", "a handoff always replies ok");
+
+        let handoff_tab = state.update(cx, |ws, _cx| {
+            let id = new_tab_id(&ws.model, &before_handoff).expect("the handoff opened a tab");
+            let tab = ws.model.tab_for(&id).expect("the new tab is in the model");
+            assert_eq!(
+                tab.parent_tab_id.as_deref(),
+                Some("t-orig"),
+                "the handoff tab still nests under the originating tab"
+            );
+            assert_eq!(
+                ws.model.active_tab_id(),
+                Some("t-orig"),
+                "the handoff must NOT steal the active tab from the originating one"
+            );
+            assert!(
+                ws.selection.contains("t-orig"),
+                "the untouched active tab stays selected"
+            );
+            assert!(
+                !ws.selection.contains(&id),
+                "the background handoff tab is not selected"
+            );
+            id
+        });
+
+        // ---- `claude` newtab: still selects (deliberately NOT unified) --------
+        let before_claude = state.update(cx, |ws, _cx| tab_ids(&ws.model));
+        let (client, server) = UnixStream::pair().unwrap();
+        state.update(cx, |ws, cx| {
+            ws.handle_claude_socket_request(
+                NO_SPAWN_CWD.to_string(),
+                Vec::new(),
+                // An empty tabId is the newtab decision (no in-place promotion).
+                String::new(),
+                String::new(),
+                Reply::for_test(server),
+                cx,
+            )
+        });
+        assert_eq!(read_reply(client), "newtab\n");
+
+        state.update(cx, |ws, _cx| {
+            let id = new_tab_id(&ws.model, &before_claude).expect("the claude newtab opened a tab");
+            assert_ne!(id, handoff_tab, "a second, distinct tab");
+            assert_eq!(
+                ws.model.active_tab_id(),
+                Some(id.as_str()),
+                "the terminal `claude` newtab path still selects the tab it opens"
+            );
+            assert!(
+                ws.selection.contains(&id),
+                "and the selection follows the newly active tab"
+            );
+        });
+
+        // Drop every session container so no pty (however short-lived) outlives
+        // the test.
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
 
     // ---- R15 SessionsModelClaudeSocketRequestTests (decision + reply) --------
     //

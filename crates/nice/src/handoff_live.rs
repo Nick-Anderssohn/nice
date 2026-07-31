@@ -10,17 +10,21 @@
 //!   stable (idempotent), and `sync_with(false, …)` removes the skill subtree +
 //!   helper file while the shared helper dir survives. NEVER the real `~/.claude`
 //!   / `~/.nice`.
-//! * **(b) handoff socket → nested `[HANDOFF]` tab** — a raw-`UnixStream`
-//!   `handoff` message naming a seeded originating Claude tab replies `ok`; a NEW
-//!   tab appears nested one indent under it (`parent_tab_id` → the originating id)
-//!   with the LOCKED title `[HANDOFF] <originating title>` and
-//!   `title_manually_set == true`; the stub `claude`'s recorded argv carries
-//!   `--session-id <v4 uuid>` then `--model <m> --effort <e>` then the prompt
-//!   `Read the handoff notes at <handoffFile>. <instructions>` as the FINAL
-//!   positional.
+//! * **(b) handoff socket → nested `[HANDOFF]` tab, opened in the BACKGROUND** —
+//!   a raw-`UnixStream` `handoff` message naming a seeded originating Claude tab
+//!   replies `ok`; a NEW tab appears nested one indent under it (`parent_tab_id`
+//!   → the originating id) with the LOCKED title `[HANDOFF] <originating title>`
+//!   and `title_manually_set == true`; the ORIGINATING tab is still
+//!   `active_tab_id()` (D7 — a handoff never steals focus) while the nested
+//!   child's Claude pane is nonetheless `is_claude_running` (its pty is owned by
+//!   the session entity, not the view, so an unselected tab's Claude really
+//!   runs); the stub `claude`'s recorded argv carries `--session-id <v4 uuid>`
+//!   then `--model <m> --effort <e>` then the prompt `Read the handoff notes at
+//!   <handoffFile>. <instructions>` as the FINAL positional.
 //! * **(c) top-level fallback on a miss** — a `handoff` with an empty `tabId`
 //!   still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` tab
-//!   (`parent_tab_id == None`), proving a miss is a fallback, not a drop.
+//!   (`parent_tab_id == None`), proving a miss is a fallback, not a drop — and it
+//!   too leaves the originating tab active (D7 holds on the fallback path).
 //! * **(d) empty model/effort omit their flags** — a `handoff` with `model:""` /
 //!   `effort:""` records argv carrying NEITHER `--model` NOR `--effort`, with the
 //!   prompt still the final positional.
@@ -290,6 +294,32 @@ async fn run_handoff(
                     }
                 }
             }
+
+            // (D7) The handoff opened in the BACKGROUND: selection never moved off
+            // the originating tab, yet the never-rendered child's Claude pane is
+            // running (its pty belongs to the session entity, not the view).
+            let (active, child_claude_running) = state.update(cx, |s, _cx| {
+                (
+                    s.model.active_tab_id().map(str::to_string),
+                    s.model.tab_for(&new_tab).map(|t| {
+                        t.panes
+                            .iter()
+                            .any(|p| p.kind == PaneKind::Claude && p.is_claude_running)
+                    }),
+                )
+            });
+            if active.as_deref() != Some("orig-tab") {
+                failures.push(format!(
+                    "(b) no-focus: the handoff must NOT select its tab — the originating \
+                     'orig-tab' must still be active, got {active:?}"
+                ));
+            }
+            if child_claude_running != Some(true) {
+                failures.push(format!(
+                    "(b) no-focus: the unselected nested child must still have a RUNNING \
+                     Claude pane (is_claude_running), got {child_claude_running:?}"
+                ));
+            }
         }
     }
     // The stub argv: `--session-id <v4> --model <m> --effort <e> <prompt-last>`.
@@ -337,6 +367,15 @@ async fn run_handoff(
                         ));
                     }
                 }
+            }
+            // (D7) holds on the bucketing fallback too — a top-level handoff tab
+            // is just as unselected as a nested one.
+            let active = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
+            if active.as_deref() != Some("orig-tab") {
+                failures.push(format!(
+                    "(c) no-focus: the top-level fallback must NOT select its tab — \
+                     'orig-tab' must still be active, got {active:?}"
+                ));
             }
         }
     }
@@ -436,10 +475,12 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      scratch dirs (helper 0o755, idempotent re-run, uninstall removed the skill \
                      subtree + helper file while the shared dir + R16 sibling survived); a socket \
                      `handoff` naming a seeded Claude tab replied `ok` and opened a nested \
-                     [HANDOFF]-titled tab (locked, parented under the originating tab) whose stub \
-                     argv carried --session-id <v4> --model --effort then the prompt last; a miss \
-                     (empty tabId) still replied `ok` and opened a top-level [HANDOFF] Session tab; \
-                     and empty model/effort omitted both flags with the prompt still last."
+                     [HANDOFF]-titled tab (locked, parented under the originating tab) IN THE \
+                     BACKGROUND (the originating tab stayed active while the unselected child's \
+                     Claude pane ran) whose stub argv carried --session-id <v4> --model --effort \
+                     then the prompt last; a miss (empty tabId) still replied `ok` and opened a \
+                     top-level [HANDOFF] Session tab, also without stealing focus; and empty \
+                     model/effort omitted both flags with the prompt still last."
                 .to_string(),
         }
     } else {

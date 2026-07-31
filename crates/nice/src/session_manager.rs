@@ -1434,10 +1434,26 @@ impl SessionManager {
     /// on [`create_claude_tab`](Self::create_claude_tab) (the same
     /// `[Claude, Terminal 1]` shape, Claude focused + `is_claude_running = true`
     /// from creation, the deferred companion terminal, a pre-minted v4 session
-    /// UUID passed as `--session-id`, `next_terminal_index = 2`, the new tab
-    /// selected + its session container registered), differing in exactly the
-    /// D3/D4/D5 ways:
+    /// UUID passed as `--session-id`, `next_terminal_index = 2`, its session
+    /// container registered), differing in exactly the D3/D4/D5/D7 ways:
     ///
+    /// * **(D7) the new tab opens UNSELECTED** — unlike [`create_claude_tab`],
+    ///   which selects the tab it builds, this never calls
+    ///   [`TabModel::select_tab`]: a handoff is background continuation prep, not
+    ///   a context switch, so the originating tab stays active and keyboard focus
+    ///   never moves. The tab is still immediately VISIBLE (sidebar children have
+    ///   no collapse state), and its Claude pty runs unrendered — the session
+    ///   entity owns it ([`TerminalSessionHandle::spawn`] in
+    ///   [`spawn_session_raw`](Self::spawn_session_raw)), not the view — exactly
+    ///   as the pty of a tab the user opened and then switched AWAY from keeps
+    ///   running while nothing renders it. (Not the restore precedent: a
+    ///   restored-but-unopened tab has no pty at all — it is modelled unspawned
+    ///   and only lazy-spawns a deferred-resume shell on first activation, via
+    ///   [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)'s
+    ///   [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) arm. A handoff tab
+    ///   is the first construct whose Claude pty runs before ANY view has been
+    ///   attached.) The companion terminal stays deferred until first
+    ///   activation, as before.
     /// * **(D4) the title is fixed AND locked** — set to `title` up front with
     ///   `title_manually_set = true`, so Claude's OSC auto-title cannot overwrite
     ///   the `[HANDOFF] …` label once the fresh session names itself (unlike an
@@ -1497,7 +1513,8 @@ impl SessionManager {
         if !model.insert_handoff_child(tab.clone(), under_tab_id) {
             model.add_tab_to_projects(tab, cwd);
         }
-        model.select_tab(&tab_id);
+        // (D7) Deliberately NO `model.select_tab(&tab_id)`: the handoff tab opens
+        // in the background so the originating tab keeps selection + key focus.
         // The (empty) session container so the deferred companion's later
         // `ensure_active_pane_spawned` precondition ("the tab has a session") holds.
         self.register_tab_session(&tab_id);
