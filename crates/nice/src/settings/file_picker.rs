@@ -6,7 +6,8 @@
 //! temp file.
 //!
 //! * The **production** impl ([`ProductionFilePicker`]) forwards to the objc2
-//!   [`crate::platform::choose_theme_file`] panel (filtered to `.ghostty`/`.conf`).
+//!   [`crate::platform::choose_theme_file`] panel (unfiltered — Ghostty theme
+//!   files are extension-less, so the parser is the gate, not the panel).
 //!   `app::run` installs it as the gpui `Global` — the `WorkspaceOps` pattern.
 //! * The **recording fake** ([`RecordingFilePicker`]) logs each call and returns a
 //!   scripted path. `run_selftest` installs one process-wide before any scenario
@@ -23,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use gpui::{App, Global};
 
 /// The file-choose seam every Settings Import… invocation routes through.
-/// Object-safe (installed as a boxed trait object in [`FilePickerOpsGlobal`]).
+/// Object-safe (installed as an `Arc`'d trait object in [`FilePickerOpsGlobal`]).
 pub trait FilePickerOps {
     /// Present the theme-file chooser. Returns the chosen file's path, or `None`
     /// when the user cancels.
@@ -89,23 +90,26 @@ impl FilePickerOps for RecordingFilePicker {
 
 // MARK: - The process Global (WorkspaceOps pattern) -----------------------------
 
-/// The installed `FilePickerOps` — a boxed trait object. `app::run` installs the
-/// production impl; `run_selftest` installs the recording fake. Absent ⇒ the
-/// Import… handler treats the choose as cancelled (no-op-when-absent).
-pub struct FilePickerOpsGlobal(pub Box<dyn FilePickerOps>);
+/// The installed `FilePickerOps` — an `Arc` so a handle can be cloned OUT of the
+/// Global and presented with no `App` borrow held (the production panel spins a
+/// nested run loop; presenting it under a live borrow double-borrows the
+/// `AppCell` when a queued gpui task fires). `app::run` installs the production
+/// impl; `run_selftest` installs the recording fake. Absent ⇒ the Import…
+/// handler treats the choose as cancelled (no-op-when-absent).
+pub struct FilePickerOpsGlobal(pub Arc<dyn FilePickerOps>);
 
 impl Global for FilePickerOpsGlobal {}
 
-/// Read the seam and present the chooser — `None` when no picker is installed
-/// (the `WorkspaceOps` no-op-when-absent discipline) or the user cancelled.
-pub(crate) fn pick_theme_file(cx: &App) -> Option<PathBuf> {
-    cx.try_global::<FilePickerOpsGlobal>()
-        .and_then(|g| g.0.pick_theme_file())
+/// The installed picker handle — `None` when no picker is installed (the
+/// `WorkspaceOps` no-op-when-absent discipline). The caller presents the chooser
+/// on this handle AFTER releasing its `App` borrow.
+pub(crate) fn picker_handle(cx: &App) -> Option<Arc<dyn FilePickerOps>> {
+    cx.try_global::<FilePickerOpsGlobal>().map(|g| g.0.clone())
 }
 
 /// Install the production impl as the Global — `app::run` ONLY.
 pub fn install_production(cx: &mut App) {
-    cx.set_global(FilePickerOpsGlobal(Box::new(ProductionFilePicker)));
+    cx.set_global(FilePickerOpsGlobal(Arc::new(ProductionFilePicker)));
 }
 
 /// Install a fresh recording fake as the Global AND stash a shared clone in the
@@ -114,7 +118,7 @@ pub fn install_production(cx: &mut App) {
 /// fake handle.
 pub fn install_recording_fake(cx: &mut App) -> RecordingFilePicker {
     let fake = RecordingFilePicker::new();
-    cx.set_global(FilePickerOpsGlobal(Box::new(fake.clone())));
+    cx.set_global(FilePickerOpsGlobal(Arc::new(fake.clone())));
     *selftest_slot().lock().unwrap() = Some(fake.clone());
     fake
 }

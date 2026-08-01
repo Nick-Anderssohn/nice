@@ -36,8 +36,8 @@
 //! `apply_*` call + the exact a11y id".
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, FontWeight, MouseButton, Rgba, SharedString,
-    Window,
+    div, prelude::*, px, AnyElement, App, AsyncApp, Context, FontWeight, MouseButton, Rgba,
+    SharedString, Window,
 };
 
 use nice_theme::glass::{glass_fill_x, glass_line};
@@ -176,18 +176,31 @@ fn set_scheme_tab(cx: &mut App, scheme: ColorScheme) {
 /// `import_theme`. On success the feedback clears (the theme joins `themes(for:)`
 /// but is NOT auto-selected — R22's documented divergence); on failure the mapped
 /// §ImportError copy is stored for the inline error row.
+///
+/// The chooser is presented from a spawned foreground task with NO `App` borrow
+/// held: the production panel is modal (`runModal` spins a nested run loop that
+/// drains the main dispatch queue), so presenting it inside the button handler's
+/// live borrow double-borrows the `AppCell` the moment any queued gpui task fires.
 pub(crate) fn perform_import(cx: &mut App) {
-    let Some(path) = crate::settings::file_picker::pick_theme_file(cx) else {
+    let Some(picker) = crate::settings::file_picker::picker_handle(cx) else {
         return;
     };
-    if cx.try_global::<TerminalThemeCatalog>().is_none() {
-        return;
-    }
-    let result = cx.global_mut::<TerminalThemeCatalog>().import_theme(&path);
-    match result {
-        Ok(_entry) => set_import_feedback(cx, None),
-        Err(err) => set_import_feedback(cx, Some(map_import_error(&err))),
-    }
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let Some(path) = picker.pick_theme_file() else {
+            return;
+        };
+        let _ = acx.update(|cx| {
+            if cx.try_global::<TerminalThemeCatalog>().is_none() {
+                return;
+            }
+            let result = cx.global_mut::<TerminalThemeCatalog>().import_theme(&path);
+            match result {
+                Ok(_entry) => set_import_feedback(cx, None),
+                Err(err) => set_import_feedback(cx, Some(map_import_error(&err))),
+            }
+        });
+    })
+    .detach();
 }
 
 /// The per-theme delete handler: remove the imported theme, then — if the removed
@@ -1283,5 +1296,119 @@ mod tests {
                 "nice-default-dark"
             );
         });
+    }
+
+    // -- perform_import end-to-end (the fake-picker seam) ----------------------
+
+    use crate::settings::file_picker::{FilePickerOps, FilePickerOpsGlobal, RecordingFilePicker};
+    use std::sync::Arc;
+
+    /// Install a temp catalog + the given picker, click Import…, and settle.
+    fn run_import(cx: &mut TestAppContext, tag: &str, picker: Arc<dyn FilePickerOps>) -> PathBuf {
+        let base = temp_base(tag);
+        std::fs::create_dir_all(base.join("terminal-themes")).unwrap();
+        cx.update(|app| {
+            app.set_global(TerminalThemeCatalog::new(base.join("terminal-themes")));
+            app.set_global(FilePickerOpsGlobal(picker));
+            perform_import(app);
+        });
+        cx.run_until_parked();
+        base
+    }
+
+    /// The crash regression (the double-borrow abort behind the Import… button):
+    /// the production panel's `runModal` spins a nested run loop that drains
+    /// queued gpui tasks, each of which borrows the `AppCell` — so this fake
+    /// re-enters the App while "presenting". Under the old synchronous handler
+    /// (picker invoked inside the button's live `&mut App` borrow) that re-entry
+    /// panics with "already borrowed"; `perform_import` must present from a
+    /// spawned task with no borrow held.
+    struct ReentrantPicker {
+        async_app: gpui::AsyncApp,
+        path: PathBuf,
+    }
+
+    impl FilePickerOps for ReentrantPicker {
+        fn pick_theme_file(&self) -> Option<PathBuf> {
+            // Panics with "already borrowed" if the caller holds an App borrow.
+            self.async_app.update(|_| {});
+            Some(self.path.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn import_presents_the_picker_with_no_app_borrow_held(cx: &mut TestAppContext) {
+        let base = temp_base("import-reentrant");
+        std::fs::create_dir_all(&base).unwrap();
+        let fixture = base.join("Reentrant Neon.ghostty");
+        std::fs::write(&fixture, ghostty_fixture("123456")).unwrap();
+        let picker = ReentrantPicker {
+            async_app: cx.to_async(),
+            path: fixture,
+        };
+        let base = run_import(cx, "import-reentrant-cat", Arc::new(picker));
+        cx.update(|app| {
+            assert!(
+                app.global::<TerminalThemeCatalog>()
+                    .imported_entries()
+                    .iter()
+                    .any(|e| e.id == "reentrant-neon"),
+                "the import completed after the picker re-entered the App"
+            );
+            assert!(last_import_feedback(app).is_none(), "a success leaves no error row");
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pick of a NON-TEXT file (an image, say) fails `read_to_string` on
+    /// invalid UTF-8 → the mapped CannotRead copy, nothing imported or persisted
+    /// — never a crash. (The panel is deliberately unfiltered — Ghostty theme
+    /// files are extension-less — so any file is pickable.)
+    #[gpui::test]
+    fn importing_a_binary_file_surfaces_cannot_read_and_imports_nothing(cx: &mut TestAppContext) {
+        let base = temp_base("import-binary");
+        std::fs::create_dir_all(&base).unwrap();
+        let img = base.join("cat.png");
+        std::fs::write(&img, [0x89u8, b'P', b'N', b'G', 0xff, 0xfe, 0x00, 0x9c]).unwrap();
+        let fake = RecordingFilePicker::new();
+        fake.set_next(Some(img));
+        let base = run_import(cx, "import-binary-cat", Arc::new(fake));
+        cx.update(|app| {
+            let copy = last_import_feedback(app).expect("a binary pick surfaces the error row");
+            assert_eq!(copy.title, "Couldn't read the theme file");
+            assert!(app.global::<TerminalThemeCatalog>().imported_entries().is_empty());
+        });
+        assert_eq!(
+            std::fs::read_dir(base.join("terminal-themes")).unwrap().count(),
+            0,
+            "a failed import persists nothing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pick of a readable file that is NOT a Ghostty theme (arbitrary text)
+    /// parses to MissingRequiredKey → the mapped invalid-theme copy, nothing
+    /// imported or persisted.
+    #[gpui::test]
+    fn importing_a_non_theme_text_file_surfaces_parse_error(cx: &mut TestAppContext) {
+        let base = temp_base("import-nontheme");
+        std::fs::create_dir_all(&base).unwrap();
+        let txt = base.join("notes.txt");
+        std::fs::write(&txt, "just some notes\nnothing = themed here\n").unwrap();
+        let fake = RecordingFilePicker::new();
+        fake.set_next(Some(txt));
+        let base = run_import(cx, "import-nontheme-cat", Arc::new(fake));
+        cx.update(|app| {
+            let copy = last_import_feedback(app).expect("a non-theme pick surfaces the error row");
+            assert_eq!(copy.title, "The theme file is invalid");
+            assert_eq!(copy.message, "The file is missing the required `background` key.");
+            assert!(app.global::<TerminalThemeCatalog>().imported_entries().is_empty());
+        });
+        assert_eq!(
+            std::fs::read_dir(base.join("terminal-themes")).unwrap().count(),
+            0,
+            "a failed import persists nothing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

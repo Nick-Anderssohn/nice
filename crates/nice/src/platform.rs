@@ -2726,10 +2726,13 @@ pub fn workspace_choose_application() -> Option<String> {
     }
 }
 
-/// R23 Import…: an `NSOpenPanel` filtered to Ghostty theme files
-/// (`.ghostty` / `.conf`), prompt "Import". Returns the chosen file's path, or
-/// `None` if the user cancels. Modal — production ONLY (the `RecordingFilePicker`
-/// answers in tests / scenarios, so no real panel ever opens under the suite).
+/// R23 Import…: an `NSOpenPanel` for Ghostty theme files, prompt "Import".
+/// Deliberately UNFILTERED: Ghostty's own theme files carry no extension (e.g.
+/// `ayu-light`), which an `allowedFileTypes` allowlist can never match — the
+/// parser is the gate, and a non-theme pick surfaces the inline §ImportError
+/// row. Returns the chosen file's path, or `None` if the user cancels. Modal —
+/// production ONLY (the `RecordingFilePicker` answers in tests / scenarios, so
+/// no real panel ever opens under the suite).
 ///
 /// # Safety
 /// Main thread with an autorelease pool (a gpui button handler satisfies both).
@@ -2747,14 +2750,8 @@ pub fn choose_theme_file() -> Option<String> {
         let _: () = msg_send![panel, setResolvesAliases: true];
         let prompt = ns_string("Import");
         let _: () = msg_send![panel, setPrompt: prompt];
-        // Restrict to Ghostty theme files (`.ghostty` import-written, `.conf`
-        // hand-placed) — the extensions R22's catalog enumerates.
-        let ghostty = ns_string("ghostty");
-        let conf = ns_string("conf");
-        let objs: [*mut AnyObject; 2] = [ghostty, conf];
-        let types: *mut AnyObject =
-            msg_send![class!(NSArray), arrayWithObjects: objs.as_ptr(), count: 2usize];
-        let _: () = msg_send![panel, setAllowedFileTypes: types];
+        // No type filter: Ghostty theme files are extension-less, so any
+        // extension allowlist grays out exactly the files this panel is for.
 
         let response: isize = msg_send![panel, runModal];
         if response != NS_MODAL_RESPONSE_OK {
