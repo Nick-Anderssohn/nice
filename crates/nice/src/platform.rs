@@ -2597,7 +2597,10 @@ fn defer_to_main(f: impl FnOnce() + 'static) {
     }
 }
 
-/// `-[NSWorkspace openURL:]` — open `path` with the OS default handler.
+/// `-[NSWorkspace openURL:]` — open the **filesystem path** `path` with the OS
+/// default handler (the URL is built with `fileURLWithPath:`). For a scheme URL
+/// (`https:`, `mailto:`, …) use [`workspace_open_url`] below — handing a scheme
+/// string to this fn would treat it as a file path.
 /// Deferred to its own main-queue turn (see [`defer_to_main`]).
 pub fn workspace_open(path: &str) {
     let path = path.to_string();
@@ -2605,6 +2608,32 @@ pub fn workspace_open(path: &str) {
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let url = file_url(&path);
         let _: Bool = msg_send![ws, openURL: url];
+    });
+}
+
+/// `-[NSWorkspace openURL:]` — open the URL `url` (an `https:`, `mailto:`, …
+/// string, NOT a filesystem path) with the OS default handler. This is what a
+/// ⌘+click on a terminal link calls, injected into the view as its
+/// [`UrlOpener`](nice_term_view::UrlOpener).
+///
+/// Unlike [`workspace_open`] the URL is built with `NSURL URLWithString:`, which
+/// parses the scheme — `fileURLWithPath:` would turn `https://example.com` into
+/// a file path. A string `URLWithString:` cannot parse yields nil, which opens
+/// nothing (rather than sending nil to NSWorkspace).
+///
+/// Deferred to its own main-queue turn (see [`defer_to_main`]) — doubly needed
+/// here, since the caller is a gpui mouse-up listener running inside a live
+/// `App` borrow.
+pub fn workspace_open_url(url: &str) {
+    let url = url.to_string();
+    defer_to_main(move || unsafe {
+        let ns = ns_string(&url);
+        let nsurl: *mut AnyObject = msg_send![class!(NSURL), URLWithString: ns];
+        if nsurl.is_null() {
+            return;
+        }
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let _: Bool = msg_send![ws, openURL: nsurl];
     });
 }
 

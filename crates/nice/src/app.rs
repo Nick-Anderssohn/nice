@@ -3772,6 +3772,10 @@ fn term_perf_report(
 /// `ExternalPaths` events and asserts byte-exact escaped-path typing (padded when
 /// DECSET 2004 is off, bracketed-paste-framed when on) — self-reported, and
 /// needs no Accessibility grant (it drives the handler directly, not via CGEvents).
+/// `niceties-link` is the ⌘+click / ⌘-hover terminal-link gate: constructed mouse
+/// and modifier events go through gpui's own dispatch over a capture-tee pty, so
+/// it too needs no Accessibility grant — self-reported (recorded opens + byte-exact
+/// pty receipt).
 /// `ax-probe` (T2 test-infra) is the AccessKit canary: it tags one stable root
 /// element with an id/role/label and walks the macOS AX tree to assert the node
 /// is exposed with the expected role + label — also self-reported.
@@ -3857,6 +3861,15 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             name: "niceties-drop",
             open: crate::niceties_drop::open_niceties_drop_window,
             gate: Gate::SelfReported {
+                budget: Duration::from_secs(30),
+            },
+            activate: true,
+        },
+        Scenario {
+            name: "niceties-link",
+            open: crate::niceties_link::open_niceties_link_window,
+            gate: Gate::SelfReported {
+                // Four phases of settles plus the mouse-reporting engage poll.
                 budget: Duration::from_secs(30),
             },
             activate: true,

@@ -192,7 +192,14 @@ The GPUI application. Structure (grows over later cycles):
   GPUI **family** name for the first-launch settings-import, validating the match
   (input == resolved PostScript or family name) so CoreText's lenient substitute
   (Helvetica for an unmatched name) is rejected — returning `None` — rather than
-  silently trusted.
+  silently trusted. The terminal-link fix adds one more injected FFI surface (same
+  pattern as the R7 pair above): `workspace_open_url` opens a ⌘+clicked terminal
+  URL with the OS default handler — `NSURL URLWithString:` + `NSWorkspace
+  openURL:`, distinct from `workspace_open`, whose `fileURLWithPath:` would mangle
+  an `https://` URL, and nil-checked so an unparseable string opens nothing —
+  **deferred** to its own main-queue turn (`defer_to_main`, the 4342e23
+  Reveal-in-Finder lesson) because the caller is a gpui mouse-up listener inside a
+  live `App` borrow, and injected into the view via `set_url_opener`.
 - `input_live` — the R5 live input self-test scenarios (`input-live` /
   `input-shell`): real CGEvents posted to our own pid, byte-exact pty receipt,
   the item-4 candidate anchor, and the IME go/no-go probe (see the scenario
@@ -216,6 +223,11 @@ The GPUI application. Structure (grows over later cycles):
 - `niceties_held` — the R7/T10 held-pane self-test (`niceties-held`): a non-zero
   exit stays mounted with the dim in-buffer footer + the dismiss affordance,
   typing is inert, and dismiss respawns a fresh shell.
+- `niceties_link` — the ⌘+click / ⌘-hover terminal-link self-test
+  (`niceties-link`): constructed mouse + modifier events go through gpui's own
+  dispatch over a capture-tee pty, asserting a recording `UrlOpener` sees
+  exactly the clicked URL with no selection and no pty bytes (even with app
+  mouse reporting on) and that the hover follows the ⌘ key.
 - `theme` — the token → `gpui::Rgba` colour adapter (`srgba_to_rgba`,
   `slot_to_rgba`, `slot_srgba`, `srgba_with_alpha`) the R10/R11 chrome
   components (`status_dot`, `context_menu`, the sidebar) convert through, per
@@ -1851,7 +1863,10 @@ ordinary element in gpui's own tree, so the `NSViewRepresentable` dance today's
 - `element` / `view` — `TerminalElement` (the per-frame paint element: whole-bg
   fill + coalesced per-cell background quads + per-cell foreground glyph runs
   carrying `background_color` so the bg-luminance curve engages + a block
-  cursor) and `TerminalView` (owns a `FocusHandle`; the caret's solid/hollow
+  cursor + the ⌘-hovered link's underline, which rides the `SnapshotKey` and the
+  per-cell `PaintCell::underline` bit exactly like `selection` — alacritty damage
+  tracks neither, so a hover change full-invalidates the row cache) and
+  `TerminalView` (owns a `FocusHandle`; the caret's solid/hollow
   state is **computed** from `is_focused && window active`, never a stored flag).
 - `font` (R7/T11) — `FontSettings`, the shared **app-level** terminal-font state
   (family chain + point size) every view `cx.observe`s so a ⌘+/⌘−/⌘0 zoom fans out
@@ -1871,6 +1886,17 @@ ordinary element in gpui's own tree, so the `NSViewRepresentable` dance today's
   readable, writes the dim in-buffer exit footer, and gates the dismiss respawn).
   Also the `LaunchDeadline` factory type the App-Nap-safe grace deadline is
   injected through (its objc2 body lives in `crates/nice/src/platform`).
+- `hyperlink` — URL detection in the grid behind ⌘+click / ⌘-hover: the
+  `URL_REGEX` constant (Alacritty/Zed's hint pattern — a broad scheme set, so a
+  bare `localhost:5173` is not a link), its lazily-compiled `UrlRegexCache`, the
+  trailing-punctuation trim (text and match range shrink together, so the
+  underline never covers a trimmed character), and the viewport-bounded
+  (`MAX_SEARCH_LINES`, ±100 lines) soft-wrap-aware search behind
+  `TerminalSessionHandle::hyperlink_at` — plus the pure release verdict for an
+  armed ⌘+click (open / cancel / not ours) and the injected `UrlOpener` seam the
+  view's ⌘+click calls (its `NSWorkspace openURL:` body lives in
+  `crates/nice/src/platform`, same injection pattern as the present-kick). OSC 8
+  **explicit** hyperlinks are deliberately out of scope — regex detection only.
 
 R4 is now complete: the full color model, text attributes, selection,
 box-drawing / block elements, wide glyphs, the row-quantized bottom-anchored
@@ -1881,6 +1907,10 @@ streaming frame time + memory under the synthetic workload. Out of R4's scope
 (later cycles): keyboard/IME/mouse input (R5), OSC title/cwd (now landed in R6),
 fonts/zoom + drag-drop + the launch overlay + held panes (now landed in R7 — the
 `font`/`drop`/`overlay` modules above), and sub-line smooth scroll (deferred).
+Terminal links landed later still (the `hyperlink` module above): ⌘+click opens
+the URL under the pointer with the OS default handler and ⌘-hover underlines it,
+in scrollback and across soft wraps, and — Ghostty parity — even while the
+foreground app has mouse reporting on, because ⌘ bypasses the report.
 
 ## Layering rule
 
@@ -2011,6 +2041,7 @@ the window, and moves to the next scenario.
 | `input-shell` | The R5 real-shell CGEvent sanity gate (Validation §5). A real `zsh -il` (user rc suppressed via an empty `ZDOTDIR`): polls the grid until the shell prints its prompt, then types `echo <marker>` + Enter entirely via CGEvents and asserts the marker appears ≥ 2× in the grid (the typed command echo **and** the command output), proving the whole path reaches a real login shell and its output round-trips. `Gate::SelfReported`. |
 | `niceties-zoom` | The R7/T11 live zoom + pty re-metric gate (Validation §2). Drives the shipped ⌘+/⌘−/⌘0 zoom keybindings with **real CGEvents** to nice's own pid over a real login shell and asserts the whole T11 chain: after ⌘+ ×3 the shared `FontSettings` reports a larger point size + cell box, the view re-fits the grid and pushes `(rows, cols)` to the pty (asserted both by the core `Term`'s grid dimensions matching an independent `fit_grid` **and** `stty size` in the child echoing them — proving SIGWINCH reached the shell), and ⌘0 restores the baseline exactly. Preflights the Accessibility grant and FAILs loudly if it is missing (a dropped CGEvent would make every zoom a no-op). `Gate::SelfReported` (state assertions, not cadence). |
 | `niceties-drop` | The R7/T7 file/image drag-drop gate (Validation §3). Drives the view's drop handler through its test seam (`handle_external_paths_drop`) with **constructed** `ExternalPaths` events over a real pty (a real OS drag is impractical headless, and gpui's macOS backend only accepts filename drags) and asserts the exact bytes typed into the child: one escaped, space-padded path (DECSET 2004 off); multiple paths space-joined in drop order; a path with spaces / shell metacharacters backslash-escaped; the **raw-image fallback** (a drop with no file URLs consults the injected image-drop provider — a stub path here); the `ESC[200~ … ESC[201~` frame with 2004 **on**; and never a trailing newline. Reuses the `input-live` capture-tee child; drives the handler directly, so it needs **no** Accessibility grant. `Gate::SelfReported` (byte-exact receipt). |
+| `niceties-link` | The ⌘+click / ⌘-hover terminal-link gate (the "⌘+click a printed URL does nothing" bug). Prints `http://localhost:5173/` into a capture-tee pty, then drives the shipped mouse/modifier listeners through **gpui's own dispatch** (`Window::dispatch_event` with constructed `MouseMove` / `MouseDown` / `MouseUp` / `ModifiersChanged` events, hit-tested against the rendered frame exactly as the platform's would be — the same seam `multiwindow` uses), aiming each event at a known cell via the view's published paint bounds. Asserts: the ⌘-hover sets on a ⌘+move over the URL, clears on ⌘ **release**, returns on ⌘ **press** with the pointer parked (no twitch), and clears on a move off the link; a ⌘+click on the URL hands the **recording** `UrlOpener` exactly that URL while creating no selection and writing **zero** bytes to the pty; the same holds with the app's SGR mouse reporting ON (⌘ bypasses the report, Ghostty parity — the bug's real setting); and a ⌘+click **off** the link opens nothing and sends the ordinary byte-exact SGR press/release pair. No CGEvents, so it needs **no** Accessibility grant, and no browser is launched (the real `NSWorkspace openURL:` is the one manual-adjacent black-box check). `Gate::SelfReported` (recorded opens + byte-exact receipt). |
 | `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent pane** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt pane** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
 | `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
 | `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/pane tests on. `Gate::SelfReported`. |

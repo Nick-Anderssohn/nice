@@ -54,6 +54,17 @@
 //!   local override: it forces selection/scroll even while the app reports.
 //! * **Local drag selection** — a bare left drag (or any drag with Shift) drives
 //!   R4's [`TerminalSessionHandle::set_selection`] in buffer coordinates.
+//! * **⌘+click opens a URL** — a ⌘+left-press over a link (matched by
+//!   [`crate::hyperlink`]) is consumed here and opened on the matching release
+//!   via the injected [`UrlOpener`], starting no selection and sending no mouse
+//!   report. Like Ghostty, ⌘ therefore overrides app mouse reporting for links —
+//!   but only for them: a ⌘+click anywhere else reports/selects as it always did.
+//! * **⌘-hover underlines the link** — while ⌘ is held, the URL under the
+//!   pointer is tracked in `hovered_hyperlink` and its range handed to the
+//!   [`TerminalElement`], which underlines exactly those cells; the pointer
+//!   turns into a hand. The hover follows the ⌘ key itself (press/release
+//!   recompute from the last pointer position) and clears when the pointer
+//!   leaves the pane. It is passive — motion reports still reach the app.
 //! * **⌘V paste** — the clipboard text is framed by
 //!   [`wrap_bracketed_paste`](nice_term_input::wrap_bracketed_paste) gated on the
 //!   core's `bracketed_paste_active()`, then written to the pty.
@@ -72,6 +83,7 @@ use std::time::Duration;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::term::search::Match;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::Processor;
 use gpui::{
@@ -92,6 +104,8 @@ use nice_theme::Srgba;
 use crate::drop::{drop_bytes, ImageDropProvider};
 use crate::element::{fit_grid, grid_top_y, GridCache, ImeInput, TerminalElement, TerminalMetrics};
 use crate::font::{snap_metrics_to_scale, FontSettings};
+use crate::hyperlink::{hover_changed, UrlOpener, UrlRegexCache};
+use crate::mouse::{link_click_verdict, LinkClickVerdict};
 use crate::input::{
     build_key_input, build_modifier_input, encoder_config, kitty_forwards_super, named_key_for,
     KeyCodeProbe,
@@ -172,6 +186,41 @@ pub struct TerminalView {
     /// sole objc2 home is `crates/nice/src/platform`); a drop with no file URLs
     /// then simply types nothing (the file-URL path is unaffected).
     image_drop_provider: Option<ImageDropProvider>,
+    /// The injected URL opener (see [`UrlOpener`]) ⌘+click hands its match to.
+    /// `None` until the app wires it, in which case the open falls back to
+    /// `cx.open_url` — enough for a standalone embedding, but production must
+    /// inject the main-queue-deferred opener (see the type's docs).
+    url_opener: Option<UrlOpener>,
+    /// The compiled [`URL_REGEX`](crate::URL_REGEX) matcher, built on first use
+    /// and reused by every link lookup — a ⌘+click today, a search per ⌘-held
+    /// mouse-move once hover lands; the DFAs are far too expensive to rebuild
+    /// per event.
+    url_regex: UrlRegexCache,
+    /// The `(vrow, col)` a ⌘+left-press landed on **over a link**, pending its
+    /// release: ⌘+click opens on mouse-UP, and only when the release lands on
+    /// that same cell, so a ⌘+drag off the link cancels (Ghostty parity).
+    /// `Some` only between such a press and the next left-up (in or out of the
+    /// pane). A ⌘+press that was NOT over a link never arms and falls through to
+    /// the normal reporting / selection paths.
+    link_click_armed: Option<(usize, usize)>,
+    /// The link the pointer is over **while ⌘ is held** — its URL text plus the
+    /// match range in buffer coordinates. This is the whole ⌘-hover affordance:
+    /// the range is handed to the [`TerminalElement`] (which underlines exactly
+    /// its cells) and its mere presence switches the pointer to the hand cursor.
+    /// `None` whenever ⌘ is not held, the pointer is not over a match, or the
+    /// pointer has left the pane. Every change to it notifies, so paint always
+    /// sees the current state (see [`set_hovered_hyperlink`](
+    /// Self::set_hovered_hyperlink)).
+    hovered_hyperlink: Option<(String, Match)>,
+    /// The last pointer position seen by [`on_mouse_move`](Self::on_mouse_move),
+    /// in window coordinates. Kept so a ⌘ press or release — which carries no
+    /// position of its own — can recompute the hover in place: pressing ⌘ while
+    /// already pointing at a URL must underline it without a pointer twitch.
+    /// `None` until the pointer first moves over this pane, and cleared again
+    /// when it leaves: gpui delivers mouse-moves only while the pointer is
+    /// inside the element, so a position kept past the exit would be a stale
+    /// place for a later ⌘ press to "hover".
+    last_mouse_pos: Option<Point<Pixels>>,
     /// This frame's grid bounds, published by the element during paint and read
     /// by the mouse handlers on the next event for pixel→cell hit-testing. Shared
     /// so paint writes it without re-entering this entity (see [`TerminalElement`]).
@@ -345,6 +394,11 @@ impl TerminalView {
             option_as_meta: OptionAsMeta::default(),
             keycode_probe: None,
             image_drop_provider: None,
+            url_opener: None,
+            url_regex: UrlRegexCache::new(),
+            link_click_armed: None,
+            hovered_hyperlink: None,
+            last_mouse_pos: None,
             paint_bounds: Rc::new(Cell::new(None)),
             grid_cache: Rc::new(RefCell::new(GridCache::default())),
             auto_refit: false,
@@ -381,6 +435,16 @@ impl TerminalView {
     /// pty fit, hit-testing, and IME anchor all use.
     pub fn metrics(&self) -> TerminalMetrics {
         self.effective_metrics
+    }
+
+    /// The grid bounds this view's last paint published — the frame
+    /// [`hit_cell`](Self::hit_cell) measures every mouse position in. Read-only,
+    /// and `None` before the first paint. Exposed so a self-test can aim a
+    /// synthetic mouse event at a known cell through the same geometry the
+    /// hit-test uses (bounds origin + [`grid_top_y`] + [`metrics`](Self::metrics))
+    /// instead of re-deriving the layout and drifting from it.
+    pub fn paint_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.paint_bounds.get()
     }
 
     /// Refresh the cached font from the shared [`FontSettings`] and **re-metric**:
@@ -587,6 +651,23 @@ impl TerminalView {
     /// raw-image fallback); without it such a drop types nothing.
     pub fn set_image_drop_provider(&mut self, provider: ImageDropProvider) {
         self.image_drop_provider = Some(provider);
+    }
+
+    /// Install the URL opener ⌘+click uses (see [`UrlOpener`]). The app calls
+    /// this once with `crates/nice/src/platform`'s deferred `NSWorkspace
+    /// openURL:` wrapper; self-tests inject a recorder. Without it the view falls
+    /// back to `cx.open_url`, which works but re-enters AppKit from inside the
+    /// mouse-up listener's `App` borrow — production must not rely on it.
+    pub fn set_url_opener(&mut self, opener: UrlOpener) {
+        self.url_opener = Some(opener);
+    }
+
+    /// The URL of the link currently ⌘-hovered, if any — a read-only probe of
+    /// `hovered_hyperlink`, whose only other observable is an underline in
+    /// painted pixels. The `niceties-link` self-test reads it to assert the
+    /// hover follows the pointer and the ⌘ key; nothing in the app calls it.
+    pub fn hovered_hyperlink_url(&self) -> Option<&str> {
+        self.hovered_hyperlink.as_ref().map(|(url, _)| url.as_str())
     }
 
     // -- launch overlay + held panes (T9 / T10) --------------------------------
@@ -1076,12 +1157,26 @@ impl TerminalView {
     /// reports bare modifiers (kitty's composition rule) — the composing flag is
     /// threaded through so it can. Pty-write only — no `cx.notify()`, same
     /// contract as [`dispatch_key`](Self::dispatch_key) (r5c lever B).
+    ///
+    /// It is also the ⌘-hover edge: ⌘ down over a URL underlines it without the
+    /// pointer moving, ⌘ up clears the underline. That runs FIRST, because the
+    /// bare-modifier report below returns early in every mode but kitty's — the
+    /// affordance must not depend on which app is running.
     fn on_modifiers_changed(
         &mut self,
         event: &ModifiersChangedEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // ⌘ pressed (or released) with the pointer somewhere in this pane:
+        // recompute from where it actually is. No position remembered means the
+        // pointer is outside the pane — and the exit already cleared any hover
+        // (the `on_hover(false)` listener drops both together), so there is
+        // nothing to do for that side.
+        if let Some(pos) = self.last_mouse_pos {
+            self.update_hover(pos, event.modifiers, cx);
+        }
+
         let mode = self.current_mode(cx);
         if !mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
             return; // bare-modifier reports are a report-all-keys feature only
@@ -1132,6 +1227,66 @@ impl TerminalView {
         })
     }
 
+    /// The URL under `hit` and its match range, if any (see
+    /// [`TerminalSessionHandle::hyperlink_at`]). Callers must gate this on ⌘
+    /// being held: it locks the `Term` and runs a regex scan, so it must never
+    /// run on ordinary pointer traffic.
+    fn hyperlink_at(&self, hit: &Hit, cx: &App) -> Option<(String, Match)> {
+        let handle = self.handle.read(cx);
+        self.url_regex
+            .with(|regex| handle.hyperlink_at(hit.buffer_line, hit.col, regex))
+            .flatten()
+    }
+
+    /// Recompute the ⌘-hover from a pointer position: the link under it while ⌘
+    /// is held, nothing otherwise. Called by every mouse-move and by the ⌘
+    /// press/release edge (which has no position of its own — hence
+    /// `last_mouse_pos`).
+    ///
+    /// The `!platform` fast path is what keeps ordinary pointer traffic free:
+    /// with ⌘ up and no hover live this returns before hit-testing, so no `Term`
+    /// lock and no regex scan happen on a plain mouse-move.
+    fn update_hover(
+        &mut self,
+        pos: Point<Pixels>,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if !modifiers.platform && self.hovered_hyperlink.is_none() {
+            return;
+        }
+        let found = modifiers
+            .platform
+            .then(|| {
+                self.hit_cell(pos, cx)
+                    .and_then(|hit| self.hyperlink_at(&hit, cx))
+            })
+            .flatten();
+        self.set_hovered_hyperlink(found, cx);
+    }
+
+    /// Store the hover state, notifying **only when the underlined range
+    /// changes**. The notify is mandatory on a real change (the underline rides
+    /// the element's [`SnapshotKey`], so paint must re-run to add or drop it) and
+    /// must be skipped otherwise — the rule itself is the pure, unit-tested
+    /// [`hover_changed`].
+    fn set_hovered_hyperlink(&mut self, next: Option<(String, Match)>, cx: &mut Context<Self>) {
+        let changed = hover_changed(&self.hovered_hyperlink, &next);
+        self.hovered_hyperlink = next;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Open `url` with the injected [`UrlOpener`], or gpui's own `open_url` when
+    /// the app never wired one (see [`set_url_opener`](Self::set_url_opener)).
+    fn open_url(&self, url: &str, cx: &App) {
+        match &self.url_opener {
+            Some(open) => open(url),
+            None => cx.open_url(url),
+        }
+    }
+
     /// Encode + write one VT mouse report for `action` on `button` at `hit`.
     fn send_mouse_report(
         &self,
@@ -1174,6 +1329,22 @@ impl TerminalView {
 
         let mode = self.current_mode(cx);
         let m = event.modifiers;
+
+        // ⌘+left-press over a URL arms a link click and consumes the press: no
+        // selection starts and NO press report is sent, so ⌘+click keeps working
+        // inside an app that grabbed the mouse (Claude Code, vim) exactly as it
+        // does in Ghostty. The open itself waits for the matching release (see
+        // `on_mouse_up`). A ⌘+press that is not over a link arms nothing and
+        // falls through to the unchanged behaviour below.
+        if event.button == MouseButton::Left && m.platform {
+            if let Some(hit) = self.hit_cell(event.position, cx) {
+                if self.hyperlink_at(&hit, cx).is_some() {
+                    self.link_click_armed = Some((hit.vrow, hit.col));
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        }
 
         // App mouse reporting, unless Shift forces a local selection.
         if mouse::reporting_active(mode) && !m.shift {
@@ -1219,13 +1390,17 @@ impl TerminalView {
         }
     }
 
-    /// gpui mouse-move: extend an active local selection, or emit a motion report.
+    /// gpui mouse-move: track the ⌘-hover, extend an active local selection, or
+    /// emit a motion report.
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Remembered for the ⌘ press/release edge, which carries no position.
+        self.last_mouse_pos = Some(event.position);
+
         if let Some((anchor_vrow, anchor_col, kind)) = self.drag_anchor {
             // The button was released (possibly outside the pane, so no mouse-up
             // reached us) — stop extending the selection.
@@ -1252,6 +1427,12 @@ impl TerminalView {
             return;
         }
 
+        // ⌘-hover, updated only outside a drag (the branch above returns): the
+        // underline is an affordance for a click that is not already happening.
+        self.update_hover(event.position, event.modifiers, cx);
+
+        // Hover is passive — motion reports are NOT suppressed while ⌘ is held,
+        // so an app that tracks the pointer keeps tracking it under ⌘.
         let mode = self.current_mode(cx);
         if !mouse::reporting_active(mode) || event.modifiers.shift {
             return;
@@ -1276,6 +1457,45 @@ impl TerminalView {
     /// gpui mouse-up: end a local selection drag (keeping the selection) or emit a
     /// release report.
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // The release of an armed ⌘+link click (see `on_mouse_down`). It opens
+        // only if the pointer is still on the pressed cell, ⌘ is still held, and
+        // a URL is still there — a ⌘+drag away, a released ⌘, or output that
+        // scrolled the link out all cancel harmlessly. Either way the up is
+        // consumed: an armed click sent no press report, so it must not send a
+        // release report either. The decision itself is
+        // [`mouse::link_click_verdict`] (pure, unit-tested); only the lookup
+        // and the open live here. Hit-testing is skipped entirely when nothing is
+        // armed, which is every ordinary release.
+        let armed_hit = self
+            .link_click_armed
+            .is_some()
+            .then(|| self.hit_cell(event.position, cx))
+            .flatten();
+        match link_click_verdict(
+            self.link_click_armed,
+            event.button,
+            event.modifiers.platform,
+            armed_hit.as_ref().map(|hit| (hit.vrow, hit.col)),
+        ) {
+            LinkClickVerdict::Open => {
+                self.link_click_armed = None;
+                if let Some((url, _range)) =
+                    armed_hit.as_ref().and_then(|hit| self.hyperlink_at(hit, cx))
+                {
+                    self.open_url(&url, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            LinkClickVerdict::Cancel => {
+                self.link_click_armed = None;
+                cx.stop_propagation();
+                return;
+            }
+            // Not an armed left-release — fall through unchanged.
+            LinkClickVerdict::NotOurs => {}
+        }
+
         if self.drag_anchor.is_some() && event.button == MouseButton::Left {
             // Selection persists (for ⌘C); nothing is sent to the pty.
             self.drag_anchor = None;
@@ -1295,7 +1515,9 @@ impl TerminalView {
     }
 
     /// A left button-up that landed outside the pane still ends a drag cleanly
-    /// (the in-bounds `on_mouse_up` never fired for it).
+    /// (the in-bounds `on_mouse_up` never fired for it) — and disarms a ⌘+link
+    /// click for the same reason: a release outside the pane is never on the
+    /// pressed cell, so it can only cancel.
     fn on_mouse_up_out(
         &mut self,
         _event: &MouseUpEvent,
@@ -1303,6 +1525,7 @@ impl TerminalView {
         _cx: &mut Context<Self>,
     ) {
         self.drag_anchor = None;
+        self.link_click_armed = None;
     }
 
     /// ⌘V: paste the clipboard, bracketed-wrapped when the app enabled DECSET
@@ -1596,15 +1819,34 @@ impl Render for TerminalView {
             self.auto_refit,
             self.grid_cache.clone(),
             background_opacity,
+            // The ⌘-hover underline: only the range travels to paint (the URL
+            // text is the click's business), and it rides the element's
+            // snapshot key, so hover on/off invalidates the row cache.
+            self.hovered_hyperlink.as_ref().map(|(_, m)| m.clone()),
         );
 
         div()
             .track_focus(&self.focus_handle)
+            .id("terminal.grid")
             .size_full()
             // Text-style I-beam pointer over the grid (standard terminal
             // behaviour, matching Terminal.app / iTerm even while the app has
-            // mouse reporting on).
-            .cursor(CursorStyle::IBeam)
+            // mouse reporting on) — except over a ⌘-hovered link, where the
+            // hand is the other half of the affordance the underline starts.
+            .cursor(if self.hovered_hyperlink.is_some() {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            })
+            // The pointer leaving the pane stops mouse-moves, so the hover would
+            // otherwise stick underlined with ⌘ still held (and the remembered
+            // position would go stale — see `last_mouse_pos`).
+            .on_hover(cx.listener(|this, hovering: &bool, _window, cx| {
+                if !*hovering {
+                    this.last_mouse_pos = None;
+                    this.set_hovered_hyperlink(None, cx);
+                }
+            }))
             // File / image drag-drop (T7): a dropped set of file URLs (or a
             // raw-image fallback) is typed as escaped paths at the prompt. gpui
             // delivers an OS file drop as an `ExternalPaths` active-drag.

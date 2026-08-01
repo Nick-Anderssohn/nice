@@ -30,6 +30,13 @@
 //!   byte builder ([`drop_bytes`]) behind [`TerminalView`]'s
 //!   `on_drop::<ExternalPaths>` handler, reusing `shell_backslash_escape` +
 //!   the R5 bracketed-paste wrap seam.
+//! * [`hyperlink`] — URL detection in the grid (the matching half of ⌘+click /
+//!   ⌘-hover links): the [`URL_REGEX`] constant, its cached compiled matcher
+//!   ([`UrlRegexCache`]), the trailing-punctuation trim, and the bounded
+//!   viewport search behind [`TerminalSessionHandle::hyperlink_at`], and the
+//!   pure release verdict for an armed ⌘+click (open / cancel / not ours) —
+//!   plus the [`UrlOpener`] seam [`TerminalView`]'s ⌘+click calls to open what
+//!   it found.
 //! * [`overlay`] — the two R7 terminal-niceties state machines (T9/T10): the
 //!   [`LaunchOverlay`] "Launching…" timing machine (silent-pane grace → overlay →
 //!   cleared on first output) and the [`HeldPane`] machine (a non-clean exit keeps
@@ -68,6 +75,7 @@ pub mod color;
 pub mod drop;
 pub mod element;
 pub mod font;
+pub mod hyperlink;
 pub mod input;
 pub mod mouse;
 pub mod overlay;
@@ -91,6 +99,7 @@ pub use font::{
     DEFAULT_TERMINAL_LINE_HEIGHT, MAX_TERMINAL_FONT_PX, MAX_TERMINAL_LINE_HEIGHT,
     MIN_TERMINAL_FONT_PX, MIN_TERMINAL_LINE_HEIGHT,
 };
+pub use hyperlink::{UrlOpener, UrlRegexCache, MAX_SEARCH_LINES, URL_REGEX};
 pub use input::{KeyCodeProbe, TermInputHandler};
 pub use overlay::{
     held_exit_footer, HeldPane, LaunchDeadline, LaunchDeadlineFuture, LaunchOverlay,

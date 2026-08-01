@@ -47,6 +47,7 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 | `⌘⇧.` | Toggle hidden files in the file browser |
 | `⌘+` / `⌘-` / `⌘0` | Zoom in, out, reset |
 | `⌘Z` / `⌘⇧Z` | Undo / redo file operation |
+| `⌘`+click | Open a URL in the terminal (hold `⌘` to underline it) |
 
 All rebindable in Settings (`⌘,`).
 

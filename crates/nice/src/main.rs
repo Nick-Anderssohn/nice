@@ -33,6 +33,11 @@
 //!   * [`niceties_held`] — the R7/T10 held-pane self-test (`niceties-held`): a
 //!     non-zero exit stays mounted with the dim in-buffer footer + the dismiss
 //!     affordance, typing is inert, and dismiss respawns a fresh shell.
+//!   * [`niceties_link`] — the ⌘+click / ⌘-hover terminal-link self-test
+//!     (`niceties-link`): constructed mouse + modifier events go through gpui's
+//!     real dispatch over a capture-tee pty, asserting the recording opener sees
+//!     exactly the clicked URL with no selection and no pty bytes (even with app
+//!     mouse reporting on), and that the hover follows the ⌘ key.
 //!   * [`theme`] — the token → `gpui::Rgba` colour adapter shared by the R10/R11
 //!     chrome components.
 //!   * [`sf_symbols`] — runtime SF Symbol icons (M2 feel-check Item A): the
@@ -139,6 +144,7 @@ mod keymap;
 mod multiwindow;
 mod niceties_drop;
 mod niceties_held;
+mod niceties_link;
 mod niceties_overlay;
 mod niceties_zoom;
 mod orphan_reaper;

@@ -103,8 +103,11 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::search::{Match, RegexSearch};
 use anyhow::Result;
 use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, Task};
+
+use crate::hyperlink::hyperlink_at_point;
 
 use nice_term_core::{
     DamageCallback, DrainWake, ExitStatus, Session, SessionEvent, SharedTerm, SpawnSpec,
@@ -610,6 +613,31 @@ impl TerminalSessionHandle {
     /// sense that offset defaults to 0, i.e. this returns `true` pre-spawn.
     pub fn is_at_bottom(&self) -> bool {
         self.display_offset() == 0
+    }
+
+    /// The hyperlink under the given **buffer** cell (`buffer_line` is negative
+    /// for scrollback), if any: the URL text with trailing punctuation trimmed,
+    /// plus the trimmed match range in buffer coordinates for underline painting.
+    /// `None` when the session has not spawned or no URL covers that cell.
+    ///
+    /// `regex` is the caller's cached, compiled matcher (see
+    /// [`crate::hyperlink::UrlRegexCache`]) — matching needs `&mut RegexSearch`,
+    /// and this runs on every ⌘-held mouse-move, so recompiling per call is not
+    /// an option.
+    ///
+    /// Locks the `Term` **once**, for the search only, and releases it before
+    /// returning — the same brief-lock discipline as every other method here. The
+    /// caller must never hold it across a paint or a URL open.
+    pub fn hyperlink_at(
+        &self,
+        buffer_line: i32,
+        col: usize,
+        regex: &mut RegexSearch,
+    ) -> Option<(String, Match)> {
+        let term_arc = self.session.term()?;
+        let point = Point::new(Line(buffer_line), Column(col));
+        let term = term_arc.lock();
+        hyperlink_at_point(&term, point, regex)
     }
 }
 

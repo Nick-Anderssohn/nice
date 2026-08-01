@@ -282,9 +282,9 @@ impl PaneHostView {
 
     /// Build a fresh [`TerminalView`] over `handle` with the shared theme / accent
     /// / font and the same platform injections `open_managed_window` wires (the
-    /// keyCode side-channel, the raw-image drop fallback, the App-Nap-safe launch
-    /// deadline) — the sole objc2 crossings, injected here so `nice-term-view`
-    /// stays foreign-code-free.
+    /// keyCode side-channel, the raw-image drop fallback, the ⌘+click URL opener,
+    /// the App-Nap-safe launch deadline) — the sole objc2 crossings, injected
+    /// here so `nice-term-view` stays foreign-code-free.
     fn make_terminal_view(
         &self,
         handle: Entity<TerminalSessionHandle>,
@@ -302,6 +302,10 @@ impl PaneHostView {
             view.set_background_opacity(background_opacity, tcx);
             view.set_keycode_probe(Arc::new(crate::platform::current_event_keycode));
             view.set_image_drop_provider(Arc::new(crate::platform::read_dropped_image_to_temp));
+            // ⌘+click on a terminal link. The platform wrapper defers the
+            // `NSWorkspace openURL:` to its own main-queue turn — the view calls
+            // this from a mouse-up listener, i.e. inside a live `App` borrow.
+            view.set_url_opener(Arc::new(crate::platform::workspace_open_url));
             view.set_launch_deadline(crate::platform::launch_deadline());
             // M2 Item E: the shipped shell's grid tracks the window — a painted
             // bounds change re-fits the pty (rows/cols → TIOCSWINSZ/SIGWINCH).

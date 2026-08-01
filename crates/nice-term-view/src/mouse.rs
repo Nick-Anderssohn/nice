@@ -76,6 +76,54 @@ pub fn report_modifiers(m: gpui::Modifiers) -> VtModifiers {
     VtModifiers::new(m.shift, m.alt, m.control, false)
 }
 
+/// What a mouse-up owes an armed ⌘+link click — the release half of the
+/// arm-on-press / open-on-release pair (see [`crate::view`]'s `on_mouse_down` /
+/// `on_mouse_up`; the URL matching itself is [`crate::hyperlink`]). Pure so the
+/// four release shapes are testable without a window, a session, or a painted
+/// frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkClickVerdict {
+    /// Released on the armed cell with ⌘ still held: open whatever URL is still
+    /// under it (the caller re-checks — streaming output may have scrolled the
+    /// link away between press and release). Disarm and consume the up.
+    Open,
+    /// Armed, but this release cannot open: ⌘ was let go, the pointer dragged to
+    /// another cell, or the hit-test failed. Disarm and consume the up **anyway**
+    /// — the armed press sent no report, so its release must not send one either.
+    Cancel,
+    /// Not an armed left-release: leave the state alone and fall through to the
+    /// selection / mouse-reporting paths below.
+    NotOurs,
+}
+
+/// Decide what a mouse-up does about an armed ⌘+link click.
+///
+/// `armed` is the `(vrow, col)` the ⌘+press landed on, `hit` the cell the
+/// release landed on (`None` when the hit-test failed — before a paint, or off
+/// the grid).
+///
+/// A non-left up while armed is [`NotOurs`](LinkClickVerdict::NotOurs): the arm
+/// belongs to the still-held left button, so a right-button release must neither
+/// disarm it nor be swallowed.
+pub(crate) fn link_click_verdict(
+    armed: Option<(usize, usize)>,
+    button: gpui::MouseButton,
+    cmd_held: bool,
+    hit: Option<(usize, usize)>,
+) -> LinkClickVerdict {
+    let Some(armed) = armed else {
+        return LinkClickVerdict::NotOurs;
+    };
+    if button != gpui::MouseButton::Left {
+        return LinkClickVerdict::NotOurs;
+    }
+    if cmd_held && hit == Some(armed) {
+        LinkClickVerdict::Open
+    } else {
+        LinkClickVerdict::Cancel
+    }
+}
+
 /// Hit-test a grid-relative pixel offset to a zero-based `(col, row)` cell,
 /// clamped to the grid. `rel_x` is measured from the grid's left edge and
 /// `rel_y` from the top of grid row 0 (`grid_top_y`, the top-anchored origin).
@@ -180,5 +228,69 @@ mod tests {
         assert_eq!(cell_from_offset(10_000.0, 10_000.0, 8.0, 16.0, 80, 24), (79, 23));
         // Exact cell boundary belongs to the higher-index cell (floor).
         assert_eq!(cell_from_offset(8.0, 16.0, 8.0, 16.0, 80, 24), (1, 1));
+    }
+
+    // ---- The ⌘+link release verdict ------------------------------------------
+
+    const ARMED: Option<(usize, usize)> = Some((3, 7));
+
+    #[test]
+    fn a_same_cell_release_with_cmd_still_held_opens() {
+        assert_eq!(
+            link_click_verdict(ARMED, gpui::MouseButton::Left, true, Some((3, 7))),
+            LinkClickVerdict::Open
+        );
+    }
+
+    #[test]
+    fn releasing_cmd_before_the_button_cancels() {
+        // ⌘ let go between press and release: no open — but still ours, so the up
+        // is swallowed rather than reported to an app that never saw the press.
+        assert_eq!(
+            link_click_verdict(ARMED, gpui::MouseButton::Left, false, Some((3, 7))),
+            LinkClickVerdict::Cancel
+        );
+    }
+
+    #[test]
+    fn a_release_on_another_cell_cancels() {
+        // ⌘+drag away from the link, and a release whose hit-test failed.
+        assert_eq!(
+            link_click_verdict(ARMED, gpui::MouseButton::Left, true, Some((3, 8))),
+            LinkClickVerdict::Cancel
+        );
+        assert_eq!(
+            link_click_verdict(ARMED, gpui::MouseButton::Left, true, Some((4, 7))),
+            LinkClickVerdict::Cancel
+        );
+        assert_eq!(
+            link_click_verdict(ARMED, gpui::MouseButton::Left, true, None),
+            LinkClickVerdict::Cancel
+        );
+    }
+
+    #[test]
+    fn a_non_left_up_while_armed_is_not_ours() {
+        // The arm belongs to the still-held left button: a right/middle release
+        // must fall through to the reporting path and leave the arm standing.
+        for button in [
+            gpui::MouseButton::Right,
+            gpui::MouseButton::Middle,
+            gpui::MouseButton::Navigate(gpui::NavigationDirection::Back),
+        ] {
+            assert_eq!(
+                link_click_verdict(ARMED, button, true, Some((3, 7))),
+                LinkClickVerdict::NotOurs,
+                "{button:?} while armed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unarmed_up_is_not_ours() {
+        assert_eq!(
+            link_click_verdict(None, gpui::MouseButton::Left, true, Some((3, 7))),
+            LinkClickVerdict::NotOurs
+        );
     }
 }

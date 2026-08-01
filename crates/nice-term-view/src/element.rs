@@ -39,7 +39,8 @@
 //! 256 computed cube/ramp, 24-bit truecolor (see [`crate::color`]) — plus text
 //! attributes (inverse-video with exact per-channel inversion, bold, italic,
 //! dim, underline, strikethrough), wide glyphs / emoji, selection rendering from
-//! the core's selection state, and procedural box-drawing + block elements
+//! the core's selection state, the ⌘-hover link underline (view state riding
+//! [`SnapshotKey`] exactly like selection), and procedural box-drawing + block elements
 //! (U+2500–259F, see [`crate::boxdraw`]). Procedural cells whose geometry is
 //! provably x-uniform (`─ ━ ═ █ ▄ ░` …) batch into per-run band quads (fix
 //! round r5c — one `paint_quad` per band per RUN; the 2026-07-10 typing
@@ -76,6 +77,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint};
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::Match;
 use alacritty_terminal::term::{Term, TermDamage};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 
@@ -588,6 +590,14 @@ fn bg_spans(row: &[PaintCell]) -> Vec<(usize, usize, u32)> {
 ///   and alacritty's damage explicitly does NOT track selection (see
 ///   `Term::damage`'s docs); this compare is the only thing keeping a
 ///   drag-select repaint honest.
+/// * `hovered_hyperlink` — the ⌘-hovered link's range is baked into cell
+///   underlines, for exactly the same reason `selection` is here: it is view
+///   state the grid knows nothing about, so alacritty's damage cannot report
+///   it. Without this compare the first ⌘-hover would underline nothing (no row
+///   is damaged by moving a pointer) and, worse, the un-hover would leave the
+///   underline painted. Hover only changes when a ⌘-held pointer crosses a
+///   match boundary, so paying a full re-copy for it is cheap — and far cheaper
+///   than a partial-invalidation scheme that gets it subtly wrong.
 #[derive(Clone, PartialEq)]
 struct SnapshotKey {
     term_ptr: usize,
@@ -596,6 +606,7 @@ struct SnapshotKey {
     cols: usize,
     display_offset: usize,
     selection: Option<SelectionRange>,
+    hovered_hyperlink: Option<Match>,
 }
 
 /// The frame's row-invalidation verdict, distilled from `Term::damage()` plus
@@ -651,7 +662,7 @@ struct RowPlan {
 ///   consumer; one `TerminalView` per session handle is the standing wiring);
 /// * **whole grid** — `TermDamage::Full`, the core's forced-full flag (in-place
 ///   ED(2)), or ANY [`SnapshotKey`] change (respawn / theme / resize / scroll
-///   offset / selection — see the key's field docs);
+///   offset / selection / ⌘-hovered hyperlink — see the key's field docs);
 /// * **plans only** — the solid-cursor glyph-skip cell moving (cursor motion,
 ///   focus flip solid↔hollow, IME composition start/end) re-plans exactly the
 ///   old + new cursor rows via [`GridCache::reconcile`]'s `glyph_skip`
@@ -868,6 +879,14 @@ impl TerminalElement {
     /// (`is_focused && window active`) — passed in so this crate keeps no
     /// separate focus flag. If the session has not spawned, the cache is
     /// cleared and the element paints just the background.
+    ///
+    /// `hovered_hyperlink` is the ⌘-hovered link's range in **buffer**
+    /// coordinates (the view's `hovered_hyperlink`, `None` whenever ⌘ is not
+    /// held over a URL). It is consumed here rather than kept as a field: the
+    /// underline it draws reaches paint through the row cache like every other
+    /// cell attribute — baked into [`PaintCell::underline`] by [`fill_row`] and
+    /// re-baked whenever the [`SnapshotKey`] carrying it changes. Painting it
+    /// after the cache instead would leave a stale underline behind on un-hover.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: &TerminalSessionHandle,
@@ -882,6 +901,7 @@ impl TerminalElement {
         auto_refit: bool,
         cache: Rc<RefCell<GridCache>>,
         background_opacity: f32,
+        hovered_hyperlink: Option<Match>,
     ) -> Self {
         let default_bg = theme.background.to_u32();
         let foreground = theme.foreground.to_u32();
@@ -952,6 +972,7 @@ impl TerminalElement {
                     cols,
                     display_offset,
                     selection,
+                    hovered_hyperlink: hovered_hyperlink.clone(),
                 };
                 // The solid-cursor glyph-skip cell (a PLAN input — see
                 // `GridCache`): only a solid, non-composing caret suppresses
@@ -970,6 +991,7 @@ impl TerminalElement {
                     .selection
                     .map(|c| c.to_u32())
                     .unwrap_or(DEFAULT_SELECTION);
+                let hovered = hovered_hyperlink.as_ref();
                 grid_cache.reconcile(key, damage, glyph_skip, |vr, out| {
                     fill_row(
                         &term,
@@ -977,6 +999,7 @@ impl TerminalElement {
                         default_bg,
                         selection,
                         selection_color,
+                        hovered,
                         display_offset as i32,
                         cols,
                         vr,
@@ -1701,7 +1724,10 @@ fn dim_rgb(fg: u32, bg: u32) -> u32 {
 /// Copy ONE visible viewport row's cells out of a locked `Term` into owned
 /// paint data — the per-row body of the pre-r5b full-grid `snapshot`, split
 /// out so [`GridCache::reconcile`] runs it for damaged rows only. Byte-for-byte
-/// the same resolution pipeline (inverse-video, dim, hidden, selection).
+/// the same resolution pipeline (inverse-video, dim, hidden, selection), plus
+/// the ⌘-hover underline — the two pieces of view state the grid itself does
+/// not carry (`selection`, `hovered`) are resolved per cell right here, so a
+/// cached row is exactly what its [`SnapshotKey`] says it is.
 /// Generic over the `Term`'s listener so the caller never has to name
 /// `nice-term-core`'s private proxy type.
 #[allow(clippy::too_many_arguments)]
@@ -1711,6 +1737,7 @@ fn fill_row<T: EventListener>(
     default_bg: u32,
     selection: Option<SelectionRange>,
     selection_color: u32,
+    hovered: Option<&Match>,
     display_offset: i32,
     cols: usize,
     vr: usize,
@@ -1721,7 +1748,8 @@ fn fill_row<T: EventListener>(
     // Viewport row `vr` maps to buffer line `vr - display_offset`.
     let line = Line(vr as i32 - display_offset);
     for col in 0..cols {
-        let cell = &term.grid()[GridPoint::new(line, Column(col))];
+        let point = GridPoint::new(line, Column(col));
+        let cell = &term.grid()[point];
         let flags = cell.flags;
 
         // Inverse video (SGR 7), the SwiftTerm way: swap the fg / bg attribute
@@ -1758,12 +1786,19 @@ fn fill_row<T: EventListener>(
         // Selection: the highlighted cells' background is replaced by the
         // theme selection colour (SwiftTerm `selectionBackgroundColor`); the
         // foreground text stays and paints over it.
-        let selected = selection
-            .map(|s| s.contains(GridPoint::new(line, Column(col))))
-            .unwrap_or(false);
+        let selected = selection.map(|s| s.contains(point)).unwrap_or(false);
         if selected {
             bg_resolved = selection_color;
         }
+
+        // ⌘-hover: the matched URL's range (buffer coords, `RangeInclusive<Point>`
+        // over the row-major point order) underlines its cells ON TOP of whatever
+        // the cell already carries — a URL printed by an app that underlines its
+        // own output stays underlined when the hover leaves. Containment is
+        // per-cell, so a wide glyph's spacer half is covered like any other
+        // column, and the run splitter already breaks runs on `underline`
+        // (`RunStyle`), so the underline starts and stops on the exact cells.
+        let hovered_here = hovered.is_some_and(|m| m.contains(&point));
 
         let bg = if bg_resolved != default_bg {
             Some(bg_resolved)
@@ -1777,7 +1812,7 @@ fn fill_row<T: EventListener>(
             bg,
             bold: flags.contains(Flags::BOLD),
             italic: flags.contains(Flags::ITALIC),
-            underline: flags.intersects(Flags::ALL_UNDERLINES),
+            underline: flags.intersects(Flags::ALL_UNDERLINES) || hovered_here,
             strikethrough: flags.contains(Flags::STRIKEOUT),
             wide_spacer: flags
                 .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
@@ -1813,6 +1848,8 @@ fn viewport_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
 
     #[test]
     fn terminal_metrics_new_defaults_glyph_h_to_cell_h() {
@@ -2276,6 +2313,125 @@ mod tests {
         assert_eq!(bg_spans(&"plain".chars().map(pc).collect::<Vec<_>>()), vec![]);
     }
 
+    // ---- ⌘-hover underline (link affordance) ---------------------------------
+
+    /// A `Term` of `cols`×`rows` fed `text` as if the child had printed it.
+    fn hover_term(cols: usize, rows: usize, text: &str) -> Term<VoidListener> {
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &alacritty_terminal::term::test::TermSize::new(cols, rows),
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, text.as_bytes());
+        term
+    }
+
+    /// Viewport row `vr` of `term`, resolved with `hovered` as the ⌘-hover range.
+    fn hovered_row(
+        term: &Term<VoidListener>,
+        cols: usize,
+        vr: usize,
+        hovered: Option<&Match>,
+    ) -> Vec<PaintCell> {
+        let theme = TerminalTheme::nice_default_dark();
+        let mut out = Vec::new();
+        fill_row(
+            term,
+            &theme,
+            theme.background.to_u32(),
+            None,
+            DEFAULT_SELECTION,
+            hovered,
+            0,
+            cols,
+            vr,
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn hovered_range_underlines_exactly_its_cells() {
+        // The hover underline is resolved per cell in `fill_row`, exactly like
+        // selection — so the cells the range covers (and only those) come out
+        // underlined, and the same row with no hover comes out clean.
+        let term = hover_term(24, 3, "go http://a.b/ now");
+        let hovered = GridPoint::new(Line(0), Column(3))..=GridPoint::new(Line(0), Column(13));
+
+        let row = hovered_row(&term, 24, 0, Some(&hovered));
+        for (col, cell) in row.iter().enumerate() {
+            assert_eq!(
+                cell.underline,
+                (3..=13).contains(&col),
+                "col {col} ({:?}) underline",
+                cell.ch
+            );
+        }
+        assert!(
+            hovered_row(&term, 24, 0, None).iter().all(|c| !c.underline),
+            "with no hover the same row has no underline at all"
+        );
+    }
+
+    #[test]
+    fn a_soft_wrapped_hover_underlines_both_lines_up_to_the_match_end() {
+        // A URL that wraps is ONE match spanning two buffer lines; `Match` is a
+        // `RangeInclusive<Point>` over the row-major point order, so containment
+        // underlines the tail of the first row and the head of the second — and
+        // stops dead at the match's end column.
+        let term = hover_term(10, 3, "x http://a.b/ccc");
+        let hovered = GridPoint::new(Line(0), Column(2))..=GridPoint::new(Line(1), Column(5));
+
+        let first = hovered_row(&term, 10, 0, Some(&hovered));
+        assert!(
+            first[2..].iter().all(|c| c.underline) && !first[1].underline,
+            "the first row is underlined from the match start to its end"
+        );
+        let second = hovered_row(&term, 10, 1, Some(&hovered));
+        for (col, cell) in second.iter().enumerate() {
+            assert_eq!(cell.underline, col <= 5, "wrapped row col {col}");
+        }
+    }
+
+    #[test]
+    fn the_hover_underline_is_ored_onto_the_cell_attribute() {
+        // SGR-underlined output that is ALSO hovered stays underlined when the
+        // hover moves on: the hover ORs in, it does not overwrite.
+        let term = hover_term(8, 2, "\u{1b}[4mab\u{1b}[0mcd");
+        let hovered = GridPoint::new(Line(0), Column(2))..=GridPoint::new(Line(0), Column(3));
+
+        let hovered_row_cells = hovered_row(&term, 8, 0, Some(&hovered));
+        assert!(
+            hovered_row_cells[..4].iter().all(|c| c.underline),
+            "the SGR-underlined pair and the hovered pair are both underlined"
+        );
+        let plain = hovered_row(&term, 8, 0, None);
+        assert!(
+            plain[0].underline && plain[1].underline && !plain[2].underline,
+            "un-hovered, only the SGR underline remains"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_key_differing_only_in_the_hover_is_unequal() {
+        // The row cache only repaints on a key difference; if this compared
+        // equal, the first ⌘-hover would underline nothing and the un-hover
+        // would leave the underline behind.
+        let base = test_key(3, 4);
+        let mut hovered = base.clone();
+        hovered.hovered_hyperlink =
+            Some(GridPoint::new(Line(0), Column(0))..=GridPoint::new(Line(0), Column(2)));
+        // `!=` rather than `assert_ne!`: the key holds a `TerminalTheme`, which
+        // is not `Debug`.
+        assert!(base != hovered, "hover on must invalidate");
+
+        let mut moved = hovered.clone();
+        moved.hovered_hyperlink =
+            Some(GridPoint::new(Line(1), Column(0))..=GridPoint::new(Line(1), Column(2)));
+        assert!(hovered != moved, "hovering a DIFFERENT match must invalidate");
+    }
+
     // ---- Damage-gated row cache (fix round r5b) -------------------------------
     //
     // These pin `GridCache`'s invalidation contract with NO gpui and NO `Term`:
@@ -2302,6 +2458,7 @@ mod tests {
             cols,
             display_offset: 0,
             selection: None,
+            hovered_hyperlink: None,
         }
     }
 
@@ -2406,6 +2563,10 @@ mod tests {
             false,
         ));
         variants.push(("selection change (not in alacritty damage)", k));
+        let mut k = test_key(3, 4);
+        k.hovered_hyperlink =
+            Some(GridPoint::new(Line(0), Column(0))..=GridPoint::new(Line(0), Column(3)));
+        variants.push(("⌘-hover change (not in alacritty damage)", k));
         let mut k = test_key(3, 4);
         k.display_offset = 2;
         variants.push(("display-offset change (scroll re-maps rows)", k));
