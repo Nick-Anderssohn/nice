@@ -1,0 +1,41 @@
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -3891,20 +3891,33 @@
+         let element_opacity = self.element_opacity();
+         let scale_factor = self.scale_factor();
+         let glyph_origin = origin.scale(scale_factor);
++
++        // On low-density (1x) displays a point is a single device pixel, so
++        // quarter-pixel x-placement smears a ~1.5px stem across 2-3 columns
++        // and the font-smoothing dilation adds up to ~0.45pt on top — text
++        // renders visibly fatter/wider than the same content on retina. Snap
++        // glyph origins to whole pixels and skip the dilation there; retina
++        // (scale >= 2) rendering is unchanged.
++        let low_density = scale_factor < 1.5;
++        let subpixel_variants_x = if low_density { 1 } else { SUBPIXEL_VARIANTS_X };
+ 
+         let quantized_origin = Point::new(
+-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+-                / SUBPIXEL_VARIANTS_X as f32,
++            round_half_toward_zero(glyph_origin.x.0 * subpixel_variants_x as f32)
++                / subpixel_variants_x as f32,
+             round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                 / SUBPIXEL_VARIANTS_Y as f32,
+         );
+         let subpixel_variant = Point::new(
+-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
++            (quantized_origin.x.fract() * subpixel_variants_x as f32) as u8,
+             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+         );
+         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+-        let dilation = self.text_system().glyph_dilation_for_color(color);
++        let dilation = if low_density {
++            0
++        } else {
++            self.text_system().glyph_dilation_for_color(color)
++        };
+         let params = RenderGlyphParams {
+             font_id,
+             glyph_id,

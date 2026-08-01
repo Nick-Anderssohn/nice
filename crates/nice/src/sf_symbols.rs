@@ -107,9 +107,22 @@ struct SfSymbolCache(HashMap<SymbolKey, Option<SymbolImage>>);
 
 impl Global for SfSymbolCache {}
 
+/// The raster scale for a window backing scale: never below 2x. AppKit's
+/// symbol rasterizer pixel-fits the vector artwork badly at backing scale 1 —
+/// symbols whose 1x canvas is an odd pixel width (`plus`, `chevron.down`,
+/// `terminal`) come back with their ink horizontally stretched (SF `plus`
+/// 11pt semibold renders 11x9 ink instead of the square 9x9 its 2x artwork
+/// downscales to). Rasterizing at 2x and letting the GPU downscale into the
+/// same point-size box keeps the ink square on 1x displays; on retina
+/// windows this is a no-op (scale is already 2.0), cache keys included.
+fn raster_scale(window_scale: f32) -> f32 {
+    window_scale.max(2.0)
+}
+
 /// The icon element: the SF Symbol `name` rasterized at `point_size` /
 /// `weight`, tinted `color`, at `scale` device pixels per point (pass the
-/// window's `scale_factor()`), or the `fallback_glyph` styled identically when
+/// window's `scale_factor()`; rasterization is upgraded to at least 2x — see
+/// [`raster_scale`]), or the `fallback_glyph` styled identically when
 /// the symbol cannot be resolved. The returned element is exactly the glyph
 /// box — callers keep their own button frames, hover fills, and press
 /// handlers.
@@ -122,6 +135,7 @@ pub(crate) fn sf_symbol_icon(
     scale: f32,
     cx: &mut App,
 ) -> AnyElement {
+    let scale = raster_scale(scale);
     let key = SymbolKey::new(name, point_size, weight, color, scale);
     let cached = cx.default_global::<SfSymbolCache>().0.get(&key).cloned();
     let entry = match cached {
@@ -191,6 +205,15 @@ fn tint_symbol(bitmap: &SymbolBitmap, color: Rgba, scale: f32) -> SymbolImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raster_scale_never_below_2x() {
+        // 1x windows must not rasterize at 1x (AppKit stretches odd-canvas
+        // symbols there — see `raster_scale`); retina passes through.
+        assert_eq!(raster_scale(1.0), 2.0);
+        assert_eq!(raster_scale(2.0), 2.0);
+        assert_eq!(raster_scale(3.0), 3.0);
+    }
 
     #[test]
     fn symbol_key_quantizes_size_scale_and_color() {

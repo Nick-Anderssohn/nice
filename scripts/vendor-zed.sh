@@ -60,6 +60,15 @@
 #          still decide move-vs-copy). The triggering `NSEvent` comes from
 #          `[NSApp currentEvent]`, so it only starts from inside synchronous
 #          mouse-event dispatch; it refuses instead of raising otherwise.
+#        - zed-1x-crisp-text.patch: crisp text on low-density (1x) displays.
+#          In paint_glyph, when scale_factor < 1.5, snap glyph origins to
+#          whole device pixels (no quarter-pixel x variants) and skip the
+#          font-smoothing dilation. At 1x a point is a single device pixel:
+#          quarter-pixel placement smears a ~1.5px stem across 2-3 columns
+#          and the dilation adds up to ~0.45pt on top, so all text rendered
+#          visibly fatter/wider than the same content on retina (the
+#          2026-07-31 "text stretched on the ultrawide" report). Retina
+#          (scale >= 2) rendering is byte-identical.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
@@ -87,6 +96,7 @@ PATCHES=(
     "zed-configurable-blur"
     "zed-translucent-dst-alpha"
     "zed-external-drag-out"
+    "zed-1x-crisp-text"
 )
 patch_file() { printf '%s/patches/%s.patch' "$REPO_ROOT" "$1"; }
 marker_file() { printf '%s/.nice-%s-applied' "$VENDOR" "${1#zed-}"; }
