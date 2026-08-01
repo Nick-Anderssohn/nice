@@ -176,29 +176,62 @@ pub(crate) fn sf_symbol_icon(
 // The brand logo mark (`logo_mark_icon` / `rasterize_logo_mark`) was retired
 // with the toolbar brand block in the 2026-07 restyle (no logo replaces it).
 
-/// Tint a coverage mask into a BGRA straight-alpha [`RenderImage`] frame. The
-/// colour channels carry the tint everywhere (also under zero coverage) so
-/// bilinear sampling at the glyph edge never pulls a foreign colour in; the
-/// alpha channel is `coverage × tint alpha`.
+/// The padded bitmap extent (in device pixels) whose point size is the next
+/// EVEN whole number of points. Symbol canvases are routinely an odd point
+/// width (SF `plus` is 13x12 at 11pt), and an odd-point box centered in an
+/// even-point button slot (`SQUARE_BTN_SIZE` 22) lands on a half-point
+/// origin. On retina that is still a whole device pixel; on a 1x display it
+/// is a HALF pixel, and the GPU resample then smears every edge of the icon
+/// across two pixels — visibly blurry at icon sizes. Even-point boxes keep
+/// centered layout on integral pixels at both scales.
+fn padded_px(px: usize, scale: f32) -> usize {
+    let pt = px as f32 / scale;
+    let even_pt = (pt / 2.0).ceil() * 2.0;
+    (even_pt * scale).round() as usize
+}
+
+/// Tint a coverage mask into a BGRA straight-alpha [`RenderImage`] frame,
+/// padded to an even-point box (see [`padded_px`]; the mask is centered, any
+/// odd leftover pixel going right/bottom). The colour channels carry the tint
+/// everywhere (also under zero coverage) so bilinear sampling at the glyph
+/// edge never pulls a foreign colour in; the alpha channel is
+/// `coverage × tint alpha`.
 fn tint_symbol(bitmap: &SymbolBitmap, color: Rgba, scale: f32) -> SymbolImage {
     let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
     let (b, g, r) = (q(color.b), q(color.g), q(color.r));
     let tint_a = color.a.clamp(0.0, 1.0);
 
-    let mut data = Vec::with_capacity(bitmap.coverage.len() * 4);
-    for &coverage in &bitmap.coverage {
+    let scale = scale.max(1.0);
+    let (pad_w, pad_h) = (
+        padded_px(bitmap.px_width, scale),
+        padded_px(bitmap.px_height, scale),
+    );
+    let (left, top) = (
+        (pad_w - bitmap.px_width) / 2,
+        (pad_h - bitmap.px_height) / 2,
+    );
+
+    let mut data = vec![0u8; pad_w * pad_h * 4];
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        let (x, y) = (i % pad_w, i / pad_w);
+        let coverage = if (left..left + bitmap.px_width).contains(&x)
+            && (top..top + bitmap.px_height).contains(&y)
+        {
+            bitmap.coverage[(y - top) * bitmap.px_width + (x - left)]
+        } else {
+            0
+        };
         let a = (f32::from(coverage) * tint_a).round() as u8;
         // BGRA byte order, straight alpha (see the module docs).
-        data.extend_from_slice(&[b, g, r, a]);
+        px.copy_from_slice(&[b, g, r, a]);
     }
-    let buffer = image::RgbaImage::from_raw(bitmap.px_width as u32, bitmap.px_height as u32, data)
-        .expect("buffer is exactly px_width * px_height * 4 bytes");
+    let buffer = image::RgbaImage::from_raw(pad_w as u32, pad_h as u32, data)
+        .expect("buffer is exactly pad_w * pad_h * 4 bytes");
 
-    let scale = scale.max(1.0);
     SymbolImage {
         image: Arc::new(RenderImage::new(vec![Frame::new(buffer)])),
-        width_pt: bitmap.px_width as f32 / scale,
-        height_pt: bitmap.px_height as f32 / scale,
+        width_pt: pad_w as f32 / scale,
+        height_pt: pad_h as f32 / scale,
     }
 }
 
@@ -233,8 +266,19 @@ mod tests {
     }
 
     #[test]
+    fn padded_px_targets_even_points() {
+        // SF plus at 11pt: 26x24 device px at 2x = 13x12 pt -> 14x12 pt.
+        assert_eq!(padded_px(26, 2.0), 28);
+        assert_eq!(padded_px(24, 2.0), 24); // already even-pt: unchanged
+        // Odd device count from a fractional canvas still lands on even pt.
+        assert_eq!(padded_px(27, 2.0), 28);
+    }
+
+    #[test]
     fn tint_fills_bgra_straight_alpha() {
-        // A 2×1 mask: transparent, fully inked. Tint = pure red at full alpha.
+        // A 2×1 mask: transparent, fully inked. Tint = pure red at full
+        // alpha. At scale 2 the mask is 1x0.5 pt, so the box pads to the
+        // even 2x2 pt = 4x4 px, mask centered (left 1, top 1).
         let bitmap = SymbolBitmap {
             coverage: vec![0, 255],
             px_width: 2,
@@ -248,11 +292,17 @@ mod tests {
         };
         let icon = tint_symbol(&bitmap, red, 2.0);
         let bytes = icon.image.as_bytes(0).expect("one frame");
-        // BGRA: colour channels carry the tint even at zero coverage.
-        assert_eq!(bytes, &[0, 0, 255, 0, 0, 0, 255, 255]);
-        // The element box is device px / scale.
-        assert_eq!(icon.width_pt, 1.0);
-        assert_eq!(icon.height_pt, 0.5);
+        assert_eq!(bytes.len(), 4 * 4 * 4);
+        for (i, px) in bytes.chunks_exact(4).enumerate() {
+            let (x, y) = (i % 4, i / 4);
+            // BGRA: colour channels carry the tint even at zero coverage;
+            // only the inked mask pixel (padded to (2,1)) has alpha.
+            let expect_a = if (x, y) == (2, 1) { 255 } else { 0 };
+            assert_eq!(px, &[0, 0, 255, expect_a], "pixel ({x},{y})");
+        }
+        // The element box is the padded even-point size.
+        assert_eq!(icon.width_pt, 2.0);
+        assert_eq!(icon.height_pt, 2.0);
     }
 
     #[test]
@@ -270,6 +320,8 @@ mod tests {
         };
         let icon = tint_symbol(&bitmap, half, 1.0);
         let bytes = icon.image.as_bytes(0).expect("one frame");
-        assert_eq!(bytes[3], 100); // 200 × 0.5
+        // 1x1 pads to 2x2 pt at scale 1; the single mask pixel keeps
+        // coverage × tint alpha = 200 × 0.5.
+        assert_eq!(bytes.iter().skip(3).step_by(4).max(), Some(&100));
     }
 }
