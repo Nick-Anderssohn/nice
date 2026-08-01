@@ -2359,6 +2359,64 @@ fn main_screen_height() -> Option<f64> {
     }
 }
 
+/// Every connected screen's `-[NSScreen frame]` in **global Cocoa points**
+/// (bottom-left origin, y up) paired with its `CGDirectDisplayID` — the input to
+/// [`crate::window_frame::restore_placement`].
+///
+/// `App::displays()` deliberately does not expose this: gpui's macOS window
+/// bounds are display-RELATIVE, so `MacDisplay::bounds` reports every display's
+/// origin as `(0,0)` (size only) and `visible_bounds` likewise subtracts the
+/// screen origin — each display is its own coordinate space. That is the right
+/// answer for gpui's own API and the wrong one for a saved GLOBAL frame, which
+/// has to be resolved against the arrangement before it can be made relative.
+/// Nice owns both ends of that round trip ([`window_screen_frame`] saves the
+/// global frame), so it reads the arrangement here too.
+///
+/// Empty when AppKit reports no screens (display asleep / no window server),
+/// which restore treats as "no clamp target" ⇒ default placement.
+pub fn screens() -> Vec<crate::window_frame::Screen> {
+    // SAFETY: `+[NSScreen screens]` returns an autoreleased array (get-rule) of
+    // borrowed `NSScreen`s; `-frame` / `-deviceDescription` / `-objectForKey:` /
+    // `-unsignedIntValue` are get-rule reads with no ownership transfer. Main
+    // thread with an autorelease pool (called from window open, on the gpui
+    // foreground runloop).
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return Vec::new();
+        }
+        let count: usize = msg_send![screens, count];
+        let mut out = Vec::with_capacity(count);
+        let key = ns_string("NSScreenNumber");
+        for i in 0..count {
+            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            if screen.is_null() {
+                continue;
+            }
+            let desc: *mut AnyObject = msg_send![screen, deviceDescription];
+            if desc.is_null() {
+                continue;
+            }
+            let number: *mut AnyObject = msg_send![desc, objectForKey: key];
+            if number.is_null() {
+                continue;
+            }
+            let id: u32 = msg_send![number, unsignedIntValue];
+            let frame: NSRect = msg_send![screen, frame];
+            out.push(crate::window_frame::Screen {
+                id,
+                frame: [
+                    frame.origin.x,
+                    frame.origin.y,
+                    frame.size.width,
+                    frame.size.height,
+                ],
+            });
+        }
+        out
+    }
+}
+
 /// The user's title-bar double-click action, read the SAME way gpui's
 /// `titlebar_double_click` does (`NSGlobalDomain` persistent domain, key
 /// `AppleActionOnDoubleClick`), so the `chrome` scenario can predict the effect

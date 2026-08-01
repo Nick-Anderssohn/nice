@@ -1657,7 +1657,7 @@ pub(crate) fn open_managed_window_with(
 
     // W6: open at the restored frame when one survives the visible-screen clamp;
     // else default placement.
-    let options = match crate::window_frame::restored_window_bounds(restored_frame.as_ref(), cx) {
+    let options = match crate::window_frame::restored_window_bounds(restored_frame.as_ref()) {
         Some((bounds, display_id)) => window_options_with(Some(bounds), display_id),
         None => window_options(),
     };

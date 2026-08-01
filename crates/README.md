@@ -828,11 +828,21 @@ The GPUI application. Structure (grows over later cycles):
       divergence from Swift's SceneStorage). `cwd_heal` holds the pure heal helpers
       (bucket encode, transcript head-scan, newest-mtime bucket recovery; injectable
       `projects_root`, `NICE_CLAUDE_PROJECTS_ROOT` override).
-    - `window_frame` (W6) — the pure Cocoa↔gpui-top-left conversion pair + the
+    - `window_frame` (W6) — the pure global-Cocoa→gpui conversion + the
       visible-screen clamp (a saved rect overlapping every display by <100×52 pt is
-      discarded for default placement; else used unchanged), plus the gpui adapter
-      `restored_window_bounds`. Persisted frames are **Cocoa bottom-left screen
-      points** (identical to Swift, so migration needs no value conversion),
+      discarded for default placement; else used unchanged, on the display it
+      overlaps by the largest area), plus the gpui adapter
+      `restored_window_bounds`. Persisted frames are **global Cocoa bottom-left
+      screen points** (identical to Swift, so migration needs no value conversion),
+      but gpui's `window_bounds` is **display-relative top-left** (its deliberate
+      convention: `MacWindow::open`/`bounds()` both use it, and
+      `PlatformDisplay::bounds()` zeroes each macOS display's origin to say so) —
+      so restore picks the target screen itself, off `platform::screens()` (the
+      `NSScreen.frame` arrangement gpui's display bounds cannot express), and
+      converts `x − screen.x` / `(screen.y + screen.h) − (y + h)`. Passing gpui a
+      global x was the multi-display restore bug (a window saved on a screen at
+      Cocoa x 1470 reopened 1470 further right, off-screen); single-display setups
+      masked it because that origin is 0.
       captured on `observe_window_bounds` (move AND resize; skipped while
       fullscreen — a deliberate fix of Swift's fullscreen-frame wart) into
       `WindowState.last_frame`. `window_options` gains an optional bounds/`display_id`
