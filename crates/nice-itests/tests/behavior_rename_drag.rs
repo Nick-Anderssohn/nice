@@ -159,6 +159,9 @@ impl Render for RenameRoot {
                         let _ = weak_key.update(app, |this, cx| {
                             let outcome = dispatch_rename_key(
                                 &mut this.editor,
+                                // The production wiring: `Context<T>` derefs to
+                                // the `App` the clipboard chords go through.
+                                &mut **cx,
                                 &ks.key,
                                 ks.key_char.as_deref(),
                                 ks.modifiers.shift,

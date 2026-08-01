@@ -120,6 +120,38 @@ impl TextFieldEditor {
         self.anchor != self.caret
     }
 
+    /// The selected substring, or `None` when the selection is collapsed — what
+    /// the ⌘C / ⌘X chords hand to the system clipboard. Char-indexed like every
+    /// other offset here, so a selection over multi-byte text yields exactly the
+    /// selected characters rather than a byte slice that could split one.
+    ///
+    /// `None` (not `Some("")`) for a collapsed caret is load-bearing: the copy
+    /// chords use it to decide to leave the clipboard ALONE, which is what
+    /// `NSTextField` does — a ⌘C with nothing selected must not clobber whatever
+    /// the user copied a moment ago.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection();
+        (start != end).then(|| self.chars[start..end].iter().collect())
+    }
+
+    /// Replace the selection (or insert at the caret when it is collapsed) with
+    /// `s`, leaving a collapsed caret directly AFTER the inserted text — the ⌘V
+    /// primitive, and the multi-char sibling of the printable [`Key::Char`]
+    /// insert. One call, so the paste is one atomic edit from the key dispatch's
+    /// point of view (a `Char`-per-glyph loop would work identically but makes
+    /// the caret arithmetic the caller's problem).
+    ///
+    /// `s` is inserted verbatim; flattening a multi-line clipboard to the single
+    /// line this field can hold is the caller's job (the field is single-line,
+    /// but this model does not police the characters it is handed).
+    pub fn insert_str(&mut self, s: &str) {
+        let (start, end) = self.selection();
+        let inserted: Vec<char> = s.chars().collect();
+        let n = inserted.len();
+        self.chars.splice(start..end, inserted);
+        self.collapse_to(start + n);
+    }
+
     /// Apply one key, mutating the state.
     pub fn apply_key(&mut self, key: Key) {
         match key {
@@ -571,6 +603,62 @@ mod tests {
         assert_eq!(e.selection(), (0, 4));
         e.apply_key(Char('x'));
         assert_eq!(e.text(), "x.txt");
+    }
+
+    // MARK: - selected_text / insert_str (the ⌘C/⌘X/⌘V primitives)
+
+    #[test]
+    fn selected_text_is_none_when_the_selection_is_collapsed() {
+        // The copy chords read this to decide NOT to touch the clipboard.
+        let e = TextFieldEditor::new("foo.txt");
+        assert!(!e.has_selection());
+        assert_eq!(e.selected_text(), None);
+    }
+
+    #[test]
+    fn selected_text_returns_the_selected_substring() {
+        let e = TextFieldEditor::with_selection("foo.txt", 3);
+        assert_eq!(e.selected_text().as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn selected_text_is_char_indexed_for_multibyte() {
+        // Offsets are char offsets: selecting the two-char "åØ" out of "xåØy"
+        // must not split either two-byte glyph.
+        let mut e = TextFieldEditor::new("xåØy");
+        e.place_cursor(1);
+        e.extend_to(3);
+        assert_eq!(e.selected_text().as_deref(), Some("åØ"));
+    }
+
+    #[test]
+    fn insert_str_replaces_the_selection_and_leaves_the_caret_after_it() {
+        // Preselect "foo" of "foo.txt" and paste "bar" over it.
+        let mut e = TextFieldEditor::with_selection("foo.txt", 3);
+        e.insert_str("bar");
+        assert_eq!(e.text(), "bar.txt");
+        assert_eq!(e.cursor(), 3);
+        assert_eq!(e.selection(), (3, 3));
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn insert_str_inserts_at_a_collapsed_caret_mid_text() {
+        let mut e = TextFieldEditor::new("ad");
+        e.place_cursor(1);
+        e.insert_str("bc");
+        assert_eq!(e.text(), "abcd");
+        assert_eq!(e.cursor(), 3);
+    }
+
+    #[test]
+    fn insert_str_is_char_indexed_for_multibyte() {
+        // The caret lands after TWO chars, not after four bytes.
+        let mut e = TextFieldEditor::new("ab");
+        e.place_cursor(1);
+        e.insert_str("åØ");
+        assert_eq!(e.text(), "aåØb");
+        assert_eq!(e.cursor(), 3);
     }
 
     // MARK: - word motion (⌥←/⌥→)

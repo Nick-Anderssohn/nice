@@ -1124,6 +1124,10 @@ impl FileBrowserView {
             };
             dispatch_rename_key(
                 &mut state.editor,
+                // `Context<Self>` derefs to the `App` the clipboard chords read
+                // and write through; the editor borrow above is `self`'s, so the
+                // two never overlap.
+                &mut **cx,
                 &ks.key,
                 ks.key_char.as_deref(),
                 ks.modifiers.shift,

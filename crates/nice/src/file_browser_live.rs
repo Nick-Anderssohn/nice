@@ -30,7 +30,10 @@
 //! open field; (d-drag) a press at one painted char boundary and a move to
 //! another selects that range and typing replaces it — attempted as a REAL
 //! guarded global-HID gesture and, either way, hard-asserted through the
-//! production hit-test over the geometry the field painted.
+//! production hit-test over the geometry the field painted; (d-clip) real
+//! ⌘A/⌘C/⌘V chords round-trip the field text through the REAL system clipboard
+//! and a seeded multi-line paste lands as one sanitized line (the leg saves and
+//! restores whatever the clipboard held before it ran).
 //!
 //! Hermeticity: the fixture tree lives under a per-run temp dir; the recording
 //! `WorkspaceOps` fake is installed process-wide by `run_selftest` before any
@@ -46,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use gpui::{AnyWindowHandle, AppContext, AsyncApp, Entity, WindowHandle};
+use gpui::{AnyWindowHandle, AppContext, AsyncApp, ClipboardItem, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
 
@@ -77,6 +80,13 @@ const KC_Z: u16 = 6;
 const KC_LEFT: u16 = 123;
 const KC_RIGHT: u16 = 124;
 const KC_BACKSPACE: u16 = 51;
+/// a / c / v (`kVK_ANSI_A` / `_C` / `_V`) — the (d-clip) leg's ⌘A/⌘C/⌘V chords,
+/// posted by keycode like the ⌘⇧B / ⌘Z / ⌘N chords above (letter keycodes carry
+/// their own `charactersIgnoringModifiers`, so no unicode override is needed).
+/// The bare `c` tap doubles as the leg's "type a suffix" keystroke.
+const KC_A: u16 = 0;
+const KC_C: u16 = 8;
+const KC_V: u16 = 9;
 
 /// The macOS `AXRole` a `gpui::Role::Group` maps to (as the `ax-probe` /
 /// `app-shell` anchors assert).
@@ -174,6 +184,10 @@ impl Fixture {
         // committed, so they stay on disk for the leg's own untouched-check.
         std::fs::write(root.join("alpha beta_gamma.txt"), b"w\n")?;
         std::fs::write(root.join("dragselect.txt"), b"d\n")?;
+        // (d-clip): its own rename target, cancelled like the two above, so the
+        // clipboard round trip can assert an exact field text with no other leg's
+        // edits in it.
+        std::fs::write(root.join("clipme.txt"), b"c\n")?;
         std::fs::write(root.join("escme.txt"), b"e\n")?;
         std::fs::write(root.join("slashme.txt"), b"s\n")?;
         // Extension-change confirmation-modal targets (disjoint from every other
@@ -331,6 +345,9 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
     // the re-root below).
     rename_word_keys_leg(cx, whandle, &fb, &fixture, pid, &mut failures).await;
     rename_drag_select_leg(cx, whandle, &fb, &fixture, &mut failures, &mut deferred).await;
+    // (d-clip) the clipboard chords on the same shared field — real ⌘A/⌘C/⌘V
+    // through the REAL system pasteboard (saved and restored by the leg).
+    rename_clipboard_leg(cx, whandle, &fb, &fixture, pid, &mut failures).await;
 
     // R20 headline: the extension-change confirmation modal END TO END (the
     // `run_rename_modals` present → confirm → apply and present → cancel → abort
@@ -1251,6 +1268,162 @@ async fn rename_word_keys_leg(
             "[selftest] file-browser (d-word): real ⌥←/⌥→/⌥⇧←/⌘←/⌘→/⌘⇧←/⌥⌫ CGEvents walked the \
              word table in the open rename field, and Esc left the file untouched"
         );
+    }
+}
+
+// ---- (d-clip) real ⌘A/⌘C/⌘V clipboard chords in the rename field -----------
+
+/// The clipboard bug's live gate: with a rename open, real ⌘A/⌘C/⌘V CGEvents
+/// must round-trip the field text through the REAL system clipboard.
+///
+/// The chord→outcome rule is unit-tested against an in-memory fake
+/// (`inline_rename`'s dispatch tests); what only a live run can prove is that a
+/// REAL OS key event carrying the ⌘ chord reaches this process's focused rename
+/// field and comes back out on the REAL system pasteboard — the ground-truth
+/// half of the wiring the bug actually was.
+///
+/// This leg posts CGEvents, so like every other leg in this scenario it cannot
+/// run without the Accessibility (TCC) grant, and it is therefore NOT the only
+/// gate on the fix: the grant-free half of the same wiring claim (the chord
+/// reaching the focused field rather than falling through as `Ignored`, the
+/// production `RenameClipboard for App` impl reading/writing the same clipboard
+/// the rest of the app does, and the call sites' `&mut **cx` deref surviving the
+/// entity update it runs inside) lives in
+/// `crates/nice-itests/tests/behavior_rename_clipboard.rs`, which drives the
+/// SHIPPED field on the mocked context and runs on any host under `cargo test`.
+///
+/// Four steps: ⌘A ⌘C copies the whole name out; ⌘V pastes it back over the
+/// still-selected field (text unchanged — a paste that dropped or doubled
+/// characters shows up here); a bare `c` tap proves the caret sits where the
+/// paste left it; and a driver-seeded MULTI-LINE clipboard pastes as one
+/// sanitized line.
+///
+/// The leg saves the pre-existing clipboard and restores it at the end — a
+/// self-test must not eat whatever the person running it had copied. The rename
+/// is CANCELLED, so the fixture must be untouched on disk afterwards.
+async fn rename_clipboard_leg(
+    cx: &mut AsyncApp,
+    whandle: WindowHandle<AppShellView>,
+    fb: &Entity<FileBrowserView>,
+    fixture: &Fixture,
+    pid: i32,
+    failures: &mut Vec<String>,
+) {
+    const NAME: &str = "clipme.txt";
+    // Seeded for the sanitization step: two runs of control characters between
+    // the segments, and an ordinary space that must survive verbatim.
+    const MULTILINE: &str = "pa\r\n\tste me";
+    const SANITIZED: &str = "pa ste me";
+    let path = fixture.path(NAME);
+    // The char offset of the end of the field text — the caret a paste over the
+    // whole selection must leave behind.
+    let end = NAME.chars().count();
+    let start = failures.len();
+
+    let saved = cx.update(|app| app.read_from_clipboard().and_then(|item| item.text()));
+
+    rekey(cx, whandle).await;
+    begin_rename(cx, whandle, fb, &path).await;
+    let opened = fb.update(cx, |v, _| v.scenario_rename_text());
+    if opened.as_deref() != Some(NAME) {
+        failures.push(format!(
+            "rename clipboard: the rename never opened on '{NAME}' (field text {opened:?})"
+        ));
+        cancel_rename(cx, whandle, fb).await;
+        // A no-op today (nothing has been written yet), but every exit from
+        // this leg restores symmetrically so a future edit that writes earlier
+        // cannot leak the leg's clipboard content past a failure.
+        restore_clipboard(cx, saved);
+        return;
+    }
+
+    // ⌘A doubles as the reach-the-field gate (as ⌘→ does in the (d-word) leg):
+    // if a real chord never lands on the focused field, every assertion below
+    // would report the same thing, so fail once with the actionable reason.
+    tap(cx, pid, KC_A, platform::FLAG_COMMAND).await;
+    let after_cmd_a = fb.update(cx, |v, _| v.scenario_rename_selection());
+    if after_cmd_a != Some((0, end)) {
+        failures.push(format!(
+            "rename clipboard: a real ⌘A did not select the whole open field (selection \
+             {after_cmd_a:?}) — the chord never reached the focused rename field (window not key, \
+             focus elsewhere, or ⌘-chords are not dispatched to it)"
+        ));
+        cancel_rename(cx, whandle, fb).await;
+        restore_clipboard(cx, saved);
+        return;
+    }
+
+    // ⌘C: the selection lands on the real pasteboard.
+    tap(cx, pid, KC_C, platform::FLAG_COMMAND).await;
+    let copied = cx.update(|app| app.read_from_clipboard().and_then(|item| item.text()));
+    if copied.as_deref() != Some(NAME) {
+        failures.push(format!(
+            "rename clipboard (⌘C): the system clipboard must hold the copied field text \
+             {NAME:?}, got {copied:?}"
+        ));
+    }
+
+    // ⌘V over the still-selected field: replacing a selection with its own text
+    // is a no-op only if the paste is exact (a dropped or doubled character
+    // shows up immediately), and it parks the caret at the end.
+    tap(cx, pid, KC_V, platform::FLAG_COMMAND).await;
+    let pasted = fb.update(cx, |v, _| v.scenario_rename_text());
+    let pasted_sel = fb.update(cx, |v, _| v.scenario_rename_selection());
+    if pasted.as_deref() != Some(NAME) || pasted_sel != Some((end, end)) {
+        failures.push(format!(
+            "rename clipboard (⌘V over the selection): expected the field text {NAME:?} with a \
+             collapsed caret at its end, got text {pasted:?} selection {pasted_sel:?}"
+        ));
+    }
+
+    // A bare `c` types at that caret — the paste left an ordinary editing state
+    // behind, not a stuck selection.
+    tap(cx, pid, KC_C, 0).await;
+    let typed = format!("{NAME}c");
+    let after_type = fb.update(cx, |v, _| v.scenario_rename_text());
+    if after_type.as_deref() != Some(typed.as_str()) {
+        failures.push(format!(
+            "rename clipboard (type after paste): expected {typed:?}, got {after_type:?}"
+        ));
+    }
+
+    // A multi-line clipboard seeded by the driver pastes as ONE line at the
+    // caret — the sanitizer, end to end through the real chord.
+    cx.update(|app| app.write_to_clipboard(ClipboardItem::new_string(MULTILINE.to_string())));
+    tap(cx, pid, KC_V, platform::FLAG_COMMAND).await;
+    let want = format!("{typed}{SANITIZED}");
+    let after_multi = fb.update(cx, |v, _| v.scenario_rename_text());
+    if after_multi.as_deref() != Some(want.as_str()) {
+        failures.push(format!(
+            "rename clipboard (⌘V of {MULTILINE:?}): a multi-line paste must flatten to one line \
+             at the caret — expected {want:?}, got {after_multi:?}"
+        ));
+    }
+
+    cancel_rename(cx, whandle, fb).await;
+    if !exists(&path) {
+        failures.push(format!(
+            "rename clipboard: Esc must leave '{NAME}' untouched on disk"
+        ));
+    }
+    restore_clipboard(cx, saved);
+    if failures.len() == start {
+        eprintln!(
+            "[selftest] file-browser (d-clip): real ⌘A/⌘C/⌘V CGEvents round-tripped the open \
+             rename field through the system clipboard, a multi-line paste flattened to one line, \
+             and Esc left the file untouched"
+        );
+    }
+}
+
+/// Put the system clipboard back the way [`rename_clipboard_leg`] found it. An
+/// empty `saved` means the clipboard held no text to begin with, in which case
+/// the leg's own copy is left in place rather than fabricating an empty item —
+/// there is no "clear it" in the gpui API, and an empty string is not the same
+/// thing as an empty pasteboard.
+fn restore_clipboard(cx: &mut AsyncApp, saved: Option<String>) {
+    if let Some(text) = saved {
+        cx.update(|app| app.write_to_clipboard(ClipboardItem::new_string(text)));
     }
 }
 
