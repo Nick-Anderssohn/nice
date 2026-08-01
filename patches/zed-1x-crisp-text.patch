@@ -1,26 +1,62 @@
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -668,10 +668,12 @@
+     pub color: Hsla,
+     pub tile: AtlasTile,
+     pub transformation: TransformationMatrix,
+-    /// Rec-709 luminance (display-gamma) of the cell background behind this
+-    /// glyph, or a negative sentinel to disable the composition curve.
+-    /// Drives the kitty-style bg-aware coverage remap in the mac fragment
+-    /// shader (text_composition_strategy "1.7 30").
++    /// The composition-curve mix factor for this glyph (pre-computed in
++    /// `paint_glyph` from fg/bg Rec-709 luminance and scaled by display
++    /// density), or a negative sentinel to disable the curve. Drives the
++    /// kitty-style bg-aware coverage remap in the mac fragment shader
++    /// (text_composition_strategy "1.7 30"). Named for the bg luminance it
++    /// originally carried; the wire layout is unchanged.
+     pub bg_luminance: f32,
+     pub pad2: u32,
+ }
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -1214,6 +1214,15 @@
+@@ -1214,6 +1214,22 @@
      pub(crate) type_name: &'static str,
  }
  
-+/// Whether the bg-aware text composition curve stays enabled on low-density
-+/// (1x) displays. Off by default there (the curve's boosted antialias fringe
-+/// is a full point per edge at 1x — text reads fat); `NICE_1X_TEXT_CURVE=1`
-+/// re-enables it as a live A/B knob for feel checks. Cached for the process.
-+fn low_density_curve_enabled() -> bool {
-+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+    *ON.get_or_init(|| std::env::var("NICE_1X_TEXT_CURVE").is_ok_and(|v| v == "1"))
++/// Strength of the bg-aware text composition curve on low-density (1x)
++/// displays, in [0, 1] (1 = the full retina-calibrated curve, 0 = off).
++/// Defaults to 0.5: at 1x the curve's boosted antialias fringe is a full
++/// point per stem edge (vs half on retina), so full strength reads fat and
++/// fully off reads thin. `NICE_1X_TEXT_CURVE=<0..1>` overrides it — a live
++/// A/B knob for feel checks. Cached for the process.
++fn low_density_curve_strength() -> f32 {
++    static STRENGTH: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *STRENGTH.get_or_init(|| {
++        std::env::var("NICE_1X_TEXT_CURVE")
++            .ok()
++            .and_then(|v| v.parse::<f32>().ok())
++            .map_or(0.5, |v| v.clamp(0.0, 1.0))
++    })
 +}
 +
  fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
      // TODO, BUG: if you open a window with the currently active window
      // on the stack, this will erroneously fallback to `None`
-@@ -3878,33 +3887,55 @@
+@@ -3878,33 +3894,67 @@
      ) -> Result<()> {
          self.invalidator.debug_assert_paint();
  
+-        // Display-gamma Rec-709 luminance, matching SwiftTerm's
+-        // TextCompositionCurve.luminance(of:) so the two stacks' mixFactor
+-        // agree. Negative = curve disabled.
+-        let bg_luminance = background
+-            .map(|bg| {
+-                let rgba = crate::Rgba::from(bg);
+-                0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b
+-            })
+-            .unwrap_or(-1.0);
 +        // On low-density (1x) displays a point is a single device pixel, so
 +        // quarter-pixel x-placement smears a ~1.5px stem across 2-3 columns
 +        // and the font-smoothing dilation adds up to ~0.45pt on top — text
@@ -33,27 +69,33 @@ diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
 +        // at 1x — a live A/B knob for feel checks.
 +        let scale_factor = self.scale_factor();
 +        let low_density = scale_factor < 1.5;
-+
-         // Display-gamma Rec-709 luminance, matching SwiftTerm's
-         // TextCompositionCurve.luminance(of:) so the two stacks' mixFactor
-         // agree. Negative = curve disabled.
--        let bg_luminance = background
--            .map(|bg| {
--                let rgba = crate::Rgba::from(bg);
--                0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b
--            })
--            .unwrap_or(-1.0);
-+        let bg_luminance = if low_density && !low_density_curve_enabled() {
-+            -1.0
-+        } else {
-+            background
-+                .map(|bg| {
-+                    let rgba = crate::Rgba::from(bg);
-+                    0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b
-+                })
-+                .unwrap_or(-1.0)
-+        };
  
++        // The composition-curve mix factor, computed here rather than in the
++        // shader so it can be scaled by display density: mixFactor =
++        // clamp((1 - L_fg + L_bg) * 0.5, 0, 1) over display-gamma Rec-709
++        // luminances, matching SwiftTerm's TextCompositionCurve. At 1x the
++        // curve's boosted antialias fringe is a full point per stem edge
++        // (half on retina) — full strength reads fat, fully off reads thin —
++        // so its strength is scaled down there (default 0.5,
++        // NICE_1X_TEXT_CURVE overrides in [0,1]). Negative disables the
++        // curve; the sprite field is named `bg_luminance` for historical
++        // reasons but now carries the final mix factor.
++        let curve_strength = if low_density {
++            low_density_curve_strength()
++        } else {
++            1.0
++        };
++        let bg_luminance = match background {
++            Some(bg) if curve_strength > 0.0 => {
++                let lum = |c: crate::Rgba| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
++                let fg_luminance = lum(color.into());
++                let mix_factor =
++                    ((1.0 - fg_luminance + lum(bg.into())) * 0.5).clamp(0.0, 1.0);
++                mix_factor * curve_strength
++            }
++            _ => -1.0,
++        };
++
          let element_opacity = self.element_opacity();
 -        let scale_factor = self.scale_factor();
          let glyph_origin = origin.scale(scale_factor);
@@ -84,3 +126,26 @@ diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
          let params = RenderGlyphParams {
              font_id,
              glyph_id,
+diff --git a/crates/gpui_macos/src/shaders.metal b/crates/gpui_macos/src/shaders.metal
+--- a/crates/gpui_macos/src/shaders.metal
++++ b/crates/gpui_macos/src/shaders.metal
+@@ -655,15 +655,10 @@
+                                                  sprite.content_mask.bounds, sprite.transformation);
+   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+   float4 color = hsla_to_rgba(sprite.color);
+-  // mixFactor = clamp((1 - L_fg + L_bg) * 0.5, 0, 1); negative bg_luminance
+-  // disables the curve (sentinel -1 propagated to the fragment stage).
+-  float mix_factor = -1.0;
+-  if (sprite.bg_luminance >= 0.0) {
+-    float fg_luminance =
+-        dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+-    mix_factor =
+-        clamp((1.0 - fg_luminance + sprite.bg_luminance) * 0.5, 0.0, 1.0);
+-  }
++  // The curve mix factor arrives pre-computed (and display-density-scaled)
++  // from gpui's paint_glyph in sprite.bg_luminance — the field name is
++  // historical; negative still disables the curve in the fragment stage.
++  float mix_factor = sprite.bg_luminance;
+   return MonochromeSpriteVertexOutput{
+       device_position,
+       tile_position,

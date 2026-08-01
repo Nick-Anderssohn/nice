@@ -63,16 +63,19 @@
 #        - zed-1x-crisp-text.patch: crisp text on low-density (1x) displays.
 #          In paint_glyph, when scale_factor < 1.5: snap glyph origins to
 #          whole device pixels (no quarter-pixel x variants), skip the
-#          font-smoothing dilation, and disable the bg-luminance composition
-#          curve (its boosted antialias fringe is a full point per edge at
-#          1x vs half on retina — measured +22% stem width; the curve was
-#          feel-calibrated on retina). NICE_1X_TEXT_CURVE=1 re-enables the
-#          curve at 1x as a live A/B knob. At 1x a point is a single device
-#          pixel: quarter-pixel placement smears a ~1.5px stem across 2-3
-#          columns, and the curve+dilation fatten it further — all text
-#          rendered visibly fatter/wider than on retina (the 2026-07-31
-#          "text stretched on the ultrawide" report). Retina (scale >= 2)
-#          rendering is byte-identical.
+#          font-smoothing dilation, and run the bg-aware composition curve
+#          at reduced strength (its boosted antialias fringe is a full point
+#          per edge at 1x vs half on retina — measured +22% stem width at
+#          full strength, "a little thin" fully off; default 0.5,
+#          NICE_1X_TEXT_CURVE=<0..1> overrides as a live A/B knob). The
+#          curve's mix factor now computes CPU-side in paint_glyph (the
+#          MonochromeSprite bg_luminance field carries the final mix factor;
+#          shader uses it directly). At 1x a point is a single device pixel:
+#          quarter-pixel placement smears a ~1.5px stem across 2-3 columns,
+#          and the curve+dilation fatten it further — all text rendered
+#          visibly fatter/wider than on retina (the 2026-07-31 "text
+#          stretched on the ultrawide" report). Retina (scale >= 2)
+#          rendering is unchanged.
 #
 # Idempotent: a second run with the pin already checked out and patched is a
 # fast no-op (a handful of git plumbing checks, no network, no re-clone).
