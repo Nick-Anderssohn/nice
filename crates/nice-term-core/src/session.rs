@@ -165,6 +165,15 @@ impl TermSession {
         };
         let config = Config {
             scrolling_history: scrollback_lines,
+            // Track the kitty keyboard protocol (CSI = / > / < u). alacritty
+            // IGNORES those sequences unless this is opted into, leaving the
+            // `TermMode` kitty bits permanently unset — which would dead-code
+            // every consumer built on them: the R5 kitty/CSI-u encoder config
+            // (`nice_term_view::input::encoder_config`), the view's ⌘-vs-app
+            // gates (`kitty_forwards_super`), and Command Compose's busy-pane
+            // ⌘↩ replay. Real terminals (kitty, Ghostty, alacritty-the-app)
+            // all track it; the `osc_plumbing` push/pop test pins it here.
+            kitty_keyboard: true,
             ..Config::default()
         };
         let term: SharedTerm = Arc::new(FairMutex::new(Term::new(
@@ -251,6 +260,19 @@ impl TermSession {
     /// lock; the child toggles it with `ESC[?2004h` / `ESC[?2004l`.
     pub fn bracketed_paste_active(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Whether the pty child has enabled a kitty mode that forwards ⌘/super
+    /// chords as CSI-u sequences — `DISAMBIGUATE_ESC_CODES` or
+    /// `REPORT_ALL_KEYS_AS_ESC`, the same bit set as
+    /// `nice_term_view::input::kitty_forwards_super` (the two must agree; the
+    /// view crate's unit tests pin the mask). Command Compose's gated-out branch
+    /// consults this to replay ⌘↩ only when the foreground app would actually
+    /// receive it. `false` at a plain zsh prompt (zsh requests no kitty flags).
+    pub fn kitty_forwards_super(&self) -> bool {
+        self.term.lock().mode().intersects(
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC,
+        )
     }
 
     /// The configured per-session scrollback limit (lines).

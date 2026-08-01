@@ -5,7 +5,7 @@
 //!
 //! ## Layout
 //! One [`setting_row`](crate::settings::root::setting_row) per rebindable
-//! [`ShortcutAction`] (all 13, `ShortcutAction::ALL` order). Each row's control is a
+//! [`ShortcutAction`] (all 14, `ShortcutAction::ALL` order). Each row's control is a
 //! **recorder field**:
 //! * **Resting** — the bound combo rendered as key-pills (⌘⌥ symbols + the key), or
 //!   `"Not bound"` when the action is unbound; clicking it enters capture mode. A
@@ -55,7 +55,7 @@ use gpui::{
 
 use nice_model::shortcuts::{conflicting_action, Modifiers, OwnedCombo, ShortcutAction};
 
-use crate::settings::root::setting_row;
+use crate::settings::root::{setting_row, setting_row_info};
 use crate::shortcuts_store::ShortcutBindings;
 use crate::theme::slot_to_rgba;
 
@@ -270,7 +270,7 @@ fn teardown(cx: &mut App) {
         state.pending = None;
         state.conflict = None;
     }
-    // Restore the full keymap (the 13 live combos + the non-rebindable set), picking
+    // Restore the full keymap (the 14 live combos + the non-rebindable set), picking
     // up any binding just committed. The SOLE rebind owner (D2).
     crate::keymap::rebuild_keymap(cx);
     cx.refresh_windows();
@@ -380,7 +380,15 @@ pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
                 .unwrap_or(true);
             resting_control(action, combo, at_default, colors)
         };
-        col = col.child(setting_row(SharedString::from(action.label()), control, cx));
+        // The one action with `info()` text (Command Compose) renders the
+        // `setting_row_info` ⓘ + tooltip variant; every other row is unchanged.
+        col = col.child(match action.info() {
+            Some(info) => {
+                setting_row_info(SharedString::from(action.label()), info, control, cx)
+                    .into_any_element()
+            }
+            None => setting_row(SharedString::from(action.label()), control, cx).into_any_element(),
+        });
     }
 
     col.into_any_element()

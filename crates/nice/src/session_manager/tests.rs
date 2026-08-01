@@ -1617,6 +1617,7 @@ fn manager_with_shell_env(
         socket_path: socket.map(str::to_string),
         zdotdir: zdotdir.map(str::to_string),
         user_zdotdir: user_zdotdir.map(str::to_string),
+        compose_conf: Some("/conf/compose.json".to_string()),
     });
     m
 }
@@ -1666,6 +1667,30 @@ fn injected_pane_env_carries_socket_and_pane_identity() {
     assert_eq!(value_of(&spec.env, "NICE_TAB_ID"), Some("tabX"));
     assert_eq!(value_of(&spec.env, "NICE_PANE_ID"), Some("paneY"));
     assert_eq!(value_of(&spec.env, "ZDOTDIR"), Some("/z"));
+    // Command Compose: the conf path rides the same injection (the ZLE widget
+    // reads it per compose); absent field ⇒ var not injected (next test).
+    assert_eq!(
+        value_of(&spec.env, "NICE_COMPOSE_CONF"),
+        Some("/conf/compose.json")
+    );
+}
+
+/// Command Compose: a `WindowShellEnv` without a conf path injects NO
+/// `NICE_COMPOSE_CONF` var (the widget falls back to its defaults).
+#[test]
+fn absent_compose_conf_is_not_injected() {
+    let mut m = SessionManager::new();
+    m.set_window_shell_env(WindowShellEnv {
+        socket_path: Some("/tmp/s".to_string()),
+        zdotdir: None,
+        user_zdotdir: None,
+        compose_conf: None,
+    });
+    let pairs = m.window_pane_env_pairs("t", "p");
+    assert!(
+        !pairs.iter().any(|(k, _)| k == "NICE_COMPOSE_CONF"),
+        "no compose_conf field ⇒ no NICE_COMPOSE_CONF injection"
+    );
 }
 
 /// Validation §3(c): `NICE_USER_ZDOTDIR` is present-but-EMPTY when Nice inherited

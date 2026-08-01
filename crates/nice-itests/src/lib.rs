@@ -88,7 +88,7 @@ mod pane_strip;
 // Mirrors `WindowState` / `WindowRegistry` / the shortcut `keymap` (all
 // unimportable from a dev/test crate) over the REAL `nice-model` types +
 // `nice_model::shortcuts` table + gpui's real action/keymap dispatch: two isolated
-// windows, focused-window routing through the registry's `active_state`, all 13
+// windows, focused-window routing through the registry's `active_state`, all 14
 // default combos reaching a live handler or a declared no-op marker, and the
 // collapsed-cycle peek set + modifier-release clear.
 #[cfg(test)]

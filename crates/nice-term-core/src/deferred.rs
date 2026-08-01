@@ -488,6 +488,12 @@ impl Session {
             .is_some_and(|ts| ts.bracketed_paste_active())
     }
 
+    /// Whether the pty child's kitty mode forwards ⌘/super chords (see
+    /// [`TermSession::kitty_forwards_super`]). `false` before spawn.
+    pub fn kitty_forwards_super(&self) -> bool {
+        self.session().is_some_and(|ts| ts.kitty_forwards_super())
+    }
+
     /// The shared `Term` the renderer (R4) locks to paint, or `None` if not yet
     /// spawned.
     pub fn term(&self) -> Option<&SharedTerm> {

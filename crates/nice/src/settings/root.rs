@@ -562,7 +562,7 @@ fn font_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElem
 }
 
 /// Claude pane (The spec §Claude) — the single live theme-sync toggle.
-fn claude_pane(window: &mut Window, cx: &mut App) -> AnyElement {
+fn claude_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     crate::settings::claude_pane::claude_pane(window, cx)
 }
 

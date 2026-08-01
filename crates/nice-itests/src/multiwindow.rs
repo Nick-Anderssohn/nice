@@ -10,7 +10,7 @@
 //! **real** `nice-model` types ([`TabModel`], [`SidebarModel`]) and gpui's **real**
 //! action/keymap dispatch: a [`RegistryProbe`] gpui global (the `WindowRegistry`
 //! mirror — MRU + `active_state`), a [`WindowStateProbe`] per window (the
-//! `WindowState` mirror — one `TabModel` + `SidebarModel` each), 13 gpui actions
+//! `WindowState` mirror — one `TabModel` + `SidebarModel` each), 14 gpui actions
 //! generated to mirror `nice_model::shortcuts`, and the app-level-vs-window-level
 //! handler split routed through the registry — the whole R12 dispatch shape, but
 //! over probes so a drift in the *ported* routing / isolation / peek semantics
@@ -30,7 +30,7 @@
 //! * **Routing** — a window-scoped action dispatched while window B is key mutates
 //!   **B** (through the registry's `active_state`), never A; with B deregistered
 //!   (its close), dispatch falls back to the most-recently-keyed surviving window.
-//! * **All 13 fire** — every default combo dispatches to a live handler or, for the
+//! * **All 14 fire** — every default combo dispatches to a live handler or, for the
 //!   three deferred actions (hidden-files R19, undo/redo R20), to a **declared
 //!   no-op marker** counter — consumed, not silently missing.
 //! * **Peek set/clear** — a sidebar-tab cycle on a *collapsed* sidebar sets the
@@ -51,7 +51,7 @@ use nice_model::shortcuts::{default_bindings, default_combo, ShortcutAction};
 use nice_model::{Pane, PaneKind, SidebarMode, SidebarModel, Tab, TabModel};
 
 // ---------------------------------------------------------------------------
-// The 13 gpui actions — one struct per `ShortcutAction` case, in a local
+// The 14 gpui actions — one struct per `ShortcutAction` case, in a local
 // `r12_itests` namespace so they can't collide with the app's own actions. The
 // `all_actions_map_to_a_binding` test pins that this set and `ShortcutAction::ALL`
 // stay in lockstep, mirroring the app keymap's completeness test.
@@ -72,6 +72,7 @@ gpui::actions!(
         ResetFontSizes,
         UndoFileOperation,
         RedoFileOperation,
+        CommandCompose,
     ]
 );
 
@@ -96,6 +97,12 @@ struct WindowStateProbe {
     /// the (window-scoped, R19-deferred) handler, so "the action fired" is
     /// observable rather than silence.
     hidden_files_noop_fires: u32,
+    /// The `CommandCompose` declared marker: incremented when ⌘↩ reaches the
+    /// window-scoped handler. The probe has no live pty sessions, so the marker
+    /// (not trigger bytes) is the honest mirror of "the handler was reached";
+    /// the gate + byte routing are the app's `compose_route` unit tests and the
+    /// live scenario.
+    compose_fires: u32,
 }
 
 impl WindowStateProbe {
@@ -105,6 +112,7 @@ impl WindowStateProbe {
             sidebar: SidebarModel::new(collapsed, SidebarMode::Tabs),
             next_pane_seq: 0,
             hidden_files_noop_fires: 0,
+            compose_fires: 0,
         }
     }
 
@@ -299,7 +307,7 @@ struct AppLevelProbe {
 impl Global for AppLevelProbe {}
 
 // ---------------------------------------------------------------------------
-// install — wire the whole probe keymap once per test: the two globals, the 13
+// install — wire the whole probe keymap once per test: the two globals, the 14
 // action handlers (app-level font/undo/redo + window-scoped through the registry),
 // and the bindings generated from the REAL `nice_model::shortcuts` table.
 // ---------------------------------------------------------------------------
@@ -349,6 +357,9 @@ fn register_window_scoped_actions(cx: &mut App) {
     cx.on_action(|_: &ToggleHiddenFiles, cx: &mut App| {
         with_active(cx, |s| s.toggle_hidden_files_noop())
     });
+    cx.on_action(|_: &CommandCompose, cx: &mut App| {
+        with_active(cx, |s| s.compose_fires += 1)
+    });
 }
 
 /// Route a window-scoped action to the key window's state (mirror of
@@ -359,7 +370,7 @@ fn with_active(cx: &mut App, f: impl FnOnce(&mut WindowStateProbe)) {
     }
 }
 
-/// Build the 13 default bindings from the real `nice_model::shortcuts` table — the
+/// Build the 14 default bindings from the real `nice_model::shortcuts` table — the
 /// mirror of `keymap::table_bindings`. Uses `KeyBinding::new` (no context = active
 /// everywhere, like the app's process-wide monitor); the app additionally applies
 /// `use_key_equivalents` layout semantics, the documented divergence the live
@@ -390,6 +401,7 @@ fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
         ShortcutAction::ResetFontSizes => KeyBinding::new(chord, ResetFontSizes, None),
         ShortcutAction::UndoFileOperation => KeyBinding::new(chord, UndoFileOperation, None),
         ShortcutAction::RedoFileOperation => KeyBinding::new(chord, RedoFileOperation, None),
+        ShortcutAction::CommandCompose => KeyBinding::new(chord, CommandCompose, None),
     }
 }
 
@@ -662,7 +674,7 @@ fn dispatch_falls_back_to_surviving_window_after_the_key_window_closes(cx: &mut 
 }
 
 // ============================================================================
-// all 13 actions fire
+// all 14 actions fire
 // ============================================================================
 
 /// The action set and `ShortcutAction::ALL` stay in lockstep, and every default
@@ -671,11 +683,11 @@ fn dispatch_falls_back_to_surviving_window_after_the_key_window_closes(cx: &mut 
 #[gpui::test]
 fn all_default_combos_generate_a_binding(_cx: &mut TestAppContext) {
     let bindings = table_bindings();
-    assert_eq!(bindings.len(), 13, "every default combo produced a binding");
-    assert_eq!(ShortcutAction::ALL.len(), 13, "13 rebindable actions");
+    assert_eq!(bindings.len(), 14, "every default combo produced a binding");
+    assert_eq!(ShortcutAction::ALL.len(), 14, "14 rebindable actions");
 }
 
-/// Every one of the 13 default combos, dispatched as a real keystroke through the
+/// Every one of the 14 default combos, dispatched as a real keystroke through the
 /// bound keymap, reaches its handler: the live handlers produce their model / app
 /// effect, and the three deferred ones (hidden-files, undo, redo) hit their
 /// **declared no-op marker** — consumed, never silent.
@@ -754,6 +766,17 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
     assert_eq!(app_probe(cx, |p| p.undo_fires), 1, "⌘Z reached the undo marker (R20)");
     cx.simulate_keystrokes(w, &combo(ShortcutAction::RedoFileOperation));
     assert_eq!(app_probe(cx, |p| p.redo_fires), 1, "⌘⇧Z reached the redo marker (R20)");
+
+    // -- Command Compose: ⌘↩ parses, binds, and dispatches window-scoped ------
+    let compose = |cx: &mut TestAppContext| cx.update(|app| state.read(app).compose_fires);
+    assert_eq!(compose(cx), 0);
+    cx.simulate_keystrokes(w, &combo(ShortcutAction::CommandCompose));
+    assert_eq!(
+        compose(cx),
+        1,
+        "⌘↩ reached the window-scoped compose marker (the probe has no pty; \
+         gate + byte routing are the app's compose_route tests + the live scenario)"
+    );
 }
 
 // ============================================================================

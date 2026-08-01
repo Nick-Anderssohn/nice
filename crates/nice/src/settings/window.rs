@@ -17,7 +17,7 @@
 //! observer clears the [`SettingsWindow`] Global so the next ⌘, opens fresh. The
 //! non-rebindable ⌘, accelerator follows the ⌘N / ⌘Q / ⌘W idiom
 //! (`app.rs:510-551`): a fixed `KeyBinding::new` with a `None` context, so it
-//! survives R24's `clear_key_bindings()` rebuild (it is not in the 13-action
+//! survives R24's `clear_key_bindings()` rebuild (it is not in the 14-action
 //! rebindable table).
 
 use gpui::{
@@ -28,7 +28,7 @@ use gpui::{
 use crate::settings::root::SettingsRootView;
 
 // The ⌘, action. Like `NewWindow` / `Quit` / `CloseWindow` (`app.rs:417-424`) this
-// is a fixed window-management action, NOT one of the 13 rebindable shortcuts
+// is a fixed window-management action, NOT one of the 14 rebindable shortcuts
 // (`nice_model::shortcuts`), so it lives here rather than in the defaults table.
 gpui::actions!(nice, [OpenSettings]);
 

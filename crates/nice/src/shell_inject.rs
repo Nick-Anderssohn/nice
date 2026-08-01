@@ -48,7 +48,10 @@
 //! them up" — the `\%` OSC 7 escape is load-bearing zsh arcana (a bare `%` is a
 //! parameter pattern anchor), and the `_nice_json_escape` dialect (backslash,
 //! double-quote, LF, CR, tab — nothing else) is exactly what Nice's JSON decoder
-//! expects.
+//! expects. The Command Compose widget tail (`_nice_compose_*` +
+//! [`COMPOSE_TRIGGER_SEQ`]) joined the frozen contract with the `commandCompose`
+//! shortcut: the trigger bytes and the `$NICE_COMPOSE_CONF` key names are
+//! app↔shell interchange, pinned the same way.
 //!
 //! The `$NICE_SOCKET` env var the `claude()` function reads, and the per-pane
 //! `NICE_TAB_ID` / `NICE_PANE_ID` / `NICE_USER_ZDOTDIR` / `NICE_PREFILL_COMMAND`
@@ -60,6 +63,21 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// The private pty trigger for Command Compose. Nice's `commandCompose` action
+/// handler writes exactly these bytes to the pane's pty (only when the shell
+/// sits at an idle interactive prompt); the `ZSHRC_BODY` widget below binds
+/// exactly this sequence. CSI 5099~ (DECFNK style): no terminal emits
+/// tilde-coded numbers anywhere near 5099 from real keys (the real ones top out
+/// in the 30s), and it is deliberately far from bracketed paste's 200/201.
+/// Written in a single `write_input` call so ZLE's keymap trie matches it
+/// atomically against the `\e[5~` (PageUp) shared prefix.
+pub const COMPOSE_TRIGGER_SEQ: &[u8] = b"\x1b[5099~";
+
+/// The zsh-side `bindkey` spelling of [`COMPOSE_TRIGGER_SEQ`] (`\e` = ESC).
+/// The static tests below pin that `ZSHRC_BODY` binds exactly this string in
+/// all three keymaps, and that its bytes agree with the Rust constant.
+pub const COMPOSE_TRIGGER_BINDKEY: &str = r"\e[5099~";
 
 /// Stub `.zshenv`: discover + stash the user's intended `ZDOTDIR`, then restore
 /// our temp dir so zsh keeps reading the other stubs.
@@ -102,7 +120,7 @@ pub const ZLOGIN_BODY: &str = r#"# Nice: defensive — if our .zshrc somehow exi
 
 /// Stub `.zshrc`: restore `ZDOTDIR` before sourcing the user's `.zshrc`, then
 /// install the `claude()` shadow, the OSC 7 cwd emitter, and the prefill tail.
-pub const ZSHRC_BODY: &str = r#"# Stash the resolved user-side ZDOTDIR before we drop NICE_USER_ZDOTDIR.
+pub const ZSHRC_BODY: &str = r##"# Stash the resolved user-side ZDOTDIR before we drop NICE_USER_ZDOTDIR.
 # Trim trailing slashes so an accidental "/Users/nick/" (from launchctl
 # or weird shells) compares equal to "/Users/nick" for the unset branch.
 NICE_RESOLVED_USER_ZDOTDIR="${NICE_USER_ZDOTDIR%/}"
@@ -266,7 +284,240 @@ _nice_emit_cwd_osc7
 # nothing runs until they hit Enter.
 if [[ -n "$NICE_PREFILL_COMMAND" ]]; then
     print -z "$NICE_PREFILL_COMMAND"
-fi"#;
+fi
+
+# Nice: Command Compose (the `commandCompose` shortcut, cmd-enter by
+# default). Nice writes the private trigger ESC[5099~ to this pty only
+# when the shell sits at an idle interactive prompt (no foreground
+# child); the widget below then rewrites the line buffer's plain-English
+# text into a real zsh command via `claude -p`, painting an animated
+# spinner under the line (in Nice's accent color, read from the
+# $NICE_COMPOSE_CONF file) while it thinks. The composed command
+# REPLACES the buffer for review — nothing here ever accepts the line;
+# running it is always the user's own Enter. A new prompt (Enter or
+# ctrl-c) abandons an in-flight compose via the precmd hook.
+typeset -g _nice_compose_gen=0
+typeset -g _nice_compose_my_gen=0
+typeset -g _nice_compose_fd= _nice_compose_pid=
+typeset -g _nice_compose_spin_fd= _nice_compose_spin_pid=
+typeset -g _nice_compose_frame=0
+typeset -g _nice_compose_color=
+typeset -g _nice_compose_hl=
+typeset -g _nice_compose_instruction='Convert this plain-English request into a single zsh command line for macOS. Reply with ONLY the command itself - no code fences, no backticks, no explanation, no surrounding quotes. If the request is already a valid shell command, return it unchanged.'
+
+_nice_compose_conf_get() {
+    # $1: key in the flat Nice-written JSON at $NICE_COMPOSE_CONF,
+    # e.g. {"accent":"#7A94DB","model":"sonnet","effort":"medium"}.
+    # Prints the string value; fails if the file or key is missing.
+    # Keys and values are Nice-controlled (no escapes), so plain
+    # parameter surgery beats requiring a JSON tool on PATH.
+    emulate -L zsh
+    [[ -n "$NICE_COMPOSE_CONF" && -r "$NICE_COMPOSE_CONF" ]] || return 1
+    local blob rest
+    blob="$(<$NICE_COMPOSE_CONF)"
+    rest="${blob#*\"$1\":\"}"
+    [[ "$rest" == "$blob" ]] && return 1
+    print -rn -- "${rest%%\"*}"
+}
+
+_nice_compose_translate() {
+    # stdin: the plain-English request; stdout: the composed command.
+    # Split from the widget so it is testable without a tty/ZLE. The
+    # request rides stdin — user text is never placed on a command
+    # line, so no quoting of it can ever be wrong.
+    emulate -L zsh
+    local -a flags=()
+    local v
+    v="$(_nice_compose_conf_get model)" && [[ -n "$v" ]] && flags+=(--model "$v")
+    v="$(_nice_compose_conf_get effort)" && [[ -n "$v" ]] && flags+=(--effort "$v")
+    # Guard the expansion so an empty `flags` never trips a user's
+    # `setopt nounset` (same pattern as the claude() shadow above).
+    if (( ${#flags} )); then
+        command claude -p "$_nice_compose_instruction" "${flags[@]}" 2>/dev/null
+    else
+        command claude -p "$_nice_compose_instruction" 2>/dev/null
+    fi
+}
+
+_nice_compose_strip() {
+    # $1: raw model output. Prints the cleaned command: trim
+    # whitespace, then defensively unwrap a ``` fence or a wrapping
+    # backtick pair if the model ignored the instruction.
+    emulate -L zsh -o extendedglob
+    local out=$1
+    out="${out##[[:space:]]#}"
+    out="${out%%[[:space:]]#}"
+    if [[ "$out" == '```'* && "$out" == *$'\n'* ]]; then
+        out="${out#*$'\n'}"
+        out="${out%$'\n'*}"
+        out="${out##[[:space:]]#}"
+        out="${out%%[[:space:]]#}"
+    fi
+    if [[ "$out" == \`*\` ]]; then
+        out="${out#\`}"
+        out="${out%\`}"
+    fi
+    print -rn -- "$out"
+}
+
+_nice_compose_display() {
+    # $1: POSTDISPLAY text ('' clears). Colors it with the accent
+    # captured at compose start; our region_highlight entry is tracked
+    # in _nice_compose_hl so repeated frames never stack entries.
+    # WIDGET context only — POSTDISPLAY/region_highlight are ZLE special
+    # parameters, live only inside widget calls (an fd handler is NOT
+    # widget context; handlers below re-enter one via `zle <widget>`).
+    if [[ -n "$_nice_compose_hl" ]]; then
+        region_highlight=("${(@)region_highlight:#$_nice_compose_hl}")
+        _nice_compose_hl=
+    fi
+    POSTDISPLAY="$1"
+    if [[ -n "$1" && -n "$_nice_compose_color" ]]; then
+        # region_highlight offsets index BUFFER then POSTDISPLAY appended
+        # after it (the P flag would ADD PREDISPLAY to the indexing — it
+        # does NOT mean "relative to POSTDISPLAY"), so the spinner span
+        # starts at the buffer's character length.
+        _nice_compose_hl="${#BUFFER} $(( ${#BUFFER} + ${#POSTDISPLAY} )) fg=$_nice_compose_color"
+        region_highlight+=("$_nice_compose_hl")
+    fi
+    zle -R
+}
+
+_nice_compose_show_frame() {
+    # Claude Code's own thinking indicator: a star on the LEFT that pulses
+    # through growing/shrinking asterisk glyphs (quoted — bare * would glob).
+    local -a frames=('·' '✢' '✳' '✶' '✻' '✽' '✻' '✶' '✳' '✢')
+    _nice_compose_display $'\n'"${frames[$(( _nice_compose_frame % 10 + 1 ))]} Composing… (ctrl-c cancels)"
+}
+
+_nice_compose_stop() {
+    # Unregister + close both fds and reap both children. ZLE-active
+    # context only (`zle -F` needs ZLE).
+    if [[ -n "$_nice_compose_fd" ]]; then
+        zle -F "$_nice_compose_fd" 2>/dev/null
+        exec {_nice_compose_fd}<&-
+        _nice_compose_fd=
+    fi
+    if [[ -n "$_nice_compose_spin_fd" ]]; then
+        zle -F "$_nice_compose_spin_fd" 2>/dev/null
+        exec {_nice_compose_spin_fd}<&-
+        _nice_compose_spin_fd=
+    fi
+    [[ -n "$_nice_compose_pid" ]] && kill "$_nice_compose_pid" 2>/dev/null
+    [[ -n "$_nice_compose_spin_pid" ]] && kill "$_nice_compose_spin_pid" 2>/dev/null
+    _nice_compose_pid= _nice_compose_spin_pid=
+}
+
+# Widget: repaint the current spinner frame (fd handlers re-enter widget
+# context through this so POSTDISPLAY is actually live).
+_nice_compose_spin_widget() {
+    _nice_compose_show_frame
+}
+zle -N _nice_compose_spin_widget
+
+# Widget: clear the spinner line (stale-compose cleanup path).
+_nice_compose_clear_widget() {
+    _nice_compose_display ""
+}
+zle -N _nice_compose_clear_widget
+
+# Widget: land the composed command in the buffer ($1 = raw model output).
+# NEVER accepts the line — running it is always the user's own Enter.
+_nice_compose_apply_widget() {
+    emulate -L zsh
+    _nice_compose_display ""
+    local out
+    out="$(_nice_compose_strip "$1")"
+    if [[ -z "$out" ]]; then
+        zle -M "nice: compose failed (is claude on PATH?)"
+        return 1
+    fi
+    BUFFER="$out"
+    CURSOR=${#BUFFER}
+    zle -R
+}
+zle -N _nice_compose_apply_widget
+
+_nice_compose_tick() {
+    # zle -F handler (NOT widget context — no direct BUFFER/POSTDISPLAY).
+    emulate -L zsh
+    if (( _nice_compose_my_gen != _nice_compose_gen )); then
+        # Stale ticker from an abandoned compose: full cleanup.
+        _nice_compose_stop
+        zle _nice_compose_clear_widget
+        return 0
+    fi
+    local junk
+    if ! read -r -k 1 -u "$1" junk 2>/dev/null; then
+        # Ticker hit EOF (crashed); drop just the spinner side.
+        zle -F "$1" 2>/dev/null
+        if [[ "$1" == "$_nice_compose_spin_fd" ]]; then
+            exec {_nice_compose_spin_fd}<&-
+            _nice_compose_spin_fd=
+        fi
+        return 0
+    fi
+    (( _nice_compose_frame++ ))
+    zle _nice_compose_spin_widget
+}
+
+_nice_compose_done() {
+    # zle -F handler (NOT widget context): drain + clean up, then hand
+    # the result to the apply widget where the ZLE params are live.
+    emulate -L zsh
+    local fd=$1 out=
+    zle -F "$fd" 2>/dev/null
+    out="$(command cat <&$fd 2>/dev/null)"
+    exec {fd}<&-
+    [[ "$fd" == "$_nice_compose_fd" ]] && _nice_compose_fd=
+    local stale=$(( _nice_compose_my_gen != _nice_compose_gen ))
+    _nice_compose_stop
+    if (( stale )); then
+        zle _nice_compose_clear_widget
+        return 0
+    fi
+    zle _nice_compose_apply_widget -- "$out"
+}
+
+_nice_command_compose() {
+    emulate -L zsh
+    [[ -z "$BUFFER" ]] && return 0
+    _nice_compose_stop
+    (( _nice_compose_gen++ ))
+    _nice_compose_my_gen=$_nice_compose_gen
+    _nice_compose_color="$(_nice_compose_conf_get accent)"
+    [[ -n "$_nice_compose_color" ]] || _nice_compose_color=8
+    local request="$BUFFER"
+    exec {_nice_compose_fd}< <(_nice_compose_translate <<< "$request")
+    _nice_compose_pid=$!
+    zle -F "$_nice_compose_fd" _nice_compose_done
+    exec {_nice_compose_spin_fd}< <(
+        while :; do printf x; command sleep 0.1; done
+    )
+    _nice_compose_spin_pid=$!
+    zle -F "$_nice_compose_spin_fd" _nice_compose_tick
+    _nice_compose_frame=0
+    _nice_compose_show_frame
+}
+
+_nice_compose_precmd() {
+    # A new prompt (accepted line or ctrl-c) abandons any in-flight
+    # compose: bump the generation so a pending fd handler discards its
+    # result, and reap the children now. The fds stay registered until
+    # ZLE is next active — the handlers self-clean on the stale path
+    # (`zle -F` is unavailable outside ZLE, so it cannot happen here).
+    (( _nice_compose_gen++ ))
+    [[ -n "$_nice_compose_pid" ]] && kill "$_nice_compose_pid" 2>/dev/null
+    [[ -n "$_nice_compose_spin_pid" ]] && kill "$_nice_compose_spin_pid" 2>/dev/null
+    _nice_compose_pid= _nice_compose_spin_pid=
+}
+typeset -ga precmd_functions
+precmd_functions+=(_nice_compose_precmd)
+
+zle -N _nice_command_compose
+bindkey -M emacs '\e[5099~' _nice_command_compose
+bindkey -M viins '\e[5099~' _nice_command_compose
+bindkey -M vicmd '\e[5099~' _nice_command_compose"##;
 
 /// Write the four `ZDOTDIR` stubs into `dir`, creating it (and any missing
 /// parents) if needed, and return `dir`. Ports Swift
@@ -917,5 +1168,340 @@ mod tests {
             out.contains(&format!("FINAL_ZDOTDIR={}", custom.display())),
             "launchctl-style: ZDOTDIR must be restored from NICE_USER_ZDOTDIR. Output: <{out}>"
         );
+    }
+
+    // ---- Command Compose: static pins ---------------------------------------
+
+    /// The widget exists, is registered as a ZLE widget, and is bound to the
+    /// trigger in ALL THREE keymaps — with the zsh-side trigger text derived
+    /// from the Rust constant so the two sides can never drift.
+    #[test]
+    fn zshrc_compose_defines_widget_and_binds_trigger_in_all_keymaps() {
+        let body = ZSHRC_BODY;
+        assert!(body.contains("_nice_command_compose() {"));
+        assert!(body.contains("zle -N _nice_command_compose"));
+        for keymap in ["emacs", "viins", "vicmd"] {
+            let line = format!("bindkey -M {keymap} '{COMPOSE_TRIGGER_BINDKEY}' _nice_command_compose");
+            assert!(body.contains(&line), "missing: {line}");
+        }
+        // Byte agreement: `\e` + the rest of the bindkey text == the pty bytes.
+        let mut expected = vec![0x1b_u8];
+        expected.extend_from_slice(COMPOSE_TRIGGER_BINDKEY.strip_prefix(r"\e").unwrap().as_bytes());
+        assert_eq!(COMPOSE_TRIGGER_SEQ, expected.as_slice());
+    }
+
+    /// The never-auto-execute invariant as a pinned NEGATIVE: no code path in
+    /// the injected rc may accept the line — running the composed command is
+    /// always the user's own Enter.
+    #[test]
+    fn zshrc_compose_never_accepts_line() {
+        assert!(
+            !ZSHRC_BODY.contains("accept-line"),
+            "the injected rc must never call zle accept-line"
+        );
+    }
+
+    /// The user's text reaches claude via STDIN (a herestring off a `$BUFFER`
+    /// copy), never argv — so no quoting of user text can ever be wrong — and
+    /// the flags ride `command claude -p` (shadow-proof; the shadow's `-p`
+    /// passthrough would also be safe, `command` makes it a non-question).
+    #[test]
+    fn zshrc_compose_pipes_buffer_via_stdin() {
+        let body = ZSHRC_BODY;
+        assert!(body.contains(r#"local request="$BUFFER""#));
+        assert!(body.contains(r#"_nice_compose_translate <<< "$request""#));
+        assert!(body.contains(r#"command claude -p "$_nice_compose_instruction""#));
+    }
+
+    /// An empty buffer is a no-op — no subprocess, no spinner.
+    #[test]
+    fn zshrc_compose_empty_buffer_is_noop() {
+        assert!(ZSHRC_BODY.contains(r#"[[ -z "$BUFFER" ]] && return 0"#));
+    }
+
+    /// The widget reads its runtime knobs from `$NICE_COMPOSE_CONF` (accent for
+    /// the spinner, model/effort for the flags) and abandons in-flight composes
+    /// from a precmd hook (Enter / ctrl-c mid-compose).
+    #[test]
+    fn zshrc_compose_reads_conf_and_hooks_precmd() {
+        let body = ZSHRC_BODY;
+        assert!(body.contains("NICE_COMPOSE_CONF"));
+        assert!(body.contains("precmd_functions+=(_nice_compose_precmd)"));
+    }
+
+    // ---- Command Compose: real-zsh end-to-end -------------------------------
+
+    /// Run real `/bin/zsh -ic` under the injection with a scratch bin dir
+    /// prepended to PATH and optional extra env — the compose flavor of
+    /// [`run_zsh_under_injection`] (which pins PATH and takes no extra env).
+    fn run_zsh_compose(home: &Path, bin: &Path, extra_env: &[(&str, &str)], commands: &str) -> String {
+        let zdotdir = make_isolated();
+        let mut cmd = Command::new("/bin/zsh");
+        cmd.arg("-ic")
+            .arg(commands)
+            .env_clear()
+            .env("ZDOTDIR", &zdotdir.0)
+            .env("HOME", home)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+            )
+            .env("HOST", "test.local")
+            .env("NICE_USER_ZDOTDIR", "")
+            .current_dir(home);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn /bin/zsh");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // The injected rc emits its startup OSC 7 (…BEL) before the command's
+        // own output — strip through the last BEL so assertions see only the
+        // command's stdout.
+        match stdout.rfind('\u{07}') {
+            Some(i) => stdout[i + 1..].to_string(),
+            None => stdout,
+        }
+    }
+
+    /// Write an executable fake `claude` into `bin` that records its argv and
+    /// stdin to files and prints `reply` (exit 0) — or exits 1 with no output.
+    fn write_fake_claude(bin: &Path, record_dir: &Path, reply: &str, fail: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let body = if fail {
+            "#!/bin/zsh\nexit 1\n".to_string()
+        } else {
+            format!(
+                "#!/bin/zsh\nprint -r -- \"$@\" > {rec}/argv\ncat > {rec}/stdin\nprint -rn -- {reply:?}\n",
+                rec = record_dir.display()
+            )
+        };
+        let path = bin.join("claude");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// End-to-end: `_nice_compose_translate` pipes the request through the fake
+    /// claude's STDIN, passes `-p` + the conf file's `--model`/`--effort`, and
+    /// prints the reply verbatim.
+    #[test]
+    fn compose_translate_pipes_stdin_and_conf_flags_e2e() {
+        let home = scratch("nice-compose-home");
+        let bin = home.0.join("bin");
+        let rec = scratch("nice-compose-rec");
+        write_fake_claude(&bin, &rec.0, "ls -la", false);
+        let conf = home.0.join("compose.json");
+        std::fs::write(&conf, r##"{"accent":"#7a94db","model":"opus","effort":"high"}"##).unwrap();
+
+        let out = run_zsh_compose(
+            &home.0,
+            &bin,
+            &[("NICE_COMPOSE_CONF", conf.to_str().unwrap())],
+            r#"_nice_compose_translate <<< "list files with details""#,
+        );
+
+        assert_eq!(out, "ls -la", "translate prints the model reply verbatim");
+        let argv = std::fs::read_to_string(rec.0.join("argv")).expect("fake claude ran");
+        assert!(argv.contains("-p"), "argv carries -p. Got: <{argv}>");
+        assert!(argv.contains("--model opus"), "conf model rides argv. Got: <{argv}>");
+        assert!(argv.contains("--effort high"), "conf effort rides argv. Got: <{argv}>");
+        let stdin = std::fs::read_to_string(rec.0.join("stdin")).unwrap();
+        assert_eq!(
+            stdin, "list files with details\n",
+            "the user text reaches claude on stdin, never argv"
+        );
+        assert!(
+            !argv.contains("list files"),
+            "the user text must NOT appear on the command line"
+        );
+    }
+
+    /// Without a conf file, translate still runs — bare `claude -p`, no flags
+    /// (the widget's built-in fallback); a failing claude yields empty output.
+    #[test]
+    fn compose_translate_no_conf_and_failure_e2e() {
+        let home = scratch("nice-compose-noconf-home");
+        let bin = home.0.join("bin");
+        let rec = scratch("nice-compose-noconf-rec");
+        write_fake_claude(&bin, &rec.0, "echo hi", false);
+
+        let out = run_zsh_compose(&home.0, &bin, &[], r#"_nice_compose_translate <<< "say hi""#);
+        assert_eq!(out, "echo hi");
+        let argv = std::fs::read_to_string(rec.0.join("argv")).unwrap();
+        assert!(!argv.contains("--model"), "no conf ⇒ no --model. Got: <{argv}>");
+        assert!(!argv.contains("--effort"), "no conf ⇒ no --effort. Got: <{argv}>");
+
+        // Failure path: claude exits non-zero with no output ⇒ empty result
+        // (the ZLE handler shows the failure message and leaves the buffer).
+        let fail_bin = home.0.join("failbin");
+        write_fake_claude(&fail_bin, &rec.0, "", true);
+        let out = run_zsh_compose(&home.0, &fail_bin, &[], r#"_nice_compose_translate <<< "x""#);
+        assert_eq!(out, "", "a failing claude yields empty translate output");
+    }
+
+    /// `_nice_compose_strip` unwraps fences/backticks and trims — driven through
+    /// real zsh so the parameter-expansion arcana is the thing under test.
+    #[test]
+    fn compose_strip_unwraps_fences_e2e() {
+        let home = scratch("nice-compose-strip-home");
+        let bin = home.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let script = concat!(
+            "print -rn -- \"$(_nice_compose_strip $'```zsh\\nls -la\\n```')\"\n",
+            "print -rn -- '|'\n",
+            "print -rn -- \"$(_nice_compose_strip $'  \\tfind . -name \"*.rs\"\\n')\"\n",
+            "print -rn -- '|'\n",
+            "print -rn -- \"$(_nice_compose_strip '`echo hi`')\"\n",
+            "print -rn -- '|'\n",
+            // A multi-line command inside a fence survives with its inner newline.
+            "print -rn -- \"$(_nice_compose_strip $'```\\nfor f in *; do\\n  echo $f\\ndone\\n```')\"\n",
+        );
+        let out = run_zsh_compose(&home.0, &bin, &[], script);
+        let parts: Vec<&str> = out.split('|').collect();
+        assert_eq!(parts[0], "ls -la", "fence unwrapped");
+        assert_eq!(parts[1], r#"find . -name "*.rs""#, "whitespace trimmed");
+        assert_eq!(parts[2], "echo hi", "wrapping backticks stripped");
+        assert_eq!(
+            parts[3],
+            "for f in *; do\n  echo $f\ndone",
+            "multi-line composition survives the fence strip"
+        );
+    }
+
+    /// The zsh conf parser and the Rust writer's parser agree key-for-key on a
+    /// production-shaped blob (the app↔shell interchange pin).
+    #[test]
+    fn compose_conf_get_matches_rust_parser_e2e() {
+        let home = scratch("nice-compose-conf-home");
+        let bin = home.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let blob = r##"{"accent":"#c96442","model":"sonnet","effort":"medium"}"##;
+        let conf = home.0.join("compose.json");
+        std::fs::write(&conf, blob).unwrap();
+
+        let script = "print -rn -- \"$(_nice_compose_conf_get accent)|$(_nice_compose_conf_get model)|$(_nice_compose_conf_get effort)\"";
+        let out = run_zsh_compose(
+            &home.0,
+            &bin,
+            &[("NICE_COMPOSE_CONF", conf.to_str().unwrap())],
+            script,
+        );
+        let zsh_values: Vec<&str> = out.split('|').collect();
+        for (i, key) in ["accent", "model", "effort"].iter().enumerate() {
+            assert_eq!(
+                Some(zsh_values[i].to_string()),
+                crate::compose_conf::parse_value(blob, key),
+                "zsh and Rust parsers agree on {key}"
+            );
+        }
+    }
+
+    /// Full-visual e2e in a REAL pty (zsh's zpty module drives an interactive
+    /// child — ZLE only paints under a pty, so `-ic` tests can't see this):
+    /// trigger a compose and assert the spinner line is painted in the conf
+    /// accent as a truecolor SGR on the wire. Pins the region_highlight offset
+    /// semantics — `P` offsets index PREDISPLAY (not POSTDISPLAY), so the
+    /// spinner span must be anchored at ${#BUFFER} with no P flag; the P form
+    /// highlighted nothing, in every terminal.
+    #[test]
+    fn compose_spinner_paints_accent_in_real_pty_e2e() {
+        use std::process::Stdio;
+
+        let home = scratch("nice-compose-pty-home");
+        let bin = home.0.join("bin");
+        let rec = scratch("nice-compose-pty-rec");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Slow reply so the spinner paints several frames before the apply.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = bin.join("claude");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/zsh\ncat > {rec}/stdin\nsleep 0.8\nprint -rn -- \"ls -la\"\n",
+                    rec = rec.0.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let conf = home.0.join("compose.json");
+        std::fs::write(
+            &conf,
+            r##"{"accent":"#c96442","model":"sonnet","effort":"medium"}"##,
+        )
+        .unwrap();
+
+        let zdotdir = make_isolated();
+        let capture = home.0.join("raw.bin");
+        let driver = home.0.join("driver.zsh");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"emulate -L zsh
+zmodload zsh/zpty || exit 2
+out=$1
+: > $out
+drain() {{ local c; while zpty -rt n c 2>/dev/null; do print -rn -- "$c" >> $out; done }}
+zpty n /bin/zsh -i
+sleep 1; drain
+zpty -w -n n "list all files with details"
+sleep 0.3; drain
+zpty -w -n n $'{trigger}'
+repeat 25; do sleep 0.1; drain; done
+zpty -d n 2>/dev/null
+"#,
+                trigger = COMPOSE_TRIGGER_BINDKEY
+            ),
+        )
+        .unwrap();
+
+        let status = Command::new("/bin/zsh")
+            .arg(driver.to_str().unwrap())
+            .arg(capture.to_str().unwrap())
+            .env_clear()
+            .env("ZDOTDIR", &zdotdir.0)
+            .env("HOME", &home.0)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+            )
+            .env("HOST", "test.local")
+            .env("NICE_USER_ZDOTDIR", "")
+            .env("NICE_COMPOSE_CONF", conf.to_str().unwrap())
+            // What Nice's spawn env really sets (nice-term-core spawn.rs).
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env("LANG", "en_US.UTF-8")
+            .current_dir(&home.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn zpty driver");
+        assert!(status.success(), "zpty driver failed: {status:?}");
+
+        let bytes = std::fs::read(&capture).expect("read pty capture");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("Composing"),
+            "spinner line never painted. Captured: <{}>",
+            text.escape_debug()
+        );
+        // #c96442 → SGR 38;2;201;100;66 (the fg truecolor form zsh emits).
+        assert!(
+            text.contains("38;2;201;100;66"),
+            "spinner must be painted in the conf accent as truecolor. Captured: <{}>",
+            text.escape_debug()
+        );
+        assert!(
+            text.contains("ls -la"),
+            "composed command never landed in the buffer. Captured: <{}>",
+            text.escape_debug()
+        );
+        // The reply landed via apply (buffer replace), not execution: the fake
+        // claude recorded the request, and no `total`-style ls output follows.
+        let stdin = std::fs::read_to_string(rec.0.join("stdin")).unwrap();
+        assert_eq!(stdin, "list all files with details\n");
     }
 }

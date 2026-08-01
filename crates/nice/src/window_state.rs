@@ -45,6 +45,25 @@
 
 use std::collections::HashSet;
 
+/// The kitty CSI-u encoding of ⌘↩ (`Enter` = codepoint 13, modifier field
+/// 1+super(8) = 9) — the exact bytes the terminal view forwarded for an unbound
+/// ⌘↩ under `kitty_forwards_super` before `commandCompose` claimed the chord.
+/// [`WindowState::dispatch_command_compose`] replays it on the gated-out branch
+/// so kitty TUIs (Claude Code, vim with kitty protocol) observe no change.
+const KITTY_CMD_ENTER: &[u8] = b"\x1b[13;9u";
+
+/// Where a Command Compose dispatch routes — see
+/// [`WindowState::compose_route`] for the truth table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeRoute {
+    /// Idle interactive shell: write the compose trigger; the ZLE widget runs.
+    Trigger,
+    /// Busy pane whose child forwards super chords: replay ⌘↩ verbatim.
+    ForwardCmdEnter,
+    /// No pty bytes at all (dead pane / busy legacy-mode shell / Claude pane).
+    Noop,
+}
+
 use gpui::{AnyWindowHandle, AppContext, Entity};
 use nice_model::file_browser::FileBrowserStore;
 use nice_model::{Pane, PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, TabModel, TabStatus};
@@ -1577,6 +1596,68 @@ impl WindowState {
             PaneKind::Claude => matches!(pane.status, TabStatus::Thinking | TabStatus::Waiting),
             PaneKind::Terminal => terminal_has_foreground_child,
         }
+    }
+
+    // MARK: - Command Compose (the `commandCompose` shortcut, ⌘↩)
+
+    /// Command Compose dispatch (window-scoped, from the keymap handler). At an
+    /// idle interactive zsh prompt — a live `Terminal` pane with no foreground
+    /// child — write [`crate::shell_inject::COMPOSE_TRIGGER_SEQ`] to the pane's
+    /// pty; the injected ZLE widget takes it from there. Otherwise replay
+    /// exactly what an unbound ⌘↩ produced before this feature existed: the
+    /// kitty CSI-u encoding when the foreground app forwards super chords
+    /// (Claude Code, kitty TUIs), nothing at all otherwise. NEVER writes a
+    /// newline — running the composed command is always the user's own Enter.
+    pub(crate) fn dispatch_command_compose(&mut self, cx: &mut gpui::Context<WindowState>) {
+        let Some(tab_id) = self.model.active_tab_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(tab) = self.model.tab_for(&tab_id) else {
+            return;
+        };
+        let Some(pane_id) = tab.active_pane_id.clone() else {
+            return;
+        };
+        let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) else {
+            return;
+        };
+        let (kind, alive) = (pane.kind, pane.is_alive);
+        // A model-only pane (no cached session) has no pty to write to.
+        let Some(handle) = self.session.pane_handle(&tab_id, &pane_id) else {
+            return;
+        };
+        let fg_child = self.session.shell_has_foreground_child(&tab_id, &pane_id, cx);
+        let kitty_super = handle.read(cx).session().kitty_forwards_super();
+        let bytes: &[u8] = match Self::compose_route(kind, alive, fg_child, kitty_super) {
+            ComposeRoute::Trigger => crate::shell_inject::COMPOSE_TRIGGER_SEQ,
+            ComposeRoute::ForwardCmdEnter => KITTY_CMD_ENTER,
+            ComposeRoute::Noop => return,
+        };
+        let _ = handle.read(cx).session().write_input(bytes);
+    }
+
+    /// The pure Command Compose routing core — the gpui-free truth table of
+    /// [`dispatch_command_compose`](Self::dispatch_command_compose):
+    /// 1. A live `Terminal` pane with no foreground child ⇒ [`ComposeRoute::Trigger`]
+    ///    (the kitty state is irrelevant: zsh at a prompt requests no kitty flags).
+    /// 2. Anything else whose child forwards super chords ⇒
+    ///    [`ComposeRoute::ForwardCmdEnter`] (vim/Claude Code/any kitty TUI keeps
+    ///    receiving ⌘↩ exactly as before the chord was bound).
+    /// 3. Otherwise ⇒ [`ComposeRoute::Noop`] (dead pane, busy legacy-mode shell —
+    ///    where an unbound ⌘↩ also produced no pty bytes).
+    fn compose_route(
+        kind: PaneKind,
+        alive: bool,
+        fg_child: bool,
+        kitty_super: bool,
+    ) -> ComposeRoute {
+        if matches!(kind, PaneKind::Terminal) && alive && !fg_child {
+            return ComposeRoute::Trigger;
+        }
+        if kitty_super {
+            return ComposeRoute::ForwardCmdEnter;
+        }
+        ComposeRoute::Noop
     }
 
     /// The [`describe`](crate::close_confirm::describe)d busy panes of `tab_id`, in
@@ -3870,6 +3951,49 @@ mod tests {
         assert!(
             !WindowState::pane_is_busy_with(&dead_shell, true),
             "a dead shell is not busy even if a stale foreground-child signal is passed"
+        );
+    }
+
+    #[test]
+    fn compose_route_truth_table() {
+        use ComposeRoute::*;
+        // 1. The trigger fires ONLY for a live Terminal pane with no foreground
+        //    child — regardless of the kitty state (zsh at a prompt has none,
+        //    but a stale bit must not divert the trigger).
+        for kitty in [false, true] {
+            assert_eq!(
+                WindowState::compose_route(PaneKind::Terminal, true, false, kitty),
+                Trigger,
+                "idle live terminal (kitty={kitty}) triggers compose"
+            );
+        }
+        // 2. A busy pane replays ⌘↩ iff the child forwards super chords —
+        //    exactly the pre-feature byte contract.
+        assert_eq!(
+            WindowState::compose_route(PaneKind::Terminal, true, true, true),
+            ForwardCmdEnter,
+            "busy kitty pane (Claude Code, vim+kitty) keeps receiving cmd-enter"
+        );
+        assert_eq!(
+            WindowState::compose_route(PaneKind::Terminal, true, true, false),
+            Noop,
+            "busy legacy-mode shell got no bytes for an unbound cmd-enter either"
+        );
+        // 3. Dead panes and Claude panes never trigger; they may still forward.
+        assert_eq!(
+            WindowState::compose_route(PaneKind::Terminal, false, false, false),
+            Noop,
+            "dead terminal: nothing"
+        );
+        assert_eq!(
+            WindowState::compose_route(PaneKind::Claude, true, false, true),
+            ForwardCmdEnter,
+            "a Claude pane (kitty on) receives cmd-enter, never the trigger"
+        );
+        assert_eq!(
+            WindowState::compose_route(PaneKind::Claude, true, false, false),
+            Noop,
+            "a Claude pane without kitty gets nothing"
         );
     }
 

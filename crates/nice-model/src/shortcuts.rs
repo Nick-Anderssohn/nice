@@ -34,7 +34,7 @@
 /// case here extends [`ShortcutAction::ALL`] (which the completeness test pins
 /// against [`default_bindings`]) and the recorder list R24 iterates.
 ///
-/// The set is intentionally exactly these 13 — the actions Nice lets a user
+/// The set is intentionally exactly these 14 — the actions Nice lets a user
 /// rebind. Window-management accelerators that are *not* rebindable (New Window
 /// ⌘N, Toggle Full Screen ⌃⌘F) are deliberately absent: they live as fixed menu
 /// actions in `crates/nice`, not in this table.
@@ -66,13 +66,18 @@ pub enum ShortcutAction {
     UndoFileOperation,
     /// Redo the last file operation (⌘⇧Z). Deferred handler — R20.
     RedoFileOperation,
+    /// Command Compose (⌘↩): rewrite the plain-English text in zsh's line buffer
+    /// into a real command via `claude -p`. Fires only at an idle interactive
+    /// prompt — the Nice-side gate and the ZLE widget live in `crates/nice`.
+    /// The first Rust-only action: it has no Swift-prod `rawValue` counterpart.
+    CommandCompose,
 }
 
 impl ShortcutAction {
     /// Every action, in a stable order. Used by the completeness test and by
     /// R24's recorder (which renders one row per action). The order matches the
     /// enum declaration and Swift's `allCases`.
-    pub const ALL: [ShortcutAction; 13] = [
+    pub const ALL: [ShortcutAction; 14] = [
         ShortcutAction::NextSidebarTab,
         ShortcutAction::PrevSidebarTab,
         ShortcutAction::NextPane,
@@ -86,6 +91,7 @@ impl ShortcutAction {
         ShortcutAction::ResetFontSizes,
         ShortcutAction::UndoFileOperation,
         ShortcutAction::RedoFileOperation,
+        ShortcutAction::CommandCompose,
     ];
 
     /// Human-readable label for the (future) recorder row. Ported verbatim from
@@ -105,6 +111,22 @@ impl ShortcutAction {
             ShortcutAction::ResetFontSizes => "Reset font size",
             ShortcutAction::UndoFileOperation => "Undo file operation",
             ShortcutAction::RedoFileOperation => "Redo file operation",
+            ShortcutAction::CommandCompose => "Compose command",
+        }
+    }
+
+    /// Explanatory tooltip text for the recorder row's ⓘ affordance, or `None`
+    /// for the actions whose label is self-explanatory. Only `CommandCompose`
+    /// carries one today — its label alone doesn't say what the feature does.
+    pub fn info(self) -> Option<&'static str> {
+        match self {
+            ShortcutAction::CommandCompose => Some(
+                "Turns plain English typed at a zsh prompt into a real command \
+                 using Claude Code. The command is placed at the prompt for \
+                 review — press Enter yourself to run it. Does nothing while a \
+                 program is running in the pane.",
+            ),
+            _ => None,
         }
     }
 
@@ -129,6 +151,7 @@ impl ShortcutAction {
             ShortcutAction::ResetFontSizes => "resetFontSizes",
             ShortcutAction::UndoFileOperation => "undoFileOperation",
             ShortcutAction::RedoFileOperation => "redoFileOperation",
+            ShortcutAction::CommandCompose => "commandCompose",
         }
     }
 
@@ -224,7 +247,7 @@ impl KeyCombo {
 /// new pane, ⌘B for the sidebar). Every action has exactly one default combo,
 /// and no two actions share a combo — both pinned by this module's tests, and by
 /// the keymap slice which would otherwise register a colliding binding.
-pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 13] {
+pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 14] {
     use ShortcutAction::*;
     [
         (
@@ -316,6 +339,13 @@ pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 13] {
             KeyCombo {
                 modifiers: Modifiers::COMMAND_SHIFT,
                 key: "z",
+            },
+        ),
+        (
+            CommandCompose,
+            KeyCombo {
+                modifiers: Modifiers::COMMAND,
+                key: "enter",
             },
         ),
     ]
@@ -420,7 +450,7 @@ impl OwnedCombo {
 
 /// The OTHER rebindable action already bound to `combo`, or `None` if the combo is
 /// free within the table. **Intra-table only**, Swift's rule verbatim
-/// (`KeyboardShortcuts.swift:238-252`): it scans the 13-action `bindings`, skips
+/// (`KeyboardShortcuts.swift:238-252`): it scans the 14-action `bindings`, skips
 /// `excluding` (so re-saving an action's own combo is not a self-conflict), and
 /// returns the first OTHER action whose bound combo equals `combo`. Modifier
 /// comparison is already masked to ⌃⌥⇧⌘ ([`Modifiers`] carries only those four).
@@ -453,11 +483,11 @@ mod tests {
     #[test]
     fn table_is_complete_every_action_bound_exactly_once() {
         let table = default_bindings();
-        assert_eq!(table.len(), 13, "13 rebindable actions");
+        assert_eq!(table.len(), 14, "14 rebindable actions");
         assert_eq!(
             ShortcutAction::ALL.len(),
-            13,
-            "ALL enumerates all 13 actions"
+            14,
+            "ALL enumerates all 14 actions"
         );
         // Every action in ALL appears exactly once as a table key.
         for action in ShortcutAction::ALL {
@@ -507,6 +537,22 @@ mod tests {
         assert_eq!(combo(ShortcutAction::ResetFontSizes), "cmd-0");
         assert_eq!(combo(ShortcutAction::UndoFileOperation), "cmd-z");
         assert_eq!(combo(ShortcutAction::RedoFileOperation), "cmd-shift-z");
+        assert_eq!(combo(ShortcutAction::CommandCompose), "cmd-enter");
+    }
+
+    /// The ⓘ tooltip contract: exactly `CommandCompose` carries info text (its
+    /// label alone doesn't explain the feature); every other label stands alone.
+    #[test]
+    fn info_is_some_only_for_command_compose() {
+        for action in ShortcutAction::ALL {
+            match action {
+                ShortcutAction::CommandCompose => {
+                    let info = action.info().expect("CommandCompose has info text");
+                    assert!(!info.is_empty());
+                }
+                _ => assert_eq!(action.info(), None, "{action:?} needs no tooltip"),
+            }
+        }
     }
 
     #[test]
@@ -518,7 +564,7 @@ mod tests {
 
     #[test]
     fn action_ids_round_trip_and_are_distinct() {
-        // Every id maps back to its action, and the 13 ids are unique — the JSON
+        // Every id maps back to its action, and the 14 ids are unique — the JSON
         // key set the `shortcuts` persistence section is keyed by.
         let mut ids = HashSet::new();
         for action in ShortcutAction::ALL {

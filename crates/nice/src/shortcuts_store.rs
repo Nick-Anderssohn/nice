@@ -6,7 +6,7 @@
 //! ## What lives here (R24 slice 1)
 //!
 //! * [`ShortcutBindings`] — the gpui `Global` wrapping a
-//!   `HashMap<ShortcutAction, Option<OwnedCombo>>` (always all 13 keys present; a
+//!   `HashMap<ShortcutAction, Option<OwnedCombo>>` (always all 14 keys present; a
 //!   value of `None` means the action is explicitly unbound) plus the injected file
 //!   path. `load(path)` is fail-soft to defaults; `with_defaults(path)` is the
 //!   `run_selftest` seam (defaults + a temp path, no disk read). The read accessors
@@ -14,20 +14,24 @@
 //!   and the mutators [`set_binding`](ShortcutBindings::set_binding) /
 //!   [`reset`](ShortcutBindings::reset) are the store API R24's recorder pane drives.
 //! * The `shortcuts`-section decode/encode over the shared **read-merge-write**
-//!   writer ([`write_ui_settings_merged`]) — each mutator persists the FULL 13-entry
+//!   writer ([`write_ui_settings_merged`]) — each mutator persists the FULL 14-entry
 //!   map (chord string or JSON `null`) then rebuilds the keymap, so a rebind survives
 //!   relaunch and every co-writer's section (`appearance` / `fonts` / `file_browser_sort`
 //!   / any unknown key) rides along untouched.
 //!
 //! ## The frozen load rules (Swift parity, `KeyboardShortcuts.swift:283-310`)
 //!
-//! 1. The `shortcuts` section absent entirely ⇒ all 13 defaults.
+//! 1. The `shortcuts` section absent entirely ⇒ all 14 defaults.
 //! 2. Malformed JSON (whole file or a mistyped section) ⇒ defaults (fail-soft, log).
 //! 3. An unknown action key ⇒ dropped silently ([`ShortcutAction::from_id`] rejects it).
 //! 4. An action key present with `null` ⇒ that action is UNBOUND.
 //! 5. An action key ABSENT from a PRESENT section ⇒ that action loads UNBOUND
 //!    (preserves explicit clears across launches; ships a future new action unbound
-//!    for upgraders).
+//!    for upgraders). **One deliberate exception**: `commandCompose` ABSENT from a
+//!    present section seeds its DEFAULT (⌘↩) instead — the action shipped after
+//!    users already had 13-key sections on disk, and Nick chose "customizers get
+//!    the new default too" over rule 5's unbound outcome. An explicit
+//!    `"commandCompose": null` still loads unbound (rule 4 wins over the seed).
 //!
 //! Write rule (a deliberate, load-equivalent divergence from Swift, which omits
 //! unbound keys): Rust persists the FULL current map every time — each action a
@@ -65,7 +69,7 @@ struct DocForShortcuts {
     shortcuts: Option<HashMap<String, Option<String>>>,
 }
 
-/// The map every action starts at (all 13 present) with its default combo owned.
+/// The map every action starts at (all 14 present) with its default combo owned.
 fn default_map() -> HashMap<ShortcutAction, Option<OwnedCombo>> {
     default_bindings()
         .into_iter()
@@ -92,6 +96,16 @@ fn decode_bindings(bytes: &[u8]) -> HashMap<ShortcutAction, Option<OwnedCombo>> 
             // Rule 5: start all-unbound, then fill from the present keys.
             Some(section) => {
                 let mut map = all_unbound_map();
+                // The rule-5 seeding exception (module docs): a section written
+                // before `commandCompose` existed has no such key at all — seed
+                // the default ⌘↩. A present key (chord or explicit `null`) is
+                // decoded by the loop below and overwrites this seed.
+                if !section.contains_key(ShortcutAction::CommandCompose.id()) {
+                    map.insert(
+                        ShortcutAction::CommandCompose,
+                        default_combo(ShortcutAction::CommandCompose).map(OwnedCombo::from),
+                    );
+                }
                 for (id, token) in section {
                     // Rule 3: an unknown action id is dropped silently.
                     if let Some(action) = ShortcutAction::from_id(&id) {
@@ -260,7 +274,7 @@ mod tests {
         OwnedCombo::from_token(token).unwrap()
     }
 
-    /// A missing file loads all 13 defaults (fresh-install path, load rule 1).
+    /// A missing file loads all 14 defaults (fresh-install path, load rule 1).
     #[test]
     fn missing_file_loads_defaults() {
         let path = temp_path("missing");
@@ -339,7 +353,7 @@ mod tests {
         assert_eq!(raw["version"], 1);
     }
 
-    /// The write rule: the persisted section carries ALL 13 keys, each a chord
+    /// The write rule: the persisted section carries ALL 14 keys, each a chord
     /// string or explicit `null` (a self-describing, diffable file).
     #[test]
     fn write_persists_full_map_with_explicit_null() {
@@ -350,7 +364,7 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let section = raw["shortcuts"].as_object().expect("shortcuts is an object");
-        assert_eq!(section.len(), 13, "all 13 keys persisted");
+        assert_eq!(section.len(), 14, "all 14 keys persisted");
         // The unbound action is an explicit JSON null.
         assert!(section["toggleSidebar"].is_null());
         // A bound action is its chord string.
@@ -358,7 +372,7 @@ mod tests {
     }
 
     /// Load rule 1: an absent `shortcuts` section (even with a sibling section
-    /// present) loads all 13 defaults.
+    /// present) loads all 14 defaults.
     #[test]
     fn absent_section_loads_all_defaults() {
         let path = temp_path("absent");
@@ -393,6 +407,83 @@ mod tests {
         // Absent from a present section ⇒ unbound, NOT the default (rule 5).
         assert_eq!(store.binding(ShortcutAction::UndoFileOperation), None);
         assert!(!store.is_at_default(ShortcutAction::UndoFileOperation));
+    }
+
+    /// The rule-5 seeding exception: `commandCompose` ABSENT from a present
+    /// (pre-14th-action) section loads at its DEFAULT ⌘↩ — a customizer's
+    /// legacy 13-key file gains the new shortcut instead of shipping it dead.
+    #[test]
+    fn legacy_section_seeds_command_compose_default() {
+        let path = temp_path("seed-compose");
+        // A customized 13-key-era section: no commandCompose key at all.
+        std::fs::write(
+            &path,
+            br#"{"version":1,"shortcuts":{"newTerminalPane":"cmd-y","toggleSidebar":null}}"#,
+        )
+        .unwrap();
+        let store = ShortcutBindings::load(path);
+        assert_eq!(
+            store.binding(ShortcutAction::CommandCompose),
+            Some(combo("cmd-enter")),
+            "absent commandCompose seeds the default, not rule 5's unbound"
+        );
+        assert!(store.is_at_default(ShortcutAction::CommandCompose));
+        // Rule 5 is UNCHANGED for every pre-existing action.
+        assert_eq!(store.binding(ShortcutAction::UndoFileOperation), None);
+    }
+
+    /// The seed never overrides an explicit choice: `"commandCompose": null`
+    /// (the user unbound it) still loads unbound, and a rebound chord decodes.
+    #[test]
+    fn explicit_command_compose_choice_beats_the_seed() {
+        let unbound = temp_path("compose-null");
+        std::fs::write(
+            &unbound,
+            br#"{"version":1,"shortcuts":{"commandCompose":null}}"#,
+        )
+        .unwrap();
+        let store = ShortcutBindings::load(unbound);
+        assert_eq!(
+            store.binding(ShortcutAction::CommandCompose),
+            None,
+            "an explicit null (rule 4) wins over the seeding exception"
+        );
+
+        let rebound = temp_path("compose-rebound");
+        std::fs::write(
+            &rebound,
+            br#"{"version":1,"shortcuts":{"commandCompose":"cmd-shift-enter"}}"#,
+        )
+        .unwrap();
+        let store2 = ShortcutBindings::load(rebound);
+        assert_eq!(
+            store2.binding(ShortcutAction::CommandCompose),
+            Some(combo("cmd-shift-enter"))
+        );
+    }
+
+    /// The seeded default persists on the next write: load a legacy section,
+    /// mutate anything, and the written file carries `commandCompose: cmd-enter`.
+    #[test]
+    fn seeded_default_round_trips_through_the_next_write() {
+        let path = temp_path("seed-roundtrip");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"shortcuts":{"newTerminalPane":"cmd-y"}}"#,
+        )
+        .unwrap();
+        let mut store = ShortcutBindings::load(path.clone());
+        store.set_in_memory(ShortcutAction::ToggleSidebar, Some(combo("cmd-j")));
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["shortcuts"]["commandCompose"], "cmd-enter");
+        // And a fresh load of the written file needs no seeding path at all.
+        let reloaded = ShortcutBindings::load(path);
+        assert_eq!(
+            reloaded.binding(ShortcutAction::CommandCompose),
+            Some(combo("cmd-enter"))
+        );
     }
 
     /// Load rule 3: an unknown action key is dropped silently (no crash, no bogus

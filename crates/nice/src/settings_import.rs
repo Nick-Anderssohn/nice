@@ -424,7 +424,8 @@ fn decode_prod_shortcuts(bytes: &[u8]) -> HashMap<String, ProdShortcut> {
     out
 }
 
-/// Build the COMPLETE 13-key `shortcuts` section from the decoded prod map, or
+/// Build the complete prod-paired (13-key) `shortcuts` section from the decoded
+/// prod map, or
 /// `None` when prod carries no binding for ANY Rust action (prod never customized
 /// our shortcuts) — in which case no section is written and the store's defaults
 /// stand (its load rule 1). When at least one of our actions is present, every
@@ -437,7 +438,11 @@ fn decode_prod_shortcuts(bytes: &[u8]) -> HashMap<String, ProdShortcut> {
 /// * an action absent from a present prod map → JSON `null` (prod had it explicitly
 ///   unbound; the store's load rule 4/5 reads `null`/absent-from-present as unbound).
 ///
-/// A prod action-id with no Rust counterpart is skipped + warned.
+/// A prod action-id with no Rust counterpart is skipped + warned. The converse —
+/// a RUST-ONLY action with no prod pairing (`commandCompose`) — is OMITTED from
+/// the section entirely, never emitted as `null`: prod cannot have unbound what
+/// it never had, and the store's rule-5 seeding exception then grants the new
+/// action its default on load (the same outcome a Rust-side customizer gets).
 fn build_shortcuts_section(
     prod: &HashMap<String, ProdShortcut>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -463,6 +468,10 @@ fn build_shortcuts_section(
 
     let mut section = Map::new();
     for action in ShortcutAction::ALL {
+        // Rust-only action (no prod pairing) — omit, don't null (doc above).
+        if !PROD_ACTION_MAP.iter().any(|(_, a)| *a == action) {
+            continue;
+        }
         let value = match by_action.get(&action) {
             Some(combo) => match key_name_for_keycode(combo.key_code) {
                 Some(key) => Value::String(emit_token(combo.modifier_flags_raw, key)),
@@ -950,14 +959,24 @@ mod tests {
 
     /// The prod-action-id → Rust action map is an explicit, verified pairing: every
     /// listed prod id resolves to its action AND agrees with the store's shared JSON
-    /// key (`ShortcutAction::id`); an unknown id has no counterpart.
+    /// key (`ShortcutAction::id`); an unknown id has no counterpart. Coverage is
+    /// "every action EXCEPT the Rust-only `commandCompose`" — prod Swift never had
+    /// that rawValue, so pairing it would be false (its import outcome is the
+    /// store's seeding exception instead).
     #[test]
     fn prod_action_map_pairs_every_action_by_verified_id() {
         for (prod_id, action) in PROD_ACTION_MAP {
             assert_eq!(rust_action_for_prod_id(prod_id), Some(action));
             assert_eq!(action.id(), prod_id, "shared JSON key agrees for {action:?}");
         }
-        assert_eq!(PROD_ACTION_MAP.len(), ShortcutAction::ALL.len());
+        for action in ShortcutAction::ALL {
+            let paired = PROD_ACTION_MAP.iter().any(|(_, a)| *a == action);
+            assert_eq!(
+                paired,
+                action != ShortcutAction::CommandCompose,
+                "{action:?}: every action is prod-paired except the Rust-only commandCompose"
+            );
+        }
         assert_eq!(rust_action_for_prod_id("notAnAction"), None);
     }
 
@@ -1034,6 +1053,9 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(raw["shortcuts"].get("someFutureAction").is_none());
+        // The Rust-only commandCompose is OMITTED (never emitted as null), so
+        // the written section carries exactly the 13 prod-paired keys …
+        assert!(raw["shortcuts"].get("commandCompose").is_none());
         assert_eq!(raw["shortcuts"].as_object().unwrap().len(), 13);
 
         let store = ShortcutBindings::load(path);
@@ -1055,10 +1077,16 @@ mod tests {
         // Present-map-omits ⇒ explicitly unbound (not the default).
         assert_eq!(store.binding(ShortcutAction::ToggleSidebar), None);
         assert!(!store.is_at_default(ShortcutAction::ToggleSidebar));
+        // … and the store's rule-5 seeding exception grants a prod migrator the
+        // new commandCompose default — same outcome as a Rust-side customizer.
+        assert_eq!(
+            store.binding(ShortcutAction::CommandCompose),
+            OwnedCombo::from_token("cmd-enter")
+        );
     }
 
     /// An absent prod `keyboardShortcuts` blob writes NO `shortcuts` section, so the
-    /// store loads all 13 defaults (load rule 1) — a fresh prod user is not
+    /// store loads all 14 defaults (load rule 1) — a fresh prod user is not
     /// clobbered into all-unbound.
     #[test]
     fn absent_prod_shortcuts_leaves_store_defaults() {

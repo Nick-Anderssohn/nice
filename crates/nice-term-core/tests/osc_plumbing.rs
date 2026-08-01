@@ -430,3 +430,46 @@ fn bracketed_paste_toggles_and_survives_scrollback_churn() {
     session.write_input(b"\n").expect("write past read d");
     drop(session);
 }
+
+// ---------------------------------------------------------------------------
+// Validation 5 — kitty super-forwarding state (Command Compose gated-out branch)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kitty_forwards_super_tracks_progressive_enhancement_push_pop() {
+    // Same gated-`read` shape as the bracketed-paste test: push the kitty
+    // disambiguate flag (`CSI > 1 u`, what Claude Code / kitty TUIs request),
+    // observe the query flip on, pop it (`CSI < u`), observe it flip off. This
+    // pins the accessor Command Compose consults before replaying ⌘↩ to a
+    // busy pane.
+    let script = "read z; printf '\\033[>1u'; read a; printf '\\033[<u'; read b";
+    let spec = SpawnSpec::command(wrap(script), "/private/tmp")
+        .with_env(test_env())
+        .with_size(24, 80);
+    let (session, _events) =
+        Session::spawn(spec, DEFAULT_SCROLLBACK_LINES, no_wake()).expect("spawn kitty pane");
+
+    // Blocked on `read z`, nothing pushed yet: a plain pane forwards no super.
+    assert!(
+        !session.kitty_forwards_super(),
+        "kitty super-forwarding must start disabled"
+    );
+
+    // Advance past `read z`; the child pushes DISAMBIGUATE → query flips on.
+    session.write_input(b"\n").expect("write past read z");
+    assert!(
+        poll_until(|| session.kitty_forwards_super()),
+        "kitty super-forwarding never became active after CSI > 1 u"
+    );
+
+    // Advance past `read a`; the child pops the flags → query flips off.
+    session.write_input(b"\n").expect("write past read a");
+    assert!(
+        poll_until(|| !session.kitty_forwards_super()),
+        "kitty super-forwarding never cleared after CSI < u"
+    );
+
+    // Let the child exit.
+    session.write_input(b"\n").expect("write past read b");
+    drop(session);
+}

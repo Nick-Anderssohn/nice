@@ -7,11 +7,11 @@
 //!
 //! ## What lives here
 //!
-//! * The 13 rebindable actions as gpui action structs (generated to mirror
+//! * The 14 rebindable actions as gpui action structs (generated to mirror
 //!   [`ShortcutAction`], one struct per case).
 //! * [`install_shortcuts`] — the one-shot app wiring: it hoists the terminal
 //!   [`FontSettings`] to a single process-level entity, registers every action's
-//!   handler, and binds all 13 default combos (plus the non-rebindable ⌃⌘F full
+//!   handler, and binds all 14 default combos (plus the non-rebindable ⌃⌘F full
 //!   screen accelerator) from the table.
 //! * The peek trigger's clear half ([`on_window_modifiers_changed`]) — the
 //!   window-level modifier-release observer the shipped window installs.
@@ -67,7 +67,7 @@ use nice_term_view::FontSettings;
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 
-// The 13 rebindable actions, one gpui action struct per `ShortcutAction` case
+// The 14 rebindable actions, one gpui action struct per `ShortcutAction` case
 // (same names, `nice` namespace). `actions!` needs compile-time identifiers, so
 // the set is spelled out here; [`shortcut_binding`] maps each `ShortcutAction`
 // value back to its struct so the *bindings* are still generated from the table.
@@ -89,6 +89,7 @@ gpui::actions!(
         ResetFontSizes,
         UndoFileOperation,
         RedoFileOperation,
+        CommandCompose,
     ]
 );
 
@@ -105,7 +106,7 @@ impl Global for SharedFontSettings {}
 /// once, but the self-test suite runs every scenario in ONE process and several
 /// scenarios (`niceties-zoom`, `multiwindow`) each install the keymap before
 /// opening their window; without this guard a second install would re-register
-/// all 13 `cx.on_action` handlers, so every dispatch would fire twice (a ⌘B toggle
+/// all 14 `cx.on_action` handlers, so every dispatch would fire twice (a ⌘B toggle
 /// would net-cancel, a ⌘= would zoom twice). The presence of this global marks the
 /// keymap installed.
 struct ShortcutsInstalled;
@@ -132,7 +133,7 @@ pub(crate) fn try_shared_font_settings(cx: &App) -> Option<Entity<FontSettings>>
 /// 1. hoist [`FontSettings`] to one process-level entity (the font fan-out);
 /// 2. register every action's handler (app-level font/undo/redo; window-scoped
 ///    sidebar/pane actions through [`WindowRegistry::active_state`]);
-/// 3. bind all 13 default combos from the table, plus ⌃⌘F full screen, with
+/// 3. bind all 14 default combos from the table, plus ⌃⌘F full screen, with
 ///    `use_key_equivalents` semantics.
 ///
 /// Idempotent: the shipped app calls it once, but the self-test suite has several
@@ -226,7 +227,7 @@ pub(crate) fn install_shortcuts(cx: &mut App) {
 ///
 /// It re-emits, on every rebuild:
 ///
-/// * the 13 LIVE rebindable combos from the store (an unbound action is omitted; a
+/// * the 14 LIVE rebindable combos from the store (an unbound action is omitted; a
 ///   persisted/user token that fails to parse is logged and skipped, never a panic
 ///   — unlike the statically-valid defaults table); and
 /// * the PROTECTED non-rebindable set (see [`non_rebindable_bindings`]) — because
@@ -271,7 +272,7 @@ pub(crate) fn rebuild_keymap(cx: &mut App) {
 
 /// The PROTECTED non-rebindable re-install set (R24 — getting this wrong is the
 /// plan's biggest regression risk). [`rebuild_keymap`]'s `clear_key_bindings()` is
-/// total — it wipes EVERY binding, not just the 13 — so each of these must be
+/// total — it wipes EVERY binding, not just the 14 — so each of these must be
 /// re-emitted on every rebuild exactly as its owner originally installed it
 /// (the `use_key_equivalents` bit differs per entry). A missing entry is a shipped
 /// regression caught by the dedicated re-install test.
@@ -369,6 +370,14 @@ fn register_window_scoped_actions(cx: &mut App) {
             // debounced upsert; a no-op when no store Global is installed).
             s.save_to_store();
         });
+    });
+    cx.on_action(|_: &CommandCompose, cx: &mut App| {
+        // Command Compose (⌘↩): gate + route in WindowState (the pure
+        // `compose_route` core carries the truth table). At an idle zsh prompt
+        // it writes the compose trigger to the active pane's pty; in a busy /
+        // kitty pane it replays the ⌘↩ bytes an unbound chord produced before
+        // this feature existed.
+        with_active_state(cx, |s, cx| s.dispatch_command_compose(cx));
     });
     cx.on_action(|_: &ToggleHiddenFiles, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
@@ -508,6 +517,7 @@ fn shortcut_binding(
         ShortcutAction::ResetFontSizes => Box::new(ResetFontSizes),
         ShortcutAction::UndoFileOperation => Box::new(UndoFileOperation),
         ShortcutAction::RedoFileOperation => Box::new(RedoFileOperation),
+        ShortcutAction::CommandCompose => Box::new(CommandCompose),
     };
     KeyBinding::load(chord, boxed, None, true, None, mapper)
 }

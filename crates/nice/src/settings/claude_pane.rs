@@ -12,10 +12,10 @@
 //! [`sync_claude_live_arm`]'s off→on colors-file write no-ops — it never touches
 //! the real `~/.claude` — leaving the gate flip as the clean assertion.
 
-use gpui::{px, div, prelude::*, AnyElement, App, Window};
+use gpui::{px, div, prelude::*, AnyElement, App, Context, Window};
 
-use crate::settings::controls::toggle_switch;
-use crate::settings::root::setting_row_info;
+use crate::settings::controls::{dropdown, toggle_switch, DropdownItem};
+use crate::settings::root::{setting_row_info, SettingsRootView};
 use crate::theme_settings;
 
 /// The full toggle handler (the shipped click path): persist the new value to the
@@ -58,10 +58,43 @@ pub(crate) fn perform_toggle_install_handoff(cx: &mut App, on: bool) {
     cx.refresh_windows();
 }
 
+/// One Command Compose dropdown (model or effort): the current selection's
+/// label on the trigger, one checkmarked item per choice, each item routing to
+/// its `compose_conf` setter. `current` is compared by VALUE (an unknown
+/// persisted token shows the raw token so the user sees what is set).
+fn compose_dropdown(
+    trigger_id: &'static str,
+    choices: &'static [(&'static str, &'static str)],
+    current: String,
+    apply: fn(&mut App, &str),
+    window: &mut Window,
+    cx: &mut Context<SettingsRootView>,
+) -> AnyElement {
+    let current_label = choices
+        .iter()
+        .find(|(value, _)| *value == current)
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| current.clone());
+    let items = choices
+        .iter()
+        .map(|(value, label)| {
+            DropdownItem::new(
+                format!("{trigger_id}.{}", if value.is_empty() { "default" } else { value }),
+                *label,
+                *value == current,
+                move |cx| apply(cx, value),
+            )
+        })
+        .collect();
+    dropdown(trigger_id, current_label, items, window, cx)
+}
+
 /// The Claude pane body (The spec §Claude). The "Sync Claude Code theme" control
 /// is the shared [`toggle_switch`] (a11y `settings.claude.syncClaudeTheme`);
-/// click → [`perform_toggle_sync_claude`] with the flipped value.
-pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
+/// click → [`perform_toggle_sync_claude`] with the flipped value. The two
+/// Command Compose dropdowns route to [`crate::compose_conf`] (persist +
+/// compose.json rewrite; the ZLE widget reads the file on the next ⌘↩).
+pub(crate) fn claude_pane(window: &mut Window, cx: &mut Context<SettingsRootView>) -> AnyElement {
     let on = crate::app::claude_theme_sync_gate_on(cx);
     // R26: the handoff-skill toggle RENDERS from the in-memory gate (seeded once
     // from the CFPref in `app::run`), NOT `read_bool_pref` — so a scenario /
@@ -98,6 +131,35 @@ pub(crate) fn claude_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
                 move |cx| {
                     perform_toggle_install_handoff(cx, !handoff_on);
                 },
+            ),
+            cx,
+        ))
+        .child(setting_row_info(
+            "Command Compose model",
+            "The Claude model that turns plain English at a zsh prompt into a real \
+             command (the Compose command shortcut). Sonnet balances speed and \
+             quality; CLI default uses whatever your claude is configured with.",
+            compose_dropdown(
+                "settings.claude.composeModel",
+                &crate::compose_conf::MODEL_CHOICES,
+                crate::compose_conf::model(cx),
+                |cx, v| crate::compose_conf::set_model(cx, v),
+                window,
+                cx,
+            ),
+            cx,
+        ))
+        .child(setting_row_info(
+            "Command Compose effort",
+            "How hard the model thinks per compose. Medium is a good default; low \
+             is snappier for simple commands.",
+            compose_dropdown(
+                "settings.claude.composeEffort",
+                &crate::compose_conf::EFFORT_CHOICES,
+                crate::compose_conf::effort(cx),
+                |cx, v| crate::compose_conf::set_effort(cx, v),
+                window,
+                cx,
             ),
             cx,
         ))

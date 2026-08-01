@@ -1054,6 +1054,10 @@ fn commit_appearance(cx: &mut App, appearance: Appearance) {
     refresh_theme_state(cx);
     apply_theme_fanout(cx);
     claude_sync_if_gated(cx);
+    // Command Compose: the accent may have changed — rewrite compose.json so
+    // the widget's spinner picks the new tint up on the next compose (no-op
+    // when the conf store was never installed).
+    crate::compose_conf::rewrite(cx);
 }
 
 /// Re-derive the resolved [`ThemeState`] from the store + catalog into the

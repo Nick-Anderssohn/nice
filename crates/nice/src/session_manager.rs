@@ -231,6 +231,10 @@ pub(crate) struct WindowShellEnv {
     /// (Nice inherited no `ZDOTDIR`); the empty/absent distinction is semantic
     /// for the `.zshenv` stub's XDG discovery branch, so the var is ALWAYS set.
     pub(crate) user_zdotdir: Option<String>,
+    /// `NICE_COMPOSE_CONF` — the Command Compose conf-file path the injected
+    /// ZLE widget reads per compose (accent + `claude -p` flags). `None` ⇒ the
+    /// var is not injected and the widget falls back to its built-in defaults.
+    pub(crate) compose_conf: Option<String>,
 }
 
 pub(crate) struct SessionManager {
@@ -1282,6 +1286,9 @@ impl SessionManager {
             "NICE_USER_ZDOTDIR".to_string(),
             env.user_zdotdir.clone().unwrap_or_default(),
         ));
+        if let Some(conf) = &env.compose_conf {
+            pairs.push(("NICE_COMPOSE_CONF".to_string(), conf.clone()));
+        }
         pairs.push(("NICE_TAB_ID".to_string(), tab_id.to_string()));
         pairs.push(("NICE_PANE_ID".to_string(), pane_id.to_string()));
         pairs

@@ -381,7 +381,7 @@ impl Render for WindowChromeView {
 gpui::actions!(nice, [ToggleFullScreen]);
 
 // R12: the New Window accelerator (⌘N) + File ▸ New Window menu item. Unlike the
-// 13 rebindable shortcuts (`nice_model::shortcuts`, wired by R12's keymap slice),
+// 14 rebindable shortcuts (`nice_model::shortcuts`, wired by R12's keymap slice),
 // `NewWindow` is a fixed window-management action — like `ToggleFullScreen` — so
 // it lives here, not in the rebindable defaults table.
 gpui::actions!(nice, [NewWindow]);
@@ -1155,7 +1155,7 @@ pub fn run() {
         cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::load(
             crate::file_browser::sort_settings_store::default_ui_settings_path(),
         ));
-        // R12: the app-wide shortcut keymap — the 13 rebindable actions + ⌃⌘F
+        // R12: the app-wide shortcut keymap — the 14 rebindable actions + ⌃⌘F
         // generated from `nice_model::shortcuts`, their handlers, and the hoisted
         // process-level `FontSettings` every window shares. Must run before the
         // first window opens: `open_managed_window` reads the shared font entity.
@@ -1170,7 +1170,7 @@ pub fn run() {
         ));
         // R24 (G7): re-apply the just-loaded map over the default keymap that
         // `install_shortcuts` bound — `rebuild_keymap` clears every binding and
-        // re-emits the 13 LIVE combos plus the PROTECTED non-rebindable set, so a
+        // re-emits the 14 LIVE combos plus the PROTECTED non-rebindable set, so a
         // persisted rebind (or explicit unbind) is live from boot. Harmless when the
         // section is absent (the store is at defaults, so the board is unchanged).
         crate::keymap::rebuild_keymap(cx);
@@ -1277,6 +1277,11 @@ pub fn run() {
         // inside). Replaces the removed fixed-triple write above; app::run ONLY
         // (never `run_selftest`, which mints no `SharedThemeState` and no gate).
         crate::theme_settings::claude_sync_if_gated(cx);
+        // Command Compose: install the conf store (persisted model/effort read
+        // back from an existing compose.json) and write the file with the NOW
+        // LIVE accent — after `install_live_theme` so the first write already
+        // carries the user's real accent, not the fallback. app::run ONLY.
+        crate::compose_conf::install(cx, crate::compose_conf::default_path());
         // Restyle plan 06: pin an existing user's pre-flip THEME SYNCHRONOUSLY now —
         // BEFORE the restore fan-out opens any window — so restored windows paint the
         // pinned legacy palette/accent from their FIRST frame instead of flashing the
@@ -1504,6 +1509,11 @@ pub(crate) fn arm_window_control_socket(
         socket_path: Some(socket_path.clone()),
         zdotdir,
         user_zdotdir,
+        compose_conf: Some(
+            crate::compose_conf::default_path()
+                .to_string_lossy()
+                .into_owned(),
+        ),
     });
 
     // Bind + start the accept thread; drain parsed messages onto the foreground.
@@ -3828,6 +3838,14 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            name: "compose-live",
+            open: crate::compose_live::open_compose_live_window,
+            gate: Gate::SelfReported {
+                budget: Duration::from_secs(40),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "niceties-zoom",
             open: crate::niceties_zoom::open_niceties_zoom_window,
             gate: Gate::SelfReported {
@@ -4292,7 +4310,7 @@ pub fn run_selftest(selector: String) {
         // R24 (G6): the rebindable-shortcut store with DEFAULTS + a throwaway temp
         // path — never the real `ui_settings.json` (the launch-time read +
         // default-path resolution stay in `run`). A scenario that rebinds a shortcut
-        // writes only this temp file; a fresh scenario reads all 13 defaults.
+        // writes only this temp file; a fresh scenario reads all 14 defaults.
         let shortcuts_path = std::env::temp_dir().join(format!(
             "nice-selftest-shortcuts-{}.json",
             std::process::id()

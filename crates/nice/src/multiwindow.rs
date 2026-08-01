@@ -7,7 +7,7 @@
 //! Where the in-process `nice-itests` `multiwindow` cases prove the routing /
 //! isolation / peek *logic* deterministically over mirrors, this proves the shipped
 //! wiring on **real `NSWindow`s**: two windows tracked in the process-wide registry,
-//! ⌘N opening a second isolated window, the 13 keymap actions dispatching through
+//! ⌘N opening a second isolated window, the 14 keymap actions dispatching through
 //! GPUI's action system, and — the one place R12 touches tranche-1 code — the
 //! terminal **pass-through contract** (a matched chord is consumed and leaks zero
 //! bytes into the pty; an unmatched key reaches the pty byte-identically).
@@ -145,7 +145,7 @@ pub fn open_multiwindow_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     //   * the process-wide WindowRegistry + its close observer,
     //   * the ⌘N / File ▸ New Window command (its handler opens a real managed
     //     window through `open_managed_window`, which registers it),
-    //   * the 13-action keymap + the hoisted shared FontSettings.
+    //   * the 14-action keymap + the hoisted shared FontSettings.
     cx.update(|app| {
         WindowRegistry::install(app);
         crate::app::install_new_window_command(app);
