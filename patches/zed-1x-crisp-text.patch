@@ -27,7 +27,7 @@ diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
  
 +/// Strength of the bg-aware text composition curve on low-density (1x)
 +/// displays, in [0, 1] (1 = the full retina-calibrated curve, 0 = off).
-+/// Defaults to 0.5: at 1x the curve's boosted antialias fringe is a full
++/// Defaults to 0.3 (Nick-tuned 2026-07-31): at 1x the curve's boosted antialias fringe is a full
 +/// point per stem edge (vs half on retina), so full strength reads fat and
 +/// fully off reads thin. `NICE_1X_TEXT_CURVE=<0..1>` overrides it — a live
 +/// A/B knob for feel checks. Cached for the process.
@@ -37,7 +37,7 @@ diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
 +        std::env::var("NICE_1X_TEXT_CURVE")
 +            .ok()
 +            .and_then(|v| v.parse::<f32>().ok())
-+            .map_or(0.5, |v| v.clamp(0.0, 1.0))
++            .map_or(0.3, |v| v.clamp(0.0, 1.0))
 +    })
 +}
 +
@@ -76,7 +76,7 @@ diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
 +        // luminances, matching SwiftTerm's TextCompositionCurve. At 1x the
 +        // curve's boosted antialias fringe is a full point per stem edge
 +        // (half on retina) — full strength reads fat, fully off reads thin —
-+        // so its strength is scaled down there (default 0.5,
++        // so its strength is scaled down there (default 0.3,
 +        // NICE_1X_TEXT_CURVE overrides in [0,1]). Negative disables the
 +        // curve; the sprite field is named `bg_luminance` for historical
 +        // reasons but now carries the final mix factor.

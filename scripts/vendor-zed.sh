@@ -66,7 +66,7 @@
 #          font-smoothing dilation, and run the bg-aware composition curve
 #          at reduced strength (its boosted antialias fringe is a full point
 #          per edge at 1x vs half on retina — measured +22% stem width at
-#          full strength, "a little thin" fully off; default 0.5,
+#          full strength, "a little thin" fully off; default 0.3,
 #          NICE_1X_TEXT_CURVE=<0..1> overrides as a live A/B knob). The
 #          curve's mix factor now computes CPU-side in paint_glyph (the
 #          MonochromeSprite bg_luminance field carries the final mix factor;

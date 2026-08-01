@@ -11,7 +11,7 @@ checkout + the `patches/*.patch` set — currently 7: `zed-bg-luminance`,
 translucent windows), `zed-external-drag-out` (makes the window's GPUIView an
 `NSDraggingSource` so files can be dragged OUT to other apps — stock gpui
 is drag-destination-only), `zed-1x-crisp-text` (whole-pixel glyph placement,
-no smoothing dilation, and half-strength composition curve on 1x
+no smoothing dilation, and 0.3-strength composition curve on 1x
 displays — text rendered visibly fat/wide there; `NICE_1X_TEXT_CURVE`
 tunes the curve; retina untouched)), which the `nice`
 crates path-depend into. There is **no Xcode project**: the old `scripts/install.sh`
