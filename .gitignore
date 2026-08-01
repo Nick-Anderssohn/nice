@@ -68,3 +68,4 @@ scripts/.env.release
 
 # macOS
 .DS_Store
+.claude/handoff/
