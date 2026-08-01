@@ -104,8 +104,10 @@ Include all of:
 Run the helper, passing three arguments:
 
 1. The **absolute path** to the handoff file you just wrote.
-2. Any arguments the user provided to this skill, forwarded verbatim
-   (or an empty string `""` when the user provided none).
+2. The instruction the NEW session should follow after reading the
+   handoff file, built from the user's arguments (or an empty string
+   `""` when the user provided none) — see "Addressing the new
+   session" below.
 3. Your **exact current model id** — the precise `claude-…` identifier
    you are running as right now (e.g. `claude-opus-4-8`), so the fresh
    session continues on the same model. If you are not certain of your
@@ -130,6 +132,18 @@ it does not start working on its own. When the user passes a custom
 instruction (e.g. `/nice-handoff keep going` or `/nice-handoff focus only
 on the UI layer`) that string tells the new session what to do after
 reading the file, so it can continue the work right away.
+
+**Addressing the new session.** The second argument is read by the NEW
+session as its own instruction — it is not a description of this
+hand-off. Preserve the user's meaning, but REWRITE any hand-off framing
+so the string is a direct instruction the new session can execute. In
+particular, if the user's request (or a wrapping skill) phrased the
+arguments as "hand off <task> to a fresh session", pass only "<task>":
+e.g. arguments of "Hand off a new task to a fresh session: fix the
+frame-restore bug" MUST be forwarded as "Fix the frame-restore bug".
+A forwarded string that still says "hand off…" makes the new session
+try to hand off AGAIN instead of doing the work. Beyond stripping that
+framing, do not editorialize or add instructions of your own.
 
 The third argument carries your model id so the new tab launches on the
 same model. Your effort level is forwarded automatically by the helper
