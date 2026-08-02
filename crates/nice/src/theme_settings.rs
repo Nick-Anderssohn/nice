@@ -27,6 +27,16 @@
 //! Claude-sync wiring are slices 2/3. This slice is the store + the pure data +
 //! the catalog resolution seam only.
 //!
+//! ## The accent axis
+//!
+//! `accent` is an [`AccentSelection`]: one of the five [`AccentPreset`]
+//! swatches, or `FromTheme` (rawValue `"from-theme"`), which derives the accent
+//! from the active scheme's terminal theme. [`resolve_theme_and_accent`] is the
+//! single place that chain — and the caret rule it implies — lives; the
+//! renderer is untouched (a preset simply clears the resolved theme's `cursor`).
+//! Claude's theme-sync mirror consumes the RESOLVED `Srgba` accent, never the
+//! rawValue, so `"from-theme"` never reaches it.
+//!
 //! ## Persistence
 //!
 //! One top-level `"appearance"` object inside the shared `ui_settings.json`
@@ -110,6 +120,62 @@ fn window_background_appearance(opacity_pct: u8, blur_radius: u16) -> WindowBack
     }
 }
 
+/// The persisted `accent` rawValue meaning "derive the accent from the active
+/// terminal theme" — the sixth Accent-row entry, stored next to the five
+/// [`AccentPreset`] rawValues.
+const FROM_THEME_ACCENT_RAW: &str = "from-theme";
+
+/// What the user picked in the Accent row: one of the five swatches, or "From
+/// theme" (derive it from whatever terminal theme the active scheme runs).
+///
+/// This is a selection KIND, not a sixth preset — [`AccentPreset`] stays the
+/// five colors. Which of the two is selected also decides the CARET rule in
+/// [`ThemeState::from_stores`]: a preset always wins over a theme's cursor
+/// color, "From theme" defers to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccentSelection {
+    /// One of the five fixed swatches. Its color is the accent, and the
+    /// resolved terminal theme's `cursor` is cleared so the caret wears it too.
+    Preset(AccentPreset),
+    /// Derive the accent from the active scheme's terminal theme
+    /// (`theme.accent` when declared, else `ansi[4]`), leaving the theme's own
+    /// `cursor` in place so the caret keeps the theme author's literal choice.
+    FromTheme,
+}
+
+impl Default for AccentSelection {
+    fn default() -> Self {
+        Self::Preset(AccentPreset::Terracotta)
+    }
+}
+
+impl AccentSelection {
+    /// The persisted rawValue: a preset's own rawValue, or `"from-theme"`.
+    pub fn raw_value(self) -> &'static str {
+        match self {
+            Self::Preset(p) => p.raw_value(),
+            Self::FromTheme => FROM_THEME_ACCENT_RAW,
+        }
+    }
+
+    /// Decode a persisted rawValue. Unknown ⇒ `None` (the caller falls back to
+    /// the default, per the store's tolerant-decode discipline).
+    pub fn from_raw(raw: &str) -> Option<Self> {
+        if raw == FROM_THEME_ACCENT_RAW {
+            return Some(Self::FromTheme);
+        }
+        AccentPreset::ALL
+            .into_iter()
+            .find(|a| a.raw_value() == raw)
+            .map(Self::Preset)
+    }
+
+    /// Whether "From theme" is selected.
+    pub fn is_from_theme(self) -> bool {
+        matches!(self, Self::FromTheme)
+    }
+}
+
 /// The persisted appearance selection — the raw user choice, before any active
 /// derivation. A pure value type: no gpui, no I/O. Ported from the `Tweaks`
 /// store's persisted axes (`Tweaks.swift:202-402`).
@@ -120,8 +186,9 @@ pub struct Appearance {
     pub scheme: ColorScheme,
     /// Whether `scheme` follows the OS appearance.
     pub sync_with_os: bool,
-    /// The accent swatch (palette-agnostic).
-    pub accent: AccentPreset,
+    /// The accent selection (palette-agnostic): a fixed swatch, or "derive it
+    /// from the active terminal theme".
+    pub accent: AccentSelection,
     /// The terminal-theme id active when `scheme == Light` (resolved via the
     /// catalog; unknown ⇒ Nice default).
     pub terminal_theme_light_id: String,
@@ -154,7 +221,7 @@ impl Default for Appearance {
         Self {
             scheme: ColorScheme::Dark,
             sync_with_os: true,
-            accent: AccentPreset::Terracotta,
+            accent: AccentSelection::Preset(AccentPreset::Terracotta),
             terminal_theme_light_id: DEFAULT_TERMINAL_THEME_LIGHT_ID.to_string(),
             terminal_theme_dark_id: DEFAULT_TERMINAL_THEME_DARK_ID.to_string(),
             window_opacity_light: DEFAULT_WINDOW_OPACITY_LIGHT_PCT,
@@ -171,8 +238,10 @@ impl Appearance {
         self.scheme
     }
 
-    /// The active accent (palette-agnostic).
-    pub fn active_accent(&self) -> AccentPreset {
+    /// The active accent SELECTION (resolve it to a color through
+    /// [`resolve_theme_and_accent`] — under "From theme" the color depends on
+    /// the active scheme's terminal theme).
+    pub fn active_accent(&self) -> AccentSelection {
         self.accent
     }
 
@@ -271,11 +340,6 @@ fn chrome_slots_for_theme(id: &str, scheme: ColorScheme, terminal: &TerminalThem
     }
 }
 
-/// Map a persisted accent rawValue to an [`AccentPreset`]. Unknown ⇒ `None`.
-fn accent_from_raw(raw: &str) -> Option<AccentPreset> {
-    AccentPreset::ALL.into_iter().find(|a| a.raw_value() == raw)
-}
-
 /// Map a persisted scheme rawValue (`"light"` / `"dark"`) to a [`ColorScheme`].
 /// Unknown ⇒ `None`. Mirrors `Tweaks.encodeScheme` (`Tweaks.swift:641-645`).
 fn scheme_from_raw(raw: &str) -> Option<ColorScheme> {
@@ -372,7 +436,7 @@ impl AppearanceSection {
             accent: self
                 .accent
                 .as_deref()
-                .and_then(accent_from_raw)
+                .and_then(AccentSelection::from_raw)
                 .unwrap_or(d.accent),
             terminal_theme_light_id: self
                 .terminal_theme_light_id
@@ -424,7 +488,7 @@ impl AppearanceSection {
 /// OS-reconciled scheme (the flip does not change the scheme axis).
 fn legacy_appearance_defaults() -> Appearance {
     Appearance {
-        accent: AccentPreset::Ocean,
+        accent: AccentSelection::Preset(AccentPreset::Ocean),
         terminal_theme_light_id: "catppuccin-latte".to_string(),
         terminal_theme_dark_id: "catppuccin-mocha".to_string(),
         // Comfort axes (opacity/blur) and scheme/sync come from the NEW defaults —
@@ -510,8 +574,8 @@ impl ThemeSettingsStore {
         self.appearance.active_scheme()
     }
 
-    /// The active accent.
-    pub fn active_accent(&self) -> AccentPreset {
+    /// The active accent SELECTION (a preset, or "From theme").
+    pub fn active_accent(&self) -> AccentSelection {
         self.appearance.active_accent()
     }
 
@@ -628,6 +692,46 @@ pub struct ThemeState {
     pub window_appearance: WindowBackgroundAppearance,
 }
 
+/// The accent a terminal theme derives under "From theme" — the locked chain:
+/// the theme's declared [`accent`](nice_term_view::TerminalTheme::accent) when
+/// `Some`, else `ansi[4]` (normal blue, the slot theme authors treat as the
+/// primary saturated hue).
+///
+/// `cursor` and `foreground` are deliberately NOT in this chain: both are
+/// near-monochrome by design (they must contrast with everything), so deriving
+/// chrome from them produces a washed-out accent.
+pub fn theme_derived_accent(theme: &TerminalTheme) -> Srgba {
+    terminal_color_to_srgba(theme.accent.unwrap_or(theme.ansi[4]))
+}
+
+/// Resolve the effective `(terminal theme, accent)` pair for a selection — the
+/// single place the accent chain and the CARET rule live.
+///
+/// * **A preset always wins.** Its color is the accent, AND the resolved
+///   theme's `cursor` is cleared to `None` so `element.rs`'s existing
+///   `match theme.cursor` falls through to the accent — the caret wears the
+///   preset even on a cursor-bearing theme (Dracula, every Ghostty import).
+///   The paint path in `nice-term-view` is untouched.
+/// * **"From theme"** leaves `cursor` as-is, so the caret keeps the theme
+///   author's literal choice, and takes the accent from
+///   [`theme_derived_accent`]. A theme with `cursor: None` (the Nice defaults)
+///   therefore lands its caret on the derived accent too.
+fn resolve_theme_and_accent(
+    store: &ThemeSettingsStore,
+    catalog: &TerminalThemeCatalog,
+) -> (TerminalTheme, Srgba) {
+    let scheme = store.active_scheme();
+    let mut theme = catalog.resolve(store.active_terminal_id(), scheme);
+    let accent = match store.active_accent() {
+        AccentSelection::Preset(preset) => {
+            theme.cursor = None;
+            preset.color()
+        }
+        AccentSelection::FromTheme => theme_derived_accent(&theme),
+    };
+    (theme, accent)
+}
+
 impl ThemeState {
     /// Derive the resolved view state from a store selection + the catalog. Slice
     /// 3's `apply_*` mutators call this after each store mutation to refresh the
@@ -635,19 +739,58 @@ impl ThemeState {
     pub fn from_stores(store: &ThemeSettingsStore, catalog: &TerminalThemeCatalog) -> Self {
         let scheme = store.active_scheme();
         let terminal_id = store.active_terminal_id();
-        // Resolve the terminal half once, then key the chrome half off the same
-        // id + resolved theme (round-2 merge: one theme drives both halves).
-        let terminal_theme = catalog.resolve(terminal_id, scheme);
+        // Resolve the terminal half + the accent together (the caret rule mutates
+        // the theme), then key the chrome half off the same id + resolved theme
+        // (round-2 merge: one theme drives both halves). The chrome derivation
+        // reads only fg/bg, so the cursor-clearing above cannot perturb it.
+        let (terminal_theme, accent) = resolve_theme_and_accent(store, catalog);
         let slots = chrome_slots_for_theme(terminal_id, scheme, &terminal_theme);
         Self {
             slots,
             scheme,
-            accent: store.active_accent().color(),
+            accent,
             terminal_theme,
             background_opacity: store.active_window_opacity(),
             blur_radius: store.active_blur_radius(),
             window_appearance: store.active_window_appearance(),
         }
+    }
+}
+
+/// The accent `scheme`'s slot would derive under "From theme" — the settings
+/// pane's split-disc entry paints the light half from
+/// `derived_accent_for(cx, Light)` and the dark half from `…(cx, Dark)`,
+/// independently of which scheme is live. Falls back to the Nice default for
+/// `scheme` (whose declared accent is terracotta) when the store / catalog
+/// globals are absent (a unit test or a bare scenario).
+pub fn derived_accent_for(cx: &App, scheme: ColorScheme) -> Srgba {
+    let theme = match (
+        cx.try_global::<ThemeSettingsStore>(),
+        cx.try_global::<TerminalThemeCatalog>(),
+    ) {
+        (Some(store), Some(catalog)) => {
+            catalog.resolve(store.appearance().terminal_theme_id_for(scheme), scheme)
+        }
+        _ => match scheme {
+            ColorScheme::Light => TerminalTheme::nice_default_light(),
+            ColorScheme::Dark => TerminalTheme::nice_default_dark(),
+        },
+    };
+    theme_derived_accent(&theme)
+}
+
+/// The effective accent color for the ACTIVE scheme, resolved from the store +
+/// catalog globals alone (no [`SharedThemeState`] needed) — the same value
+/// [`ThemeState::from_stores`] computes. Command Compose's conf writer uses it
+/// so the spinner tint tracks "From theme" as well as the presets. Falls back to
+/// Terracotta when either global is absent.
+pub(crate) fn active_accent_color(cx: &App) -> Srgba {
+    match (
+        cx.try_global::<ThemeSettingsStore>(),
+        cx.try_global::<TerminalThemeCatalog>(),
+    ) {
+        (Some(store), Some(catalog)) => resolve_theme_and_accent(store, catalog).1,
+        _ => AccentPreset::Terracotta.color(),
     }
 }
 
@@ -920,9 +1063,12 @@ pub fn apply_scheme(cx: &mut App, scheme: ColorScheme) {
     commit_appearance(cx, appearance);
 }
 
-/// Set the accent (palette-agnostic): recolors the caret on cursor-None terminal
-/// themes plus the chrome / selection / logo tint.
-pub fn apply_accent(cx: &mut App, accent: AccentPreset) {
+/// Set the accent selection (palette-agnostic): recolors the chrome / selection
+/// / logo tint plus the caret. A PRESET always recolors the caret (the resolved
+/// theme's `cursor` is cleared — see [`resolve_theme_and_accent`]); "From theme"
+/// hands the caret back to the theme's own cursor color and derives the accent
+/// from the active scheme's theme.
+pub fn apply_accent(cx: &mut App, accent: AccentSelection) {
     let Some(mut appearance) = current_appearance(cx) else {
         return;
     };
@@ -1266,7 +1412,7 @@ mod tests {
         let a = Appearance::default();
         assert_eq!(a.scheme, ColorScheme::Dark);
         assert!(a.sync_with_os);
-        assert_eq!(a.accent, AccentPreset::Terracotta);
+        assert_eq!(a.accent, AccentSelection::Preset(AccentPreset::Terracotta));
         assert_eq!(a.terminal_theme_light_id, "nice-default-light");
         assert_eq!(a.terminal_theme_dark_id, "nice-default-dark");
         // Restyle plan 3 new-install defaults: dark 80% / light 90% opacity, blur
@@ -1404,7 +1550,7 @@ mod tests {
         // A write never re-emits the legacy popup key.
         store
             .set(Appearance {
-                accent: AccentPreset::Fern,
+                accent: AccentSelection::Preset(AccentPreset::Fern),
                 ..store.appearance().clone()
             })
             .unwrap();
@@ -1432,7 +1578,7 @@ mod tests {
         // THEME axes pin to the LEGACY literal — NOT the flipped fresh-install theme
         // (Terracotta / nice-default-*).
         assert_eq!(pinned, legacy_appearance_defaults());
-        assert_eq!(pinned.accent, AccentPreset::Ocean);
+        assert_eq!(pinned.accent, AccentSelection::Preset(AccentPreset::Ocean));
         assert_eq!(pinned.terminal_theme_light_id, "catppuccin-latte");
         assert_eq!(pinned.terminal_theme_dark_id, "catppuccin-mocha");
         assert!(pinned.sync_with_os, "OS-sync stays pinned on");
@@ -1460,7 +1606,11 @@ mod tests {
         // the legacy theme / new comfort defaults.
         let partial = br#"{"appearance":{"accent":"iris","window_opacity_dark":70}}"#;
         let pinned = legacy_pinned_appearance(partial, ColorScheme::Light);
-        assert_eq!(pinned.accent, AccentPreset::Iris, "explicit accent survives");
+        assert_eq!(
+            pinned.accent,
+            AccentSelection::Preset(AccentPreset::Iris),
+            "explicit accent survives"
+        );
         assert_eq!(pinned.window_opacity_dark, 70, "explicit opacity survives");
         // Absent THEME keys still legacy; absent COMFORT keys take the new defaults.
         assert_eq!(pinned.terminal_theme_light_id, "catppuccin-latte");
@@ -1488,7 +1638,7 @@ mod tests {
         let target = Appearance {
             scheme: ColorScheme::Light,
             sync_with_os: false,
-            accent: AccentPreset::Iris,
+            accent: AccentSelection::Preset(AccentPreset::Iris),
             terminal_theme_light_id: "solarized-light".to_string(),
             terminal_theme_dark_id: "dracula".to_string(),
             window_opacity_light: 85,
@@ -1508,7 +1658,7 @@ mod tests {
         let path = temp_path("noop");
         let mut store = ThemeSettingsStore::load(path);
         let target = Appearance {
-            accent: AccentPreset::Fern,
+            accent: AccentSelection::Preset(AccentPreset::Fern),
             ..Appearance::default()
         };
         assert!(store.set(target.clone()).unwrap(), "first set writes");
@@ -1593,6 +1743,245 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         let store = ThemeSettingsStore::load(path);
         assert_eq!(*store.appearance(), Appearance::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Accent selection + the effective (theme, accent) resolution
+    // (`accent-from-theme` plan Validation §). The origin bug: a theme with a
+    // `cursor` color (every non-Nice built-in, every import) overrode the
+    // configured preset accent at the caret.
+    // -----------------------------------------------------------------------
+
+    /// A store at a temp path holding `appearance`, WITHOUT touching disk beyond
+    /// the write `set` performs.
+    fn store_with(tag: &str, appearance: Appearance) -> ThemeSettingsStore {
+        let mut store = ThemeSettingsStore::load(temp_path(tag));
+        store.set(appearance).unwrap();
+        store
+    }
+
+    /// A PRESET always wins over a cursor-bearing theme: the fanned-out
+    /// `TerminalTheme` has `cursor: None` (so `element.rs`'s `match theme.cursor`
+    /// falls through to the accent) and the accent is the preset's color. This is
+    /// the origin-bug fix — Dracula's `#f8f8f2` cursor must NOT reach the caret.
+    #[test]
+    fn preset_accent_clears_a_cursor_bearing_themes_cursor() {
+        let catalog = hermetic_catalog("preset-clears-cursor");
+        let store = store_with(
+            "preset-clears-cursor",
+            Appearance {
+                scheme: ColorScheme::Dark,
+                sync_with_os: false,
+                accent: AccentSelection::Preset(AccentPreset::Ocean),
+                terminal_theme_dark_id: "dracula".to_string(),
+                ..Appearance::default()
+            },
+        );
+        // Dracula really does carry a cursor color — otherwise this asserts nothing.
+        assert_eq!(
+            catalog.resolve("dracula", ColorScheme::Dark).cursor,
+            Some(TerminalColor::new(0xf8, 0xf8, 0xf2))
+        );
+
+        let state = ThemeState::from_stores(&store, &catalog);
+        assert_eq!(state.terminal_theme.cursor, None, "the preset clears the cursor");
+        assert_eq!(state.accent, AccentPreset::Ocean.color());
+        // Only the cursor is touched — the rest of the theme is verbatim.
+        let dracula = catalog.resolve("dracula", ColorScheme::Dark);
+        assert_eq!(state.terminal_theme.background, dracula.background);
+        assert_eq!(state.terminal_theme.foreground, dracula.foreground);
+        assert_eq!(state.terminal_theme.ansi, dracula.ansi);
+    }
+
+    /// "From theme" × Dracula: the caret keeps the theme's own cursor
+    /// (`#f8f8f2`) while the chrome accent becomes Dracula's curated identity
+    /// hue (`#bd93f9`) — NOT the cursor.
+    #[test]
+    fn from_theme_keeps_the_themes_cursor_and_derives_its_accent() {
+        let catalog = hermetic_catalog("from-theme-dracula");
+        let store = store_with(
+            "from-theme-dracula",
+            Appearance {
+                scheme: ColorScheme::Dark,
+                sync_with_os: false,
+                accent: AccentSelection::FromTheme,
+                terminal_theme_dark_id: "dracula".to_string(),
+                ..Appearance::default()
+            },
+        );
+        let state = ThemeState::from_stores(&store, &catalog);
+        assert_eq!(
+            state.terminal_theme.cursor,
+            Some(TerminalColor::new(0xf8, 0xf8, 0xf2)),
+            "from-theme leaves the caret on the theme author's cursor"
+        );
+        assert_eq!(
+            state.accent,
+            terminal_color_to_srgba(TerminalColor::new(0xbd, 0x93, 0xf9)),
+            "the accent is Dracula's curated hue, not its cursor"
+        );
+    }
+
+    /// "From theme" × Nice dark: the theme declares `cursor: None`, so the caret
+    /// falls through to the accent — which the chain derives as terracotta.
+    #[test]
+    fn from_theme_on_nice_dark_lands_the_caret_on_terracotta() {
+        let catalog = hermetic_catalog("from-theme-nice-dark");
+        let store = store_with(
+            "from-theme-nice-dark",
+            Appearance {
+                scheme: ColorScheme::Dark,
+                sync_with_os: false,
+                accent: AccentSelection::FromTheme,
+                ..Appearance::default()
+            },
+        );
+        let state = ThemeState::from_stores(&store, &catalog);
+        assert_eq!(state.terminal_theme.cursor, None);
+        assert_eq!(state.accent, AccentPreset::Terracotta.color());
+    }
+
+    /// "From theme" × an IMPORTED theme (which declares no accent): the chain
+    /// falls through to `ansi[4]`, the normal-blue slot. Driven through a real
+    /// catalog over a real imported `.ghostty` file, so the parser→catalog→
+    /// resolve path is exercised end to end.
+    #[test]
+    fn from_theme_on_an_import_falls_back_to_ansi4() {
+        let dir = temp_path("from-theme-import").parent().unwrap().to_path_buf();
+        let mut src = String::from("background = #101010\nforeground = #e0e0e0\n");
+        for i in 0..16u8 {
+            // ansi[4] is the only distinctive entry (#33cc99).
+            let hex = if i == 4 { "33cc99".to_string() } else { format!("{i:02x}0000") };
+            src.push_str(&format!("palette = {i}=#{hex}\n"));
+        }
+        std::fs::write(dir.join("moss.ghostty"), src).unwrap();
+        let catalog = TerminalThemeCatalog::new(dir);
+        // The import really landed and declares no accent.
+        let imported = catalog.resolve("moss", ColorScheme::Dark);
+        assert_eq!(imported.background, TerminalColor::new(0x10, 0x10, 0x10));
+        assert_eq!(imported.accent, None);
+
+        let store = store_with(
+            "from-theme-import-store",
+            Appearance {
+                scheme: ColorScheme::Dark,
+                sync_with_os: false,
+                accent: AccentSelection::FromTheme,
+                terminal_theme_dark_id: "moss".to_string(),
+                ..Appearance::default()
+            },
+        );
+        let state = ThemeState::from_stores(&store, &catalog);
+        assert_eq!(
+            state.accent,
+            terminal_color_to_srgba(TerminalColor::new(0x33, 0xcc, 0x99)),
+            "an accent-less theme derives its ansi[4]"
+        );
+    }
+
+    /// The chain itself: declared accent wins; absent ⇒ `ansi[4]`. Neither
+    /// `cursor` nor `foreground` is ever consulted.
+    #[test]
+    fn theme_derived_accent_prefers_declared_then_ansi4() {
+        let mut t = TerminalTheme::nice_default_dark();
+        t.accent = Some(TerminalColor::new(1, 2, 3));
+        t.cursor = Some(TerminalColor::new(9, 9, 9));
+        assert_eq!(
+            theme_derived_accent(&t),
+            terminal_color_to_srgba(TerminalColor::new(1, 2, 3))
+        );
+        t.accent = None;
+        assert_eq!(theme_derived_accent(&t), terminal_color_to_srgba(t.ansi[4]));
+        assert_ne!(theme_derived_accent(&t), terminal_color_to_srgba(t.foreground));
+    }
+
+    /// Under "From theme" the accent is SCHEME-dependent: flipping the scheme
+    /// re-derives it from the other slot's theme (no new fan-out machinery —
+    /// `from_stores` simply re-runs).
+    #[test]
+    fn from_theme_accent_follows_the_scheme_flip() {
+        let catalog = hermetic_catalog("from-theme-scheme-flip");
+        let base = Appearance {
+            sync_with_os: false,
+            accent: AccentSelection::FromTheme,
+            terminal_theme_light_id: "solarized-light".to_string(),
+            terminal_theme_dark_id: "dracula".to_string(),
+            ..Appearance::default()
+        };
+        let dark = store_with(
+            "from-theme-flip-dark",
+            Appearance {
+                scheme: ColorScheme::Dark,
+                ..base.clone()
+            },
+        );
+        let light = store_with(
+            "from-theme-flip-light",
+            Appearance {
+                scheme: ColorScheme::Light,
+                ..base
+            },
+        );
+        assert_eq!(
+            ThemeState::from_stores(&dark, &catalog).accent,
+            terminal_color_to_srgba(TerminalColor::new(0xbd, 0x93, 0xf9))
+        );
+        assert_eq!(
+            ThemeState::from_stores(&light, &catalog).accent,
+            terminal_color_to_srgba(TerminalColor::new(0x26, 0x8b, 0xd2))
+        );
+    }
+
+    /// The `"from-theme"` rawValue round-trips through the store, and the five
+    /// preset rawValues are unchanged (a legacy store decodes exactly as before).
+    #[test]
+    fn accent_selection_raw_values_round_trip() {
+        for preset in AccentPreset::ALL {
+            let selection = AccentSelection::Preset(preset);
+            assert_eq!(selection.raw_value(), preset.raw_value());
+            assert_eq!(AccentSelection::from_raw(preset.raw_value()), Some(selection));
+        }
+        assert_eq!(AccentSelection::FromTheme.raw_value(), "from-theme");
+        assert_eq!(
+            AccentSelection::from_raw("from-theme"),
+            Some(AccentSelection::FromTheme)
+        );
+        assert_eq!(AccentSelection::from_raw("neon"), None);
+
+        // Through the store: `"from-theme"` persists and reloads.
+        let path = temp_path("from-theme-roundtrip");
+        let mut store = ThemeSettingsStore::load(path.clone());
+        let target = Appearance {
+            accent: AccentSelection::FromTheme,
+            ..Appearance::default()
+        };
+        assert!(store.set(target.clone()).unwrap());
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["appearance"]["accent"], "from-theme");
+        assert_eq!(*ThemeSettingsStore::load(path).appearance(), target);
+    }
+
+    /// Tolerant decode of the accent key: a legacy preset rawValue decodes
+    /// unchanged, `"from-theme"` decodes to the new variant, and anything else
+    /// (including a stale future value) falls back to Terracotta.
+    #[test]
+    fn accent_key_decodes_tolerantly() {
+        for (raw, expected) in [
+            ("ocean", AccentSelection::Preset(AccentPreset::Ocean)),
+            ("graphite", AccentSelection::Preset(AccentPreset::Graphite)),
+            ("from-theme", AccentSelection::FromTheme),
+            ("fromTheme", AccentSelection::Preset(AccentPreset::Terracotta)),
+            ("", AccentSelection::Preset(AccentPreset::Terracotta)),
+        ] {
+            let path = temp_path("accent-decode");
+            std::fs::write(&path, format!(r#"{{"appearance":{{"accent":"{raw}"}}}}"#)).unwrap();
+            assert_eq!(
+                ThemeSettingsStore::load(path).appearance().accent,
+                expected,
+                "accent rawValue {raw:?}"
+            );
+        }
     }
 
     /// A hermetic builtins-only catalog over a throwaway (nonexistent) temp dir.
@@ -1736,9 +2125,18 @@ mod tests {
         let catalog = hermetic_catalog("legacy-mismatch");
         let state = ThemeState::from_stores(&store, &catalog);
 
-        // Terminal half: byte-identical to the catalog's Dracula (unchanged look).
+        // Terminal half: the catalog's Dracula — except `cursor`, which the
+        // accent-from-theme caret rule clears because a PRESET is selected (the
+        // legacy store's Ocean), so the caret wears the preset rather than
+        // Dracula's `#f8f8f2`.
         let dracula = catalog.resolve("dracula", ColorScheme::Dark);
-        assert_eq!(state.terminal_theme, dracula);
+        assert_eq!(
+            state.terminal_theme,
+            TerminalTheme {
+                cursor: None,
+                ..dracula.clone()
+            }
+        );
 
         // Chrome half: Dracula-DERIVED — the Catppuccin Mocha table is NOT used.
         assert_eq!(
@@ -1860,7 +2258,7 @@ mod tests {
         let mut store = ThemeSettingsStore::load(path.clone());
         store
             .set(Appearance {
-                accent: AccentPreset::Graphite,
+                accent: AccentSelection::Preset(AccentPreset::Graphite),
                 ..Appearance::default()
             })
             .unwrap();

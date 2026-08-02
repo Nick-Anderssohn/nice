@@ -192,6 +192,11 @@ pub fn parse_ghostty_theme(source: &str) -> Result<TerminalTheme, GhosttyParseEr
         foreground,
         cursor,
         selection,
+        // Ghostty's format declares no accent key, so an imported theme never
+        // carries one — the "From theme" resolve chain falls through to
+        // `ansi[4]`. (Formats that DO declare one — iTerm2, Warp — are a
+        // separate follow-up plan; nothing here parses a new key.)
+        accent: None,
         ansi,
     })
 }
@@ -255,6 +260,20 @@ mod tests {
             let v = i as u8;
             assert_eq!(theme.ansi[i], c(v, v, v), "ansi[{i}]");
         }
+    }
+
+    /// An imported Ghostty theme never carries a declared accent — the parser
+    /// reads no accent key, so "From theme" falls through to `ansi[4]`. Even a
+    /// file that spells an `accent` key is ignored like any other unknown key.
+    #[test]
+    fn imported_themes_declare_no_accent() {
+        let mut src = String::from("background = #000000\nforeground = #ffffff\naccent = #ff0000\n");
+        for i in 0..16u8 {
+            src.push_str(&format!("palette = {i}=#00{i:02x}00\n"));
+        }
+        let theme = parse_ghostty_theme(&src).expect("the unknown accent key is ignored");
+        assert_eq!(theme.accent, None);
+        assert_eq!(theme.ansi[4], c(0x00, 0x04, 0x00), "ansi[4] is the fallback hue");
     }
 
     #[test]

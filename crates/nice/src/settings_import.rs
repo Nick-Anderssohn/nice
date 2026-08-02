@@ -586,7 +586,7 @@ mod tests {
     use crate::file_browser::sort_settings_store::SortSettingsStore;
     use crate::settings::prefs_store::SettingsPrefsStore;
     use crate::shortcuts_store::ShortcutBindings;
-    use crate::theme_settings::ThemeSettingsStore;
+    use crate::theme_settings::{AccentSelection, ThemeSettingsStore};
 
     /// An absent temp `ui_settings.json` path in its own throwaway dir (never the
     /// real support root — the import core takes the path directly, so
@@ -724,7 +724,7 @@ mod tests {
         let a = theme.appearance();
         assert_eq!(a.scheme, ColorScheme::Light);
         assert!(!a.sync_with_os);
-        assert_eq!(a.accent, AccentPreset::Iris);
+        assert_eq!(a.accent, AccentSelection::Preset(AccentPreset::Iris));
         assert_eq!(a.terminal_theme_light_id, "solarized-light");
         assert_eq!(a.terminal_theme_dark_id, "dracula");
 

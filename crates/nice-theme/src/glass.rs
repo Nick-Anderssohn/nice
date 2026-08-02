@@ -30,6 +30,19 @@ pub fn glass_line(scheme: ColorScheme) -> Srgba {
     }
 }
 
+/// The stronger over-glass hairline for `scheme` — one step up from
+/// [`glass_line`], for a rule that has to separate two things sitting on the
+/// SAME surface rather than fence off a region (the Accent row's divider
+/// between the five fixed presets and the "From theme" entry). Cites
+/// `docs/design/accent-from-theme-mock.html`'s `--hairline-strong`:
+/// `rgba(255,255,255,.10)` (dark) / `rgba(23,19,15,.12)` (light).
+pub fn glass_line_strong(scheme: ColorScheme) -> Srgba {
+    match scheme {
+        ColorScheme::Dark => Srgba::new(1.0, 1.0, 1.0, 0.10),
+        ColorScheme::Light => Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.12),
+    }
+}
+
 /// The over-glass active/hover fill color for `scheme` — the companion to
 /// [`glass_line`], used for the sidebar's active-row / hover / footer-icon
 /// fills (NOT the hairline's alpha family). Cites
@@ -86,6 +99,22 @@ mod tests {
         assert_eq!(
             glass_line(ColorScheme::Light),
             Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.10)
+        );
+    }
+
+    #[test]
+    fn glass_line_strong_matches_the_mock_hairline_strong() {
+        // docs/design/accent-from-theme-mock.html: --hairline-strong:
+        // rgba(255,255,255,.10) (dark).
+        assert_eq!(
+            glass_line_strong(ColorScheme::Dark),
+            Srgba::new(1.0, 1.0, 1.0, 0.10)
+        );
+        // docs/design/accent-from-theme-mock.html: --hairline-strong:
+        // rgba(23,19,15,.12) (light).
+        assert_eq!(
+            glass_line_strong(ColorScheme::Light),
+            Srgba::new(23.0 / 255.0, 19.0 / 255.0, 15.0 / 255.0, 0.12)
         );
     }
 

@@ -104,7 +104,7 @@ use crate::settings::window::{
 };
 use crate::terminal_theme_catalog::TerminalThemeCatalog;
 use crate::theme_settings::{
-    self, OsSchemeSource, SharedThemeState, ThemeSettingsStore, ThemeState,
+    self, AccentSelection, OsSchemeSource, SharedThemeState, ThemeSettingsStore, ThemeState,
 };
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
@@ -475,7 +475,7 @@ async fn leg_b_accent_fanout(
         }
     };
 
-    cx.update(|app| theme_settings::apply_accent(app, target));
+    cx.update(|app| theme_settings::apply_accent(app, AccentSelection::Preset(target)));
     settle(cx, 300).await;
 
     let after = cx.update(|app| theme_settings::active_chrome_accent(app));
@@ -521,7 +521,7 @@ async fn leg_b_accent_fanout(
         .copied()
         .find(|p| p.color() == before)
         .unwrap_or(AccentPreset::Terracotta);
-    cx.update(|app| theme_settings::apply_accent(app, baseline));
+    cx.update(|app| theme_settings::apply_accent(app, AccentSelection::Preset(baseline)));
     settle(cx, 100).await;
 }
 
@@ -1091,7 +1091,7 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
         // apply_terminal_theme_id is a latent no-op here — the terminal-cell recolor
         // comes from the scheme flip, exactly as `theme-fanout` leg (a) proves;
         // R22's distinct themes make apply_terminal_theme_id visible there.)
-        cx.update(|app| theme_settings::apply_accent(app, target_accent));
+        cx.update(|app| theme_settings::apply_accent(app, AccentSelection::Preset(target_accent)));
         settle(cx, 200).await;
         cx.update(|app| theme_settings::apply_scheme(app, target_scheme));
         settle(cx, 400).await;
@@ -1137,7 +1137,7 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
             .unwrap_or(AccentPreset::Ocean);
         cx.update(|app| {
             theme_settings::apply_scheme(app, baseline_scheme);
-            theme_settings::apply_accent(app, baseline_preset);
+            theme_settings::apply_accent(app, AccentSelection::Preset(baseline_preset));
         });
         settle(cx, 200).await;
     } else {

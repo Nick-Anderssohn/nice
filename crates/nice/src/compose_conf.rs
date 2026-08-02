@@ -104,12 +104,15 @@ pub(crate) fn rewrite(cx: &mut App) {
     if cx.try_global::<ComposeConfStore>().is_none() {
         return;
     }
-    let accent = cx
-        .try_global::<crate::theme_settings::ThemeSettingsStore>()
-        .map(|s| s.active_accent().hex())
-        .unwrap_or_else(|| nice_theme::AccentPreset::Terracotta.hex());
+    // The RESOLVED accent (a preset's color, or the active scheme's
+    // theme-derived hue under "From theme") — so the spinner tint tracks both
+    // selection kinds. Falls back to Terracotta without the theme globals.
+    let accent = crate::claude_theme_sync::Rgb8::from_srgba(
+        crate::theme_settings::active_accent_color(cx),
+    )
+    .hex();
     let store = cx.global::<ComposeConfStore>();
-    let body = render(accent, &store.model, &store.effort);
+    let body = render(&accent, &store.model, &store.effort);
     if let Err(e) = write_atomic(&store.path, &body) {
         eprintln!("nice: compose conf write failed: {e}");
     }

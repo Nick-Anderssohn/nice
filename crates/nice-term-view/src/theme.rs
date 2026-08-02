@@ -63,6 +63,16 @@ pub struct TerminalTheme {
     /// The selection color. `None` => the renderer's default selection tint
     /// (selection *rendering* is a later slice; the value rides here now).
     pub selection: Option<TerminalColor>,
+    /// The theme's own identity hue — the color the app's accent derives from
+    /// when the user picks the "From theme" accent selection. `None` => the
+    /// resolve layer falls back to `ansi[4]` (normal blue), the slot theme
+    /// authors treat as the primary saturated hue.
+    ///
+    /// **The renderer never reads this.** It exists purely so the app crate's
+    /// `ThemeState` resolution has a declared hue to prefer over the ANSI
+    /// fallback; `cursor` / `foreground` are deliberately NOT part of that
+    /// chain (they are near-monochrome by design and make washed-out chrome).
+    pub accent: Option<TerminalColor>,
     /// The 16 ANSI palette entries, indices 0–7 normal then 8–15 bright — the
     /// only palette entries a theme configures.
     pub ansi: [TerminalColor; 16],
@@ -78,6 +88,7 @@ impl TerminalTheme {
             foreground: TerminalColor::new(0xf4, 0xf0, 0xef), // niceDefaultDark foreground
             cursor: None,                                     // caret follows accent
             selection: Some(TerminalColor::new(0x3a, 0x34, 0x30)), // niceDefaultDark selection
+            accent: Some(TerminalColor::new(0xc9, 0x64, 0x42)), // Nice terracotta (#c96442)
             ansi: [
                 TerminalColor::new(0x09, 0x07, 0x05), // 0  black = niceBg3
                 TerminalColor::new(0xc2, 0x36, 0x21), // 1  red
@@ -108,6 +119,7 @@ impl TerminalTheme {
             foreground: TerminalColor::new(0x17, 0x13, 0x0f), // niceDefaultLight foreground
             cursor: None,                                     // caret follows accent
             selection: Some(TerminalColor::new(0xe8, 0xdf, 0xd6)), // niceDefaultLight selection
+            accent: Some(TerminalColor::new(0xc9, 0x64, 0x42)), // Nice terracotta (#c96442)
             ansi: [
                 TerminalColor::new(0x17, 0x13, 0x0f), // 0  black = niceInk
                 TerminalColor::new(0xb7, 0x40, 0x20), // 1  red
@@ -154,6 +166,9 @@ mod tests {
         assert_eq!(t.foreground, TerminalColor::new(244, 240, 239));
         assert_eq!(t.cursor, None);
         assert_eq!(t.selection, Some(TerminalColor::new(58, 52, 48)));
+        // The Nice identity hue the "From theme" accent derives (terracotta,
+        // the same #c96442 as `AccentPreset::Terracotta`).
+        assert_eq!(t.accent, Some(TerminalColor::new(201, 100, 66)));
         // A representative slice of the 16 ANSI entries (0, 1, 7, 8, 15).
         assert_eq!(t.ansi[0], TerminalColor::new(9, 7, 5)); // black = niceBg3
         assert_eq!(t.ansi[1], TerminalColor::new(194, 54, 33)); // red
@@ -170,6 +185,7 @@ mod tests {
         assert_eq!(t.foreground, TerminalColor::new(23, 19, 15));
         assert_eq!(t.cursor, None);
         assert_eq!(t.selection, Some(TerminalColor::new(232, 223, 214)));
+        assert_eq!(t.accent, Some(TerminalColor::new(201, 100, 66)));
         assert_eq!(t.ansi[0], TerminalColor::new(23, 19, 15)); // black = niceInk
         assert_eq!(t.ansi[4], TerminalColor::new(40, 96, 175)); // blue
         assert_eq!(t.ansi[15], TerminalColor::new(23, 19, 15)); // bright white stays dark

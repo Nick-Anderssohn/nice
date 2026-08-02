@@ -36,11 +36,11 @@
 //! `apply_*` call + the exact a11y id".
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, AsyncApp, Context, FontWeight, MouseButton, Rgba,
-    SharedString, Window,
+    div, linear_color_stop, linear_gradient, prelude::*, px, AnyElement, App, AsyncApp, Context,
+    FontWeight, MouseButton, Rgba, SharedString, Window,
 };
 
-use nice_theme::glass::{glass_fill_x, glass_line};
+use nice_theme::glass::{glass_fill_x, glass_line, glass_line_strong};
 use nice_theme::palette::ColorScheme;
 use nice_theme::AccentPreset;
 
@@ -51,7 +51,7 @@ use crate::settings::root::{
 };
 use crate::terminal_theme_catalog::{CatalogEntry, TerminalThemeCatalog, ThemeImportError};
 use crate::theme::{slot_to_rgba, srgba_to_rgba};
-use crate::theme_settings::{self, ThemeSettingsStore};
+use crate::theme_settings::{self, AccentSelection, ThemeSettingsStore};
 
 // ===========================================================================
 // §ImportError — the human-readable mapping R23 OWNS
@@ -269,6 +269,15 @@ fn accent_label(accent: AccentPreset) -> &'static str {
     }
 }
 
+/// A user-facing label for an [`AccentSelection`] — a preset's own name, or
+/// "From theme" for the theme-derived entry (its a11y label, per the plan).
+fn accent_selection_label(selection: AccentSelection) -> &'static str {
+    match selection {
+        AccentSelection::Preset(p) => accent_label(p),
+        AccentSelection::FromTheme => "From theme",
+    }
+}
+
 /// The Appearance pane body (The spec §Appearance) — round-2 restyle plan 06
 /// regroup: scheme-independent controls on top (OS-sync + accent + the manual
 /// Scheme flip), a per-scheme subsection headed by Light/Dark tabs (theme
@@ -330,7 +339,36 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     ));
 
     // --- Accent (scheme-independent) ---------------------------------------
-    col = col.child(setting_row("Accent", accent_control(appearance.accent, ink), cx));
+    // The row is scheme-independent, so the trailing "From theme" entry shows
+    // BOTH schemes' derived accents at once (the split disc's two halves);
+    // the hint line below then names what the LIVE scheme resolves right now.
+    let derived_light = srgba_to_rgba(theme_settings::derived_accent_for(cx, ColorScheme::Light));
+    let derived_dark = srgba_to_rgba(theme_settings::derived_accent_for(cx, ColorScheme::Dark));
+    let hairline_strong = srgba_to_rgba(glass_line_strong(active_scheme));
+    col = col.child(setting_row(
+        "Accent",
+        accent_control(
+            appearance.accent,
+            ink,
+            hairline_strong,
+            derived_light,
+            derived_dark,
+        ),
+        cx,
+    ));
+
+    // The hint line — only while "From theme" is selected. It names the ACTIVE
+    // scheme's source theme and shows the accent that scheme currently derives.
+    let active_entries: &[CatalogEntry] = match active_scheme {
+        ColorScheme::Light => &light_themes,
+        ColorScheme::Dark => &dark_themes,
+    };
+    let active_theme_name =
+        theme_display_name(active_entries, appearance.terminal_theme_id_for(active_scheme));
+    if let Some(name) = accent_hint_theme_name(appearance.accent, &active_theme_name) {
+        let effective = srgba_to_rgba(theme_settings::derived_accent_for(cx, active_scheme));
+        col = col.child(accent_hint(name, effective, ink2, ink3));
+    }
 
     // --- Per-scheme subsection: Light/Dark tabs ----------------------------
     // The tabs head the subsection (same text + accent-underline grammar as the
@@ -478,34 +516,110 @@ fn scheme_tabs(
         .child(tab("Dark mode", "dark", ColorScheme::Dark))
 }
 
-/// The five accent swatches (a11y `settings.appearance.accent`); the selected one
-/// carries an `ink` ring offset 2px off the swatch (mock `.swatch.sel`). Every
-/// cell reserves the ring's footprint (a transparent border when unselected) so
-/// selection never shifts the row. Click → `apply_accent`.
-fn accent_control(selected: AccentPreset, ink: Rgba) -> impl IntoElement {
+// --- Accent row (five presets + the trailing "From theme" entry) ------------
+
+/// One entry in the Accent row: each of the five [`AccentPreset`] swatches, then
+/// the trailing "From theme" split disc. Carries the entry's selection contract
+/// — [`AccentEntry::select`] is the exact path its click runs — so the ordering,
+/// the a11y id → `apply_accent` mapping, and the divider placement are all
+/// unit-testable without a gpui window (the [`SchemeSegment`] precedent).
+pub(crate) struct AccentEntry {
+    id: SharedString,
+    label: &'static str,
+    selection: AccentSelection,
+    selected: bool,
+    /// A `hairline_strong` divider precedes this entry — true only for "From
+    /// theme", which sits apart from the five fixed presets (the mock's
+    /// `.accent-divider`).
+    leading_divider: bool,
+}
+
+impl AccentEntry {
+    /// Run the entry's click contract: `apply_accent(selection)`.
+    pub(crate) fn select(&self, cx: &mut App) {
+        theme_settings::apply_accent(cx, self.selection);
+    }
+}
+
+/// The Accent row's entries for the current `selected` selection, in render
+/// order: `AccentPreset::ALL`, then "From theme" behind the divider.
+fn accent_entries(selected: AccentSelection) -> Vec<AccentEntry> {
+    let entry = |selection: AccentSelection, leading_divider: bool| AccentEntry {
+        id: SharedString::from(format!(
+            "settings.appearance.accent.{}",
+            selection.raw_value()
+        )),
+        label: accent_selection_label(selection),
+        selection,
+        selected: selected == selection,
+        leading_divider,
+    };
+    let mut entries: Vec<AccentEntry> = AccentPreset::ALL
+        .into_iter()
+        .map(|p| entry(AccentSelection::Preset(p), false))
+        .collect();
+    entries.push(entry(AccentSelection::FromTheme, true));
+    entries
+}
+
+/// `Some(theme_name)` when the Accent row's hint line renders — i.e. only while
+/// "From theme" is selected; `None` under any preset (the mock shows the hint
+/// exclusively in the theme-driven state).
+fn accent_hint_theme_name(selected: AccentSelection, theme_name: &str) -> Option<SharedString> {
+    selected
+        .is_from_theme()
+        .then(|| SharedString::from(theme_name.to_string()))
+}
+
+/// The accent swatches (a11y `settings.appearance.accent`): the five presets,
+/// a 1px `hairline_strong` divider, then the "From theme" split disc. The
+/// selected entry carries an `ink` ring offset 2px off the swatch (mock
+/// `.cell.sel`); every cell reserves that footprint (a transparent border when
+/// unselected) so selection never shifts the row — the from-theme entry uses
+/// the identical grammar. Click → `apply_accent`.
+fn accent_control(
+    selected: AccentSelection,
+    ink: Rgba,
+    hairline_strong: Rgba,
+    derived_light: Rgba,
+    derived_dark: Rgba,
+) -> impl IntoElement {
     let mut row = div()
         .id("settings.appearance.accent")
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0));
-    for preset in AccentPreset::ALL {
-        let is_selected = preset == selected;
-        let swatch = div()
-            .id(SharedString::from(format!(
-                "settings.appearance.accent.{}",
-                preset.raw_value()
-            )))
+    for entry in accent_entries(selected) {
+        if entry.leading_divider {
+            // The 1px/16px rule setting the theme-driven entry apart from the
+            // five fixed presets (mock `.accent-divider`).
+            row = row.child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .mx(px(1.0))
+                    .bg(hairline_strong),
+            );
+        }
+        let (selection, is_selected) = (entry.selection, entry.selected);
+        let mut swatch = div()
+            .id(entry.id.clone())
             .role(gpui::Role::Button)
-            .aria_label(accent_label(preset))
+            .aria_label(entry.label)
+            .relative()
             .size(px(16.0))
             .rounded(px(8.0))
-            .bg(srgba_to_rgba(preset.color()))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
-                theme_settings::apply_accent(cx, preset);
+                entry.select(cx);
             });
-        // The offset ring: a same-size cell across all swatches (transparent
+        swatch = match selection {
+            AccentSelection::Preset(preset) => swatch.bg(srgba_to_rgba(preset.color())),
+            AccentSelection::FromTheme => split_disc(swatch, derived_light, derived_dark),
+        };
+        // The offset ring: a same-size cell across all entries (transparent
         // border unselected) so the selected ink ring adds no layout shift.
         row = row.child(
             div()
@@ -524,6 +638,98 @@ fn accent_control(selected: AccentPreset, ink: Rgba) -> impl IntoElement {
         );
     }
     row
+}
+
+/// The "From theme" disc's diagonal split angle — CSS degrees, 0 = up, clockwise
+/// (gpui's [`linear_gradient`] convention), so 135° runs upper-left → lower-right:
+/// the upper-left half is the LIGHT slot's derived accent, the lower-right the
+/// DARK slot's (mock `.disc.fromtheme`).
+const SPLIT_DISC_ANGLE: f32 = 135.0;
+
+/// Half the seam's width in gradient-`t` units. gpui normalizes `t` over the
+/// element's bounding box along the gradient line, so on the 16px disc 1px is
+/// `1/16` of the range — a 1px seam therefore spans `±1/32` around the midpoint.
+const SPLIT_SEAM_HALF_T: f32 = 1.0 / 32.0;
+
+/// The spread between the two stops of a hard-edged band. gpui's gradient
+/// shader divides by `stop1.percentage - stop0.percentage`, so identical
+/// percentages are not an option; `0.0025` of the range is ~1/25 of a pixel
+/// here — an edge, with antialiasing, not a visible ramp.
+const SPLIT_HARD_STOP_T: f32 = 0.0025;
+
+/// Paint the "From theme" split disc onto `disc` (a 16px rounded div): the light
+/// slot's derived accent in the upper-left, the dark slot's in the lower-right,
+/// parted by a 1px seam.
+///
+/// gpui backgrounds carry only TWO color stops, so the three bands are two
+/// stacked gradients: the base fades the light half out at the seam's leading
+/// edge, and an overlay fades the dark half in at its trailing edge. The seam
+/// itself is left fully transparent — what shows through is the settings
+/// window's own surface, which is exactly the mock's `--seam: var(--win-bg)`
+/// and self-adapts to the scheme (and to the window's translucency) for free.
+fn split_disc(
+    disc: gpui::Stateful<gpui::Div>,
+    light: Rgba,
+    dark: Rgba,
+) -> gpui::Stateful<gpui::Div> {
+    let clear = |c: Rgba| Rgba { a: 0.0, ..c };
+    let seam_start = 0.5 - SPLIT_SEAM_HALF_T;
+    let seam_end = 0.5 + SPLIT_SEAM_HALF_T;
+    disc.bg(linear_gradient(
+        SPLIT_DISC_ANGLE,
+        linear_color_stop(light, seam_start - SPLIT_HARD_STOP_T),
+        linear_color_stop(clear(light), seam_start),
+    ))
+    .child(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size(px(16.0))
+            .rounded(px(8.0))
+            .bg(linear_gradient(
+                SPLIT_DISC_ANGLE,
+                linear_color_stop(clear(dark), seam_end),
+                linear_color_stop(dark, seam_end + SPLIT_HARD_STOP_T),
+            )),
+    )
+}
+
+/// The hint line under the Accent row, rendered only under "From theme" (mock
+/// `.accent-hint`): right-aligned 11px `ink3` copy naming the ACTIVE scheme's
+/// source theme in `ink2`, with a 9px swatch of the accent that theme currently
+/// derives. A11y `settings.appearance.accent.hint`.
+fn accent_hint(
+    theme_name: SharedString,
+    effective: Rgba,
+    ink2: Rgba,
+    ink3: Rgba,
+) -> impl IntoElement {
+    div()
+        .id("settings.appearance.accent.hint")
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .gap(px(4.0))
+        .pt(px(2.0))
+        .pb(px(6.0))
+        .text_size(px(11.0))
+        .text_color(ink3)
+        .child("Accent follows the theme — now")
+        .child(
+            div()
+                .flex_none()
+                .size(px(9.0))
+                .rounded(px(4.5))
+                .bg(effective),
+        )
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ink2)
+                .child(theme_name),
+        )
 }
 
 // --- Scheme control (the manual light/dark flip) ----------------------------
@@ -1279,6 +1485,120 @@ mod tests {
                 ColorScheme::Light,
                 "a sync-locked segment never flips the scheme"
             );
+        });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- The Accent row's six entries (plan: accent-from-theme, seam 2) -------
+
+    /// The row renders SIX entries — the five presets in `AccentPreset::ALL`
+    /// order, then "From theme" — each with its persisted-rawValue a11y id and
+    /// its display label.
+    #[test]
+    fn accent_row_renders_six_entries_with_from_theme_last() {
+        let entries = accent_entries(AccentSelection::default());
+        assert_eq!(entries.len(), 6, "five presets + the From theme entry");
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "settings.appearance.accent.terracotta",
+                "settings.appearance.accent.ocean",
+                "settings.appearance.accent.fern",
+                "settings.appearance.accent.iris",
+                "settings.appearance.accent.graphite",
+                "settings.appearance.accent.from-theme",
+            ]
+        );
+        let last = entries.last().unwrap();
+        assert_eq!(last.label, "From theme");
+        assert_eq!(last.selection, AccentSelection::FromTheme);
+        assert_eq!(entries[0].label, "Terracotta");
+    }
+
+    /// The divider sits between the five fixed presets and the theme-driven
+    /// entry — exactly one, immediately before "From theme".
+    #[test]
+    fn only_the_from_theme_entry_trails_behind_the_divider() {
+        let entries = accent_entries(AccentSelection::FromTheme);
+        let dividers: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.leading_divider)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(dividers, vec![5], "one divider, right before From theme");
+    }
+
+    /// The selection ring follows the stored selection across BOTH kinds: a
+    /// preset rings its own swatch and leaves the split disc bare; "From theme"
+    /// rings the split disc and leaves every preset bare.
+    #[test]
+    fn accent_selection_ring_tracks_both_selection_kinds() {
+        let ringed = |sel: AccentSelection| -> Vec<String> {
+            accent_entries(sel)
+                .into_iter()
+                .filter(|e| e.selected)
+                .map(|e| e.id.to_string())
+                .collect()
+        };
+        assert_eq!(
+            ringed(AccentSelection::Preset(AccentPreset::Ocean)),
+            vec!["settings.appearance.accent.ocean".to_string()]
+        );
+        assert_eq!(
+            ringed(AccentSelection::FromTheme),
+            vec!["settings.appearance.accent.from-theme".to_string()]
+        );
+    }
+
+    /// The hint line renders ONLY under "From theme", and names the theme it is
+    /// handed (the pane passes the ACTIVE scheme's source theme).
+    #[test]
+    fn the_hint_line_shows_only_under_from_theme() {
+        assert_eq!(
+            accent_hint_theme_name(AccentSelection::FromTheme, "Gruvbox Dark").as_deref(),
+            Some("Gruvbox Dark")
+        );
+        for preset in AccentPreset::ALL {
+            assert_eq!(
+                accent_hint_theme_name(AccentSelection::Preset(preset), "Gruvbox Dark"),
+                None,
+                "a preset selection hides the hint line"
+            );
+        }
+    }
+
+    /// The entry's click contract: clicking "From theme" applies
+    /// `AccentSelection::FromTheme`, and clicking a preset applies that preset —
+    /// the same pinning `scheme_segment_selection_…` gives the Scheme control.
+    #[gpui::test]
+    fn accent_entry_selection_drives_the_exact_apply_accent_calls(cx: &mut TestAppContext) {
+        let base = setup_theme_store(cx, "accent-entries");
+        cx.update(|app| {
+            let stored = |app: &gpui::App| app.global::<ThemeSettingsStore>().appearance().accent;
+            assert_eq!(stored(app), AccentSelection::default());
+
+            let entries = accent_entries(stored(app));
+            entries
+                .iter()
+                .find(|e| e.id.as_ref() == "settings.appearance.accent.from-theme")
+                .expect("the From theme entry is offered")
+                .select(app);
+            assert_eq!(
+                stored(app),
+                AccentSelection::FromTheme,
+                "the From theme entry applied apply_accent(FromTheme)"
+            );
+
+            // …and a preset click still takes it back (the row stays a radio group).
+            let entries = accent_entries(stored(app));
+            entries
+                .iter()
+                .find(|e| e.id.as_ref() == "settings.appearance.accent.iris")
+                .expect("the Iris preset is offered")
+                .select(app);
+            assert_eq!(stored(app), AccentSelection::Preset(AccentPreset::Iris));
         });
         let _ = std::fs::remove_dir_all(&base);
     }

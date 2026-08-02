@@ -14,6 +14,13 @@
 //! provenance fixture per theme (double-entry, crates/README "Fixture-provenance
 //! convention") so a fat-fingered value fails the build.
 //!
+//! The `accent` slot is NOT from Swift — it is the hand-curated identity hue
+//! each theme derives under the "From theme" accent selection (the
+//! `accent-from-theme` plan's locked table). It is deliberately each theme's
+//! primary hue, NOT its cursor color (cursors are near-monochrome by design and
+//! make washed-out chrome). [`every_built_in_accent_matches_the_curated_table`]
+//! pins the whole table.
+//!
 //! Boundary note (TRANCHE-2-NOTES §4): this is an **app-crate** concern. It
 //! composes catalog metadata over the render subset; nothing leaks into
 //! `nice-term-*`.
@@ -132,6 +139,7 @@ const fn solarized_light() -> TerminalTheme {
         foreground: c(0x65, 0x7b, 0x83), // base00
         cursor: Some(c(0x58, 0x6e, 0x75)), // base01
         selection: Some(c(0xee, 0xe8, 0xd5)), // base2
+        accent: Some(c(0x26, 0x8b, 0xd2)), // Solarized blue (the shared accent hue)
         ansi: [
             c(0x07, 0x36, 0x42), // 0  black = base02
             c(0xdc, 0x32, 0x2f), // 1  red
@@ -160,6 +168,7 @@ const fn solarized_dark() -> TerminalTheme {
         foreground: c(0x83, 0x94, 0x96), // base0
         cursor: Some(c(0x93, 0xa1, 0xa1)), // base1
         selection: Some(c(0x07, 0x36, 0x42)), // base02
+        accent: Some(c(0x26, 0x8b, 0xd2)), // Solarized blue (the shared accent hue)
         ansi: [
             c(0x07, 0x36, 0x42), // 0  black = base02
             c(0xdc, 0x32, 0x2f), // 1  red
@@ -190,6 +199,7 @@ const fn dracula() -> TerminalTheme {
         foreground: c(0xf8, 0xf8, 0xf2),
         cursor: Some(c(0xf8, 0xf8, 0xf2)),
         selection: Some(c(0x44, 0x47, 0x5a)),
+        accent: Some(c(0xbd, 0x93, 0xf9)), // Dracula purple
         ansi: [
             c(0x21, 0x22, 0x2c), // 0  black
             c(0xff, 0x55, 0x55), // 1  red
@@ -220,6 +230,7 @@ const fn nord() -> TerminalTheme {
         foreground: c(0xd8, 0xde, 0xe9),
         cursor: Some(c(0xd8, 0xde, 0xe9)),
         selection: Some(c(0x43, 0x4c, 0x5e)),
+        accent: Some(c(0x88, 0xc0, 0xd0)), // Nord frost cyan (nord8)
         ansi: [
             c(0x3b, 0x42, 0x52), // 0  black
             c(0xbf, 0x61, 0x6a), // 1  red
@@ -251,6 +262,7 @@ const fn gruvbox_light() -> TerminalTheme {
         foreground: c(0x3c, 0x38, 0x36),
         cursor: Some(c(0x3c, 0x38, 0x36)),
         selection: Some(c(0xeb, 0xdb, 0xb2)),
+        accent: Some(c(0xd6, 0x5d, 0x0e)), // Gruvbox orange
         ansi: [
             c(0xfb, 0xf1, 0xc7), // 0  black (bg0)
             c(0xcc, 0x24, 0x1d), // 1  red
@@ -279,6 +291,7 @@ const fn gruvbox_dark() -> TerminalTheme {
         foreground: c(0xeb, 0xdb, 0xb2),
         cursor: Some(c(0xeb, 0xdb, 0xb2)),
         selection: Some(c(0x66, 0x5c, 0x54)),
+        accent: Some(c(0xfe, 0x80, 0x19)), // Gruvbox bright orange
         ansi: [
             c(0x28, 0x28, 0x28), // 0  black (bg0)
             c(0xcc, 0x24, 0x1d), // 1  red
@@ -310,6 +323,7 @@ const fn catppuccin_latte() -> TerminalTheme {
         foreground: c(0x4c, 0x4f, 0x69),
         cursor: Some(c(0xdc, 0x8a, 0x78)), // Rosewater
         selection: Some(c(0xac, 0xb0, 0xbe)), // Surface2
+        accent: Some(c(0x72, 0x87, 0xfd)), // Latte Lavender
         ansi: [
             c(0x5c, 0x5f, 0x77), // 0  black
             c(0xd2, 0x0f, 0x39), // 1  red
@@ -338,6 +352,7 @@ const fn catppuccin_mocha() -> TerminalTheme {
         foreground: c(0xcd, 0xd6, 0xf4),
         cursor: Some(c(0xf5, 0xe0, 0xdc)), // Rosewater
         selection: Some(c(0x58, 0x5b, 0x70)), // Surface2
+        accent: Some(c(0xb4, 0xbe, 0xfe)), // Mocha Lavender
         ansi: [
             c(0x45, 0x47, 0x5a), // 0  black
             c(0xf3, 0x8b, 0xa8), // 1  red
@@ -369,6 +384,7 @@ const fn tokyo_night() -> TerminalTheme {
         foreground: c(0xc0, 0xca, 0xf5),
         cursor: Some(c(0xc0, 0xca, 0xf5)),
         selection: Some(c(0x28, 0x34, 0x57)),
+        accent: Some(c(0x7a, 0xa2, 0xf7)), // Tokyo Night blue
         ansi: [
             c(0x15, 0x16, 0x1e), // 0  black
             c(0xf7, 0x76, 0x8e), // 1  red
@@ -400,6 +416,7 @@ const fn one_dark() -> TerminalTheme {
         foreground: c(0xab, 0xb2, 0xbf),
         cursor: Some(c(0xab, 0xb2, 0xbf)),
         selection: Some(c(0x32, 0x38, 0x44)),
+        accent: Some(c(0x61, 0xaf, 0xef)), // One Dark blue
         ansi: [
             c(0x21, 0x25, 0x2b), // 0  black
             c(0xe0, 0x6c, 0x75), // 1  red
@@ -471,6 +488,47 @@ mod tests {
     fn nice_defaults_reuse_view_crate_ctors() {
         assert_eq!(find("nice-default-light").theme, TerminalTheme::nice_default_light());
         assert_eq!(find("nice-default-dark").theme, TerminalTheme::nice_default_dark());
+    }
+
+    /// Every catalog theme's curated `accent` matches the locked table in
+    /// `docs/plans/accent-from-theme.md` — the identity hue "From theme"
+    /// derives, independently transcribed here. The two Nice defaults get their
+    /// terracotta from the view-crate ctors (pinned in
+    /// `nice-term-view/src/theme.rs`); this asserts the value that reaches the
+    /// catalog is the same one.
+    #[test]
+    fn every_built_in_accent_matches_the_curated_table() {
+        let expected: [(&str, TerminalColor); 12] = [
+            ("nice-default-light", c(0xc9, 0x64, 0x42)),
+            ("nice-default-dark", c(0xc9, 0x64, 0x42)),
+            ("solarized-light", c(0x26, 0x8b, 0xd2)),
+            ("solarized-dark", c(0x26, 0x8b, 0xd2)),
+            ("dracula", c(0xbd, 0x93, 0xf9)),
+            ("nord", c(0x88, 0xc0, 0xd0)),
+            ("gruvbox-light", c(0xd6, 0x5d, 0x0e)),
+            ("gruvbox-dark", c(0xfe, 0x80, 0x19)),
+            ("catppuccin-latte", c(0x72, 0x87, 0xfd)),
+            ("catppuccin-mocha", c(0xb4, 0xbe, 0xfe)),
+            ("tokyo-night", c(0x7a, 0xa2, 0xf7)),
+            ("one-dark", c(0x61, 0xaf, 0xef)),
+        ];
+        // The table covers EVERY built-in — a new theme without a curated accent
+        // fails here rather than silently falling back to `ansi[4]`.
+        assert_eq!(expected.len(), built_in_terminal_themes().len());
+        for (id, accent) in expected {
+            assert_eq!(find(id).theme.accent, Some(accent), "{id} accent");
+        }
+    }
+
+    /// The curated accent is the theme's identity hue, NOT its cursor — the
+    /// locked decision behind the resolution chain (cursors are near-monochrome
+    /// by design). Pinned on the themes where the two genuinely differ.
+    #[test]
+    fn curated_accent_is_never_the_cursor_color() {
+        for id in ["dracula", "catppuccin-mocha", "nord", "tokyo-night", "one-dark"] {
+            let t = find(id).theme;
+            assert_ne!(t.accent, t.cursor, "{id} accent must not be its cursor");
+        }
     }
 
     // Each check below re-transcribes bg/fg/cursor/selection + a representative

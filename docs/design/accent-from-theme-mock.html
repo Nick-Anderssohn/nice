@@ -1,0 +1,349 @@
+<title>Nice · “From theme” accent — revised</title>
+<style>
+  :root {
+    --pg-bg: #141210;
+    --pg-panel: #1d1916;
+    --pg-ink: #eee9e4;
+    --pg-ink2: #a49e98;
+    --pg-ink3: #6f6a66;
+    --pg-line: rgba(255,255,255,.08);
+    --pg-accent: #c96442;
+    --mono: ui-monospace, "SF Mono", "Menlo", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+
+    /* the live derived accents, driven by the switcher below. Seeded to the
+       CURATED theme accents (built_in_terminal_themes.rs): Catppuccin Latte
+       (light) + Gruvbox Dark (dark). */
+    --derived-light: #7287fd;
+    --derived-dark:  #fe8019;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: radial-gradient(120% 80% at 50% -8%, #211c19 0%, var(--pg-bg) 58%) fixed;
+    color: var(--pg-ink2); font: 14px/1.6 var(--sans); padding: 0 0 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 0 28px; }
+  header.page { padding: 54px 0 4px; }
+  .eyebrow { font: 600 11px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; color: var(--pg-accent); margin: 0; }
+  h1 { font: 600 27px/1.25 var(--sans); color: var(--pg-ink); margin: 12px 0 10px; letter-spacing: -.01em; text-wrap: balance; }
+  .lede { max-width: 66ch; margin: 0; }
+  .lede b { color: var(--pg-ink); font-weight: 600; }
+  h2 { font: 600 15px/1.3 var(--sans); color: var(--pg-ink); margin: 46px 0 6px; }
+  .note { max-width: 68ch; font-size: 13px; margin: 4px 0 0; }
+  figure { margin: 16px 0 0; }
+  figcaption { font-size: 12px; color: var(--pg-ink3); margin: 10px 2px 0; max-width: 72ch; }
+  code { font: 500 12px var(--mono); color: var(--pg-ink); }
+
+  /* ── live example-theme switcher ────────────────────────────────── */
+  .switcher {
+    position: sticky; top: 0; z-index: 30; margin: 30px 0 6px;
+    background: color-mix(in srgb, var(--pg-bg) 85%, transparent);
+    backdrop-filter: blur(14px);
+    border-top: 1px solid var(--pg-line); border-bottom: 1px solid var(--pg-line);
+  }
+  .switcher .inner { max-width: 1000px; margin: 0 auto; padding: 12px 28px; display: grid; gap: 9px; }
+  .swrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .swrow .cap { font: 600 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--pg-ink3); flex: 0 0 92px; }
+  .tbtn {
+    display: inline-flex; align-items: center; gap: 8px; font: 500 12.5px/1 var(--sans);
+    color: var(--pg-ink2); background: rgba(255,255,255,.04); border: 1px solid var(--pg-line);
+    padding: 6px 10px 6px 8px; border-radius: 8px; cursor: pointer;
+    transition: border-color .12s, color .12s, background .12s;
+  }
+  .tbtn:hover { color: var(--pg-ink); border-color: #4a423c; }
+  .tbtn[aria-pressed="true"] { color: var(--pg-ink); border-color: var(--pg-accent); background: color-mix(in srgb, var(--pg-accent) 14%, transparent); }
+  .tbtn .dot { width: 12px; height: 12px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(127,127,127,.4); }
+  .tbtn .dot.fallback { box-shadow: inset 0 0 0 1px rgba(127,127,127,.4), 0 0 0 1px #6a635d; }
+
+  /* ── Nice chrome tokens (verbatim, both schemes) ────────────────── */
+  .scheme-dark {
+    --ink: #f4f1ef; --ink2: #b1adaa; --ink3: #75706d;
+    --hairline: rgba(255,255,255,.08); --hairline-strong: rgba(255,255,255,.10);
+    --fill-x: rgba(255,255,255,.08); --win-ring: rgba(255,255,255,.14);
+    --desk: #1a1512; --win-bg: #0d0b09; --seam: #0d0b09;
+    --accent: var(--derived-dark);      /* From-theme is selected → chrome follows the dark theme */
+    --derived-here: var(--derived-dark);
+  }
+  .scheme-light {
+    --ink: #17130f; --ink2: #46423e; --ink3: #7e7976;
+    --hairline: rgba(23,19,15,.10); --hairline-strong: rgba(23,19,15,.12);
+    --fill-x: rgba(23,19,15,.08); --win-ring: rgba(0,0,0,.14);
+    --desk: #d9d3cc; --win-bg: #fdfaf8; --seam: #fdfaf8;
+    --accent: var(--derived-light);
+    --derived-here: var(--derived-light);
+  }
+
+  /* settings-window mock */
+  .desk-panel { background: var(--desk); border-radius: 14px; padding: 30px; overflow-x: auto; }
+  .window { width: 620px; max-width: 100%; margin: 0 auto; background: var(--win-bg); border: 1px solid var(--win-ring); border-radius: 12px; box-shadow: 0 18px 44px rgba(0,0,0,.30); color: var(--ink2); overflow: hidden; }
+  .titlebar { position: relative; height: 40px; display: flex; align-items: center; justify-content: center; border-bottom: 1px solid var(--hairline); font-size: 12px; color: var(--ink2); }
+  .lights { position: absolute; left: 14px; display: flex; gap: 8px; }
+  .light { width: 12px; height: 12px; border-radius: 50%; }
+  .light.r { background: #ff5f57; } .light.y { background: #febc2e; } .light.g { background: #28c840; }
+  .set-body { display: flex; font-size: 12px; }
+  .set-nav { width: 146px; flex: none; display: flex; flex-direction: column; gap: 1px; border-right: 1px solid var(--hairline); padding: 8px 0 18px; }
+  .set-nav .row { padding: 5px 16px; color: var(--ink2); }
+  .set-nav .row.active { color: var(--accent); font-weight: 600; transition: color .15s; }
+  .set-pane { flex: 1; min-width: 0; padding: 14px 22px 18px; }
+  .set-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 0; color: var(--ink2); }
+  .set-row > span:first-child { color: var(--ink); }
+  .set-row .val { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .toggle { flex: none; position: relative; width: 32px; height: 18px; border-radius: 9px; background: var(--fill-x); transition: background .15s; }
+  .toggle i { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--ink3); }
+  .toggle.on { background: var(--accent); } .toggle.on i { left: auto; right: 2px; background: #fff; }
+  .scheme-seg { flex: none; display: inline-flex; border: 1px solid var(--hairline); border-radius: 7px; overflow: hidden; }
+  .scheme-seg span { padding: 4px 12px; color: var(--ink3); }
+  .scheme-seg span.sel { background: var(--fill-x); color: var(--ink); }
+  .scheme-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--hairline); margin: 14px 0 4px; }
+  .scheme-tab { position: relative; padding: 6px 12px; color: var(--ink3); }
+  .scheme-tab.active { color: var(--ink); }
+  .scheme-tab.active::after { content: ""; position: absolute; left: 11px; right: 11px; bottom: -1px; height: 1px; background: var(--accent); transition: background .15s; }
+  .dropdown { flex: none; display: inline-flex; align-items: center; gap: 10px; padding: 5px 12px; border: 1px solid var(--hairline); border-radius: 7px; color: var(--ink); white-space: nowrap; }
+  .dropdown .chev { color: var(--ink3); font-size: 10px; }
+
+  /* the Accent row — real geometry from accent_control() */
+  .accent-cells { display: flex; align-items: center; gap: 8px; }
+  .cell { flex: none; display: inline-flex; padding: 2px; border: 1px solid transparent; border-radius: 11px; line-height: 0; cursor: pointer; }
+  .cell.sel { border-color: var(--ink); }
+  .disc { display: inline-block; width: 16px; height: 16px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(127,127,127,.28); }
+
+  /* NEW: the "From theme" split disc — upper-left = light theme's derived
+     accent, lower-right = dark theme's; 1px seam in the surface color so it
+     reads as two chips, not a gradient. Both halves live. */
+  .disc.fromtheme {
+    background: linear-gradient(135deg,
+      var(--derived-light) calc(50% - .6px),
+      var(--seam) calc(50% - .6px) calc(50% + .6px),
+      var(--derived-dark) calc(50% + .6px));
+    box-shadow: inset 0 0 0 1px rgba(127,127,127,.32);
+    transition: background .15s;
+  }
+  .accent-divider { flex: none; width: 1px; height: 16px; background: var(--hairline-strong); margin: 0 1px; }
+  .accent-hint { padding: 2px 0 6px; text-align: right; font: 11px/1.4 var(--sans); color: var(--ink3); }
+  .accent-hint b { color: var(--ink2); font-weight: 500; }
+  .accent-hint .sw-inline { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: -1px; margin: 0 1px; background: var(--derived-here); box-shadow: inset 0 0 0 1px rgba(127,127,127,.4); }
+
+  /* ── anatomy + states ───────────────────────────────────────────── */
+  .duo { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
+  .chip-panel { flex: 1 1 300px; border-radius: 12px; padding: 20px 22px; }
+  .chip-surface { background: var(--win-bg); border: 1px solid var(--win-ring); border-radius: 10px; padding: 16px 18px; display: flex; align-items: center; gap: 22px; }
+  .state { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .state small { font-size: 10px; color: var(--ink3); }
+  .anatomy { display: flex; flex-wrap: wrap; align-items: center; gap: 30px; background: var(--pg-panel); border-radius: 12px; padding: 24px 28px; margin-top: 14px; }
+  .anatomy .big { flex: none; padding: 8px; border: 3px solid #f4f1ef; border-radius: 50%; }
+  .anatomy .big .disc { width: 60px; height: 60px; }
+  .anatomy ul { list-style: none; margin: 0; padding: 0; font-size: 13px; display: grid; gap: 8px; min-width: 250px; flex: 1; }
+  .anatomy li { padding-left: 16px; position: relative; }
+  .anatomy li::before { content: ""; position: absolute; left: 0; top: .6em; width: 7px; height: 1px; background: var(--pg-accent); }
+  .anatomy li b { color: var(--pg-ink); font-weight: 600; }
+
+  /* ── decision callout ───────────────────────────────────────────── */
+  .callout { margin: 44px 0 0; padding: 22px 24px; border-radius: 12px; background: var(--pg-panel); border: 1px solid var(--pg-line); border-left: 3px solid var(--pg-accent); }
+  .callout h3 { margin: 0 0 10px; font: 600 15px/1.3 var(--sans); color: var(--pg-ink); }
+  .callout p { margin: 0 0 10px; max-width: 74ch; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout b { color: var(--pg-ink); }
+  .callout code { background: rgba(255,255,255,.06); padding: 2px 5px; border-radius: 5px; }
+  .provenance { margin-top: 26px; font-size: 12px; color: var(--pg-ink3); display: flex; gap: 20px; flex-wrap: wrap; }
+  .provenance b { color: var(--pg-ink2); font-weight: 600; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="page">
+    <p class="eyebrow">Nice · Settings · Appearance</p>
+    <h1>“From theme” — a theme-driven entry in the Accent row</h1>
+    <p class="lede">
+      A sixth entry meaning <b>derive the accent from the active theme</b> instead of a fixed
+      preset. It renders as a <b>diagonally split disc</b>: the upper-left half is the accent your
+      <b>light</b> theme yields, the lower-right is your <b>dark</b> theme’s. Two halves say
+      “this changes with context,” and no preset has two colors — so it can’t be misread as just
+      another swatch. It sits apart behind a hairline divider, keeps the row’s exact selection
+      grammar (1px ink ring, 2px offset), and — because the Accent row is scheme-independent —
+      one disc honestly shows what you’ll get in both modes at once. Change the example themes
+      below and watch the halves, the hint, and the window chrome retint live.
+    </p>
+  </header>
+</div>
+
+<div class="switcher">
+  <div class="inner">
+    <div class="swrow">
+      <span class="cap">Light theme</span>
+      <div class="themebtns" data-group="light">
+        <button class="tbtn" data-color="#7287fd" data-name="Catppuccin Latte" aria-pressed="true"><span class="dot" style="background:#7287fd"></span>Catppuccin Latte</button>
+        <button class="tbtn" data-color="#268bd2" data-name="Solarized Light" aria-pressed="false"><span class="dot" style="background:#268bd2"></span>Solarized Light</button>
+        <button class="tbtn" data-color="#c96442" data-name="Nice Light" aria-pressed="false"><span class="dot" style="background:#c96442"></span>Nice Light</button>
+        <button class="tbtn" data-color="#2860af" data-name="an imported theme" aria-pressed="false"><span class="dot fallback" style="background:#2860af"></span>Imported · ansi 4 fallback</button>
+      </div>
+    </div>
+    <div class="swrow">
+      <span class="cap">Dark theme</span>
+      <div class="themebtns" data-group="dark">
+        <button class="tbtn" data-color="#fe8019" data-name="Gruvbox Dark" aria-pressed="true"><span class="dot" style="background:#fe8019"></span>Gruvbox Dark</button>
+        <button class="tbtn" data-color="#bd93f9" data-name="Dracula" aria-pressed="false"><span class="dot" style="background:#bd93f9"></span>Dracula</button>
+        <button class="tbtn" data-color="#7aa2f7" data-name="Tokyo Night" aria-pressed="false"><span class="dot" style="background:#7aa2f7"></span>Tokyo Night</button>
+        <button class="tbtn" data-color="#c96442" data-name="Nice Dark" aria-pressed="false"><span class="dot" style="background:#c96442"></span>Nice Dark</button>
+        <button class="tbtn" data-color="#89b4fa" data-name="an imported theme" aria-pressed="false"><span class="dot fallback" style="background:#89b4fa"></span>Imported · ansi 4 fallback</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <h2>In context — dark scheme</h2>
+  <p class="note">“From theme” selected. The whole window follows the derived accent: the
+  <em>Appearance</em> nav item, the sync toggle, and the scheme-tab underline all pick up the
+  dark theme’s color. A hint under the row names the source.</p>
+  <figure>
+    <div class="desk-panel scheme-dark">
+      <div class="window">
+        <div class="titlebar"><div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div><span>Settings</span></div>
+        <div class="set-body">
+          <aside class="set-nav"><div class="row">General</div><div class="row active">Appearance</div><div class="row">Fonts</div><div class="row">Shortcuts</div></aside>
+          <div class="set-pane">
+            <div class="set-row"><span>Sync with OS appearance</span><span class="toggle on"><i></i></span></div>
+            <div class="set-row"><span>Scheme</span><span class="scheme-seg"><span>Light</span><span class="sel">Dark</span></span></div>
+            <div class="set-row">
+              <span>Accent</span>
+              <span class="accent-cells">
+                <span class="cell"><span class="disc" style="background:#c96442" title="Terracotta"></span></span>
+                <span class="cell"><span class="disc" style="background:#3b82f6" title="Ocean"></span></span>
+                <span class="cell"><span class="disc" style="background:#10b981" title="Fern"></span></span>
+                <span class="cell"><span class="disc" style="background:#7c3aed" title="Iris"></span></span>
+                <span class="cell"><span class="disc" style="background:#1f2937" title="Graphite"></span></span>
+                <span class="accent-divider"></span>
+                <span class="cell sel"><span class="disc fromtheme" title="From theme"></span></span>
+              </span>
+            </div>
+            <div class="accent-hint">Accent follows the theme — now <span class="sw-inline"></span><b data-hint="dark">Gruvbox Dark</b></div>
+            <div class="scheme-tabs"><span class="scheme-tab">Light mode</span><span class="scheme-tab active">Dark mode</span></div>
+            <div class="set-row"><span>Theme</span><span class="dropdown"><b data-drop="dark" style="font-weight:400">Gruvbox Dark</b> <span class="chev">▾</span></span></div>
+            <div class="set-row"><span>Opacity</span><span class="val">80%</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <figcaption>The split disc is stable across schemes (it always shows both halves); the
+    <em>effective</em> accent is the half for the scheme currently rendering.</figcaption>
+  </figure>
+
+  <h2>In context — light scheme</h2>
+  <figure>
+    <div class="desk-panel scheme-light">
+      <div class="window">
+        <div class="titlebar"><div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div><span>Settings</span></div>
+        <div class="set-body">
+          <aside class="set-nav"><div class="row">General</div><div class="row active">Appearance</div><div class="row">Fonts</div><div class="row">Shortcuts</div></aside>
+          <div class="set-pane">
+            <div class="set-row"><span>Sync with OS appearance</span><span class="toggle on"><i></i></span></div>
+            <div class="set-row"><span>Scheme</span><span class="scheme-seg"><span class="sel">Light</span><span>Dark</span></span></div>
+            <div class="set-row">
+              <span>Accent</span>
+              <span class="accent-cells">
+                <span class="cell"><span class="disc" style="background:#c96442" title="Terracotta"></span></span>
+                <span class="cell"><span class="disc" style="background:#3b82f6" title="Ocean"></span></span>
+                <span class="cell"><span class="disc" style="background:#10b981" title="Fern"></span></span>
+                <span class="cell"><span class="disc" style="background:#7c3aed" title="Iris"></span></span>
+                <span class="cell"><span class="disc" style="background:#1f2937" title="Graphite"></span></span>
+                <span class="accent-divider"></span>
+                <span class="cell sel"><span class="disc fromtheme" title="From theme"></span></span>
+              </span>
+            </div>
+            <div class="accent-hint">Accent follows the theme — now <span class="sw-inline"></span><b data-hint="light">Catppuccin Latte</b></div>
+            <div class="scheme-tabs"><span class="scheme-tab active">Light mode</span><span class="scheme-tab">Dark mode</span></div>
+            <div class="set-row"><span>Theme</span><span class="dropdown"><b data-drop="light" style="font-weight:400">Catppuccin Latte</b> <span class="chev">▾</span></span></div>
+            <div class="set-row"><span>Opacity</span><span class="val">90%</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <figcaption>Same 16px footprint, same divider. On the near-white surface the seam stays
+    visible because it’s drawn in the window color, not a fixed value.</figcaption>
+  </figure>
+
+  <h2>States, both surfaces</h2>
+  <div class="duo">
+    <div class="chip-panel scheme-dark">
+      <div class="chip-surface">
+        <span class="state"><span class="cell"><span class="disc fromtheme"></span></span><small>rest</small></span>
+        <span class="state"><span class="cell sel"><span class="disc fromtheme"></span></span><small>selected</small></span>
+        <span class="state"><span class="cell sel"><span class="disc" style="background:#c96442"></span></span><small>preset (compare)</small></span>
+      </div>
+    </div>
+    <div class="chip-panel scheme-light">
+      <div class="chip-surface">
+        <span class="state"><span class="cell"><span class="disc fromtheme"></span></span><small>rest</small></span>
+        <span class="state"><span class="cell sel"><span class="disc fromtheme"></span></span><small>selected</small></span>
+        <span class="state"><span class="cell sel"><span class="disc" style="background:#c96442"></span></span><small>preset (compare)</small></span>
+      </div>
+    </div>
+  </div>
+
+  <h2>Anatomy</h2>
+  <div class="anatomy scheme-dark">
+    <span class="big"><span class="disc fromtheme"></span></span>
+    <ul>
+      <li><b>16px disc</b> split at 135°: upper-left = light theme’s derived accent, lower-right = dark theme’s. Both halves <b>live</b>.</li>
+      <li><b>1px seam</b> in the window surface color → reads as two chips, not a gradient; self-adapts per scheme.</li>
+      <li><b>Selection ring unchanged</b> — 1px ink, 2px offset, footprint reserved. Exactly <code>accent_control</code>’s grammar, no collision.</li>
+      <li><b>1px hairline divider</b> sets it apart from the five fixed presets.</li>
+      <li><b>Hint line when selected</b> names the source theme + shows the effective color; a11y label “From theme”.</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <h3>Where the derived color comes from (landed 2026-08-02)</h3>
+    <p>
+      The accent tints more than the caret (selection wash, chrome, logo), so “From theme” needs
+      a <b>source color and a fallback</b>. The landed chain: the theme’s own <b>accent slot</b>
+      (<code>TerminalTheme.accent</code> — hand-curated for every built-in, file-declared for
+      future Warp-style imports) → <b><code>ansi[4]</code> blue</b> for imported themes that
+      declare none. Flip either picker to <b>“Imported · ansi 4 fallback”</b> to see the
+      fallback in action.
+    </p>
+    <p>
+      <b>Cursor and foreground are deliberately NOT in the chain</b> — they are near-monochrome
+      by design (they must contrast with everything) and make washed-out chrome; Warp’s own
+      Catppuccin file declares <code>accent: #b4befe</code> and points the cursor <em>at</em> it,
+      not the reverse. An earlier revision of this mock recommended cursor→foreground; that is
+      superseded. Under “From theme” the <em>caret</em> still honors <code>theme.cursor</code>
+      when set — only the accent derivation excludes it. The hint line names the source theme.
+    </p>
+  </div>
+
+  <div class="provenance">
+    <span><b>Split-disc concept + full-window framing</b> — Fable agent’s take</span>
+    <span><b>Live theme switcher + honest fallback</b> — first mock</span>
+    <span><b>Trailing position</b> — flippable; macOS convention would lead with it</span>
+  </div>
+</div>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    function set(group, color, name) {
+      root.style.setProperty(group === "light" ? "--derived-light" : "--derived-dark", color);
+      document.querySelectorAll('[data-hint="' + group + '"]').forEach(function (el) { el.textContent = name; });
+      document.querySelectorAll('[data-drop="' + group + '"]').forEach(function (el) {
+        el.textContent = name;
+      });
+    }
+    document.querySelectorAll(".themebtns").forEach(function (grpEl) {
+      var group = grpEl.dataset.group;
+      var btns = grpEl.querySelectorAll(".tbtn");
+      btns.forEach(function (b) {
+        b.addEventListener("click", function () {
+          btns.forEach(function (o) { o.setAttribute("aria-pressed", "false"); });
+          b.setAttribute("aria-pressed", "true");
+          set(group, b.dataset.color, b.dataset.name);
+        });
+      });
+    });
+  })();
+</script>

@@ -20,7 +20,10 @@
 //!   `sync_with_os` off (the `userPicked` analog).
 //! * **(b) accent recolors the caret.** `apply_accent` pushes a new accent into the
 //!   pane; on the cursor-None Nice theme the accent IS the caret color, so the
-//!   view's accent updates.
+//!   view's accent updates. **(b2)** over a CURSOR-BEARING theme (Solarized
+//!   Light) a PRESET still wins — the pane's theme arrives with `cursor` cleared
+//!   — while `AccentSelection::FromTheme` hands the caret back to the theme's own
+//!   cursor and derives the accent from the theme's curated hue.
 //! * **(c) terminal-theme-id: inactive is latent, the flip applies it.** Setting the
 //!   INACTIVE scheme's terminal-id does not recolor the pane (persisted, latent);
 //!   the next scheme flip makes that slot active and the pane picks it up. (The R21
@@ -67,7 +70,7 @@ use nice_term_view::{TerminalColor, TerminalTheme};
 use crate::app_shell::{AppShellView, PaneHostView};
 use crate::terminal_theme_catalog::TerminalThemeCatalog;
 use crate::theme_settings::{
-    self, OsSchemeSource, SharedThemeState, ThemeSettingsStore, ThemeState,
+    self, AccentSelection, OsSchemeSource, SharedThemeState, ThemeSettingsStore, ThemeState,
 };
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
@@ -549,7 +552,7 @@ async fn accent_leg(
     };
     // Pick an accent that differs from the current one (default is Terracotta).
     let target = AccentPreset::Fern;
-    cx.update(|app| theme_settings::apply_accent(app, target));
+    cx.update(|app| theme_settings::apply_accent(app, AccentSelection::Preset(target)));
     settle(cx, 200).await;
     match terminal_theme_accent(cx, pane_host, pane_id) {
         Some((_, accent_after)) if accent_after != accent_before && accent_after == target.color() => {
@@ -558,6 +561,68 @@ async fn accent_leg(
         Some(_) => failures.push("(b) accent fan-out: the pane's accent did not update on apply_accent".into()),
         None => failures.push("(b) accent fan-out: the Main pane TerminalView vanished".into()),
     }
+
+    // (b2) The caret rule over a CURSOR-BEARING theme — the origin bug + the
+    // "From theme" feature, asserted on the real fan-out into the live pane.
+    // The active scheme is Light here (leg (d) left it Light, sync off), so
+    // Solarized Light is the cursor-bearing theme under test.
+    const SOLARIZED_CURSOR: TerminalColor = TerminalColor::new(0x58, 0x6e, 0x75);
+    const SOLARIZED_ACCENT: TerminalColor = TerminalColor::new(0x26, 0x8b, 0xd2);
+    let restore_id = cx.update(|app| {
+        app.global::<ThemeSettingsStore>()
+            .appearance()
+            .terminal_theme_light_id
+            .clone()
+    });
+    cx.update(|app| {
+        theme_settings::apply_terminal_theme_id(app, ColorScheme::Light, "solarized-light")
+    });
+    settle(cx, 200).await;
+
+    // A PRESET wins: the pane's theme arrives with `cursor` cleared, so the
+    // renderer's `match theme.cursor` puts the preset on the caret instead of
+    // Solarized's `#586e75`.
+    match terminal_theme_accent(cx, pane_host, pane_id) {
+        Some((theme, accent)) if theme.cursor.is_none() && accent == target.color() => {
+            eprintln!("[selftest] theme-fanout (b2): a preset accent cleared the cursor-bearing theme's caret override");
+        }
+        Some((theme, accent)) => failures.push(format!(
+            "(b2) preset accent did not win over the theme cursor: cursor {:?}, accent {accent:?}",
+            theme.cursor
+        )),
+        None => failures.push("(b2) the Main pane TerminalView vanished".into()),
+    }
+
+    // "From theme": the caret goes back to the theme author's cursor, and the
+    // accent becomes the theme's curated hue (NOT its cursor).
+    cx.update(|app| theme_settings::apply_accent(app, AccentSelection::FromTheme));
+    settle(cx, 200).await;
+    let expected_accent = nice_theme::color::Srgba::rgb(
+        f32::from(SOLARIZED_ACCENT.r) / 255.0,
+        f32::from(SOLARIZED_ACCENT.g) / 255.0,
+        f32::from(SOLARIZED_ACCENT.b) / 255.0,
+    );
+    match terminal_theme_accent(cx, pane_host, pane_id) {
+        Some((theme, accent))
+            if theme.cursor == Some(SOLARIZED_CURSOR) && accent == expected_accent =>
+        {
+            eprintln!("[selftest] theme-fanout (b2): \"From theme\" restored the theme's caret and derived its accent");
+        }
+        Some((theme, accent)) => failures.push(format!(
+            "(b2) \"From theme\" resolution wrong: cursor {:?} (want {SOLARIZED_CURSOR:?}), \
+             accent {accent:?} (want {expected_accent:?})",
+            theme.cursor
+        )),
+        None => failures.push("(b2) the Main pane TerminalView vanished".into()),
+    }
+
+    // Restore the preset accent + the slot's original theme so the later legs
+    // start from the state they expect.
+    cx.update(|app| {
+        theme_settings::apply_accent(app, AccentSelection::Preset(target));
+        theme_settings::apply_terminal_theme_id(app, ColorScheme::Light, &restore_id);
+    });
+    settle(cx, 200).await;
 }
 
 // -- leg (c): terminal-theme-id — inactive latent, flip applies --------------
@@ -647,7 +712,7 @@ async fn claude_sync_leg(
 
     // A theme change with the gate ON rewrites the colors file to the new colors.
     if !bytes_after_on.is_empty() {
-        cx.update(|app| theme_settings::apply_accent(app, AccentPreset::Iris));
+        cx.update(|app| theme_settings::apply_accent(app, AccentSelection::Preset(AccentPreset::Iris)));
         settle(cx, 150).await;
         match std::fs::read(&colors_file) {
             Ok(bytes_after_change) if bytes_after_change != bytes_after_on => {

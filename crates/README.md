@@ -256,6 +256,12 @@ The GPUI application. Structure (grows over later cycles):
       derivation for every other built-in and imported theme), and
       `Palette::MacOs` / `SlotColor::System` are gone (no System black-fallback
       substitution remains).
+    - **The accent axis is an `AccentSelection`**, not an `AccentPreset`:
+      `Preset(AccentPreset) | FromTheme`, persisted rawValue = the preset's own
+      or `"from-theme"` (tolerant decode ⇒ Terracotta). `settings_import` reads
+      the same `accent` key, so the sixth rawValue is a cross-subsystem
+      file-format contract. `AccentPreset` itself still holds exactly five
+      colors — "From theme" is a selection kind, not a sixth swatch.
     - **`ThemeSettingsStore`** (gpui `Global`) — `load(path)` fail-soft; the
       `appearance` section persisted through the shared `ui_settings`
       read-merge-write writer (`file_browser::sort_settings_store::write_ui_settings_merged`)
@@ -263,7 +269,8 @@ The GPUI application. Structure (grows over later cycles):
       shares the sort store's `ui_settings.json` (per-variant folder,
       `NICE_APPLICATION_SUPPORT_ROOT`-honoring), resolved from `app::run` ONLY.
       The persisted **`appearance`** schema (R23 + settings-import read/write it):
-      `scheme`, `sync_with_os`, `accent`, `terminal_theme_light_id`,
+      `scheme`, `sync_with_os`, `accent` (six rawValues — the five `AccentPreset`
+      swatches plus `"from-theme"`), `terminal_theme_light_id`,
       `terminal_theme_dark_id`, plus the restyle-plan-3 keys
       `window_opacity_light`/`window_opacity_dark`,
       `blur_radius_light`/`blur_radius_dark`, and `restyle_popup_shown`
@@ -280,10 +287,20 @@ The GPUI application. Structure (grows over later cycles):
       reads it at render (`active_chrome_slots` / `active_chrome_accent`),
       `build_window_root` seeds panes from it (`active_terminal_theme_and_accent`).
       Absent ⇒ the shipped Nice/Dark + Terracotta fallback (scenarios/tests render
-      byte-identically).
+      byte-identically). `from_stores` resolves the (theme, accent) PAIR through
+      `resolve_theme_and_accent`, which owns the accent chain AND the caret rule:
+      a **preset** wins outright — its color is the accent and the resolved
+      `TerminalTheme`'s `cursor` is cleared to `None` so `nice-term-view`'s
+      existing `match theme.cursor` falls through to the accent (the renderer is
+      deliberately untouched); **"From theme"** leaves `cursor` intact (the theme
+      author's literal caret) and derives the accent from `theme.accent` when
+      declared, else `ansi[4]` (`theme_derived_accent`). `derived_accent_for(cx,
+      scheme)` runs that chain for EITHER scheme — the settings pane's split-disc
+      swatch and the hint line read it.
     - **The `apply_*` mutators** (Exported; R23 builds pickers over them):
       `apply_scheme` (a manual pick contradicting the OS turns `sync_with_os` off —
-      the `userPicked` analog), `apply_accent`,
+      the `userPicked` analog), `apply_accent(cx, AccentSelection)` (it takes the
+      SELECTION, not an `AccentPreset` — the sixth Accent-row entry rides it),
       `apply_terminal_theme_id` (an INACTIVE-scheme slot change is latent),
       `apply_sync_with_os` (on ⇒ reconcile now), and the restyle-plan-3 window
       mutators `apply_window_opacity(scheme, pct)` / `apply_blur_radius(scheme,
@@ -301,7 +318,9 @@ The GPUI application. Structure (grows over later cycles):
       `commit_appearance`, so they fan out live.
     - **`apply_theme_fanout`** — repaint chrome (`refresh_windows`) + push the
       resolved terminal theme + accent AND the active surface-fill
-      `background_opacity` into every window's `PaneHostView` (walking
+      `background_opacity` into every window's `PaneHostView` (the theme pushed
+      here is the POST-caret-rule one: under a preset its `cursor` is already
+      `None`, which is what makes the caret wear the accent) (walking
       `WindowRegistry::all_states` → each `WindowState::pane_host` → its cached
       `TerminalView`s) through the boundary-legal setters (the `SessionThemeCache`
       analog; the terminal recolor is an explicit push, never a cross-boundary
@@ -348,7 +367,13 @@ The GPUI application. Structure (grows over later cycles):
       order, each a `CatalogEntry` metadata half + a render `TerminalTheme` payload.
       The two Nice defaults reuse the view-crate const ctors (single source of
       truth); the other 10 are literal tables transcribed from
-      `BuiltInTerminalThemes.swift` with a provenance fixture per theme (double-entry).
+      `BuiltInTerminalThemes.swift` with a provenance fixture per theme
+      (double-entry) — except each theme's `accent` slot, which has NO Swift
+      antecedent: it is the hand-curated identity hue from
+      `docs/plans/accent-from-theme.md`'s locked table (each theme's primary hue,
+      deliberately not its cursor color), pinned by
+      `every_built_in_accent_matches_the_curated_table` against an independent
+      transcription of that table rather than of Swift.
     - **Ghostty parser** (`ghostty_theme_parser`): a pure
       `parse_ghostty_theme(source) -> Result<nice_term_view::TerminalTheme,
       GhosttyParseError>` porting `GhosttyThemeParser.swift`'s `key = value` grammar
@@ -1847,8 +1872,13 @@ ordinary element in gpui's own tree, so the `NSViewRepresentable` dance today's
 `TerminalHost.swift` needs does not exist). Modules:
 
 - `theme` — `TerminalTheme` / `TerminalColor`, the render-half theme value (16
-  ANSI + bg/fg/cursor/selection) shaped like `TerminalTheme.swift`. The two
-  Nice built-in defaults are ported here; the catalog / import UI is R22.
+  ANSI + bg/fg/cursor/selection/accent) shaped like `TerminalTheme.swift` —
+  except `accent: Option<TerminalColor>`, which has no Swift antecedent. That
+  slot is the theme's identity hue, read ONLY by the app crate's `ThemeState`
+  resolution (`theme_derived_accent`) under the "From theme" accent selection;
+  the renderer never reads it, and `None` ⇒ the resolve layer falls back to
+  `ansi[4]`. The two Nice built-in defaults are ported here (both declaring
+  `accent: #c96442`); the catalog / import UI is R22.
 - `color` — the full color-model resolver: 16 themed ANSI (through the theme),
   256-color indexed (computed xterm cube + grayscale ramp), and 24-bit
   truecolor, from an `alacritty_terminal` `vte::ansi::Color`.
