@@ -9,7 +9,7 @@ brew install --cask Nick-Anderssohn/nice/nice
 ```
 
 <p align="center">
-  <img src="docs/images/nice-mocha.png" alt="Nice running on the Catppuccin Mocha terminal theme">
+  <img src="docs/gifs/nice-demo.gif" alt="Nice demo">
 </p>
 
 ## Auto-organized sessions
