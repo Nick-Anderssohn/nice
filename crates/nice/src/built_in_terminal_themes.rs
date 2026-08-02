@@ -522,12 +522,18 @@ mod tests {
 
     /// The curated accent is the theme's identity hue, NOT its cursor — the
     /// locked decision behind the resolution chain (cursors are near-monochrome
-    /// by design). Pinned on the themes where the two genuinely differ.
+    /// by design). Every built-in is asserted so a future addition (or edit)
+    /// that points `accent` at the cursor fails here instead of shipping
+    /// washed-out chrome.
     #[test]
     fn curated_accent_is_never_the_cursor_color() {
-        for id in ["dracula", "catppuccin-mocha", "nord", "tokyo-night", "one-dark"] {
-            let t = find(id).theme;
-            assert_ne!(t.accent, t.cursor, "{id} accent must not be its cursor");
+        for built_in in built_in_terminal_themes() {
+            let t = &built_in.theme;
+            assert_ne!(
+                t.accent, t.cursor,
+                "{} accent must not be its cursor",
+                built_in.id
+            );
         }
     }
 

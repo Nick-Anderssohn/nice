@@ -302,7 +302,7 @@ impl Appearance {
 /// [`Srgba`] the chrome-derivation seam consumes — the app-boundary conversion
 /// the crate layering keeps out of `nice-theme` (`nice-theme` must not depend on
 /// `nice-term-view`). Alpha is implicitly opaque.
-fn terminal_color_to_srgba(c: TerminalColor) -> Srgba {
+pub(crate) fn terminal_color_to_srgba(c: TerminalColor) -> Srgba {
     Srgba::rgb(
         f32::from(c.r) / 255.0,
         f32::from(c.g) / 255.0,
@@ -2100,6 +2100,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every built-in's DERIVED accent ([`theme_derived_accent`] — the curated
+    /// slot, or `ansi[4]` if one were ever dropped) must clear a visibility
+    /// floor against that theme's own terminal background: under "From theme"
+    /// the accent paints the caret (on cursor-None themes), the selection tint
+    /// and the chrome over surfaces keyed to that background, so an accent
+    /// near its own background is the washed-out failure the chain's
+    /// cursor/foreground exclusion exists to prevent. The floor is grounded
+    /// under the observed minimum across the current twelve (catppuccin-latte
+    /// at 2.814; the rest span 3.4-9.2) — a deliberate margin, same
+    /// discipline as the ink-ramp floors above: it catches a collapse, not a
+    /// stylistic dip.
+    #[test]
+    fn every_built_in_derived_accent_is_visible_over_its_own_background() {
+        use crate::built_in_terminal_themes::built_in_terminal_themes;
+
+        // Same WCAG 2.1 formula as the ink-ramp test above.
+        fn relative_luminance(c: Srgba) -> f32 {
+            fn linearize(ch: f32) -> f32 {
+                if ch <= 0.039_28 {
+                    ch / 12.92
+                } else {
+                    ((ch + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * linearize(c.r) + 0.7152 * linearize(c.g) + 0.0722 * linearize(c.b)
+        }
+        fn contrast(a: Srgba, b: Srgba) -> f32 {
+            let (la, lb) = (relative_luminance(a), relative_luminance(b));
+            let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+
+        const FLOOR: f32 = 2.5;
+        let mut failures = Vec::new();
+        for built_in in built_in_terminal_themes() {
+            let accent = theme_derived_accent(&built_in.theme);
+            let bg = terminal_color_to_srgba(built_in.theme.background);
+            let ratio = contrast(accent, bg);
+            if ratio < FLOOR {
+                failures.push(format!("{} accent contrast {ratio:.3}", built_in.id));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "derived accents below visibility floor {FLOOR:.2}: {failures:?}"
+        );
     }
 
     /// Migration (plan Validation): a legacy store with a MISMATCHED pair

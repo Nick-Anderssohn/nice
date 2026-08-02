@@ -597,11 +597,7 @@ async fn accent_leg(
     // accent becomes the theme's curated hue (NOT its cursor).
     cx.update(|app| theme_settings::apply_accent(app, AccentSelection::FromTheme));
     settle(cx, 200).await;
-    let expected_accent = nice_theme::color::Srgba::rgb(
-        f32::from(SOLARIZED_ACCENT.r) / 255.0,
-        f32::from(SOLARIZED_ACCENT.g) / 255.0,
-        f32::from(SOLARIZED_ACCENT.b) / 255.0,
-    );
+    let expected_accent = theme_settings::terminal_color_to_srgba(SOLARIZED_ACCENT);
     match terminal_theme_accent(cx, pane_host, pane_id) {
         Some((theme, accent))
             if theme.cursor == Some(SOLARIZED_CURSOR) && accent == expected_accent =>

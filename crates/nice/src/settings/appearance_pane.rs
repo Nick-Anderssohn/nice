@@ -366,7 +366,12 @@ pub(crate) fn appearance_pane(window: &mut Window, cx: &mut Context<SettingsRoot
     let active_theme_name =
         theme_display_name(active_entries, appearance.terminal_theme_id_for(active_scheme));
     if let Some(name) = accent_hint_theme_name(appearance.accent, &active_theme_name) {
-        let effective = srgba_to_rgba(theme_settings::derived_accent_for(cx, active_scheme));
+        // The hint swatch IS the split disc's half for the live scheme — select
+        // from the pair computed above rather than re-resolving.
+        let effective = match active_scheme {
+            ColorScheme::Light => derived_light,
+            ColorScheme::Dark => derived_dark,
+        };
         col = col.child(accent_hint(name, effective, ink2, ink3));
     }
 
