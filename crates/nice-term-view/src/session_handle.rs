@@ -549,6 +549,52 @@ impl TerminalSessionHandle {
         }
     }
 
+    /// Begin a drag selection of type `ty` anchored at `point` (buffer grid
+    /// coordinates, like [`set_selection`](Self::set_selection)). The `Term`
+    /// owns the `Selection` from here on: alacritty rotates it with the grid as
+    /// output streams (`Term::scroll_up` → `Selection::rotate`), so the anchor
+    /// stays glued to the clicked content with no bookkeeping in the view —
+    /// including before the first [`extend_selection`](Self::extend_selection),
+    /// while the selection is still zero-length (a freshly pressed anchor must
+    /// rotate too; kitty shipped that bug separately from the drag one).
+    ///
+    /// A `Simple` selection starts empty (`is_empty`: same point, same side),
+    /// so a single click paints nothing until the drag moves — which also
+    /// collapses any previous highlight, replacing the old clear-on-click.
+    /// `Semantic`/`Lines` paint the word/line immediately via `to_range`
+    /// expansion. Caller should `cx.notify()`.
+    pub fn start_selection(&self, ty: SelectionType, point: (i32, usize)) {
+        if let Some(term_arc) = self.session.term() {
+            drag_selection_start(
+                &mut term_arc.lock(),
+                ty,
+                Point::new(Line(point.0), Column(point.1)),
+            );
+        }
+    }
+
+    /// Move the drag END of the live selection to `point`, leaving the anchor
+    /// untouched — the other half of the invariant every terminal converges on
+    /// (anchor content-locked, end screen-locked; see
+    /// [`start_selection`](Self::start_selection) and
+    /// `docs/plans/selection-scroll-anchor.md`). The caller re-derives `point`
+    /// from the pointer against the *current* display offset on every mouse
+    /// move and every mid-drag wheel step; the anchor needs no algebra at all.
+    ///
+    /// Returns `false` when there is no live selection to extend — the `Term`
+    /// dropped it (a clear/erase intersecting it, a column resize, or the whole
+    /// selection rotating out of scrollback) — so the caller can end the drag.
+    /// Caller should `cx.notify()` on `true`.
+    pub fn extend_selection(&self, point: (i32, usize)) -> bool {
+        match self.session.term() {
+            Some(term_arc) => drag_selection_extend(
+                &mut term_arc.lock(),
+                Point::new(Line(point.0), Column(point.1)),
+            ),
+            None => false,
+        }
+    }
+
     /// Clear any active selection. Caller should `cx.notify()` to repaint.
     pub fn clear_selection(&self) {
         if let Some(term_arc) = self.session.term() {
@@ -654,6 +700,41 @@ fn selection_sides(start: Point, end: Point) -> (Side, Side) {
         (Side::Right, Side::Left)
     } else {
         (Side::Left, Side::Right)
+    }
+}
+
+/// Core of [`TerminalSessionHandle::start_selection`], generic over the `Term`
+/// listener so the tests drive the production mutation against a
+/// `Term<VoidListener>` instead of a mimic that could drift.
+fn drag_selection_start<L: alacritty_terminal::event::EventListener>(
+    term: &mut alacritty_terminal::Term<L>,
+    ty: SelectionType,
+    pt: Point,
+) {
+    // The side is provisional: `drag_selection_extend`'s `include_all` rewrites
+    // both sides on every drag step, and a zero-length selection has no sides
+    // to render.
+    term.selection = Some(Selection::new(ty, pt, Side::Left));
+}
+
+/// Core of [`TerminalSessionHandle::extend_selection`]. `update` rewrites only
+/// the selection's end anchor; `include_all` then recomputes BOTH endpoint
+/// sides from the drag direction — its non-`Block` arms are the same
+/// comparison as [`selection_sides`], so the leftward-drag inclusion rule
+/// (BUGS.md #11) is preserved without ever rebuilding the content-locked
+/// start anchor.
+fn drag_selection_extend<L: alacritty_terminal::event::EventListener>(
+    term: &mut alacritty_terminal::Term<L>,
+    pt: Point,
+) -> bool {
+    match term.selection.as_mut() {
+        Some(sel) => {
+            // This side is immediately overwritten by `include_all`.
+            sel.update(pt, Side::Right);
+            sel.include_all();
+            true
+        }
+        None => false,
     }
 }
 
@@ -1450,73 +1531,227 @@ mod tests {
         assert_eq!(range, (Point::new(Line(0), Column(0)), Point::new(Line(0), Column(79))));
     }
 
-    // ---- Scrolled-drag anchor tracks streaming content ------------------------
+    // ---- Drag selection: Term-owned content-locked anchor ---------------------
     //
-    // Pins the fix for the scrolled-selection bug: while the viewport is scrolled
-    // up and the process keeps printing, the drag anchor must stay on the clicked
-    // row. The view stores the anchor's click-time *viewport row* and re-derives
-    // its grid line against the current display offset each move (mirroring the
-    // end point). The old code froze the grid line, so a streamed line drifted the
-    // anchor one row down. This reproduces that sequence against a real `Term`.
+    // These pin the drag contract (`start_selection`/`extend_selection`, via the
+    // shared `drag_selection_start`/`drag_selection_extend` cores): the anchor
+    // lives in the Term's own `Selection`, which alacritty rotates with the grid
+    // as output streams, while the end is re-resolved from the pointer per
+    // move/wheel step. Design + terminal survey: docs/plans/selection-scroll-anchor.md.
+    //
+    // Every assertion is on CONTENT (grid coordinates checked against row text)
+    // — never viewport rows: at the scrollback cap the viewport legitimately
+    // drifts while the selection stays glued to its text.
 
-    #[test]
-    fn scrolled_streaming_drag_anchor_stays_on_clicked_row() {
-        use alacritty_terminal::grid::Scroll;
+    use alacritty_terminal::grid::{Dimensions, Scroll};
 
-        // Fill the 24-row screen and build scrollback.
+    /// A term fed `"line 0"..="line 39"`. 41 rows total (40 printed + the
+    /// cursor's fresh row) on a 24-row screen leaves history rows `line 0..=16`;
+    /// grid `Line(l)` shows `line (17 + l)` for any `l >= -17`.
+    fn numbered_term() -> (Term<VoidListener>, Processor) {
         let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
         let mut parser: Processor = Processor::new();
         for i in 0..40 {
             parser.advance(&mut term, format!("line {i}\r\n").as_bytes());
         }
+        (term, parser)
+    }
 
-        // Scroll up into history: the viewport parks at display_offset D0.
+    /// The text content of grid row `line`, trailing blanks trimmed.
+    fn row_text(term: &Term<VoidListener>, line: i32) -> String {
+        let row = &term.grid()[Line(line)];
+        let cols = term.columns();
+        let s: String = (0..cols).map(|c| row[Column(c)].c).collect();
+        s.trim_end().to_string()
+    }
+
+    /// Resolve the live drag selection, panicking on "no selection".
+    fn drag_range(term: &Term<VoidListener>) -> (Point, Point) {
+        let range = term
+            .selection
+            .as_ref()
+            .expect("selection alive")
+            .to_range(term)
+            .expect("non-empty");
+        (range.start, range.end)
+    }
+
+    #[test]
+    fn streaming_while_parked_keeps_anchor_on_clicked_content() {
+        // The 63b6080 regression case, now the library's job: parked in
+        // scrollback with output streaming, the Term rotates the selection with
+        // the grid, so the anchor follows the clicked text into history.
+        let (mut term, mut parser) = numbered_term();
         term.scroll_display(Scroll::Delta(5));
-        let d0 = term.grid().display_offset() as i32;
-        assert_eq!(d0, 5, "scrolled 5 lines up");
+        assert_eq!(term.grid().display_offset(), 5);
 
-        // The user presses at viewport row `vr` while parked at D0. The old code
-        // froze the anchor as this grid line and never updated it.
-        let vr: usize = 3;
-        let frozen_anchor_line = vr as i32 - d0;
-
-        // One more line streams in. Scrolled up, alacritty bumps the offset to
-        // keep the same content parked, so D_now = D0 + 1 and the clicked content
-        // is still shown at row `vr`.
-        parser.advance(&mut term, b"streamed\r\n");
-        let d_now = term.grid().display_offset() as i32;
-        assert_eq!(d_now, d0 + 1, "streaming while scrolled up bumps the offset");
-
-        // The drag's end point is re-hit-tested live, so it tracks the clicked row.
-        let end_line = vr as i32 - d_now;
-        // The fix re-derives the anchor the same way; it stays on the clicked row.
-        let fixed_anchor_line = vr as i32 - d_now;
-
-        // Frozen anchor: spans two rows (the clicked row plus one below it).
-        let frozen = resolved_range_typed(
-            &term,
+        assert_eq!(row_text(&term, 0), "line 17");
+        super::drag_selection_start(
+            &mut term,
             SelectionType::Simple,
-            (frozen_anchor_line, 0),
-            (end_line, 5),
-        )
-        .expect("non-empty");
-        assert_ne!(
-            frozen.0.line, frozen.1.line,
-            "frozen grid-line anchor drifts: selection wrongly spans two rows"
+            Point::new(Line(0), Column(0)),
         );
 
-        // Re-derived anchor: exactly the clicked row.
-        let fixed = resolved_range_typed(
-            &term,
-            SelectionType::Simple,
-            (fixed_anchor_line, 0),
-            (end_line, 5),
-        )
-        .expect("non-empty");
+        for streamed in ["one\r\n", "two\r\n", "three\r\n"] {
+            parser.advance(&mut term, streamed.as_bytes());
+        }
+        assert_eq!(term.grid().display_offset(), 8, "viewport auto-parked");
+        assert_eq!(row_text(&term, -3), "line 17", "clicked content rotated 3 into history");
+
+        // Extend along the SAME content row: exactly one row selected. A
+        // drifted anchor would span extra rows (the old bug's shape).
+        assert!(super::drag_selection_extend(&mut term, Point::new(Line(-3), Column(5))));
         assert_eq!(
-            fixed.0.line, fixed.1.line,
-            "re-derived anchor stays on the clicked row"
+            drag_range(&term),
+            (Point::new(Line(-3), Column(0)), Point::new(Line(-3), Column(5))),
+            "anchor stayed glued to the clicked content"
         );
-        assert_eq!(fixed.0.line, Line(end_line));
+    }
+
+    #[test]
+    fn user_scroll_mid_drag_extends_from_the_anchored_content() {
+        // THE reported bug: drag, then wheel into history without moving the
+        // pointer's content along. A display scroll never touches grid
+        // coordinates, so the anchor must stay put while the end reaches the
+        // newly revealed rows.
+        let (mut term, _parser) = numbered_term();
+        assert_eq!(row_text(&term, 13), "line 30");
+        super::drag_selection_start(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(Line(13), Column(2)),
+        );
+
+        term.scroll_display(Scroll::Delta(10));
+
+        // The pointer now rests over content revealed from history — e.g.
+        // viewport row 3 resolves to Line(3 - 10) = Line(-7).
+        assert_eq!(row_text(&term, -7), "line 10");
+        assert!(super::drag_selection_extend(&mut term, Point::new(Line(-7), Column(4))));
+        assert_eq!(
+            drag_range(&term),
+            (Point::new(Line(-7), Column(4)), Point::new(Line(13), Column(2))),
+            "selection spans from the revealed content back to the unmoved anchor"
+        );
+    }
+
+    #[test]
+    fn fresh_click_anchor_rotates_before_first_extend() {
+        // A just-pressed anchor is a zero-length selection and must still
+        // rotate with the grid (kitty shipped exactly this bug, separately
+        // from the drag one — commit a13f815591 there).
+        let (mut term, mut parser) = numbered_term();
+        term.scroll_display(Scroll::Delta(5));
+        assert_eq!(row_text(&term, 0), "line 17");
+        super::drag_selection_start(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+        );
+
+        parser.advance(&mut term, b"one\r\ntwo\r\n");
+        assert_eq!(row_text(&term, -2), "line 17");
+
+        assert!(super::drag_selection_extend(&mut term, Point::new(Line(-2), Column(3))));
+        assert_eq!(
+            drag_range(&term),
+            (Point::new(Line(-2), Column(0)), Point::new(Line(-2), Column(3))),
+            "zero-length anchor rotated with the content before the first extend"
+        );
+    }
+
+    #[test]
+    fn drag_path_includes_both_endpoint_cells() {
+        // `include_all`'s non-Block arms are `selection_sides`' comparison; pin
+        // that equivalence through the production path so the leftward-drag fix
+        // (BUGS.md #11) survives the anchor move into the Term — including when
+        // the drag direction flips mid-gesture, which rewrites BOTH sides.
+        let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        let mut drag = |start: (i32, usize), moves: &[(i32, usize)]| {
+            super::drag_selection_start(
+                &mut term,
+                SelectionType::Simple,
+                Point::new(Line(start.0), Column(start.1)),
+            );
+            for &(l, c) in moves {
+                assert!(super::drag_selection_extend(
+                    &mut term,
+                    Point::new(Line(l), Column(c))
+                ));
+            }
+            let range = term.selection.as_ref().unwrap().to_range(&term).expect("non-empty");
+            (range.start, range.end)
+        };
+
+        // Rightward, leftward, upward: both endpoint cells included.
+        assert_eq!(
+            drag((0, 2), &[(0, 5)]),
+            (Point::new(Line(0), Column(2)), Point::new(Line(0), Column(5)))
+        );
+        assert_eq!(
+            drag((0, 5), &[(0, 0)]),
+            (Point::new(Line(0), Column(0)), Point::new(Line(0), Column(5)))
+        );
+        assert_eq!(
+            drag((3, 4), &[(1, 7)]),
+            (Point::new(Line(1), Column(7)), Point::new(Line(3), Column(4)))
+        );
+        // Direction flip mid-drag: right past the anchor, then back left.
+        assert_eq!(
+            drag((0, 5), &[(0, 7), (0, 1)]),
+            (Point::new(Line(0), Column(1)), Point::new(Line(0), Column(5)))
+        );
+    }
+
+    #[test]
+    fn fresh_simple_click_is_an_empty_selection() {
+        // Replaces the old clear-on-click: a single press installs a zero-length
+        // Simple selection, which resolves to no range (paints nothing, ⌘C
+        // copies nothing) until the drag actually moves.
+        let mut term = term_with("hello world");
+        super::drag_selection_start(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(Line(0), Column(3)),
+        );
+        assert!(term.selection.as_ref().unwrap().to_range(&term).is_none());
+        assert!(term.selection_to_string().is_none());
+    }
+
+    #[test]
+    fn extend_without_live_selection_reports_the_drag_dead() {
+        // The Term drops the selection on clear/erase/reflow or when it rotates
+        // fully out of history; the view ends the drag on this `false`.
+        let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        assert!(!super::drag_selection_extend(&mut term, Point::new(Line(0), Column(0))));
+    }
+
+    #[test]
+    fn anchor_falling_off_the_scrollback_cap_clamps_instead_of_drifting() {
+        // With history saturated, further streaming rotates the anchor past the
+        // top of scrollback. `to_range` clamps the overshoot to the grid top at
+        // read time (alacritty's design: clamp at read, not at rotate) — the
+        // selection shrinks; it never drifts onto other content or panics.
+        let cfg = Config { scrolling_history: 5, ..Config::default() };
+        let mut term = Term::new(cfg, &TermSize::new(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        for i in 0..40 {
+            parser.advance(&mut term, format!("line {i}\r\n").as_bytes());
+        }
+        assert_eq!(term.topmost_line(), Line(-5), "history saturated at 5");
+
+        // Anchor at the very top of history, end on screen.
+        super::drag_selection_start(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(Line(-5), Column(0)),
+        );
+        assert!(super::drag_selection_extend(&mut term, Point::new(Line(0), Column(5))));
+
+        // Three more lines rotate the anchor to Line(-8), past the cap.
+        parser.advance(&mut term, b"a\r\nb\r\nc\r\n");
+        let (start, end) = drag_range(&term);
+        assert_eq!(start, Point::new(term.topmost_line(), Column(0)), "start clamped to grid top");
+        assert_eq!(end, Point::new(Line(-3), Column(5)), "end rotated with its content");
     }
 }
