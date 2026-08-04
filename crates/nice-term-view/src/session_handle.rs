@@ -1720,10 +1720,50 @@ mod tests {
 
     #[test]
     fn extend_without_live_selection_reports_the_drag_dead() {
-        // The Term drops the selection on clear/erase/reflow or when it rotates
-        // fully out of history; the view ends the drag on this `false`.
+        // Never-started drag: nothing to extend.
         let mut term = Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
         assert!(!super::drag_selection_extend(&mut term, Point::new(Line(0), Column(0))));
+
+        // And the mid-gesture case the view actually hits: the Term drops the
+        // selection out from under a live drag — ED All (`ESC[2J`) clears the
+        // screen and nulls `term.selection`. Extends turn into no-op `false`s;
+        // the view keeps the gesture armed but stops extending.
+        let (mut term, mut parser) = numbered_term();
+        super::drag_selection_start(
+            &mut term,
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+        );
+        assert!(super::drag_selection_extend(&mut term, Point::new(Line(2), Column(3))));
+        parser.advance(&mut term, b"\x1b[2J");
+        assert!(term.selection.is_none(), "ED All drops the selection");
+        assert!(!super::drag_selection_extend(&mut term, Point::new(Line(3), Column(0))));
+    }
+
+    #[test]
+    fn semantic_drag_extends_word_by_word_through_the_drag_path() {
+        // Double-click mid-"world", then drag into "again" — via the production
+        // drag cores, not the set_selection_typed seam. `to_range` re-expands
+        // both raw anchors on every read, so end-only extension works for the
+        // typed granularities too.
+        let mut term = term_with("hello world again");
+        super::drag_selection_start(
+            &mut term,
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(8)),
+        );
+        // The fresh zero-length Semantic already resolves to the clicked word.
+        assert_eq!(
+            drag_range(&term),
+            (Point::new(Line(0), Column(6)), Point::new(Line(0), Column(10))),
+            "double-click selects \"world\""
+        );
+        assert!(super::drag_selection_extend(&mut term, Point::new(Line(0), Column(14))));
+        assert_eq!(
+            drag_range(&term),
+            (Point::new(Line(0), Column(6)), Point::new(Line(0), Column(16))),
+            "dragging into \"again\" extends to its far boundary"
+        );
     }
 
     #[test]
@@ -1751,7 +1791,9 @@ mod tests {
         // Three more lines rotate the anchor to Line(-8), past the cap.
         parser.advance(&mut term, b"a\r\nb\r\nc\r\n");
         let (start, end) = drag_range(&term);
-        assert_eq!(start, Point::new(term.topmost_line(), Column(0)), "start clamped to grid top");
+        // Hard-coded Line(-5), not `term.topmost_line()`: the clamp uses
+        // `topmost_line` internally, so asserting against it would be circular.
+        assert_eq!(start, Point::new(Line(-5), Column(0)), "start clamped to grid top");
         assert_eq!(end, Point::new(Line(-3), Column(5)), "end rotated with its content");
     }
 }

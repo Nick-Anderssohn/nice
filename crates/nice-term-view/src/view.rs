@@ -259,21 +259,27 @@ pub struct TerminalView {
     /// (the fork's semantics): a sustained drag lands once per window rather
     /// than never.
     pending_refit_scheduled: bool,
-    /// An in-progress local selection drag: the granularity the click count
-    /// chose (single = `Simple`, double = `Semantic`/word, triple+ = `Lines`),
-    /// `Some` between mouse-down and the ending mouse-up. The anchor itself is
-    /// NOT here — it lives in the `Term`'s own `Selection`, which
-    /// `extend_selection` never rebuilds and which alacritty rotates with the
-    /// grid as output streams (`Term::scroll_up` → `Selection::rotate`). That
-    /// keeps the anchor **content-locked** through both motions the old
-    /// viewport-row anchor could not reconcile: streaming while parked in
-    /// scrollback (grid rotation moves selection and display offset together)
-    /// and the user scrolling mid-drag (grid coordinates don't move at all).
-    /// The drag END is **screen-locked** instead: every mouse-move and every
-    /// mid-drag wheel step re-resolves the pointer against the current display
-    /// offset and extends to that cell (see
+    /// Whether a local selection drag is in progress: `true` between the left
+    /// mouse-down that anchored a selection and the ending mouse-up (in or out
+    /// of the pane). The anchor itself is NOT here — it lives in the `Term`'s
+    /// own `Selection`, which `extend_selection` never rebuilds and which
+    /// alacritty rotates with the grid as output streams (`Term::scroll_up` →
+    /// `Selection::rotate`). That keeps the anchor **content-locked** through
+    /// both motions the old viewport-row anchor could not reconcile: streaming
+    /// while parked in scrollback (grid rotation moves selection and display
+    /// offset together) and the user scrolling mid-drag (grid coordinates
+    /// don't move at all). The drag END is **screen-locked** instead: every
+    /// mouse-move and every mid-drag wheel step re-resolves the pointer
+    /// against the current display offset and extends to that cell (see
     /// `docs/plans/selection-scroll-anchor.md`).
-    drag_selecting: Option<SelectionType>,
+    ///
+    /// This is the GESTURE flag, deliberately not tied to the selection's
+    /// liveness: if the Term drops the selection mid-drag (a clear/erase
+    /// intersecting it, alt-screen swap, column resize), extends become
+    /// no-ops but the flag stays set until a real release — matching
+    /// alacritty — so the mouse-up/move guards keep swallowing the gesture's
+    /// events instead of leaking VT reports for a press the app never saw.
+    drag_selecting: bool,
     /// The last cell a mouse **report** was emitted for, to de-duplicate motion
     /// reports (an app gets one report per cell crossed, not per pixel moved).
     last_report_cell: Option<(usize, usize)>,
@@ -408,7 +414,7 @@ impl TerminalView {
             resize_debounce: RESIZE_DEBOUNCE_DEFAULT,
             pending_refit_arrived: false,
             pending_refit_scheduled: false,
-            drag_selecting: None,
+            drag_selecting: false,
             last_report_cell: None,
             wheel_accum: 0.0,
             last_focus_reported: None,
@@ -1373,7 +1379,7 @@ impl TerminalView {
                     2 => SelectionType::Semantic,
                     _ => SelectionType::Lines,
                 };
-                self.drag_selecting = Some(kind);
+                self.drag_selecting = true;
                 // The Term owns the anchor from here (content-locked; see the
                 // `drag_selecting` field docs). A `Simple` selection starts
                 // empty, so a single click still collapses any prior highlight
@@ -1398,24 +1404,22 @@ impl TerminalView {
         // Remembered for the ⌘ press/release edge, which carries no position.
         self.last_mouse_pos = Some(event.position);
 
-        if self.drag_selecting.is_some() {
+        if self.drag_selecting {
             // The button was released (possibly outside the pane, so no mouse-up
             // reached us) — stop extending the selection.
             if event.pressed_button != Some(MouseButton::Left) {
-                self.drag_selecting = None;
+                self.drag_selecting = false;
                 return;
             }
             if let Some(hit) = self.hit_cell(event.position, cx) {
                 // Screen-locked end: `hit.buffer_line` is the pointer resolved
                 // against the current display offset. The anchor needs no
-                // algebra — it lives in the Term, content-locked (see the
-                // `drag_selecting` field docs).
+                // algebra — it lives in the Term, content-locked. A `false`
+                // (the Term dropped the selection mid-drag) is a no-op: the
+                // gesture idles until release but keeps owning the button
+                // events (see the `drag_selecting` field docs).
                 if self.handle.read(cx).extend_selection((hit.buffer_line, hit.col)) {
                     cx.notify();
-                } else {
-                    // The Term dropped the selection (a clear/reflow, or it
-                    // rotated out of scrollback) — nothing left to extend.
-                    self.drag_selecting = None;
                 }
             }
             return;
@@ -1490,9 +1494,9 @@ impl TerminalView {
             LinkClickVerdict::NotOurs => {}
         }
 
-        if self.drag_selecting.is_some() && event.button == MouseButton::Left {
+        if self.drag_selecting && event.button == MouseButton::Left {
             // Selection persists (for ⌘C); nothing is sent to the pty.
-            self.drag_selecting = None;
+            self.drag_selecting = false;
             return;
         }
         let mode = self.current_mode(cx);
@@ -1518,7 +1522,7 @@ impl TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        self.drag_selecting = None;
+        self.drag_selecting = false;
         self.link_click_armed = None;
     }
 
@@ -2092,15 +2096,14 @@ impl TerminalView {
             // kitty (#7453) and alacritty (#1598) both pin; reversed it lags a
             // row per event. The anchor needs nothing: it is content-locked in
             // the Term (see the `drag_selecting` field docs).
-            if self.drag_selecting.is_some() {
+            if self.drag_selecting {
                 if let Some(hit) = self.hit_cell(event.position, cx) {
-                    if !self
-                        .handle
+                    // A dead selection makes this a no-op; the gesture flag is
+                    // only cleared by a real release (field docs). The repaint
+                    // rides the `hcx.notify()` above via the handle observer.
+                    self.handle
                         .read(cx)
-                        .extend_selection((hit.buffer_line, hit.col))
-                    {
-                        self.drag_selecting = None;
-                    }
+                        .extend_selection((hit.buffer_line, hit.col));
                 }
             }
         }

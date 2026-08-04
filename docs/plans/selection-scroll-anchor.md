@@ -186,6 +186,41 @@ path (real `Term` + `Processor`, the harness the existing tests already use):
 - `less` / `man` scroll → selection stays on screen rows; expected, all
   terminals behave this way.
 
+## Review addenda (post-implementation)
+
+Findings from the fresh-eyes review of the landed diff, folded in or accepted:
+
+- **`drag_selecting` is a gesture flag, not a selection-liveness flag.** If the
+  Term drops the selection mid-drag, extends become no-ops but the flag stays
+  set until a real release. Tying the two together leaked VT reports: with app
+  mouse reporting on and a Shift-drag in flight, a mid-drag drop let mouse-up
+  fall through to the report branch and send the app a Release for a press it
+  never saw.
+- **Accepted behavior change (alacritty parity):** the Term drops the selection
+  on erase/clear sequences intersecting it, alt-screen swap, and column resize
+  (`EL`/`ED`, `term/mod.rs:1657,1773,1786,1803`, `:733`, `:682`). A live drag
+  over such content now stops extending until re-pressed, where the old
+  rebuild-every-move code resurrected it. This is what upstream alacritty does
+  (their `update_selection` early-returns on `None`).
+- **Accepted behavior change (intended):** parked AT the bottom with output
+  streaming, the anchor now follows its text up and off the viewport (grid
+  rotation), where the old scheme pinned it to the screen row. Content-locked
+  is the correct reading; all four surveyed terminals behave this way.
+- **Correction to §Implementation:** "during app mouse reporting there is no
+  local drag" is wrong — Shift-drag is the local override and does drag
+  locally while reporting is active. The wheel hook is still correct: Shifted
+  wheel events route to the local-scrollback branch (same override), unshifted
+  ones go to the app without touching the selection.
+- **Known narrow divergence (library, alacritty has it too):** a DECSTBM
+  scrolling region with a non-zero top that scrolls during a live drag can
+  clamp the anchor to the region top with column reset to 0
+  (`Selection::rotate`'s `range_top != 0` arm). The old view-held anchor was
+  immune. Not worth defending against.
+- **Residual test gap:** the scroll-then-extend *ordering* inside
+  `on_scroll_wheel` has no automated pin — `nice-term-view` has no gpui test
+  harness. The core-level tests pin everything up to that seam; the ordering
+  itself is covered by manual validation.
+
 ## Out of scope (deliberate, YAGNI)
 
 - **Edge auto-scroll** (drag past the top edge keeps scrolling): a separate
