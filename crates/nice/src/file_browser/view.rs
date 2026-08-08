@@ -195,6 +195,13 @@ pub(crate) struct FileBrowserView {
     /// by the next render (which has the `Window` [`begin_rename`](Self::begin_rename)
     /// needs to grab field focus) exactly like [`pending_open_with`](Self::pending_open_with).
     pending_rename_path: Option<String>,
+    /// One-shot scroll-into-view request, set only by the "New Folder" handler:
+    /// its freshly-created row can sort far below the viewport (a `uniform_list`
+    /// paints only visible rows), so the inline-rename field would otherwise open
+    /// off-screen. Consumed by the same render pass that arms the rename. Other
+    /// rename triggers (Rename / Return / slow-click) act on an already-visible
+    /// row, so they deliberately do NOT set this (no surprise re-centring).
+    pending_scroll_path: Option<String>,
     /// R20 (F8): the active inline-rename edit session (the field's editing model
     /// + its target), or `None` when no row is being renamed.
     rename: Option<RenameState>,
@@ -301,6 +308,7 @@ impl FileBrowserView {
             accent,
             window_scale: 2.0,
             pending_rename_path: None,
+            pending_scroll_path: None,
             rename: None,
             rename_focus: cx.focus_handle(),
             rename_blur_sub: None,
@@ -677,7 +685,8 @@ impl FileBrowserView {
     /// [`FileBrowserContextMenuModel`] (Open / Open With hidden on directories);
     /// R19 renders only its owned entries (Open, Open With ▸, Reveal in Finder, ─,
     /// Copy Path). The snap-on-action rule fires from each item's handler, not on
-    /// the right-click itself.
+    /// the right-click itself (the lone exception is "New Folder", which replaces
+    /// the selection with its new row instead of snapping — see `menu_new_folder`).
     fn open_row_menu(
         &mut self,
         path: &str,
@@ -740,6 +749,13 @@ impl FileBrowserView {
                 }
                 FileBrowserContextMenuItem::DividerOpen => {
                     items.push(ContextMenuItem::separator());
+                }
+                FileBrowserContextMenuItem::NewFolder => {
+                    let e = weak.clone();
+                    let p = clicked.clone();
+                    items.push(ContextMenuItem::entry("New Folder", move |_w, app| {
+                        let _ = e.update(app, |this, cx| this.menu_new_folder(&p, is_dir, cx));
+                    }));
                 }
                 FileBrowserContextMenuItem::CopyPath => {
                     let e = weak.clone();
@@ -945,6 +961,59 @@ impl FileBrowserView {
     fn menu_rename(&mut self, path: &str, cx: &mut Context<Self>) {
         self.snap_and_resolve(path, cx);
         self.pending_rename_path = Some(path.to_string());
+        cx.notify();
+    }
+
+    /// Context-menu "New Folder": create `untitled folder` (auto-suffixed on a
+    /// collision) inside the clicked directory — or the clicked file's PARENT —
+    /// through the shared history/service (so ⌘Z removes the empty folder),
+    /// expand + select the new row, then arm inline rename via
+    /// `pending_rename_path` so the field opens on the next render with the name
+    /// selected. Uses the same `Window`-free `pending_rename_path` handoff as
+    /// `menu_rename` (the `view.rs` render consumer calls `begin_rename`).
+    fn menu_new_folder(&mut self, clicked: &str, is_dir: bool, cx: &mut Context<Self>) {
+        let dir = if is_dir {
+            PathBuf::from(clicked)
+        } else {
+            Path::new(clicked)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"))
+        };
+        let name = nice_model::file_browser::new_folder_name(|n| dir.join(n).exists());
+        let new_path = dir.join(&name);
+
+        let Some(history) = self.history(cx) else {
+            return;
+        };
+        let origin = self.origin(cx);
+        let mut err = None;
+        history.update(cx, |h, hcx| {
+            match h.service().create_dir(&new_path, origin) {
+                Ok(op) => h.push(op),
+                Err(e) => err = Some(e),
+            }
+            hcx.notify();
+        });
+        if let Some(e) = err {
+            self.publish_drift(format!("Couldn't create folder: {e}"), cx);
+            return;
+        }
+
+        // Make the new row visible + selected, then hand off to inline rename.
+        // Unlike the other handlers this deliberately skips `snap_and_resolve` —
+        // the op targets a path that didn't exist at right-click time, so it
+        // replaces the selection with the new row rather than snapping to it.
+        let dir = dir.to_string_lossy().into_owned();
+        let new_path = new_path.to_string_lossy().into_owned();
+        self.with_active_fb_state(cx, |st| {
+            st.insert_expanded(dir);
+            st.selection_mut().replace(&[new_path.clone()], None);
+        });
+        // Scroll the new row into view as the rename arms — it can sort below the
+        // viewport, and the field must be visible for the edit to make sense.
+        self.pending_scroll_path = Some(new_path.clone());
+        self.pending_rename_path = Some(new_path);
         cx.notify();
     }
 
@@ -2111,6 +2180,16 @@ impl gpui::Render for FileBrowserView {
             }
         }
 
+        // New Folder scroll-into-view: `rendered_paths` is still last frame's at
+        // this point, so index off the fresh projection — it is the same
+        // `visible_order` (same expanded set + sort) `snapshot` renders this pass,
+        // so the index aligns with the `uniform_list` about to lay out.
+        if let Some(path) = self.pending_scroll_path.take() {
+            if let Some(ix) = self.current_projection(cx).iter().position(|p| *p == path) {
+                self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+            }
+        }
+
         let Some(snap) = self.snapshot(cx) else {
             return div()
                 .id(SharedString::from(FILE_BROWSER_ROOT_LABEL))
@@ -2955,5 +3034,189 @@ mod tests {
             !exists(&fx.p("D/A.txt")),
             "the stale A must NOT be redirected into D"
         );
+    }
+
+    // MARK: - New Folder (context menu)
+
+    /// New Folder on a directory row: creates `untitled folder` INSIDE it, pushes
+    /// an undoable create, selects the new row, and arms inline rename on it
+    /// (`pending_rename_path`, the `Window`-free handoff the render loop consumes).
+    /// Undo removes the empty folder.
+    #[gpui::test]
+    fn new_folder_on_a_directory_creates_inside_selects_and_arms_rename(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("new-folder-dir");
+        let (window, _ops) = mount(cx, &fx);
+        let d = fx.p("D");
+        let created = fx.p("D/untitled folder");
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.menu_new_folder(&d, true, cx);
+
+                assert!(exists(&created), "the new folder lands INSIDE the clicked dir");
+                assert_eq!(
+                    selection_of(view, cx),
+                    vec![created.clone()],
+                    "the new row is selected"
+                );
+                assert_eq!(
+                    view.pending_rename_path.as_deref(),
+                    Some(created.as_str()),
+                    "inline rename is armed on the new folder"
+                );
+
+                // Undo (⌘Z) removes the empty folder via the shared history.
+                view.history(cx)
+                    .unwrap()
+                    .update(cx, |h, _| h.undo());
+                assert!(!exists(&created), "undo removes the empty new folder");
+            })
+            .unwrap();
+    }
+
+    /// New Folder on a FILE row lands in the file's PARENT (Finder-like), not
+    /// under the file.
+    #[gpui::test]
+    fn new_folder_on_a_file_creates_in_the_parent(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("new-folder-file");
+        let (window, _ops) = mount(cx, &fx);
+        let a = fx.p("A.txt");
+        let created = fx.p("untitled folder");
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.menu_new_folder(&a, false, cx);
+                assert!(
+                    exists(&created),
+                    "the new folder lands in the file's parent (the root)"
+                );
+                assert_eq!(view.pending_rename_path.as_deref(), Some(created.as_str()));
+            })
+            .unwrap();
+    }
+
+    /// Auto-suffix on collision: a second New Folder in the same directory creates
+    /// `untitled folder 2` rather than colliding.
+    #[gpui::test]
+    fn new_folder_auto_suffixes_on_collision(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("new-folder-suffix");
+        let (window, _ops) = mount(cx, &fx);
+        let d = fx.p("D");
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.menu_new_folder(&d, true, cx);
+                view.menu_new_folder(&d, true, cx);
+                assert!(exists(&fx.p("D/untitled folder")));
+                assert!(
+                    exists(&fx.p("D/untitled folder 2")),
+                    "the second create auto-suffixes"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A create that fails at the filesystem (here the target directory doesn't
+    /// exist — e.g. deleted between right-click and action) surfaces the
+    /// "Couldn't create folder: …" banner via the one drift channel, creates
+    /// nothing, and does NOT arm a rename.
+    #[gpui::test]
+    fn new_folder_create_failure_publishes_drift_banner(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("new-folder-fail");
+        let (window, _ops) = mount(cx, &fx);
+        let ghost = fx.p("ghost-dir"); // a directory that was never created
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.menu_new_folder(&ghost, true, cx);
+
+                assert!(
+                    !exists(&fx.p("ghost-dir/untitled folder")),
+                    "a failed create leaves nothing behind"
+                );
+                assert!(
+                    view.pending_rename_path.is_none(),
+                    "a failed create does not arm inline rename"
+                );
+                let msg = view
+                    .history(cx)
+                    .unwrap()
+                    .read(cx)
+                    .last_drift_message()
+                    .map(str::to_owned);
+                assert!(
+                    msg.as_deref()
+                        .is_some_and(|m| m.starts_with("Couldn't create folder:")),
+                    "the failure routes to the drift banner, got {msg:?}"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Create-then-rename is TWO independent history entries — the `CreateDir`
+    /// push, then the rename's separate `Move` push — so a full unwind is two ⌘Z:
+    /// the first reverts the rename, the second removes the now-empty folder.
+    #[gpui::test]
+    fn new_folder_then_rename_are_two_independent_undo_steps(cx: &mut gpui::TestAppContext) {
+        let fx = DropFixture::new("new-folder-undo2");
+        let (window, _ops) = mount(cx, &fx);
+        let d = fx.p("D");
+        let created = fx.p("D/untitled folder");
+        let renamed = fx.p("D/renamed");
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.menu_new_folder(&d, true, cx);
+                // Commit an inline rename through the same seam the field uses.
+                let origin = view.origin(cx);
+                view.perform_rename(Path::new(&created), Path::new(&renamed), origin, cx);
+                assert!(exists(&renamed) && !exists(&created), "the rename landed");
+
+                let history = view.history(cx).unwrap();
+                assert_eq!(
+                    history.read(cx).undo_stack().len(),
+                    2,
+                    "one CreateDir + one Move, not a single fused entry"
+                );
+
+                history.update(cx, |h, _| h.undo());
+                assert!(
+                    exists(&created) && !exists(&renamed),
+                    "the first ⌘Z reverts the rename"
+                );
+
+                history.update(cx, |h, _| h.undo());
+                assert!(!exists(&created), "the second ⌘Z removes the empty folder");
+            })
+            .unwrap();
+    }
+
+    /// New Folder is offered on the project-ROOT row (unconditional in the menu
+    /// model) and creates at the top level, selecting + arming rename like any dir.
+    #[gpui::test]
+    fn new_folder_on_the_root_row_is_offered_and_creates_at_top_level(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fx = DropFixture::new("new-folder-root");
+        let (window, _ops) = mount(cx, &fx);
+        let root = fx.root.to_string_lossy().into_owned();
+        let created = fx.p("untitled folder");
+
+        window
+            .update(cx, |view, window, cx| {
+                view.drive_right_click(&root, window, cx);
+                assert!(
+                    view.scenario_menu_labels(cx).iter().any(|l| l == "New Folder"),
+                    "the root row's menu offers New Folder"
+                );
+
+                view.menu_new_folder(&root, true, cx);
+                assert!(exists(&created), "creates at the project top level");
+                assert_eq!(selection_of(view, cx), vec![created.clone()]);
+                assert_eq!(view.pending_rename_path.as_deref(), Some(created.as_str()));
+            })
+            .unwrap();
     }
 }

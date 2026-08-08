@@ -11,10 +11,12 @@
 //! remaining handlers **without touching this model**.
 //!
 //! Frozen final order (`build` output when everything is visible):
-//! Open, Open With ▸, Reveal in Finder, ─, Rename, Copy, Copy Path, Cut,
-//! Paste, Move to Trash. Rules:
+//! Open, Open With ▸, Reveal in Finder, ─, New Folder, Rename, Copy, Copy Path,
+//! Cut, Paste, Move to Trash. Rules:
 //! * Open / Open With hidden on directories.
 //! * Copy / Cut / Move-to-Trash hidden on the root row.
+//! * New Folder always (files, folders, and the root row — the handler creates
+//!   inside a folder row, else in a file's parent).
 //! * Rename only when `can_rename` (caller passes `false` for multi-select or
 //!   the filesystem root `/`).
 //! * Paste only when `can_paste`.
@@ -28,6 +30,7 @@ pub enum FileBrowserContextMenuItem {
     OpenWith,
     RevealInFinder,
     DividerOpen,
+    NewFolder,
     Rename,
     Copy,
     CopyPath,
@@ -68,6 +71,9 @@ impl FileBrowserContextMenuModel {
         }
         items.push(RevealInFinder);
         items.push(DividerOpen);
+        // New Folder is unconditional (visible on files, folders, and the root
+        // row, like Reveal in Finder / Copy Path).
+        items.push(NewFolder);
         if can_rename {
             items.push(Rename);
         }
@@ -156,7 +162,7 @@ mod tests {
         let model = FileBrowserContextMenuModel::build(false, false, true, true);
         assert_eq!(
             model.items,
-            vec![Open, OpenWith, RevealInFinder, DividerOpen, Rename, Copy, CopyPath, Cut, Paste, Trash]
+            vec![Open, OpenWith, RevealInFinder, DividerOpen, NewFolder, Rename, Copy, CopyPath, Cut, Paste, Trash]
         );
     }
 
@@ -166,7 +172,7 @@ mod tests {
         let model = FileBrowserContextMenuModel::build(true, false, false, true);
         assert_eq!(
             model.items,
-            vec![RevealInFinder, DividerOpen, Rename, Copy, CopyPath, Cut, Trash]
+            vec![RevealInFinder, DividerOpen, NewFolder, Rename, Copy, CopyPath, Cut, Trash]
         );
     }
 
@@ -176,8 +182,24 @@ mod tests {
         let model = FileBrowserContextMenuModel::build(true, true, true, true);
         assert_eq!(
             model.items,
-            vec![RevealInFinder, DividerOpen, Rename, CopyPath, Paste]
+            vec![RevealInFinder, DividerOpen, NewFolder, Rename, CopyPath, Paste]
         );
+    }
+
+    // MARK: - New Folder visibility
+
+    /// New Folder is unconditional — present on a file, a directory, and the
+    /// root row, positioned right after the divider (before Rename).
+    #[test]
+    fn menu_items_new_folder_present_on_file_dir_and_root() {
+        // file row, dir row, root row
+        for (is_dir, is_root) in [(false, false), (true, false), (true, true)] {
+            let model = FileBrowserContextMenuModel::build(is_dir, is_root, false, true);
+            assert!(model.contains(NewFolder), "New Folder missing for is_dir={is_dir} is_root={is_root}");
+            let divider = model.items.iter().position(|i| *i == DividerOpen).unwrap();
+            let new_folder = model.items.iter().position(|i| *i == NewFolder).unwrap();
+            assert_eq!(new_folder, divider + 1, "New Folder must sit right after the divider");
+        }
     }
 
     // MARK: - Rename visibility

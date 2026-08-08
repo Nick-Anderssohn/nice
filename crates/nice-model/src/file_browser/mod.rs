@@ -64,7 +64,7 @@ pub use cwd_impact::{affected_by, PaneCWDRef, PaneCWDSnapshot};
 pub use drop_resolver::{can_drop, operation as drop_operation, FileDragOperation};
 pub use header::file_browser_header_title;
 pub use menu::{FileBrowserContextMenuItem, FileBrowserContextMenuModel};
-pub use naming::split_name_and_extension;
+pub use naming::{new_folder_name, split_name_and_extension};
 pub use open_with::{entries as open_with_entries, OpenWithEntry, OpenWithLookups};
 pub use rename_validator::{
     can_rename, is_extension_change, validate as validate_rename, RenameValidation,

@@ -25,7 +25,10 @@
 //!   destinations (the system relocates each pass).
 //! * **Undo asymmetry**: undo-copy treats a missing destination as silently
 //!   satisfied; undo-move drifts `SourceMissing`; undo-trash drifts
-//!   `TrashedItemMissing`.
+//!   `TrashedItemMissing`; undo-create-dir is silently satisfied when the folder
+//!   is already gone but drifts (`Underlying`) on a NON-empty folder — its
+//!   `remove_dir` is empty-only, so a folder the user has since filled is never
+//!   recursively deleted.
 
 use nice_model::file_browser::split_name_and_extension;
 use std::collections::HashSet;
@@ -108,6 +111,14 @@ pub enum FileOperation {
         items: Vec<FileTrashItem>,
         origin: FileOperationOrigin,
     },
+    /// Create a single empty directory at `path`. Undo removes it — EMPTY-ONLY,
+    /// so a folder the user has since filled is never recursively deleted by a
+    /// later ⌘Z (a non-empty dir drifts to `Underlying`). Backs the file-browser
+    /// New Folder context-menu action.
+    CreateDir {
+        path: PathBuf,
+        origin: FileOperationOrigin,
+    },
 }
 
 impl FileOperation {
@@ -116,17 +127,21 @@ impl FileOperation {
         match self {
             FileOperation::Copy { origin, .. }
             | FileOperation::Move { origin, .. }
-            | FileOperation::Trash { origin, .. } => origin,
+            | FileOperation::Trash { origin, .. }
+            | FileOperation::CreateDir { origin, .. } => origin,
         }
     }
 
-    /// Human-readable label for the transient drift / status banner — FROZEN
-    /// strings (`FileOperation.swift:60-66`): "Copy" / "Move" / "Move to Trash".
+    /// Human-readable label for the transient drift / status banner. The
+    /// copy/move/trash strings are FROZEN (`FileOperation.swift:60-66`): "Copy" /
+    /// "Move" / "Move to Trash". "New Folder" is a Rust-only label (no Swift
+    /// counterpart — the feature postdates the port).
     pub fn label(&self) -> &'static str {
         match self {
             FileOperation::Copy { .. } => "Copy",
             FileOperation::Move { .. } => "Move",
             FileOperation::Trash { .. } => "Move to Trash",
+            FileOperation::CreateDir { .. } => "New Folder",
         }
     }
 }
@@ -270,6 +285,29 @@ impl FileOperationsService {
         })
     }
 
+    // MARK: - New Folder
+
+    /// Create a single empty directory at `path`. Guards an existing `path` up
+    /// front (surface `Underlying` rather than clobber, mirroring the copy/move
+    /// destination guards), then delegates to [`FileOperationsService::apply`]
+    /// which returns the `CreateDir` record the history layer pushes for undo.
+    pub fn create_dir(
+        &self,
+        path: &Path,
+        origin: FileOperationOrigin,
+    ) -> Result<FileOperation, FileOperationError> {
+        if path.exists() {
+            return Err(underlying(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("'{}' already exists", path.display()),
+            )));
+        }
+        self.apply(FileOperation::CreateDir {
+            path: path.to_path_buf(),
+            origin,
+        })
+    }
+
     // MARK: - Apply / Undo (used by FileOperationHistory)
 
     /// Re-apply `op` exactly as first performed (the history's redo). Copy/move
@@ -320,6 +358,14 @@ impl FileOperationsService {
                     items: new_items,
                     origin,
                 })
+            }
+            FileOperation::CreateDir { path, origin } => {
+                // Redo of a create simply re-creates the directory. `create_dir`
+                // (non-recursive) errors if `path` already exists, so a redo onto
+                // a name the user reclaimed surfaces as drift rather than a silent
+                // no-op. The public `create_dir` guards the first-time case.
+                std::fs::create_dir(&path).map_err(underlying)?;
+                Ok(FileOperation::CreateDir { path, origin })
             }
         }
     }
@@ -376,6 +422,18 @@ impl FileOperationsService {
                         )));
                     }
                     std::fs::rename(&item.trashed, &item.original).map_err(underlying)?;
+                }
+                Ok(())
+            }
+            FileOperation::CreateDir { path, .. } => {
+                // Inverse of a create is to remove the (empty) directory.
+                // `remove_dir` is EMPTY-ONLY: a folder the user has since filled
+                // makes it error to `Underlying`, which the history layer drops +
+                // banners — a later ⌘Z never recursively deletes their contents.
+                // An already-gone directory (deleted in Finder) leaves nothing to
+                // undo.
+                if path.exists() {
+                    std::fs::remove_dir(path).map_err(underlying)?;
                 }
                 Ok(())
             }
@@ -883,6 +941,86 @@ mod tests {
         assert_eq!(fs::read_to_string(&src).unwrap(), "hi");
     }
 
+    // MARK: - New Folder (create_dir)
+
+    /// create → the directory exists; the record carries the path.
+    #[test]
+    fn create_dir_creates_directory() {
+        let t = TempTree::new();
+        let parent = t.make_dir("parent");
+        let new = parent.join("untitled folder");
+        let op = service(&t).create_dir(&new, origin()).unwrap();
+        assert!(new.is_dir());
+        match op {
+            FileOperation::CreateDir { path, .. } => assert_eq!(path, new),
+            _ => panic!("expected CreateDir"),
+        }
+    }
+
+    /// undo → the (empty) directory is removed.
+    #[test]
+    fn create_dir_undo_removes_empty_directory() {
+        let t = TempTree::new();
+        let parent = t.make_dir("parent");
+        let new = parent.join("untitled folder");
+        let svc = service(&t);
+        let op = svc.create_dir(&new, origin()).unwrap();
+        assert!(new.is_dir());
+        svc.undo(&op).unwrap();
+        assert!(!new.exists());
+    }
+
+    /// redo (apply of the record) → the directory is recreated.
+    #[test]
+    fn create_dir_redo_recreates_directory() {
+        let t = TempTree::new();
+        let parent = t.make_dir("parent");
+        let new = parent.join("untitled folder");
+        let svc = service(&t);
+        let op = svc.create_dir(&new, origin()).unwrap();
+        svc.undo(&op).unwrap();
+        assert!(!new.exists());
+        svc.apply(op).unwrap();
+        assert!(new.is_dir());
+    }
+
+    /// create over an existing path errors (`Underlying`) and leaves it intact.
+    #[test]
+    fn create_dir_existing_path_errors() {
+        let t = TempTree::new();
+        let existing = t.make_dir("parent/untitled folder");
+        fs::write(existing.join("keep.txt"), "hi").unwrap();
+        match service(&t).create_dir(&existing, origin()) {
+            Err(FileOperationError::Underlying(_)) => {}
+            other => panic!("expected Underlying, got {other:?}"),
+        }
+        assert!(existing.join("keep.txt").exists(), "existing dir untouched");
+    }
+
+    /// undo of a create whose folder the user later FILLED errors (`Underlying`,
+    /// empty-only `remove_dir`) and leaves the folder + its contents intact — a
+    /// later ⌘Z must never recursively delete the user's files.
+    #[test]
+    fn create_dir_undo_non_empty_errors_and_leaves_contents() {
+        let t = TempTree::new();
+        let parent = t.make_dir("parent");
+        let new = parent.join("untitled folder");
+        let svc = service(&t);
+        let op = svc.create_dir(&new, origin()).unwrap();
+        // User drops a file into the new folder before undoing.
+        fs::write(new.join("added.txt"), "mine").unwrap();
+        match svc.undo(&op) {
+            Err(FileOperationError::Underlying(_)) => {}
+            other => panic!("expected Underlying, got {other:?}"),
+        }
+        assert!(new.is_dir(), "non-empty folder must survive the failed undo");
+        assert_eq!(
+            fs::read_to_string(new.join("added.txt")).unwrap(),
+            "mine",
+            "user's contents must not be deleted"
+        );
+    }
+
     // MARK: - Collision naming
 
     /// `FileOperationsServiceTests.test_nextAvailableName_skipsExistingNumberedSiblings`
@@ -1072,8 +1210,12 @@ mod tests {
             "Move"
         );
         assert_eq!(
-            (FileOperation::Trash { items: vec![], origin: o }).label(),
+            (FileOperation::Trash { items: vec![], origin: o.clone() }).label(),
             "Move to Trash"
+        );
+        assert_eq!(
+            (FileOperation::CreateDir { path: PathBuf::from("/x"), origin: o }).label(),
+            "New Folder"
         );
     }
 
