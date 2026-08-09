@@ -8,8 +8,34 @@
 //! source — it does not try to distinguish "Nice already knows this id" cases
 //! client-side, because the receiver's id-equality short-circuit makes
 //! redundant forwards a true no-op. Source-side filtering is also subtly wrong:
-//! `/branch` reports `source: "resume"`, so a `resume`-excluding gate would
-//! silently lose `/branch` rotations. Classification lives app-side.
+//! an in-pane `/branch` reports a source that has CHANGED across Claude
+//! versions (`"resume"` before 2.1.214, `"fork"` from 2.1.214 on), so a gate
+//! excluding either one silently loses `/branch` rotations. Classification
+//! lives app-side, in `WindowState::apply_session_update`.
+//!
+//! ## What `source` can be, and what `/fork` means now
+//!
+//! Claude documents `startup | resume | clear | compact | fork`. Two changes
+//! (verified against CLI 2.1.222) matter to the receiver:
+//!
+//!   * **2.1.214** — in-pane rotations (`/branch`, `--fork-session` resumes)
+//!     report `source: "fork"` where they used to report `"resume"`.
+//!   * **2.1.212** — `/fork` stopped rotating the foreground session. It now
+//!     copies the conversation into a **detached background session** run by
+//!     the Claude Code daemon, registered under
+//!     `~/.claude/jobs/<first-8-of-fork-id>/state.json`. The foreground pane
+//!     keeps its id and fires no SessionStart at all; the fork's own
+//!     SessionStart fires in the daemon-spawned child.
+//!
+//! That child inherits `NICE_SOCKET` + `NICE_PANE_ID` from whichever Nice pane
+//! first spawned the daemon, so its relay carries a **stale pane id** — and the
+//! script cannot tell: per-child environment is not something a hook script can
+//! validate, and there is no other signal in the payload. The receiver resolves
+//! it instead, by probing for the jobs entry the daemon creates before spawning
+//! the child (`window_state::ForkJobInfo`): entry present ⇒ background fork,
+//! touch no tab; entry absent ⇒ in-pane rotation. The script is therefore
+//! unchanged by that fix — it already relays `source` verbatim (the wide
+//! `[^"]+` class passes `fork` through untouched).
 //!
 //! Two empirical constraints (learned the hard way in Swift) shape where the
 //! script and the settings entry live:
@@ -837,6 +863,26 @@ mod tests {
             payload.as_deref(),
             Some(r#"{"action":"session_update","paneId":"p1","sessionId":"aaaa-1111","source":"branch.auto","cwd":"/tmp/work"}"#),
             "dotted source must survive verbatim"
+        );
+    }
+
+    /// `source: "fork"` — emitted by BOTH an in-pane `/branch` (Claude ≥ 2.1.214)
+    /// and the daemon's detached background `/fork` child — relays verbatim, like
+    /// every other source. The script draws no distinction between the two; the
+    /// receiver's `~/.claude/jobs/<first8>/` probe does. Pinned because a
+    /// receiver-side classification that keys off this exact byte string is only
+    /// as sound as the relay that produces it.
+    #[test]
+    fn blackbox_fork_source_relays_verbatim() {
+        let (_root, script) = installed_script();
+        let sock = sock_path();
+        let input = r#"{"session_id":"298689bf-1111-2222-3333-444455556666","source":"fork","cwd":"/Users/me/proj","transcript_path":"/x/y.jsonl"}"#;
+        let (ok, payload) = run_hook(&script, Some(&sock.0), Some("pane-9"), input);
+        assert!(ok, "script must exit 0");
+        assert_eq!(
+            payload.as_deref(),
+            Some(r#"{"action":"session_update","paneId":"pane-9","sessionId":"298689bf-1111-2222-3333-444455556666","source":"fork","cwd":"/Users/me/proj"}"#),
+            "a fork source must reach the receiver verbatim"
         );
     }
 

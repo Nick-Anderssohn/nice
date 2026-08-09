@@ -2166,6 +2166,36 @@ fn reply_inplace_sync_off_never_has_third_field() {
     }
 }
 
+/// Fix D's two normalizing verbs keep the same three positional fields, so the
+/// wrapper's frozen `read -r mode sid settings` still parses them. Their id
+/// field is ALWAYS the full uuid — never the `-` placeholder — because the
+/// whole point is handing the wrapper an id its own args did not have.
+#[test]
+fn reply_attach_and_resume_carry_the_uuid_then_the_pointer() {
+    let uuid = "b8c8244b-e94e-4c38-95fb-31be9a28187e";
+    for (decision, verb) in [
+        (
+            ClaudeReplyDecision::Attach {
+                session_id: uuid.into(),
+            },
+            "attach",
+        ),
+        (
+            ClaudeReplyDecision::Resume {
+                session_id: uuid.into(),
+            },
+            "resume",
+        ),
+    ] {
+        assert_eq!(compose_claude_reply(&decision, None), format!("{verb} {uuid}"));
+        assert_eq!(
+            compose_claude_reply(&decision, Some("/ptr.json")),
+            format!("{verb} {uuid} /ptr.json"),
+            "the settings pointer stays the 3rd field"
+        );
+    }
+}
+
 // =====================================================================
 // parse_claude_title — the T5 status/label split (`SessionsModel.swift:439-453`).
 // The pure split; the trim / empty-skip / "Claude Code" placeholder / auto-title

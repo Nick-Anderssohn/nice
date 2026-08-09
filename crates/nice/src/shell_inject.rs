@@ -164,6 +164,22 @@ _nice_json_escape() {
     printf '"%s"' "$s"
 }
 
+# Tell Nice the Claude we ran as a CHILD has returned, so this pane is a
+# plain shell prompt again. Only the `attach` verb below runs one as a
+# child; every other verb execs, and a pane whose pty exits tells Nice by
+# exiting. Without this Nice's per-pane "a Claude is running here" flag
+# would stay set forever and every later `claude` in this tab would open a
+# NEW tab instead of promoting this pane. Fire-and-forget: Nice closes the
+# connection before handling it, so `nc` returns at once.
+_nice_claude_exited() {
+    [[ -z "$NICE_SOCKET" ]] && return 0
+    local pane_id_json
+    pane_id_json=$(_nice_json_escape "${NICE_PANE_ID:-}")
+    printf '%s\n' "{\"action\":\"claude_exited\",\"paneId\":${pane_id_json}}" \
+        | nc -U "$NICE_SOCKET" -w 2 >/dev/null 2>&1
+    return 0
+}
+
 claude() {
     # Passthrough to the real binary (no handshake) when:
     #   1. Not inside a Nice pty ($NICE_SOCKET unset).
@@ -220,6 +236,14 @@ claude() {
         exec command claude "$@"
     fi
 
+    # The reply is one line of up to three positional fields:
+    #   newtab
+    #   inplace [<uuid>|-] [<settings path>]
+    #   attach  <uuid> [<settings path>]   (exec-time normalization)
+    #   resume  <uuid> [<settings path>]   (exec-time normalization)
+    # The last two carry Nice's decision about whether the named session is
+    # still hosted by the Claude daemon — only Nice can tell, and only at this
+    # moment (a deferred pane's pre-typed command may have waited hours).
     local mode sid settings
     read -r mode sid settings <<< "$response"
     case "$mode" in
@@ -246,6 +270,41 @@ claude() {
             else
                 exec command claude "$@"
             fi
+            ;;
+        attach)
+            # Nice resolved this invocation to a background session the Claude
+            # daemon STILL hosts (a `--resume <uuid>` would spawn a second
+            # process against a live conversation). `sid` is the FULL uuid;
+            # `claude attach` matches jobs by ~/.claude/jobs directory-name
+            # prefix, so it gets the leading 8 characters.
+            #
+            # Run attach as a CHILD, not exec: a jobs entry the daemon left
+            # behind when it died exits non-zero, and the fallback leg then
+            # degrades to a plain --resume instead of stranding the user at an
+            # error. Detaching is NOT a failure and never takes that leg —
+            # attach exits 0 both when the ctrl-z detach key fires and when the
+            # session ends, and non-zero only on an error outcome or an
+            # unmatched id (verified against 2.1.223).
+            #
+            # A child leaves this shell alive, which is exactly what the CLI
+            # promises ("Ctrl+Z drops back to your shell") — so tell Nice the
+            # pane is a prompt again, or its promotion flag stays set forever.
+            local -a post=(--resume "$sid")
+            [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
+            if command claude attach "${sid[1,8]}"; then
+                _nice_claude_exited
+                return 0
+            fi
+            exec command claude "${post[@]}"
+            ;;
+        resume)
+            # The mirror: the user ran `claude attach <id>` for a session the
+            # daemon no longer hosts, so their args can only fail. Replace them
+            # wholesale with `--resume <uuid>` (never "$@" — that still says
+            # `attach`).
+            local -a post=(--resume "$sid")
+            [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
+            exec command claude "${post[@]}"
             ;;
         *)
             print -u2 "nice: unexpected response '$response'; running claude directly"
@@ -855,6 +914,84 @@ mod tests {
             body.contains(r#"pre+=(--settings "$settings")"#),
             "inplace must splice --settings"
         );
+        // Fix D's exec-time normalization verbs. They reuse the same three
+        // positional fields (`mode sid settings`), so only the dispatch is new.
+        assert!(body.contains("attach)"), "wrapper must handle the `attach` mode");
+        assert!(body.contains("resume)"), "wrapper must handle the `resume` mode");
+    }
+
+    /// The `attach` verb runs attach as a CHILD and degrades to `--resume` when
+    /// it fails, so a jobs entry the daemon left behind never strands the user
+    /// at an error. The short id `claude attach` matches on is derived from the
+    /// full uuid the reply carries (attach prefix-matches `~/.claude/jobs`
+    /// directory names, which are the first 8 characters).
+    #[test]
+    fn zshrc_attach_mode_falls_back_to_resume() {
+        let body = zshrc();
+        assert!(
+            body.contains(r#"if command claude attach "${sid[1,8]}"; then"#),
+            "attach must run as a child so its failure can fall back"
+        );
+        assert!(
+            body.contains(r#"local -a post=(--resume "$sid")"#),
+            "the fallback resumes the FULL uuid from the reply"
+        );
+        assert!(
+            !body.contains(r#"exec command claude attach"#),
+            "attach must NOT be exec'd — that would discard the fallback"
+        );
+    }
+
+    /// A returned attach leaves this shell alive (the CLI's ctrl-z detach drops
+    /// the user back to their prompt), so the wrapper must report the pane back
+    /// to Nice — otherwise its promotion flag stays set and every later `claude`
+    /// in the tab opens a new tab instead of promoting the pane.
+    #[test]
+    fn zshrc_reports_a_returned_attach_back_to_nice() {
+        let body = zshrc();
+        assert!(
+            body.contains(r#""{\"action\":\"claude_exited\",\"paneId\":${pane_id_json}}""#),
+            "the notifier must send the claude_exited action with this pane's id"
+        );
+        let arm = body
+            .split_once("        attach)")
+            .expect("attach arm present")
+            .1;
+        let arm = arm.split_once(";;").expect("attach arm terminated").0;
+        assert!(
+            arm.contains("_nice_claude_exited"),
+            "the attach arm must notify on the success leg. Got: <{arm}>"
+        );
+    }
+
+    /// The `resume` verb replaces the user's args wholesale: they still say
+    /// `attach <id>`, which is exactly what Nice decided cannot work.
+    #[test]
+    fn zshrc_resume_mode_replaces_the_users_args() {
+        let body = zshrc();
+        let arm = body
+            .split_once("        resume)")
+            .expect("resume arm present")
+            .1;
+        let arm = arm.split_once(";;").expect("resume arm terminated").0;
+        // Code only — the arm's comment names `"$@"` to explain why it is absent.
+        let code: String = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains(r#"exec command claude "${post[@]}""#),
+            "resume must exec the rebuilt argv. Got: <{code}>"
+        );
+        assert!(
+            !code.contains(r#""$@""#),
+            "resume must NOT pass the user's `attach` args through. Got: <{code}>"
+        );
+        assert!(
+            arm.contains(r#"post=(--settings "$settings" "${post[@]}")"#),
+            "resume must still splice the theme pointer. Got: <{arm}>"
+        );
     }
 
     #[test]
@@ -972,6 +1109,190 @@ mod tests {
             return None;
         }
         (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+    }
+
+    /// Drive the injected `claude()` shadow END-TO-END in a real pty: a fake
+    /// `nc` answers the handshake with `reply`, and a fake `claude` appends its
+    /// argv to a record file (exiting `attach_exit` when invoked as
+    /// `attach …`, 0 otherwise). Returns the recorded argv lines, one per exec.
+    ///
+    /// The pty is what makes the dispatch reachable at all: the wrapper passes
+    /// straight through to the real binary when stdin is not a tty, so the
+    /// `-ic` helpers above can never enter it. Same zpty machinery as the
+    /// Command Compose pty test below.
+    /// What [`run_claude_shadow_e2e`] observed: the fake `claude`'s recorded
+    /// argv lines (one per exec) plus the pty transcript, which the assertions
+    /// quote so a failure shows what the shell actually did.
+    struct ShadowRun {
+        execs: Vec<String>,
+        /// Every payload the wrapper wrote to the socket, one per line — the
+        /// handshake first, then any fire-and-forget notification.
+        payloads: Vec<String>,
+        transcript: String,
+    }
+
+    fn run_claude_shadow_e2e(reply: &str, attach_exit: i32, command: &str) -> ShadowRun {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let home = scratch("nice-shadow-home");
+        let bin = home.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let record = home.0.join("argv");
+        let sent = home.0.join("payloads");
+
+        // The handshake partner: record the payload, print Nice's one-line reply.
+        let nc = bin.join("nc");
+        std::fs::write(
+            &nc,
+            format!(
+                "#!/bin/zsh\ncommand cat >> {sent}\nprint -r -- {reply:?}\n",
+                sent = sent.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&nc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The exec target: record argv, then honor the requested attach outcome.
+        let fake = bin.join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/zsh\nprint -r -- \"$@\" >> {rec}\n[[ \"$1\" == attach ]] && exit {attach_exit}\nexit 0\n",
+                rec = record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let zdotdir = make_isolated();
+        let capture = home.0.join("pty.bin");
+        let driver = home.0.join("driver.zsh");
+        std::fs::write(
+            &driver,
+            "emulate -L zsh\n\
+             zmodload zsh/zpty || exit 2\n\
+             out=$2\n\
+             : > $out\n\
+             drain() { local c; while zpty -rt n c 2>/dev/null; do print -rn -- \"$c\" >> $out; done }\n\
+             zpty n /bin/zsh -i\n\
+             sleep 1.5; drain\n\
+             zpty -w n \"$1\"\n\
+             repeat 25; do sleep 0.1; drain; done\n\
+             zpty -d n 2>/dev/null\n",
+        )
+        .unwrap();
+
+        let status = Command::new("/bin/zsh")
+            .arg(driver.to_str().unwrap())
+            .arg(command)
+            .arg(capture.to_str().unwrap())
+            .env_clear()
+            .env("ZDOTDIR", &zdotdir.0)
+            .env("HOME", &home.0)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+            )
+            .env("HOST", "test.local")
+            .env("NICE_USER_ZDOTDIR", "")
+            // Non-empty socket + pane ids: what a real Nice pane injects.
+            .env("NICE_SOCKET", home.0.join("nice.sock"))
+            .env("NICE_TAB_ID", "t1")
+            .env("NICE_PANE_ID", "t1-claude")
+            .env("TERM", "xterm-256color")
+            .env("LANG", "en_US.UTF-8")
+            .current_dir(&home.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn zpty driver");
+        assert!(status.success(), "zpty driver failed: {status:?}");
+
+        ShadowRun {
+            execs: std::fs::read_to_string(&record)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            payloads: std::fs::read_to_string(&sent)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            transcript: String::from_utf8_lossy(
+                &std::fs::read(&capture).unwrap_or_default(),
+            )
+            .escape_debug()
+            .to_string(),
+        }
+    }
+
+    /// The `attach` reply execs `claude attach <first 8 of the uuid>` — and,
+    /// when that fails (a jobs entry the daemon left behind), degrades to
+    /// `--resume <full uuid>` with the theme pointer rather than stranding the
+    /// user at attach's error.
+    #[test]
+    fn claude_shadow_attach_mode_attaches_then_falls_back_e2e() {
+        let uuid = "b8c8244b-e94e-4c38-95fb-31be9a28187e";
+
+        let ok = run_claude_shadow_e2e(
+            &format!("attach {uuid} /ptr.json"),
+            0,
+            &format!("claude --resume {uuid}"),
+        );
+        assert_eq!(
+            ok.execs,
+            vec!["attach b8c8244b".to_string()],
+            "a successful attach must be the only exec — no resume behind it. pty: <{}>",
+            ok.transcript
+        );
+        // The attached Claude ran as a CHILD, so this shell outlived it: Nice
+        // must be told the pane is a prompt again, or its promotion flag stays
+        // set and every later `claude` here opens a new tab.
+        assert_eq!(
+            ok.payloads.last().map(String::as_str),
+            Some(r#"{"action":"claude_exited","paneId":"t1-claude"}"#),
+            "a returned attach must report the pane back to Nice. payloads: {:?}",
+            ok.payloads
+        );
+
+        let fell_back = run_claude_shadow_e2e(
+            &format!("attach {uuid} /ptr.json"),
+            1,
+            &format!("claude --resume {uuid}"),
+        );
+        assert_eq!(
+            fell_back.execs,
+            vec![
+                "attach b8c8244b".to_string(),
+                format!("--settings /ptr.json --resume {uuid}"),
+            ],
+            "a failed attach must degrade to the durable --resume. pty: <{}>",
+            fell_back.transcript
+        );
+        assert!(
+            !fell_back
+                .payloads
+                .iter()
+                .any(|p| p.contains("claude_exited")),
+            "the fallback EXECS claude — the pty's own exit reports that pane. payloads: {:?}",
+            fell_back.payloads
+        );
+    }
+
+    /// The `resume` reply execs `--resume <uuid>` and DROPS the user's original
+    /// `attach <id>` args — they name a session the daemon no longer hosts.
+    #[test]
+    fn claude_shadow_resume_mode_replaces_the_attach_args_e2e() {
+        let uuid = "b8c8244b-e94e-4c38-95fb-31be9a28187e";
+        let run = run_claude_shadow_e2e(&format!("resume {uuid}"), 0, "claude attach b8c8244b");
+        assert_eq!(
+            run.execs,
+            vec![format!("--resume {uuid}")],
+            "pty: <{}>",
+            run.transcript
+        );
     }
 
     /// Launch a real `/bin/zsh` under the synthetic ZDOTDIR with a controlled

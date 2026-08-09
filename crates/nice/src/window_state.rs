@@ -66,7 +66,9 @@ enum ComposeRoute {
 
 use gpui::{AnyWindowHandle, AppContext, Entity};
 use nice_model::file_browser::FileBrowserStore;
-use nice_model::{Pane, PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, TabModel, TabStatus};
+use nice_model::{
+    Pane, PaneKind, SidebarMode, SidebarModel, SidebarTabSelection, Tab, TabModel, TabStatus,
+};
 use nice_term_view::TerminalEvent;
 
 use crate::confirmation_modal::ConfirmationModal;
@@ -75,7 +77,7 @@ use crate::control_socket::{NiceControlSocket, Reply, RecordedSocketMessage, Soc
 use crate::pane_strip_actions::{ModelPaneStripActions, PaneStripActions};
 use crate::session_manager::{
     compose_claude_reply, mint_session_uuid, ClaudeReplyDecision, ClaudeSessionMode,
-    ClaudeTabPlacement, DissolveTerminus, SessionManager,
+    ClaudeTabPlacement, ClaudeTabSession, DissolveTerminus, SessionManager,
 };
 use crate::sidebar_actions::{ModelSidebarActions, SidebarActions};
 
@@ -96,7 +98,13 @@ fn mint_session_id() -> String {
 /// out, and the gpui-context-carrying caller must build + spawn the Claude tab.
 struct NewTabSpawn {
     cwd: String,
+    /// The argv the new tab's `claude` runs. Normally the client's args
+    /// verbatim; Fix D rewrites them when the request names a background
+    /// session (`--resume <hosted uuid>` ⇒ `attach <short id>` and back).
     args: Vec<String>,
+    /// Which session that tab runs — the newtab twin of the in-place reply's
+    /// exec-time decision (see [`WindowState::plan_newtab_claude_exec`]).
+    session: ClaudeTabSession,
 }
 
 /// The deferred-resume branch-parent spawn returned by the pure model half of a
@@ -119,15 +127,241 @@ struct BranchParentSpawn {
     old_session_id: String,
 }
 
+/// A `~/.claude/jobs/<first8>/` entry — the discriminator that tells a
+/// daemon-hosted BACKGROUND fork apart from an in-pane rotation. Both relay
+/// `source: "fork"` since Claude Code 2.1.214, so the source alone cannot
+/// separate them:
+///
+/// * `/fork` (since 2.1.212) copies the conversation into a detached background
+///   session run by the Claude Code daemon. The daemon creates
+///   `~/.claude/jobs/<first8(fork id)>/` (and copies the parent transcript into
+///   `…/tmp/`) **before** spawning the fork child, so the directory is already
+///   on disk when that child's SessionStart hook fires.
+/// * `/branch` and `--fork-session` resumes rotate the FOREGROUND pane's session
+///   and never create a jobs entry.
+///
+/// Hence the directory's mere existence is the classification signal (a `Some`
+/// at all), while every parsed field is optional: `state.json` may not have
+/// landed yet when the hook fires, and an aborted fork never writes one. A
+/// `Some` with all-`None` fields means "background fork, details not on disk
+/// yet" — the deferred retry that fills them in is Fix B's job (next slice).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ForkJobInfo {
+    /// `state.json`'s `sessionId` — the fork's own full uuid. Lets a caller
+    /// guard against first-8 collisions by comparing it with the id it probed
+    /// with (the id in hand is the truth; a mismatch means someone else's job).
+    pub(crate) session_id: Option<String>,
+    /// `state.json`'s `forkParentSessionId` — the conversation this fork
+    /// branched from. The key the parent sidebar tab is resolved by (Fix B).
+    pub(crate) fork_parent_session_id: Option<String>,
+    /// `state.json`'s `name` — the job's human label (it carries the `⑂`
+    /// marker), the fork tab's title when present.
+    pub(crate) name: Option<String>,
+}
+
+/// How long [`WindowState::materialize_background_fork`] waits between re-probes
+/// while a background fork's `state.json` has not landed yet.
+const FORK_STATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many times that materialization re-probes before giving up SILENTLY.
+/// 20 × 500 ms ≈ 10 s — the top of the plan's 5–10 s window, and comfortably more
+/// than the daemon needs between creating `jobs/<first8>/` and writing its
+/// `state.json`. Past it the job is treated as aborted: an aborted `/fork` (the
+/// live `298689bf` evidence: a jobs dir that only ever got `tmp/`) must leave
+/// nothing behind in the sidebar.
+const FORK_STATE_POLL_ATTEMPTS: usize = 20;
+
+/// The injectable `~/.claude/jobs/<first8>/` probe behind
+/// [`WindowState::fork_job_probe`]: maps a session id to its jobs entry, or
+/// `None` when no such entry exists (⇒ not a daemon job).
+type ForkJobProbe = Box<dyn Fn(&str) -> Option<ForkJobInfo>>;
+
+/// The production probe: read `~/.claude/jobs/<first8(session_id)>/`. Hardcodes
+/// `~/.claude` exactly as [`crate::claude_hook_installer`] does — Nice honors no
+/// `$CLAUDE_CONFIG_DIR`-style override anywhere today, and inventing one here
+/// would make the hook and the probe disagree about where Claude's state lives.
+fn probe_fork_job(session_id: &str) -> Option<ForkJobInfo> {
+    let home = std::env::var("HOME").ok()?;
+    probe_fork_job_in(std::path::Path::new(&home).join(".claude").join("jobs"), session_id)
+}
+
+/// [`probe_fork_job`] against an explicit jobs directory — the hermetic entry
+/// point (tests / fixtures point it at a scratch dir instead of the developer's
+/// real `~/.claude`). `None` when the id is too short to have a first-8 or the
+/// per-job directory is absent; a present directory with an unreadable or
+/// malformed `state.json` still yields `Some(ForkJobInfo::default())`, because
+/// the DIRECTORY is the classification signal and its contents are only detail.
+fn probe_fork_job_in(jobs_dir: impl AsRef<std::path::Path>, session_id: &str) -> Option<ForkJobInfo> {
+    let short = session_id.get(..8)?;
+    let dir = jobs_dir.as_ref().join(short);
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut info = ForkJobInfo::default();
+    if let Ok(bytes) = std::fs::read(dir.join("state.json")) {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let field = |key: &str| {
+                map.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            };
+            info.session_id = field("sessionId");
+            info.fork_parent_session_id = field("forkParentSessionId");
+            info.name = field("name");
+        }
+    }
+    Some(info)
+}
+
+/// The session-identifying shape of an intercepted `claude` invocation — the
+/// input to Fix D's exec-time normalization
+/// ([`WindowState::plan_claude_exec`]). Only the two shapes that name ONE
+/// specific session are modelled; everything else (a bare `claude`, a
+/// `--session-id`, an argument-less `-r` picker) is [`Neither`](Self::Neither)
+/// and takes the untouched pre-Fix-D path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeArgSession {
+    /// `--resume <uuid>`, `-r <uuid>`, or `--resume=<uuid>`.
+    Resume(String),
+    /// The `attach <id>` subcommand (`id` is normally the 8-hex short job id).
+    Attach(String),
+    /// Nothing in the args names a session.
+    Neither,
+}
+
+/// Classify `args` for Fix D. Deliberately NOT
+/// [`TabModel::extract_claude_session_id`]: that one folds `--session-id` in
+/// with `--resume` (both "the session this pane will run"), while Fix D must
+/// tell a RESUME of an existing conversation apart from a fresh id, and must
+/// also see `-r` and the `attach` subcommand, neither of which the shared
+/// parser knows.
+fn classify_claude_session_args(args: &[String]) -> ClaudeArgSession {
+    // `attach <id>`: a subcommand, so only ever in first position.
+    if args.first().map(String::as_str) == Some("attach") {
+        return match args.get(1) {
+            Some(id) if !id.is_empty() && !id.starts_with('-') => {
+                ClaudeArgSession::Attach(id.clone())
+            }
+            _ => ClaudeArgSession::Neither,
+        };
+    }
+    for (i, a) in args.iter().enumerate() {
+        let value = match a.as_str() {
+            "--resume" | "-r" => args.get(i + 1).map(String::as_str),
+            other => match other.strip_prefix("--resume=") {
+                Some(v) => Some(v),
+                None => continue,
+            },
+        };
+        // A value-less `--resume` / `-r` (or one followed by another flag)
+        // opens Claude's interactive picker — it names no session, so there is
+        // nothing to normalize.
+        return match value {
+            Some(v) if !v.is_empty() && !v.starts_with('-') => {
+                ClaudeArgSession::Resume(v.to_string())
+            }
+            _ => ClaudeArgSession::Neither,
+        };
+    }
+    ClaudeArgSession::Neither
+}
+
+/// What a `claude` invocation resolves to once Fix D's jobs probe has run —
+/// the shared core of the two consumers that must agree: the in-place reply
+/// verb ([`WindowState::plan_claude_exec`]) and the newtab spawn
+/// ([`WindowState::plan_newtab_claude_exec`]). Both used to derive this
+/// independently, and the newtab half silently didn't (it spliced
+/// `--session-id` beside the user's `--resume`, an argv Claude Code refuses).
+enum ResolvedClaudeSession {
+    /// The named session is a background job the daemon still hosts: open it
+    /// with `attach`. `short_id` is what `attach` resolves (it prefix-matches
+    /// `~/.claude/jobs` directory names); `uuid` is the full id — the wire verb
+    /// carries it for the wrapper's `--resume` fallback, and the tab pins it.
+    Attach { short_id: String, uuid: String },
+    /// The user said `attach <full uuid>` for a session no daemon hosts:
+    /// `attach` could only ever fail on it, so resume `uuid` instead.
+    Resume { uuid: String },
+    /// The args already name their session — run them as typed, splicing no
+    /// `--session-id`. `pin` is the id the tab should remember (`None` when
+    /// the named session resolves to no full uuid).
+    AsTyped { pin: Option<String> },
+    /// Nothing in the args names a session.
+    Unnamed,
+}
+
+/// The 8-hex short job id `claude attach` resolves, derived from a full
+/// session uuid (`~/.claude/jobs/<first8>/`). Falls back to the whole string
+/// for an id too short to slice — the probe that produced it already agreed
+/// it keys a jobs entry.
+fn short_job_id(uuid: &str) -> String {
+    uuid.get(..8).unwrap_or(uuid).to_string()
+}
+
+/// Whether `id` has the shape of a full Claude session uuid (8-4-4-4-12 hex),
+/// as opposed to the 8-hex short job id `claude attach` takes. The two are
+/// interchangeable to a human and NOT to the CLI: `attach` resolves its
+/// argument by prefix-matching `~/.claude/jobs/` DIRECTORY names, so a full
+/// uuid matches nothing there, while `--resume` accepts only the full uuid.
+fn looks_like_session_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// Fix D's decision for one intercepted `claude` invocation: what the wrapper
+/// should exec ([`decision`](Self::decision)) and which session id the promoted
+/// tab should remember ([`pin_session_id`](Self::pin_session_id)).
+struct ClaudeExecPlan {
+    /// The id to pin on the promoted tab, or `None` when the request names a
+    /// session we cannot resolve to a full uuid (a short `attach <id>` with no
+    /// readable jobs entry). Pinning the short id there would leave the tab
+    /// holding an id no later `claude --resume` could ever use, so the tab
+    /// keeps whatever it already had.
+    pin_session_id: Option<String>,
+    /// The reply the wrapper acts on.
+    decision: ClaudeReplyDecision,
+}
+
+/// A `session_update` that classified as a NEWLY BORN daemon-hosted background
+/// fork: `source == "fork"` AND a `~/.claude/jobs/<first8>/` entry for the
+/// incoming id. A jobs entry under any other source is the same daemon relaying
+/// a later life-cycle event for a job that already has its tab — distrusted the
+/// same way, but handed off nowhere.
+///
+/// The classification itself closes bug 3 by rotating NOTHING — the pane id
+/// such a relay carries belongs to whichever pane first spawned the daemon, so
+/// it is untrustworthy. This type is the hand-off from that context-free
+/// classification ([`WindowState::apply_session_update`]) to the
+/// gpui-context-carrying router, which passes it to
+/// [`materialize_background_fork`](WindowState::materialize_background_fork):
+/// a nested child tab under the tab whose `claude_session_id` is
+/// [`ForkJobInfo::fork_parent_session_id`], after the deferred `state.json`
+/// retry that fills that field in (`job` may still be all-`None` at hook time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackgroundFork {
+    /// The fork's own session id (the id the hook relayed).
+    fork_session_id: String,
+    /// The relayed cwd, empty-normalized to `None` — the fork may live in its
+    /// own worktree since 2.1.220, so it is not necessarily the parent's cwd.
+    cwd: Option<String>,
+    /// The jobs entry that classified this as a background fork.
+    job: ForkJobInfo,
+}
+
 /// Outcome of the pure model half of a `session_update`
 /// ([`WindowState::apply_session_update`]): whether any tab state actually
 /// changed — the R18 save signal, Swift's `onSessionMutation`; nothing persists
-/// yet — and, when the rotation classified as a `/branch`, the deferred-resume
-/// [`BranchParentSpawn`] the router must fulfil with its gpui context.
+/// yet — plus, when the rotation classified as a `/branch`, the deferred-resume
+/// [`BranchParentSpawn`] the router must fulfil with its gpui context, or, when
+/// it classified as a background `/fork`, the [`BackgroundFork`] hand-off. The
+/// two are mutually exclusive: a background fork touches no tab at all.
 #[derive(Default)]
 struct SessionUpdateOutcome {
     did_mutate: bool,
     spawn: Option<BranchParentSpawn>,
+    background_fork: Option<BackgroundFork>,
 }
 
 /// The per-window composition root. One per Nice window, owned by a
@@ -235,6 +469,16 @@ pub(crate) struct WindowState {
     /// via [`prune_dissolved_file_browser_states`](Self::prune_dissolved_file_browser_states)
     /// off the session dissolve cascade.
     pub(crate) file_browser: FileBrowserStore,
+    /// The `~/.claude/jobs/<first8>/` probe that classifies a `source: "fork"`
+    /// `session_update` as a daemon-hosted BACKGROUND fork (entry present) or an
+    /// in-pane `/branch`-shaped rotation (entry absent) — see [`ForkJobInfo`].
+    /// Defaults to [`probe_fork_job`] (a real read under `$HOME/.claude`); unit
+    /// tests swap in a fixture via
+    /// [`set_fork_job_probe_for_test`](WindowState::set_fork_job_probe_for_test)
+    /// so the classification is testable without touching the developer's real
+    /// `~/.claude` — and so no test can be perturbed by whatever forks happen to
+    /// be running on the machine.
+    fork_job_probe: ForkJobProbe,
     /// R21: this window's mounted pane-content host, stashed at
     /// [`crate::app::build_window_root`] so the process-level theme fan-out
     /// ([`crate::theme_settings::apply_theme_fanout`]) can reach every window's
@@ -317,6 +561,7 @@ impl WindowState {
             // render, defaulting to dotfiles-hidden (the 2026-07-07 deviation from
             // Swift's cwd-aware `show_hidden` heuristic).
             file_browser: FileBrowserStore::new(),
+            fork_job_probe: Box::new(probe_fork_job),
             pane_host: None,
         }
     }
@@ -549,6 +794,30 @@ impl WindowState {
         self.claude_settings_path = path;
     }
 
+    /// Test seam: inject the `~/.claude/jobs/<first8>/` probe (production reads
+    /// the real directory — see [`probe_fork_job`]). Every `source: "fork"` case
+    /// in the suite installs one, so the classification never depends on the
+    /// developer's machine state.
+    #[cfg(test)]
+    pub(crate) fn set_fork_job_probe_for_test(
+        &mut self,
+        probe: impl Fn(&str) -> Option<ForkJobInfo> + 'static,
+    ) {
+        self.fork_job_probe = Box::new(probe);
+    }
+
+    /// Scenario seam: re-root the fork-job probe at `jobs_dir` instead of
+    /// `$HOME/.claude/jobs`. Unlike
+    /// [`set_fork_job_probe_for_test`](Self::set_fork_job_probe_for_test) this
+    /// keeps the REAL probe ([`probe_fork_job_in`]) — only its directory moves —
+    /// so a live scenario exercises the shipped filesystem read against a scratch
+    /// fixture instead of the developer's `~/.claude` (which the live suites can't
+    /// use: they restore the real `HOME` after the window opens, and the machine's
+    /// actual background forks would make the assertions non-deterministic).
+    pub(crate) fn set_fork_jobs_dir_for_scenario(&mut self, jobs_dir: std::path::PathBuf) {
+        self.fork_job_probe = Box::new(move |id| probe_fork_job_in(&jobs_dir, id));
+    }
+
     /// Fill R15's Claude theme-sync `--settings` provider (R17 slice 2). The
     /// shipped window builder (`crate::app::open_managed_window`) computes the value
     /// from the process gate (`ClaudeThemeSyncGate` →
@@ -629,7 +898,8 @@ impl WindowState {
     /// spawns a fresh Claude tab.
     /// `session_update`'s handler is context-free (the pure rotation flow),
     /// returning a deferred-resume [`BranchParentSpawn`] the router fulfils here
-    /// with `cx` when the rotation was a `/branch` (R16).
+    /// with `cx` when the rotation was a `/branch` (R16), or a [`BackgroundFork`]
+    /// the router materializes here (Fix B) when it was a daemon-hosted `/fork`.
     pub(crate) fn route_socket_message(
         &mut self,
         msg: SocketMessage,
@@ -649,9 +919,22 @@ impl WindowState {
                 source,
                 cwd,
             } => {
-                if let Some(spawn) = self.handle_session_update(pane_id, session_id, source, cwd) {
+                let outcome = self.handle_session_update(pane_id, session_id, source, cwd);
+                if let Some(spawn) = outcome.spawn {
                     self.spawn_branch_parent(spawn, cx);
                 }
+                // A daemon-hosted background `/fork` rotated nothing (that is bug
+                // 3's fix) and is instead materialized as its own sidebar entry.
+                if let Some(fork) = outcome.background_fork {
+                    self.materialize_background_fork(fork, cx);
+                }
+            }
+            SocketMessage::ClaudeExited { pane_id } => {
+                self.handle_claude_exited(pane_id);
+                // Re-render: the pane's status dot / waiting pulse and its pill
+                // must leave the running state now, not at the next unrelated
+                // event.
+                cx.notify();
             }
             SocketMessage::Handoff {
                 cwd,
@@ -742,6 +1025,7 @@ impl WindowState {
                 model,
                 ClaudeTabPlacement::Bucket { cwd: spawn.cwd },
                 &spawn.args,
+                spawn.session,
                 settings.as_deref(),
                 cx,
             );
@@ -753,6 +1037,41 @@ impl WindowState {
         }
         // Re-render: the newtab appears / the in-place promotion retitles the pill.
         cx.notify();
+    }
+
+    /// `claude_exited` handler — the wrapper telling us the Claude it ran as a
+    /// CHILD has returned and the pane is a shell prompt again.
+    ///
+    /// Only Fix D's `attach` verb runs Claude as a child (so a jobs entry the
+    /// daemon left behind can degrade to `--resume` instead of stranding the
+    /// user). Every other verb `exec`s, which ties Claude's lifetime to the
+    /// pty's: when it ends the pane dies and [`SessionManager::pane_held`]
+    /// clears the promotion flag. A child leaves the pty alive, so without this
+    /// message `is_claude_running` would stay `true` forever — and that flag is
+    /// the ≤1-Claude-per-tab guard, so every later `claude` in the tab would
+    /// open a NEW tab instead of promoting in place (observed in validation:
+    /// after detaching from an attached fork, `claude --resume <fork id>` at the
+    /// pane's own prompt opened a stray root tab).
+    ///
+    /// Clears only what the promotion set. The pane stays Claude-kind: it is
+    /// still the tab's Claude pane, exactly as a deferred-resume pane is before
+    /// its first run.
+    fn handle_claude_exited(&mut self, pane_id: String) {
+        self.record_socket_message(RecordedSocketMessage::ClaudeExited {
+            pane_id: pane_id.clone(),
+        });
+        let Some(tab_id) = self.model.tab_id_owning(&pane_id) else {
+            return; // stale / unknown pane — silent no-op, like session_update
+        };
+        self.model.mutate_tab(&tab_id, |tab| {
+            if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
+                pane.is_claude_running = false;
+                // A prompt is neither thinking nor waiting; clear the ack too so
+                // a future run can pulse again (`pane_held`'s rule).
+                pane.status = TabStatus::Idle;
+                pane.waiting_acknowledged = false;
+            }
+        });
     }
 
     /// The `claude` newtab/inplace decision + reply — the pure, spawn-free half of
@@ -785,18 +1104,23 @@ impl WindowState {
         };
         if !(known && !is_terminals && pane_in_tab && !has_running) {
             reply.send("newtab");
+            // The fresh tab still owes Fix D's decision: a request that NAMES a
+            // session must keep that id (and never get a `--session-id` spliced
+            // in beside it — an argv the CLI refuses).
+            let (args, session) = self.plan_newtab_claude_exec(args);
             return Some(NewTabSpawn {
                 cwd: cwd.to_string(),
-                args: args.to_vec(),
+                args,
+                session,
             });
         }
 
-        // Promotion in place. Extract `--resume`/`--session-id` from args if present
-        // (a restored deferred pane's pre-typed `claude --resume <uuid>`); else mint
-        // a fresh session id to persist for the next relaunch.
-        let parsed = TabModel::extract_claude_session_id(args);
-        let parsed_from_args = parsed.is_some();
-        let session_id = parsed.unwrap_or_else(mint_session_uuid);
+        // Promotion in place. Resolve the session the invocation names — the id
+        // parsed from `--resume`/`--session-id`/`attach` (a restored deferred
+        // pane's pre-typed `claude --resume <uuid>`), else a freshly minted one to
+        // persist for the next relaunch — and, with it, Fix D's exec-time
+        // normalization between `--resume` and `attach`.
+        let plan = self.plan_claude_exec(args);
         self.model.mutate_tab(tab_id, |tab| {
             if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
                 pane.kind = PaneKind::Claude;
@@ -811,7 +1135,9 @@ impl WindowState {
                 }
             }
             tab.active_pane_id = Some(pane_id.to_string());
-            tab.claude_session_id = Some(session_id.clone());
+            if let Some(id) = &plan.pin_session_id {
+                tab.claude_session_id = Some(id.clone());
+            }
         });
         // onSessionMutation → R18's did-mutate save; nothing to persist yet.
 
@@ -819,15 +1145,191 @@ impl WindowState {
         // the args don't already carry `--settings` (no doubled flag). Sync off /
         // gated → the reply stays byte-identical to the pre-theming protocol.
         let settings = self.effective_inplace_settings(args);
-        let line = compose_claude_reply(
-            &ClaudeReplyDecision::InPlace {
-                parsed_from_args,
-                session_id,
-            },
-            settings.as_deref(),
-        );
+        let line = compose_claude_reply(&plan.decision, settings.as_deref());
         reply.send(&line);
         None
+    }
+
+    /// Fix D — the exec-time `--resume` ⇄ `attach` normalization, plus the
+    /// pre-existing "parse the id out of the args, else mint one" resolution
+    /// they share.
+    ///
+    /// Which of the two verbs opens a background session correctly can only be
+    /// decided HERE, at exec time: a deferred pane's `claude --resume <uuid>`
+    /// sits pre-typed in the shell until the user presses Enter, by which point
+    /// the Claude daemon may have picked the session up or dropped it. The
+    /// discriminator is the same `~/.claude/jobs/<first8>/` probe the
+    /// `session_update` classification uses (see [`ForkJobInfo`]), read through
+    /// the same injectable seam.
+    ///
+    /// * `--resume <uuid>` naming a session the daemon still hosts ⇒ `attach`.
+    ///   A `--resume` would spawn a SECOND process against a live conversation.
+    /// * `attach <full uuid>` ⇒ normalized either way: `attach` matches jobs by
+    ///   directory-name prefix, so a full uuid can only ever fail there.
+    /// * `attach <short id>` ⇒ passed through untouched (it is already the
+    ///   right verb when the job exists, and when the job is gone there is no
+    ///   `state.json` left to recover the uuid from — `attach` reports the miss
+    ///   itself, exiting 1). Still session-IDENTIFYING, so no `--session-id`
+    ///   gets spliced in beside it.
+    /// * everything else ⇒ exactly the pre-Fix-D behavior.
+    fn plan_claude_exec(&self, args: &[String]) -> ClaudeExecPlan {
+        match self.resolve_claude_session(args) {
+            ResolvedClaudeSession::Attach { uuid, .. } => ClaudeExecPlan {
+                pin_session_id: Some(uuid.clone()),
+                // The FULL uuid rides the wire: the wrapper slices attach's
+                // short id off it and needs the uuid for its fallback leg.
+                decision: ClaudeReplyDecision::Attach { session_id: uuid },
+            },
+            ResolvedClaudeSession::Resume { uuid } => ClaudeExecPlan {
+                pin_session_id: Some(uuid.clone()),
+                decision: ClaudeReplyDecision::Resume { session_id: uuid },
+            },
+            ResolvedClaudeSession::AsTyped { pin } => ClaudeExecPlan {
+                decision: ClaudeReplyDecision::InPlace {
+                    parsed_from_args: true,
+                    // Never rendered under `parsed_from_args` (the reply is the
+                    // bare `inplace` / the `-` placeholder form).
+                    session_id: pin.clone().unwrap_or_default(),
+                },
+                pin_session_id: pin,
+            },
+            ResolvedClaudeSession::Unnamed => {
+                let session_id = mint_session_uuid();
+                ClaudeExecPlan {
+                    pin_session_id: Some(session_id.clone()),
+                    decision: ClaudeReplyDecision::InPlace {
+                        parsed_from_args: false,
+                        session_id,
+                    },
+                }
+            }
+        }
+    }
+
+    /// Fix D on the **newtab** branch: the same decision as
+    /// [`plan_claude_exec`](Self::plan_claude_exec), expressed as the argv +
+    /// [`ClaudeTabSession`] the fresh tab's spawn needs.
+    ///
+    /// The branch exists because the in-place guard refused (an unknown /
+    /// Terminals / stale-pane request, or a tab that already runs a Claude), and
+    /// it used to hand the args to the tab constructor untouched — which then
+    /// prepended its own freshly minted `--session-id`. Beside a `--resume` or
+    /// an `attach` that is an argv the CLI rejects outright (`--session-id can
+    /// only be used with --continue or --resume if --fork-session is also
+    /// specified`), so the pane printed one line and died. A request that names
+    /// a session therefore keeps ITS id and splices none.
+    ///
+    /// The attach rewrite carries no wrapper-style `|| --resume <uuid>`
+    /// fallback: the tab constructor execs a single command line, and the probe
+    /// it rests on ran milliseconds earlier in this same handler (not hours ago
+    /// at prefill time, which is what makes the in-place fallback worth its
+    /// complexity).
+    fn plan_newtab_claude_exec(&self, args: &[String]) -> (Vec<String>, ClaudeTabSession) {
+        match self.resolve_claude_session(args) {
+            ResolvedClaudeSession::Attach { short_id, uuid } => (
+                vec!["attach".to_string(), short_id.clone()],
+                ClaudeTabSession {
+                    mode: ClaudeSessionMode::Attach(short_id),
+                    pin: Some(uuid),
+                },
+            ),
+            ResolvedClaudeSession::Resume { uuid } => (
+                vec!["--resume".to_string(), uuid.clone()],
+                ClaudeTabSession {
+                    mode: ClaudeSessionMode::Resume(uuid.clone()),
+                    pin: Some(uuid),
+                },
+            ),
+            ResolvedClaudeSession::AsTyped { pin } => {
+                // `attach <short id>` passes through as the SUBCOMMAND mode, not
+                // as trailing args: the exec builder would otherwise emit the
+                // theme `--settings` ahead of it, which stops the CLI from
+                // seeing a subcommand at all.
+                let mode = match args.first().map(String::as_str) {
+                    Some("attach") => ClaudeSessionMode::Attach(
+                        args.get(1).cloned().unwrap_or_default(),
+                    ),
+                    _ => ClaudeSessionMode::None,
+                };
+                (args.to_vec(), ClaudeTabSession { mode, pin })
+            }
+            ResolvedClaudeSession::Unnamed => (args.to_vec(), ClaudeTabSession::mint()),
+        }
+    }
+
+    /// Resolve what session an intercepted `claude` argv names, probing the
+    /// daemon's jobs directory for the two shapes that name one. The single
+    /// source of truth behind [`plan_claude_exec`](Self::plan_claude_exec) and
+    /// [`plan_newtab_claude_exec`](Self::plan_newtab_claude_exec).
+    fn resolve_claude_session(&self, args: &[String]) -> ResolvedClaudeSession {
+        match classify_claude_session_args(args) {
+            // `--resume <uuid>` for a session the daemon still hosts: resuming
+            // would spawn a SECOND process against a live conversation.
+            ClaudeArgSession::Resume(id) if self.daemon_hosts_session(&id) => {
+                ResolvedClaudeSession::Attach {
+                    short_id: short_job_id(&id),
+                    uuid: id,
+                }
+            }
+            ClaudeArgSession::Resume(id) => ResolvedClaudeSession::AsTyped { pin: Some(id) },
+            ClaudeArgSession::Attach(id) if looks_like_session_uuid(&id) => {
+                if self.daemon_hosts_session(&id) {
+                    ResolvedClaudeSession::Attach {
+                        short_id: short_job_id(&id),
+                        uuid: id,
+                    }
+                } else {
+                    ResolvedClaudeSession::Resume { uuid: id }
+                }
+            }
+            ClaudeArgSession::Attach(id) => ResolvedClaudeSession::AsTyped {
+                // Pin the job's full uuid when `state.json` still maps this
+                // short id (so the tab resumes durably after a relaunch), and
+                // nothing at all when it does not. The `starts_with` guard is
+                // the short-id twin of `daemon_hosts_session`'s equality check:
+                // a jobs entry naming some other uuid is not this session.
+                pin: (self.fork_job_probe)(&id)
+                    .and_then(|job| job.session_id)
+                    .filter(|uuid| uuid.starts_with(&id)),
+            },
+            ClaudeArgSession::Neither => match TabModel::extract_claude_session_id(args) {
+                Some(id) => ResolvedClaudeSession::AsTyped { pin: Some(id) },
+                None => ResolvedClaudeSession::Unnamed,
+            },
+        }
+    }
+
+    /// Whether the Claude daemon is hosting `session_id` as a background job:
+    /// a `~/.claude/jobs/<first8>/state.json` whose `sessionId` is EXACTLY this
+    /// uuid. The equality is the first-8 collision guard — a jobs entry is
+    /// keyed by 8 hex characters, so a foreign job can share the prefix, and
+    /// attaching to it would drop the user into someone else's conversation.
+    /// A jobs directory whose `state.json` has not landed (or does not parse)
+    /// therefore reads as "not hosted" and keeps the durable `--resume`.
+    fn daemon_hosts_session(&self, session_id: &str) -> bool {
+        matches!(
+            (self.fork_job_probe)(session_id),
+            Some(job) if job.session_id.as_deref() == Some(session_id)
+        )
+    }
+
+    /// The `~/.claude/jobs/<first8>/` entry `session_id` belongs to, or `None`
+    /// when the id names no background job. A `Some` is the "this SessionStart
+    /// came from the daemon, not from the pane it names" signal
+    /// ([`apply_session_update`](Self::apply_session_update)).
+    ///
+    /// Deliberately looser than
+    /// [`daemon_hosts_session`](Self::daemon_hosts_session), which answers "is
+    /// the daemon hosting it RIGHT NOW" for the exec-time attach/resume choice: a
+    /// jobs directory whose `state.json` has not landed yet still counts here,
+    /// because a background fork's SessionStart can beat the daemon's write (the
+    /// `tmp/`-only `298689bf` evidence) and that relay is exactly the one that
+    /// must not rotate a tab. Where `state.json` IS readable its `sessionId` must
+    /// match — the same first-8 collision guard, so a foreign job sharing the
+    /// prefix can never silence a genuine in-pane rotation.
+    fn daemon_job_for(&self, session_id: &str) -> Option<ForkJobInfo> {
+        (self.fork_job_probe)(session_id)
+            .filter(|job| job.session_id.as_deref().is_none_or(|id| id == session_id))
     }
 
     /// The `--settings` pointer to splice into the in-place promotion reply: the
@@ -844,9 +1346,10 @@ impl WindowState {
     /// `SessionsModel.handleClaudeSessionUpdate` (`SessionsModel.swift:946-963`).
     /// The SessionStart hook relays a pane's rotated session id / cwd; this records
     /// the normalized message, runs the pure rotation flow
-    /// ([`apply_session_update`](Self::apply_session_update)), and returns the
-    /// deferred-resume [`BranchParentSpawn`] for the router to fulfil with `cx`
-    /// when the rotation classified as a `/branch`.
+    /// ([`apply_session_update`](Self::apply_session_update)), and returns its
+    /// outcome — the deferred-resume [`BranchParentSpawn`] for the router to
+    /// fulfil with `cx` when the rotation classified as a `/branch`, or the
+    /// [`BackgroundFork`] hand-off when it classified as a daemon-hosted `/fork`.
     ///
     /// Context-free itself (fire-and-forget: R14's transport dropped the client fd
     /// BEFORE dispatch, so the handler never replies). The gpui-context spawn lives
@@ -859,7 +1362,7 @@ impl WindowState {
         session_id: String,
         source: Option<String>,
         cwd: Option<String>,
-    ) -> Option<BranchParentSpawn> {
+    ) -> SessionUpdateOutcome {
         self.record_socket_message(RecordedSocketMessage::SessionUpdate {
             pane_id: pane_id.clone(),
             session_id: session_id.clone(),
@@ -867,23 +1370,40 @@ impl WindowState {
             cwd: cwd.clone(),
         });
         self.apply_session_update(&pane_id, &session_id, source.as_deref(), cwd.as_deref())
-            .spawn
     }
 
     /// The pure model half of a `session_update` — the rotation flow per the
     /// PROTECTED ordering (`SessionsModel.swift:946-963`), unit-testable without a
-    /// gpui context. Resolve the owning tab by pane (stale/unknown pane ⇒ silent
-    /// no-op) → capture `old_id` → `update_claude_session_id` (equality
-    /// short-circuit: a redundant forward mutates nothing) → **iff
-    /// `source == "resume"` && `old_id` exists && `old_id != session_id`:
-    /// materialize the branch parent, BEFORE the cwd update** (so the sibling
-    /// inherits the pre-rotation cwd) → `update_tab_cwd` (None/empty filtered).
-    /// An unknown/absent source with an id change is a plain id update, NEVER a
-    /// parent (deliberately miss an occasional `/branch` rather than spawn a
-    /// phantom parent from a mis-classified `/clear`).
+    /// gpui context. **Background-fork gate first** (below) → resolve the owning
+    /// tab by pane (stale/unknown pane ⇒ silent no-op) → capture `old_id` →
+    /// `update_claude_session_id` (equality short-circuit: a redundant forward
+    /// mutates nothing) → **iff `source ∈ {"resume", "fork"}` && `old_id` exists
+    /// && `old_id != session_id`: materialize the branch parent, BEFORE the cwd
+    /// update** (so the sibling inherits the pre-rotation cwd) → `update_tab_cwd`
+    /// (None/empty filtered). An unknown/absent source with an id change is a
+    /// plain id update, NEVER a parent (deliberately miss an occasional `/branch`
+    /// rather than spawn a phantom parent from a mis-classified `/clear`).
+    ///
+    /// `"fork"` joined `"resume"` in the branch arm because Claude Code 2.1.214
+    /// changed what an in-pane rotation reports: `/branch` and `--fork-session`
+    /// resumes now relay `source: "fork"`, so a `resume`-only gate silently drops
+    /// the pre-branch conversation from the sidebar (bug 2). Older CLIs still say
+    /// `"resume"`, so both stay in.
+    ///
+    /// The same `"fork"` source ALSO reaches us from the Claude daemon's detached
+    /// background `/fork` child, whose relayed pane id belongs to whichever pane
+    /// first spawned the daemon — rotating that pane's tab is what corrupted an
+    /// unrelated tab's session id (bug 3). The jobs-entry probe
+    /// ([`daemon_job_for`](Self::daemon_job_for)) separates the two, and it runs
+    /// on EVERY source before anything is read or written: the daemon relays a
+    /// stale pane id for a background job's whole life, not just at its birth (a
+    /// cold `claude attach` wakes the job and its SessionStart says `"resume"`).
+    /// A daemon-owned id must touch no tab at all, so this cannot sit downstream
+    /// of the id update.
     ///
     /// Returns whether anything changed (the R18 save signal — `onSessionMutation`;
-    /// nothing persists yet) plus the deferred-resume spawn the caller owes.
+    /// nothing persists yet) plus the deferred-resume spawn the caller owes, or
+    /// the [`BackgroundFork`] hand-off.
     fn apply_session_update(
         &mut self,
         pane_id: &str,
@@ -891,6 +1411,32 @@ impl WindowState {
         source: Option<&str>,
         cwd: Option<&str>,
     ) -> SessionUpdateOutcome {
+        // Daemon-relayed SessionStart: a jobs entry for the incoming id means the
+        // Claude daemon runs this session, so the relayed pane id is whichever
+        // pane happened to spawn the daemon and NOTHING here may be acted on.
+        // Probed for EVERY source, not just `"fork"` — a cold-woken background job
+        // fires SessionStart with `source: "resume"`, and a `"fork"`-only gate let
+        // that relay fall straight through to the rotation path below and rewrite
+        // an unrelated tab (bug 3, via `claude attach`). Probed before the pane is
+        // even resolved — a daemon relay whose stale pane has since closed is
+        // still a daemon relay, and resolving that pane would only tempt a later
+        // edit into writing to the wrong tab.
+        if let Some(job) = self.daemon_job_for(session_id) {
+            return SessionUpdateOutcome {
+                did_mutate: false,
+                spawn: None,
+                // `"fork"` is the job's BIRTH — the one relay that owes the
+                // sidebar a new entry (Fix B). Every other source is a later
+                // life-cycle event (a wake, a resume, the daemon's own restart)
+                // for a job that already has its tab, so it changes nothing at
+                // all: re-materializing would just duplicate that tab.
+                background_fork: (source == Some("fork")).then(|| BackgroundFork {
+                    fork_session_id: session_id.to_string(),
+                    cwd: cwd.filter(|c| !c.is_empty()).map(str::to_string),
+                    job,
+                }),
+            };
+        }
         let Some(tab_id) = self.model.tab_id_owning(pane_id) else {
             return SessionUpdateOutcome::default();
         };
@@ -899,13 +1445,13 @@ impl WindowState {
             .tab_for(&tab_id)
             .and_then(|t| t.claude_session_id.clone());
         let id_changed = self.update_claude_session_id(&tab_id, session_id);
-        // /branch classification: a `resume` source with an ACTUAL id change is the
-        // signature of `/branch` and `--fork-session`. Real `/resume` keeps the id
-        // stable (absorbed by the short-circuit above), `/clear` reports
-        // `source == "clear"`, and a nil/unknown source is treated as a plain id
-        // update. Materialize BEFORE the cwd update so the sibling parent inherits
-        // the pre-rotation cwd.
-        let spawn = if source == Some("resume") {
+        // /branch classification: a `resume` / `fork` source with an ACTUAL id
+        // change is the signature of `/branch` and `--fork-session`. Real
+        // `/resume` keeps the id stable (absorbed by the short-circuit above),
+        // `/clear` reports `source == "clear"`, and a nil/unknown source is
+        // treated as a plain id update. Materialize BEFORE the cwd update so the
+        // sibling parent inherits the pre-rotation cwd.
+        let spawn = if matches!(source, Some("resume") | Some("fork")) {
             match &old_id {
                 Some(old) if old != session_id => self.materialize_branch_parent(&tab_id, old),
                 _ => None,
@@ -919,6 +1465,7 @@ impl WindowState {
         SessionUpdateOutcome {
             did_mutate: id_changed || spawn.is_some() || cwd_changed,
             spawn,
+            background_fork: None,
         }
     }
 
@@ -1003,19 +1550,223 @@ impl WindowState {
     /// recovery tab (the tree mutation already landed), so it is logged-and-swallowed
     /// like the rest of the rotation feature.
     fn spawn_branch_parent(&mut self, spawn: BranchParentSpawn, cx: &mut gpui::Context<WindowState>) {
-        self.session.register_tab_session(&spawn.tab_id);
-        let settings = self.claude_settings_path.clone();
-        let _ = self.session.spawn_claude_pane(
+        self.spawn_deferred_resume_pane(
             &spawn.tab_id,
             &spawn.claude_pane_id,
             &spawn.cwd,
-            &ClaudeSessionMode::ResumeDeferred(spawn.old_session_id),
-            &[],
-            settings.as_deref(),
+            spawn.old_session_id,
             cx,
         );
         // Re-render so the sidebar shows the new sibling parent + re-parented child.
         cx.notify();
+    }
+
+    /// Give a just-inserted tab its deferred-resume Claude pane: register the
+    /// (empty) session container so the tab's later
+    /// [`ensure_active_pane_spawned`](crate::session_manager::SessionManager::ensure_active_pane_spawned)
+    /// precondition holds, then spawn the pane in
+    /// [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) mode — a plain login
+    /// shell carrying `claude --resume <session id>` as `NICE_PREFILL_COMMAND`
+    /// (nothing resumes, and no tokens are spent, until the user opens the tab and
+    /// presses Enter). Fire-and-forget: a spawn failure degrades to a model-only
+    /// recovery tab (the tree mutation already landed), so it is
+    /// logged-and-swallowed like the rest of the rotation feature.
+    ///
+    /// Shared by the `/branch` parent ([`spawn_branch_parent`](Self::spawn_branch_parent))
+    /// and the background-`/fork` child
+    /// ([`insert_background_fork_child`](Self::insert_background_fork_child)) — the
+    /// two differ only in which tab they hang off and which id they pin, never in
+    /// how the deferred pane is brought up.
+    fn spawn_deferred_resume_pane(
+        &mut self,
+        tab_id: &str,
+        claude_pane_id: &str,
+        cwd: &str,
+        session_id: String,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        self.session.register_tab_session(tab_id);
+        let settings = self.claude_settings_path.clone();
+        let _ = self.session.spawn_claude_pane(
+            tab_id,
+            claude_pane_id,
+            cwd,
+            &ClaudeSessionMode::ResumeDeferred(session_id),
+            &[],
+            settings.as_deref(),
+            cx,
+        );
+    }
+
+    /// **Fix B.** Materialize a daemon-hosted background `/fork`
+    /// ([`BackgroundFork`]) as its own sidebar entry: a nested, UNSELECTED child
+    /// tab under the tab whose conversation was forked, pinned to the fork's
+    /// session id and carrying a deferred `claude --resume <fork id>` prefill.
+    ///
+    /// Everything happens on a spawned foreground task, for two reasons that both
+    /// forbid doing it inline:
+    ///
+    /// * **`state.json` may not exist yet.** The daemon creates
+    ///   `~/.claude/jobs/<first8>/` BEFORE spawning the fork child, so the child's
+    ///   SessionStart hook can beat the file that names
+    ///   [`fork_parent_session_id`](ForkJobInfo::fork_parent_session_id) — the only
+    ///   key we can resolve the parent tab by. The task re-probes on a short poll
+    ///   ([`FORK_STATE_POLL_ATTEMPTS`] × [`FORK_STATE_POLL_INTERVAL`]) and then
+    ///   gives up SILENTLY: an aborted fork (the daemon writes `tmp/` and dies)
+    ///   must leave no trace in the sidebar.
+    /// * **The parent tab may live in another window.** `session_update` is routed
+    ///   to the window owning the relayed pane id, and for a background fork that
+    ///   pane id is whichever pane first spawned the daemon — it says NOTHING about
+    ///   where the forked conversation is open. Reading another window's
+    ///   [`WindowState`] means reading another entity, which is illegal while this
+    ///   one is leased by the routing `update`; off the task no lease is held.
+    fn materialize_background_fork(
+        &mut self,
+        fork: BackgroundFork,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        cx.spawn(async move |this: gpui::WeakEntity<WindowState>, acx: &mut gpui::AsyncApp| {
+            let mut fork = fork;
+            // 1. The parent session id, re-probing while `state.json` is missing.
+            let mut attempts = 0usize;
+            let parent_session_id = loop {
+                if let Some(parent) = fork.job.fork_parent_session_id.clone() {
+                    break parent;
+                }
+                if attempts >= FORK_STATE_POLL_ATTEMPTS {
+                    return; // never landed — an aborted fork, drop it silently
+                }
+                attempts += 1;
+                acx.background_executor().timer(FORK_STATE_POLL_INTERVAL).await;
+                match this.update(acx, |ws, _cx| (ws.fork_job_probe)(&fork.fork_session_id)) {
+                    // The jobs entry itself is gone: the daemon cleaned up an
+                    // aborted job, so there is no fork left to materialize.
+                    Ok(None) => return,
+                    Ok(Some(job)) => fork.job = job,
+                    Err(_) => return, // this window is gone
+                }
+            };
+
+            // 2. The window holding the forked-from tab: THIS one first (the common
+            //    case — the daemon usually inherited a pane id from the same window),
+            //    then every other live window.
+            let owner = match this
+                .update(acx, |ws, _cx| {
+                    ws.model.tab_id_for_claude_session(&parent_session_id).is_some()
+                }) {
+                Ok(true) => this.upgrade(),
+                Ok(false) => acx.update(|app| {
+                    crate::window_registry::WindowRegistry::state_for_claude_session(
+                        app,
+                        &parent_session_id,
+                    )
+                }),
+                Err(_) => return, // this window is gone
+            };
+            // No tab anywhere is pinned to the forked-from conversation (it was
+            // never open in Nice, or its tab has since closed) ⇒ drop silently.
+            let Some(owner) = owner else { return };
+
+            owner.update(acx, |ws, cx| {
+                if ws.insert_background_fork_child(&fork, &parent_session_id, cx) {
+                    // Re-render so the sidebar shows the new nested child.
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Insert `fork` as a nested child of the tab in THIS window pinned to
+    /// `parent_session_id`, and bring up its deferred-resume Claude pane. Returns
+    /// whether the child actually landed.
+    ///
+    /// Shape (the handoff shape, not the `/branch` one): built with
+    /// [`TabModel::insert_handoff_child`], which nests one indent under the parent
+    /// WITHOUT re-parenting the parent's existing children, and — decisively — is
+    /// never selected. The foreground conversation the user forked from keeps
+    /// selection and key focus; the fork is a background offshoot, exactly like a
+    /// `/nice-handoff` tab.
+    ///
+    /// Field sources:
+    /// * **session id** — the fork's own id, pinned before insertion (the ONE field
+    ///   `insert_handoff_child` leaves alone is `parent_tab_id`; everything else is
+    ///   inserted verbatim), so the deferred prefill opens that exact conversation.
+    /// * **cwd** — the relayed cwd when non-empty, else the parent tab's. Since
+    ///   Claude Code 2.1.220 a fork can relocate into its own worktree, so the
+    ///   relayed value is NOT redundant with the parent's.
+    /// * **title** — the job's `name` when present (it carries the `⑂` fork
+    ///   marker), locked against Claude's OSC auto-title so resuming the fork can't
+    ///   erase the marker; else the parent's title with the parent's title flags,
+    ///   the same inheritance [`TabModel::insert_branch_parent`] does.
+    ///
+    /// `false` when a tab here is already pinned to the fork's own id (the entry
+    /// exists — a repeat relay must not double it), when this window has no tab
+    /// pinned to `parent_session_id`, or when the anchor refuses the child (an
+    /// unknown tab, or one in the pinned Terminals group) — each drops the fork
+    /// silently, per Fix B step 3.
+    fn insert_background_fork_child(
+        &mut self,
+        fork: &BackgroundFork,
+        parent_session_id: &str,
+        cx: &mut gpui::Context<WindowState>,
+    ) -> bool {
+        // Idempotence: a tab already pinned to this fork IS the fork's sidebar
+        // entry. A second `"fork"` relay for the same id (the daemon respawning a
+        // woken job with its `respawnFlags`) must not mint a rival tab — two tabs
+        // claiming one conversation is the shape bug 3 produced.
+        if self.model.tab_id_for_claude_session(&fork.fork_session_id).is_some() {
+            return false;
+        }
+        let Some(parent_tab_id) = self.model.tab_id_for_claude_session(parent_session_id) else {
+            return false;
+        };
+        // Owned copies so the immutable model borrow ends before the mutable insert.
+        let Some((parent_title, parent_cwd, title_auto, title_manual)) =
+            self.model.tab_for(&parent_tab_id).map(|t| {
+                (
+                    t.title.clone(),
+                    t.cwd.clone(),
+                    t.title_auto_generated,
+                    t.title_manually_set,
+                )
+            })
+        else {
+            return false;
+        };
+
+        let cwd = fork.cwd.clone().unwrap_or(parent_cwd);
+        let named = fork.job.name.clone().filter(|n| !n.is_empty());
+
+        let tab_id = self.session.mint_tab_id("t");
+        let claude_pane_id = format!("{tab_id}-claude");
+        let terminal_pane_id = format!("{tab_id}-t1");
+        let mut claude_pane = Pane::new(&claude_pane_id, "Claude", PaneKind::Claude);
+        // Deferred resume: nothing is running in this pane until the user opens the
+        // tab and presses Enter (the /branch parent's shape).
+        claude_pane.is_claude_running = false;
+        let mut tab = Tab::new(&tab_id, named.clone().unwrap_or(parent_title), &cwd);
+        tab.panes = vec![
+            claude_pane,
+            Pane::new(&terminal_pane_id, "Terminal 1", PaneKind::Terminal),
+        ];
+        tab.active_pane_id = Some(claude_pane_id.clone());
+        tab.claude_session_id = Some(fork.fork_session_id.clone());
+        tab.title_auto_generated = if named.is_some() { false } else { title_auto };
+        tab.title_manually_set = if named.is_some() { true } else { title_manual };
+        tab.next_terminal_index = 2;
+
+        if !self.model.insert_handoff_child(tab, &parent_tab_id) {
+            return false;
+        }
+        self.spawn_deferred_resume_pane(
+            &tab_id,
+            &claude_pane_id,
+            &cwd,
+            fork.fork_session_id.clone(),
+            cx,
+        );
+        true
     }
 
     /// Handle a `handoff` request from the `/nice-handoff` skill's helper — the
@@ -3017,6 +3768,453 @@ mod tests {
         );
     }
 
+    // ---- Fix D: exec-time resume/attach normalization -----------------------
+    //
+    // The wrapper ships every interactive `claude` argv through this handler, so
+    // this is the one place that can decide — at the moment the user presses
+    // Enter on a pre-typed command — whether the session it names is still
+    // daemon-hosted (`attach <short id>`) or only on disk (`--resume <uuid>`).
+    // Every case drives the same reply path with a FIXTURE jobs probe, so none
+    // of them reads the developer's real `~/.claude`.
+
+    /// A full session uuid whose first 8 characters key its jobs directory.
+    const HOSTED_UUID: &str = "b8c8244b-e94e-4c38-95fb-31be9a28187e";
+
+    /// A jobs probe reporting exactly one live daemon job: a
+    /// `jobs/<first8(uuid)>/state.json` whose `sessionId` is `uuid`. Keying on
+    /// the first 8 characters is what makes the collision case below expressible
+    /// (a foreign job answering the same probe).
+    fn hosted_job_probe(uuid: &'static str) -> impl Fn(&str) -> Option<ForkJobInfo> {
+        move |probed: &str| {
+            (probed.get(..8).is_some() && probed.get(..8) == uuid.get(..8)).then(|| ForkJobInfo {
+                session_id: Some(uuid.to_string()),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn claude_resume_of_a_daemon_hosted_session_replies_attach() {
+        // The materialized fork tab's pre-typed `claude --resume <fork id>`, run
+        // while the daemon still hosts the job: resuming would spawn a SECOND
+        // process against a live conversation, so the wrapper is told to attach.
+        // The FULL uuid rides the reply — the wrapper derives attach's short id
+        // from it and needs it for the fallback leg.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", HOSTED_UUID], "t1", &claude),
+            format!("attach {HOSTED_UUID}\n")
+        );
+        assert_eq!(
+            state.model.tab_for("t1").unwrap().claude_session_id.as_deref(),
+            Some(HOSTED_UUID),
+            "the tab keeps the full uuid — the short id is an exec detail"
+        );
+    }
+
+    #[test]
+    fn claude_resume_short_flag_and_settings_pointer_ride_the_attach_reply() {
+        // `-r <uuid>` is the same shape (the shared `extract_claude_session_id`
+        // never learned it), and theme sync still gets its 3rd field — the
+        // wrapper needs it for the `--resume` fallback, not for attach itself.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        state.set_claude_settings_path_for_test(Some("/ptr.json".into()));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["-r", HOSTED_UUID], "t1", &claude),
+            format!("attach {HOSTED_UUID} /ptr.json\n")
+        );
+    }
+
+    #[test]
+    fn claude_resume_without_a_jobs_entry_is_unchanged() {
+        // No jobs entry ⇒ nothing is hosting the session ⇒ today's flow, byte for
+        // byte (the durable `--resume` the user typed).
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", HOSTED_UUID], "t1", &claude),
+            "inplace\n"
+        );
+        assert_eq!(
+            state.model.tab_for("t1").unwrap().claude_session_id.as_deref(),
+            Some(HOSTED_UUID)
+        );
+    }
+
+    #[test]
+    fn claude_resume_with_a_first8_collision_is_unchanged() {
+        // A jobs entry is keyed by 8 hex characters, so a FOREIGN job can answer
+        // the probe. `state.json`'s sessionId is the tiebreak: it names someone
+        // else's conversation, so attaching would drop the user into it.
+        let other = "b8c8244b-0000-0000-0000-000000000000";
+        assert_eq!(&other[..8], &HOSTED_UUID[..8], "precondition: the prefixes collide");
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(other));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", HOSTED_UUID], "t1", &claude),
+            "inplace\n"
+        );
+    }
+
+    #[test]
+    fn claude_resume_with_a_jobs_entry_missing_state_json_is_unchanged() {
+        // The directory lands before `state.json` does. Until the uuid can be
+        // CONFIRMED, the durable `--resume` stands.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| Some(ForkJobInfo::default()));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", HOSTED_UUID], "t1", &claude),
+            "inplace\n"
+        );
+    }
+
+    #[test]
+    fn claude_attach_of_an_evicted_job_replies_resume() {
+        // The user typed `claude attach <full uuid>` for a job the daemon has
+        // dropped: attach can only fail (it prefix-matches jobs DIRECTORY names,
+        // which a full uuid never matches, and the entry is gone besides), so the
+        // wrapper is handed the recoverable `--resume <uuid>` instead.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        state.set_claude_settings_path_for_test(Some("/ptr.json".into()));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["attach", HOSTED_UUID], "t1", &claude),
+            format!("resume {HOSTED_UUID} /ptr.json\n")
+        );
+        assert_eq!(
+            state.model.tab_for("t1").unwrap().claude_session_id.as_deref(),
+            Some(HOSTED_UUID),
+            "`attach <id>` is session-identifying — the tab adopts the id"
+        );
+    }
+
+    #[test]
+    fn claude_attach_of_a_hosted_full_uuid_replies_attach() {
+        // Same shape, still hosted: normalize the other way so attach gets the
+        // short id it can actually resolve.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["attach", HOSTED_UUID], "t1", &claude),
+            format!("attach {HOSTED_UUID}\n")
+        );
+    }
+
+    #[test]
+    fn claude_attach_of_a_short_id_passes_through_and_splices_no_session_id() {
+        // The `claude agents`-shaped invocation. attach is already the right verb,
+        // so the args run as typed — but they IDENTIFY a session, so the reply
+        // must be the bare `inplace` (a spliced `--session-id <fresh uuid>` would
+        // both fight the attach and orphan the conversation). The tab adopts the
+        // job's full uuid so a later relaunch can `--resume` it.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["attach", &HOSTED_UUID[..8]], "t1", &claude),
+            "inplace\n"
+        );
+        assert_eq!(
+            state.model.tab_for("t1").unwrap().claude_session_id.as_deref(),
+            Some(HOSTED_UUID),
+            "the short id resolves to the job's full uuid"
+        );
+    }
+
+    #[test]
+    fn claude_attach_of_an_unresolvable_short_id_leaves_the_tab_id_alone() {
+        // No jobs entry and no uuid in the args: nothing is recoverable, so the
+        // args pass through (attach reports the miss itself, exiting 1) and the
+        // tab keeps the session id it had — pinning `deadbeef` would leave it
+        // holding an id no `--resume` could ever use.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["attach", "deadbeef"], "t1", &claude),
+            "inplace\n"
+        );
+        assert_eq!(
+            state.model.tab_for("t1").unwrap().claude_session_id.as_deref(),
+            Some("OLD"),
+            "an unresolvable attach id must not overwrite the tab's session id"
+        );
+    }
+
+    #[test]
+    fn claude_valueless_resume_picker_still_mints_a_session_id() {
+        // A bare `-r` opens Claude's interactive picker: it names no session, so
+        // there is nothing to normalize and the mint-new path stands.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let (_c, term) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        let reply = drive_claude(&mut state, "/tmp/p", &["-r"], "t1", &term);
+        let minted = reply.trim_end().strip_prefix("inplace ").unwrap_or_default();
+        assert!(!minted.is_empty(), "picker invocation mints an id: {reply:?}");
+    }
+
+    #[test]
+    fn classify_claude_session_args_shapes() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let uuid = HOSTED_UUID.to_string();
+        for form in [
+            vec!["--resume", HOSTED_UUID],
+            vec!["-r", HOSTED_UUID],
+            vec![&format!("--resume={HOSTED_UUID}")],
+            vec!["--model", "sonnet", "--resume", HOSTED_UUID],
+        ] {
+            assert_eq!(
+                classify_claude_session_args(&args(&form)),
+                ClaudeArgSession::Resume(uuid.clone()),
+                "{form:?} names a session to resume"
+            );
+        }
+        assert_eq!(
+            classify_claude_session_args(&args(&["attach", "b8c8244b"])),
+            ClaudeArgSession::Attach("b8c8244b".to_string())
+        );
+        for form in [
+            vec![],
+            vec!["-r"],
+            vec!["--resume", "--model"],
+            vec!["--resume="],
+            vec!["attach"],
+            vec!["attach", "-h"],
+            // `attach` is a subcommand — only ever first.
+            vec!["--model", "opus", "attach", "b8c8244b"],
+            vec!["--session-id", HOSTED_UUID],
+        ] {
+            assert_eq!(
+                classify_claude_session_args(&args(&form)),
+                ClaudeArgSession::Neither,
+                "{form:?} names no session"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_session_uuid_separates_full_ids_from_short_job_ids() {
+        assert!(looks_like_session_uuid(HOSTED_UUID));
+        assert!(!looks_like_session_uuid("b8c8244b"), "the 8-hex attach id");
+        assert!(!looks_like_session_uuid(""));
+        assert!(
+            !looks_like_session_uuid("b8c8244b-e94e-4c38-95fb-31be9a28187"),
+            "one character short"
+        );
+        assert!(
+            !looks_like_session_uuid("b8c8244b-e94e-4c38-95fb-31be9a28187z"),
+            "non-hex payload"
+        );
+        assert!(
+            !looks_like_session_uuid("b8c8244be94e-4c38-95fb-31be9a28187e"),
+            "hyphens in the wrong places"
+        );
+    }
+
+    // ---- claude_exited (the attach child returned) --------------------------
+
+    #[test]
+    fn claude_exited_reopens_the_pane_to_in_place_promotion() {
+        // The validation break, end to end at the model layer: the pane was
+        // promoted (Fix D replied `attach`, which runs Claude as a CHILD), the
+        // user detached, and the pane is a shell prompt again. Until the wrapper
+        // says so, `is_claude_running` stays true and the ≤1-Claude guard sends
+        // the NEXT `claude` in this tab to a brand-new tab.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", false);
+
+        // Promote in place — the state the attach verb leaves behind.
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", HOSTED_UUID], "t1", &claude),
+            "inplace\n"
+        );
+        assert!(pane(&state, "t1", &claude).is_claude_running);
+
+        state.handle_claude_exited(claude.clone());
+        assert!(
+            !pane(&state, "t1", &claude).is_claude_running,
+            "a returned attach child leaves a shell prompt, not a running Claude"
+        );
+
+        // And the pane promotes in place again instead of opening a stray tab.
+        assert_eq!(
+            drive_claude(&mut state, "/tmp/p", &["--resume", HOSTED_UUID], "t1", &claude),
+            "inplace\n"
+        );
+    }
+
+    #[test]
+    fn claude_exited_for_an_unknown_pane_is_a_no_op() {
+        let mut state = WindowState::new("/home/u");
+        let (claude, _t) = seed_claude_tab(&mut state.model, "t1", "OLD", true);
+        state.handle_claude_exited("no-such-pane".to_string());
+        assert!(
+            pane(&state, "t1", &claude).is_claude_running,
+            "a stale pane id must touch nothing"
+        );
+    }
+
+    /// Read a pane out of a tab (test-only convenience).
+    fn pane<'a>(state: &'a WindowState, tab_id: &str, pane_id: &str) -> &'a Pane {
+        state
+            .model
+            .tab_for(tab_id)
+            .expect("tab")
+            .panes
+            .iter()
+            .find(|p| p.id == pane_id)
+            .expect("pane")
+    }
+
+    // ---- Fix D on the NEWTAB branch ----------------------------------------
+    //
+    // The in-place guard refuses plenty of real invocations (a Terminals tab, a
+    // stale pane id, a tab that already runs a Claude), and the fresh tab it
+    // opens instead used to prepend its own minted `--session-id` to whatever
+    // the user typed. Beside a `--resume`/`attach` that is an argv Claude Code
+    // rejects outright, so the pane died at once. These pin the decision AND the
+    // exec line the tab constructor ultimately builds from it.
+
+    /// Drive `resolve_claude_request` with an EMPTY tab id (the guard's
+    /// unknown-tab arm, always a newtab) and return the spawn request it owes
+    /// the caller, asserting the reply was `newtab`.
+    fn drive_claude_newtab(state: &mut WindowState, args: &[&str]) -> NewTabSpawn {
+        let (client, server) = UnixStream::pair().unwrap();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let spawn = state
+            .resolve_claude_request("/tmp/p", &args, "", "p", Reply::for_test(server))
+            .expect("the unknown-tab arm owes a newtab spawn");
+        assert_eq!(read_reply(client), "newtab\n");
+        spawn
+    }
+
+    /// The exec line the new tab's Claude pane runs, built from the spawn the
+    /// handler returned — the same composer `create_claude_tab` feeds.
+    fn newtab_exec_line(spawn: &NewTabSpawn, settings: Option<&str>) -> String {
+        crate::session_manager::build_claude_exec_command(
+            "/c",
+            &spawn.session.mode,
+            &spawn.args,
+            false,
+            settings,
+        )
+    }
+
+    #[test]
+    fn newtab_resume_request_splices_no_session_id() {
+        // The observed break: `claude --resume <fork uuid>` typed in a tab whose
+        // Claude is already running opened a new tab that exec'd
+        // `claude --session-id <minted> --resume <fork uuid>` — which the CLI
+        // refuses ("--session-id can only be used with --continue or --resume if
+        // --fork-session is also specified"), killing the pane on the spot.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        let spawn = drive_claude_newtab(&mut state, &["--resume", HOSTED_UUID]);
+
+        assert_eq!(spawn.args, vec!["--resume".to_string(), HOSTED_UUID.to_string()]);
+        assert_eq!(
+            spawn.session.pin.as_deref(),
+            Some(HOSTED_UUID),
+            "the new tab remembers the session it resumed, not a minted phantom"
+        );
+        // The user's args ride through the shared single-quoter, so the flag is
+        // quoted too — same argv, no `--session-id` anywhere in it.
+        assert_eq!(
+            newtab_exec_line(&spawn, Some("/ptr.json")),
+            format!("exec '/c' --settings '/ptr.json' '--resume' '{HOSTED_UUID}'"),
+        );
+    }
+
+    #[test]
+    fn newtab_resume_of_a_daemon_hosted_session_attaches() {
+        // Same normalization the in-place reply does, on the branch that spawns
+        // its own pane: a `--resume` would race the live background process.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let spawn = drive_claude_newtab(&mut state, &["--resume", HOSTED_UUID]);
+
+        assert_eq!(spawn.args, vec!["attach".to_string(), HOSTED_UUID[..8].to_string()]);
+        assert_eq!(spawn.session.pin.as_deref(), Some(HOSTED_UUID));
+        assert_eq!(
+            newtab_exec_line(&spawn, Some("/ptr.json")),
+            format!("exec '/c' attach '{}'", &HOSTED_UUID[..8]),
+            "a global flag before the subcommand makes the CLI stop seeing one"
+        );
+    }
+
+    #[test]
+    fn newtab_attach_of_an_evicted_full_uuid_resumes() {
+        // `attach` prefix-matches jobs DIRECTORY names, so a full uuid can only
+        // ever miss — and with no job left there is nothing to attach to anyway.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        let spawn = drive_claude_newtab(&mut state, &["attach", HOSTED_UUID]);
+
+        assert_eq!(spawn.args, vec!["--resume".to_string(), HOSTED_UUID.to_string()]);
+        assert_eq!(spawn.session.pin.as_deref(), Some(HOSTED_UUID));
+        assert_eq!(
+            newtab_exec_line(&spawn, None),
+            format!("exec '/c' --resume '{HOSTED_UUID}'")
+        );
+    }
+
+    #[test]
+    fn newtab_attach_of_a_short_id_runs_the_subcommand() {
+        // The `claude agents`-shaped invocation: already the right verb, so it
+        // runs as typed — as a SUBCOMMAND (no theme pointer ahead of it) and
+        // with no `--session-id` spliced in.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let spawn = drive_claude_newtab(&mut state, &["attach", &HOSTED_UUID[..8]]);
+
+        assert_eq!(
+            spawn.session.pin.as_deref(),
+            Some(HOSTED_UUID),
+            "the short id resolves to the job's full uuid"
+        );
+        assert_eq!(
+            newtab_exec_line(&spawn, Some("/ptr.json")),
+            format!("exec '/c' attach '{}'", &HOSTED_UUID[..8])
+        );
+    }
+
+    #[test]
+    fn newtab_without_a_named_session_still_mints_one() {
+        // The untouched majority path: a plain `claude …` opens a fresh session
+        // under a minted `--session-id`, args verbatim after it.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(hosted_job_probe(HOSTED_UUID));
+        let spawn = drive_claude_newtab(&mut state, &["-w", "feature"]);
+
+        assert_eq!(spawn.args, vec!["-w".to_string(), "feature".to_string()]);
+        let minted = spawn.session.pin.clone().expect("a fresh tab mints an id");
+        assert!(looks_like_session_uuid(&minted), "a real v4 uuid: {minted}");
+        assert_eq!(
+            newtab_exec_line(&spawn, None),
+            format!("exec '/c' --session-id '{minted}' '-w' 'feature'")
+        );
+    }
+
     #[test]
     fn teardown_stops_and_unlinks_the_control_socket() {
         use crate::control_socket::NiceControlSocket;
@@ -3046,8 +4244,8 @@ mod tests {
         // session_update is fire-and-forget and context-free — drive the sub-handler
         // directly. It records the parsed, normalized message, and an unknown pane id
         // (no tab owns "P1") classifies as a silent no-op ⇒ no branch-parent spawn.
-        let spawn = state.handle_session_update("P1".into(), "S1".into(), Some("resume".into()), None);
-        assert!(spawn.is_none(), "an unknown pane must not materialize a branch parent");
+        let outcome = state.handle_session_update("P1".into(), "S1".into(), Some("resume".into()), None);
+        assert!(outcome.spawn.is_none(), "an unknown pane must not materialize a branch parent");
         let recorded = state.recorded_socket_messages();
         assert_eq!(recorded.len(), 1);
         assert_eq!(
@@ -3637,6 +4835,734 @@ mod tests {
         assert_eq!(
             project_tabs(&state, "p")[0].title, "wire up the foo",
             "branch parent's inherited title must survive its deferred-resume zsh's OSC titles"
+        );
+    }
+
+    // === Fork classification (Claude Code ≥ 2.1.212 / 2.1.214) =================
+    //
+    // Two different events now arrive as `source: "fork"`:
+    //   * an IN-PANE rotation (`/branch`, `--fork-session` resume) — what used to
+    //     report `"resume"`; it must behave exactly like the legacy `/branch`;
+    //   * the Claude daemon's DETACHED background `/fork` child — whose relayed
+    //     pane id belongs to whichever pane first spawned the daemon, so acting
+    //     on it rewrote an unrelated tab's session id (bug 3).
+    // The `~/.claude/jobs/<first8>/` entry is the discriminator. Every case here
+    // injects the probe, so none of them read the developer's real `~/.claude`.
+
+    /// A throwaway `jobs`-shaped directory removed on drop — the fixture for the
+    /// REAL probe ([`probe_fork_job_in`]); never the developer's `~/.claude`.
+    struct ScratchJobs(std::path::PathBuf);
+    impl Drop for ScratchJobs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch_jobs() -> ScratchJobs {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("fork-jobs-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch jobs dir");
+        ScratchJobs(dir)
+    }
+
+    /// A full uuid whose first 8 chars are `first8` — the shape the daemon keys
+    /// its jobs directory by.
+    fn fork_uuid(first8: &str) -> String {
+        format!("{first8}-1111-2222-3333-444455556666")
+    }
+
+    #[test]
+    fn fork_source_without_jobs_entry_rotates_and_creates_parent() {
+        // `/branch` on Claude ≥ 2.1.214 relays `"fork"`, not `"resume"`. With no
+        // jobs entry it is an in-pane rotation: the tab adopts the new id AND the
+        // pre-branch conversation is materialized as a sibling parent (bug 2).
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        state.model.mutate_tab("t1", |t| t.title = "wire up the foo".into());
+
+        let out = state.apply_session_update("t1-claude", "NEW", Some("fork"), None);
+        assert!(out.did_mutate);
+        assert!(out.background_fork.is_none(), "no jobs entry ⇒ not a background fork");
+        assert!(out.spawn.is_some(), "an in-pane fork owes a deferred-resume parent spawn");
+
+        let tabs = project_tabs(&state, "p");
+        assert_eq!(tabs.len(), 2, "in-pane fork adds exactly one sibling parent tab");
+        let (parent, child) = (&tabs[0], &tabs[1]);
+        assert_eq!(child.id, "t1");
+        assert_eq!(child.claude_session_id.as_deref(), Some("NEW"), "originating tab adopts the post-rotation id");
+        assert_eq!(parent.claude_session_id.as_deref(), Some("OLD"), "parent pinned to the pre-rotation id");
+        assert_eq!(parent.title, "wire up the foo", "parent inherits the title");
+        assert_eq!(child.parent_tab_id.as_deref(), Some(parent.id.as_str()));
+    }
+
+    #[test]
+    fn fork_source_with_jobs_entry_leaves_the_pane_tab_untouched() {
+        // BUG-3 REGRESSION PIN. The daemon relays the background fork's
+        // SessionStart with the stale pane id it inherited. Nothing about the
+        // addressed tab may change — not its session id, not its cwd, not the
+        // tree — and the fork's identity is handed off for materialization.
+        let fork_id = fork_uuid("298689bf");
+        let mut state = WindowState::new("/home/u");
+        let probe_id = fork_id.clone();
+        state.set_fork_job_probe_for_test(move |id| {
+            assert_eq!(id, probe_id, "the probe is asked about the INCOMING id");
+            Some(ForkJobInfo {
+                session_id: Some(probe_id.clone()),
+                fork_parent_session_id: Some("2f3b14e8-parent".into()),
+                name: Some("⑂ tmux keybinds".into()),
+            })
+        });
+        seed_rotation_tab(&mut state.model, "p", "t1", "LIVE-ID", "/tmp/p");
+
+        let out = state.apply_session_update("t1-claude", &fork_id, Some("fork"), Some("/tmp/forked"));
+
+        assert_eq!(
+            tab_session_id(&state, "t1").as_deref(),
+            Some("LIVE-ID"),
+            "a daemon-hosted fork must NEVER rewrite the relayed pane's tab id"
+        );
+        assert_eq!(
+            state.model.tab_for("t1").map(|t| t.cwd.clone()).as_deref(),
+            Some("/tmp/p"),
+            "nor adopt the fork's cwd onto that tab"
+        );
+        assert_eq!(project_tabs(&state, "p").len(), 1, "and no parent tab is spawned");
+        assert!(!out.did_mutate, "nothing was mutated");
+        assert!(out.spawn.is_none());
+
+        let fork = out.background_fork.expect("a jobs-backed fork must hand off for materialization");
+        assert_eq!(fork.fork_session_id, fork_id);
+        assert_eq!(fork.cwd.as_deref(), Some("/tmp/forked"));
+        assert_eq!(fork.job.fork_parent_session_id.as_deref(), Some("2f3b14e8-parent"));
+        assert_eq!(fork.job.name.as_deref(), Some("⑂ tmux keybinds"));
+    }
+
+    #[test]
+    fn fork_with_jobs_entry_hands_off_even_when_the_pane_is_unknown() {
+        // The daemon's pane id can be not just stale but GONE (the pane that
+        // spawned it closed). The fork still exists and still deserves a sidebar
+        // entry, so the classification runs before the pane is resolved.
+        let fork_id = fork_uuid("b8c8244b");
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| Some(ForkJobInfo::default()));
+        seed_rotation_tab(&mut state.model, "p", "t1", "LIVE-ID", "/tmp/p");
+
+        let out = state.apply_session_update("pane-that-no-longer-exists", &fork_id, Some("fork"), None);
+        let fork = out.background_fork.expect("an unknown pane must not swallow the fork");
+        assert_eq!(fork.fork_session_id, fork_id);
+        assert_eq!(fork.cwd, None, "absent cwd stays absent");
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("LIVE-ID"));
+    }
+
+    #[test]
+    fn fork_with_jobs_entry_normalizes_an_empty_cwd_to_none() {
+        // The hook always sends a `cwd` key; a missing value arrives as "". The
+        // hand-off carries None so the next slice falls back to the parent's cwd
+        // rather than resolving a fork tab at the filesystem root.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| Some(ForkJobInfo::default()));
+        seed_rotation_tab(&mut state.model, "p", "t1", "LIVE-ID", "/tmp/p");
+        let out = state.apply_session_update("t1-claude", &fork_uuid("aaaaaaaa"), Some("fork"), Some(""));
+        assert_eq!(out.background_fork.expect("fork hand-off").cwd, None);
+    }
+
+    #[test]
+    fn resume_source_without_a_jobs_entry_still_materializes_a_parent() {
+        // Legacy CLIs (< 2.1.214) report `"resume"` for `/branch`. The probe now
+        // runs on this source too, but an id that names no job leaves the legacy
+        // path byte for byte as it was: rotate, and materialize the parent.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+
+        state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "every source is screened against the jobs dir");
+        assert_eq!(project_tabs(&state, "p").len(), 2, "legacy /branch still materializes a parent");
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn resume_source_with_a_jobs_entry_leaves_the_pane_tab_untouched() {
+        // BUG-3 REGRESSION PIN, the `claude attach` route. Waking a COLD
+        // background job fires SessionStart with `source: "resume"` — from the
+        // daemon, carrying the stale pane id it inherited, and naming a session
+        // that belongs to some other tab entirely. Observed live: it rewrote the
+        // addressed tab's id and invented a branch parent for the conversation it
+        // had just displaced. Nothing about that tab may change, and no fork is
+        // materialized either (the job's tab was created at its birth).
+        let woken = fork_uuid("578ad088");
+        let mut state = WindowState::new("/home/u");
+        let probe_id = woken.clone();
+        state.set_fork_job_probe_for_test(move |id| {
+            (id == probe_id).then(|| ForkJobInfo {
+                session_id: Some(probe_id.clone()),
+                fork_parent_session_id: Some("2f3b14e8-parent".into()),
+                name: Some("⑂ woken job".into()),
+            })
+        });
+        seed_rotation_tab(&mut state.model, "p", "t1", "798e31f1-live", "/tmp/p");
+
+        let out = state.apply_session_update("t1-claude", &woken, Some("resume"), Some("/tmp/forked"));
+
+        assert!(!out.did_mutate, "a woken background job mutates nothing");
+        assert!(out.spawn.is_none(), "and invents no branch parent");
+        assert!(out.background_fork.is_none(), "the job's tab already exists — do not duplicate it");
+        assert_eq!(
+            tab_session_id(&state, "t1").as_deref(),
+            Some("798e31f1-live"),
+            "the addressed tab keeps its own conversation"
+        );
+        assert_eq!(
+            state.model.tab_for("t1").map(|t| t.cwd.clone()).as_deref(),
+            Some("/tmp/p"),
+            "nor adopts the job's cwd"
+        );
+        assert_eq!(project_tabs(&state, "p").len(), 1);
+    }
+
+    #[test]
+    fn startup_source_with_a_jobs_entry_leaves_the_pane_tab_untouched() {
+        // Same distrust for the daemon's other relay shapes: whatever source a
+        // daemon-run session reports, its pane id is not ours to act on.
+        let job = fork_uuid("578ad088");
+        let mut state = WindowState::new("/home/u");
+        let probe_id = job.clone();
+        state.set_fork_job_probe_for_test(move |id| {
+            (id == probe_id).then(|| ForkJobInfo {
+                session_id: Some(probe_id.clone()),
+                ..Default::default()
+            })
+        });
+        seed_rotation_tab(&mut state.model, "p", "t1", "LIVE-ID", "/tmp/p");
+
+        let out = state.apply_session_update("t1-claude", &job, Some("startup"), None);
+
+        assert!(!out.did_mutate);
+        assert!(out.background_fork.is_none());
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("LIVE-ID"));
+    }
+
+    #[test]
+    fn resume_source_with_a_first8_collision_still_rotates() {
+        // The screen is keyed by 8 hex characters, so a FOREIGN job can answer the
+        // probe. `state.json`'s sessionId is the tiebreak, exactly as it is at
+        // exec time: it names someone else's conversation, so this relay is an
+        // ordinary in-pane rotation and must not be silenced.
+        let mine = fork_uuid("578ad088");
+        let theirs = "578ad088-9999-9999-9999-999999999999";
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(move |_| Some(ForkJobInfo {
+            session_id: Some(theirs.into()),
+            ..Default::default()
+        }));
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+
+        let out = state.apply_session_update("t1-claude", &mine, Some("resume"), None);
+
+        assert!(out.did_mutate);
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some(mine.as_str()));
+        assert_eq!(project_tabs(&state, "p").len(), 2, "a foreign job must not swallow a real /branch");
+    }
+
+    #[test]
+    fn fork_with_same_id_does_not_create_parent() {
+        // A `fork`-sourced relay that carries the id the tab already has (a
+        // redundant forward) is absorbed by the equality short-circuit, exactly
+        // as the `resume` shape is — no phantom parent.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        seed_rotation_tab(&mut state.model, "p", "t1", "SAME", "/tmp/p");
+        let out = state.apply_session_update("t1-claude", "SAME", Some("fork"), None);
+        assert!(!out.did_mutate);
+        assert_eq!(project_tabs(&state, "p").len(), 1, "no rotation ⇒ no parent tab");
+    }
+
+    #[test]
+    fn clear_with_a_stale_pane_id_still_applies_to_that_tab() {
+        // ACCEPTED EXPOSURE, documented rather than fixed. The jobs screen keys
+        // off the INCOMING id, and `/clear` inside a daemon-run child rotates to a
+        // fresh id that keys no jobs directory (the entry stays under the job's
+        // ORIGINAL first-8), so such a relay slips through and still rewrites the
+        // addressed tab. Pre-existing, not reachable through `/fork` (which never
+        // fires `clear` in the fork child), and the only alternative — distrusting
+        // an id no probe can place — would break the ordinary in-pane `/clear`
+        // this line is here to preserve.
+        let mut state = WindowState::new("/home/u");
+        state.set_fork_job_probe_for_test(|_| None);
+        seed_rotation_tab(&mut state.model, "p", "t1", "OLD", "/tmp/p");
+        let out = state.apply_session_update("t1-claude", "CLEARED", Some("clear"), None);
+        assert!(out.did_mutate);
+        assert!(out.background_fork.is_none(), "`clear` is never classified as a fork");
+        assert_eq!(tab_session_id(&state, "t1").as_deref(), Some("CLEARED"));
+        assert_eq!(project_tabs(&state, "p").len(), 1, "/clear still spawns no parent");
+    }
+
+    // === Fork materialization (Fix B) =========================================
+    //
+    // A classified background fork becomes its own sidebar entry: a nested,
+    // UNSELECTED child of the tab whose conversation was forked, pinned to the
+    // fork's id and carrying a deferred `claude --resume <fork id>` prefill.
+    //
+    // These drive the SHIPPED entry point (`route_socket_message` with a
+    // `SessionUpdate`) so the classification, the deferred retry task, the parent
+    // resolution, and the insert are all exercised together. They need a gpui
+    // context (the materialization spawns a task and a deferred-resume pane),
+    // hence `#[gpui::test]`.
+    //
+    // Containment, as in the handoff/dispatch tests above: the resolved-`claude`
+    // global is pinned to `None` and every cwd is a path that does not exist, so a
+    // forked child `_exit`s at its `chdir` and no login shell is ever sourced;
+    // each test tears its sessions down at the end.
+
+    /// A cwd no spawn can chdir into (so the ResumeDeferred shell dies instantly).
+    const NO_SPAWN_CWD: &str = "/nice-unit-test-no-such-dir";
+
+    /// A `WindowState` entity with `p`/`t-parent` seeded and selected, standing in
+    /// for the tab the user ran `/fork` in. `probe` is the injected jobs-dir seam.
+    fn fork_window(
+        cx: &mut gpui::TestAppContext,
+        cwd: &str,
+        probe: impl Fn(&str) -> Option<ForkJobInfo> + 'static,
+    ) -> Entity<WindowState> {
+        cx.update(|app| app.set_global(crate::session_manager::ResolvedClaudePath(None)));
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+        state.update(cx, |ws, _cx| {
+            // The fork's deferred pane spawns a real (immediately dying) pty from
+            // inside the materialization task; its exit-watcher thread would wake
+            // the parked drain across threads and trip gpui's determinism guard.
+            ws.session.set_event_wakes_enabled_for_test(false);
+            ws.set_fork_job_probe_for_test(probe);
+            seed_rotation_tab(&mut ws.model, "p", "t-parent", "PARENT-SID", cwd);
+            ws.model
+                .mutate_tab("t-parent", |t| t.title = "wire up the foo".into());
+            ws.model.select_tab("t-parent");
+            ws.selection.sync_active_tab_id(ws.model.active_tab_id());
+        });
+        state
+    }
+
+    /// Relay a background fork's SessionStart through the SHIPPED router. The pane
+    /// id is deliberately one no tab owns — the daemon inherits whichever pane
+    /// first spawned it, and the fork path must never lean on it.
+    fn relay_fork(
+        cx: &mut gpui::TestAppContext,
+        state: &Entity<WindowState>,
+        fork_id: &str,
+        cwd: Option<&str>,
+    ) {
+        state.update(cx, |ws, cx| {
+            ws.route_socket_message(
+                SocketMessage::SessionUpdate {
+                    pane_id: "daemon-inherited-pane".into(),
+                    session_id: fork_id.to_string(),
+                    source: Some("fork".into()),
+                    cwd: cwd.map(str::to_string),
+                },
+                cx,
+            )
+        });
+    }
+
+    /// The tab in project `p` other than the seeded `t-parent`, if the fork landed.
+    fn fork_child(state: &WindowState) -> Option<Tab> {
+        state
+            .model
+            .projects
+            .iter()
+            .find(|p| p.id == "p")?
+            .tabs
+            .iter()
+            .find(|t| t.id != "t-parent")
+            .cloned()
+    }
+
+    #[gpui::test]
+    fn background_fork_nests_a_pinned_unselected_child_under_the_forked_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The headline of Fix B (bug 1): a `/fork` finally shows up in the sidebar.
+        let fork_id = fork_uuid("b8c8244b");
+        let fork_cwd = format!("{NO_SPAWN_CWD}/fork-worktree");
+        let state = fork_window(cx, NO_SPAWN_CWD, |_| {
+            Some(ForkJobInfo {
+                session_id: None,
+                fork_parent_session_id: Some("PARENT-SID".into()),
+                name: Some("⑂ wire up the foo".into()),
+            })
+        });
+
+        relay_fork(cx, &state, &fork_id, Some(&fork_cwd));
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| {
+            let child = fork_child(ws).expect("the fork materialized a tab");
+            assert_eq!(
+                child.parent_tab_id.as_deref(),
+                Some("t-parent"),
+                "the fork nests one indent under the tab it was forked from"
+            );
+            assert_eq!(
+                child.claude_session_id.as_deref(),
+                Some(fork_id.as_str()),
+                "the child is pinned to the FORK's id, so its deferred resume opens that conversation"
+            );
+            assert_eq!(
+                child.cwd, fork_cwd,
+                "a fork that relocated into its own worktree keeps that cwd (≥ 2.1.220)"
+            );
+            assert_eq!(
+                child.title, "⑂ wire up the foo",
+                "the job's name (carrying the ⑂ marker) titles the tab"
+            );
+            assert!(
+                child.title_manually_set,
+                "and is locked, so resuming the fork cannot OSC the ⑂ marker away"
+            );
+            let claude = child
+                .panes
+                .iter()
+                .find(|p| p.kind == PaneKind::Claude)
+                .expect("the fork tab has a Claude pane");
+            assert!(
+                !claude.is_claude_running,
+                "the fork's pane is a DEFERRED resume — nothing runs until the user opens it"
+            );
+
+            // The foreground conversation is untouched: same id, same selection.
+            assert_eq!(
+                tab_session_id(ws, "t-parent").as_deref(),
+                Some("PARENT-SID"),
+                "the forked-from tab keeps its own session id"
+            );
+            assert_eq!(
+                ws.model.active_tab_id(),
+                Some("t-parent"),
+                "materializing a fork must not steal the active tab"
+            );
+            assert!(
+                !ws.selection.contains(&child.id),
+                "the fork tab opens UNSELECTED (background offshoot, not a context switch)"
+            );
+        });
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_falls_back_to_the_parents_cwd_and_title(cx: &mut gpui::TestAppContext) {
+        // An empty relayed cwd and a `state.json` without a `name` (the shapes an
+        // older / partially-written job produces) must still yield a usable tab.
+        let fork_id = fork_uuid("aaaaaaaa");
+        let state = fork_window(cx, NO_SPAWN_CWD, |_| {
+            Some(ForkJobInfo {
+                session_id: None,
+                fork_parent_session_id: Some("PARENT-SID".into()),
+                name: None,
+            })
+        });
+
+        relay_fork(cx, &state, &fork_id, Some(""));
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| {
+            let child = fork_child(ws).expect("the fork materialized a tab");
+            assert_eq!(child.cwd, NO_SPAWN_CWD, "empty relayed cwd ⇒ the parent's cwd");
+            assert_eq!(
+                child.title, "wire up the foo",
+                "no job name ⇒ the parent's title"
+            );
+            assert!(
+                !child.title_manually_set,
+                "an inherited title keeps the parent's title flags (nothing to lock)"
+            );
+        });
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_with_no_matching_parent_tab_is_a_silent_no_op(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The forked conversation was never open in Nice (or its tab has since
+        // closed). There is nothing to nest under, and guessing would be worse
+        // than nothing — so the fork is dropped without a trace.
+        let state = fork_window(cx, NO_SPAWN_CWD, |_| {
+            Some(ForkJobInfo {
+                session_id: None,
+                fork_parent_session_id: Some("A-CONVERSATION-NICE-NEVER-SAW".into()),
+                name: Some("⑂ elsewhere".into()),
+            })
+        });
+
+        relay_fork(cx, &state, &fork_uuid("deadbeef"), None);
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| {
+            assert!(fork_child(ws).is_none(), "no parent ⇒ no tab");
+            assert_eq!(project_tabs(ws, "p").len(), 1);
+        });
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_relayed_twice_materializes_exactly_one_tab(cx: &mut gpui::TestAppContext) {
+        // A job can announce itself more than once (the daemon respawning a woken
+        // one carries its `respawnFlags`). The fork's sidebar entry already exists,
+        // so the second relay must add nothing: two tabs claiming one conversation
+        // is exactly the corruption this feature set out to end.
+        let fork_id = fork_uuid("b8c8244b");
+        let state = fork_window(cx, NO_SPAWN_CWD, |_| {
+            Some(ForkJobInfo {
+                session_id: None,
+                fork_parent_session_id: Some("PARENT-SID".into()),
+                name: Some("⑂ wire up the foo".into()),
+            })
+        });
+
+        relay_fork(cx, &state, &fork_id, None);
+        cx.run_until_parked();
+        relay_fork(cx, &state, &fork_id, None);
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| {
+            assert_eq!(
+                project_tabs(ws, "p").len(),
+                2,
+                "the forked-from tab plus ONE fork tab"
+            );
+            assert_eq!(
+                fork_child(ws).and_then(|t| t.claude_session_id).as_deref(),
+                Some(fork_id.as_str())
+            );
+        });
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_waits_for_a_late_state_json(cx: &mut gpui::TestAppContext) {
+        // The daemon creates `jobs/<first8>/` BEFORE spawning the fork child, so
+        // the hook can beat `state.json` to disk. The first probe classifies the
+        // event (directory present) but names no parent; a later re-probe does.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let landed = Rc::new(Cell::new(false));
+        let seen = landed.clone();
+        let state = fork_window(cx, NO_SPAWN_CWD, move |_| {
+            Some(ForkJobInfo {
+                session_id: None,
+                fork_parent_session_id: seen
+                    .get()
+                    .then(|| "PARENT-SID".to_string()),
+                name: None,
+            })
+        });
+
+        relay_fork(cx, &state, &fork_uuid("b8c8244b"), None);
+        cx.run_until_parked();
+        state.update(cx, |ws, _cx| {
+            assert!(
+                fork_child(ws).is_none(),
+                "nothing can be materialized while the parent id is unknown"
+            );
+        });
+
+        // `state.json` lands; the next poll picks it up.
+        landed.set(true);
+        cx.executor().advance_clock(FORK_STATE_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| {
+            let child = fork_child(ws).expect("the retry materialized the fork");
+            assert_eq!(child.parent_tab_id.as_deref(), Some("t-parent"));
+        });
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_gives_up_silently_when_state_json_never_lands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // An ABORTED fork: the daemon wrote the directory (and `tmp/`) and then
+        // died, so `forkParentSessionId` never appears. The live `298689bf` job on
+        // this machine is exactly that. The retry must expire and leave no tab.
+        let state = fork_window(cx, NO_SPAWN_CWD, |_| Some(ForkJobInfo::default()));
+
+        relay_fork(cx, &state, &fork_uuid("298689bf"), None);
+        // Well past FORK_STATE_POLL_ATTEMPTS × FORK_STATE_POLL_INTERVAL.
+        cx.executor()
+            .advance_clock(FORK_STATE_POLL_INTERVAL * (FORK_STATE_POLL_ATTEMPTS as u32 + 4));
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| {
+            assert!(fork_child(ws).is_none(), "an aborted fork leaves no tab behind");
+            assert_eq!(project_tabs(ws, "p").len(), 1);
+        });
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_gives_up_when_the_jobs_entry_disappears(cx: &mut gpui::TestAppContext) {
+        // The daemon cleaned the aborted job up between the classification and a
+        // retry. No entry, no fork — stop polling immediately rather than burning
+        // the full retry budget.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let gone = Rc::new(Cell::new(false));
+        let swept = gone.clone();
+        let state = fork_window(cx, NO_SPAWN_CWD, move |_| {
+            (!swept.get()).then(ForkJobInfo::default)
+        });
+
+        relay_fork(cx, &state, &fork_uuid("298689bf"), None);
+        cx.run_until_parked();
+        gone.set(true);
+        cx.executor().advance_clock(FORK_STATE_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+
+        state.update(cx, |ws, _cx| assert!(fork_child(ws).is_none()));
+        state.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    #[gpui::test]
+    fn background_fork_finds_its_parent_tab_in_another_window(cx: &mut gpui::TestAppContext) {
+        // THE cross-window case, and the reason the fork path can't stop at the
+        // window `session_update` was routed to: the Claude daemon inherits
+        // `NICE_PANE_ID` from whichever pane first spawned it, which may belong to
+        // a completely different window than the one the user forked in.
+        use crate::window_registry::WindowRegistry;
+        let fork_id = fork_uuid("b8c8244b");
+
+        // Window A receives the relay but holds no tab for the forked conversation.
+        cx.update(|app| app.set_global(crate::session_manager::ResolvedClaudePath(None)));
+        let window_a = cx.new(|_cx| WindowState::new("/home/u"));
+        window_a.update(cx, |ws, _cx| {
+            ws.session.set_event_wakes_enabled_for_test(false);
+            ws.set_fork_job_probe_for_test(|_| {
+                Some(ForkJobInfo {
+                    session_id: None,
+                    fork_parent_session_id: Some("PARENT-SID".into()),
+                    name: None,
+                })
+            });
+            seed_rotation_tab(&mut ws.model, "other", "t-other", "UNRELATED", NO_SPAWN_CWD);
+        });
+        // Window B is where the user actually ran `/fork`.
+        let window_b = fork_window(cx, NO_SPAWN_CWD, |_| None);
+
+        let (id_a, id_b) = (
+            cx.add_window(|_w, _cx| gpui::Empty).window_id(),
+            cx.add_window(|_w, _cx| gpui::Empty).window_id(),
+        );
+        cx.update(|app| {
+            app.set_global(WindowRegistry::default());
+            WindowRegistry::register(app, id_a, window_a.clone());
+            WindowRegistry::register(app, id_b, window_b.clone());
+        });
+
+        relay_fork(cx, &window_a, &fork_id, None);
+        cx.run_until_parked();
+
+        window_a.update(cx, |ws, _cx| {
+            assert_eq!(
+                ws.model
+                    .projects
+                    .iter()
+                    .flat_map(|p| p.tabs.iter())
+                    .count(),
+                // The Main Terminal tab + the seeded unrelated tab, nothing new.
+                project_tabs(ws, "other").len() + 1,
+                "the receiving window must not grow a tab it has no parent for"
+            );
+        });
+        window_b.update(cx, |ws, _cx| {
+            let child = fork_child(ws).expect("the fork landed in the window holding its parent");
+            assert_eq!(child.parent_tab_id.as_deref(), Some("t-parent"));
+            assert_eq!(child.claude_session_id.as_deref(), Some(fork_id.as_str()));
+        });
+
+        window_a.update(cx, |ws, _cx| ws.teardown());
+        window_b.update(cx, |ws, _cx| ws.teardown());
+    }
+
+    // -- the real (filesystem) half of the probe seam ---------------------------
+
+    #[test]
+    fn probe_returns_none_when_no_jobs_entry_exists() {
+        let jobs = scratch_jobs();
+        assert_eq!(probe_fork_job_in(&jobs.0, &fork_uuid("deadbeef")), None);
+    }
+
+    #[test]
+    fn probe_returns_none_for_an_id_shorter_than_its_first8() {
+        // A malformed / truncated id can't key a jobs directory; refusing it here
+        // keeps `jobs_dir.join(..)` from ever being handed a partial prefix that
+        // could match some other job.
+        let jobs = scratch_jobs();
+        assert_eq!(probe_fork_job_in(&jobs.0, "abc"), None);
+        assert_eq!(probe_fork_job_in(&jobs.0, ""), None);
+    }
+
+    #[test]
+    fn probe_returns_empty_info_when_state_json_has_not_landed() {
+        // The daemon creates the directory (and `tmp/`) BEFORE spawning the fork
+        // child, so the hook can fire while `state.json` is still missing — an
+        // aborted fork never writes one at all. The directory alone still
+        // classifies the event as a background fork.
+        let jobs = scratch_jobs();
+        std::fs::create_dir_all(jobs.0.join("298689bf").join("tmp")).unwrap();
+        assert_eq!(
+            probe_fork_job_in(&jobs.0, &fork_uuid("298689bf")),
+            Some(ForkJobInfo::default())
+        );
+    }
+
+    #[test]
+    fn probe_reads_session_parent_and_name_from_state_json() {
+        let jobs = scratch_jobs();
+        let id = fork_uuid("b8c8244b");
+        std::fs::create_dir_all(jobs.0.join("b8c8244b")).unwrap();
+        std::fs::write(
+            jobs.0.join("b8c8244b").join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "sessionId": id,
+                "forkParentSessionId": "2f3b14e8-0000-0000-0000-000000000000",
+                "forkBoundaryAt": 42,
+                "name": "⑂ fix the thing",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            probe_fork_job_in(&jobs.0, &id),
+            Some(ForkJobInfo {
+                session_id: Some(id.clone()),
+                fork_parent_session_id: Some("2f3b14e8-0000-0000-0000-000000000000".into()),
+                name: Some("⑂ fix the thing".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn probe_tolerates_a_malformed_state_json() {
+        // A half-written / hand-mangled state.json must not make the entry vanish:
+        // the directory is what classifies, and losing the classification would
+        // resurrect the bug-3 rotation.
+        let jobs = scratch_jobs();
+        std::fs::create_dir_all(jobs.0.join("cafebabe")).unwrap();
+        std::fs::write(jobs.0.join("cafebabe").join("state.json"), b"{ not json").unwrap();
+        assert_eq!(
+            probe_fork_job_in(&jobs.0, &fork_uuid("cafebabe")),
+            Some(ForkJobInfo::default())
         );
     }
 

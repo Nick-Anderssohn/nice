@@ -30,7 +30,19 @@
 //!   (`parent_tab_id == None`) with the PRE-rotation cwd, while the originating tab
 //!   is re-parented UNDER it (indented) and moves into the post-rotation worktree;
 //!   a `source:"clear"` update rotates the id in place with NO new tab; a
-//!   cwd-bearing update adopts onto `Tab.cwd`.
+//!   cwd-bearing update adopts onto `Tab.cwd`; and a `source:"fork"` update WITH a
+//!   `jobs/<first8>/state.json` entry (a daemon-hosted background `/fork`,
+//!   Claude Code ≥ 2.1.212) relayed from a pane NO tab owns materializes a nested,
+//!   deferred child under the tab its `forkParentSessionId` names — pinned to the
+//!   fork's id, titled by the job's `name`, carrying the fork's own worktree cwd —
+//!   while the addressed tab's session id and the active tab are untouched; and a
+//!   `source:"fork"` update WITHOUT a jobs entry (an in-pane `/branch` on Claude
+//!   Code ≥ 2.1.214, which stopped reporting `"resume"`) rotates the addressed tab
+//!   and materializes the pre-rotation conversation as a deferred parent, exactly
+//!   like the legacy `source:"resume"` leg; and a `source:"resume"` update naming
+//!   an id that HAS a jobs entry — the daemon waking a COLD background job on
+//!   `claude attach`, relayed with the stale pane id it inherited — touches
+//!   nothing at all: no rotation, no phantom parent (bug 3's second route).
 //!
 //! ## Hermeticity
 //!
@@ -78,11 +90,13 @@ const READY_MARKER: &str = "NICERS__CLAUDE__EXIT__READY";
 // -- fixture -----------------------------------------------------------------
 
 /// The sandboxed fixture: a fake `$HOME`, a stub `claude` (exported as
-/// `NICE_CLAUDE_OVERRIDE`), and two invocation work dirs (one per bucketing leg).
+/// `NICE_CLAUDE_OVERRIDE`), two invocation work dirs (one per bucketing leg), and
+/// a scratch `~/.claude/jobs` stand-in for the background-fork leg.
 struct Fixture {
     home: PathBuf,
     work_a: PathBuf,
     work_d: PathBuf,
+    jobs: PathBuf,
 }
 
 impl Fixture {
@@ -94,7 +108,12 @@ impl Fixture {
         let home = base.join("home");
         let work_a = base.join("work-a");
         let work_d = base.join("work-d");
-        for d in [&home, &work_a, &work_d] {
+        // Stands in for `~/.claude/jobs` — the Claude daemon's background-job
+        // registry, which leg (f4) writes a fork entry into. Never the developer's
+        // real `~/.claude`: `HOME` is restored once the window is open, and the
+        // machine's actual background forks would make the leg non-deterministic.
+        let jobs = base.join("jobs");
+        for d in [&home, &work_a, &work_d, &jobs] {
             std::fs::create_dir_all(d).context("create fixture dir")?;
         }
 
@@ -132,7 +151,12 @@ impl Fixture {
         // matches the existing `std::env::set_var` seams (spawn.rs, selftest).
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
-        Ok(Fixture { home, work_a, work_d })
+        Ok(Fixture {
+            home,
+            work_a,
+            work_d,
+            jobs,
+        })
     }
 
     fn home_str(&self) -> String {
@@ -372,6 +396,13 @@ async fn run_claude_lifecycle(
     // Reuse the tab promoted in leg (c): "promote-tab" (in non-Terminals project
     // "promote-proj"), whose claude pane "promote-pane" is now a running Claude with
     // a minted session id. That minted id is the pre-rotation OLD id.
+    //
+    // Re-root the fork-job probe at the fixture's scratch jobs dir up front, before
+    // the FIRST rotation: every source is screened against it now (a daemon relays
+    // a stale pane id for a background job's whole life, not just at its birth), so
+    // leaving it pointed at the developer's real `~/.claude` would let their actual
+    // background forks decide these assertions.
+    state.update(cx, |s, _cx| s.set_fork_jobs_dir_for_scenario(fixture.jobs.clone()));
     let old_sid = state.update(cx, |s, _cx| {
         s.model.tab_for("promote-tab").and_then(|t| t.claude_session_id.clone())
     });
@@ -527,6 +558,169 @@ async fn run_claude_lifecycle(
             if !poll_tab_cwd(cx, &state, "promote-tab", &adopt_cwd).await {
                 failures.push("(f) cwd adopt: a cwd-bearing update must adopt onto Tab.cwd".into());
             }
+
+            // -- f4 background /fork: a `source:"fork"` update WITH a jobs entry ----
+            //    Claude Code ≥ 2.1.212 runs `/fork` as a detached daemon session and
+            //    relays its SessionStart with whichever pane id first spawned the
+            //    daemon. The `~/.claude/jobs/<first8>/` entry (here: the fixture's
+            //    scratch jobs dir, read through the SHIPPED filesystem probe) is what
+            //    separates it from an in-pane `/branch`. The relayed pane is
+            //    deliberately one NO tab owns, so a pass proves the parent was found
+            //    by session id alone.
+            let fork_id = "b8c8244b-1111-2222-3333-444455556666";
+            let fork_cwd = format!("{work_a}/.claude/worktrees/fork-wt");
+            let selected_before_fork = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
+            match write_fork_job(&fixture.jobs, fork_id, "cleared-id", "⑂ forked work") {
+                Err(e) => failures.push(format!("(f) fork: could not write the jobs fixture: {e:#}")),
+                Ok(()) => {
+                    send_session_update(cx, &socket_path, "a-pane-no-tab-owns", fork_id, Some("fork"), Some(&fork_cwd)).await;
+                    match poll_branch_parent(cx, &state, "promote-proj", fork_id, "promote-tab").await {
+                        None => failures.push(
+                            "(f) fork: a daemon-hosted /fork must materialize a tab pinned to the FORK's id".into(),
+                        ),
+                        Some(fork_tab_id) => {
+                            let fork_tab = state.update(cx, |s, _cx| s.model.tab_for(&fork_tab_id).cloned());
+                            let fork_tab = fork_tab.expect("fork tab id just polled must resolve");
+                            // Nested one indent under the forked-from tab's lineage,
+                            // and placed immediately after it. The handoff shape's
+                            // DEPTH-1 rule decides the pointer: an anchor that is
+                            // already a depth-1 child (promote-tab is — f1's /branch
+                            // re-parented it under the new root) hands the fork its
+                            // own root instead of becoming a second level.
+                            let (expected_parent, follows_anchor) = state.update(cx, |s, _cx| {
+                                let anchor = s.model.tab_for("promote-tab");
+                                let expected = anchor
+                                    .and_then(|t| t.parent_tab_id.clone())
+                                    .unwrap_or_else(|| "promote-tab".to_string());
+                                let follows = s
+                                    .model
+                                    .projects
+                                    .iter()
+                                    .find(|p| p.id == "promote-proj")
+                                    .and_then(|p| {
+                                        let i = p.tabs.iter().position(|t| t.id == "promote-tab")?;
+                                        Some(p.tabs.get(i + 1).map(|t| t.id.clone()))
+                                    })
+                                    .flatten()
+                                    == Some(fork_tab_id.clone());
+                                (expected, follows)
+                            });
+                            if fork_tab.parent_tab_id.as_deref() != Some(expected_parent.as_str()) {
+                                failures.push(format!(
+                                    "(f) fork: the fork tab must nest at depth 1 under {expected_parent:?}, got parent_tab_id {:?}",
+                                    fork_tab.parent_tab_id
+                                ));
+                            }
+                            if !follows_anchor {
+                                failures.push(
+                                    "(f) fork: the fork tab must be inserted immediately after the forked-from tab".into(),
+                                );
+                            }
+                            // The fork relocated into its own worktree (≥ 2.1.220).
+                            if fork_tab.cwd != fork_cwd {
+                                failures.push(format!(
+                                    "(f) fork: the fork tab must carry the relayed cwd {fork_cwd:?}, got {:?}",
+                                    fork_tab.cwd
+                                ));
+                            }
+                            // Titled by the job's `name` (it carries the ⑂ marker).
+                            if fork_tab.title != "⑂ forked work" {
+                                failures.push(format!(
+                                    "(f) fork: the fork tab must take the job's name as its title, got {:?}",
+                                    fork_tab.title
+                                ));
+                            }
+                            // Deferred: nothing runs until the user opens it.
+                            let fork_claude = fork_tab.panes.iter().find(|p| p.kind == PaneKind::Claude);
+                            if fork_claude.map(|p| p.is_claude_running) != Some(false) {
+                                failures.push(
+                                    "(f) fork: the fork tab's claude pane must be is_claude_running == false (deferred)".into(),
+                                );
+                            }
+                            // BUG-3 REGRESSION PIN + the no-focus-steal contract: the
+                            // relayed pane's world is untouched and selection never moved.
+                            if tab_session_id(cx, &state, "promote-tab").as_deref() != Some("cleared-id") {
+                                failures.push(
+                                    "(f) fork: a daemon-hosted fork must NOT rewrite the addressed tab's session id".into(),
+                                );
+                            }
+                            let selected_after_fork = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
+                            if selected_after_fork != selected_before_fork {
+                                failures.push(format!(
+                                    "(f) fork: materializing a fork must not move the active tab ({selected_before_fork:?} → {selected_after_fork:?})"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // -- f5 in-pane /branch on Claude ≥ 2.1.214: `source:"fork"` with NO ----
+            //    jobs entry. The OTHER half of the fork discriminator, and bug 2:
+            //    2.1.214 changed what an in-pane rotation reports, so this exact
+            //    payload used to slip past the `source == "resume"` gate and drop
+            //    the pre-branch conversation from the sidebar. Runs LAST because it
+            //    rotates promote-tab off the "cleared-id" that f4's bug-3 pin (and
+            //    its `forkParentSessionId`) reads. The probe points at the fixture's
+            //    jobs dir (re-rooted at the top of leg (f)), which holds no entry
+            //    for this id — so the classification is hermetic, not a read of the
+            //    developer's real `~/.claude`.
+            let inpane_id = "9e105a11-1111-2222-3333-444455556666";
+            send_session_update(cx, &socket_path, "promote-pane", inpane_id, Some("fork"), None).await;
+            if !poll_tab_session_id(cx, &state, "promote-tab", inpane_id).await {
+                failures.push(
+                    "(f) in-pane fork: a jobs-less source=fork must rotate the addressed tab onto the new id".into(),
+                );
+            }
+            match poll_branch_parent(cx, &state, "promote-proj", "cleared-id", "promote-tab").await {
+                None => failures.push(
+                    "(f) in-pane fork: a jobs-less source=fork must materialize a parent pinned to the PRE-rotation id (bug 2)".into(),
+                ),
+                Some(parent_id) => {
+                    let parent = state.update(cx, |s, _cx| s.model.tab_for(&parent_id).cloned());
+                    let parent = parent.expect("parent id just polled must resolve");
+                    let parent_claude = parent.panes.iter().find(|p| p.kind == PaneKind::Claude);
+                    if parent_claude.map(|p| p.is_claude_running) != Some(false) {
+                        failures.push(
+                            "(f) in-pane fork: the branch parent's claude pane must be is_claude_running == false (deferred)".into(),
+                        );
+                    }
+                    // The pre-rotation cwd, exactly as the legacy `source=resume`
+                    // leg (f1) asserts — the ordering pin is source-independent.
+                    if parent.cwd != adopt_cwd {
+                        failures.push(format!(
+                            "(f) in-pane fork: the branch parent must inherit the pre-rotation cwd {adopt_cwd:?}, got {:?}",
+                            parent.cwd
+                        ));
+                    }
+                }
+            }
+
+            // -- f6 cold-woken background job: `source:"resume"` naming an id that ---
+            //    HAS a jobs entry, relayed with a stale pane id a LIVE tab owns.
+            //    Opening a fork tab execs `claude attach`, and attaching to a COLD
+            //    job makes the daemon wake it — the woken worker fires SessionStart
+            //    for its own session while carrying whichever NICE_PANE_ID the
+            //    daemon inherited. Observed live: that relay rewrote the addressed
+            //    tab onto the woken job's id and invented a branch parent for the
+            //    conversation it had just displaced (bug 3, through the route Fix D
+            //    made routine). The source is `"resume"`, not `"fork"`, which is
+            //    exactly why the screen cannot be gated on the source.
+            if fixture.jobs.join(&fork_id[..8]).is_dir() {
+                let tabs_before_wake = project_tab_count(cx, &state, "promote-proj");
+                send_session_update(cx, &socket_path, "promote-pane", fork_id, Some("resume"), Some(&fork_cwd)).await;
+                settle(cx, 400).await;
+                if tab_session_id(cx, &state, "promote-tab").as_deref() != Some(inpane_id) {
+                    failures.push(
+                        "(f) woken job: a daemon-relayed resume must NOT rewrite the addressed tab's session id".into(),
+                    );
+                }
+                if project_tab_count(cx, &state, "promote-proj") != tabs_before_wake {
+                    failures.push(
+                        "(f) woken job: a daemon-relayed resume must materialize no tab (no phantom branch parent)".into(),
+                    );
+                }
+            }
         }
     }
 
@@ -552,7 +746,12 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      (source=resume + new id + cwd move) materialized a deferred sibling parent \
                      pinned to the OLD id at root with the pre-rotation cwd while the originating \
                      tab re-parented under it into the post-rotation worktree, a /clear rotated \
-                     the id in place with no new tab, and a cwd-bearing update adopted Tab.cwd."
+                     the id in place with no new tab, a cwd-bearing update adopted Tab.cwd, and a \
+                     jobs-dir-backed source=fork update (relayed from a pane no tab owns) \
+                     materialized a nested deferred child pinned to the fork id under the tab its \
+                     forkParentSessionId named, without touching the addressed tab or the \
+                     selection, while a jobs-less source=fork update rotated the addressed tab and \
+                     materialized its pre-rotation conversation as a deferred parent."
                 .to_string(),
         }
     } else {
@@ -681,6 +880,27 @@ async fn send_session_update(
     let _ = done.join();
     // Let the foreground drain route the fire-and-forget message before we poll.
     settle(cx, POLL_MS).await;
+}
+
+/// Write the `<jobs>/<first8(fork_id)>/state.json` the Claude daemon lays down
+/// before it spawns a background `/fork`'s child — the entry the SHIPPED probe
+/// reads to tell that fork apart from an in-pane `/branch`. Mirrors the real
+/// file's shape (`sessionId`, `forkParentSessionId`, `forkBoundaryAt`, `name`).
+fn write_fork_job(jobs: &std::path::Path, fork_id: &str, parent_id: &str, name: &str) -> Result<()> {
+    let short = fork_id.get(..8).context("fork id shorter than its first 8")?;
+    let dir = jobs.join(short);
+    std::fs::create_dir_all(&dir).context("create the fork's jobs dir")?;
+    std::fs::write(
+        dir.join("state.json"),
+        format!(
+            "{{\"sessionId\":\"{}\",\"forkParentSessionId\":\"{}\",\"forkBoundaryAt\":42,\"name\":\"{}\"}}",
+            json_escape(fork_id),
+            json_escape(parent_id),
+            json_escape(name),
+        ),
+    )
+    .context("write the fork's state.json")?;
+    Ok(())
 }
 
 /// Build a frozen `session_update` NDJSON request line (absent `source`/`cwd` are

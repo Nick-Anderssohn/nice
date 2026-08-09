@@ -2499,6 +2499,87 @@ fn handoff_terminals_project_tab_returns_false_no_insertion() {
     assert_eq!(project_by_id(&model, TabModel::TERMINALS_PROJECT_ID).tabs.len(), before);
 }
 
+// -- the pinned-session-id child (background /fork) ---------------------
+//
+// A background `/fork` nests under the forked-from tab and must resume the
+// FORK's conversation, not a fresh one. `insert_handoff_child` already
+// supports that: it rewrites `parent_tab_id` and nothing else, so a caller
+// pins `claude_session_id` on the tab it hands over. These pin that the
+// pinned id survives insertion, through both lineage shapes and the refusal.
+
+/// A fork-shaped child: a Claude tab pinned to `session_id`, unselected and
+/// deferred (its Claude pane is not running until the user opens it).
+fn make_pinned_fork_tab(id: &str, cwd: &str, session_id: &str) -> Tab {
+    let mut tab = make_handoff_tab(id, cwd);
+    tab.title = "⑂ fix the thing".into();
+    tab.claude_session_id = Some(session_id.into());
+    tab
+}
+
+#[test]
+fn handoff_child_keeps_its_pinned_claude_session_id() {
+    let mut model = TabModel::with_fs("/tmp", fake_fs("/home", &[]));
+    seed_claude_tab(&mut model, "p", "t1", "parent-session", "/tmp/p", true);
+
+    let inserted = model.insert_handoff_child(
+        make_pinned_fork_tab("fork1", "/tmp/p/worktree", "fork-session-id"),
+        "t1",
+    );
+    assert!(inserted);
+
+    let child = model.tab_for("fork1").expect("fork child must exist");
+    assert_eq!(
+        child.claude_session_id.as_deref(),
+        Some("fork-session-id"),
+        "the child's pinned session id must survive the insert verbatim"
+    );
+    assert_eq!(child.parent_tab_id.as_deref(), Some("t1"), "nested under the forked-from tab");
+    assert_eq!(child.cwd, "/tmp/p/worktree", "the fork's own worktree cwd is kept");
+    assert_eq!(child.title, "⑂ fix the thing");
+    assert_eq!(
+        model.tab_for("t1").unwrap().claude_session_id.as_deref(),
+        Some("parent-session"),
+        "the anchor tab is not rotated onto the fork's id"
+    );
+}
+
+#[test]
+fn handoff_child_of_a_child_pins_its_id_at_depth_1() {
+    // Forking from a tab that is already a depth-1 child: the fork becomes a
+    // sibling under the same root (never depth 2) and still carries its id.
+    let mut model = TabModel::with_fs("/tmp", fake_fs("/home", &[]));
+    seed_claude_tab(&mut model, "p", "root", "s-root", "/tmp/p", true);
+    seed_claude_tab(&mut model, "p", "originating", "s-orig", "/tmp/p", true);
+    model.mutate_tab("originating", |t| t.parent_tab_id = Some("root".into()));
+
+    assert!(model.insert_handoff_child(
+        make_pinned_fork_tab("fork1", "/tmp/p", "fork-session-id"),
+        "originating"
+    ));
+
+    let child = model.tab_for("fork1").expect("fork child must exist");
+    assert_eq!(child.parent_tab_id.as_deref(), Some("root"), "depth-1: sibling under the root");
+    assert_eq!(child.claude_session_id.as_deref(), Some("fork-session-id"));
+}
+
+#[test]
+fn handoff_child_refused_under_terminals_is_not_inserted_anywhere() {
+    // The pinned id changes nothing about the refusal: the Terminals group never
+    // hosts Claude, so a fork anchored there is dropped whole rather than
+    // leaking a tab into another project.
+    let mut model = TabModel::with_fs("/tmp", fake_fs("/home", &[]));
+    let before: usize = model.projects.iter().map(|p| p.tabs.len()).sum();
+
+    let inserted = model.insert_handoff_child(
+        make_pinned_fork_tab("fork1", "/tmp", "fork-session-id"),
+        TabModel::MAIN_TERMINAL_TAB_ID,
+    );
+
+    assert!(!inserted, "Terminals-project anchor must refuse the child");
+    assert!(model.tab_for("fork1").is_none(), "the refused child must not land in ANY project");
+    assert_eq!(model.projects.iter().map(|p| p.tabs.len()).sum::<usize>(), before);
+}
+
 // =====================================================================
 // ensure_terminals_project_seeded (spawn-hook fire-once)
 // =====================================================================

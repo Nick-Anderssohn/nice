@@ -3,9 +3,9 @@
 //! Ports Swift `NiceControlSocket` (`Sources/Nice/Process/NiceControlSocket.swift`)
 //! — a tiny AF_UNIX listener that lets Nice's shell helpers and Claude Code
 //! skills talk to the app. One newline-delimited JSON object per client, then
-//! close. Four actions (the first three are FROZEN — installed helpers on user
-//! disks already speak that protocol byte-for-byte, see the plan's "wire protocol
-//! is FROZEN" decision):
+//! close. Five actions — `claude` / `session_update` / `handoff` are FROZEN
+//! (installed helpers on user disks already speak that protocol byte-for-byte,
+//! see the plan's "wire protocol is FROZEN" decision):
 //!
 //!   * `claude`         — the shadowed `claude()` zsh function asking Nice to
 //!                        open a new tab or promote a pane in place.
@@ -16,6 +16,10 @@
 //!   * `dispatch`       — the `/nice-dispatch` skill's helper asking Nice to open
 //!                        a nested tab running `claude --worktree <name> …` on a
 //!                        task file the dispatcher wrote.
+//!   * `claude_exited`  — the same `claude()` shadow reporting that the Claude it
+//!                        ran as a CHILD has returned, so the pane is a shell
+//!                        prompt again. Only the `attach` reply verb produces
+//!                        such a child (Fix D). Fire-and-forget, no reply.
 //!
 //! ## What differs from Swift (deliberately — plan "do not port the Swift
 //! structure")
@@ -53,14 +57,15 @@
 //!
 //! [`Reply`] owns the accepted [`UnixStream`] and is **consumed on use**
 //! ([`Reply::send`] takes `self`): at-most-once by construction, stronger than
-//! Swift's closure convention. `session_update` drops the stream BEFORE dispatch
-//! (fire-and-forget); `claude` / `handoff` / `dispatch` carry a `Reply` and
-//! answer once from the foreground.
+//! Swift's closure convention. `session_update` and `claude_exited` drop the
+//! stream BEFORE dispatch (fire-and-forget); `claude` / `handoff` / `dispatch`
+//! carry a `Reply` and answer once from the foreground.
 //!
-//! The window-side routing point + the four handlers live on
+//! The window-side routing point + the five handlers live on
 //! [`crate::window_state::WindowState`] (`route_socket_message`); R15/R16/R26
-//! filled the first three's bodies and `dispatch` added a fourth arm, all
-//! without reshaping this socket. The `app::run` bootstrap
+//! filled the first three's bodies, `dispatch` added a fourth arm and Fix D a
+//! fifth (`claude_exited`), all without reshaping this socket. The `app::run`
+//! bootstrap
 //! (mint before the Main pane's spawn, start the listener, spawn the foreground
 //! drain, stop in teardown) is wired by the R14 env-injection slice — this
 //! module only provides the mechanism, hence the module-wide `dead_code` allow
@@ -111,8 +116,10 @@ const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Discriminated payload parsed off the control socket. Produced by
 /// [`parse_message`], routed by
-/// [`crate::window_state::WindowState::route_socket_message`]. The enum is
-/// finished business after R14 — R15/R16/R26 only fill handler bodies.
+/// [`crate::window_state::WindowState::route_socket_message`]. R14 fixed the
+/// four ported variants and R15/R16/R26 only filled their handler bodies; Fix D
+/// added the fifth, [`SocketMessage::ClaudeExited`], for a message the Swift
+/// app never had.
 ///
 /// Mirrors Swift `enum SocketMessage`
 /// (`NiceControlSocket.swift:43-144`). Every normalization rule the parser
@@ -142,6 +149,14 @@ pub(crate) enum SocketMessage {
         source: Option<String>,
         cwd: Option<String>,
     },
+    /// The `claude()` shadow reporting that the Claude it ran as a CHILD has
+    /// returned, so the sending pane is a plain shell prompt again. Only the
+    /// `attach` reply verb produces such a child — every other verb `exec`s,
+    /// and a pane whose pty exits clears itself through `pane_held` — which is
+    /// why nothing but the promotion flag needs undoing here. Fire-and-forget:
+    /// the client fd is closed BEFORE dispatch, so this variant carries no
+    /// [`Reply`]. `pane_id` is required non-empty.
+    ClaudeExited { pane_id: String },
     /// `/nice-handoff` skill asking Nice to open a fresh Claude session nested
     /// under the originating tab. `cwd` + `handoff_file` are required non-empty;
     /// `instructions` / `model` / `effort` / `tab_id` / `pane_id` are normalized
@@ -239,6 +254,9 @@ pub(crate) enum RecordedSocketMessage {
         session_id: String,
         source: Option<String>,
         cwd: Option<String>,
+    },
+    ClaudeExited {
+        pane_id: String,
     },
     Handoff {
         cwd: String,
@@ -618,6 +636,14 @@ fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
                 source,
                 cwd,
             })
+        }
+        "claude_exited" => {
+            let pane_id = non_empty(obj, "paneId")?;
+            // Fire-and-forget, same as `session_update`: close the fd BEFORE
+            // dispatch so the wrapper's `nc` returns to the user's prompt
+            // immediately rather than waiting on the foreground.
+            drop(stream);
+            Some(SocketMessage::ClaudeExited { pane_id })
         }
         "handoff" => {
             let cwd = non_empty(obj, "cwd")?;
@@ -1031,6 +1057,7 @@ mod tests {
             SocketMessage::Handoff { reply, .. } => reply.send("ok"),
             SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
             SocketMessage::SessionUpdate { .. } => {}
+            SocketMessage::ClaudeExited { .. } => {}
         }
     }
 
@@ -1053,6 +1080,7 @@ mod tests {
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
                 SocketMessage::Handoff { reply, .. } => reply.send("ok"),
                 SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
+                SocketMessage::ClaudeExited { .. } => {}
             }
         }
         fn count(&self) -> usize {
@@ -1355,6 +1383,66 @@ mod tests {
         assert_eq!(got.3, None, "non-string cwd must surface as None");
     }
 
+    // ---- claude_exited parse ------------------------------------------------
+
+    /// Thread-safe collector for dispatched `claude_exited` pane ids.
+    #[derive(Clone, Default)]
+    struct CapturedExits {
+        items: Arc<Mutex<Vec<String>>>,
+    }
+    impl CapturedExits {
+        fn handler(&self) -> impl Fn(SocketMessage) + Send + Sync + 'static {
+            let items = Arc::clone(&self.items);
+            move |msg| match msg {
+                SocketMessage::ClaudeExited { pane_id } => items.lock().unwrap().push(pane_id),
+                SocketMessage::Claude { reply, .. } => reply.send("newtab"),
+                SocketMessage::Handoff { reply, .. } => reply.send("ok"),
+                SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
+                SocketMessage::SessionUpdate { .. } => {}
+            }
+        }
+        fn count(&self) -> usize {
+            self.items.lock().unwrap().len()
+        }
+    }
+
+    #[test]
+    fn claude_exited_dispatches_its_pane_id() {
+        let captured = CapturedExits::default();
+        let socket = NiceControlSocket::with_intervals(
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+        );
+        socket.start(captured.handler()).unwrap();
+
+        send_raw(
+            socket.path(),
+            r#"{"action":"claude_exited","paneId":"t1-claude"}"#,
+        );
+
+        wait_for(Duration::from_secs(1), || captured.count() >= 1);
+        assert_eq!(
+            captured.items.lock().unwrap().first().map(String::as_str),
+            Some("t1-claude")
+        );
+    }
+
+    #[test]
+    fn claude_exited_without_a_pane_id_drops_silently() {
+        // Nothing to clear without a pane — the same required-field rule
+        // `session_update` applies.
+        let captured = CapturedExits::default();
+        let socket = NiceControlSocket::with_intervals(
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+        );
+        socket.start(captured.handler()).unwrap();
+
+        send_raw(socket.path(), r#"{"action":"claude_exited","paneId":""}"#);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(captured.count(), 0, "an empty paneId must drop");
+    }
+
     #[test]
     fn unknown_action_drops_silently() {
         let captured = CapturedUpdates::default();
@@ -1418,6 +1506,7 @@ mod tests {
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
                 SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
                 SocketMessage::SessionUpdate { .. } => {}
+                SocketMessage::ClaudeExited { .. } => {}
             }
         }
         fn count(&self) -> usize {
@@ -1672,6 +1761,7 @@ mod tests {
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
                 SocketMessage::Handoff { reply, .. } => reply.send("ok"),
                 SocketMessage::SessionUpdate { .. } => {}
+                SocketMessage::ClaudeExited { .. } => {}
             }
         }
         fn count(&self) -> usize {

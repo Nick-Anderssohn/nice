@@ -289,6 +289,25 @@ impl TabModel {
             .map(|t| t.id.clone())
     }
 
+    /// The id of the tab pinned to Claude session `session_id`, in tree order —
+    /// the pane-free twin of [`tab_id_owning`](Self::tab_id_owning), for the
+    /// events that identify a conversation rather than a pane. A daemon-hosted
+    /// background `/fork` is the first: its SessionStart relays a pane id that
+    /// belongs to whichever pane happened to spawn the Claude daemon, so the
+    /// forked-from conversation is resolvable only by its session id.
+    ///
+    /// Session ids are unique across tabs by construction (each is minted per tab
+    /// or adopted from a rotation), so the first match is the only match; a
+    /// corrupt snapshot with duplicates resolves to the first in tree order rather
+    /// than failing.
+    pub fn tab_id_for_claude_session(&self, session_id: &str) -> Option<String> {
+        self.projects
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .find(|t| t.claude_session_id.as_deref() == Some(session_id))
+            .map(|t| t.id.clone())
+    }
+
     // MARK: - Selection
 
     /// Select a tab. The single `active_tab_id` writer — carries the Swift
@@ -1108,6 +1127,16 @@ impl TabModel {
     /// children remain valid; this asymmetry is deliberate). Inserted
     /// immediately after the anchor. Returns `false` (mutating nothing) when
     /// the anchor is unknown or in the Terminals group (`TabModel.swift:401-416`).
+    ///
+    /// **`parent_tab_id` is the ONLY field this touches.** The child arrives
+    /// fully built and every other field — panes, title flags, and in
+    /// particular `claude_session_id` — is inserted verbatim. So a caller that
+    /// needs the child PINNED to a specific session id (a handoff tab to its
+    /// pre-minted `--session-id`, a background `/fork` tab to the fork's id, so
+    /// its later deferred resume opens that exact conversation) simply sets
+    /// `tab.claude_session_id` before calling; no variant of this method is
+    /// needed for it. [`crate::TabModel::insert_branch_parent`] pins the old id
+    /// itself only because it MINTS the tab it inserts.
     pub fn insert_handoff_child(&mut self, tab: Tab, under_tab_id: &str) -> bool {
         let Some((pi, ti)) = self.project_tab_index(under_tab_id) else {
             return false;

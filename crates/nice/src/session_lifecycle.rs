@@ -74,7 +74,7 @@ use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_term_core::SpawnSpec;
 use nice_term_view::{TerminalEvent, TerminalSessionHandle};
 
-use crate::session_manager::ClaudeTabPlacement;
+use crate::session_manager::{ClaudeTabPlacement, ClaudeTabSession};
 use crate::window_state::WindowState;
 
 // -- fixed geometry / timing -------------------------------------------------
@@ -278,6 +278,7 @@ fn project_new_claude_tab(
                 project_id: PROJECT_ID.to_string(),
             },
             &[],
+            ClaudeTabSession::mint(),
             None,
             cx,
         )?;

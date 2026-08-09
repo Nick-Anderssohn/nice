@@ -100,7 +100,7 @@ use crate::inline_rename::{
     apply_rename_click, dispatch_rename_key, field_probe_cell, field_text, rename_field,
     reset_field_probe, FieldColors, FieldProbeCell, RenameKeyOutcome,
 };
-use crate::session_manager::ClaudeTabPlacement;
+use crate::session_manager::{ClaudeTabPlacement, ClaudeTabSession};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -1034,6 +1034,8 @@ impl SidebarShellView {
                         project_id: group_id.to_string(),
                     },
                     &[],
+                    // The sidebar `+` always starts a FRESH conversation.
+                    ClaudeTabSession::mint(),
                     settings.as_deref(),
                     wcx,
                 );

@@ -186,6 +186,40 @@ impl WindowRegistry {
             .find(|h| h.read(cx).session_id() == session_id)
     }
 
+    /// The window holding the tab pinned to Claude conversation
+    /// `claude_session_id` — the cross-window half of the background-`/fork`
+    /// parent lookup (Fix B). `session_update` is routed to the window owning the
+    /// relayed pane id, but a daemon-spawned fork child relays whichever pane id
+    /// first spawned the Claude daemon, which says nothing about where the forked
+    /// conversation is actually open — so the fork path falls back to searching
+    /// every live window. Modelled on
+    /// [`state_for_session_id`](Self::state_for_session_id), which does the same
+    /// for a WINDOW session id (this one keys on a CLAUDE session id, a per-tab
+    /// value). `None` when no live window carries that conversation.
+    ///
+    /// Must not be called while any window's [`WindowState`] is being updated:
+    /// reading an entity that is currently leased panics in gpui. The fork path
+    /// calls it from a spawned task, where no lease is held.
+    pub(crate) fn state_for_claude_session(
+        cx: &App,
+        claude_session_id: &str,
+    ) -> Option<Entity<WindowState>> {
+        // Clone the handles out first so the global borrow ends before we read
+        // each entity (`Entity::read` also borrows the app).
+        let handles: Vec<Entity<WindowState>> = cx
+            .try_global::<WindowRegistry>()?
+            .entries
+            .values()
+            .cloned()
+            .collect();
+        handles.into_iter().find(|h| {
+            h.read(cx)
+                .model
+                .tab_id_for_claude_session(claude_session_id)
+                .is_some()
+        })
+    }
+
     /// The number of live registered windows (used by the multi-window scenario /
     /// itests to assert open/close deltas against the real `NSWindow` count).
     pub(crate) fn count(cx: &App) -> usize {

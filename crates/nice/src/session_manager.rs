@@ -275,6 +275,20 @@ pub(crate) struct SessionManager {
     /// populates it outside the [`mark_synthetic_foreground_child`](Self::mark_synthetic_foreground_child)
     /// test seam. Mirrors the `synthetic_spawned`/`_held`/`_armed` seams.
     synthetic_foreground_child: HashSet<String>,
+    /// Test seam (gpui's deterministic scheduler): when `false`, every session
+    /// spawned from here on has its event-driven drain wake disabled
+    /// ([`TerminalSessionHandle::set_event_wake_enabled`]). A pty's feeder /
+    /// exit-watcher threads wake the drain task from a BACKGROUND thread, which
+    /// gpui's test scheduler flags as non-determinism ("schedule_local must run on
+    /// the test thread") — so a `#[gpui::test]` that both spawns a pane and runs
+    /// the executor (`run_until_parked` / `advance_clock`, which is what parks the
+    /// drain and registers the waker the exit-watcher then wakes) fails
+    /// intermittently. Applied at spawn time, which is the ONLY point early enough
+    /// for a pane the test does not spawn itself (the background-`/fork`
+    /// materialization spawns its deferred pane from inside a spawned task). Always
+    /// `true` in production — the field only exists under `cfg(test)`.
+    #[cfg(test)]
+    event_wakes_enabled: bool,
     /// Injectable id minter (test seam). Production default:
     /// `<prefix><ms>-<suffix>` — the millisecond keeps ids roughly time-sortable
     /// for log triage; the short suffix keeps two creations in the same
@@ -325,6 +339,8 @@ impl SessionManager {
             synthetic_held: HashSet::new(),
             synthetic_armed: HashSet::new(),
             synthetic_foreground_child: HashSet::new(),
+            #[cfg(test)]
+            event_wakes_enabled: true,
             mint_id,
             window_shell_env: None,
             pending_project_removal: HashSet::new(),
@@ -1092,6 +1108,16 @@ impl SessionManager {
         self.synthetic_armed.insert(key);
     }
 
+    /// Test seam: turn the event-driven drain wake off for every session this
+    /// manager spawns from now on — see [`event_wakes_enabled`](Self::event_wakes_enabled).
+    /// A `#[gpui::test]` that spawns a pane AND runs the executor must call this
+    /// first, or the pane's exit-watcher thread eventually wakes the parked drain
+    /// task cross-thread and trips gpui's determinism guard.
+    #[cfg(test)]
+    pub(crate) fn set_event_wakes_enabled_for_test(&mut self, enabled: bool) {
+        self.event_wakes_enabled = enabled;
+    }
+
     /// R20.5 test seam: mark `(tab_id, pane_id)` as a terminal pane whose shell
     /// has a **foreground child** — [`shell_has_foreground_child`](Self::shell_has_foreground_child)
     /// then reports it busy WITHOUT a real pty running a real command, so the
@@ -1338,6 +1364,14 @@ impl SessionManager {
             return Ok(());
         }
         let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
+        // Deterministic-scheduler opt-out (see `event_wakes_enabled`). Set here,
+        // before control returns to the executor, so it lands before this
+        // session's drain task first parks and registers the waker its pty
+        // threads would otherwise wake cross-thread.
+        #[cfg(test)]
+        if !self.event_wakes_enabled {
+            handle.read(cx).set_event_wake_enabled(false);
+        }
         self.tabs
             .entry(tab_id.to_string())
             .or_default()
@@ -1356,9 +1390,12 @@ impl SessionManager {
     ///
     /// The Claude pane is created with `is_claude_running = true` from day one (the
     /// PROTECTED creation invariant: it gates the ≤1-Claude promotion refusal, the
-    /// OSC title/status pulse, and auto-titles). The session UUID is pre-minted
-    /// (real v4, via [`mint_session_uuid`]) so `--session-id` is passed now and the
-    /// same id persists for later `--resume`.
+    /// OSC title/status pulse, and auto-titles). `session` says which session the
+    /// pane runs: [`ClaudeTabSession::mint`] (the caller's default) pre-mints a
+    /// real v4 UUID so `--session-id` is passed now and the same id persists for
+    /// later `--resume`; a request whose args already NAME a session hands one in
+    /// instead, because splicing `--session-id` beside `--resume`/`attach` is an
+    /// argv Claude Code refuses to run.
     ///
     /// `settings_path` is the injectable theme-sync provider's output (R17 fills it;
     /// `None` until then). Returns the new tab id, or `None` for a bad placement (an
@@ -1368,6 +1405,7 @@ impl SessionManager {
         model: &mut TabModel,
         placement: ClaudeTabPlacement,
         args: &[String],
+        session: ClaudeTabSession,
         settings_path: Option<&str>,
         cx: &mut App,
     ) -> Option<String> {
@@ -1397,7 +1435,6 @@ impl SessionManager {
         let tab_id = self.mint("t");
         let claude_pane_id = format!("{tab_id}-claude");
         let terminal_pane_id = format!("{tab_id}-t1");
-        let session_id = mint_session_uuid();
 
         // The Claude pane is `is_claude_running = true` at creation (PROTECTED).
         let mut claude_pane = Pane::new(&claude_pane_id, "Claude", PaneKind::Claude);
@@ -1408,7 +1445,7 @@ impl SessionManager {
             Pane::new(&terminal_pane_id, "Terminal 1", PaneKind::Terminal),
         ];
         tab.active_pane_id = Some(claude_pane_id.clone());
-        tab.claude_session_id = Some(session_id.clone());
+        tab.claude_session_id = session.pin.clone();
         tab.next_terminal_index = 2;
 
         match &placement {
@@ -1428,7 +1465,7 @@ impl SessionManager {
             &tab_id,
             &claude_pane_id,
             &spawn_cwd,
-            &ClaudeSessionMode::New(session_id),
+            &session.mode,
             &extra_args,
             settings_path,
             cx,
@@ -1872,6 +1909,17 @@ pub(crate) enum ClaudeSessionMode {
     New(String),
     /// Resume a prior session by UUID (`--resume <uuid>`).
     Resume(String),
+    /// Fix D: attach to a background session the Claude daemon still hosts
+    /// (`claude attach <short id>`). Carries the SHORT (8-hex) job id, because
+    /// that is what `attach` resolves — it prefix-matches `~/.claude/jobs`
+    /// directory names, which a full uuid never matches.
+    ///
+    /// `attach` is a SUBCOMMAND, and the CLI only recognizes a subcommand in
+    /// FIRST position: `claude --settings <path> attach <id>` parses as the
+    /// default command with `attach <id>` as its PROMPT (verified against
+    /// 2.1.223 — it starts a brand-new conversation). So this mode emits no
+    /// `--settings` pointer and no `extra_claude_args`.
+    Attach(String),
     /// Restore path: don't run claude — spawn a plain `zsh -il` with
     /// `claude --resume <uuid>` pre-typed at the prompt via the stub's
     /// `print -z "$NICE_PREFILL_COMMAND"` tail. This is the only mode that needs
@@ -1991,8 +2039,11 @@ pub(crate) fn build_claude_exec_command(
     if !is_override {
         // Nice-managed theme pointer (`{"theme":"custom:nice"}`) — a global flag
         // with its own value; emit it before the session flags so it never sits
-        // between `--session-id`/`--resume` and their UUID.
-        if let Some(sp) = settings_path {
+        // between `--session-id`/`--resume` and their UUID. Suppressed for
+        // [`Attach`](ClaudeSessionMode::Attach): a global flag BEFORE the
+        // `attach` subcommand makes the CLI stop seeing a subcommand at all
+        // (the id degrades into a prompt), so attach takes no theme pointer.
+        if let (Some(sp), false) = (settings_path, matches!(mode, ClaudeSessionMode::Attach(_))) {
             parts.push("--settings".to_string());
             parts.push(nice_term_core::shell_single_quote(sp));
         }
@@ -2017,6 +2068,13 @@ pub(crate) fn build_claude_exec_command(
                 parts.push("--resume".to_string());
                 parts.push(nice_term_core::shell_single_quote(id));
             }
+            ClaudeSessionMode::Attach(short_id) => {
+                // Subcommand FIRST, and nothing after the id: `attach` takes one
+                // positional argument, so `extra_claude_args` is dropped exactly
+                // as [`Resume`](ClaudeSessionMode::Resume) drops it.
+                parts.push("attach".to_string());
+                parts.push(nice_term_core::shell_single_quote(short_id));
+            }
             ClaudeSessionMode::ResumeDeferred(_) => {}
         }
     }
@@ -2038,6 +2096,18 @@ pub(crate) enum ClaudeReplyDecision {
         parsed_from_args: bool,
         session_id: String,
     },
+    /// Fix D: promote in place, but exec `claude attach` instead of what the
+    /// user typed — their `--resume <uuid>` names a background session the
+    /// Claude daemon STILL hosts, and a second `--resume` would race the live
+    /// process. The FULL uuid rides the wire (not the 8-hex short id `attach`
+    /// takes): the wrapper derives the short id from it, and the fallback leg
+    /// (`attach` failed ⇒ the daemon dropped the job after we probed) needs the
+    /// uuid to resume with.
+    Attach { session_id: String },
+    /// Fix D: promote in place, but exec `claude --resume <uuid>` instead of
+    /// what the user typed — they ran `claude attach <id>` for a session the
+    /// daemon no longer hosts, which `attach` alone can only fail on.
+    Resume { session_id: String },
 }
 
 /// Compose the socket `claude` reply — the FROZEN R14 grammar (≤3
@@ -2045,13 +2115,19 @@ pub(crate) enum ClaudeReplyDecision {
 /// Swift `handleClaudeSocketRequest` (`SessionsModel.swift:897-910`); an
 /// R15-owned protocol composer.
 ///
-/// The four byte-exact variants:
+/// The byte-exact variants:
 /// - `newtab`
 /// - `inplace` — in-place, args already carried the id, theme sync off
 /// - `inplace <uuid>` — in-place, minted id, theme sync off
 /// - `inplace <uuid|-> <path>` — theme sync on: the third field is the
 ///   `--settings` path the wrapper splices; the second is the minted uuid, or
 ///   `-` when the client's args already named the session.
+/// - `attach <uuid> [path]` / `resume <uuid> [path]` — Fix D's exec-time
+///   normalization. Same three positional fields (the second is always the FULL
+///   uuid, the third the optional `--settings` pointer), so the frozen
+///   `read -r mode sid settings` grammar is untouched; only the verb is new.
+///   An older wrapper that predates these verbs falls into its `*)` arm and
+///   runs the user's original args — the pre-Fix-D behavior, never a crash.
 ///
 /// `settings_path` is the injectable theme-sync provider's output (R17 fills
 /// it; `None` until then). With `settings_path == None` the replies are
@@ -2085,6 +2161,22 @@ pub(crate) fn compose_claude_reply(
                 }
             }
         },
+        ClaudeReplyDecision::Attach { session_id } => {
+            compose_id_reply("attach", session_id, settings_path)
+        }
+        ClaudeReplyDecision::Resume { session_id } => {
+            compose_id_reply("resume", session_id, settings_path)
+        }
+    }
+}
+
+/// The `<verb> <uuid> [settings]` shape shared by Fix D's two normalizing
+/// replies. Unlike `inplace` the id field is never a `-` placeholder: these
+/// verbs exist precisely to hand the wrapper an id it did not have.
+fn compose_id_reply(verb: &str, session_id: &str, settings_path: Option<&str>) -> String {
+    match settings_path {
+        Some(path) => format!("{verb} {session_id} {path}"),
+        None => format!("{verb} {session_id}"),
     }
 }
 
@@ -2111,6 +2203,37 @@ pub(crate) fn parse_claude_title(title: &str) -> (Option<TabStatus>, &str) {
         (Some(TabStatus::Waiting), &title[first.len_utf8()..])
     } else {
         (None, title)
+    }
+}
+
+/// WHICH session a [`SessionManager::create_claude_tab`] spawn runs — the
+/// newtab twin of the in-place reply's exec-time decision (Fix D).
+///
+/// The default ([`mint`](Self::mint)) is the pre-Fix-D behavior: mint a fresh
+/// v4 uuid and pass it as `--session-id`, so the tab can `--resume` it after a
+/// relaunch. That is WRONG when the invocation already names a session: Claude
+/// Code rejects `--session-id` beside `--resume`/`--continue` outright
+/// (`--session-id can only be used with --continue or --resume if
+/// --fork-session is also specified`), so the pane dies on the spot. Those
+/// invocations carry their own mode and pin instead.
+pub(crate) struct ClaudeTabSession {
+    /// How the pane's `claude` is exec'd ([`build_claude_exec_command`]).
+    pub(crate) mode: ClaudeSessionMode,
+    /// The session id the new tab remembers, or `None` when the request names a
+    /// session that cannot be resolved to a full uuid (a short `attach <id>`
+    /// with no readable jobs entry). Minting one there would pin a phantom id
+    /// no later `--resume` could use.
+    pub(crate) pin: Option<String>,
+}
+
+impl ClaudeTabSession {
+    /// A fresh session: mint a real v4 uuid, pass it as `--session-id`, pin it.
+    pub(crate) fn mint() -> Self {
+        let id = mint_session_uuid();
+        Self {
+            mode: ClaudeSessionMode::New(id.clone()),
+            pin: Some(id),
+        }
     }
 }
 
@@ -2198,6 +2321,7 @@ fn claude_worktree_cwd(cwd: &str, args: &[String]) -> String {
 fn claude_launch_display_command(mode: &ClaudeSessionMode, extra_args: &[String]) -> String {
     match mode {
         ClaudeSessionMode::Resume(_) => "claude --resume".to_string(),
+        ClaudeSessionMode::Attach(short_id) => format!("claude attach {short_id}"),
         _ => {
             if extra_args.is_empty() {
                 "claude".to_string()
