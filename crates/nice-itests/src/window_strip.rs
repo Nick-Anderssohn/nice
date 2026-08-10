@@ -1,4 +1,4 @@
-//! In-process pane-strip **real-layout** differentials for the R11 toolbar pane
+//! In-process window-strip **real-layout** differentials for the R11 toolbar window
 //! strip — **execution model: mocked [`gpui::TestAppContext`], ordinary libtest
 //! `#[gpui::test]` cases** (no Metal, no pixels; parallel-safe).
 //!
@@ -6,10 +6,10 @@
 //! here — `nice-itests` is dev/test-only and the app binary never depends on it
 //! (and vice versa), the same constraint the R9 [`crate::chrome_band`] probe and
 //! the R10 [`crate::sidebar_multiselect`] probe document. So this mirrors the
-//! strip's real-layout logic in a local [`PaneStripProbe`] that drives a **real**
+//! strip's real-layout logic in a local [`WindowStripProbe`] that drives a **real**
 //! [`gpui::ScrollHandle`] over real, fixed-width pill children and the **real**
 //! `nice-model` predicates ([`should_show_overflow_chevron`], [`StripGeometry`],
-//! [`center_offset_x`], [`Tab::has_offscreen_attention`], [`TabModel`]). The
+//! [`center_offset_x`], [`Session::has_offscreen_attention`], [`WorkspaceModel`]). The
 //! mirrored glue is thin (the `viewport_relative_rect` translation, the
 //! chevron/fades/badge derivations, and the select/close/add/rename routing); the
 //! real `ScrollHandle` does the layout and the real model does the reasoning, so a
@@ -20,7 +20,7 @@
 //! [`nice_model::strip_geometry`]'s pure predicates are already unit-tested with
 //! plain rect fixtures (slice 1). What those fixtures **cannot** prove is that the
 //! GPUI `ScrollHandle` actually reports the overflow / per-item bounds the view
-//! feeds them — that the chevron flips at the exact pane count where the
+//! feeds them — that the chevron flips at the exact window count where the
 //! reserved-width viewport first overflows, that a hover-toggled ✕ slot keeps the
 //! pill's laid-out width constant, that centering an offscreen pill via
 //! `set_offset(center_offset_x(..))` actually reveals it. Those are layout facts;
@@ -53,8 +53,8 @@ use gpui::{
 };
 
 use nice_model::{
-    center_offset_x, resolve, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry,
-    Tab, TabModel, TabStatus,
+    center_offset_x, resolve, should_show_overflow_chevron, TermWindow, TermWindowKind, Rect, StripGeometry,
+    Session, WorkspaceModel, SessionStatus,
 };
 
 // ---- Geometry (deterministic, fixed-width pills) ----------------------------
@@ -108,18 +108,18 @@ fn viewport_relative_rect(item_left: f32, item_width: f32, offset_x: f32, viewpo
 
 // ---- Pill drag (R25 reorder) mirror -----------------------------------------
 
-/// Mirror of the shipped `PaneDragPayload` (`toolbar.rs`, D3): the dragged pane id
-/// + its tab, the type gate `on_drop::<PaneDragPayload>` matches on. The shipped
+/// Mirror of the shipped `WindowDragPayload` (`toolbar.rs`, D3): the dragged window id
+/// + its session, the type gate `on_drop::<WindowDragPayload>` matches on. The shipped
 /// type is private to the `nice` binary (which this dev crate cannot import), so
 /// the probe carries its own structurally-identical payload — the drag wiring
 /// under test is the arming + resolve + move, not the type name.
 #[derive(Clone)]
-struct PaneDragPayload {
-    pane_id: SharedString,
-    tab_id: SharedString,
+struct WindowDragPayload {
+    term_window_id: SharedString,
+    session_id: SharedString,
 }
 
-/// The cursor-following drag ghost (mirror of the shipped `PaneDragGhost`, D4). Its
+/// The cursor-following drag ghost (mirror of the shipped `WindowDragGhost`, D4). Its
 /// paint is irrelevant to these behaviour tests — only that a drag armed and a
 /// ghost view exists — so it renders a bare title box.
 struct DragGhost {
@@ -134,14 +134,14 @@ impl Render for DragGhost {
 
 // ---- The probe --------------------------------------------------------------
 
-/// A flat pane strip mirroring `WindowToolbarView`'s real-layout logic over the
+/// A flat window strip mirroring `WindowToolbarView`'s real-layout logic over the
 /// real `nice-model` state and a real [`ScrollHandle`], recording nothing beyond
 /// the model + scroll state the accessors read back.
-struct PaneStripProbe {
+struct WindowStripProbe {
     /// The real R8 document the routing mutates.
-    model: TabModel,
-    /// The active tab whose panes render (fixed for a probe's lifetime).
-    tab_id: String,
+    workspace: WorkspaceModel,
+    /// The active session whose windows render (fixed for a probe's lifetime).
+    session_id: String,
     /// The total toolbar-row width; the scroll viewport is this minus the two
     /// always-reserved trailing slots (the reservation the overflow rule needs).
     toolbar_w: f32,
@@ -150,28 +150,28 @@ struct PaneStripProbe {
     scroll: ScrollHandle,
     /// The pill (if any) the cursor is over — toggles its ✕ visibility; the slot
     /// is always laid out either way (the hover-invariant-width contract).
-    hovered_pane_id: Option<String>,
-    /// The pane being inline-renamed + its draft, if any.
-    editing_pane: Option<String>,
+    hovered_window_id: Option<String>,
+    /// The window being inline-renamed + its draft, if any.
+    editing_window: Option<String>,
     draft: String,
-    /// Monotonic id source for added panes (mirrors `ModelPaneStripActions`).
+    /// Monotonic id source for added windows (mirrors `ModelWindowStripActions`).
     next_id: u64,
     /// The gated pill-reorder drop slot (mirror of the view's `drag_target`, D7):
-    /// `(target_pane_id, place_after)`, already filtered through
-    /// [`TabModel::would_move_pane`]. Recomputed in `on_pill_drag_move`, cleared on
+    /// `(target_window_id, place_after)`, already filtered through
+    /// [`WorkspaceModel::would_move_window`]. Recomputed in `on_pill_drag_move`, cleared on
     /// drop / strip exit.
     drag_target: Option<(String, bool)>,
 }
 
-impl PaneStripProbe {
-    fn new(model: TabModel, tab_id: String, toolbar_w: f32, _cx: &mut Context<Self>) -> Self {
+impl WindowStripProbe {
+    fn new(workspace: WorkspaceModel, session_id: String, toolbar_w: f32, _cx: &mut Context<Self>) -> Self {
         Self {
-            model,
-            tab_id,
+            workspace,
+            session_id,
             toolbar_w,
             scroll: ScrollHandle::new(),
-            hovered_pane_id: None,
-            editing_pane: None,
+            hovered_window_id: None,
+            editing_window: None,
             draft: String::new(),
             next_id: 0,
             drag_target: None,
@@ -180,21 +180,21 @@ impl PaneStripProbe {
 
     // ---- model access ------------------------------------------------------
 
-    fn tab(&self) -> &Tab {
-        self.model.tab_for(&self.tab_id).expect("probe tab exists")
+    fn session(&self) -> &Session {
+        self.workspace.session_for(&self.session_id).expect("probe session exists")
     }
 
-    fn pane_ids(&self) -> Vec<String> {
-        self.tab().panes.iter().map(|p| p.id.clone()).collect()
+    fn term_window_ids(&self) -> Vec<String> {
+        self.session().windows.iter().map(|p| p.id.clone()).collect()
     }
 
-    fn active_pane_id(&self) -> Option<String> {
-        self.tab().active_pane_id.clone()
+    fn active_window_id(&self) -> Option<String> {
+        self.session().active_window_id.clone()
     }
 
     // ---- real-layout derivations (mirror of the view) ----------------------
 
-    /// The pill row's real geometry: each pane's viewport-relative rect + the
+    /// The pill row's real geometry: each window's viewport-relative rect + the
     /// viewport width, fed to [`StripGeometry`] (mirror of the view's
     /// `strip_geometry`).
     fn strip_geometry(&self) -> StripGeometry {
@@ -203,10 +203,10 @@ impl PaneStripProbe {
         let visible_width = f32::from(viewport.size.width);
         let offset_x = f32::from(self.scroll.offset().x);
         let mut frames = std::collections::HashMap::new();
-        for (ix, pane) in self.tab().panes.iter().enumerate() {
+        for (ix, term_window) in self.session().windows.iter().enumerate() {
             if let Some(b) = self.scroll.bounds_for_item(ix) {
                 frames.insert(
-                    pane.id.clone(),
+                    term_window.id.clone(),
                     viewport_relative_rect(
                         f32::from(b.origin.x),
                         f32::from(b.size.width),
@@ -219,67 +219,67 @@ impl PaneStripProbe {
         StripGeometry::new(frames, visible_width)
     }
 
-    /// The `>= 2` panes + reserved-real-overflow rule (mirror of `show_chevron`).
+    /// The `>= 2` windows + reserved-real-overflow rule (mirror of `show_chevron`).
     fn show_chevron(&self) -> bool {
-        should_show_overflow_chevron(self.tab().panes.len(), f32::from(self.scroll.max_offset().x))
+        should_show_overflow_chevron(self.session().windows.len(), f32::from(self.scroll.max_offset().x))
     }
 
-    /// The fully-offscreen pane ids (drives the fades + badge).
+    /// The fully-offscreen window ids (drives the fades + badge).
     fn offscreen_ids(&self) -> HashSet<String> {
-        self.strip_geometry().offscreen_pane_ids()
+        self.strip_geometry().offscreen_window_ids()
     }
 
-    /// Whether some fully-offscreen pane needs attention — reuses the R8
-    /// [`Tab::has_offscreen_attention`] fed this cycle's offscreen set (no second
+    /// Whether some fully-offscreen window needs attention — reuses the R8
+    /// [`Session::has_offscreen_attention`] fed this cycle's offscreen set (no second
     /// predicate — dossier G2).
     fn has_offscreen_attention(&self) -> bool {
-        self.tab().has_offscreen_attention(&self.offscreen_ids())
+        self.session().has_offscreen_attention(&self.offscreen_ids())
     }
 
-    fn pill_bounds(&self, pane_id: &str) -> Option<Bounds<Pixels>> {
-        let ix = self.tab().panes.iter().position(|p| p.id == pane_id)?;
+    fn pill_bounds(&self, term_window_id: &str) -> Option<Bounds<Pixels>> {
+        let ix = self.session().windows.iter().position(|p| p.id == term_window_id)?;
         self.scroll.bounds_for_item(ix)
     }
 
-    // ---- routing (mirror of ModelPaneStripActions + the view) --------------
+    // ---- routing (mirror of ModelWindowStripActions + the view) --------------
 
-    /// A plain press on a pill body: select the pane (mirror of the view's
-    /// `select_pane` → `ModelPaneStripActions::select_pane`, guarded against a
+    /// A plain press on a pill body: select the window (mirror of the view's
+    /// `select_window` → `ModelWindowStripActions::select_window`, guarded against a
     /// dangling active id), then auto-center it (mirror of `try_center_active`).
-    fn select_pane(&mut self, pane_id: &str) {
-        if let Some((pi, ti)) = self.model.project_tab_index(&self.tab_id) {
-            let tab = &mut self.model.projects[pi].tabs[ti];
-            if tab.panes.iter().any(|p| p.id == pane_id)
-                && tab.active_pane_id.as_deref() != Some(pane_id)
+    fn select_window(&mut self, term_window_id: &str) {
+        if let Some((pi, ti)) = self.workspace.project_session_index(&self.session_id) {
+            let session = &mut self.workspace.projects[pi].sessions[ti];
+            if session.windows.iter().any(|p| p.id == term_window_id)
+                && session.active_window_id.as_deref() != Some(term_window_id)
             {
-                tab.active_pane_id = Some(pane_id.to_string());
+                session.active_window_id = Some(term_window_id.to_string());
                 self.center_active();
             }
         }
     }
 
-    /// Close a pane via the single [`TabModel::extract_pane`] entry point (mirror
-    /// of `close_pane` → `ModelPaneStripActions::close_pane`; no busy-close
+    /// Close a window via the single [`WorkspaceModel::extract_window`] entry point (mirror
+    /// of `close_term_window` → `ModelWindowStripActions::close_term_window`; no busy-close
     /// confirmation — that is R18).
-    fn close_pane(&mut self, pane_id: &str) {
-        self.model.extract_pane(pane_id, &self.tab_id);
+    fn close_term_window(&mut self, term_window_id: &str) {
+        self.workspace.extract_window(term_window_id, &self.session_id);
     }
 
-    /// Append an auto-named terminal pane (mirror of `add_terminal_pane` →
-    /// `ModelPaneStripActions::add_terminal_pane` → the R8 "Terminal N" counter).
-    fn add_terminal_pane(&mut self) -> Option<String> {
+    /// Append an auto-named terminal window (mirror of `add_terminal_window` →
+    /// `ModelWindowStripActions::add_terminal_window` → the R8 "Terminal N" counter).
+    fn add_terminal_window(&mut self) -> Option<String> {
         self.next_id += 1;
         let id = format!("added-{}", self.next_id);
-        self.model.add_pane(&self.tab_id, id, None)
+        self.workspace.add_window(&self.session_id, id, None)
     }
 
-    /// Center the active pane in the viewport using the real laid-out bounds +
+    /// Center the active window in the viewport using the real laid-out bounds +
     /// [`center_offset_x`] + `set_offset` — the shipped `try_center_active` math.
     fn center_active(&mut self) {
-        let Some(active) = self.active_pane_id() else {
+        let Some(active) = self.active_window_id() else {
             return;
         };
-        let Some(ix) = self.tab().panes.iter().position(|p| p.id == active) else {
+        let Some(ix) = self.session().windows.iter().position(|p| p.id == active) else {
             return;
         };
         let Some(item) = self.scroll.bounds_for_item(ix) else {
@@ -299,15 +299,15 @@ impl PaneStripProbe {
 
     // ---- inline rename (mirror of the view; the pill reimplements no policy) ---
 
-    fn begin_editing(&mut self, pane_id: &str) {
+    fn begin_editing(&mut self, term_window_id: &str) {
         let title = self
-            .tab()
-            .panes
+            .session()
+            .windows
             .iter()
-            .find(|p| p.id == pane_id)
+            .find(|p| p.id == term_window_id)
             .map(|p| p.title.clone());
         if let Some(title) = title {
-            self.editing_pane = Some(pane_id.to_string());
+            self.editing_window = Some(term_window_id.to_string());
             self.draft = title;
         }
     }
@@ -316,15 +316,15 @@ impl PaneStripProbe {
         self.draft = draft.to_string();
     }
 
-    /// Commit the draft through the R8 [`TabModel::rename_pane`] (empty input
+    /// Commit the draft through the R8 [`WorkspaceModel::rename_window`] (empty input
     /// resets to the per-kind auto-default + consumes a "Terminal N" counter slot
     /// — asymmetry 3; the pill reimplements none of it).
     fn commit_rename(&mut self) {
-        let Some(pane_id) = self.editing_pane.take() else {
+        let Some(term_window_id) = self.editing_window.take() else {
             return;
         };
         let draft = std::mem::take(&mut self.draft);
-        self.model.rename_pane(&self.tab_id, &pane_id, &draft);
+        self.workspace.rename_window(&self.session_id, &term_window_id, &draft);
     }
 
     // ---- event handlers ----------------------------------------------------
@@ -334,18 +334,18 @@ impl PaneStripProbe {
     /// press; this probe keeps driving the routing on the down event for
     /// determinism. What it pins is the select/close ROUTING + the
     /// ✕-consumes-press differential, not the gesture phase; the phase (a drag
-    /// suppresses the click) is asserted black-box in `pane_strip_live`.
-    fn on_pill_down(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        self.select_pane(pane_id);
+    /// suppresses the click) is asserted black-box in `window_strip_live`.
+    fn on_pill_down(&mut self, term_window_id: &str, cx: &mut Context<Self>) {
+        self.select_window(term_window_id);
         cx.notify();
         cx.stop_propagation();
     }
 
     /// The ✕ closes and **consumes** the press (`stop_propagation`) so the pill's
     /// own select never runs — the differential that keeps a ✕-click from
-    /// activating the pane it closes.
-    fn on_close_down(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        self.close_pane(pane_id);
+    /// activating the window it closes.
+    fn on_close_down(&mut self, term_window_id: &str, cx: &mut Context<Self>) {
+        self.close_term_window(term_window_id);
         cx.notify();
         cx.stop_propagation();
     }
@@ -354,10 +354,10 @@ impl PaneStripProbe {
     /// D8): guard strip containment (the `dropExited` port), else recompute the
     /// gated drop slot from the cursor's viewport-relative x + the model order +
     /// the viewport-relative frames, through the pure [`resolve`] whose `would_move`
-    /// gate closes over [`TabModel::would_move_pane`].
+    /// gate closes over [`WorkspaceModel::would_move_window`].
     fn on_pill_drag_move(
         &mut self,
-        event: &DragMoveEvent<PaneDragPayload>,
+        event: &DragMoveEvent<WindowDragPayload>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -368,15 +368,15 @@ impl PaneStripProbe {
             return;
         }
         let payload = event.drag(cx).clone();
-        let dragged = payload.pane_id.to_string();
-        let tab_id = payload.tab_id.to_string();
+        let dragged = payload.term_window_id.to_string();
+        let session_id = payload.session_id.to_string();
         let x_rel = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
-        let pane_order = self.pane_ids();
-        let frames = self.strip_geometry().pane_frames;
+        let window_order = self.term_window_ids();
+        let frames = self.strip_geometry().window_frames;
         let new_target = {
-            let model = &self.model;
-            resolve(&dragged, x_rel, &pane_order, &frames, |target, place_after| {
-                model.would_move_pane(&dragged, &tab_id, target, place_after)
+            let model = &self.workspace;
+            resolve(&dragged, x_rel, &window_order, &frames, |target, place_after| {
+                model.would_move_window(&dragged, &session_id, target, place_after)
             })
         };
         if self.drag_target != new_target {
@@ -386,27 +386,27 @@ impl PaneStripProbe {
     }
 
     /// The scroll row's `on_drop` (mirror of the view's `on_pill_drop`, D9): commit
-    /// the reorder to the stored slot via [`TabModel::move_pane`] synchronously,
+    /// the reorder to the stored slot via [`WorkspaceModel::move_window`] synchronously,
     /// then clear the field. (The view also calls `save_to_store`; the probe has no
     /// store, matching the isolated-scenario contract.)
-    fn on_pill_drop(&mut self, payload: &PaneDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_pill_drop(&mut self, payload: &WindowDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some((target, place_after)) = self.drag_target.take() {
-            let dragged = payload.pane_id.to_string();
-            let tab_id = payload.tab_id.to_string();
-            self.model.move_pane(&dragged, &tab_id, &target, place_after);
+            let dragged = payload.term_window_id.to_string();
+            let session_id = payload.session_id.to_string();
+            self.workspace.move_window(&dragged, &session_id, &target, place_after);
         }
         cx.notify();
     }
 
     // ---- render ------------------------------------------------------------
 
-    fn pill(&self, pane: &Pane, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let active = self.tab().active_pane_id.as_deref() == Some(pane.id.as_str());
-        let hovered = self.hovered_pane_id.as_deref() == Some(pane.id.as_str());
+    fn pill(&self, term_window: &TermWindow, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active = self.session().active_window_id.as_deref() == Some(term_window.id.as_str());
+        let hovered = self.hovered_window_id.as_deref() == Some(term_window.id.as_str());
         let close_visible = active || hovered;
 
-        let id_body = pane.id.clone();
-        let id_close = pane.id.clone();
+        let id_body = term_window.id.clone();
+        let id_close = term_window.id.clone();
 
         // The always-reserved ✕ slot: laid out at CLOSE_SLOT wide regardless of
         // visibility; only the handler + paint are gated (mirror of the view's
@@ -423,16 +423,16 @@ impl PaneStripProbe {
             close = close.opacity(0.0);
         }
 
-        // The stable per-pane element id the drag arms from + the drag payload +
+        // The stable per-window element id the drag arms from + the drag payload +
         // ghost title (mirror of the view's `.id()` + `on_drag`, D3/D4/D11). The
         // `.id()` also persists the pill's `pending_mouse_down` element-state across
         // frames — which is what lets a press-then-move arm the drag.
-        let pill_id = SharedString::from(format!("probe.pill.{}", pane.id));
-        let payload = PaneDragPayload {
-            pane_id: SharedString::from(pane.id.clone()),
-            tab_id: SharedString::from(self.tab_id.clone()),
+        let pill_id = SharedString::from(format!("probe.pill.{}", term_window.id));
+        let payload = WindowDragPayload {
+            term_window_id: SharedString::from(term_window.id.clone()),
+            session_id: SharedString::from(self.session_id.clone()),
         };
-        let ghost_title = SharedString::from(pane.title.clone());
+        let ghost_title = SharedString::from(term_window.title.clone());
 
         div()
             .id(pill_id)
@@ -464,16 +464,16 @@ impl PaneStripProbe {
                     .w(px(TITLE_W))
                     .h(px(PILL_H))
                     .overflow_hidden()
-                    .child(SharedString::from(pane.title.clone())),
+                    .child(SharedString::from(term_window.title.clone())),
             )
             .child(close)
             .into_any_element()
     }
 }
 
-impl Render for PaneStripProbe {
+impl Render for WindowStripProbe {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let panes: Vec<Pane> = self.tab().panes.clone();
+        let windows: Vec<TermWindow> = self.session().windows.clone();
         let mut row = div()
             .id("probe.paneStrip")
             .track_scroll(&self.scroll)
@@ -487,8 +487,8 @@ impl Render for PaneStripProbe {
             // recomputes the gated slot, `on_drop` commits it.
             .on_drag_move(cx.listener(Self::on_pill_drag_move))
             .on_drop(cx.listener(Self::on_pill_drop));
-        for pane in &panes {
-            row = row.child(self.pill(pane, cx));
+        for term_window in &windows {
+            row = row.child(self.pill(term_window, cx));
         }
 
         // The toolbar row: a fixed-width band holding the flex_1 scroll viewport
@@ -509,20 +509,20 @@ impl Render for PaneStripProbe {
 
 // ---- harness ----------------------------------------------------------------
 
-/// Seed a model whose pinned Main terminal tab holds `n` fixed-width terminal
+/// Seed a model whose pinned Main terminal session holds `n` fixed-width terminal
 /// pills (`p0..p{n-1}`, "Terminal 1".."Terminal n"), `p0` active,
 /// `next_terminal_index = n + 1`.
-fn seed_terminals(n: usize) -> (TabModel, String) {
-    let mut m = TabModel::new("/tmp");
-    let tab_id = TabModel::MAIN_TERMINAL_TAB_ID.to_string();
-    let (pi, ti) = m.project_tab_index(&tab_id).expect("main tab exists");
-    let panes: Vec<Pane> = (0..n)
-        .map(|i| Pane::new(format!("p{i}"), format!("Terminal {}", i + 1), PaneKind::Terminal))
+fn seed_terminals(n: usize) -> (WorkspaceModel, String) {
+    let mut m = WorkspaceModel::new("/tmp");
+    let session_id = WorkspaceModel::MAIN_TERMINAL_SESSION_ID.to_string();
+    let (pi, ti) = m.project_session_index(&session_id).expect("main session exists");
+    let windows: Vec<TermWindow> = (0..n)
+        .map(|i| TermWindow::new(format!("p{i}"), format!("Terminal {}", i + 1), TermWindowKind::Terminal))
         .collect();
-    m.projects[pi].tabs[ti].panes = panes;
-    m.projects[pi].tabs[ti].active_pane_id = Some("p0".to_string());
-    m.projects[pi].tabs[ti].next_terminal_index = n as u32 + 1;
-    (m, tab_id)
+    m.projects[pi].sessions[ti].windows = windows;
+    m.projects[pi].sessions[ti].active_window_id = Some("p0".to_string());
+    m.projects[pi].sessions[ti].next_terminal_index = n as u32 + 1;
+    (m, session_id)
 }
 
 /// The overflow-fixture toolbar width: a scroll viewport of exactly
@@ -539,19 +539,19 @@ const WIDE_TOOLBAR_W: f32 = 2.0 * RESERVED_SLOT + 900.0;
 /// the scroll handle + hitboxes are registered.
 fn mount<'a>(
     cx: &'a mut TestAppContext,
-    model: TabModel,
-    tab_id: String,
+    workspace: WorkspaceModel,
+    session_id: String,
     toolbar_w: f32,
-) -> (Entity<PaneStripProbe>, &'a mut VisualTestContext) {
-    let (probe, vcx) = cx.add_window_view(|_window, cx| PaneStripProbe::new(model, tab_id, toolbar_w, cx));
+) -> (Entity<WindowStripProbe>, &'a mut VisualTestContext) {
+    let (probe, vcx) = cx.add_window_view(|_window, cx| WindowStripProbe::new(workspace, session_id, toolbar_w, cx));
     vcx.run_until_parked();
     (probe, vcx)
 }
 
 fn read<T>(
-    probe: &Entity<PaneStripProbe>,
+    probe: &Entity<WindowStripProbe>,
     vcx: &mut VisualTestContext,
-    f: impl Fn(&PaneStripProbe) -> T,
+    f: impl Fn(&WindowStripProbe) -> T,
 ) -> T {
     probe.read_with(vcx, |p, _| f(p))
 }
@@ -560,9 +560,9 @@ fn read<T>(
 /// offset), for a simulated click. Only used in non-overflowing fixtures where
 /// the offset is 0, so the offset term is a formality that stays correct if a
 /// case ever scrolls first.
-fn pill_center(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pane_id: &str) -> Point<Pixels> {
+fn pill_center(probe: &Entity<WindowStripProbe>, vcx: &mut VisualTestContext, term_window_id: &str) -> Point<Pixels> {
     probe.read_with(vcx, |p, _| {
-        let b = p.pill_bounds(pane_id).expect("pill laid out");
+        let b = p.pill_bounds(term_window_id).expect("pill laid out");
         let off = p.scroll.offset().x;
         point(b.origin.x + off + b.size.width / 2.0, b.origin.y + b.size.height / 2.0)
     })
@@ -573,24 +573,24 @@ fn pill_center(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pane
 /// pill's `mid_x`, so the bare `x > mid_x` split lands `place_after == false`),
 /// `> 0.5` the right half (`place_after == true`), `< 0.5` the left half.
 fn pill_point_at(
-    probe: &Entity<PaneStripProbe>,
+    probe: &Entity<WindowStripProbe>,
     vcx: &mut VisualTestContext,
-    pane_id: &str,
+    term_window_id: &str,
     frac: f32,
 ) -> Point<Pixels> {
     probe.read_with(vcx, |p, _| {
-        let b = p.pill_bounds(pane_id).expect("pill laid out");
+        let b = p.pill_bounds(term_window_id).expect("pill laid out");
         let off = p.scroll.offset().x;
         point(b.origin.x + off + b.size.width * frac, b.origin.y + b.size.height / 2.0)
     })
 }
 
-/// Arm a pill drag: press at pane `pane_id`'s centre, then move past the 2pt
+/// Arm a pill drag: press at window `term_window_id`'s centre, then move past the 2pt
 /// `DRAG_THRESHOLD` so gpui's window-level recorder promotes the pending press to
 /// an `active_drag` (records `pending_mouse_down` on the pill's persisted
 /// element-state, then arms on the move). Returns whether the drag armed.
-fn arm_pill_drag(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pane_id: &str) -> bool {
-    let start = pill_point_at(probe, vcx, pane_id, 0.5);
+fn arm_pill_drag(probe: &Entity<WindowStripProbe>, vcx: &mut VisualTestContext, term_window_id: &str) -> bool {
+    let start = pill_point_at(probe, vcx, term_window_id, 0.5);
     vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
     // A move well past the 2pt threshold arms the drag.
@@ -604,9 +604,9 @@ fn arm_pill_drag(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pa
 }
 
 /// The on-screen centre of a pill's ✕ slot (its trailing reserved square).
-fn close_center(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pane_id: &str) -> Point<Pixels> {
+fn close_center(probe: &Entity<WindowStripProbe>, vcx: &mut VisualTestContext, term_window_id: &str) -> Point<Pixels> {
     probe.read_with(vcx, |p, _| {
-        let b = p.pill_bounds(pane_id).expect("pill laid out");
+        let b = p.pill_bounds(term_window_id).expect("pill laid out");
         let off = p.scroll.offset().x;
         point(
             b.origin.x + off + b.size.width - px(PILL_PAD_R) - px(CLOSE_SLOT / 2.0),
@@ -619,14 +619,14 @@ fn close_center(probe: &Entity<PaneStripProbe>, vcx: &mut VisualTestContext, pan
 // overflow chevron: onset at the exact reserved-width count, and never flickers
 // ============================================================================
 
-/// The chevron flips on at the exact pane count where the pills first overflow the
-/// reserved-width viewport, and adding more panes never flips it back
+/// The chevron flips on at the exact window count where the pills first overflow the
+/// reserved-width viewport, and adding more windows never flips it back
 /// (monotonic — the reservation rule kills the show→shrink→hide loop). With the
 /// 404pt viewport, two 138pt pills (278pt) fit, three (418pt) do not.
 #[gpui::test]
 fn chevron_appears_at_the_reserved_width_overflow_count_and_never_flickers(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(2);
-    let (probe, vcx) = mount(cx, model, tab_id, OVERFLOW_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(2);
+    let (probe, vcx) = mount(cx, model, session_id, OVERFLOW_TOOLBAR_W);
 
     // The scroll viewport really measures toolbar − the two reserved slots.
     let vw = read(&probe, vcx, |p| f32::from(p.scroll.bounds().size.width));
@@ -642,7 +642,7 @@ fn chevron_appears_at_the_reserved_width_overflow_count_and_never_flickers(cx: &
 
     // A third pill overflows (418 > 404): the chevron appears.
     probe.update(vcx, |p, cx| {
-        p.add_terminal_pane();
+        p.add_terminal_window();
         cx.notify();
     });
     vcx.run_until_parked();
@@ -653,7 +653,7 @@ fn chevron_appears_at_the_reserved_width_overflow_count_and_never_flickers(cx: &
     // A fourth pill only deepens the overflow — the chevron never flickers back.
     let max3 = read(&probe, vcx, |p| f32::from(p.scroll.max_offset().x));
     probe.update(vcx, |p, cx| {
-        p.add_terminal_pane();
+        p.add_terminal_window();
         cx.notify();
     });
     vcx.run_until_parked();
@@ -668,8 +668,8 @@ fn chevron_appears_at_the_reserved_width_overflow_count_and_never_flickers(cx: &
 /// overflow, measured against the reserved-width viewport, is what proves it.
 #[gpui::test]
 fn reservation_alone_triggers_the_chevron(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3);
-    let (probe, vcx) = mount(cx, model, tab_id, OVERFLOW_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(3);
+    let (probe, vcx) = mount(cx, model, session_id, OVERFLOW_TOOLBAR_W);
 
     let content = pills_content_width(3);
     assert!(content < OVERFLOW_TOOLBAR_W, "pills alone ({content}) fit the full strip ({OVERFLOW_TOOLBAR_W})");
@@ -681,14 +681,14 @@ fn reservation_alone_triggers_the_chevron(cx: &mut TestAppContext) {
     );
 }
 
-/// The `>= 2`-panes gate is a real-layout fact too: a single pill wider than the
+/// The `>= 2`-windows gate is a real-layout fact too: a single pill wider than the
 /// viewport genuinely overflows (`max_offset > 0`) yet shows no chevron (an
 /// overflow menu is pointless with one pill); a second pill flips it on.
 #[gpui::test]
 fn a_single_overflowing_pill_shows_no_chevron(cx: &mut TestAppContext) {
     // A 100pt viewport is narrower than one 138pt pill.
-    let (model, tab_id) = seed_terminals(1);
-    let (probe, vcx) = mount(cx, model, tab_id, 2.0 * RESERVED_SLOT + 100.0);
+    let (model, session_id) = seed_terminals(1);
+    let (probe, vcx) = mount(cx, model, session_id, 2.0 * RESERVED_SLOT + 100.0);
 
     assert!(
         read(&probe, vcx, |p| f32::from(p.scroll.max_offset().x)) > 0.0,
@@ -697,7 +697,7 @@ fn a_single_overflowing_pill_shows_no_chevron(cx: &mut TestAppContext) {
     assert!(!read(&probe, vcx, |p| p.show_chevron()), "one pill never shows the chevron");
 
     probe.update(vcx, |p, cx| {
-        p.add_terminal_pane();
+        p.add_terminal_window();
         cx.notify();
     });
     vcx.run_until_parked();
@@ -714,8 +714,8 @@ fn a_single_overflowing_pill_shows_no_chevron(cx: &mut TestAppContext) {
 /// both show; scrolled fully right only the leading fade shows.
 #[gpui::test]
 fn edge_fades_gate_on_hidden_pills(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(5); // content 698 in a 404 viewport
-    let (probe, vcx) = mount(cx, model, tab_id, OVERFLOW_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(5); // content 698 in a 404 viewport
+    let (probe, vcx) = mount(cx, model, session_id, OVERFLOW_TOOLBAR_W);
 
     let max = read(&probe, vcx, |p| f32::from(p.scroll.max_offset().x));
     assert!(max > 0.0);
@@ -741,58 +741,58 @@ fn edge_fades_gate_on_hidden_pills(cx: &mut TestAppContext) {
 }
 
 // ============================================================================
-// attention badge: only for a FULLY-offscreen pane, driven via the model
+// attention badge: only for a FULLY-offscreen window, driven via the model
 // ============================================================================
 
 /// The overflow chevron's attention badge lights only when a **fully-offscreen**
-/// pane needs attention (status driven through the model, never a second
-/// predicate): a Waiting-unacked Claude pane scrolled fully out lights it; the
-/// same pane scrolled into view — or merely partially clipped — does not.
+/// window needs attention (status driven through the model, never a second
+/// predicate): a Waiting-unacked Claude window scrolled fully out lights it; the
+/// same window scrolled into view — or merely partially clipped — does not.
 #[gpui::test]
-fn badge_lights_only_for_a_fully_offscreen_attention_pane(cx: &mut TestAppContext) {
-    // Four terminals then a trailing Claude pane, so at offset 0 the Claude pane
+fn badge_lights_only_for_a_fully_offscreen_attention_window(cx: &mut TestAppContext) {
+    // Four terminals then a trailing Claude window, so at offset 0 the Claude window
     // sits fully past the trailing edge.
-    let (mut model, tab_id) = seed_terminals(4);
+    let (mut model, session_id) = seed_terminals(4);
     {
-        let (pi, ti) = model.project_tab_index(&tab_id).unwrap();
-        model.projects[pi].tabs[ti]
-            .panes
-            .push(Pane::new("claude", "Claude", PaneKind::Claude));
+        let (pi, ti) = model.project_session_index(&session_id).unwrap();
+        model.projects[pi].sessions[ti]
+            .windows
+            .push(TermWindow::new("claude", "Claude", TermWindowKind::Claude));
     }
-    let (probe, vcx) = mount(cx, model, tab_id, OVERFLOW_TOOLBAR_W);
+    let (probe, vcx) = mount(cx, model, session_id, OVERFLOW_TOOLBAR_W);
 
-    // Drive the Claude pane into Waiting-unacked THROUGH THE MODEL (needs_attention).
+    // Drive the Claude window into Waiting-unacked THROUGH THE MODEL (needs_attention).
     probe.update(vcx, |p, _| {
-        let (pi, ti) = p.model.project_tab_index(&p.tab_id).unwrap();
-        let pane = p.projects_pane(pi, ti, "claude");
-        pane.apply_status_transition(TabStatus::Waiting, false);
+        let (pi, ti) = p.workspace.project_session_index(&p.session_id).unwrap();
+        let term_window = p.projects_window(pi, ti, "claude");
+        term_window.apply_status_transition(SessionStatus::Waiting, false);
     });
     vcx.run_until_parked();
 
-    // Fully offscreen (parked left): the Claude pane is in the offscreen set and
+    // Fully offscreen (parked left): the Claude window is in the offscreen set and
     // the badge lights.
     assert!(
         read(&probe, vcx, |p| p.offscreen_ids().contains("claude")),
-        "the trailing Claude pane is fully offscreen at rest"
+        "the trailing Claude window is fully offscreen at rest"
     );
-    assert!(read(&probe, vcx, |p| p.has_offscreen_attention()), "badge lights for the offscreen attention pane");
+    assert!(read(&probe, vcx, |p| p.has_offscreen_attention()), "badge lights for the offscreen attention window");
 
     // Scroll it fully into view: no longer offscreen, badge dark.
     let max = read(&probe, vcx, |p| f32::from(p.scroll.max_offset().x));
     probe.update(vcx, |p, _| p.scroll.set_offset(point(px(-max), px(0.0))));
     vcx.run_until_parked();
-    assert!(!read(&probe, vcx, |p| p.offscreen_ids().contains("claude")), "scrolled the Claude pane into view");
+    assert!(!read(&probe, vcx, |p| p.offscreen_ids().contains("claude")), "scrolled the Claude window into view");
     assert!(
         !read(&probe, vcx, |p| p.has_offscreen_attention()),
-        "a visible attention pane never badges the chevron"
+        "a visible attention window never badges the chevron"
     );
 
     // Partially clipped (straddling the trailing edge) also does not count: nudge
-    // the offset so the Claude pane's leading edge sits just inside the viewport.
+    // the offset so the Claude window's leading edge sits just inside the viewport.
     probe.update(vcx, |p, _| {
-        // Place the Claude pane so it straddles the trailing edge: its left edge a
+        // Place the Claude window so it straddles the trailing edge: its left edge a
         // little inside the viewport, its right edge past it.
-        let ix = p.tab().panes.iter().position(|pane| pane.id == "claude").unwrap();
+        let ix = p.session().windows.iter().position(|term_window| term_window.id == "claude").unwrap();
         let item_left = f32::from(p.scroll.bounds_for_item(ix).unwrap().origin.x);
         let viewport_left = f32::from(p.scroll.bounds().origin.x);
         let vw = f32::from(p.scroll.bounds().size.width);
@@ -803,11 +803,11 @@ fn badge_lights_only_for_a_fully_offscreen_attention_pane(cx: &mut TestAppContex
     vcx.run_until_parked();
     assert!(
         !read(&probe, vcx, |p| p.offscreen_ids().contains("claude")),
-        "a partially-clipped pane is not in the offscreen set"
+        "a partially-clipped window is not in the offscreen set"
     );
     assert!(
         !read(&probe, vcx, |p| p.has_offscreen_attention()),
-        "a partially-visible attention pane never badges the chevron"
+        "a partially-visible attention window never badges the chevron"
     );
 }
 
@@ -819,14 +819,14 @@ fn badge_lights_only_for_a_fully_offscreen_attention_pane(cx: &mut TestAppContex
 /// laid-out bounds are byte-identical hovered vs not — the width never jumps.
 #[gpui::test]
 fn close_slot_reservation_keeps_pill_width_constant_across_hover(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3);
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(3);
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     // p1 is not active and not hovered: its ✕ is hidden but the slot is reserved.
     let before = read(&probe, vcx, |p| p.pill_bounds("p1")).expect("p1 laid out");
 
     probe.update(vcx, |p, cx| {
-        p.hovered_pane_id = Some("p1".to_string());
+        p.hovered_window_id = Some("p1".to_string());
         cx.notify();
     });
     vcx.run_until_parked();
@@ -841,35 +841,35 @@ fn close_slot_reservation_keeps_pill_width_constant_across_hover(cx: &mut TestAp
 // ✕ click closes without activating; a body click activates
 // ============================================================================
 
-/// A ✕ click closes its pane and, because the ✕ consumes the press, never
-/// activates it: closing a non-active pane leaves the active pane put. A plain
-/// body click on a different pane DOES activate it (the differential pair).
+/// A ✕ click closes its window and, because the ✕ consumes the press, never
+/// activates it: closing a non-active window leaves the active window put. A plain
+/// body click on a different window DOES activate it (the differential pair).
 #[gpui::test]
 fn close_click_closes_without_activating_and_body_click_activates(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
-    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p0"));
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
+    assert_eq!(read(&probe, vcx, |p| p.active_window_id()).as_deref(), Some("p0"));
 
     // Hover p2 so its ✕ is live, then click the ✕: p2 is closed and p0 stays active.
     probe.update(vcx, |p, cx| {
-        p.hovered_pane_id = Some("p2".to_string());
+        p.hovered_window_id = Some("p2".to_string());
         cx.notify();
     });
     vcx.run_until_parked();
     let x = close_center(&probe, vcx, "p2");
     vcx.simulate_click(x, Modifiers::none());
 
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0".to_string(), "p1".to_string()], "p2 is closed");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0".to_string(), "p1".to_string()], "p2 is closed");
     assert_eq!(
-        read(&probe, vcx, |p| p.active_pane_id()).as_deref(),
+        read(&probe, vcx, |p| p.active_window_id()).as_deref(),
         Some("p0"),
-        "closing a non-active pane must not move the active pane (the ✕ consumed the press)"
+        "closing a non-active window must not move the active window (the ✕ consumed the press)"
     );
 
     // A plain body click on p1 activates it.
     let b = pill_center(&probe, vcx, "p1");
     vcx.simulate_click(b, Modifiers::none());
-    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p1"), "a body click activates the pill");
+    assert_eq!(read(&probe, vcx, |p| p.active_window_id()).as_deref(), Some("p1"), "a body click activates the pill");
 }
 
 // ============================================================================
@@ -885,14 +885,14 @@ fn close_click_closes_without_activating_and_body_click_activates(cx: &mut TestA
 /// `stop_propagation` mouse-down.
 #[gpui::test]
 fn drag_arms_alongside_select_and_plain_click_still_selects(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     // A press-then-move past the threshold arms a drag.
     let armed = arm_pill_drag(&probe, vcx, "p1");
     assert!(armed, "a press-then-move > 2pt arms a pill drag (active_drag present)");
     // Order untouched by merely arming — no drop yet.
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "arming a drag does not reorder");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p1", "p2"], "arming a drag does not reorder");
     // Release to clear the drag before the next leg.
     let here = pill_point_at(&probe, vcx, "p1", 0.5);
     vcx.simulate_mouse_up(here, MouseButton::Left, Modifiers::none());
@@ -904,18 +904,18 @@ fn drag_arms_alongside_select_and_plain_click_still_selects(cx: &mut TestAppCont
     let center = pill_center(&probe, vcx, "p2");
     vcx.simulate_click(center, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p2"), "a plain click still selects");
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "a plain click never reorders");
+    assert_eq!(read(&probe, vcx, |p| p.active_window_id()).as_deref(), Some("p2"), "a plain click still selects");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p1", "p2"], "a plain click never reorders");
 }
 
 /// End-to-end reorder: arm a drag on a NON-active pill, move over another pill
 /// past its `mid_x` (→ `place_after == true`), assert the resolved
-/// `drag_target`, drop, and assert the order changed with the active pane
-/// unchanged (`move_pane` never touches `active_pane_id`).
+/// `drag_target`, drop, and assert the order changed with the active window
+/// unchanged (`move_window` never touches `active_window_id`).
 #[gpui::test]
-fn drag_reorder_after_slot_moves_pane_and_keeps_active(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+fn drag_reorder_after_slot_moves_window_and_keeps_active(cx: &mut TestAppContext) {
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     // Drag p1 (non-active) onto p2's right half.
     assert!(arm_pill_drag(&probe, vcx, "p1"), "drag arms");
@@ -930,12 +930,12 @@ fn drag_reorder_after_slot_moves_pane_and_keeps_active(cx: &mut TestAppContext) 
 
     vcx.simulate_mouse_up(over_p2_right, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p2", "p1"], "p1 moved after p2");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p2", "p1"], "p1 moved after p2");
     // The press that began the drag selects the pressed pill (real pill behavior);
-    // `move_pane` then leaves that active pane put — it never shuffles the active
-    // id. (The "active pane truly unchanged by the move alone" isolation is the
+    // `move_window` then leaves that active window put — it never shuffles the active
+    // id. (The "active window truly unchanged by the move alone" isolation is the
     // active-pill case, which drags the already-active pill.)
-    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p1"), "the move leaves the active pane put");
+    assert_eq!(read(&probe, vcx, |p| p.active_window_id()).as_deref(), Some("p1"), "the move leaves the active window put");
     assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "drag_target cleared after drop");
 }
 
@@ -943,9 +943,9 @@ fn drag_reorder_after_slot_moves_pane_and_keeps_active(cx: &mut TestAppContext) 
 /// (`place_after == false`) lands it before that target. p2 dragged onto p1's
 /// left half is a real move (p2 is not already before p1).
 #[gpui::test]
-fn drag_reorder_before_slot_lands_pane_before_target(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+fn drag_reorder_before_slot_lands_window_before_target(cx: &mut TestAppContext) {
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     assert!(arm_pill_drag(&probe, vcx, "p2"), "drag arms");
     let over_p1_left = pill_point_at(&probe, vcx, "p1", 0.25);
@@ -959,16 +959,16 @@ fn drag_reorder_before_slot_lands_pane_before_target(cx: &mut TestAppContext) {
 
     vcx.simulate_mouse_up(over_p1_left, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p2", "p1"], "p2 moved before p1");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p2", "p1"], "p2 moved before p1");
 }
 
-/// No-op suppression (the `would_move_pane` gate): dropping a pill onto ITSELF, or
+/// No-op suppression (the `would_move_window` gate): dropping a pill onto ITSELF, or
 /// into the adjacent slot it already occupies, resolves `drag_target` to `None`
 /// and never reorders. p0→before-p1 is the adjacent no-op (p0 is already there).
 #[gpui::test]
 fn drag_no_op_slots_are_suppressed(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     // Self-drop: drag p1, hover its own centre — target == dragged, gated out.
     assert!(arm_pill_drag(&probe, vcx, "p1"), "drag arms");
@@ -978,7 +978,7 @@ fn drag_no_op_slots_are_suppressed(cx: &mut TestAppContext) {
     assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "a self-drop resolves to no slot");
     vcx.simulate_mouse_up(over_self, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "self-drop reorders nothing");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p1", "p2"], "self-drop reorders nothing");
 
     // Adjacent no-op: drag p0 onto p1's left half — p0 is already immediately
     // before p1, so the move would not change order.
@@ -989,7 +989,7 @@ fn drag_no_op_slots_are_suppressed(cx: &mut TestAppContext) {
     assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "the adjacent slot is a no-op, gated out");
     vcx.simulate_mouse_up(over_p1_left, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "the adjacent no-op reorders nothing");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p1", "p2"], "the adjacent no-op reorders nothing");
 }
 
 /// Vertical exit / dropped-nowhere (D8 `dropExited` port + D10 gate): resolve a
@@ -997,8 +997,8 @@ fn drag_no_op_slots_are_suppressed(cx: &mut TestAppContext) {
 /// bounds) → `drag_target` clears to `None`; releasing there reorders nothing.
 #[gpui::test]
 fn drag_vertical_exit_clears_target_and_release_is_a_no_op(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     assert!(arm_pill_drag(&probe, vcx, "p1"), "drag arms");
     let over_p2_right = pill_point_at(&probe, vcx, "p2", 0.75);
@@ -1020,17 +1020,17 @@ fn drag_vertical_exit_clears_target_and_release_is_a_no_op(cx: &mut TestAppConte
     // Releasing over nothing reorders nothing and clears the drag.
     vcx.simulate_mouse_up(below, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p0", "p1", "p2"], "a dropped-nowhere release is a no-op");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p0", "p1", "p2"], "a dropped-nowhere release is a no-op");
     assert!(!vcx.update(|_w, cx| cx.has_active_drag()), "gpui cleared the drag on the outside mouse-up");
     assert_eq!(read(&probe, vcx, |p| p.drag_target.clone()), None, "no slot survives the release");
 }
 
-/// Dragging the ACTIVE pill reorders it and keeps it active (`move_pane` never
-/// touches `active_pane_id`).
+/// Dragging the ACTIVE pill reorders it and keeps it active (`move_window` never
+/// touches `active_window_id`).
 #[gpui::test]
 fn dragging_the_active_pill_reorders_and_keeps_it_active(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(3); // p0 active
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(3); // p0 active
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     // Drag the active p0 onto p2's right half.
     assert!(arm_pill_drag(&probe, vcx, "p0"), "drag arms on the active pill");
@@ -1041,8 +1041,8 @@ fn dragging_the_active_pill_reorders_and_keeps_it_active(cx: &mut TestAppContext
 
     vcx.simulate_mouse_up(over_p2_right, MouseButton::Left, Modifiers::none());
     vcx.run_until_parked();
-    assert_eq!(read(&probe, vcx, |p| p.pane_ids()), vec!["p1", "p2", "p0"], "the active pill moved to the end");
-    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p0"), "it is still active after the move");
+    assert_eq!(read(&probe, vcx, |p| p.term_window_ids()), vec!["p1", "p2", "p0"], "the active pill moved to the end");
+    assert_eq!(read(&probe, vcx, |p| p.active_window_id()).as_deref(), Some("p0"), "it is still active after the move");
 }
 
 // ============================================================================
@@ -1051,14 +1051,14 @@ fn dragging_the_active_pill_reorders_and_keeps_it_active(cx: &mut TestAppContext
 
 /// Committing an EMPTY rename on a terminal pill resets its title to the next
 /// "Terminal N" auto-default and consumes a counter slot — the R8
-/// `rename_pane` empty-submit asymmetry (asymmetry 3), routed through the pill's
+/// `rename_window` empty-submit asymmetry (asymmetry 3), routed through the pill's
 /// begin/commit path (the pill reimplements none of the policy).
 #[gpui::test]
 fn empty_rename_resets_to_terminal_auto_default_and_consumes_a_counter_slot(cx: &mut TestAppContext) {
     // Two seeded terminals → next_terminal_index == 3.
-    let (model, tab_id) = seed_terminals(2);
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
-    assert_eq!(read(&probe, vcx, |p| p.tab().next_terminal_index), 3);
+    let (model, session_id) = seed_terminals(2);
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
+    assert_eq!(read(&probe, vcx, |p| p.session().next_terminal_index), 3);
 
     probe.update(vcx, |p, _| {
         p.begin_editing("p0");
@@ -1067,18 +1067,18 @@ fn empty_rename_resets_to_terminal_auto_default_and_consumes_a_counter_slot(cx: 
     });
     vcx.run_until_parked();
 
-    let title = read(&probe, vcx, |p| p.tab().panes[0].title.clone());
+    let title = read(&probe, vcx, |p| p.session().windows[0].title.clone());
     assert_eq!(title, "Terminal 3", "empty submit resets to the next monotonic auto-default");
-    assert_eq!(read(&probe, vcx, |p| p.tab().next_terminal_index), 4, "the counter slot was consumed");
-    assert!(!read(&probe, vcx, |p| p.tab().panes[0].title_manually_set), "the manual-title lock was cleared");
+    assert_eq!(read(&probe, vcx, |p| p.session().next_terminal_index), 4, "the counter slot was consumed");
+    assert!(!read(&probe, vcx, |p| p.session().windows[0].title_manually_set), "the manual-title lock was cleared");
 }
 
 /// A non-empty rename sets the title and locks it — the other half of the
 /// asymmetry, so the empty-reset case above can't pass by coincidence.
 #[gpui::test]
 fn nonempty_rename_sets_and_locks_the_title(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(2);
-    let (probe, vcx) = mount(cx, model, tab_id, WIDE_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(2);
+    let (probe, vcx) = mount(cx, model, session_id, WIDE_TOOLBAR_W);
 
     probe.update(vcx, |p, _| {
         p.begin_editing("p0");
@@ -1087,9 +1087,9 @@ fn nonempty_rename_sets_and_locks_the_title(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    assert_eq!(read(&probe, vcx, |p| p.tab().panes[0].title.clone()), "build");
-    assert!(read(&probe, vcx, |p| p.tab().panes[0].title_manually_set), "a non-empty rename locks the title");
-    assert_eq!(read(&probe, vcx, |p| p.tab().next_terminal_index), 3, "a non-empty rename does not touch the counter");
+    assert_eq!(read(&probe, vcx, |p| p.session().windows[0].title.clone()), "build");
+    assert!(read(&probe, vcx, |p| p.session().windows[0].title_manually_set), "a non-empty rename locks the title");
+    assert_eq!(read(&probe, vcx, |p| p.session().next_terminal_index), 3, "a non-empty rename does not touch the counter");
 }
 
 // ============================================================================
@@ -1102,15 +1102,15 @@ fn nonempty_rename_sets_and_locks_the_title(cx: &mut TestAppContext) {
 /// offscreen set).
 #[gpui::test]
 fn activate_from_elsewhere_centers_the_offscreen_pill(cx: &mut TestAppContext) {
-    let (model, tab_id) = seed_terminals(6); // content 838 in a 404 viewport
-    let (probe, vcx) = mount(cx, model, tab_id, OVERFLOW_TOOLBAR_W);
+    let (model, session_id) = seed_terminals(6); // content 838 in a 404 viewport
+    let (probe, vcx) = mount(cx, model, session_id, OVERFLOW_TOOLBAR_W);
 
     // The last pill is fully offscreen at rest.
     assert!(read(&probe, vcx, |p| p.offscreen_ids().contains("p5")), "p5 starts offscreen");
 
     // Independently compute the expected centring offset from the real bounds.
     let expected = read(&probe, vcx, |p| {
-        let ix = p.tab().panes.iter().position(|pane| pane.id == "p5").unwrap();
+        let ix = p.session().windows.iter().position(|term_window| term_window.id == "p5").unwrap();
         let item = p.scroll.bounds_for_item(ix).unwrap();
         let vp = p.scroll.bounds();
         center_offset_x(
@@ -1123,12 +1123,12 @@ fn activate_from_elsewhere_centers_the_offscreen_pill(cx: &mut TestAppContext) {
     });
 
     // Activate p5 from elsewhere (it was not active) — the view auto-centers.
-    probe.update(vcx, |p, _| p.select_pane("p5"));
+    probe.update(vcx, |p, _| p.select_window("p5"));
     vcx.run_until_parked();
 
     let applied = read(&probe, vcx, |p| f32::from(p.scroll.offset().x));
     assert!((applied - expected).abs() < 0.5, "applied offset {applied} != center_offset_x {expected}");
-    assert_eq!(read(&probe, vcx, |p| p.active_pane_id()).as_deref(), Some("p5"), "p5 is now active");
+    assert_eq!(read(&probe, vcx, |p| p.active_window_id()).as_deref(), Some("p5"), "p5 is now active");
     assert!(
         !read(&probe, vcx, |p| p.offscreen_ids().contains("p5")),
         "centring revealed p5 — it is no longer offscreen"
@@ -1137,14 +1137,14 @@ fn activate_from_elsewhere_centers_the_offscreen_pill(cx: &mut TestAppContext) {
 
 // ---- small helpers on the probe used only by tests --------------------------
 
-impl PaneStripProbe {
-    /// Mutable access to a pane by (project, tab) index + id — for driving status
+impl WindowStripProbe {
+    /// Mutable access to a window by (project, session) index + id — for driving status
     /// through the model in the badge case.
-    fn projects_pane(&mut self, pi: usize, ti: usize, pane_id: &str) -> &mut Pane {
-        self.model.projects[pi].tabs[ti]
-            .panes
+    fn projects_window(&mut self, pi: usize, ti: usize, term_window_id: &str) -> &mut TermWindow {
+        self.workspace.projects[pi].sessions[ti]
+            .windows
             .iter_mut()
-            .find(|p| p.id == pane_id)
-            .expect("pane exists")
+            .find(|p| p.id == term_window_id)
+            .expect("window exists")
     }
 }

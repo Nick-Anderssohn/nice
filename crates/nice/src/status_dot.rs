@@ -1,6 +1,6 @@
 //! `StatusDot` — the sidebar/toolbar status dot, ported from
 //! `Sources/Nice/Views/StatusDot.swift`. An 8pt circle whose colour maps to a
-//! [`TabStatus`], with two repeat-forever pulse animations: an expanding outer
+//! [`SessionStatus`], with two repeat-forever pulse animations: an expanding outer
 //! ring and a breathing inner dot. Rendered by slice 3's sidebar `TabRow` and
 //! reused by R11's toolbar pills.
 //!
@@ -9,11 +9,11 @@
 //! The dot's state is supplied by the caller from the R8 model predicates — it
 //! is **not** recomputed here:
 //!
-//!   * [`StatusDot::status`] comes from [`nice_model::Tab::status`] (or, for
-//!     R11's per-pane pills, [`nice_model::Pane::status`]);
+//!   * [`StatusDot::status`] comes from [`nice_model::Session::status`] (or, for
+//!     R11's per-window pills, [`nice_model::TermWindow::status`]);
 //!   * [`StatusDot::suppress_waiting_pulse`] comes from
-//!     [`nice_model::Tab::waiting_acknowledged`] (per-pane:
-//!     [`nice_model::Pane::waiting_acknowledged`]).
+//!     [`nice_model::Session::waiting_acknowledged`] (per-window:
+//!     [`nice_model::TermWindow::waiting_acknowledged`]).
 //!
 //! The *writer* of acknowledgment-on-view is the session/focus logic landing in
 //! R13; this component only renders pulse-suppression off the fields as they
@@ -44,7 +44,7 @@ use gpui::{
     IntoElement, ParentElement, PathBuilder, Pixels, RenderOnce, Rgba, Styled, Window,
 };
 
-use nice_model::TabStatus;
+use nice_model::SessionStatus;
 use nice_theme::color::Srgba;
 use nice_theme::status::{
     BreathePulse, RingPulse, BREATHE_MAX_OPACITY, DOT_FRAME_PADDING, DOT_SIZE, THINKING_BREATHE,
@@ -58,34 +58,34 @@ use crate::theme::srgba_to_rgba;
 /// (`StatusDot.swift:27-37`): thinking → the fixed [`THINKING_DOT`] brand
 /// Terracotta (`.niceAccent`, NOT the user's chosen accent), waiting → the fixed
 /// [`WAITING_DOT`] blue, idle → `idle` (the palette's `ink3`).
-pub(crate) fn status_dot_base_color(status: TabStatus, idle: Srgba) -> Srgba {
+pub(crate) fn status_dot_base_color(status: SessionStatus, idle: Srgba) -> Srgba {
     match status {
-        TabStatus::Thinking => THINKING_DOT,
-        TabStatus::Waiting => WAITING_DOT,
-        TabStatus::Idle => idle,
+        SessionStatus::Thinking => THINKING_DOT,
+        SessionStatus::Waiting => WAITING_DOT,
+        SessionStatus::Idle => idle,
     }
 }
 
 /// Whether the dot pulses for `status`. Ported from `StatusDot.shouldPulse`
 /// (`StatusDot.swift:47-53`): thinking always pulses, waiting pulses until
 /// acknowledged (`suppress_waiting_pulse`), idle never.
-pub(crate) fn status_dot_should_pulse(status: TabStatus, suppress_waiting_pulse: bool) -> bool {
+pub(crate) fn status_dot_should_pulse(status: SessionStatus, suppress_waiting_pulse: bool) -> bool {
     match status {
-        TabStatus::Thinking => true,
-        TabStatus::Waiting => !suppress_waiting_pulse,
-        TabStatus::Idle => false,
+        SessionStatus::Thinking => true,
+        SessionStatus::Waiting => !suppress_waiting_pulse,
+        SessionStatus::Idle => false,
     }
 }
 
 /// The ring + breathe pulse specs for a pulsing `status`. Only `thinking` and
 /// `waiting` pulse (idle never reaches here); returns the per-status
 /// (`StatusDot.swift:94-99,107-111`) constants.
-fn pulse_specs(status: TabStatus) -> (RingPulse, BreathePulse) {
+fn pulse_specs(status: SessionStatus) -> (RingPulse, BreathePulse) {
     match status {
-        TabStatus::Waiting => (WAITING_RING, WAITING_BREATHE),
+        SessionStatus::Waiting => (WAITING_RING, WAITING_BREATHE),
         // Thinking (and the idle fallthrough, which never pulses) use the
         // thinking timings.
-        TabStatus::Thinking | TabStatus::Idle => (THINKING_RING, THINKING_BREATHE),
+        SessionStatus::Thinking | SessionStatus::Idle => (THINKING_RING, THINKING_BREATHE),
     }
 }
 
@@ -157,13 +157,13 @@ pub(crate) struct StatusDot {
     /// Unique element-id seed so each dot's per-layer animation state is
     /// distinct even when many dots render as siblings (one per sidebar row).
     id: ElementId,
-    status: TabStatus,
+    status: SessionStatus,
     /// Idle colour — the active palette's `ink3` slot.
     idle: Srgba,
     /// Inner-dot diameter (pt). Defaults to [`DOT_SIZE`] (8).
     size: f32,
     /// Fed from the R8 `waiting_acknowledged` predicate: suppresses the
-    /// **waiting** pulse when the user is already looking at the owning tab/pane.
+    /// **waiting** pulse when the user is already looking at the owning session/window.
     suppress_waiting_pulse: bool,
     /// Disables the pulse entirely (for snapshots / non-animated previews),
     /// mirroring Swift's `pulsePaused` (`StatusDot.swift:21`).
@@ -174,9 +174,9 @@ impl StatusDot {
     /// A status dot for `status`, with the caller-resolved `idle` (the palette's
     /// `ink3`) colour — thinking and waiting are fixed tokens. `id` seeds the
     /// per-layer animation element-ids and must be unique among sibling dots
-    /// (e.g. the tab id). Size defaults to [`DOT_SIZE`]; the pulse flags default
+    /// (e.g. the session id). Size defaults to [`DOT_SIZE`]; the pulse flags default
     /// off.
-    pub(crate) fn new(id: impl Into<ElementId>, status: TabStatus, idle: Srgba) -> Self {
+    pub(crate) fn new(id: impl Into<ElementId>, status: SessionStatus, idle: Srgba) -> Self {
         Self {
             id: id.into(),
             status,
@@ -193,7 +193,7 @@ impl StatusDot {
         self
     }
 
-    /// Suppress the **waiting** pulse — pass [`nice_model::Tab::waiting_acknowledged`]
+    /// Suppress the **waiting** pulse — pass [`nice_model::Session::waiting_acknowledged`]
     /// (never recomputed here).
     pub(crate) fn suppress_waiting_pulse(mut self, suppress: bool) -> Self {
         self.suppress_waiting_pulse = suppress;
@@ -316,36 +316,36 @@ mod tests {
     fn base_color_maps_status_per_swift() {
         // StatusDot.swift:27-37 — thinking is the FIXED THINKING_DOT brand
         // accent, NOT a caller-supplied swatch.
-        assert_eq!(status_dot_base_color(TabStatus::Thinking, idle()), THINKING_DOT);
-        assert_eq!(status_dot_base_color(TabStatus::Waiting, idle()), WAITING_DOT);
-        assert_eq!(status_dot_base_color(TabStatus::Idle, idle()), idle());
+        assert_eq!(status_dot_base_color(SessionStatus::Thinking, idle()), THINKING_DOT);
+        assert_eq!(status_dot_base_color(SessionStatus::Waiting, idle()), WAITING_DOT);
+        assert_eq!(status_dot_base_color(SessionStatus::Idle, idle()), idle());
     }
 
     #[test]
     fn thinking_always_pulses() {
         // StatusDot.swift:48 — thinking pulses regardless of suppression.
-        assert!(status_dot_should_pulse(TabStatus::Thinking, false));
-        assert!(status_dot_should_pulse(TabStatus::Thinking, true));
+        assert!(status_dot_should_pulse(SessionStatus::Thinking, false));
+        assert!(status_dot_should_pulse(SessionStatus::Thinking, true));
     }
 
     #[test]
     fn waiting_pulses_until_acknowledged() {
         // StatusDot.swift:49 — waiting pulses only while NOT acknowledged.
-        assert!(status_dot_should_pulse(TabStatus::Waiting, false));
-        assert!(!status_dot_should_pulse(TabStatus::Waiting, true));
+        assert!(status_dot_should_pulse(SessionStatus::Waiting, false));
+        assert!(!status_dot_should_pulse(SessionStatus::Waiting, true));
     }
 
     #[test]
     fn idle_never_pulses() {
         // StatusDot.swift:50 — idle never pulses.
-        assert!(!status_dot_should_pulse(TabStatus::Idle, false));
-        assert!(!status_dot_should_pulse(TabStatus::Idle, true));
+        assert!(!status_dot_should_pulse(SessionStatus::Idle, false));
+        assert!(!status_dot_should_pulse(SessionStatus::Idle, true));
     }
 
     #[test]
     fn pulse_specs_select_per_status() {
-        assert_eq!(pulse_specs(TabStatus::Waiting), (WAITING_RING, WAITING_BREATHE));
-        assert_eq!(pulse_specs(TabStatus::Thinking), (THINKING_RING, THINKING_BREATHE));
+        assert_eq!(pulse_specs(SessionStatus::Waiting), (WAITING_RING, WAITING_BREATHE));
+        assert_eq!(pulse_specs(SessionStatus::Thinking), (THINKING_RING, THINKING_BREATHE));
     }
 
     #[test]
@@ -360,11 +360,11 @@ mod tests {
     fn suppress_flag_and_helpers_never_borrow_across_status() {
         // The "reads R8, never recomputes" contract in helper form: the pulse
         // decision is a pure function of (status, suppress) only.
-        for &status in &[TabStatus::Thinking, TabStatus::Waiting, TabStatus::Idle] {
+        for &status in &[SessionStatus::Thinking, SessionStatus::Waiting, SessionStatus::Idle] {
             let a = status_dot_should_pulse(status, false);
             let b = status_dot_should_pulse(status, true);
             // Only waiting is sensitive to the suppress flag.
-            if status == TabStatus::Waiting {
+            if status == SessionStatus::Waiting {
                 assert_ne!(a, b);
             } else {
                 assert_eq!(a, b);

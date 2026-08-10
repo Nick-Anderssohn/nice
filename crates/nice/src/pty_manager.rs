@@ -1,27 +1,27 @@
-//! `SessionManager` — the per-window pty/session subsystem, the Rust twin of
+//! `PtyManager` — the per-window pty/session subsystem, the Rust twin of
 //! Swift's `SessionsModel` (`Sources/Nice/State/SessionsModel.swift`).
 //!
-//! One `SessionManager` per window (it lives on [`crate::window_state::WindowState`],
+//! One `PtyManager` per window (it lives on [`crate::window_state::WindowState`],
 //! the R12 per-window state struct). It wires the R3–R7 terminal stack
 //! (`nice_term_view::TerminalSessionHandle` gpui entities) to the R8
-//! [`TabModel`] document: it owns the live pane sessions, spawns deferred panes
+//! [`WorkspaceModel`] document: it owns the live window sessions, spawns deferred windows
 //! on focus, and routes the entity's OSC title/cwd events back into the model.
 //!
 //! ## What this slice (R13 slice 1) owns
 //!
-//! * **Pure model routing** — [`SessionManager::pane_cwd_changed`],
-//!   [`SessionManager::pane_title_changed`], [`SessionManager::set_active_pane`]
-//!   (the model half: active-pane + ack-when-viewed),
-//!   [`SessionManager::select_next_pane`] / [`select_prev_pane`] /
-//!   `step_active_pane`, [`SessionManager::add_pane`] /
-//!   [`add_terminal_to_active_tab`], and [`SessionManager::route_terminal_event`]
+//! * **Pure model routing** — [`PtyManager::window_cwd_changed`],
+//!   [`PtyManager::window_title_changed`], [`PtyManager::set_active_window`]
+//!   (the model half: active-window + ack-when-viewed),
+//!   [`PtyManager::select_next_window`] / [`select_prev_window`] /
+//!   `step_active_window`, [`PtyManager::add_window`] /
+//!   [`add_terminal_to_active_session`], and [`PtyManager::route_terminal_event`]
 //!   (map a decoded [`TerminalEvent`] into the right routing call). These take
-//!   `&mut TabModel` and touch no gpui, so they are unit-tested with plain
+//!   `&mut WorkspaceModel` and touch no gpui, so they are unit-tested with plain
 //!   `#[test]` (the `nice` binary crate never links gpui test-support — see
 //!   `crates/nice-itests`).
-//! * **The gpui spawn primitives** — [`SessionManager::spawn_pane`],
-//!   [`ensure_active_pane_spawned`],
-//!   [`register_tab_session`], [`teardown`]. These are the building blocks the
+//! * **The gpui spawn primitives** — [`PtyManager::spawn_window`],
+//!   [`ensure_active_window_spawned`],
+//!   [`register_session_pty`], [`teardown`]. These are the building blocks the
 //!   live app composes; they compile now and are exercised by the R13 slice-3
 //!   live scenario (nothing wires an action to them yet, hence the
 //!   module-level `dead_code` allow — the same seam pattern as
@@ -29,43 +29,43 @@
 //!
 //! ## What R13 slice 2 owns (this slice)
 //!
-//! * **The pane lifecycle handlers** — [`pane_exited`](SessionManager::pane_exited)
+//! * **The window lifecycle handlers** — [`window_exited`](PtyManager::window_exited)
 //!   (the exact 5-step Swift ordering: clear overlay → model removal + neighbor
 //!   refocus → pty release → deferred-companion spawn → dissolve check) and
-//!   [`pane_held`](SessionManager::pane_held) (flip `is_alive` / idle the status
-//!   / clear overlay, keep the pane mounted). [`route_terminal_event`] now routes
+//!   [`window_held`](PtyManager::window_held) (flip `is_alive` / idle the status
+//!   / clear overlay, keep the window mounted). [`route_terminal_event`] now routes
 //!   `Exited` / `OutputStarted` into them instead of dropping them.
 //! * **The synchronous dissolve cascade**
-//!   ([`finalize_dissolved_tab`](SessionManager::finalize_dissolved_tab)) — core
-//!   `remove_tab` (the single removal entry point, parent-pointer sweep) → pty
-//!   release → selection prune → active-tab fallback → the declared-but-inert
+//!   ([`finalize_dissolved_session`](PtyManager::finalize_dissolved_session)) — core
+//!   `remove_session` (the single removal entry point, parent-pointer sweep) → pty
+//!   release → selection prune → active-session fallback → the declared-but-inert
 //!   R18/R19 hooks → the every-project-empty terminus. Three entry points share
-//!   it: pane-exit, [`close_tab`](SessionManager::close_tab) (R10's action,
+//!   it: window-exit, [`close_session`](PtyManager::close_session) (R10's action,
 //!   unconditional this cycle), and the unused cross-window
-//!   [`dissolve_tab_if_empty`](SessionManager::dissolve_tab_if_empty) (R25).
+//!   [`dissolve_session_if_empty`](PtyManager::dissolve_session_if_empty) (R25).
 //! * **The launch-overlay registry** —
-//!   [`register_pane_launch`](SessionManager::register_pane_launch) /
-//!   [`clear_pane_launch`](SessionManager::clear_pane_launch) /
-//!   [`promote_pane_launch`](SessionManager::promote_pane_launch), the
+//!   [`register_window_launch`](PtyManager::register_window_launch) /
+//!   [`clear_window_launch`](PtyManager::clear_window_launch) /
+//!   [`promote_window_launch`](PtyManager::promote_window_launch), the
 //!   `launch_overlay_grace` seam (default [`nice_term_view::DEFAULT_LAUNCH_OVERLAY_GRACE`],
 //!   `<= 0` promotes synchronously). The grace deadline reuses R7's App-Nap-safe
 //!   `LaunchDeadline` injection — the live caller arms it and calls
-//!   `promote_pane_launch` on fire (the `Pending`-guard covers the clear race).
-//! * **Termination** — [`terminate_pane`](SessionManager::terminate_pane) /
-//!   [`terminate_all`](SessionManager::terminate_all) / [`teardown`], plus the
+//!   `promote_window_launch` on fire (the `Pending`-guard covers the clear race).
+//! * **Termination** — [`terminate_window`](PtyManager::terminate_window) /
+//!   [`terminate_all`](PtyManager::terminate_all) / [`teardown`], plus the
 //!   synthetic held/armed test seams
-//!   ([`mark_synthetic_held_pane`](SessionManager::mark_synthetic_held_pane) /
-//!   [`mark_synthetic_armed_deferred_pane`](SessionManager::mark_synthetic_armed_deferred_pane)
-//!   / [`pane_is_spawned`](SessionManager::pane_is_spawned)) so close-flow tests
+//!   ([`mark_synthetic_held_window`](PtyManager::mark_synthetic_held_window) /
+//!   [`mark_synthetic_armed_deferred_window`](PtyManager::mark_synthetic_armed_deferred_window)
+//!   / [`window_is_spawned`](PtyManager::window_is_spawned)) so close-flow tests
 //!   construct all three tri-state shapes without racing a real child.
 //!
 //! The gpui side effects the live caller composes on top of the pure cascade —
-//! step-4 deferred spawn ([`ensure_active_pane_spawned`]) and the terminus
-//! actuator ([`apply_dissolve_terminus`](SessionManager::apply_dissolve_terminus),
+//! step-4 deferred spawn ([`ensure_active_window_spawned`]) and the terminus
+//! actuator ([`apply_dissolve_terminus`](PtyManager::apply_dissolve_terminus),
 //! close-this-window-or-quit via R12's registry) — need a gpui context, so they
 //! stay separate primitives the slice-3 wiring calls (same seam pattern as slice
-//! 1's `spawn_pane`). [`pane_exited`] returns a
-//! [`PaneExitResolution`] telling that caller which to run.
+//! 1's `spawn_window`). [`window_exited`] returns a
+//! [`WindowExitResolution`] telling that caller which to run.
 //!
 //! ## Deliberately deferred (later R13 slices — do not add here)
 //!
@@ -73,22 +73,22 @@
 //!   the `cx.subscribe` that feeds [`route_terminal_event`] from a live entity,
 //!   the live arming of the launch-overlay `LaunchDeadline`, and the
 //!   `session-lifecycle` live scenario — **slice 3**.
-//! * Claude status parsing (braille/✳ → thinking/waiting), tab auto-title from
+//! * Claude status parsing (braille/✳ → thinking/waiting), session auto-title from
 //!   the OSC label, socket, promotion, persistence — **R15/R18** (breadcrumbs
 //!   below).
 //!
-//! [`ensure_active_pane_spawned`]: SessionManager::ensure_active_pane_spawned
-//! [`register_tab_session`]: SessionManager::register_tab_session
-//! [`teardown`]: SessionManager::teardown
-//! [`select_prev_pane`]: SessionManager::select_prev_pane
-//! [`add_terminal_to_active_tab`]: SessionManager::add_terminal_to_active_tab
-//! [`route_terminal_event`]: SessionManager::route_terminal_event
-//! [`pane_exited`]: SessionManager::pane_exited
-//! [`pane_held`]: SessionManager::pane_held
-//! [`close_tab`]: SessionManager::close_tab
-//! [`terminate_pane`]: SessionManager::terminate_pane
-//! [`terminate_all`]: SessionManager::terminate_all
-//! [`register_pane_launch`]: SessionManager::register_pane_launch
+//! [`ensure_active_window_spawned`]: PtyManager::ensure_active_window_spawned
+//! [`register_session_pty`]: PtyManager::register_session_pty
+//! [`teardown`]: PtyManager::teardown
+//! [`select_prev_window`]: PtyManager::select_prev_window
+//! [`add_terminal_to_active_session`]: PtyManager::add_terminal_to_active_session
+//! [`route_terminal_event`]: PtyManager::route_terminal_event
+//! [`window_exited`]: PtyManager::window_exited
+//! [`window_held`]: PtyManager::window_held
+//! [`close_session`]: PtyManager::close_session
+//! [`terminate_window`]: PtyManager::terminate_window
+//! [`terminate_all`]: PtyManager::terminate_all
+//! [`register_window_launch`]: PtyManager::register_window_launch
 
 // The gpui spawn/focus primitives + a few pure helpers have no live caller until
 // R13 slice 3 wires the action seams and the entity subscription to them; the
@@ -103,25 +103,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui::{App, Entity, Global, Window};
 
-use nice_model::{Pane, PaneKind, SidebarTabSelection, Tab, TabModel, TabStatus};
+use nice_model::{TermWindow, TermWindowKind, SidebarSessionSelection, Session, WorkspaceModel, SessionStatus};
 use nice_term_core::{SpawnSpec, DEFAULT_SCROLLBACK_LINES};
 use nice_term_view::{TerminalEvent, TerminalSessionHandle, DEFAULT_LAUNCH_OVERLAY_GRACE};
 
 use crate::window_registry::WindowRegistry;
 
-/// Terminal-pane pill titles clip at 40 chars so the toolbar pill never
+/// Terminal-window pill titles clip at 40 chars so the toolbar pill never
 /// overflows (`SessionsModel.swift:400-404`).
-const PANE_TITLE_MAX: usize = 40;
+const WINDOW_TITLE_MAX: usize = 40;
 
-/// The per-pane "Launching…" overlay state — the Rust twin of Swift's
-/// `PaneLaunchStatus` (`SessionsModel.paneLaunchStates`). App-shaped (it carries
+/// The per-window "Launching…" overlay state — the Rust twin of Swift's
+/// `WindowLaunchStatus` (`SessionsModel.paneLaunchStates`). App-shaped (it carries
 /// the launch command string the overlay renders), so it lives here in `crates/nice`
 /// rather than in `nice-term-*` (the boundary block). The R7 view owns its own
 /// zero-frame [`nice_term_view::LaunchOverlay`] timing machine; this registry is
 /// the app-level mirror the shell reads to paint the placeholder, driven by the
 /// same grace deadline.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PaneLaunchStatus {
+pub(crate) enum WindowLaunchStatus {
     /// Spawned, still within the grace window — overlay not yet shown.
     Pending { command: String },
     /// Grace elapsed with no output — the "Launching…" overlay is showing.
@@ -137,15 +137,15 @@ pub(crate) enum DissolveTerminus {
     #[default]
     None,
     /// Every project is now empty. The live caller closes this window when
-    /// another is live, else quits the app (see [`SessionManager::apply_dissolve_terminus`]).
+    /// another is live, else quits the app (see [`PtyManager::apply_dissolve_terminus`]).
     WindowEmptied,
 }
 
 impl DissolveTerminus {
-    /// Combine two terminus outcomes across a multi-pane close loop:
+    /// Combine two terminus outcomes across a multi-window close loop:
     /// `WindowEmptied` wins (once the window is empty it stays empty). Used by the
-    /// `close_tab`/close batch loops here and by
-    /// [`crate::window_state::WindowState`]'s multi-tab close aggregation.
+    /// `close_session`/close batch loops here and by
+    /// [`crate::window_state::WindowState`]'s multi-session close aggregation.
     pub(crate) fn or(self, other: DissolveTerminus) -> DissolveTerminus {
         match (self, other) {
             (DissolveTerminus::WindowEmptied, _) | (_, DissolveTerminus::WindowEmptied) => {
@@ -156,61 +156,61 @@ impl DissolveTerminus {
     }
 }
 
-/// The outcome of a pane exit — what gpui side effects the live caller must run
-/// on top of the pure model cascade [`pane_exited`](SessionManager::pane_exited)
+/// The outcome of a window exit — what gpui side effects the live caller must run
+/// on top of the pure model cascade [`window_exited`](PtyManager::window_exited)
 /// already applied. Swift runs these inline (steps 4–5 of `paneExited`); the Rust
 /// split keeps the model routing unit-testable without a gpui context, and the
-/// two effects are mutually exclusive with the dissolve (a surviving tab may
+/// two effects are mutually exclusive with the dissolve (a surviving session may
 /// spawn a companion; a dissolved one runs the terminus), so applying them after
 /// the pure cascade is observably identical to Swift's inline order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PaneExitResolution {
-    /// `Some(tab_id)` when the tab **survived** the exit — the live caller runs
-    /// [`ensure_active_pane_spawned`](SessionManager::ensure_active_pane_spawned)
+pub(crate) struct WindowExitResolution {
+    /// `Some(session_id)` when the session **survived** the exit — the live caller runs
+    /// [`ensure_active_window_spawned`](PtyManager::ensure_active_window_spawned)
     /// (Swift step 4) so a refocus onto a deferred companion spawns its shell.
-    /// `None` when the tab dissolved (nothing to spawn) or the tab was unknown.
-    pub(crate) refocus_tab: Option<String>,
+    /// `None` when the session dissolved (nothing to spawn) or the session was unknown.
+    pub(crate) refocus_session: Option<String>,
     /// The dissolve terminus (whether the window emptied → close/quit).
     pub(crate) terminus: DissolveTerminus,
 }
 
 /// The routing outcome of a single [`TerminalEvent`] — empty for the title / cwd
-/// / reset / first-output events (fully handled inline), carrying the pane-exit
+/// / reset / first-output events (fully handled inline), carrying the window-exit
 /// resolution for an `Exited { held: false }` event so the live subscription
-/// applies the same step-4 spawn + terminus the direct [`pane_exited`] caller
+/// applies the same step-4 spawn + terminus the direct [`window_exited`] caller
 /// does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RoutedExit {
-    pub(crate) refocus_tab: Option<String>,
+    pub(crate) refocus_session: Option<String>,
     pub(crate) terminus: DissolveTerminus,
 }
 
-/// One live pane session: the core→gpui adapter entity for this pane. Dropping
+/// One live window session: the core→gpui adapter entity for this window. Dropping
 /// the entity tears the child process group down (SIGHUP→SIGKILL via
-/// `nice_term_core::Session::drop`), so a tab entry removed from the cache leaks
+/// `nice_term_core::Session::drop`), so a session entry removed from the cache leaks
 /// no zsh.
 ///
-/// Key focus is NOT owned here. The pane's `TerminalView` mints and tracks its
-/// own focus handle, and the pane host ([`crate::app_shell::PaneHostView`]) —
+/// Key focus is NOT owned here. The window's `TerminalView` mints and tracks its
+/// own focus handle, and the window host ([`crate::app_shell::WindowHostView`]) —
 /// which owns the views — routes key focus to it on activation. An earlier
 /// design minted a focus handle on this struct for the manager to drive, but it
 /// was never wired to any view, so focusing it did nothing; it has been removed.
-struct PaneSession {
-    /// The `nice-term-view` adapter entity owning this pane's `Session`.
+struct WindowPty {
+    /// The `nice-term-view` adapter entity owning this window's `Session`.
     handle: Entity<TerminalSessionHandle>,
 }
 
-/// The per-window pty/session manager. Tab-keyed: each tab maps to its live pane
-/// sessions (`pane_id -> PaneSession`), mirroring Swift's tab-keyed
-/// `ptySessions` cache. A tab entry existing (even empty) means Swift's
-/// `makeSession` ran for that tab — the precondition
-/// [`ensure_active_pane_spawned`](SessionManager::ensure_active_pane_spawned)
-/// checks before lazily spawning a deferred companion pane.
+/// The per-window pty/session manager. Session-keyed: each session maps to its live window
+/// sessions (`term_window_id -> WindowPty`), mirroring Swift's session-keyed
+/// `ptySessions` cache. A session entry existing (even empty) means Swift's
+/// `makeSession` ran for that session — the precondition
+/// [`ensure_active_window_spawned`](PtyManager::ensure_active_window_spawned)
+/// checks before lazily spawning a deferred companion window.
 /// The per-window shell-injection env, set once at window construction by
 /// `crate::app::arm_window_control_socket` (the Rust twin of Swift
 /// `SessionsModel.bootstrapSocket`'s `controlSocketExtraEnv`). Every pty this
-/// window's [`SessionManager`] spawns gets these merged into its env
-/// **spec-wins** (see [`spawn_pane`](SessionManager::spawn_pane)).
+/// window's [`PtyManager`] spawns gets these merged into its env
+/// **spec-wins** (see [`spawn_window`](PtyManager::spawn_window)).
 ///
 /// `None` on a manager whose window never bootstrapped a control socket (the
 /// ~10 landed scenarios / itests that build a `WindowState` directly and spawn
@@ -224,7 +224,7 @@ pub(crate) struct WindowShellEnv {
     /// fails fast and falls back to direct `command claude`.
     pub(crate) socket_path: Option<String>,
     /// `ZDOTDIR` — the synthetic rc-chain directory. `None` when the launch-time
-    /// stub write failed (panes still get `NICE_SOCKET`; they just source the
+    /// stub write failed (windows still get `NICE_SOCKET`; they just source the
     /// user's real rc directly).
     pub(crate) zdotdir: Option<String>,
     /// The value for `NICE_USER_ZDOTDIR`. `None` ⇒ the empty string is injected
@@ -237,36 +237,36 @@ pub(crate) struct WindowShellEnv {
     pub(crate) compose_conf: Option<String>,
 }
 
-pub(crate) struct SessionManager {
-    /// `tab_id -> (pane_id -> live session)`.
-    tabs: HashMap<String, HashMap<String, PaneSession>>,
-    /// Per-pane "Launching…" overlay entries (Swift's `paneLaunchStates`). A
-    /// pane is inserted `Pending` at spawn and promoted to `Visible` when the
+pub(crate) struct PtyManager {
+    /// `session_id -> (term_window_id -> live session)`.
+    sessions: HashMap<String, HashMap<String, WindowPty>>,
+    /// Per-window "Launching…" overlay entries (Swift's `paneLaunchStates`). A
+    /// window is inserted `Pending` at spawn and promoted to `Visible` when the
     /// grace deadline fires with no output; cleared on first output, exit, or
     /// held.
-    pane_launch_states: HashMap<String, PaneLaunchStatus>,
-    /// The grace window before a silent pane's overlay promotes to `Visible`
+    window_launch_states: HashMap<String, WindowLaunchStatus>,
+    /// The grace window before a silent window's overlay promotes to `Visible`
     /// (Swift's `launchOverlayGraceSeconds`). Default
     /// [`DEFAULT_LAUNCH_OVERLAY_GRACE`]; a `<= 0` value promotes synchronously
-    /// inside [`register_pane_launch`](Self::register_pane_launch) (the test seam).
+    /// inside [`register_window_launch`](Self::register_window_launch) (the test seam).
     launch_overlay_grace: Duration,
-    /// Test-only: `<tab>:<pane>` keys [`pane_is_spawned`](Self::pane_is_spawned)
+    /// Test-only: `<session>:<window>` keys [`window_is_spawned`](Self::window_is_spawned)
     /// reports as spawned without a real session (Swift's `syntheticSpawnedPanes`).
     /// Always empty in production — nothing populates it outside the `mark_*`
     /// test seams.
     synthetic_spawned: HashSet<String>,
     /// Subset of [`synthetic_spawned`](Self::synthetic_spawned) whose
-    /// [`terminate_pane`](Self::terminate_pane) fires
-    /// [`pane_exited`](Self::pane_exited) synchronously, mirroring the production
-    /// held-pane fast path (`syntheticHeldPanes`). One-shot: consumed on terminate.
+    /// [`terminate_window`](Self::terminate_window) fires
+    /// [`window_exited`](Self::window_exited) synchronously, mirroring the production
+    /// held-window fast path (`syntheticHeldPanes`). One-shot: consumed on terminate.
     synthetic_held: HashSet<String>,
     /// Subset of [`synthetic_spawned`](Self::synthetic_spawned) whose
-    /// [`terminate_pane`](Self::terminate_pane) fires
-    /// [`pane_exited`](Self::pane_exited) synchronously with no real child ever
+    /// [`terminate_window`](Self::terminate_window) fires
+    /// [`window_exited`](Self::window_exited) synchronously with no real child ever
     /// having run (`syntheticArmedDeferredPanes` — the armed-but-not-fired
     /// deferred spawn). One-shot: consumed on terminate.
     synthetic_armed: HashSet<String>,
-    /// R20.5 test seam: `<tab>:<pane>` keys
+    /// R20.5 test seam: `<session>:<window>` keys
     /// [`shell_has_foreground_child`](Self::shell_has_foreground_child) reports as
     /// busy (a shell with a foreground child) WITHOUT a real pty running a real
     /// command. Lets the busy-close → confirmation-modal wiring be unit-tested off
@@ -280,12 +280,12 @@ pub(crate) struct SessionManager {
     /// ([`TerminalSessionHandle::set_event_wake_enabled`]). A pty's feeder /
     /// exit-watcher threads wake the drain task from a BACKGROUND thread, which
     /// gpui's test scheduler flags as non-determinism ("schedule_local must run on
-    /// the test thread") — so a `#[gpui::test]` that both spawns a pane and runs
+    /// the test thread") — so a `#[gpui::test]` that both spawns a window and runs
     /// the executor (`run_until_parked` / `advance_clock`, which is what parks the
     /// drain and registers the waker the exit-watcher then wakes) fails
     /// intermittently. Applied at spawn time, which is the ONLY point early enough
-    /// for a pane the test does not spawn itself (the background-`/fork`
-    /// materialization spawns its deferred pane from inside a spawned task). Always
+    /// for a window the test does not spawn itself (the background-`/fork`
+    /// materialization spawns its deferred window from inside a spawned task). Always
     /// `true` in production — the field only exists under `cfg(test)`.
     #[cfg(test)]
     event_wakes_enabled: bool,
@@ -296,29 +296,29 @@ pub(crate) struct SessionManager {
     /// Unit tests inject a deterministic counter and assert by id.
     mint_id: Box<dyn Fn(&str) -> String>,
     /// R14: the per-window shell-injection env, set once at window construction
-    /// (before the Main pane forks). `None` until a control socket is bootstrapped
+    /// (before the Main window forks). `None` until a control socket is bootstrapped
     /// for this window, so managers built directly by scenarios/itests inject
     /// nothing. See [`WindowShellEnv`].
     window_shell_env: Option<WindowShellEnv>,
     /// W5 (R18): project ids the user asked to close whole (Swift's
     /// `CloseRequestCoordinator.projectsPendingRemoval`). Read — not cleared —
-    /// by [`finalize_dissolved_tab`](Self::finalize_dissolved_tab) on each tab
-    /// dissolve so a multi-tab project keeps the flag across earlier dissolves;
-    /// cleared when its last tab empties and the row drops.
+    /// by [`finalize_dissolved_session`](Self::finalize_dissolved_session) on each session
+    /// dissolve so a multi-session project keeps the flag across earlier dissolves;
+    /// cleared when its last session empties and the row drops.
     pending_project_removal: HashSet<String>,
-    /// R19: tab ids dissolved since the last drain — the file-browser per-tab
-    /// cleanup hook. [`finalize_dissolved_tab`](Self::finalize_dissolved_tab) (the
-    /// single tab-removal entry point) pushes here; [`WindowState`](crate::window_state::WindowState),
+    /// R19: session ids dissolved since the last drain — the file-browser per-session
+    /// cleanup hook. [`finalize_dissolved_session`](Self::finalize_dissolved_session) (the
+    /// single session-removal entry point) pushes here; [`WindowState`](crate::window_state::WindowState),
     /// which owns the [`FileBrowserStore`](nice_model::file_browser::FileBrowserStore),
-    /// drains it via [`take_dissolved_tab_ids`](Self::take_dissolved_tab_ids) after
-    /// each cascade to drop the closed tab's browser state. Kept here (not threaded
+    /// drains it via [`take_dissolved_session_ids`](Self::take_dissolved_session_ids) after
+    /// each cascade to drop the closed session's browser state. Kept here (not threaded
     /// through the cascade signatures) so every dissolve path — UI close AND the
-    /// route_terminal_event pane-exit — funnels one removal list without rippling
-    /// the store into `SessionManager`.
-    dissolved_tab_ids: Vec<String>,
+    /// route_terminal_event window-exit — funnels one removal list without rippling
+    /// the store into `PtyManager`.
+    dissolved_session_ids: Vec<String>,
 }
 
-impl SessionManager {
+impl PtyManager {
     /// A fresh manager with the production id minter and an empty session cache.
     pub(crate) fn new() -> Self {
         Self::build(Box::new(default_mint_id))
@@ -332,8 +332,8 @@ impl SessionManager {
     /// Shared constructor: empty caches, default launch grace, the given minter.
     fn build(mint_id: Box<dyn Fn(&str) -> String>) -> Self {
         Self {
-            tabs: HashMap::new(),
-            pane_launch_states: HashMap::new(),
+            sessions: HashMap::new(),
+            window_launch_states: HashMap::new(),
             launch_overlay_grace: DEFAULT_LAUNCH_OVERLAY_GRACE,
             synthetic_spawned: HashSet::new(),
             synthetic_held: HashSet::new(),
@@ -344,64 +344,64 @@ impl SessionManager {
             mint_id,
             window_shell_env: None,
             pending_project_removal: HashSet::new(),
-            dissolved_tab_ids: Vec::new(),
+            dissolved_session_ids: Vec::new(),
         }
     }
 
-    /// Drain the tab ids dissolved since the last call — the R19 file-browser
+    /// Drain the session ids dissolved since the last call — the R19 file-browser
     /// cleanup hook. [`WindowState`](crate::window_state::WindowState) calls this
     /// after every session cascade and drops each id's browser state from its
     /// [`FileBrowserStore`](nice_model::file_browser::FileBrowserStore).
-    pub(crate) fn take_dissolved_tab_ids(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.dissolved_tab_ids)
+    pub(crate) fn take_dissolved_session_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.dissolved_session_ids)
     }
 
     /// Mark `project_id` for whole-project removal (W5 "Close Project"): its row
-    /// drops from the tree once its last tab dissolves
-    /// ([`finalize_dissolved_tab`](Self::finalize_dissolved_tab)). The pinned
+    /// drops from the tree once its last session dissolves
+    /// ([`finalize_dissolved_session`](Self::finalize_dissolved_session)). The pinned
     /// Terminals group is never marked. Swift's
     /// `CloseRequestCoordinator.projectsPendingRemoval.insert`.
     pub(crate) fn mark_project_pending_removal(&mut self, project_id: &str) {
-        if project_id != TabModel::TERMINALS_PROJECT_ID {
+        if project_id != WorkspaceModel::TERMINALS_PROJECT_ID {
             self.pending_project_removal.insert(project_id.to_string());
         }
     }
 
-    /// Mint a unique id for a freshly-created pane, via the injected seam.
+    /// Mint a unique id for a freshly-created window, via the injected seam.
     fn mint(&self, prefix: &str) -> String {
         (self.mint_id)(prefix)
     }
 
-    /// Mint a fresh tab id via the injected seam — the branch-parent
+    /// Mint a fresh session id via the injected seam — the branch-parent
     /// materialization path (`WindowState::materialize_branch_parent`) mints its
-    /// tab + `-claude`/`-t1` pane ids up front to hand to the model's
+    /// session + `-claude`/`-t1` window ids up front to hand to the model's
     /// `insert_branch_parent` (which takes them as params), mirroring
-    /// `create_claude_tab`'s internal `self.mint("t")`.
-    pub(crate) fn mint_tab_id(&self, prefix: &str) -> String {
+    /// `create_claude_session`'s internal `self.mint("t")`.
+    pub(crate) fn mint_session_id(&self, prefix: &str) -> String {
         self.mint(prefix)
     }
 
-    // MARK: - Pane title / cwd routing (pure model, unit-tested)
+    // MARK: - Window title / cwd routing (pure model, unit-tested)
 
-    /// A pane's shell emitted OSC 7 with a new working directory. Stash it on
-    /// `Pane.cwd` **only** so a relaunch respawns the pane where it was — never
-    /// `Tab.cwd`, which is load-bearing for `claude --resume`'s working dir and
+    /// A window's shell emitted OSC 7 with a new working directory. Stash it on
+    /// `TermWindow.cwd` **only** so a relaunch respawns the window where it was — never
+    /// `Session.cwd`, which is load-bearing for `claude --resume`'s working dir and
     /// would silently relocate the session on restore if a companion terminal's
     /// `cd` overwrote it (`SessionsModel.swift:483-497`). Silently drops a stale
-    /// tab/pane id. Returns whether anything changed — the caller fires the
+    /// session/window id. Returns whether anything changed — the caller fires the
     /// debounced session save on `true` (the `onSessionMutation` seam; R18).
-    pub(crate) fn pane_cwd_changed(
+    pub(crate) fn window_cwd_changed(
         &mut self,
-        model: &mut TabModel,
-        tab_id: &str,
-        pane_id: &str,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
         cwd: &str,
     ) -> bool {
         let mut changed = false;
-        model.mutate_tab(tab_id, |tab| {
-            if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
-                if pane.cwd.as_deref() != Some(cwd) {
-                    pane.cwd = Some(cwd.to_string());
+        model.mutate_session(session_id, |session| {
+            if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                if term_window.cwd.as_deref() != Some(cwd) {
+                    term_window.cwd = Some(cwd.to_string());
                     changed = true;
                 }
             }
@@ -409,45 +409,45 @@ impl SessionManager {
         changed
     }
 
-    /// A pane's program emitted an OSC 0/2 title. **Terminal-branch policy only**
+    /// A window's program emitted an OSC 0/2 title. **Terminal-branch policy only**
     /// (`SessionsModel.swift:385-414`): the emitted title becomes the pill label
     /// verbatim, except an empty/whitespace title is ignored, a manually-renamed
-    /// pane (`title_manually_set`) is never clobbered by OSC, and an accepted
-    /// title clips at [`PANE_TITLE_MAX`] chars.
+    /// window (`title_manually_set`) is never clobbered by OSC, and an accepted
+    /// title clips at [`WINDOW_TITLE_MAX`] chars.
     ///
     /// The **Claude branch is gated on `is_claude_running`** and dropped whole
-    /// this cycle: `is_claude_running` stays `false` for every pane in R13 (only
-    /// R15's socket promotion flips it), so a claude-kind pane contributes no
-    /// status and no OSC-driven tab title — a deferred-resume Claude pane is a
+    /// this cycle: `is_claude_running` stays `false` for every window in R13 (only
+    /// R15's socket promotion flips it), so a claude-kind window contributes no
+    /// status and no OSC-driven session title — a deferred-resume Claude window is a
     /// plain `zsh` whose theme OSC titles must not clobber the persisted session
-    /// label (`SessionsModel.swift:416-435`). Silently drops a stale tab/pane id.
+    /// label (`SessionsModel.swift:416-435`). Silently drops a stale session/window id.
     ///
     /// Returns whether the pill label actually changed — the caller fires the
     /// debounced session save on `true` (Swift's `@Observable` write-back →
     /// `onTreeMutation`, byte-equality-skipped; R18 owns the save). A no-op
     /// re-report of the current title returns `false` (Validation probe (b)),
-    /// mirroring [`pane_cwd_changed`](Self::pane_cwd_changed)'s did-change signal.
-    pub(crate) fn pane_title_changed(
+    /// mirroring [`window_cwd_changed`](Self::window_cwd_changed)'s did-change signal.
+    pub(crate) fn window_title_changed(
         &mut self,
-        model: &mut TabModel,
-        tab_id: &str,
-        pane_id: &str,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
         title: &str,
     ) -> bool {
-        // Read the pane's kind + lock facts, then drop the borrow before the
-        // mutation (Swift reads `pane` then re-enters via `mutateTab`).
-        let Some(tab) = model.tab_for(tab_id) else {
+        // Read the window's kind + lock facts, then drop the borrow before the
+        // mutation (Swift reads `pane` then re-enters via `mutateTab` — parity note).
+        let Some(session) = model.session_for(session_id) else {
             return false;
         };
-        let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) else {
+        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
             return false;
         };
-        let kind = pane.kind;
-        let title_manually_set = pane.title_manually_set;
-        let is_claude_running = pane.is_claude_running;
+        let kind = term_window.kind;
+        let title_manually_set = term_window.title_manually_set;
+        let is_claude_running = term_window.is_claude_running;
 
         match kind {
-            PaneKind::Terminal => {
+            TermWindowKind::Terminal => {
                 let trimmed = title.trim();
                 // Whitespace-only titles never overwrite the current pill label.
                 if trimmed.is_empty() {
@@ -458,25 +458,25 @@ impl SessionManager {
                 if title_manually_set {
                     return false;
                 }
-                let clipped = clip_title(trimmed, PANE_TITLE_MAX);
+                let clipped = clip_title(trimmed, WINDOW_TITLE_MAX);
                 let mut changed = false;
-                model.mutate_tab(tab_id, |tab| {
-                    if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
-                        if pane.title != clipped {
-                            pane.title = clipped;
+                model.mutate_session(session_id, |session| {
+                    if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                        if term_window.title != clipped {
+                            term_window.title = clipped;
                             changed = true;
                         }
                     }
                 });
                 changed
             }
-            PaneKind::Claude => {
+            TermWindowKind::Claude => {
                 // R15 T5: the Claude branch — split the braille-spinner (U+2800..
                 // U+28FF → thinking) / sparkle (U+2733 → waiting) status prefix via
                 // [`parse_claude_title`], apply the status transition, and feed the
-                // trailing label into the tab auto-title (dropping the "Claude Code"
+                // trailing label into the session auto-title (dropping the "Claude Code"
                 // placeholder). Gated on `is_claude_running`: a deferred-resume
-                // Claude pane is a plain `zsh` whose theme OSC titles must not
+                // Claude window is a plain `zsh` whose theme OSC titles must not
                 // clobber the persisted session label, so the whole branch drops
                 // until the socket in-place promotion (the only production
                 // false→true flip) opens the gate (`SessionsModel.swift:416-474`).
@@ -486,89 +486,89 @@ impl SessionManager {
                 let (status, label) = parse_claude_title(title);
                 if let Some(new_status) = status {
                     // Acknowledge the pulse only when the user is actually looking at
-                    // this pane — the viewed tab's active pane (Swift's
-                    // `viewing && isActivePane`). A manually-renamed Claude pane still
+                    // this window — the viewed session's active window (Swift's
+                    // `viewing && isActivePane`). A manually-renamed Claude window still
                     // flips status: the title lock lives in the terminal branch, not
                     // here (`AppStatePaneLifecycleTests.claudePane_manuallySet_...`).
-                    let viewing = model.active_tab_id() == Some(tab_id);
-                    model.mutate_tab(tab_id, |tab| {
-                        let is_active_pane = tab.active_pane_id.as_deref() == Some(pane_id);
-                        if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
-                            pane.apply_status_transition(new_status, viewing && is_active_pane);
+                    let viewing = model.active_session_id() == Some(session_id);
+                    model.mutate_session(session_id, |session| {
+                        let is_active_window = session.active_window_id.as_deref() == Some(term_window_id);
+                        if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                            term_window.apply_status_transition(new_status, viewing && is_active_window);
                         }
                     });
                 }
                 // The trailing label humanizes into the TAB auto-title — never the
-                // Claude pane's own pill (that stays "Claude"/the user's rename).
+                // Claude window's own pill (that stays "Claude"/the user's rename).
                 // Skip an empty label and Claude's generic "Claude Code" placeholder.
                 let raw_label = label.trim();
                 if raw_label.is_empty() || raw_label == "Claude Code" {
                     return false;
                 }
-                model.apply_auto_title(tab_id, raw_label);
-                // This branch never writes the pane pill, so the pill-label-changed
-                // signal is always `false` (status + tab title flow through the
+                model.apply_auto_title(session_id, raw_label);
+                // This branch never writes the window pill, so the pill-label-changed
+                // signal is always `false` (status + session title flow through the
                 // model's own mutation hooks).
                 false
             }
         }
     }
 
-    /// Dispatch a decoded [`TerminalEvent`] from a pane's session entity to the
+    /// Dispatch a decoded [`TerminalEvent`] from a window's session entity to the
     /// right routing call. This is the pure connector the live entity
     /// subscription (slice 3) invokes per event; splitting it out keeps the
     /// routing unit-testable without a live pty or a gpui context.
     ///
     /// Returns a [`RoutedExit`]: empty for title / cwd / reset / first-output
-    /// (fully handled here), carrying the pane-exit resolution for a clean
+    /// (fully handled here), carrying the window-exit resolution for a clean
     /// `Exited { held: false }` so the live subscription runs the same step-4
-    /// spawn + terminus a direct [`pane_exited`](Self::pane_exited) caller does.
+    /// spawn + terminus a direct [`window_exited`](Self::window_exited) caller does.
     pub(crate) fn route_terminal_event(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
-        tab_id: &str,
-        pane_id: &str,
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
+        term_window_id: &str,
         event: &TerminalEvent,
     ) -> RoutedExit {
         match event {
             TerminalEvent::TitleChanged(title) => {
-                let _ = self.pane_title_changed(model, tab_id, pane_id, title);
+                let _ = self.window_title_changed(model, session_id, term_window_id, title);
                 RoutedExit::default()
             }
             TerminalEvent::CwdChanged(path) => {
-                // OSC 7 → `Pane.cwd` (plain path across the boundary; the app owns
+                // OSC 7 → `TermWindow.cwd` (plain path across the boundary; the app owns
                 // the model type). The `to_string_lossy` is safe for the on-disk
                 // absolute paths OSC 7 reports.
-                let _ = self.pane_cwd_changed(model, tab_id, pane_id, &path.to_string_lossy());
+                let _ = self.window_cwd_changed(model, session_id, term_window_id, &path.to_string_lossy());
                 RoutedExit::default()
             }
             TerminalEvent::TitleReset => {
                 // The terminal title-policy (`SessionsModel.swift:391-414`) only
                 // accepts a non-empty OSC *set*; a reset to the terminal default
-                // carries no new label, so it is a no-op for the pane pill here.
+                // carries no new label, so it is a no-op for the window pill here.
                 RoutedExit::default()
             }
             TerminalEvent::OutputStarted => {
                 // First pty byte — dismiss the "Launching…" overlay (Swift's
                 // `NiceTerminalView.onFirstData` → `clearPaneLaunch`).
-                self.clear_pane_launch(pane_id);
+                self.clear_window_launch(term_window_id);
                 RoutedExit::default()
             }
             TerminalEvent::Exited { held: true, .. } => {
                 // `TabPtySession` decided to keep the view mounted (non-clean /
                 // pre-first-byte exit) — flip the model to dead-but-on-screen and
                 // clear the overlay. No removal, no dissolve.
-                self.pane_held(model, tab_id, pane_id);
+                self.window_held(model, session_id, term_window_id);
                 RoutedExit::default()
             }
             TerminalEvent::Exited { held: false, .. } => {
                 // Clean exit — the full 5-step `paneExited` cascade. The
                 // resolution tells the live caller to run step-4 spawn on a
-                // surviving tab and to actuate the terminus.
-                let r = self.pane_exited(model, selection, tab_id, pane_id);
+                // surviving session and to actuate the terminus.
+                let r = self.window_exited(model, selection, session_id, term_window_id);
                 RoutedExit {
-                    refocus_tab: r.refocus_tab,
+                    refocus_session: r.refocus_session,
                     terminus: r.terminus,
                 }
             }
@@ -578,129 +578,129 @@ impl SessionManager {
         }
     }
 
-    // MARK: - Selection / pane navigation (pure model, unit-tested)
+    // MARK: - Selection / window navigation (pure model, unit-tested)
 
-    /// Pick which pane is focused in `tab_id` — the **model half** of Swift's
-    /// `setActivePane` (`SessionsModel.swift:534-545`): re-point `active_pane_id`
-    /// (a no-op if `pane_id` isn't on the tab, so selection never dangles) and,
-    /// when the tab is the one being viewed, acknowledge the newly-active pane if
+    /// Pick which window is focused in `session_id` — the **model half** of Swift's
+    /// `setActivePane` (`SessionsModel.swift:534-545`): re-point `active_window_id`
+    /// (a no-op if `term_window_id` isn't on the session, so selection never dangles) and,
+    /// when the session is the one being viewed, acknowledge the newly-active window if
     /// it was waiting.
     ///
     /// The live app composes the side effect Swift's `setActivePane` also runs
-    /// on top of this: [`ensure_active_pane_spawned`] (deferred spawn), which
+    /// on top of this: [`ensure_active_window_spawned`] (deferred spawn), which
     /// needs a gpui context and so is a separate primitive the slice-3 action
     /// wiring calls right after this. Key focus is Swift's third piece, but in
-    /// the Rust app it lives in the pane host ([`crate::app_shell::PaneHostView`],
+    /// the Rust app it lives in the window host ([`crate::app_shell::WindowHostView`],
     /// which owns the terminal views), not here.
     ///
-    /// [`ensure_active_pane_spawned`]: SessionManager::ensure_active_pane_spawned
-    pub(crate) fn set_active_pane(&mut self, model: &mut TabModel, tab_id: &str, pane_id: &str) {
-        let viewing = model.active_tab_id() == Some(tab_id);
-        model.mutate_tab(tab_id, |tab| {
-            if tab.panes.iter().any(|p| p.id == pane_id) {
-                tab.active_pane_id = Some(pane_id.to_string());
+    /// [`ensure_active_window_spawned`]: PtyManager::ensure_active_window_spawned
+    pub(crate) fn set_active_window(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
+        let viewing = model.active_session_id() == Some(session_id);
+        model.mutate_session(session_id, |session| {
+            if session.windows.iter().any(|p| p.id == term_window_id) {
+                session.active_window_id = Some(term_window_id.to_string());
                 if viewing {
-                    if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
-                        pane.mark_acknowledged_if_waiting();
+                    if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                        term_window.mark_acknowledged_if_waiting();
                     }
                 }
             }
         });
     }
 
-    /// Move focus to the next pane within the active tab, wrapping. No-op when
-    /// the active tab has fewer than two panes (`SessionsModel.swift:569`).
-    pub(crate) fn select_next_pane(&mut self, model: &mut TabModel) {
-        self.step_active_pane(model, 1);
+    /// Move focus to the next window within the active session, wrapping. No-op when
+    /// the active session has fewer than two windows (`SessionsModel.swift:569`).
+    pub(crate) fn select_next_window(&mut self, model: &mut WorkspaceModel) {
+        self.step_active_window(model, 1);
     }
 
-    /// Move focus to the previous pane within the active tab, wrapping
+    /// Move focus to the previous window within the active session, wrapping
     /// (`SessionsModel.swift:572`).
-    pub(crate) fn select_prev_pane(&mut self, model: &mut TabModel) {
-        self.step_active_pane(model, -1);
+    pub(crate) fn select_prev_window(&mut self, model: &mut WorkspaceModel) {
+        self.step_active_window(model, -1);
     }
 
-    /// Wrapping step of the active tab's active pane by `offset`, routed through
-    /// [`set_active_pane`](Self::set_active_pane) so the ack side effect rides
+    /// Wrapping step of the active session's active window by `offset`, routed through
+    /// [`set_active_window`](Self::set_active_window) so the ack side effect rides
     /// along (and, in the live app, the deferred spawn + focus the caller adds).
-    /// No-op when there is no active tab, the tab has fewer than two panes, or
-    /// its active pane isn't resolvable (`SessionsModel.swift:574-584`).
-    fn step_active_pane(&mut self, model: &mut TabModel, offset: isize) {
-        let Some(tab_id) = model.active_tab_id().map(str::to_owned) else {
+    /// No-op when there is no active session, the session has fewer than two windows, or
+    /// its active window isn't resolvable (`SessionsModel.swift:574-584`).
+    fn step_active_window(&mut self, model: &mut WorkspaceModel, offset: isize) {
+        let Some(session_id) = model.active_session_id().map(str::to_owned) else {
             return;
         };
-        let Some(tab) = model.tab_for(&tab_id) else {
+        let Some(session) = model.session_for(&session_id) else {
             return;
         };
-        let count = tab.panes.len();
+        let count = session.windows.len();
         if count < 2 {
             return;
         }
-        let Some(active) = tab.active_pane_id.clone() else {
+        let Some(active) = session.active_window_id.clone() else {
             return;
         };
-        let Some(cur) = tab.panes.iter().position(|p| p.id == active) else {
+        let Some(cur) = session.windows.iter().position(|p| p.id == active) else {
             return;
         };
         // `((i + off) % n + n) % n`, expressed with rem_euclid.
         let next = (cur as isize + offset).rem_euclid(count as isize) as usize;
-        let next_id = tab.panes[next].id.clone();
-        self.set_active_pane(model, &tab_id, &next_id);
+        let next_id = session.windows[next].id.clone();
+        self.set_active_window(model, &session_id, &next_id);
     }
 
-    /// Append a new **terminal** pane to `tab_id`, focus it, and return its new
-    /// id (`None` if the tab is unknown). The model half of Swift's `addPane`
-    /// (`SessionsModel.swift:592-636`): only terminal-kind panes are
-    /// constructible here — Claude panes are created exclusively by the
-    /// claude-tab paths, preserving the ≤1-Claude-per-tab creation edge. The
+    /// Append a new **terminal** window to `session_id`, focus it, and return its new
+    /// id (`None` if the session is unknown). The model half of Swift's `addPane`
+    /// (`SessionsModel.swift:592-636`): only terminal-kind windows are
+    /// constructible here — Claude windows are created exclusively by the
+    /// claude-session paths, preserving the ≤1-Claude-per-session creation edge. The
     /// monotonic `next_terminal_index` counter is consumed via
-    /// [`TabModel::add_pane`] (an explicit `title` consumes the slot too).
+    /// [`WorkspaceModel::add_window`] (an explicit `title` consumes the slot too).
     ///
     /// The live app spawns the pty behind this immediately (explicit adds are
-    /// **not** deferred — deferred spawn is only for panes modelled up front by a
-    /// tab-creation path); slice 3 composes [`spawn_pane`](Self::spawn_pane) after
+    /// **not** deferred — deferred spawn is only for windows modelled up front by a
+    /// session-creation path); slice 3 composes [`spawn_window`](Self::spawn_window) after
     /// the model mutation.
-    pub(crate) fn add_pane(
+    pub(crate) fn add_window(
         &mut self,
-        model: &mut TabModel,
-        tab_id: &str,
+        model: &mut WorkspaceModel,
+        session_id: &str,
         title: Option<String>,
     ) -> Option<String> {
-        // Guard before minting so an unknown tab wastes no id (Swift guards
-        // `tabs.tab(for:)` first).
-        model.tab_for(tab_id)?;
-        let new_id = self.mint(&format!("{tab_id}-p"));
-        model.add_pane(tab_id, new_id, title)
+        // Guard before minting so an unknown session wastes no id (Swift guards
+        // `sessions.session(for:)` first).
+        model.session_for(session_id)?;
+        let new_id = self.mint(&format!("{session_id}-p"));
+        model.add_window(session_id, new_id, title)
     }
 
-    /// Append a terminal pane to the active tab and focus it; no-op (returns
-    /// `None`) when there is no active tab (`SessionsModel.swift:640-643`).
-    pub(crate) fn add_terminal_to_active_tab(&mut self, model: &mut TabModel) -> Option<String> {
-        let tab_id = model.active_tab_id().map(str::to_owned)?;
-        self.add_pane(model, &tab_id, None)
+    /// Append a terminal window to the active session and focus it; no-op (returns
+    /// `None`) when there is no active session (`SessionsModel.swift:640-643`).
+    pub(crate) fn add_terminal_to_active_session(&mut self, model: &mut WorkspaceModel) -> Option<String> {
+        let session_id = model.active_session_id().map(str::to_owned)?;
+        self.add_window(model, &session_id, None)
     }
 
     // MARK: - Launch overlay registry (pure model, unit-tested)
 
-    /// Record that a pane was just spawned and start the grace window (Swift's
+    /// Record that a window was just spawned and start the grace window (Swift's
     /// `registerPaneLaunch`, `SessionsModel.swift:506-520`). The entry lands
     /// `Pending`; if it stays silent past [`launch_overlay_grace`](Self::launch_overlay_grace)
     /// it promotes to `Visible` and the shell paints "Launching…", and if
-    /// [`clear_pane_launch`](Self::clear_pane_launch) fires first (first byte /
+    /// [`clear_window_launch`](Self::clear_window_launch) fires first (first byte /
     /// exit / held) the overlay never appears.
     ///
     /// A `<= 0` grace promotes **synchronously** here (the test seam — no
     /// deadline hop). Otherwise this returns `true`: the live caller (slice 3)
     /// arms R7's App-Nap-safe [`nice_term_view::LaunchDeadline`] and calls
-    /// [`promote_pane_launch`](Self::promote_pane_launch) when it fires. That
+    /// [`promote_window_launch`](Self::promote_window_launch) when it fires. That
     /// method's `Pending`-guard covers the clear-before-fire race, so a coalesced
     /// or late deadline never resurrects a cleared overlay.
-    pub(crate) fn register_pane_launch(&mut self, pane_id: &str, command: impl Into<String>) -> bool {
+    pub(crate) fn register_window_launch(&mut self, term_window_id: &str, command: impl Into<String>) -> bool {
         let command = command.into();
-        self.pane_launch_states
-            .insert(pane_id.to_string(), PaneLaunchStatus::Pending { command });
+        self.window_launch_states
+            .insert(term_window_id.to_string(), WindowLaunchStatus::Pending { command });
         if self.launch_overlay_grace <= Duration::ZERO {
-            self.promote_pane_launch(pane_id);
+            self.promote_window_launch(term_window_id);
             false
         } else {
             true
@@ -711,25 +711,25 @@ impl SessionManager {
     /// fired (Swift's inline `promote` closure). A no-op once the entry was
     /// cleared or already promoted, so a deadline that fires after the first byte
     /// never resurrects the overlay.
-    pub(crate) fn promote_pane_launch(&mut self, pane_id: &str) {
-        if let Some(PaneLaunchStatus::Pending { command }) = self.pane_launch_states.get(pane_id) {
+    pub(crate) fn promote_window_launch(&mut self, term_window_id: &str) {
+        if let Some(WindowLaunchStatus::Pending { command }) = self.window_launch_states.get(term_window_id) {
             let command = command.clone();
-            self.pane_launch_states
-                .insert(pane_id.to_string(), PaneLaunchStatus::Visible { command });
+            self.window_launch_states
+                .insert(term_window_id.to_string(), WindowLaunchStatus::Visible { command });
         }
     }
 
-    /// Remove any pending/visible overlay for `pane_id` (Swift's `clearPaneLaunch`).
-    /// Fired on first pty byte, pane exit, and held so a process that dies before
+    /// Remove any pending/visible overlay for `term_window_id` (Swift's `clearPaneLaunch`).
+    /// Fired on first pty byte, window exit, and held so a process that dies before
     /// emitting anything leaves no orphan "Launching…" placeholder.
-    pub(crate) fn clear_pane_launch(&mut self, pane_id: &str) {
-        self.pane_launch_states.remove(pane_id);
+    pub(crate) fn clear_window_launch(&mut self, term_window_id: &str) {
+        self.window_launch_states.remove(term_window_id);
     }
 
-    /// The launch-overlay entry for `pane_id`, if any (the shell reads it to
+    /// The launch-overlay entry for `term_window_id`, if any (the shell reads it to
     /// paint the placeholder; tests assert on it).
-    pub(crate) fn pane_launch_state(&self, pane_id: &str) -> Option<&PaneLaunchStatus> {
-        self.pane_launch_states.get(pane_id)
+    pub(crate) fn window_launch_state(&self, term_window_id: &str) -> Option<&WindowLaunchStatus> {
+        self.window_launch_states.get(term_window_id)
     }
 
     /// Override the launch-overlay grace window (the `launchOverlayGraceSeconds`
@@ -738,165 +738,165 @@ impl SessionManager {
         self.launch_overlay_grace = grace;
     }
 
-    // MARK: - Pane lifecycle handlers (pure model + cascade; unit-tested)
+    // MARK: - Window lifecycle handlers (pure model + cascade; unit-tested)
 
-    /// A pane's child exited cleanly — the exact 5-step Swift `paneExited`
+    /// A window's child exited cleanly — the exact 5-step Swift `paneExited`
     /// ordering (`SessionsModel.swift:318-346`): (1) clear the launch overlay;
-    /// (2) remove the pane from its tab, re-pointing `active_pane_id` to the slot
+    /// (2) remove the window from its session, re-pointing `active_window_id` to the slot
     /// neighbor via the same rule a cross-window move uses
-    /// ([`TabModel::neighbor_active_pane_id`]); (3) release the pane's pty session;
-    /// (5) if the tab is now empty, run the dissolve cascade synchronously with
+    /// ([`WorkspaceModel::neighbor_active_window_id`]); (3) release the window's pty session;
+    /// (5) if the session is now empty, run the dissolve cascade synchronously with
     /// indices resolved at that instant.
     ///
     /// **Step 4 — the deferred-companion spawn — is the caller's gpui side
     /// effect.** It has no model-observable effect (it only forks a pty) and is
-    /// mutually exclusive with the dissolve (a surviving tab may spawn; a
-    /// dissolved one cannot), so this returns [`PaneExitResolution`]: the live
-    /// caller runs [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)
-    /// on `refocus_tab` (Swift's step 4) and actuates `terminus`. Applying them
+    /// mutually exclusive with the dissolve (a surviving session may spawn; a
+    /// dissolved one cannot), so this returns [`WindowExitResolution`]: the live
+    /// caller runs [`ensure_active_window_spawned`](Self::ensure_active_window_spawned)
+    /// on `refocus_session` (Swift's step 4) and actuates `terminus`. Applying them
     /// after this pure cascade is observably identical to Swift's inline order.
-    /// Silently drops a stale tab/pane id.
-    pub(crate) fn pane_exited(
+    /// Silently drops a stale session/window id.
+    pub(crate) fn window_exited(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
-        tab_id: &str,
-        pane_id: &str,
-    ) -> PaneExitResolution {
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
+        term_window_id: &str,
+    ) -> WindowExitResolution {
         // (1) clear the launch overlay.
-        self.clear_pane_launch(pane_id);
+        self.clear_window_launch(term_window_id);
         // (2) model removal + neighbor refocus.
-        model.mutate_tab(tab_id, |tab| {
-            if let Some(idx) = tab.panes.iter().position(|p| p.id == pane_id) {
-                tab.panes.remove(idx);
-                if tab.active_pane_id.as_deref() == Some(pane_id) {
-                    tab.active_pane_id = TabModel::neighbor_active_pane_id(idx, &tab.panes);
+        model.mutate_session(session_id, |session| {
+            if let Some(idx) = session.windows.iter().position(|p| p.id == term_window_id) {
+                session.windows.remove(idx);
+                if session.active_window_id.as_deref() == Some(term_window_id) {
+                    session.active_window_id = WorkspaceModel::neighbor_active_window_id(idx, &session.windows);
                 }
             }
         });
         // (3) pty release.
-        self.release_pane_session(tab_id, pane_id);
-        // (5) dissolve check — the empty-tab callback's indices are valid only
+        self.release_window_pty(session_id, term_window_id);
+        // (5) dissolve check — the empty-session callback's indices are valid only
         // because nothing runs in between (Swift keeps this synchronous). The
-        // caller runs step 4 (spawn) on `refocus_tab` on the way out.
-        match model.tab_for(tab_id) {
-            Some(tab) if tab.panes.is_empty() => {
-                let terminus = match model.project_tab_index(tab_id) {
-                    Some((pi, ti)) => self.finalize_dissolved_tab(model, selection, pi, ti, tab_id),
+        // caller runs step 4 (spawn) on `refocus_session` on the way out.
+        match model.session_for(session_id) {
+            Some(session) if session.windows.is_empty() => {
+                let terminus = match model.project_session_index(session_id) {
+                    Some((pi, ti)) => self.finalize_dissolved_session(model, selection, pi, ti, session_id),
                     None => DissolveTerminus::None,
                 };
-                PaneExitResolution {
-                    refocus_tab: None,
+                WindowExitResolution {
+                    refocus_session: None,
                     terminus,
                 }
             }
-            Some(_) => PaneExitResolution {
-                // Tab survived: focus may have auto-switched onto a deferred
+            Some(_) => WindowExitResolution {
+                // Session survived: focus may have auto-switched onto a deferred
                 // companion — the live caller spawns it before anything else.
-                refocus_tab: Some(tab_id.to_string()),
+                refocus_session: Some(session_id.to_string()),
                 terminus: DissolveTerminus::None,
             },
-            None => PaneExitResolution::default(),
+            None => WindowExitResolution::default(),
         }
     }
 
-    /// A pane's process exited but its view stays mounted so the user can read
+    /// A window's process exited but its view stays mounted so the user can read
     /// the scrollback (Swift's `paneHeld`, `SessionsModel.swift:362-377`): clear
     /// the launch overlay, flip `is_alive` false, and idle out any pulsing status
     /// so the rest of the model (sidebar dot, live counts, `has_claude`) treats
-    /// the pane as dead — while leaving it in `tab.panes` so the pill + view stay
-    /// on screen. The model removal happens later when the user closes the tab
-    /// ([`terminate_pane`](Self::terminate_pane) synthesizes the deferred exit).
-    /// Silently drops a stale tab/pane id.
-    pub(crate) fn pane_held(&mut self, model: &mut TabModel, tab_id: &str, pane_id: &str) {
-        self.clear_pane_launch(pane_id);
-        model.mutate_tab(tab_id, |tab| {
-            if let Some(pane) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
-                pane.is_alive = false;
-                // A held-dead pane is not thinking or waiting regardless of its
+    /// the window as dead — while leaving it in `session.term_windows` so the pill + view stay
+    /// on screen. The model removal happens later when the user closes the session
+    /// ([`terminate_window`](Self::terminate_window) synthesizes the deferred exit).
+    /// Silently drops a stale session/window id.
+    pub(crate) fn window_held(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
+        self.clear_window_launch(term_window_id);
+        model.mutate_session(session_id, |session| {
+            if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                term_window.is_alive = false;
+                // A held-dead window is not thinking or waiting regardless of its
                 // last OSC title; idle it and clear the ack so a future fresh
-                // waiting pane can pulse again.
-                pane.status = TabStatus::Idle;
-                pane.waiting_acknowledged = false;
-                // Clear the promotion flag so a fresh `claude` in this tab routes
+                // waiting window can pulse again.
+                term_window.status = SessionStatus::Idle;
+                term_window.waiting_acknowledged = false;
+                // Clear the promotion flag so a fresh `claude` in this session routes
                 // correctly (R15) — a held pty is a corpse, not a live shell.
-                pane.is_claude_running = false;
+                term_window.is_claude_running = false;
             }
         });
     }
 
-    /// Drop a single pane's pty session from the cache (Swift's
-    /// `ptySessions[tabId]?.removePane`). Keeps the (possibly now-empty) per-tab
+    /// Drop a single window's pty session from the cache (Swift's
+    /// `ptySessions[tabId]?.removePane`). Keeps the (possibly now-empty) per-session
     /// container; the dissolve cascade drops that separately. Dropping the
     /// [`TerminalSessionHandle`] tears its child process group down
     /// (SIGHUP→SIGKILL via `nice_term_core::Session::drop`), so no orphan zsh.
-    fn release_pane_session(&mut self, tab_id: &str, pane_id: &str) {
-        if let Some(panes) = self.tabs.get_mut(tab_id) {
-            panes.remove(pane_id);
+    fn release_window_pty(&mut self, session_id: &str, term_window_id: &str) {
+        if let Some(windows) = self.sessions.get_mut(session_id) {
+            windows.remove(term_window_id);
         }
     }
 
     // MARK: - Dissolve cascade (pure core + gpui terminus; unit-tested)
 
-    /// Finish dissolving a tab whose `panes` array reached zero — the synchronous
+    /// Finish dissolving a session whose `term_windows` array reached zero — the synchronous
     /// core of Swift's `AppState.finalizeDissolvedTab` (`AppState.swift:326-373`),
-    /// in its exact order: `remove_tab` (the **single** removal entry point, which
+    /// in its exact order: `remove_session` (the **single** removal entry point, which
     /// does the parent-pointer sweep) → pty-session release → selection prune →
-    /// active-tab fallback in [`TabModel::navigable_sidebar_tab_ids`] order. The
+    /// active-session fallback in [`WorkspaceModel::navigable_sidebar_session_ids`] order. The
     /// later-row subscriber hooks stay **declared but inert** (see the body).
     /// Returns the every-project-empty [`DissolveTerminus`] the gpui caller
     /// actuates via [`apply_dissolve_terminus`](Self::apply_dissolve_terminus).
     ///
     /// Delivery is synchronous by contract: `(pi, ti)` are valid only because
-    /// nothing runs between the empty-tab check and this call.
-    fn finalize_dissolved_tab(
+    /// nothing runs between the empty-session check and this call.
+    fn finalize_dissolved_session(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
         pi: usize,
         ti: usize,
-        tab_id: &str,
+        session_id: &str,
     ) -> DissolveTerminus {
         // Core: the single removal entry point (array remove + parent-pointer
         // sweep, atomically — a future close path can't orphan a /branch child).
-        model.remove_tab(pi, ti);
+        model.remove_session(pi, ti);
         // pty-session release (Swift's `removePtySession`).
-        self.tabs.remove(tab_id);
+        self.sessions.remove(session_id);
 
         // Subscriber hooks (later rows):
-        //   * file-browser per-tab cleanup (R19): record the dissolved tab id so
+        //   * file-browser per-session cleanup (R19): record the dissolved session id so
         //     `WindowState` drops its `FileBrowserStore` entry after the cascade
-        //     (the single tab-removal entry point, so every dissolve path — UI
-        //     close AND the pane-exit route — funnels one removal list).
-        self.dissolved_tab_ids.push(tab_id.to_string());
+        //     (the single session-removal entry point, so every dissolve path — UI
+        //     close AND the window-exit route — funnels one removal list).
+        self.dissolved_session_ids.push(session_id.to_string());
         //   * debounced session save (onSessionMutation) → the UI-close callers
         //     (`WindowState::save_to_store`) schedule it; R18.
 
         // Selection prune (R10 multi-select): drop the dissolved id (and clear a
         // dangling anchor/active mirror) before any view re-renders against the
         // shrunken tree. Uses the post-removal navigable set.
-        let valid: HashSet<String> = model.navigable_sidebar_tab_ids().into_iter().collect();
+        let valid: HashSet<String> = model.navigable_sidebar_session_ids().into_iter().collect();
         selection.prune(&valid);
 
-        // Active-tab fallback via navigable order (Swift's `firstAvailableTabId`).
-        if model.active_tab_id() == Some(tab_id) {
-            if let Some(fallback) = model.navigable_sidebar_tab_ids().into_iter().next() {
-                model.select_tab(&fallback);
+        // Active-session fallback via navigable order (Swift's `firstAvailableTabId`).
+        if model.active_session_id() == Some(session_id) {
+            if let Some(fallback) = model.navigable_sidebar_session_ids().into_iter().next() {
+                model.select_session(&fallback);
             }
-            // else: no navigable tab remains — the window is empty and closes /
-            // quits below (the `TabModel` has no `None` active-tab writer, and
+            // else: no navigable session remains — the window is empty and closes /
+            // quits below (the `WorkspaceModel` has no `None` active-session writer, and
             // the window is going away, so leaving the stale id is harmless).
         }
 
         // W5 (R18) project-pending-removal (Swift `AppState.finalizeDissolvedTab:349-355`):
-        // if the user asked to close this whole project and its last tab just
+        // if the user asked to close this whole project and its last session just
         // dissolved, drop the (non-Terminals) row. Read without clearing until it
-        // empties so earlier-tab dissolves in a multi-tab project keep the flag.
+        // empties so earlier-session dissolves in a multi-session project keep the flag.
         if pi < model.projects.len() {
             let project_id = model.projects[pi].id.clone();
             if self.pending_project_removal.contains(&project_id)
-                && model.projects[pi].tabs.is_empty()
-                && project_id != TabModel::TERMINALS_PROJECT_ID
+                && model.projects[pi].sessions.is_empty()
+                && project_id != WorkspaceModel::TERMINALS_PROJECT_ID
             {
                 self.pending_project_removal.remove(&project_id);
                 model.projects.remove(pi);
@@ -905,275 +905,275 @@ impl SessionManager {
 
         // Every-project-empty terminus (Swift closes this window when another is
         // live, else quits the app).
-        if model.projects.iter().all(|p| p.tabs.is_empty()) {
+        if model.projects.iter().all(|p| p.sessions.is_empty()) {
             DissolveTerminus::WindowEmptied
         } else {
             DissolveTerminus::None
         }
     }
 
-    /// Dissolve `tab_id` if a cross-window move / tear-off left it with no panes,
-    /// running the same cascade a last-pane exit would (Swift's
-    /// `dissolveTabIfEmpty`, `AppState.swift:382-387`). No-op when the tab still
-    /// has panes or doesn't exist. This is the dissolve entry point for the R25
-    /// `extract_pane` path, which bypasses the pane-exit callback — **modelled
+    /// Dissolve `session_id` if a cross-window move / tear-off left it with no windows,
+    /// running the same cascade a last-window exit would (Swift's
+    /// `dissolveTabIfEmpty`, `AppState.swift:382-387`). No-op when the session still
+    /// has windows or doesn't exist. This is the dissolve entry point for the R25
+    /// `extract_window` path, which bypasses the window-exit callback — **modelled
     /// now, unused this cycle** (no cross-window migration until R25).
-    pub(crate) fn dissolve_tab_if_empty(
+    pub(crate) fn dissolve_session_if_empty(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
-        tab_id: &str,
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
     ) -> DissolveTerminus {
-        match model.project_tab_index(tab_id) {
-            Some((pi, ti)) if model.projects[pi].tabs[ti].panes.is_empty() => {
-                self.finalize_dissolved_tab(model, selection, pi, ti, tab_id)
+        match model.project_session_index(session_id) {
+            Some((pi, ti)) if model.projects[pi].sessions[ti].windows.is_empty() => {
+                self.finalize_dissolved_session(model, selection, pi, ti, session_id)
             }
             _ => DissolveTerminus::None,
         }
     }
 
-    /// Close an entire tab unconditionally (this cycle has no confirmation — W5 is
+    /// Close an entire session unconditionally (this cycle has no confirmation — W5 is
     /// R18), the Rust twin of `CloseRequestCoordinator.hardKillTab`
     /// (`CloseRequestCoordinator.swift:297-363`). The third dissolve entry point.
     ///
-    /// Splits panes by [`pane_is_spawned`](Self::pane_is_spawned).
-    /// [`terminate_pane`](Self::terminate_pane) is a no-op for a **model-only**
-    /// pane (no session at all — the lazy companion the user never focused), so
+    /// Splits windows by [`window_is_spawned`](Self::window_is_spawned).
+    /// [`terminate_window`](Self::terminate_window) is a no-op for a **model-only**
+    /// window (no session at all — the lazy companion the user never focused), so
     /// those are dropped from the model directly; otherwise a SIGHUP-only close
-    /// would leave them behind and the tab would never dissolve. Unspawned rows
-    /// are dropped **before** terminating the spawned ones so a held pane's
-    /// synchronous `pane_exited` sees an already-pruned array and its empty-tab
+    /// would leave them behind and the session would never dissolve. Unspawned rows
+    /// are dropped **before** terminating the spawned ones so a held window's
+    /// synchronous `window_exited` sees an already-pruned array and its empty-session
     /// check fires (the tri-state close bug the Swift reorder fixed). Returns the
     /// aggregate [`DissolveTerminus`].
-    pub(crate) fn close_tab(
+    pub(crate) fn close_session(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
-        tab_id: &str,
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
     ) -> DissolveTerminus {
-        let Some(tab) = model.tab_for(tab_id) else {
+        let Some(session) = model.session_for(session_id) else {
             return DissolveTerminus::None;
         };
         let mut spawned: Vec<String> = Vec::new();
         let mut unspawned: Vec<String> = Vec::new();
-        for pane in &tab.panes {
-            if self.pane_is_spawned(tab_id, &pane.id) {
-                spawned.push(pane.id.clone());
+        for term_window in &session.windows {
+            if self.window_is_spawned(session_id, &term_window.id) {
+                spawned.push(term_window.id.clone());
             } else {
-                unspawned.push(pane.id.clone());
+                unspawned.push(term_window.id.clone());
             }
         }
 
         if !unspawned.is_empty() {
             if spawned.is_empty() {
-                // Model-only tab: nothing async to hook into — clear the panes and
+                // Model-only session: nothing async to hook into — clear the windows and
                 // dissolve synchronously (Validation probe (d)).
-                model.mutate_tab(tab_id, |tab| {
-                    tab.panes.clear();
-                    tab.active_pane_id = None;
+                model.mutate_session(session_id, |session| {
+                    session.windows.clear();
+                    session.active_window_id = None;
                 });
-                return match model.project_tab_index(tab_id) {
-                    Some((pi, ti)) => self.finalize_dissolved_tab(model, selection, pi, ti, tab_id),
+                return match model.project_session_index(session_id) {
+                    Some((pi, ti)) => self.finalize_dissolved_session(model, selection, pi, ti, session_id),
                     None => DissolveTerminus::None,
                 };
             }
             // Drop unspawned rows up front (before terminating spawned ones).
             let drop: HashSet<String> = unspawned.into_iter().collect();
-            model.mutate_tab(tab_id, |tab| {
-                tab.panes.retain(|p| !drop.contains(&p.id));
-                let active_dropped = tab
-                    .active_pane_id
+            model.mutate_session(session_id, |session| {
+                session.windows.retain(|p| !drop.contains(&p.id));
+                let active_dropped = session
+                    .active_window_id
                     .as_deref()
                     .is_some_and(|a| drop.contains(a));
                 if active_dropped {
-                    tab.active_pane_id = tab.panes.first().map(|p| p.id.clone());
+                    session.active_window_id = session.windows.first().map(|p| p.id.clone());
                 }
             });
         }
 
         let mut terminus = DissolveTerminus::None;
-        for pane_id in spawned {
-            terminus = terminus.or(self.terminate_pane(model, selection, tab_id, &pane_id).terminus);
+        for term_window_id in spawned {
+            terminus = terminus.or(self.terminate_window(model, selection, session_id, &term_window_id).terminus);
         }
         terminus
     }
 
     // MARK: - Termination (pure model + synthetic seams; unit-tested)
 
-    /// SIGHUP→SIGKILL the named pane and drop its pty, driving the model removal
-    /// through [`pane_exited`](Self::pane_exited) — the Rust twin of
+    /// SIGHUP→SIGKILL the named window and drop its pty, driving the model removal
+    /// through [`window_exited`](Self::window_exited) — the Rust twin of
     /// `TabPtySession.terminatePane` (`TabPtySession.swift:680-715`). Three fast
     /// paths mirror Swift, in order:
     ///
-    /// * **Synthetic held** — fires `pane_exited` synchronously (the production
-    ///   held-pane fast path); the marker is consumed (one-shot).
+    /// * **Synthetic held** — fires `window_exited` synchronously (the production
+    ///   held-window fast path); the marker is consumed (one-shot).
     /// * **Synthetic armed-but-not-fired** — same, for a captured deferred spawn
     ///   that never forked (nil-status synthesized exit).
-    /// * **Live/held real session** — `pane_exited`'s step-3 drop tears the child
-    ///   group down and unconditionally removes the model pane. This is the
+    /// * **Live/held real session** — `window_exited`'s step-3 drop tears the child
+    ///   group down and unconditionally removes the model window. This is the
     ///   "intentional-terminate flag set **before** the pid guard" contract:
-    ///   the pane always drops (never holds), even if its child never got a pid.
+    ///   the window always drops (never holds), even if its child never got a pid.
     ///
-    /// A **model-only** pane (no session, no synthetic marker) is a no-op —
+    /// A **model-only** window (no session, no synthetic marker) is a no-op —
     /// matching Swift's `guard var entry = entries[id] else { return }`;
-    /// [`close_tab`](Self::close_tab) removes those from the model up front.
-    /// Returns the [`PaneExitResolution`] of the synthesized exit (so a
-    /// single-pane close can spawn a refocused companion / actuate the terminus).
-    pub(crate) fn terminate_pane(
+    /// [`close_session`](Self::close_session) removes those from the model up front.
+    /// Returns the [`WindowExitResolution`] of the synthesized exit (so a
+    /// single-window close can spawn a refocused companion / actuate the terminus).
+    pub(crate) fn terminate_window(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
-        tab_id: &str,
-        pane_id: &str,
-    ) -> PaneExitResolution {
-        let key = synthetic_key(tab_id, pane_id);
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
+        term_window_id: &str,
+    ) -> WindowExitResolution {
+        let key = synthetic_key(session_id, term_window_id);
         if self.synthetic_held.remove(&key) {
             self.synthetic_spawned.remove(&key);
-            return self.pane_exited(model, selection, tab_id, pane_id);
+            return self.window_exited(model, selection, session_id, term_window_id);
         }
         if self.synthetic_armed.remove(&key) {
             self.synthetic_spawned.remove(&key);
-            return self.pane_exited(model, selection, tab_id, pane_id);
+            return self.window_exited(model, selection, session_id, term_window_id);
         }
-        if self.has_pane(tab_id, pane_id) {
-            return self.pane_exited(model, selection, tab_id, pane_id);
+        if self.has_window(session_id, term_window_id) {
+            return self.window_exited(model, selection, session_id, term_window_id);
         }
-        PaneExitResolution::default()
+        WindowExitResolution::default()
     }
 
-    /// Tear down every live pane on `tab_id` (Swift's `SessionsModel.terminateAll`
-    /// → `TabPtySession.terminateAll`, `:838-854`). **Snapshots the pane ids up
-    /// front** because each [`terminate_pane`](Self::terminate_pane) → held
-    /// `pane_exited` mutates the cache and the tree mid-loop (synthesized exits
+    /// Tear down every live window on `session_id` (Swift's `SessionsModel.terminateAll`
+    /// → `TabPtySession.terminateAll`, `:838-854`). **Snapshots the window ids up
+    /// front** because each [`terminate_window`](Self::terminate_window) → held
+    /// `window_exited` mutates the cache and the tree mid-loop (synthesized exits
     /// re-enter removal); a live iterator would skip or double-visit an entry.
     /// Returns the aggregate [`DissolveTerminus`].
     pub(crate) fn terminate_all(
         &mut self,
-        model: &mut TabModel,
-        selection: &mut SidebarTabSelection,
-        tab_id: &str,
+        model: &mut WorkspaceModel,
+        selection: &mut SidebarSessionSelection,
+        session_id: &str,
     ) -> DissolveTerminus {
-        // Snapshot: every live-session pane id for this tab, plus any synthetic
-        // marker (held/armed panes have no `self.tabs` entry).
+        // Snapshot: every live-session window id for this session, plus any synthetic
+        // marker (held/armed windows have no `self.sessions` entry).
         let mut ids: Vec<String> = self
-            .tabs
-            .get(tab_id)
-            .map(|panes| panes.keys().cloned().collect())
+            .sessions
+            .get(session_id)
+            .map(|windows| windows.keys().cloned().collect())
             .unwrap_or_default();
-        let prefix = format!("{tab_id}:");
+        let prefix = format!("{session_id}:");
         for key in &self.synthetic_spawned {
-            if let Some(pane_id) = key.strip_prefix(&prefix) {
-                let pane_id = pane_id.to_string();
-                if !ids.contains(&pane_id) {
-                    ids.push(pane_id);
+            if let Some(term_window_id) = key.strip_prefix(&prefix) {
+                let term_window_id = term_window_id.to_string();
+                if !ids.contains(&term_window_id) {
+                    ids.push(term_window_id);
                 }
             }
         }
 
         let mut terminus = DissolveTerminus::None;
-        for pane_id in ids {
-            terminus = terminus.or(self.terminate_pane(model, selection, tab_id, &pane_id).terminus);
+        for term_window_id in ids {
+            terminus = terminus.or(self.terminate_window(model, selection, session_id, &term_window_id).terminus);
         }
         terminus
     }
 
-    /// Whether `(tab_id, pane_id)` counts as spawned for close routing — a real
+    /// Whether `(session_id, term_window_id)` counts as spawned for close routing — a real
     /// live session **or** a synthetic marker (Swift's `paneIsSpawned`). Drives
-    /// [`close_tab`](Self::close_tab)'s spawned/unspawned split.
-    pub(crate) fn pane_is_spawned(&self, tab_id: &str, pane_id: &str) -> bool {
+    /// [`close_session`](Self::close_session)'s spawned/unspawned split.
+    pub(crate) fn window_is_spawned(&self, session_id: &str, term_window_id: &str) -> bool {
         self.synthetic_spawned
-            .contains(&synthetic_key(tab_id, pane_id))
-            || self.has_pane(tab_id, pane_id)
+            .contains(&synthetic_key(session_id, term_window_id))
+            || self.has_window(session_id, term_window_id)
     }
 
-    /// Test seam: mark `(tab_id, pane_id)` as a **held** pane without a real pty —
-    /// [`pane_is_spawned`](Self::pane_is_spawned) then returns `true` and
-    /// [`terminate_pane`](Self::terminate_pane) fires `pane_exited` synchronously,
+    /// Test seam: mark `(session_id, term_window_id)` as a **held** window without a real pty —
+    /// [`window_is_spawned`](Self::window_is_spawned) then returns `true` and
+    /// [`terminate_window`](Self::terminate_window) fires `window_exited` synchronously,
     /// letting close-flow tests build the held tri-state shape without racing a
     /// real child (Swift's `markSyntheticHeldPaneForTesting`).
-    pub(crate) fn mark_synthetic_held_pane(&mut self, tab_id: &str, pane_id: &str) {
-        let key = synthetic_key(tab_id, pane_id);
+    pub(crate) fn mark_synthetic_held_window(&mut self, session_id: &str, term_window_id: &str) {
+        let key = synthetic_key(session_id, term_window_id);
         self.synthetic_spawned.insert(key.clone());
         self.synthetic_held.insert(key);
     }
 
-    /// Test seam: mark `(tab_id, pane_id)` as an **armed-but-not-fired** deferred
-    /// spawn (a resume-deferred Claude pane whose view captured a spawn that never
-    /// forked) — [`pane_is_spawned`](Self::pane_is_spawned) returns `true` and
-    /// [`terminate_pane`](Self::terminate_pane) fires the nil-status `pane_exited`
+    /// Test seam: mark `(session_id, term_window_id)` as an **armed-but-not-fired** deferred
+    /// spawn (a resume-deferred Claude window whose view captured a spawn that never
+    /// forked) — [`window_is_spawned`](Self::window_is_spawned) returns `true` and
+    /// [`terminate_window`](Self::terminate_window) fires the nil-status `window_exited`
     /// synchronously (Swift's `markSyntheticArmedDeferredPaneForTesting`).
-    pub(crate) fn mark_synthetic_armed_deferred_pane(&mut self, tab_id: &str, pane_id: &str) {
-        let key = synthetic_key(tab_id, pane_id);
+    pub(crate) fn mark_synthetic_armed_deferred_window(&mut self, session_id: &str, term_window_id: &str) {
+        let key = synthetic_key(session_id, term_window_id);
         self.synthetic_spawned.insert(key.clone());
         self.synthetic_armed.insert(key);
     }
 
-    /// Test seam: turn the event-driven drain wake off for every session this
+    /// Test seam: turn the event-driven drain wake off for every pty this
     /// manager spawns from now on — see [`event_wakes_enabled`](Self::event_wakes_enabled).
-    /// A `#[gpui::test]` that spawns a pane AND runs the executor must call this
-    /// first, or the pane's exit-watcher thread eventually wakes the parked drain
+    /// A `#[gpui::test]` that spawns a window AND runs the executor must call this
+    /// first, or the window's exit-watcher thread eventually wakes the parked drain
     /// task cross-thread and trips gpui's determinism guard.
     #[cfg(test)]
     pub(crate) fn set_event_wakes_enabled_for_test(&mut self, enabled: bool) {
         self.event_wakes_enabled = enabled;
     }
 
-    /// R20.5 test seam: mark `(tab_id, pane_id)` as a terminal pane whose shell
+    /// R20.5 test seam: mark `(session_id, term_window_id)` as a terminal window whose shell
     /// has a **foreground child** — [`shell_has_foreground_child`](Self::shell_has_foreground_child)
     /// then reports it busy WITHOUT a real pty running a real command, so the
     /// busy-close → confirmation-modal wiring is unit-testable off the live
     /// `tcgetpgrp` syscall (covered once by the live scenario). Mirrors
-    /// [`mark_synthetic_held_pane`](Self::mark_synthetic_held_pane).
-    pub(crate) fn mark_synthetic_foreground_child(&mut self, tab_id: &str, pane_id: &str) {
+    /// [`mark_synthetic_held_window`](Self::mark_synthetic_held_window).
+    pub(crate) fn mark_synthetic_foreground_child(&mut self, session_id: &str, term_window_id: &str) {
         self.synthetic_foreground_child
-            .insert(synthetic_key(tab_id, pane_id));
+            .insert(synthetic_key(session_id, term_window_id));
     }
 
-    /// Whether `(tab_id, pane_id)`'s shell has a foreground child — R20.5's
-    /// terminal-busy signal (a `PaneKind::Terminal` pane is busy iff this is
+    /// Whether `(session_id, term_window_id)`'s shell has a foreground child — R20.5's
+    /// terminal-busy signal (a `TermWindowKind::Terminal` window is busy iff this is
     /// `true`). Consults the synthetic seam FIRST (a
     /// [`mark_synthetic_foreground_child`](Self::mark_synthetic_foreground_child)
     /// marker ⇒ `true`, so the busy→modal wiring is unit-testable without a real
     /// child), else reads the real session handle's
     /// [`has_foreground_child`](nice_term_view::TerminalSessionHandle::has_foreground_child)
     /// (which runs the `tcgetpgrp` probe inside `nice-term-core`; only a `bool`
-    /// crosses the boundary). A **model-only / absent** pane — no cached session
+    /// crosses the boundary). A **model-only / absent** window — no cached session
     /// and no synthetic marker — is NOT busy (`false`; mirrors Swift's
     /// `guard let entry = entries[id] else { return false }` — a lazy companion
     /// terminal never focused is idle, not busy).
     pub(crate) fn shell_has_foreground_child(
         &self,
-        tab_id: &str,
-        pane_id: &str,
+        session_id: &str,
+        term_window_id: &str,
         cx: &App,
     ) -> bool {
-        match self.synthetic_or_absent_foreground_child(tab_id, pane_id) {
+        match self.synthetic_or_absent_foreground_child(session_id, term_window_id) {
             Some(answer) => answer,
             // A real session is cached and no synthetic override applies — read
             // the true fd predicate off its handle.
             None => self
-                .pane_handle(tab_id, pane_id)
+                .term_window_handle(session_id, term_window_id)
                 .map(|handle| handle.read(cx).has_foreground_child())
                 .unwrap_or(false),
         }
     }
 
-    /// The synthetic-seam / absent-pane answer for
+    /// The synthetic-seam / absent-window answer for
     /// [`shell_has_foreground_child`](Self::shell_has_foreground_child), or `None`
     /// when a real handle must be read. Pure (no `cx`), so the seam-first and
     /// model-only-`false` paths are unit-testable without a gpui context (the
     /// `nice` crate links no gpui test-support):
     /// - a synthetic-foreground-child marker ⇒ `Some(true)`;
-    /// - no live session cached for this pane ⇒ `Some(false)` (model-only/absent);
+    /// - no live session cached for this window ⇒ `Some(false)` (model-only/absent);
     /// - otherwise ⇒ `None` (a real handle exists; read its fd predicate).
-    fn synthetic_or_absent_foreground_child(&self, tab_id: &str, pane_id: &str) -> Option<bool> {
+    fn synthetic_or_absent_foreground_child(&self, session_id: &str, term_window_id: &str) -> Option<bool> {
         if self
             .synthetic_foreground_child
-            .contains(&synthetic_key(tab_id, pane_id))
+            .contains(&synthetic_key(session_id, term_window_id))
         {
             return Some(true);
         }
-        if !self.has_pane(tab_id, pane_id) {
+        if !self.has_window(session_id, term_window_id) {
             return Some(false);
         }
         None
@@ -1194,7 +1194,7 @@ impl SessionManager {
     /// inside a `WindowState` entity lease via a *nested* `handle.update` on that
     /// same window (a `cx.subscribe` callback): the teardown would re-enter the
     /// still-leased entity and abort. Such callers MUST `cx.defer` this out of the
-    /// lease first (see [`WindowState::subscribe_spawned_panes`]).
+    /// lease first (see [`WindowState::subscribe_spawned_windows`]).
     ///
     /// This actuator does NOT touch the closing window's [`WindowState`] (that
     /// would re-lease it on the UI-close paths that call this mid-update). The
@@ -1218,86 +1218,86 @@ impl SessionManager {
 
     // MARK: - Session spawn / focus primitives (gpui; live-wired slice 3)
 
-    /// Whether `tab_id` has a session container (Swift's `ptySessions[tabId]`).
-    fn tab_has_session(&self, tab_id: &str) -> bool {
-        self.tabs.contains_key(tab_id)
+    /// Whether `session_id` has a session container (Swift's `ptySessions[tabId]`).
+    fn session_has_pty(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
     }
 
-    /// Whether `(tab_id, pane_id)` currently has a live pane session (Swift's
+    /// Whether `(session_id, term_window_id)` currently has a live window session (Swift's
     /// `session.hasPane`).
-    pub(crate) fn has_pane(&self, tab_id: &str, pane_id: &str) -> bool {
-        self.tabs
-            .get(tab_id)
-            .is_some_and(|panes| panes.contains_key(pane_id))
+    pub(crate) fn has_window(&self, session_id: &str, term_window_id: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|windows| windows.contains_key(term_window_id))
     }
 
-    /// The live session entity for `(tab_id, pane_id)`, if one is cached — the
+    /// The live session entity for `(session_id, term_window_id)`, if one is cached — the
     /// **slice-3 subscription seam**. The live wiring clones this out to
     /// `cx.subscribe` the window's [`crate::window_state::WindowState`] to the
-    /// pane's OSC / exit events (feeding them through
+    /// window's OSC / exit events (feeding them through
     /// [`route_terminal_event`](Self::route_terminal_event)), to read its grid for
     /// a readiness poll, and to write input. Cloning an [`Entity`] is a cheap
     /// refcount bump that does **not** keep the session alive past the manager's
     /// own release — a transient clone dropped after subscribing leaves the manager
-    /// the sole owner, so a later [`pane_exited`](Self::pane_exited) /
+    /// the sole owner, so a later [`window_exited`](Self::window_exited) /
     /// [`teardown`](Self::teardown) still tears the child process group down.
-    pub(crate) fn pane_handle(
+    pub(crate) fn term_window_handle(
         &self,
-        tab_id: &str,
-        pane_id: &str,
+        session_id: &str,
+        term_window_id: &str,
     ) -> Option<Entity<TerminalSessionHandle>> {
-        self.tabs
-            .get(tab_id)
-            .and_then(|panes| panes.get(pane_id))
+        self.sessions
+            .get(session_id)
+            .and_then(|windows| windows.get(term_window_id))
             .map(|session| session.handle.clone())
     }
 
-    /// Every `(tab_id, pane_id)` with a live pane session right now — the
+    /// Every `(session_id, term_window_id)` with a live window session right now — the
     /// enumeration the shipped window's subscribe-once sweep
-    /// ([`crate::window_state::WindowState::subscribe_spawned_panes`]) walks to
-    /// wire each freshly-spawned pane's entity to [`route_terminal_event`](Self::route_terminal_event).
+    /// ([`crate::window_state::WindowState::subscribe_spawned_windows`]) walks to
+    /// wire each freshly-spawned window's entity to [`route_terminal_event`](Self::route_terminal_event).
     /// Order is unspecified (a `HashMap` walk); the sweep dedupes by key, so
     /// order does not matter.
-    pub(crate) fn live_pane_keys(&self) -> Vec<(String, String)> {
-        self.tabs
+    pub(crate) fn live_window_keys(&self) -> Vec<(String, String)> {
+        self.sessions
             .iter()
-            .flat_map(|(tab_id, panes)| {
-                panes
+            .flat_map(|(session_id, windows)| {
+                windows
                     .keys()
-                    .map(move |pane_id| (tab_id.clone(), pane_id.clone()))
+                    .map(move |term_window_id| (session_id.clone(), term_window_id.clone()))
             })
             .collect()
     }
 
-    /// Register an **empty** per-tab session container without spawning any pane.
-    /// On the claude-tab creation path it runs just before the eager Claude spawn
-    /// (`create_claude_tab` calls `spawn_claude_pane` immediately — claude-kind
-    /// panes never lazy-spawn) while the companion terminal stays deferred.
-    /// It exists so [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)'s
-    /// "the tab already has a session" precondition holds when the user first
+    /// Register an **empty** per-session session container without spawning any window.
+    /// On the claude-session creation path it runs just before the eager Claude spawn
+    /// (`create_claude_session` calls `spawn_claude_window` immediately — claude-kind
+    /// windows never lazy-spawn) while the companion terminal stays deferred.
+    /// It exists so [`ensure_active_window_spawned`](Self::ensure_active_window_spawned)'s
+    /// "the session already has a session" precondition holds when the user first
     /// focuses the deferred companion. Idempotent.
-    pub(crate) fn register_tab_session(&mut self, tab_id: &str) {
-        self.tabs.entry(tab_id.to_string()).or_default();
+    pub(crate) fn register_session_pty(&mut self, session_id: &str) {
+        self.sessions.entry(session_id.to_string()).or_default();
     }
 
     /// Set this window's shell-injection env (Swift `SessionsModel.bootstrapSocket`).
-    /// Called once at window construction, BEFORE the Main pane forks, so every
-    /// pty spawned through [`spawn_pane`](Self::spawn_pane) inherits `NICE_SOCKET`
+    /// Called once at window construction, BEFORE the Main window forks, so every
+    /// pty spawned through [`spawn_window`](Self::spawn_window) inherits `NICE_SOCKET`
     /// / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from launch (the "env before fork"
     /// invariant the shell's `claude()` shadow depends on).
     pub(crate) fn set_window_shell_env(&mut self, env: WindowShellEnv) {
         self.window_shell_env = Some(env);
     }
 
-    /// The per-pane terminal env pairs this window injects into every pty
+    /// The per-window terminal env pairs this window injects into every pty
     /// (Swift `TabPtySession.addTerminalPane`'s `extraEnv`): `NICE_SOCKET` +
     /// `ZDOTDIR` (each only when set) + `NICE_USER_ZDOTDIR` (ALWAYS, empty string
     /// when Nice inherited none — the empty/absent distinction is semantic for the
-    /// `.zshenv` stub) + this pane's `NICE_TAB_ID` / `NICE_PANE_ID` (the handshake
+    /// `.zshenv` stub) + this window's `NICE_TAB_ID` / `NICE_PANE_ID` (the handshake
     /// identity the `claude()` shadow includes in its socket payload). Empty when
     /// the window bootstrapped no socket. Pure — no `cx`, so the env matrix is
     /// unit-tested directly (Validation §3 b/c).
-    fn window_pane_env_pairs(&self, tab_id: &str, pane_id: &str) -> Vec<(String, String)> {
+    fn session_window_env_pairs(&self, session_id: &str, term_window_id: &str) -> Vec<(String, String)> {
         let Some(env) = &self.window_shell_env else {
             return Vec::new();
         };
@@ -1315,200 +1315,200 @@ impl SessionManager {
         if let Some(conf) = &env.compose_conf {
             pairs.push(("NICE_COMPOSE_CONF".to_string(), conf.clone()));
         }
-        pairs.push(("NICE_TAB_ID".to_string(), tab_id.to_string()));
-        pairs.push(("NICE_PANE_ID".to_string(), pane_id.to_string()));
+        pairs.push(("NICE_TAB_ID".to_string(), session_id.to_string()));
+        pairs.push(("NICE_PANE_ID".to_string(), term_window_id.to_string()));
         pairs
     }
 
-    /// Spawn a live terminal session for `(tab_id, pane_id)` from `spec` and
-    /// cache it with a fresh key-focus handle. Idempotent per `(tab, pane)`.
+    /// Spawn a live terminal session for `(session_id, term_window_id)` from `spec` and
+    /// cache it with a fresh key-focus handle. Idempotent per `(session, window)`.
     ///
     /// R14: the window's shell-injection env
-    /// ([`window_pane_env_pairs`](Self::window_pane_env_pairs) — `NICE_SOCKET` /
+    /// ([`session_window_env_pairs`](Self::session_window_env_pairs) — `NICE_SOCKET` /
     /// `ZDOTDIR` / `NICE_USER_ZDOTDIR` / `NICE_TAB_ID` / `NICE_PANE_ID`) is merged
     /// into `spec.env` **spec-wins** ([`merge_env_spec_wins`]): a key already
     /// present on the caller-built spec (e.g. a deliberately-blanked `ZDOTDIR`)
     /// survives the injection. This is the single choke point every pty spawn
-    /// passes through, so it covers the Main pane, `ensure_active_pane_spawned`,
+    /// passes through, so it covers the Main window, `ensure_active_window_spawned`,
     /// and every future R15/R18 path for free.
-    pub(crate) fn spawn_pane(
+    pub(crate) fn spawn_window(
         &mut self,
-        tab_id: &str,
-        pane_id: &str,
+        session_id: &str,
+        term_window_id: &str,
         mut spec: SpawnSpec,
         cx: &mut App,
     ) -> Result<()> {
-        if self.has_pane(tab_id, pane_id) {
+        if self.has_window(session_id, term_window_id) {
             return Ok(());
         }
-        merge_env_spec_wins(&mut spec.env, self.window_pane_env_pairs(tab_id, pane_id));
-        self.spawn_session_raw(tab_id, pane_id, spec, cx)
+        merge_env_spec_wins(&mut spec.env, self.session_window_env_pairs(session_id, term_window_id));
+        self.spawn_session_raw(session_id, term_window_id, spec, cx)
     }
 
     /// Spawn + cache a live session from `spec` **verbatim** — no window
-    /// injection. The Claude spawn path ([`spawn_claude_pane`](Self::spawn_claude_pane))
-    /// uses this because a Claude pane's env is fully determined by
+    /// injection. The Claude spawn path ([`spawn_claude_window`](Self::spawn_claude_window))
+    /// uses this because a Claude window's env is fully determined by
     /// [`build_claude_extra_env`] (it deliberately omits `ZDOTDIR` for a
-    /// non-deferred pane, so it `exec`s claude under the user's own rc — matching
-    /// Swift's per-mode env); routing it through [`spawn_pane`](Self::spawn_pane)'s
+    /// non-deferred window, so it `exec`s claude under the user's own rc — matching
+    /// Swift's per-mode env); routing it through [`spawn_window`](Self::spawn_window)'s
     /// blanket injection would re-add `ZDOTDIR`/`NICE_USER_ZDOTDIR` it doesn't
-    /// want. Idempotent per `(tab, pane)`.
+    /// want. Idempotent per `(session, window)`.
     fn spawn_session_raw(
         &mut self,
-        tab_id: &str,
-        pane_id: &str,
+        session_id: &str,
+        term_window_id: &str,
         spec: SpawnSpec,
         cx: &mut App,
     ) -> Result<()> {
-        if self.has_pane(tab_id, pane_id) {
+        if self.has_window(session_id, term_window_id) {
             return Ok(());
         }
         let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
         // Deterministic-scheduler opt-out (see `event_wakes_enabled`). Set here,
         // before control returns to the executor, so it lands before this
-        // session's drain task first parks and registers the waker its pty
+        // pty's drain task first parks and registers the waker its pty
         // threads would otherwise wake cross-thread.
         #[cfg(test)]
         if !self.event_wakes_enabled {
             handle.read(cx).set_event_wake_enabled(false);
         }
-        self.tabs
-            .entry(tab_id.to_string())
+        self.sessions
+            .entry(session_id.to_string())
             .or_default()
-            .insert(pane_id.to_string(), PaneSession { handle });
+            .insert(term_window_id.to_string(), WindowPty { handle });
         Ok(())
     }
 
-    /// The ONE shared Claude-tab constructor — the Rust twin of Swift's
+    /// The ONE shared Claude-session constructor — the Rust twin of Swift's
     /// near-duplicate `createTabFromMainTerminal` (socket newtab path) /
     /// `createClaudeTabInProject` (sidebar project-`+` path)
     /// (`SessionsModel.swift:650-714, :758-794`). Builds the `[Claude, Terminal 1]`
-    /// shape (Claude focused), places it, selects it, registers the tab session,
-    /// and spawns the Claude pane from `spawn_cwd` (claude resolves/creates its own
+    /// shape (Claude focused), places it, selects it, registers the session's pty container,
+    /// and spawns the Claude window from `spawn_cwd` (claude resolves/creates its own
     /// `-w` worktree) — the companion terminal stays **deferred** (model-only until
     /// first focus, per Swift `makeSession(initialTerminalPaneId: nil)`).
     ///
-    /// The Claude pane is created with `is_claude_running = true` from day one (the
+    /// The Claude window is created with `is_claude_running = true` from day one (the
     /// PROTECTED creation invariant: it gates the ≤1-Claude promotion refusal, the
-    /// OSC title/status pulse, and auto-titles). `session` says which session the
-    /// pane runs: [`ClaudeTabSession::mint`] (the caller's default) pre-mints a
-    /// real v4 UUID so `--session-id` is passed now and the same id persists for
-    /// later `--resume`; a request whose args already NAME a session hands one in
-    /// instead, because splicing `--session-id` beside `--resume`/`attach` is an
-    /// argv Claude Code refuses to run.
+    /// OSC title/status pulse, and auto-titles). `spec` says which claude session
+    /// the window runs: [`ClaudeSessionSpec::mint`] (the caller's default) pre-mints
+    /// a real v4 UUID so `--session-id` is passed now and the same id persists for
+    /// later `--resume`; a request whose args already NAME a claude session hands
+    /// one in instead, because splicing `--session-id` beside `--resume`/`attach`
+    /// is an argv Claude Code refuses to run.
     ///
     /// `settings_path` is the injectable theme-sync provider's output (R17 fills it;
-    /// `None` until then). Returns the new tab id, or `None` for a bad placement (an
+    /// `None` until then). Returns the new session id, or `None` for a bad placement (an
     /// unknown / pinned-Terminals project id).
-    pub(crate) fn create_claude_tab(
+    pub(crate) fn create_claude_session(
         &mut self,
-        model: &mut TabModel,
-        placement: ClaudeTabPlacement,
+        model: &mut WorkspaceModel,
+        placement: ClaudeSessionPlacement,
         args: &[String],
-        session: ClaudeTabSession,
+        spec: ClaudeSessionSpec,
         settings_path: Option<&str>,
         cx: &mut App,
     ) -> Option<String> {
         // Placement-specific facts, resolved before we mint anything that would
         // otherwise leak on a bad project id.
-        let (title, tab_cwd, spawn_cwd, extra_args): (String, String, String, Vec<String>) =
+        let (title, session_cwd, spawn_cwd, extra_args): (String, String, String, Vec<String>) =
             match &placement {
-                ClaudeTabPlacement::Bucket { cwd } => (
-                    // The bucketing anchor (`project_path`) stays `cwd`; the tab cwd
+                ClaudeSessionPlacement::Bucket { cwd } => (
+                    // The bucketing anchor (`project_path`) stays `cwd`; the session cwd
                     // follows the `-w` worktree in.
-                    claude_tab_title_from_args(args),
+                    claude_session_title_from_args(args),
                     claude_worktree_cwd(cwd, args),
                     cwd.clone(),
                     args.to_vec(),
                 ),
-                ClaudeTabPlacement::Project { project_id } => {
-                    // The pinned Terminals group only holds terminal tabs.
-                    if project_id == TabModel::TERMINALS_PROJECT_ID {
+                ClaudeSessionPlacement::Project { project_id } => {
+                    // The pinned Terminals group only holds terminal sessions.
+                    if project_id == WorkspaceModel::TERMINALS_PROJECT_ID {
                         return None;
                     }
                     let pi = model.projects.iter().position(|p| &p.id == project_id)?;
                     let path = model.projects[pi].path.clone();
-                    ("New tab".to_string(), path.clone(), path, Vec::new())
+                    ("New session".to_string(), path.clone(), path, Vec::new())
                 }
             };
 
-        let tab_id = self.mint("t");
-        let claude_pane_id = format!("{tab_id}-claude");
-        let terminal_pane_id = format!("{tab_id}-t1");
+        let session_id = self.mint("t");
+        let claude_window_id = format!("{session_id}-claude");
+        let terminal_window_id = format!("{session_id}-t1");
 
-        // The Claude pane is `is_claude_running = true` at creation (PROTECTED).
-        let mut claude_pane = Pane::new(&claude_pane_id, "Claude", PaneKind::Claude);
-        claude_pane.is_claude_running = true;
-        let mut tab = Tab::new(&tab_id, title, tab_cwd);
-        tab.panes = vec![
-            claude_pane,
-            Pane::new(&terminal_pane_id, "Terminal 1", PaneKind::Terminal),
+        // The Claude window is `is_claude_running = true` at creation (PROTECTED).
+        let mut claude_window = TermWindow::new(&claude_window_id, "Claude", TermWindowKind::Claude);
+        claude_window.is_claude_running = true;
+        let mut session = Session::new(&session_id, title, session_cwd);
+        session.windows = vec![
+            claude_window,
+            TermWindow::new(&terminal_window_id, "Terminal 1", TermWindowKind::Terminal),
         ];
-        tab.active_pane_id = Some(claude_pane_id.clone());
-        tab.claude_session_id = session.pin.clone();
-        tab.next_terminal_index = 2;
+        session.active_window_id = Some(claude_window_id.clone());
+        session.claude_session_id = spec.pin.clone();
+        session.next_terminal_index = 2;
 
         match &placement {
-            ClaudeTabPlacement::Bucket { cwd } => model.add_tab_to_projects(tab, cwd),
-            ClaudeTabPlacement::Project { project_id } => {
+            ClaudeSessionPlacement::Bucket { cwd } => model.add_session_to_projects(session, cwd),
+            ClaudeSessionPlacement::Project { project_id } => {
                 let pi = model.projects.iter().position(|p| &p.id == project_id)?;
-                model.projects[pi].tabs.push(tab);
+                model.projects[pi].sessions.push(session);
             }
         }
-        model.select_tab(&tab_id);
+        model.select_session(&session_id);
         // The (empty) session container so the deferred companion's later
-        // `ensure_active_pane_spawned` precondition ("the tab has a session") holds.
-        self.register_tab_session(&tab_id);
+        // `ensure_active_window_spawned` precondition ("the session has a session") holds.
+        self.register_session_pty(&session_id);
 
-        // Spawn the Claude pane immediately (claude-kind panes never lazy-spawn).
-        let _ = self.spawn_claude_pane(
-            &tab_id,
-            &claude_pane_id,
+        // Spawn the Claude window immediately (claude-kind windows never lazy-spawn).
+        let _ = self.spawn_claude_window(
+            &session_id,
+            &claude_window_id,
             &spawn_cwd,
-            &session.mode,
+            &spec.mode,
             &extra_args,
             settings_path,
             cx,
         );
-        Some(tab_id)
+        Some(session_id)
     }
 
-    /// The nested-child Claude-tab constructor shared by the `handoff` and
+    /// The nested-child Claude-session constructor shared by the `handoff` and
     /// `dispatch` socket handlers — the Rust twin of Swift
     /// `SessionsModel.createHandoffTab` (`SessionsModel.swift:1246-1303`). The two
     /// flavors differ ONLY in the `title` / `extra_args` their handlers build
     /// (`handoff_title` + [`handoff_extra_args`] vs [`dispatch_title`] +
-    /// [`dispatch_extra_args`]), so the tab-construction half lives here once.
-    /// Modelled on [`create_claude_tab`](Self::create_claude_tab) (the same
+    /// [`dispatch_extra_args`]), so the session-construction half lives here once.
+    /// Modelled on [`create_claude_session`](Self::create_claude_session) (the same
     /// `[Claude, Terminal 1]` shape, Claude focused + `is_claude_running = true`
     /// from creation, the deferred companion terminal, a pre-minted v4 session
     /// UUID passed as `--session-id`, `next_terminal_index = 2`, its session
     /// container registered), differing in exactly the D3/D4/D5/D7 ways:
     ///
-    /// * **(D7) the new tab opens UNSELECTED** — unlike [`create_claude_tab`],
-    ///   which selects the tab it builds, this never calls
-    ///   [`TabModel::select_tab`]: a handoff is background continuation prep, not
-    ///   a context switch, so the originating tab stays active and keyboard focus
-    ///   never moves. The tab is still immediately VISIBLE (sidebar children have
+    /// * **(D7) the new session opens UNSELECTED** — unlike [`create_claude_session`],
+    ///   which selects the session it builds, this never calls
+    ///   [`WorkspaceModel::select_session`]: a handoff is background continuation prep, not
+    ///   a context switch, so the originating session stays active and keyboard focus
+    ///   never moves. The session is still immediately VISIBLE (sidebar children have
     ///   no collapse state), and its Claude pty runs unrendered — the session
     ///   entity owns it ([`TerminalSessionHandle::spawn`] in
     ///   [`spawn_session_raw`](Self::spawn_session_raw)), not the view — exactly
-    ///   as the pty of a tab the user opened and then switched AWAY from keeps
+    ///   as the pty of a session the user opened and then switched AWAY from keeps
     ///   running while nothing renders it. (Not the restore precedent: a
-    ///   restored-but-unopened tab has no pty at all — it is modelled unspawned
+    ///   restored-but-unopened session has no pty at all — it is modelled unspawned
     ///   and only lazy-spawns a deferred-resume shell on first activation, via
-    ///   [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)'s
-    ///   [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) arm. A handoff tab
+    ///   [`ensure_active_window_spawned`](Self::ensure_active_window_spawned)'s
+    ///   [`ResumeDeferred`](ClaudeSessionMode::ResumeDeferred) arm. A handoff session
     ///   is the first construct whose Claude pty runs before ANY view has been
     ///   attached.) The companion terminal stays deferred until first
     ///   activation, as before.
     /// * **(D4) the title is fixed AND locked** — set to `title` up front with
     ///   `title_manually_set = true`, so Claude's OSC auto-title cannot overwrite
     ///   the `[HANDOFF] …` / `[DISPATCH] …` label once the fresh session names
-    ///   itself (unlike an ordinary claude tab, which keeps auto-title).
-    /// * **(D3) placement nests one indent under the originating tab** — via
-    ///   [`TabModel::insert_handoff_child`] (depth-1 lineage, the invariant
-    ///   `/branch` uses), falling back to [`TabModel::add_tab_to_projects`] (cwd
+    ///   itself (unlike an ordinary claude session, which keeps auto-title).
+    /// * **(D3) placement nests one indent under the originating session** — via
+    ///   [`WorkspaceModel::insert_handoff_child`] (depth-1 lineage, the invariant
+    ///   `/branch` uses), falling back to [`WorkspaceModel::add_session_to_projects`] (cwd
     ///   bucketing) when the anchor is empty / unknown / in the Terminals group,
     ///   so a top-level handoff (Main Terminal, or a stale id) still opens.
     /// * **(D5) `extra_args` are emitted verbatim after `--session-id`** — each
@@ -1518,68 +1518,68 @@ impl SessionManager {
     ///   prompt. This constructor never reorders or appends to them.
     ///
     /// `settings_path` threads the R17 theme-sync pointer exactly as
-    /// [`create_claude_tab`] does. Returns the new tab id (placement here never
+    /// [`create_claude_session`] does. Returns the new session id (placement here never
     /// fails — the fallback always buckets — but the signature mirrors
-    /// [`create_claude_tab`] for symmetry).
+    /// [`create_claude_session`] for symmetry).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_nested_claude_tab(
+    pub(crate) fn create_nested_claude_session(
         &mut self,
-        model: &mut TabModel,
-        under_tab_id: &str,
+        model: &mut WorkspaceModel,
+        under_session_id: &str,
         cwd: &str,
         title: String,
         extra_args: &[String],
         settings_path: Option<&str>,
         cx: &mut App,
     ) -> Option<String> {
-        let tab_id = self.mint("t");
-        let claude_pane_id = format!("{tab_id}-claude");
-        let terminal_pane_id = format!("{tab_id}-t1");
+        let session_id = self.mint("t");
+        let claude_window_id = format!("{session_id}-claude");
+        let terminal_window_id = format!("{session_id}-t1");
         // Pre-mint the session UUID so `--session-id` is passed now and the same
-        // id persists for later `--resume` (create_claude_tab parity).
-        let session_id = mint_session_uuid();
+        // id persists for later `--resume` (create_claude_session parity).
+        let claude_session_id = mint_session_uuid();
 
-        let mut claude_pane = Pane::new(&claude_pane_id, "Claude", PaneKind::Claude);
-        claude_pane.is_claude_running = true;
-        let mut tab = Tab::new(&tab_id, title, cwd);
-        tab.panes = vec![
-            claude_pane,
-            Pane::new(&terminal_pane_id, "Terminal 1", PaneKind::Terminal),
+        let mut claude_window = TermWindow::new(&claude_window_id, "Claude", TermWindowKind::Claude);
+        claude_window.is_claude_running = true;
+        let mut session = Session::new(&session_id, title, cwd);
+        session.windows = vec![
+            claude_window,
+            TermWindow::new(&terminal_window_id, "Terminal 1", TermWindowKind::Terminal),
         ];
-        tab.active_pane_id = Some(claude_pane_id.clone());
-        tab.claude_session_id = Some(session_id.clone());
+        session.active_window_id = Some(claude_window_id.clone());
+        session.claude_session_id = Some(claude_session_id.clone());
         // (D4) Lock the "[HANDOFF] …" / "[DISPATCH] …" title against Claude's OSC
         // auto-title.
-        tab.title_manually_set = true;
-        tab.next_terminal_index = 2;
+        session.title_manually_set = true;
+        session.next_terminal_index = 2;
 
-        // (D3) Nest under the originating tab; else bucket at top level so a
+        // (D3) Nest under the originating session; else bucket at top level so a
         // Main-Terminal (or stale-id) request still opens. `insert_handoff_child`
-        // consumes `tab` on the success path, so clone for the attempt and hand
+        // consumes `session` on the success path, so clone for the attempt and hand
         // the original to the bucketing fallback (Swift passes a value type twice).
-        if !model.insert_handoff_child(tab.clone(), under_tab_id) {
-            model.add_tab_to_projects(tab, cwd);
+        if !model.insert_handoff_child(session.clone(), under_session_id) {
+            model.add_session_to_projects(session, cwd);
         }
-        // (D7) Deliberately NO `model.select_tab(&tab_id)`: the nested tab opens
-        // in the background so the originating tab keeps selection + key focus.
+        // (D7) Deliberately NO `model.select_session(&session_id)`: the nested session opens
+        // in the background so the originating session keeps selection + key focus.
         // The (empty) session container so the deferred companion's later
-        // `ensure_active_pane_spawned` precondition ("the tab has a session") holds.
-        self.register_tab_session(&tab_id);
+        // `ensure_active_window_spawned` precondition ("the session has a session") holds.
+        self.register_session_pty(&session_id);
 
         // (D5) The caller's args verbatim — already prompt-last.
-        let _ = self.spawn_claude_pane(
-            &tab_id,
-            &claude_pane_id,
+        let _ = self.spawn_claude_window(
+            &session_id,
+            &claude_window_id,
             cwd,
-            &ClaudeSessionMode::New(session_id),
+            &ClaudeSessionMode::New(claude_session_id),
             extra_args,
             settings_path,
             cx,
         );
-        Some(tab_id)
+        Some(session_id)
     }
 
-    /// Spawn a **Claude-kind** pane's child — the Rust twin of Swift
+    /// Spawn a **Claude-kind** window's child — the Rust twin of Swift
     /// `TabPtySession.spawnClaudePane` (`TabPtySession.swift:275-340`). The spec is
     /// mode-driven:
     ///
@@ -1590,17 +1590,17 @@ impl SessionManager {
     /// * Probe resolved a `claude` binary → `zsh -ilc "exec <claude> …"` via
     ///   [`build_claude_exec_command`], env from [`build_claude_extra_env`].
     /// * Probe unresolved → a plain `zsh -il` with **no** Nice env (Swift's
-    ///   `environment: nil` fallback: the pane renders as Claude but is really a
+    ///   `environment: nil` fallback: the window renders as Claude but is really a
     ///   shell). No retro-upgrade when the probe later resolves.
     ///
     /// The env comes wholly from [`build_claude_extra_env`] (which reads this
     /// window's socket / zdotdir facts) and the spawn bypasses the blanket window
     /// injection ([`spawn_session_raw`](Self::spawn_session_raw)) — see that method.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_claude_pane(
+    pub(crate) fn spawn_claude_window(
         &mut self,
-        tab_id: &str,
-        pane_id: &str,
+        session_id: &str,
+        term_window_id: &str,
         cwd: &str,
         mode: &ClaudeSessionMode,
         extra_args: &[String],
@@ -1626,8 +1626,8 @@ impl SessionManager {
         let spec = if matches!(mode, ClaudeSessionMode::ResumeDeferred(_)) {
             let env = build_claude_extra_env(
                 mode,
-                tab_id,
-                pane_id,
+                session_id,
+                term_window_id,
                 socket_path.as_deref(),
                 zdotdir.as_deref(),
                 user_zdotdir.as_deref(),
@@ -1637,8 +1637,8 @@ impl SessionManager {
         } else if let Some(claude) = claude.as_deref() {
             let env = build_claude_extra_env(
                 mode,
-                tab_id,
-                pane_id,
+                session_id,
+                term_window_id,
                 socket_path.as_deref(),
                 zdotdir.as_deref(),
                 user_zdotdir.as_deref(),
@@ -1659,72 +1659,72 @@ impl SessionManager {
             SpawnSpec::shell(cwd)
         };
 
-        self.spawn_session_raw(tab_id, pane_id, spec, cx)?;
+        self.spawn_session_raw(session_id, term_window_id, spec, cx)?;
 
         // Launch-overlay policy: register the user-facing command string; a
-        // deferred-resume pane suppresses it (Swift `installLaunchOverlayHooks`'s
+        // deferred-resume window suppresses it (Swift `installLaunchOverlayHooks`'s
         // early return for `.resumeDeferred`). The live window root clears it on
         // first output / exit via the routed events (the subscription lift).
         if !matches!(mode, ClaudeSessionMode::ResumeDeferred(_)) {
-            let _ = self.register_pane_launch(pane_id, claude_launch_display_command(mode, extra_args));
+            let _ = self.register_window_launch(term_window_id, claude_launch_display_command(mode, extra_args));
         }
         Ok(())
     }
 
-    /// Spawn the active pane's deferred pty if it was modelled up front — Swift's
+    /// Spawn the active window's deferred pty if it was modelled up front — Swift's
     /// `ensureActivePaneSpawned` (`SessionsModel.swift:553-565`), extended for R18
-    /// restore. Two lazy-spawn arms, both gated on the tab having a session
+    /// restore. Two lazy-spawn arms, both gated on the session having a session
     /// container and the pty not being live yet:
     ///
-    /// * a **terminal-kind** active pane spawns a plain login shell in its
-    ///   resolved cwd (last OSC 7, else the tab/project fallback) — unchanged;
-    /// * a **claude-kind** active pane lazy-spawns **only in resume-deferred
-    ///   form** (L3): iff the tab carries a `claude_session_id`, the pane is not
+    /// * a **terminal-kind** active window spawns a plain login shell in its
+    ///   resolved cwd (last OSC 7, else the session/project fallback) — unchanged;
+    /// * a **claude-kind** active window lazy-spawns **only in resume-deferred
+    ///   form** (L3): iff the session carries a `claude_session_id`, the window is not
     ///   yet spawned, and no Claude is running, it spawns a plain login shell
     ///   carrying `claude --resume <sid>` as `NICE_PREFILL_COMMAND` (nothing runs
-    ///   until the user opens the tab and presses Enter). This **supersedes** R15's
-    ///   "claude never lazy-spawns" note: a *restored* Claude pane returns modelled
+    ///   until the user opens the session and presses Enter). This **supersedes** R15's
+    ///   "claude never lazy-spawns" note: a *restored* Claude window returns modelled
     ///   but unspawned and must lazy-spawn its deferred-resume shell on first
-    ///   activation. A *running* Claude pane (already spawned, or one promoted in
+    ///   activation. A *running* Claude window (already spawned, or one promoted in
     ///   place) still never lazy-spawns — the `is_claude_running` / already-spawned
     ///   guards below reject it.
     ///
-    /// Never creates a tab container itself. `settings_path` is R17's theme
+    /// Never creates a session container itself. `settings_path` is R17's theme
     /// `--settings` pointer (threaded from the window's provider), spliced into the
     /// deferred-resume prefill; `None` ⇒ no `--settings` (sync off / gate unset).
-    pub(crate) fn ensure_active_pane_spawned(
+    pub(crate) fn ensure_active_window_spawned(
         &mut self,
-        model: &TabModel,
-        tab_id: &str,
+        model: &WorkspaceModel,
+        session_id: &str,
         settings_path: Option<&str>,
         cx: &mut App,
     ) {
-        let Some(tab) = model.tab_for(tab_id) else {
+        let Some(session) = model.session_for(session_id) else {
             return;
         };
-        let Some(pane_id) = tab.active_pane_id.clone() else {
+        let Some(term_window_id) = session.active_window_id.clone() else {
             return;
         };
-        let Some(pane) = tab.panes.iter().find(|p| p.id == pane_id) else {
+        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
             return;
         };
-        if !self.tab_has_session(tab_id) || self.has_pane(tab_id, &pane_id) {
+        if !self.session_has_pty(session_id) || self.has_window(session_id, &term_window_id) {
             return;
         }
-        // L3 restore arm: a claude-kind active pane lazy-spawns its deferred-resume
-        // shell (never a running claude). A running-claude or session-less pane is
+        // L3 restore arm: a claude-kind active window lazy-spawns its deferred-resume
+        // shell (never a running claude). A running-claude or session-less window is
         // left to its eager/socket spawn path.
-        if pane.kind == PaneKind::Claude {
-            if pane.is_claude_running {
+        if term_window.kind == TermWindowKind::Claude {
+            if term_window.is_claude_running {
                 return;
             }
-            let Some(sid) = tab.claude_session_id.clone() else {
+            let Some(sid) = session.claude_session_id.clone() else {
                 return;
             };
-            let cwd = model.resolved_spawn_cwd_for_pane(tab, pane);
-            let _ = self.spawn_claude_pane(
-                tab_id,
-                &pane_id,
+            let cwd = model.resolved_spawn_cwd_for_window(session, term_window);
+            let _ = self.spawn_claude_window(
+                session_id,
+                &term_window_id,
                 &cwd,
                 &ClaudeSessionMode::ResumeDeferred(sid),
                 &[],
@@ -1733,39 +1733,39 @@ impl SessionManager {
             );
             return;
         }
-        if pane.kind != PaneKind::Terminal {
+        if term_window.kind != TermWindowKind::Terminal {
             return;
         }
-        let cwd = model.resolved_spawn_cwd_for_pane(tab, pane);
+        let cwd = model.resolved_spawn_cwd_for_window(session, term_window);
         // R14: the extra-env hook threads NICE_SOCKET/NICE_TAB_ID/NICE_PANE_ID
         // onto this spec before spawn.
         let spec = SpawnSpec::shell(cwd);
-        let _ = self.spawn_pane(tab_id, &pane_id, spec, cx);
+        let _ = self.spawn_window(session_id, &term_window_id, spec, cx);
     }
 
     /// The **full** Swift `setActivePane` behavior (`SessionsModel.swift:534-546`)
     /// — the live composition the slice-3 action seams call: the model half
-    /// ([`set_active_pane`](Self::set_active_pane), which acknowledges a waiting
-    /// pane on the viewed tab) plus [`ensure_active_pane_spawned`](Self::ensure_active_pane_spawned)
+    /// ([`set_active_window`](Self::set_active_window), which acknowledges a waiting
+    /// window on the viewed session) plus [`ensure_active_window_spawned`](Self::ensure_active_window_spawned)
     /// (a deferred terminal companion spawns on first focus). The navigation
     /// steppers compose the same pieces in the live app so the ack + spawn ride
-    /// along; the pure `set_active_pane` / `select_next_pane` methods are its
+    /// along; the pure `set_active_window` / `select_next_window` methods are its
     /// unit-testable model half.
     ///
-    /// Key focus is NOT moved here — the pane host
-    /// ([`crate::app_shell::PaneHostView`]) owns the terminal views and focuses
+    /// Key focus is NOT moved here — the window host
+    /// ([`crate::app_shell::WindowHostView`]) owns the terminal views and focuses
     /// the newly-active one on the same activation render (right after it fills
     /// the view cache), so the manager doesn't need a view handle it doesn't own.
-    pub(crate) fn activate_pane(
+    pub(crate) fn activate_term_window(
         &mut self,
-        model: &mut TabModel,
-        tab_id: &str,
-        pane_id: &str,
+        model: &mut WorkspaceModel,
+        session_id: &str,
+        term_window_id: &str,
         settings_path: Option<&str>,
         cx: &mut App,
     ) {
-        self.set_active_pane(model, tab_id, pane_id);
-        self.ensure_active_pane_spawned(model, tab_id, settings_path, cx);
+        self.set_active_window(model, session_id, term_window_id);
+        self.ensure_active_window_spawned(model, session_id, settings_path, cx);
     }
 
     /// Tear down every session this window owns. Dropping each
@@ -1775,8 +1775,8 @@ impl SessionManager {
     /// calls it once, but app-terminate paths may double up. R18 extends this to
     /// flush the session snapshot first.
     pub(crate) fn teardown(&mut self) {
-        self.tabs.clear();
-        self.pane_launch_states.clear();
+        self.sessions.clear();
+        self.window_launch_states.clear();
         self.synthetic_spawned.clear();
         self.synthetic_held.clear();
         self.synthetic_armed.clear();
@@ -1784,19 +1784,19 @@ impl SessionManager {
     }
 }
 
-impl Default for SessionManager {
+impl Default for PtyManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// The `<tab>:<pane>` key the synthetic spawned/held/armed sets index by, matching
+/// The `<session>:<window>` key the synthetic spawned/held/armed sets index by, matching
 /// Swift's `SessionsModel.syntheticPaneKey`.
-fn synthetic_key(tab_id: &str, pane_id: &str) -> String {
-    format!("{tab_id}:{pane_id}")
+fn synthetic_key(session_id: &str, term_window_id: &str) -> String {
+    format!("{session_id}:{term_window_id}")
 }
 
-/// Clip a pane title to `max` **characters** (not bytes), trimming any trailing
+/// Clip a window title to `max` **characters** (not bytes), trimming any trailing
 /// whitespace the cut exposed — `SessionsModel.swift:400-404`
 /// (`trimmingCharacters(in: .whitespaces)` after the 40-char cut). The input is
 /// already outer-trimmed, so only a trailing space from a mid-word cut matters.
@@ -1828,7 +1828,7 @@ pub(crate) fn default_mint_id(prefix: &str) -> String {
 
 /// Mint a fresh lowercased UUIDv4 session id (Swift's
 /// `UUID().uuidString.lowercased()` at `SessionsModel.swift:664, :866`). This is
-/// a SEPARATE mint from [`default_mint_id`]: tab/pane ids stay the time-sortable
+/// a SEPARATE mint from [`default_mint_id`]: session/window ids stay the time-sortable
 /// ms+counter form, but a Claude session id is handed to the `claude` CLI as
 /// `--session-id`/`--resume` and must be a real v4 UUID (the CLI validates the
 /// shape), so it needs 122 bits of real entropy with the version/variant bits
@@ -1896,7 +1896,7 @@ fn merge_env_spec_wins(spec_env: &mut Vec<(String, String)>, injected: Vec<(Stri
     }
 }
 
-/// How a Claude pane attaches to the Claude CLI's session layer. Ports Swift
+/// How a Claude window attaches to the Claude CLI's session layer. Ports Swift
 /// `TabPtySession.ClaudeSessionMode` (`TabPtySession.swift:180-197`). The env
 /// matrix ([`build_claude_extra_env`]) branches on the `ResumeDeferred` variant
 /// only. R15 owns the decision logic that selects a mode; R14 ports the enum +
@@ -1923,11 +1923,11 @@ pub(crate) enum ClaudeSessionMode {
     /// Restore path: don't run claude — spawn a plain `zsh -il` with
     /// `claude --resume <uuid>` pre-typed at the prompt via the stub's
     /// `print -z "$NICE_PREFILL_COMMAND"` tail. This is the only mode that needs
-    /// `ZDOTDIR` + `NICE_PREFILL_COMMAND` in the pane env.
+    /// `ZDOTDIR` + `NICE_PREFILL_COMMAND` in the window env.
     ResumeDeferred(String),
 }
 
-/// Build the extra-env pairs for a **Claude** pane. Pure port of Swift
+/// Build the extra-env pairs for a **Claude** window. Pure port of Swift
 /// `TabPtySession.buildClaudeExtraEnv` (`TabPtySession.swift:875-902`).
 ///
 /// The per-mode matrix is R14's FROZEN spec (R15 wired this function into the
@@ -1937,8 +1937,8 @@ pub(crate) enum ClaudeSessionMode {
 /// adds `ZDOTDIR` (when set), the always-present `NICE_USER_ZDOTDIR` (empty when
 /// none), and the `NICE_PREFILL_COMMAND` the stub's `print -z` tail pre-types.
 ///
-/// Was production-unused before R15; R15's [`spawn_claude_pane`](SessionManager::spawn_claude_pane)
-/// now wires it as the live env composer for every Claude pane spawn.
+/// Was production-unused before R15; R15's [`spawn_claude_window`](PtyManager::spawn_claude_window)
+/// now wires it as the live env composer for every Claude window spawn.
 /// `settings_path` is threaded now but always `None` until
 /// R17 fills R15's theme-sync provider; when `Some`, it splices a single-quoted
 /// `--settings <path>` before `--resume` in the prefill line (theme parity for a
@@ -1946,8 +1946,8 @@ pub(crate) enum ClaudeSessionMode {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_claude_extra_env(
     mode: &ClaudeSessionMode,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     socket_path: Option<&str>,
     zdotdir_path: Option<&str>,
     user_zdotdir: Option<&str>,
@@ -1955,13 +1955,13 @@ pub(crate) fn build_claude_extra_env(
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
         ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
-        ("NICE_TAB_ID".to_string(), tab_id.to_string()),
-        ("NICE_PANE_ID".to_string(), pane_id.to_string()),
+        ("NICE_TAB_ID".to_string(), session_id.to_string()),
+        ("NICE_PANE_ID".to_string(), term_window_id.to_string()),
     ];
     if let Some(sp) = socket_path {
         env.push(("NICE_SOCKET".to_string(), sp.to_string()));
     }
-    if let ClaudeSessionMode::ResumeDeferred(session_id) = mode {
+    if let ClaudeSessionMode::ResumeDeferred(claude_session_id) = mode {
         if let Some(zp) = zdotdir_path {
             env.push(("ZDOTDIR".to_string(), zp.to_string()));
         }
@@ -1978,7 +1978,7 @@ pub(crate) fn build_claude_extra_env(
         // `claude[ --settings '<path>'] --resume <sid>`.
         env.push((
             "NICE_PREFILL_COMMAND".to_string(),
-            build_claude_prefill_command(settings_path.as_deref(), session_id),
+            build_claude_prefill_command(settings_path.as_deref(), claude_session_id),
         ));
     }
     env
@@ -1997,11 +1997,11 @@ pub(crate) fn build_claude_extra_env(
 /// it; `None` until then): when `Some`, a single-quoted `--settings <path>` is
 /// spliced BEFORE `--resume` so the deferred-resumed session adopts Nice's
 /// theme, matching the exec builder's flag order.
-pub(crate) fn build_claude_prefill_command(settings_path: Option<&str>, session_id: &str) -> String {
+pub(crate) fn build_claude_prefill_command(settings_path: Option<&str>, claude_session_id: &str) -> String {
     let settings_arg = settings_path
         .map(|p| format!(" --settings {}", nice_term_core::shell_single_quote(p)))
         .unwrap_or_default();
-    format!("claude{settings_arg} --resume {session_id}")
+    format!("claude{settings_arg} --resume {claude_session_id}")
 }
 
 /// Assemble the `exec <claude> …` command line for the inner `zsh -ilc`
@@ -2086,15 +2086,15 @@ pub(crate) fn build_claude_exec_command(
 /// ([`compose_claude_reply`]) renders it byte-exact. Ported from the reply
 /// tail of Swift `handleClaudeSocketRequest` (`SessionsModel.swift:897-910`).
 pub(crate) enum ClaudeReplyDecision {
-    /// Open a new sidebar tab — reply `newtab`.
-    NewTab,
-    /// Promote the requesting pane in place. `parsed_from_args` is true when the
+    /// Open a new sidebar session — reply `newtab`.
+    NewSession,
+    /// Promote the requesting window in place. `parsed_from_args` is true when the
     /// client's `args` already carried the session id (`--resume`/`--session-id`),
-    /// which selects the bare `inplace` / `-` placeholder forms; `session_id` is
+    /// which selects the bare `inplace` / `-` placeholder forms; `claude_session_id` is
     /// the resolved id (parsed, or a freshly minted UUID) the wrapper prepends.
     InPlace {
         parsed_from_args: bool,
-        session_id: String,
+        claude_session_id: String,
     },
     /// Fix D: promote in place, but exec `claude attach` instead of what the
     /// user typed — their `--resume <uuid>` names a background session the
@@ -2103,11 +2103,11 @@ pub(crate) enum ClaudeReplyDecision {
     /// takes): the wrapper derives the short id from it, and the fallback leg
     /// (`attach` failed ⇒ the daemon dropped the job after we probed) needs the
     /// uuid to resume with.
-    Attach { session_id: String },
+    Attach { claude_session_id: String },
     /// Fix D: promote in place, but exec `claude --resume <uuid>` instead of
     /// what the user typed — they ran `claude attach <id>` for a session the
     /// daemon no longer hosts, which `attach` alone can only fail on.
-    Resume { session_id: String },
+    Resume { claude_session_id: String },
 }
 
 /// Compose the socket `claude` reply — the FROZEN R14 grammar (≤3
@@ -2137,10 +2137,10 @@ pub(crate) fn compose_claude_reply(
     settings_path: Option<&str>,
 ) -> String {
     match decision {
-        ClaudeReplyDecision::NewTab => "newtab".to_string(),
+        ClaudeReplyDecision::NewSession => "newtab".to_string(),
         ClaudeReplyDecision::InPlace {
             parsed_from_args,
-            session_id,
+            claude_session_id,
         } => match settings_path {
             Some(path) => {
                 // `-` sid placeholder when the client's args already carry the
@@ -2149,7 +2149,7 @@ pub(crate) fn compose_claude_reply(
                 let sid_field = if *parsed_from_args {
                     "-"
                 } else {
-                    session_id.as_str()
+                    claude_session_id.as_str()
                 };
                 format!("inplace {sid_field} {path}")
             }
@@ -2157,15 +2157,15 @@ pub(crate) fn compose_claude_reply(
                 if *parsed_from_args {
                     "inplace".to_string()
                 } else {
-                    format!("inplace {session_id}")
+                    format!("inplace {claude_session_id}")
                 }
             }
         },
-        ClaudeReplyDecision::Attach { session_id } => {
-            compose_id_reply("attach", session_id, settings_path)
+        ClaudeReplyDecision::Attach { claude_session_id } => {
+            compose_id_reply("attach", claude_session_id, settings_path)
         }
-        ClaudeReplyDecision::Resume { session_id } => {
-            compose_id_reply("resume", session_id, settings_path)
+        ClaudeReplyDecision::Resume { claude_session_id } => {
+            compose_id_reply("resume", claude_session_id, settings_path)
         }
     }
 }
@@ -2184,50 +2184,50 @@ fn compose_id_reply(verb: &str, session_id: &str, settings_path: Option<&str>) -
 /// per the T5 grammar. Pure port of the status-prefix extraction in Swift
 /// `paneTitleChanged`'s Claude branch (`SessionsModel.swift:439-453`): the
 /// first Unicode scalar in `U+2800..=U+28FF` (braille spinner) ⇒
-/// [`Thinking`](TabStatus::Thinking); exactly `U+2733` (✳ sparkle) ⇒
-/// [`Waiting`](TabStatus::Waiting); anything else ⇒ no status change and the
+/// [`Thinking`](SessionStatus::Thinking); exactly `U+2733` (✳ sparkle) ⇒
+/// [`Waiting`](SessionStatus::Waiting); anything else ⇒ no status change and the
 /// whole string is the label.
 ///
 /// Returns `(status, label)` where `label` is the input with the status prefix
 /// scalar removed (untrimmed — the caller trims, drops the empty / `Claude Code`
 /// placeholder, and feeds the rest to `apply_auto_title`; that wiring is R15
-/// slice-3's `pane_title_changed` branch).
-pub(crate) fn parse_claude_title(title: &str) -> (Option<TabStatus>, &str) {
+/// slice-3's `window_title_changed` branch).
+pub(crate) fn parse_claude_title(title: &str) -> (Option<SessionStatus>, &str) {
     let Some(first) = title.chars().next() else {
         return (None, title);
     };
     let cp = first as u32;
     if (0x2800..=0x28FF).contains(&cp) {
-        (Some(TabStatus::Thinking), &title[first.len_utf8()..])
+        (Some(SessionStatus::Thinking), &title[first.len_utf8()..])
     } else if cp == 0x2733 {
-        (Some(TabStatus::Waiting), &title[first.len_utf8()..])
+        (Some(SessionStatus::Waiting), &title[first.len_utf8()..])
     } else {
         (None, title)
     }
 }
 
-/// WHICH session a [`SessionManager::create_claude_tab`] spawn runs — the
+/// WHICH claude session a [`PtyManager::create_claude_session`] spawn runs — the
 /// newtab twin of the in-place reply's exec-time decision (Fix D).
 ///
 /// The default ([`mint`](Self::mint)) is the pre-Fix-D behavior: mint a fresh
-/// v4 uuid and pass it as `--session-id`, so the tab can `--resume` it after a
-/// relaunch. That is WRONG when the invocation already names a session: Claude
-/// Code rejects `--session-id` beside `--resume`/`--continue` outright
+/// v4 uuid and pass it as `--session-id`, so the session can `--resume` it after
+/// a relaunch. That is WRONG when the invocation already names a claude session:
+/// Claude Code rejects `--session-id` beside `--resume`/`--continue` outright
 /// (`--session-id can only be used with --continue or --resume if
-/// --fork-session is also specified`), so the pane dies on the spot. Those
+/// --fork-session is also specified`), so the window dies on the spot. Those
 /// invocations carry their own mode and pin instead.
-pub(crate) struct ClaudeTabSession {
-    /// How the pane's `claude` is exec'd ([`build_claude_exec_command`]).
+pub(crate) struct ClaudeSessionSpec {
+    /// How the window's `claude` is exec'd ([`build_claude_exec_command`]).
     pub(crate) mode: ClaudeSessionMode,
-    /// The session id the new tab remembers, or `None` when the request names a
-    /// session that cannot be resolved to a full uuid (a short `attach <id>`
-    /// with no readable jobs entry). Minting one there would pin a phantom id
-    /// no later `--resume` could use.
+    /// The claude session id the new session remembers, or `None` when the
+    /// request names a claude session that cannot be resolved to a full uuid (a
+    /// short `attach <id>` with no readable jobs entry). Minting one there would
+    /// pin a phantom id no later `--resume` could use.
     pub(crate) pin: Option<String>,
 }
 
-impl ClaudeTabSession {
-    /// A fresh session: mint a real v4 uuid, pass it as `--session-id`, pin it.
+impl ClaudeSessionSpec {
+    /// A fresh claude session: mint a real v4 uuid, pass it as `--session-id`, pin it.
     pub(crate) fn mint() -> Self {
         let id = mint_session_uuid();
         Self {
@@ -2237,15 +2237,15 @@ impl ClaudeTabSession {
     }
 }
 
-/// Where [`SessionManager::create_claude_tab`] puts the new tab — the two Swift
+/// Where [`PtyManager::create_claude_session`] puts the new session — the two Swift
 /// call sites' only real divergence (`SessionsModel.swift:650-714, :758-794`).
-pub(crate) enum ClaudeTabPlacement {
-    /// The socket `newtab` path (Swift `createTabFromMainTerminal`): bucket the tab
-    /// by `cwd` via [`TabModel::add_tab_to_projects`] (git-root / longest-prefix),
+pub(crate) enum ClaudeSessionPlacement {
+    /// The socket `newtab` path (Swift `createTabFromMainTerminal`): bucket the session
+    /// by `cwd` via [`WorkspaceModel::add_session_to_projects`] (git-root / longest-prefix),
     /// title from `args`, `-w` worktree split honored.
     Bucket { cwd: String },
     /// The sidebar project-`+` path (Swift `createClaudeTabInProject`): append
-    /// directly to `project_id`, title `"New tab"`, no worktree split, no extra args.
+    /// directly to `project_id`, title `"New session"`, no worktree split, no extra args.
     Project { project_id: String },
 }
 
@@ -2275,37 +2275,37 @@ fn resolve_claude_binary(cx: &App) -> Option<String> {
         .and_then(|g| g.0.clone())
 }
 
-/// The Claude tab's title from its invocation `args` — Swift
+/// The Claude session's title from its invocation `args` — Swift
 /// `createTabFromMainTerminal`'s title closure (`SessionsModel.swift:653-659`):
 /// join with spaces, take the first 40 chars, trim; an empty result (no args, or
-/// all-whitespace) falls back to `"New tab"`. A third, independent 40-char cap
-/// (pane pills clip at 40 too — [`PANE_TITLE_MAX`] — but separately).
-fn claude_tab_title_from_args(args: &[String]) -> String {
+/// all-whitespace) falls back to `"New session"`. A third, independent 40-char cap
+/// (window pills clip at 40 too — [`WINDOW_TITLE_MAX`] — but separately).
+fn claude_session_title_from_args(args: &[String]) -> String {
     if args.is_empty() {
-        return "New tab".to_string();
+        return "New session".to_string();
     }
     let joined = args.join(" ");
     let capped: String = joined.chars().take(40).collect();
     let trimmed = capped.trim();
     if trimmed.is_empty() {
-        "New tab".to_string()
+        "New session".to_string()
     } else {
         trimmed.to_string()
     }
 }
 
-/// The Claude tab's `Tab.cwd` — Swift `createTabFromMainTerminal`'s `sessionCwd`
+/// The Claude session's `Session.cwd` — Swift `createTabFromMainTerminal`'s `sessionCwd`
 /// (`SessionsModel.swift:675-683`): when the user ran `claude -w <name>`, Claude
 /// creates and runs inside a worktree at `<cwd>/.claude/worktrees/<sanitized>`
-/// (`/`→`+` via [`TabModel::sanitize_worktree_name`]); otherwise the tab cwd is
+/// (`/`→`+` via [`WorkspaceModel::sanitize_worktree_name`]); otherwise the session cwd is
 /// `cwd`. The bucketing anchor (`project_path`) stays `cwd` regardless, so the
-/// sidebar still buckets the tab under the parent project. The `-w`/`--worktree`
+/// sidebar still buckets the session under the parent project. The `-w`/`--worktree`
 /// **space form** only is recognized (the extractor is landed in `nice-model`); the
 /// `=` form is deliberately NOT a worktree while session-id takes both.
 fn claude_worktree_cwd(cwd: &str, args: &[String]) -> String {
-    match TabModel::extract_worktree_name(args) {
+    match WorkspaceModel::extract_worktree_name(args) {
         Some(name) => {
-            let sanitized = TabModel::sanitize_worktree_name(&name);
+            let sanitized = WorkspaceModel::sanitize_worktree_name(&name);
             format!("{}/.claude/worktrees/{}", cwd.trim_end_matches('/'), sanitized)
         }
         None => cwd.to_string(),
@@ -2313,7 +2313,7 @@ fn claude_worktree_cwd(cwd: &str, args: &[String]) -> String {
 }
 
 /// The human-readable command string the launch overlay shows for a fresh Claude
-/// pane — Swift `TabPtySession.launchDisplayCommand` (`TabPtySession.swift:618-634`):
+/// window — Swift `TabPtySession.launchDisplayCommand` (`TabPtySession.swift:618-634`):
 /// deliberately skips the `zsh -ilc "exec …"` wrapper and the `--session-id <uuid>`
 /// plumbing so the user sees what *they* asked for. `.resume` → `claude --resume`;
 /// otherwise `claude` (no args) or `claude <user args>`. `.resumeDeferred` is
@@ -2332,14 +2332,14 @@ fn claude_launch_display_command(mode: &ClaudeSessionMode, extra_args: &[String]
     }
 }
 
-/// The prefix on every handoff-tab title — Swift `handoffTitlePrefix`
+/// The prefix on every handoff-session title — Swift `handoffTitlePrefix`
 /// (`SessionsModel.swift:1161`). A single existing occurrence is stripped before
 /// re-prefixing so a handoff-fired-from-a-handoff reads `[HANDOFF] Foo`, not
 /// `[HANDOFF] [HANDOFF] Foo`.
 const HANDOFF_TITLE_PREFIX: &str = "[HANDOFF] ";
 
-/// Build the locked `[HANDOFF] …` title for a handoff tab from the originating
-/// tab's current title — pure port of Swift `handoffTitle`
+/// Build the locked `[HANDOFF] …` title for a handoff session from the originating
+/// session's current title — pure port of Swift `handoffTitle`
 /// (`SessionsModel.swift:1173-1181`), unit-tested directly like
 /// [`build_claude_exec_command`]. Strips a single leading `[HANDOFF] ` (no
 /// stacking), trims whitespace/newlines, and falls back to `Session` when the
@@ -2395,13 +2395,13 @@ pub(crate) fn handoff_extra_args(model: &str, effort: &str, prompt: &str) -> Vec
     args
 }
 
-/// The prefix on every dispatch-tab title. Unlike [`HANDOFF_TITLE_PREFIX`] there
+/// The prefix on every dispatch-session title. Unlike [`HANDOFF_TITLE_PREFIX`] there
 /// is no stripping rule: a dispatch title is built from the WORKTREE NAME, not
-/// from another tab's title, so it can never stack.
+/// from another session's title, so it can never stack.
 const DISPATCH_TITLE_PREFIX: &str = "[DISPATCH] ";
 
-/// Build the locked `[DISPATCH] <worktree-name>` title for a dispatch tab. The
-/// locked title keeps the sidebar's tab→worktree mapping stable against Claude's
+/// Build the locked `[DISPATCH] <worktree-name>` title for a dispatch session. The
+/// locked title keeps the sidebar's session→worktree mapping stable against Claude's
 /// OSC auto-title. Trims and falls back to `Session` on a blank name exactly as
 /// [`handoff_title`] does, so a whitespace-only name can't render a ragged
 /// `[DISPATCH]    ` (the socket parser only rejects a truly empty

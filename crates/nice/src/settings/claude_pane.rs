@@ -119,10 +119,10 @@ pub(crate) fn claude_pane(window: &mut Window, cx: &mut Context<SettingsRootView
         .child(setting_row_info(
             "Install the Nice Claude skills",
             "Adds the global /nice-handoff and /nice-dispatch Claude Code skills and \
-             installs their helpers in ~/.nice. Run inside a Claude pane, /nice-handoff \
-             writes a handoff file capturing the current work and opens a new tab so a \
-             fresh session can continue from where this one left off; /nice-dispatch \
-             writes a task brief and opens a background tab running it in its own \
+             installs their helpers in ~/.nice. Run inside a Claude window, /nice-handoff \
+             writes a handoff file capturing the current work and opens a new session \
+             where a fresh Claude continues from where this one left off; /nice-dispatch \
+             writes a task brief and opens a background session running it in its own \
              worktree.",
             toggle_switch(
                 "settings.claude.installHandoffSkill",

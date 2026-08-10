@@ -360,7 +360,7 @@ async fn run_niceties_link(
     settle(cx, 700).await;
 
     // Modifiers-changed events route to the focused element; in the app a click
-    // focuses the pane, but the hover phase runs before any click.
+    // focuses the window, but the hover phase runs before any click.
     let _ = window.update(cx, |_root, win, app| {
         let focus = terminal.read(app).focus_handle_ref().clone();
         win.focus(&focus, app);

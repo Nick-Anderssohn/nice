@@ -5,40 +5,40 @@
 //! shipped composition the way a **user** does: it types `claude\n` into a real
 //! pty whose login shell carries the R14 `claude()` shadow, and asserts the
 //! Milestone-3 clauses end-to-end — "typing `claude` anywhere opens/promotes
-//! tabs; statuses pulse; `/clear`/`/branch` tracked" — WITH R17's theme sync ON.
+//! sessions; statuses pulse; `/clear`/`/branch` tracked" — WITH R17's theme sync ON.
 //!
 //! Legs (all fail-loud, grid/model-poll bounded — never sleep-and-hope):
 //!
 //! * **(a) typed newtab + minted uuid + theme sync ON** — `claude\n` into the real
-//!   Main pane's pty: the shadow handshakes over `NICE_SOCKET`, the Terminals-group
-//!   Main tab forces `newtab`, and a fresh Claude tab appears with its stub SPAWNED
+//!   Main window's pty: the shadow handshakes over `NICE_SOCKET`, the Terminals-group
+//!   Main session forces `newtab`, and a fresh Claude session appears with its stub SPAWNED
 //!   (`is_claude_running` from creation), a valid v4 session UUID, and — because the
 //!   process theme-sync gate is ON — the window's `--settings` provider resolved to
-//!   the sandbox pointer file (leg (e) proves the file). (The Main-tab newtab spawn
+//!   the sandbox pointer file (leg (e) proves the file). (The Main-session newtab spawn
 //!   runs under `NICE_CLAUDE_OVERRIDE`, so `build_claude_exec_command` suppresses
 //!   the Nice flags — the wrapper-spliced `--settings`/`--session-id` argv is
 //!   asserted concretely in leg (c), where the zsh wrapper, not the override spawn,
 //!   owns the argv.)
-//! * **(b) status pulse Thinking → Waiting** — the new Claude pane's braille-prefixed
-//!   stub OSC title drives the shipped tab's sidebar-dot status to Thinking, then
+//! * **(b) status pulse Thinking → Waiting** — the new Claude window's braille-prefixed
+//!   stub OSC title drives the shipped session's sidebar-dot status to Thinking, then
 //!   (after a line of input unblocks its `read`) its ✳ OSC → Waiting, over the
 //!   SHIPPED window's subscription (the dot-input read on the shipped entity).
 //! * **(c) typed in-place promotion through the real zsh wrapper** — a live terminal
-//!   pane in a non-Terminals project, typing `claude\n`: the reply is
+//!   window in a non-Terminals project, typing `claude\n`: the reply is
 //!   `inplace <uuid> <ptr>` (theme sync ON), the wrapper `exec`s the stub, and the
 //!   grid shows its `--settings <ptr> --session-id <uuid>` argv verbatim, while the
 //!   model flips (kind → Claude, `is_claude_running` true).
 //! * **(d) rotation on the shipped sidebar** — a raw-socket `session_update` with
 //!   `source:"resume"` + a new id materializes the branch parent at ROOT
-//!   (`parent_tab_id == None`) with the originating tab re-parented + indented
+//!   (`parent_session_id == None`) with the originating session re-parented + indented
 //!   beneath it (root promotion), then a `source:"clear"` update rotates the id in
-//!   place with NO new tab (`/clear` tracking).
+//!   place with NO new session (`/clear` tracking).
 //! * **(e) theme + pointer files present** — the theme file exists at the `nice`
 //!   slug carrying `"_niceManaged": true`, and the `--settings` pointer file has the
 //!   exact `{"theme":"custom:nice"}` bytes.
 //! * **(f) gate-OFF parity** — with the theme-sync gate flipped OFF (a scenario
 //!   seam) and the window provider re-filled, repeating leg (c)'s typed promotion in
-//!   a fresh terminal tab yields a settings-less reply: the wrapper `exec`s the stub
+//!   a fresh terminal session yields a settings-less reply: the wrapper `exec`s the stub
 //!   with `--session-id <uuid>` and NO `--settings` (byte-identical to the
 //!   pre-theming protocol).
 //!
@@ -64,7 +64,7 @@ use anyhow::{Context as _, Result};
 use gpui::{AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, Tab, TabModel, TabStatus};
+use nice_model::{TermWindow, TermWindowKind, Session, WorkspaceModel, SessionStatus};
 use nice_term_core::SpawnSpec;
 use nice_term_view::{TerminalSessionHandle, TerminalTheme};
 use nice_theme::{AccentPreset, ColorScheme};
@@ -207,9 +207,9 @@ impl Fixture {
 /// (self-reported gate). Before opening, it (1) writes the theme + pointer files
 /// against sandbox paths (the bootstrap-write mirror `run_selftest` skips), (2)
 /// installs the theme-sync gate ON so the SHIPPED provider fill lights up, and (3)
-/// installs the scenario `ShellInjectConfig` so the Main pane forks WITH the
+/// installs the scenario `ShellInjectConfig` so the Main window forks WITH the
 /// `claude()` shadow. `HOME` is sandboxed only around `open_managed_window` (the
-/// Main pane inherits it at fork), then restored.
+/// Main window inherits it at fork), then restored.
 pub fn open_claude_e2e_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let fixture = Fixture::build()?;
     let home = fixture.home_str();
@@ -221,12 +221,12 @@ pub fn open_claude_e2e_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     // Point the spawn path's `resolve_claude_binary` at the stub (process env,
     // re-read every spawn) — overwrite-always so a prior scenario's override is
     // replaced by this argv-echoing stub.
-    // SAFETY: single-threaded scenario setup, before any pane forks; matches the
+    // SAFETY: single-threaded scenario setup, before any window forks; matches the
     // existing `std::env::set_var` seams (spawn.rs, claude-lifecycle).
     unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
     let whandle: WindowHandle<AppShellView> = cx.update(|app| {
-        // The shipped builder reads the process-global font settings (via the pane
+        // The shipped builder reads the process-global font settings (via the window
         // host); `install_shortcuts` seeds it (idempotent across scenarios).
         crate::keymap::install_shortcuts(app);
 
@@ -244,13 +244,13 @@ pub fn open_claude_e2e_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
         // Theme sync ON, through the SHIPPED provider fill: `open_managed_window`
         // reads this gate and sets each window's `--settings` provider from it.
         crate::app::set_claude_theme_sync_gate(app, true);
-        // Give the SHIPPED Main pane the synthetic ZDOTDIR shadow (points at the
+        // Give the SHIPPED Main window the synthetic ZDOTDIR shadow (points at the
         // fixture stubs, never the real Application Support location).
         crate::app::set_scenario_shell_inject_config(app, Some(zdotdir.clone()), None);
 
         let prev = std::env::var("HOME").ok();
         // SAFETY: single-threaded setup; restored immediately after the (synchronous)
-        // Main-pane spawn inside `open_managed_window`.
+        // Main-window spawn inside `open_managed_window`.
         unsafe { std::env::set_var("HOME", &home) };
         let opened = crate::app::open_managed_window(app);
         match prev {
@@ -310,67 +310,67 @@ async fn run_claude_e2e(
         )),
     }
 
-    // The real Main pane (Terminals-group Main tab), spawned with the shadow.
-    let main_tab = TabModel::MAIN_TERMINAL_TAB_ID.to_string();
-    let Some(main_pane) = state.update(cx, |s, _cx| {
-        s.model.tab_for(&main_tab).and_then(|t| t.panes.first()).map(|p| p.id.clone())
+    // The real Main window (Terminals-group Main session), spawned with the shadow.
+    let main_session = WorkspaceModel::MAIN_TERMINAL_SESSION_ID.to_string();
+    let Some(main_window) = state.update(cx, |s, _cx| {
+        s.workspace.session_for(&main_session).and_then(|t| t.windows.first()).map(|p| p.id.clone())
     }) else {
-        return CadenceReport::error("claude-e2e: the shipped window has no Main terminal pane");
+        return CadenceReport::error("claude-e2e: the shipped window has no Main terminal window");
     };
-    let Some(main_handle) = pane_handle(cx, &state, &main_tab, &main_pane) else {
-        return CadenceReport::error("claude-e2e: the Main pane never spawned its pty");
+    let Some(main_handle) = term_window_handle(cx, &state, &main_session, &main_window) else {
+        return CadenceReport::error("claude-e2e: the Main window never spawned its pty");
     };
     if !poll_grid_contains(cx, &main_handle, READY_MARKER).await {
         return CadenceReport::error(
-            "claude-e2e: the Main pane's login shell never printed READY — the synthetic ZDOTDIR \
+            "claude-e2e: the Main window's login shell never printed READY — the synthetic ZDOTDIR \
              chain did not source the sandbox ~/.zshrc (no claude() shadow)",
         );
     }
 
-    // === (a) typed `claude` in the Main pane ⇒ newtab + spawned running Claude =====
-    let tabs_before = all_tab_ids(cx, &state);
+    // === (a) typed `claude` in the Main window ⇒ newtab + spawned running Claude =====
+    let sessions_before = all_session_ids(cx, &state);
     write_line(cx, &main_handle, b"claude\n");
-    let claude_tab = match poll_new_tab(cx, &state, &tabs_before).await {
+    let claude_session = match poll_new_session(cx, &state, &sessions_before).await {
         Some(t) => t,
         None => {
             return CadenceReport::error(
-                "claude-e2e (a): typing `claude` in the Main pane produced no new Claude tab (the \
-                 shadow did not handshake / the Terminals tab did not force newtab)",
+                "claude-e2e (a): typing `claude` in the Main window produced no new Claude session (the \
+                 shadow did not handshake / the Terminals session did not force newtab)",
             )
         }
     };
-    let (claude_pane, _companion) = match tab_pane_ids(cx, &state, &claude_tab) {
+    let (claude_window, _companion) = match session_window_ids(cx, &state, &claude_session) {
         Some(p) => p,
         None => {
             return CadenceReport::error(
-                "claude-e2e (a): the new Claude tab has no [Claude, Terminal 1] panes",
+                "claude-e2e (a): the new Claude session has no [Claude, Terminal 1] windows",
             )
         }
     };
-    if !pane_is_claude_running(cx, &state, &claude_tab, &claude_pane) {
-        failures.push("(a) the new Claude pane is not is_claude_running from creation".into());
+    if !window_is_claude_running(cx, &state, &claude_session, &claude_window) {
+        failures.push("(a) the new Claude window is not is_claude_running from creation".into());
     }
-    if !poll_has_pane(cx, &state, &claude_tab, &claude_pane).await {
-        failures.push("(a) the new Claude pane never spawned its pty (the stub did not run)".into());
+    if !poll_has_window(cx, &state, &claude_session, &claude_window).await {
+        failures.push("(a) the new Claude window never spawned its pty (the stub did not run)".into());
     }
-    match tab_session_id(cx, &state, &claude_tab) {
+    match session_claude_id(cx, &state, &claude_session) {
         Some(sid) if is_v4_uuid(&sid) => {}
-        Some(sid) => failures.push(format!("(a) tab session id {sid:?} is not a valid v4 UUID")),
-        None => failures.push("(a) the new Claude tab carries no minted session id".into()),
+        Some(sid) => failures.push(format!("(a) the session's Claude session id {sid:?} is not a valid v4 UUID")),
+        None => failures.push("(a) the new Claude session carries no minted session id".into()),
     }
 
     // === (b) the shipped sidebar-dot status pulses Thinking → Waiting =============
-    if !poll_tab_status(cx, &state, &claude_tab, TabStatus::Thinking).await {
+    if !poll_session_status(cx, &state, &claude_session, SessionStatus::Thinking).await {
         failures.push(
-            "(b) the Claude pane's braille OSC title did not drive the shipped tab status to \
+            "(b) the Claude window's braille OSC title did not drive the shipped session status to \
              Thinking (the subscription did not route the title)"
                 .into(),
         );
     } else {
-        write_pane_line(cx, &state, &claude_tab, &claude_pane, b"go\n");
-        if !poll_tab_status(cx, &state, &claude_tab, TabStatus::Waiting).await {
+        write_window_line(cx, &state, &claude_session, &claude_window, b"go\n");
+        if !poll_session_status(cx, &state, &claude_session, SessionStatus::Waiting).await {
             failures.push(
-                "(b) the Claude pane's ✳ OSC title did not drive the shipped tab status to Waiting"
+                "(b) the Claude window's ✳ OSC title did not drive the shipped session status to Waiting"
                     .into(),
             );
         }
@@ -379,15 +379,15 @@ async fn run_claude_e2e(
     // === (c) typed in-place promotion through the real zsh wrapper ================
     let want_ptr = want_pointer.clone();
     match run_typed_promotion(cx, &state, &fixture, "e2e-c", &fixture.work_c).await {
-        Ok((tab_c, pane_c, handle_c)) => {
-            if !poll_pane_promoted(cx, &state, &tab_c, &pane_c).await {
+        Ok((session_c, window_c, handle_c)) => {
+            if !poll_window_promoted(cx, &state, &session_c, &window_c).await {
                 failures.push(
-                    "(c) promotion: the terminal pane did not flip to a running Claude pane in the model"
+                    "(c) promotion: the terminal window did not flip to a running Claude window in the model"
                         .into(),
                 );
             }
             // The wrapper `exec`ed the stub with the theme pointer + minted uuid.
-            let uuid = tab_session_id(cx, &state, &tab_c).unwrap_or_default();
+            let uuid = session_claude_id(cx, &state, &session_c).unwrap_or_default();
             let want_argv = format!("--settings {want_ptr} --session-id {uuid}");
             if !poll_grid_contains_wrapped(cx, &handle_c, &want_argv).await {
                 let grid = grid_of(cx, &handle_c);
@@ -397,8 +397,8 @@ async fn run_claude_e2e(
                     grid_tail(&grid)
                 ));
             }
-            // -- (d) rotation on the shipped sidebar (reuses the leg-(c) tab) -------
-            drive_rotation(cx, &state, &socket_path, &fixture, &tab_c, &pane_c, &mut failures).await;
+            // -- (d) rotation on the shipped sidebar (reuses the leg-(c) session) -------
+            drive_rotation(cx, &state, &socket_path, &fixture, &session_c, &window_c, &mut failures).await;
         }
         Err(e) => failures.push(format!("(c) promotion setup failed: {e}")),
     }
@@ -432,11 +432,11 @@ async fn run_claude_e2e(
         s.set_claude_settings_path(crate::claude_theme_sync::settings_path_for_gate(false))
     });
     match run_typed_promotion(cx, &state, &fixture, "e2e-f", &fixture.work_f).await {
-        Ok((tab_f, pane_f, handle_f)) => {
-            if !poll_pane_promoted(cx, &state, &tab_f, &pane_f).await {
-                failures.push("(f) gate-off: the terminal pane did not flip to a running Claude pane".into());
+        Ok((session_f, window_f, handle_f)) => {
+            if !poll_window_promoted(cx, &state, &session_f, &window_f).await {
+                failures.push("(f) gate-off: the terminal window did not flip to a running Claude window".into());
             }
-            let uuid = tab_session_id(cx, &state, &tab_f).unwrap_or_default();
+            let uuid = session_claude_id(cx, &state, &session_f).unwrap_or_default();
             let want_argv = format!("--session-id {uuid}");
             if !poll_grid_contains_wrapped(cx, &handle_f, &want_argv).await {
                 failures.push(format!(
@@ -471,13 +471,13 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: "claude-e2e OK (shipped surface, theme sync ON): typing `claude` in the real \
-                     Main pane handshaked over the socket and opened a running Claude tab with a \
+                     Main window handshaked over the socket and opened a running Claude session with a \
                      minted v4 uuid whose stub OSC titles pulsed the shipped sidebar-dot status \
                      Thinking → Waiting; a typed in-place promotion through the real zsh wrapper \
                      exec'd the stub with `--settings <ptr> --session-id <uuid>` and flipped the \
                      model; a `session_update` /branch rotation materialized a root branch parent \
-                     with the originating tab re-parented beneath it, and a /clear rotated the id \
-                     in place with no new tab; the theme file carries _niceManaged:true and the \
+                     with the originating session re-parented beneath it, and a /clear rotated the id \
+                     in place with no new session; the theme file carries _niceManaged:true and the \
                      pointer file holds the exact bytes; and with the gate flipped OFF a fresh \
                      typed promotion exec'd the stub settings-less (`--session-id <uuid>`, no \
                      `--settings`)."
@@ -498,10 +498,10 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
 
 // -- typed-promotion leg (shared by (c) and (f)) -----------------------------
 
-/// Seed a live terminal pane in a fresh non-Terminals project, wait for its shell
-/// to source the shadow, type `claude\n`, and return `(tab, pane, handle)`. The
-/// pane spawns through the manager's live spawn path so the window env injection
-/// (`NICE_SOCKET` / `ZDOTDIR` / this pane's `NICE_TAB_ID` / `NICE_PANE_ID`) applies;
+/// Seed a live terminal window in a fresh non-Terminals project, wait for its shell
+/// to source the shadow, type `claude\n`, and return `(session, window, handle)`. The
+/// window spawns through the manager's live spawn path so the window env injection
+/// (`NICE_SOCKET` / `ZDOTDIR` / this window's `NICE_TAB_ID` / `NICE_PANE_ID`) applies;
 /// `HOME` is spec-provided (spec-wins) so the chain sources the sandbox `~/.zshrc`
 /// (PATH → the stub). The caller polls the promotion + the wrapper-spliced argv.
 async fn run_typed_promotion(
@@ -512,21 +512,21 @@ async fn run_typed_promotion(
     cwd: &Path,
 ) -> Result<(String, String, Entity<TerminalSessionHandle>)> {
     let proj = format!("{key}-proj");
-    let tab = format!("{key}-tab");
-    let pane = format!("{key}-pane");
+    let session = format!("{key}-tab");
+    let term_window = format!("{key}-pane");
     let cwd = cwd.to_string_lossy().into_owned();
 
-    // Seed the non-Terminals project + tab + terminal pane, and select it so the
+    // Seed the non-Terminals project + session + terminal window, and select it so the
     // shipped shell renders it (Swift's promotable-target shape).
     let seeded = state.update(cx, |s, _cx| {
-        s.model.ensure_project(&proj, "E2E", &cwd);
-        let mut t = Tab::new(tab.as_str(), "term", cwd.as_str());
-        t.panes = vec![Pane::new(pane.as_str(), "Terminal 1", PaneKind::Terminal)];
-        t.active_pane_id = Some(pane.clone());
+        s.workspace.ensure_project(&proj, "E2E", &cwd);
+        let mut t = Session::new(session.as_str(), "term", cwd.as_str());
+        t.windows = vec![TermWindow::new(term_window.as_str(), "Terminal 1", TermWindowKind::Terminal)];
+        t.active_window_id = Some(term_window.clone());
         t.next_terminal_index = 2;
-        if let Some(pi) = s.model.projects.iter().position(|p| p.id == proj) {
-            s.model.projects[pi].tabs.push(t);
-            s.model.select_tab(&tab);
+        if let Some(pi) = s.workspace.projects.iter().position(|p| p.id == proj) {
+            s.workspace.projects[pi].sessions.push(t);
+            s.workspace.select_session(&session);
             true
         } else {
             false
@@ -536,7 +536,7 @@ async fn run_typed_promotion(
         return Err(anyhow::anyhow!("could not seed the promotable project"));
     }
 
-    // Spawn the pane's live pty. HOME=sandbox is spec-provided (spec-wins) so the
+    // Spawn the window's live pty. HOME=sandbox is spec-provided (spec-wins) so the
     // synthetic chain sources the sandbox ~/.zshrc; NICE_CLAUDE_OVERRIDE keeps a
     // consistent claude for any resolve; the window injection adds the socket + ids.
     let spec = SpawnSpec::shell(cwd)
@@ -546,94 +546,94 @@ async fn run_typed_promotion(
         ])
         .with_size(ROWS, COLS);
     let spawned = state.update(cx, |s, cx| {
-        s.session.spawn_pane(&tab, &pane, spec, cx).is_ok()
+        s.ptys.spawn_window(&session, &term_window, spec, cx).is_ok()
     });
     if !spawned {
-        return Err(anyhow::anyhow!("could not spawn the promotable pane's pty"));
+        return Err(anyhow::anyhow!("could not spawn the promotable window's pty"));
     }
-    // Re-render so the host's sweep subscribes the fresh pane.
+    // Re-render so the host's sweep subscribes the fresh window.
     let _ = state.update(cx, |_s, cx| cx.notify());
 
-    let Some(handle) = pane_handle(cx, state, &tab, &pane) else {
-        return Err(anyhow::anyhow!("no handle for the promotable pane"));
+    let Some(handle) = term_window_handle(cx, state, &session, &term_window) else {
+        return Err(anyhow::anyhow!("no handle for the promotable window"));
     };
     if !poll_grid_contains(cx, &handle, READY_MARKER).await {
-        return Err(anyhow::anyhow!("the promotable pane's shell never became ready (no READY)"));
+        return Err(anyhow::anyhow!("the promotable window's shell never became ready (no READY)"));
     }
     write_line(cx, &handle, b"claude\n");
-    Ok((tab, pane, handle))
+    Ok((session, term_window, handle))
 }
 
 // -- rotation leg (d) --------------------------------------------------------
 
 /// Drive the `/branch` (resume + new id) then `/clear` rotations over the socket
-/// against the just-promoted tab, asserting root promotion + `/clear` in-place
+/// against the just-promoted session, asserting root promotion + `/clear` in-place
 /// tracking (Swift `TabModel.swift:336-362`).
 async fn drive_rotation(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     socket_path: &str,
     fixture: &Fixture,
-    tab: &str,
-    pane: &str,
+    session: &str,
+    term_window: &str,
     failures: &mut Vec<String>,
 ) {
-    let proj = format!("{}-proj", tab.trim_end_matches("-tab"));
-    let Some(old_sid) = tab_session_id(cx, state, tab) else {
-        failures.push("(d) rotation: the promoted tab carries no session id to rotate".into());
+    let proj = format!("{}-proj", session.trim_end_matches("-tab"));
+    let Some(old_sid) = session_claude_id(cx, state, session) else {
+        failures.push("(d) rotation: the promoted session carries no session id to rotate".into());
         return;
     };
 
     // -- /branch: source=resume + a NEW id + a cwd move.
     let branch_wt = format!("{}/.claude/worktrees/branch-wt", fixture.work_c.display());
-    send_session_update(cx, socket_path, pane, "e2e-branch-id", Some("resume"), Some(&branch_wt)).await;
-    match poll_branch_parent(cx, state, &proj, &old_sid, tab).await {
+    send_session_update(cx, socket_path, term_window, "e2e-branch-id", Some("resume"), Some(&branch_wt)).await;
+    match poll_branch_parent(cx, state, &proj, &old_sid, session).await {
         None => failures.push(
-            "(d) branch: no sibling parent tab pinned to the OLD id materialized on the shipped sidebar".into(),
+            "(d) branch: no sibling parent session pinned to the OLD id materialized on the shipped sidebar".into(),
         ),
         Some(parent_id) => {
             let (parent, orig) = state.update(cx, |s, _cx| {
-                (s.model.tab_for(&parent_id).cloned(), s.model.tab_for(tab).cloned())
+                (s.workspace.session_for(&parent_id).cloned(), s.workspace.session_for(session).cloned())
             });
             match (parent, orig) {
                 (Some(parent), Some(orig)) => {
-                    // Root promotion: the new parent renders at ROOT (parent_tab_id None).
-                    if parent.parent_tab_id.is_some() {
+                    // Root promotion: the new parent renders at ROOT (parent_session_id None).
+                    if parent.parent_session_id.is_some() {
                         failures.push(format!(
                             "(d) branch: ROOT PROMOTION — the new parent must render at root \
-                             (parent_tab_id == None), got {:?}",
-                            parent.parent_tab_id
+                             (parent_session_id == None), got {:?}",
+                            parent.parent_session_id
                         ));
                     }
-                    // The originating tab re-parents UNDER the new root (renders indented).
-                    if orig.parent_tab_id.as_deref() != Some(parent_id.as_str()) {
+                    // The originating session re-parents UNDER the new root (renders indented).
+                    if orig.parent_session_id.as_deref() != Some(parent_id.as_str()) {
                         failures.push(format!(
-                            "(d) branch: the originating tab must re-parent under the new root \
-                             (indented), got parent_tab_id {:?}",
-                            orig.parent_tab_id
+                            "(d) branch: the originating session must re-parent under the new root \
+                             (indented), got parent_session_id {:?}",
+                            orig.parent_session_id
                         ));
                     }
-                    // The originating tab carries the NEW id.
+                    // The originating session carries the NEW id.
                     if orig.claude_session_id.as_deref() != Some("e2e-branch-id") {
                         failures.push(format!(
-                            "(d) branch: the originating tab must carry the NEW session id, got {:?}",
+                            "(d) branch: the originating session must carry the NEW session id, got {:?}",
                             orig.claude_session_id
                         ));
                     }
                 }
-                _ => failures.push("(d) branch: the branch parent / originating tab vanished".into()),
+                _ => failures.push("(d) branch: the branch parent / originating session vanished".into()),
             }
         }
     }
 
-    // -- /clear: source=clear + a new id ⇒ id updates in place, NO new tab.
-    let count_before = project_tab_count(cx, state, &proj);
-    send_session_update(cx, socket_path, pane, "e2e-cleared-id", Some("clear"), None).await;
-    if !poll_tab_session_id(cx, state, tab, "e2e-cleared-id").await {
-        failures.push("(d) clear: /clear must update the originating tab's session id in place".into());
+    // -- /clear: source=clear + a new id ⇒ id updates in place, NO new session.
+    let count_before = project_session_count(cx, state, &proj);
+    send_session_update(cx, socket_path, term_window, "e2e-cleared-id", Some("clear"), None).await;
+    if !poll_session_claude_id(cx, state, session, "e2e-cleared-id").await {
+        failures.push("(d) clear: /clear must update the originating session's session id in place".into());
     }
-    if project_tab_count(cx, state, &proj) != count_before {
-        failures.push("(d) clear: /clear must NOT materialize a new tab".into());
+    if project_session_count(cx, state, &proj) != count_before {
+        failures.push("(d) clear: /clear must NOT materialize a new session".into());
     }
 }
 
@@ -645,12 +645,12 @@ async fn drive_rotation(
 async fn send_session_update(
     cx: &mut AsyncApp,
     socket_path: &str,
-    pane_id: &str,
-    session_id: &str,
+    term_window_id: &str,
+    claude_session_id: &str,
     source: Option<&str>,
     cwd: Option<&str>,
 ) {
-    let payload = session_update_json(pane_id, session_id, source, cwd);
+    let payload = session_update_json(term_window_id, claude_session_id, source, cwd);
     let path = socket_path.to_string();
     let done = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(4);
@@ -671,11 +671,11 @@ async fn send_session_update(
     settle(cx, POLL_MS).await;
 }
 
-fn session_update_json(pane_id: &str, session_id: &str, source: Option<&str>, cwd: Option<&str>) -> String {
+fn session_update_json(term_window_id: &str, claude_session_id: &str, source: Option<&str>, cwd: Option<&str>) -> String {
     let mut fields = format!(
         "\"action\":\"session_update\",\"paneId\":\"{}\",\"sessionId\":\"{}\"",
-        json_escape(pane_id),
-        json_escape(session_id),
+        json_escape(term_window_id),
+        json_escape(claude_session_id),
     );
     if let Some(src) = source {
         fields.push_str(&format!(",\"source\":\"{}\"", json_escape(src)));
@@ -714,24 +714,24 @@ fn is_v4_uuid(s: &str) -> bool {
 
 // -- model / session readers -------------------------------------------------
 
-fn all_tab_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
+fn all_session_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
     state.update(cx, |s, _cx| {
-        s.model
+        s.workspace
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect()
     })
 }
 
-async fn poll_new_tab(
+async fn poll_new_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     before: &[String],
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let now = all_tab_ids(cx, state);
+        let now = all_session_ids(cx, state);
         if let Some(new) = now.iter().find(|t| !before.contains(t)) {
             return Some(new.clone());
         }
@@ -739,43 +739,43 @@ async fn poll_new_tab(
     None
 }
 
-fn tab_pane_ids(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str) -> Option<(String, String)> {
+fn session_window_ids(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str) -> Option<(String, String)> {
     state.update(cx, |s, _cx| {
-        let tab = s.model.tab_for(tab_id)?;
-        let claude = tab.panes.first()?.id.clone();
-        let companion = tab.panes.get(1)?.id.clone();
+        let session = s.workspace.session_for(session_id)?;
+        let claude = session.windows.first()?.id.clone();
+        let companion = session.windows.get(1)?.id.clone();
         Some((claude, companion))
     })
 }
 
-fn pane_is_claude_running(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, pane_id: &str) -> bool {
+fn window_is_claude_running(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str, term_window_id: &str) -> bool {
     state.update(cx, |s, _cx| {
-        s.model
-            .tab_for(tab_id)
-            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
+        s.workspace
+            .session_for(session_id)
+            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
             .map(|p| p.is_claude_running)
             .unwrap_or(false)
     })
 }
 
-fn tab_session_id(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str) -> Option<String> {
-    state.update(cx, |s, _cx| s.model.tab_for(tab_id).and_then(|t| t.claude_session_id.clone()))
+fn session_claude_id(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str) -> Option<String> {
+    state.update(cx, |s, _cx| s.workspace.session_for(session_id).and_then(|t| t.claude_session_id.clone()))
 }
 
 async fn poll_branch_parent(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     project_id: &str,
-    session_id: &str,
-    exclude_tab: &str,
+    claude_session_id: &str,
+    exclude_session: &str,
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let found = state.update(cx, |s, _cx| {
-            s.model.projects.iter().find(|p| p.id == project_id).and_then(|p| {
-                p.tabs
+            s.workspace.projects.iter().find(|p| p.id == project_id).and_then(|p| {
+                p.sessions
                     .iter()
-                    .find(|t| t.id != exclude_tab && t.claude_session_id.as_deref() == Some(session_id))
+                    .find(|t| t.id != exclude_session && t.claude_session_id.as_deref() == Some(claude_session_id))
                     .map(|t| t.id.clone())
             })
         });
@@ -786,26 +786,26 @@ async fn poll_branch_parent(
     None
 }
 
-fn project_tab_count(cx: &mut AsyncApp, state: &Entity<WindowState>, project_id: &str) -> usize {
+fn project_session_count(cx: &mut AsyncApp, state: &Entity<WindowState>, project_id: &str) -> usize {
     state.update(cx, |s, _cx| {
-        s.model.projects.iter().find(|p| p.id == project_id).map(|p| p.tabs.len()).unwrap_or(0)
+        s.workspace.projects.iter().find(|p| p.id == project_id).map(|p| p.sessions.len()).unwrap_or(0)
     })
 }
 
-async fn poll_tab_session_id(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, want: &str) -> bool {
+async fn poll_session_claude_id(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str, want: &str) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        if tab_session_id(cx, state, tab_id).as_deref() == Some(want) {
+        if session_claude_id(cx, state, session_id).as_deref() == Some(want) {
             return true;
         }
     }
     false
 }
 
-async fn poll_tab_status(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, want: TabStatus) -> bool {
+async fn poll_session_status(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str, want: SessionStatus) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let got = state.update(cx, |s, _cx| s.model.tab_for(tab_id).map(|t| t.status()));
+        let got = state.update(cx, |s, _cx| s.workspace.session_for(session_id).map(|t| t.status()));
         if got == Some(want) {
             return true;
         }
@@ -813,24 +813,24 @@ async fn poll_tab_status(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id:
     false
 }
 
-async fn poll_has_pane(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, pane_id: &str) -> bool {
+async fn poll_has_window(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str, term_window_id: &str) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        if state.update(cx, |s, _cx| s.session.has_pane(tab_id, pane_id)) {
+        if state.update(cx, |s, _cx| s.ptys.has_window(session_id, term_window_id)) {
             return true;
         }
     }
     false
 }
 
-async fn poll_pane_promoted(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, pane_id: &str) -> bool {
+async fn poll_window_promoted(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str, term_window_id: &str) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let ok = state.update(cx, |s, _cx| {
-            s.model
-                .tab_for(tab_id)
-                .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
-                .map(|p| p.kind == PaneKind::Claude && p.is_claude_running)
+            s.workspace
+                .session_for(session_id)
+                .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
+                .map(|p| p.kind == TermWindowKind::Claude && p.is_claude_running)
                 .unwrap_or(false)
         });
         if ok {
@@ -842,13 +842,13 @@ async fn poll_pane_promoted(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_
 
 // -- grid / pty helpers ------------------------------------------------------
 
-fn pane_handle(
+fn term_window_handle(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> Option<Entity<TerminalSessionHandle>> {
-    state.update(cx, |s, _cx| s.session.pane_handle(tab_id, pane_id))
+    state.update(cx, |s, _cx| s.ptys.term_window_handle(session_id, term_window_id))
 }
 
 fn grid_of(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> String {
@@ -907,8 +907,8 @@ fn write_line(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>, bytes: 
     });
 }
 
-fn write_pane_line(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str, pane_id: &str, bytes: &[u8]) {
-    if let Some(handle) = pane_handle(cx, state, tab_id, pane_id) {
+fn write_window_line(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str, term_window_id: &str, bytes: &[u8]) {
+    if let Some(handle) = term_window_handle(cx, state, session_id, term_window_id) {
         write_line(cx, &handle, bytes);
     }
 }

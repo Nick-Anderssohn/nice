@@ -1,13 +1,13 @@
-//! `StripGeometry` — the toolbar pane strip's pure visibility math — ported
+//! `StripGeometry` — the toolbar window strip's pure visibility math — ported
 //! from `Sources/Nice/Views/PaneStripGeometry.swift`. Pure logic with no
 //! `gpui` dependency: which pills are scrolled past which edge of the
-//! viewport, driving the leading/trailing edge fades and the offscreen-pane
+//! viewport, driving the leading/trailing edge fades and the offscreen-window
 //! id set the overflow chevron's attention badge reads.
 //!
 //! The badge itself is **not** computed here. It already exists as
-//! [`crate::Tab::has_offscreen_attention`] (ported in R8, the pure
-//! combination of [`crate::Pane::needs_attention`] with an offscreen id set)
-//! — R11's toolbar feeds this module's [`StripGeometry::offscreen_pane_ids`]
+//! [`crate::Session::has_offscreen_attention`] (ported in R8, the pure
+//! combination of [`crate::TermWindow::needs_attention`] with an offscreen id set)
+//! — R11's toolbar feeds this module's [`StripGeometry::offscreen_window_ids`]
 //! into that existing method rather than a second attention predicate here.
 //!
 //! ## What dies with real layout
@@ -23,7 +23,7 @@
 //! What *does* survive from the estimator is behavioral, not mechanical: the
 //! unconditional reservation of the chevron + `+` button's slots in the
 //! tracked content width (`PaneStripOverflowEstimator.swift:26-31`), and the
-//! `panes.count >= 2` gate (`PaneStripOverflowEstimator.swift:107-115`). Both
+//! `windows.count >= 2` gate (`PaneStripOverflowEstimator.swift:107-115`). Both
 //! are folded into [`should_show_overflow_chevron`].
 
 use std::collections::{HashMap, HashSet};
@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 /// flickering on layout snaps. `PaneStripGeometry.swift:29`.
 pub const EDGE_TOLERANCE: f32 = 0.5;
 
-/// A pane pill's horizontal extent within the strip's scroll-content
+/// A window pill's horizontal extent within the strip's scroll-content
 /// coordinate space — the pure-Rust analog of the `CGRect` values Swift's
 /// `PaneStripGeometry.paneFrames` keyed on. Only `x`/`width` are kept because
 /// every ported predicate is horizontal-only (`PaneStripGeometry.swift:20`);
@@ -61,7 +61,7 @@ impl Rect {
     }
 }
 
-/// Pure snapshot of the pill row's real layout, keyed by pane id. Ported from
+/// Pure snapshot of the pill row's real layout, keyed by window id. Ported from
 /// `PaneStripGeometry.swift`.
 ///
 /// Coordinate convention (unchanged from Swift, `PaneStripGeometry.swift:11-17`):
@@ -74,16 +74,16 @@ impl Rect {
 /// viewport-relative space by the view — real layout, no estimation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripGeometry {
-    pub pane_frames: HashMap<String, Rect>,
+    pub window_frames: HashMap<String, Rect>,
     pub visible_width: f32,
 }
 
 impl StripGeometry {
-    /// Construct a geometry snapshot from per-pane frames and the strip's
+    /// Construct a geometry snapshot from per-window frames and the strip's
     /// visible width.
-    pub fn new(pane_frames: HashMap<String, Rect>, visible_width: f32) -> Self {
+    pub fn new(window_frames: HashMap<String, Rect>, visible_width: f32) -> Self {
         StripGeometry {
-            pane_frames,
+            window_frames,
             visible_width,
         }
     }
@@ -91,7 +91,7 @@ impl StripGeometry {
     /// Some pill is hidden past the leading edge. Drives the leading edge
     /// fade. `PaneStripGeometry.swift:33-35`.
     pub fn can_scroll_leading(&self) -> bool {
-        self.pane_frames.values().any(|r| r.min_x() < -EDGE_TOLERANCE)
+        self.window_frames.values().any(|r| r.min_x() < -EDGE_TOLERANCE)
     }
 
     /// Some pill is hidden past the trailing edge. Drives the trailing edge
@@ -100,20 +100,20 @@ impl StripGeometry {
         if self.visible_width <= 0.0 {
             return false;
         }
-        self.pane_frames
+        self.window_frames
             .values()
             .any(|r| r.max_x() > self.visible_width + EDGE_TOLERANCE)
     }
 
-    /// Pane ids whose frames sit entirely outside the viewport.
-    /// Partially-clipped panes are *not* in this set: the user can still see
+    /// TermWindow ids whose frames sit entirely outside the viewport.
+    /// Partially-clipped windows are *not* in this set: the user can still see
     /// their pulse/icon and they don't need a separate badge.
     /// `PaneStripGeometry.swift:49-60`.
-    pub fn offscreen_pane_ids(&self) -> HashSet<String> {
+    pub fn offscreen_window_ids(&self) -> HashSet<String> {
         if self.visible_width <= 0.0 {
             return HashSet::new();
         }
-        self.pane_frames
+        self.window_frames
             .iter()
             .filter(|(_, r)| {
                 r.max_x() <= EDGE_TOLERANCE || r.min_x() >= self.visible_width - EDGE_TOLERANCE
@@ -124,7 +124,7 @@ impl StripGeometry {
 }
 
 /// Whether the overflow chevron should render, given the pill row's real
-/// measured overflow amount and the pane count.
+/// measured overflow amount and the window count.
 ///
 /// `max_offset_x` is the strip's real scrollable overflow — on GPUI,
 /// `ScrollHandle::max_offset().x` — measured with the chevron's own slot and
@@ -135,11 +135,11 @@ impl StripGeometry {
 /// (`PaneStripOverflowEstimator.swift:26-31`): the content width this
 /// predicate is measured against never excludes the chevron's own width, so
 /// showing the chevron can never retroactively make the row "fit" and hide
-/// it again. `pane_count < 2` short-circuits to `false` — the overflow menu
+/// it again. `window_count < 2` short-circuits to `false` — the overflow menu
 /// is pointless with a single pill
 /// (`PaneStripOverflowEstimator.swift:107-115`).
-pub fn should_show_overflow_chevron(pane_count: usize, max_offset_x: f32) -> bool {
-    pane_count >= 2 && max_offset_x > 0.0
+pub fn should_show_overflow_chevron(window_count: usize, max_offset_x: f32) -> bool {
+    window_count >= 2 && max_offset_x > 0.0
 }
 
 /// The horizontal scroll offset that centers the pill occupying
@@ -183,9 +183,9 @@ pub fn center_offset_x(
 mod tests {
     //! Ported from `Tests/NiceUnitTests/PaneStripGeometryTests.swift`'s
     //! rect-fixture cases (the "Edge / offscreen detection" and "Edge cases"
-    //! sections, :35-157). The `Tab.hasOffscreenAttention` /
-    //! `Pane.needsAttention` sections of that file (:159-273) pin
-    //! `crate::Tab::has_offscreen_attention` / `crate::Pane::needs_attention`
+    //! sections, :35-157). The `Session.hasOffscreenAttention` /
+    //! `TermWindow.needsAttention` sections of that file (:159-273) pin
+    //! `crate::Session::has_offscreen_attention` / `crate::TermWindow::needs_attention`
     //! directly and are out of this module's scope — see this file's module
     //! docs.
     use super::*;
@@ -194,8 +194,8 @@ mod tests {
         Rect::new(x, width)
     }
 
-    fn geometry(pane_frames: HashMap<String, Rect>, visible_width: f32) -> StripGeometry {
-        StripGeometry::new(pane_frames, visible_width)
+    fn geometry(window_frames: HashMap<String, Rect>, visible_width: f32) -> StripGeometry {
+        StripGeometry::new(window_frames, visible_width)
     }
 
     fn frames<const N: usize>(pairs: [(&str, Rect); N]) -> HashMap<String, Rect> {
@@ -205,9 +205,9 @@ mod tests {
     // MARK: - Edge / offscreen detection
 
     /// Three pills that fit inside the viewport: no scroll affordances, no
-    /// offscreen panes. `PaneStripGeometryTests.swift:39-52`.
+    /// offscreen windows. `PaneStripGeometryTests.swift:39-52`.
     #[test]
-    fn no_overflow_when_all_panes_fit() {
+    fn no_overflow_when_all_windows_fit() {
         let geo = geometry(
             frames([
                 ("p1", rect(0.0, 100.0)),
@@ -219,7 +219,7 @@ mod tests {
 
         assert!(!geo.can_scroll_leading());
         assert!(!geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::new());
+        assert_eq!(geo.offscreen_window_ids(), HashSet::new());
     }
 
     /// p1 is scrolled past the leading edge; p2/p3 are visible. Only the
@@ -238,7 +238,7 @@ mod tests {
 
         assert!(geo.can_scroll_leading());
         assert!(!geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::from(["p1".to_string()]));
+        assert_eq!(geo.offscreen_window_ids(), HashSet::from(["p1".to_string()]));
     }
 
     /// p3 extends past the trailing edge; p1/p2 are visible. Trailing fade
@@ -256,10 +256,10 @@ mod tests {
 
         assert!(!geo.can_scroll_leading());
         assert!(geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::from(["p3".to_string()]));
+        assert_eq!(geo.offscreen_window_ids(), HashSet::from(["p3".to_string()]));
     }
 
-    /// Active pane in the middle scrolled into view, with hidden panes on
+    /// Active window in the middle scrolled into view, with hidden windows on
     /// both sides — both fades fire and both offscreen ids surface.
     /// `PaneStripGeometryTests.swift:90-103`.
     #[test]
@@ -276,19 +276,19 @@ mod tests {
         assert!(geo.can_scroll_leading());
         assert!(geo.can_scroll_trailing());
         assert_eq!(
-            geo.offscreen_pane_ids(),
+            geo.offscreen_window_ids(),
             HashSet::from(["p1".to_string(), "p3".to_string()])
         );
     }
 
-    /// A single pane wider than the viewport extends past the trailing edge
+    /// A single window wider than the viewport extends past the trailing edge
     /// — the trailing fade fires. `PaneStripGeometryTests.swift:107-115`.
     #[test]
-    fn single_huge_pane_extends_past_trailing_edge() {
+    fn single_huge_window_extends_past_trailing_edge() {
         let geo = geometry(frames([("p1", rect(0.0, 500.0))]), 200.0);
 
         assert!(geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::new());
+        assert_eq!(geo.offscreen_window_ids(), HashSet::new());
     }
 
     // MARK: - Edge cases
@@ -301,7 +301,7 @@ mod tests {
         let geo = geometry(frames([("p1", rect(0.0, 100.0))]), 0.0);
 
         assert!(!geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::new());
+        assert_eq!(geo.offscreen_window_ids(), HashSet::new());
     }
 
     /// Frames straddling each edge by sub-pixel amounts must not flip the
@@ -320,10 +320,10 @@ mod tests {
 
         assert!(!geo.can_scroll_leading());
         assert!(!geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::new());
+        assert_eq!(geo.offscreen_window_ids(), HashSet::new());
     }
 
-    /// No panes at all (e.g. between active-tab swaps) must be safe and
+    /// No windows at all (e.g. between active-session swaps) must be safe and
     /// produce no chrome. `PaneStripGeometryTests.swift:151-157`.
     #[test]
     fn empty_frames_is_quiet() {
@@ -331,20 +331,20 @@ mod tests {
 
         assert!(!geo.can_scroll_leading());
         assert!(!geo.can_scroll_trailing());
-        assert_eq!(geo.offscreen_pane_ids(), HashSet::new());
+        assert_eq!(geo.offscreen_window_ids(), HashSet::new());
     }
 
     // MARK: - should_show_overflow_chevron (reservation / >=2 rule)
     //
     // Ported behaviorally from `PaneStripOverflowEstimator.swift:26-31,107-115`
     // — the estimator's width-estimation MACHINERY dies (real layout replaces
-    // it), but the reservation + >=2-panes RULES survive as this pure gate
+    // it), but the reservation + >=2-windows RULES survive as this pure gate
     // over the real measured overflow amount.
 
-    /// Fewer than two panes never shows the chevron, no matter how large the
+    /// Fewer than two windows never shows the chevron, no matter how large the
     /// measured overflow is — the menu is pointless with a single pill.
     #[test]
-    fn fewer_than_two_panes_never_shows_chevron() {
+    fn fewer_than_two_windows_never_shows_chevron() {
         assert!(!should_show_overflow_chevron(0, 999.0));
         assert!(!should_show_overflow_chevron(1, 999.0));
     }
@@ -356,9 +356,9 @@ mod tests {
         assert!(!should_show_overflow_chevron(3, -5.0));
     }
 
-    /// Two-plus panes with positive measured overflow shows the chevron.
+    /// Two-plus windows with positive measured overflow shows the chevron.
     #[test]
-    fn overflow_with_two_or_more_panes_shows_chevron() {
+    fn overflow_with_two_or_more_windows_shows_chevron() {
         assert!(should_show_overflow_chevron(2, 0.1));
         assert!(should_show_overflow_chevron(5, 240.0));
     }

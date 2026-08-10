@@ -13,7 +13,7 @@
 //!      later. R12's only close behavior is deregister + [`WindowState::teardown`]
 //!      + quit-when-empty.
 //!   c. **Per-session-id lookup** (Stage 5 undo routing) —
-//!      [`WindowRegistry::state_for_session_id`].
+//!      [`WindowRegistry::state_for_window_session_id`].
 //!   d. **R25 cross-window migration** — served by
 //!      [`WindowRegistry::state_for_window`] / the id-keyed map.
 //!
@@ -28,12 +28,12 @@
 //! drops it (after teardown) on close.
 
 // The read side of the lookup contract — `active_state` (consumer a),
-// `state_for_window` / `state_for_session_id` (consumers c/d), `count`, and the
+// `state_for_window` / `state_for_window_session_id` (consumers c/d), `count`, and the
 // pure `mru::select` they lean on — has no in-crate caller until R12's keymap
 // slice routes shortcuts through `active_state` and the multi-window scenario /
 // itests assert `count`. The plan requires all four consumers to EXIST now
 // (dossier G5); the write side (register / note_active / close hook) is live.
-// Same "seam ahead of its caller" pattern as `sidebar_actions` / `pane_strip_actions`.
+// Same "seam ahead of its caller" pattern as `sidebar_actions` / `window_strip_actions`.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -167,11 +167,11 @@ impl WindowRegistry {
         cx.try_global::<WindowRegistry>()?.entries.get(&id).cloned()
     }
 
-    /// Consumer (c): the state owning `session_id` (undo routing, Stage 5).
+    /// Consumer (c): the state owning `window_session_id` (undo routing, Stage 5).
     /// Returns `None` when no live window carries that session.
-    pub(crate) fn state_for_session_id(
+    pub(crate) fn state_for_window_session_id(
         cx: &App,
-        session_id: &str,
+        window_session_id: &str,
     ) -> Option<Entity<WindowState>> {
         // Clone the handles out first so the global borrow ends before we read
         // each entity (`Entity::read` also borrows the app).
@@ -183,19 +183,19 @@ impl WindowRegistry {
             .collect();
         handles
             .into_iter()
-            .find(|h| h.read(cx).session_id() == session_id)
+            .find(|h| h.read(cx).window_session_id() == window_session_id)
     }
 
-    /// The window holding the tab pinned to Claude conversation
+    /// The window holding the session pinned to Claude conversation
     /// `claude_session_id` — the cross-window half of the background-`/fork`
     /// parent lookup (Fix B). `session_update` is routed to the window owning the
-    /// relayed pane id, but a daemon-spawned fork child relays whichever pane id
-    /// first spawned the Claude daemon, which says nothing about where the forked
-    /// conversation is actually open — so the fork path falls back to searching
-    /// every live window. Modelled on
+    /// relayed window id, but a daemon-spawned fork child relays whichever window
+    /// id first spawned the Claude daemon, which says nothing about where the
+    /// forked conversation is actually open — so the fork path falls back to
+    /// searching every live window. Modelled on
     /// [`state_for_session_id`](Self::state_for_session_id), which does the same
-    /// for a WINDOW session id (this one keys on a CLAUDE session id, a per-tab
-    /// value). `None` when no live window carries that conversation.
+    /// for a WINDOW session id (this one keys on a CLAUDE session id, a
+    /// per-session value). `None` when no live window carries that conversation.
     ///
     /// Must not be called while any window's [`WindowState`] is being updated:
     /// reading an entity that is currently leased panics in gpui. The fork path
@@ -214,8 +214,8 @@ impl WindowRegistry {
             .collect();
         handles.into_iter().find(|h| {
             h.read(cx)
-                .model
-                .tab_id_for_claude_session(claude_session_id)
+                .workspace
+                .session_id_for_claude_session(claude_session_id)
                 .is_some()
         })
     }
@@ -227,7 +227,7 @@ impl WindowRegistry {
             .map_or(0, |r| r.entries.len())
     }
 
-    /// Every live window's per-window state (W5: the ⌘Q pane-count sum + the
+    /// Every live window's per-window state (W5: the ⌘Q window-count sum + the
     /// quit-cascade snapshot/teardown loop — Swift's `registry.allAppStates`).
     /// Cloned handles so the global borrow ends before the caller reads/updates
     /// each entity.

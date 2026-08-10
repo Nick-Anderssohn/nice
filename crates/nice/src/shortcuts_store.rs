@@ -175,7 +175,7 @@ impl ShortcutBindings {
         self.binding(action) == default
     }
 
-    /// A snapshot of the live map (read hook — the conflict check and the pane
+    /// A snapshot of the live map (read hook — the conflict check and the window
     /// iterate it).
     pub fn bindings(&self) -> &HashMap<ShortcutAction, Option<OwnedCombo>> {
         &self.map
@@ -292,12 +292,12 @@ mod tests {
     fn full_map_round_trip() {
         let path = temp_path("roundtrip");
         let mut store = ShortcutBindings::load(path.clone());
-        assert!(store.set_in_memory(ShortcutAction::NewTerminalPane, Some(combo("cmd-y"))));
+        assert!(store.set_in_memory(ShortcutAction::NewTerminalWindow, Some(combo("cmd-y"))));
         assert!(store.set_in_memory(ShortcutAction::ToggleSidebar, None)); // explicit unbind
 
         let reloaded = ShortcutBindings::load(path);
         assert_eq!(
-            reloaded.binding(ShortcutAction::NewTerminalPane),
+            reloaded.binding(ShortcutAction::NewTerminalWindow),
             Some(combo("cmd-y"))
         );
         assert_eq!(reloaded.binding(ShortcutAction::ToggleSidebar), None);
@@ -314,11 +314,11 @@ mod tests {
         let path = temp_path("noop");
         let mut store = ShortcutBindings::load(path);
         assert!(
-            store.set_in_memory(ShortcutAction::NewTerminalPane, Some(combo("cmd-y"))),
+            store.set_in_memory(ShortcutAction::NewTerminalWindow, Some(combo("cmd-y"))),
             "first set changes"
         );
         assert!(
-            !store.set_in_memory(ShortcutAction::NewTerminalPane, Some(combo("cmd-y"))),
+            !store.set_in_memory(ShortcutAction::NewTerminalWindow, Some(combo("cmd-y"))),
             "re-setting the identical combo reports no change"
         );
         // Re-setting an action to its existing default is likewise a no-op.
@@ -338,7 +338,7 @@ mod tests {
         .unwrap();
 
         let mut store = ShortcutBindings::load(path.clone());
-        assert!(store.set_in_memory(ShortcutAction::NewTerminalPane, Some(combo("cmd-y"))));
+        assert!(store.set_in_memory(ShortcutAction::NewTerminalWindow, Some(combo("cmd-y"))));
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -401,7 +401,7 @@ mod tests {
         .unwrap();
         let store = ShortcutBindings::load(path);
         // Present + bound.
-        assert_eq!(store.binding(ShortcutAction::NewTerminalPane), Some(combo("cmd-y")));
+        assert_eq!(store.binding(ShortcutAction::NewTerminalWindow), Some(combo("cmd-y")));
         // Present + null ⇒ unbound (rule 4).
         assert_eq!(store.binding(ShortcutAction::ToggleSidebar), None);
         // Absent from a present section ⇒ unbound, NOT the default (rule 5).
@@ -497,7 +497,7 @@ mod tests {
         )
         .unwrap();
         let store = ShortcutBindings::load(path);
-        assert_eq!(store.binding(ShortcutAction::NewTerminalPane), Some(combo("cmd-y")));
+        assert_eq!(store.binding(ShortcutAction::NewTerminalWindow), Some(combo("cmd-y")));
         // The bogus key produced no entry; every other action is unbound (rule 5).
         assert_eq!(store.binding(ShortcutAction::ToggleSidebar), None);
     }
@@ -508,13 +508,13 @@ mod tests {
         let path = temp_path("garbage");
         std::fs::write(&path, b"{ not json").unwrap();
         let store = ShortcutBindings::load(path);
-        assert!(store.is_at_default(ShortcutAction::NewTerminalPane));
+        assert!(store.is_at_default(ShortcutAction::NewTerminalWindow));
 
         // A mistyped section (not a map) also fails soft to defaults.
         let path2 = temp_path("mistyped");
         std::fs::write(&path2, br#"{"version":1,"shortcuts":"not-a-map"}"#).unwrap();
         let store2 = ShortcutBindings::load(path2);
-        assert!(store2.is_at_default(ShortcutAction::NewTerminalPane));
+        assert!(store2.is_at_default(ShortcutAction::NewTerminalWindow));
     }
 
     /// `is_at_default` flips off after a rebind and back on after reset-to-default
@@ -523,16 +523,16 @@ mod tests {
     fn is_at_default_tracks_rebind_and_reset() {
         let path = temp_path("at-default");
         let mut store = ShortcutBindings::load(path);
-        assert!(store.is_at_default(ShortcutAction::NewTerminalPane));
+        assert!(store.is_at_default(ShortcutAction::NewTerminalWindow));
 
-        store.set_in_memory(ShortcutAction::NewTerminalPane, Some(combo("cmd-y")));
-        assert!(!store.is_at_default(ShortcutAction::NewTerminalPane));
+        store.set_in_memory(ShortcutAction::NewTerminalWindow, Some(combo("cmd-y")));
+        assert!(!store.is_at_default(ShortcutAction::NewTerminalWindow));
 
         // Restore the default combo (what `reset` sets).
-        let default = default_combo(ShortcutAction::NewTerminalPane)
+        let default = default_combo(ShortcutAction::NewTerminalWindow)
             .map(OwnedCombo::from);
-        store.set_in_memory(ShortcutAction::NewTerminalPane, default);
-        assert!(store.is_at_default(ShortcutAction::NewTerminalPane));
+        store.set_in_memory(ShortcutAction::NewTerminalWindow, default);
+        assert!(store.is_at_default(ShortcutAction::NewTerminalWindow));
     }
 
     /// An unbound action is never "at default" (every action HAS a default).
@@ -540,11 +540,11 @@ mod tests {
     fn unbound_is_not_at_default() {
         let path = temp_path("unbound");
         let mut store = ShortcutBindings::load(path);
-        store.set_in_memory(ShortcutAction::NewTerminalPane, None);
-        assert!(!store.is_at_default(ShortcutAction::NewTerminalPane));
+        store.set_in_memory(ShortcutAction::NewTerminalWindow, None);
+        assert!(!store.is_at_default(ShortcutAction::NewTerminalWindow));
         // A masked-modifier default sanity check: the default really is cmd-t.
         assert_eq!(
-            default_combo(ShortcutAction::NewTerminalPane).map(OwnedCombo::from),
+            default_combo(ShortcutAction::NewTerminalWindow).map(OwnedCombo::from),
             Some(OwnedCombo {
                 modifiers: Modifiers::COMMAND,
                 key: "t".to_string()
@@ -552,3 +552,140 @@ mod tests {
         );
     }
 }
+
+// ---- Phase R: pre-rename `shortcuts` section compatibility ---------------
+
+#[cfg(test)]
+mod pre_rename_compat_tests {
+    use super::*;
+
+    /// A real-shaped `ui_settings.json` written BEFORE the Phase R rename of the
+    /// `ShortcutAction` variants (`NextSidebarSession`/`NextWindow`/`NewTerminalWindow` →
+    /// `NextSidebarSession`/`NextWindow`/`NewTerminalWindow`). The serialized
+    /// action ids are a frozen surface and are unchanged by the rename.
+    const PRE_RENAME_UI_SETTINGS: &str = include_str!("fixtures/pre_rename_ui_settings.json");
+
+    /// The exact id strings the fixture uses, in [`ShortcutAction::ALL`] order.
+    /// Written out longhand so a variant rename that forgot to pin its id fails
+    /// here rather than silently orphaning every user's binding.
+    const FROZEN_IDS: [(ShortcutAction, &str); 14] = [
+        (ShortcutAction::NextSidebarSession, "nextSidebarTab"),
+        (ShortcutAction::PrevSidebarSession, "prevSidebarTab"),
+        (ShortcutAction::NextWindow, "nextPane"),
+        (ShortcutAction::PrevWindow, "prevPane"),
+        (ShortcutAction::NewTerminalWindow, "newTerminalPane"),
+        (ShortcutAction::ToggleSidebar, "toggleSidebar"),
+        (ShortcutAction::ToggleSidebarMode, "toggleSidebarMode"),
+        (ShortcutAction::ToggleHiddenFiles, "toggleHiddenFiles"),
+        (ShortcutAction::IncreaseFontSize, "increaseFontSize"),
+        (ShortcutAction::DecreaseFontSize, "decreaseFontSize"),
+        (ShortcutAction::ResetFontSizes, "resetFontSizes"),
+        (ShortcutAction::UndoFileOperation, "undoFileOperation"),
+        (ShortcutAction::RedoFileOperation, "redoFileOperation"),
+        (ShortcutAction::CommandCompose, "commandCompose"),
+    ];
+
+    fn scratch_ui_settings(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nice-shortcuts-compat-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui_settings.json");
+        std::fs::write(&path, PRE_RENAME_UI_SETTINGS).unwrap();
+        path
+    }
+
+    /// Every action id serializes to its pre-rename spelling. The variants moved;
+    /// the on-disk keys did not.
+    #[test]
+    fn shortcut_action_ids_are_frozen_across_the_rename() {
+        assert_eq!(ShortcutAction::ALL, FROZEN_IDS.map(|(a, _)| a));
+        for (action, id) in FROZEN_IDS {
+            assert_eq!(action.id(), id, "{action:?} id must stay frozen");
+            assert_eq!(ShortcutAction::from_id(id), Some(action));
+        }
+    }
+
+    /// A pre-rename `shortcuts` section loads with every binding intact: the
+    /// custom chords land on the renamed variants, the explicit `null` loads
+    /// unbound, and an id no longer in the set is dropped silently.
+    #[test]
+    fn loads_pre_rename_shortcuts_section_with_every_binding_intact() {
+        let store = ShortcutBindings::load(scratch_ui_settings("load"));
+
+        let expected = [
+            (ShortcutAction::NextSidebarSession, Some("cmd-alt-down")),
+            (ShortcutAction::PrevSidebarSession, Some("cmd-alt-up")),
+            (ShortcutAction::NextWindow, Some("cmd-alt-right")),
+            (ShortcutAction::PrevWindow, Some("cmd-alt-left")),
+            // A user-customized chord (the default is plain ⌘T) — proves the
+            // stored VALUE is read, not silently re-defaulted.
+            (ShortcutAction::NewTerminalWindow, Some("cmd-shift-t")),
+            (ShortcutAction::ToggleSidebar, None), // explicit null ⇒ unbound
+            (ShortcutAction::ToggleSidebarMode, Some("cmd-shift-b")),
+            (ShortcutAction::ToggleHiddenFiles, Some("cmd-shift-.")),
+            (ShortcutAction::IncreaseFontSize, Some("cmd-=")),
+            (ShortcutAction::DecreaseFontSize, Some("cmd--")),
+            (ShortcutAction::ResetFontSizes, Some("cmd-0")),
+            (ShortcutAction::UndoFileOperation, Some("cmd-z")),
+            (ShortcutAction::RedoFileOperation, Some("cmd-shift-z")),
+            (ShortcutAction::CommandCompose, Some("cmd-enter")),
+        ];
+        for (action, token) in expected {
+            assert_eq!(
+                store.binding(action),
+                token.map(|t| OwnedCombo::from_token(t).unwrap()),
+                "{action:?} must load its pre-rename binding"
+            );
+        }
+        // The unknown `somethingRemovedLongAgo` key was dropped, not mapped.
+        assert_eq!(store.bindings().len(), 14);
+    }
+
+    /// Round-trip: persisting the freshly-loaded map rewrites the SAME 14 ids with
+    /// the SAME values, and leaves every co-writer's section alone.
+    #[test]
+    fn pre_rename_shortcuts_section_round_trips_with_identical_ids() {
+        let path = scratch_ui_settings("roundtrip");
+        let before: serde_json::Value =
+            serde_json::from_str(PRE_RENAME_UI_SETTINGS).unwrap();
+
+        let mut store = ShortcutBindings::load(path.clone());
+        // Flip one binding away and back so `persist` actually runs (the store
+        // only writes on a real change), leaving the map exactly as loaded.
+        let original = store.binding(ShortcutAction::NewTerminalWindow);
+        assert!(store.set_in_memory(
+            ShortcutAction::NewTerminalWindow,
+            Some(OwnedCombo::from_token("cmd-y").unwrap())
+        ));
+        assert!(store.set_in_memory(ShortcutAction::NewTerminalWindow, original));
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let written = after["shortcuts"].as_object().expect("shortcuts section");
+
+        // Exactly the 14 frozen ids — the unknown key is not re-emitted.
+        let mut keys: Vec<&str> = written.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want: Vec<&str> = FROZEN_IDS.iter().map(|(_, id)| *id).collect();
+        want.sort_unstable();
+        assert_eq!(keys, want, "the persisted key set is the frozen id set");
+
+        // Every value that was in the pre-rename file round-trips unchanged.
+        let read_section = before["shortcuts"].as_object().unwrap();
+        for (id, value) in read_section {
+            if ShortcutAction::from_id(id).is_none() {
+                continue; // the dropped unknown key
+            }
+            assert_eq!(&written[id], value, "{id} must round-trip unchanged");
+        }
+
+        // A co-writer's section survives the read-merge-write.
+        assert_eq!(after["appearance"], before["appearance"]);
+    }
+}
+

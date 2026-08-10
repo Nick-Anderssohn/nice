@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn with_selection_whole_title_selects_all() {
-        // The tab/pane-pill rename seed: passing the char count selects the WHOLE
+        // The session/window-pill rename seed: passing the char count selects the WHOLE
         // title (not base-minus-extension), so the first keystroke replaces it.
         let title = "my session tab";
         let e = TextFieldEditor::with_selection(title, title.chars().count());

@@ -1,7 +1,7 @@
-//! `FileBrowserStore` — the per-window `Tab.id → FileBrowserState` catalog.
+//! `FileBrowserStore` — the per-window `Session.id → FileBrowserState` catalog.
 //! Ported from `Sources/Nice/State/FileBrowserStore.swift`. Owns the
-//! lifecycle of the browser's per-tab state: lazy creation on first access,
-//! removal on tab close (wired into the landed dissolve hook by a later
+//! lifecycle of the browser's per-session state: lazy creation on first access,
+//! removal on session close (wired into the landed dissolve hook by a later
 //! slice), and the "toggle hidden iff a state already exists" semantics the
 //! ⌘⇧. shortcut needs.
 //!
@@ -13,7 +13,7 @@
 use crate::file_browser::state::FileBrowserState;
 use std::collections::HashMap;
 
-/// Per-window map of tab id → file-browser state (see the module docs).
+/// Per-window map of session id → file-browser state (see the module docs).
 #[derive(Debug, Default)]
 pub struct FileBrowserStore {
     states: HashMap<String, FileBrowserState>,
@@ -25,43 +25,43 @@ impl FileBrowserStore {
         Self::default()
     }
 
-    /// Fetch the state for `tab_id`, creating one rooted at `cwd` if none
+    /// Fetch the state for `session_id`, creating one rooted at `cwd` if none
     /// exists. `cwd` is a **seed** used only on first creation — a subsequent
     /// call with a different cwd returns the existing state unchanged, so the
     /// user's in-state navigation (`root_path`) is never reset
     /// (`FileBrowserStore.swift:34-39`).
-    pub fn ensure_state(&mut self, tab_id: &str, cwd: &str) -> &mut FileBrowserState {
+    pub fn ensure_state(&mut self, session_id: &str, cwd: &str) -> &mut FileBrowserState {
         self.states
-            .entry(tab_id.to_string())
+            .entry(session_id.to_string())
             .or_insert_with(|| FileBrowserState::new(cwd))
     }
 
-    /// The state for `tab_id`, if one exists — a pure read that never
+    /// The state for `session_id`, if one exists — a pure read that never
     /// allocates.
-    pub fn state_for(&self, tab_id: &str) -> Option<&FileBrowserState> {
-        self.states.get(tab_id)
+    pub fn state_for(&self, session_id: &str) -> Option<&FileBrowserState> {
+        self.states.get(session_id)
     }
 
-    /// Whether a state exists for `tab_id` (the ⌘⇧. gate's "if exists" check,
+    /// Whether a state exists for `session_id` (the ⌘⇧. gate's "if exists" check,
     /// read-only).
-    pub fn has_state(&self, tab_id: &str) -> bool {
-        self.states.contains_key(tab_id)
+    pub fn has_state(&self, session_id: &str) -> bool {
+        self.states.contains_key(session_id)
     }
 
-    /// Remove the state for a tab. Called when a tab is dissolved so the map
-    /// doesn't grow over a long session. Unknown tabs are a no-op
+    /// Remove the state for a session. Called when a session is dissolved so the map
+    /// doesn't grow over a long session. Unknown sessions are a no-op
     /// (`FileBrowserStore.swift:43-45`).
-    pub fn remove_state(&mut self, tab_id: &str) {
-        self.states.remove(tab_id);
+    pub fn remove_state(&mut self, session_id: &str) {
+        self.states.remove(session_id);
     }
 
-    /// Toggle hidden-file visibility for `tab_id` **iff** a state already
+    /// Toggle hidden-file visibility for `session_id` **iff** a state already
     /// exists; returns `true` if a toggle happened. The "if exists" guard is
     /// what makes the ⌘⇧. shortcut a true no-op — no allocation, no change —
-    /// when the user has never opened the file browser for the active tab
+    /// when the user has never opened the file browser for the active session
     /// (`FileBrowserStore.swift:53-58`).
-    pub fn toggle_hidden_files_if_exists(&mut self, tab_id: &str) -> bool {
-        match self.states.get_mut(tab_id) {
+    pub fn toggle_hidden_files_if_exists(&mut self, session_id: &str) -> bool {
+        match self.states.get_mut(session_id) {
             Some(state) => {
                 state.toggle_show_hidden();
                 true
@@ -121,7 +121,7 @@ mod tests {
 
     /// `FileBrowserStoreTests.test_ensureState_distinctTabs_getDistinctStates`
     #[test]
-    fn ensure_state_distinct_tabs_get_distinct_states() {
+    fn ensure_state_distinct_sessions_get_distinct_states() {
         let mut store = store();
         assert_eq!(store.ensure_state("t1", "/tmp/a").root_path(), "/tmp/a");
         assert_eq!(store.ensure_state("t2", "/tmp/b").root_path(), "/tmp/b");
@@ -142,7 +142,7 @@ mod tests {
 
     /// `FileBrowserStoreTests.test_removeState_unknownTab_isNoop`
     #[test]
-    fn remove_state_unknown_tab_is_noop() {
+    fn remove_state_unknown_session_is_noop() {
         let mut store = store();
         store.remove_state("nope");
         assert!(!store.has_state("nope"));

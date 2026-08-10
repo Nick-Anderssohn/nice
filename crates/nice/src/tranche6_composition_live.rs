@@ -18,10 +18,10 @@
 //!     toolbar (AX `"toolbar.updateAvailable"`, an `AXButton`); a real guarded-HID
 //!     click on it (behind the mandatory preflight) opens the popover showing
 //!     `brew update && brew upgrade --cask nice`.
-//!   * **(b) R25 — pill drag-reorder on the shipped strip.** With ≥2 panes in the
-//!     active tab, a real guarded-HID drag of the trailing pill leftward past the
+//!   * **(b) R25 — pill drag-reorder on the shipped strip.** With ≥2 windows in the
+//!     active session, a real guarded-HID drag of the trailing pill leftward past the
 //!     leading pill's midpoint should reorder it BEFORE the leader — a COMMITTED
-//!     reorder read back off the shipped strip (`pane_ids()` flips), hard-asserted
+//!     reorder read back off the shipped strip (`term_window_ids()` flips), hard-asserted
 //!     when the drag commits, and hard-FAILED if it commits to the WRONG slot. But
 //!     a synthetic global-HID drag lands only the PRESS: AppKit does not deliver
 //!     `mouseDragged:` for an injected press (no implicit mouse-grab), so R25's
@@ -29,13 +29,13 @@
 //!     with-order-untouched therefore DEFERS (the honest-deferral discipline
 //!     below) rather than failing — the deterministic reorder is hard-asserted
 //!     in-process by `nice-itests`.
-//!   * **(c) R26 — handoff nested tab + settings toggle.** A raw-`UnixStream`
-//!     `handoff` naming a seeded originating Claude tab replies `ok` and opens a
-//!     nested `[HANDOFF] <title>` tab on the shipped window (parented under the
-//!     originating tab), with the stub `claude` (never the machine's real one); and
+//!   * **(c) R26 — handoff nested session + settings toggle.** A raw-`UnixStream`
+//!     `handoff` naming a seeded originating Claude session replies `ok` and opens a
+//!     nested `[HANDOFF] <title>` session on the shipped window (parented under the
+//!     originating session), with the stub `claude` (never the machine's real one); and
 //!     ⌘, opens R23's shipped settings window whose rail exposes the Claude section
 //!     (an `AXButton`) — the home of R26's `settings.claude.installHandoffSkill`
-//!     handoff toggle (whose click behaviour is pinned by R26's own `claude_pane`
+//!     handoff toggle (whose click behaviour is pinned by R26's own `claude_window`
 //!     unit test + the `handoff` installer scenario).
 //!
 //! ## The guarded global-HID seam (SELFTEST-ONLY; the `platform.rs` invariant carve-out)
@@ -53,7 +53,7 @@
 //! — an explicit `DEFER` with remediation, no post — so an unattended
 //! `NICE_SELFTEST=all` run can never send clicks into another app. A synthetic
 //! gesture that passes the preflight yet does not drive the real behaviour also
-//! DEFERS (the `pane_strip_live` honest-deferral discipline: a synthetic mouse
+//! DEFERS (the `window_strip_live` honest-deferral discipline: a synthetic mouse
 //! event need not land on a gpui hitbox). This covers two shapes for the R25 drag:
 //! the press not landing at all, AND — the shape observed here — the press landing
 //! (it selects the mover) while the DRAG never arms, because AppKit does not
@@ -71,8 +71,8 @@
 //! worker is `app::run`-only + gated OFF). The handoff stub `claude` is seeded via
 //! the `ResolvedClaudePath` Global with `NICE_CLAUDE_OVERRIDE` UNSET; the machine's
 //! real `claude` is NEVER spawned. `HOME` is a sandbox with no rc for the driver's
-//! lifetime (restored at teardown), so the shipped Main pane's login shell + the
-//! handoff pane's stub source nothing. A `SavedInputSource` is held for the whole
+//! lifetime (restored at teardown), so the shipped Main window's login shell + the
+//! handoff window's stub source nothing. A `SavedInputSource` is held for the whole
 //! leg (Pinyin is enabled on this machine; a mid-leg failure must not strand it).
 //! `Gate::SelfReported`; registered BEFORE `multiwindow` — its `build_window_root`
 //! only `register`s (no `WindowRegistry` close observer), so its window never trips
@@ -90,12 +90,12 @@ use anyhow::{Context as _, Result};
 use gpui::{AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, Tab};
+use nice_model::{TermWindow, TermWindowKind, Session};
 
 use crate::app_shell::AppShellView;
 use crate::platform;
 use crate::release_check::{self, release_fetch};
-use crate::session_manager::ResolvedClaudePath;
+use crate::pty_manager::ResolvedClaudePath;
 use crate::settings::window::{current_settings_window, install_open_settings_command};
 use crate::toolbar::WindowToolbarView;
 use crate::window_registry::WindowRegistry;
@@ -122,7 +122,7 @@ const CLAUDE_SECTION_AX_ROLE: &str = "AXButton";
 /// cannot surface a same-titled node first.
 const SETTINGS_WINDOW_AX_TITLE: &str = "Settings";
 /// R26's handoff-toggle a11y id — pinned here for the report; its click behaviour
-/// is covered by R26's `claude_pane` unit test + the `handoff` installer scenario.
+/// is covered by R26's `claude_window` unit test + the `handoff` installer scenario.
 const HANDOFF_TOGGLE_AX_ID: &str = "settings.claude.installHandoffSkill";
 /// ⌘, — OpenSettings (`CGKeyCode` for `,`).
 const KC_COMMA: u16 = 43;
@@ -130,12 +130,12 @@ const KC_COMMA: u16 = 43;
 /// How far LEFT of the leading pill's centre the reorder release lands. A pill's
 /// centre IS its midpoint and the resolver flips on `x > mid_x`, so releasing a few
 /// pt left of centre resolves to the before-leader slot (`place_after == false`)
-/// while staying inside the leader's frame (the `pane_strip_live` reorder margin).
+/// while staying inside the leader's frame (the `window_strip_live` reorder margin).
 const REORDER_BEFORE_MARGIN: f64 = 15.0;
 
 /// General poll timeout for a state / AX / popover transition.
 const POLL_TIMEOUT: Duration = Duration::from_secs(4);
-/// Poll cap + interval for the socket-routed tab creation (the drain-task hop, on
+/// Poll cap + interval for the socket-routed session creation (the drain-task hop, on
 /// the real clock) — mirrors `handoff_live`.
 const ROUTE_POLLS: usize = 60;
 const POLL_MS: u64 = 100;
@@ -173,9 +173,9 @@ impl Fixture {
         for d in [&home, &work, &bin] {
             std::fs::create_dir_all(d).context("create fixture dir")?;
         }
-        // The stub `claude`: idle reading stdin so its pane stays alive until
+        // The stub `claude`: idle reading stdin so its window stays alive until
         // teardown. NEVER the machine's real claude (hermeticity). It records no
-        // argv — this leg asserts the [HANDOFF] tab + `ok` reply, not the flags
+        // argv — this leg asserts the [HANDOFF] session + `ok` reply, not the flags
         // (the `handoff` scenario pins the argv).
         let stub = bin.join("claude");
         std::fs::write(&stub, "#!/bin/sh\nwhile IFS= read -r _l; do : ; done\n")
@@ -184,7 +184,7 @@ impl Fixture {
             .context("chmod stub claude")?;
         // Remove any prior scenario's NICE_CLAUDE_OVERRIDE so the ResolvedClaudePath
         // Global (seeded in `open`) is what resolves the stub.
-        // SAFETY: single-threaded scenario setup, before any Claude pane forks.
+        // SAFETY: single-threaded scenario setup, before any Claude window forks.
         unsafe { std::env::remove_var("NICE_CLAUDE_OVERRIDE") };
         let prev_home = std::env::var("HOME").ok();
         Ok(Fixture {
@@ -235,10 +235,10 @@ pub fn open_tranche6_composition_window(cx: &mut AsyncApp) -> Result<AnyWindowHa
         // ⌘, / OpenSettings, exactly as the shipped `run` (leg c).
         install_open_settings_command(app);
         // Seed the stub as the resolved claude binary (env override unset ⇒
-        // is_override false ⇒ the handoff pane spawns the stub, never real claude).
+        // is_override false ⇒ the handoff window spawns the stub, never real claude).
         app.set_global(ResolvedClaudePath(Some(stub.clone())));
         // Sandbox HOME (no rc) for the whole driver; restored at teardown.
-        // SAFETY: single-threaded setup; the Main pane forks synchronously inside
+        // SAFETY: single-threaded setup; the Main window forks synchronously inside
         // `open_managed_window` under this HOME.
         unsafe { std::env::set_var("HOME", &home) };
         crate::app::open_managed_window(app)
@@ -312,7 +312,7 @@ async fn run_composition(
     // (b) R25 — a real committed pill reorder on the SHIPPED strip.
     leg_b_reorder(cx, whandle, &toolbar, &mut failures, &mut deferred).await;
 
-    // (c) R26 — the handoff nested tab + the shipped settings toggle's home.
+    // (c) R26 — the handoff nested session + the shipped settings toggle's home.
     leg_c_handoff(cx, whandle, &state, &fixture, pid, &mut failures).await;
 
     // Teardown: drop every session so no zsh / stub outlives the window, clear the
@@ -459,27 +459,27 @@ async fn leg_b_reorder(
     failures: &mut Vec<String>,
     deferred: &mut Vec<String>,
 ) {
-    // Ensure ≥2 panes on the active tab (the shipped Main tab starts with one).
-    let mut ids = toolbar.update(cx, |v, cx| v.pane_ids(cx));
+    // Ensure ≥2 windows on the active session (the shipped Main session starts with one).
+    let mut ids = toolbar.update(cx, |v, cx| v.term_window_ids(cx));
     if ids.len() < 2 {
         let _ = whandle.update(cx, |_r, _w, app| {
-            toolbar.update(app, |v, cx| v.drive_add_terminal_pane(cx))
+            toolbar.update(app, |v, cx| v.drive_add_terminal_window(cx))
         });
         settle(cx, 400).await;
-        ids = toolbar.update(cx, |v, cx| v.pane_ids(cx));
+        ids = toolbar.update(cx, |v, cx| v.term_window_ids(cx));
     }
     if ids.len() < 2 {
-        failures.push("(b) could not get ≥2 panes on the shipped strip to reorder".to_string());
+        failures.push("(b) could not get ≥2 windows on the shipped strip to reorder".to_string());
         return;
     }
     let leader = ids[0].clone();
     let mover = ids[1].clone();
 
     // Select the LEADER active, so a landed press on the mover flips active
-    // leader→mover — the delivery signal (`move_pane` never touches
-    // `active_pane_id`, so the flip evidences the PRESS landing, not the reorder).
+    // leader→mover — the delivery signal (`move_window` never touches
+    // `active_window_id`, so the flip evidences the PRESS landing, not the reorder).
     let _ = whandle.update(cx, |_r, window, app| {
-        toolbar.update(app, |v, cx| v.drive_select_pane(&leader, window, cx))
+        toolbar.update(app, |v, cx| v.drive_select_window(&leader, window, cx))
     });
     settle(cx, 250).await;
 
@@ -504,11 +504,11 @@ async fn leg_b_reorder(
     }
     settle(cx, 400).await;
     let active_after = read_active(cx, toolbar);
-    let order_after = toolbar.update(cx, |v, cx| v.pane_ids(cx));
+    let order_after = toolbar.update(cx, |v, cx| v.term_window_ids(cx));
 
     // The press must be shown to have LANDED (it selected the mover) before we can
     // hard-assert the reorder — a synthetic press need not land on a gpui hitbox
-    // (the `pane_strip_live` honest-deferral; the deterministic reorder is
+    // (the `window_strip_live` honest-deferral; the deterministic reorder is
     // hard-asserted in-process by nice-itests). A non-landing press DEFERS rather
     // than reading a vacuous "order unchanged" as a pass.
     let landed = active_before.as_deref() != Some(mover.as_str())
@@ -533,7 +533,7 @@ async fn leg_b_reorder(
     if reordered {
         eprintln!(
             "[selftest] tranche6-composition (b): a real guarded-HID drag reordered the mover before \
-             the leader on the shipped strip — pane_ids now leads [{mover}, {leader}]"
+             the leader on the shipped strip — term_window_ids now leads [{mover}, {leader}]"
         );
     } else if unchanged {
         // The press landed (it selected the mover) yet the strip order is untouched:
@@ -541,7 +541,7 @@ async fn leg_b_reorder(
         // does not deliver `mouseDragged:` for an injected press (no implicit
         // mouse-grab — cursor-warp + re-cadenced posts were both tried and neither
         // drives it), so `on_drag`/`on_drag_move`/`on_drop` never fire. This is the
-        // SAME synthetic-mouse limitation `pane_strip_live` DEFERS (its press does
+        // SAME synthetic-mouse limitation `window_strip_live` DEFERS (its press does
         // not even land); the deterministic reorder — move past the leader's
         // midpoint → order flips + `save_to_store` persists — is hard-asserted
         // in-process by `nice-itests`. DEFER (never read a vacuous "order unchanged"
@@ -564,7 +564,7 @@ async fn leg_b_reorder(
     }
 }
 
-// ---- (c) R26 handoff nested tab + settings toggle home ---------------------
+// ---- (c) R26 handoff nested session + settings toggle home ---------------------
 
 async fn leg_c_handoff(
     cx: &mut AsyncApp,
@@ -581,9 +581,9 @@ async fn leg_c_handoff(
     };
     let work = fixture.work_str();
 
-    // Seed a model-only originating Claude tab so the handoff NESTS under it.
-    seed_originating_claude_tab(cx, state, &work, "comp-orig-tab", "comp-orig-pane", "my-project");
-    let before = all_tab_ids(cx, state);
+    // Seed a model-only originating Claude session so the handoff NESTS under it.
+    seed_originating_claude_session(cx, state, &work, "comp-orig-tab", "comp-orig-pane", "my-project");
+    let before = all_session_ids(cx, state);
     let handoff_file = format!("{work}/comp-handoff.md");
     let reply = send_handoff(
         cx,
@@ -600,32 +600,32 @@ async fn leg_c_handoff(
     if reply.as_deref().map(str::trim_end) != Some("ok") {
         failures.push(format!("(c) handoff: expected reply 'ok', got {reply:?}"));
     }
-    match poll_new_tab(cx, state, &before).await {
-        None => failures.push("(c) handoff: the socket `handoff` produced no new tab on the shipped window".to_string()),
-        Some(new_tab) => {
+    match poll_new_session(cx, state, &before).await {
+        None => failures.push("(c) handoff: the socket `handoff` produced no new session on the shipped window".to_string()),
+        Some(new_session) => {
             let snap = state.update(cx, |s, _cx| {
-                s.model
-                    .tab_for(&new_tab)
-                    .map(|t| (t.title.clone(), t.title_manually_set, t.parent_tab_id.clone()))
+                s.workspace
+                    .session_for(&new_session)
+                    .map(|t| (t.title.clone(), t.title_manually_set, t.parent_session_id.clone()))
             });
             match snap {
-                None => failures.push("(c) handoff: the new tab vanished before assertion".to_string()),
+                None => failures.push("(c) handoff: the new session vanished before assertion".to_string()),
                 Some((title, locked, parent)) => {
                     if title != "[HANDOFF] my-project" {
                         failures.push(format!(
-                            "(c) handoff: the nested tab title must be '[HANDOFF] my-project', got {title:?}"
+                            "(c) handoff: the nested session title must be '[HANDOFF] my-project', got {title:?}"
                         ));
                     }
                     if !locked {
-                        failures.push("(c) handoff: the handoff tab's title must be LOCKED (title_manually_set == true)".to_string());
+                        failures.push("(c) handoff: the handoff session's title must be LOCKED (title_manually_set == true)".to_string());
                     }
                     if parent.as_deref() != Some("comp-orig-tab") {
                         failures.push(format!(
-                            "(c) handoff: the handoff tab must nest under the originating tab \
-                             (parent_tab_id == 'comp-orig-tab'), got {parent:?}"
+                            "(c) handoff: the handoff session must nest under the originating session \
+                             (parent_session_id == 'comp-orig-tab'), got {parent:?}"
                         ));
                     } else {
-                        eprintln!("[selftest] tranche6-composition (c): a socket `handoff` opened a nested [HANDOFF]-titled tab on the shipped window (reply ok, parented under the originating tab)");
+                        eprintln!("[selftest] tranche6-composition (c): a socket `handoff` opened a nested [HANDOFF]-titled session on the shipped window (reply ok, parented under the originating session)");
                     }
                 }
             }
@@ -636,7 +636,7 @@ async fn leg_c_handoff(
     // ⌘, opens R23's shipped settings window (the OpenSettings non-rebindable firing
     // live); its rail exposes the Claude section (an AXButton) — the home of R26's
     // `settings.claude.installHandoffSkill` toggle. The toggle's click behaviour is
-    // pinned by R26's `claude_pane` unit test + the `handoff` installer scenario; a
+    // pinned by R26's `claude_window` unit test + the `handoff` installer scenario; a
     // gpui toggle exposes its aria_label ("On"/"Off"), not its a11y id, as AXTitle,
     // so the shipped-surface assertion is the AX-discoverable Claude section that
     // hosts it.
@@ -795,13 +795,13 @@ async fn send_handoff(
     socket_path: &str,
     cwd: &str,
     handoff_file: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     instructions: &str,
     model: &str,
     effort: &str,
 ) -> Option<String> {
-    let payload = handoff_json(cwd, handoff_file, tab_id, pane_id, instructions, model, effort);
+    let payload = handoff_json(cwd, handoff_file, session_id, term_window_id, instructions, model, effort);
     let rx = raw_request(socket_path.to_string(), payload);
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
@@ -846,8 +846,8 @@ fn raw_request(path: String, payload: String) -> Receiver<Option<Vec<u8>>> {
 fn handoff_json(
     cwd: &str,
     handoff_file: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     instructions: &str,
     model: &str,
     effort: &str,
@@ -856,8 +856,8 @@ fn handoff_json(
         "{{\"action\":\"handoff\",\"cwd\":\"{}\",\"handoffFile\":\"{}\",\"tabId\":\"{}\",\"paneId\":\"{}\",\"instructions\":\"{}\",\"model\":\"{}\",\"effort\":\"{}\"}}",
         json_escape(cwd),
         json_escape(handoff_file),
-        json_escape(tab_id),
-        json_escape(pane_id),
+        json_escape(session_id),
+        json_escape(term_window_id),
         json_escape(instructions),
         json_escape(model),
         json_escape(effort),
@@ -870,24 +870,24 @@ fn json_escape(s: &str) -> String {
 
 // -- model / poll helpers ----------------------------------------------------
 
-fn all_tab_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
+fn all_session_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
     state.update(cx, |s, _cx| {
-        s.model
+        s.workspace
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect()
     })
 }
 
-async fn poll_new_tab(
+async fn poll_new_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     before: &[String],
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let now = all_tab_ids(cx, state);
+        let now = all_session_ids(cx, state);
         if let Some(new) = now.iter().find(|t| !before.contains(t)) {
             return Some(new.clone());
         }
@@ -895,49 +895,49 @@ async fn poll_new_tab(
     None
 }
 
-/// Seed a model-only originating Claude tab (present, non-Terminals, owning
-/// `pane_id`) so the handoff resolves + nests. Mirrors `handoff_live`.
-fn seed_originating_claude_tab(
+/// Seed a model-only originating Claude session (present, non-Terminals, owning
+/// `term_window_id`) so the handoff resolves + nests. Mirrors `handoff_live`.
+fn seed_originating_claude_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     cwd: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     title: &str,
 ) {
     let _ = state.update(cx, |s, _cx| {
-        s.model.ensure_project("comp-orig-proj", "Orig", cwd);
-        let mut claude = Pane::new(pane_id, "Claude", PaneKind::Claude);
+        s.workspace.ensure_project("comp-orig-proj", "Orig", cwd);
+        let mut claude = TermWindow::new(term_window_id, "Claude", TermWindowKind::Claude);
         claude.is_claude_running = true;
-        let mut tab = Tab::new(tab_id, title, cwd);
-        tab.panes = vec![
+        let mut session = Session::new(session_id, title, cwd);
+        session.windows = vec![
             claude,
-            Pane::new(&format!("{tab_id}-t1"), "Terminal 1", PaneKind::Terminal),
+            TermWindow::new(&format!("{session_id}-t1"), "Terminal 1", TermWindowKind::Terminal),
         ];
-        tab.active_pane_id = Some(pane_id.to_string());
-        tab.next_terminal_index = 2;
-        if let Some(pi) = s.model.projects.iter().position(|p| p.id == "comp-orig-proj") {
-            s.model.projects[pi].tabs.push(tab);
+        session.active_window_id = Some(term_window_id.to_string());
+        session.next_terminal_index = 2;
+        if let Some(pi) = s.workspace.projects.iter().position(|p| p.id == "comp-orig-proj") {
+            s.workspace.projects[pi].sessions.push(session);
         }
-        s.model.select_tab(tab_id);
+        s.workspace.select_session(session_id);
     });
 }
 
 fn read_active(cx: &mut AsyncApp, toolbar: &Entity<WindowToolbarView>) -> Option<String> {
-    toolbar.update(cx, |v, cx| v.active_pane_id(cx))
+    toolbar.update(cx, |v, cx| v.active_window_id(cx))
 }
 
 /// The on-screen content-view centre of a pill (offset-free bounds + the current
 /// scroll offset), as `(x, y_from_top)` — the guarded-drag target. Mirrors
-/// `pane_strip_live::read_pill_center`; in the shipped window the toolbar's pill
+/// `window_strip_live::read_pill_center`; in the shipped window the toolbar's pill
 /// bounds are the same window-content coords `close-confirmation` clicks through.
 fn read_pill_center(
     cx: &mut AsyncApp,
     toolbar: &Entity<WindowToolbarView>,
-    pane_id: &str,
+    term_window_id: &str,
 ) -> Option<(f64, f64)> {
     toolbar.update(cx, |v, cx| {
-        let b = v.scenario_pill_bounds(pane_id, cx)?;
+        let b = v.scenario_pill_bounds(term_window_id, cx)?;
         let off = v.scenario_scroll_offset_x();
         let x = f32::from(b.origin.x) + off + f32::from(b.size.width) / 2.0;
         let y = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
@@ -1048,7 +1048,7 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
                  (hard-asserted when the drag armed, else DEFERRED — a synthetic press does not \
                  arm gpui's drag-and-drop; the deterministic reorder is pinned by nice-itests); \
                  (c) a socket `handoff` opened a nested \
-                 [HANDOFF]-titled tab (reply ok) and ⌘, opened the shipped settings window exposing \
+                 [HANDOFF]-titled session (reply ok) and ⌘, opened the shipped settings window exposing \
                  the Claude section (AXButton) — the R26 handoff toggle's home; {} item(s) DEFERRED \
                  to a human pass",
                 deferred.len()

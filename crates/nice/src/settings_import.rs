@@ -291,11 +291,11 @@ const NS_COMMAND: u64 = 1 << 20;
 /// authoritative, test-verified statement of each pairing, and a prod action with
 /// no entry here (a future prod-only action) is simply skipped on import.
 const PROD_ACTION_MAP: [(&str, ShortcutAction); 13] = [
-    ("nextSidebarTab", ShortcutAction::NextSidebarTab),
-    ("prevSidebarTab", ShortcutAction::PrevSidebarTab),
-    ("nextPane", ShortcutAction::NextPane),
-    ("prevPane", ShortcutAction::PrevPane),
-    ("newTerminalPane", ShortcutAction::NewTerminalPane),
+    ("nextSidebarTab", ShortcutAction::NextSidebarSession),
+    ("prevSidebarTab", ShortcutAction::PrevSidebarSession),
+    ("nextPane", ShortcutAction::NextWindow),
+    ("prevPane", ShortcutAction::PrevWindow),
+    ("newTerminalPane", ShortcutAction::NewTerminalWindow),
     ("toggleSidebar", ShortcutAction::ToggleSidebar),
     ("toggleSidebarMode", ShortcutAction::ToggleSidebarMode),
     ("toggleHiddenFiles", ShortcutAction::ToggleHiddenFiles),
@@ -981,7 +981,7 @@ mod tests {
     }
 
     /// The kVK → key-name table uses gpui's exact token spellings for the named
-    /// specials the plan enumerates (esc/tab/return/space/delete + an arrow); an
+    /// specials the plan enumerates (esc/session/return/space/delete + an arrow); an
     /// unmapped keyCode is `None`.
     #[test]
     fn special_key_names_match_gpui_tokens() {
@@ -1061,12 +1061,12 @@ mod tests {
         let store = ShortcutBindings::load(path);
         // Custom rebind imported and re-parsed by the real store.
         assert_eq!(
-            store.binding(ShortcutAction::NewTerminalPane),
+            store.binding(ShortcutAction::NewTerminalWindow),
             OwnedCombo::from_token("cmd-y")
         );
         // A prod entry equal to the default lands as the default.
         assert_eq!(
-            store.binding(ShortcutAction::NextSidebarTab),
+            store.binding(ShortcutAction::NextSidebarSession),
             OwnedCombo::from_token("cmd-alt-down")
         );
         // Unmappable keyCode kept the Rust default (⌘Z).
@@ -1121,7 +1121,7 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(raw.get("shortcuts").is_none());
-        assert!(ShortcutBindings::load(path).is_at_default(ShortcutAction::NewTerminalPane));
+        assert!(ShortcutBindings::load(path).is_at_default(ShortcutAction::NewTerminalWindow));
     }
 
     /// Partial data: an entry missing `modifierFlagsRaw` is skipped while the valid

@@ -8,7 +8,7 @@
 //! (and vice versa), exactly the constraint the R9 [`crate::chrome_band`] probe
 //! documents. So this mirrors the view's tap-routing handlers in a local
 //! [`SidebarProbe`] that drives the **real** `nice-model` selection / rename-gate
-//! types ([`SidebarTabSelection`], [`InlineRenameClickGate`], [`TabModel`]) and
+//! types ([`SidebarSessionSelection`], [`InlineRenameClickGate`], [`WorkspaceModel`]) and
 //! **records the classification outcome** of every simulated event — which model
 //! mutation the press produced, and whether the press was consumed by the row or
 //! leaked to the empty-area / band / background handlers behind it. The mirrored
@@ -22,7 +22,7 @@
 //! outcome**, never a frame-motion claim: an in-process simulated event cannot
 //! move a real NSWindow frame, so "the top-strip drag moved the window" is
 //! vacuous here and lives only in the live `sidebar` scenario. What is asserted
-//! is the pair — *a press on a tab row is consumed by the row (`stop_propagation`)
+//! is the pair — *a press on a session row is consumed by the row (`stop_propagation`)
 //! so the band's window-drag arm never fires and the empty-area collapse never
 //! runs; a press on the empty area DOES reach the collapse handler; a press on the
 //! band DOES arm a window drag.* The band handlers therefore record what the band
@@ -43,7 +43,7 @@ use gpui::{
     Pixels, Point, Render, TestAppContext, VisualTestContext, Window,
 };
 
-use nice_model::{InlineRenameClickGate, Pane, PaneKind, SidebarTabSelection, Tab, TabModel};
+use nice_model::{InlineRenameClickGate, TermWindow, TermWindowKind, SidebarSessionSelection, Session, WorkspaceModel};
 
 // The Esc key binding is a gpui action — the same shape as the shipped
 // `CollapseSidebarSelection` (the DO-NOT-PORT replacement for the `NSEvent` Esc
@@ -56,8 +56,8 @@ const PROBE_KEY_CONTEXT: &str = "SidebarShellProbe";
 
 // ---- Geometry (deterministic absolute hitboxes) -----------------------------
 //
-// A flat mini-sidebar: a top strip (the R9 band pattern), a tab list carrying the
-// empty-area collapse handler, and one absolute row per *visible* tab (a row bg +
+// A flat mini-sidebar: a top strip (the R9 band pattern), a session list carrying the
+// empty-area collapse handler, and one absolute row per *visible* session (a row bg +
 // a title sub-hitbox), over a full-window background catcher. Absolute positions
 // make every simulated click land deterministically, like `chrome_band`.
 
@@ -92,19 +92,19 @@ fn band_point() -> Point<Pixels> {
     point(px(CARD_W / 2.0), px(BAND_H / 2.0))
 }
 
-/// A point in the tab list below every row (the empty gap the collapse handler
+/// A point in the session list below every row (the empty gap the collapse handler
 /// owns), for a list holding `n_rows` visible rows.
 fn empty_area_point(n_rows: usize) -> Point<Pixels> {
     point(px(CARD_W / 2.0), px(LIST_TOP + n_rows as f32 * ROW_H + 40.0))
 }
 
-/// The context-menu close label for `count` tabs — parity with the shipped
+/// The context-menu close label for `count` sessions — parity with the shipped
 /// `close_menu_label` (`sidebar_shell.rs:155`, `SidebarView.swift:644`).
 fn close_menu_label(count: usize) -> String {
     if count > 1 {
-        format!("Close {count} Tabs")
+        format!("Close {count} Sessions")
     } else {
-        "Close Tab".to_string()
+        "Close Session".to_string()
     }
 }
 
@@ -117,7 +117,7 @@ struct MenuDescriptor {
     action_ids: Vec<String>,
     /// The close item's label (`close_menu_label`).
     close_label: String,
-    /// Whether "Rename Tab" is offered — single-row selection only.
+    /// Whether "Rename Session" is offered — single-row selection only.
     has_rename: bool,
 }
 
@@ -125,12 +125,12 @@ struct MenuDescriptor {
 /// the real `nice-model` state, recording every classification outcome.
 struct SidebarProbe {
     // --- real model state (the routing acts on these) ---
-    model: TabModel,
-    selection: SidebarTabSelection,
+    workspace: WorkspaceModel,
+    selection: SidebarSessionSelection,
     collapsed_projects: HashSet<String>,
-    editing_tab_id: Option<String>,
+    editing_session_id: Option<String>,
     draft_title: String,
-    /// When the active tab became active — the rename-gate reference, read from
+    /// When the active session became active — the rename-gate reference, read from
     /// the **simulated** clock so `advance_clock` moves it deterministically.
     activated_at: Option<Instant>,
 
@@ -160,17 +160,17 @@ struct SidebarProbe {
 }
 
 impl SidebarProbe {
-    fn new(model: TabModel, cx: &mut Context<Self>) -> Self {
-        let mut selection = SidebarTabSelection::new();
-        selection.sync_active_tab_id(model.active_tab_id());
+    fn new(workspace: WorkspaceModel, cx: &mut Context<Self>) -> Self {
+        let mut selection = SidebarSessionSelection::new();
+        selection.sync_active_session_id(workspace.active_session_id());
         // Seed the rename-gate clock so a later same-instant tap on the seeded
         // active row is (correctly) inside the gate.
         let activated_at = Some(cx.background_executor().now());
         Self {
-            model,
+            workspace,
             selection,
             collapsed_projects: HashSet::new(),
-            editing_tab_id: None,
+            editing_session_id: None,
             draft_title: String::new(),
             activated_at,
             band_press: None,
@@ -186,30 +186,30 @@ impl SidebarProbe {
 
     // ---- snapshot ----------------------------------------------------------
 
-    /// The tab ids that render as rows — navigable order minus any tab whose
+    /// The session ids that render as rows — navigable order minus any session whose
     /// project's disclosure is collapsed (mirrors `snapshot_groups`: a collapsed
     /// project contributes no rows).
-    fn visible_tab_ids(&self) -> Vec<String> {
-        self.model
+    fn visible_session_ids(&self) -> Vec<String> {
+        self.workspace
             .projects
             .iter()
             .flat_map(|p| {
                 if self.collapsed_projects.contains(&p.id) {
                     Vec::new()
                 } else {
-                    p.tabs.iter().map(|t| t.id.clone()).collect()
+                    p.sessions.iter().map(|t| t.id.clone()).collect()
                 }
             })
             .collect()
     }
 
-    /// The count pill for a project — always `tabs.len()`, disclosure-independent.
-    fn project_tab_count(&self, project_id: &str) -> Option<usize> {
-        self.model
+    /// The count pill for a project — always `sessions.len()`, disclosure-independent.
+    fn project_session_count(&self, project_id: &str) -> Option<usize> {
+        self.workspace
             .projects
             .iter()
             .find(|p| p.id == project_id)
-            .map(|p| p.tabs.len())
+            .map(|p| p.sessions.len())
     }
 
     // ---- routing (mirror of SidebarShellView) ------------------------------
@@ -217,77 +217,77 @@ impl SidebarProbe {
     /// Mirror of `SidebarShellView::route_click` (`sidebar_shell.rs:392`): plain
     /// replaces + activates; ⌘ toggles (only-and-active refused → no reselect);
     /// ⇧ extends from the sticky anchor. Resets `activated_at` only when the
-    /// active tab actually changes. The shipped view routes the active-tab write
-    /// through `ModelSidebarActions::select_tab`, a `TabModel::select_tab`
+    /// active session actually changes. The shipped view routes the active-session write
+    /// through `ModelSidebarActions::select_session`, a `WorkspaceModel::select_session`
     /// passthrough in R10, so the probe calls the model directly.
-    fn route_click(&mut self, tab_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
-        let before = self.model.active_tab_id().map(str::to_string);
+    fn route_click(&mut self, session_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
+        let before = self.workspace.active_session_id().map(str::to_string);
         if cmd {
-            if let Some(new_active) = self.selection.toggle(tab_id) {
-                self.model.select_tab(&new_active);
+            if let Some(new_active) = self.selection.toggle(session_id) {
+                self.workspace.select_session(&new_active);
             }
         } else if shift {
-            let order = self.model.navigable_sidebar_tab_ids();
-            self.selection.extend(tab_id, &order);
-            self.model.select_tab(tab_id);
+            let order = self.workspace.navigable_sidebar_session_ids();
+            self.selection.extend(session_id, &order);
+            self.workspace.select_session(session_id);
         } else {
-            self.selection.replace(tab_id);
-            self.model.select_tab(tab_id);
+            self.selection.replace(session_id);
+            self.workspace.select_session(session_id);
         }
-        let after = self.model.active_tab_id().map(str::to_string);
+        let after = self.workspace.active_session_id().map(str::to_string);
         if before != after {
             self.activated_at = Some(cx.background_executor().now());
         }
-        let active = self.model.active_tab_id().map(str::to_string);
-        self.selection.sync_active_tab_id(active.as_deref());
+        let active = self.workspace.active_session_id().map(str::to_string);
+        self.selection.sync_active_session_id(active.as_deref());
     }
 
-    /// Mirror of the shipped `NextSidebarTab` keymap handler (`keymap.rs`, the R10
-    /// keyboard tab-cycle ⌘⌥↓): advance the model's active tab, then re-sync the
-    /// selection's active mirror — `WindowState::sync_selection_to_active_tab`, the
+    /// Mirror of the shipped `NextSidebarSession` keymap handler (`keymap.rs`, the R10
+    /// keyboard session-cycle ⌘⌥↓): advance the model's active session, then re-sync the
+    /// selection's active mirror — `WindowState::sync_selection_to_active_session`, the
     /// fix. The handler previously mutated only the model, leaving the prior-active
     /// row a stale selection-set member (the faint-highlight residue). Mouse paths
     /// sync inline in [`route_click`](Self::route_click); this is the keyboard analog.
-    fn route_next_sidebar_tab(&mut self) {
-        self.model.select_next_sidebar_tab();
-        let active = self.model.active_tab_id().map(str::to_string);
-        self.selection.sync_active_tab_id(active.as_deref());
+    fn route_next_sidebar_session(&mut self) {
+        self.workspace.select_next_sidebar_session();
+        let active = self.workspace.active_session_id().map(str::to_string);
+        self.selection.sync_active_session_id(active.as_deref());
     }
 
     /// Mirror of `SidebarShellView::handle_title_tap` (`sidebar_shell.rs:420`): a
     /// plain tap on the already-active row enters rename only past the gate;
     /// otherwise it routes like a plain select. Reads the simulated clock so a
     /// test drives the gate with `advance_clock`.
-    fn handle_title_tap(&mut self, tab_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
+    fn handle_title_tap(&mut self, session_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
         if cmd || shift {
-            self.route_click(tab_id, cmd, shift, cx);
+            self.route_click(session_id, cmd, shift, cx);
             return;
         }
-        let is_active = self.model.active_tab_id() == Some(tab_id);
+        let is_active = self.workspace.active_session_id() == Some(session_id);
         if is_active {
             let now = cx.background_executor().now();
             if InlineRenameClickGate::can_begin_edit(self.activated_at, now, DOUBLE_CLICK_INTERVAL) {
-                self.begin_editing(tab_id);
+                self.begin_editing(session_id);
             }
             // else: the same-click-as-select window — no-op.
         } else {
-            self.route_click(tab_id, false, false, cx);
+            self.route_click(session_id, false, false, cx);
         }
     }
 
-    fn begin_editing(&mut self, tab_id: &str) {
-        let Some(tab) = self.model.tab_for(tab_id) else {
+    fn begin_editing(&mut self, session_id: &str) {
+        let Some(session) = self.workspace.session_for(session_id) else {
             return;
         };
-        self.editing_tab_id = Some(tab_id.to_string());
-        self.draft_title = tab.title.clone();
+        self.editing_session_id = Some(session_id.to_string());
+        self.draft_title = session.title.clone();
     }
 
     /// Mirror of `SidebarShellView::collapse_selection_to_active`
-    /// (`sidebar_shell.rs:450`): collapse the multi-selection to the active tab
-    /// (or clear if the tree has no active tab).
+    /// (`sidebar_shell.rs:450`): collapse the multi-selection to the active session
+    /// (or clear if the tree has no active session).
     fn collapse_selection_to_active(&mut self) {
-        if let Some(active) = self.model.active_tab_id().map(str::to_string) {
+        if let Some(active) = self.workspace.active_session_id().map(str::to_string) {
             self.selection.collapse(&active);
         } else {
             self.selection.clear();
@@ -296,24 +296,24 @@ impl SidebarProbe {
 
     // ---- event handlers (recorded classification) --------------------------
 
-    fn on_row_bg_down(&mut self, tab_id: &str, e: &MouseDownEvent, cx: &mut Context<Self>) {
-        self.route_click(tab_id, e.modifiers.platform, e.modifiers.shift, cx);
+    fn on_row_bg_down(&mut self, session_id: &str, e: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.route_click(session_id, e.modifiers.platform, e.modifiers.shift, cx);
         cx.notify();
         cx.stop_propagation();
     }
 
-    fn on_title_down(&mut self, tab_id: &str, e: &MouseDownEvent, cx: &mut Context<Self>) {
-        self.handle_title_tap(tab_id, e.modifiers.platform, e.modifiers.shift, cx);
+    fn on_title_down(&mut self, session_id: &str, e: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.handle_title_tap(session_id, e.modifiers.platform, e.modifiers.shift, cx);
         cx.notify();
         cx.stop_propagation();
     }
 
-    /// Mirror of `SidebarShellView::open_tab_context_menu`'s id resolution
+    /// Mirror of `SidebarShellView::open_session_context_menu`'s id resolution
     /// (`sidebar_shell.rs:596-621`): the menu acts on the whole selection when the
     /// right-clicked row is inside it, else just the clicked row; "Rename" is
     /// offered only for a single-row selection. Recorded, not minted.
-    fn on_row_right_down(&mut self, tab_id: &str, _e: &MouseDownEvent, cx: &mut Context<Self>) {
-        let action_ids = self.selection.selection_ids_for_right_click_on(tab_id);
+    fn on_row_right_down(&mut self, session_id: &str, _e: &MouseDownEvent, cx: &mut Context<Self>) {
+        let action_ids = self.selection.selection_ids_for_right_click_on(session_id);
         self.last_menu = Some(MenuDescriptor {
             close_label: close_menu_label(action_ids.len()),
             has_rename: action_ids.len() == 1,
@@ -323,7 +323,7 @@ impl SidebarProbe {
     }
 
     /// Mirror of the shipped menu action's pre-run snap
-    /// (`SidebarTabSelection::snap_if_right_click_outside`): picking a menu item
+    /// (`SidebarSessionSelection::snap_if_right_click_outside`): picking a menu item
     /// for a row outside the selection first snaps the selection to it.
     fn pick_menu_item_snaps(&mut self, clicked_id: &str) {
         self.selection.snap_if_right_click_outside(clicked_id);
@@ -394,12 +394,12 @@ impl SidebarProbe {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing_tab_id.is_some() {
-            self.editing_tab_id = None;
+        if self.editing_session_id.is_some() {
+            self.editing_session_id = None;
             self.draft_title.clear();
             return; // consumed
         }
-        if self.selection.selected_tab_ids().len() > 1 {
+        if self.selection.selected_session_ids().len() > 1 {
             self.collapse_selection_to_active();
             cx.notify(); // consumed
         } else {
@@ -419,10 +419,10 @@ impl SidebarProbe {
 
     // ---- render ------------------------------------------------------------
 
-    fn row(&self, i: usize, tab_id: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let id_bg = tab_id.to_string();
-        let id_title = tab_id.to_string();
-        let id_right = tab_id.to_string();
+    fn row(&self, i: usize, session_id: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_bg = session_id.to_string();
+        let id_title = session_id.to_string();
+        let id_right = session_id.to_string();
         // An absolutely-positioned row is itself the containing block for its
         // title child — no `.relative()` (which would clobber `.absolute()`,
         // last-wins, and collapse every row back to flow position).
@@ -471,7 +471,7 @@ impl Focusable for SidebarProbe {
 
 impl Render for SidebarProbe {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let visible = self.visible_tab_ids();
+        let visible = self.visible_session_ids();
         let rows: Vec<gpui::AnyElement> = visible
             .iter()
             .enumerate()
@@ -503,7 +503,7 @@ impl Render for SidebarProbe {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_strip_up)),
             )
             .child(
-                // The tab list — carries the empty-area collapse handler; rows are
+                // The session list — carries the empty-area collapse handler; rows are
                 // absolute children (the absolute list is their containing block,
                 // so no `.relative()`, which would clobber `.absolute()`).
                 div()
@@ -520,35 +520,35 @@ impl Render for SidebarProbe {
 
 // ---- harness ---------------------------------------------------------------
 
-/// Seed a flat model of four navigable terminal tabs
+/// Seed a flat model of four navigable terminal sessions
 /// (`terminals-main`, `t1`, `t2`, `t3`), Main selected — the fixture for the
 /// multi-select / rename / Esc / band cases.
-fn seed_flat_model() -> TabModel {
-    let mut m = TabModel::new("/home/u");
+fn seed_flat_model() -> WorkspaceModel {
+    let mut m = WorkspaceModel::new("/home/u");
     for i in 1..=3 {
         let id = format!("t{i}");
-        let pane_id = format!("{id}-p");
-        let mut tab = Tab::new(id.clone(), format!("Tab {i}"), "/home/u");
-        tab.panes = vec![Pane::new(pane_id.clone(), "Terminal 1", PaneKind::Terminal)];
-        tab.active_pane_id = Some(pane_id);
-        m.projects[0].tabs.push(tab);
+        let term_window_id = format!("{id}-p");
+        let mut session = Session::new(id.clone(), format!("Tab {i}"), "/home/u");
+        session.windows = vec![TermWindow::new(term_window_id.clone(), "Terminal 1", TermWindowKind::Terminal)];
+        session.active_window_id = Some(term_window_id);
+        m.projects[0].sessions.push(session);
     }
-    m.select_tab(TabModel::MAIN_TERMINAL_TAB_ID);
+    m.select_session(WorkspaceModel::MAIN_TERMINAL_SESSION_ID);
     m
 }
 
 /// Seed a two-group model: the pinned Terminals group (Main) plus a project
-/// `proj` holding two Claude tabs — the fixture for disclosure + count-pill cases.
-fn seed_projects_model() -> TabModel {
-    let mut m = TabModel::new("/home/u");
+/// `proj` holding two Claude sessions — the fixture for disclosure + count-pill cases.
+fn seed_projects_model() -> WorkspaceModel {
+    let mut m = WorkspaceModel::new("/home/u");
     let pi = m.ensure_project("proj", "Proj", "/home/u/proj");
     for i in 0..2 {
         let id = format!("p{i}");
-        let pane_id = format!("{id}-c");
-        let mut tab = Tab::new(id.clone(), format!("Claude {i}"), "/home/u/proj");
-        tab.panes = vec![Pane::new(pane_id.clone(), "Claude", PaneKind::Claude)];
-        tab.active_pane_id = Some(pane_id);
-        m.projects[pi].tabs.push(tab);
+        let term_window_id = format!("{id}-c");
+        let mut session = Session::new(id.clone(), format!("Claude {i}"), "/home/u/proj");
+        session.windows = vec![TermWindow::new(term_window_id.clone(), "Claude", TermWindowKind::Claude)];
+        session.active_window_id = Some(term_window_id);
+        m.projects[pi].sessions.push(session);
     }
     m
 }
@@ -558,7 +558,7 @@ fn seed_projects_model() -> TabModel {
 /// and run to a first paint. Returns the view + the window context.
 fn mount_probe<'a>(
     cx: &'a mut TestAppContext,
-    model: TabModel,
+    workspace: WorkspaceModel,
 ) -> (Entity<SidebarProbe>, &'a mut VisualTestContext) {
     cx.update(|app| {
         app.bind_keys([KeyBinding::new(
@@ -567,7 +567,7 @@ fn mount_probe<'a>(
             Some(PROBE_KEY_CONTEXT),
         )]);
     });
-    let (probe, vcx) = cx.add_window_view(|_window, cx| SidebarProbe::new(model, cx));
+    let (probe, vcx) = cx.add_window_view(|_window, cx| SidebarProbe::new(workspace, cx));
     let handle = probe.read_with(vcx, |p, _| p.focus_handle.clone());
     vcx.update(|window, cx| window.focus(&handle, cx));
     vcx.run_until_parked();
@@ -577,17 +577,17 @@ fn mount_probe<'a>(
 /// Read the sorted selected-id set (for order-independent assertions).
 fn selection(probe: &Entity<SidebarProbe>, vcx: &mut VisualTestContext) -> Vec<String> {
     let mut ids: Vec<String> =
-        probe.read_with(vcx, |p, _| p.selection.selected_tab_ids().iter().cloned().collect());
+        probe.read_with(vcx, |p, _| p.selection.selected_session_ids().iter().cloned().collect());
     ids.sort();
     ids
 }
 
 fn active(probe: &Entity<SidebarProbe>, vcx: &mut VisualTestContext) -> Option<String> {
-    probe.read_with(vcx, |p, _| p.model.active_tab_id().map(str::to_string))
+    probe.read_with(vcx, |p, _| p.workspace.active_session_id().map(str::to_string))
 }
 
 fn anchor(probe: &Entity<SidebarProbe>, vcx: &mut VisualTestContext) -> Option<String> {
-    probe.read_with(vcx, |p, _| p.selection.last_clicked_tab_id().map(str::to_string))
+    probe.read_with(vcx, |p, _| p.selection.last_clicked_session_id().map(str::to_string))
 }
 
 fn read_u32(
@@ -648,7 +648,7 @@ fn cmd_click_toggles_in_and_moves_active(cx: &mut TestAppContext) {
 }
 
 /// ⌘-click on the only-and-active selected row is **refused** — the invariant
-/// selection ⊇ {active} survives (`SidebarTabSelection::toggle` returns `None`).
+/// selection ⊇ {active} survives (`SidebarSessionSelection::toggle` returns `None`).
 #[gpui::test]
 fn cmd_click_only_active_row_is_refused(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
@@ -688,13 +688,13 @@ fn shift_click_extends_from_sticky_anchor(cx: &mut TestAppContext) {
 // keyboard sidebar-nav re-syncs the selection (the ⌘⌥↓ residue fix)
 // ============================================================================
 
-/// Keyboard sidebar-nav (`NextSidebarTab`, ⌘⌥↓) collapses the multi-selection to
-/// the new active tab: the previously-active/selected rows must NOT linger in the
+/// Keyboard sidebar-nav (`NextSidebarSession`, ⌘⌥↓) collapses the multi-selection to
+/// the new active session: the previously-active/selected rows must NOT linger in the
 /// selection set (the faint `SELECTED_DIM_FACTOR` highlight residue). This is the
 /// gap the file's mouse-only cases missed — the shipped keymap handler mutated the
 /// model without re-syncing `selection`, so a prior-active row stayed a
-/// dim-tinted set member. Seed a >1 selection whose active tab is one member,
-/// cycle, and assert the set is exactly the new active tab.
+/// dim-tinted set member. Seed a >1 selection whose active session is one member,
+/// cycle, and assert the set is exactly the new active session.
 #[gpui::test]
 fn keyboard_nav_resyncs_selection_to_new_active(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
@@ -705,16 +705,16 @@ fn keyboard_nav_resyncs_selection_to_new_active(cx: &mut TestAppContext) {
     assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
     assert_eq!(active(&probe, vcx).as_deref(), Some("t1"));
 
-    // Keyboard-cycle to the next tab: the selection must collapse onto it, dropping
+    // Keyboard-cycle to the next session: the selection must collapse onto it, dropping
     // both the prior-active row (t1) and the other set member (terminals-main).
-    probe.update(vcx, |p, _| p.route_next_sidebar_tab());
+    probe.update(vcx, |p, _| p.route_next_sidebar_session());
 
-    let new_active = active(&probe, vcx).expect("a tab is active after cycling");
-    assert_ne!(new_active, "t1", "the cycle moved the active tab off t1");
+    let new_active = active(&probe, vcx).expect("a session is active after cycling");
+    assert_ne!(new_active, "t1", "the cycle moved the active session off t1");
     assert_eq!(
         selection(&probe, vcx),
         ids(&[new_active.as_str()]),
-        "keyboard nav collapses the selection to the new active tab — no stale prior-active row lingers"
+        "keyboard nav collapses the selection to the new active session — no stale prior-active row lingers"
     );
 }
 
@@ -722,8 +722,8 @@ fn keyboard_nav_resyncs_selection_to_new_active(cx: &mut TestAppContext) {
 // empty-area click + Esc collapse
 // ============================================================================
 
-/// A click in the empty tab-list gap collapses a multi-selection to the active
-/// tab and reaches the collapse handler; a row press (the differential half) does
+/// A click in the empty session-list gap collapses a multi-selection to the active
+/// session and reaches the collapse handler; a row press (the differential half) does
 /// not.
 #[gpui::test]
 fn empty_area_click_collapses_multi_selection(cx: &mut TestAppContext) {
@@ -735,7 +735,7 @@ fn empty_area_click_collapses_multi_selection(cx: &mut TestAppContext) {
 
     vcx.simulate_click(empty_area_point(4), Modifiers::none());
 
-    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "empty-area click collapses to the active tab");
+    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "empty-area click collapses to the active session");
     assert!(
         read_u32(&probe, vcx, |p| p.empty_area_collapses) >= 1,
         "the empty-area press reached the collapse handler"
@@ -761,7 +761,7 @@ fn esc_collapses_only_when_more_than_one_selected(cx: &mut TestAppContext) {
     assert_eq!(selection(&probe, vcx), ids(&["terminals-main", "t1"]));
 
     vcx.simulate_keystrokes("escape");
-    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "Esc with >1 selected collapses to the active tab");
+    assert_eq!(selection(&probe, vcx), ids(&["t1"]), "Esc with >1 selected collapses to the active session");
     assert_eq!(
         read_u32(&probe, vcx, |p| p.esc_reached_terminal),
         0,
@@ -779,12 +779,12 @@ fn esc_collapses_only_when_more_than_one_selected(cx: &mut TestAppContext) {
 }
 
 // ============================================================================
-// band drag arm (top-strip vs tab-row) — classification, not frame motion
+// band drag arm (top-strip vs session-row) — classification, not frame motion
 // ============================================================================
 
 /// A press-drag on the empty top strip arms + promotes a window drag; the same
-/// press-drag started on a tab row consumes at the row so the band never arms
-/// (the in-process analog of "top-strip drag moves the window, a tab-row drag
+/// press-drag started on a session row consumes at the row so the band never arms
+/// (the in-process analog of "top-strip drag moves the window, a session-row drag
 /// does not" — real frame motion is vacuous in-process and lives in the live
 /// scenario).
 #[gpui::test]
@@ -803,7 +803,7 @@ fn band_arm_fires_for_strip_press_not_for_row_press(cx: &mut TestAppContext) {
     );
     vcx.simulate_mouse_up(point(start.x + px(40.0), start.y), MouseButton::Left, Modifiers::none());
 
-    // Row: a press-drag beginning on a tab row is consumed by the row, so the
+    // Row: a press-drag beginning on a session row is consumed by the row, so the
     // band never arms and never promotes — no window move.
     let rstart = row_bg_point(1);
     vcx.simulate_mouse_down(rstart, MouseButton::Left, Modifiers::none());
@@ -816,7 +816,7 @@ fn band_arm_fires_for_strip_press_not_for_row_press(cx: &mut TestAppContext) {
     assert_eq!(
         read_u32(&probe, vcx, |p| p.band_window_moves),
         1,
-        "a drag beginning on a tab row promotes no window move"
+        "a drag beginning on a session row promotes no window move"
     );
     vcx.simulate_mouse_up(point(rstart.x + px(40.0), rstart.y), MouseButton::Left, Modifiers::none());
 }
@@ -825,11 +825,11 @@ fn band_arm_fires_for_strip_press_not_for_row_press(cx: &mut TestAppContext) {
 // right-click snap policy + menu title + Rename single-selection-only
 // ============================================================================
 
-/// Right-clicking a row **outside** the current selection offers a single-tab
-/// menu ("Close Tab" + "Rename Tab"); picking an item snaps the selection to that
+/// Right-clicking a row **outside** the current selection offers a single-session
+/// menu ("Close Session" + "Rename Session"); picking an item snaps the selection to that
 /// row (Finder's "right-click outside replaces").
 #[gpui::test]
-fn right_click_outside_selection_is_single_tab_and_snaps(cx: &mut TestAppContext) {
+fn right_click_outside_selection_is_single_session_and_snaps(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_flat_model());
 
     vcx.simulate_click(row_bg_point(0), Modifiers::none()); // selection {terminals-main}
@@ -837,7 +837,7 @@ fn right_click_outside_selection_is_single_tab_and_snaps(cx: &mut TestAppContext
 
     let menu = probe.read_with(vcx, |p, _| p.last_menu.clone()).expect("a menu was recorded");
     assert_eq!(menu.action_ids, vec!["t1".to_string()], "menu acts on the clicked row only");
-    assert_eq!(menu.close_label, "Close Tab");
+    assert_eq!(menu.close_label, "Close Session");
     assert!(menu.has_rename, "Rename is offered for a single-row selection");
     // The pure read must NOT have mutated the selection (that would loop render).
     assert_eq!(selection(&probe, vcx), ids(&["terminals-main"]), "menu id resolution is a pure read");
@@ -847,7 +847,7 @@ fn right_click_outside_selection_is_single_tab_and_snaps(cx: &mut TestAppContext
     assert_eq!(selection(&probe, vcx), ids(&["t1"]), "picking a menu item outside the selection snaps to it");
 }
 
-/// Right-clicking a row **inside** a multi-selection offers a "Close N Tabs" menu
+/// Right-clicking a row **inside** a multi-selection offers a "Close N Sessions" menu
 /// acting on the whole set, with **no** Rename (single-selection only); a pick is
 /// a no-op snap (the row is already selected).
 #[gpui::test]
@@ -863,7 +863,7 @@ fn right_click_inside_multi_selection_is_close_n_no_rename(cx: &mut TestAppConte
     let mut got = menu.action_ids.clone();
     got.sort();
     assert_eq!(got, ids(&["terminals-main", "t1", "t2"]), "menu acts on the whole selection");
-    assert_eq!(menu.close_label, "Close 3 Tabs", "close label pluralizes with the selection size");
+    assert_eq!(menu.close_label, "Close 3 Sessions", "close label pluralizes with the selection size");
     assert!(!menu.has_rename, "Rename is hidden for a multi-row selection");
 
     // A pick inside the selection does not collapse it (no snap).
@@ -891,14 +891,14 @@ fn rename_gate_blocks_activation_and_quick_taps_allows_slow_tap(cx: &mut TestApp
     vcx.simulate_click(row_title_point(1), Modifiers::none());
     assert_eq!(active(&probe, vcx).as_deref(), Some("t1"), "the title tap activated the row");
     assert!(
-        probe.read_with(vcx, |p, _| p.editing_tab_id.is_none()),
+        probe.read_with(vcx, |p, _| p.editing_session_id.is_none()),
         "the activating click must never begin a rename"
     );
 
     // A quick second tap, still inside the interval: must NOT edit.
     vcx.simulate_click(row_title_point(1), Modifiers::none());
     assert!(
-        probe.read_with(vcx, |p, _| p.editing_tab_id.is_none()),
+        probe.read_with(vcx, |p, _| p.editing_session_id.is_none()),
         "a second tap inside the double-click interval must not begin a rename"
     );
 
@@ -906,7 +906,7 @@ fn rename_gate_blocks_activation_and_quick_taps_allows_slow_tap(cx: &mut TestApp
     vcx.executor().advance_clock(DOUBLE_CLICK_INTERVAL + Duration::from_millis(10));
     vcx.simulate_click(row_title_point(1), Modifiers::none());
     assert_eq!(
-        probe.read_with(vcx, |p, _| p.editing_tab_id.clone()),
+        probe.read_with(vcx, |p, _| p.editing_session_id.clone()),
         Some("t1".to_string()),
         "a slow second tap past the interval begins the inline rename"
     );
@@ -923,9 +923,9 @@ fn rename_gate_blocks_activation_and_quick_taps_allows_slow_tap(cx: &mut TestApp
 fn disclosure_collapse_hides_a_projects_rows(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_projects_model());
 
-    // Both groups' rows render: Terminals' Main + proj's two Claude tabs.
+    // Both groups' rows render: Terminals' Main + proj's two Claude sessions.
     assert_eq!(
-        probe.read_with(vcx, |p, _| p.visible_tab_ids()),
+        probe.read_with(vcx, |p, _| p.visible_session_ids()),
         vec!["terminals-main".to_string(), "p0".to_string(), "p1".to_string()]
     );
 
@@ -935,7 +935,7 @@ fn disclosure_collapse_hides_a_projects_rows(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     assert_eq!(
-        probe.read_with(vcx, |p, _| p.visible_tab_ids()),
+        probe.read_with(vcx, |p, _| p.visible_session_ids()),
         vec!["terminals-main".to_string()],
         "a collapsed project contributes no rows"
     );
@@ -946,37 +946,37 @@ fn disclosure_collapse_hides_a_projects_rows(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     assert_eq!(
-        probe.read_with(vcx, |p, _| p.visible_tab_ids()),
+        probe.read_with(vcx, |p, _| p.visible_session_ids()),
         vec!["terminals-main".to_string(), "p0".to_string(), "p1".to_string()]
     );
 }
 
-/// The count pill tracks the project's tab count — independent of disclosure —
+/// The count pill tracks the project's session count — independent of disclosure —
 /// and follows an add.
 #[gpui::test]
-fn count_pill_tracks_tab_count(cx: &mut TestAppContext) {
+fn count_pill_tracks_session_count(cx: &mut TestAppContext) {
     let (probe, vcx) = mount_probe(cx, seed_projects_model());
 
-    assert_eq!(probe.read_with(vcx, |p, _| p.project_tab_count("proj")), Some(2));
+    assert_eq!(probe.read_with(vcx, |p, _| p.project_session_count("proj")), Some(2));
 
     // Count is disclosure-independent: collapsing the group must not change it.
     probe.update(vcx, |p, _| {
         p.collapsed_projects.insert("proj".to_string());
     });
     assert_eq!(
-        probe.read_with(vcx, |p, _| p.project_tab_count("proj")),
+        probe.read_with(vcx, |p, _| p.project_session_count("proj")),
         Some(2),
-        "the count pill shows the tab count even while the group is collapsed"
+        "the count pill shows the session count even while the group is collapsed"
     );
 
-    // Adding a tab bumps the count.
+    // Adding a session bumps the count.
     probe.update(vcx, |p, _| {
-        let pi = p.model.projects.iter().position(|pr| pr.id == "proj").unwrap();
-        p.model.projects[pi].tabs.push(Tab::new("p2", "Claude 2", "/home/u/proj"));
+        let pi = p.workspace.projects.iter().position(|pr| pr.id == "proj").unwrap();
+        p.workspace.projects[pi].sessions.push(Session::new("p2", "Claude 2", "/home/u/proj"));
     });
     assert_eq!(
-        probe.read_with(vcx, |p, _| p.project_tab_count("proj")),
+        probe.read_with(vcx, |p, _| p.project_session_count("proj")),
         Some(3),
-        "the count pill follows an added tab"
+        "the count pill follows an added session"
     );
 }

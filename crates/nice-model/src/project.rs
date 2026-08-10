@@ -1,25 +1,27 @@
-//! `Project` — an ordered group of tabs — ported from
+//! `Project` — an ordered group of sessions — ported from
 //! `Sources/Nice/State/Models.swift`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::tab::Tab;
+use crate::session::Session;
 
-/// A project: a named, path-rooted group of [`Tab`]s rendered as one sidebar
+/// A project: a named, path-rooted group of [`Session`]s rendered as one sidebar
 /// section. The Terminals project + cwd bucketing that populate these are
-/// provided by [`crate::TabModel`] (`add_tab_to_projects`); this is the pure
+/// provided by [`crate::WorkspaceModel`] (`add_session_to_projects`); this is the pure
 /// value type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
     pub path: String,
-    pub tabs: Vec<Tab>,
+    /// Serialized as `tabs` — frozen spelling.
+    #[serde(rename = "tabs")]
+    pub sessions: Vec<Session>,
 }
 
 impl Project {
     /// The empty seed set — the projects list starts empty and is populated by
-    /// `TabModel` seeding (`Models.swift:270-272`).
+    /// `WorkspaceModel` seeding (`Models.swift:270-272`).
     pub fn seed() -> Vec<Project> {
         Vec::new()
     }

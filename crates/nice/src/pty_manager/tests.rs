@@ -1,8 +1,8 @@
 //! Ported `SessionsModel` unit tests (R13 slice 1) — the pure model-routing
-//! half. Each case drives the [`SessionManager`] surface and asserts on the
-//! [`TabModel`] document, exactly as the Swift `SessionsModelNavigationTests` /
+//! half. Each case drives the [`PtyManager`] surface and asserts on the
+//! [`WorkspaceModel`] document, exactly as the Swift `SessionsModelNavigationTests` /
 //! `SessionsModelPaneCwdTests` / the `AppStatePaneLifecycleTests` title-policy
-//! cases assert on `appState.tabs`. The Swift originals also spawn real ptys as a
+//! cases assert on `appState.sessions`. The Swift originals also spawn real ptys as a
 //! side effect (`AppState` is live); the observable assertions are purely the
 //! model mutations, which these reproduce without a gpui context — the spawn /
 //! focus side effects are exercised by the slice-3 `session-lifecycle` scenario.
@@ -11,119 +11,119 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use nice_model::{Pane, PaneKind, Project, SidebarTabSelection, Tab, TabModel, TabStatus};
+use nice_model::{TermWindow, TermWindowKind, Project, SidebarSessionSelection, Session, WorkspaceModel, SessionStatus};
 use nice_term_core::SpawnSpec;
 use nice_term_view::TerminalEvent;
 
 use super::{
     build_claude_exec_command, build_claude_extra_env, build_claude_prefill_command,
-    claude_launch_display_command, claude_tab_title_from_args, claude_worktree_cwd, clip_title,
+    claude_launch_display_command, claude_session_title_from_args, claude_worktree_cwd, clip_title,
     compose_claude_reply, default_mint_id, dispatch_extra_args, dispatch_prompt, dispatch_title,
     handoff_extra_args, handoff_prompt, handoff_title,
     merge_env_spec_wins, mint_session_uuid, parse_claude_title, ClaudeReplyDecision,
-    ClaudeSessionMode, DissolveTerminus, PaneLaunchStatus, SessionManager, WindowShellEnv,
-    PANE_TITLE_MAX,
+    ClaudeSessionMode, DissolveTerminus, WindowLaunchStatus, PtyManager, WindowShellEnv,
+    WINDOW_TITLE_MAX,
 };
 
 /// A fresh empty selection for cascade tests that don't seed a multi-selection.
-fn selection() -> SidebarTabSelection {
-    SidebarTabSelection::new()
+fn selection() -> SidebarSessionSelection {
+    SidebarSessionSelection::new()
 }
 
-/// Seed a `[Claude, Terminal 1]` tab (Claude focused) into project `project_id`
+/// Seed a `[Claude, Terminal 1]` session (Claude focused) into project `project_id`
 /// (created or appended-to) — the Rust twin of `TabModelFixtures.seedClaudeTab`.
-/// Returns `(claude_pane_id, terminal_pane_id)`. `is_claude_running` is explicit
+/// Returns `(claude_window_id, terminal_window_id)`. `is_claude_running` is explicit
 /// so the paneHeld case can seed a running Claude and observe the flag clearing.
-fn seed_claude_tab_in(
-    model: &mut TabModel,
+fn seed_claude_session_in(
+    model: &mut WorkspaceModel,
     project_id: &str,
-    tab_id: &str,
+    session_id: &str,
     is_claude_running: bool,
 ) -> (String, String) {
-    let claude_id = format!("{tab_id}-claude");
-    let terminal_id = format!("{tab_id}-t1");
+    let claude_id = format!("{session_id}-claude");
+    let terminal_id = format!("{session_id}-t1");
     let path = format!("/tmp/{project_id}");
-    let mut claude = Pane::new(&claude_id, "Claude", PaneKind::Claude);
+    let mut claude = TermWindow::new(&claude_id, "Claude", TermWindowKind::Claude);
     claude.is_claude_running = is_claude_running;
-    let mut tab = Tab::new(tab_id, "New tab", &path);
-    tab.panes = vec![
+    let mut session = Session::new(session_id, "New session", &path);
+    session.windows = vec![
         claude,
-        Pane::new(&terminal_id, "Terminal 1", PaneKind::Terminal),
+        TermWindow::new(&terminal_id, "Terminal 1", TermWindowKind::Terminal),
     ];
-    tab.active_pane_id = Some(claude_id.clone());
-    tab.next_terminal_index = 2;
+    session.active_window_id = Some(claude_id.clone());
+    session.next_terminal_index = 2;
     if let Some(p) = model.projects.iter_mut().find(|p| p.id == project_id) {
-        p.tabs.push(tab);
+        p.sessions.push(session);
     } else {
         model.projects.push(Project {
             id: project_id.into(),
             name: project_id.to_uppercase(),
             path: path.into(),
-            tabs: vec![tab],
+            sessions: vec![session],
         });
     }
     (claude_id, terminal_id)
 }
 
 /// A manager with a deterministic, collision-free id minter (`<prefix>N`) so
-/// ported tests that add panes can reason about ids if they need to.
-fn counting_manager() -> SessionManager {
+/// ported tests that add windows can reason about ids if they need to.
+fn counting_manager() -> PtyManager {
     let counter = AtomicU64::new(0);
-    SessionManager::with_mint_id(move |prefix| {
+    PtyManager::with_mint_id(move |prefix| {
         format!("{prefix}{}", counter.fetch_add(1, Ordering::Relaxed))
     })
 }
 
-/// The freshly-seeded window model: pinned Terminals group + Main tab (one
-/// "Terminal 1" pane, `next_terminal_index = 2`, that pane active).
-fn seeded() -> TabModel {
-    TabModel::new("/home/u")
+/// The freshly-seeded window model: pinned Terminals group + Main session (one
+/// "Terminal 1" window, `next_terminal_index = 2`, that window active).
+fn seeded() -> WorkspaceModel {
+    WorkspaceModel::new("/home/u")
 }
 
-fn main_tab_id() -> &'static str {
-    TabModel::MAIN_TERMINAL_TAB_ID
+fn main_session_id() -> &'static str {
+    WorkspaceModel::MAIN_TERMINAL_SESSION_ID
 }
 
-/// Snapshot of the Main terminal tab (re-read on each access so assertions
+/// Snapshot of the Main terminal session (re-read on each access so assertions
 /// observe the latest mutation).
-fn main_tab(model: &TabModel) -> &Tab {
-    model.tab_for(TabModel::MAIN_TERMINAL_TAB_ID).unwrap()
+fn main_session(model: &WorkspaceModel) -> &Session {
+    model.session_for(WorkspaceModel::MAIN_TERMINAL_SESSION_ID).unwrap()
 }
 
-/// Seed a bare terminal tab (`tab_id` with a single terminal pane `pane_id`,
-/// `Tab.cwd == tab_cwd`) into a fresh non-Terminals project — the Rust twin of
+/// Seed a bare terminal session (`session_id` with a single terminal window `term_window_id`,
+/// `Session.cwd == session_cwd`) into a fresh non-Terminals project — the Rust twin of
 /// `SessionsModelPaneCwdTests.seedTerminalTab`.
-fn seed_terminal_tab(model: &mut TabModel, tab_id: &str, pane_id: &str, tab_cwd: &str) {
-    let mut tab = Tab::new(tab_id, "Terminal", tab_cwd);
-    tab.panes = vec![Pane::new(pane_id, "zsh", PaneKind::Terminal)];
-    tab.active_pane_id = Some(pane_id.to_string());
+fn seed_terminal_session(model: &mut WorkspaceModel, session_id: &str, term_window_id: &str, session_cwd: &str) {
+    let mut session = Session::new(session_id, "Terminal", session_cwd);
+    session.windows = vec![TermWindow::new(term_window_id, "zsh", TermWindowKind::Terminal)];
+    session.active_window_id = Some(term_window_id.to_string());
     model.projects.push(Project {
         id: "p".into(),
         name: "P".into(),
-        path: tab_cwd.into(),
-        tabs: vec![tab],
+        path: session_cwd.into(),
+        sessions: vec![session],
     });
 }
 
-/// Seed a `[Claude, Terminal 1]` tab (Claude focused) into a non-Terminals
+/// Seed a `[Claude, Terminal 1]` session (Claude focused) into a non-Terminals
 /// project — the Rust twin of `AppStatePaneLifecycleTests.seedProjectWithClaudeTab`.
-/// Returns `(claude_pane_id, terminal_pane_id)`. `is_claude_running` stays
+/// Returns `(claude_window_id, terminal_window_id)`. `is_claude_running` stays
 /// `false` (its default), matching R13's invariant.
-fn seed_claude_tab(model: &mut TabModel, tab_id: &str) -> (String, String) {
-    let claude_id = format!("{tab_id}-claude");
-    let terminal_id = format!("{tab_id}-t1");
-    let mut tab = Tab::new(tab_id, "New tab", "/home/u/proj");
-    tab.panes = vec![
-        Pane::new(&claude_id, "Claude", PaneKind::Claude),
-        Pane::new(&terminal_id, "Terminal 1", PaneKind::Terminal),
+fn seed_claude_session(model: &mut WorkspaceModel, session_id: &str) -> (String, String) {
+    let claude_id = format!("{session_id}-claude");
+    let terminal_id = format!("{session_id}-t1");
+    let mut session = Session::new(session_id, "New session", "/home/u/proj");
+    session.windows = vec![
+        TermWindow::new(&claude_id, "Claude", TermWindowKind::Claude),
+        TermWindow::new(&terminal_id, "Terminal 1", TermWindowKind::Terminal),
     ];
-    tab.active_pane_id = Some(claude_id.clone());
-    tab.next_terminal_index = 2;
+    session.active_window_id = Some(claude_id.clone());
+    session.next_terminal_index = 2;
     model.projects.push(Project {
         id: "p".into(),
         name: "P".into(),
         path: "/home/u/proj".into(),
-        tabs: vec![tab],
+        sessions: vec![session],
     });
     (claude_id, terminal_id)
 }
@@ -132,112 +132,112 @@ fn seed_claude_tab(model: &mut TabModel, tab_id: &str) -> (String, String) {
 // SessionsModelNavigationTests (ported)
 // ===========================================================================
 
-/// Add a second terminal pane to Main so pane-navigation has something to step
+/// Add a second terminal window to Main so window-navigation has something to step
 /// through — the Rust twin of `addExtraTerminalPaneToMain` (goes through
-/// `add_pane`, which in the live app spawns; here the model half).
-fn add_extra_terminal_pane_to_main(mgr: &mut SessionManager, model: &mut TabModel) -> String {
-    mgr.add_pane(model, main_tab_id(), None).unwrap()
+/// `add_window`, which in the live app spawns; here the model half).
+fn add_extra_terminal_window_to_main(mgr: &mut PtyManager, model: &mut WorkspaceModel) -> String {
+    mgr.add_window(model, main_session_id(), None).unwrap()
 }
 
 #[test]
-fn next_pane_moves_right_when_not_at_end() {
+fn next_window_moves_right_when_not_at_end() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    add_extra_terminal_pane_to_main(&mut mgr, &mut model);
+    add_extra_terminal_window_to_main(&mut mgr, &mut model);
 
-    let tab = main_tab(&model);
-    assert_eq!(tab.panes.len(), 2);
-    let first_id = tab.panes[0].id.clone();
-    let second_id = tab.panes[1].id.clone();
+    let session = main_session(&model);
+    assert_eq!(session.windows.len(), 2);
+    let first_id = session.windows[0].id.clone();
+    let second_id = session.windows[1].id.clone();
 
-    mgr.set_active_pane(&mut model, main_tab_id(), &first_id);
-    mgr.select_next_pane(&mut model);
-    assert_eq!(main_tab(&model).active_pane_id.as_ref(), Some(&second_id));
+    mgr.set_active_window(&mut model, main_session_id(), &first_id);
+    mgr.select_next_window(&mut model);
+    assert_eq!(main_session(&model).active_window_id.as_ref(), Some(&second_id));
 }
 
 #[test]
-fn next_pane_wraps_to_first_when_at_last() {
+fn next_window_wraps_to_first_when_at_last() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    add_extra_terminal_pane_to_main(&mut mgr, &mut model);
+    add_extra_terminal_window_to_main(&mut mgr, &mut model);
 
-    let tab = main_tab(&model);
-    let first_id = tab.panes[0].id.clone();
-    let last_id = tab.panes.last().unwrap().id.clone();
+    let session = main_session(&model);
+    let first_id = session.windows[0].id.clone();
+    let last_id = session.windows.last().unwrap().id.clone();
 
-    mgr.set_active_pane(&mut model, main_tab_id(), &last_id);
-    mgr.select_next_pane(&mut model);
-    assert_eq!(main_tab(&model).active_pane_id.as_ref(), Some(&first_id));
+    mgr.set_active_window(&mut model, main_session_id(), &last_id);
+    mgr.select_next_window(&mut model);
+    assert_eq!(main_session(&model).active_window_id.as_ref(), Some(&first_id));
 }
 
 #[test]
-fn prev_pane_wraps_to_last_when_at_first() {
+fn prev_window_wraps_to_last_when_at_first() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    add_extra_terminal_pane_to_main(&mut mgr, &mut model);
+    add_extra_terminal_window_to_main(&mut mgr, &mut model);
 
-    let tab = main_tab(&model);
-    let first_id = tab.panes[0].id.clone();
-    let last_id = tab.panes.last().unwrap().id.clone();
+    let session = main_session(&model);
+    let first_id = session.windows[0].id.clone();
+    let last_id = session.windows.last().unwrap().id.clone();
 
-    mgr.set_active_pane(&mut model, main_tab_id(), &first_id);
-    mgr.select_prev_pane(&mut model);
-    assert_eq!(main_tab(&model).active_pane_id.as_ref(), Some(&last_id));
+    mgr.set_active_window(&mut model, main_session_id(), &first_id);
+    mgr.select_prev_window(&mut model);
+    assert_eq!(main_session(&model).active_window_id.as_ref(), Some(&last_id));
 }
 
 #[test]
-fn next_pane_is_noop_when_single_pane() {
-    // The seeded Main tab starts with a single pane; stepping must not move.
+fn next_window_is_noop_when_single_window() {
+    // The seeded Main session starts with a single window; stepping must not move.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let original_active = main_tab(&model).active_pane_id.clone();
+    let original_active = main_session(&model).active_window_id.clone();
 
-    mgr.select_next_pane(&mut model);
-    assert_eq!(main_tab(&model).active_pane_id, original_active);
+    mgr.select_next_window(&mut model);
+    assert_eq!(main_session(&model).active_window_id, original_active);
 }
 
 #[test]
-fn add_terminal_to_active_tab_appends_terminal_and_focuses() {
+fn add_terminal_to_active_session_appends_terminal_and_focuses() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    model.select_tab(main_tab_id());
-    let original_count = main_tab(&model).panes.len();
+    model.select_session(main_session_id());
+    let original_count = main_session(&model).windows.len();
 
-    mgr.add_terminal_to_active_tab(&mut model);
+    mgr.add_terminal_to_active_session(&mut model);
 
-    let tab = main_tab(&model);
-    assert_eq!(tab.panes.len(), original_count + 1);
-    let new_pane = tab.panes.last().unwrap();
-    assert_eq!(new_pane.kind, PaneKind::Terminal);
+    let session = main_session(&model);
+    assert_eq!(session.windows.len(), original_count + 1);
+    let new_term_window = session.windows.last().unwrap();
+    assert_eq!(new_term_window.kind, TermWindowKind::Terminal);
     // Seed consumed slot 1 ("Terminal 1"); the add is auto-named "Terminal 2".
-    assert_eq!(new_pane.title, "Terminal 2");
-    assert_eq!(tab.active_pane_id.as_ref(), Some(&new_pane.id));
+    assert_eq!(new_term_window.title, "Terminal 2");
+    assert_eq!(session.active_window_id.as_ref(), Some(&new_term_window.id));
 }
 
 /// Rust twin of `test_helpers_areNoOpWhenActiveTabIdIsNil`, adapted to the
 /// Rust model's invariant. Swift set `activeTabId = nil` directly; the Rust
-/// `TabModel` has **no `None` writer** for `active_tab_id` post-construction
-/// (the sole writer, `set_active_tab_id`, is private and only ever sets `Some`),
+/// `WorkspaceModel` has **no `None` writer** for `active_session_id` post-construction
+/// (the sole writer, `set_active_session_id`, is private and only ever sets `Some`),
 /// so the literal nil case is unreachable. This ports the reachable half of the
-/// Swift intent: the pane-navigation helpers are safe no-ops with nothing to
-/// step through, and the sidebar step is a no-op with a single navigable tab
+/// Swift intent: the window-navigation helpers are safe no-ops with nothing to
+/// step through, and the sidebar step is a no-op with a single navigable session
 /// (the "single navigable id ⇒ no-op" tail the Swift case also asserts).
 #[test]
 fn helpers_are_safe_noops_when_nothing_to_navigate() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    // Fresh window: one navigable tab (Main), one pane.
-    let before_active_tab = model.active_tab_id().map(str::to_owned);
-    let before_active_pane = main_tab(&model).active_pane_id.clone();
+    // Fresh window: one navigable session (Main), one window.
+    let before_active_session = model.active_session_id().map(str::to_owned);
+    let before_active_window = main_session(&model).active_window_id.clone();
 
-    // Single-pane tab: pane stepping is a no-op (must not crash or move).
-    mgr.select_next_pane(&mut model);
-    mgr.select_prev_pane(&mut model);
-    assert_eq!(main_tab(&model).active_pane_id, before_active_pane);
+    // Single-window session: window stepping is a no-op (must not crash or move).
+    mgr.select_next_window(&mut model);
+    mgr.select_prev_window(&mut model);
+    assert_eq!(main_session(&model).active_window_id, before_active_window);
 
-    // Single navigable sidebar tab: stepping the sidebar is a no-op too.
-    model.select_next_sidebar_tab();
-    assert_eq!(model.active_tab_id().map(str::to_owned), before_active_tab);
+    // Single navigable sidebar session: stepping the sidebar is a no-op too.
+    model.select_next_sidebar_session();
+    assert_eq!(model.active_session_id().map(str::to_owned), before_active_session);
 }
 
 // ===========================================================================
@@ -245,63 +245,63 @@ fn helpers_are_safe_noops_when_nothing_to_navigate() {
 // ===========================================================================
 
 #[test]
-fn pane_cwd_changed_stores_on_pane() {
+fn window_cwd_changed_stores_on_window() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_terminal_tab(&mut model, "t1", "p1", "/tmp");
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp");
 
-    let changed = mgr.pane_cwd_changed(&mut model, "t1", "p1", "/Users/nick/Downloads");
+    let changed = mgr.window_cwd_changed(&mut model, "t1", "p1", "/Users/nick/Downloads");
 
     assert!(changed, "a real cwd change reports changed");
     assert_eq!(
-        model.tab_for("t1").unwrap().panes[0].cwd.as_deref(),
+        model.session_for("t1").unwrap().windows[0].cwd.as_deref(),
         Some("/Users/nick/Downloads"),
-        "OSC 7 update must land on Pane.cwd"
+        "OSC 7 update must land on TermWindow.cwd"
     );
 }
 
 #[test]
-fn pane_cwd_changed_does_not_mutate_tab_cwd() {
-    // Tab.cwd is load-bearing for `claude --resume` — a companion terminal's cd
+fn window_cwd_changed_does_not_mutate_session_cwd() {
+    // Session.cwd is load-bearing for `claude --resume` — a companion terminal's cd
     // must never relocate the session's anchor.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_terminal_tab(&mut model, "t1", "p1", "/tmp/anchor");
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
 
-    mgr.pane_cwd_changed(&mut model, "t1", "p1", "/Users/nick/Downloads");
+    mgr.window_cwd_changed(&mut model, "t1", "p1", "/Users/nick/Downloads");
 
     assert_eq!(
-        model.tab_for("t1").unwrap().cwd,
+        model.session_for("t1").unwrap().cwd,
         "/tmp/anchor",
-        "Tab.cwd must stay anchored even when a pane cd's elsewhere"
+        "Session.cwd must stay anchored even when a window cd's elsewhere"
     );
 }
 
 #[test]
-fn pane_cwd_changed_unknown_pane_is_noop() {
+fn window_cwd_changed_unknown_window_is_noop() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_terminal_tab(&mut model, "t1", "p1", "/tmp");
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp");
 
-    let changed = mgr.pane_cwd_changed(&mut model, "t1", "ghost", "/Users/nick");
+    let changed = mgr.window_cwd_changed(&mut model, "t1", "ghost", "/Users/nick");
 
     assert!(!changed);
     assert_eq!(
-        model.tab_for("t1").unwrap().panes[0].cwd, None,
-        "stale paneId must not invent a cwd on the wrong pane"
+        model.session_for("t1").unwrap().windows[0].cwd, None,
+        "stale paneId must not invent a cwd on the wrong window"
     );
 }
 
 #[test]
-fn pane_cwd_changed_unknown_tab_is_noop() {
+fn window_cwd_changed_unknown_session_is_noop() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_terminal_tab(&mut model, "t1", "p1", "/tmp");
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp");
 
-    let changed = mgr.pane_cwd_changed(&mut model, "ghost-tab", "p1", "/Users/nick");
+    let changed = mgr.window_cwd_changed(&mut model, "ghost-tab", "p1", "/Users/nick");
 
     assert!(!changed);
-    assert_eq!(model.tab_for("t1").unwrap().panes[0].cwd, None);
+    assert_eq!(model.session_for("t1").unwrap().windows[0].cwd, None);
 }
 
 // ===========================================================================
@@ -309,44 +309,44 @@ fn pane_cwd_changed_unknown_tab_is_noop() {
 // ===========================================================================
 
 #[test]
-fn pane_title_changed_terminal_pane_updates_pane_title() {
+fn window_title_changed_terminal_window_updates_window_title() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
 
-    mgr.pane_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb");
+    mgr.window_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap();
-    assert_eq!(pane.title, "nvim foo.rb");
+    assert_eq!(term_window.title, "nvim foo.rb");
 }
 
 #[test]
-fn pane_title_changed_terminal_pane_empty_title_ignored() {
+fn window_title_changed_terminal_window_empty_title_ignored() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
     let before = model
-        .tab_for("t1")
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap()
         .title
         .clone();
 
-    mgr.pane_title_changed(&mut model, "t1", &terminal_id, "   \n");
+    mgr.window_title_changed(&mut model, "t1", &terminal_id, "   \n");
 
     let after = model
-        .tab_for("t1")
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap()
@@ -359,19 +359,19 @@ fn pane_title_changed_terminal_pane_empty_title_ignored() {
 }
 
 #[test]
-fn pane_title_changed_terminal_pane_manually_set_ignores_osc_title() {
-    // Once the user renames a terminal pane, OSC titles from the running program
+fn window_title_changed_terminal_window_manually_set_ignores_osc_title() {
+    // Once the user renames a terminal window, OSC titles from the running program
     // must not overwrite their custom label.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
 
-    model.rename_pane("t1", &terminal_id, "build watcher");
+    model.rename_window("t1", &terminal_id, "build watcher");
     assert!(
         model
-            .tab_for("t1")
+            .session_for("t1")
             .unwrap()
-            .panes
+            .windows
             .iter()
             .find(|p| p.id == terminal_id)
             .unwrap()
@@ -379,35 +379,35 @@ fn pane_title_changed_terminal_pane_manually_set_ignores_osc_title() {
         "Pre-condition: rename must flip the lock."
     );
 
-    mgr.pane_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb");
+    mgr.window_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap();
     assert_eq!(
-        pane.title, "build watcher",
-        "OSC titles must not overwrite a manually-renamed terminal pane."
+        term_window.title, "build watcher",
+        "OSC titles must not overwrite a manually-renamed terminal window."
     );
 }
 
 #[test]
-fn pane_title_changed_terminal_empty_submit_releases_lock_then_accepts_osc() {
+fn window_title_changed_terminal_empty_submit_releases_lock_then_accepts_osc() {
     // Empty-submit in the pill editor releases the lock; the next OSC flows in.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
 
-    model.rename_pane("t1", &terminal_id, "logs");
-    model.rename_pane("t1", &terminal_id, "");
+    model.rename_window("t1", &terminal_id, "logs");
+    model.rename_window("t1", &terminal_id, "");
     assert!(
         !model
-            .tab_for("t1")
+            .session_for("t1")
             .unwrap()
-            .panes
+            .windows
             .iter()
             .find(|p| p.id == terminal_id)
             .unwrap()
@@ -415,39 +415,39 @@ fn pane_title_changed_terminal_empty_submit_releases_lock_then_accepts_osc() {
         "Pre-condition: empty submit must clear the lock."
     );
 
-    mgr.pane_title_changed(&mut model, "t1", &terminal_id, "vim x.swift");
+    mgr.window_title_changed(&mut model, "t1", &terminal_id, "vim x.swift");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap();
     assert_eq!(
-        pane.title, "vim x.swift",
+        term_window.title, "vim x.swift",
         "After releasing the lock, OSC titles must flow into the pill again."
     );
 }
 
 #[test]
-fn pane_title_changed_terminal_pane_clips_at_40_chars() {
+fn window_title_changed_terminal_window_clips_at_40_chars() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
     let long: String = "x".repeat(80);
 
-    mgr.pane_title_changed(&mut model, "t1", &terminal_id, &long);
+    mgr.window_title_changed(&mut model, "t1", &terminal_id, &long);
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap();
     assert_eq!(
-        pane.title.chars().count(),
+        term_window.title.chars().count(),
         40,
         "Terminal titles must cap at 40 chars so the toolbar pill doesn't overflow."
     );
@@ -458,21 +458,21 @@ fn pane_title_changed_terminal_pane_clips_at_40_chars() {
 // ===========================================================================
 
 #[test]
-fn pane_title_changed_claude_deferred_resume_ignores_shell_title() {
-    // A deferred-resume Claude pane is a plain zsh (is_claude_running == false);
+fn window_title_changed_claude_deferred_resume_ignores_shell_title() {
+    // A deferred-resume Claude window is a plain zsh (is_claude_running == false);
     // its theme OSC titles ("user@host:cwd") must not clobber the persisted
     // session label. The whole Claude branch drops on the gate this cycle.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab(&mut model, "t1");
+    let (claude_id, _terminal) = seed_claude_session(&mut model, "t1");
     model.apply_auto_title("t1", "fix-top-bar-height");
     assert_eq!(
-        model.tab_for("t1").unwrap().title,
+        model.session_for("t1").unwrap().title,
         "Fix top bar height",
-        "Precondition: tab has a real auto-titled label."
+        "Precondition: session has a real auto-titled label."
     );
 
-    mgr.pane_title_changed(
+    mgr.window_title_changed(
         &mut model,
         "t1",
         &claude_id,
@@ -480,51 +480,51 @@ fn pane_title_changed_claude_deferred_resume_ignores_shell_title() {
     );
 
     assert_eq!(
-        model.tab_for("t1").unwrap().title,
+        model.session_for("t1").unwrap().title,
         "Fix top bar height",
-        "OSC titles from a deferred-resume Claude pane (zsh, not claude) \
+        "OSC titles from a deferred-resume Claude window (zsh, not claude) \
          must not overwrite the persisted session title."
     );
     // The Claude pill label is likewise untouched.
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.title, "Claude");
+    assert_eq!(term_window.title, "Claude");
 }
 
 #[test]
-fn pane_title_changed_claude_deferred_resume_ignores_status_prefix() {
+fn window_title_changed_claude_deferred_resume_ignores_status_prefix() {
     // Defensive: a braille/sparkle status prefix from a non-claude process must
-    // not flip the pane status while is_claude_running is false — the
+    // not flip the window status while is_claude_running is false — the
     // spinner/sparkle vocabulary belongs to claude (R15).
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab(&mut model, "t1");
-    let title_before = model.tab_for("t1").unwrap().title.clone();
+    let (claude_id, _terminal) = seed_claude_session(&mut model, "t1");
+    let title_before = model.session_for("t1").unwrap().title.clone();
 
     // U+2840 is inside the braille spinner range Claude uses for "thinking".
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
     assert_eq!(
-        pane.status,
-        nice_model::TabStatus::Idle,
+        term_window.status,
+        nice_model::SessionStatus::Idle,
         "Status transitions are gated on is_claude_running."
     );
     assert_eq!(
-        model.tab_for("t1").unwrap().title,
+        model.session_for("t1").unwrap().title,
         title_before,
-        "Tab title must not change while is_claude_running is false."
+        "Session title must not change while is_claude_running is false."
     );
 }
 
@@ -532,255 +532,255 @@ fn pane_title_changed_claude_deferred_resume_ignores_status_prefix() {
 // Claude-branch T5 status parsing (ported AppStatePaneLifecycleTests, running)
 // ===========================================================================
 
-/// Seed a `[Claude, Terminal 1]` tab whose Claude pane is **running** (the
-/// post-promotion / creation state that opens the T5 OSC gate). Selects the tab
-/// so `apply_status_transition`'s viewed-pane ack fires like the shipped window.
-fn seed_running_claude_tab(model: &mut TabModel, tab_id: &str) -> (String, String) {
-    let (claude_id, terminal_id) = seed_claude_tab(model, tab_id);
-    model.mutate_tab(tab_id, |tab| {
-        if let Some(p) = tab.panes.iter_mut().find(|p| p.id == claude_id) {
+/// Seed a `[Claude, Terminal 1]` session whose Claude window is **running** (the
+/// post-promotion / creation state that opens the T5 OSC gate). Selects the session
+/// so `apply_status_transition`'s viewed-window ack fires like the shipped window.
+fn seed_running_claude_session(model: &mut WorkspaceModel, session_id: &str) -> (String, String) {
+    let (claude_id, terminal_id) = seed_claude_session(model, session_id);
+    model.mutate_session(session_id, |session| {
+        if let Some(p) = session.windows.iter_mut().find(|p| p.id == claude_id) {
             p.is_claude_running = true;
         }
     });
-    model.select_tab(tab_id);
+    model.select_session(session_id);
     (claude_id, terminal_id)
 }
 
 #[test]
-fn pane_title_changed_claude_braille_spinner_sets_thinking_and_humanizes_title() {
+fn window_title_changed_claude_braille_spinner_sets_thinking_and_humanizes_title() {
     // U+2840 is inside the braille spinner range (0x2800..=0x28FF) Claude uses
-    // for "thinking"; the trailing label humanizes onto the tab title.
+    // for "thinking"; the trailing label humanizes onto the session title.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+    let (claude_id, _t) = seed_running_claude_session(&mut model, "t1");
 
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-top-bar-height");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-top-bar-height");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.status, nice_model::TabStatus::Thinking);
-    assert_eq!(model.tab_for("t1").unwrap().title, "Fix top bar height");
+    assert_eq!(term_window.status, nice_model::SessionStatus::Thinking);
+    assert_eq!(model.session_for("t1").unwrap().title, "Fix top bar height");
 }
 
 #[test]
-fn pane_title_changed_claude_sparkle_sets_waiting() {
+fn window_title_changed_claude_sparkle_sets_waiting() {
     // U+2733 (✳) is the sparkle Claude uses for "waiting for input."
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+    let (claude_id, _t) = seed_running_claude_session(&mut model, "t1");
 
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2733} needs-input");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2733} needs-input");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.status, nice_model::TabStatus::Waiting);
+    assert_eq!(term_window.status, nice_model::SessionStatus::Waiting);
 }
 
 #[test]
-fn pane_title_changed_claude_placeholder_label_ignored() {
+fn window_title_changed_claude_placeholder_label_ignored() {
     // "Claude Code" is the generic placeholder Claude emits before a session has
-    // a real name — it must not clobber an existing tab title.
+    // a real name — it must not clobber an existing session title.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+    let (claude_id, _t) = seed_running_claude_session(&mut model, "t1");
 
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
-    assert_eq!(model.tab_for("t1").unwrap().title, "Fix bug");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
+    assert_eq!(model.session_for("t1").unwrap().title, "Fix bug");
 
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} Claude Code");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2840} Claude Code");
     assert_eq!(
-        model.tab_for("t1").unwrap().title,
+        model.session_for("t1").unwrap().title,
         "Fix bug",
         "Placeholder 'Claude Code' must not overwrite a real session title."
     );
 }
 
 #[test]
-fn pane_title_changed_claude_unknown_prefix_treated_as_label() {
+fn window_title_changed_claude_unknown_prefix_treated_as_label() {
     // A non-braille, non-sparkle first char means no status update — the whole
     // string is the label.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
+    let (claude_id, _t) = seed_running_claude_session(&mut model, "t1");
 
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "refactor-auth-layer");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "refactor-auth-layer");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.status, nice_model::TabStatus::Idle, "no prefix ⇒ no status change");
-    assert_eq!(model.tab_for("t1").unwrap().title, "Refactor auth layer");
+    assert_eq!(term_window.status, nice_model::SessionStatus::Idle, "no prefix ⇒ no status change");
+    assert_eq!(model.session_for("t1").unwrap().title, "Refactor auth layer");
 }
 
 #[test]
-fn pane_title_changed_claude_manually_set_pane_still_flips_status() {
-    // The pane-level title lock is a *title* lock, not a *status* lock: a renamed
-    // Claude pane must still flip status when claude emits a braille prefix, and
+fn window_title_changed_claude_manually_set_window_still_flips_status() {
+    // The window-level title lock is a *title* lock, not a *status* lock: a renamed
+    // Claude window must still flip status when claude emits a braille prefix, and
     // its custom pill name must survive (the OSC gate lives in the terminal
     // branch, never blocking status extraction).
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _t) = seed_running_claude_tab(&mut model, "t1");
-    model.mutate_tab("t1", |tab| {
-        if let Some(p) = tab.panes.iter_mut().find(|p| p.id == claude_id) {
+    let (claude_id, _t) = seed_running_claude_session(&mut model, "t1");
+    model.mutate_session("t1", |session| {
+        if let Some(p) = session.windows.iter_mut().find(|p| p.id == claude_id) {
             p.title = "deploy session".to_string();
             p.title_manually_set = true;
         }
     });
 
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-top-bar-height");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-top-bar-height");
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.status, nice_model::TabStatus::Thinking, "status still flips");
-    assert_eq!(pane.title, "deploy session", "the user's custom pill name survives");
+    assert_eq!(term_window.status, nice_model::SessionStatus::Thinking, "status still flips");
+    assert_eq!(term_window.title, "deploy session", "the user's custom pill name survives");
 }
 
 #[test]
-fn pane_title_changed_claude_accepts_title_after_promotion() {
+fn window_title_changed_claude_accepts_title_after_promotion() {
     // The full deferred-resume → live-claude story: the gate holds against zsh
     // OSC while is_claude_running is false, and RELEASES after the promotion
     // flips it true (`AppStatePaneLifecycleTests.acceptsTitleAfterPromotion`).
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _t) = seed_claude_tab(&mut model, "t1"); // is_claude_running == false
-    model.select_tab("t1");
-    let title_before = model.tab_for("t1").unwrap().title.clone();
+    let (claude_id, _t) = seed_claude_session(&mut model, "t1"); // is_claude_running == false
+    model.select_session("t1");
+    let title_before = model.session_for("t1").unwrap().title.clone();
 
     // Pre-promotion: zsh OSC ignored.
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "Nick@host:~/repo");
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "Nick@host:~/repo");
     assert_eq!(
-        model.tab_for("t1").unwrap().title,
+        model.session_for("t1").unwrap().title,
         title_before,
         "gate must hold before is_claude_running flips true"
     );
 
     // Simulate the socket-handshake promotion that flips the flag.
-    model.mutate_tab("t1", |tab| {
-        if let Some(p) = tab.panes.iter_mut().find(|p| p.id == claude_id) {
+    model.mutate_session("t1", |session| {
+        if let Some(p) = session.windows.iter_mut().find(|p| p.id == claude_id) {
             p.is_claude_running = true;
         }
     });
 
     // Post-promotion: real claude OSC accepted; status flips, label humanizes.
-    mgr.pane_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
-    let pane = model
-        .tab_for("t1")
+    mgr.window_title_changed(&mut model, "t1", &claude_id, "\u{2840} fix-bug");
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.status, nice_model::TabStatus::Thinking, "status fires once the gate releases");
-    assert_eq!(model.tab_for("t1").unwrap().title, "Fix bug", "auto-title applies once the gate releases");
+    assert_eq!(term_window.status, nice_model::SessionStatus::Thinking, "status fires once the gate releases");
+    assert_eq!(model.session_for("t1").unwrap().title, "Fix bug", "auto-title applies once the gate releases");
 }
 
 // ===========================================================================
-// set_active_pane model-half: ack-when-viewed (SessionsModel.swift:534-545)
+// set_active_window model-half: ack-when-viewed (SessionsModel.swift:534-545)
 // ===========================================================================
 
 #[test]
-fn set_active_pane_acknowledges_waiting_pane_when_tab_is_viewed() {
-    // A waiting pane that becomes active while its tab is the viewed tab lands
+fn set_active_window_acknowledges_waiting_window_when_session_is_viewed() {
+    // A waiting window that becomes active while its session is the viewed session lands
     // acknowledged (no lingering pulse) — the `markAcknowledgedIfWaiting` side
     // effect of setActivePane.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, terminal_id) = seed_claude_tab(&mut model, "t1");
-    model.select_tab("t1"); // t1 is the viewed tab
+    let (claude_id, terminal_id) = seed_claude_session(&mut model, "t1");
+    model.select_session("t1"); // t1 is the viewed session
 
-    // Claude pane enters waiting while the companion terminal is active.
-    model.mutate_tab("t1", |tab| {
-        tab.active_pane_id = Some(terminal_id.clone());
-        let pane = tab.panes.iter_mut().find(|p| p.id == claude_id).unwrap();
-        pane.apply_status_transition(nice_model::TabStatus::Waiting, false);
+    // Claude window enters waiting while the companion terminal is active.
+    model.mutate_session("t1", |session| {
+        session.active_window_id = Some(terminal_id.clone());
+        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        term_window.apply_status_transition(nice_model::SessionStatus::Waiting, false);
     });
     assert!(
         !model
-            .tab_for("t1")
+            .session_for("t1")
             .unwrap()
-            .panes
+            .windows
             .iter()
             .find(|p| p.id == claude_id)
             .unwrap()
             .waiting_acknowledged
     );
 
-    // Focusing the waiting Claude pane while viewing t1 acknowledges it.
-    mgr.set_active_pane(&mut model, "t1", &claude_id);
+    // Focusing the waiting Claude window while viewing t1 acknowledges it.
+    mgr.set_active_window(&mut model, "t1", &claude_id);
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert_eq!(pane.status, nice_model::TabStatus::Waiting);
+    assert_eq!(term_window.status, nice_model::SessionStatus::Waiting);
     assert!(
-        pane.waiting_acknowledged,
-        "activating a waiting pane on the viewed tab must acknowledge it"
+        term_window.waiting_acknowledged,
+        "activating a waiting window on the viewed session must acknowledge it"
     );
 }
 
 #[test]
-fn set_active_pane_does_not_acknowledge_when_tab_not_viewed() {
+fn set_active_window_does_not_acknowledge_when_session_not_viewed() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab(&mut model, "t1");
-    // Main is the viewed tab, not t1.
-    model.select_tab(TabModel::MAIN_TERMINAL_TAB_ID);
-    model.mutate_tab("t1", |tab| {
-        let pane = tab.panes.iter_mut().find(|p| p.id == claude_id).unwrap();
-        pane.apply_status_transition(nice_model::TabStatus::Waiting, false);
+    let (claude_id, _terminal) = seed_claude_session(&mut model, "t1");
+    // Main is the viewed session, not t1.
+    model.select_session(WorkspaceModel::MAIN_TERMINAL_SESSION_ID);
+    model.mutate_session("t1", |session| {
+        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        term_window.apply_status_transition(nice_model::SessionStatus::Waiting, false);
     });
 
-    mgr.set_active_pane(&mut model, "t1", &claude_id);
+    mgr.set_active_window(&mut model, "t1", &claude_id);
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
     assert!(
-        !pane.waiting_acknowledged,
-        "activating a pane on an unviewed tab must not acknowledge its pulse"
+        !term_window.waiting_acknowledged,
+        "activating a window on an unviewed session must not acknowledge its pulse"
     );
 }
 
 #[test]
-fn set_active_pane_unknown_pane_never_dangles_active() {
+fn set_active_window_unknown_window_never_dangles_active() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let before = main_tab(&model).active_pane_id.clone();
+    let before = main_session(&model).active_window_id.clone();
 
-    mgr.set_active_pane(&mut model, main_tab_id(), "ghost-pane");
+    mgr.set_active_window(&mut model, main_session_id(), "ghost-pane");
 
     assert_eq!(
-        main_tab(&model).active_pane_id,
+        main_session(&model).active_window_id,
         before,
-        "selecting a pane not on the tab must leave active_pane_id untouched"
+        "selecting a window not on the session must leave active_window_id untouched"
     );
 }
 
@@ -789,10 +789,10 @@ fn set_active_pane_unknown_pane_never_dangles_active() {
 // ===========================================================================
 
 #[test]
-fn route_title_changed_updates_terminal_pane_pill() {
+fn route_title_changed_updates_terminal_window_pill() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
 
     mgr.route_terminal_event(
         &mut model,
@@ -802,21 +802,21 @@ fn route_title_changed_updates_terminal_pane_pill() {
         &TerminalEvent::TitleChanged("nvim foo.rb".to_string()),
     );
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap();
-    assert_eq!(pane.title, "nvim foo.rb");
+    assert_eq!(term_window.title, "nvim foo.rb");
 }
 
 #[test]
-fn route_cwd_changed_writes_pane_cwd_only() {
+fn route_cwd_changed_writes_window_cwd_only() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_terminal_tab(&mut model, "t1", "p1", "/tmp/anchor");
+    seed_terminal_session(&mut model, "t1", "p1", "/tmp/anchor");
 
     mgr.route_terminal_event(
         &mut model,
@@ -826,24 +826,24 @@ fn route_cwd_changed_writes_pane_cwd_only() {
         &TerminalEvent::CwdChanged(std::path::PathBuf::from("/Users/nick/Downloads")),
     );
 
-    let tab = model.tab_for("t1").unwrap();
-    assert_eq!(tab.panes[0].cwd.as_deref(), Some("/Users/nick/Downloads"));
-    assert_eq!(tab.cwd, "/tmp/anchor", "Tab.cwd stays anchored");
+    let session = model.session_for("t1").unwrap();
+    assert_eq!(session.windows[0].cwd.as_deref(), Some("/Users/nick/Downloads"));
+    assert_eq!(session.cwd, "/tmp/anchor", "Session.cwd stays anchored");
 }
 
 #[test]
 fn route_title_reset_and_output_started_leave_the_pill() {
     // TitleReset carries no new label (terminal title-policy only accepts a
     // non-empty set); OutputStarted only clears the launch overlay. Neither may
-    // panic or mutate the pill. (Exited routes to pane_exited — covered by the
+    // panic or mutate the pill. (Exited routes to window_exited — covered by the
     // paneExited / route-exit cases below.)
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab(&mut model, "t1");
+    let (_claude, terminal_id) = seed_claude_session(&mut model, "t1");
     let before = model
-        .tab_for("t1")
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap()
@@ -866,9 +866,9 @@ fn route_title_reset_and_output_started_leave_the_pill() {
     );
 
     let after = model
-        .tab_for("t1")
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == terminal_id)
         .unwrap()
@@ -884,12 +884,12 @@ fn route_title_reset_and_output_started_leave_the_pill() {
 #[test]
 fn clip_title_caps_at_char_boundary_not_bytes() {
     let long: String = "x".repeat(80);
-    assert_eq!(clip_title(&long, PANE_TITLE_MAX).chars().count(), 40);
+    assert_eq!(clip_title(&long, WINDOW_TITLE_MAX).chars().count(), 40);
     // A short title passes through untouched.
-    assert_eq!(clip_title("nvim foo.rb", PANE_TITLE_MAX), "nvim foo.rb");
+    assert_eq!(clip_title("nvim foo.rb", WINDOW_TITLE_MAX), "nvim foo.rb");
     // Multi-byte chars are counted by char, not byte (10 CJK chars < 40).
     let cjk = "工作".repeat(5); // 10 chars, 30 bytes
-    assert_eq!(clip_title(&cjk, PANE_TITLE_MAX), cjk);
+    assert_eq!(clip_title(&cjk, WINDOW_TITLE_MAX), cjk);
 }
 
 #[test]
@@ -909,106 +909,106 @@ fn default_mint_id_is_prefixed_and_unique() {
 // ===========================================================================
 
 #[test]
-fn pane_exited_removes_pane_and_shifts_active_to_neighbor() {
+fn window_exited_removes_window_and_shifts_active_to_neighbor() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, terminal_id) = seed_claude_tab_in(&mut model, "p", "t1", false);
-    model.select_tab("t1");
+    let (claude_id, terminal_id) = seed_claude_session_in(&mut model, "p", "t1", false);
+    model.select_session("t1");
 
-    // Focus the claude pane, then exit it — focus must shift to the neighbor
-    // (the terminal pane at index 1).
-    mgr.set_active_pane(&mut model, "t1", &claude_id);
-    let res = mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id);
+    // Focus the claude window, then exit it — focus must shift to the neighbor
+    // (the terminal window at index 1).
+    mgr.set_active_window(&mut model, "t1", &claude_id);
+    let res = mgr.window_exited(&mut model, &mut selection(), "t1", &claude_id);
 
-    let tab = model.tab_for("t1").unwrap();
-    assert_eq!(tab.panes.len(), 1);
-    assert_eq!(tab.panes[0].id, terminal_id);
+    let session = model.session_for("t1").unwrap();
+    assert_eq!(session.windows.len(), 1);
+    assert_eq!(session.windows[0].id, terminal_id);
     assert_eq!(
-        tab.active_pane_id.as_deref(),
+        session.active_window_id.as_deref(),
         Some(terminal_id.as_str()),
-        "focus must shift to the surviving pane; a dangling activePaneId breaks the toolbar"
+        "focus must shift to the surviving window; a dangling activePaneId breaks the toolbar"
     );
     assert_eq!(
-        res.refocus_tab.as_deref(),
+        res.refocus_session.as_deref(),
         Some("t1"),
-        "the tab survived → the live caller spawns the refocused companion (step 4)"
+        "the session survived → the live caller spawns the refocused companion (step 4)"
     );
     assert_eq!(res.terminus, DissolveTerminus::None);
 }
 
 #[test]
-fn pane_exited_last_pane_dissolves_tab() {
-    // Seed two extra projects so dissolving one tab doesn't empty everything
+fn window_exited_last_window_dissolves_session() {
+    // Seed two extra projects so dissolving one session doesn't empty everything
     // (which would fire the window terminus).
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (c1, term1) = seed_claude_tab_in(&mut model, "p1", "t1", false);
-    seed_claude_tab_in(&mut model, "p2", "t2", false);
+    let (c1, term1) = seed_claude_session_in(&mut model, "p1", "t1", false);
+    seed_claude_session_in(&mut model, "p2", "t2", false);
 
-    mgr.pane_exited(&mut model, &mut selection(), "t1", &c1);
-    mgr.pane_exited(&mut model, &mut selection(), "t1", &term1);
+    mgr.window_exited(&mut model, &mut selection(), "t1", &c1);
+    mgr.window_exited(&mut model, &mut selection(), "t1", &term1);
 
     assert!(
-        model.tab_for("t1").is_none(),
-        "tab must dissolve once every pane exits"
+        model.session_for("t1").is_none(),
+        "session must dissolve once every window exits"
     );
     assert!(
-        model.tab_for("t2").is_some(),
-        "other tabs must not be touched by one tab's dissolve"
+        model.session_for("t2").is_some(),
+        "other sessions must not be touched by one session's dissolve"
     );
 }
 
 #[test]
-fn pane_exited_dissolved_active_tab_falls_back_to_first_available() {
+fn window_exited_dissolved_active_session_falls_back_to_first_available() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (c1, term1) = seed_claude_tab_in(&mut model, "p1", "t1", false);
-    seed_claude_tab_in(&mut model, "p2", "t2", false);
-    model.select_tab("t1");
+    let (c1, term1) = seed_claude_session_in(&mut model, "p1", "t1", false);
+    seed_claude_session_in(&mut model, "p2", "t2", false);
+    model.select_session("t1");
 
-    mgr.pane_exited(&mut model, &mut selection(), "t1", &c1);
-    mgr.pane_exited(&mut model, &mut selection(), "t1", &term1);
+    mgr.window_exited(&mut model, &mut selection(), "t1", &c1);
+    mgr.window_exited(&mut model, &mut selection(), "t1", &term1);
 
-    // Dissolving the active tab leaves active_tab_id at the first tab in
-    // navigable order — the Terminals Main tab.
-    assert_eq!(model.active_tab_id(), Some(TabModel::MAIN_TERMINAL_TAB_ID));
+    // Dissolving the active session leaves active_session_id at the first session in
+    // navigable order — the Terminals Main session.
+    assert_eq!(model.active_session_id(), Some(WorkspaceModel::MAIN_TERMINAL_SESSION_ID));
 }
 
 #[test]
-fn pane_exited_unknown_pane_is_noop() {
+fn window_exited_unknown_window_is_noop() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let before = main_tab(&model).panes.len();
+    let before = main_session(&model).windows.len();
 
-    let res = mgr.pane_exited(&mut model, &mut selection(), main_tab_id(), "does-not-exist");
+    let res = mgr.window_exited(&mut model, &mut selection(), main_session_id(), "does-not-exist");
 
     assert_eq!(
-        main_tab(&model).panes.len(),
+        main_session(&model).windows.len(),
         before,
         "unknown paneId must not corrupt state"
     );
     assert_eq!(
-        res.refocus_tab.as_deref(),
-        Some(main_tab_id()),
-        "the tab survived untouched"
+        res.refocus_session.as_deref(),
+        Some(main_session_id()),
+        "the session survived untouched"
     );
     assert_eq!(res.terminus, DissolveTerminus::None);
 }
 
 #[test]
-fn pane_exited_last_tab_of_last_project_reports_window_emptied() {
-    // Dissolving the only tab in the window (the seeded Terminals Main tab, its
-    // single pane) leaves every project empty — the terminus the live caller
+fn window_exited_last_session_of_last_project_reports_window_emptied() {
+    // Dissolving the only session in the window (the seeded Terminals Main session, its
+    // single window) leaves every project empty — the terminus the live caller
     // turns into close-window-or-quit. (The Swift lifecycle tests deliberately
     // seed extra projects to AVOID this; here we pin the signal itself.)
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let main = main_tab_id();
-    let pane_id = main_tab(&model).panes[0].id.clone();
+    let main = main_session_id();
+    let term_window_id = main_session(&model).windows[0].id.clone();
 
-    let res = mgr.pane_exited(&mut model, &mut selection(), main, &pane_id);
+    let res = mgr.window_exited(&mut model, &mut selection(), main, &term_window_id);
 
-    assert!(model.tab_for(main).is_none(), "the last tab dissolved");
+    assert!(model.session_for(main).is_none(), "the last session dissolved");
     assert_eq!(
         res.terminus,
         DissolveTerminus::WindowEmptied,
@@ -1021,91 +1021,91 @@ fn pane_exited_last_tab_of_last_project_reports_window_emptied() {
 // ===========================================================================
 
 #[test]
-fn pane_held_flips_is_alive_and_idles_status() {
-    // Seed a running Claude pane mid-think, then hold it: is_alive → false, the
+fn window_held_flips_is_alive_and_idles_status() {
+    // Seed a running Claude window mid-think, then hold it: is_alive → false, the
     // pulsing status idles out, the ack clears, and is_claude_running clears.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p", "t1", true);
-    model.mutate_tab("t1", |tab| {
-        let pane = tab.panes.iter_mut().find(|p| p.id == claude_id).unwrap();
-        pane.status = TabStatus::Thinking;
-        pane.waiting_acknowledged = false;
+    let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p", "t1", true);
+    model.mutate_session("t1", |session| {
+        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        term_window.status = SessionStatus::Thinking;
+        term_window.waiting_acknowledged = false;
     });
 
-    mgr.pane_held(&mut model, "t1", &claude_id);
+    mgr.window_held(&mut model, "t1", &claude_id);
 
-    let pane = model
-        .tab_for("t1")
+    let term_window = model
+        .session_for("t1")
         .unwrap()
-        .panes
+        .windows
         .iter()
         .find(|p| p.id == claude_id)
         .unwrap();
-    assert!(!pane.is_alive, "paneHeld flips is_alive to false");
-    assert_eq!(pane.status, TabStatus::Idle, "paneHeld idles the status out");
+    assert!(!term_window.is_alive, "paneHeld flips is_alive to false");
+    assert_eq!(term_window.status, SessionStatus::Idle, "paneHeld idles the status out");
     assert!(
-        !pane.waiting_acknowledged,
-        "paneHeld clears waiting_acknowledged so a future waiting pane can pulse"
+        !term_window.waiting_acknowledged,
+        "paneHeld clears waiting_acknowledged so a future waiting window can pulse"
     );
     assert!(
-        !pane.is_claude_running,
+        !term_window.is_claude_running,
         "paneHeld clears is_claude_running (a held pty is a corpse, not a live shell)"
     );
 }
 
 #[test]
-fn pane_held_keeps_pane_in_tab_panes_array() {
+fn window_held_keeps_window_in_session_windows_array() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p", "t1", false);
-    let before = model.tab_for("t1").unwrap().panes.len();
+    let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p", "t1", false);
+    let before = model.session_for("t1").unwrap().windows.len();
 
-    mgr.pane_held(&mut model, "t1", &claude_id);
+    mgr.window_held(&mut model, "t1", &claude_id);
 
-    let tab = model.tab_for("t1").unwrap();
+    let session = model.session_for("t1").unwrap();
     assert_eq!(
-        tab.panes.len(),
+        session.windows.len(),
         before,
-        "paneHeld must not remove the pane — that's paneExited's job"
+        "paneHeld must not remove the window — that's paneExited's job"
     );
     assert!(
-        tab.panes.iter().any(|p| p.id == claude_id),
-        "the held pane must still be findable by id"
+        session.windows.iter().any(|p| p.id == claude_id),
+        "the held window must still be findable by id"
     );
 }
 
 #[test]
-fn pane_held_clears_launch_overlay() {
+fn window_held_clears_launch_overlay() {
     // Exit-before-first-byte: the overlay was still up when the process died;
     // paneHeld must clear it so the placeholder doesn't sit on the held footer.
     let mut mgr = counting_manager();
     let mut model = seeded();
     mgr.set_launch_overlay_grace(Duration::ZERO);
-    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p", "t1", false);
-    mgr.register_pane_launch(&claude_id, "claude");
+    let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p", "t1", false);
+    mgr.register_window_launch(&claude_id, "claude");
     assert!(
-        mgr.pane_launch_state(&claude_id).is_some(),
+        mgr.window_launch_state(&claude_id).is_some(),
         "pre-condition: overlay entry exists before paneHeld"
     );
 
-    mgr.pane_held(&mut model, "t1", &claude_id);
+    mgr.window_held(&mut model, "t1", &claude_id);
 
     assert!(
-        mgr.pane_launch_state(&claude_id).is_none(),
+        mgr.window_launch_state(&claude_id).is_none(),
         "paneHeld must clear the launch overlay"
     );
 }
 
 #[test]
-fn pane_held_unknown_pane_is_noop() {
+fn window_held_unknown_window_is_noop() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let before = main_tab(&model).panes.len();
+    let before = main_session(&model).windows.len();
 
-    mgr.pane_held(&mut model, main_tab_id(), "does-not-exist");
+    mgr.window_held(&mut model, main_session_id(), "does-not-exist");
 
-    assert_eq!(main_tab(&model).panes.len(), before);
+    assert_eq!(main_session(&model).windows.len(), before);
 }
 
 // ===========================================================================
@@ -1113,16 +1113,16 @@ fn pane_held_unknown_pane_is_noop() {
 // ===========================================================================
 
 #[test]
-fn register_pane_launch_zero_grace_immediately_visible() {
+fn register_window_launch_zero_grace_immediately_visible() {
     let mut mgr = counting_manager();
     mgr.set_launch_overlay_grace(Duration::ZERO);
 
-    let armed = mgr.register_pane_launch("p1", "claude -w foo");
+    let armed = mgr.register_window_launch("p1", "claude -w foo");
 
     assert!(!armed, "zero grace promotes synchronously — no deadline to arm");
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Visible {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Visible {
             command: "claude -w foo".into()
         }),
         "with a zero-second grace the overlay is promoted immediately"
@@ -1130,70 +1130,70 @@ fn register_pane_launch_zero_grace_immediately_visible() {
 }
 
 #[test]
-fn clear_pane_launch_removes_visible_entry() {
+fn clear_window_launch_removes_visible_entry() {
     let mut mgr = counting_manager();
     mgr.set_launch_overlay_grace(Duration::ZERO);
-    mgr.register_pane_launch("p1", "claude");
+    mgr.register_window_launch("p1", "claude");
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Visible {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Visible {
             command: "claude".into()
         })
     );
 
-    mgr.clear_pane_launch("p1");
+    mgr.clear_window_launch("p1");
 
     assert!(
-        mgr.pane_launch_state("p1").is_none(),
+        mgr.window_launch_state("p1").is_none(),
         "first-byte clear must remove the entry entirely"
     );
 }
 
 #[test]
-fn clear_pane_launch_before_deadline_fires_suppresses_overlay() {
+fn clear_window_launch_before_deadline_fires_suppresses_overlay() {
     // Non-zero grace → registration leaves the entry Pending (the live caller
     // arms the deadline). Clear before the deadline fires, then simulate the
-    // deadline firing via promote_pane_launch: the Pending-guard early-exits.
+    // deadline firing via promote_window_launch: the Pending-guard early-exits.
     let mut mgr = counting_manager();
     mgr.set_launch_overlay_grace(Duration::from_millis(200));
-    let armed = mgr.register_pane_launch("p1", "claude");
+    let armed = mgr.register_window_launch("p1", "claude");
     assert!(armed, "non-zero grace defers to the injected deadline");
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Pending {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Pending {
             command: "claude".into()
         })
     );
 
-    mgr.clear_pane_launch("p1");
+    mgr.clear_window_launch("p1");
     // Deadline fires after the clear — must not resurrect the overlay.
-    mgr.promote_pane_launch("p1");
+    mgr.promote_window_launch("p1");
 
     assert!(
-        mgr.pane_launch_state("p1").is_none(),
-        "a cleared pane must stay cleared even after the grace deadline fires"
+        mgr.window_launch_state("p1").is_none(),
+        "a cleared window must stay cleared even after the grace deadline fires"
     );
 }
 
 #[test]
-fn register_pane_launch_async_path_promotes_on_deadline() {
+fn register_window_launch_async_path_promotes_on_deadline() {
     let mut mgr = counting_manager();
     mgr.set_launch_overlay_grace(Duration::from_millis(150));
-    mgr.register_pane_launch("p1", "claude -w slow");
+    mgr.register_window_launch("p1", "claude -w slow");
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Pending {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Pending {
             command: "claude -w slow".into()
         }),
         "before the deadline the state is Pending — overlay stays hidden"
     );
 
     // The injected deadline fires (App-Nap-safe in production, direct here).
-    mgr.promote_pane_launch("p1");
+    mgr.promote_window_launch("p1");
 
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Visible {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Visible {
             command: "claude -w slow".into()
         }),
         "after the deadline the entry is promoted to Visible"
@@ -1201,24 +1201,24 @@ fn register_pane_launch_async_path_promotes_on_deadline() {
 }
 
 #[test]
-fn register_pane_launch_replaces_prior_entry() {
+fn register_window_launch_replaces_prior_entry() {
     // A second register for the same paneId replaces the first (defends against
-    // in-place pane promotion re-using an id that already had state).
+    // in-place window promotion re-using an id that already had state).
     let mut mgr = counting_manager();
     mgr.set_launch_overlay_grace(Duration::ZERO);
-    mgr.register_pane_launch("p1", "claude");
+    mgr.register_window_launch("p1", "claude");
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Visible {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Visible {
             command: "claude".into()
         })
     );
 
-    mgr.register_pane_launch("p1", "claude --resume");
+    mgr.register_window_launch("p1", "claude --resume");
 
     assert_eq!(
-        mgr.pane_launch_state("p1"),
-        Some(&PaneLaunchStatus::Visible {
+        mgr.window_launch_state("p1"),
+        Some(&WindowLaunchStatus::Visible {
             command: "claude --resume".into()
         }),
         "re-registering must overwrite the command, not stack entries"
@@ -1226,30 +1226,30 @@ fn register_pane_launch_replaces_prior_entry() {
 }
 
 #[test]
-fn pane_exited_clears_launch_state() {
-    // A pane that exits — even silently, before emitting any byte — must not
+fn window_exited_clears_launch_state() {
+    // A window that exits — even silently, before emitting any byte — must not
     // leave a stale overlay entry behind.
     let mut mgr = counting_manager();
     let mut model = seeded();
     mgr.set_launch_overlay_grace(Duration::ZERO);
-    let pane_id = "p-exit";
-    let mut tab = Tab::new("t1", "t", "/tmp");
-    tab.panes = vec![Pane::new(pane_id, "Claude", PaneKind::Claude)];
-    tab.active_pane_id = Some(pane_id.to_string());
+    let term_window_id = "p-exit";
+    let mut session = Session::new("t1", "t", "/tmp");
+    session.windows = vec![TermWindow::new(term_window_id, "Claude", TermWindowKind::Claude)];
+    session.active_window_id = Some(term_window_id.to_string());
     model.projects.push(Project {
         id: "p".into(),
         name: "P".into(),
         path: "/tmp".into(),
-        tabs: vec![tab],
+        sessions: vec![session],
     });
-    mgr.register_pane_launch(pane_id, "claude");
-    assert!(mgr.pane_launch_state(pane_id).is_some());
+    mgr.register_window_launch(term_window_id, "claude");
+    assert!(mgr.window_launch_state(term_window_id).is_some());
 
-    mgr.pane_exited(&mut model, &mut selection(), "t1", pane_id);
+    mgr.window_exited(&mut model, &mut selection(), "t1", term_window_id);
 
     assert!(
-        mgr.pane_launch_state(pane_id).is_none(),
-        "an exited pane must leave no stale overlay entry"
+        mgr.window_launch_state(term_window_id).is_none(),
+        "an exited window must leave no stale overlay entry"
     );
 }
 
@@ -1258,66 +1258,66 @@ fn pane_exited_clears_launch_state() {
 // ===========================================================================
 
 #[test]
-fn closing_tab_prunes_from_multi_selection() {
+fn closing_session_prunes_from_multi_selection() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "pa", "a", false);
-    seed_claude_tab_in(&mut model, "pb", "b", false);
-    let mut sel = SidebarTabSelection::new();
+    seed_claude_session_in(&mut model, "pa", "a", false);
+    seed_claude_session_in(&mut model, "pb", "b", false);
+    let mut sel = SidebarSessionSelection::new();
     sel.replace("a");
     let _ = sel.toggle("b");
     assert_eq!(
-        sel.selected_tab_ids(),
+        sel.selected_session_ids(),
         &HashSet::from(["a".to_string(), "b".to_string()])
     );
 
-    mgr.close_tab(&mut model, &mut sel, "a");
+    mgr.close_session(&mut model, &mut sel, "a");
 
     assert_eq!(
-        sel.selected_tab_ids(),
+        sel.selected_session_ids(),
         &HashSet::from(["b".to_string()]),
-        "finalize_dissolved_tab must prune so closed tabs don't linger in the selection"
+        "finalize_dissolved_session must prune so closed sessions don't linger in the selection"
     );
 }
 
 #[test]
-fn closing_tab_clears_anchor_when_anchor_was_the_closed_tab() {
+fn closing_session_clears_anchor_when_anchor_was_the_closed_session() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "pa", "a", false);
-    seed_claude_tab_in(&mut model, "pb", "b", false);
-    let mut sel = SidebarTabSelection::new();
+    seed_claude_session_in(&mut model, "pa", "a", false);
+    seed_claude_session_in(&mut model, "pb", "b", false);
+    let mut sel = SidebarSessionSelection::new();
     sel.replace("b");
     let _ = sel.toggle("a"); // toggle moves the anchor to the toggled id
-    assert_eq!(sel.last_clicked_tab_id(), Some("a"));
+    assert_eq!(sel.last_clicked_session_id(), Some("a"));
 
-    mgr.close_tab(&mut model, &mut sel, "a");
+    mgr.close_session(&mut model, &mut sel, "a");
 
     assert_eq!(
-        sel.last_clicked_tab_id(),
+        sel.last_clicked_session_id(),
         None,
-        "the anchor must clear when its tab dissolves"
+        "the anchor must clear when its session dissolves"
     );
 }
 
 #[test]
-fn closing_tab_keeps_anchor_when_anchor_survives() {
+fn closing_session_keeps_anchor_when_anchor_survives() {
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "pa", "a", false);
-    seed_claude_tab_in(&mut model, "pb", "b", false);
-    let mut sel = SidebarTabSelection::new();
+    seed_claude_session_in(&mut model, "pa", "a", false);
+    seed_claude_session_in(&mut model, "pb", "b", false);
+    let mut sel = SidebarSessionSelection::new();
     sel.replace("b");
     let _ = sel.toggle("a"); // anchor is now `a`; we close `b` instead
 
-    mgr.close_tab(&mut model, &mut sel, "b");
+    mgr.close_session(&mut model, &mut sel, "b");
 
     assert_eq!(
-        sel.last_clicked_tab_id(),
+        sel.last_clicked_session_id(),
         Some("a"),
-        "the anchor must survive when a different tab dissolves"
+        "the anchor must survive when a different session dissolves"
     );
-    assert_eq!(sel.selected_tab_ids(), &HashSet::from(["a".to_string()]));
+    assert_eq!(sel.selected_session_ids(), &HashSet::from(["a".to_string()]));
 }
 
 // ===========================================================================
@@ -1327,67 +1327,67 @@ fn closing_tab_keeps_anchor_when_anchor_survives() {
 // ===========================================================================
 
 #[test]
-fn close_tab_claude_tab_with_unspawned_companion_dissolves() {
-    // Model-only shape: neither pane has a session. Close must still dissolve
-    // the row — an earlier cut left the tab alive with its unfocused companion.
+fn close_session_claude_session_with_unspawned_companion_dissolves() {
+    // Model-only shape: neither window has a session. Close must still dissolve
+    // the row — an earlier cut left the session alive with its unfocused companion.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "p1", "t1", false);
-    seed_claude_tab_in(&mut model, "p2", "t2", false); // keep off the window terminus
+    seed_claude_session_in(&mut model, "p1", "t1", false);
+    seed_claude_session_in(&mut model, "p2", "t2", false); // keep off the window terminus
 
-    mgr.close_tab(&mut model, &mut selection(), "t1");
+    mgr.close_session(&mut model, &mut selection(), "t1");
 
     assert!(
-        model.tab_for("t1").is_none(),
-        "close must dissolve the tab even when the companion terminal was never spawned"
+        model.session_for("t1").is_none(),
+        "close must dissolve the session even when the companion terminal was never spawned"
     );
     assert!(
         model.projects.iter().any(|p| p.id == "p1"),
-        "close tab must leave the containing project in place (only close-project removes it)"
+        "close session must leave the containing project in place (only close-project removes it)"
     );
 }
 
 #[test]
-fn close_tab_armed_deferred_claude_pane_with_unspawned_companion_dissolves() {
-    // Spawning shape: the Claude pane captured a deferred spawn that never fired
+fn close_session_armed_deferred_claude_window_with_unspawned_companion_dissolves() {
+    // Spawning shape: the Claude window captured a deferred spawn that never fired
     // (paneIsSpawned true), the companion is model-only. Close routes the Claude
-    // pane through terminate_pane's armed fast path → synthesized nil exit.
+    // window through terminate_window's armed fast path → synthesized nil exit.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p1", "t1", false);
-    seed_claude_tab_in(&mut model, "p2", "t2", false);
-    mgr.mark_synthetic_armed_deferred_pane("t1", &claude_id);
+    let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p1", "t1", false);
+    seed_claude_session_in(&mut model, "p2", "t2", false);
+    mgr.mark_synthetic_armed_deferred_window("t1", &claude_id);
 
-    mgr.close_tab(&mut model, &mut selection(), "t1");
+    mgr.close_session(&mut model, &mut selection(), "t1");
 
     assert!(
-        model.tab_for("t1").is_none(),
-        "close on a never-focused resume-deferred Claude tab must dissolve the sidebar row"
+        model.session_for("t1").is_none(),
+        "close on a never-focused resume-deferred Claude session must dissolve the sidebar row"
     );
     assert!(model.projects.iter().any(|p| p.id == "p1"));
 }
 
 #[test]
-fn close_tab_held_claude_pane_with_unspawned_companion_dissolves() {
-    // Held shape: the Claude pane's process already died (view mounted), the
-    // companion is model-only. Close routes the held pane through terminate_pane's
-    // held fast path → synchronous pane_exited → cascade.
+fn close_session_held_claude_window_with_unspawned_companion_dissolves() {
+    // Held shape: the Claude window's process already died (view mounted), the
+    // companion is model-only. Close routes the held window through terminate_window's
+    // held fast path → synchronous window_exited → cascade.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, _terminal) = seed_claude_tab_in(&mut model, "p1", "t1", false);
-    seed_claude_tab_in(&mut model, "p2", "t2", false);
-    model.mutate_tab("t1", |tab| {
-        let pane = tab.panes.iter_mut().find(|p| p.id == claude_id).unwrap();
-        pane.is_alive = false;
-        pane.is_claude_running = false;
+    let (claude_id, _terminal) = seed_claude_session_in(&mut model, "p1", "t1", false);
+    seed_claude_session_in(&mut model, "p2", "t2", false);
+    model.mutate_session("t1", |session| {
+        let term_window = session.windows.iter_mut().find(|p| p.id == claude_id).unwrap();
+        term_window.is_alive = false;
+        term_window.is_claude_running = false;
     });
-    mgr.mark_synthetic_held_pane("t1", &claude_id);
+    mgr.mark_synthetic_held_window("t1", &claude_id);
 
-    mgr.close_tab(&mut model, &mut selection(), "t1");
+    mgr.close_session(&mut model, &mut selection(), "t1");
 
     assert!(
-        model.tab_for("t1").is_none(),
-        "close on a held-pane tab must dissolve the row, not just remove the panes"
+        model.session_for("t1").is_none(),
+        "close on a held-window session must dissolve the row, not just remove the windows"
     );
     assert!(model.projects.iter().any(|p| p.id == "p1"));
 }
@@ -1398,93 +1398,93 @@ fn close_tab_held_claude_pane_with_unspawned_companion_dissolves() {
 
 #[test]
 fn probe_a_exit_refocuses_neighbor_and_flags_companion_spawn_before_dissolve() {
-    // (a) Exiting the active pane refocuses the slot neighbor AND signals the
+    // (a) Exiting the active window refocuses the slot neighbor AND signals the
     // deferred-companion spawn (step 4), and the dissolve check runs AFTER — a
-    // surviving tab with a refocused companion must NOT dissolve. pane_exited
-    // returns refocus_tab=Some (→ the live caller spawns the companion) with
+    // surviving session with a refocused companion must NOT dissolve. window_exited
+    // returns refocus_session=Some (→ the live caller spawns the companion) with
     // terminus=None, proving the exit handled the refocus-onto-companion case
     // instead of dissolving.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (claude_id, terminal_id) = seed_claude_tab_in(&mut model, "p", "t1", false);
-    model.select_tab("t1");
-    mgr.set_active_pane(&mut model, "t1", &claude_id);
+    let (claude_id, terminal_id) = seed_claude_session_in(&mut model, "p", "t1", false);
+    model.select_session("t1");
+    mgr.set_active_window(&mut model, "t1", &claude_id);
 
-    let res = mgr.pane_exited(&mut model, &mut selection(), "t1", &claude_id);
+    let res = mgr.window_exited(&mut model, &mut selection(), "t1", &claude_id);
 
-    let tab = model.tab_for("t1").expect("tab must survive — a companion remains");
+    let session = model.session_for("t1").expect("session must survive — a companion remains");
     assert_eq!(
-        tab.active_pane_id.as_deref(),
+        session.active_window_id.as_deref(),
         Some(terminal_id.as_str()),
         "focus refocuses onto the slot neighbor (the deferred companion)"
     );
     assert_eq!(
-        res.refocus_tab.as_deref(),
+        res.refocus_session.as_deref(),
         Some("t1"),
-        "the surviving tab is flagged for the step-4 companion spawn"
+        "the surviving session is flagged for the step-4 companion spawn"
     );
     assert_eq!(
         res.terminus,
         DissolveTerminus::None,
-        "the dissolve check ran after the refocus and saw a non-empty tab"
+        "the dissolve check ran after the refocus and saw a non-empty session"
     );
 }
 
 #[test]
 fn probe_b_noop_title_re_report_reports_no_change() {
-    // (b) A no-op title re-report fires no mutation event: pane_title_changed
+    // (b) A no-op title re-report fires no mutation event: window_title_changed
     // returns did-change (the caller's R18 save gate). A real change returns
     // true; re-reporting the same title returns false.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    let (_claude, terminal_id) = seed_claude_tab_in(&mut model, "p", "t1", false);
+    let (_claude, terminal_id) = seed_claude_session_in(&mut model, "p", "t1", false);
 
     assert!(
-        mgr.pane_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb"),
+        mgr.window_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb"),
         "a real title change reports changed"
     );
     assert!(
-        !mgr.pane_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb"),
+        !mgr.window_title_changed(&mut model, "t1", &terminal_id, "nvim foo.rb"),
         "re-reporting the current title must report no change (no mutation event)"
     );
 }
 
 #[test]
-fn probe_c_terminate_all_two_held_panes_visits_each_once() {
-    // (c) terminate_all with two held panes completes without skipping or
-    // double-visiting an entry: both panes removed, tab dissolved, both synthetic
+fn probe_c_terminate_all_two_held_windows_visits_each_once() {
+    // (c) terminate_all with two held windows completes without skipping or
+    // double-visiting an entry: both windows removed, session dissolved, both synthetic
     // markers consumed. The snapshot-first iteration is what makes this safe (the
-    // first held pane_exited mutates the model + cache mid-loop).
+    // first held window_exited mutates the model + cache mid-loop).
     let mut mgr = counting_manager();
     let mut model = seeded();
-    // A tab with two panes, both marked held (kind is irrelevant to terminate).
-    let mut tab = Tab::new("t1", "t", "/tmp/p1");
-    tab.panes = vec![
-        Pane::new("t1-a", "A", PaneKind::Terminal),
-        Pane::new("t1-b", "B", PaneKind::Terminal),
+    // A session with two windows, both marked held (kind is irrelevant to terminate).
+    let mut session = Session::new("t1", "t", "/tmp/p1");
+    session.windows = vec![
+        TermWindow::new("t1-a", "A", TermWindowKind::Terminal),
+        TermWindow::new("t1-b", "B", TermWindowKind::Terminal),
     ];
-    tab.active_pane_id = Some("t1-a".to_string());
-    tab.next_terminal_index = 3;
+    session.active_window_id = Some("t1-a".to_string());
+    session.next_terminal_index = 3;
     model.projects.push(Project {
         id: "p1".into(),
         name: "P1".into(),
         path: "/tmp/p1".into(),
-        tabs: vec![tab],
+        sessions: vec![session],
     });
-    seed_claude_tab_in(&mut model, "p2", "t2", false); // keep off the window terminus
-    mgr.mark_synthetic_held_pane("t1", "t1-a");
-    mgr.mark_synthetic_held_pane("t1", "t1-b");
+    seed_claude_session_in(&mut model, "p2", "t2", false); // keep off the window terminus
+    mgr.mark_synthetic_held_window("t1", "t1-a");
+    mgr.mark_synthetic_held_window("t1", "t1-b");
 
     mgr.terminate_all(&mut model, &mut selection(), "t1");
 
     assert!(
-        model.tab_for("t1").is_none(),
-        "both held panes exit and the tab dissolves — no entry skipped"
+        model.session_for("t1").is_none(),
+        "both held windows exit and the session dissolves — no entry skipped"
     );
     // Both one-shot markers consumed exactly once (a double-visit would have
     // found the marker already gone and mis-routed as model-only).
-    assert!(!mgr.pane_is_spawned("t1", "t1-a"));
-    assert!(!mgr.pane_is_spawned("t1", "t1-b"));
+    assert!(!mgr.window_is_spawned("t1", "t1-a"));
+    assert!(!mgr.window_is_spawned("t1", "t1-b"));
 }
 
 // ---- R20.5 terminal foreground-child busy seam ------------------------------
@@ -1504,8 +1504,8 @@ fn synthetic_foreground_child_marker_reports_busy() {
 }
 
 #[test]
-fn model_only_pane_has_no_foreground_child() {
-    // A model-only / absent pane — no cached session and no synthetic marker —
+fn model_only_window_has_no_foreground_child() {
+    // A model-only / absent window — no cached session and no synthetic marker —
     // is NOT busy (`shell_has_foreground_child` ⇒ false), mirroring Swift's
     // `guard let entry = entries[id] else { return false }`: a lazy companion
     // terminal never focused is idle, not a foreground-child holder.
@@ -1513,65 +1513,65 @@ fn model_only_pane_has_no_foreground_child() {
     assert_eq!(
         mgr.synthetic_or_absent_foreground_child("t1", "t1-a"),
         Some(false),
-        "an absent/model-only pane must not be classified as having a foreground child"
+        "an absent/model-only window must not be classified as having a foreground child"
     );
 }
 
 // ---- W5 (R18) project-pending-removal (Close Project) -----------------------
 
 #[test]
-fn pending_removal_drops_project_row_when_its_last_tab_dissolves() {
-    // Close Project marks the project pending; closing its (model-only) tab
+fn pending_removal_drops_project_row_when_its_last_session_dissolves() {
+    // Close Project marks the project pending; closing its (model-only) session
     // dissolves it, and finalize drops the now-empty non-Terminals row.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "proj", "t1", false);
+    seed_claude_session_in(&mut model, "proj", "t1", false);
     // Another project keeps the window non-empty (so no terminus fires).
-    seed_claude_tab_in(&mut model, "other", "t2", false);
+    seed_claude_session_in(&mut model, "other", "t2", false);
     mgr.mark_project_pending_removal("proj");
 
-    let terminus = mgr.close_tab(&mut model, &mut selection(), "t1");
+    let terminus = mgr.close_session(&mut model, &mut selection(), "t1");
 
     assert!(
         model.projects.iter().all(|p| p.id != "proj"),
-        "the pending non-Terminals project row drops when its last tab dissolves"
+        "the pending non-Terminals project row drops when its last session dissolves"
     );
     assert_eq!(terminus, DissolveTerminus::None, "the other project keeps the window alive");
 }
 
 #[test]
-fn pending_removal_keeps_row_until_the_last_tab_goes() {
-    // A multi-tab pending project keeps its row (and the flag) across the first
-    // dissolve; only the final tab drops the row.
+fn pending_removal_keeps_row_until_the_last_session_goes() {
+    // A multi-session pending project keeps its row (and the flag) across the first
+    // dissolve; only the final session drops the row.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "proj", "t1", false);
-    seed_claude_tab_in(&mut model, "proj", "t2", false); // same project, 2nd tab
+    seed_claude_session_in(&mut model, "proj", "t1", false);
+    seed_claude_session_in(&mut model, "proj", "t2", false); // same project, 2nd session
     mgr.mark_project_pending_removal("proj");
 
-    mgr.close_tab(&mut model, &mut selection(), "t1");
+    mgr.close_session(&mut model, &mut selection(), "t1");
     assert!(
         model.projects.iter().any(|p| p.id == "proj"),
-        "an earlier-tab dissolve keeps the pending flag + the project row"
+        "an earlier-session dissolve keeps the pending flag + the project row"
     );
 
-    mgr.close_tab(&mut model, &mut selection(), "t2");
+    mgr.close_session(&mut model, &mut selection(), "t2");
     assert!(
         model.projects.iter().all(|p| p.id != "proj"),
-        "the last-tab dissolve finally drops the pending project row"
+        "the last-session dissolve finally drops the pending project row"
     );
 }
 
 #[test]
-fn unmarked_project_row_survives_an_empty_tab_dissolve() {
-    // Without the pending flag, a dissolved tab leaves its (now-empty) project
+fn unmarked_project_row_survives_an_empty_session_dissolve() {
+    // Without the pending flag, a dissolved session leaves its (now-empty) project
     // row in place — the default (non-Close-Project) close behavior.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "proj", "t1", false);
-    seed_claude_tab_in(&mut model, "other", "t2", false);
+    seed_claude_session_in(&mut model, "proj", "t1", false);
+    seed_claude_session_in(&mut model, "other", "t2", false);
 
-    mgr.close_tab(&mut model, &mut selection(), "t1");
+    mgr.close_session(&mut model, &mut selection(), "t1");
 
     assert!(
         model.projects.iter().any(|p| p.id == "proj"),
@@ -1580,29 +1580,29 @@ fn unmarked_project_row_survives_an_empty_tab_dissolve() {
 }
 
 #[test]
-fn probe_d_close_model_only_tab_reaches_cascade_synchronously() {
-    // (d) Closing a tab whose panes are all model-only reaches the cascade
-    // synchronously — no async pane-exit to wait on, the tab is gone on return.
+fn probe_d_close_model_only_session_reaches_cascade_synchronously() {
+    // (d) Closing a session whose windows are all model-only reaches the cascade
+    // synchronously — no async window-exit to wait on, the session is gone on return.
     let mut mgr = counting_manager();
     let mut model = seeded();
-    seed_claude_tab_in(&mut model, "p1", "t1", false);
-    seed_claude_tab_in(&mut model, "p2", "t2", false);
+    seed_claude_session_in(&mut model, "p1", "t1", false);
+    seed_claude_session_in(&mut model, "p2", "t2", false);
 
-    let terminus = mgr.close_tab(&mut model, &mut selection(), "t1");
+    let terminus = mgr.close_session(&mut model, &mut selection(), "t1");
 
     assert!(
-        model.tab_for("t1").is_none(),
-        "a model-only tab dissolves synchronously on close_tab's return"
+        model.session_for("t1").is_none(),
+        "a model-only session dissolves synchronously on close_session's return"
     );
     assert_eq!(terminus, DissolveTerminus::None, "other projects remain non-empty");
 }
 
-// ---- R14 env injection: the spec-wins merge + the per-pane matrix -----------
+// ---- R14 env injection: the spec-wins merge + the per-window matrix -----------
 //
-// The manager's `spawn_pane` merges these pairs into the caller-built spec's env
-// before forking the pty. `spawn_pane` itself needs a gpui `App`, so the pure
-// merge + matrix (`window_pane_env_pairs`, exercised here through a
-// spawn_pane-shaped merge) are unit-tested directly (Validation §3 a/b/c); the
+// The manager's `spawn_window` merges these pairs into the caller-built spec's env
+// before forking the pty. `spawn_window` itself needs a gpui `App`, so the pure
+// merge + matrix (`session_window_env_pairs`, exercised here through a
+// spawn_window-shaped merge) are unit-tested directly (Validation §3 a/b/c); the
 // full live spawn path is the `shell-socket` scenario.
 
 /// Helper: a manager with a fully-populated window shell env (socket + zdotdir +
@@ -1611,8 +1611,8 @@ fn manager_with_shell_env(
     socket: Option<&str>,
     zdotdir: Option<&str>,
     user_zdotdir: Option<&str>,
-) -> SessionManager {
-    let mut m = SessionManager::new();
+) -> PtyManager {
+    let mut m = PtyManager::new();
     m.set_window_shell_env(WindowShellEnv {
         socket_path: socket.map(str::to_string),
         zdotdir: zdotdir.map(str::to_string),
@@ -1634,7 +1634,7 @@ fn spec_provided_zdotdir_survives_manager_injection() {
     // A spec that blanks ZDOTDIR to its own cwd, exactly like the ~10 landed
     // scenarios (`SpawnSpec::with_env(vec![("ZDOTDIR", cwd)])`).
     let mut spec = SpawnSpec::shell("/work").with_env(vec![("ZDOTDIR".to_string(), "/work".to_string())]);
-    merge_env_spec_wins(&mut spec.env, mgr.window_pane_env_pairs("t1", "p1"));
+    merge_env_spec_wins(&mut spec.env, mgr.session_window_env_pairs("t1", "p1"));
 
     assert_eq!(
         value_of(&spec.env, "ZDOTDIR"),
@@ -1652,16 +1652,16 @@ fn spec_provided_zdotdir_survives_manager_injection() {
     assert_eq!(value_of(&spec.env, "NICE_TAB_ID"), Some("t1"));
 }
 
-/// Validation §3(b): a pane spawned through the manager carries
+/// Validation §3(b): a window spawned through the manager carries
 /// `NICE_SOCKET` + `NICE_TAB_ID` + `NICE_PANE_ID` (the exact ids handed to
-/// `spawn_pane` — the same ids `ensure_active_pane_spawned` passes through).
+/// `spawn_window` — the same ids `ensure_active_window_spawned` passes through).
 #[test]
-fn injected_pane_env_carries_socket_and_pane_identity() {
+fn injected_window_env_carries_socket_and_window_identity() {
     let mgr = manager_with_shell_env(Some("/tmp/win.sock"), Some("/z"), Some("/user/z"));
-    // A default shell spec (what `ensure_active_pane_spawned` builds), then the
-    // exact merge `spawn_pane` performs.
+    // A default shell spec (what `ensure_active_window_spawned` builds), then the
+    // exact merge `spawn_window` performs.
     let mut spec = SpawnSpec::shell("/work");
-    merge_env_spec_wins(&mut spec.env, mgr.window_pane_env_pairs("tabX", "paneY"));
+    merge_env_spec_wins(&mut spec.env, mgr.session_window_env_pairs("tabX", "paneY"));
 
     assert_eq!(value_of(&spec.env, "NICE_SOCKET"), Some("/tmp/win.sock"));
     assert_eq!(value_of(&spec.env, "NICE_TAB_ID"), Some("tabX"));
@@ -1679,14 +1679,14 @@ fn injected_pane_env_carries_socket_and_pane_identity() {
 /// `NICE_COMPOSE_CONF` var (the widget falls back to its defaults).
 #[test]
 fn absent_compose_conf_is_not_injected() {
-    let mut m = SessionManager::new();
+    let mut m = PtyManager::new();
     m.set_window_shell_env(WindowShellEnv {
         socket_path: Some("/tmp/s".to_string()),
         zdotdir: None,
         user_zdotdir: None,
         compose_conf: None,
     });
-    let pairs = m.window_pane_env_pairs("t", "p");
+    let pairs = m.session_window_env_pairs("t", "p");
     assert!(
         !pairs.iter().any(|(k, _)| k == "NICE_COMPOSE_CONF"),
         "no compose_conf field ⇒ no NICE_COMPOSE_CONF injection"
@@ -1698,7 +1698,7 @@ fn absent_compose_conf_is_not_injected() {
 #[test]
 fn user_zdotdir_is_present_but_empty_when_none_inherited() {
     let mgr = manager_with_shell_env(Some("/tmp/sock"), Some("/z"), None);
-    let pairs = mgr.window_pane_env_pairs("t", "p");
+    let pairs = mgr.session_window_env_pairs("t", "p");
     assert_eq!(
         value_of(&pairs, "NICE_USER_ZDOTDIR"),
         Some(""),
@@ -1714,9 +1714,9 @@ fn user_zdotdir_is_present_but_empty_when_none_inherited() {
 /// that build a `WindowState` directly keep their env untouched.
 #[test]
 fn unbootstrapped_manager_injects_no_env() {
-    let mgr = SessionManager::new();
+    let mgr = PtyManager::new();
     assert!(
-        mgr.window_pane_env_pairs("t", "p").is_empty(),
+        mgr.session_window_env_pairs("t", "p").is_empty(),
         "a manager with no window shell env must inject nothing"
     );
 }
@@ -2090,9 +2090,9 @@ fn prefill_command_settings_path_with_space_single_quoted() {
 /// The newtab path replies `newtab` regardless of any settings path.
 #[test]
 fn reply_newtab() {
-    assert_eq!(compose_claude_reply(&ClaudeReplyDecision::NewTab, None), "newtab");
+    assert_eq!(compose_claude_reply(&ClaudeReplyDecision::NewSession, None), "newtab");
     assert_eq!(
-        compose_claude_reply(&ClaudeReplyDecision::NewTab, Some("/s.json")),
+        compose_claude_reply(&ClaudeReplyDecision::NewSession, Some("/s.json")),
         "newtab",
         "a settings path never changes the newtab reply"
     );
@@ -2104,7 +2104,7 @@ fn reply_newtab() {
 fn reply_inplace_parsed_id_sync_off_is_bare_inplace() {
     let decision = ClaudeReplyDecision::InPlace {
         parsed_from_args: true,
-        session_id: "OLD".into(),
+        claude_session_id: "OLD".into(),
     };
     assert_eq!(compose_claude_reply(&decision, None), "inplace");
 }
@@ -2115,7 +2115,7 @@ fn reply_inplace_parsed_id_sync_off_is_bare_inplace() {
 fn reply_inplace_minted_id_sync_off_appends_uuid() {
     let decision = ClaudeReplyDecision::InPlace {
         parsed_from_args: false,
-        session_id: "minted-uuid".into(),
+        claude_session_id: "minted-uuid".into(),
     };
     assert_eq!(compose_claude_reply(&decision, None), "inplace minted-uuid");
 }
@@ -2127,7 +2127,7 @@ fn reply_inplace_minted_id_sync_off_appends_uuid() {
 fn reply_inplace_parsed_id_sync_on_uses_dash_placeholder() {
     let decision = ClaudeReplyDecision::InPlace {
         parsed_from_args: true,
-        session_id: "unused".into(),
+        claude_session_id: "unused".into(),
     };
     assert_eq!(
         compose_claude_reply(&decision, Some("/ptr.json")),
@@ -2141,7 +2141,7 @@ fn reply_inplace_parsed_id_sync_on_uses_dash_placeholder() {
 fn reply_inplace_minted_id_sync_on_appends_uuid_then_path() {
     let decision = ClaudeReplyDecision::InPlace {
         parsed_from_args: false,
-        session_id: "minted-uuid".into(),
+        claude_session_id: "minted-uuid".into(),
     };
     assert_eq!(
         compose_claude_reply(&decision, Some("/ptr.json")),
@@ -2156,7 +2156,7 @@ fn reply_inplace_sync_off_never_has_third_field() {
     for parsed in [true, false] {
         let decision = ClaudeReplyDecision::InPlace {
             parsed_from_args: parsed,
-            session_id: "x".into(),
+            claude_session_id: "x".into(),
         };
         let reply = compose_claude_reply(&decision, None);
         assert!(
@@ -2176,13 +2176,13 @@ fn reply_attach_and_resume_carry_the_uuid_then_the_pointer() {
     for (decision, verb) in [
         (
             ClaudeReplyDecision::Attach {
-                session_id: uuid.into(),
+                claude_session_id: uuid.into(),
             },
             "attach",
         ),
         (
             ClaudeReplyDecision::Resume {
-                session_id: uuid.into(),
+                claude_session_id: uuid.into(),
             },
             "resume",
         ),
@@ -2199,7 +2199,7 @@ fn reply_attach_and_resume_carry_the_uuid_then_the_pointer() {
 // =====================================================================
 // parse_claude_title — the T5 status/label split (`SessionsModel.swift:439-453`).
 // The pure split; the trim / empty-skip / "Claude Code" placeholder / auto-title
-// pipeline is R15 slice-3's pane_title_changed branch.
+// pipeline is R15 slice-3's window_title_changed branch.
 // =====================================================================
 
 /// A braille-spinner first scalar (U+2800..=U+28FF) ⇒ Thinking; the label is the
@@ -2207,22 +2207,22 @@ fn reply_attach_and_resume_carry_the_uuid_then_the_pointer() {
 #[test]
 fn parse_title_braille_spinner_sets_thinking() {
     let (status, label) = parse_claude_title("\u{2840} fix-top-bar-height");
-    assert_eq!(status, Some(TabStatus::Thinking));
+    assert_eq!(status, Some(SessionStatus::Thinking));
     assert_eq!(label, " fix-top-bar-height");
 }
 
 /// The braille range is inclusive at both ends.
 #[test]
 fn parse_title_braille_range_boundaries_set_thinking() {
-    assert_eq!(parse_claude_title("\u{2800}x").0, Some(TabStatus::Thinking));
-    assert_eq!(parse_claude_title("\u{28FF}x").0, Some(TabStatus::Thinking));
+    assert_eq!(parse_claude_title("\u{2800}x").0, Some(SessionStatus::Thinking));
+    assert_eq!(parse_claude_title("\u{28FF}x").0, Some(SessionStatus::Thinking));
 }
 
 /// The sparkle ✳ (U+2733) ⇒ Waiting.
 #[test]
 fn parse_title_sparkle_sets_waiting() {
     let (status, label) = parse_claude_title("\u{2733} needs-input");
-    assert_eq!(status, Some(TabStatus::Waiting));
+    assert_eq!(status, Some(SessionStatus::Waiting));
     assert_eq!(label, " needs-input");
 }
 
@@ -2244,7 +2244,7 @@ fn parse_title_placeholder_is_a_plain_label() {
     // placeholder (which the caller trims and drops).
     assert_eq!(
         parse_claude_title("\u{2840} Claude Code"),
-        (Some(TabStatus::Thinking), " Claude Code")
+        (Some(SessionStatus::Thinking), " Claude Code")
     );
 }
 
@@ -2260,13 +2260,13 @@ fn parse_title_empty_is_none_empty_label() {
 fn parse_title_bare_status_glyph_empty_label() {
     assert_eq!(
         parse_claude_title("\u{2733}"),
-        (Some(TabStatus::Waiting), "")
+        (Some(SessionStatus::Waiting), "")
     );
 }
 
 // =====================================================================
 // mint_session_uuid — real lowercased UUIDv4 (getentropy-backed), a separate
-// mint from the ms+counter tab/pane id minter.
+// mint from the ms+counter session/window id minter.
 // =====================================================================
 
 /// Canonical `8-4-4-4-12` lowercase hex shape, 36 chars, hyphens at the fixed
@@ -2329,31 +2329,31 @@ fn session_uuid_uniqueness() {
     }
 }
 
-// ---- R15 Claude-tab constructor pure helpers --------------------------------
+// ---- R15 Claude-session constructor pure helpers --------------------------------
 //
-// The constructor itself (`create_claude_tab`) spawns a pty, so its end-to-end
+// The constructor itself (`create_claude_session`) spawns a pty, so its end-to-end
 // shape is the slice-3 `claude-lifecycle` scenario; these pin the pure pieces it
 // composes (Swift `createTabFromMainTerminal`'s title + sessionCwd closures and
 // `TabPtySession.launchDisplayCommand`).
 
-// claude_tab_title_from_args — join, 40-char cap, trim, empty ⇒ "New tab".
+// claude_session_title_from_args — join, 40-char cap, trim, empty ⇒ "New session".
 
 #[test]
-fn claude_title_empty_args_is_new_tab() {
-    assert_eq!(claude_tab_title_from_args(&[]), "New tab");
+fn claude_title_empty_args_is_new_session() {
+    assert_eq!(claude_session_title_from_args(&[]), "New session");
 }
 
 #[test]
 fn claude_title_joins_args_with_spaces() {
     let args = vec!["--resume".to_string(), "abc-123".to_string()];
-    assert_eq!(claude_tab_title_from_args(&args), "--resume abc-123");
+    assert_eq!(claude_session_title_from_args(&args), "--resume abc-123");
 }
 
 #[test]
 fn claude_title_caps_at_40_chars() {
     // A single 50-char arg: the cut lands mid-content, no trailing space to trim.
     let args = vec!["x".repeat(50)];
-    let title = claude_tab_title_from_args(&args);
+    let title = claude_session_title_from_args(&args);
     assert_eq!(title, "x".repeat(40));
     assert_eq!(title.chars().count(), 40);
 }
@@ -2363,17 +2363,17 @@ fn claude_title_trims_trailing_space_exposed_by_the_cut() {
     // 39 x's + " tail" joins to 44 chars; the 40-char cut lands on the space after
     // the x-run, which is then trimmed off (→ 39 x's).
     let args = vec!["x".repeat(39), "tail".to_string()];
-    let title = claude_tab_title_from_args(&args);
+    let title = claude_session_title_from_args(&args);
     assert_eq!(title, "x".repeat(39));
 }
 
 #[test]
-fn claude_title_all_whitespace_falls_back_to_new_tab() {
+fn claude_title_all_whitespace_falls_back_to_new_session() {
     let args = vec!["   ".to_string()];
-    assert_eq!(claude_tab_title_from_args(&args), "New tab");
+    assert_eq!(claude_session_title_from_args(&args), "New session");
 }
 
-// claude_worktree_cwd — Tab.cwd worktree split (`-w` space form only, `/`→`+`).
+// claude_worktree_cwd — Session.cwd worktree split (`-w` space form only, `/`→`+`).
 
 #[test]
 fn claude_worktree_cwd_no_worktree_is_plain_cwd() {
@@ -2450,7 +2450,7 @@ fn handoff_title_prefixes_a_plain_title() {
 
 #[test]
 fn handoff_title_does_not_stack_an_existing_prefix() {
-    // A handoff fired FROM a handoff tab reads "[HANDOFF] Foo", not doubled.
+    // A handoff fired FROM a handoff session reads "[HANDOFF] Foo", not doubled.
     assert_eq!(handoff_title(Some("[HANDOFF] Foo")), "[HANDOFF] Foo");
 }
 

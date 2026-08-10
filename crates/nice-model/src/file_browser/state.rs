@@ -1,8 +1,8 @@
-//! `FileBrowserState` — per-tab state for the sidebar's file-browser mode.
+//! `FileBrowserState` — per-session state for the sidebar's file-browser mode.
 //! Ported from `Sources/Nice/State/FileBrowserState.swift`. In-memory only
 //! (deliberately not persisted — expansion sets don't round-trip well across
-//! launches when directories churn, and the tab's cwd is already persisted on
-//! [`crate::Tab`]).
+//! launches when directories churn, and the session's cwd is already persisted on
+//! [`crate::Session`]).
 //!
 //! Owns: the tree `root_path`, the set of expanded directory paths, the
 //! dotfile-visibility flag (seeded cwd-aware, sticky afterwards), and the
@@ -18,7 +18,7 @@
 use crate::file_browser::selection::FileBrowserSelection;
 use std::collections::BTreeSet;
 
-/// Per-tab file-browser state (see the module docs). `expanded_paths` is a
+/// Per-session file-browser state (see the module docs). `expanded_paths` is a
 /// [`BTreeSet`] of **absolute** paths — stable across rebuilds because it keys
 /// on paths, not identity.
 #[derive(Debug, Default)]
@@ -35,13 +35,13 @@ impl FileBrowserState {
     /// (`FileBrowserState.swift:58-64`).
     ///
     /// INTENTIONAL DEVIATION from the Swift app (user decision 2026-07-07): a new
-    /// tab always defaults to hidden-off (dotfiles hidden), regardless of cwd.
+    /// session always defaults to hidden-off (dotfiles hidden), regardless of cwd.
     /// The Swift original seeded `show_hidden` from a cwd heuristic — hidden off
     /// only in `$HOME`, on in every project root so `.gitignore` / `.env` showed
-    /// — but the user prefers a clean listing everywhere by default. A per-tab
+    /// — but the user prefers a clean listing everywhere by default. A per-session
     /// value, once the user toggles it (⌘⇧. / the eye control), keeps winning:
     /// the [`FileBrowserStore`](crate::file_browser::FileBrowserStore) creates a
-    /// state on first access and never re-seeds it, so only brand-new tabs take
+    /// state on first access and never re-seeds it, so only brand-new sessions take
     /// this default.
     pub fn new(root_path: impl Into<String>) -> Self {
         let root_path = root_path.into();
@@ -129,7 +129,7 @@ mod tests {
         assert!(state.expanded_paths().contains("/tmp/proj"));
     }
 
-    /// New tabs default to hidden-off (dotfiles hidden) everywhere — the
+    /// New sessions default to hidden-off (dotfiles hidden) everywhere — the
     /// INTENTIONAL deviation from the Swift cwd heuristic (user decision
     /// 2026-07-07). A project root no longer shows `.gitignore` / `.env` by
     /// default; the user opts in with ⌘⇧. or the eye control.

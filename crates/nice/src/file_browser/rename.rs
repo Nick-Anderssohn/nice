@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use nice_model::file_browser::{
-    affected_by, is_extension_change, split_name_and_extension, validate_rename, PaneCWDSnapshot,
+    affected_by, is_extension_change, split_name_and_extension, validate_rename, TermWindowCWDSnapshot,
     RenameValidation,
 };
 
@@ -147,7 +147,7 @@ pub fn modals_for(
     original_path: &str,
     new_name: &str,
     is_dir: bool,
-    snapshot: &PaneCWDSnapshot,
+    snapshot: &TermWindowCWDSnapshot,
 ) -> Vec<ConfirmSpec> {
     let original_name = last_component(original_path);
     let mut specs = Vec::new();
@@ -208,8 +208,8 @@ fn last_component(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nice_model::file_browser::{PaneCWDRef, PaneCWDSnapshot};
-    use nice_model::PaneKind;
+    use nice_model::file_browser::{TermWindowCWDRef, TermWindowCWDSnapshot};
+    use nice_model::TermWindowKind;
     use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
@@ -317,7 +317,7 @@ mod tests {
     /// CWD modal (here empty snapshot ⇒ just the extension modal).
     #[test]
     fn modals_for_extension_change_fires_extension_modal() {
-        let specs = modals_for("/tmp/foo.txt", "foo.md", false, &PaneCWDSnapshot::default());
+        let specs = modals_for("/tmp/foo.txt", "foo.md", false, &TermWindowCWDSnapshot::default());
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].title, "Are you sure you want to change the extension?");
         assert!(specs[0].message.contains(".txt"));
@@ -330,14 +330,14 @@ mod tests {
     /// looks like it changes extension.
     #[test]
     fn modals_for_directory_skips_extension_modal() {
-        let specs = modals_for("/tmp/my.dir", "my.folder", true, &PaneCWDSnapshot::default());
+        let specs = modals_for("/tmp/my.dir", "my.folder", true, &TermWindowCWDSnapshot::default());
         assert!(specs.is_empty());
     }
 
     /// No-extension rendering uses the literal "(no extension)".
     #[test]
     fn modals_for_no_extension_uses_placeholder() {
-        let specs = modals_for("/tmp/README", "README.md", false, &PaneCWDSnapshot::default());
+        let specs = modals_for("/tmp/README", "README.md", false, &TermWindowCWDSnapshot::default());
         assert_eq!(specs.len(), 1);
         assert!(specs[0].message.contains("(no extension)"));
         assert_eq!(specs[0].cancel_label, "Keep (no extension)");
@@ -349,20 +349,20 @@ mod tests {
     /// here a folder so only the CWD modal.
     #[test]
     fn modals_for_cwd_impact_fires_cwd_modal() {
-        let snapshot = PaneCWDSnapshot {
+        let snapshot = TermWindowCWDSnapshot {
             entries: vec![
-                PaneCWDRef {
+                TermWindowCWDRef {
                     window_session_id: "w".into(),
-                    tab_id: "t".into(),
-                    pane_id: "p1".into(),
-                    kind: PaneKind::Terminal,
+                    session_id: "t".into(),
+                    window_id: "p1".into(),
+                    kind: TermWindowKind::Terminal,
                     cwd: "/tmp/proj/src".into(),
                 },
-                PaneCWDRef {
+                TermWindowCWDRef {
                     window_session_id: "w".into(),
-                    tab_id: "t".into(),
-                    pane_id: "p2".into(),
-                    kind: PaneKind::Terminal,
+                    session_id: "t".into(),
+                    window_id: "p2".into(),
+                    kind: TermWindowKind::Terminal,
                     cwd: "/tmp/proj".into(),
                 },
             ],
@@ -377,16 +377,16 @@ mod tests {
 
     /// Both modals for a file rename inside an affected directory: extension FIRST,
     /// then CWD (the walk runs unconditionally — for a file it usually can't match,
-    /// but a pane sitting exactly at the file's path would; assert ordering with a
+    /// but a window sitting exactly at the file's path would; assert ordering with a
     /// contrived match).
     #[test]
     fn modals_for_orders_extension_before_cwd() {
-        let snapshot = PaneCWDSnapshot {
-            entries: vec![PaneCWDRef {
+        let snapshot = TermWindowCWDSnapshot {
+            entries: vec![TermWindowCWDRef {
                 window_session_id: "w".into(),
-                tab_id: "t".into(),
-                pane_id: "p1".into(),
-                kind: PaneKind::Terminal,
+                session_id: "t".into(),
+                window_id: "p1".into(),
+                kind: TermWindowKind::Terminal,
                 cwd: "/tmp/foo.txt".into(),
             }],
         };

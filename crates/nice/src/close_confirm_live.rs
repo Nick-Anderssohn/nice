@@ -1,22 +1,22 @@
-//! `close-confirmation` self-test scenario — the R20.5 busy-pane close
+//! `close-confirmation` self-test scenario — the R20.5 busy-window close
 //! confirmation gate (Validation §3).
 //!
 //! Drives the **shipped window** (`open_managed_window` / `build_window_root`,
 //! the exact path `run` takes) with a real, hermetic (ZDOTDIR-blanked) terminal
 //! shell over ONE `Application::run`. Three legs:
 //!
-//! * **(a) idle close is immediate** — an idle terminal pane's pill ✕ closes it
+//! * **(a) idle close is immediate** — an idle terminal window's pill ✕ closes it
 //!   with NO modal (`pending_modal().is_none()`).
 //! * **(b) busy shell is gated** (the required veto assert + the ONE true
-//!   `tcgetpgrp` leg) — a pane's interactive shell is given a REAL foreground child
+//!   `tcgetpgrp` leg) — a window's interactive shell is given a REAL foreground child
 //!   (`sleep`), polled to `has_foreground_child()` true; the pill-✕ close vetoes
-//!   (window/tab stay, `pending_modal().is_some()`, the modal's "Force quit" button
+//!   (window/session stay, `pending_modal().is_some()`, the modal's "Force quit" button
 //!   is a live AX node). While that modal is up, a SECOND busy-close is issued and
 //!   asserted DROPPED (the D7 re-entrancy guard — the first modal survives, nothing
 //!   closes). Then **Cancel** closes nothing; a second ✕ re-opens it and **Confirm**
-//!   kills the busy pane (reaping the `sleep`).
+//!   kills the busy window (reaping the `sleep`).
 //! * **(c) `.tabs` partial-cancel** (D5) — a multi-select batch of one idle + one
-//!   busy tab (the busy tab marked through the `synthetic_foreground_child` seam —
+//!   busy session (the busy session marked through the `synthetic_foreground_child` seam —
 //!   the true syscall is covered once, in (b)); the idle member is hard-killed
 //!   eagerly and the busy survivor is gated; on **Cancel** the idle member stays
 //!   gone AND the busy survivor REMAINS — NOT a total no-op.
@@ -26,13 +26,13 @@
 //! The plan specifies a **real CGEvent** click on the located pill ✕. Under the
 //! shipped **full-size-content** window a `CGEventPostToPid` mouse click does not
 //! hit-test to gpui content — this scenario re-verified it on-device (a
-//! body-centre CGEvent click did not even select the pane), the same limitation
+//! body-centre CGEvent click did not even select the window), the same limitation
 //! the R18 `persistence_restore_live` veto documented for the traffic-light button
 //! (which drove `-[NSWindow performClose:]` instead). There is no AppKit selector
-//! for a pane close, so — following that precedent — [`drive_pill_close`] asserts
+//! for a window close, so — following that precedent — [`drive_pill_close`] asserts
 //! the ✕ is a real, on-screen, locatable target (the coordinate a click would
 //! strike) and then drives the EXACT pill-✕ handler (`WindowToolbarView::
-//! close_pane` → the busy gate, the `app-shell` scenario's "real pill-× close
+//! close_term_window` → the busy gate, the `app-shell` scenario's "real pill-× close
 //! path"). The gate + modal are exercised end-to-end; the modal is answered via
 //! `resolve`.
 //!
@@ -42,7 +42,7 @@
 //! and `NICE_CLAUDE_OVERRIDE` at an idle stub — the real `claude` and the real `~`
 //! are NEVER touched. The modal is answered via `ConfirmationModal::resolve`. No
 //! session store is installed (`save_to_store` no-ops without the Global). The
-//! scenario keeps the window's Main tab populated throughout, so no close ever
+//! scenario keeps the window's Main session populated throughout, so no close ever
 //! empties the window (which would trip the dissolve terminus). Registered BEFORE
 //! `multiwindow`: `open_managed_window`'s `build_window_root` only `register`s the
 //! `WindowRegistry` (no quit-when-empty close observer), so `multiwindow` stays the
@@ -105,7 +105,7 @@ impl Fixture {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
         }
-        // SAFETY: single-threaded scenario setup before any pane forks.
+        // SAFETY: single-threaded scenario setup before any window forks.
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
         Ok(Fixture { base, home, zdotdir })
@@ -126,7 +126,7 @@ pub fn open_close_confirmation_window(cx: &mut AsyncApp) -> Result<AnyWindowHand
         // Install the shipped keymap + SharedFontSettings the window builder reads
         // (run_selftest doesn't wire them; idempotent one-shot).
         crate::keymap::install_shortcuts(app);
-        // The terminal panes fork with the synthetic ZDOTDIR rc chain (spec-wins),
+        // The terminal windows fork with the synthetic ZDOTDIR rc chain (spec-wins),
         // so every shell in this scenario is hermetic.
         crate::app::set_scenario_shell_inject_config(app, Some(zdotdir.clone()), None);
         // SAFETY: single-threaded scenario setup.
@@ -213,20 +213,20 @@ async fn run_close_confirmation(
     let pid = std::process::id() as i32;
     let mut failures: Vec<String> = Vec::new();
 
-    let Some(main_tab) = active_tab_id(cx, &state) else {
+    let Some(main_session) = active_session_id(cx, &state) else {
         return CadenceReport::error(
-            "close-confirmation: the shipped window has no active tab".to_string(),
+            "close-confirmation: the shipped window has no active session".to_string(),
         );
     };
 
     // (a) idle close is immediate.
-    idle_close_leg(cx, whandle, &toolbar, &state, &main_tab, &mut failures).await;
+    idle_close_leg(cx, whandle, &toolbar, &state, &main_session, &mut failures).await;
 
     // (b) busy shell is gated (the required veto + the true tcgetpgrp leg).
-    busy_close_leg(cx, whandle, &toolbar, &state, &main_tab, pid, &mut failures).await;
+    busy_close_leg(cx, whandle, &toolbar, &state, &main_session, pid, &mut failures).await;
 
-    // (c) .tabs partial-cancel.
-    tabs_partial_cancel_leg(cx, whandle, &state, &mut failures).await;
+    // (c) .sessions partial-cancel.
+    sessions_partial_cancel_leg(cx, whandle, &state, &mut failures).await;
 
     build_report(failures)
 }
@@ -238,38 +238,38 @@ async fn idle_close_leg(
     whandle: WindowHandle<AppShellView>,
     toolbar: &Entity<WindowToolbarView>,
     state: &Entity<WindowState>,
-    main_tab: &str,
+    main_session: &str,
     failures: &mut Vec<String>,
 ) {
-    // Add a second terminal pane so closing it can't dissolve the Main tab.
-    let Some(pane) = add_spawned_pane(cx, toolbar, state, main_tab).await else {
-        failures.push("(a) could not add + spawn a second terminal pane on the Main tab".into());
+    // Add a second terminal window so closing it can't dissolve the Main session.
+    let Some(term_window) = add_spawned_window(cx, toolbar, state, main_session).await else {
+        failures.push("(a) could not add + spawn a second terminal window on the Main session".into());
         return;
     };
     // An idle shell at a prompt has no foreground child.
-    if !poll_foreground_child(cx, state, main_tab, &pane, false).await {
+    if !poll_foreground_child(cx, state, main_session, &term_window, false).await {
         failures.push(format!(
-            "(a) the freshly-spawned pane {pane} still reports a foreground child (never settled to \
+            "(a) the freshly-spawned window {term_window} still reports a foreground child (never settled to \
              an idle prompt)"
         ));
         return;
     }
-    if let Err(e) = drive_pill_close(cx, whandle, toolbar, &pane).await {
+    if let Err(e) = drive_pill_close(cx, whandle, toolbar, &term_window).await {
         failures.push(format!("(a) {e}"));
         return;
     }
-    // The idle pane closes immediately, with NO modal.
+    // The idle window closes immediately, with NO modal.
     let mut gone = false;
     for _ in 0..READY_POLLS {
         settle(cx, POLL_MS).await;
-        if !toolbar_pane_ids(cx, toolbar).contains(&pane) {
+        if !toolbar_window_ids(cx, toolbar).contains(&term_window) {
             gone = true;
             break;
         }
     }
     if !gone {
         failures.push(format!(
-            "(a) the idle pill-✕ close did not remove pane {pane} (the real CGEvent missed the ✕, or \
+            "(a) the idle pill-✕ close did not remove window {term_window} (the real CGEvent missed the ✕, or \
              the idle path did not close)"
         ));
     }
@@ -279,7 +279,7 @@ async fn idle_close_leg(
         resolve_modal(cx, whandle, state, false);
     }
     if gone && !state.update(cx, |s, _| s.pending_modal().is_some()) {
-        eprintln!("[selftest] close-confirmation (a): idle pill-✕ closed the pane immediately, no modal");
+        eprintln!("[selftest] close-confirmation (a): idle pill-✕ closed the window immediately, no modal");
     }
 }
 
@@ -290,26 +290,26 @@ async fn busy_close_leg(
     whandle: WindowHandle<AppShellView>,
     toolbar: &Entity<WindowToolbarView>,
     state: &Entity<WindowState>,
-    main_tab: &str,
+    main_session: &str,
     pid: i32,
     failures: &mut Vec<String>,
 ) {
-    let Some(pane) = add_spawned_pane(cx, toolbar, state, main_tab).await else {
-        failures.push("(b) could not add + spawn a busy-candidate terminal pane".into());
+    let Some(term_window) = add_spawned_window(cx, toolbar, state, main_session).await else {
+        failures.push("(b) could not add + spawn a busy-candidate terminal window".into());
         return;
     };
     // Give the interactive shell a REAL foreground child in a new process group —
     // the ONLY leg exercising the true `tcgetpgrp(master_fd) != child_pid` read.
-    let Some(handle) = pane_handle(cx, state, main_tab, &pane) else {
-        failures.push(format!("(b) pane {pane} spawned but its session handle vanished"));
+    let Some(handle) = term_window_handle(cx, state, main_session, &term_window) else {
+        failures.push(format!("(b) window {term_window} spawned but its session handle vanished"));
         return;
     };
     let _ = handle.update(cx, |h, _| {
         let _ = h.session().write_input(b"sleep 30\n");
     });
-    if !poll_foreground_child(cx, state, main_tab, &pane, true).await {
+    if !poll_foreground_child(cx, state, main_session, &term_window, true).await {
         failures.push(format!(
-            "(b) pane {pane}'s shell never reported a foreground child after `sleep 30` — the \
+            "(b) window {term_window}'s shell never reported a foreground child after `sleep 30` — the \
              interactive shell's job control did not fork it into a new pgroup (tcgetpgrp == \
              child_pid)"
         ));
@@ -317,20 +317,20 @@ async fn busy_close_leg(
     }
     eprintln!("[selftest] close-confirmation (b): the busy shell reports a real foreground child (tcgetpgrp != child_pid)");
 
-    // First close: the busy pane is GATED — the window/tab stay, the modal shows.
-    if let Err(e) = drive_pill_close(cx, whandle, toolbar, &pane).await {
+    // First close: the busy window is GATED — the window/session stay, the modal shows.
+    if let Err(e) = drive_pill_close(cx, whandle, toolbar, &term_window).await {
         failures.push(format!("(b) {e}"));
         return;
     }
     if !poll_modal(cx, state, true).await {
         failures.push(format!(
-            "(b) closing busy pane {pane} presented NO confirmation modal (the busy gate did not \
+            "(b) closing busy window {term_window} presented NO confirmation modal (the busy gate did not \
              interpose)"
         ));
         return;
     }
-    if !toolbar_pane_ids(cx, toolbar).contains(&pane) {
-        failures.push(format!("(b) the busy close removed pane {pane} without confirmation (no veto)"));
+    if !toolbar_window_ids(cx, toolbar).contains(&term_window) {
+        failures.push(format!("(b) the busy close removed window {term_window} without confirmation (no veto)"));
         return;
     }
     // The modal's confirm ("Force quit") button is a live AX node.
@@ -343,13 +343,13 @@ async fn busy_close_leg(
 
     // D7 re-entrancy guard (Validation §2(d)): while THIS modal is up, a second
     // busy-close must be dropped-and-logged, never clobber the live `pending_modal`
-    // (Swift's `requestCloseTabs` drop-and-log `:160-163`). The Main tab still holds
-    // this busy pane, so `request_close_tab(main_tab)` WOULD present a second modal
+    // (Swift's `requestCloseTabs` drop-and-log `:160-163`). The Main session still holds
+    // this busy window, so `request_close_session(main_session)` WOULD present a second modal
     // if unguarded; assert instead that the FIRST modal survives untouched (same
     // entity — its completion is not stranded) and nothing closed.
     let first_modal = state.update(cx, |s, _| s.pending_modal());
     let _ = whandle.update(cx, |_root, window, app| {
-        state.update(app, |ws, wcx| ws.request_close_tab(main_tab, window, wcx));
+        state.update(app, |ws, wcx| ws.request_close_session(main_session, window, wcx));
     });
     settle(cx, 200).await;
     match (first_modal, state.update(cx, |s, _| s.pending_modal())) {
@@ -372,9 +372,9 @@ async fn busy_close_leg(
         _ => failures
             .push("(b) the busy modal vanished before the D7 re-entrancy probe could run".into()),
     }
-    if !toolbar_pane_ids(cx, toolbar).contains(&pane) {
+    if !toolbar_window_ids(cx, toolbar).contains(&term_window) {
         failures.push(format!(
-            "(b) the dropped second busy-close still closed pane {pane} (the D7 guard must be a \
+            "(b) the dropped second busy-close still closed window {term_window} (the D7 guard must be a \
              total no-op)"
         ));
         return;
@@ -386,84 +386,84 @@ async fn busy_close_leg(
     if state.update(cx, |s, _| s.pending_modal().is_some()) {
         failures.push("(b) the confirmation did not dismiss on Cancel".into());
     }
-    if !toolbar_pane_ids(cx, toolbar).contains(&pane) {
-        failures.push(format!("(b) Cancel closed busy pane {pane} (must be a no-op)"));
+    if !toolbar_window_ids(cx, toolbar).contains(&term_window) {
+        failures.push(format!("(b) Cancel closed busy window {term_window} (must be a no-op)"));
         return;
     }
-    eprintln!("[selftest] close-confirmation (b): the busy pill-✕ vetoed; Cancel kept the pane open");
+    eprintln!("[selftest] close-confirmation (b): the busy pill-✕ vetoed; Cancel kept the window open");
 
-    // Re-open the modal with a second pill-✕ close, then Confirm → the pane (and
+    // Re-open the modal with a second pill-✕ close, then Confirm → the window (and
     // its `sleep` child) is killed.
-    if let Err(e) = drive_pill_close(cx, whandle, toolbar, &pane).await {
+    if let Err(e) = drive_pill_close(cx, whandle, toolbar, &term_window).await {
         failures.push(format!("(b) re-close {e}"));
         return;
     }
     if !poll_modal(cx, state, true).await {
-        failures.push(format!("(b) the second busy close on {pane} presented no modal"));
+        failures.push(format!("(b) the second busy close on {term_window} presented no modal"));
         return;
     }
     resolve_modal(cx, whandle, state, true);
     let mut killed = false;
     for _ in 0..READY_POLLS {
         settle(cx, POLL_MS).await;
-        if !toolbar_pane_ids(cx, toolbar).contains(&pane) {
+        if !toolbar_window_ids(cx, toolbar).contains(&term_window) {
             killed = true;
             break;
         }
     }
     if killed {
-        eprintln!("[selftest] close-confirmation (b): Confirm force-quit the busy pane (sleep reaped)");
+        eprintln!("[selftest] close-confirmation (b): Confirm force-quit the busy window (sleep reaped)");
     } else {
-        failures.push(format!("(b) Confirm did not close the busy pane {pane}"));
+        failures.push(format!("(b) Confirm did not close the busy window {term_window}"));
     }
 }
 
-// -- leg (c): .tabs partial-cancel -------------------------------------------
+// -- leg (c): .sessions partial-cancel -------------------------------------------
 
-async fn tabs_partial_cancel_leg(
+async fn sessions_partial_cancel_leg(
     cx: &mut AsyncApp,
     whandle: WindowHandle<AppShellView>,
     state: &Entity<WindowState>,
     failures: &mut Vec<String>,
 ) {
-    // Two fresh model-only terminal tabs in the Terminals group: one idle, one
+    // Two fresh model-only terminal sessions in the Terminals group: one idle, one
     // marked busy through the synthetic seam (the true syscall is covered by (b)).
-    let idle_tab = state.update(cx, |s, _| s.sidebar_actions.create_terminal_tab(&mut s.model));
-    let busy_tab = state.update(cx, |s, _| s.sidebar_actions.create_terminal_tab(&mut s.model));
-    let (Some(idle_tab), Some(busy_tab)) = (idle_tab, busy_tab) else {
-        failures.push("(c) could not create the idle + busy terminal tabs".into());
+    let idle_session = state.update(cx, |s, _| s.sidebar_actions.create_terminal_session(&mut s.workspace));
+    let busy_session = state.update(cx, |s, _| s.sidebar_actions.create_terminal_session(&mut s.workspace));
+    let (Some(idle_session), Some(busy_session)) = (idle_session, busy_session) else {
+        failures.push("(c) could not create the idle + busy terminal sessions".into());
         return;
     };
-    let busy_pane = state.update(cx, |s, _| {
-        s.model
-            .tab_for(&busy_tab)
-            .and_then(|t| t.panes.first().map(|p| p.id.clone()))
+    let busy_window = state.update(cx, |s, _| {
+        s.workspace
+            .session_for(&busy_session)
+            .and_then(|t| t.windows.first().map(|p| p.id.clone()))
     });
-    let Some(busy_pane) = busy_pane else {
-        failures.push("(c) the busy tab has no seeded pane to mark busy".into());
+    let Some(busy_window) = busy_window else {
+        failures.push("(c) the busy session has no seeded window to mark busy".into());
         return;
     };
-    // Mark the busy tab's shell as holding a foreground child (the test seam).
+    // Mark the busy session's shell as holding a foreground child (the test seam).
     state.update(cx, |s, _| {
-        s.session.mark_synthetic_foreground_child(&busy_tab, &busy_pane);
+        s.ptys.mark_synthetic_foreground_child(&busy_session, &busy_window);
     });
 
     // Drive the multi-select close over BOTH ids (the partial-eager `.tabs` flow).
-    let ids = vec![idle_tab.clone(), busy_tab.clone()];
+    let ids = vec![idle_session.clone(), busy_session.clone()];
     let _ = whandle.update(cx, |_root, window, app| {
-        state.update(app, |ws, wcx| ws.request_close_tabs(&ids, window, wcx));
+        state.update(app, |ws, wcx| ws.request_close_sessions(&ids, window, wcx));
     });
     settle(cx, 400).await;
 
     // The idle member is hard-killed eagerly; the busy survivor is gated.
-    if tab_exists(cx, state, &idle_tab) {
-        failures.push(format!("(c) the idle tab {idle_tab} was not eagerly closed before the dialog"));
+    if session_exists(cx, state, &idle_session) {
+        failures.push(format!("(c) the idle session {idle_session} was not eagerly closed before the dialog"));
     }
-    if !tab_exists(cx, state, &busy_tab) {
-        failures.push(format!("(c) the busy tab {busy_tab} was closed instead of gated"));
+    if !session_exists(cx, state, &busy_session) {
+        failures.push(format!("(c) the busy session {busy_session} was closed instead of gated"));
     }
     if !state.update(cx, |s, _| s.pending_modal().is_some()) {
-        failures.push("(c) the multi-select busy close presented no .tabs modal".into());
+        failures.push("(c) the multi-select busy close presented no `.tabs` modal".into());
         return;
     }
 
@@ -473,46 +473,46 @@ async fn tabs_partial_cancel_leg(
     if state.update(cx, |s, _| s.pending_modal().is_some()) {
         failures.push("(c) the .tabs confirmation did not dismiss on Cancel".into());
     }
-    if !tab_exists(cx, state, &busy_tab) {
-        failures.push(format!("(c) Cancel closed the busy survivor {busy_tab} (must remain alive)"));
+    if !session_exists(cx, state, &busy_session) {
+        failures.push(format!("(c) Cancel closed the busy survivor {busy_session} (must remain alive)"));
     }
-    if tab_exists(cx, state, &idle_tab) {
+    if session_exists(cx, state, &idle_session) {
         failures.push(format!(
-            "(c) the eagerly-closed idle tab {idle_tab} came back on Cancel (must stay closed — a \
+            "(c) the eagerly-closed idle session {idle_session} came back on Cancel (must stay closed — a \
              PARTIAL close, not a total no-op)"
         ));
     }
     if !failures.iter().any(|f| f.starts_with("(c)")) {
-        eprintln!("[selftest] close-confirmation (c): partial-cancel — idle tab gone, busy survivor kept on Cancel");
+        eprintln!("[selftest] close-confirmation (c): partial-cancel — idle session gone, busy survivor kept on Cancel");
     }
-    // The busy survivor is a model-only tab with only a synthetic marker; the
+    // The busy survivor is a model-only session with only a synthetic marker; the
     // driver's teardown (`state.teardown()`, which clears the synthetic sets)
     // reaps it — no dangling real child, and the modal was already cancelled.
 }
 
 // -- shared drive helpers ----------------------------------------------------
 
-/// Add a terminal pane to `tab` through the shipped strip `+` seam and poll it
-/// spawned (the pane host deferred-spawns the new active pane). Returns its id.
-async fn add_spawned_pane(
+/// Add a terminal window to `session` through the shipped strip `+` seam and poll it
+/// spawned (the window host deferred-spawns the new active window). Returns its id.
+async fn add_spawned_window(
     cx: &mut AsyncApp,
     toolbar: &Entity<WindowToolbarView>,
     state: &Entity<WindowState>,
-    tab: &str,
+    session: &str,
 ) -> Option<String> {
-    let before = toolbar_pane_ids(cx, toolbar);
-    let _ = toolbar.update(cx, |v, cx| v.drive_add_terminal_pane(cx));
+    let before = toolbar_window_ids(cx, toolbar);
+    let _ = toolbar.update(cx, |v, cx| v.drive_add_terminal_window(cx));
     settle(cx, 300).await;
-    let after = toolbar_pane_ids(cx, toolbar);
-    let pane = after.into_iter().find(|p| !before.contains(p))?;
+    let after = toolbar_window_ids(cx, toolbar);
+    let term_window = after.into_iter().find(|p| !before.contains(p))?;
     // Poll spawned + push a readiness echo through so the interactive shell is live.
     for _ in 0..READY_POLLS {
-        if state.update(cx, |s, _| s.session.has_pane(tab, &pane)) {
+        if state.update(cx, |s, _| s.ptys.has_window(session, &term_window)) {
             break;
         }
         settle(cx, POLL_MS).await;
     }
-    let handle = pane_handle(cx, state, tab, &pane)?;
+    let handle = term_window_handle(cx, state, session, &term_window)?;
     let echo = format!("echo {READY_MARKER}\n");
     let _ = handle.update(cx, |h, _| {
         let _ = h.session().write_input(echo.as_bytes());
@@ -521,27 +521,27 @@ async fn add_spawned_pane(
         settle(cx, POLL_MS).await;
         let grid = handle.update(cx, |h, _| h.session().grid_lines().join("\n"));
         if grid.contains(READY_MARKER) {
-            return Some(pane);
+            return Some(term_window);
         }
     }
     // The shell may still be usable even if the marker didn't render in time; hand
-    // the pane back and let the caller's foreground-child poll be the real gate.
-    Some(pane)
+    // the window back and let the caller's foreground-child poll be the real gate.
+    Some(term_window)
 }
 
-/// Drive `pane_id`'s pill-✕ close through the SHIPPED handler — the exact method
-/// (`WindowToolbarView::close_pane` → [`WindowState::request_close_pane`], the
-/// busy-close gate) the pill's `on_mouse_down` invokes. Selects the pane first
+/// Drive `term_window_id`'s pill-✕ close through the SHIPPED handler — the exact method
+/// (`WindowToolbarView::close_term_window` → [`WindowState::request_close_term_window`], the
+/// busy-close gate) the pill's `on_mouse_down` invokes. Selects the window first
 /// (so its ✕ is laid out + would be hit-testable) and asserts the ✕ is a real,
 /// on-screen target via [`WindowToolbarView::scenario_close_button_center`].
 ///
 /// A literal synthetic CGEvent click on the ✕ is NOT usable in the shipped window:
 /// under its **full-size-content** style a `CGEventPostToPid` mouse click does not
 /// hit-test to gpui content (an on-device limitation this scenario re-verified — a
-/// body-centre CGEvent click did not even select the pane; the same limitation the
+/// body-centre CGEvent click did not even select the window; the same limitation the
 /// R18 `persistence_restore_live` veto documented for the traffic-light button,
 /// which drove `-[NSWindow performClose:]` instead). There is no AppKit selector
-/// for a pane close, so — following that pattern — we drive the real pill-✕
+/// for a window close, so — following that pattern — we drive the real pill-✕
 /// handler directly (the `app-shell` scenario's "real pill-× close path") after
 /// asserting the ✕'s locatable frame; the busy gate + modal are still exercised
 /// end-to-end, and the modal is answered via `resolve`.
@@ -552,17 +552,17 @@ async fn drive_pill_close(
     cx: &mut AsyncApp,
     whandle: WindowHandle<AppShellView>,
     toolbar: &Entity<WindowToolbarView>,
-    pane_id: &str,
+    term_window_id: &str,
 ) -> Result<(), String> {
     rekey(cx, whandle).await;
     let _ = whandle.update(cx, |_root, window, app| {
-        toolbar.update(app, |v, cx| v.drive_select_pane(pane_id, window, cx));
+        toolbar.update(app, |v, cx| v.drive_select_window(term_window_id, window, cx));
     });
     settle(cx, 250).await;
     // Assert the ✕ is a real, laid-out, on-screen target (the coordinate a real
     // click would strike) before driving the handler — mirrors the persistence
     // veto asserting the traffic-light frame is locatable.
-    let center = toolbar.update(cx, |v, cx| v.scenario_close_button_center(pane_id, cx));
+    let center = toolbar.update(cx, |v, cx| v.scenario_close_button_center(term_window_id, cx));
     let vh = whandle
         .update(cx, |_v, w, _a| {
             let s = w.viewport_size();
@@ -581,36 +581,36 @@ async fn drive_pill_close(
                 .flatten();
             if gxy.is_none() {
                 return Err(format!(
-                    "pane {pane_id}'s ✕ centre ({x:.0},{y:.0}) did not resolve to a screen point"
+                    "window {term_window_id}'s ✕ centre ({x:.0},{y:.0}) did not resolve to a screen point"
                 ));
             }
         }
         (Some((x, y)), Some((vw, vh))) => {
             return Err(format!(
-                "pane {pane_id}'s ✕ centre ({x:.0},{y:.0}) is off the {vw:.0}x{vh:.0} content view"
+                "window {term_window_id}'s ✕ centre ({x:.0},{y:.0}) is off the {vw:.0}x{vh:.0} content view"
             ));
         }
-        _ => return Err(format!("pane {pane_id}'s ✕ is not laid out (no locatable close target)")),
+        _ => return Err(format!("window {term_window_id}'s ✕ is not laid out (no locatable close target)")),
     }
     // Drive the real pill-✕ handler.
     let _ = whandle.update(cx, |_root, window, app| {
-        toolbar.update(app, |v, cx| v.drive_close_pane(pane_id, window, cx));
+        toolbar.update(app, |v, cx| v.drive_close_term_window(term_window_id, window, cx));
     });
     settle(cx, 350).await;
     Ok(())
 }
 
-/// Poll until `pane`'s shell foreground-child signal matches `want` (the true
+/// Poll until `term_window`'s shell foreground-child signal matches `want` (the true
 /// `tcgetpgrp` read via the live session handle).
 async fn poll_foreground_child(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab: &str,
-    pane: &str,
+    session: &str,
+    term_window: &str,
     want: bool,
 ) -> bool {
     for _ in 0..READY_POLLS {
-        if let Some(h) = pane_handle(cx, state, tab, pane) {
+        if let Some(h) = term_window_handle(cx, state, session, term_window) {
             if h.update(cx, |h, _| h.has_foreground_child()) == want {
                 return true;
             }
@@ -665,25 +665,25 @@ fn resolve_modal(
 
 // -- reads -------------------------------------------------------------------
 
-fn active_tab_id(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<String> {
-    state.update(cx, |s, _| s.model.active_tab_id().map(str::to_string))
+fn active_session_id(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<String> {
+    state.update(cx, |s, _| s.workspace.active_session_id().map(str::to_string))
 }
 
-fn tab_exists(cx: &mut AsyncApp, state: &Entity<WindowState>, tab: &str) -> bool {
-    state.update(cx, |s, _| s.model.tab_for(tab).is_some())
+fn session_exists(cx: &mut AsyncApp, state: &Entity<WindowState>, session: &str) -> bool {
+    state.update(cx, |s, _| s.workspace.session_for(session).is_some())
 }
 
-fn toolbar_pane_ids(cx: &mut AsyncApp, toolbar: &Entity<WindowToolbarView>) -> Vec<String> {
-    toolbar.update(cx, |v, cx| v.pane_ids(cx))
+fn toolbar_window_ids(cx: &mut AsyncApp, toolbar: &Entity<WindowToolbarView>) -> Vec<String> {
+    toolbar.update(cx, |v, cx| v.term_window_ids(cx))
 }
 
-fn pane_handle(
+fn term_window_handle(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab: &str,
-    pane: &str,
+    session: &str,
+    term_window: &str,
 ) -> Option<Entity<TerminalSessionHandle>> {
-    state.update(cx, |s, _| s.session.pane_handle(tab, pane))
+    state.update(cx, |s, _| s.ptys.term_window_handle(session, term_window))
 }
 
 // -- report ------------------------------------------------------------------

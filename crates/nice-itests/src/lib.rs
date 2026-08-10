@@ -3,7 +3,7 @@
 //!
 //! This crate is **dev/test-only** (it is `publish = false` and the shipped app
 //! binary `nice` never depends on it). It holds the shared fixtures the Stage-2
-//! chrome/pane cycles (R9–R13) write their tests on, plus the three exemplar
+//! chrome/window cycles (R9–R13) write their tests on, plus the three exemplar
 //! harness proofs that pin how those fixtures are meant to be used.
 //!
 //! ## The two execution models (never conflate them)
@@ -75,13 +75,13 @@ mod chrome_band;
 #[cfg(test)]
 mod sidebar_multiselect;
 
-// R11 pane-strip real-layout differentials — libtest `#[gpui::test]` cases on the
+// R11 window-strip real-layout differentials — libtest `#[gpui::test]` cases on the
 // mocked context. Mirrors `WindowToolbarView`'s strip logic (unimportable from a
 // dev/test crate) over a REAL `ScrollHandle` + the REAL `nice-model` strip
 // predicates, asserting overflow onset / fades / badge / ✕-slot reservation /
 // select-close-rename routing / centering against real Taffy layout.
 #[cfg(test)]
-mod pane_strip;
+mod window_strip;
 
 // R12 multi-window isolation / shortcut-routing / all-actions-fire / peek
 // set-clear differentials — libtest `#[gpui::test]` cases on the mocked context.

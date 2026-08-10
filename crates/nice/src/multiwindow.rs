@@ -16,17 +16,17 @@
 //!
 //! 1. **⌘N opens a second window** — the registry count and the real
 //!    `App::windows()` count both step 1 → 2 (Validation §3).
-//! 2. **⌘T routes to the key window B** — with B activated, ⌘T adds a pane to B's
+//! 2. **⌘T routes to the key window B** — with B activated, ⌘T adds a window to B's
 //!    `WindowState` model only; A's model signature is unchanged (§3).
 //! 3. **Font fan-out (§2)** — ⌘= grows the one process-level `FontSettings` every
 //!    window observes, and leaks **zero** bytes into the focused capture-tee pty.
 //! 4. **Pass-through differential (§2)** — a plain `x` arrives at the pty as `x`;
-//!    ⌘⌥↓ changes the sidebar (the active tab cycles) and leaks **zero** capture
+//!    ⌘⌥↓ changes the sidebar (the active session cycles) and leaks **zero** capture
 //!    bytes.
 //! 5. **Live peek (§5)** — with A's sidebar collapsed, ⌘⌥↓ floats the peek; a
 //!    modifiers-release clears it (the window-level `on_modifiers_changed` observer).
-//! 6. **Last-pane shell exit closes only its window (§3.5, regression)** — with
-//!    A + B live, a fresh window C's Main pane exits cleanly; C dissolves and
+//! 6. **Last-window shell exit closes only its window (§3.5, regression)** — with
+//!    A + B live, a fresh window C's Main window exits cleanly; C dissolves and
 //!    `remove_window`s while A + B stay registered and the process survives.
 //!    Guards two fix-crash regressions: (a) the ctrl+d-quits-the-whole-app crash
 //!    (a re-entrant window teardown from inside the live pty-exit subscription),
@@ -72,14 +72,14 @@ const COLS: u16 = 80;
 
 // macOS virtual keycodes (`CGKeyCode`) the driver posts.
 const KC_N: u16 = 45; // ⌘N — New Window
-const KC_T: u16 = 17; // ⌘T — new terminal pane
+const KC_T: u16 = 17; // ⌘T — new terminal window
 const KC_B: u16 = 11; // ⌘B — toggle sidebar
-const KC_DOWN: u16 = 125; // ⌘⌥↓ — next sidebar tab
+const KC_DOWN: u16 = 125; // ⌘⌥↓ — next sidebar session
 const KC_EQUAL: u16 = 24; // ⌘= — increase font
 const KC_ZERO: u16 = 29; // ⌘0 — reset font
 const KC_X: u16 = 7; // plain x — the pass-through control char
 
-/// A controlled Main-pane command (via `NICE_COMMAND`) that prints a marker, then
+/// A controlled Main-window command (via `NICE_COMMAND`) that prints a marker, then
 /// blocks on one line of stdin, then exits **cleanly** (`exit 0`). Feeding a
 /// newline drives a deterministic `Exited { held: false }` down the live
 /// subscription — where a bare login shell's exit behaviour (held vs clean) varies
@@ -168,16 +168,16 @@ pub fn open_multiwindow_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
                 v
             });
 
-            // Window A's per-window state, seeded with two extra terminal tabs so a
-            // ⌘⌥↓ sidebar-tab cycle genuinely moves the active tab (a fresh window
-            // has a single navigable tab, which cannot cycle).
+            // Window A's per-window state, seeded with two extra terminal sessions so a
+            // ⌘⌥↓ sidebar-session cycle genuinely moves the active session (a fresh window
+            // has a single navigable session, which cannot cycle).
             let state = cx.new(|_cx| WindowState::new(cwd));
             state.update(cx, |s, _cx| {
-                s.sidebar_actions.create_terminal_tab(&mut s.model);
-                s.sidebar_actions.create_terminal_tab(&mut s.model);
-                // Re-seed the active tab back to Main so the first cycle is a clean
+                s.sidebar_actions.create_terminal_session(&mut s.workspace);
+                s.sidebar_actions.create_terminal_session(&mut s.workspace);
+                // Re-seed the active session back to Main so the first cycle is a clean
                 // Main → next step.
-                s.model.select_tab(nice_model::TabModel::MAIN_TERMINAL_TAB_ID);
+                s.workspace.select_session(nice_model::WorkspaceModel::MAIN_TERMINAL_SESSION_ID);
             });
 
             // Register A + track its activation for the registry MRU — the same
@@ -213,11 +213,11 @@ pub fn open_multiwindow_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 
 // -- §3.5 fix-crash regression helpers --------------------------------------
 
-/// Open a fresh managed window whose Main pane runs the controlled clean-exit
+/// Open a fresh managed window whose Main window runs the controlled clean-exit
 /// command ([`EXIT_ON_LINE_CMD`], via `NICE_COMMAND`), returning its handle once
 /// registered. `existing` is the set of window ids already open, so the new one is
 /// identified by difference. `None` on failure. The env var is set/removed around
-/// the synchronous open so only this window's pane inherits it.
+/// the synchronous open so only this window's window inherits it.
 async fn open_controlled_window(
     cx: &mut AsyncApp,
     existing: &[gpui::WindowId],
@@ -238,9 +238,9 @@ async fn open_controlled_window(
     })
 }
 
-async fn wait_pane_live(cx: &mut AsyncApp, state: &Entity<WindowState>) {
+async fn wait_window_live(cx: &mut AsyncApp, state: &Entity<WindowState>) {
     for _ in 0..40 {
-        if state.update(cx, |s, _| !s.session.live_pane_keys().is_empty()) {
+        if state.update(cx, |s, _| !s.ptys.live_window_keys().is_empty()) {
             return;
         }
         settle(cx, 100).await;
@@ -258,7 +258,7 @@ async fn wait_registry_count(cx: &mut AsyncApp, target: usize) {
     }
 }
 
-/// Shared §3.5 assertions after a NON-last window's last pane was closed: the
+/// Shared §3.5 assertions after a NON-last window's last window was closed: the
 /// registry is back to `reg_before` (exactly that window closed), the app is alive
 /// with A + B intact (no over-teardown / abort), and the closed window's disk slot
 /// `sid` was REMOVED (not preserved to restore as a broken empty window).
@@ -296,13 +296,13 @@ fn assert_closed_and_slot_removed(
 }
 
 async fn wait_output_started(cx: &mut AsyncApp, state: &Entity<WindowState>) {
-    let pane = state.update(cx, |s, _| {
-        s.session
-            .live_pane_keys()
+    let term_window = state.update(cx, |s, _| {
+        s.ptys
+            .live_window_keys()
             .first()
-            .and_then(|(t, p)| s.session.pane_handle(t, p))
+            .and_then(|(t, p)| s.ptys.term_window_handle(t, p))
     });
-    if let Some(h) = pane {
+    if let Some(h) = term_window {
         for _ in 0..50 {
             if h.update(cx, |th, _| th.output_started()) {
                 return;
@@ -381,34 +381,34 @@ fn esc(bytes: &[u8]) -> String {
     out
 }
 
-/// A compact signature of a window's tab tree (`active` + per-navigable-tab pane
+/// A compact signature of a window's session tree (`active` + per-navigable-session window
 /// counts) — the "model hash" the routing check asserts is unchanged on window A.
 fn model_sig(cx: &mut AsyncApp, state: &Entity<WindowState>) -> String {
     state.update(cx, |s, _cx| {
-        let active = s.model.active_tab_id().unwrap_or("").to_string();
-        let tabs: Vec<String> = s
-            .model
-            .navigable_sidebar_tab_ids()
+        let active = s.workspace.active_session_id().unwrap_or("").to_string();
+        let sessions: Vec<String> = s
+            .workspace
+            .navigable_sidebar_session_ids()
             .iter()
-            .map(|id| format!("{id}:{}", s.model.tab_for(id).map_or(0, |t| t.panes.len())))
+            .map(|id| format!("{id}:{}", s.workspace.session_for(id).map_or(0, |t| t.windows.len())))
             .collect();
-        format!("active={active};{}", tabs.join(","))
+        format!("active={active};{}", sessions.join(","))
     })
 }
 
-/// The active tab's pane count for the window state (used for the ⌘T routing +
+/// The active session's window count for the window state (used for the ⌘T routing +
 /// A-unchanged assertions).
-fn active_pane_count(cx: &mut AsyncApp, state: &Entity<WindowState>) -> usize {
+fn active_window_count(cx: &mut AsyncApp, state: &Entity<WindowState>) -> usize {
     state.update(cx, |s, _cx| {
-        s.model
-            .active_tab_id()
-            .and_then(|id| s.model.tab_for(id))
-            .map_or(0, |t| t.panes.len())
+        s.workspace
+            .active_session_id()
+            .and_then(|id| s.workspace.session_for(id))
+            .map_or(0, |t| t.windows.len())
     })
 }
 
-fn active_tab_id(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<String> {
-    state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string))
+fn active_session_id(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<String> {
+    state.update(cx, |s, _cx| s.workspace.active_session_id().map(str::to_string))
 }
 
 fn sidebar_collapsed(cx: &mut AsyncApp, state: &Entity<WindowState>) -> bool {
@@ -439,8 +439,8 @@ fn state_for(cx: &mut AsyncApp, id: gpui::WindowId) -> Option<Entity<WindowState
 
 /// This window's persisted session id (R18: the persisted window id in
 /// `sessions.json`).
-fn session_id_of(cx: &mut AsyncApp, state: &Entity<WindowState>) -> String {
-    state.update(cx, |s, _cx| s.session_id().to_string())
+fn window_session_id_of(cx: &mut AsyncApp, state: &Entity<WindowState>) -> String {
+    state.update(cx, |s, _cx| s.window_session_id().to_string())
 }
 
 /// Whether `id` is a lowercased RFC-4122 v4 UUID (the shape R18 mints for a fresh
@@ -478,18 +478,18 @@ fn is_uuid_v4(id: &str) -> bool {
     true
 }
 
-/// Write raw bytes into the first live pane's pty of the window `state` owns —
+/// Write raw bytes into the first live window's pty of the window `state` owns —
 /// the ⌘N-window twin of the capture-tee readiness probe (which writes A's pty
-/// directly). Reaches the pane through the window's own `SessionManager`, so it
+/// directly). Reaches the window through the window's own `PtyManager`, so it
 /// needs no Accessibility grant (unlike a synthetic key tap). Returns `false`
-/// when the window has no live pane yet (its Main pane hasn't forked), so the
+/// when the window has no live window yet (its Main window hasn't forked), so the
 /// caller can poll until the login shell is up.
-fn write_to_first_pane(cx: &mut AsyncApp, state: &Entity<WindowState>, bytes: &[u8]) -> bool {
+fn write_to_first_window(cx: &mut AsyncApp, state: &Entity<WindowState>, bytes: &[u8]) -> bool {
     let handle = state.update(cx, |s, _cx| {
-        s.session
-            .live_pane_keys()
+        s.ptys
+            .live_window_keys()
             .first()
-            .and_then(|(t, p)| s.session.pane_handle(t, p))
+            .and_then(|(t, p)| s.ptys.term_window_handle(t, p))
     });
     match handle {
         Some(h) => {
@@ -568,7 +568,7 @@ async fn run_multiwindow(
         .update(|app| app.windows().into_iter().find(|w| w.window_id() != a_id));
 
     // === R18 (L2) — ⌘N mints a UUID window id, distinct from A's =============
-    // The ⌘N window's `session_id` IS its persisted `sessions.json` id, so it must
+    // The ⌘N window's `window_session_id` IS its persisted `sessions.json` id, so it must
     // be a real minted UUID (never the retired `win-<seq>` stand-in, which
     // restarts at 1 each launch and would collide across relaunches) and distinct
     // from A's.
@@ -576,8 +576,8 @@ async fn run_multiwindow(
         if let (Some(a_st), Some(b_st)) =
             (state_for(cx, a_id), state_for(cx, b_handle.window_id()))
         {
-            let a_sid = session_id_of(cx, &a_st);
-            let b_sid = session_id_of(cx, &b_st);
+            let a_sid = window_session_id_of(cx, &a_st);
+            let b_sid = window_session_id_of(cx, &b_st);
             if !is_uuid_v4(&a_sid) {
                 failures.push(format!("window A's session id is not a minted UUID: '{a_sid}'"));
             }
@@ -612,14 +612,14 @@ async fn run_multiwindow(
                     .to_string(),
             );
         } else if let Some(b_state) = state_for(cx, b_id) {
-            let b_panes_before = active_pane_count(cx, &b_state);
+            let b_windows_before = active_window_count(cx, &b_state);
             tap(cx, pid, KC_T, platform::FLAG_COMMAND, None).await;
             settle(cx, 300).await;
-            let b_panes_after = active_pane_count(cx, &b_state);
-            if b_panes_after != b_panes_before + 1 {
+            let b_windows_after = active_window_count(cx, &b_state);
+            if b_windows_after != b_windows_before + 1 {
                 failures.push(format!(
-                    "⌘T to key window B did not add a pane to B: active-tab pane count \
-                     {b_panes_before} → {b_panes_after}"
+                    "⌘T to key window B did not add a window to B: active-session window count \
+                     {b_windows_before} → {b_windows_after}"
                 ));
             }
             let a_sig_after = model_sig(cx, &a_state);
@@ -680,17 +680,17 @@ async fn run_multiwindow(
             ));
         }
 
-        // A matched chord (⌘⌥↓) changes the sidebar (active tab cycles) and leaks
+        // A matched chord (⌘⌥↓) changes the sidebar (active session cycles) and leaks
         // zero bytes.
-        let tab_before = active_tab_id(cx, &a_state);
+        let session_before = active_session_id(cx, &a_state);
         let start = cap_len(&cap_path);
         tap(cx, pid, KC_DOWN, platform::FLAG_COMMAND | platform::FLAG_OPTION, None).await;
         settle(cx, 200).await;
-        let tab_after = active_tab_id(cx, &a_state);
+        let session_after = active_session_id(cx, &a_state);
         let leaked = cap_since(&cap_path, start);
-        if tab_after == tab_before {
+        if session_after == session_before {
             failures.push(format!(
-                "⌘⌥↓ did not cycle the active sidebar tab (still {tab_before:?}) — the chord did \
+                "⌘⌥↓ did not cycle the active sidebar session (still {session_before:?}) — the chord did \
                  not route to A"
             ));
         }
@@ -736,11 +736,11 @@ async fn run_multiwindow(
         }
     }
 
-    // === §3.5 — closing the last pane of a NON-last window closes ONLY that
+    // === §3.5 — closing the last window of a NON-last window closes ONLY that
     // window (never quitting/crashing the app) AND drops its disk slot ==========
     // Guards two fix-crash regressions, over BOTH actuation paths:
     //
-    //   (a) CRASH — closing the last pane of a window while a SECOND window is live
+    //   (a) CRASH — closing the last window of a window while a SECOND window is live
     //       used to abort the whole app. The terminus actuator (`remove_window()`)
     //       drives gpui's close trail → `route_close_disk_fate` →
     //       `state.update(.., teardown)` on the closing window's `WindowState`;
@@ -755,8 +755,8 @@ async fn run_multiwindow(
     //
     // Two windows are driven to empty here with A + B live: window C via a clean
     // PTY exit (the deferred subscription path), and window D via the toolbar ✕
-    // `request_close_pane` handler (the leased-mid-update path). Each runs a
-    // CONTROLLED clean-exit command as its Main pane (`NICE_COMMAND`), so no
+    // `request_close_term_window` handler (the leased-mid-update path). Each runs a
+    // CONTROLLED clean-exit command as its Main window (`NICE_COMMAND`), so no
     // synthetic key / Accessibility is needed and the exit is deterministic. A temp
     // session store is installed for the leg (cleared after) so the disk fate is
     // observable.
@@ -778,15 +778,15 @@ async fn run_multiwindow(
             None => failures.push("fix-crash pty-exit(C): could not open window C".to_string()),
             Some(c) => {
                 if let Some(cs) = state_for(cx, c.window_id()) {
-                    wait_pane_live(cx, &cs).await;
-                    let sid = session_id_of(cx, &cs);
+                    wait_window_live(cx, &cs).await;
+                    let sid = window_session_id_of(cx, &cs);
                     persist_slot(cx, &cs, &sid, "pty-exit(C)", &mut failures);
                     wait_output_started(cx, &cs).await;
-                    // Wire C's pane as `PaneHostView::render` does (the harness may
+                    // Wire C's window as `WindowHostView::render` does (the harness may
                     // not repaint C), then feed a newline: `read` returns → exit 0.
-                    cs.update(cx, |ws, wcx| ws.subscribe_spawned_panes(wcx));
+                    cs.update(cx, |ws, wcx| ws.subscribe_spawned_windows(wcx));
                     settle(cx, 200).await;
-                    let _ = write_to_first_pane(cx, &cs, b"\n");
+                    let _ = write_to_first_window(cx, &cs, b"\n");
                     wait_registry_count(cx, reg_before).await;
                     assert_closed_and_slot_removed(
                         cx, reg_before, a_id, b_id, &sid, "pty-exit(C)", &mut failures,
@@ -800,7 +800,7 @@ async fn run_multiwindow(
         let _ = cx.update(|app| app.activate(true));
         settle(cx, 200).await;
 
-        // -- (ii) UI ✕ path (window D): the toolbar `request_close_pane` handler,
+        // -- (ii) UI ✕ path (window D): the toolbar `request_close_term_window` handler,
         //         which actuates the terminus WHILE `WindowState` is leased.
         let reg_before = registry_count(cx);
         let existing: Vec<gpui::WindowId> =
@@ -809,17 +809,17 @@ async fn run_multiwindow(
             None => failures.push("fix-crash UI-✕(D): could not open window D".to_string()),
             Some(d) => {
                 if let Some(ds) = state_for(cx, d.window_id()) {
-                    wait_pane_live(cx, &ds).await;
-                    let sid = session_id_of(cx, &ds);
+                    wait_window_live(cx, &ds).await;
+                    let sid = window_session_id_of(cx, &ds);
                     persist_slot(cx, &ds, &sid, "UI-✕(D)", &mut failures);
                     // Drive the real toolbar-✕ handler with `WindowState` LEASED and
                     // a live `&mut Window` — the exact shape that re-leases + aborts
                     // if the terminus actuator touches this entity.
-                    let key = ds.update(cx, |s, _| s.session.live_pane_keys().first().cloned());
-                    if let Some((tab, pane)) = key {
+                    let key = ds.update(cx, |s, _| s.ptys.live_window_keys().first().cloned());
+                    if let Some((session, term_window)) = key {
                         let _ = d.update(cx, |_root, window, app| {
                             ds.update(app, |ws, wcx| {
-                                ws.request_close_pane(&tab, &pane, window, wcx)
+                                ws.request_close_term_window(&session, &term_window, window, wcx)
                             });
                         });
                         wait_registry_count(cx, reg_before).await;
@@ -827,7 +827,7 @@ async fn run_multiwindow(
                             cx, reg_before, a_id, b_id, &sid, "UI-✕(D)", &mut failures,
                         );
                     } else {
-                        failures.push("fix-crash UI-✕(D): window D had no live pane".to_string());
+                        failures.push("fix-crash UI-✕(D): window D had no live window".to_string());
                     }
                 } else {
                     failures.push("fix-crash UI-✕(D): window D not registered".to_string());

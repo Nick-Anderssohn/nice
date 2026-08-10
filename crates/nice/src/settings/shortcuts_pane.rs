@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn auto_repeat_is_ignored() {
         let out = decide_capture(
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             Modifiers::COMMAND,
             "y",
             true, // is_held
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn plain_escape_cancels() {
         let out = decide_capture(
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             Modifiers::default(),
             "escape",
             false,
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn escape_with_modifiers_commits() {
         let out = decide_capture(
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             Modifiers::COMMAND_SHIFT,
             "escape",
             false,
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn free_combo_commits() {
         let out = decide_capture(
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             Modifiers::COMMAND,
             "y",
             false,
@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn conflicting_combo_yields_pending_and_conflict() {
         let out = decide_capture(
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             Modifiers::COMMAND,
             "b",
             false,
@@ -717,11 +717,11 @@ mod tests {
     }
 
     /// Re-capturing the action's OWN current combo is not a self-conflict (the
-    /// `excluding` rule): ⌘T on NewTerminalPane commits.
+    /// `excluding` rule): ⌘T on NewTerminalWindow commits.
     #[test]
     fn recapturing_own_combo_is_not_a_self_conflict() {
         let out = decide_capture(
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             Modifiers::COMMAND,
             "t",
             false,
@@ -758,24 +758,24 @@ mod tests {
             // Off-default: rebind newTerminalPane ⌘T -> ⌘Y (persist + rebuild inside).
             ShortcutBindings::set_binding(
                 app,
-                ShortcutAction::NewTerminalPane,
+                ShortcutAction::NewTerminalWindow,
                 OwnedCombo::from_token("cmd-y"),
             );
             assert!(!app
                 .global::<ShortcutBindings>()
-                .is_at_default(ShortcutAction::NewTerminalPane));
+                .is_at_default(ShortcutAction::NewTerminalWindow));
 
             // Reset through the recorder's per-action Reset path.
-            reset_action(app, ShortcutAction::NewTerminalPane);
+            reset_action(app, ShortcutAction::NewTerminalWindow);
 
             let store = app.global::<ShortcutBindings>();
             assert_eq!(
-                store.binding(ShortcutAction::NewTerminalPane),
+                store.binding(ShortcutAction::NewTerminalWindow),
                 OwnedCombo::from_token("cmd-t"),
                 "Reset restored the default combo"
             );
             assert!(
-                store.is_at_default(ShortcutAction::NewTerminalPane),
+                store.is_at_default(ShortcutAction::NewTerminalWindow),
                 "is_at_default flips back on after Reset (the button hides)"
             );
         });
@@ -843,21 +843,21 @@ mod tests {
         // overwrite).
         window
             .update(cx, |_v, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
                 apply_key_down(cx, &key_down("cmd-b"));
             })
             .unwrap();
         cx.update(|app| {
             assert_eq!(
                 recording_action(app),
-                Some(ShortcutAction::NewTerminalPane),
+                Some(ShortcutAction::NewTerminalWindow),
                 "a conflict keeps the recorder recording"
             );
             assert_eq!(pending_combo(app), OwnedCombo::from_token("cmd-b"));
             assert_eq!(conflict_action(app), Some(ShortcutAction::ToggleSidebar));
             assert_eq!(
                 app.global::<ShortcutBindings>()
-                    .binding(ShortcutAction::NewTerminalPane),
+                    .binding(ShortcutAction::NewTerminalWindow),
                 OwnedCombo::from_token("cmd-t"),
                 "the conflict did not silently overwrite the recording action's binding"
             );
@@ -866,7 +866,7 @@ mod tests {
         // Commit: ⌘Y is free — capture commits it (set_binding) and tears down.
         window
             .update(cx, |_v, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
                 apply_key_down(cx, &key_down("cmd-y"));
             })
             .unwrap();
@@ -879,7 +879,7 @@ mod tests {
             assert_eq!(pending_combo(app), None, "commit clears any pending combo");
             assert_eq!(
                 app.global::<ShortcutBindings>()
-                    .binding(ShortcutAction::NewTerminalPane),
+                    .binding(ShortcutAction::NewTerminalWindow),
                 OwnedCombo::from_token("cmd-y"),
                 "the free combo committed to the recording action"
             );
@@ -888,7 +888,7 @@ mod tests {
         // Cancel: plain Esc tears down with no change (binding stays ⌘Y).
         window
             .update(cx, |_v, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
                 apply_key_down(cx, &key_down("escape"));
             })
             .unwrap();
@@ -896,7 +896,7 @@ mod tests {
             assert_eq!(recording_action(app), None, "plain Esc tears the capture down");
             assert_eq!(
                 app.global::<ShortcutBindings>()
-                    .binding(ShortcutAction::NewTerminalPane),
+                    .binding(ShortcutAction::NewTerminalWindow),
                 OwnedCombo::from_token("cmd-y"),
                 "Esc-cancel left the binding untouched"
             );
@@ -916,10 +916,10 @@ mod tests {
             app.set_global(ShortcutBindings::with_defaults(path));
         });
 
-        // Record ⌘B onto NewTerminalPane → conflict with ToggleSidebar (its default).
+        // Record ⌘B onto NewTerminalWindow → conflict with ToggleSidebar (its default).
         window
             .update(cx, |_v, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
                 apply_key_down(cx, &key_down("cmd-b"));
             })
             .unwrap();
@@ -934,7 +934,7 @@ mod tests {
                 "Replace unbinds the losing action (⌘B is freed from ToggleSidebar)"
             );
             assert_eq!(
-                store.binding(ShortcutAction::NewTerminalPane),
+                store.binding(ShortcutAction::NewTerminalWindow),
                 OwnedCombo::from_token("cmd-b"),
                 "Replace binds the pending combo to the recording action"
             );
@@ -964,13 +964,13 @@ mod tests {
         // Enter recording but capture nothing: recording is Some, pending/conflict None.
         window
             .update(cx, |_v, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
             })
             .unwrap();
         cx.update(|app| {
             assert_eq!(
                 recording_action(app),
-                Some(ShortcutAction::NewTerminalPane),
+                Some(ShortcutAction::NewTerminalWindow),
                 "recording, but with no pending combo yet"
             );
             assert_eq!(pending_combo(app), None);
@@ -984,8 +984,8 @@ mod tests {
             );
             assert!(
                 app.global::<ShortcutBindings>()
-                    .is_at_default(ShortcutAction::NewTerminalPane),
-                "an incomplete Replace rebinds nothing (NewTerminalPane stays at ⌘T)"
+                    .is_at_default(ShortcutAction::NewTerminalWindow),
+                "an incomplete Replace rebinds nothing (NewTerminalWindow stays at ⌘T)"
             );
         });
 
@@ -1050,14 +1050,14 @@ mod tests {
         // Enter capture: keymap stands down (D3), recorder is focused.
         window
             .update(cx, |_host, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
             })
             .unwrap();
         cx.run_until_parked();
         cx.update(|app| {
             assert_eq!(
                 recording_action(app),
-                Some(ShortcutAction::NewTerminalPane),
+                Some(ShortcutAction::NewTerminalWindow),
                 "enter_record put the pane into capture mode"
             );
             assert_eq!(
@@ -1152,14 +1152,14 @@ mod tests {
         // that the focus-out net is unavailable on close.
         window
             .update(cx, |_host, window, cx| {
-                enter_record(window, cx, ShortcutAction::NewTerminalPane);
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
             })
             .unwrap();
         cx.run_until_parked();
         cx.update(|app| {
             assert_eq!(
                 recording_action(app),
-                Some(ShortcutAction::NewTerminalPane),
+                Some(ShortcutAction::NewTerminalWindow),
                 "enter_record put the pane into capture mode"
             );
             assert_eq!(

@@ -1,21 +1,21 @@
 //! `FileBrowserView` — the gpui view for the sidebar's files mode (R19 "What to
 //! build" #5/#6). Mounted by [`crate::sidebar_shell::SidebarShellView`]'s
 //! `build_body` in place of the landed placeholder when the sidebar is in files
-//! mode and not peeking (peeking always shows the tab list — the preserved
+//! mode and not peeking (peeking always shows the session list — the preserved
 //! invariant).
 //!
-//! It renders a disclosure tree rooted at the active tab's cwd over the pure
+//! It renders a disclosure tree rooted at the active session's cwd over the pure
 //! [`nice_model::file_browser`] model family:
 //!
 //! * a project header (title via [`nice_model::file_browser::file_browser_header_title`];
-//!   click resets the root to the tab cwd),
+//!   click resets the root to the session cwd),
 //! * a control strip (up-nav, sort-criterion menu, direction toggle, hidden
 //!   toggle) driving the persisted [`SortSettingsStore`](crate::file_browser::sort_settings_store::SortSettingsStore)
-//!   and the per-tab [`FileBrowserState`](nice_model::file_browser::FileBrowserState),
+//!   and the per-session [`FileBrowserState`](nice_model::file_browser::FileBrowserState),
 //! * a [`gpui::uniform_list`] over the flattened
 //!   [`visible_order`](nice_model::file_browser::listing::visible_order) projection
 //!   (fixed-height rows index straight in), and
-//! * the missing-folder / no-active-tab empty states.
+//! * the missing-folder / no-active-session empty states.
 //!
 //! Clicks route through the hand-rolled 280 ms
 //! [`FileBrowserClickRouter`](nice_model::file_browser::FileBrowserClickRouter)
@@ -51,7 +51,7 @@ use nice_model::file_browser::{
 };
 use nice_model::InlineRenameClickGate;
 
-use crate::app_shell::PaneHostView;
+use crate::app_shell::WindowHostView;
 use crate::file_browser::cwd_snapshot::build_snapshot;
 use crate::file_browser::rename::{self, ConfirmSpec, RenameCommit};
 use crate::inline_rename::{
@@ -155,11 +155,11 @@ struct Snapshot {
 /// created lazily when the sidebar first enters files mode.
 pub(crate) struct FileBrowserView {
     /// The window's shared state — the [`FileBrowserStore`](nice_model::file_browser::FileBrowserStore),
-    /// the [`TabModel`](nice_model::TabModel) (active tab + cwd + header title).
+    /// the [`WorkspaceModel`](nice_model::WorkspaceModel) (active session + cwd + header title).
     state: Entity<WindowState>,
-    /// Re-render when the shared state notifies (active-tab / cwd changes).
+    /// Re-render when the shared state notifies (active-session / cwd changes).
     _state_sub: Subscription,
-    /// The uniform-list scroll handle (reset to the top on a root/tab change).
+    /// The uniform-list scroll handle (reset to the top on a root/session change).
     scroll: UniformListScrollHandle,
     /// The hand-rolled 280 ms double-click + modifier router.
     router: FileBrowserClickRouter,
@@ -224,10 +224,10 @@ pub(crate) struct FileBrowserView {
     /// `activated_at` stamp the slow-second-click gate ([`InlineRenameClickGate`])
     /// reads.
     sole_activated: Option<(String, Instant)>,
-    /// The window's pane host, so a rename exit hands key focus back to the active
+    /// The window's window host, so a rename exit hands key focus back to the active
     /// terminal (`refocus_terminal_after_rename` parity). Pushed down by
     /// [`SidebarShellView`](crate::sidebar_shell::SidebarShellView).
-    pane_host: Option<Entity<PaneHostView>>,
+    window_host: Option<Entity<WindowHostView>>,
     /// The rename field's painted geometry (text-run + field-box left edges and
     /// the shaped char-boundary table, window coordinates), written by the
     /// field's paint and read by its click handler to turn a click-x into a
@@ -315,7 +315,7 @@ impl FileBrowserView {
             refocus_count: 0,
             rename_click_gen: 0,
             sole_activated: None,
-            pane_host: None,
+            window_host: None,
             rename_probe: field_probe_cell(),
             pending_press: None,
             option_probe: Arc::new(|| false),
@@ -330,31 +330,31 @@ impl FileBrowserView {
         self.option_probe = probe;
     }
 
-    /// Push down the window's pane host so a rename exit hands key focus back to
+    /// Push down the window's window host so a rename exit hands key focus back to
     /// the active terminal (called by [`SidebarShellView`](crate::sidebar_shell::SidebarShellView)).
-    pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
-        self.pane_host = Some(host);
+    pub(crate) fn set_window_host(&mut self, host: Entity<WindowHostView>) {
+        self.window_host = Some(host);
     }
 
     // MARK: - Snapshot
 
-    /// Ensure the active tab's browser state exists and read a render snapshot.
-    /// `None` when there is no active tab (⇒ the empty panel).
+    /// Ensure the active session's browser state exists and read a render snapshot.
+    /// `None` when there is no active session (⇒ the empty panel).
     fn snapshot(&mut self, cx: &mut Context<Self>) -> Option<Snapshot> {
-        let (tab_id, cwd) = {
+        let (session_id, cwd) = {
             let ws = self.state.read(cx);
-            let tab_id = ws.model.active_tab_id()?.to_string();
+            let session_id = ws.workspace.active_session_id()?.to_string();
             let cwd = ws
-                .model
-                .tab_for(&tab_id)
+                .workspace
+                .session_for(&session_id)
                 .map(|t| t.cwd.clone())
                 .unwrap_or_default();
-            (tab_id, cwd)
+            (session_id, cwd)
         };
-        // Lazily create the per-tab state (cwd is a seed used only on first
+        // Lazily create the per-session state (cwd is a seed used only on first
         // creation — a re-render never resets the user's in-state navigation).
         self.state.update(cx, |ws, _| {
-            ws.file_browser.ensure_state(&tab_id, &cwd);
+            ws.file_browser.ensure_state(&session_id, &cwd);
         });
 
         let settings = cx
@@ -363,12 +363,12 @@ impl FileBrowserView {
             .unwrap_or_default();
 
         let ws = self.state.read(cx);
-        let st = ws.file_browser.state_for(&tab_id)?;
+        let st = ws.file_browser.state_for(&session_id)?;
         let root = st.root_path().to_string();
         let expanded: BTreeSet<String> = st.expanded_paths().clone();
         let show_hidden = st.show_hidden();
         let selected: HashSet<String> = st.selection().selected_paths().clone();
-        let header = file_browser_header_title(&ws.model, &tab_id);
+        let header = file_browser_header_title(&ws.workspace, &session_id);
         // The shared-state borrow (`ws`) ends here (NLL) — everything below is
         // computed from the owned locals cloned out above.
 
@@ -469,34 +469,34 @@ impl FileBrowserView {
         }
     }
 
-    // MARK: - Mutation helpers (all through the per-tab FileBrowserState)
+    // MARK: - Mutation helpers (all through the per-session FileBrowserState)
 
-    /// Run `f` against the active tab's browser state (creating it if needed),
-    /// then notify. `None`-tab is a no-op.
+    /// Run `f` against the active session's browser state (creating it if needed),
+    /// then notify. `None`-session is a no-op.
     fn with_active_fb_state(
         &mut self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut nice_model::file_browser::FileBrowserState),
     ) {
-        let Some((tab_id, cwd)) = self.active_tab_cwd(cx) else {
+        let Some((session_id, cwd)) = self.active_session_cwd(cx) else {
             return;
         };
         self.state.update(cx, |ws, _| {
-            let st = ws.file_browser.ensure_state(&tab_id, &cwd);
+            let st = ws.file_browser.ensure_state(&session_id, &cwd);
             f(st);
         });
         cx.notify();
     }
 
-    fn active_tab_cwd(&self, cx: &App) -> Option<(String, String)> {
+    fn active_session_cwd(&self, cx: &App) -> Option<(String, String)> {
         let ws = self.state.read(cx);
-        let tab_id = ws.model.active_tab_id()?.to_string();
+        let session_id = ws.workspace.active_session_id()?.to_string();
         let cwd = ws
-            .model
-            .tab_for(&tab_id)
+            .workspace
+            .session_for(&session_id)
             .map(|t| t.cwd.clone())
             .unwrap_or_default();
-        Some((tab_id, cwd))
+        Some((session_id, cwd))
     }
 
     /// The current flattened projection (fresh read) — the ⇧-range order source.
@@ -506,10 +506,10 @@ impl FileBrowserView {
             .map(|s| s.settings())
             .unwrap_or_default();
         let ws = self.state.read(cx);
-        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+        let Some((session_id, _)) = self.active_session_cwd(cx) else {
             return Vec::new();
         };
-        let Some(st) = ws.file_browser.state_for(&tab_id) else {
+        let Some(st) = ws.file_browser.state_for(&session_id) else {
             return Vec::new();
         };
         visible_order(
@@ -928,25 +928,25 @@ impl FileBrowserView {
 
     // MARK: - R20 file-operation menu handlers (all through the snap hook)
 
-    /// The number of paths selected for the active tab (multi-select gate).
+    /// The number of paths selected for the active session (multi-select gate).
     fn selection_count(&self, cx: &App) -> usize {
-        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+        let Some((session_id, _)) = self.active_session_cwd(cx) else {
             return 0;
         };
         self.state
             .read(cx)
             .file_browser
-            .state_for(&tab_id)
+            .state_for(&session_id)
             .map(|s| s.selection().selected_paths().len())
             .unwrap_or(0)
     }
 
-    /// The op origin: this window's session id + active tab (undo routes back here).
+    /// The op origin: this window's session id + active session (undo routes back here).
     fn origin(&self, cx: &App) -> FileOperationOrigin {
         let ws = self.state.read(cx);
         FileOperationOrigin::new(
-            ws.session_id().to_string(),
-            ws.model.active_tab_id().map(str::to_string),
+            ws.window_session_id().to_string(),
+            ws.workspace.active_session_id().map(str::to_string),
         )
     }
 
@@ -1346,10 +1346,10 @@ impl FileBrowserView {
     }
 
     /// Every rename exit funnels here: bump the focus-call counter (the test seam)
-    /// and hand key focus back to the active terminal via the pane host.
+    /// and hand key focus back to the active terminal via the window host.
     fn end_rename_refocus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refocus_count += 1;
-        if let Some(host) = self.pane_host.clone() {
+        if let Some(host) = self.window_host.clone() {
             host.update(cx, |host, cx| host.focus_active_terminal(window, cx));
         }
         cx.notify();
@@ -1357,12 +1357,12 @@ impl FileBrowserView {
 
     /// The path currently the sole selection, if exactly one row is selected.
     fn single_selected_path(&self, cx: &App) -> Option<String> {
-        let (tab_id, _) = self.active_tab_cwd(cx)?;
+        let (session_id, _) = self.active_session_cwd(cx)?;
         let paths = self
             .state
             .read(cx)
             .file_browser
-            .state_for(&tab_id)?
+            .state_for(&session_id)?
             .selection()
             .selected_paths()
             .clone();
@@ -1404,12 +1404,12 @@ impl FileBrowserView {
 
     // MARK: - R20 in-tree drag & drop (F9)
 
-    /// The active-tab selection in on-screen order (empty when none / no tab).
+    /// The active-session selection in on-screen order (empty when none / no session).
     fn ordered_selection(&self, cx: &App) -> Vec<String> {
-        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+        let Some((session_id, _)) = self.active_session_cwd(cx) else {
             return Vec::new();
         };
-        let selected = match self.state.read(cx).file_browser.state_for(&tab_id) {
+        let selected = match self.state.read(cx).file_browser.state_for(&session_id) {
             Some(st) => st.selection().selected_paths().clone(),
             None => return Vec::new(),
         };
@@ -1492,14 +1492,14 @@ impl FileBrowserView {
     // MARK: - Control strip actions
 
     fn go_to_parent(&mut self, cx: &mut Context<Self>) {
-        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+        let Some((session_id, _)) = self.active_session_cwd(cx) else {
             return;
         };
         let root = self
             .state
             .read(cx)
             .file_browser
-            .state_for(&tab_id)
+            .state_for(&session_id)
             .map(|s| s.root_path().to_string())
             .unwrap_or_default();
         if root == "/" || root.is_empty() {
@@ -1510,7 +1510,7 @@ impl FileBrowserView {
     }
 
     fn reset_root_to_cwd(&mut self, cx: &mut Context<Self>) {
-        let Some((_, cwd)) = self.active_tab_cwd(cx) else {
+        let Some((_, cwd)) = self.active_session_cwd(cx) else {
             return;
         };
         if cwd.is_empty() {
@@ -1546,7 +1546,7 @@ impl FileBrowserView {
 
     fn build_header(&self, snap: &Snapshot, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         // The flat restyle renders sidebar text in the terminal mono family (the
-        // same seam the tabs-mode rows / project headers use); only the family
+        // same seam the sessions-mode rows / project headers use); only the family
         // changes — the size stays `NAME_SIZE`.
         let family = crate::sidebar_shell::resolved_mono_family(cx);
         div()
@@ -1720,7 +1720,7 @@ impl FileBrowserView {
         let scheme = crate::theme_settings::active_chrome_scheme(cx);
         let colors = RowColors {
             // Hovered / selected rows share the faint over-glass fill (the flat
-            // restyle skin — matches the tabs-mode rows), replacing the old accent
+            // restyle skin — matches the sessions-mode rows), replacing the old accent
             // row tint and the ink hover.
             glass: srgba_to_rgba(glass_fill(scheme)),
             // Kept accent-based: the rename FIELD's selected-text highlight (a
@@ -1735,7 +1735,7 @@ impl FileBrowserView {
             caret: srgba_to_rgba(self.accent),
         };
         // The flat restyle renders row names in the terminal mono family (same
-        // seam as the tabs-mode rows); only the family changes — size stays
+        // seam as the sessions-mode rows); only the family changes — size stays
         // `NAME_SIZE`.
         let family = crate::sidebar_shell::resolved_mono_family(cx);
         let count = rows.len();
@@ -1814,19 +1814,19 @@ impl FileBrowserView {
                 d.font_family(fam)
             })
             .text_color(slot_to_rgba(s.ink3))
-            .child(SharedString::from("No active tab"))
+            .child(SharedString::from("No active session"))
             .into_any_element()
     }
 
     // MARK: - Scenario / driver seams (the `file-browser` self-test reads these)
 
-    /// The current root path of the active tab's browser, if any.
+    /// The current root path of the active session's browser, if any.
     pub(crate) fn scenario_root(&self, cx: &App) -> Option<String> {
-        let (tab_id, _) = self.active_tab_cwd(cx)?;
+        let (session_id, _) = self.active_session_cwd(cx)?;
         self.state
             .read(cx)
             .file_browser
-            .state_for(&tab_id)
+            .state_for(&session_id)
             .map(|s| s.root_path().to_string())
     }
 
@@ -1842,15 +1842,15 @@ impl FileBrowserView {
         self.drag_arm_count
     }
 
-    /// Whether `path` is currently expanded for the active tab.
+    /// Whether `path` is currently expanded for the active session.
     pub(crate) fn scenario_is_expanded(&self, path: &str, cx: &App) -> bool {
-        let Some((tab_id, _)) = self.active_tab_cwd(cx) else {
+        let Some((session_id, _)) = self.active_session_cwd(cx) else {
             return false;
         };
         self.state
             .read(cx)
             .file_browser
-            .state_for(&tab_id)
+            .state_for(&session_id)
             .map(|s| s.expanded_paths().contains(path))
             .unwrap_or(false)
     }
@@ -2094,7 +2094,7 @@ impl FileBrowserView {
         self.with_active_fb_state(cx, |st| st.selection_mut().toggle(path));
     }
 
-    /// The active-tab selection in on-screen order — the read the (e′) live leg
+    /// The active-session selection in on-screen order — the read the (e′) live leg
     /// asserts a real press against (it must NOT collapse a multi-selection).
     pub(crate) fn scenario_selected_paths(&self, cx: &App) -> Vec<String> {
         self.ordered_selection(cx)
@@ -2199,7 +2199,7 @@ impl gpui::Render for FileBrowserView {
                 .child(self.build_empty_panel(&s, cx));
         };
 
-        // Scroll resets to the top on a root change (re-root / up-nav / tab
+        // Scroll resets to the top on a root change (re-root / up-nav / session
         // switch); expansion survives, scroll does not (Swift parity).
         if self.last_root.as_deref() != Some(snap.root.as_str()) {
             self.scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -2272,14 +2272,14 @@ fn chrome_slots(cx: &gpui::App) -> Slots {
 #[derive(Clone, Copy)]
 struct RowColors {
     /// The faint over-glass fill for a hovered OR selected row (`glass_fill`
-    /// 6%/5% — the 2026-07 flat restyle skin, matching the tabs-mode rows;
+    /// 6%/5% — the 2026-07 flat restyle skin, matching the sessions-mode rows;
     /// replaces the old accent selection tint and the separate ink hover).
     glass: Rgba,
     drag_hover: Rgba,
     ink: Rgba,
     ink2: Rgba,
     ink3: Rgba,
-    /// Rename-field chrome — the same slots the sidebar tab / pane pill
+    /// Rename-field chrome — the same slots the sidebar session / window pill
     /// `rename_field` uses (background3 fill + line_strong border), so the
     /// editor reads as a field against the row instead of vanishing into it.
     field_bg: Rgba,
@@ -2488,7 +2488,7 @@ fn render_row(
         let _ = weak_left.update(app, |this, cx| {
             this.on_row_press(&p, modifier, cx);
             // Parking focus in the browser panel makes Return-to-rename work and
-            // fires commit-on-blur when the user later clicks away / switches tabs.
+            // fires commit-on-blur when the user later clicks away / switches sessions.
             this.focus_handle.focus(window, cx);
             cx.stop_propagation();
         });
@@ -2746,7 +2746,7 @@ mod tests {
         path: &str,
         cx: &mut Context<FileBrowserView>,
     ) -> Vec<String> {
-        let snap = view.snapshot(cx).expect("the fixture root has an active tab");
+        let snap = view.snapshot(cx).expect("the fixture root has an active session");
         let mut paths = snap
             .rows
             .iter()

@@ -8,7 +8,7 @@
 //! The inline-rename field's click hit-test used to shape the text with the
 //! WINDOW BASE text style inside a mouse handler, while the field painted the
 //! text with whatever style the element tree resolved at that spot (the toolbar
-//! pill and the sidebar tab both set the terminal font family on an ancestor)
+//! pill and the sidebar session both set the terminal font family on an ancestor)
 //! and split it across three sibling divs. Two measurements, so the caret drew
 //! further and further right of the click the further right you clicked.
 //!
@@ -25,7 +25,7 @@
 //! from:
 //!
 //! * `ancestor-mono-family` — an ancestor sets the terminal font family, as the
-//!   toolbar pill (`toolbar.rs`) and the sidebar tab (`sidebar_shell.rs`) do.
+//!   toolbar pill (`toolbar.rs`) and the sidebar session (`sidebar_shell.rs`) do.
 //! * `window-base-family` — nothing overrides the family, as the file-browser
 //!   row (`file_browser/view.rs`) does.
 //!
@@ -65,7 +65,7 @@ use inline_rename::{
 /// right end — the shape of the reported drift.
 const TEXT: &str = "WWWWiiiimmmm-1234567890.txt";
 const TEXT_SIZE: f32 = 14.0;
-/// The family an ancestor sets in the pill / tab configuration. Menlo ships with
+/// The family an ancestor sets in the pill / session configuration. Menlo ships with
 /// macOS and is the same family the terminal exemplar uses.
 const MONO_FAMILY: &str = "Menlo";
 

@@ -501,7 +501,7 @@ pub fn settings_path_for_gate_in(sync_on: bool, home: &Path) -> Option<String> {
 /// `themeCache.syncClaudeTheme ? ClaudeThemeSync.settingsFlagPath() : nil`
 /// (`SessionThemeCache.swift`). The shipped window builder
 /// (`crate::app::open_managed_window`) calls this with the process gate's bool to
-/// fill each window's provider before the Main pane forks.
+/// fill each window's provider before the Main window forks.
 pub fn settings_path_for_gate(sync_on: bool) -> Option<String> {
     if sync_on {
         settings_flag_path()

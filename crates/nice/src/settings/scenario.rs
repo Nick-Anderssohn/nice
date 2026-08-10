@@ -43,14 +43,14 @@
 //!   registered launch window (`open_managed_window` / `build_window_root`, the
 //!   exact path `run` takes — NOT a scenario host), composes the whole tranche's
 //!   board by CGEvent to nice's own pid: **(6a)** a REBOUND chord dispatches on
-//!   the shipped window (rebind `newTerminalPane` → ⌘Y, post it → a pane appears;
+//!   the shipped window (rebind `newTerminalPane` → ⌘Y, post it → a window appears;
 //!   the old default ⌘T no longer does), **(6b)** the PROTECTED non-rebindable set
 //!   (⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@SidebarShell, ⌘,) survives the rebuild (a
 //!   `key_bindings()` presence audit), **(6c)** ⌘, opens R23's settings window (the
 //!   `OpenSettings` non-rebindable firing LIVE) and a live theme change
 //!   (`apply_accent` + `apply_scheme`) repaints the shipped chrome AND a terminal
 //!   cell (`sample_window_pixels`, max channel delta > 8/255), and **(6d)** a busy
-//!   pane close (the `synthetic_foreground_child` seam) presents R20.5's
+//!   window close (the `synthetic_foreground_child` seam) presents R20.5's
 //!   `ConfirmationModal` (`pending_modal()` + the AX confirm id), cancelled. A
 //!   hermetic ZDOTDIR/HOME/`NICE_CLAUDE_OVERRIDE` fixture; the launch window is
 //!   reaped + the rebind reset at teardown. No earlier cycle asserted this board
@@ -88,7 +88,7 @@ use nice_theme::AccentPreset;
 
 use nice_model::shortcuts::{OwnedCombo, ShortcutAction};
 
-use crate::app_shell::{AppShellView, PaneHostView};
+use crate::app_shell::{AppShellView, WindowHostView};
 use crate::platform;
 use crate::settings::appearance_pane::{last_import_feedback, perform_import};
 use crate::settings::file_picker::selftest_fake;
@@ -151,7 +151,7 @@ impl Render for ShortcutsHostRoot {
 // macOS virtual keycodes (`CGKeyCode`) for the recorder legs' chords.
 const KC_Y: u16 = 16; // kVK_ANSI_Y → ⌘Y (s1: a free chord)
 const KC_B: u16 = 11; // kVK_ANSI_B → ⌘B (s2: ToggleSidebar's default → a conflict)
-const KC_T: u16 = 17; // kVK_ANSI_T → ⌘T (§6a: NewTerminalPane's DEFAULT combo)
+const KC_T: u16 = 17; // kVK_ANSI_T → ⌘T (§6a: NewTerminalWindow's DEFAULT combo)
 const KC_COMMA: u16 = 43; // kVK_ANSI_Comma → ⌘, (§6c: the OpenSettings non-rebindable)
 
 /// Accessibility-grant remediation (shared wording with the `niceties-zoom` /
@@ -295,7 +295,7 @@ async fn leg_c_font_slider(cx: &mut AsyncApp, failures: &mut Vec<String>) {
         ));
     }
     // The cell metrics re-derive off the new size (a main-window terminal cell
-    // re-metrics on the same entity every pane observes).
+    // re-metrics on the same entity every window observes).
     let after_metrics = cx.update(|app| font.read(app).metrics());
     if after_metrics == before_metrics {
         failures.push("the size change did not re-metric the shared FontSettings".to_string());
@@ -641,10 +641,10 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
 
     // --- s1: enter recording on newTerminalPane, post a free ⌘Y, assert rebind ---
     let _ = host.update(cx, |_root, window, cx| {
-        enter_record(window, cx, ShortcutAction::NewTerminalPane)
+        enter_record(window, cx, ShortcutAction::NewTerminalWindow)
     });
     settle(cx, 200).await;
-    if cx.update(|app| recording_action(app)) != Some(ShortcutAction::NewTerminalPane) {
+    if cx.update(|app| recording_action(app)) != Some(ShortcutAction::NewTerminalWindow) {
         failures.push("(s1) enter_record did not put newTerminalPane into capture mode".to_string());
     }
     // Re-assert frontmost right before the chord so the CGEvent routes to the host.
@@ -654,7 +654,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     settle(cx, 300).await;
 
     let cmd_y = OwnedCombo::from_token("cmd-y");
-    let bound = cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::NewTerminalPane)));
+    let bound = cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::NewTerminalWindow)));
     if bound != cmd_y {
         failures.push(format!(
             "(s1) the real ⌘Y chord did not rebind newTerminalPane: binding is {bound:?}, expected cmd-y \
@@ -668,7 +668,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
 
     // --- s2: capture a conflicting chord (⌘B = ToggleSidebar), then Replace -------
     let _ = host.update(cx, |_root, window, cx| {
-        enter_record(window, cx, ShortcutAction::NewTerminalPane)
+        enter_record(window, cx, ShortcutAction::NewTerminalWindow)
     });
     settle(cx, 200).await;
     let _ = host.update(cx, |_root, window, _cx| window.activate_window());
@@ -684,7 +684,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
                 failures.push(format!("(s2) the conflict copy is wrong: {msg:?}"));
             }
             // The conflict blocked commit — still recording, not yet bound.
-            if cx.update(|app| recording_action(app)) != Some(ShortcutAction::NewTerminalPane) {
+            if cx.update(|app| recording_action(app)) != Some(ShortcutAction::NewTerminalWindow) {
                 failures.push("(s2) a conflict did not keep the recorder in capture mode".to_string());
             }
         }
@@ -699,7 +699,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     if cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::ToggleSidebar))).is_some() {
         failures.push("(s2) Replace did not clear the losing action (ToggleSidebar still bound)".to_string());
     }
-    if cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::NewTerminalPane))) != OwnedCombo::from_token("cmd-b") {
+    if cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::NewTerminalWindow))) != OwnedCombo::from_token("cmd-b") {
         failures.push("(s2) Replace did not bind newTerminalPane to the conflicting combo (cmd-b)".to_string());
     }
     if cx.update(|app| recording_action(app)).is_some() {
@@ -707,13 +707,13 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     }
 
     // --- s3: Reset newTerminalPane → the default (⌘T), and the Reset button hides -
-    cx.update(|app| reset_action(app, ShortcutAction::NewTerminalPane));
+    cx.update(|app| reset_action(app, ShortcutAction::NewTerminalWindow));
     settle(cx, 150).await;
-    if cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::NewTerminalPane))) != OwnedCombo::from_token("cmd-t") {
+    if cx.update(|app| app.try_global::<ShortcutBindings>().and_then(|s| s.binding(ShortcutAction::NewTerminalWindow))) != OwnedCombo::from_token("cmd-t") {
         failures.push("(s3) Reset did not restore newTerminalPane to its default (cmd-t)".to_string());
     }
     // `is_at_default` drives the Reset button's visibility — true ⇒ the button hides.
-    if !cx.update(|app| app.try_global::<ShortcutBindings>().map(|s| s.is_at_default(ShortcutAction::NewTerminalPane)).unwrap_or(false)) {
+    if !cx.update(|app| app.try_global::<ShortcutBindings>().map(|s| s.is_at_default(ShortcutAction::NewTerminalWindow)).unwrap_or(false)) {
         failures.push("(s3) newTerminalPane is not is_at_default after Reset (the Reset button would still show)".to_string());
     }
 
@@ -722,7 +722,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     // close the host window.
     cx.update(|app| {
         cancel_capture(app);
-        reset_action(app, ShortcutAction::NewTerminalPane);
+        reset_action(app, ShortcutAction::NewTerminalWindow);
         reset_action(app, ShortcutAction::ToggleSidebar);
     });
     let _ = host.update(cx, |_root, window, _cx| window.remove_window());
@@ -736,7 +736,7 @@ async fn leg_shortcuts(cx: &mut AsyncApp, failures: &mut Vec<String>) {
 // compose the whole tranche's board (Validation §6a–d): a REBOUND chord dispatches
 // on the shipped window, the PROTECTED non-rebindable set survives the rebuild, ⌘,
 // opens R23's settings window and a live theme change repaints shipped chrome + a
-// terminal cell (R21 fan-out through the store `apply_*`), and a busy pane close
+// terminal cell (R21 fan-out through the store `apply_*`), and a busy window close
 // presents R20.5's ConfirmationModal. Real CGEvents (⌘Y / ⌘T / ⌘,) post to
 // nice's OWN pid; a `SavedInputSource` is held for the whole leg (IME restore).
 
@@ -774,7 +774,7 @@ impl CompFixture {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
         }
-        // SAFETY: single-threaded scenario setup before any pane forks.
+        // SAFETY: single-threaded scenario setup before any window forks.
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
         Ok(CompFixture { base, home, zdotdir })
     }
@@ -792,23 +792,23 @@ fn comp_sample(cx: &mut AsyncApp, window: AnyWindowHandle, points: &[(f32, f32)]
     nice_harness::capture::sample_window_pixels(window, cx, points)
 }
 
-fn comp_active_pane_count(cx: &mut AsyncApp, state: &Entity<WindowState>) -> usize {
+fn comp_active_window_count(cx: &mut AsyncApp, state: &Entity<WindowState>) -> usize {
     state.update(cx, |s, _| {
-        s.model
-            .active_tab_id()
-            .and_then(|id| s.model.tab_for(id))
-            .map_or(0, |t| t.panes.len())
+        s.workspace
+            .active_session_id()
+            .and_then(|id| s.workspace.session_for(id))
+            .map_or(0, |t| t.windows.len())
     })
 }
 
-fn comp_active_tab_and_pane(
+fn comp_active_session_and_window(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
 ) -> Option<(String, String)> {
     state.update(cx, |s, _| {
-        let tab = s.model.active_tab_id()?.to_string();
-        let pane = s.model.tab_for(&tab).and_then(|t| t.active_pane_id.clone())?;
-        Some((tab, pane))
+        let session = s.workspace.active_session_id()?.to_string();
+        let term_window = s.workspace.session_for(&session).and_then(|t| t.active_window_id.clone())?;
+        Some((session, term_window))
     })
 }
 
@@ -870,7 +870,7 @@ async fn comp_finish(
 ) {
     let _ = cx.update(|app| {
         // Restore the rebound action so the later `multiwindow` scenario's ⌘T works.
-        ShortcutBindings::reset(app, ShortcutAction::NewTerminalPane);
+        ShortcutBindings::reset(app, ShortcutAction::NewTerminalWindow);
         if let Some(state) = WindowRegistry::state_for_window(app, win_id) {
             state.update(app, |s, _| s.teardown());
         }
@@ -974,19 +974,19 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
         }
     };
     let toolbar = shell.update(cx, |s, _| s.scenario_toolbar());
-    let pane_host: Entity<PaneHostView> = shell.update(cx, |s, _| s.scenario_pane_host());
-    let Some((main_tab, main_pane)) = comp_active_tab_and_pane(cx, &state) else {
-        failures.push("(6) the shipped launch window has no active tab/pane".into());
+    let window_host: Entity<WindowHostView> = shell.update(cx, |s, _| s.scenario_window_host());
+    let Some((main_session, main_window)) = comp_active_session_and_window(cx, &state) else {
+        failures.push("(6) the shipped launch window has no active session/window".into());
         comp_finish(cx, whandle, win_id, &prev_home, &fixture).await;
         return;
     };
 
-    // Poll the Main pane's TerminalView mounted (the fan-out target for §6c). §6a/
+    // Poll the Main window's TerminalView mounted (the fan-out target for §6c). §6a/
     // §6b/§6d do not need it painted; only §6c's pixel sample does.
     let mut mounted = false;
     for _ in 0..40 {
-        if pane_host
-            .update(cx, |h, _| h.scenario_terminal_for(&main_pane))
+        if window_host
+            .update(cx, |h, _| h.scenario_terminal_for(&main_window))
             .is_some()
         {
             mounted = true;
@@ -999,7 +999,7 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     cx.update(|app| {
         ShortcutBindings::set_binding(
             app,
-            ShortcutAction::NewTerminalPane,
+            ShortcutAction::NewTerminalWindow,
             OwnedCombo::from_token("cmd-y"),
         )
     });
@@ -1008,27 +1008,27 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
     let _ = cx.update(|app| app.activate(true));
     settle(cx, 300).await;
 
-    let panes_before = comp_active_pane_count(cx, &state);
+    let windows_before = comp_active_window_count(cx, &state);
     comp_tap(cx, pid, KC_Y, platform::FLAG_COMMAND).await;
     settle(cx, 300).await;
-    let panes_after_y = comp_active_pane_count(cx, &state);
-    if panes_after_y != panes_before + 1 {
+    let windows_after_y = comp_active_window_count(cx, &state);
+    if windows_after_y != windows_before + 1 {
         failures.push(format!(
-            "(6a) the rebound ⌘Y did not add a pane on the shipped launch window: active-tab pane \
-             count {panes_before} → {panes_after_y} (is the window key/focused?)"
+            "(6a) the rebound ⌘Y did not add a window on the shipped launch window: active-session window \
+             count {windows_before} → {windows_after_y} (is the window key/focused?)"
         ));
     } else {
-        eprintln!("[selftest] settings-window (6a): the rebound ⌘Y dispatched NewTerminalPane on the shipped window");
+        eprintln!("[selftest] settings-window (6a): the rebound ⌘Y dispatched NewTerminalWindow on the shipped window");
     }
     // The OLD default ⌘T no longer dispatches (rebuild_keymap dropped it).
-    let panes_before_t = comp_active_pane_count(cx, &state);
+    let windows_before_t = comp_active_window_count(cx, &state);
     comp_tap(cx, pid, KC_T, platform::FLAG_COMMAND).await;
     settle(cx, 250).await;
-    let panes_after_t = comp_active_pane_count(cx, &state);
-    if panes_after_t != panes_before_t {
+    let windows_after_t = comp_active_window_count(cx, &state);
+    if windows_after_t != windows_before_t {
         failures.push(format!(
-            "(6a) the old default ⌘T still added a pane after the rebind: {panes_before_t} → \
-             {panes_after_t} (rebuild_keymap did not drop the old combo)"
+            "(6a) the old default ⌘T still added a window after the rebind: {windows_before_t} → \
+             {windows_after_t} (rebuild_keymap did not drop the old combo)"
         ));
     }
 
@@ -1148,24 +1148,24 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
         );
     }
 
-    // === §6d — R20.5 gates a busy pane close ================================
-    // Add a fresh terminal pane, mark it busy through the `synthetic_foreground_child`
+    // === §6d — R20.5 gates a busy window close ================================
+    // Add a fresh terminal window, mark it busy through the `synthetic_foreground_child`
     // seam (the TRUE tcgetpgrp read is covered once in `close-confirmation`), then
     // drive its close: R20.5's ConfirmationModal must interpose (a veto, no close).
-    let before_ids = toolbar.update(cx, |v, cx| v.pane_ids(cx));
-    let _ = toolbar.update(cx, |v, cx| v.drive_add_terminal_pane(cx));
+    let before_ids = toolbar.update(cx, |v, cx| v.term_window_ids(cx));
+    let _ = toolbar.update(cx, |v, cx| v.drive_add_terminal_window(cx));
     settle(cx, 300).await;
-    let after_ids = toolbar.update(cx, |v, cx| v.pane_ids(cx));
+    let after_ids = toolbar.update(cx, |v, cx| v.term_window_ids(cx));
     match after_ids.into_iter().find(|p| !before_ids.contains(p)) {
-        Some(busy_pane) => {
+        Some(busy_window) => {
             cx.update(|app| {
                 state.update(app, |s, _| {
-                    s.session
-                        .mark_synthetic_foreground_child(&main_tab, &busy_pane)
+                    s.ptys
+                        .mark_synthetic_foreground_child(&main_session, &busy_window)
                 })
             });
             let _ = whandle.update(cx, |_root, window, app| {
-                toolbar.update(app, |v, cx| v.drive_close_pane(&busy_pane, window, cx));
+                toolbar.update(app, |v, cx| v.drive_close_term_window(&busy_window, window, cx));
             });
             settle(cx, 300).await;
 
@@ -1179,12 +1179,12 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
             }
             if !modal_up {
                 failures.push(format!(
-                    "(6d) closing the busy pane {busy_pane} presented NO confirmation modal (R20.5's \
+                    "(6d) closing the busy window {busy_window} presented NO confirmation modal (R20.5's \
                      busy gate did not interpose)"
                 ));
-            } else if !toolbar.update(cx, |v, cx| v.pane_ids(cx)).contains(&busy_pane) {
+            } else if !toolbar.update(cx, |v, cx| v.term_window_ids(cx)).contains(&busy_window) {
                 failures.push(format!(
-                    "(6d) the busy close removed pane {busy_pane} without confirmation (no veto)"
+                    "(6d) the busy close removed window {busy_window} without confirmation (no veto)"
                 ));
             } else {
                 // The confirm ("Force quit") button surfaces as a live AXButton.
@@ -1206,7 +1206,7 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
                             .into(),
                     );
                 } else {
-                    eprintln!("[selftest] settings-window (6d): a busy pane close presented R20.5's confirmation (live AXButton)");
+                    eprintln!("[selftest] settings-window (6d): a busy window close presented R20.5's confirmation (live AXButton)");
                 }
             }
             // Cancel — the composed leg makes no destructive close.
@@ -1219,7 +1219,7 @@ async fn leg_composition(cx: &mut AsyncApp, failures: &mut Vec<String>) {
             settle(cx, 200).await;
         }
         None => failures.push(
-            "(6d) could not add a terminal pane to mark busy for the close-gate assert".into(),
+            "(6d) could not add a terminal window to mark busy for the close-gate assert".into(),
         ),
     }
 
@@ -1253,7 +1253,7 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      final-composition board held on the REAL launch window — a rebound ⌘Y \
                      dispatched (old ⌘T dead) (6a), the non-rebindable set survived the rebuild \
                      (6b), ⌘, opened R23's settings + a live theme change repainted shipped chrome \
-                     AND a terminal cell (6c), and a busy pane close presented R20.5's confirmation \
+                     AND a terminal cell (6c), and a busy window close presented R20.5's confirmation \
                      (6d)"
                 .to_string(),
         }

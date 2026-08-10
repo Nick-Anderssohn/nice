@@ -3,10 +3,10 @@
 //!
 //! Entry points:
 //!   * [`run`] — the shipped app: one "Nice" window hosting a single live
-//!     terminal pane running the login shell (zsh), wired to the damage-driven
+//!     terminal window running the login shell (zsh), wired to the damage-driven
 //!     present kick. Quitting closes the window, which drops the session and
 //!     tears down its child process group (no orphan zsh). Set `NICE_COMMAND`
-//!     to run a one-off command pane instead of an interactive shell (the live
+//!     to run a one-off command window instead of an interactive shell (the live
 //!     smoke feeds `ls -la` / colour tests that way).
 //!   * [`run_selftest`] — the `NICE_SELFTEST` harness path: opens each
 //!     registered scenario's window in turn (see [`selftest_scenarios`]).
@@ -318,8 +318,8 @@ impl Render for WindowChromeView {
             .flex()
             .flex_col()
             .size_full()
-            // R12: the window-level peek clear. A sidebar-tab cycle on a collapsed
-            // sidebar floats the peek overlay (set in the keymap's tab-cycle
+            // R12: the window-level peek clear. A sidebar-session cycle on a collapsed
+            // sidebar floats the peek overlay (set in the keymap's session-cycle
             // handler); this ends it once the shortcut's modifiers are all
             // released (Swift's flagsChanged monitor). Registered on the root so
             // it observes modifier changes regardless of which descendant holds
@@ -570,7 +570,7 @@ fn install_file_operations(cx: &mut App) {
     let service = FileOperationsService::new(Box::new(ProductionTrasher));
     let history = cx.new(|_| FileOperationHistory::new(service, None));
     // The production focus-follow closure: cross-window ⌘Z routes focus back to
-    // the originating window (activate + sidebar → Files + select the origin tab),
+    // the originating window (activate + sidebar → Files + select the origin session),
     // resolved via the `WindowRegistry`. Installed here + also by the
     // `file-browser` composition leg (both over a registry-registered window set).
     crate::file_browser::focus_route::install(cx, &history);
@@ -602,7 +602,7 @@ fn claude_projects_root() -> PathBuf {
 /// loop applies, so after it every survivor is restorable), then opens one window
 /// per saved slot via [`open_managed_window_with`] (seed + cwd-heal root). Zero
 /// restorable slots ⇒ one fresh default window. A post-restore
-/// `prune_empty_windows_keeping` drops any leftover zero-tab store slot, keeping
+/// `prune_empty_windows_keeping` drops any leftover zero-session store slot, keeping
 /// every just-restored id (Swift's `pruneEmptyWindows(keeping:)`). No
 /// `WindowClaimLedger`, no SceneStorage, no fan-out tokens — one
 /// `Application::run`, the windows opened explicitly (the do-not-port list).
@@ -648,13 +648,13 @@ pub(crate) fn run_restore_fan_out(cx: &mut App) -> Result<usize> {
     Ok(restored_ids.len())
 }
 
-/// Total live panes `(claude, terminal)` across every registered window — the ⌘Q
+/// Total live windows `(claude, terminal)` across every registered window — the ⌘Q
 /// counting rule (Swift `AppDelegate.applicationShouldTerminate:34-40`).
-fn total_live_pane_counts(cx: &App) -> (usize, usize) {
+fn total_live_window_counts(cx: &App) -> (usize, usize) {
     let mut claude = 0;
     let mut terminal = 0;
     for state in WindowRegistry::all_states(cx) {
-        let (c, t) = state.read(cx).live_pane_counts();
+        let (c, t) = state.read(cx).live_window_counts();
         claude += c;
         terminal += t;
     }
@@ -728,19 +728,19 @@ fn resolve_modal_host(cx: &mut App) -> Option<(AnyWindowHandle, Entity<WindowSta
     Some((win, state))
 }
 
-/// ⌘Q / Quit-menu handler. Zero live panes ⇒ [`quit_cascade`] with no dialog;
+/// ⌘Q / Quit-menu handler. Zero live windows ⇒ [`quit_cascade`] with no dialog;
 /// else present the quit confirmation in the active window (confirm ⇒ cascade,
 /// cancel ⇒ total no-op). When the key window is the unregistered Settings window
 /// the confirmation is routed to the registry's MRU window (see
 /// [`resolve_modal_host`]) rather than bypassed (#4).
 fn request_quit(cx: &mut App) {
-    let (claude, terminal) = total_live_pane_counts(cx);
+    let (claude, terminal) = total_live_window_counts(cx);
     if claude + terminal == 0 {
         quit_cascade(cx);
         return;
     }
     // Resolve the window + state to host the confirmation. `None` ⇒ no Nice window
-    // is registered at all, so quit as today (the zero-live-panes fast path already
+    // is registered at all, so quit as today (the zero-live-windows fast path already
     // returned above).
     let Some((win, state)) = resolve_modal_host(cx) else {
         quit_cascade(cx);
@@ -815,7 +815,7 @@ fn present_handoff_prompt(cx: &mut App) {
         state.update(app, |ws, wcx| {
             ws.present_confirmation(
                 "Install the Nice Claude skills?",
-                "The /nice-handoff skill lets Claude hand off the current work to a fresh session in a new tab, and /nice-dispatch sends a task to a fresh session working in its own worktree. You can change this anytime in Settings.",
+                "The /nice-handoff skill lets Claude hand off the current work to a fresh session in a new session, and /nice-dispatch sends a task to a fresh session working in its own worktree. You can change this anytime in Settings.",
                 "Install",
                 "Not Now",
                 false,
@@ -939,8 +939,8 @@ fn request_close_active_window(cx: &mut App) {
 /// bool, and `request_close_active_window` calls `remove_window()` when `true`.
 ///
 /// Once quit has begun ([`AppQuitting`]) every close is unconditional. With no
-/// live panes the close is unconditional too — but marks `user_initiated_close`
-/// so the slot is dropped from disk. With live panes it presents the confirmation
+/// live windows the close is unconditional too — but marks `user_initiated_close`
+/// so the slot is dropped from disk. With live windows it presents the confirmation
 /// (confirm ⇒ set the flag + `remove_window()`; cancel ⇒ total no-op) and vetoes
 /// the immediate close.
 pub(crate) fn request_window_close(
@@ -951,7 +951,7 @@ pub(crate) fn request_window_close(
     if cx.has_global::<crate::lifecycle::AppQuitting>() {
         return true;
     }
-    let (claude, terminal) = state.read(cx).live_pane_counts();
+    let (claude, terminal) = state.read(cx).live_window_counts();
     if claude + terminal == 0 {
         state.update(cx, |ws, _cx| ws.set_user_initiated_close(true));
         return true;
@@ -1005,7 +1005,7 @@ pub(crate) fn install_fullscreen_menu_sync<V: 'static>(
 
 /// The shipped window's initial live-terminal grid size. Chosen to fit inside the
 /// 960×640 window's content area (≈118×36 at the old 8×16 Menlo box, comfortably
-/// inside the SF Mono box the R7 chain now resolves); the pane is top-anchored,
+/// inside the SF Mono box the R7 chain now resolves); the window is top-anchored,
 /// so row 0 sits flush at the content top. The font family + size + cell metrics
 /// are now the app-level [`FontSettings`] (T11): a ⌘+/⌘−/⌘0 zoom re-metrics from
 /// here and resizes the pty to refill the window.
@@ -1052,7 +1052,7 @@ pub(crate) fn claude_theme_sync_gate_on(cx: &App) -> bool {
 }
 
 /// R26's in-memory mirror of the `installHandoffSkill` CFPref — the SOURCE the
-/// Claude-pane's handoff toggle RENDERS from, so a scenario / `run_selftest`
+/// Claude-window's handoff toggle RENDERS from, so a scenario / `run_selftest`
 /// render never reads the real `dev.nickanderssohn.nice` CFPrefs domain (D7
 /// render-read note). Seeded ONCE in [`run`] from the CFPref (Step 5, the
 /// bootstrap reconcile), UNSET under [`run_selftest`] — absent ⇒ OFF (default),
@@ -1064,7 +1064,7 @@ struct HandoffSkillGate(bool);
 impl Global for HandoffSkillGate {}
 
 /// Seed / update the process handoff-skill render gate. [`run`] sets it from the
-/// CFPref at boot; the Claude-pane toggle handler re-sets it on every flip so the
+/// CFPref at boot; the Claude-window toggle handler re-sets it on every flip so the
 /// re-render reflects the new state. Not reachable from `run_selftest` at boot
 /// (hermeticity) — a render there sees the absent Global ⇒ OFF.
 pub(crate) fn set_handoff_skill_gate(cx: &mut App, on: bool) {
@@ -1072,7 +1072,7 @@ pub(crate) fn set_handoff_skill_gate(cx: &mut App, on: bool) {
 }
 
 /// Read the process handoff-skill render gate (absent ⇒ OFF, the `run_selftest`
-/// default). The Claude-pane toggle reads THIS at render time — never
+/// default). The Claude-window toggle reads THIS at render time — never
 /// `read_bool_pref` — so a scenario render stays off the real CFPrefs domain.
 pub(crate) fn handoff_skill_gate_on(cx: &App) -> bool {
     cx.try_global::<HandoffSkillGate>()
@@ -1080,7 +1080,7 @@ pub(crate) fn handoff_skill_gate_on(cx: &App) -> bool {
         .unwrap_or(false)
 }
 
-/// Run the shipped application: one window hosting a single live terminal pane
+/// Run the shipped application: one window hosting a single live terminal window
 /// running the login shell, quit on window close.
 pub fn run() {
     // Nice-parity antialiasing: turn off CoreGraphics font-smoothing dilation
@@ -1178,11 +1178,11 @@ pub fn run() {
         // run_selftest, so the regression suite never writes real user files, per
         // the tranche-3 hermeticity rule). Order (Swift NiceServices.bootstrap):
         // sweep stale $TMPDIR debris → write the ZDOTDIR stubs (overwrite-always
-        // self-heal; a write failure ⇒ zdotdir None and panes still get
+        // self-heal; a write failure ⇒ zdotdir None and windows still get
         // NICE_SOCKET) → capture Nice's own inherited ZDOTDIR before any pty child
         // sees our override. The captured config becomes an app global so every
         // window (the first + every ⌘N) threads the same zdotdir / user-zdotdir
-        // into its SessionManager's shell env.
+        // into its PtyManager's shell env.
         install_shell_inject_bootstrap(cx);
         // R16: install (or refresh) the Claude Code SessionStart hook — the
         // frozen socket-client script at ~/.nice/nice-claude-hook.sh (mode 0755)
@@ -1191,7 +1191,7 @@ pub fn run() {
         // control socket. Runs from app::run ONLY (never run_selftest, per the
         // tranche-3 hermeticity rule: the regression suite must never write the
         // real ~/.claude / ~/.nice). Slotted after R15's reaper (in the bootstrap
-        // above) and before the first pane spawns — it touches no ptys. Failures
+        // above) and before the first window spawns — it touches no ptys. Failures
         // are logged and swallowed (the feature degrades, the app still runs).
         crate::claude_hook_installer::install();
         // R26: reconcile the on-disk Nice Claude skills (handoff AND dispatch —
@@ -1201,7 +1201,7 @@ pub fn run() {
         // on-disk state to it at launch — installing (or removing) each SKILL.md
         // + helper if the user toggled while the app was closed, or a prior write
         // was partial. Seed `HandoffSkillGate` from the SAME value so the Claude
-        // pane's toggle renders the persisted state without touching CFPrefs at
+        // window's toggle renders the persisted state without touching CFPrefs at
         // render time. app::run ONLY (never run_selftest, per tranche-3
         // hermeticity: the regression suite must not write the real ~/.claude /
         // ~/.nice, and a suite render sees the absent gate ⇒ OFF). Failures are
@@ -1217,7 +1217,7 @@ pub fn run() {
         // ON, mirror the shipped default theme (`nice_default_dark` + Terracotta —
         // the same fixed pair `build_window_root` paints) into Claude's
         // live-reloaded custom-theme file once; the `--settings` pointer file is
-        // ensured on read when a Claude pane spawns (the provider fill in
+        // ensured on read when a Claude window spawns (the provider fill in
         // `open_managed_window`). app::run ONLY — `run_selftest` never writes the
         // real ~/.claude / ~/.nice (tranche-3 hermeticity). Failures are logged and
         // swallowed inside the writer (Claude renders fine on its own theme).
@@ -1252,7 +1252,7 @@ pub fn run() {
         ));
         // R21: load the theme store from the SAME `ui_settings.json` and mint the
         // live `SharedThemeState` (+ install the terminal-theme catalog stub)
-        // BEFORE the first window opens, so every chrome view + terminal pane reads
+        // BEFORE the first window opens, so every chrome view + terminal window reads
         // the persisted appearance from birth. Launch-time read + default-path
         // resolution live here in app::run ONLY — `run_selftest` installs a
         // defaults+temp store + the catalog stub (no SharedThemeState, no write).
@@ -1355,7 +1355,7 @@ pub fn run() {
 /// exactly as before R14).
 struct ShellInjectConfig {
     /// The synthetic rc-chain directory (`ZDOTDIR`), or `None` if the stub write
-    /// failed. Threaded into every window's `SessionManager` shell env.
+    /// failed. Threaded into every window's `PtyManager` shell env.
     zdotdir: Option<String>,
     /// Nice's own inherited `ZDOTDIR` (the value for `NICE_USER_ZDOTDIR`), captured
     /// before any pty child sees our override. `None` when Nice inherited none.
@@ -1365,9 +1365,9 @@ struct ShellInjectConfig {
 impl Global for ShellInjectConfig {}
 
 /// Scenario-only seam (R17 `claude-e2e`): install a [`ShellInjectConfig`] so the
-/// SHIPPED window built by [`open_managed_window`] forks its Main pane WITH the
+/// SHIPPED window built by [`open_managed_window`] forks its Main window WITH the
 /// synthetic `ZDOTDIR` rc chain (the `claude()` shadow) — the `claude-e2e` scenario
-/// needs a live shadow in the real Main pane to drive the typed handshake, and
+/// needs a live shadow in the real Main window to drive the typed handshake, and
 /// [`run_selftest`] never runs the real [`install_shell_inject_bootstrap`]
 /// (hermeticity). The scenario points `zdotdir` at a stub-written FIXTURE dir (never
 /// the real Application Support location) and resets it to `(None, None)` at
@@ -1392,7 +1392,7 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
     //    `nice-zdotdir-*` dirs) whose owning pid is gone. Cross-app safe: a live
     //    sibling's debris is kept (pid-liveness rule).
     crate::tmp_sweep::sweep_stale_temp_files();
-    // R15 (C12): reap zsh orphaned by prior crashes / SIGKILLs BEFORE any new pane
+    // R15 (C12): reap zsh orphaned by prior crashes / SIGKILLs BEFORE any new window
     // spawns, so we don't inherit a starved pty table (macOS caps kern.tty.ptmx_max
     // at 511). Match = PPID==1 & uid==me & comm=="zsh" & env has NICE_TAB_ID=; never
     // name-pattern matching. Best-effort + synchronous; `run_selftest` never runs it.
@@ -1401,17 +1401,17 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
         eprintln!("nice: reaped {reaped} orphan zsh shell(s) from prior runs");
     }
     // 2. Write the ZDOTDIR stubs (overwrite-always self-heal). A write failure is
-    //    non-fatal: zdotdir stays None and panes still get NICE_SOCKET.
+    //    non-fatal: zdotdir stays None and windows still get NICE_SOCKET.
     let zdotdir = match crate::shell_inject::write_stubs(&crate::shell_inject::default_location()) {
         Ok(path) => Some(path.to_string_lossy().into_owned()),
         Err(e) => {
-            eprintln!("nice: ZDOTDIR inject failed: {e} (panes still get NICE_SOCKET)");
+            eprintln!("nice: ZDOTDIR inject failed: {e} (windows still get NICE_SOCKET)");
             None
         }
     };
     // 3. Capture Nice's own inherited ZDOTDIR from the process env, BEFORE any pty
     //    child inherits our override (read straight from the env so this works even
-    //    if the stub write failed — a pane still benefits from NICE_USER_ZDOTDIR).
+    //    if the stub write failed — a window still benefits from NICE_USER_ZDOTDIR).
     let user_zdotdir = std::env::var("ZDOTDIR").ok();
     cx.set_global(ShellInjectConfig {
         zdotdir,
@@ -1431,7 +1431,7 @@ fn install_shell_inject_bootstrap(cx: &mut App) {
 /// foreground when it completes. The spawn path also re-reads the override at spawn
 /// time, so a scenario's stub resolves even though `run_selftest` skips this.
 fn kickoff_claude_probe(cx: &mut App) {
-    use crate::session_manager::ResolvedClaudePath;
+    use crate::pty_manager::ResolvedClaudePath;
     if let Ok(over) = std::env::var("NICE_CLAUDE_OVERRIDE") {
         if !over.is_empty() {
             cx.set_global(ResolvedClaudePath(Some(over)));
@@ -1471,9 +1471,9 @@ fn run_which_claude() -> Option<String> {
 }
 
 /// Mint + arm this window's control socket and thread its shell-injection env into
-/// the window's [`SessionManager`] — the Rust twin of Swift
+/// the window's [`PtyManager`] — the Rust twin of Swift
 /// `SessionsModel.bootstrapSocket` + `startSocketListener`. Must run BEFORE the
-/// window's Main pane forks (the "env before fork" invariant: the pane inherits
+/// window's Main window forks (the "env before fork" invariant: the window inherits
 /// `NICE_SOCKET` / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from launch, or the `claude()`
 /// shadow can't reach us). Shared by [`open_managed_window`] (production) and the
 /// `shell-socket` scenario, so both wire the socket identically.
@@ -1495,7 +1495,7 @@ pub(crate) fn arm_window_control_socket(
     health_interval: Option<Duration>,
 ) -> String {
     use crate::control_socket::{socket_channel, NiceControlSocket};
-    use crate::session_manager::WindowShellEnv;
+    use crate::pty_manager::WindowShellEnv;
     use std::sync::mpsc::TryRecvError;
 
     let socket = match health_interval {
@@ -1504,8 +1504,8 @@ pub(crate) fn arm_window_control_socket(
     };
     let socket_path = socket.path().to_string();
 
-    // Set the window's shell-injection env BEFORE the caller forks the Main pane.
-    ws.session.set_window_shell_env(WindowShellEnv {
+    // Set the window's shell-injection env BEFORE the caller forks the Main window.
+    ws.ptys.set_window_shell_env(WindowShellEnv {
         socket_path: Some(socket_path.clone()),
         zdotdir,
         user_zdotdir,
@@ -1552,21 +1552,21 @@ pub(crate) fn arm_window_control_socket(
 }
 
 /// Open a managed Nice window: mint + seed this window's [`WindowState`], spawn
-/// its Main tab's terminal pane into the [`SessionManager`](crate::session_manager::SessionManager)
+/// its Main session's terminal window into the [`PtyManager`](crate::pty_manager::PtyManager)
 /// (a login shell, or a one-off `NICE_COMMAND`), and mount the R13.5 shell —
-/// the pane strip + floating sidebar card + a pane-content host that follows the
-/// active pane. Used both for the first window ([`run`]) and every ⌘N window
+/// the window strip + floating sidebar card + a window-content host that follows the
+/// active window. Used both for the first window ([`run`]) and every ⌘N window
 /// ([`install_new_window_command`]); each is fully isolated.
 ///
-/// The Main pane is spawned **here** with the full shipped spec (command + the
-/// live grid size) so the initial pane keeps its `NICE_COMMAND` / geometry;
-/// explicitly-added panes spawn a plain login shell through R13's deferred-spawn
-/// path (`ensure_active_pane_spawned`). The session is owned by the window's
-/// `SessionManager`, so closing the window tears its child process groups down
+/// The Main window is spawned **here** with the full shipped spec (command + the
+/// live grid size) so the initial window keeps its `NICE_COMMAND` / geometry;
+/// explicitly-added windows spawn a plain login shell through R13's deferred-spawn
+/// path (`ensure_active_window_spawned`). The session is owned by the window's
+/// `PtyManager`, so closing the window tears its child process groups down
 /// (`WindowState::teardown` → SIGHUP/SIGKILL): no orphan zsh survives. Window
 /// close also deregisters the state and runs its teardown hook (the registry's
 /// `on_window_closed` observer). The demand-present kick is owned by the shell's
-/// pane host, which re-points it to the active pane on every switch.
+/// window host, which re-points it to the active window on every switch.
 ///
 /// Returns the shell window handle. `run` / the ⌘N handler discard it; the
 /// `app-shell` self-test scenario (`crate::app_shell_live`) keeps it so its driver
@@ -1581,12 +1581,12 @@ pub(crate) fn open_managed_window(
 /// [`open_managed_window`] parameterized by an optional restore
 /// [`WindowSeed`](crate::restore::WindowSeed) (L2/L3) and an optional cwd-heal
 /// `projects_root` (L3/C5). `seed = None` is the fresh / ⌘N window (a seeded
-/// Terminals+Main tree, its Main pane eagerly spawned with the shipped spec to
+/// Terminals+Main tree, its Main window eagerly spawned with the shipped spec to
 /// preserve `NICE_COMMAND` + grid size); `seed = Some` rebuilds a saved
-/// window ([`WindowState::with_seed`]) whose panes lazy-spawn on activation
+/// window ([`WindowState::with_seed`]) whose windows lazy-spawn on activation
 /// (never eagerly — the documented restore divergence that kills the 0×0-pty
 /// hazard), opens it at the restored frame (W6), runs the cwd-heal pass over its
-/// Claude tabs, and fires restore's single explicit save (the save-gate lift).
+/// Claude sessions, and fires restore's single explicit save (the save-gate lift).
 pub(crate) fn open_managed_window_with(
     cx: &mut App,
     seed: Option<crate::restore::WindowSeed>,
@@ -1603,12 +1603,12 @@ pub(crate) fn open_managed_window_with(
         None => cx.new(|_cx| WindowState::new(cwd.clone())),
     };
 
-    // L3/C5: the restore-time cwd-heal pass over the rebuilt model's Claude tabs
-    // (terminal tabs never heal), BEFORE the window opens so the active pane
+    // L3/C5: the restore-time cwd-heal pass over the rebuilt model's Claude sessions
+    // (terminal sessions never heal), BEFORE the window opens so the active window
     // lazy-spawns in the healed cwd. No-op for a fresh window.
     if let Some(root) = &projects_root {
         state.update(cx, |ws, _cx| {
-            crate::restore::heal_model_cwds(&mut ws.model, root);
+            crate::restore::heal_model_cwds(&mut ws.workspace, root);
         });
     }
 
@@ -1616,7 +1616,7 @@ pub(crate) fn open_managed_window_with(
     // gate. ON ⇒ the ensure-on-read pointer path (`~/.nice/…`), which the Claude
     // exec/spawn/reply/prefill composers splice; OFF — or the gate UNSET, as under
     // run_selftest — ⇒ None, so OFF spawns get no `--settings` and the regression
-    // suite never writes the real ~/.nice. Set before the Main pane forks so a
+    // suite never writes the real ~/.nice. Set before the Main window forks so a
     // later Claude spawn in this window sees it.
     let sync_on = cx
         .try_global::<ClaudeThemeSyncGate>()
@@ -1625,24 +1625,24 @@ pub(crate) fn open_managed_window_with(
     let claude_settings = crate::claude_theme_sync::settings_path_for_gate(sync_on);
     state.update(cx, |ws, _cx| ws.set_claude_settings_path(claude_settings));
 
-    // The Main pane spawn is fresh-window-only: a restored window's active pane
-    // (terminal or deferred-resume Claude) lazy-spawns through `PaneHostView`'s
-    // activation path (`ensure_active_pane_spawned`), so restore never forks a pane
+    // The Main window spawn is fresh-window-only: a restored window's active window
+    // (terminal or deferred-resume Claude) lazy-spawns through `WindowHostView`'s
+    // activation path (`ensure_active_window_spawned`), so restore never forks a window
     // here.
     let main = if restoring {
         None
     } else {
         let ws = state.read(cx);
-        let tab = ws.model.active_tab_id().map(str::to_owned);
-        let pane = tab
+        let session = ws.workspace.active_session_id().map(str::to_owned);
+        let term_window = session
             .as_deref()
-            .and_then(|t| ws.model.tab_for(t))
-            .and_then(|t| t.active_pane_id.clone());
-        tab.zip(pane)
+            .and_then(|t| ws.workspace.session_for(t))
+            .and_then(|t| t.active_window_id.clone());
+        session.zip(term_window)
     };
 
     // R14: mint + arm this window's control socket and set its shell-injection env
-    // BEFORE the Main pane forks (env-before-fork). The zdotdir / user-zdotdir come
+    // BEFORE the Main window forks (env-before-fork). The zdotdir / user-zdotdir come
     // from the process-wide bootstrap config, which is UNSET under run_selftest —
     // a scenario opening through here gets a socket-only window env (no real
     // ZDOTDIR override), so its shells behave exactly as before R14.
@@ -1654,15 +1654,15 @@ pub(crate) fn open_managed_window_with(
         arm_window_control_socket(ws, cx, zdotdir, user_zdotdir, None);
     });
 
-    if let Some((tab_id, pane_id)) = main {
+    if let Some((session_id, term_window_id)) = main {
         let spec = match std::env::var("NICE_COMMAND") {
-            // A one-off command pane (the live-smoke path: `ls -la`, colour tests).
+            // A one-off command window (the live-smoke path: `ls -la`, colour tests).
             Ok(cmd) if !cmd.trim().is_empty() => SpawnSpec::command(cmd, cwd.clone()),
             // The default: an interactive login shell (`zsh -il`).
             _ => SpawnSpec::shell(cwd.clone()),
         }
         .with_size(LIVE_ROWS, LIVE_COLS);
-        state.update(cx, |ws, cx| ws.session.spawn_pane(&tab_id, &pane_id, spec, cx))?;
+        state.update(cx, |ws, cx| ws.ptys.spawn_window(&session_id, &term_window_id, spec, cx))?;
     }
 
     // W6: open at the restored frame when one survives the visible-screen clamp;
@@ -1686,10 +1686,10 @@ pub(crate) fn open_managed_window_with(
     Ok(handle)
 }
 
-/// BUGHUNT1-D: wire this window's [`TabModel`](nice_model::TabModel) did-mutate
+/// BUGHUNT1-D: wire this window's [`WorkspaceModel`](nice_model::WorkspaceModel) did-mutate
 /// observer to the debounced session save, once per window.
 ///
-/// Every model mutation runs inside `state.update(cx, |ws, _| ws.model.…)`, so
+/// Every model mutation runs inside `state.update(cx, |ws, _| ws.workspace.…)`, so
 /// the observer fires SYNCHRONOUSLY while the [`WindowState`] entity is leased.
 /// It therefore MUST NOT call back into the entity synchronously — that is the
 /// gpui double-lease `SIGABRT` class (watchlist #3, fixed once in `908f217`). The
@@ -1704,7 +1704,7 @@ pub(crate) fn open_managed_window_with(
 /// D5 (restore/boot ordering): the caller wires this only from
 /// [`build_window_root`], which runs AFTER the window's model is fully
 /// constructed — `WindowState::with_seed`'s `repair_project_structure` +
-/// `prune_dangling_parent_references` + active-tab re-apply, and
+/// `prune_dangling_parent_references` + active-session re-apply, and
 /// `open_managed_window_with`'s cwd-heal pass, all land BEFORE the observer
 /// exists — so boot never self-saves a half-built snapshot. Restore's single
 /// explicit `save_to_store` (which persists that healed, repaired shape) is a
@@ -1714,7 +1714,7 @@ pub(crate) fn wire_tree_mutation_save(state: &Entity<WindowState>, cx: &mut App)
     // The model's `FnMut()` observer: signal only — NEVER re-enter the leased
     // entity here (D1). A dropped receiver (window gone) just makes the send fail.
     state.update(cx, |ws, _cx| {
-        ws.model.set_on_tree_mutation(move || {
+        ws.workspace.set_on_tree_mutation(move || {
             let _ = tx.unbounded_send(());
         });
     });
@@ -1742,14 +1742,14 @@ pub(crate) fn wire_tree_mutation_save(state: &Entity<WindowState>, cx: &mut App)
 /// Build a managed window's root view over its per-window [`WindowState`] entity
 /// — the R13.5 shipped shell. Registers the state in the [`WindowRegistry`],
 /// tracks activation for the registry's MRU (Swift's `didBecomeKey` role), mounts
-/// the [`AppShellView`](crate::app_shell::AppShellView) composition (the R11 pane
-/// strip + R10 floating sidebar card + the pane-content host, all over the one
+/// the [`AppShellView`](crate::app_shell::AppShellView) composition (the R11 window
+/// strip + R10 floating sidebar card + the window-content host, all over the one
 /// shared state), and keeps the View-menu full-screen title in sync.
 ///
 /// The R9 chrome-band behaviour (drag / double-click / traffic-light row / press
 /// arbitration) is carried by the toolbar band + the sidebar top strip inside the
 /// shell; [`WindowChromeView`] is unchanged and now mounted only by the `chrome`
-/// self-test scenario. R18 will hand this restored state, R25 an adopted pane —
+/// self-test scenario. R18 will hand this restored state, R25 an adopted window —
 /// they change what `WindowState::new` produces, not this wiring.
 fn build_window_root(
     state: Entity<WindowState>,
@@ -1764,15 +1764,15 @@ fn build_window_root(
     let id = window.window_handle().window_id();
     WindowRegistry::register(cx, id, state.clone());
     // R18 (W5): the red-traffic-light close gate (reserved for R18 by
-    // `window_registry.rs`). With live panes it presents the confirmation and
+    // `window_registry.rs`). With live windows it presents the confirmation and
     // vetoes (`false`); the confirm handler calls `remove_window()` (which does
     // not re-enter the gate). Once quit begins it returns `true` unconditionally.
     window.on_window_should_close(cx, {
         let state = state.clone();
         move |window, cx| request_window_close(state.clone(), window, cx)
     });
-    // R15 subscription lift: stash this window's handle so the pane-event
-    // subscription (wired lazily by `PaneHostView`'s render sweep) can actuate a
+    // R15 subscription lift: stash this window's handle so the window-event
+    // subscription (wired lazily by `WindowHostView`'s render sweep) can actuate a
     // RoutedExit's every-project-empty terminus (close/quit) — a `&mut Window` a
     // subscription callback otherwise lacks.
     state.update(cx, |ws, _cx| ws.set_window_handle(window.window_handle()));
@@ -1780,7 +1780,7 @@ fn build_window_root(
     // save, once per window. Runs here — after `open_managed_window_with` has
     // finished constructing/restoring/cwd-healing the model — so restore never
     // self-saves a half-built snapshot (D5). Every live mutation from now on
-    // (rename, add/remove pane or tab, OSC cwd/title, dissolve, …) persists by
+    // (rename, add/remove window or session, OSC cwd/title, dissolve, …) persists by
     // construction, retiring the fragile per-site enumeration.
     wire_tree_mutation_save(&state, cx);
     state.update(cx, |_state, cx| {
@@ -1805,33 +1805,33 @@ fn build_window_root(
     });
 
     // Mount the shipped shell. The sidebar owns the two-mode layout + peek +
-    // resize; the toolbar band and the pane-content host ride its content slots
+    // resize; the toolbar band and the window-content host ride its content slots
     // (Swift's `AppShellView` expanded / collapsed layout). All three surfaces
-    // render from and mutate the ONE shared `WindowState` (the "one TabModel per
-    // window" invariant). The pane host uses the same theme / accent / shared
-    // font as the old single-terminal window and follows the active pane through
-    // `SessionManager::activate_pane`.
+    // render from and mutate the ONE shared `WindowState` (the "one WorkspaceModel per
+    // window" invariant). The window host uses the same theme / accent / shared
+    // font as the old single-terminal window and follows the active window through
+    // `PtyManager::activate_term_window`.
     let font = crate::keymap::shared_font_settings(cx);
-    // R21: seed new panes with the live active terminal theme + accent
+    // R21: seed new windows with the live active terminal theme + accent
     // (`SharedThemeState`), replacing the fixed `nice_default_dark` + Terracotta
     // pair. Falls back to that same pair when the theme global is absent (a
     // scenario driving `build_window_root` without live theming), so the shipped
     // pre-R21 look is unchanged for those paths.
     let (theme, accent) = crate::theme_settings::active_terminal_theme_and_accent(cx);
-    // Restyle plan 3: seed the pane host with the active-scheme surface-fill
-    // opacity so this window's first-built panes paint their default background at
+    // Restyle plan 3: seed the window host with the active-scheme surface-fill
+    // opacity so this window's first-built windows paint their default background at
     // the stored translucency (1.0 — opaque — when no live theme is installed).
     let opacity = crate::theme_settings::active_window_opacity(cx);
-    let pane_host = cx.new(|cx| {
-        crate::app_shell::PaneHostView::new(state.clone(), theme, accent, opacity, font, cx)
+    let window_host = cx.new(|cx| {
+        crate::app_shell::WindowHostView::new(state.clone(), theme, accent, opacity, font, cx)
     });
-    // R21: stash the pane host on the window state so the process theme fan-out
-    // (`apply_theme_fanout`) can reach this window's terminal panes through
+    // R21: stash the window host on the window state so the process theme fan-out
+    // (`apply_theme_fanout`) can reach this window's terminal windows through
     // `WindowRegistry::all_states`.
-    state.update(cx, |ws, _cx| ws.set_pane_host(pane_host.clone()));
+    state.update(cx, |ws, _cx| ws.set_window_host(window_host.clone()));
     // R21: the OS-appearance sync adapter (OQ1) — on a system light/dark switch,
     // reconcile the store (a no-op unless `sync_with_os`, which then fans chrome +
-    // panes + Claude out). Wired on the `Window` directly (NOT through a
+    // windows + Claude out). Wired on the `Window` directly (NOT through a
     // `WindowState` Context): the fan-out reads every window's `WindowState`, so the
     // callback must run with a clean `&mut App`, never inside a `WindowState` update
     // (that would re-enter the entity read). The value comes from the injected
@@ -1861,17 +1861,17 @@ fn build_window_root(
         crate::sidebar_shell::SidebarShellView::new_composed(
             state.clone(),
             toolbar.clone().into(),
-            pane_host.clone().into(),
+            window_host.clone().into(),
             cx,
         )
     });
     // M2 Item D focus routing: the toolbar / sidebar return key focus to the
-    // active terminal through the pane host (rename commit/cancel, context-menu
+    // active terminal through the window host (rename commit/cancel, context-menu
     // dismissal, and the chrome-click focus bounce).
-    toolbar.update(cx, |t, _| t.set_pane_host(pane_host.clone()));
-    sidebar.update(cx, |s, _| s.set_pane_host(pane_host.clone()));
+    toolbar.update(cx, |t, _| t.set_window_host(window_host.clone()));
+    sidebar.update(cx, |s, _| s.set_window_host(window_host.clone()));
     let shell =
-        cx.new(|cx| crate::app_shell::AppShellView::new(state, sidebar, toolbar, pane_host, cx));
+        cx.new(|cx| crate::app_shell::AppShellView::new(state, sidebar, toolbar, window_host, cx));
 
     // R9 (slice 2): keep the View menu's full-screen title in sync as this window
     // enters / exits full screen (now hung on the shell root instead of the bare
@@ -2662,8 +2662,8 @@ impl Render for TermRenderView {
 /// VISIBLE window it is a no-op — the running display link presents the
 /// notify-dirtied window on its next tick — and it fires only while the window
 /// is occluded, i.e. exactly when gpui has stopped the link and the kick is
-/// the only path to a present. So installing this on every pane stays correct
-/// AND cheap: a flooding pane in a visible window no longer drives the
+/// the only path to a present. So installing this on every window stays correct
+/// AND cheap: a flooding window in a visible window no longer drives the
 /// `displayLayer:` link stop/recreate storm (up to ~166/s at the r5 throttle
 /// cadence) that wedged presentation on 2026-07-10 (see `platform` fact 1).
 pub(crate) fn install_present_kick(
@@ -2725,7 +2725,7 @@ fn open_term_render_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 
     // Wire the demand-present kick now that the window exists: on damage the
     // session handle notifies + `setNeedsDisplay`s this window (see
-    // `platform::present_kick`), so an occluded pane still presents. Harmless on
+    // `platform::present_kick`), so an occluded window still presents. Harmless on
     // this frontmost, RAF-animated self-test window (it presents every frame).
     install_present_kick(&handle, window, cx);
 
@@ -3447,7 +3447,7 @@ async fn run_term_scroll_assertions(
 // `term-perf` self-test scenario — the streaming frame-time + memory budget gate
 // (R4, Validation §5).
 //
-// Floods a live ~120×40 pane (scrollback knob 10_000, explicit) with 15 s of the
+// Floods a live ~120×40 window (scrollback knob 10_000, explicit) with 15 s of the
 // deterministic `nice_harness::workload` synthetic stream (the spike's renderer
 // stressor: SGR churn, line-redraw/reflow, long lines, unicode/box glyphs) fed
 // through a RAW-mode `cat`, while the RAF-animated `TerminalView` stamps a frame
@@ -3462,13 +3462,13 @@ async fn run_term_scroll_assertions(
 // `nice_harness::selftest::report_gate` (see [`Gate::SelfReported`]).
 // ---------------------------------------------------------------------------
 
-/// Perf pane grid (Validation §5: "~120×40"). Rows first in `with_size`.
+/// Perf window grid (Validation §5: "~120×40"). Rows first in `with_size`.
 const TP_ROWS: u16 = 40;
 const TP_COLS: u16 = 120;
 /// Scrollback knob, set **explicitly** to 10_000 (not the parity default) per
 /// Validation §5 — the perf/memory workload must exercise a deep history.
 const TP_SCROLLBACK: usize = 10_000;
-/// Perf pane font + cell box (fixed; font resolution / zoom is R7). Matches the
+/// Perf window font + cell box (fixed; font resolution / zoom is R7). Matches the
 /// `term-render` pitch so the renderer paints identically.
 const TP_FONT_FAMILY: &str = "Menlo";
 const TP_FONT_PX: f32 = 13.0;
@@ -3486,7 +3486,7 @@ const TP_P95_LIMIT_MS: f64 = 20.0;
 /// run (a fresh process — measured 142 MiB).
 const TP_MEM_LIMIT_MIB: f64 = 200.0;
 /// The **gated** memory budget: term-perf's own footprint GROWTH (delta from the
-/// entry baseline, sampled before the pane is fed). Run inside the `all` suite,
+/// entry baseline, sampled before the window is fed). Run inside the `all` suite,
 /// term-perf inherits ~140 MiB of retained state from the five prior scenarios
 /// (windows, sessions, the glyph atlas, `render_to_image` readbacks) — a harness
 /// artifact, not the renderer's footprint. Gating the growth measures exactly
@@ -3525,7 +3525,7 @@ const TP_WORKLOAD_BYTES: usize = 2_000_000;
 /// machine's retries.
 const TP_REPORT_BUDGET: Duration = Duration::from_secs(60);
 
-/// Window geometry for the perf pane: sized so the full 120×40 grid (960×640 px
+/// Window geometry for the perf window: sized so the full 120×40 grid (960×640 px
 /// at 8×16) fits inside the content area, so no rows clip and the measured paint
 /// is the whole grid.
 fn perf_window_options() -> WindowOptions {
@@ -3924,7 +3924,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "pane-strip",
-            open: crate::pane_strip_live::open_pane_strip_window,
+            open: crate::window_strip_live::open_window_strip_window,
             gate: Gate::SelfReported {
                 // A pill-vs-band drag differential, the overflow adds + chevron,
                 // an auto-center select, and a chevron click, with their settles —
@@ -3933,9 +3933,9 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
-        // R13: the session-manager lifecycle gate — drives the real SessionManager
+        // R13: the session-manager lifecycle gate — drives the real PtyManager
         // on a real WindowState (create-and-spawn, deferred spawn, clean-exit
-        // neighbor refocus, last-pane dissolve + fallback, held detour) over real
+        // neighbor refocus, last-window dissolve + fallback, held detour) over real
         // ptys, headless (no view). Self-reported; it registers no WindowRegistry,
         // so it stays before the `multiwindow` scenario that installs the
         // quit-when-empty close observer.
@@ -3951,10 +3951,10 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         },
         // R13.5: the app-shell composition gate — drives the SHIPPED builder
         // (`open_managed_window` / `build_window_root`, the exact path `run` uses)
-        // and asserts the mounted shell: the sidebar + pane-strip AX anchors are
-        // exposed, ⌘T adds a visible pill and switches pane content, ⌘B collapses/
+        // and asserts the mounted shell: the sidebar + window-strip AX anchors are
+        // exposed, ⌘T adds a visible pill and switches window content, ⌘B collapses/
         // expands the card (geometry read), the strip `+` spawns a real pty whose
-        // output renders, closing the extra pane refocuses a neighbor, and teardown
+        // output renders, closing the extra window refocuses a neighbor, and teardown
         // reaps every pty. Registered BEFORE `multiwindow`: it does NOT install the
         // `WindowRegistry` close observer (its `build_window_root` only `register`s,
         // via `default_global`), so closing its window never trips the quit-when-
@@ -3965,7 +3965,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             open: crate::app_shell_live::open_app_shell_window,
             gate: Gate::SelfReported {
                 // Login-shell spawns + grid-readiness polls for the ⌘T and strip-+
-                // panes, the AX-tree activation poll, and the teardown reap of
+                // windows, the AX-tree activation poll, and the teardown reap of
                 // several ptys, each on the real pty clock; generous headroom.
                 budget: Duration::from_secs(60),
             },
@@ -3973,9 +3973,9 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         },
         // R14: the shell-injection + control-socket transport gate — spawns real
         // login shells through the live spawn path with manager env injection
-        // active (the synthetic ZDOTDIR rc chain + per-pane NICE_SOCKET/ids), then
+        // active (the synthetic ZDOTDIR rc chain + per-window NICE_SOCKET/ids), then
         // asserts the TRANSPORT: the USER_RC_RAN chain-back, the `claude --help`
-        // bypass, a `claude` handshake recording the pane's exact ids/cwd + one
+        // bypass, a `claude` handshake recording the window's exact ids/cwd + one
         // reply line, a raw-UnixStream session_update surfacing normalized, the
         // NICE_PREFILL_COMMAND pre-type, socket self-heal, and teardown unlink.
         // Headless (its own root, no view assertions); registers no WindowRegistry,
@@ -3987,20 +3987,20 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 // Two real login-shell spawns + grid-readiness polls, a real
                 // `claude()` handshake round-trip, raw-socket drives, the prefill
-                // pane, a socket self-heal poll, and the teardown reap — each on the
+                // window, a socket self-heal poll, and the teardown reap — each on the
                 // real pty / socket clock; generous headroom.
                 budget: Duration::from_secs(90),
             },
             activate: true,
         },
-        // R15: the Claude tab lifecycle gate — drives the WHOLE Claude flow over the
+        // R15: the Claude session lifecycle gate — drives the WHOLE Claude flow over the
         // SHIPPED window (open_managed_window / build_window_root) with a real
         // control socket + real ptys + the live route_terminal_event subscription
-        // lift: a socket newtab spawns a running Claude tab (minted v4 uuid, stub
+        // lift: a socket newtab spawns a running Claude session (minted v4 uuid, stub
         // OSC titles drive the sidebar-dot status Thinking → Waiting); a second
-        // `claude` in that tab is refused; a terminal pane promotes in place
-        // (inplace <uuid> + model flip); `claude -w foo` splits Tab.cwd into
-        // .claude/worktrees/foo; a typed `exit` removes a live pane via the
+        // `claude` in that session is refused; a terminal window promotes in place
+        // (inplace <uuid> + model flip); `claude -w foo` splits Session.cwd into
+        // .claude/worktrees/foo; a typed `exit` removes a live window via the
         // subscription lift. Stub-`claude` via NICE_CLAUDE_OVERRIDE + sandbox HOME
         // (never the real claude / real ~). Registered BEFORE `multiwindow`: its
         // build_window_root only `register`s (no WindowRegistry close observer), so
@@ -4011,7 +4011,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             gate: Gate::SelfReported {
                 // A socket round-trip + a spawned stub's two OSC titles (with a line
                 // of input between), a promotion, a worktree split, and a
-                // read-then-exit pane — each on the real socket / pty clock; generous
+                // read-then-exit window — each on the real socket / pty clock; generous
                 // headroom.
                 budget: Duration::from_secs(75),
             },
@@ -4020,7 +4020,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // R17: the Milestone-3 shipped-surface gate — drives the SHIPPED window
         // (open_managed_window / build_window_root) the way a user does: types
         // `claude\n` into real ptys carrying the R14 `claude()` shadow, with R17's
-        // theme sync ON. A typed newtab opens a running Claude tab (minted v4 uuid,
+        // theme sync ON. A typed newtab opens a running Claude session (minted v4 uuid,
         // stub OSC titles pulse the shipped sidebar-dot Thinking → Waiting); a typed
         // in-place promotion through the real zsh wrapper exec's the stub with
         // `--settings <ptr> --session-id <uuid>` argv; a session_update /branch +
@@ -4086,18 +4086,18 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             },
             activate: true,
         },
-        // R20.5: the busy-pane close-confirmation gate. Drives the SHIPPED window
+        // R20.5: the busy-window close-confirmation gate. Drives the SHIPPED window
         // (open_managed_window / build_window_root) with a real ZDOTDIR-blanked
         // terminal shell: an idle pill-✕ close is immediate (no modal); a shell
         // given a real foreground child (`sleep`) is gated behind the "Force quit"
         // modal (the ONE true-`tcgetpgrp` leg) — cancel keeps it, confirm kills it;
-        // and a `.tabs` batch of one idle + one busy tab partial-closes on cancel.
+        // and a `.tabs` batch of one idle + one busy session partial-closes on cancel.
         // Only the pill-✕ close is a real CGEvent; the modal is answered via
         // ConfirmationModal::resolve. Stub-`claude` via NICE_CLAUDE_OVERRIDE + a
         // sandbox HOME/ZDOTDIR (never the real claude / ~). Registered BEFORE
         // `multiwindow`: its build_window_root only `register`s (no WindowRegistry
-        // close observer), so its pane/tab closes never trip the quit-when-empty
-        // terminus (the driver keeps the Main tab populated throughout).
+        // close observer), so its window/session closes never trip the quit-when-empty
+        // terminus (the driver keeps the Main session populated throughout).
         Scenario {
             name: "close-confirmation",
             open: crate::close_confirm_live::open_close_confirmation_window,
@@ -4115,7 +4115,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // installed (store at a temp path, catalog stub, a scenario-minted
         // SharedThemeState + injected OsSchemeSource stub), then drives the store
         // apply_* mutators + reconcile_with_os and asserts BOTH fan-out halves:
-        // chrome (active Slots) and a live terminal pane (pushed TerminalTheme + a
+        // chrome (active Slots) and a live terminal window (pushed TerminalTheme + a
         // ground-truth pixel recolor), plus the OS-sync gate, the userPicked
         // sync-off contradiction, the inactive-slot latency, and the R17-live Claude
         // mirror (colors-file byte-diff + provider re-source). Sandbox HOME + temp
@@ -4138,7 +4138,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // Import legs, R24's recorder legs (s1–s3), and R24's §6 tranche-5 FINAL
         // COMPOSITION leg over the REAL registered launch window (a rebound chord
         // dispatches, the non-rebindable set survives, ⌘, opens settings + a live
-        // theme change repaints shipped chrome + a terminal cell, and a busy pane
+        // theme change repaints shipped chrome + a terminal cell, and a busy window
         // close presents R20.5's confirmation — the Milestone-6 claim). The R23 host
         // legs run over minimal host windows; the §6 leg opens its OWN shipped window
         // (`open_managed_window`, whose `build_window_root` only `register`s — no
@@ -4161,10 +4161,10 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // build_window_root) over a real control socket + real ptys: the installer
         // round-trips the two -rs files against INJECTED scratch dirs (never the
         // real ~/.claude / ~/.nice); a socket `handoff` naming a seeded originating
-        // Claude tab opens a nested [HANDOFF]-titled tab (locked, parented under the
-        // originating tab) whose stub argv carries --session-id/--model/--effort +
+        // Claude session opens a nested [HANDOFF]-titled session (locked, parented under the
+        // originating session) whose stub argv carries --session-id/--model/--effort +
         // the prompt last; a miss (empty tabId) still replies `ok` and opens a
-        // top-level [HANDOFF] Session tab; and empty model/effort omit both flags.
+        // top-level [HANDOFF] session; and empty model/effort omit both flags.
         // The stub `claude` is seeded via the ResolvedClaudePath Global with
         // NICE_CLAUDE_OVERRIDE UNSET (so is_override stays false and the flags emit);
         // no real claude spawns. Sandbox HOME (no rc) for the driver's lifetime.
@@ -4185,7 +4185,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // The dispatch gate — the `/nice-dispatch` twin of `handoff`, likewise on
         // the SHIPPED window over a real control socket + real ptys with a stub
         // `claude` (never the real one) and a sandboxed HOME. Two legs: a raw
-        // `dispatch` message opens a nested, UNSELECTED `[DISPATCH] <worktree>` tab
+        // `dispatch` message opens a nested, UNSELECTED `[DISPATCH] <worktree>` session
         // (locked title, parented under the seeded dispatcher, spawned from the
         // PAYLOAD cwd — never the dispatcher's own) whose argv carries
         // `--add-dir <brief dir>` immediately followed by `--worktree <name>` then
@@ -4209,7 +4209,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         // R27: the update-checker gate — mounts the real WindowToolbarView over a
-        // seeded tab and drives the WHOLE nudge through the INJECTED recording
+        // seeded session and drives the WHOLE nudge through the INJECTED recording
         // ReleaseFetcher (never the real network / github.com, never the launch
         // timer): a newer tag flips update_available + exposes the trailing pill as
         // an AXButton; a real guarded-HID click (behind the activate + raise +
@@ -4236,7 +4236,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // update pill appears on the SHIPPED toolbar off the injected fetcher and a
         // guarded global-HID click opens its popover; (b) a real guarded global-HID
         // drag commits an R25 pill reorder on the shipped strip; (c) a socket
-        // `handoff` opens a nested [HANDOFF]-titled tab on the shipped window (stub
+        // `handoff` opens a nested [HANDOFF]-titled session on the shipped window (stub
         // claude, never real) and ⌘, opens R23's shipped settings window exposing
         // the Claude section (the R26 handoff toggle's home). The R25 drag + R27
         // click post via the NEW guarded global-HID seams (activate + raise +
@@ -4251,8 +4251,8 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             open: crate::tranche6_composition_live::open_tranche6_composition_window,
             gate: Gate::SelfReported {
                 // A check_now marshal-back + AX poll, a guarded-HID pill click, a
-                // guarded-HID reorder drag, a socket handoff round-trip + tab
-                // creation, a stub-claude pane spawn, and a ⌘, settings open + AX
+                // guarded-HID reorder drag, a socket handoff round-trip + session
+                // creation, a stub-claude window spawn, and a ⌘, settings open + AX
                 // rail poll — each on the real socket / pty / AX clock; generous
                 // headroom.
                 budget: Duration::from_secs(90),
@@ -4359,7 +4359,7 @@ pub fn run_selftest(selector: String) {
         // explicitly against it. The production objc2 GET is installed by `run`
         // only. The `UpdateCheckStore` gets DEFAULTS + a throwaway temp path (never
         // the real `ui_settings.json`), so its empty cache seeds no pill — keeping
-        // the toolbar layout-identical for the pane-strip / chrome / app-shell /
+        // the toolbar layout-identical for the window-strip / chrome / app-shell /
         // sidebar scenarios. Construct + install the checker WITHOUT starting the
         // worker (no launch-time network — the worker is `run`-only + gated).
         crate::release_check::release_fetch::install_recording_fake(cx);
@@ -4461,7 +4461,7 @@ mod tests {
     /// #4 / D1+D2: ⌘Q while an UNREGISTERED window (Settings) is key must route the
     /// quit confirmation to the registry's MRU (registered) window — NOT bypass the
     /// dialog into an immediate quit that tears down live terminals unwarned. The
-    /// registered window holds a live Terminal pane (`WindowState::new` seeds one)
+    /// registered window holds a live Terminal window (`WindowState::new` seeds one)
     /// and the unregistered window is the active/key one.
     ///
     /// Asserted through the [`resolve_modal_host`] seam rather than by driving
@@ -4489,9 +4489,9 @@ mod tests {
             .unwrap();
 
         cx.update(|app| {
-            // Preconditions: a live pane keeps ⌘Q on the confirmation path, and the
+            // Preconditions: a live window keeps ⌘Q on the confirmation path, and the
             // active window is genuinely the unregistered one (no registered state).
-            assert_eq!(total_live_pane_counts(app), (0, 1));
+            assert_eq!(total_live_window_counts(app), (0, 1));
             assert_eq!(
                 app.active_window().map(|w| w.window_id()),
                 Some(settings_window.window_id())
@@ -4606,90 +4606,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The persisted tab with `tab_id` across the store's one window, if any.
-    fn persisted_tab(
+    /// The persisted session with `session_id` across the store's one window, if any.
+    fn persisted_session(
         store: &crate::session_store::SessionStore,
-        tab_id: &str,
-    ) -> Option<nice_model::PersistedTab> {
+        session_id: &str,
+    ) -> Option<nice_model::PersistedSession> {
         store
             .load()
             .windows
             .iter()
             .flat_map(|w| w.projects.clone())
-            .flat_map(|p| p.tabs)
-            .find(|t| t.id == tab_id)
+            .flat_map(|p| p.sessions)
+            .find(|t| t.id == session_id)
     }
 
     /// Acceptance #1 (BUGS.md #8 site 1 — `sidebar_shell.rs` `commit_rename`): a
-    /// `rename_tab` inside the lease persists the new title through the observer
+    /// `rename_session` inside the lease persists the new title through the observer
     /// (no explicit per-site save).
     #[gpui::test]
-    fn tab_rename_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
+    fn session_rename_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
         let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (store, dir) = install_temp_store("tab-rename");
+        let (store, dir) = install_temp_store("session-rename");
 
-        let (state, tab_id) = cx.update(|app| {
+        let (state, session_id) = cx.update(|app| {
             let state = app.new(|_cx| WindowState::new("/tmp"));
             wire_tree_mutation_save(&state, app);
-            let tab_id = state.read(app).model.active_tab_id().unwrap().to_string();
-            (state, tab_id)
+            let session_id = state.read(app).workspace.active_session_id().unwrap().to_string();
+            (state, session_id)
         });
 
         cx.update(|app| {
-            state.update(app, |ws, _cx| ws.model.rename_tab(&tab_id, "Renamed Tab"));
+            state.update(app, |ws, _cx| ws.workspace.rename_session(&session_id, "Renamed Tab"));
         });
         cx.run_until_parked();
 
         assert_eq!(
-            persisted_tab(&store, &tab_id).map(|t| t.title),
+            persisted_session(&store, &session_id).map(|t| t.title),
             Some("Renamed Tab".to_string()),
-            "the tab rename persisted through the wired observer, not a per-site save"
+            "the session rename persisted through the wired observer, not a per-site save"
         );
 
         teardown_temp_store(dir);
     }
 
     /// Acceptance #2 (BUGS.md #8 site 2 — `toolbar.rs` `commit_rename`): a
-    /// `rename_pane` persists both the label AND the `next_terminal_index`
+    /// `rename_window` persists both the label AND the `next_terminal_index`
     /// never-reuse counter. A non-empty rename locks the label; a follow-up
     /// empty-submit resets it and CONSUMES a counter slot — the increment bug #2
     /// specifically called out. Both land in the store via the observer.
     #[gpui::test]
-    fn pane_rename_persists_label_and_next_terminal_index(cx: &mut gpui::TestAppContext) {
+    fn window_rename_persists_label_and_next_terminal_index(cx: &mut gpui::TestAppContext) {
         let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (store, dir) = install_temp_store("pane-rename");
+        let (store, dir) = install_temp_store("window-rename");
 
-        let (state, tab_id, pane_id) = cx.update(|app| {
+        let (state, session_id, term_window_id) = cx.update(|app| {
             let state = app.new(|_cx| WindowState::new("/tmp"));
             wire_tree_mutation_save(&state, app);
-            let (tab_id, pane_id) = {
+            let (session_id, term_window_id) = {
                 let ws = state.read(app);
-                let tab_id = ws.model.active_tab_id().unwrap().to_string();
-                let pane_id = ws
-                    .model
-                    .tab_for(&tab_id)
-                    .and_then(|t| t.panes.first())
+                let session_id = ws.workspace.active_session_id().unwrap().to_string();
+                let term_window_id = ws
+                    .workspace
+                    .session_for(&session_id)
+                    .and_then(|t| t.windows.first())
                     .map(|p| p.id.clone())
                     .unwrap();
-                (tab_id, pane_id)
+                (session_id, term_window_id)
             };
-            (state, tab_id, pane_id)
+            (state, session_id, term_window_id)
         });
 
         // Non-empty rename: label locks; counter unchanged (baseline 2 persisted).
         cx.update(|app| {
             state.update(app, |ws, _cx| {
-                ws.model.rename_pane(&tab_id, &pane_id, "Deploy")
+                ws.workspace.rename_window(&session_id, &term_window_id, "Deploy")
             });
         });
         cx.run_until_parked();
         {
-            let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
-            let pane = tab.panes.iter().find(|p| p.id == pane_id).expect("pane persisted");
-            assert_eq!(pane.title, "Deploy", "the custom pane label persisted");
-            assert_eq!(pane.title_manually_set, Some(true), "the rename lock persisted");
+            let session = persisted_session(&store, &session_id).expect("session persisted");
+            let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+            assert_eq!(term_window.title, "Deploy", "the custom window label persisted");
+            assert_eq!(term_window.title_manually_set, Some(true), "the rename lock persisted");
             assert_eq!(
-                tab.next_terminal_index,
+                session.next_terminal_index,
                 Some(2),
                 "the never-reuse counter rides the snapshot"
             );
@@ -4697,15 +4697,15 @@ mod tests {
 
         // Empty submit: reset to the per-kind auto-default + consume a slot.
         cx.update(|app| {
-            state.update(app, |ws, _cx| ws.model.rename_pane(&tab_id, &pane_id, ""));
+            state.update(app, |ws, _cx| ws.workspace.rename_window(&session_id, &term_window_id, ""));
         });
         cx.run_until_parked();
         {
-            let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
-            let pane = tab.panes.iter().find(|p| p.id == pane_id).expect("pane persisted");
-            assert_eq!(pane.title, "Terminal 2", "empty submit reset to the auto-default");
+            let session = persisted_session(&store, &session_id).expect("session persisted");
+            let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+            assert_eq!(term_window.title, "Terminal 2", "empty submit reset to the auto-default");
             assert_eq!(
-                tab.next_terminal_index,
+                session.next_terminal_index,
                 Some(3),
                 "the never-reuse counter INCREMENT (site 2's lost mutation) persisted"
             );
@@ -4715,57 +4715,57 @@ mod tests {
     }
 
     /// Acceptance #3 (BUGS.md #8 site 3 — OSC 7 cwd via `route_terminal_event`):
-    /// a `pane_cwd_changed` (which routes through `TabModel::mutate_tab`) persists
-    /// the pane's new cwd through the observer.
+    /// a `window_cwd_changed` (which routes through `WorkspaceModel::mutate_session`) persists
+    /// the window's new cwd through the observer.
     #[gpui::test]
-    fn osc_cwd_change_persists_through_mutate_tab(cx: &mut gpui::TestAppContext) {
+    fn osc_cwd_change_persists_through_mutate_session(cx: &mut gpui::TestAppContext) {
         let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (store, dir) = install_temp_store("osc-cwd");
 
-        let (state, tab_id, pane_id) = cx.update(|app| {
+        let (state, session_id, term_window_id) = cx.update(|app| {
             let state = app.new(|_cx| WindowState::new("/tmp"));
             wire_tree_mutation_save(&state, app);
-            let (tab_id, pane_id) = {
+            let (session_id, term_window_id) = {
                 let ws = state.read(app);
-                let tab_id = ws.model.active_tab_id().unwrap().to_string();
-                let pane_id = ws
-                    .model
-                    .tab_for(&tab_id)
-                    .and_then(|t| t.panes.first())
+                let session_id = ws.workspace.active_session_id().unwrap().to_string();
+                let term_window_id = ws
+                    .workspace
+                    .session_for(&session_id)
+                    .and_then(|t| t.windows.first())
                     .map(|p| p.id.clone())
                     .unwrap();
-                (tab_id, pane_id)
+                (session_id, term_window_id)
             };
-            (state, tab_id, pane_id)
+            (state, session_id, term_window_id)
         });
 
         cx.update(|app| {
             state.update(app, |ws, _cx| {
-                let WindowState { session, model, .. } = ws;
-                let changed = session.pane_cwd_changed(model, &tab_id, &pane_id, "/tmp/newcwd");
+                let WindowState { ptys, workspace, .. } = ws;
+                let changed = ptys.window_cwd_changed(workspace, &session_id, &term_window_id, "/tmp/newcwd");
                 assert!(changed, "the cwd genuinely changed");
             });
         });
         cx.run_until_parked();
 
-        let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
-        let pane = tab.panes.iter().find(|p| p.id == pane_id).expect("pane persisted");
+        let session = persisted_session(&store, &session_id).expect("session persisted");
+        let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
         assert_eq!(
-            pane.cwd.as_deref(),
+            term_window.cwd.as_deref(),
             Some("/tmp/newcwd"),
-            "the OSC 7 cwd (routed through mutate_tab) persisted through the observer"
+            "the OSC 7 cwd (routed through mutate_session) persisted through the observer"
         );
 
         teardown_temp_store(dir);
     }
 
     /// Acceptance #4 (BUGS.md #8 site 4 — ctrl+d / clean pty-exit dissolve): a
-    /// `remove_tab` persists the tab's disappearance through the observer, so a
-    /// crash after a dissolve cannot resurrect the closed tab.
+    /// `remove_session` persists the session's disappearance through the observer, so a
+    /// crash after a dissolve cannot resurrect the closed session.
     #[gpui::test]
-    fn remove_tab_dissolve_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
+    fn remove_session_dissolve_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
         let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (store, dir) = install_temp_store("remove-tab");
+        let (store, dir) = install_temp_store("remove-session");
 
         let state = cx.update(|app| {
             let state = app.new(|_cx| WindowState::new("/tmp"));
@@ -4773,69 +4773,69 @@ mod tests {
             state
         });
 
-        // Add a second tab, then confirm it persisted (add_tab_to_projects fires
+        // Add a second session, then confirm it persisted (add_session_to_projects fires
         // the observer too).
         cx.update(|app| {
             state.update(app, |ws, _cx| {
-                let mut tab = nice_model::Tab::new("tab-dissolve", "Doomed", "/tmp");
-                tab.panes
-                    .push(nice_model::Pane::new("tab-dissolve-p0", "Terminal 1", nice_model::PaneKind::Terminal));
-                tab.active_pane_id = Some("tab-dissolve-p0".to_string());
-                ws.model.add_tab_to_projects(tab, "/tmp");
+                let mut session = nice_model::Session::new("tab-dissolve", "Doomed", "/tmp");
+                session.windows
+                    .push(nice_model::TermWindow::new("tab-dissolve-p0", "Terminal 1", nice_model::TermWindowKind::Terminal));
+                session.active_window_id = Some("tab-dissolve-p0".to_string());
+                ws.workspace.add_session_to_projects(session, "/tmp");
             });
         });
         cx.run_until_parked();
         assert!(
-            persisted_tab(&store, "tab-dissolve").is_some(),
-            "precondition: the added tab persisted"
+            persisted_session(&store, "tab-dissolve").is_some(),
+            "precondition: the added session persisted"
         );
 
         // Dissolve it through the single removal entry point.
         cx.update(|app| {
             state.update(app, |ws, _cx| {
-                let (pi, ti) = ws.model.project_tab_index("tab-dissolve").expect("tab present");
-                ws.model.remove_tab(pi, ti);
+                let (pi, ti) = ws.workspace.project_session_index("tab-dissolve").expect("session present");
+                ws.workspace.remove_session(pi, ti);
             });
         });
         cx.run_until_parked();
         assert!(
-            persisted_tab(&store, "tab-dissolve").is_none(),
-            "the dissolve persisted — the closed tab is gone from the store"
+            persisted_session(&store, "tab-dissolve").is_none(),
+            "the dissolve persisted — the closed session is gone from the store"
         );
 
         teardown_temp_store(dir);
     }
 
-    /// Acceptance #5 (BUGS.md #8 site 5 — tab/pane creation seams): an `add_pane`
-    /// persists the new pane through the observer.
+    /// Acceptance #5 (BUGS.md #8 site 5 — session/window creation seams): an `add_window`
+    /// persists the new window through the observer.
     #[gpui::test]
-    fn add_pane_creation_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
+    fn add_window_creation_persists_through_the_observer(cx: &mut gpui::TestAppContext) {
         let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (store, dir) = install_temp_store("add-pane");
+        let (store, dir) = install_temp_store("add-window");
 
-        let (state, tab_id) = cx.update(|app| {
+        let (state, session_id) = cx.update(|app| {
             let state = app.new(|_cx| WindowState::new("/tmp"));
             wire_tree_mutation_save(&state, app);
-            let tab_id = state.read(app).model.active_tab_id().unwrap().to_string();
-            (state, tab_id)
+            let session_id = state.read(app).workspace.active_session_id().unwrap().to_string();
+            (state, session_id)
         });
 
         cx.update(|app| {
             state.update(app, |ws, _cx| {
-                ws.model.add_pane(&tab_id, "new-pane-id", None);
+                ws.workspace.add_window(&session_id, "new-pane-id", None);
             });
         });
         cx.run_until_parked();
 
-        let tab = persisted_tab(&store, &tab_id).expect("tab persisted");
+        let session = persisted_session(&store, &session_id).expect("session persisted");
         assert!(
-            tab.panes.iter().any(|p| p.id == "new-pane-id"),
-            "the newly-created pane persisted through the observer"
+            session.windows.iter().any(|p| p.id == "new-pane-id"),
+            "the newly-created window persisted through the observer"
         );
         assert_eq!(
-            tab.next_terminal_index,
+            session.next_terminal_index,
             Some(3),
-            "add_pane consumed a counter slot and the increment persisted"
+            "add_window consumed a counter slot and the increment persisted"
         );
 
         teardown_temp_store(dir);
@@ -4852,24 +4852,24 @@ mod tests {
         let _guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (store, dir) = install_temp_store("double-lease");
 
-        let (state, tab_id) = cx.update(|app| {
+        let (state, session_id) = cx.update(|app| {
             let state = app.new(|_cx| WindowState::new("/tmp"));
             wire_tree_mutation_save(&state, app);
-            let tab_id = state.read(app).model.active_tab_id().unwrap().to_string();
-            (state, tab_id)
+            let session_id = state.read(app).workspace.active_session_id().unwrap().to_string();
+            (state, session_id)
         });
 
         // The mutation runs while the entity is leased — the observer fires here.
         // If it re-entered `state` synchronously, this line would abort the process.
         cx.update(|app| {
             state.update(app, |ws, _cx| {
-                ws.model.rename_tab(&tab_id, "Lease Safe");
+                ws.workspace.rename_session(&session_id, "Lease Safe");
             });
         });
         cx.run_until_parked();
 
         assert_eq!(
-            persisted_tab(&store, &tab_id).map(|t| t.title),
+            persisted_session(&store, &session_id).map(|t| t.title),
             Some("Lease Safe".to_string()),
             "the deferred drain saved outside the lease — no double-lease abort"
         );

@@ -1,8 +1,8 @@
 //! `AppShellView` — the per-window composition root that mounts the shipped
-//! Swift-parity shell (`Sources/Nice/Views/AppShellView.swift`): the R11 pane
+//! Swift-parity shell (`Sources/Nice/Views/AppShellView.swift`): the R11 window
 //! strip riding the chrome band, the R10 floating sidebar card on the leading
-//! edge, and terminal content that follows the active pane through R13's
-//! [`SessionManager`]. One `AppShellView` per window; the app's window builder
+//! edge, and terminal content that follows the active window through R13's
+//! [`PtyManager`]. One `AppShellView` per window; the app's window builder
 //! (`crate::app::build_window_root`) mints it over the window's shared
 //! [`WindowState`] entity for the first window and every ⌘N window.
 //!
@@ -10,7 +10,7 @@
 //!
 //! The layout tree is rooted in [`SidebarShellView`], which already owns the two
 //! shell modes (expanded floating card / collapsed full-width band), the peek overlay, and
-//! the resize handle. R13.5 threads the toolbar band and the pane content into
+//! the resize handle. R13.5 threads the toolbar band and the window content into
 //! its previously-placeholder content region through two injected `AnyView`
 //! slots (`main_toolbar` / `main_body`) — mirroring Swift's `expandedShell`
 //! (`HStack { card ; VStack { WindowToolbarView ; mainContent } }`); the
@@ -21,7 +21,7 @@
 //! formerly on `WindowChromeView`) and re-renders the whole shell subtree when
 //! any of its parts notify — so a pill click (which notifies only the toolbar)
 //! or a sidebar-row click (which notifies only the sidebar) still re-renders the
-//! [`PaneHostView`] sibling and switches pane content.
+//! [`WindowHostView`] sibling and switches window content.
 //!
 //! The R9 chrome band's drag / double-click / traffic-light-row behaviour is
 //! preserved byte-for-byte: in the shipped shell the band role is carried by the
@@ -30,17 +30,17 @@
 //! gate). `WindowChromeView` itself is unchanged and still exercised by the
 //! `chrome` self-test scenario.
 //!
-//! ## Pane content host (the PROTECTED activation decision)
+//! ## Window content host (the PROTECTED activation decision)
 //!
-//! [`PaneHostView`] maps the active `(tab_id, pane_id)` →
-//! [`SessionManager::pane_handle`] → a per-pane [`TerminalView`] created lazily
-//! on first activation, cached per pane id, and dropped when the pane leaves the
+//! [`WindowHostView`] maps the active `(session_id, term_window_id)` →
+//! [`PtyManager::term_window_handle`] → a per-window [`TerminalView`] created lazily
+//! on first activation, cached per window id, and dropped when the window leaves the
 //! model. It uses the shared theme / accent / font exactly as
 //! `open_managed_window` does today. Activation flows **only** through
-//! [`SessionManager::activate_pane`] (R13's deferred-spawn — no view-side spawn
-//! shortcuts); this host then focuses the newly-active pane's terminal on the
+//! [`PtyManager::activate_term_window`] (R13's deferred-spawn — no view-side spawn
+//! shortcuts); this host then focuses the newly-active window's terminal on the
 //! same activation render, and re-points the demand-present kick to the active
-//! pane's handle on every switch.
+//! window's handle on every switch.
 
 // Mounted by `crate::app::build_window_root`; the AX-anchor label constants are a
 // deliberately-exported contract (the shipped-surface assertion hooks, §6) whose
@@ -68,24 +68,24 @@ use crate::window_state::WindowState;
 /// root by the sidebar view; named here as the composition contract.
 pub(crate) const SIDEBAR_ROOT_LABEL: &str = "nice-sidebar-root";
 
-/// The AX label + element id the shipped pane-strip (toolbar) root carries — the
+/// The AX label + element id the shipped window-strip (toolbar) root carries — the
 /// sibling of [`SIDEBAR_ROOT_LABEL`]. Placed on [`WindowToolbarView`]'s root.
-pub(crate) const PANE_STRIP_ROOT_LABEL: &str = "nice-pane-strip-root";
+pub(crate) const WINDOW_STRIP_ROOT_LABEL: &str = "nice-pane-strip-root";
 
 /// The per-window composition root. Renders the shipped shell (sidebar card +
-/// toolbar band + pane content) and owns the window-level peek-clear observer.
+/// toolbar band + window content) and owns the window-level peek-clear observer.
 pub(crate) struct AppShellView {
-    /// The shell subtree: the [`SidebarShellView`] with the toolbar band + pane
+    /// The shell subtree: the [`SidebarShellView`] with the toolbar band + window
     /// host injected into its content slots. Rendered as this view's sole child.
     sidebar: Entity<SidebarShellView>,
     /// Held so a re-render of the whole shell can be forced when any composed
     /// part notifies (the observers below). Kept alive alongside `sidebar`.
     toolbar: Entity<WindowToolbarView>,
-    /// The pane-content host mounted in the sidebar's body slot. Held here so
+    /// The window-content host mounted in the sidebar's body slot. Held here so
     /// the `app-shell` scenario can reach the SAME host the window renders (the
     /// M2 Item D focus-routing assertions read its active terminal's focus
     /// handle) — not a parallel copy.
-    pane_host: Entity<PaneHostView>,
+    window_host: Entity<WindowHostView>,
     /// Kept for lifetime + future direct routing; the shared per-window state.
     state: Entity<WindowState>,
     /// R20 (F6): the per-window drift banner — a bottom overlay observing the ONE
@@ -96,8 +96,8 @@ pub(crate) struct AppShellView {
     /// Re-render the shell subtree whenever the shared state (keymap-driven
     /// actions), the toolbar (pill clicks), or the sidebar (row clicks) notifies.
     /// A pill/row click notifies only its own view; without observing them here
-    /// the [`PaneHostView`] sibling would not re-render, so pane content would not
-    /// follow a click-driven active-pane change. Re-rendering `AppShellView`
+    /// the [`WindowHostView`] sibling would not re-render, so window content would not
+    /// follow a click-driven active-window change. Re-rendering `AppShellView`
     /// re-renders the whole subtree (child views render fresh each parent render),
     /// so all three surfaces stay in lockstep.
     _subs: Vec<Subscription>,
@@ -105,14 +105,14 @@ pub(crate) struct AppShellView {
 
 impl AppShellView {
     /// Compose the shell over the window's shared state. `sidebar` already holds
-    /// the injected toolbar + pane-host slots (wired by
+    /// the injected toolbar + window-host slots (wired by
     /// `crate::app::build_window_root`); `toolbar` is held only so its notifies
     /// can force a full-shell re-render.
     pub(crate) fn new(
         state: Entity<WindowState>,
         sidebar: Entity<SidebarShellView>,
         toolbar: Entity<WindowToolbarView>,
-        pane_host: Entity<PaneHostView>,
+        window_host: Entity<WindowHostView>,
         cx: &mut Context<Self>,
     ) -> Self {
         let banner = cx.new(crate::file_browser::banner::DriftBannerView::new);
@@ -127,7 +127,7 @@ impl AppShellView {
         Self {
             sidebar,
             toolbar,
-            pane_host,
+            window_host,
             state,
             banner,
             _subs: subs,
@@ -147,17 +147,17 @@ impl AppShellView {
         self.sidebar.clone()
     }
 
-    /// The shell's toolbar / pane-strip view (its pill list + laid-out pill bounds
+    /// The shell's toolbar / window-strip view (its pill list + laid-out pill bounds
     /// drive the ⌘T "visible pill" assertion, and its `drive_*` seams the strip-`+`
-    /// / close-pane assertions).
+    /// / close-window assertions).
     pub(crate) fn scenario_toolbar(&self) -> Entity<WindowToolbarView> {
         self.toolbar.clone()
     }
 
-    /// The shell's pane-content host (its active terminal's focus handle drives
+    /// The shell's window-content host (its active terminal's focus handle drives
     /// the M2 Item D focus-routing assertions).
-    pub(crate) fn scenario_pane_host(&self) -> Entity<PaneHostView> {
-        self.pane_host.clone()
+    pub(crate) fn scenario_window_host(&self) -> Entity<WindowHostView> {
+        self.window_host.clone()
     }
 }
 
@@ -190,7 +190,7 @@ impl Render for AppShellView {
             .bg(terminal_backing_color(&terminal_theme, opacity))
             // App-wide font family: the (single) terminal font-family setting drives
             // the WHOLE app, not just the terminal grid. Set on the shell root so
-            // every chrome descendant (sidebar, tab strip, settings, buttons,
+            // every chrome descendant (sidebar, session strip, settings, buttons,
             // overlays) inherits it via gpui's text-style cascade unless it sets its
             // own family. Only the family cascades — chrome text SIZES stay per-view,
             // and the terminal grid is unaffected (it shapes glyphs with an explicit
@@ -204,7 +204,7 @@ impl Render for AppShellView {
             )
             // R12: the window-level peek clear (moved here from `WindowChromeView`
             // when the shell replaced the bare chrome band as the window root). A
-            // sidebar-tab cycle on a collapsed sidebar floats the peek overlay; this
+            // sidebar-session cycle on a collapsed sidebar floats the peek overlay; this
             // ends it once the shortcut's modifiers are all released. Registered on
             // the root so it observes modifier changes regardless of which
             // descendant holds focus.
@@ -219,17 +219,17 @@ impl Render for AppShellView {
     }
 }
 
-/// The pane-content host: maps the active `(tab_id, pane_id)` to a per-pane
-/// [`TerminalView`] through the window's [`SessionManager`], following the active
-/// pane as tabs / panes switch. See the module docs' PROTECTED activation
+/// The window-content host: maps the active `(session_id, term_window_id)` to a per-window
+/// [`TerminalView`] through the window's [`PtyManager`], following the active
+/// window as sessions / windows switch. See the module docs' PROTECTED activation
 /// decision.
-pub(crate) struct PaneHostView {
-    /// The shared per-window state (its [`SessionManager`](crate::session_manager::SessionManager)
-    /// owns the live pane sessions; its [`TabModel`](nice_model::TabModel) names
-    /// the active pane).
+pub(crate) struct WindowHostView {
+    /// The shared per-window state (its [`PtyManager`](crate::pty_manager::PtyManager)
+    /// owns the live window sessions; its [`WorkspaceModel`](nice_model::WorkspaceModel) names
+    /// the active window).
     state: Entity<WindowState>,
     /// Re-render when the shared state notifies (a keymap action switched the
-    /// active pane / tab). Click-driven switches are covered by [`AppShellView`]'s
+    /// active window / session). Click-driven switches are covered by [`AppShellView`]'s
     /// observers cascading a full re-render; this covers keymap-driven switches
     /// directly too.
     _state_sub: Subscription,
@@ -240,25 +240,25 @@ pub(crate) struct PaneHostView {
     accent: Srgba,
     /// The active-scheme surface-fill opacity (0.55–1.0) each hosted terminal
     /// paints its DEFAULT background at (restyle plan 3). Seeded from the live
-    /// theme at construction and refreshed by the theme fan-out, so a pane built
+    /// theme at construction and refreshed by the theme fan-out, so a window built
     /// later inherits it too. `1.0` ⇒ the opaque pre-restyle grid.
     background_opacity: f32,
-    /// The process-level shared [`FontSettings`] every pane observes, so a
-    /// ⌘=/⌘−/⌘0 zoom fans out across panes and windows.
+    /// The process-level shared [`FontSettings`] every window observes, so a
+    /// ⌘=/⌘−/⌘0 zoom fans out across windows and windows.
     font: Entity<FontSettings>,
-    /// Per-pane [`TerminalView`] cache (`pane_id -> view`). Created lazily on
-    /// first activation; an entry is dropped when its pane leaves the model.
+    /// Per-window [`TerminalView`] cache (`term_window_id -> view`). Created lazily on
+    /// first activation; an entry is dropped when its window leaves the model.
     cache: HashMap<String, Entity<TerminalView>>,
-    /// The `(tab_id, pane_id)` hosted as of the last render — a change drives the
-    /// single [`SessionManager::activate_pane`] activation + a present-kick
+    /// The `(session_id, term_window_id)` hosted as of the last render — a change drives the
+    /// single [`PtyManager::activate_term_window`] activation + a present-kick
     /// re-point.
     last_active: Option<(String, String)>,
 }
 
-impl PaneHostView {
+impl WindowHostView {
     /// A host over the window's shared state, using the shared theme / accent /
     /// font. Starts with an empty cache; the first render activates + hosts the
-    /// model's active pane.
+    /// model's active window.
     pub(crate) fn new(
         state: Entity<WindowState>,
         theme: TerminalTheme,
@@ -296,7 +296,7 @@ impl PaneHostView {
         let font = self.font.clone();
         cx.new(|tcx| {
             let mut view = TerminalView::new(handle, theme, accent, font, tcx);
-            // Seed the surface-fill opacity so a pane built after a slider change
+            // Seed the surface-fill opacity so a window built after a slider change
             // (or on window open) inherits the current translucency, not the 1.0
             // default (restyle plan 3).
             view.set_background_opacity(background_opacity, tcx);
@@ -315,8 +315,8 @@ impl PaneHostView {
         })
     }
 
-    /// Push a live theme + accent recolor into every hosted pane (R21 fan-out).
-    /// Updates the host's own `theme`/`accent` so panes built LATER seed with the
+    /// Push a live theme + accent recolor into every hosted window (R21 fan-out).
+    /// Updates the host's own `theme`/`accent` so windows built LATER seed with the
     /// new colors too, then pushes into each cached [`TerminalView`] via the
     /// boundary-legal [`TerminalView::set_theme`] setter. Slice 3's
     /// `apply_theme_fanout` calls this per window (walking
@@ -330,8 +330,8 @@ impl PaneHostView {
         }
     }
 
-    /// Push a live surface-fill opacity into every hosted pane (restyle plan 3
-    /// transparency fan-out). Updates the host's own `background_opacity` so panes
+    /// Push a live surface-fill opacity into every hosted window (restyle plan 3
+    /// transparency fan-out). Updates the host's own `background_opacity` so windows
     /// built LATER seed with it too, then pushes into each cached
     /// [`TerminalView`] via [`TerminalView::set_background_opacity`]. The theme
     /// fan-out ([`crate::theme_settings::apply_theme_fanout`]) calls this per window
@@ -343,9 +343,9 @@ impl PaneHostView {
         }
     }
 
-    /// Push a live accent-only recolor into every hosted pane (R21 accent fan-out),
+    /// Push a live accent-only recolor into every hosted window (R21 accent fan-out),
     /// leaving the terminal theme untouched. Updates the host's `accent` so later
-    /// panes seed with it too. The accent-only companion to
+    /// windows seed with it too. The accent-only companion to
     /// [`set_theme`](Self::set_theme).
     pub(crate) fn set_accent(&mut self, accent: Srgba, cx: &mut Context<Self>) {
         self.accent = accent;
@@ -354,39 +354,39 @@ impl PaneHostView {
         }
     }
 
-    /// Move key focus to the active pane's hosted terminal, if any — the
+    /// Move key focus to the active window's hosted terminal, if any — the
     /// app-side focus-routing seam (M2 Item D). The toolbar / sidebar call it
     /// after an inline-rename commit/cancel and on context-menu dismissal, and
     /// the chrome roots bounce stray chrome-click focus back through it. A
-    /// no-op when the active pane has no hosted view (a model-only Claude pane).
+    /// no-op when the active window has no hosted view (a model-only Claude window).
     pub(crate) fn focus_active_terminal(&self, window: &mut Window, cx: &mut App) {
         if let Some(fh) = self.active_terminal_focus_handle(cx) {
             window.focus(&fh, cx);
         }
     }
 
-    /// The active pane's terminal focus handle, if a view is hosted for it —
+    /// The active window's terminal focus handle, if a view is hosted for it —
     /// the `app-shell` scenario's "focus returned to the terminal" read.
     pub(crate) fn active_terminal_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
-        let (_, pane) = self.last_active.as_ref()?;
-        let view = self.cache.get(pane)?;
+        let (_, term_window) = self.last_active.as_ref()?;
+        let view = self.cache.get(term_window)?;
         Some(view.read(cx).focus_handle_ref().clone())
     }
 
-    /// The cached [`TerminalView`] hosting `pane_id`, if the host has built one —
+    /// The cached [`TerminalView`] hosting `term_window_id`, if the host has built one —
     /// the `claude-lifecycle` /branch-overlay leg's read: it activates the deferred
-    /// branch parent, then asserts that pane's view never flashed the stray
+    /// branch parent, then asserts that window's view never flashed the stray
     /// "Launching…" overlay (its `OutputStarted` fired while it had no view).
-    pub(crate) fn scenario_terminal_for(&self, pane_id: &str) -> Option<Entity<TerminalView>> {
-        self.cache.get(pane_id).cloned()
+    pub(crate) fn scenario_terminal_for(&self, term_window_id: &str) -> Option<Entity<TerminalView>> {
+        self.cache.get(term_window_id).cloned()
     }
 }
 
-/// The pane-host's fill when the active pane has no live session yet (a
-/// model-only Claude pane, or a terminal pane an instant before its deferred
+/// The window-host's fill when the active window has no live session yet (a
+/// model-only Claude window, or a terminal window an instant before its deferred
 /// spawn caches a handle) — the shipped dark backdrop, matching the terminal
 /// theme's background so the swap to a real grid is seamless.
-fn pane_placeholder() -> impl IntoElement {
+fn window_placeholder() -> impl IntoElement {
     div().size_full().bg(rgb(0x11141b))
 }
 
@@ -400,7 +400,7 @@ fn pane_placeholder() -> impl IntoElement {
 // scrollerWidth`). `nice-term-view` likewise paints from its bounds origin
 // with zero internal inset (`TERMINAL_BOTTOM_GAP == 0` mirrors prod's
 // `TerminalContainerView.bottomInset == 0`), so the whole prod inset is
-// applied here, app-side, around the hosted pane. Padding shrinks the
+// applied here, app-side, around the hosted window. Padding shrinks the
 // `TerminalView`'s painted bounds, so the grid refit (auto_refit → 200 ms
 // debounce → TIOCSWINSZ) re-fits cols/rows to the inset content area — the
 // same path any window resize takes. The uncovered gap composites over the
@@ -469,40 +469,40 @@ pub(crate) fn terminal_backing_color(theme: &TerminalTheme, opacity: f32) -> Rgb
 
 // ---------------------------------------------------------------------------
 // Pure host logic (target resolution + cache eviction) — extracted so it is
-// unit-testable off-view (`PaneHostView` lives in the `nice` BINARY, which
+// unit-testable off-view (`WindowHostView` lives in the `nice` BINARY, which
 // `nice-itests` cannot import, so the render-level placeholder→TerminalView swap
 // is asserted in the `claude-lifecycle` scenario and the pure logic here). The
 // render path calls exactly these, so the tests cover the code the window runs.
 // ---------------------------------------------------------------------------
 
-/// The active `(tab_id, pane_id)` the host should follow — the active tab's
-/// active pane, or `None` when the model has no active tab / that tab has no
-/// active pane. Whether a live session (and thus a `TerminalView`) exists for it
+/// The active `(session_id, term_window_id)` the host should follow — the active session's
+/// active window, or `None` when the model has no active session / that session has no
+/// active window. Whether a live session (and thus a `TerminalView`) exists for it
 /// is a separate question the render answers via
-/// [`SessionManager::pane_handle`](crate::session_manager::SessionManager::pane_handle):
-/// a model-only Claude pane resolves as the target here but has no handle, so the
-/// render shows the [`pane_placeholder`] until its spawn/promotion caches one.
-fn active_pane_target(model: &nice_model::TabModel) -> Option<(String, String)> {
-    let tab = model.active_tab_id()?;
-    let pane = model.tab_for(tab)?.active_pane_id.clone()?;
-    Some((tab.to_string(), pane))
+/// [`PtyManager::term_window_handle`](crate::pty_manager::PtyManager::term_window_handle):
+/// a model-only Claude window resolves as the target here but has no handle, so the
+/// render shows the [`window_placeholder`] until its spawn/promotion caches one.
+fn active_window_target(model: &nice_model::WorkspaceModel) -> Option<(String, String)> {
+    let session = model.active_session_id()?;
+    let term_window = model.session_for(session)?.active_window_id.clone()?;
+    Some((session.to_string(), term_window))
 }
 
-/// Every pane id present in the model right now — the live set the cache is
-/// pruned against (a cached view whose pane id is absent has left the model).
-fn model_pane_ids(model: &nice_model::TabModel) -> HashSet<String> {
+/// Every window id present in the model right now — the live set the cache is
+/// pruned against (a cached view whose window id is absent has left the model).
+fn model_window_ids(model: &nice_model::WorkspaceModel) -> HashSet<String> {
     let mut all = HashSet::new();
     for project in &model.projects {
-        for tab in &project.tabs {
-            for pane in &tab.panes {
-                all.insert(pane.id.clone());
+        for session in &project.sessions {
+            for term_window in &session.windows {
+                all.insert(term_window.id.clone());
             }
         }
     }
     all
 }
 
-/// The cached pane ids to evict — those no longer present in `live` (the pane
+/// The cached window ids to evict — those no longer present in `live` (the window
 /// left the model). Returns owned ids so the caller can mutate the cache without
 /// aliasing its key iterator.
 fn stale_cache_ids<'a>(
@@ -519,72 +519,72 @@ fn stale_cache_ids<'a>(
 #[cfg(test)]
 mod tests {
     //! Pure host-logic tests (target resolution + eviction). The render-level
-    //! placeholder→`TerminalView` swap (a model-only Claude pane shows the
+    //! placeholder→`TerminalView` swap (a model-only Claude window shows the
     //! placeholder; its spawn/promotion swaps to a cached view) is asserted in the
-    //! `claude-lifecycle` scenario — `PaneHostView` needs a live gpui window a plain
+    //! `claude-lifecycle` scenario — `WindowHostView` needs a live gpui window a plain
     //! `#[test]` can't build, per the placement rule.
-    use super::{active_pane_target, model_pane_ids, stale_cache_ids};
-    use nice_model::{Pane, PaneKind, Tab, TabModel};
+    use super::{active_window_target, model_window_ids, stale_cache_ids};
+    use nice_model::{TermWindow, TermWindowKind, Session, WorkspaceModel};
     use std::collections::HashSet;
 
     /// A model with a non-Terminals project holding one `[Claude, Terminal 1]`
-    /// tab (Claude focused + active), returning `(model, claude_id, term_id)`.
-    fn model_with_claude_tab() -> (TabModel, String, String) {
-        let mut model = TabModel::new("/home/u");
+    /// session (Claude focused + active), returning `(model, claude_id, term_id)`.
+    fn model_with_claude_session() -> (WorkspaceModel, String, String) {
+        let mut model = WorkspaceModel::new("/home/u");
         model.ensure_project("p", "P", "/home/u/proj");
         let claude_id = "t1-claude".to_string();
         let term_id = "t1-t1".to_string();
-        let mut tab = Tab::new("t1", "New tab", "/home/u/proj");
-        tab.panes = vec![
-            Pane::new(&claude_id, "Claude", PaneKind::Claude),
-            Pane::new(&term_id, "Terminal 1", PaneKind::Terminal),
+        let mut session = Session::new("t1", "New session", "/home/u/proj");
+        session.windows = vec![
+            TermWindow::new(&claude_id, "Claude", TermWindowKind::Claude),
+            TermWindow::new(&term_id, "Terminal 1", TermWindowKind::Terminal),
         ];
-        tab.active_pane_id = Some(claude_id.clone());
+        session.active_window_id = Some(claude_id.clone());
         let pi = model.projects.iter().position(|p| p.id == "p").unwrap();
-        model.projects[pi].tabs.push(tab);
-        model.select_tab("t1");
+        model.projects[pi].sessions.push(session);
+        model.select_session("t1");
         (model, claude_id, term_id)
     }
 
     #[test]
-    fn active_pane_target_resolves_the_active_tabs_active_pane() {
-        let (model, claude_id, _term) = model_with_claude_tab();
+    fn active_window_target_resolves_the_active_sessions_active_window() {
+        let (model, claude_id, _term) = model_with_claude_session();
         assert_eq!(
-            active_pane_target(&model),
+            active_window_target(&model),
             Some(("t1".to_string(), claude_id)),
-            "the host follows the active tab's active pane (a model-only Claude pane \
+            "the host follows the active session's active window (a model-only Claude window \
              still resolves as the target — the render shows the placeholder until a \
              handle exists)"
         );
     }
 
     #[test]
-    fn model_pane_ids_collects_every_pane_across_projects_and_tabs() {
-        let (model, claude_id, term_id) = model_with_claude_tab();
-        let ids = model_pane_ids(&model);
-        // The seeded Terminals Main pane + the claude tab's two panes.
+    fn model_window_ids_collects_every_window_across_projects_and_sessions() {
+        let (model, claude_id, term_id) = model_with_claude_session();
+        let ids = model_window_ids(&model);
+        // The seeded Terminals Main window + the claude session's two windows.
         assert!(ids.contains(&claude_id));
         assert!(ids.contains(&term_id));
-        let main_pane = model
-            .tab_for(TabModel::MAIN_TERMINAL_TAB_ID)
+        let main_window = model
+            .session_for(WorkspaceModel::MAIN_TERMINAL_SESSION_ID)
             .unwrap()
-            .panes[0]
+            .windows[0]
             .id
             .clone();
-        assert!(ids.contains(&main_pane), "the pinned Main tab's pane is included");
+        assert!(ids.contains(&main_window), "the pinned Main session's window is included");
     }
 
     #[test]
-    fn stale_cache_ids_evicts_panes_that_left_the_model() {
-        // Cache holds three panes; two are still live, one has left the model.
+    fn stale_cache_ids_evicts_windows_that_left_the_model() {
+        // Cache holds three windows; two are still live, one has left the model.
         let cached: Vec<String> = vec!["a".into(), "gone".into(), "b".into()];
         let live: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
         let stale = stale_cache_ids(cached.iter(), &live);
-        assert_eq!(stale, vec!["gone".to_string()], "only the departed pane is evicted");
+        assert_eq!(stale, vec!["gone".to_string()], "only the departed window is evicted");
     }
 
     #[test]
-    fn stale_cache_ids_evicts_nothing_when_all_cached_panes_are_live() {
+    fn stale_cache_ids_evicts_nothing_when_all_cached_windows_are_live() {
         let cached: Vec<String> = vec!["a".into(), "b".into()];
         let live: HashSet<String> = ["a".to_string(), "b".to_string(), "c".to_string()]
             .into_iter()
@@ -615,31 +615,31 @@ mod tests {
     }
 }
 
-impl Render for PaneHostView {
+impl Render for WindowHostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Snapshot the active pane + the full set of live pane ids up front (via the
+        // Snapshot the active window + the full set of live window ids up front (via the
         // pure resolvers so the target/eviction logic is unit-testable off-view),
         // then drop the state borrow before any mutation.
-        let (active, all_pane_ids): (Option<(String, String)>, HashSet<String>) = {
+        let (active, all_window_ids): (Option<(String, String)>, HashSet<String>) = {
             let ws = self.state.read(cx);
-            (active_pane_target(&ws.model), model_pane_ids(&ws.model))
+            (active_window_target(&ws.workspace), model_window_ids(&ws.workspace))
         };
 
-        // R15 subscription lift: subscribe any freshly-spawned pane (the Main pane,
-        // deferred terminals `activate_pane` forks below, and Claude panes the socket
+        // R15 subscription lift: subscribe any freshly-spawned window (the Main window,
+        // deferred terminals `activate_term_window` forks below, and Claude windows the socket
         // / sidebar seams spawn) to `route_terminal_event`, so OSC titles / cwd / exits
         // reach the model in the SHIPPED window — not just the `session-lifecycle`
         // scenario. Idempotent (subscribe-once dedupe on the window state), so it is
         // safe to sweep on every render.
         self.state
-            .update(cx, |ws, wcx| ws.subscribe_spawned_panes(wcx));
+            .update(cx, |ws, wcx| ws.subscribe_spawned_windows(wcx));
 
-        // Drop cached views for panes that left the model (the PROTECTED
-        // "dropped when the pane leaves the model"). The pane's pty session lives
-        // on in the `SessionManager` until window teardown reaps it (SIGHUP→
+        // Drop cached views for windows that left the model (the PROTECTED
+        // "dropped when the window leaves the model"). The window's pty session lives
+        // on in the `PtyManager` until window teardown reaps it (SIGHUP→
         // SIGKILL); wiring the UI close actions to the R13 dissolve cascade is
         // out of this composition slice.
-        for stale in stale_cache_ids(self.cache.keys(), &all_pane_ids) {
+        for stale in stale_cache_ids(self.cache.keys(), &all_window_ids) {
             self.cache.remove(&stale);
         }
 
@@ -647,68 +647,68 @@ impl Render for PaneHostView {
         let activation_changed = active != self.last_active;
         if activation_changed {
             self.last_active = active.clone();
-            if let Some((tab, pane)) = active.clone() {
+            if let Some((session, term_window)) = active.clone() {
                 let state = self.state.clone();
                 state.update(cx, |ws, wcx| {
-                    // Ensure the active tab has a session container so R13's
+                    // Ensure the active session has a session container so R13's
                     // deferred-spawn precondition holds (Swift makes the session
-                    // when a tab is first shown). Idempotent; not a spawn itself —
-                    // spawning still flows through `activate_pane`.
-                    ws.session.register_tab_session(&tab);
-                    // R18 (L3): a restored Claude active pane lazy-spawns its
+                    // when a session is first shown). Idempotent; not a spawn itself —
+                    // spawning still flows through `activate_term_window`.
+                    ws.ptys.register_session_pty(&session);
+                    // R18 (L3): a restored Claude active window lazy-spawns its
                     // deferred-resume shell here — thread the window's `--settings`
-                    // provider in before the model/session split borrows `ws`.
+                    // provider in before the workspace/ptys split borrows `ws`.
                     let settings = ws.claude_settings_path_provider();
-                    let model = &mut ws.model;
-                    let session = &mut ws.session;
-                    session.activate_pane(model, &tab, &pane, settings.as_deref(), wcx);
+                    let workspace = &mut ws.workspace;
+                    let ptys = &mut ws.ptys;
+                    ptys.activate_term_window(workspace, &session, &term_window, settings.as_deref(), wcx);
                 });
-                // Re-point the demand-present kick to the (now-active) pane's
+                // Re-point the demand-present kick to the (now-active) window's
                 // handle so its damage kicks this window while occluded.
-                let handle = self.state.read(cx).session.pane_handle(&tab, &pane);
+                let handle = self.state.read(cx).ptys.term_window_handle(&session, &term_window);
                 if let Some(handle) = handle {
                     crate::app::install_present_kick(&handle, window.window_handle(), cx);
                 }
             }
         }
 
-        // Host the active pane's view (lazily created + cached), else a
-        // placeholder when the pane has no live session.
+        // Host the active window's view (lazily created + cached), else a
+        // placeholder when the window has no live session.
         let content: AnyElement = match &active {
-            Some((tab, pane)) => {
-                let handle = self.state.read(cx).session.pane_handle(tab, pane);
+            Some((session, term_window)) => {
+                let handle = self.state.read(cx).ptys.term_window_handle(session, term_window);
                 match handle {
                     Some(handle) => {
-                        if !self.cache.contains_key(pane) {
+                        if !self.cache.contains_key(term_window) {
                             let view = self.make_terminal_view(handle, cx);
-                            self.cache.insert(pane.clone(), view);
+                            self.cache.insert(term_window.clone(), view);
                         }
                         // Safe: just inserted (or already present).
-                        self.cache.get(pane).unwrap().clone().into_any_element()
+                        self.cache.get(term_window).unwrap().clone().into_any_element()
                     }
-                    None => pane_placeholder().into_any_element(),
+                    None => window_placeholder().into_any_element(),
                 }
             }
-            None => pane_placeholder().into_any_element(),
+            None => window_placeholder().into_any_element(),
         };
 
         // Focus follows activation (M2 Item D): the terminal's per-frame render
         // grab is gone (focus-once in `TerminalView`), so the host moves key
-        // focus to the newly-active pane's terminal on every activation change —
-        // window open, ⌘T, pill/row click, pane-step, close-refocus. Runs after
-        // the cache fill above so a just-activated terminal pane (spawned
-        // synchronously by `activate_pane`) is focusable this same render. A
-        // pane with no hosted view (Claude placeholder) has nothing to focus.
+        // focus to the newly-active window's terminal on every activation change —
+        // window open, ⌘T, pill/row click, window-step, close-refocus. Runs after
+        // the cache fill above so a just-activated terminal window (spawned
+        // synchronously by `activate_term_window`) is focusable this same render. A
+        // window with no hosted view (Claude placeholder) has nothing to focus.
         if activation_changed {
-            if let Some((_, pane)) = &active {
-                if let Some(view) = self.cache.get(pane) {
+            if let Some((_, term_window)) = &active {
+                if let Some(view) = self.cache.get(term_window) {
                     let fh = view.read(cx).focus_handle_ref().clone();
                     window.focus(&fh, cx);
                 }
             }
         }
 
-        // Prod-parity content insets around the hosted pane (constants above).
+        // Prod-parity content insets around the hosted window (constants above).
         // Applied to placeholder and terminal alike — Swift pads both branches
         // of `mainContent` (the placeholder branch keeps its leading pad).
         div()

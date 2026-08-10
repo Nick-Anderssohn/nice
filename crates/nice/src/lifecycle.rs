@@ -14,7 +14,7 @@
 //!   * [`close_disposition`] — the reason routing (Swift's `TearDownReason`): a
 //!     window's disk fate on close, given the process `AppQuitting` state and its
 //!     per-window `user_initiated_close` flag.
-//!   * the alert-copy builders ([`describe_live_panes`] / [`quit_dialog_copy`] /
+//!   * the alert-copy builders ([`describe_live_windows`] / [`quit_dialog_copy`] /
 //!     [`close_dialog_copy`]) — the verbatim wording from
 //!     `AppDelegate.QuitConfirmation` (`:112-153`), which Swift never unit-pinned
 //!     and Rust does.
@@ -36,7 +36,7 @@ use gpui::Global;
 /// window close is treated as app-terminating (preserve), never user-closed
 /// (remove). This is Swift's detach-observers-before-teardown invariant
 /// (`SessionLifecycleController.swift:42-50` — getting it wrong once wiped a
-/// window's tabs on quit in production). A marker global — presence is the
+/// window's sessions on quit in production). A marker global — presence is the
 /// signal.
 pub(crate) struct AppQuitting;
 
@@ -84,7 +84,7 @@ pub(crate) fn close_disposition(app_quitting: bool, user_initiated_close: bool) 
 }
 
 /// One confirmation dialog's copy — the generic modal's `(title, message,
-/// confirm_label)` for a given live-pane count. R18's quit/close callers pass
+/// confirm_label)` for a given live-window count. R18's quit/close callers pass
 /// `cancel_label = "Cancel"`, `destructive_confirm = false` alongside these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DialogCopy {
@@ -96,15 +96,15 @@ pub(crate) struct DialogCopy {
     pub confirm_label: String,
 }
 
-/// The informative-text body describing the live panes — Swift's
+/// The informative-text body describing the live windows — Swift's
 /// `QuitConfirmation.describe(claude:terminal:)` (`AppDelegate.swift:132-152`),
 /// verbatim. Parts are `"N Claude session(s)"` / `"N terminal(s)"`, joined with
 /// `" and "`; the trailing sentence depends on which kinds are present (Claude
 /// sessions are saved for next launch, terminals are closed).
 ///
 /// Precondition (the callers guarantee it): `claude + terminal > 0` — the
-/// zero-pane path never opens a dialog.
-pub(crate) fn describe_live_panes(claude: usize, terminal: usize) -> String {
+/// zero-window path never opens a dialog.
+pub(crate) fn describe_live_windows(claude: usize, terminal: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     if claude > 0 {
         parts.push(format!(
@@ -136,7 +136,7 @@ pub(crate) fn describe_live_panes(claude: usize, terminal: usize) -> String {
 pub(crate) fn quit_dialog_copy(claude: usize, terminal: usize) -> DialogCopy {
     DialogCopy {
         title: "Quit NICE?".to_string(),
-        message: describe_live_panes(claude, terminal),
+        message: describe_live_windows(claude, terminal),
         confirm_label: "Quit".to_string(),
     }
 }
@@ -146,7 +146,7 @@ pub(crate) fn quit_dialog_copy(claude: usize, terminal: usize) -> DialogCopy {
 pub(crate) fn close_dialog_copy(claude: usize, terminal: usize) -> DialogCopy {
     DialogCopy {
         title: "Close this window?".to_string(),
-        message: describe_live_panes(claude, terminal),
+        message: describe_live_windows(claude, terminal),
         confirm_label: "Close".to_string(),
     }
 }
@@ -157,7 +157,7 @@ mod tests {
 
     use std::path::Path;
 
-    use nice_model::{PersistedProject, PersistedTab};
+    use nice_model::{PersistedProject, PersistedSession};
 
     use crate::session_store::{read_state, PersistedWindow, SessionStore, DiskIo, DEBOUNCE};
 
@@ -204,26 +204,26 @@ mod tests {
     // Rust collapse tests the disposition applied to a real SessionStore (no gpui,
     // no global — a locally-owned store, race-free under libtest).
 
-    /// A minimal one-tab window snapshot with id `id`.
+    /// A minimal one-session window snapshot with id `id`.
     fn window(id: &str) -> PersistedWindow {
         PersistedWindow {
             id: id.to_string(),
-            active_tab_id: Some("t".to_string()),
+            active_session_id: Some("t".to_string()),
             sidebar_collapsed: false,
             sidebar_mode: None,
             projects: vec![PersistedProject {
                 id: "terminals".to_string(),
                 name: "Terminals".to_string(),
                 path: "/tmp".to_string(),
-                tabs: vec![PersistedTab {
+                sessions: vec![PersistedSession {
                     id: "t".to_string(),
                     title: "t".to_string(),
                     cwd: "/tmp".to_string(),
                     claude_session_id: None,
-                    active_pane_id: None,
-                    panes: vec![],
+                    active_window_id: None,
+                    windows: vec![],
                     title_manually_set: None,
-                    parent_tab_id: None,
+                    parent_session_id: None,
                     next_terminal_index: None,
                 }],
             }],
@@ -298,7 +298,7 @@ mod tests {
         let path = dir.0.join("sessions.json");
         let store = disk_store(&path);
 
-        // Both snapshots pre-seeded (a tab mutation pushed each).
+        // Both snapshots pre-seeded (a session mutation pushed each).
         store.upsert(window("win-closed"));
         store.upsert(window("win-surviving"));
         store.flush();
@@ -323,7 +323,7 @@ mod tests {
         );
     }
 
-    /// The single-window emptied-dissolve quit (ctrl+d exits the last pane):
+    /// The single-window emptied-dissolve quit (ctrl+d exits the last window):
     /// `apply_dissolve_terminus` → `cx.quit()` bypasses the window-close trail
     /// (gpui `shutdown` clears windows without firing `on_window_closed`), so the
     /// `on_app_quit` flush is the slot's last word. `flush_all_window_snapshots`
@@ -384,28 +384,28 @@ mod tests {
     #[test]
     fn describe_pluralizes_and_joins() {
         assert_eq!(
-            describe_live_panes(1, 0),
+            describe_live_windows(1, 0),
             "You still have 1 Claude session open. They will be saved for next launch."
         );
         assert_eq!(
-            describe_live_panes(2, 0),
+            describe_live_windows(2, 0),
             "You still have 2 Claude sessions open. They will be saved for next launch."
         );
         assert_eq!(
-            describe_live_panes(0, 1),
+            describe_live_windows(0, 1),
             "You still have 1 terminal open. They will be closed."
         );
         assert_eq!(
-            describe_live_panes(0, 3),
+            describe_live_windows(0, 3),
             "You still have 3 terminals open. They will be closed."
         );
         assert_eq!(
-            describe_live_panes(1, 1),
+            describe_live_windows(1, 1),
             "You still have 1 Claude session and 1 terminal open. Claude sessions \
              will be saved for next launch; terminals will be closed."
         );
         assert_eq!(
-            describe_live_panes(2, 3),
+            describe_live_windows(2, 3),
             "You still have 2 Claude sessions and 3 terminals open. Claude sessions \
              will be saved for next launch; terminals will be closed."
         );
@@ -416,11 +416,11 @@ mod tests {
         let q = quit_dialog_copy(1, 2);
         assert_eq!(q.title, "Quit NICE?");
         assert_eq!(q.confirm_label, "Quit");
-        assert_eq!(q.message, describe_live_panes(1, 2));
+        assert_eq!(q.message, describe_live_windows(1, 2));
 
         let c = close_dialog_copy(1, 2);
         assert_eq!(c.title, "Close this window?");
         assert_eq!(c.confirm_label, "Close");
-        assert_eq!(c.message, describe_live_panes(1, 2));
+        assert_eq!(c.message, describe_live_windows(1, 2));
     }
 }

@@ -2,18 +2,18 @@
 //! ported from `Sources/Nice/Views/AppShellView.swift` (the shell — layout
 //! modes, floating card, resize handle, collapsed band, peek overlay) and
 //! `Sources/Nice/Views/SidebarView.swift` (the card content — project groups,
-//! tab rows, footer, and the multi-select / rename / Esc behaviour). The pure
+//! session rows, footer, and the multi-select / rename / Esc behaviour). The pure
 //! state it drives ships gpui-free in `nice-model` (slice 1): [`SidebarModel`],
-//! [`SidebarTabSelection`], [`InlineRenameClickGate`].
+//! [`SidebarSessionSelection`], [`InlineRenameClickGate`].
 //!
 //! ## Shared per-window state + transient view state (the GPUI shape)
 //!
 //! Swift spreads this across `AppShellView`, `SidebarView`, `ProjectGroup`, and
 //! `TabRow` `@State`. GPUI splits it in two: the *document* state a whole window
-//! shares — the [`TabModel`] (R8), the sidebar mode/collapse/peek `SidebarModel`,
-//! the `SidebarTabSelection`, and the `SidebarActions` seam — lives in the
+//! shares — the [`WorkspaceModel`] (R8), the sidebar mode/collapse/peek `SidebarModel`,
+//! the `SidebarSessionSelection`, and the `SidebarActions` seam — lives in the
 //! per-window [`WindowState`] entity this view holds a handle to and renders
-//! from / mutates (R13.5's "one `TabModel` per window" invariant: no divergent
+//! from / mutates (R13.5's "one `WorkspaceModel` per window" invariant: no divergent
 //! model copy in any mounted view, every mutation flowing through
 //! `WindowState`'s seams). A sibling holder of that same entity — the keymap's
 //! window-scoped actions, routed through the `WindowRegistry` — mutating it
@@ -43,9 +43,9 @@
 //!
 //! The S7 drag-reorder machinery (`SidebarDragState`, the drop delegates, the
 //! insertion line) is ported here with gpui's own drag pipeline (M7.8 feel-check
-//! round 2): rows arm an [`TabDragPayload`] drag via `on_drag`, each project
+//! round 2): rows arm an [`SessionDragPayload`] drag via `on_drag`, each project
 //! group's container hosts `on_drag_move`/`on_drop` with bounds-containment
-//! clearing (the R25 listener split), and [`tab_drop_target`] is the pure
+//! clearing (the R25 listener split), and [`session_drop_target`] is the pure
 //! midpoint resolver (`SidebarDropResolver.tabTarget`,
 //! `SidebarView.swift:994-1013`).
 //!
@@ -83,7 +83,7 @@ use gpui::{
 };
 
 use nice_model::file_browser::TextFieldEditor;
-use nice_model::{InlineRenameClickGate, SidebarMode, TabModel, TabStatus};
+use nice_model::{InlineRenameClickGate, SidebarMode, WorkspaceModel, SessionStatus};
 use nice_theme::chrome_geometry::{
     CARD_CORNER_RADIUS, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET,
     INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
@@ -93,14 +93,14 @@ use nice_theme::color::Srgba;
 use nice_theme::glass::{glass_fill, glass_line};
 use nice_theme::palette::{ColorScheme, Slots};
 
-use crate::app_shell::{PaneHostView, SIDEBAR_ROOT_LABEL};
+use crate::app_shell::{WindowHostView, SIDEBAR_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::file_browser::view::FileBrowserView;
 use crate::inline_rename::{
     apply_rename_click, dispatch_rename_key, field_probe_cell, field_text, rename_field,
     reset_field_probe, FieldColors, FieldProbeCell, RenameKeyOutcome,
 };
-use crate::session_manager::{ClaudeTabPlacement, ClaudeTabSession};
+use crate::pty_manager::{ClaudeSessionPlacement, ClaudeSessionSpec};
 use crate::sf_symbols::{sf_symbol_icon, SymbolWeight};
 use crate::status_dot::StatusDot;
 use crate::theme::{slot_srgba, slot_to_rgba, srgba_to_rgba, srgba_with_alpha};
@@ -113,7 +113,7 @@ gpui::actions!(nice, [CollapseSidebarSelection]);
 
 // ---- Geometry / behaviour constants (Swift provenance) ----------------------
 
-/// Row leading inset for a root (non-lineage) tab. `SidebarView.swift:619`.
+/// Row leading inset for a root (non-lineage) session. `SidebarView.swift:619`.
 const ROW_INDENT_ROOT: f32 = 22.0;
 /// Row leading inset for a depth-1 `/branch` child (one status-dot width
 /// deeper). `SidebarView.swift:619`.
@@ -165,16 +165,16 @@ const ICON_PLUS: &str = "+"; // fallback for SF_PLUS
 const SF_CHEVRON_CLOSED: &str = "chevron.right";
 /// Group-header disclosure, open.
 const SF_CHEVRON_OPEN: &str = "chevron.down";
-/// Tab-row / pill leading icon (`SidebarView.swift:602`).
+/// Session-row / pill leading icon (`SidebarView.swift:602`).
 const SF_TERMINAL: &str = "terminal";
 /// Group-header add button (`SidebarView.swift:379`).
 const SF_PLUS: &str = "plus";
 
-// The footer mode-switcher (tabs / files) and settings gear now render the
-// 2026-07 restyle's stroke SVGs from `crate::chrome_icons` (`MODE_TABS` /
+// The footer mode-switcher (sessions / files) and settings gear now render the
+// 2026-07 restyle's stroke SVGs from `crate::chrome_icons` (`MODE_SESSIONS` /
 // `MODE_FILES` / `MODE_GEAR`), not SF Symbols — see [`SidebarShellView::build_footer`].
 
-/// Sidebar row status-dot size (pt). Matches the tab-strip dot
+/// Sidebar row status-dot size (pt). Matches the window-strip dot
 /// (`toolbar::TAB_STATUS_DOT_SIZE`, 7pt) so the sidebar and title-bar status
 /// dots read the same size; the default is 8pt. Only the size parameter
 /// changes — the dot's colours + pulse are untouched
@@ -193,7 +193,7 @@ fn resize_width(baseline: f32, delta_x: f32) -> f32 {
     clamp_sidebar_width(baseline + delta_x)
 }
 
-/// Row leading inset for a tab, given whether it is a depth-1 lineage child.
+/// Row leading inset for a session, given whether it is a depth-1 lineage child.
 fn row_indent(indented: bool) -> f32 {
     if indented {
         ROW_INDENT_CHILD
@@ -202,13 +202,13 @@ fn row_indent(indented: bool) -> f32 {
     }
 }
 
-/// The context-menu close label for a right-click acting on `count` tabs
+/// The context-menu close label for a right-click acting on `count` sessions
 /// (`SidebarView.swift:644`).
 fn close_menu_label(count: usize) -> String {
     if count > 1 {
-        format!("Close {count} Tabs")
+        format!("Close {count} Sessions")
     } else {
-        "Close Tab".to_string()
+        "Close Session".to_string()
     }
 }
 
@@ -230,25 +230,25 @@ fn disclosure_icon(is_open: bool) -> (&'static str, &'static str) {
 /// space as `y` (window coords here); a collapsed group paints no rows, so its
 /// ids have no frames and every branch misses — same net `nil` as Swift's
 /// empty `tabFrames` snapshot.
-fn tab_drop_target(
+fn session_drop_target(
     y: f32,
-    tab_order: &[String],
+    session_order: &[String],
     frames: &HashMap<String, (f32, f32)>,
 ) -> Option<(String, bool)> {
-    let first = tab_order.first()?;
+    let first = session_order.first()?;
     if let Some(&(min_y, _)) = frames.get(first) {
         if y < min_y {
             return Some((first.clone(), false));
         }
     }
-    if let Some(last) = tab_order.last() {
+    if let Some(last) = session_order.last() {
         if let Some(&(_, max_y)) = frames.get(last) {
             if y > max_y {
                 return Some((last.clone(), true));
             }
         }
     }
-    for id in tab_order {
+    for id in session_order {
         if let Some(&(min_y, max_y)) = frames.get(id) {
             if y >= min_y && y <= max_y {
                 return Some((id.clone(), y > (min_y + max_y) / 2.0));
@@ -259,8 +259,8 @@ fn tab_drop_target(
 }
 
 /// Build the drop-resolution scope for a drag of `dragged` over one project
-/// group — the target order and frame spans [`tab_drop_target`] resolves
-/// against — subtree-aware (M7.8 round 3, matching [`TabModel::move_tab`]'s
+/// group — the target order and frame spans [`session_drop_target`] resolves
+/// against — subtree-aware (M7.8 round 3, matching [`WorkspaceModel::move_session`]'s
 /// block semantics):
 ///
 /// * **Root drag** (dragged has no parent): one unit per top-level BLOCK
@@ -269,12 +269,12 @@ fn tab_drop_target(
 ///   before/after the WHOLE block — "after a parent visually at its bottom
 ///   edge" is after its last child, and no slot inside a group is ever
 ///   proposed (or a line drawn there).
-/// * **Child drag**: only the rows of the dragged tab's own block (its root,
+/// * **Child drag**: only the rows of the dragged session's own block (its root,
 ///   then the siblings) — a slot anywhere else resolves to `None`, and
-///   `would_move_tab` rejects the boundary cases (before the root / other
+///   `would_move_session` rejects the boundary cases (before the root / other
 ///   blocks) the row scope still reaches.
 ///
-/// `rows` is the group's `(tab_id, parent_tab_id)` list in display order;
+/// `rows` is the group's `(session_id, parent_session_id)` list in display order;
 /// `frames` the per-row painted extents. Pure — unit-tested below.
 fn drag_scope(
     rows: &[(String, Option<String>)],
@@ -330,7 +330,7 @@ fn active_slots(cx: &App) -> Slots {
 
 /// The resolved terminal mono family (SF Mono default) the flattened sidebar
 /// renders its text in — read from the process `SharedFontSettings` (the same
-/// source the tab strip's titles use). Shared by the tabs-mode
+/// source the session strip's titles use). Shared by the sessions-mode
 /// [`SidebarShellView`] and the files-mode
 /// [`FileBrowserView`](crate::file_browser::view::FileBrowserView) so both flat
 /// surfaces use one family seam (plan `docs/plans/restyle/02-sidebar-flatten.md`).
@@ -391,15 +391,15 @@ fn selection_tint(accent: Srgba, factor: f32) -> Rgba {
 
 // ---- View-model snapshot (decouples rendering from model borrows) -----------
 
-/// A per-render snapshot of one tab row.
-struct TabVm {
+/// A per-render snapshot of one session row.
+struct SessionVm {
     id: String,
     title: String,
     indented: bool,
-    /// Depth-1 children under this tab (the drag ghost's `+N` group hint).
+    /// Depth-1 children under this session (the drag ghost's `+N` group hint).
     child_count: usize,
     has_claude: bool,
-    status: TabStatus,
+    status: SessionStatus,
     waiting_ack: bool,
     is_active: bool,
     is_selected: bool,
@@ -413,28 +413,28 @@ struct GroupVm {
     is_terminals: bool,
     is_open: bool,
     hovered: bool,
-    tabs: Vec<TabVm>,
+    sessions: Vec<SessionVm>,
 }
 
 // ---- Row drag (the S7 sidebar reorder, ported on the R25 pattern) -----------
 
-/// The value a sidebar row drag carries: just the dragged tab id (Swift stashes
+/// The value a sidebar row drag carries: just the dragged session id (Swift stashes
 /// it in `SidebarDragState` + an `NSItemProvider`, `SidebarView.swift:654-657`;
-/// here it is a purely in-app gpui payload the `on_drop::<TabDragPayload>` type
+/// here it is a purely in-app gpui payload the `on_drop::<SessionDragPayload>` type
 /// gate matches on). Same-project-only is enforced by the model
-/// ([`TabModel::would_move_tab`] refuses cross-project targets), not the
+/// ([`WorkspaceModel::would_move_session`] refuses cross-project targets), not the
 /// payload.
 #[derive(Clone)]
-struct TabDragPayload {
-    tab_id: SharedString,
+struct SessionDragPayload {
+    session_id: SharedString,
 }
 
 /// The drag ghost that follows the cursor: a simplified row chip (title only,
-/// reduced opacity) — the R25 `PaneDragGhost` pattern, not a bitmap snapshot.
+/// reduced opacity) — the R25 `WindowDragGhost` pattern, not a bitmap snapshot.
 /// gpui lays it out at `mouse - offset` each frame, so it compensates by
 /// re-adding `offset` (plus a small lead) as leading padding. A parent dragging
 /// its child block appends a dim `+N` so the chip reads as the whole group.
-struct TabRowDragGhost {
+struct SessionRowDragGhost {
     title: SharedString,
     /// Depth-1 children coming along with the drag (0 for a childless row).
     child_count: usize,
@@ -444,7 +444,7 @@ struct TabRowDragGhost {
     offset: Point<Pixels>,
 }
 
-impl Render for TabRowDragGhost {
+impl Render for SessionRowDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = active_slots(cx);
         // Outer wrapper carries the offset compensation as padding so the visible
@@ -497,7 +497,7 @@ impl Render for TabRowDragGhost {
 #[derive(Clone, PartialEq)]
 struct SidebarDropTarget {
     project_id: String,
-    target_tab_id: String,
+    target_session_id: String,
     place_after: bool,
     line_y: f32,
 }
@@ -509,13 +509,13 @@ struct SidebarDropTarget {
 /// renders the shared `model` / `sidebar` / `selection` and mutates them through
 /// `WindowState`'s seams.
 pub(crate) struct SidebarShellView {
-    /// The shared per-window state (the single [`TabModel`], the sidebar
+    /// The shared per-window state (the single [`WorkspaceModel`], the sidebar
     /// collapse/mode/peek model, the multi-selection, and the create/close/select
     /// [`SidebarActions`] seam). This view renders from and mutates it; it never
-    /// keeps a private copy (R13.5's "one `TabModel` per window" invariant).
+    /// keeps a private copy (R13.5's "one `WorkspaceModel` per window" invariant).
     state: Entity<WindowState>,
     /// Re-render this view whenever the shared state notifies — the seam through
-    /// which the keymap's window-scoped actions (⌘S toggle, tab cycle, …) become
+    /// which the keymap's window-scoped actions (⌘S toggle, session cycle, …) become
     /// visible in the shell. Held so the subscription lives as long as the view.
     _state_sub: Subscription,
 
@@ -525,7 +525,7 @@ pub(crate) struct SidebarShellView {
     /// full-width band. `None` in the isolated `sidebar` scenario, which mounts
     /// the shell standalone and keeps the placeholder content region.
     main_toolbar: Option<AnyView>,
-    /// R13.5 composition slot: the pane-content host (`PaneHostView`), rendered as
+    /// R13.5 composition slot: the window-content host (`WindowHostView`), rendered as
     /// the shell's fill body below the toolbar. `None` in the isolated scenario.
     main_body: Option<AnyView>,
 
@@ -546,13 +546,13 @@ pub(crate) struct SidebarShellView {
     hovered_project: Option<String>,
 
     /// Per-paint window-coord vertical extents `(min_y, max_y)` of each painted
-    /// tab row, keyed by tab id — the Swift `TabFramesKey` preference analog
+    /// session row, keyed by session id — the Swift `TabFramesKey` preference analog
     /// (`SidebarView.swift:805-810`), written by a canvas probe inside each row
-    /// and cleared at the top of every render so closed tabs / collapsed groups
+    /// and cleared at the top of every render so closed sessions / collapsed groups
     /// can't leave stale frames.
     row_frames: Rc<RefCell<HashMap<String, (f32, f32)>>>,
     /// The row-reorder drop slot the cursor currently resolves to, already gated
-    /// through [`TabModel::would_move_tab`] (a no-op / cross-project slot
+    /// through [`WorkspaceModel::would_move_session`] (a no-op / cross-project slot
     /// resolves to `None`). Recomputed in each group's `on_drag_move`, cleared
     /// on drop / when the cursor leaves the owning group (the R25 `drag_target`
     /// pattern + Swift's `dropExited`). The insertion line reads it, gated
@@ -560,15 +560,15 @@ pub(crate) struct SidebarShellView {
     /// drops the line the same frame.
     drag_target: Option<SidebarDropTarget>,
 
-    /// The tab currently being inline-renamed, if any.
-    editing_tab_id: Option<String>,
+    /// The session currently being inline-renamed, if any.
+    editing_session_id: Option<String>,
     /// The in-flight rename editor (cursor + selection; `None` when not editing).
     rename_editor: Option<TextFieldEditor>,
     /// The rename field's painted geometry (text-run + field-box left edges and
     /// the shaped char-boundary table, window coords), written by the field's
     /// paint and read by its click-to-position handler.
     rename_probe: FieldProbeCell,
-    /// When the current active tab became active — the rename gate reference.
+    /// When the current active session became active — the rename gate reference.
     activated_at: Option<Instant>,
     /// Focus for the inline-rename field (grabbed on begin, released on commit).
     rename_focus: FocusHandle,
@@ -576,24 +576,24 @@ pub(crate) struct SidebarShellView {
     /// monitor's replacement). Replaced on each `begin_editing`.
     rename_blur_sub: Option<Subscription>,
 
-    /// The open tab context menu, if any.
+    /// The open session context menu, if any.
     context_menu: Option<Entity<ContextMenu>>,
     /// The menu's dismiss subscription.
     menu_sub: Option<Subscription>,
 
     /// R19: the files-mode browser view, created lazily the first time the sidebar
     /// enters files mode and rendered by [`build_body`](Self::build_body) in place
-    /// of the tab list (peeking keeps showing the tabs — the preserved invariant).
+    /// of the session list (peeking keeps showing the sessions — the preserved invariant).
     /// One per window; owns its own kqueue watcher + scroll handle.
     file_browser: Option<Entity<FileBrowserView>>,
 
     /// Root focus handle (hosts the `SidebarShell` key context for Esc).
     focus_handle: FocusHandle,
-    /// The window's pane-content host, wired by `crate::app::build_window_root`
+    /// The window's window-content host, wired by `crate::app::build_window_root`
     /// (M2 Item D): the seam through which the shell returns key focus to the
     /// active terminal after a rename commit/cancel and on menu dismissal.
     /// `None` in the isolated `sidebar` scenario (refocus is then a no-op).
-    pane_host: Option<Entity<PaneHostView>>,
+    window_host: Option<Entity<WindowHostView>>,
     /// Chrome-click focus bounce (M2 Item D): a click on empty shell chrome
     /// (card body, top strip, footer) focuses this root via gpui's tracked-focus
     /// mouse-down transfer; this `on_focus` subscription bounces it straight
@@ -621,9 +621,9 @@ pub(crate) struct SidebarShellView {
 
 impl SidebarShellView {
     /// A shell over the window's shared [`WindowState`]: it reads the sidebar
-    /// mode/collapse/peek, the selection, and the tab tree from that entity and
+    /// mode/collapse/peek, the selection, and the session tree from that entity and
     /// mutates them through its seams. The `sidebar`/`selection` invariants
-    /// (expanded, tabs mode, selection seeded from the active tab) are established
+    /// (expanded, sessions mode, selection seeded from the active session) are established
     /// by [`WindowState::with_model`] / [`WindowState::new`], not here. Width 240,
     /// Terracotta accent. Observing the state re-renders the shell when a sibling
     /// holder (the keymap) mutates it.
@@ -661,7 +661,7 @@ impl SidebarShellView {
             hovered_project: None,
             row_frames: Rc::new(RefCell::new(HashMap::new())),
             drag_target: None,
-            editing_tab_id: None,
+            editing_session_id: None,
             rename_editor: None,
             rename_probe: field_probe_cell(),
             activated_at: Some(Instant::now()),
@@ -671,7 +671,7 @@ impl SidebarShellView {
             menu_sub: None,
             file_browser: None,
             focus_handle: cx.focus_handle(),
-            pane_host: None,
+            window_host: None,
             focus_bounce_sub: None,
             // R21: seed the accent from the live `SharedThemeState` (Terracotta
             // fallback when the theme global is absent, i.e. isolated scenarios).
@@ -693,7 +693,7 @@ impl SidebarShellView {
 
     /// The resolved terminal mono family (SF Mono default) the flattened sidebar's
     /// session rows + project headers render in — read from the process
-    /// `SharedFontSettings` (the same source the tab strip's titles use). `None`
+    /// `SharedFontSettings` (the same source the session strip's titles use). `None`
     /// before the keymap wires that global (the isolated `sidebar` scenario),
     /// which leaves gpui's default UI family. Only the FAMILY comes from here; the
     /// row text SIZE stays proportional off [`sidebar_pt`](Self::sidebar_pt)
@@ -702,14 +702,14 @@ impl SidebarShellView {
         resolved_mono_family(cx)
     }
 
-    /// Wire the window's pane host (called once by `build_window_root`) so the
+    /// Wire the window's window host (called once by `build_window_root`) so the
     /// shell can return key focus to the active terminal (M2 Item D).
-    pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
-        self.pane_host = Some(host);
+    pub(crate) fn set_window_host(&mut self, host: Entity<WindowHostView>) {
+        self.window_host = Some(host);
     }
 
     /// The R13.5 composed shell: same shared-state shell as [`new`](Self::new)
-    /// with the toolbar band + pane-content host injected into the content
+    /// with the toolbar band + window-content host injected into the content
     /// region's top-bar-accessory + body slots. `crate::app::build_window_root`
     /// wires this for the shipped window and every ⌘N window; the isolated
     /// `sidebar` scenario keeps [`new`](Self::new) (placeholder content).
@@ -729,30 +729,30 @@ impl SidebarShellView {
 
     fn snapshot_groups(&self, cx: &mut Context<Self>) -> Vec<GroupVm> {
         let ws = self.state.read(cx);
-        let active = ws.model.active_tab_id().map(|s| s.to_string());
-        ws.model
+        let active = ws.workspace.active_session_id().map(|s| s.to_string());
+        ws.workspace
             .projects
             .iter()
             .map(|p| {
                 let is_open = !self.collapsed_projects.contains(&p.id);
-                let tabs = if is_open {
-                    p.tabs
+                let sessions = if is_open {
+                    p.sessions
                         .iter()
-                        .map(|t| TabVm {
+                        .map(|t| SessionVm {
                             id: t.id.clone(),
                             title: t.title.clone(),
-                            indented: t.parent_tab_id.is_some(),
+                            indented: t.parent_session_id.is_some(),
                             child_count: p
-                                .tabs
+                                .sessions
                                 .iter()
-                                .filter(|c| c.parent_tab_id.as_deref() == Some(t.id.as_str()))
+                                .filter(|c| c.parent_session_id.as_deref() == Some(t.id.as_str()))
                                 .count(),
                             has_claude: t.has_claude(),
                             status: t.status(),
                             waiting_ack: t.waiting_acknowledged(),
                             is_active: active.as_deref() == Some(t.id.as_str()),
                             is_selected: ws.selection.contains(&t.id),
-                            is_editing: self.editing_tab_id.as_deref() == Some(t.id.as_str()),
+                            is_editing: self.editing_session_id.as_deref() == Some(t.id.as_str()),
                         })
                         .collect()
                 } else {
@@ -761,10 +761,10 @@ impl SidebarShellView {
                 GroupVm {
                     id: p.id.clone(),
                     name: p.name.clone(),
-                    is_terminals: p.id == TabModel::TERMINALS_PROJECT_ID,
+                    is_terminals: p.id == WorkspaceModel::TERMINALS_PROJECT_ID,
                     is_open,
                     hovered: self.hovered_project.as_deref() == Some(p.id.as_str()),
-                    tabs,
+                    sessions,
                 }
             })
             .collect()
@@ -775,29 +775,29 @@ impl SidebarShellView {
     /// Route a modifier-aware row click. Plain collapses to `{id}` + activates;
     /// ⌘ toggles (most-recently-clicked stays active, only-and-active refused);
     /// ⇧ extends from the sticky anchor. Resets `activated_at` only when the
-    /// active tab actually changes (so a click on the already-active row keeps
+    /// active session actually changes (so a click on the already-active row keeps
     /// the rename gate armed — `SidebarView.swift`'s `onChange(of: isActive)`).
-    fn route_click(&mut self, tab_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
+    fn route_click(&mut self, session_id: &str, cmd: bool, shift: bool, cx: &mut Context<Self>) {
         let changed = self.state.update(cx, |ws, _| {
-            let before = ws.model.active_tab_id().map(|s| s.to_string());
+            let before = ws.workspace.active_session_id().map(|s| s.to_string());
             if cmd {
-                if let Some(new_active) = ws.selection.toggle(tab_id) {
-                    ws.sidebar_actions.select_tab(&mut ws.model, &new_active);
+                if let Some(new_active) = ws.selection.toggle(session_id) {
+                    ws.sidebar_actions.select_session(&mut ws.workspace, &new_active);
                 }
             } else if shift {
-                let order = ws.model.navigable_sidebar_tab_ids();
-                ws.selection.extend(tab_id, &order);
-                ws.sidebar_actions.select_tab(&mut ws.model, tab_id);
+                let order = ws.workspace.navigable_sidebar_session_ids();
+                ws.selection.extend(session_id, &order);
+                ws.sidebar_actions.select_session(&mut ws.workspace, session_id);
             } else {
-                ws.selection.replace(tab_id);
-                ws.sidebar_actions.select_tab(&mut ws.model, tab_id);
+                ws.selection.replace(session_id);
+                ws.sidebar_actions.select_session(&mut ws.workspace, session_id);
             }
-            let after = ws.model.active_tab_id().map(|s| s.to_string());
+            let after = ws.workspace.active_session_id().map(|s| s.to_string());
             // Reconcile the selection's active mirror with the model (a no-op on
             // the tap paths since the mutators already set it; keeps the invariant
             // if a toggle refused).
-            let active = ws.model.active_tab_id().map(|s| s.to_string());
-            ws.selection.sync_active_tab_id(active.as_deref());
+            let active = ws.workspace.active_session_id().map(|s| s.to_string());
+            ws.selection.sync_active_session_id(active.as_deref());
             before != after
         });
         if changed {
@@ -810,37 +810,37 @@ impl SidebarShellView {
     /// select (`SidebarView.swift:569-586`).
     fn handle_title_tap(
         &mut self,
-        tab_id: &str,
+        session_id: &str,
         cmd: bool,
         shift: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if cmd || shift {
-            self.route_click(tab_id, cmd, shift, cx);
+            self.route_click(session_id, cmd, shift, cx);
             return;
         }
-        let is_active = self.state.read(cx).model.active_tab_id() == Some(tab_id);
+        let is_active = self.state.read(cx).workspace.active_session_id() == Some(session_id);
         if is_active {
             if InlineRenameClickGate::can_begin_edit(
                 self.activated_at,
                 Instant::now(),
                 DOUBLE_CLICK_INTERVAL,
             ) {
-                self.begin_editing(tab_id, window, cx);
+                self.begin_editing(session_id, window, cx);
             }
             // else: same-click-as-select window — no-op (no redundant reselect).
         } else {
-            self.route_click(tab_id, false, false, cx);
+            self.route_click(session_id, false, false, cx);
         }
     }
 
-    /// Collapse a multi-selection back to the active tab (Esc / empty-area
-    /// click). Drops everything only when the tree has no active tab — a
+    /// Collapse a multi-selection back to the active session (Esc / empty-area
+    /// click). Drops everything only when the tree has no active session — a
     /// mid-shutdown edge (`SidebarView.swift:86-92`).
     fn collapse_selection_to_active(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |ws, _| {
-            if let Some(active) = ws.model.active_tab_id().map(|s| s.to_string()) {
+            if let Some(active) = ws.workspace.active_session_id().map(|s| s.to_string()) {
                 ws.selection.collapse(&active);
             } else {
                 ws.selection.clear();
@@ -849,33 +849,33 @@ impl SidebarShellView {
     }
 
     /// Re-seed the selection + arm the rename gate after a create/select (the new
-    /// tab is already the model's active tab).
+    /// session is already the model's active session).
     fn reseed_selection_after_create(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |ws, _| {
-            let active = ws.model.active_tab_id().map(|s| s.to_string());
-            ws.selection.sync_active_tab_id(active.as_deref());
+            let active = ws.workspace.active_session_id().map(|s| s.to_string());
+            ws.selection.sync_active_session_id(active.as_deref());
         });
         self.activated_at = Some(Instant::now());
     }
 
     // MARK: - Inline rename
 
-    fn begin_editing(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_editing(&mut self, session_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(title) = self
             .state
             .read(cx)
-            .model
-            .tab_for(tab_id)
+            .workspace
+            .session_for(session_id)
             .map(|t| t.title.clone())
         else {
             return;
         };
-        self.editing_tab_id = Some(tab_id.to_string());
+        self.editing_session_id = Some(session_id.to_string());
         // The probe cell is per-view and outlives every field it has measured:
         // drop the previous edit's boundary table and, crucially, any drag arm
         // it left behind (see `reset_field_probe`).
         reset_field_probe(&self.rename_probe);
-        // Select the whole title on entry (a tab title is not a filename, so the
+        // Select the whole title on entry (a session title is not a filename, so the
         // whole name — not base-minus-extension — is the replace target): the
         // first keystroke replaces it.
         self.rename_editor = Some(TextFieldEditor::with_selection(&title, title.chars().count()));
@@ -891,17 +891,17 @@ impl SidebarShellView {
     /// Commit the draft (empty input is a model no-op — asymmetry 3). Idempotent:
     /// a stray focus-out after the edit already ended does nothing.
     fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.editing_tab_id.take() else {
+        let Some(id) = self.editing_session_id.take() else {
             return;
         };
         let draft = self.rename_editor.take().map(|e| e.text()).unwrap_or_default();
-        self.state.update(cx, |ws, _| ws.model.rename_tab(&id, &draft));
+        self.state.update(cx, |ws, _| ws.workspace.rename_session(&id, &draft));
         self.refocus_terminal_after_rename(window, cx);
         cx.notify();
     }
 
     fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_tab_id.take().is_none() {
+        if self.editing_session_id.take().is_none() {
             return;
         }
         self.rename_editor = None;
@@ -911,7 +911,7 @@ impl SidebarShellView {
 
     /// Apply a click hit-test to the rename field — single click drops the caret,
     /// double selects the word, triple selects all ([`apply_rename_click`]) — then
-    /// re-grab field focus (the click already stopped propagation, so the tab's
+    /// re-grab field focus (the click already stopped propagation, so the session's
     /// title-tap gate never re-trips).
     fn place_rename_cursor(
         &mut self,
@@ -940,12 +940,12 @@ impl SidebarShellView {
 
     /// Swift's rename end paths call `sessions.focusActiveTerminal()` so the
     /// terminal regains first responder (dossier G10). Here the window's
-    /// [`PaneHostView`] owns the hosted terminal views, so focus routes back
+    /// [`WindowHostView`] owns the hosted terminal views, so focus routes back
     /// through its `focus_active_terminal` (M2 Item D — the sidebar-rename
     /// equivalent of the toolbar's refocus). A no-op in the isolated `sidebar`
-    /// scenario (no pane host wired).
+    /// scenario (no window host wired).
     fn refocus_terminal_after_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(host) = self.pane_host.clone() {
+        if let Some(host) = self.window_host.clone() {
             host.update(cx, |host, cx| host.focus_active_terminal(window, cx));
         }
     }
@@ -1014,28 +1014,28 @@ impl SidebarShellView {
         self.state.update(cx, |ws, wcx| ws.toggle_sidebar_collapsed(wcx));
     }
 
-    fn add_tab_in_group(&mut self, group_id: &str, is_terminals: bool, cx: &mut Context<Self>) {
+    fn add_session_in_group(&mut self, group_id: &str, is_terminals: bool, cx: &mut Context<Self>) {
         self.state.update(cx, |ws, wcx| {
             if is_terminals {
-                // Terminal tab: model-only; its pane spawns render-driven on first
-                // activation (`ensure_active_pane_spawned`).
-                ws.sidebar_actions.create_terminal_tab(&mut ws.model);
+                // Terminal session: model-only; its window spawns render-driven on first
+                // activation (`ensure_active_window_spawned`).
+                ws.sidebar_actions.create_terminal_session(&mut ws.workspace);
             } else {
-                // R15: a real Claude tab through the ONE shared constructor — mints
+                // R15: a real Claude session through the ONE shared constructor — mints
                 // the session UUID, registers the session, and spawns the Claude
-                // pane immediately (claude-kind panes never lazy-spawn); the
+                // window immediately (claude-kind windows never lazy-spawn); the
                 // companion terminal stays deferred.
                 let settings = ws.claude_settings_path_provider();
-                let model = &mut ws.model;
-                let session = &mut ws.session;
-                let _ = session.create_claude_tab(
-                    model,
-                    ClaudeTabPlacement::Project {
+                let workspace = &mut ws.workspace;
+                let ptys = &mut ws.ptys;
+                let _ = ptys.create_claude_session(
+                    workspace,
+                    ClaudeSessionPlacement::Project {
                         project_id: group_id.to_string(),
                     },
                     &[],
                     // The sidebar `+` always starts a FRESH conversation.
-                    ClaudeTabSession::mint(),
+                    ClaudeSessionSpec::mint(),
                     settings.as_deref(),
                     wcx,
                 );
@@ -1060,11 +1060,11 @@ impl SidebarShellView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing_tab_id.is_some() {
+        if self.editing_session_id.is_some() {
             self.cancel_rename(window, cx);
             return; // consumed
         }
-        let multi = self.state.read(cx).selection.selected_tab_ids().len() > 1;
+        let multi = self.state.read(cx).selection.selected_session_ids().len() > 1;
         if multi {
             self.collapse_selection_to_active(cx);
             cx.notify(); // consumed
@@ -1078,21 +1078,21 @@ impl SidebarShellView {
 
     /// A group container's `on_drag_move`: recompute the gated drop slot while a
     /// row drag is in flight. Fires for EVERY window mouse-move while a
-    /// [`TabDragPayload`] drags — including over other groups and the pane body —
+    /// [`SessionDragPayload`] drags — including over other groups and the window body —
     /// so it FIRST guards containment (the port of Swift's `dropExited`,
     /// `SidebarView.swift:888-896`, and R25's D8): a cursor outside this group
     /// clears only a slot this group owns (another group's `on_drag_move` may
     /// already have overwritten it — Swift's `ownsCurrentIndicator`). When
     /// contained, the cursor's window y is resolved against this group's painted
     /// row frames — collapsed through [`drag_scope`] into subtree-aware units
-    /// ([`tab_drop_target`], midpoint rule) — and gated through
-    /// [`TabModel::would_move_tab`] — cross-project, illegal-lineage, and no-op
+    /// ([`session_drop_target`], midpoint rule) — and gated through
+    /// [`WorkspaceModel::would_move_session`] — cross-project, illegal-lineage, and no-op
     /// slots resolve to `None`, so no line paints and a drop is a no-op (prod's
     /// `dropUpdated` proposing `.forbidden`).
-    fn on_tab_drag_move(
+    fn on_session_drag_move(
         &mut self,
         group_id: &str,
-        event: &DragMoveEvent<TabDragPayload>,
+        event: &DragMoveEvent<SessionDragPayload>,
         cx: &mut Context<Self>,
     ) {
         if !event.bounds.contains(&event.event.position) {
@@ -1106,20 +1106,20 @@ impl SidebarShellView {
             }
             return;
         }
-        let dragged = event.drag(cx).tab_id.to_string();
+        let dragged = event.drag(cx).session_id.to_string();
         let y = f32::from(event.event.position.y);
         let frames = self.row_frames.borrow().clone();
         let new_target = {
             let ws = self.state.read(cx);
             let rows: Vec<(String, Option<String>)> = ws
-                .model
+                .workspace
                 .projects
                 .iter()
                 .find(|p| p.id == group_id)
                 .map(|p| {
-                    p.tabs
+                    p.sessions
                         .iter()
-                        .map(|t| (t.id.clone(), t.parent_tab_id.clone()))
+                        .map(|t| (t.id.clone(), t.parent_session_id.clone()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1127,20 +1127,20 @@ impl SidebarShellView {
             // units (the insertion line snaps to block boundaries); a child
             // drag against its own sibling run only.
             let (order, spans) = drag_scope(&rows, &dragged, &frames);
-            tab_drop_target(y, &order, &spans)
+            session_drop_target(y, &order, &spans)
                 .filter(|(target, place_after)| {
-                    ws.model.would_move_tab(&dragged, target, *place_after)
+                    ws.workspace.would_move_session(&dragged, target, *place_after)
                 })
-                .map(|(target_tab_id, place_after)| {
-                    // `tab_drop_target` only returns ids it found spans for.
-                    let (min_y, max_y) = spans[&target_tab_id];
+                .map(|(target_session_id, place_after)| {
+                    // `session_drop_target` only returns ids it found spans for.
+                    let (min_y, max_y) = spans[&target_session_id];
                     let edge = if place_after { max_y } else { min_y };
-                    (target_tab_id, place_after, edge)
+                    (target_session_id, place_after, edge)
                 })
         }
-        .map(|(target_tab_id, place_after, edge)| SidebarDropTarget {
+        .map(|(target_session_id, place_after, edge)| SidebarDropTarget {
             project_id: group_id.to_string(),
-            target_tab_id,
+            target_session_id,
             place_after,
             line_y: edge - f32::from(event.bounds.origin.y),
         });
@@ -1152,21 +1152,21 @@ impl SidebarShellView {
 
     /// A group container's `on_drop`: commit the reorder to the slot the last
     /// `on_drag_move` resolved, guarded to the owning group. Calls
-    /// [`TabModel::move_tab`] synchronously — gpui clears `active_drag` itself
+    /// [`WorkspaceModel::move_session`] synchronously — gpui clears `active_drag` itself
     /// after this listener, so prod's next-runloop-tick deferral
     /// (`SidebarView.swift:897-915`) has no analog to port — then persists
     /// explicitly via `WindowState::save_to_store`. The once-per-window
-    /// `on_tree_mutation` observer (BUGHUNT1-D) now also fires from `move_tab`, so
+    /// `on_tree_mutation` observer (BUGHUNT1-D) now also fires from `move_session`, so
     /// this explicit save is belt-and-suspenders (a duplicate debounced upsert is
     /// harmless — kept per that plan's D2). A drop with no resolved slot just
     /// clears the field.
-    fn on_tab_drop(&mut self, group_id: &str, payload: &TabDragPayload, cx: &mut Context<Self>) {
+    fn on_session_drop(&mut self, group_id: &str, payload: &SessionDragPayload, cx: &mut Context<Self>) {
         if let Some(target) = self.drag_target.take() {
             if target.project_id == group_id {
-                let dragged = payload.tab_id.to_string();
+                let dragged = payload.session_id.to_string();
                 self.state.update(cx, |ws, _| {
-                    ws.model
-                        .move_tab(&dragged, &target.target_tab_id, target.place_after);
+                    ws.workspace
+                        .move_session(&dragged, &target.target_session_id, target.place_after);
                     ws.save_to_store();
                 });
             }
@@ -1181,7 +1181,7 @@ impl SidebarShellView {
     /// the resolved slot AND gpui still has an active drag — the
     /// `has_active_drag` conjunct drops the line the instant a dropped-nowhere
     /// mouse-up clears `active_drag` (R25 D10). Because `drag_target` is
-    /// already `would_move_tab`-gated, no line shows for a no-op or
+    /// already `would_move_session`-gated, no line shows for a no-op or
     /// cross-project slot. Pure paint: no id, no listeners.
     fn insertion_line(&self, group_id: &str, cx: &App) -> Option<gpui::AnyElement> {
         if !cx.has_active_drag() {
@@ -1206,9 +1206,9 @@ impl SidebarShellView {
 
     // MARK: - Context menu
 
-    fn open_tab_context_menu(
+    fn open_session_context_menu(
         &mut self,
-        tab_id: &str,
+        session_id: &str,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1217,19 +1217,19 @@ impl SidebarShellView {
             .state
             .read(cx)
             .selection
-            .selection_ids_for_right_click_on(tab_id);
+            .selection_ids_for_right_click_on(session_id);
         let mut items = Vec::new();
         let weak = cx.weak_entity();
 
         // Rename appears only for a single-row selection (`SidebarView.swift:636`).
         if action_ids.len() == 1 {
-            let tid = tab_id.to_string();
+            let tid = session_id.to_string();
             let w = weak.clone();
-            items.push(ContextMenuItem::entry("Rename Tab", move |window, app| {
+            items.push(ContextMenuItem::entry("Rename Session", move |window, app| {
                 let _ = w.update(app, |this, cx| {
                     this.state.update(cx, |ws, _| {
                         ws.selection.snap_if_right_click_outside(&tid);
-                        ws.sidebar_actions.select_tab(&mut ws.model, &tid);
+                        ws.sidebar_actions.select_session(&mut ws.workspace, &tid);
                     });
                     this.reseed_selection_after_create(cx);
                     this.begin_editing(&tid, window, cx);
@@ -1239,12 +1239,12 @@ impl SidebarShellView {
 
         let close_label = close_menu_label(action_ids.len());
         let ids = action_ids.clone();
-        let tid = tab_id.to_string();
+        let tid = session_id.to_string();
         let w = weak.clone();
-        // R20.5: route through the busy-close gate. A tab with an alive busy pane
+        // R20.5: route through the busy-close gate. A session with an alive busy window
         // (thinking/waiting Claude, or a shell with a foreground child) interposes
-        // the "Force quit" confirmation; an idle tab still closes immediately (pty
-        // release + dissolve cascade + save + reconcile + terminus). The multi-tab
+        // the "Force quit" confirmation; an idle session still closes immediately (pty
+        // release + dissolve cascade + save + reconcile + terminus). The multi-session
         // gate is partial-eager: idle members close now, only busy survivors are
         // gated (D5). The gate owns the reconcile + notify + terminus in every path.
         items.push(ContextMenuItem::entry(close_label, move |window, app| {
@@ -1252,9 +1252,9 @@ impl SidebarShellView {
                 this.state.update(cx, |ws, wcx| {
                     ws.selection.snap_if_right_click_outside(&tid);
                     if ids.len() > 1 {
-                        ws.request_close_tabs(&ids, window, wcx);
+                        ws.request_close_sessions(&ids, window, wcx);
                     } else {
-                        ws.request_close_tab(&tid, window, wcx);
+                        ws.request_close_session(&tid, window, wcx);
                     }
                 });
             });
@@ -1280,7 +1280,7 @@ impl SidebarShellView {
         let weak = cx.weak_entity();
         let gid = group_id.to_string();
         // R20.5: route through the busy-close gate — a project with an alive busy
-        // pane across its tabs interposes the "Force quit" confirmation; an idle
+        // window across its sessions interposes the "Force quit" confirmation; an idle
         // project still closes immediately (pending-removal flag → row drop on last
         // dissolve + pty release + save + reconcile + terminus). The gate owns the
         // reconcile + notify + terminus in both paths.
@@ -1309,9 +1309,9 @@ impl SidebarShellView {
                 this.context_menu = None;
                 // The menu grabbed key focus on open; hand it back to the active
                 // terminal — unless the dismissed action began an inline rename
-                // (the Rename Tab entry focuses the field before the menu
+                // (the Rename Session entry focuses the field before the menu
                 // dismisses), which must keep the field focused (M2 Item D).
-                if this.editing_tab_id.is_none() {
+                if this.editing_session_id.is_none() {
                     this.refocus_terminal_after_rename(window, cx);
                 }
                 cx.notify();
@@ -1413,7 +1413,7 @@ impl SidebarShellView {
     ) -> impl IntoElement {
         let peeking = peeking_model || self.peek_mouse_pinned;
         let peek = peeking.then(|| self.build_peek_overlay(&groups, peeking, mode, cx));
-        // Collapsed: the full-width titlebar row over the full-width pane body —
+        // Collapsed: the full-width titlebar row over the full-width window body —
         // no cap card, no restore button, no fill, no divider. The
         // sidebar-collapse toggle in the titlebar (a `WindowToolbarView` control)
         // restores the sidebar (plan `docs/plans/restyle/01-titlebar-restyle.md`).
@@ -1441,7 +1441,7 @@ impl SidebarShellView {
         }
     }
 
-    /// The flat docked sidebar column: the body (tab list or file browser) over
+    /// The flat docked sidebar column: the body (session list or file browser) over
     /// the footer (mode switcher + gear), sharing the window-body / terminal
     /// surface — no card inset, fill, border, rounding, or shadow. A single 1px
     /// over-glass hairline sits at the trailing edge; because the column itself
@@ -1473,7 +1473,7 @@ impl SidebarShellView {
             .h_full()
             // No fill: the flattened column shows the shared window-body backing
             // (the terminal-theme background app_shell paints), so the sidebar and
-            // pane surfaces are one continuous surface.
+            // window surfaces are one continuous surface.
             .child(self.build_body(groups, &s, false, mode, cx))
             .child(self.build_footer(&s, mode, cx))
             // The 1px over-glass hairline at the trailing edge, full column height.
@@ -1495,9 +1495,9 @@ impl SidebarShellView {
     /// content, so it keeps the panel treatment for readability (and the opaque
     /// fill avoids double-alpha stacking once plan 3 makes the window
     /// translucent). Fixed [`SIDEBAR_PEEK_WIDTH`], never resizable, no hairline.
-    /// `peeking` forces the body to the tabs list — the same effective-peek
+    /// `peeking` forces the body to the sessions list — the same effective-peek
     /// predicate that gates the overlay's visibility, so the body and its presence
-    /// never disagree (peek overlays always show tabs, even in files mode).
+    /// never disagree (peek overlays always show sessions, even in files mode).
     fn build_peek_card(
         &self,
         groups: &[GroupVm],
@@ -1565,8 +1565,8 @@ impl SidebarShellView {
             .on_mouse_down(MouseButton::Left, on_down)
     }
 
-    /// The card body: the scrollable tab list, or (in files mode while not
-    /// peeking) the placeholder browser panel. Peeking always shows the tabs
+    /// The card body: the scrollable session list, or (in files mode while not
+    /// peeking) the placeholder browser panel. Peeking always shows the sessions
     /// list even in files mode (`SidebarView.swift:122-128`). `peeking` is the
     /// caller's effective-peek predicate (`sidebar.peeking() ||
     /// peek_mouse_pinned`), threaded so the body agrees with the overlay's own
@@ -1579,9 +1579,9 @@ impl SidebarShellView {
         mode: SidebarMode,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let show_tabs = peeking || mode == SidebarMode::Tabs;
-        if show_tabs {
-            self.build_tab_list(groups, s, cx).into_any_element()
+        let show_sessions = peeking || mode == SidebarMode::Sessions;
+        if show_sessions {
+            self.build_session_list(groups, s, cx).into_any_element()
         } else if let Some(fb) = self.file_browser.clone() {
             // R19: the real file browser (mounted here in place of the landed
             // placeholder). `render` mints it on first entry to files mode.
@@ -1602,7 +1602,7 @@ impl SidebarShellView {
         }
     }
 
-    fn build_tab_list(&self, groups: &[GroupVm], s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+    fn build_session_list(&self, groups: &[GroupVm], s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let group_els: Vec<gpui::AnyElement> = groups
             .iter()
             .map(|g| self.build_project_group(g, s, cx))
@@ -1612,7 +1612,7 @@ impl SidebarShellView {
             .overflow_y_scroll()
             .flex_1()
             .w_full()
-            // Empty-area click collapses a multi-selection back to the active tab
+            // Empty-area click collapses a multi-selection back to the active session
             // (`SidebarView.swift:142-163`, a `.onTapGesture` — so a CLICK, not a
             // mouse-down: rows consume their own clicks via `stop_propagation`,
             // and a row drag ending over empty space fires no click at all, so
@@ -1747,7 +1747,7 @@ impl SidebarShellView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _e: &MouseDownEvent, _w, cx| {
-                            this.add_tab_in_group(&gid_add, is_terminals, cx);
+                            this.add_session_in_group(&gid_add, is_terminals, cx);
                             cx.stop_propagation();
                         }),
                     );
@@ -1760,15 +1760,15 @@ impl SidebarShellView {
         }
 
         let rows: Vec<gpui::AnyElement> = g
-            .tabs
+            .sessions
             .iter()
-            .map(|t| self.build_tab_row(t, s, cx))
+            .map(|t| self.build_session_row(t, s, cx))
             .collect();
 
         // The group container is the drop region (Swift attaches the
         // `ProjectGroupDropDelegate` to this same VStack, `SidebarView.swift:270`):
         // it spans the header, every row, and the 4pt trailing padding, so a row
-        // can drop "above the first tab" (header area) or "below the last tab"
+        // can drop "above the first session" (header area) or "below the last session"
         // (trailing gap). `relative` hosts the absolute insertion line.
         let gid_move = gid.clone();
         let gid_drop = gid.clone();
@@ -1779,12 +1779,12 @@ impl SidebarShellView {
             .w_full()
             .pb(px(4.0))
             .on_drag_move(cx.listener(
-                move |this, e: &DragMoveEvent<TabDragPayload>, _w, cx| {
-                    this.on_tab_drag_move(&gid_move, e, cx);
+                move |this, e: &DragMoveEvent<SessionDragPayload>, _w, cx| {
+                    this.on_session_drag_move(&gid_move, e, cx);
                 },
             ))
-            .on_drop(cx.listener(move |this, payload: &TabDragPayload, _w, cx| {
-                this.on_tab_drop(&gid_drop, payload, cx);
+            .on_drop(cx.listener(move |this, payload: &SessionDragPayload, _w, cx| {
+                this.on_session_drop(&gid_drop, payload, cx);
             }))
             .child(header)
             .children(rows)
@@ -1792,7 +1792,7 @@ impl SidebarShellView {
             .into_any_element()
     }
 
-    fn build_tab_row(&self, t: &TabVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn build_session_row(&self, t: &SessionVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = crate::theme_settings::active_chrome_accent(cx);
         let scheme = crate::theme_settings::active_chrome_scheme(cx);
         let ink = slot_to_rgba(s.ink);
@@ -1804,7 +1804,7 @@ impl SidebarShellView {
         let glass = glass_fill_rgba(scheme);
         let indent = row_indent(t.indented);
 
-        // Leading icon: the status dot for a Claude tab, else the `terminal`
+        // Leading icon: the status dot for a Claude session, else the `terminal`
         // symbol — 12pt regular ink3 in a 16pt box (`SidebarView.swift:602-607`).
         // Row dots render small (5pt) — only the size parameter changes; colours
         // + pulse are untouched.
@@ -1953,8 +1953,8 @@ impl SidebarShellView {
         .inset_0();
 
         // The drag payload + ghost title, captured at build time (R25 D3/D4).
-        let drag_payload = TabDragPayload {
-            tab_id: SharedString::from(t.id.clone()),
+        let drag_payload = SessionDragPayload {
+            session_id: SharedString::from(t.id.clone()),
         };
         let ghost_title = SharedString::from(t.title.clone());
         let ghost_child_count = t.child_count;
@@ -1972,7 +1972,7 @@ impl SidebarShellView {
         //     monitor (`SidebarView.swift:484-498`): it commits another row's
         //     in-flight rename at press time. It deliberately does NOT
         //     `stop_propagation` — gpui's click/drag arming for this row is a
-        //     window-level recorder that already ran, but the tab list's
+        //     window-level recorder that already ran, but the session list's
         //     empty-area click machinery must also keep seeing the press.
         let inner = div()
             .id(SharedString::from(format!("sidebar.tab.{}", t.id)))
@@ -1997,7 +1997,7 @@ impl SidebarShellView {
             .child(title)
             .on_drag(drag_payload, move |_payload, offset, _window, app| {
                 let title = ghost_title.clone();
-                app.new(|_| TabRowDragGhost {
+                app.new(|_| SessionRowDragGhost {
                     title,
                     child_count: ghost_child_count,
                     offset,
@@ -2006,27 +2006,27 @@ impl SidebarShellView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
-                    if this.editing_tab_id.as_deref() == Some(tid_down.as_str()) {
+                    if this.editing_session_id.as_deref() == Some(tid_down.as_str()) {
                         // A press on the editing row's own icon/padding keeps
                         // the edit alive (the field swallows its own presses)
                         // — Swift's `guard !isEditing` (`SidebarView.swift:522`).
                         cx.stop_propagation();
                         return;
                     }
-                    if this.editing_tab_id.is_some() {
+                    if this.editing_session_id.is_some() {
                         this.commit_rename(window, cx);
                     }
                 }),
             )
             .on_click(cx.listener(move |this, e: &ClickEvent, _window, cx| {
-                if this.editing_tab_id.as_deref() == Some(tid_click.as_str()) {
+                if this.editing_session_id.as_deref() == Some(tid_click.as_str()) {
                     cx.stop_propagation();
                     return;
                 }
                 let mods = e.modifiers();
                 this.route_click(&tid_click, mods.platform, mods.shift, cx);
                 cx.notify();
-                // Consume so the tab list's empty-area click (selection
+                // Consume so the session list's empty-area click (selection
                 // collapse) doesn't also fire — rows absorb their own taps
                 // (`SidebarView.swift:155-160`).
                 cx.stop_propagation();
@@ -2034,7 +2034,7 @@ impl SidebarShellView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                    this.open_tab_context_menu(&tid_menu, e.position, window, cx);
+                    this.open_session_context_menu(&tid_menu, e.position, window, cx);
                     cx.stop_propagation();
                 }),
             );
@@ -2042,7 +2042,7 @@ impl SidebarShellView {
         div().px(px(6.0)).w_full().child(inner).into_any_element()
     }
 
-    /// The footer: the tabs/files mode switcher at the leading edge and the
+    /// The footer: the sessions/files mode switcher at the leading edge and the
     /// Settings gear at the trailing edge, sitting flush on the flat sidebar
     /// surface (no top rule — the 2026-07 restyle removed it). The mode buttons
     /// and gear render the restyle's stroke SVGs (`crate::chrome_icons`). The
@@ -2051,7 +2051,7 @@ impl SidebarShellView {
     /// routes share the singleton open-or-focus handler.
     fn build_footer(&self, s: &Slots, mode: SidebarMode, cx: &mut Context<Self>) -> impl IntoElement {
         let scheme = crate::theme_settings::active_chrome_scheme(cx);
-        let tabs_active = mode == SidebarMode::Tabs;
+        let sessions_active = mode == SidebarMode::Sessions;
         let files_active = mode == SidebarMode::Files;
         let gear_ink3 = slot_to_rgba(s.ink3);
         let gear_ink = slot_to_rgba(s.ink);
@@ -2065,7 +2065,7 @@ impl SidebarShellView {
             .px(px(8.0))
             .py(px(6.0))
             .child(
-                // Leading: the tabs ↔ files mode switcher.
+                // Leading: the sessions ↔ files mode switcher.
                 div()
                     .flex()
                     .flex_row()
@@ -2073,14 +2073,14 @@ impl SidebarShellView {
                     .gap(px(4.0))
                     .child(self.mode_button(
                         "sidebar.mode.tabs",
-                        crate::chrome_icons::MODE_TABS,
-                        crate::chrome_icons::MODE_TABS_W,
-                        crate::chrome_icons::MODE_TABS_H,
-                        tabs_active,
+                        crate::chrome_icons::MODE_SESSIONS,
+                        crate::chrome_icons::MODE_SESSIONS_W,
+                        crate::chrome_icons::MODE_SESSIONS_H,
+                        sessions_active,
                         scheme,
                         s,
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.set_mode(SidebarMode::Tabs, cx);
+                            this.set_mode(SidebarMode::Sessions, cx);
                             cx.notify();
                             cx.stop_propagation();
                         }),
@@ -2157,7 +2157,7 @@ impl SidebarShellView {
 
     /// The content column beside (expanded) or beneath (collapsed) the sidebar.
     /// A plain background when no content is injected (the isolated `sidebar`
-    /// scenario); the composed shell replaces it with the pane-content host via
+    /// scenario); the composed shell replaces it with the window-content host via
     /// the [`main_body`](Self::main_body) slot.
     fn build_content(&self, cx: &App) -> impl IntoElement {
         div()
@@ -2167,7 +2167,7 @@ impl SidebarShellView {
             .bg(slot_to_rgba(active_slots(cx).background))
     }
 
-    /// The pane content fill below the titlebar row: the injected pane-host
+    /// The window content fill below the titlebar row: the injected window-host
     /// when composed, else the placeholder [`build_content`](Self::build_content).
     fn build_main_body(&self, cx: &App) -> gpui::AnyElement {
         if let Some(body) = &self.main_body {
@@ -2185,7 +2185,7 @@ impl SidebarShellView {
     /// content at top-leading, staying open while the cursor pins it
     /// (`AppShellView.swift:908-923`). R12 sets `SidebarModel::peeking`; this
     /// renders it and OR's in the hover pin. `peeking` (the caller's effective
-    /// predicate) is threaded through to the card body so it always shows tabs.
+    /// predicate) is threaded through to the card body so it always shows sessions.
     fn build_peek_overlay(
         &self,
         groups: &[GroupVm],
@@ -2236,14 +2236,14 @@ impl SidebarShellView {
     }
 
     /// The `(status, waiting_acknowledged)` pair the row would feed its
-    /// [`StatusDot`] for `tab_id` — the R8 predicates read straight off the model,
-    /// never recomputed. `None` if the tab is unknown. The scenario asserts the
+    /// [`StatusDot`] for `session_id` — the R8 predicates read straight off the model,
+    /// never recomputed. `None` if the session is unknown. The scenario asserts the
     /// dot colour + pulse rule against these.
-    pub(crate) fn tab_dot_inputs(&self, tab_id: &str, cx: &App) -> Option<(TabStatus, bool)> {
+    pub(crate) fn session_dot_inputs(&self, session_id: &str, cx: &App) -> Option<(SessionStatus, bool)> {
         self.state
             .read(cx)
-            .model
-            .tab_for(tab_id)
+            .workspace
+            .session_for(session_id)
             .map(|t| (t.status(), t.waiting_acknowledged()))
     }
 
@@ -2271,36 +2271,36 @@ impl SidebarShellView {
         }
     }
 
-    /// Begin an inline rename of the ACTIVE tab through the real path (the
-    /// gate-passed title tap and the context-menu Rename Tab entry both land in
+    /// Begin an inline rename of the ACTIVE session through the real path (the
+    /// gate-passed title tap and the context-menu Rename Session entry both land in
     /// `begin_editing`) — the `app-shell` scenario's focus-routing driver.
-    pub(crate) fn drive_begin_tab_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.state.read(cx).model.active_tab_id().map(str::to_owned) else {
+    pub(crate) fn drive_begin_session_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.state.read(cx).workspace.active_session_id().map(str::to_owned) else {
             return;
         };
-        self.begin_editing(&tab_id, window, cx);
+        self.begin_editing(&session_id, window, cx);
     }
 
-    /// Whether an inline tab rename is in flight.
-    pub(crate) fn scenario_tab_rename_editing(&self) -> bool {
-        self.editing_tab_id.is_some()
+    /// Whether an inline session rename is in flight.
+    pub(crate) fn scenario_session_rename_editing(&self) -> bool {
+        self.editing_session_id.is_some()
     }
 
-    /// The in-flight tab-rename draft (the scenario's "keys land in the field"
+    /// The in-flight session-rename draft (the scenario's "keys land in the field"
     /// read).
-    pub(crate) fn scenario_tab_rename_draft(&self) -> String {
+    pub(crate) fn scenario_session_rename_draft(&self) -> String {
         self.rename_editor.as_ref().map(|e| e.text()).unwrap_or_default()
     }
 
-    /// The in-flight tab-rename selection `(start, end)` as char offsets — the
+    /// The in-flight session-rename selection `(start, end)` as char offsets — the
     /// scenario asserts caret moves / mid-string edits through it.
-    pub(crate) fn scenario_tab_rename_selection(&self) -> Option<(usize, usize)> {
+    pub(crate) fn scenario_session_rename_selection(&self) -> Option<(usize, usize)> {
         self.rename_editor.as_ref().map(|e| e.selection())
     }
 
-    /// Move the tab-rename caret one char left/right (the scenario's arrow-key
+    /// Move the session-rename caret one char left/right (the scenario's arrow-key
     /// driver — direct so it needn't post an arrow CGEvent).
-    pub(crate) fn drive_tab_rename_arrow(&mut self, right: bool, cx: &mut Context<Self>) {
+    pub(crate) fn drive_session_rename_arrow(&mut self, right: bool, cx: &mut Context<Self>) {
         if let Some(editor) = self.rename_editor.as_mut() {
             editor.apply_key(if right {
                 nice_model::file_browser::TextFieldKey::Right
@@ -2311,8 +2311,8 @@ impl SidebarShellView {
         }
     }
 
-    /// Whether the tab-rename field currently holds key focus.
-    pub(crate) fn scenario_tab_rename_focused(&self, window: &Window) -> bool {
+    /// Whether the session-rename field currently holds key focus.
+    pub(crate) fn scenario_session_rename_focused(&self, window: &Window) -> bool {
         self.rename_focus.is_focused(window)
     }
 
@@ -2336,7 +2336,7 @@ impl Render for SidebarShellView {
         // at this window's device resolution.
         self.window_scale = window.scale_factor();
         // Drop the previous frame's row extents — the paint that follows this
-        // render re-records every VISIBLE row, so closed tabs and collapsed
+        // render re-records every VISIBLE row, so closed sessions and collapsed
         // groups can't leave stale frames for the drop resolver to hit.
         self.row_frames.borrow_mut().clear();
         // R23 (D3): re-read the sidebar base size so a live Font-pane change repaints
@@ -2369,10 +2369,10 @@ impl Render for SidebarShellView {
             fb.update(cx, |fb, _| {
                 fb.set_option_probe(std::sync::Arc::new(crate::platform::option_key_held));
             });
-            // R20 (F8): push the pane host down so a rename exit hands key focus
-            // back to the active terminal (set_pane_host runs before first render).
-            if let Some(host) = self.pane_host.clone() {
-                fb.update(cx, |fb, _| fb.set_pane_host(host));
+            // R20 (F8): push the window host down so a rename exit hands key focus
+            // back to the active terminal (set_window_host runs before first render).
+            if let Some(host) = self.window_host.clone() {
+                fb.update(cx, |fb, _| fb.set_window_host(host));
             }
             self.file_browser = Some(fb);
         }
@@ -2439,9 +2439,9 @@ mod tests {
 
     #[test]
     fn close_menu_label_pluralizes_on_multi() {
-        assert_eq!(close_menu_label(1), "Close Tab");
-        assert_eq!(close_menu_label(3), "Close 3 Tabs");
-        assert_eq!(close_menu_label(2), "Close 2 Tabs");
+        assert_eq!(close_menu_label(1), "Close Session");
+        assert_eq!(close_menu_label(3), "Close 3 Sessions");
+        assert_eq!(close_menu_label(2), "Close 2 Sessions");
     }
 
     #[test]
@@ -2454,7 +2454,7 @@ mod tests {
         assert_ne!(disclosure_icon(true), disclosure_icon(false));
     }
 
-    // ---- tab_drop_target (mirrors Tests/NiceUnitTests/SidebarDropResolverTests.swift)
+    // ---- session_drop_target (mirrors Tests/NiceUnitTests/SidebarDropResolverTests.swift)
 
     /// Three 28pt rows stacked from y=100 (a: 100-128, b: 128-156, c: 156-184).
     fn frames3() -> HashMap<String, (f32, f32)> {
@@ -2470,45 +2470,45 @@ mod tests {
     }
 
     #[test]
-    fn drop_over_first_tab_splits_on_midpoint() {
+    fn drop_over_first_session_splits_on_midpoint() {
         let (f, o) = (frames3(), order3());
-        assert_eq!(tab_drop_target(105.0, &o, &f), Some(("a".to_string(), false)));
-        assert_eq!(tab_drop_target(125.0, &o, &f), Some(("a".to_string(), true)));
+        assert_eq!(session_drop_target(105.0, &o, &f), Some(("a".to_string(), false)));
+        assert_eq!(session_drop_target(125.0, &o, &f), Some(("a".to_string(), true)));
     }
 
     #[test]
-    fn drop_above_first_tab_header_area_is_before_first() {
+    fn drop_above_first_session_header_area_is_before_first() {
         assert_eq!(
-            tab_drop_target(80.0, &order3(), &frames3()),
+            session_drop_target(80.0, &order3(), &frames3()),
             Some(("a".to_string(), false))
         );
     }
 
     #[test]
-    fn drop_below_last_tab_trailing_gap_is_after_last() {
+    fn drop_below_last_session_trailing_gap_is_after_last() {
         assert_eq!(
-            tab_drop_target(200.0, &order3(), &frames3()),
+            session_drop_target(200.0, &order3(), &frames3()),
             Some(("c".to_string(), true))
         );
     }
 
     #[test]
-    fn drop_over_middle_tab_splits_on_midpoint() {
+    fn drop_over_middle_session_splits_on_midpoint() {
         let (f, o) = (frames3(), order3());
-        assert_eq!(tab_drop_target(135.0, &o, &f), Some(("b".to_string(), false)));
-        assert_eq!(tab_drop_target(150.0, &o, &f), Some(("b".to_string(), true)));
+        assert_eq!(session_drop_target(135.0, &o, &f), Some(("b".to_string(), false)));
+        assert_eq!(session_drop_target(150.0, &o, &f), Some(("b".to_string(), true)));
     }
 
     #[test]
     fn drop_in_empty_group_is_none() {
-        assert_eq!(tab_drop_target(120.0, &[], &frames3()), None);
+        assert_eq!(session_drop_target(120.0, &[], &frames3()), None);
     }
 
     #[test]
     fn drop_in_collapsed_group_no_frames_is_none() {
         // A collapsed group paints no rows, so its ids carry no frames — every
         // branch misses (Swift's empty `tabFrames` snapshot).
-        assert_eq!(tab_drop_target(120.0, &order3(), &HashMap::new()), None);
+        assert_eq!(session_drop_target(120.0, &order3(), &HashMap::new()), None);
     }
 
     // ---- drag_scope (subtree-aware drop units, M7.8 round 3) ----------------
@@ -2554,9 +2554,9 @@ mod tests {
         let (order, spans) = drag_scope(&lineage_rows(), "C", &lineage_frames());
         // y=150 is over A's SECOND row but above the block midpoint (142):
         // resolves after the whole A block, never between A and its children…
-        assert_eq!(tab_drop_target(150.0, &order, &spans), Some(("A".into(), true)));
+        assert_eq!(session_drop_target(150.0, &order, &spans), Some(("A".into(), true)));
         // …and y=120 (top half of the block) is before it.
-        assert_eq!(tab_drop_target(120.0, &order, &spans), Some(("A".into(), false)));
+        assert_eq!(session_drop_target(120.0, &order, &spans), Some(("A".into(), false)));
     }
 
     #[test]
@@ -2570,7 +2570,7 @@ mod tests {
         // Rows outside the block are not in the order, so a cursor over B's
         // row (y=190) falls into the below-last branch → after A2 (the last
         // sibling), which the model gates as a no-op when unchanged.
-        assert_eq!(tab_drop_target(190.0, &order, &spans), Some(("A2".into(), true)));
+        assert_eq!(session_drop_target(190.0, &order, &spans), Some(("A2".into(), true)));
     }
 
     #[test]

@@ -2,12 +2,12 @@
 //! reparented to launchd. Rust port of Swift
 //! `Sources/Nice/Process/OrphanShellReaper.swift`.
 //!
-//! After a normal quit each pane's zsh is terminated and exits before the
+//! After a normal quit each window's zsh is terminated and exits before the
 //! parent. After a crash / SIGKILL of the parent / a teardown path that never
 //! runs, the children reparent to launchd (PPID == 1) and sit idle holding pty
 //! slots. macOS caps `kern.tty.ptmx_max` at 511; accumulated orphans eventually
-//! starve `forkpty()` and new panes hang at "Launching terminal…". This reaper
-//! runs once, synchronously, at bootstrap BEFORE any pane spawns — wired from
+//! starve `forkpty()` and new windows hang at "Launching terminal…". This reaper
+//! runs once, synchronously, at bootstrap BEFORE any window spawns — wired from
 //! `app::run`'s `install_shell_inject_bootstrap` (this module owns the pure
 //! filter + the OS surface behind the injectable [`ReaperEnv`] seam).
 //!

@@ -7,44 +7,44 @@
 //! which reaches every live window's [`WindowState`](crate::window_state::WindowState)
 //! model through the registry — is registry-dependent, so it lands here.
 //!
-//! Every window/project/tab contributes: one synthetic tab-anchor entry
-//! ([`Tab::cwd`](nice_model::Tab)) plus one entry per `is_alive` pane with a
-//! non-empty OSC-7 cwd. The per-tab projection ([`entries_for_tab`]) is pure over
-//! a plain [`nice_model::Tab`] so it is table-tested without a gpui `App`; the
+//! Every window/project/session contributes: one synthetic session-anchor entry
+//! ([`Session::cwd`](nice_model::Session)) plus one entry per `is_alive` window with a
+//! non-empty OSC-7 cwd. The per-session projection ([`entries_for_session`]) is pure over
+//! a plain [`nice_model::Session`] so it is table-tested without a gpui `App`; the
 //! registry walk ([`build_snapshot`]) is exercised by the rename flow + scenario.
 
 use gpui::App;
 
 use nice_model::file_browser::cwd_impact::normalize_path;
-use nice_model::file_browser::{PaneCWDRef, PaneCWDSnapshot};
-use nice_model::{PaneKind, Tab};
+use nice_model::file_browser::{TermWindowCWDRef, TermWindowCWDSnapshot};
+use nice_model::{TermWindowKind, Session};
 
 use crate::window_registry::WindowRegistry;
 
-/// The CWD references a single tab contributes: the tab anchor (`Tab.cwd`, an
-/// empty `pane_id` + a [`PaneKind::Terminal`] sentinel — the message only counts,
-/// it never distinguishes kinds) plus one entry per `is_alive` pane carrying a
+/// The CWD references a single session contributes: the session anchor (`Session.cwd`, an
+/// empty `term_window_id` + a [`TermWindowKind::Terminal`] sentinel — the message only counts,
+/// it never distinguishes kinds) plus one entry per `is_alive` window carrying a
 /// non-empty OSC-7 cwd. Each `cwd` is normalized (trailing slash stripped) so the
 /// prefix rule in [`affected_by`](nice_model::file_browser::affected_by) sees
 /// canonical forms.
-pub fn entries_for_tab(window_session_id: &str, tab: &Tab) -> Vec<PaneCWDRef> {
+pub fn entries_for_session(window_session_id: &str, session: &Session) -> Vec<TermWindowCWDRef> {
     let mut out = Vec::new();
-    // The synthetic tab-anchor entry (always present — Swift adds `Tab.cwd`
+    // The synthetic session-anchor entry (always present — Swift adds `Session.cwd`
     // unconditionally; an empty cwd normalizes to "" and simply never matches).
-    out.push(PaneCWDRef {
+    out.push(TermWindowCWDRef {
         window_session_id: window_session_id.to_string(),
-        tab_id: tab.id.clone(),
-        pane_id: String::new(),
-        kind: PaneKind::Terminal,
-        cwd: normalize_path(&tab.cwd),
+        session_id: session.id.clone(),
+        window_id: String::new(),
+        kind: TermWindowKind::Terminal,
+        cwd: normalize_path(&session.cwd),
     });
-    for pane in tab.panes.iter().filter(|p| p.is_alive) {
-        if let Some(cwd) = pane.cwd.as_deref().filter(|c| !c.is_empty()) {
-            out.push(PaneCWDRef {
+    for term_window in session.windows.iter().filter(|p| p.is_alive) {
+        if let Some(cwd) = term_window.cwd.as_deref().filter(|c| !c.is_empty()) {
+            out.push(TermWindowCWDRef {
                 window_session_id: window_session_id.to_string(),
-                tab_id: tab.id.clone(),
-                pane_id: pane.id.clone(),
-                kind: pane.kind,
+                session_id: session.id.clone(),
+                window_id: term_window.id.clone(),
+                kind: term_window.kind,
                 cwd: normalize_path(cwd),
             });
         }
@@ -52,78 +52,78 @@ pub fn entries_for_tab(window_session_id: &str, tab: &Tab) -> Vec<PaneCWDRef> {
     out
 }
 
-/// Build a [`PaneCWDSnapshot`] over every live window's tabs by walking the
+/// Build a [`TermWindowCWDSnapshot`] over every live window's sessions by walking the
 /// [`WindowRegistry`]. Runs once at the start of a rename attempt so the CWD-impact
 /// check sees a consistent view. Empty when no registry is installed.
-pub fn build_snapshot(cx: &App) -> PaneCWDSnapshot {
+pub fn build_snapshot(cx: &App) -> TermWindowCWDSnapshot {
     let mut entries = Vec::new();
     for state in WindowRegistry::all_states(cx) {
         let ws = state.read(cx);
-        let session_id = ws.session_id().to_string();
-        for project in &ws.model.projects {
-            for tab in &project.tabs {
-                entries.extend(entries_for_tab(&session_id, tab));
+        let window_session_id = ws.window_session_id().to_string();
+        for project in &ws.workspace.projects {
+            for session in &project.sessions {
+                entries.extend(entries_for_session(&window_session_id, session));
             }
         }
     }
-    PaneCWDSnapshot { entries }
+    TermWindowCWDSnapshot { entries }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nice_model::{Pane, PaneKind, Tab};
+    use nice_model::{TermWindow, TermWindowKind, Session};
 
-    fn tab_with_cwd(id: &str, cwd: &str) -> Tab {
-        Tab::new(id, "title", cwd)
+    fn session_with_cwd(id: &str, cwd: &str) -> Session {
+        Session::new(id, "title", cwd)
     }
 
-    /// The tab-anchor entry is always present, carrying the (normalized) tab cwd,
-    /// an empty pane_id, and the Terminal sentinel kind.
+    /// The session-anchor entry is always present, carrying the (normalized) session cwd,
+    /// an empty term_window_id, and the Terminal sentinel kind.
     #[test]
-    fn entries_for_tab_includes_tab_anchor() {
-        let tab = tab_with_cwd("t1", "/proj/nice/");
-        let entries = entries_for_tab("win-A", &tab);
+    fn entries_for_session_includes_session_anchor() {
+        let session = session_with_cwd("t1", "/proj/nice/");
+        let entries = entries_for_session("win-A", &session);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].window_session_id, "win-A");
-        assert_eq!(entries[0].tab_id, "t1");
-        assert_eq!(entries[0].pane_id, "");
+        assert_eq!(entries[0].session_id, "t1");
+        assert_eq!(entries[0].window_id, "");
         assert_eq!(entries[0].cwd, "/proj/nice", "trailing slash normalized off");
     }
 
-    /// Each `is_alive` pane with a non-empty OSC-7 cwd contributes an entry;
-    /// dead panes and panes without an OSC-7 cwd are skipped.
+    /// Each `is_alive` window with a non-empty OSC-7 cwd contributes an entry;
+    /// dead windows and windows without an OSC-7 cwd are skipped.
     #[test]
-    fn entries_for_tab_includes_live_panes_with_cwd() {
-        let mut tab = tab_with_cwd("t1", "/proj");
-        let mut alive = Pane::new("p1", "sh", PaneKind::Terminal);
+    fn entries_for_session_includes_live_windows_with_cwd() {
+        let mut session = session_with_cwd("t1", "/proj");
+        let mut alive = TermWindow::new("p1", "sh", TermWindowKind::Terminal);
         alive.cwd = Some("/proj/src/".to_string());
-        let mut dead = Pane::new("p2", "sh", PaneKind::Terminal);
+        let mut dead = TermWindow::new("p2", "sh", TermWindowKind::Terminal);
         dead.is_alive = false;
         dead.cwd = Some("/proj/dead".to_string());
-        let mut no_cwd = Pane::new("p3", "claude", PaneKind::Claude);
+        let mut no_cwd = TermWindow::new("p3", "claude", TermWindowKind::Claude);
         no_cwd.cwd = None;
-        tab.panes = vec![alive, dead, no_cwd];
+        session.windows = vec![alive, dead, no_cwd];
 
-        let entries = entries_for_tab("win-A", &tab);
-        // tab-anchor + the one live pane with a cwd (dead + no-cwd skipped).
+        let entries = entries_for_session("win-A", &session);
+        // session-anchor + the one live window with a cwd (dead + no-cwd skipped).
         assert_eq!(entries.len(), 2);
-        let pane_entry = entries.iter().find(|e| e.pane_id == "p1").unwrap();
-        assert_eq!(pane_entry.cwd, "/proj/src", "pane cwd normalized");
-        assert!(entries.iter().all(|e| e.pane_id != "p2"), "dead pane skipped");
-        assert!(entries.iter().all(|e| e.pane_id != "p3"), "no-cwd pane skipped");
+        let window_entry = entries.iter().find(|e| e.window_id == "p1").unwrap();
+        assert_eq!(window_entry.cwd, "/proj/src", "window cwd normalized");
+        assert!(entries.iter().all(|e| e.window_id != "p2"), "dead window skipped");
+        assert!(entries.iter().all(|e| e.window_id != "p3"), "no-cwd window skipped");
     }
 
-    /// A claude pane's kind is preserved on its entry (the message doesn't use it,
+    /// A claude window's kind is preserved on its entry (the message doesn't use it,
     /// but the value carries through — matching the pure `affected_by` test).
     #[test]
-    fn entries_for_tab_preserves_pane_kind() {
-        let mut tab = tab_with_cwd("t1", "/proj");
-        let mut claude = Pane::new("p1", "claude", PaneKind::Claude);
+    fn entries_for_session_preserves_window_kind() {
+        let mut session = session_with_cwd("t1", "/proj");
+        let mut claude = TermWindow::new("p1", "claude", TermWindowKind::Claude);
         claude.cwd = Some("/proj/sub".to_string());
-        tab.panes = vec![claude];
-        let entries = entries_for_tab("win-A", &tab);
-        let pane_entry = entries.iter().find(|e| e.pane_id == "p1").unwrap();
-        assert_eq!(pane_entry.kind, PaneKind::Claude);
+        session.windows = vec![claude];
+        let entries = entries_for_session("win-A", &session);
+        let window_entry = entries.iter().find(|e| e.window_id == "p1").unwrap();
+        assert_eq!(window_entry.kind, TermWindowKind::Claude);
     }
 }

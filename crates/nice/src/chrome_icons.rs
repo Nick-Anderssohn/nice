@@ -41,15 +41,15 @@ pub(crate) const SIDEBAR_TOGGLE_H: f32 = 12.0;
 
 const SIDEBAR_TOGGLE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="15" height="12" viewBox="0 0 15 12" fill="none" stroke="#000" stroke-width="1"><rect x="0.5" y="0.5" width="14" height="11" rx="2.5"/><line x1="5.5" y1="0.5" x2="5.5" y2="11.5"/></svg>"##;
 
-/// The sidebar footer's "Claude tabs" mode-switcher icon: three horizontal
+/// The sidebar footer's "Claude sessions" mode-switcher icon: three horizontal
 /// lines. Verbatim from `docs/design/restyle-mocks.html` (`.sb-footer`
-/// `.sb-ico` "Claude tabs"): 14×12 viewBox, 1.4 stroke, round caps, `path d="M1
+/// `.sb-ico` "Claude sessions"): 14×12 viewBox, 1.4 stroke, round caps, `path d="M1
 /// 2h12M1 6h12M1 10h8"`.
-pub(crate) const MODE_TABS: &str = "chrome/mode-tabs.svg";
-pub(crate) const MODE_TABS_W: f32 = 14.0;
-pub(crate) const MODE_TABS_H: f32 = 12.0;
+pub(crate) const MODE_SESSIONS: &str = "chrome/mode-tabs.svg";
+pub(crate) const MODE_SESSIONS_W: f32 = 14.0;
+pub(crate) const MODE_SESSIONS_H: f32 = 12.0;
 
-const MODE_TABS_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="#000" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg>"##;
+const MODE_SESSIONS_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="#000" stroke-width="1.4" stroke-linecap="round"><path d="M1 2h12M1 6h12M1 10h8"/></svg>"##;
 
 /// The sidebar footer's "File explorer" mode-switcher icon: an outline
 /// folder. Verbatim from `docs/design/restyle-mocks.html` (`.sb-footer`
@@ -86,7 +86,7 @@ impl AssetSource for ChromeIconAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(match path {
             SIDEBAR_TOGGLE => Some(Cow::Borrowed(SIDEBAR_TOGGLE_SVG)),
-            MODE_TABS => Some(Cow::Borrowed(MODE_TABS_SVG)),
+            MODE_SESSIONS => Some(Cow::Borrowed(MODE_SESSIONS_SVG)),
             MODE_FILES => Some(Cow::Borrowed(MODE_FILES_SVG)),
             MODE_GEAR => Some(Cow::Borrowed(MODE_GEAR_SVG)),
             _ => None,
@@ -96,7 +96,7 @@ impl AssetSource for ChromeIconAssets {
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
         Ok(vec![
             SharedString::from(SIDEBAR_TOGGLE),
-            SharedString::from(MODE_TABS),
+            SharedString::from(MODE_SESSIONS),
             SharedString::from(MODE_FILES),
             SharedString::from(MODE_GEAR),
         ])
@@ -121,11 +121,11 @@ mod tests {
     }
 
     #[test]
-    fn serves_the_mode_tabs_icon() {
+    fn serves_the_mode_sessions_icon() {
         let assets = ChromeIconAssets;
-        let bytes = assets.load(MODE_TABS).unwrap().expect("icon present");
+        let bytes = assets.load(MODE_SESSIONS).unwrap().expect("icon present");
         let svg = std::str::from_utf8(&bytes).unwrap();
-        // docs/design/restyle-mocks.html .sb-footer "Claude tabs": 14×12
+        // docs/design/restyle-mocks.html .sb-footer "Claude sessions": 14×12
         // viewBox, 1.4 stroke, round caps, three horizontal lines.
         assert!(svg.contains("viewBox=\"0 0 14 12\""));
         assert!(svg.contains("stroke-width=\"1.4\""));
@@ -166,7 +166,7 @@ mod tests {
     fn list_enumerates_every_served_icon() {
         let assets = ChromeIconAssets;
         let listed = assets.list("chrome").unwrap();
-        for path in [SIDEBAR_TOGGLE, MODE_TABS, MODE_FILES, MODE_GEAR] {
+        for path in [SIDEBAR_TOGGLE, MODE_SESSIONS, MODE_FILES, MODE_GEAR] {
             assert!(listed.iter().any(|s| s.as_ref() == path), "{path} missing from list()");
         }
     }

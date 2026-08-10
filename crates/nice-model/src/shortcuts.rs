@@ -40,19 +40,19 @@
 /// actions in `crates/nice`, not in this table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutAction {
-    /// Cycle to the next sidebar tab (⌘⌥↓ by default).
-    NextSidebarTab,
-    /// Cycle to the previous sidebar tab (⌘⌥↑).
-    PrevSidebarTab,
-    /// Focus the next pane in the active tab (⌘⌥→).
-    NextPane,
-    /// Focus the previous pane in the active tab (⌘⌥←).
-    PrevPane,
-    /// Add a new terminal pane to the active tab (⌘T).
-    NewTerminalPane,
+    /// Cycle to the next sidebar session (⌘⌥↓ by default).
+    NextSidebarSession,
+    /// Cycle to the previous sidebar session (⌘⌥↑).
+    PrevSidebarSession,
+    /// Focus the next window in the active session (⌘⌥→).
+    NextWindow,
+    /// Focus the previous window in the active session (⌘⌥←).
+    PrevWindow,
+    /// Add a new terminal window to the active session (⌘T).
+    NewTerminalWindow,
     /// Collapse / expand the sidebar (⌘B).
     ToggleSidebar,
-    /// Switch the sidebar between tabs and files mode (⌘⇧B).
+    /// Switch the sidebar between sessions and files mode (⌘⇧B).
     ToggleSidebarMode,
     /// Toggle hidden files in the file browser (⌘⇧.). Deferred handler — R19.
     ToggleHiddenFiles,
@@ -78,11 +78,11 @@ impl ShortcutAction {
     /// R24's recorder (which renders one row per action). The order matches the
     /// enum declaration and Swift's `allCases`.
     pub const ALL: [ShortcutAction; 14] = [
-        ShortcutAction::NextSidebarTab,
-        ShortcutAction::PrevSidebarTab,
-        ShortcutAction::NextPane,
-        ShortcutAction::PrevPane,
-        ShortcutAction::NewTerminalPane,
+        ShortcutAction::NextSidebarSession,
+        ShortcutAction::PrevSidebarSession,
+        ShortcutAction::NextWindow,
+        ShortcutAction::PrevWindow,
+        ShortcutAction::NewTerminalWindow,
         ShortcutAction::ToggleSidebar,
         ShortcutAction::ToggleSidebarMode,
         ShortcutAction::ToggleHiddenFiles,
@@ -98,11 +98,11 @@ impl ShortcutAction {
     /// Swift's `ShortcutAction.label`.
     pub fn label(self) -> &'static str {
         match self {
-            ShortcutAction::NextSidebarTab => "Next sidebar tab",
-            ShortcutAction::PrevSidebarTab => "Previous sidebar tab",
-            ShortcutAction::NextPane => "Next pane",
-            ShortcutAction::PrevPane => "Previous pane",
-            ShortcutAction::NewTerminalPane => "New terminal pane",
+            ShortcutAction::NextSidebarSession => "Next sidebar session",
+            ShortcutAction::PrevSidebarSession => "Previous sidebar session",
+            ShortcutAction::NextWindow => "Next window",
+            ShortcutAction::PrevWindow => "Previous window",
+            ShortcutAction::NewTerminalWindow => "New terminal window",
             ShortcutAction::ToggleSidebar => "Toggle sidebar",
             ShortcutAction::ToggleSidebarMode => "Toggle sidebar mode",
             ShortcutAction::ToggleHiddenFiles => "Toggle hidden files",
@@ -124,7 +124,7 @@ impl ShortcutAction {
                 "Turns plain English typed at a zsh prompt into a real command \
                  using Claude Code. The command is placed at the prompt for \
                  review — press Enter yourself to run it. Does nothing while a \
-                 program is running in the pane.",
+                 program is running in the window.",
             ),
             _ => None,
         }
@@ -138,11 +138,11 @@ impl ShortcutAction {
     /// deliberately. Adding a case here must add its id (and a defaults-table row).
     pub fn id(self) -> &'static str {
         match self {
-            ShortcutAction::NextSidebarTab => "nextSidebarTab",
-            ShortcutAction::PrevSidebarTab => "prevSidebarTab",
-            ShortcutAction::NextPane => "nextPane",
-            ShortcutAction::PrevPane => "prevPane",
-            ShortcutAction::NewTerminalPane => "newTerminalPane",
+            ShortcutAction::NextSidebarSession => "nextSidebarTab",
+            ShortcutAction::PrevSidebarSession => "prevSidebarTab",
+            ShortcutAction::NextWindow => "nextPane",
+            ShortcutAction::PrevWindow => "prevPane",
+            ShortcutAction::NewTerminalWindow => "newTerminalPane",
             ShortcutAction::ToggleSidebar => "toggleSidebar",
             ShortcutAction::ToggleSidebarMode => "toggleSidebarMode",
             ShortcutAction::ToggleHiddenFiles => "toggleHiddenFiles",
@@ -244,42 +244,42 @@ impl KeyCombo {
 /// The default binding for every [`ShortcutAction`], in [`ShortcutAction::ALL`]
 /// order. Ported from Swift's `KeyboardShortcuts.defaults` (the Option-B +
 /// pure-wrap scheme the user picked: directional arrows for both axes, ⌘T for a
-/// new pane, ⌘B for the sidebar). Every action has exactly one default combo,
+/// new window, ⌘B for the sidebar). Every action has exactly one default combo,
 /// and no two actions share a combo — both pinned by this module's tests, and by
 /// the keymap slice which would otherwise register a colliding binding.
 pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 14] {
     use ShortcutAction::*;
     [
         (
-            NextSidebarTab,
+            NextSidebarSession,
             KeyCombo {
                 modifiers: Modifiers::COMMAND_ALT,
                 key: "down",
             },
         ),
         (
-            PrevSidebarTab,
+            PrevSidebarSession,
             KeyCombo {
                 modifiers: Modifiers::COMMAND_ALT,
                 key: "up",
             },
         ),
         (
-            NextPane,
+            NextWindow,
             KeyCombo {
                 modifiers: Modifiers::COMMAND_ALT,
                 key: "right",
             },
         ),
         (
-            PrevPane,
+            PrevWindow,
             KeyCombo {
                 modifiers: Modifiers::COMMAND_ALT,
                 key: "left",
             },
         ),
         (
-            NewTerminalPane,
+            NewTerminalWindow,
             KeyCombo {
                 modifiers: Modifiers::COMMAND,
                 key: "t",
@@ -524,11 +524,11 @@ mod tests {
         // arrow + letter combos, the trailing-'-' minus case, and the shifted
         // period (the character-based-matching divergence).
         let combo = |a| default_combo(a).unwrap().chord_str();
-        assert_eq!(combo(ShortcutAction::NextSidebarTab), "cmd-alt-down");
-        assert_eq!(combo(ShortcutAction::PrevSidebarTab), "cmd-alt-up");
-        assert_eq!(combo(ShortcutAction::NextPane), "cmd-alt-right");
-        assert_eq!(combo(ShortcutAction::PrevPane), "cmd-alt-left");
-        assert_eq!(combo(ShortcutAction::NewTerminalPane), "cmd-t");
+        assert_eq!(combo(ShortcutAction::NextSidebarSession), "cmd-alt-down");
+        assert_eq!(combo(ShortcutAction::PrevSidebarSession), "cmd-alt-up");
+        assert_eq!(combo(ShortcutAction::NextWindow), "cmd-alt-right");
+        assert_eq!(combo(ShortcutAction::PrevWindow), "cmd-alt-left");
+        assert_eq!(combo(ShortcutAction::NewTerminalWindow), "cmd-t");
         assert_eq!(combo(ShortcutAction::ToggleSidebar), "cmd-b");
         assert_eq!(combo(ShortcutAction::ToggleSidebarMode), "cmd-shift-b");
         assert_eq!(combo(ShortcutAction::ToggleHiddenFiles), "cmd-shift-.");
@@ -574,7 +574,7 @@ mod tests {
             assert_eq!(ShortcutAction::from_id(id), Some(action));
         }
         // A spot-check of the Swift rawValues (KeyboardShortcuts.swift:37-70).
-        assert_eq!(ShortcutAction::NewTerminalPane.id(), "newTerminalPane");
+        assert_eq!(ShortcutAction::NewTerminalWindow.id(), "newTerminalPane");
         assert_eq!(ShortcutAction::UndoFileOperation.id(), "undoFileOperation");
         // An unknown id is dropped (persistence load rule 3).
         assert_eq!(ShortcutAction::from_id("notAnAction"), None);
@@ -670,30 +670,30 @@ mod tests {
         // A distinct, unbound combo conflicts with nothing.
         let free = OwnedCombo::from_token("cmd-y").unwrap();
         assert_eq!(
-            conflicting_action(view(), &free, ShortcutAction::NewTerminalPane),
+            conflicting_action(view(), &free, ShortcutAction::NewTerminalWindow),
             None
         );
 
-        // `cmd-t` is NewTerminalPane's default. Asking on behalf of a DIFFERENT
+        // `cmd-t` is NewTerminalWindow's default. Asking on behalf of a DIFFERENT
         // action (ToggleSidebar) finds the holder.
         let cmd_t = OwnedCombo::from_token("cmd-t").unwrap();
         assert_eq!(
             conflicting_action(view(), &cmd_t, ShortcutAction::ToggleSidebar),
-            Some(ShortcutAction::NewTerminalPane)
+            Some(ShortcutAction::NewTerminalWindow)
         );
 
-        // Re-saving NewTerminalPane's own combo, excluding itself, is not a
+        // Re-saving NewTerminalWindow's own combo, excluding itself, is not a
         // self-conflict.
         assert_eq!(
-            conflicting_action(view(), &cmd_t, ShortcutAction::NewTerminalPane),
+            conflicting_action(view(), &cmd_t, ShortcutAction::NewTerminalWindow),
             None
         );
 
-        // An unbound action never conflicts: drop NewTerminalPane's binding, then
+        // An unbound action never conflicts: drop NewTerminalWindow's binding, then
         // `cmd-t` is free.
         let mut cleared = bindings.clone();
         for (a, c) in cleared.iter_mut() {
-            if *a == ShortcutAction::NewTerminalPane {
+            if *a == ShortcutAction::NewTerminalWindow {
                 *c = None;
             }
         }
@@ -717,7 +717,7 @@ mod tests {
             .collect();
         let view = || bindings.iter().map(|(a, c)| (*a, c.as_ref()));
 
-        // NewTerminalPane holds plain `cmd-t`. `cmd-shift-t` shares the key but not
+        // NewTerminalWindow holds plain `cmd-t`. `cmd-shift-t` shares the key but not
         // the modifier set — no conflict.
         let cmd_shift_t = OwnedCombo::from_token("cmd-shift-t").unwrap();
         assert_eq!(

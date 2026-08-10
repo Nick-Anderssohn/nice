@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use nice_model::{PaneKind, PersistedPane, PersistedProject, PersistedTab};
+use nice_model::{TermWindowKind, PersistedTermWindow, PersistedProject, PersistedSession};
 
 use super::*;
 
@@ -108,37 +108,37 @@ fn disk_store(path: &Path) -> SessionStore {
     SessionStore::open_with(path.to_path_buf(), Box::new(DiskIo), DEBOUNCE)
 }
 
-// ---- window/tab builders (mirror the Swift helpers) --------------------
+// ---- window/session builders (mirror the Swift helpers) --------------------
 
-fn make_persisted_tab(id: &str) -> PersistedTab {
-    PersistedTab {
+fn make_persisted_session(id: &str) -> PersistedSession {
+    PersistedSession {
         id: id.into(),
         title: id.into(),
         cwd: "/tmp".into(),
         claude_session_id: None,
-        active_pane_id: None,
-        panes: vec![],
+        active_window_id: None,
+        windows: vec![],
         title_manually_set: None,
-        parent_tab_id: None,
+        parent_session_id: None,
         next_terminal_index: None,
     }
 }
 
-fn make_window(id: &str, tabs: Vec<PersistedTab>) -> PersistedWindow {
-    let active_tab_id = tabs.first().map(|t| t.id.clone());
-    let projects = if tabs.is_empty() {
+fn make_window(id: &str, sessions: Vec<PersistedSession>) -> PersistedWindow {
+    let active_session_id = sessions.first().map(|t| t.id.clone());
+    let projects = if sessions.is_empty() {
         vec![]
     } else {
         vec![PersistedProject {
             id: "p".into(),
             name: "Project".into(),
             path: "/tmp".into(),
-            tabs,
+            sessions,
         }]
     };
     PersistedWindow {
         id: id.into(),
-        active_tab_id,
+        active_session_id,
         sidebar_collapsed: false,
         sidebar_mode: None,
         projects,
@@ -146,36 +146,36 @@ fn make_window(id: &str, tabs: Vec<PersistedTab>) -> PersistedWindow {
     }
 }
 
-/// A window whose single tab carries `session_id` (a Claude tab) — for the
+/// A window whose single session carries `claude_session_id` (a Claude session) — for the
 /// flush-ordering rotations.
-fn make_session_window(id: &str, session_id: &str) -> PersistedWindow {
-    let tab = PersistedTab {
+fn make_session_window(id: &str, claude_session_id: &str) -> PersistedWindow {
+    let session = PersistedSession {
         id: format!("tab-{id}"),
         title: "Tab".into(),
         cwd: "/tmp".into(),
-        claude_session_id: Some(session_id.into()),
-        active_pane_id: Some(format!("pane-{id}")),
-        panes: vec![PersistedPane {
+        claude_session_id: Some(claude_session_id.into()),
+        active_window_id: Some(format!("pane-{id}")),
+        windows: vec![PersistedTermWindow {
             id: format!("pane-{id}"),
             title: "Claude".into(),
-            kind: PaneKind::Claude,
+            kind: TermWindowKind::Claude,
             cwd: None,
             title_manually_set: None,
         }],
         title_manually_set: None,
-        parent_tab_id: None,
+        parent_session_id: None,
         next_terminal_index: None,
     };
     PersistedWindow {
         id: id.into(),
-        active_tab_id: Some(tab.id.clone()),
+        active_session_id: Some(session.id.clone()),
         sidebar_collapsed: false,
         sidebar_mode: None,
         projects: vec![PersistedProject {
             id: format!("project-{id}"),
             name: format!("Project {id}"),
             path: "/tmp".into(),
-            tabs: vec![tab],
+            sessions: vec![session],
         }],
         frame: None,
     }
@@ -205,15 +205,15 @@ fn sidebar_mode_round_trips_and_defaults_absent() {
         Some(nice_model::SidebarMode::Files)
     );
 
-    // A pre-R19 document with no sidebarMode key decodes to None (absent ⇒ Tabs
+    // A pre-R19 document with no sidebarMode key decodes to None (absent ⇒ Sessions
     // is applied at restore time by `WindowState::with_seed`).
     let legacy = r#"{"version":3,"windows":[{"id":"w","sidebarCollapsed":false,"projects":[]}]}"#;
     let decoded: PersistedState = serde_json::from_str(legacy).unwrap();
     assert_eq!(decoded.windows[0].sidebar_mode, None);
 }
 
-fn first_tab_session_id(window: &PersistedWindow) -> Option<String> {
-    window.projects.first()?.tabs.first()?.claude_session_id.clone()
+fn first_session_claude_id(window: &PersistedWindow) -> Option<String> {
+    window.projects.first()?.sessions.first()?.claude_session_id.clone()
 }
 
 fn sorted_ids(state: &PersistedState) -> Vec<String> {
@@ -272,24 +272,24 @@ fn upsert_appends_new_window() {
 fn upsert_replaces_existing_window_by_id() {
     let dir = scratch("nice-store-upsert-replace");
     let store = disk_store(&dir.0.join("sessions.json"));
-    store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
+    store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
     store.flush();
     store.upsert(make_window(
         "w1",
-        vec![make_persisted_tab("t1"), make_persisted_tab("t2")],
+        vec![make_persisted_session("t1"), make_persisted_session("t2")],
     ));
     store.flush();
     let windows = store.load().windows;
     assert_eq!(windows.len(), 1, "upsert must replace by id, not append");
-    assert_eq!(windows[0].total_tab_count(), 2);
+    assert_eq!(windows[0].total_session_count(), 2);
 }
 
 #[test]
 fn upsert_multiple_windows_coexist_by_distinct_id() {
     let dir = scratch("nice-store-upsert-multi");
     let store = disk_store(&dir.0.join("sessions.json"));
-    store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
-    store.upsert(make_window("w2", vec![make_persisted_tab("t2")]));
+    store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
+    store.upsert(make_window("w2", vec![make_persisted_session("t2")]));
     store.flush();
     assert_eq!(sorted_ids(&store.load()), vec!["w1", "w2"]);
 }
@@ -316,11 +316,11 @@ fn flush_after_upsert_persists_latest_state_for_same_window() {
     let path = dir.0.join("sessions.json");
     {
         let store = disk_store(&path);
-        store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
+        store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
         store.flush();
         store.upsert(make_window(
             "w1",
-            vec![make_persisted_tab("t1"), make_persisted_tab("t2")],
+            vec![make_persisted_session("t1"), make_persisted_session("t2")],
         ));
         store.flush();
         // Spin past the debounce so any stale cancelled work would fire.
@@ -329,7 +329,7 @@ fn flush_after_upsert_persists_latest_state_for_same_window() {
     let fresh = disk_store(&path);
     assert_eq!(fresh.load().windows.len(), 1);
     assert_eq!(
-        fresh.load().windows[0].total_tab_count(),
+        fresh.load().windows[0].total_session_count(),
         2,
         "the latest state must survive — a cancelled debounce must not resurrect the first upsert"
     );
@@ -406,12 +406,12 @@ fn flush_after_in_flight_debounce_writes_in_order_latest_snapshot_wins() {
     let w = writes.lock().unwrap();
     assert_eq!(w.len(), 2, "debounced write(A) plus flush write(B) must both land");
     assert_eq!(
-        first_tab_session_id(&w[0].snapshot.windows[0]).as_deref(),
+        first_session_claude_id(&w[0].snapshot.windows[0]).as_deref(),
         Some("A"),
         "serial writer: write(A) completes first"
     );
     assert_eq!(
-        first_tab_session_id(&w[1].snapshot.windows[0]).as_deref(),
+        first_session_claude_id(&w[1].snapshot.windows[0]).as_deref(),
         Some("B"),
         "then write(B) from flush"
     );
@@ -434,19 +434,19 @@ fn rapid_upserts_coalesce_to_single_write() {
 // MARK: - prune_empty_windows
 
 #[test]
-fn prune_empty_windows_drops_zero_tab_windows_except_keep() {
+fn prune_empty_windows_drops_zero_session_windows_except_keep() {
     let dir = scratch("nice-store-prune");
     let store = disk_store(&dir.0.join("sessions.json"));
     store.upsert(make_window("keep", vec![]));
     store.upsert(make_window("empty", vec![]));
-    store.upsert(make_window("full", vec![make_persisted_tab("t1")]));
+    store.upsert(make_window("full", vec![make_persisted_session("t1")]));
     store.flush();
     store.prune_empty_windows("keep");
     store.flush();
     assert_eq!(
         sorted_ids(&store.load()),
         vec!["full", "keep"],
-        "prune keeps the caller's slot and anything with tabs; drops the rest"
+        "prune keeps the caller's slot and anything with sessions; drops the rest"
     );
 }
 
@@ -454,7 +454,7 @@ fn prune_empty_windows_drops_zero_tab_windows_except_keep() {
 fn prune_empty_windows_is_noop_when_nothing_to_prune() {
     let dir = scratch("nice-store-prune-noop");
     let store = disk_store(&dir.0.join("sessions.json"));
-    store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
+    store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
     store.flush();
     let before = store.load();
     store.prune_empty_windows("w1");
@@ -470,8 +470,8 @@ fn remove_drops_entry_by_id_and_persists() {
     let path = dir.0.join("sessions.json");
     {
         let store = disk_store(&path);
-        store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
-        store.upsert(make_window("w2", vec![make_persisted_tab("t2")]));
+        store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
+        store.upsert(make_window("w2", vec![make_persisted_session("t2")]));
         store.flush();
         store.remove("w1");
         store.flush();
@@ -488,7 +488,7 @@ fn remove_drops_entry_by_id_and_persists() {
 #[test]
 fn remove_is_noop_when_id_missing() {
     let (store, writes, _rx) = recorder_store(Duration::ZERO);
-    store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
+    store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
     store.flush();
     let before = writes.lock().unwrap().len();
     store.remove("ghost");
@@ -506,8 +506,8 @@ fn remove_schedules_debounced_write() {
     let path = dir.0.join("sessions.json");
     {
         let store = disk_store(&path);
-        store.upsert(make_window("w1", vec![make_persisted_tab("t1")]));
-        store.upsert(make_window("w2", vec![make_persisted_tab("t2")]));
+        store.upsert(make_window("w1", vec![make_persisted_session("t1")]));
+        store.upsert(make_window("w2", vec![make_persisted_session("t2")]));
         store.flush();
         store.remove("w1");
         // No flush — wait for the debounce + write to land.
@@ -529,37 +529,37 @@ fn round_trip_preserves_every_field() {
     let path = dir.0.join("sessions.json");
     let window = PersistedWindow {
         id: "w1".into(),
-        active_tab_id: Some("t1".into()),
+        active_session_id: Some("t1".into()),
         sidebar_collapsed: true,
         sidebar_mode: None,
         projects: vec![PersistedProject {
             id: "nice".into(),
             name: "Nice".into(),
             path: "/Users/nick/Projects/nice".into(),
-            tabs: vec![PersistedTab {
+            sessions: vec![PersistedSession {
                 id: "t1".into(),
                 title: "Fix top bar height".into(),
                 cwd: "/Users/nick/Projects/nice".into(),
                 claude_session_id: Some("e4f1a2b3-c0d4-4e5f-9a0b-1c2d3e4f5a6b".into()),
-                active_pane_id: Some("p1".into()),
-                panes: vec![
-                    PersistedPane {
+                active_window_id: Some("p1".into()),
+                windows: vec![
+                    PersistedTermWindow {
                         id: "p1".into(),
                         title: "Claude".into(),
-                        kind: PaneKind::Claude,
+                        kind: TermWindowKind::Claude,
                         cwd: None,
                         title_manually_set: None,
                     },
-                    PersistedPane {
+                    PersistedTermWindow {
                         id: "p2".into(),
                         title: "zsh".into(),
-                        kind: PaneKind::Terminal,
+                        kind: TermWindowKind::Terminal,
                         cwd: None,
                         title_manually_set: None,
                     },
                 ],
                 title_manually_set: None,
-                parent_tab_id: None,
+                parent_session_id: None,
                 next_terminal_index: None,
             }],
         }],
@@ -580,22 +580,22 @@ fn round_trip_preserves_nil_optionals() {
     let path = dir.0.join("sessions.json");
     let window = PersistedWindow {
         id: "w1".into(),
-        active_tab_id: None,
+        active_session_id: None,
         sidebar_collapsed: false,
         sidebar_mode: None,
         projects: vec![PersistedProject {
             id: "terminals".into(),
             name: "Terminals".into(),
             path: "/tmp".into(),
-            tabs: vec![PersistedTab {
+            sessions: vec![PersistedSession {
                 id: "t1".into(),
                 title: "Main".into(),
                 cwd: "/tmp".into(),
                 claude_session_id: None,
-                active_pane_id: None,
-                panes: vec![],
+                active_window_id: None,
+                windows: vec![],
                 title_manually_set: None,
-                parent_tab_id: None,
+                parent_session_id: None,
                 next_terminal_index: None,
             }],
         }],
@@ -616,14 +616,14 @@ fn persisted_window_round_trip_with_frame() {
     let path = dir.0.join("sessions.json");
     let window = PersistedWindow {
         id: "w1".into(),
-        active_tab_id: Some("t1".into()),
+        active_session_id: Some("t1".into()),
         sidebar_collapsed: false,
         sidebar_mode: None,
         projects: vec![PersistedProject {
             id: "p".into(),
             name: "P".into(),
             path: "/tmp".into(),
-            tabs: vec![make_persisted_tab("t1")],
+            sessions: vec![make_persisted_session("t1")],
         }],
         frame: Some(PersistedFrame {
             x: 17.5,
@@ -671,13 +671,13 @@ fn decodes_future_version_with_unknown_fields_forward_compat() {
     let decoded: PersistedState = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.windows.len(), 1);
     assert_eq!(decoded.windows[0].id, "w1");
-    let tab = &decoded.windows[0].projects[0].tabs[0];
+    let session = &decoded.windows[0].projects[0].sessions[0];
     assert_eq!(
-        tab.claude_session_id.as_deref(),
+        session.claude_session_id.as_deref(),
         Some("session-uuid"),
         "forward-compat must preserve v3 fields verbatim"
     );
-    assert_eq!(tab.panes[0].kind, PaneKind::Claude);
+    assert_eq!(session.windows[0].kind, TermWindowKind::Claude);
 }
 
 #[test]
@@ -750,7 +750,7 @@ fn flush_failure_leaves_prior_file_untouched_and_does_not_panic() {
     );
     let fresh = disk_store(&path);
     assert_eq!(
-        first_tab_session_id(&fresh.load().windows[0]).as_deref(),
+        first_session_claude_id(&fresh.load().windows[0]).as_deref(),
         Some("STATE-A"),
         "after a failed flush, a fresh store must read the prior state"
     );
@@ -781,7 +781,7 @@ fn interleaved_upserts_across_windows_flush_persists_latest_for_each() {
             .windows
             .iter()
             .find(|w| w.id == id)
-            .and_then(first_tab_session_id)
+            .and_then(first_session_claude_id)
     };
     assert_eq!(by_id("w1").as_deref(), Some("S1-NEW"));
     assert_eq!(by_id("w2").as_deref(), Some("S2-NEW"));
@@ -803,7 +803,7 @@ fn late_upsert_after_flush_does_not_resurrect_stale_state() {
     }
     let fresh = disk_store(&path);
     assert_eq!(
-        first_tab_session_id(&fresh.load().windows[0]).as_deref(),
+        first_session_claude_id(&fresh.load().windows[0]).as_deref(),
         Some("B"),
         "latest flushed state must survive — no late debounce can revert it"
     );
@@ -844,7 +844,7 @@ fn global_routing_then_absent_is_noop() {
     let store = disk_store(&dir.0.join("sessions.json"));
     let _handle = install_global(store);
     assert!(global().is_some());
-    upsert(make_window("w1", vec![make_persisted_tab("t1")]));
+    upsert(make_window("w1", vec![make_persisted_session("t1")]));
     flush();
     assert_eq!(load().windows.iter().map(|w| w.id.clone()).collect::<Vec<_>>(), vec!["w1"]);
 
@@ -853,4 +853,109 @@ fn global_routing_then_absent_is_noop() {
     clear_global();
     assert!(global().is_none());
     assert!(load().windows.is_empty());
+}
+
+// ---- Phase R: pre-rename on-disk compatibility -------------------------
+
+/// A real-shaped v3 `sessions.json` written BEFORE the Phase R tmux-terminology
+/// rename (`Tab`/`Pane` → `Session`/`TermWindow`). Every key here is a frozen
+/// surface: `activeTabId`, `tabs`, `panes`, `activePaneId`, `parentTabId`.
+const PRE_RENAME_SESSIONS_V3: &str = include_str!("../fixtures/pre_rename_sessions_v3.json");
+
+/// Phase R restore compat: the checked-in pre-rename v3 file decodes into the
+/// renamed structs with every value landing on the right field.
+#[test]
+fn restores_pre_rename_sessions_json_fixture() {
+    let dir = scratch("nice-store-pre-rename");
+    let path = dir.0.join("sessions.json");
+    fs::write(&path, PRE_RENAME_SESSIONS_V3).unwrap();
+
+    let state = read_state(&path);
+    assert_eq!(state.version, 3);
+    assert_eq!(state.windows.len(), 1, "one persisted window");
+
+    let w = &state.windows[0];
+    assert_eq!(w.id, "win-1");
+    assert_eq!(
+        w.active_session_id.as_deref(),
+        Some("t-claude"),
+        "`activeTabId` hydrates the renamed `active_session_id` field"
+    );
+    assert!(!w.sidebar_collapsed);
+    assert_eq!(w.sidebar_mode, Some(nice_model::SidebarMode::Sessions));
+    assert_eq!(w.frame.as_ref().map(|f| (f.x, f.y)), Some((120.0, 60.0)));
+
+    // `sessions` hydrates `sessions`; the pinned Terminals project comes first.
+    assert_eq!(
+        w.projects.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        vec!["terminals", "p-nice"]
+    );
+    let terminals = &w.projects[0];
+    assert_eq!(terminals.sessions.len(), 1);
+    assert_eq!(terminals.sessions[0].id, "terminals-main");
+    assert_eq!(terminals.sessions[0].windows.len(), 1, "`term_windows` → `windows`");
+    assert_eq!(terminals.sessions[0].windows[0].title, "Terminal 1");
+    assert_eq!(terminals.sessions[0].next_terminal_index, Some(2));
+
+    let nice = &w.projects[1];
+    let root = &nice.sessions[0];
+    assert_eq!(root.id, "t-root");
+    assert_eq!(
+        root.claude_session_id.as_deref(),
+        Some("8f1c0a2e-3b4d-4c5e-9a6b-7d8e9f0a1b2c"),
+        "the restore discriminator survives"
+    );
+    assert_eq!(
+        root.active_window_id.as_deref(),
+        Some("t-root-claude"),
+        "`activePaneId` → `active_window_id`"
+    );
+    assert_eq!(root.title_manually_set, Some(true));
+    assert_eq!(root.windows.len(), 2);
+    assert_eq!(root.windows[0].kind, TermWindowKind::Claude);
+    assert_eq!(root.windows[1].kind, TermWindowKind::Terminal);
+    assert_eq!(root.windows[1].cwd.as_deref(), Some("/Users/nick/Projects/nice/crates"));
+    assert_eq!(root.windows[1].title_manually_set, Some(true));
+    assert_eq!(root.windows[0].title_manually_set, None, "omitted ⇒ None");
+
+    let child = &nice.sessions[1];
+    assert_eq!(
+        child.parent_session_id.as_deref(),
+        Some("t-root"),
+        "`parentTabId` → `parent_session_id`, the depth-1 lineage link"
+    );
+
+    // Hydrating into the model tree keeps the same shape.
+    let project = nice.hydrate();
+    assert_eq!(project.sessions.len(), 2);
+    assert_eq!(project.sessions[0].windows.len(), 2);
+    assert_eq!(
+        project.sessions[0].active_window_id.as_deref(),
+        Some("t-root-claude")
+    );
+    assert_eq!(
+        project.sessions[1].parent_session_id.as_deref(),
+        Some("t-root")
+    );
+}
+
+/// Phase R write compat: re-serializing the decoded pre-rename state through the
+/// production pretty+sorted-keys writer reproduces the fixture BYTE FOR BYTE.
+/// This is the frozen-surface gate — a stray field rename without a matching
+/// `#[serde(rename = "…")]` fails here.
+#[test]
+fn re_serializing_pre_rename_fixture_is_byte_identical() {
+    let dir = scratch("nice-store-pre-rename-write");
+    let path = dir.0.join("sessions.json");
+    fs::write(&path, PRE_RENAME_SESSIONS_V3).unwrap();
+
+    let state = read_state(&path);
+    let mut bytes = serialize_state(&state).expect("serialize");
+    bytes.push(b'\n'); // the fixture is stored with a trailing newline
+    let round_tripped = String::from_utf8(bytes).unwrap();
+    assert_eq!(
+        round_tripped, PRE_RENAME_SESSIONS_V3,
+        "the v3 key spellings are frozen: re-writing a pre-rename file must not \
+         change a single byte"
+    );
 }

@@ -31,7 +31,7 @@ GPUI/zed is vendored: `scripts/vendor-zed.sh` produces `vendor/zed/` (pinned zed
 
 ## Validating in the real app (never against live state)
 
-Launch the installed **`Nice Dev`** bundle binary **directly** (not `open`, not `cargo run`) under a scratch environment. **Seed the scratch home BEFORE launching** — a bare empty `HOME` gives a LOGGED-OUT Claude in every pane, which looks like a product bug and wastes a validation round:
+Launch the installed **`Nice Dev`** bundle binary **directly** (not `open`, not `cargo run`) under a scratch environment. **Seed the scratch home BEFORE launching** — a bare empty `HOME` gives a LOGGED-OUT Claude in every window, which looks like a product bug and wastes a validation round:
 
 ```sh
 SCRATCH=<dir>
@@ -45,7 +45,7 @@ NICE_PROD_SETTINGS_DOMAIN=<scratch-domain> \
 "/Applications/Nice Dev.app/Contents/MacOS/Nice Dev"
 ```
 
-Export those on top of the **full current environment** — never `env -i`. `PATH` must keep `~/.local/bin` or the panes find no `claude` binary.
+Export those on top of the **full current environment** — never `env -i`. `PATH` must keep `~/.local/bin` or the windows find no `claude` binary.
 
 What this still isolates: Claude's `projects/`, `jobs/`, and its daemon all key off `HOME`, so they land in `$SCRATCH/home/.claude` and `/tmp/cc-daemon-501/<hash>` — separate from the real ones. Quitting or evicting that daemon is safe.
 

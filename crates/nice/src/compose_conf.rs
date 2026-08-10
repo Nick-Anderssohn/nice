@@ -2,7 +2,7 @@
 //! reads on every compose (`$NICE_COMPOSE_CONF`), and the process store behind
 //! the Settings ▸ Claude model/effort dropdowns.
 //!
-//! The file is the app→shell channel for values that can change while a pane's
+//! The file is the app→shell channel for values that can change while a window's
 //! env is already frozen (env is inherited at fork): the current accent color
 //! (the spinner tint) and the `claude -p` model/effort flags. Nice rewrites it
 //! at boot, on every appearance commit (accent may have changed), and on every

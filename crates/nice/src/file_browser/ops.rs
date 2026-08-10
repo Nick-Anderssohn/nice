@@ -61,20 +61,20 @@ impl std::fmt::Display for FileOperationError {
     }
 }
 
-/// Identifies which window/tab originated an op so undo/redo can follow focus
-/// back. `tab_id` is optional; `window_session_id` is the empty string when no
+/// Identifies which window/session originated an op so undo/redo can follow focus
+/// back. `session_id` is optional; `window_session_id` is the empty string when no
 /// window (`FileOperationOrigin`, `FileOperation.swift:22-25`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileOperationOrigin {
     pub window_session_id: String,
-    pub tab_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 impl FileOperationOrigin {
-    pub fn new(window_session_id: impl Into<String>, tab_id: Option<String>) -> Self {
+    pub fn new(window_session_id: impl Into<String>, session_id: Option<String>) -> Self {
         Self {
             window_session_id: window_session_id.into(),
-            tab_id,
+            session_id,
         }
     }
 }
@@ -122,7 +122,7 @@ pub enum FileOperation {
 }
 
 impl FileOperation {
-    /// The originating window/tab.
+    /// The originating window/session.
     pub fn origin(&self) -> &FileOperationOrigin {
         match self {
             FileOperation::Copy { origin, .. }

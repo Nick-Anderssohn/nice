@@ -40,7 +40,7 @@ use nice_theme::AccentPreset;
 
 use crate::platform;
 
-// -- fixed pane geometry ----------------------------------------------------
+// -- fixed window geometry ----------------------------------------------------
 
 /// Initial spawn grid. Arbitrary (the first zoom re-fits it to the window); a
 /// mid-size that the shell comes up in cleanly.

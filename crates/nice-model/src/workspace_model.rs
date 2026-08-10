@@ -1,15 +1,15 @@
-//! `TabModel` — Nice's per-window document — ported from
-//! `Sources/Nice/State/TabModel.swift`. The projects/tabs/panes value tree
-//! plus which tab is selected, with all the tree mutation, cwd
+//! `WorkspaceModel` — Nice's per-window document — ported from
+//! `Sources/Nice/State/TabModel.swift`. The projects/sessions/windows value tree
+//! plus which session is selected, with all the tree mutation, cwd
 //! bucketing/repair, renames + title locks, depth-1 `/branch`+handoff lineage,
 //! and the arg parsers. Pure value-tree: nothing here spawns a process, opens
 //! a socket, or writes to disk. The model's only impurities — existence probes
 //! and the home-dir lookup — go through the injected [`FsProbe`] seam.
 //!
 //! The pinned "Terminals" group at the top of the sidebar is a regular
-//! [`Project`] with the reserved id [`TabModel::TERMINALS_PROJECT_ID`]; it is
-//! always present at index 0 and cannot be removed by the user, but its tabs
-//! are ordinary terminal-only tabs.
+//! [`Project`] with the reserved id [`WorkspaceModel::TERMINALS_PROJECT_ID`]; it is
+//! always present at index 0 and cannot be removed by the user, but its sessions
+//! are ordinary terminal-only sessions.
 //!
 //! ## The did-mutate signal (`onTreeMutation` port)
 //!
@@ -20,13 +20,13 @@
 //! persisted state fires it**, and read-only / pure helpers never do. Most
 //! change-guarded mutators still fire exactly once on a real change and not at
 //! all on a no-op. Two mutators fire without proving a change:
-//! [`TabModel::mutate_tab`] (it cannot see whether the caller's transform
-//! actually changed anything, so it fires whenever the tab is found) and
-//! [`TabModel::repair_project_structure`] (it runs at boot before the observer
+//! [`WorkspaceModel::mutate_session`] (it cannot see whether the caller's transform
+//! actually changed anything, so it fires whenever the session is found) and
+//! [`WorkspaceModel::repair_project_structure`] (it runs at boot before the observer
 //! is wired, so its unconditional fire costs nothing in practice). Those
 //! spurious fires are tolerated — the save is debounced. The only mutation that
 //! deliberately does NOT fire is the selection-side
-//! `acknowledge_waiting_on_active_pane`, whose sole write is the runtime-only,
+//! `acknowledge_waiting_on_active_window`, whose sole write is the runtime-only,
 //! non-persisted `waiting_acknowledged` flag.
 
 use std::cell::RefCell;
@@ -34,9 +34,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::pane::{Pane, PaneKind};
+use crate::term_window::{TermWindow, TermWindowKind};
 use crate::project::Project;
-use crate::tab::Tab;
+use crate::session::Session;
 
 /// The filesystem seam. The model's only impurities are existence probes
 /// (`.git` discovery, worktree-cwd liveness) and the home-dir lookup for
@@ -46,7 +46,7 @@ use crate::tab::Tab;
 /// the Rust ports stay hermetic).
 pub trait FsProbe {
     /// Whether a filesystem entry exists at `path` (a `.git` marker, or a
-    /// tab/project cwd). Mirrors `FileManager.default.fileExists(atPath:)`.
+    /// session/project cwd). Mirrors `FileManager.default.fileExists(atPath:)`.
     fn exists(&self, path: &str) -> bool;
     /// The user's home directory, for tilde-expansion. Mirrors
     /// `NSHomeDirectory()`.
@@ -67,20 +67,20 @@ impl FsProbe for StdFs {
 
 /// The per-window document. `projects` is public (mirroring the Swift `var
 /// projects`) so callers/tests can seed and read the tree directly, but
-/// `active_tab_id` is private — every write goes through [`TabModel::select_tab`]
+/// `active_session_id` is private — every write goes through [`WorkspaceModel::select_session`]
 /// (or the internal navigation setter) so the selection side effects can't be
 /// skipped by a stray field assignment.
-pub struct TabModel {
+pub struct WorkspaceModel {
     /// The sidebar's project sections, in display order. The pinned Terminals
     /// group is expected at index 0 (kept there by
-    /// [`TabModel::ensure_terminals_project_seeded`]).
+    /// [`WorkspaceModel::ensure_terminals_project_seeded`]).
     pub projects: Vec<Project>,
-    /// Currently-selected tab. Private: the only writer is
-    /// [`TabModel::select_tab`] / the navigation stepper, which carry the
+    /// Currently-selected session. Private: the only writer is
+    /// [`WorkspaceModel::select_session`] / the navigation stepper, which carry the
     /// Swift `didSet` side effects (acknowledge waiting on the target's active
-    /// pane + fire the did-mutate signal, only when the id actually changed —
+    /// window + fire the did-mutate signal, only when the id actually changed —
     /// `TabModel.swift:43-53`).
-    active_tab_id: Option<String>,
+    active_session_id: Option<String>,
     /// The filesystem seam (existence + home).
     fs: Box<dyn FsProbe>,
     /// The did-mutate signal. `RefCell` so it can fire while the tree is
@@ -89,94 +89,94 @@ pub struct TabModel {
     on_tree_mutation: Option<RefCell<Box<dyn FnMut()>>>,
 }
 
-impl TabModel {
+impl WorkspaceModel {
     /// Reserved id for the pinned Terminals project at index 0 of `projects`.
     /// The project is always present and cannot be deleted by the user; its
-    /// tabs are ordinary terminal-only tabs.
+    /// sessions are ordinary terminal-only sessions.
     pub const TERMINALS_PROJECT_ID: &'static str = "terminals";
-    /// Stable id for the default "Main" tab seeded into the Terminals project
+    /// Stable id for the default "Main" session seeded into the Terminals project
     /// on fresh launches.
-    pub const MAIN_TERMINAL_TAB_ID: &'static str = "terminals-main";
+    pub const MAIN_TERMINAL_SESSION_ID: &'static str = "terminals-main";
 
     // MARK: - Construction
 
     /// Seed a fresh window: a pinned Terminals project at index 0 holding one
-    /// "Main" tab with a single "Terminal 1" pane, `next_terminal_index = 2`,
-    /// and the Main tab selected (`TabModel.swift:63-87`). Uses the production
+    /// "Main" session with a single "Terminal 1" window, `next_terminal_index = 2`,
+    /// and the Main session selected (`TabModel.swift:63-87`). Uses the production
     /// [`StdFs`] seam.
     pub fn new(initial_main_cwd: impl Into<String>) -> Self {
         Self::with_fs(initial_main_cwd, Box::new(StdFs))
     }
 
-    /// [`TabModel::new`] with a caller-supplied [`FsProbe`] (tests inject a
+    /// [`WorkspaceModel::new`] with a caller-supplied [`FsProbe`] (tests inject a
     /// fake so existence/home lookups are deterministic and disk-free).
     pub fn with_fs(initial_main_cwd: impl Into<String>, fs: Box<dyn FsProbe>) -> Self {
         let initial_main_cwd = initial_main_cwd.into();
-        let main_tab_id = Self::MAIN_TERMINAL_TAB_ID;
-        let pane_id = mint_pane_id(main_tab_id);
-        let pane = Pane::new(pane_id.clone(), "Terminal 1", PaneKind::Terminal);
-        let mut main_tab = Tab::new(main_tab_id, "Main", &initial_main_cwd);
-        main_tab.panes = vec![pane];
-        main_tab.active_pane_id = Some(pane_id);
-        main_tab.next_terminal_index = 2;
+        let main_session_id = Self::MAIN_TERMINAL_SESSION_ID;
+        let window_id = mint_window_id(main_session_id);
+        let window = TermWindow::new(window_id.clone(), "Terminal 1", TermWindowKind::Terminal);
+        let mut main_session = Session::new(main_session_id, "Main", &initial_main_cwd);
+        main_session.windows = vec![window];
+        main_session.active_window_id = Some(window_id);
+        main_session.next_terminal_index = 2;
         let terminals = Project {
             id: Self::TERMINALS_PROJECT_ID.into(),
             name: "Terminals".into(),
             path: initial_main_cwd,
-            tabs: vec![main_tab],
+            sessions: vec![main_session],
         };
-        TabModel {
+        WorkspaceModel {
             projects: vec![terminals],
             // Init assignment does not run the `didSet` (Swift initializers
             // don't); no acknowledge, no mutation event.
-            active_tab_id: Some(main_tab_id.to_string()),
+            active_session_id: Some(main_session_id.to_string()),
             fs,
             on_tree_mutation: None,
         }
     }
 
     /// Construct a document from already-hydrated `projects` + a saved
-    /// `active_tab_id`, WITHOUT seeding a Terminals/Main tab. The restore
-    /// constructor: [`TabModel::new`]/[`TabModel::with_fs`] always seed a fresh
-    /// Terminals project + Main tab, which restore must NOT do — it trusts the
+    /// `active_session_id`, WITHOUT seeding a Terminals/Main session. The restore
+    /// constructor: [`WorkspaceModel::new`]/[`WorkspaceModel::with_fs`] always seed a fresh
+    /// Terminals project + Main session, which restore must NOT do — it trusts the
     /// saved grouping (`WindowSession.restoreSavedWindow` rebuilds from the
-    /// persisted projects). Like the initializers, the `active_tab_id`
+    /// persisted projects). Like the initializers, the `active_session_id`
     /// assignment does not run the `didSet` side effects (no acknowledge, no
     /// mutation event) — the caller runs restore's single explicit save.
     pub fn from_parts(
         projects: Vec<Project>,
-        active_tab_id: Option<String>,
+        active_session_id: Option<String>,
         fs: Box<dyn FsProbe>,
     ) -> Self {
-        TabModel {
+        WorkspaceModel {
             projects,
-            active_tab_id,
+            active_session_id,
             fs,
             on_tree_mutation: None,
         }
     }
 
-    /// [`TabModel::from_parts`] with the production [`StdFs`] probe — the R18
+    /// [`WorkspaceModel::from_parts`] with the production [`StdFs`] probe — the R18
     /// restore call site (`crate::window_state::WindowState::with_seed`) has no
     /// injected fs, so this is the disk-backed default.
-    pub fn from_parts_std(projects: Vec<Project>, active_tab_id: Option<String>) -> Self {
-        Self::from_parts(projects, active_tab_id, Box::new(StdFs))
+    pub fn from_parts_std(projects: Vec<Project>, active_session_id: Option<String>) -> Self {
+        Self::from_parts(projects, active_session_id, Box::new(StdFs))
     }
 
-    /// Snapshot of this window's live panes grouped by kind — the quit /
+    /// Snapshot of this window's live windows grouped by kind — the quit /
     /// window-close confirmation counting rule (`TabModel.swift:186-200`). A
-    /// pure fold over `pane.is_alive`: BOTH kinds count, held (not-alive) panes
-    /// don't, and modelled-but-unspawned panes (a restored pane hydrates
+    /// pure fold over `window.is_alive`: BOTH kinds count, held (not-alive) windows
+    /// don't, and modelled-but-unspawned windows (a restored window hydrates
     /// `is_alive = true`) DO — the Swift quirk, preserved deliberately.
-    pub fn live_pane_counts(&self) -> (usize, usize) {
+    pub fn live_window_counts(&self) -> (usize, usize) {
         let mut claude = 0;
         let mut terminal = 0;
         for project in &self.projects {
-            for tab in &project.tabs {
-                for pane in tab.panes.iter().filter(|p| p.is_alive) {
-                    match pane.kind {
-                        PaneKind::Claude => claude += 1,
-                        PaneKind::Terminal => terminal += 1,
+            for session in &project.sessions {
+                for window in session.windows.iter().filter(|p| p.is_alive) {
+                    match window.kind {
+                        TermWindowKind::Claude => claude += 1,
+                        TermWindowKind::Terminal => terminal += 1,
                     }
                 }
             }
@@ -198,281 +198,282 @@ impl TabModel {
 
     // MARK: - Lookup
 
-    /// The currently-selected tab id, if any.
-    pub fn active_tab_id(&self) -> Option<&str> {
-        self.active_tab_id.as_deref()
+    /// The currently-selected session id, if any.
+    pub fn active_session_id(&self) -> Option<&str> {
+        self.active_session_id.as_deref()
     }
 
-    /// Look up a tab by id across every project, including the pinned
+    /// Look up a session by id across every project, including the pinned
     /// Terminals group (`TabModel.swift:93-100`).
-    pub fn tab_for(&self, id: &str) -> Option<&Tab> {
+    pub fn session_for(&self, id: &str) -> Option<&Session> {
         self.projects
             .iter()
-            .flat_map(|p| p.tabs.iter())
+            .flat_map(|p| p.sessions.iter())
             .find(|t| t.id == id)
     }
 
-    /// Project + tab index for the tab with id `id`, for in-place mutation
+    /// Project + session index for the session with id `id`, for in-place mutation
     /// (`TabModel.swift:132-139`).
-    pub fn project_tab_index(&self, id: &str) -> Option<(usize, usize)> {
+    pub fn project_session_index(&self, id: &str) -> Option<(usize, usize)> {
         for (pi, project) in self.projects.iter().enumerate() {
-            if let Some(ti) = project.tabs.iter().position(|t| t.id == id) {
+            if let Some(ti) = project.sessions.iter().position(|t| t.id == id) {
                 return Some((pi, ti));
             }
         }
         None
     }
 
-    /// Mutate the tab identified by `id` in place; returns true if the tab was
+    /// Mutate the session identified by `id` in place; returns true if the session was
     /// found (`TabModel.swift:120-128`). Fires the did-mutate signal whenever
-    /// the tab is found: this is the generic mutation path (it carries the OSC
+    /// the session is found: this is the generic mutation path (it carries the OSC
     /// cwd/title changes), and it cannot see whether the caller's transform
     /// actually changed anything, so it fires unconditionally on a hit. A
     /// spurious fire on an unchanged re-delivery is tolerated — the save is
     /// debounced (BUGHUNT1-D, D4).
-    pub fn mutate_tab(&mut self, id: &str, transform: impl FnOnce(&mut Tab)) -> bool {
-        let found = self.mutate_tab_silent(id, transform);
+    pub fn mutate_session(&mut self, id: &str, transform: impl FnOnce(&mut Session)) -> bool {
+        let found = self.mutate_session_silent(id, transform);
         if found {
             self.fire_mutation();
         }
         found
     }
 
-    /// [`TabModel::mutate_tab`] without firing the did-mutate signal — the
+    /// [`WorkspaceModel::mutate_session`] without firing the did-mutate signal — the
     /// internal path for a mutation that is not a persisted-state change. The
-    /// only caller is `acknowledge_waiting_on_active_pane`, whose sole write is
+    /// only caller is `acknowledge_waiting_on_active_window`, whose sole write is
     /// the runtime-only `waiting_acknowledged` flag (dropped from the persisted
     /// snapshot); the selection change that triggers it already fires via
-    /// [`TabModel::set_active_tab_id`]. Returns true if the tab was found.
-    fn mutate_tab_silent(&mut self, id: &str, transform: impl FnOnce(&mut Tab)) -> bool {
-        match self.project_tab_index(id) {
+    /// [`WorkspaceModel::set_active_session_id`]. Returns true if the session was found.
+    fn mutate_session_silent(&mut self, id: &str, transform: impl FnOnce(&mut Session)) -> bool {
+        match self.project_session_index(id) {
             Some((pi, ti)) => {
-                transform(&mut self.projects[pi].tabs[ti]);
+                transform(&mut self.projects[pi].sessions[ti]);
                 true
             }
             None => false,
         }
     }
 
-    /// True when `tab_id` lives inside the pinned Terminals project
+    /// True when `session_id` lives inside the pinned Terminals project
     /// (`TabModel.swift:176-181`).
-    pub fn is_terminals_project_tab(&self, tab_id: &str) -> bool {
+    pub fn is_terminals_project_session(&self, session_id: &str) -> bool {
         self.projects
             .iter()
             .find(|p| p.id == Self::TERMINALS_PROJECT_ID)
-            .is_some_and(|t| t.tabs.iter().any(|x| x.id == tab_id))
+            .is_some_and(|t| t.sessions.iter().any(|x| x.id == session_id))
     }
 
-    /// Flat list of sidebar tab ids in displayed order — the pinned Terminals
-    /// project first, then project tabs in project/then-tab order. The single
+    /// Flat list of sidebar session ids in displayed order — the pinned Terminals
+    /// project first, then project sessions in project/then-session order. The single
     /// source of truth for keyboard navigation and the dissolve-selection
     /// fallback (`TabModel.swift:206-208`).
-    pub fn navigable_sidebar_tab_ids(&self) -> Vec<String> {
+    pub fn navigable_sidebar_session_ids(&self) -> Vec<String> {
         self.projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect()
     }
 
-    /// The id of the tab whose pane list contains `pane_id`, scanning every
+    /// The id of the session whose window list contains `window_id`, scanning every
     /// project including the pinned Terminals group (`TabModel.swift:211-220`).
     /// The reverse index the SessionStart hook's `session_update` uses to route a
-    /// pane's rotated session id / cwd back onto its owning tab. Scoped to this
-    /// `TabModel` — a per-window lookup, never a global index — so a pane owned by
+    /// window's rotated session id / cwd back onto its owning session. Scoped to this
+    /// `WorkspaceModel` — a per-window lookup, never a global index — so a window owned by
     /// a sibling window returns `None` here. Returns an owned id (the id must
     /// outlive later `&mut self` mutations the rotation handler makes).
-    pub fn tab_id_owning(&self, pane_id: &str) -> Option<String> {
+    pub fn session_id_owning(&self, window_id: &str) -> Option<String> {
         self.projects
             .iter()
-            .flat_map(|p| p.tabs.iter())
-            .find(|t| t.panes.iter().any(|pane| pane.id == pane_id))
+            .flat_map(|p| p.sessions.iter())
+            .find(|t| t.windows.iter().any(|window| window.id == window_id))
             .map(|t| t.id.clone())
     }
 
-    /// The id of the tab pinned to Claude session `session_id`, in tree order —
-    /// the pane-free twin of [`tab_id_owning`](Self::tab_id_owning), for the
-    /// events that identify a conversation rather than a pane. A daemon-hosted
-    /// background `/fork` is the first: its SessionStart relays a pane id that
-    /// belongs to whichever pane happened to spawn the Claude daemon, so the
-    /// forked-from conversation is resolvable only by its session id.
+    /// The id of the session pinned to Claude session `claude_session_id`, in
+    /// tree order — the window-free twin of
+    /// [`session_id_owning`](Self::session_id_owning), for the events that
+    /// identify a conversation rather than a window. A daemon-hosted background
+    /// `/fork` is the first: its SessionStart relays a window id that belongs to
+    /// whichever window happened to spawn the Claude daemon, so the forked-from
+    /// conversation is resolvable only by its claude session id.
     ///
-    /// Session ids are unique across tabs by construction (each is minted per tab
-    /// or adopted from a rotation), so the first match is the only match; a
-    /// corrupt snapshot with duplicates resolves to the first in tree order rather
-    /// than failing.
-    pub fn tab_id_for_claude_session(&self, session_id: &str) -> Option<String> {
+    /// Claude session ids are unique across sessions by construction (each is
+    /// minted per session or adopted from a rotation), so the first match is the
+    /// only match; a corrupt snapshot with duplicates resolves to the first in
+    /// tree order rather than failing.
+    pub fn session_id_for_claude_session(&self, claude_session_id: &str) -> Option<String> {
         self.projects
             .iter()
-            .flat_map(|p| p.tabs.iter())
-            .find(|t| t.claude_session_id.as_deref() == Some(session_id))
-            .map(|t| t.id.clone())
+            .flat_map(|p| p.sessions.iter())
+            .find(|s| s.claude_session_id.as_deref() == Some(claude_session_id))
+            .map(|s| s.id.clone())
     }
 
     // MARK: - Selection
 
-    /// Select a tab. The single `active_tab_id` writer — carries the Swift
+    /// Select a session. The single `active_session_id` writer — carries the Swift
     /// `didSet` side effects.
-    pub fn select_tab(&mut self, id: &str) {
-        self.set_active_tab_id(Some(id.to_string()));
+    pub fn select_session(&mut self, id: &str) {
+        self.set_active_session_id(Some(id.to_string()));
     }
 
-    /// The sole `active_tab_id` writer. When the id actually changes to a
+    /// The sole `active_session_id` writer. When the id actually changes to a
     /// non-`None` value, dismiss the attention pulse on the target's active
-    /// pane and fire the did-mutate signal (`TabModel.swift:43-53`).
-    fn set_active_tab_id(&mut self, new: Option<String>) {
-        if self.active_tab_id == new {
+    /// window and fire the did-mutate signal (`TabModel.swift:43-53`).
+    fn set_active_session_id(&mut self, new: Option<String>) {
+        if self.active_session_id == new {
             return;
         }
-        self.active_tab_id = new.clone();
+        self.active_session_id = new.clone();
         if let Some(id) = new {
-            self.acknowledge_waiting_on_active_pane(&id);
+            self.acknowledge_waiting_on_active_window(&id);
             self.fire_mutation();
         }
     }
 
-    /// Move focus to the next sidebar tab, wrapping. No-op when there's only
-    /// one navigable tab (`TabModel.swift:452, 457-463`).
-    pub fn select_next_sidebar_tab(&mut self) {
-        self.step_sidebar_tab(1);
+    /// Move focus to the next sidebar session, wrapping. No-op when there's only
+    /// one navigable session (`TabModel.swift:452, 457-463`).
+    pub fn select_next_sidebar_session(&mut self) {
+        self.step_sidebar_session(1);
     }
 
-    /// Move focus to the previous sidebar tab, wrapping.
-    pub fn select_prev_sidebar_tab(&mut self) {
-        self.step_sidebar_tab(-1);
+    /// Move focus to the previous sidebar session, wrapping.
+    pub fn select_prev_sidebar_session(&mut self) {
+        self.step_sidebar_session(-1);
     }
 
-    fn step_sidebar_tab(&mut self, offset: isize) {
-        let ids = self.navigable_sidebar_tab_ids();
+    fn step_sidebar_session(&mut self, offset: isize) {
+        let ids = self.navigable_sidebar_session_ids();
         if ids.len() <= 1 {
             return;
         }
         let current_idx = self
-            .active_tab_id
+            .active_session_id
             .as_ref()
             .and_then(|a| ids.iter().position(|x| x == a))
             .unwrap_or(0) as isize;
         let n = ids.len() as isize;
         let next_idx = (((current_idx + offset) % n + n) % n) as usize;
-        self.set_active_tab_id(Some(ids[next_idx].clone()));
+        self.set_active_session_id(Some(ids[next_idx].clone()));
     }
 
-    /// Clear the waiting-attention pulse on whichever pane is focused in
-    /// `tab_id` — the `active_tab_id` `didSet` side effect
+    /// Clear the waiting-attention pulse on whichever window is focused in
+    /// `session_id` — the `active_session_id` `didSet` side effect
     /// (`TabModel.swift:468-475`).
-    fn acknowledge_waiting_on_active_pane(&mut self, tab_id: &str) {
+    fn acknowledge_waiting_on_active_window(&mut self, session_id: &str) {
         // Silent: the only write is the runtime-only `waiting_acknowledged`
         // flag (not persisted), and the selection that triggers this already
-        // fired via `set_active_tab_id`.
-        self.mutate_tab_silent(tab_id, |tab| {
-            if let Some(pane_id) = tab.active_pane_id.clone() {
-                if let Some(p) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
+        // fired via `set_active_session_id`.
+        self.mutate_session_silent(session_id, |session| {
+            if let Some(window_id) = session.active_window_id.clone() {
+                if let Some(p) = session.windows.iter_mut().find(|p| p.id == window_id) {
                     p.mark_acknowledged_if_waiting();
                 }
             }
         });
     }
 
-    // MARK: - Reordering (tabs)
+    // MARK: - Reordering (sessions)
 
-    /// Move `tab_id` to a new slot within the same project, relative to
-    /// `target_tab_id`. No-op — and no event — when the tabs aren't in the same
-    /// project, either id is unknown, the slot is illegal for the dragged tab's
-    /// lineage, or the move wouldn't change order. Tabs in the pinned Terminals
+    /// Move `session_id` to a new slot within the same project, relative to
+    /// `target_session_id`. No-op — and no event — when the sessions aren't in the same
+    /// project, either id is unknown, the slot is illegal for the dragged session's
+    /// lineage, or the move wouldn't change order. Sessions in the pinned Terminals
     /// project reorder internally but never leave it (cross-project is a no-op)
     /// (`TabModel.swift:485-500`).
     ///
     /// **Deliberate divergence from prod** (M7.8 feel-check round 3): Swift's
     /// `moveTab` moves a single row and ignores the depth-1 lineage, so
-    /// dragging a parent strands its children and a foreign tab can land
+    /// dragging a parent strands its children and a foreign session can land
     /// inside another parent's group. Here the move is subtree-aware — see
-    /// [`plan_tab_move`] for the full slot legality rules:
-    /// * a ROOT tab moves with its entire child block, gathered contiguously;
+    /// [`plan_session_move`] for the full slot legality rules:
+    /// * a ROOT session moves with its entire child block, gathered contiguously;
     /// * a root can only land at another BLOCK's boundary (never interleaved,
     ///   never inside its own subtree);
     /// * a CHILD reorders among its own siblings only.
-    pub fn move_tab(&mut self, tab_id: &str, target_tab_id: &str, place_after: bool) {
+    pub fn move_session(&mut self, session_id: &str, target_session_id: &str, place_after: bool) {
         let (Some((sp, _)), Some((dp, _))) = (
-            self.project_tab_index(tab_id),
-            self.project_tab_index(target_tab_id),
+            self.project_session_index(session_id),
+            self.project_session_index(target_session_id),
         ) else {
             return;
         };
         if sp != dp {
             return;
         }
-        let tabs = &mut self.projects[sp].tabs;
-        let Some(order) = plan_tab_move(tabs, tab_id, target_tab_id, place_after) else {
+        let sessions = &mut self.projects[sp].sessions;
+        let Some(order) = plan_session_move(sessions, session_id, target_session_id, place_after) else {
             return;
         };
-        let mut old: Vec<Option<Tab>> = tabs.drain(..).map(Some).collect();
-        *tabs = order
+        let mut old: Vec<Option<Session>> = sessions.drain(..).map(Some).collect();
+        *sessions = order
             .iter()
-            .map(|&i| old[i].take().expect("plan_tab_move yields a permutation"))
+            .map(|&i| old[i].take().expect("plan_session_move yields a permutation"))
             .collect();
         self.fire_mutation();
     }
 
-    /// Mirrors [`TabModel::move_tab`] without mutating — true iff the drop
+    /// Mirrors [`WorkspaceModel::move_session`] without mutating — true iff the drop
     /// would actually reorder (`TabModel.swift:505-514`, with the same
-    /// subtree-aware divergence as [`TabModel::move_tab`]).
-    pub fn would_move_tab(&self, tab_id: &str, target_tab_id: &str, place_after: bool) -> bool {
+    /// subtree-aware divergence as [`WorkspaceModel::move_session`]).
+    pub fn would_move_session(&self, session_id: &str, target_session_id: &str, place_after: bool) -> bool {
         let (Some((sp, _)), Some((dp, _))) = (
-            self.project_tab_index(tab_id),
-            self.project_tab_index(target_tab_id),
+            self.project_session_index(session_id),
+            self.project_session_index(target_session_id),
         ) else {
             return false;
         };
         if sp != dp {
             return false;
         }
-        plan_tab_move(&self.projects[sp].tabs, tab_id, target_tab_id, place_after).is_some()
+        plan_session_move(&self.projects[sp].sessions, session_id, target_session_id, place_after).is_some()
     }
 
-    // MARK: - Panes: reorder / insert / extract
+    // MARK: - TermWindows: reorder / insert / extract
 
-    /// Which pane id should receive focus after the pane at `idx` is removed
-    /// (the post-removal array): prefer the pane that slid into the freed slot,
-    /// else the new last pane, else `None`. Shared by [`TabModel::extract_pane`]
-    /// and the R13 process-exit path so a moved pane and an exited pane
+    /// Which window id should receive focus after the window at `idx` is removed
+    /// (the post-removal array): prefer the window that slid into the freed slot,
+    /// else the new last window, else `None`. Shared by [`WorkspaceModel::extract_window`]
+    /// and the R13 process-exit path so a moved window and an exited window
     /// re-focus the same neighbor (`TabModel.swift:554-558`).
-    pub fn neighbor_active_pane_id(after_removing_index: usize, panes: &[Pane]) -> Option<String> {
-        if after_removing_index < panes.len() {
-            return Some(panes[after_removing_index].id.clone());
+    pub fn neighbor_active_window_id(after_removing_index: usize, windows: &[TermWindow]) -> Option<String> {
+        if after_removing_index < windows.len() {
+            return Some(windows[after_removing_index].id.clone());
         }
         if after_removing_index > 0 {
-            return Some(panes[after_removing_index - 1].id.clone());
+            return Some(windows[after_removing_index - 1].id.clone());
         }
         None
     }
 
-    /// Move `pane_id` within tab `tab_id`'s pane list, relative to
-    /// `target_pane_id`. No-op (no event) when the tab is unknown, either pane
+    /// Move `window_id` within session `session_id`'s window list, relative to
+    /// `target_window_id`. No-op (no event) when the session is unknown, either window
     /// isn't in it, or the move wouldn't change order. Never touches
-    /// `active_pane_id` (`TabModel.swift:526-546`).
-    pub fn move_pane(
+    /// `active_window_id` (`TabModel.swift:526-546`).
+    pub fn move_window(
         &mut self,
-        pane_id: &str,
-        tab_id: &str,
-        target_pane_id: &str,
+        window_id: &str,
+        session_id: &str,
+        target_window_id: &str,
         place_after: bool,
     ) {
-        if pane_id == target_pane_id {
+        if window_id == target_window_id {
             return;
         }
         let mut moved = false;
-        if let Some((pi, ti)) = self.project_tab_index(tab_id) {
-            let tab = &mut self.projects[pi].tabs[ti];
+        if let Some((pi, ti)) = self.project_session_index(session_id) {
+            let session = &mut self.projects[pi].sessions[ti];
             if let (Some(src), Some(dst)) = (
-                tab.panes.iter().position(|p| p.id == pane_id),
-                tab.panes.iter().position(|p| p.id == target_pane_id),
+                session.windows.iter().position(|p| p.id == window_id),
+                session.windows.iter().position(|p| p.id == target_window_id),
             ) {
                 let mut insert_index = if place_after { dst + 1 } else { dst };
                 if src < insert_index {
                     insert_index -= 1;
                 }
                 if insert_index != src {
-                    let pane = tab.panes.remove(src);
-                    tab.panes.insert(insert_index, pane);
+                    let window = session.windows.remove(src);
+                    session.windows.insert(insert_index, window);
                     moved = true;
                 }
             }
@@ -482,23 +483,23 @@ impl TabModel {
         }
     }
 
-    /// Mirrors [`TabModel::move_pane`] without mutating (`TabModel.swift:648-657`).
-    pub fn would_move_pane(
+    /// Mirrors [`WorkspaceModel::move_window`] without mutating (`TabModel.swift:648-657`).
+    pub fn would_move_window(
         &self,
-        pane_id: &str,
-        tab_id: &str,
-        target_pane_id: &str,
+        window_id: &str,
+        session_id: &str,
+        target_window_id: &str,
         place_after: bool,
     ) -> bool {
-        if pane_id == target_pane_id {
+        if window_id == target_window_id {
             return false;
         }
-        let Some(tab) = self.tab_for(tab_id) else {
+        let Some(session) = self.session_for(session_id) else {
             return false;
         };
         let (Some(src), Some(dst)) = (
-            tab.panes.iter().position(|p| p.id == pane_id),
-            tab.panes.iter().position(|p| p.id == target_pane_id),
+            session.windows.iter().position(|p| p.id == window_id),
+            session.windows.iter().position(|p| p.id == target_window_id),
         ) else {
             return false;
         };
@@ -509,21 +510,21 @@ impl TabModel {
         insert_index != src
     }
 
-    /// Remove `pane_id` from tab `tab_id`, returning the removed [`Pane`] so a
-    /// destination window can re-insert it. When the removed pane was active,
-    /// focus re-points to a neighbor via [`TabModel::neighbor_active_pane_id`].
+    /// Remove `window_id` from session `session_id`, returning the removed [`TermWindow`] so a
+    /// destination window can re-insert it. When the removed window was active,
+    /// focus re-points to a neighbor via [`WorkspaceModel::neighbor_active_window_id`].
     /// Fires the did-mutate signal on a real removal; returns `None` (no
-    /// mutation, no event) when the tab or pane isn't found
+    /// mutation, no event) when the session or window isn't found
     /// (`TabModel.swift:572-587`).
-    pub fn extract_pane(&mut self, pane_id: &str, tab_id: &str) -> Option<Pane> {
+    pub fn extract_window(&mut self, window_id: &str, session_id: &str) -> Option<TermWindow> {
         let mut removed = None;
-        if let Some((pi, ti)) = self.project_tab_index(tab_id) {
-            let tab = &mut self.projects[pi].tabs[ti];
-            if let Some(idx) = tab.panes.iter().position(|p| p.id == pane_id) {
-                let was_active = tab.active_pane_id.as_deref() == Some(pane_id);
-                let r = tab.panes.remove(idx);
+        if let Some((pi, ti)) = self.project_session_index(session_id) {
+            let session = &mut self.projects[pi].sessions[ti];
+            if let Some(idx) = session.windows.iter().position(|p| p.id == window_id) {
+                let was_active = session.active_window_id.as_deref() == Some(window_id);
+                let r = session.windows.remove(idx);
                 if was_active {
-                    tab.active_pane_id = Self::neighbor_active_pane_id(idx, &tab.panes);
+                    session.active_window_id = Self::neighbor_active_window_id(idx, &session.windows);
                 }
                 removed = Some(r);
             }
@@ -534,23 +535,23 @@ impl TabModel {
         removed
     }
 
-    /// Insert an externally-sourced `pane` into tab `tab_id` relative to
-    /// `target_pane_id` (a `None`/unknown target appends). No-op (no event)
-    /// when the tab is unknown or already contains a pane with this id. Does
-    /// **not** change `active_pane_id` (`TabModel.swift:598-613`).
-    pub fn insert_pane(
+    /// Insert an externally-sourced `window` into session `session_id` relative to
+    /// `target_window_id` (a `None`/unknown target appends). No-op (no event)
+    /// when the session is unknown or already contains a window with this id. Does
+    /// **not** change `active_window_id` (`TabModel.swift:598-613`).
+    pub fn insert_window(
         &mut self,
-        pane: Pane,
-        tab_id: &str,
-        target_pane_id: Option<&str>,
+        window: TermWindow,
+        session_id: &str,
+        target_window_id: Option<&str>,
         place_after: bool,
     ) {
         let mut inserted = false;
-        if let Some((pi, ti)) = self.project_tab_index(tab_id) {
-            let tab = &mut self.projects[pi].tabs[ti];
-            if !tab.panes.iter().any(|p| p.id == pane.id) {
-                let insert_index = match target_pane_id
-                    .and_then(|t| tab.panes.iter().position(|p| p.id == t))
+        if let Some((pi, ti)) = self.project_session_index(session_id) {
+            let session = &mut self.projects[pi].sessions[ti];
+            if !session.windows.iter().any(|p| p.id == window.id) {
+                let insert_index = match target_window_id
+                    .and_then(|t| session.windows.iter().position(|p| p.id == t))
                 {
                     Some(t) => {
                         if place_after {
@@ -559,9 +560,9 @@ impl TabModel {
                             t
                         }
                     }
-                    None => tab.panes.len(),
+                    None => session.windows.len(),
                 };
-                tab.panes.insert(insert_index, pane);
+                session.windows.insert(insert_index, window);
                 inserted = true;
             }
         }
@@ -570,81 +571,81 @@ impl TabModel {
         }
     }
 
-    /// The model half of pane creation: append an auto-named terminal pane to
-    /// `tab_id` and focus it, all in one mutation — counter read → "Terminal N"
+    /// The model half of window creation: append an auto-named terminal window to
+    /// `session_id` and focus it, all in one mutation — counter read → "Terminal N"
     /// (or the explicit `title`) → increment. The counter increments
     /// unconditionally (an explicit title consumes the slot too), and only
-    /// terminal-kind panes are constructible through this method — the
+    /// terminal-kind windows are constructible through this method — the
     /// ≤1-running-Claude creation edge (`SessionsModel.swift:603-626`).
-    /// Returns the new pane id, or `None` when the tab isn't found. Fires the
-    /// did-mutate signal on a real append (BUGHUNT1-D) so the new pane persists
+    /// Returns the new window id, or `None` when the session isn't found. Fires the
+    /// did-mutate signal on a real append (BUGHUNT1-D) so the new window persists
     /// by construction.
-    pub fn add_pane(
+    pub fn add_window(
         &mut self,
-        tab_id: &str,
-        new_pane_id: impl Into<String>,
+        session_id: &str,
+        new_window_id: impl Into<String>,
         title: Option<String>,
     ) -> Option<String> {
-        let (pi, ti) = self.project_tab_index(tab_id)?;
-        let new_pane_id = new_pane_id.into();
-        let tab = &mut self.projects[pi].tabs[ti];
-        let n = tab.next_terminal_index;
+        let (pi, ti) = self.project_session_index(session_id)?;
+        let new_window_id = new_window_id.into();
+        let session = &mut self.projects[pi].sessions[ti];
+        let n = session.next_terminal_index;
         let resolved_title = title.unwrap_or_else(|| format!("Terminal {}", n));
-        tab.panes
-            .push(Pane::new(new_pane_id.clone(), resolved_title, PaneKind::Terminal));
-        tab.active_pane_id = Some(new_pane_id.clone());
-        tab.next_terminal_index = n + 1;
+        session.windows
+            .push(TermWindow::new(new_window_id.clone(), resolved_title, TermWindowKind::Terminal));
+        session.active_window_id = Some(new_window_id.clone());
+        session.next_terminal_index = n + 1;
         self.fire_mutation();
-        Some(new_pane_id)
+        Some(new_window_id)
     }
 
     // MARK: - Titles
 
-    /// Default display title for a pane of `kind`. Terminal panes use the tab's
+    /// Default display title for a window of `kind`. Terminal windows use the session's
     /// monotonic `next_terminal_index` — the single source of truth
-    /// [`TabModel::rename_pane`]'s empty-submit reset also reads
+    /// [`WorkspaceModel::rename_window`]'s empty-submit reset also reads
     /// (`TabModel.swift:666-671`).
-    pub fn default_pane_title(kind: PaneKind, terminal_index: u32) -> String {
+    pub fn default_window_title(kind: TermWindowKind, terminal_index: u32) -> String {
         match kind {
-            PaneKind::Claude => "Claude".to_string(),
-            PaneKind::Terminal => format!("Terminal {}", terminal_index),
+            TermWindowKind::Claude => "Claude".to_string(),
+            TermWindowKind::Terminal => format!("Terminal {}", terminal_index),
         }
     }
 
-    /// User-initiated rename for an individual pane. **Non-empty** input sets
+    /// User-initiated rename for an individual window. **Non-empty** input sets
     /// the title and locks it (`title_manually_set = true`) so OSC titles can't
     /// clobber the user's choice. **Empty** input resets to the per-kind
-    /// auto-default and clears the lock; for terminal panes the reset consumes
+    /// auto-default and clears the lock; for terminal windows the reset consumes
     /// and increments `next_terminal_index` (the monotonic-never-reuse policy —
     /// asymmetry 3) (`TabModel.swift:687-727`).
-    pub fn rename_pane(&mut self, tab_id: &str, pane_id: &str, new_title: &str) {
+    pub fn rename_window(&mut self, session_id: &str, window_id: &str, new_title: &str) {
         let trimmed = new_title.trim();
         let mut changed = false;
-        if let Some((pi, ti)) = self.project_tab_index(tab_id) {
-            let tab = &mut self.projects[pi].tabs[ti];
-            if let Some(idx) = tab.panes.iter().position(|p| p.id == pane_id) {
+        if let Some((pi, ti)) = self.project_session_index(session_id) {
+            let session = &mut self.projects[pi].sessions[ti];
+            if let Some(idx) = session.windows.iter().position(|p| p.id == window_id) {
                 if trimmed.is_empty() {
                     // Empty submit: release the lock and recompute the
                     // auto-default. A terminal reset consumes the next slot from
                     // the monotonic counter (unconditionally — the increment
                     // happens before the change check, matching the Swift order).
-                    let reset_title = match tab.panes[idx].kind {
-                        PaneKind::Claude => Self::default_pane_title(PaneKind::Claude, 0),
-                        PaneKind::Terminal => {
-                            let n = tab.next_terminal_index;
-                            let t = Self::default_pane_title(PaneKind::Terminal, n);
-                            tab.next_terminal_index = n + 1;
+                    let reset_title = match session.windows[idx].kind {
+                        TermWindowKind::Claude => Self::default_window_title(TermWindowKind::Claude, 0),
+                        TermWindowKind::Terminal => {
+                            let n = session.next_terminal_index;
+                            let t = Self::default_window_title(TermWindowKind::Terminal, n);
+                            session.next_terminal_index = n + 1;
                             t
                         }
                     };
-                    if tab.panes[idx].title != reset_title || tab.panes[idx].title_manually_set {
-                        tab.panes[idx].title = reset_title;
-                        tab.panes[idx].title_manually_set = false;
+                    if session.windows[idx].title != reset_title || session.windows[idx].title_manually_set {
+                        session.windows[idx].title = reset_title;
+                        session.windows[idx].title_manually_set = false;
                         changed = true;
                     }
-                } else if tab.panes[idx].title != trimmed || !tab.panes[idx].title_manually_set {
-                    tab.panes[idx].title = trimmed.to_string();
-                    tab.panes[idx].title_manually_set = true;
+                } else if session.windows[idx].title != trimmed || !session.windows[idx].title_manually_set {
+                    session.windows[idx].title = trimmed.to_string();
+                    session.windows[idx].title_manually_set = true;
                     changed = true;
                 }
             }
@@ -654,21 +655,21 @@ impl TabModel {
         }
     }
 
-    /// User-initiated tab rename from the sidebar editor. Trims whitespace,
+    /// User-initiated session rename from the sidebar editor. Trims whitespace,
     /// **ignores empty input** (a no-op — asymmetry 3, the mirror of
-    /// [`TabModel::rename_pane`]'s reset), and locks the title so
-    /// [`TabModel::apply_auto_title`] skips it (`TabModel.swift:732-744`).
-    pub fn rename_tab(&mut self, id: &str, new_title: &str) {
+    /// [`WorkspaceModel::rename_window`]'s reset), and locks the title so
+    /// [`WorkspaceModel::apply_auto_title`] skips it (`TabModel.swift:732-744`).
+    pub fn rename_session(&mut self, id: &str, new_title: &str) {
         let trimmed = new_title.trim();
         if trimmed.is_empty() {
             return;
         }
         let mut changed = false;
-        if let Some((pi, ti)) = self.project_tab_index(id) {
-            let tab = &mut self.projects[pi].tabs[ti];
-            if tab.title != trimmed || !tab.title_manually_set {
-                tab.title = trimmed.to_string();
-                tab.title_manually_set = true;
+        if let Some((pi, ti)) = self.project_session_index(id) {
+            let session = &mut self.projects[pi].sessions[ti];
+            if session.title != trimmed || !session.title_manually_set {
+                session.title = trimmed.to_string();
+                session.title_manually_set = true;
                 changed = true;
             }
         }
@@ -678,11 +679,11 @@ impl TabModel {
     }
 
     /// Apply a Claude-generated session title, humanized into sentence case.
-    /// Skipped entirely once the user has manually renamed the tab, keyed on
-    /// `tab_id` so locking one tab never affects another
+    /// Skipped entirely once the user has manually renamed the session, keyed on
+    /// `session_id` so locking one session never affects another
     /// (`TabModel.swift:752-767`).
-    pub fn apply_auto_title(&mut self, tab_id: &str, raw_title: &str) {
-        match self.tab_for(tab_id) {
+    pub fn apply_auto_title(&mut self, session_id: &str, raw_title: &str) {
+        match self.session_for(session_id) {
             Some(t) if !t.title_manually_set => {}
             _ => return,
         }
@@ -691,13 +692,13 @@ impl TabModel {
             return;
         }
         let mut changed = false;
-        if let Some((pi, ti)) = self.project_tab_index(tab_id) {
-            let tab = &mut self.projects[pi].tabs[ti];
-            if tab.title != humanized {
-                tab.title = humanized;
+        if let Some((pi, ti)) = self.project_session_index(session_id) {
+            let session = &mut self.projects[pi].sessions[ti];
+            if session.title != humanized {
+                session.title = humanized;
                 changed = true;
             }
-            tab.title_auto_generated = true;
+            session.title_auto_generated = true;
         }
         if changed {
             self.fire_mutation();
@@ -707,12 +708,12 @@ impl TabModel {
     // MARK: - Project structure
 
     /// Guarantee a pinned Terminals project sits at `projects[0]`. Synthesize
-    /// one (Main tab + fresh "Terminal 1" pane) when absent, or move it to
+    /// one (Main session + fresh "Terminal 1" window) when absent, or move it to
     /// index 0 when merely out of place. `spawn_hook` fires **exactly once**,
-    /// with the synthesized Main tab, only when the project had to be created
+    /// with the synthesized Main session, only when the project had to be created
     /// from scratch — the one-way bridge into pty-aware callers
     /// (`TabModel.swift:803-839`).
-    pub fn ensure_terminals_project_seeded(&mut self, spawn_hook: impl FnOnce(&Tab)) {
+    pub fn ensure_terminals_project_seeded(&mut self, spawn_hook: impl FnOnce(&Session)) {
         if let Some(idx) = self
             .projects
             .iter()
@@ -724,38 +725,38 @@ impl TabModel {
                 // Reordering the pinned group changes the persisted layout.
                 self.fire_mutation();
             }
-            if self.active_tab_id.is_none() {
-                if let Some(first_id) = self.projects[0].tabs.first().map(|t| t.id.clone()) {
-                    // `set_active_tab_id` fires the did-mutate signal itself.
-                    self.set_active_tab_id(Some(first_id));
+            if self.active_session_id.is_none() {
+                if let Some(first_id) = self.projects[0].sessions.first().map(|t| t.id.clone()) {
+                    // `set_active_session_id` fires the did-mutate signal itself.
+                    self.set_active_session_id(Some(first_id));
                 }
             }
             return;
         }
 
         let cwd = self.fs.home();
-        let main_tab_id = Self::MAIN_TERMINAL_TAB_ID;
-        let pane_id = mint_pane_id(main_tab_id);
-        let pane = Pane::new(pane_id.clone(), "Terminal 1", PaneKind::Terminal);
-        let mut main_tab = Tab::new(main_tab_id, "Main", &cwd);
-        main_tab.panes = vec![pane];
-        main_tab.active_pane_id = Some(pane_id);
-        main_tab.next_terminal_index = 2;
+        let main_session_id = Self::MAIN_TERMINAL_SESSION_ID;
+        let window_id = mint_window_id(main_session_id);
+        let window = TermWindow::new(window_id.clone(), "Terminal 1", TermWindowKind::Terminal);
+        let mut main_session = Session::new(main_session_id, "Main", &cwd);
+        main_session.windows = vec![window];
+        main_session.active_window_id = Some(window_id);
+        main_session.next_terminal_index = 2;
         let project = Project {
             id: Self::TERMINALS_PROJECT_ID.into(),
             name: "Terminals".into(),
             path: cwd,
-            tabs: vec![main_tab.clone()],
+            sessions: vec![main_session.clone()],
         };
         self.projects.insert(0, project);
         // Synthesizing the pinned Terminals project is a persisted change.
-        // (`set_active_tab_id` below fires again when it sets selection; the
+        // (`set_active_session_id` below fires again when it sets selection; the
         // duplicate schedule is harmless — the save is debounced.)
         self.fire_mutation();
-        if self.active_tab_id.is_none() {
-            self.set_active_tab_id(Some(main_tab_id.to_string()));
+        if self.active_session_id.is_none() {
+            self.set_active_session_id(Some(main_session_id.to_string()));
         }
-        spawn_hook(&main_tab);
+        spawn_hook(&main_session);
     }
 
     /// Look up `projects` by saved id; append a fresh empty `Project` with the
@@ -769,7 +770,7 @@ impl TabModel {
             id: id.into(),
             name: name.into(),
             path: path.into(),
-            tabs: vec![],
+            sessions: vec![],
         });
         // Appending a new project grouping is a persisted change.
         self.fire_mutation();
@@ -778,7 +779,7 @@ impl TabModel {
 
     /// Find a non-Terminals project whose expanded `path` matches; else append
     /// a fresh project carrying the supplied id/name/path verbatim. Matches by
-    /// filesystem path (distinct from [`TabModel::ensure_project`]'s id match),
+    /// filesystem path (distinct from [`WorkspaceModel::ensure_project`]'s id match),
     /// and never appends a second project with the reserved Terminals id
     /// (`TabModel.swift:623-643`).
     pub fn ensure_project_by_path(&mut self, id: &str, name: &str, path: &str) -> usize {
@@ -801,28 +802,28 @@ impl TabModel {
             id: id.into(),
             name: name.into(),
             path: path.into(),
-            tabs: vec![],
+            sessions: vec![],
         });
         // Appending a new project grouping is a persisted change.
         self.fire_mutation();
         self.projects.len() - 1
     }
 
-    /// Bucket `tab` into the project anchoring `cwd`'s git repo, creating one at
+    /// Bucket `session` into the project anchoring `cwd`'s git repo, creating one at
     /// the git root when none matches. Falls back to legacy longest-prefix
     /// matching (excluding Terminals) when `cwd` is not inside any git repo
     /// (`TabModel.swift:857-878`).
-    pub fn add_tab_to_projects(&mut self, tab: Tab, cwd: &str) {
+    pub fn add_session_to_projects(&mut self, session: Session, cwd: &str) {
         let normalized = self.expand_tilde(cwd);
         if let Some(git_root) = self.find_git_root(&normalized) {
-            self.append_or_insert(tab, &git_root);
-            // Adding a tab always changes persisted state.
+            self.append_or_insert(session, &git_root);
+            // Adding a session always changes persisted state.
             self.fire_mutation();
             return;
         }
         // No git root: legacy longest-prefix, excluding the pinned Terminals
         // group (whose path — typically $HOME — would prefix-match almost any
-        // cwd and swallow new Claude tabs). Ties keep the first max, matching
+        // cwd and swallow new Claude sessions). Ties keep the first max, matching
         // Swift's `max(by:)`.
         let mut best: Option<(usize, usize)> = None;
         for (idx, p) in self.projects.iter().enumerate() {
@@ -839,20 +840,20 @@ impl TabModel {
             }
         }
         match best {
-            Some((idx, _)) => self.projects[idx].tabs.push(tab),
-            None => self.append_new_project(&normalized, tab),
+            Some((idx, _)) => self.projects[idx].sessions.push(session),
+            None => self.append_new_project(&normalized, session),
         }
-        // Adding a tab always changes persisted state.
+        // Adding a session always changes persisted state.
         self.fire_mutation();
     }
 
-    /// Append `tab` to the existing non-Terminals project rooted at `path`, or
+    /// Append `session` to the existing non-Terminals project rooted at `path`, or
     /// create a new project there (`TabModel.swift:882-888`).
-    fn append_or_insert(&mut self, tab: Tab, path: &str) {
+    fn append_or_insert(&mut self, session: Session, path: &str) {
         if let Some(idx) = self.first_index_of_non_terminals_project_at(path) {
-            self.projects[idx].tabs.push(tab);
+            self.projects[idx].sessions.push(session);
         } else {
-            self.append_new_project(path, tab);
+            self.append_new_project(path, session);
         }
     }
 
@@ -868,14 +869,14 @@ impl TabModel {
     /// the last path component. A unique suffix (Swift uses a UUID prefix)
     /// keeps back-to-back appends in the same instant from colliding on `id`
     /// (`TabModel.swift:904-910`).
-    fn append_new_project(&mut self, path: &str, tab: Tab) {
+    fn append_new_project(&mut self, path: &str, session: Session) {
         let dir_name = last_path_component(path).to_uppercase();
         let project_id = format!("p-{}-{}", dir_name.to_lowercase(), unique_suffix());
         self.projects.push(Project {
             id: project_id,
             name: dir_name,
             path: path.to_string(),
-            tabs: vec![tab],
+            sessions: vec![session],
         });
     }
 
@@ -883,7 +884,7 @@ impl TabModel {
     /// Four passes (`TabModel.swift:924-985`):
     /// 1. promote each non-Terminals project's `path` to its enclosing git root
     ///    (when a strict descendant of one);
-    /// 2. move tabs whose own git-root anchor differs from their project (tabs
+    /// 2. move sessions whose own git-root anchor differs from their project (sessions
     ///    whose cwd no longer exists stay put);
     /// 3. merge non-Terminals projects that converged on the same expanded path
     ///    (lowest index wins);
@@ -908,9 +909,9 @@ impl TabModel {
             self.projects[i].path = root;
         }
 
-        // Pass 2: collect mis-bucketed tabs, then re-insert at the right anchor.
+        // Pass 2: collect mis-bucketed sessions, then re-insert at the right anchor.
         struct Move {
-            tab: Tab,
+            session: Session,
             target_git_root: String,
         }
         let mut moves: Vec<Move> = Vec::new();
@@ -919,28 +920,28 @@ impl TabModel {
                 continue;
             }
             let project_anchor = self.expand_tilde(&self.projects[i].path);
-            let tabs = std::mem::take(&mut self.projects[i].tabs);
-            let mut keep: Vec<Tab> = Vec::with_capacity(tabs.len());
-            for tab in tabs {
-                let tab_cwd = self.expand_tilde(&tab.cwd);
-                if !self.fs.exists(&tab_cwd) {
-                    keep.push(tab);
+            let sessions = std::mem::take(&mut self.projects[i].sessions);
+            let mut keep: Vec<Session> = Vec::with_capacity(sessions.len());
+            for session in sessions {
+                let session_cwd = self.expand_tilde(&session.cwd);
+                if !self.fs.exists(&session_cwd) {
+                    keep.push(session);
                     continue;
                 }
-                let anchor = self.find_git_root(&tab_cwd).unwrap_or(tab_cwd);
+                let anchor = self.find_git_root(&session_cwd).unwrap_or(session_cwd);
                 if anchor == project_anchor {
-                    keep.push(tab);
+                    keep.push(session);
                 } else {
                     moves.push(Move {
-                        tab,
+                        session,
                         target_git_root: anchor,
                     });
                 }
             }
-            self.projects[i].tabs = keep;
+            self.projects[i].sessions = keep;
         }
         for m in moves {
-            self.append_or_insert(m.tab, &m.target_git_root);
+            self.append_or_insert(m.session, &m.target_git_root);
         }
 
         // Pass 3: merge duplicates targeting the same expanded path.
@@ -952,8 +953,8 @@ impl TabModel {
             }
             let key = self.expand_tilde(&self.projects[i].path);
             if let Some(&c) = canonical.get(&key) {
-                let moved = std::mem::take(&mut self.projects[i].tabs);
-                self.projects[c].tabs.extend(moved);
+                let moved = std::mem::take(&mut self.projects[i].sessions);
+                self.projects[c].sessions.extend(moved);
                 dupes.push(i);
             } else {
                 canonical.insert(key, i);
@@ -966,7 +967,7 @@ impl TabModel {
 
         // Pass 4: drop empty non-Terminals projects.
         self.projects
-            .retain(|p| p.id == Self::TERMINALS_PROJECT_ID || !p.tabs.is_empty());
+            .retain(|p| p.id == Self::TERMINALS_PROJECT_ID || !p.sessions.is_empty());
 
         // Fire unconditionally: repair may have rewritten the tree, and tracking
         // a change flag across four passes buys nothing. In production repair
@@ -978,67 +979,67 @@ impl TabModel {
 
     // MARK: - Cwd resolution
 
-    /// Resolve the spawn cwd for `tab`: prefer `tab.cwd`, falling back to the
-    /// containing project's path when the tab's cwd no longer exists on disk
+    /// Resolve the spawn cwd for `session`: prefer `session.cwd`, falling back to the
+    /// containing project's path when the session's cwd no longer exists on disk
     /// (`TabModel.swift:994-1003`).
-    pub fn resolved_spawn_cwd(&self, tab: &Tab) -> String {
-        let expanded = self.expand_tilde(&tab.cwd);
+    pub fn resolved_spawn_cwd(&self, session: &Session) -> String {
+        let expanded = self.expand_tilde(&session.cwd);
         if self.fs.exists(&expanded) {
             return expanded;
         }
         if let Some(project) = self
             .projects
             .iter()
-            .find(|p| p.tabs.iter().any(|t| t.id == tab.id))
+            .find(|p| p.sessions.iter().any(|t| t.id == session.id))
         {
             return self.expand_tilde(&project.path);
         }
         expanded
     }
 
-    /// Per-pane variant: prefer `pane.cwd` (last-observed via OSC 7) when set
-    /// and still on disk, else fall back to [`TabModel::resolved_spawn_cwd`]
+    /// Per-window variant: prefer `window.cwd` (last-observed via OSC 7) when set
+    /// and still on disk, else fall back to [`WorkspaceModel::resolved_spawn_cwd`]
     /// (`TabModel.swift:1021-1029`).
-    pub fn resolved_spawn_cwd_for_pane(&self, tab: &Tab, pane: &Pane) -> String {
-        if let Some(raw) = &pane.cwd {
+    pub fn resolved_spawn_cwd_for_window(&self, session: &Session, window: &TermWindow) -> String {
+        if let Some(raw) = &window.cwd {
             let expanded = self.expand_tilde(raw);
             if self.fs.exists(&expanded) {
                 return expanded;
             }
         }
-        self.resolved_spawn_cwd(tab)
+        self.resolved_spawn_cwd(session)
     }
 
-    /// Resolve the cwd for a new pane in `tab`: an explicit `caller_provided`
-    /// cwd wins; else inherit from the active pane; else fall back to `tab.cwd`
+    /// Resolve the cwd for a new window in `session`: an explicit `caller_provided`
+    /// cwd wins; else inherit from the active window; else fall back to `session.cwd`
     /// (`TabModel.swift:1009-1016`).
-    pub fn spawn_cwd_for_new_pane(&self, tab: &Tab, caller_provided: Option<&str>) -> String {
+    pub fn spawn_cwd_for_new_window(&self, session: &Session, caller_provided: Option<&str>) -> String {
         if let Some(cwd) = caller_provided {
             return cwd.to_string();
         }
-        if let Some(active_id) = &tab.active_pane_id {
-            if let Some(active_pane) = tab.panes.iter().find(|p| &p.id == active_id) {
-                return self.resolved_spawn_cwd_for_pane(tab, active_pane);
+        if let Some(active_id) = &session.active_window_id {
+            if let Some(active_window) = session.windows.iter().find(|p| &p.id == active_id) {
+                return self.resolved_spawn_cwd_for_window(session, active_window);
             }
         }
-        tab.cwd.clone()
+        session.cwd.clone()
     }
 
-    /// Update `tab.cwd` to `new_cwd` and pull along any pane whose `cwd` was
-    /// `None` or still tracking the old `tab.cwd` (diverged panes stay put —
-    /// asymmetry 4, per-pane not all-or-nothing). Returns `true` iff anything
+    /// Update `session.cwd` to `new_cwd` and pull along any window whose `cwd` was
+    /// `None` or still tracking the old `session.cwd` (diverged windows stay put —
+    /// asymmetry 4, per-window not all-or-nothing). Returns `true` iff anything
     /// changed. Fires the did-mutate signal on a real change (BUGHUNT1-D) so an
     /// OSC 7 cwd adoption persists by construction (`TabModel.swift:1052-1067`).
-    pub fn adopt_tab_cwd(&mut self, tab_id: &str, new_cwd: &str) -> bool {
+    pub fn adopt_session_cwd(&mut self, session_id: &str, new_cwd: &str) -> bool {
         let mut changed = false;
-        if let Some((pi, ti)) = self.project_tab_index(tab_id) {
-            let tab = &mut self.projects[pi].tabs[ti];
-            let old_cwd = tab.cwd.clone();
+        if let Some((pi, ti)) = self.project_session_index(session_id) {
+            let session = &mut self.projects[pi].sessions[ti];
+            let old_cwd = session.cwd.clone();
             if old_cwd != new_cwd {
-                tab.cwd = new_cwd.to_string();
-                for pane in tab.panes.iter_mut() {
-                    if pane.cwd.is_none() || pane.cwd.as_deref() == Some(old_cwd.as_str()) {
-                        pane.cwd = Some(new_cwd.to_string());
+                session.cwd = new_cwd.to_string();
+                for window in session.windows.iter_mut() {
+                    if window.cwd.is_none() || window.cwd.as_deref() == Some(old_cwd.as_str()) {
+                        window.cwd = Some(new_cwd.to_string());
                     }
                 }
                 changed = true;
@@ -1052,64 +1053,64 @@ impl TabModel {
 
     // MARK: - Lineage (depth-1 /branch + handoff)
 
-    /// Insert a fresh "branch parent" tab into the same project as
-    /// `originating_tab_id`, applying the depth-1 lineage rule. The claude pane
+    /// Insert a fresh "branch parent" session into the same project as
+    /// `originating_session_id`, applying the depth-1 lineage rule. The claude window
     /// is created **not running** (deferred resume). Root promotion: when the
-    /// originating tab has no parent, the new parent becomes the root and the
-    /// originating tab plus all its former children are re-parented to it so
+    /// originating session has no parent, the new parent becomes the root and the
+    /// originating session plus all its former children are re-parented to it so
     /// the depth-1 invariant survives (`TabModel.swift:297-365`).
     ///
-    /// Returns the inserted parent, or `None` when the originating tab is
+    /// Returns the inserted parent, or `None` when the originating session is
     /// unknown or lives in the pinned Terminals project.
     pub fn insert_branch_parent(
         &mut self,
-        originating_tab_id: &str,
-        new_tab_id: &str,
-        claude_pane_id: &str,
-        terminal_pane_id: &str,
+        originating_session_id: &str,
+        new_session_id: &str,
+        claude_window_id: &str,
+        terminal_window_id: &str,
         old_session_id: &str,
-    ) -> Option<Tab> {
-        let (pi, ti) = self.project_tab_index(originating_tab_id)?;
-        if self.is_terminals_project_tab(originating_tab_id) {
+    ) -> Option<Session> {
+        let (pi, ti) = self.project_session_index(originating_session_id)?;
+        if self.is_terminals_project_session(originating_session_id) {
             return None;
         }
-        let originating = self.projects[pi].tabs[ti].clone();
-        let inherited_root = originating.parent_tab_id.clone();
+        let originating = self.projects[pi].sessions[ti].clone();
+        let inherited_root = originating.parent_session_id.clone();
         if let Some(root) = &inherited_root {
-            // Defensive: parent_tab_id is a within-project reference. A
+            // Defensive: parent_session_id is a within-project reference. A
             // cross-project pointer would mean prior corruption; don't compound
             // it by inheriting the bad pointer.
             debug_assert!(
-                self.projects[pi].tabs.iter().any(|t| &t.id == root),
-                "originating tab's parent_tab_id must live in the same project"
+                self.projects[pi].sessions.iter().any(|t| &t.id == root),
+                "originating session's parent_session_id must live in the same project"
             );
         }
 
-        let mut claude_pane = Pane::new(claude_pane_id, "Claude", PaneKind::Claude);
-        claude_pane.is_claude_running = false;
-        let terminal_pane = Pane::new(terminal_pane_id, "Terminal 1", PaneKind::Terminal);
-        let mut parent = Tab::new(new_tab_id, originating.title.clone(), originating.cwd.clone());
-        parent.panes = vec![claude_pane, terminal_pane];
-        parent.active_pane_id = Some(claude_pane_id.to_string());
+        let mut claude_window = TermWindow::new(claude_window_id, "Claude", TermWindowKind::Claude);
+        claude_window.is_claude_running = false;
+        let terminal_window = TermWindow::new(terminal_window_id, "Terminal 1", TermWindowKind::Terminal);
+        let mut parent = Session::new(new_session_id, originating.title.clone(), originating.cwd.clone());
+        parent.windows = vec![claude_window, terminal_window];
+        parent.active_window_id = Some(claude_window_id.to_string());
         parent.title_auto_generated = originating.title_auto_generated;
         parent.title_manually_set = originating.title_manually_set;
         parent.claude_session_id = Some(old_session_id.to_string());
-        parent.parent_tab_id = inherited_root.clone();
+        parent.parent_session_id = inherited_root.clone();
         parent.next_terminal_index = 2;
 
-        // Insert immediately above the originating tab: order reads [parent, child].
-        self.projects[pi].tabs.insert(ti, parent.clone());
+        // Insert immediately above the originating session: order reads [parent, child].
+        self.projects[pi].sessions.insert(ti, parent.clone());
 
         if inherited_root.is_none() {
-            // First-branch root promotion: re-parent the originating tab and
-            // every tab already pointing at it to the new root.
-            for j in 0..self.projects[pi].tabs.len() {
+            // First-branch root promotion: re-parent the originating session and
+            // every session already pointing at it to the new root.
+            for j in 0..self.projects[pi].sessions.len() {
                 let (id, ptid) = {
-                    let t = &self.projects[pi].tabs[j];
-                    (t.id.clone(), t.parent_tab_id.clone())
+                    let t = &self.projects[pi].sessions[j];
+                    (t.id.clone(), t.parent_session_id.clone())
                 };
-                if id == originating_tab_id || ptid.as_deref() == Some(originating_tab_id) {
-                    self.projects[pi].tabs[j].parent_tab_id = Some(new_tab_id.to_string());
+                if id == originating_session_id || ptid.as_deref() == Some(originating_session_id) {
+                    self.projects[pi].sessions[j].parent_session_id = Some(new_session_id.to_string());
                 }
             }
         }
@@ -1120,34 +1121,34 @@ impl TabModel {
         Some(parent)
     }
 
-    /// Nest an already-constructed `tab` one indent under `under_tab_id`,
+    /// Nest an already-constructed `session` one indent under `under_session_id`,
     /// applying the same depth-1 rule — but, unlike
-    /// [`TabModel::insert_branch_parent`], **without** re-parenting the anchor's
+    /// [`WorkspaceModel::insert_branch_parent`], **without** re-parenting the anchor's
     /// former children (the anchor stays the root, so its existing depth-1
     /// children remain valid; this asymmetry is deliberate). Inserted
     /// immediately after the anchor. Returns `false` (mutating nothing) when
     /// the anchor is unknown or in the Terminals group (`TabModel.swift:401-416`).
     ///
-    /// **`parent_tab_id` is the ONLY field this touches.** The child arrives
-    /// fully built and every other field — panes, title flags, and in
+    /// **`parent_session_id` is the ONLY field this touches.** The child arrives
+    /// fully built and every other field — windows, title flags, and in
     /// particular `claude_session_id` — is inserted verbatim. So a caller that
-    /// needs the child PINNED to a specific session id (a handoff tab to its
-    /// pre-minted `--session-id`, a background `/fork` tab to the fork's id, so
-    /// its later deferred resume opens that exact conversation) simply sets
-    /// `tab.claude_session_id` before calling; no variant of this method is
-    /// needed for it. [`crate::TabModel::insert_branch_parent`] pins the old id
-    /// itself only because it MINTS the tab it inserts.
-    pub fn insert_handoff_child(&mut self, tab: Tab, under_tab_id: &str) -> bool {
-        let Some((pi, ti)) = self.project_tab_index(under_tab_id) else {
+    /// needs the child PINNED to a specific claude session id (a handoff session
+    /// to its pre-minted `--session-id`, a background `/fork` session to the
+    /// fork's id, so its later deferred resume opens that exact conversation)
+    /// simply sets `session.claude_session_id` before calling; no variant of
+    /// this method is needed for it. [`WorkspaceModel::insert_branch_parent`]
+    /// pins the old id itself only because it MINTS the session it inserts.
+    pub fn insert_handoff_child(&mut self, session: Session, under_session_id: &str) -> bool {
+        let Some((pi, ti)) = self.project_session_index(under_session_id) else {
             return false;
         };
-        if self.is_terminals_project_tab(under_tab_id) {
+        if self.is_terminals_project_session(under_session_id) {
             return false;
         }
-        let originating_parent = self.projects[pi].tabs[ti].parent_tab_id.clone();
-        let mut child = tab;
-        child.parent_tab_id = Some(originating_parent.unwrap_or_else(|| under_tab_id.to_string()));
-        self.projects[pi].tabs.insert(ti + 1, child);
+        let originating_parent = self.projects[pi].sessions[ti].parent_session_id.clone();
+        let mut child = session;
+        child.parent_session_id = Some(originating_parent.unwrap_or_else(|| under_session_id.to_string()));
+        self.projects[pi].sessions.insert(ti + 1, child);
         // Nesting the handoff child is a persisted change (BUGHUNT1-D).
         self.fire_mutation();
         true
@@ -1155,14 +1156,14 @@ impl TabModel {
 
     // MARK: - Removal
 
-    /// Remove the tab at `(project_index, tab_index)` and sweep any sibling
-    /// `parent_tab_id` references that pointed at it, atomically. The single
+    /// Remove the session at `(project_index, session_index)` and sweep any sibling
+    /// `parent_session_id` references that pointed at it, atomically. The single
     /// removal entry point — every removal path must funnel through here so the
     /// parent-pointer sweep can't be skipped (`TabModel.swift:237-241`). Fires
     /// the did-mutate signal (BUGHUNT1-D) — a removal always changes persisted
     /// state — so the ctrl+d / pty-exit dissolve persists by construction.
-    pub fn remove_tab(&mut self, project_index: usize, tab_index: usize) -> Tab {
-        let removed = self.projects[project_index].tabs.remove(tab_index);
+    pub fn remove_session(&mut self, project_index: usize, session_index: usize) -> Session {
+        let removed = self.projects[project_index].sessions.remove(session_index);
         // The sweep fires its own signal only when it actually clears a
         // reference; the removal itself always warrants a fire.
         self.clear_dangling_parent_references(&removed.id);
@@ -1170,15 +1171,15 @@ impl TabModel {
         removed
     }
 
-    /// Clear `parent_tab_id` on every tab that pointed at `removed_tab_id`
+    /// Clear `parent_session_id` on every session that pointed at `removed_session_id`
     /// (`TabModel.swift:249-257`). Fires the did-mutate signal when it clears at
     /// least one reference (BUGHUNT1-D).
-    pub fn clear_dangling_parent_references(&mut self, removed_tab_id: &str) {
+    pub fn clear_dangling_parent_references(&mut self, removed_session_id: &str) {
         let mut changed = false;
         for pi in 0..self.projects.len() {
-            for ti in 0..self.projects[pi].tabs.len() {
-                if self.projects[pi].tabs[ti].parent_tab_id.as_deref() == Some(removed_tab_id) {
-                    self.projects[pi].tabs[ti].parent_tab_id = None;
+            for ti in 0..self.projects[pi].sessions.len() {
+                if self.projects[pi].sessions[ti].parent_session_id.as_deref() == Some(removed_session_id) {
+                    self.projects[pi].sessions[ti].parent_session_id = None;
                     changed = true;
                 }
             }
@@ -1188,9 +1189,9 @@ impl TabModel {
         }
     }
 
-    /// Sweep every `parent_tab_id` against the set of present tab ids and clear
+    /// Sweep every `parent_session_id` against the set of present session ids and clear
     /// any dangling one. Called after a full-tree restore so a hand-edited or
-    /// partially-corrupt snapshot can't leave a child indented under a tab that
+    /// partially-corrupt snapshot can't leave a child indented under a session that
     /// doesn't exist. Pure cleanup — safe to call repeatedly
     /// (`TabModel.swift:427-442`). Fires the did-mutate signal when it clears at
     /// least one dangling reference (BUGHUNT1-D). In production this runs during
@@ -1200,14 +1201,14 @@ impl TabModel {
         let valid: HashSet<String> = self
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect();
         let mut changed = false;
         for pi in 0..self.projects.len() {
-            for ti in 0..self.projects[pi].tabs.len() {
-                if let Some(parent) = &self.projects[pi].tabs[ti].parent_tab_id {
+            for ti in 0..self.projects[pi].sessions.len() {
+                if let Some(parent) = &self.projects[pi].sessions[ti].parent_session_id {
                     if !valid.contains(parent) {
-                        self.projects[pi].tabs[ti].parent_tab_id = None;
+                        self.projects[pi].sessions[ti].parent_session_id = None;
                         changed = true;
                     }
                 }
@@ -1218,30 +1219,30 @@ impl TabModel {
         }
     }
 
-    /// Sweep every pane id in the tree for duplicates and re-mint any repeat —
-    /// first occurrence (in project/tab/pane order) keeps the id, later ones get
+    /// Sweep every window id in the tree for duplicates and re-mint any repeat —
+    /// first occurrence (in project/session/window order) keeps the id, later ones get
     /// the lowest unused `<id>-dup<n>` suffix. Restore-time self-heal: a
-    /// pre-fix launch could persist two panes sharing one id (the strip/sidebar
-    /// minters restarted their counter at 0 every launch while restored panes
+    /// pre-fix launch could persist two windows sharing one id (the strip/sidebar
+    /// minters restarted their counter at 0 every launch while restored windows
     /// kept their persisted ids verbatim), and every id-keyed strip affordance
-    /// then matches both panes (double-selected pills, click-inert select,
-    /// rename editing both). When a rename orphans a tab's `active_pane_id`
-    /// (the duplicate lived on another tab), the pointer follows the renamed
-    /// pane. Pure cleanup — safe to call repeatedly. Fires the did-mutate
-    /// signal when it renamed at least one pane; in production this runs during
+    /// then matches both windows (double-selected pills, click-inert select,
+    /// rename editing both). When a rename orphans a session's `active_window_id`
+    /// (the duplicate lived on another session), the pointer follows the renamed
+    /// window. Pure cleanup — safe to call repeatedly. Fires the did-mutate
+    /// signal when it renamed at least one window; in production this runs during
     /// restore, before the observer is wired, so it self-heals silently there.
-    pub fn dedupe_pane_ids(&mut self) {
+    pub fn dedupe_window_ids(&mut self) {
         let mut seen: HashSet<String> = HashSet::new();
         let mut changed = false;
         for project in &mut self.projects {
-            for tab in &mut project.tabs {
-                // (old, new) renames on this tab, for active_pane_id repair.
+            for session in &mut project.sessions {
+                // (old, new) renames on this session, for active_window_id repair.
                 let mut renames: Vec<(String, String)> = Vec::new();
-                for pane in &mut tab.panes {
-                    if seen.insert(pane.id.clone()) {
+                for window in &mut session.windows {
+                    if seen.insert(window.id.clone()) {
                         continue;
                     }
-                    let old = pane.id.clone();
+                    let old = window.id.clone();
                     let mut n = 2u32;
                     let new_id = loop {
                         let candidate = format!("{old}-dup{n}");
@@ -1250,20 +1251,20 @@ impl TabModel {
                         }
                         n += 1;
                     };
-                    pane.id = new_id.clone();
+                    window.id = new_id.clone();
                     renames.push((old, new_id));
                     changed = true;
                 }
-                // Re-point active_pane_id only when the rename left it dangling
-                // (no pane on this tab retains the old id — the duplicate that
-                // kept it lives on another tab). When a pane on this tab kept
+                // Re-point active_window_id only when the rename left it dangling
+                // (no window on this session retains the old id — the duplicate that
+                // kept it lives on another session). When a window on this session kept
                 // the id, the pointer already resolves unambiguously to it.
-                if let Some(active) = tab.active_pane_id.clone() {
-                    if !tab.panes.iter().any(|p| p.id == active) {
+                if let Some(active) = session.active_window_id.clone() {
+                    if !session.windows.iter().any(|p| p.id == active) {
                         if let Some((_, new_id)) =
                             renames.iter().find(|(old, _)| *old == active)
                         {
-                            tab.active_pane_id = Some(new_id.clone());
+                            session.active_window_id = Some(new_id.clone());
                         }
                     }
                 }
@@ -1327,7 +1328,7 @@ impl TabModel {
 
     /// Scan `args` for the session UUID from `--resume <id>`, `--session-id
     /// <id>`, `--resume=<id>`, or `--session-id=<id>` (both forms, unlike
-    /// [`TabModel::extract_worktree_name`]) (`TabModel.swift:1129-1145`).
+    /// [`WorkspaceModel::extract_worktree_name`]) (`TabModel.swift:1129-1145`).
     pub fn extract_claude_session_id<S: AsRef<str>>(args: &[S]) -> Option<String> {
         let mut i = 0;
         while i < args.len() {
@@ -1349,9 +1350,9 @@ impl TabModel {
     /// Derive the on-disk worktree directory name Claude creates from a `-w`
     /// value. Claude Code sanitizes `/` → `+` when materializing the worktree
     /// directory (so `foo/bar` becomes `foo+bar`); Nice mirrors that so the
-    /// companion terminal's `Tab.cwd` lands in the same directory Claude
+    /// companion terminal's `Session.cwd` lands in the same directory Claude
     /// actually created (`SessionsModel.swift:677-682`). Pure counterpart to
-    /// [`TabModel::extract_worktree_name`] (which pulls the raw `-w` value);
+    /// [`WorkspaceModel::extract_worktree_name`] (which pulls the raw `-w` value);
     /// the caller joins `<cwd>/.claude/worktrees/<sanitized>`.
     pub fn sanitize_worktree_name(name: &str) -> String {
         name.replace('/', "+")
@@ -1360,17 +1361,17 @@ impl TabModel {
 
 // MARK: - Pure free helpers
 
-/// Plan the reorder [`TabModel::move_tab`] performs on one project's tab list:
-/// the resulting display order as a permutation of indices into `tabs`, or
+/// Plan the reorder [`WorkspaceModel::move_session`] performs on one project's session list:
+/// the resulting display order as a permutation of indices into `sessions`, or
 /// `None` when the drop is illegal or would not change the order.
 ///
-/// The depth-1 lineage (`Tab::parent_tab_id`) partitions a project's tabs into
-/// BLOCKS: a root tab plus every tab pointing at it. The slot rules keep every
+/// The depth-1 lineage (`Session::parent_session_id`) partitions a project's sessions into
+/// BLOCKS: a root session plus every session pointing at it. The slot rules keep every
 /// block visually contiguous (children always read as nested under their
 /// parent — a foreign row interleaved into a group would visually adopt the
 /// children below it):
 ///
-/// * **Root drag** (dragged tab has no parent): the root moves together with
+/// * **Root drag** (dragged session has no parent): the root moves together with
 ///   its whole child block, child order preserved, gathered contiguously (a
 ///   previously scattered block self-heals). The landing slot is a block
 ///   boundary of the target's block — BEFORE it when the drop names the target
@@ -1378,28 +1379,28 @@ impl TabModel {
 ///   block (an interior slot — a child row, or "just after the parent row" —
 ///   normalizes to the block's end; lineage is never rewritten by a drag, so
 ///   a root cannot be dropped INTO a group). A drop anywhere inside the
-///   dragged tab's own block is a no-op.
+///   dragged session's own block is a no-op.
 /// * **Child drag**: the child reorders among its own siblings only — legal
 ///   targets are its root with `place_after == true` (the slot at the top of
 ///   the sibling run) or a sibling with either edge. Everything else
 ///   (before its root, another block, another project) is illegal: dragging
 ///   can't re-parent, so a child leaving its block would keep its indent and
 ///   read as nested under whatever row it landed beneath.
-fn plan_tab_move(
-    tabs: &[Tab],
-    tab_id: &str,
-    target_tab_id: &str,
+fn plan_session_move(
+    sessions: &[Session],
+    session_id: &str,
+    target_session_id: &str,
     place_after: bool,
 ) -> Option<Vec<usize>> {
-    if tab_id == target_tab_id {
+    if session_id == target_session_id {
         return None;
     }
-    let src = tabs.iter().position(|t| t.id == tab_id)?;
-    let dst = tabs.iter().position(|t| t.id == target_tab_id)?;
+    let src = sessions.iter().position(|t| t.id == session_id)?;
+    let dst = sessions.iter().position(|t| t.id == target_session_id)?;
 
-    let order = match tabs[src].parent_tab_id.clone() {
-        None => plan_root_block_move(tabs, src, dst, place_after)?,
-        Some(root_id) => plan_child_move(tabs, src, dst, place_after, &root_id)?,
+    let order = match sessions[src].parent_session_id.clone() {
+        None => plan_root_block_move(sessions, src, dst, place_after)?,
+        Some(root_id) => plan_child_move(sessions, src, dst, place_after, &root_id)?,
     };
     // A plan that reproduces the current order is a no-op (no event).
     if order.iter().enumerate().all(|(i, &j)| i == j) {
@@ -1409,18 +1410,18 @@ fn plan_tab_move(
 }
 
 /// Indices of the depth-1 children of the root at `root_idx`, in display order.
-fn child_indices(tabs: &[Tab], root_idx: usize) -> Vec<usize> {
-    let root_id = tabs[root_idx].id.as_str();
-    tabs.iter()
+fn child_indices(sessions: &[Session], root_idx: usize) -> Vec<usize> {
+    let root_id = sessions[root_idx].id.as_str();
+    sessions.iter()
         .enumerate()
-        .filter(|(_, t)| t.parent_tab_id.as_deref() == Some(root_id))
+        .filter(|(_, t)| t.parent_session_id.as_deref() == Some(root_id))
         .map(|(i, _)| i)
         .collect()
 }
 
-/// The root-drag half of [`plan_tab_move`].
+/// The root-drag half of [`plan_session_move`].
 fn plan_root_block_move(
-    tabs: &[Tab],
+    sessions: &[Session],
     src: usize,
     dst: usize,
     place_after: bool,
@@ -1429,30 +1430,30 @@ fn plan_root_block_move(
     // children in display order — so a block the old single-row move already
     // scattered self-heals on the next real move.
     let mut dragged_block = vec![src];
-    dragged_block.extend(child_indices(tabs, src));
+    dragged_block.extend(child_indices(sessions, src));
     // Resolve the target's block root. A dangling parent pointer (should be
     // impossible after `prune_dangling_parent_references`) rejects the drop.
-    let target_root = match tabs[dst].parent_tab_id.as_deref() {
+    let target_root = match sessions[dst].parent_session_id.as_deref() {
         None => dst,
-        Some(pid) => tabs.iter().position(|t| t.id == pid)?,
+        Some(pid) => sessions.iter().position(|t| t.id == pid)?,
     };
     if target_root == src {
-        // The slot lands inside the dragged tab's own subtree.
+        // The slot lands inside the dragged session's own subtree.
         return None;
     }
     // Block boundaries are the target block's displayed extremes (min/max
     // index), robust to a scattered target block too.
-    let target_first = child_indices(tabs, target_root)
+    let target_first = child_indices(sessions, target_root)
         .into_iter()
         .fold(target_root, usize::min);
-    let target_last = child_indices(tabs, target_root)
+    let target_last = child_indices(sessions, target_root)
         .into_iter()
         .fold(target_root, usize::max);
     // Before the target block only when the drop names its root's leading
     // edge; every interior slot normalizes to after the whole block.
     let before = dst == target_root && !place_after;
 
-    let rest: Vec<usize> = (0..tabs.len())
+    let rest: Vec<usize> = (0..sessions.len())
         .filter(|i| !dragged_block.contains(i))
         .collect();
     let anchor_index = if before {
@@ -1460,26 +1461,26 @@ fn plan_root_block_move(
     } else {
         rest.iter().position(|i| *i == target_last)? + 1
     };
-    let mut order = Vec::with_capacity(tabs.len());
+    let mut order = Vec::with_capacity(sessions.len());
     order.extend_from_slice(&rest[..anchor_index]);
     order.extend_from_slice(&dragged_block);
     order.extend_from_slice(&rest[anchor_index..]);
     Some(order)
 }
 
-/// The child-drag half of [`plan_tab_move`].
+/// The child-drag half of [`plan_session_move`].
 fn plan_child_move(
-    tabs: &[Tab],
+    sessions: &[Session],
     src: usize,
     dst: usize,
     place_after: bool,
     root_id: &str,
 ) -> Option<Vec<usize>> {
-    let dst_tab = &tabs[dst];
-    let legal = if dst_tab.id == root_id {
+    let dst_session = &sessions[dst];
+    let legal = if dst_session.id == root_id {
         place_after
     } else {
-        dst_tab.parent_tab_id.as_deref() == Some(root_id)
+        dst_session.parent_session_id.as_deref() == Some(root_id)
     };
     if !legal {
         return None;
@@ -1492,7 +1493,7 @@ fn plan_child_move(
     if insert == src {
         return None;
     }
-    let mut order: Vec<usize> = (0..tabs.len()).filter(|i| *i != src).collect();
+    let mut order: Vec<usize> = (0..sessions.len()).filter(|i| *i != src).collect();
     order.insert(insert, src);
     Some(order)
 }
@@ -1546,7 +1547,7 @@ fn last_path_component(path: &str) -> String {
 }
 
 /// Parent directory, mirroring NSString `deletingLastPathComponent` for the
-/// absolute paths [`TabModel::find_git_root`] walks: "/a/b" → "/a", "/a" → "/",
+/// absolute paths [`WorkspaceModel::find_git_root`] walks: "/a/b" → "/a", "/a" → "/",
 /// "/" → "/" (its own parent, terminating the walk).
 fn parent_path(p: &str) -> String {
     match Path::new(p).parent() {
@@ -1562,8 +1563,8 @@ fn parent_path(p: &str) -> String {
     }
 }
 
-/// Mint a pane id shaped like the Swift seed's (`<prefix>-p<ms>`).
-fn mint_pane_id(prefix: &str) -> String {
+/// Mint a window id shaped like the Swift seed's (`<prefix>-p<ms>`).
+fn mint_window_id(prefix: &str) -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1573,7 +1574,7 @@ fn mint_pane_id(prefix: &str) -> String {
 
 /// A short unique suffix for a generated project id (Swift uses a UUID prefix).
 /// A process-local counter mixed with the clock keeps back-to-back appends in
-/// the same instant — e.g. inside the repair tab-move loop — from colliding.
+/// the same instant — e.g. inside the repair session-move loop — from colliding.
 fn unique_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

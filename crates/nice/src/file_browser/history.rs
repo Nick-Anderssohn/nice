@@ -16,7 +16,7 @@
 //! injectable [`FocusFollow`] closure (`FnMut(&FileOperationOrigin) ->
 //! FocusResult`). The production closure resolves the origin via the
 //! `WindowRegistry`, activates the window, flips sidebar mode → Files, and
-//! selects the origin tab; on a live origin it returns [`FocusResult::Routed`],
+//! selects the origin session; on a live origin it returns [`FocusResult::Routed`],
 //! on a gone origin [`FocusResult::OriginGone`] (the op still applies,
 //! headlessly, plus the closed-window banner). Seam absent (tests without a
 //! recording fake) ⇒ [`FocusResult::NoRouter`], no banner.
@@ -34,7 +34,7 @@ use super::ops::{FileOperation, FileOperationError, FileOperationOrigin, FileOpe
 /// Result of attempting to route focus to an originating window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusResult {
-    /// Focus follow ran (window activated + sidebar/tab updated).
+    /// Focus follow ran (window activated + sidebar/session updated).
     Routed,
     /// No seam configured — a test/preview that doesn't route. No banner.
     NoRouter,
@@ -467,7 +467,7 @@ mod tests {
     /// A recording focus-follow fake: registered session ids are "live"
     /// (routed); unregistered ones are gone. Records every followed origin and
     /// every window it was asked to bring to front — the native-shape stand-in
-    /// for Swift's `FakeFocusRouter` + the `AppState` sidebar/tab mutations.
+    /// for Swift's `FakeFocusRouter` + the `AppState` sidebar/session mutations.
     #[derive(Default)]
     struct FocusRecorderInner {
         live: HashSet<String>,
@@ -479,8 +479,8 @@ mod tests {
     struct FocusRecorder(Rc<RefCell<FocusRecorderInner>>);
 
     impl FocusRecorder {
-        fn register(&self, session_id: &str) {
-            self.0.borrow_mut().live.insert(session_id.to_string());
+        fn register(&self, window_session_id: &str) {
+            self.0.borrow_mut().live.insert(window_session_id.to_string());
         }
         fn follower(&self) -> FocusFollow {
             let inner = self.0.clone();
@@ -531,10 +531,10 @@ mod tests {
     }
 
     /// `CrossWindowUndoTests.test_undo_setsSidebarToFiles_andSelectsOriginatingTab`
-    /// — the tab selection happens in the production closure; assert the
-    /// recorder routed to the origin tab.
+    /// — the session selection happens in the production closure; assert the
+    /// recorder routed to the origin session.
     #[test]
-    fn undo_routes_to_originating_tab() {
+    fn undo_routes_to_originating_session() {
         let t = TempTree::new();
         let recorder = FocusRecorder::default();
         recorder.register("win-A");
@@ -548,7 +548,7 @@ mod tests {
 
         history.undo();
         let followed = recorder.followed();
-        assert_eq!(followed[0].tab_id.as_deref(), Some("tab-XYZ"));
+        assert_eq!(followed[0].session_id.as_deref(), Some("tab-XYZ"));
     }
 
     /// `CrossWindowUndoTests.test_undo_originatingWindowGone_appliesHeadless_publishesMessage_pushesToRedo`

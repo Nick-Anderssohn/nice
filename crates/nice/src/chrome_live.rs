@@ -91,7 +91,7 @@ Verify: swift -e 'import ApplicationServices; print(AXIsProcessTrusted())'";
 // ===========================================================================
 
 /// Open the `chrome` scenario window — the shipped chrome shell
-/// (`WindowChromeView` over a silent live pane) with slice 2's full-screen
+/// (`WindowChromeView` over a silent live window) with slice 2's full-screen
 /// command + menu sync stood up (the selftest path doesn't call `run()`, so the
 /// scenario installs them itself to exercise the real wiring). Spawns the driver
 /// (self-reported gate).
@@ -103,7 +103,7 @@ pub fn open_chrome_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 
     let base = prepare_dir()?;
     let base_s = base.to_string_lossy().to_string();
-    // A silent, long-lived content pane so the "terminal content area" exists to
+    // A silent, long-lived content window so the "terminal content area" exists to
     // drag on; user rc suppressed so the grid stays quiet. Closing the window
     // drops the handle → SIGHUP/SIGKILL teardown, so no orphan survives.
     let spec = SpawnSpec::command("sleep 1000000".to_string(), base_s.clone())
@@ -138,7 +138,7 @@ pub fn open_chrome_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     Ok(window)
 }
 
-/// Build the silent-pane content view (fixed Menlo metrics, Nice/Dark theme).
+/// Build the silent-window content view (fixed Menlo metrics, Nice/Dark theme).
 fn make_view(handle: Entity<TerminalSessionHandle>, cx: &mut AsyncApp) -> Entity<TerminalView> {
     let theme = TerminalTheme::nice_default_dark();
     let accent = AccentPreset::Terracotta.color();

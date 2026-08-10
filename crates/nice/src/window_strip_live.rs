@@ -1,4 +1,4 @@
-//! `pane-strip` self-test scenario — the R11 toolbar pane-strip LIVE gate
+//! `pane-strip` self-test scenario — the R11 toolbar window-strip LIVE gate
 //! (Validation §3), the sibling of [`crate::chrome_live`] / [`crate::sidebar_live`]:
 //! it mounts the real [`WindowToolbarView`] over a seeded model on a real,
 //! frontmost NSWindow and ground-truths the one thing only a real window can
@@ -24,18 +24,18 @@
 //!     pills present," ground-truthed on a real frame — the same honest-deferral
 //!     `chrome_live` / `sidebar_live` use for synthetic mouse gestures.
 //!   * **§3 pill reorder (R25).** A CGEvent press-drag of the `p1` pill leftward
-//!     past `p0`'s midpoint reorders it BEFORE `p0` (`pane_ids()` flips to
-//!     `[p1, p0]`) and commits + persists via `move_pane` + `save_to_store` —
+//!     past `p0`'s midpoint reorders it BEFORE `p0` (`term_window_ids()` flips to
+//!     `[p1, p0]`) and commits + persists via `move_window` + `save_to_store` —
 //!     hard-asserted only when the press is shown to have LANDED (the drag
 //!     selected `p1`, the same landed-gate the drag differential uses), else
 //!     DEFERRED (a `CGEventPostToPid` press need not land on a gpui hitbox; the
 //!     deterministic reorder is pinned in-process by `nice-itests`). It never
 //!     reads a vacuous "order unchanged" as a pass.
-//!   * **§3 overflow chevron (real layout).** After enough panes are added to
+//!   * **§3 overflow chevron (real layout).** After enough windows are added to
 //!     overflow the reserved-width viewport, the chevron renders — asserted HARD
 //!     from the view's own real-layout predicate on a REAL on-screen window (the
 //!     mocked-layout onset is pinned in `nice-itests`).
-//!   * **§3 activate-from-elsewhere centers.** Selecting a currently-offscreen pane
+//!   * **§3 activate-from-elsewhere centers.** Selecting a currently-offscreen window
 //!     through the real action path makes it active (HARD) and auto-scrolls it into
 //!     view (the once-offscreen pill leaves the offscreen set) — the latter
 //!     DEFERRED if the frontmost window's repaint has not applied the centering
@@ -43,11 +43,11 @@
 //!   * **§3 overflow menu opens via click.** A CGEvent click on the chevron opens
 //!     the overflow menu (the view reports the menu open) — DEFERRED if the
 //!     synthetic click missed the 22pt chevron. The menu's *contents* ("lists every
-//!     pane", "checkmark on active") are pinned by `toolbar.rs`'s unit tests + the
+//!     window", "checkmark on active") are pinned by `toolbar.rs`'s unit tests + the
 //!     in-process cases, the sidebar-scenario precedent for menu classification.
-//!   * **§3 single-tab mode (round-2 plan 4).** Closing the strip down to ONE pane
-//!     (through the real close path) replaces the tab boxes with the centered
-//!     titlebar title (the view reports single-tab active + the surviving pane's
+//!   * **§3 single-session mode (round-2 plan 4).** Closing the strip down to ONE window
+//!     (through the real close path) replaces the session boxes with the centered
+//!     titlebar title (the view reports single-session active + the surviving window's
 //!     name) and HIDES the overflow chevron — all HARD-asserted from the live
 //!     view's model/layout reads. The centered title's drag pass-through is the one
 //!     part left to the human black-box pass.
@@ -61,7 +61,7 @@ use anyhow::Result;
 use gpui::{prelude::*, AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, TabModel};
+use nice_model::{TermWindow, TermWindowKind, WorkspaceModel};
 use nice_theme::chrome_geometry::TOP_BAR_HEIGHT;
 
 use crate::app;
@@ -81,7 +81,7 @@ const FRAME_EPS: f64 = 4.0;
 /// left of centre resolves to the before-`p0` slot (`place_after == false`)
 /// while staying inside `p0`'s frame.
 const REORDER_BEFORE_MARGIN: f64 = 15.0;
-/// How many terminal panes to add so the strip overflows its viewport and the
+/// How many terminal windows to add so the strip overflows its viewport and the
 /// chevron shows (comfortably past the ~780pt viewport with ~130pt pills).
 const OVERFLOW_ADDS: usize = 8;
 /// The chevron button's centre, measured from the window's trailing edge:
@@ -110,9 +110,9 @@ Verify: swift -e 'import ApplicationServices; print(AXIsProcessTrusted())'";
 // ===========================================================================
 
 /// Open the `pane-strip` scenario window — the real [`WindowToolbarView`] over a
-/// seeded two-pane Main tab (no pty: the strip renders purely from the model +
+/// seeded two-window Main session (no pty: the strip renders purely from the model +
 /// the injected action seam this cycle). Spawns the driver (self-reported gate).
-pub fn open_pane_strip_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
+pub fn open_window_strip_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let model = seed_model();
     let whandle: WindowHandle<WindowToolbarView> = cx.open_window(app::window_options(), {
         // Seed the shared per-window state around the fixture model, then mount
@@ -127,7 +127,7 @@ pub fn open_pane_strip_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let any: AnyWindowHandle = whandle.into();
 
     cx.spawn(async move |acx: &mut AsyncApp| {
-        let report = run_pane_strip(acx, whandle).await;
+        let report = run_window_strip(acx, whandle).await;
         eprintln!("[selftest] scenario 'pane-strip': {}", report.detail);
         nice_harness::selftest::report_gate(report);
     })
@@ -136,19 +136,19 @@ pub fn open_pane_strip_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     Ok(any)
 }
 
-/// The fixture: the pinned Main terminal tab holding two terminal pills (`p0`
+/// The fixture: the pinned Main terminal session holding two terminal pills (`p0`
 /// active, `p1`), so the drag differential has a pill to press and empty band to
 /// the right, and `drive_add` can later push the strip into overflow.
-fn seed_model() -> TabModel {
-    let mut m = TabModel::new("/tmp");
-    let tab_id = TabModel::MAIN_TERMINAL_TAB_ID.to_string();
-    let (pi, ti) = m.project_tab_index(&tab_id).expect("main tab exists");
-    m.projects[pi].tabs[ti].panes = vec![
-        Pane::new("p0", "Terminal 1", PaneKind::Terminal),
-        Pane::new("p1", "Terminal 2", PaneKind::Terminal),
+fn seed_model() -> WorkspaceModel {
+    let mut m = WorkspaceModel::new("/tmp");
+    let session_id = WorkspaceModel::MAIN_TERMINAL_SESSION_ID.to_string();
+    let (pi, ti) = m.project_session_index(&session_id).expect("main session exists");
+    m.projects[pi].sessions[ti].windows = vec![
+        TermWindow::new("p0", "Terminal 1", TermWindowKind::Terminal),
+        TermWindow::new("p1", "Terminal 2", TermWindowKind::Terminal),
     ];
-    m.projects[pi].tabs[ti].active_pane_id = Some("p0".to_string());
-    m.projects[pi].tabs[ti].next_terminal_index = 3;
+    m.projects[pi].sessions[ti].active_window_id = Some("p0".to_string());
+    m.projects[pi].sessions[ti].next_terminal_index = 3;
     m
 }
 
@@ -162,7 +162,7 @@ async fn settle(cx: &mut AsyncApp, ms: u64) {
 // driver
 // ===========================================================================
 
-async fn run_pane_strip(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarView>) -> CadenceReport {
+async fn run_window_strip(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarView>) -> CadenceReport {
     // Self-activate + settle so the window is frontmost/key and has painted once
     // (registering the pills' + band's mouse handlers) before any event is posted.
     let _ = cx.update(|app| app.activate(true));
@@ -181,7 +181,7 @@ async fn run_pane_strip(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarVi
 
     let view = match whandle.entity(cx) {
         Ok(v) => v,
-        Err(e) => return CadenceReport::error(format!("pane-strip: could not read the root view: {e}")),
+        Err(e) => return CadenceReport::error(format!("window-strip: could not read the root view: {e}")),
     };
     let pid = std::process::id() as i32;
     let mut failures: Vec<String> = Vec::new();
@@ -196,9 +196,9 @@ async fn run_pane_strip(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarVi
     // §3 — overflow chevron (real layout) + centering + menu-opens.
     overflow_checks(cx, whandle, &view, pid, &mut failures, &mut deferred).await;
 
-    // §3 — single-tab mode (round-2 plan 4): close the strip down to one pane and
-    // assert the tab boxes give way to the centered titlebar title + the chevron hides.
-    single_tab_leg(cx, whandle, &view, &mut failures).await;
+    // §3 — single-session mode (round-2 plan 4): close the strip down to one window and
+    // assert the session boxes give way to the centered titlebar title + the chevron hides.
+    single_session_leg(cx, whandle, &view, &mut failures).await;
 
     build_report(failures, deferred)
 }
@@ -237,11 +237,11 @@ async fn drag_differential(
         active_before.as_deref() != Some("p1") && active_after_click.as_deref() == Some("p1");
     if landed {
         eprintln!(
-            "[selftest] pane-strip pill click: a plain click on p1's pill selected it \
+            "[selftest] window-strip pill click: a plain click on p1's pill selected it \
              (select routes on CLICK — the M7.8 round-3 gesture)"
         );
         // Reset active to p0 so the drag half can assert "the drag did NOT select".
-        let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
+        let _ = whandle.update(cx, |v, window, cx| v.drive_select_window("p0", window, cx));
         settle(cx, 250).await;
         let frame_before = read_frame(cx, whandle);
         do_cg_drag(cx, whandle, pid, px_x, px_y).await;
@@ -250,7 +250,7 @@ async fn drag_differential(
         let frame_after = read_frame(cx, whandle);
         if active_after_drag.as_deref() != Some("p0") {
             failures.push(format!(
-                "pill drag: the press-drag on p1 changed the active pane to {active_after_drag:?} — \
+                "pill drag: the press-drag on p1 changed the active window to {active_after_drag:?} — \
                  a drag must not select (the click is suppressed once the drag arms)"
             ));
         }
@@ -268,7 +268,7 @@ async fn drag_differential(
                     settle(cx, 200).await;
                 } else {
                     eprintln!(
-                        "[selftest] pane-strip pill drag: did not select AND left the window frame put \
+                        "[selftest] window-strip pill drag: did not select AND left the window frame put \
                          (the pill claimed the press — R9's contract holds with pills present)"
                     );
                 }
@@ -301,7 +301,7 @@ async fn drag_differential(
             let dx = a[0] - b[0];
             let dy = a[1] - b[1];
             if (dx - DRAG_DX).abs() <= 10.0 && dy.abs() <= 10.0 {
-                eprintln!("[selftest] pane-strip band drag: window moved by ({dx:.1},{dy:.1}) ≈ the {DRAG_DX}pt drag");
+                eprintln!("[selftest] window-strip band drag: window moved by ({dx:.1},{dy:.1}) ≈ the {DRAG_DX}pt drag");
             } else {
                 deferred.push(
                     "band drag: the NSWindow frame did not follow the synthetic drag — \
@@ -367,10 +367,10 @@ async fn reorder_leg(
     failures: &mut Vec<String>,
     deferred: &mut Vec<String>,
 ) {
-    // Reset the active pane to p0 so the evidence click on p1 flips active
+    // Reset the active window to p0 so the evidence click on p1 flips active
     // p0→p1 — the delivery signal. The toolbar IS this scenario window's root
     // view, so drive it through the root-update context.
-    let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
+    let _ = whandle.update(cx, |v, window, cx| v.drive_select_window("p0", window, cx));
     settle(cx, 250).await;
 
     let order_before = read_order(cx, view);
@@ -415,8 +415,8 @@ async fn reorder_leg(
             && order_after[1].as_str() == "p0";
         if reordered {
             eprintln!(
-                "[selftest] pane-strip reorder: dragged p1 before p0 — the strip now reads [p1, p0] \
-                 (move_pane committed + save_to_store persisted)"
+                "[selftest] window-strip reorder: dragged p1 before p0 — the strip now reads [p1, p0] \
+                 (move_window committed + save_to_store persisted)"
             );
         } else {
             failures.push(format!(
@@ -427,8 +427,8 @@ async fn reorder_leg(
         }
         if active_after.as_deref() != Some("p1") {
             failures.push(format!(
-                "reorder: the drag changed the active pane to {active_after:?} — `move_pane` never \
-                 touches `active_pane_id`, and a drag must not select (p1 was active from the \
+                "reorder: the drag changed the active window to {active_after:?} — `move_window` never \
+                 touches `active_window_id`, and a drag must not select (p1 was active from the \
                  evidence click)"
             ));
         }
@@ -482,43 +482,43 @@ async fn overflow_checks(
     failures: &mut Vec<String>,
     deferred: &mut Vec<String>,
 ) {
-    // Add panes until the strip overflows its reserved-width viewport.
+    // Add windows until the strip overflows its reserved-width viewport.
     for _ in 0..OVERFLOW_ADDS {
-        let _ = view.update(cx, |v, cx| v.drive_add_terminal_pane(cx));
+        let _ = view.update(cx, |v, cx| v.drive_add_terminal_window(cx));
     }
     settle(cx, 400).await;
 
     // The chevron shows on a REAL on-screen window (real-layout overflow).
     if read_bool(cx, view, |v, cx| v.scenario_show_chevron(cx)) {
-        eprintln!("[selftest] pane-strip overflow: chevron shows (real-layout overflow with the reserved slots)");
+        eprintln!("[selftest] window-strip overflow: chevron shows (real-layout overflow with the reserved slots)");
     } else {
         failures.push(format!(
-            "overflow: added {OVERFLOW_ADDS} panes but the chevron did not show — the strip did not \
+            "overflow: added {OVERFLOW_ADDS} windows but the chevron did not show — the strip did not \
              overflow its reserved-width viewport"
         ));
         return;
     }
 
     // Activate-from-elsewhere centers: p0 is at the far leading edge and is
-    // offscreen now (the last add centered the trailing pane). Selecting it must
+    // offscreen now (the last add centered the trailing window). Selecting it must
     // make it active (hard) and scroll it back into view (deferred on repaint).
     let p0_offscreen_before =
-        read_bool(cx, view, |v, cx| v.scenario_offscreen_pane_ids(cx).contains("p0"));
+        read_bool(cx, view, |v, cx| v.scenario_offscreen_window_ids(cx).contains("p0"));
     // The toolbar IS this scenario window's root view, so drive it through the
     // root-update context (a nested `view.update` would re-enter the entity).
-    let _ = whandle.update(cx, |v, window, cx| v.drive_select_pane("p0", window, cx));
+    let _ = whandle.update(cx, |v, window, cx| v.drive_select_window("p0", window, cx));
     settle(cx, 500).await;
     if read_active(cx, view).as_deref() == Some("p0") {
-        eprintln!("[selftest] pane-strip centering: selecting p0 made it active");
+        eprintln!("[selftest] window-strip centering: selecting p0 made it active");
     } else {
-        failures.push("centering: selecting p0 did not make it the active pane".to_string());
+        failures.push("centering: selecting p0 did not make it the active window".to_string());
     }
     let p0_offscreen_after =
-        read_bool(cx, view, |v, cx| v.scenario_offscreen_pane_ids(cx).contains("p0"));
+        read_bool(cx, view, |v, cx| v.scenario_offscreen_window_ids(cx).contains("p0"));
     if p0_offscreen_before && !p0_offscreen_after {
-        eprintln!("[selftest] pane-strip centering: p0 was offscreen and is now revealed (auto-centered)");
+        eprintln!("[selftest] window-strip centering: p0 was offscreen and is now revealed (auto-centered)");
     } else if !p0_offscreen_before {
-        eprintln!("[selftest] pane-strip centering: p0 was already visible before selection (nothing to reveal)");
+        eprintln!("[selftest] window-strip centering: p0 was already visible before selection (nothing to reveal)");
     } else {
         deferred.push(
             "centering: p0 was offscreen and the frontmost window's repaint had not applied the \
@@ -537,11 +537,11 @@ async fn overflow_checks(
         platform::post_left_mouse_up(pid, gx, gy, 1);
         settle(cx, 400).await;
         if read_bool(cx, view, |v, _| v.scenario_menu_open()) {
-            eprintln!("[selftest] pane-strip overflow menu: opened via a real click on the chevron");
+            eprintln!("[selftest] window-strip overflow menu: opened via a real click on the chevron");
         } else {
             deferred.push(
                 "overflow menu: the synthetic click did not open the menu — it may have missed the \
-                 22pt chevron button. DEFERRED to a human click; the menu contents (every pane + the \
+                 22pt chevron button. DEFERRED to a human click; the menu contents (every window + the \
                  active checkmark) are pinned by toolbar.rs's unit tests."
                     .to_string(),
             );
@@ -549,22 +549,22 @@ async fn overflow_checks(
     }
 }
 
-// ---- §3 single-tab mode (round-2 plan 4) -----------------------------------
+// ---- §3 single-session mode (round-2 plan 4) -----------------------------------
 
-/// Close the strip down to exactly one pane through the real close path, then
-/// hard-assert single-tab mode on the live view: the strip reports single-tab
-/// active, the centered title reads the surviving pane's name, and the overflow
+/// Close the strip down to exactly one window through the real close path, then
+/// hard-assert single-session mode on the live view: the strip reports single-session
+/// active, the centered title reads the surviving window's name, and the overflow
 /// chevron is hidden. Pure model/layout reads (no synthetic events), so these
 /// are deterministic hard assertions — the drag-through of the centered title
 /// (the overlay stays in the titlebar drag region) is the one part left to the
 /// human black-box pass.
-async fn single_tab_leg(
+async fn single_session_leg(
     cx: &mut AsyncApp,
     whandle: WindowHandle<WindowToolbarView>,
     view: &Entity<WindowToolbarView>,
     failures: &mut Vec<String>,
 ) {
-    // Close the leading pane repeatedly (the seeded terminal panes have no shell
+    // Close the leading window repeatedly (the seeded terminal windows have no shell
     // foreground child, so the busy-close gate closes each immediately) until one
     // remains. Bounded so a stuck close can never spin forever.
     for _ in 0..64 {
@@ -573,7 +573,7 @@ async fn single_tab_leg(
             break;
         }
         let victim = ids[0].clone();
-        let _ = whandle.update(cx, |v, window, cx| v.drive_close_pane(&victim, window, cx));
+        let _ = whandle.update(cx, |v, window, cx| v.drive_close_term_window(&victim, window, cx));
         settle(cx, 120).await;
     }
     settle(cx, 300).await;
@@ -581,40 +581,40 @@ async fn single_tab_leg(
     let ids = read_order(cx, view);
     if ids.len() != 1 {
         failures.push(format!(
-            "single-tab: expected to reduce the strip to one pane but it reads {ids:?} \
-             — cannot assert single-tab mode"
+            "single-window: expected to reduce the strip to one window but it reads {ids:?} \
+             — cannot assert single-window mode"
         ));
         return;
     }
     let sole = ids[0].clone();
 
     let (single_active, title) = view.update(cx, |v, cx| {
-        (v.scenario_single_tab_active(cx), v.scenario_single_tab_title(cx))
+        (v.scenario_single_session_active(cx), v.scenario_single_session_title(cx))
     });
     if !single_active {
         failures.push(
-            "single-tab: the strip holds one pane but scenario_single_tab_active is false \
+            "single-window: the strip holds one window but scenario_single_session_active is false \
              — the centered-title branch did not engage"
                 .to_string(),
         );
     }
     match &title {
         Some(t) if !t.is_empty() => eprintln!(
-            "[selftest] pane-strip single-tab: one pane ({sole}) renders the centered titlebar \
-             title {t:?} instead of a tab box"
+            "[selftest] window-strip single-window: one window ({sole}) renders the centered titlebar \
+             title {t:?} instead of a session box"
         ),
         other => failures.push(format!(
-            "single-tab: the centered title read {other:?} — with one pane it must be the sole \
-             pane's title"
+            "single-window: the centered title read {other:?} — with one window it must be the sole \
+             window's title"
         )),
     }
     if read_bool(cx, view, |v, cx| v.scenario_show_chevron(cx)) {
         failures.push(
-            "single-tab: the overflow chevron still shows with one pane — it must be hidden"
+            "single-window: the overflow chevron still shows with one window — it must be hidden"
                 .to_string(),
         );
     } else {
-        eprintln!("[selftest] pane-strip single-tab: the overflow chevron is hidden (one pane)");
+        eprintln!("[selftest] window-strip single-window: the overflow chevron is hidden (one window)");
     }
     let _ = cx.update(|app| app.activate(true));
     settle(cx, 200).await;
@@ -627,12 +627,12 @@ async fn single_tab_leg(
 // `WindowHandle::update` returns a `Result` (the window can close), hence `.ok()`.
 
 fn read_active(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>) -> Option<String> {
-    view.update(cx, |v, cx| v.active_pane_id(cx))
+    view.update(cx, |v, cx| v.active_window_id(cx))
 }
 
-/// The strip's current pane order (`pane_ids()`), the reorder assertion surface.
+/// The strip's current window order (`term_window_ids()`), the reorder assertion surface.
 fn read_order(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>) -> Vec<String> {
-    view.update(cx, |v, cx| v.pane_ids(cx))
+    view.update(cx, |v, cx| v.term_window_ids(cx))
 }
 
 fn read_bool(
@@ -645,9 +645,9 @@ fn read_bool(
 
 /// The on-screen content-view centre of a pill (offset-free bounds + the current
 /// scroll offset), as `(x, y_from_top)` for a CGEvent.
-fn read_pill_center(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, pane_id: &str) -> Option<(f64, f64)> {
+fn read_pill_center(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, term_window_id: &str) -> Option<(f64, f64)> {
     view.update(cx, |v, cx| {
-        let b = v.scenario_pill_bounds(pane_id, cx)?;
+        let b = v.scenario_pill_bounds(term_window_id, cx)?;
         let off = v.scenario_scroll_offset_x();
         let x = f32::from(b.origin.x) + off + f32::from(b.size.width) / 2.0;
         let y = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
@@ -660,7 +660,7 @@ fn read_pill_center(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, pane_id
 /// cluster. Falls back to 60% width if the pill bounds can't be read.
 fn pick_empty_band_x(cx: &mut AsyncApp, view: &Entity<WindowToolbarView>, vw: f64) -> f64 {
     let last_right = view.update(cx, |v, cx| {
-        let ids = v.pane_ids(cx);
+        let ids = v.term_window_ids(cx);
         let last = ids.last()?;
         let b = v.scenario_pill_bounds(last, cx)?;
         let off = v.scenario_scroll_offset_x();
@@ -702,7 +702,7 @@ fn to_global(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbarView>, cx_pt:
 
 fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
     if !deferred.is_empty() {
-        eprintln!("[selftest] pane-strip DEFERRED HUMAN PASS checklist:");
+        eprintln!("[selftest] window-strip DEFERRED HUMAN PASS checklist:");
         for d in &deferred {
             eprintln!("  - {d}");
         }
@@ -712,8 +712,8 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: format!(
-                "all hard pane-strip assertions passed (the reserved-width overflow shows the chevron \
-                 on a real window, activating an offscreen pane makes it active + reveals it, and — \
+                "all hard window-strip assertions passed (the reserved-width overflow shows the chevron \
+                 on a real window, activating an offscreen window makes it active + reveals it, and — \
                  when the synthetic evidence click LANDED — the pill click selects, the press-drag \
                  neither selects nor moves the window frame); the evidence-click landing, the \
                  empty-band window move, and the overflow-menu open hard-assert when the synthetic \
@@ -727,7 +727,7 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
             passed: false,
             stats: IntervalStats::default(),
             detail: format!(
-                "{} pane-strip assertion(s) failed:\n  {}",
+                "{} window-strip assertion(s) failed:\n  {}",
                 failures.len(),
                 failures.join("\n  ")
             ),

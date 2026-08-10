@@ -655,12 +655,12 @@ pub fn default_theme_settings_path() -> PathBuf {
 // it (`SharedThemeState`), plus the chrome/terminal read accessors. This is the
 // R21 slice-2 fan-out source: chrome views read the active `Slots`/accent from
 // the process entity AT RENDER TIME (mirroring the `SharedFontSettings` idiom,
-// `keymap.rs:100`), and `build_window_root` seeds each new terminal pane with the
+// `keymap.rs:100`), and `build_window_root` seeds each new terminal window with the
 // active `TerminalTheme`/accent. The store's `apply_*` mutators (slice 3) refresh
 // this entity (re-derive from the store + catalog) and then fan out.
 // ---------------------------------------------------------------------------
 
-/// The resolved active view state — what chrome + panes actually paint this
+/// The resolved active view state — what chrome + windows actually paint this
 /// moment, derived from the [`ThemeSettingsStore`]'s selection through the
 /// [`TerminalThemeCatalog`]. Held as one process [`Entity`] inside
 /// [`SharedThemeState`]. All fields are already macOS-substituted / resolved, so a
@@ -758,7 +758,7 @@ impl ThemeState {
 }
 
 /// The accent `scheme`'s slot would derive under "From theme" — the settings
-/// pane's split-disc entry paints the light half from
+/// window's split-disc entry paints the light half from
 /// `derived_accent_for(cx, Light)` and the dark half from `…(cx, Dark)`,
 /// independently of which scheme is live. Falls back to the Nice default for
 /// `scheme` (whose declared accent is terracotta) when the store / catalog
@@ -835,7 +835,7 @@ pub fn active_chrome_accent(cx: &App) -> Srgba {
 }
 
 /// The font family chrome text renders in this frame: the user's terminal
-/// family (the restyle renders ALL chrome — settings, toolbar tabs, sidebar
+/// family (the restyle renders ALL chrome — settings, toolbar sessions, sidebar
 /// rows — in it), or `None` when the shared font settings global is absent
 /// (unit tests / bare scenarios), in which case callers fall through to the
 /// window default via `when_some`.
@@ -843,8 +843,8 @@ pub fn chrome_font_family(cx: &App) -> Option<gpui::SharedString> {
     crate::keymap::try_shared_font_settings(cx).map(|f| f.read(cx).family())
 }
 
-/// The `(terminal theme, accent)` a freshly-built terminal pane is seeded with —
-/// read by `build_window_root` / the pane host. Live [`SharedThemeState`] when
+/// The `(terminal theme, accent)` a freshly-built terminal window is seeded with —
+/// read by `build_window_root` / the window host. Live [`SharedThemeState`] when
 /// installed, else the shipped `nice_default_dark` + Terracotta pair (unchanged
 /// pre-R21 look for scenarios without the global).
 pub fn active_terminal_theme_and_accent(cx: &App) -> (nice_term_view::TerminalTheme, Srgba) {
@@ -878,7 +878,7 @@ pub fn active_window_opacity(cx: &App) -> f32 {
 /// composites toward black instead of showing the desktop (the same reason
 /// Ghostty disables background opacity in native full screen). Every
 /// render-time consumer of the window opacity (the window backing, the
-/// terminal grid's skip-own-fill rule, the tab-strip edge fade) reads this so
+/// terminal grid's skip-own-fill rule, the window-strip edge fade) reads this so
 /// a full-screen window paints the exact opaque theme background and reverts
 /// to the stored translucency on exit (the enter/exit resize redraws the
 /// tree; no explicit observer is needed).
@@ -1015,7 +1015,7 @@ fn install_production_os_scheme_source(cx: &mut App) {
 
 /// Reconcile the live selection with `os`: a no-op unless `sync_with_os`; when on
 /// and the scheme differs, flip `scheme` to `os` (cascading chrome + the active
-/// per-scheme terminal slot), persist, and fan out (chrome + panes + Claude). The
+/// per-scheme terminal slot), persist, and fan out (chrome + windows + Claude). The
 /// production `Window::observe_window_appearance` adapter and
 /// [`apply_sync_with_os`]`(cx, true)` both call it. No-op when the store Global is
 /// absent.
@@ -1033,7 +1033,7 @@ pub fn reconcile_with_os(cx: &mut App, os: ColorScheme) {
 // ---------------------------------------------------------------------------
 // The live `apply_*` mutators (Exported contracts). Each reads the current
 // selection, mutates it, then routes through `commit_appearance`: persist
-// (only-if-changed) → refresh the resolved `ThemeState` → fan chrome + panes out →
+// (only-if-changed) → refresh the resolved `ThemeState` → fan chrome + windows out →
 // mirror to Claude when the sync gate is on. Free functions (not `&mut self`
 // methods) because the store lives inside `App` as a `Global` — the mutation needs
 // `&mut App` to also touch `SharedThemeState`, `WindowRegistry`, and the gate.
@@ -1078,7 +1078,7 @@ pub fn apply_accent(cx: &mut App, accent: AccentSelection) {
 
 /// Set the terminal-theme id for one scheme's slot. A change to the INACTIVE
 /// scheme's slot is LATENT — persisted now, applied on the next scheme flip
-/// (`AppShellView.swift:557-571`); the active slot recolors every pane immediately.
+/// (`AppShellView.swift:557-571`); the active slot recolors every window immediately.
 pub fn apply_terminal_theme_id(cx: &mut App, scheme: ColorScheme, id: &str) {
     let Some(mut appearance) = current_appearance(cx) else {
         return;
@@ -1165,7 +1165,7 @@ pub fn apply_sync_with_os(cx: &mut App, on: bool) {
 /// provider (the provider path depends ONLY on the gate, so it is re-sourced only
 /// here, not on every theme change). On `off→on` the colors file is rewritten
 /// immediately to the active triple; `on→off` leaves the file in place and stops
-/// handing NEW panes the flag (Swift semantics). R23's Settings toggle drives this.
+/// handing NEW windows the flag (Swift semantics). R23's Settings toggle drives this.
 pub fn apply_sync_claude_theme(cx: &mut App, on: bool) {
     let was_on = crate::app::claude_theme_sync_gate_on(cx);
     crate::app::set_claude_theme_sync_gate(cx, on);
@@ -1182,7 +1182,7 @@ pub fn apply_sync_claude_theme(cx: &mut App, on: bool) {
 }
 
 /// Set the store selection (persist only-if-changed) and, when it changed, refresh
-/// the live [`ThemeState`] + fan out to chrome and panes + mirror to Claude. The
+/// the live [`ThemeState`] + fan out to chrome and windows + mirror to Claude. The
 /// shared engine behind every `apply_*` mutator and [`reconcile_with_os`].
 fn commit_appearance(cx: &mut App, appearance: Appearance) {
     let changed = match cx.global_mut::<ThemeSettingsStore>().set(appearance) {
@@ -1228,12 +1228,12 @@ fn refresh_theme_state(cx: &mut App) {
 
 /// Fan the live theme out across every window: repaint chrome
 /// ([`App::refresh_windows`]) and push the resolved terminal theme + accent into
-/// every window's [`PaneHostView`](crate::app_shell::PaneHostView) — walking
+/// every window's [`WindowHostView`](crate::app_shell::WindowHostView) — walking
 /// [`WindowRegistry::all_states`](crate::window_registry::WindowRegistry) — through
 /// the boundary-legal `TerminalView::set_theme` setters (the `SessionThemeCache`
-/// analog). Later-built panes seed with the new colors because
-/// `PaneHostView::set_theme` updates the host's own seed fields first (the
-/// load-bearing theme-before-per-pane order, dossier §0.7/§4.1). No-op when the
+/// analog). Later-built windows seed with the new colors because
+/// `WindowHostView::set_theme` updates the host's own seed fields first (the
+/// load-bearing theme-before-per-window order, dossier §0.7/§4.1). No-op when the
 /// live entity is absent.
 pub fn apply_theme_fanout(cx: &mut App) {
     let Some(state) = cx
@@ -1246,12 +1246,12 @@ pub fn apply_theme_fanout(cx: &mut App) {
     // the window-body backing re-reads the active window opacity via
     // [`active_window_opacity`]).
     cx.refresh_windows();
-    // Panes: collect the hosts first (each read borrows `cx`), then push into each
+    // Windows: collect the hosts first (each read borrows `cx`), then push into each
     // — both the terminal theme + accent AND the active surface-fill opacity (the
     // grid's default-background surface tracks the same alpha as the backing).
     let hosts: Vec<_> = crate::window_registry::WindowRegistry::all_states(cx)
         .into_iter()
-        .filter_map(|ws| ws.read(cx).pane_host())
+        .filter_map(|ws| ws.read(cx).window_host())
         .collect();
     for host in hosts {
         host.update(cx, |h, cx| {

@@ -8,7 +8,7 @@
 //! source — it does not try to distinguish "Nice already knows this id" cases
 //! client-side, because the receiver's id-equality short-circuit makes
 //! redundant forwards a true no-op. Source-side filtering is also subtly wrong:
-//! an in-pane `/branch` reports a source that has CHANGED across Claude
+//! an in-window `/branch` reports a source that has CHANGED across Claude
 //! versions (`"resume"` before 2.1.214, `"fork"` from 2.1.214 on), so a gate
 //! excluding either one silently loses `/branch` rotations. Classification
 //! lives app-side, in `WindowState::apply_session_update`.
@@ -18,22 +18,22 @@
 //! Claude documents `startup | resume | clear | compact | fork`. Two changes
 //! (verified against CLI 2.1.222) matter to the receiver:
 //!
-//!   * **2.1.214** — in-pane rotations (`/branch`, `--fork-session` resumes)
+//!   * **2.1.214** — in-window rotations (`/branch`, `--fork-session` resumes)
 //!     report `source: "fork"` where they used to report `"resume"`.
 //!   * **2.1.212** — `/fork` stopped rotating the foreground session. It now
 //!     copies the conversation into a **detached background session** run by
 //!     the Claude Code daemon, registered under
-//!     `~/.claude/jobs/<first-8-of-fork-id>/state.json`. The foreground pane
+//!     `~/.claude/jobs/<first-8-of-fork-id>/state.json`. The foreground window
 //!     keeps its id and fires no SessionStart at all; the fork's own
 //!     SessionStart fires in the daemon-spawned child.
 //!
-//! That child inherits `NICE_SOCKET` + `NICE_PANE_ID` from whichever Nice pane
-//! first spawned the daemon, so its relay carries a **stale pane id** — and the
+//! That child inherits `NICE_SOCKET` + `NICE_PANE_ID` from whichever Nice window
+//! first spawned the daemon, so its relay carries a **stale window id** — and the
 //! script cannot tell: per-child environment is not something a hook script can
 //! validate, and there is no other signal in the payload. The receiver resolves
 //! it instead, by probing for the jobs entry the daemon creates before spawning
 //! the child (`window_state::ForkJobInfo`): entry present ⇒ background fork,
-//! touch no tab; entry absent ⇒ in-pane rotation. The script is therefore
+//! touch no session; entry absent ⇒ in-window rotation. The script is therefore
 //! unchanged by that fix — it already relays `source` verbatim (the wide
 //! `[^"]+` class passes `fork` through untouched).
 //!
@@ -84,7 +84,7 @@ use serde_json::{json, Map, Value};
 /// Extracts `session_id`, `source`, and `cwd` from Claude's stdin JSON with
 /// `sed` (no jq dependency) and posts a `session_update` payload to
 /// `$NICE_SOCKET` via `/usr/bin/nc` (ABSOLUTE path — so a stub `nc` on `PATH`
-/// cannot intercept it). No-ops outside a Nice pane (`NICE_SOCKET` /
+/// cannot intercept it). No-ops outside a Nice term window (`NICE_SOCKET` /
 /// `NICE_PANE_ID` unset) and on a missing/empty `session_id`.
 ///
 /// FROZEN: this is a compatibility contract shared with the Swift installer at
@@ -752,7 +752,7 @@ mod tests {
     fn run_hook(
         script: &Path,
         sock: Option<&Path>,
-        pane_id: Option<&str>,
+        term_window_id: Option<&str>,
         stdin_json: &str,
     ) -> (bool, Option<String>) {
         let listener = sock.map(|p| {
@@ -771,7 +771,7 @@ mod tests {
         if let Some(p) = sock {
             cmd.env("NICE_SOCKET", p);
         }
-        if let Some(pid) = pane_id {
+        if let Some(pid) = term_window_id {
             cmd.env("NICE_PANE_ID", pid);
         }
         let mut child = cmd.spawn().expect("spawn hook script");
@@ -866,7 +866,7 @@ mod tests {
         );
     }
 
-    /// `source: "fork"` — emitted by BOTH an in-pane `/branch` (Claude ≥ 2.1.214)
+    /// `source: "fork"` — emitted by BOTH an in-window `/branch` (Claude ≥ 2.1.214)
     /// and the daemon's detached background `/fork` child — relays verbatim, like
     /// every other source. The script draws no distinction between the two; the
     /// receiver's `~/.claude/jobs/<first8>/` probe does. Pinned because a

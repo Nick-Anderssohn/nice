@@ -1,6 +1,6 @@
 //! `update-check` self-test scenario — the R27 update pill + popover LIVE gate
-//! (Validation §4), the update-checker sibling of [`crate::pane_strip_live`]. It
-//! mounts the real [`WindowToolbarView`] over a seeded tab on a real frontmost
+//! (Validation §4), the update-checker sibling of [`crate::window_strip_live`]. It
+//! mounts the real [`WindowToolbarView`] over a seeded session on a real frontmost
 //! NSWindow and drives the WHOLE nudge through the INJECTED
 //! [`crate::release_check::ReleaseFetcherGlobal`] recording fake — never the real
 //! network / `github.com`, and never the launch timer (the worker is not started
@@ -34,7 +34,7 @@ use anyhow::Result;
 use gpui::{prelude::*, AnyWindowHandle, App, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, TabModel};
+use nice_model::{TermWindow, TermWindowKind, WorkspaceModel};
 
 use crate::app;
 use crate::platform;
@@ -70,7 +70,7 @@ is STALE — remove it with '-' and re-add it, then re-run. Verify: swift -e \
 // ===========================================================================
 
 /// Open the `update-check` scenario window — the real [`WindowToolbarView`] over a
-/// seeded single-pane Main tab. Spawns the driver (self-reported gate).
+/// seeded single-window Main session. Spawns the driver (self-reported gate).
 pub fn open_update_check_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let model = seed_model();
     let whandle: WindowHandle<WindowToolbarView> = cx.open_window(app::window_options(), {
@@ -91,16 +91,16 @@ pub fn open_update_check_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     Ok(any)
 }
 
-/// The fixture: the pinned Main terminal tab with a single terminal pill (the
+/// The fixture: the pinned Main terminal session with a single terminal pill (the
 /// strip renders purely from the model; the pill visibility comes from the
 /// process-wide checker, not the model).
-fn seed_model() -> TabModel {
-    let mut m = TabModel::new("/tmp");
-    let tab_id = TabModel::MAIN_TERMINAL_TAB_ID.to_string();
-    let (pi, ti) = m.project_tab_index(&tab_id).expect("main tab exists");
-    m.projects[pi].tabs[ti].panes = vec![Pane::new("p0", "Terminal 1", PaneKind::Terminal)];
-    m.projects[pi].tabs[ti].active_pane_id = Some("p0".to_string());
-    m.projects[pi].tabs[ti].next_terminal_index = 2;
+fn seed_model() -> WorkspaceModel {
+    let mut m = WorkspaceModel::new("/tmp");
+    let session_id = WorkspaceModel::MAIN_TERMINAL_SESSION_ID.to_string();
+    let (pi, ti) = m.project_session_index(&session_id).expect("main session exists");
+    m.projects[pi].sessions[ti].windows = vec![TermWindow::new("p0", "Terminal 1", TermWindowKind::Terminal)];
+    m.projects[pi].sessions[ti].active_window_id = Some("p0".to_string());
+    m.projects[pi].sessions[ti].next_terminal_index = 2;
     m
 }
 
@@ -206,7 +206,7 @@ async fn run_update_check(cx: &mut AsyncApp, whandle: WindowHandle<WindowToolbar
 
     // Deterministic content: open the popover in-process and assert the exact
     // brew command + the Copy → clipboard (so a DEFERRED real click never weakens
-    // the content coverage — the pane-strip in-process-pins-content precedent).
+    // the content coverage — the window-strip in-process-pins-content precedent).
     content_leg(cx, whandle, &view, &mut failures).await;
 
     // Drop the popover — the scenario's assertions are complete.

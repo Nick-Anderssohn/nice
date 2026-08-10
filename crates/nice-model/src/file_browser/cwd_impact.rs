@@ -1,8 +1,8 @@
 //! `cwd_impact` — the pure CWD-invalidation rule, ported from
 //! `FileBrowserCWDImpactCheck.swift`. Decides whether renaming a file or folder
-//! would invalidate any open terminal pane's working directory: any pane whose
-//! live `cwd` (or its tab's anchor `cwd`) equals the renamed path or is a
-//! descendant of it is "affected" — after the on-disk move that pane sits in a
+//! would invalidate any open terminal window's working directory: any window whose
+//! live `cwd` (or its session's anchor `cwd`) equals the renamed path or is a
+//! descendant of it is "affected" — after the on-disk move that window sits in a
 //! path that no longer exists.
 //!
 //! Only the string-prefix algorithm ([`affected_by`] + [`normalize_path`]) and
@@ -10,19 +10,19 @@
 //! builder (`FileBrowserCWDImpactCheck.snapshot(from:)`) is registry-dependent
 //! and lands with the `crates/nice` rename slice.
 
-use crate::PaneKind;
+use crate::TermWindowKind;
 
-/// One CWD reference captured by the snapshot: either a live pane or a tab
-/// anchor. Tab-anchor entries carry an empty `pane_id` and use
-/// [`PaneKind::Terminal`] as a sentinel — the alert message doesn't distinguish
+/// One CWD reference captured by the snapshot: either a live window or a session
+/// anchor. Session-anchor entries carry an empty `window_id` and use
+/// [`TermWindowKind::Terminal`] as a sentinel — the alert message doesn't distinguish
 /// kinds, it just counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaneCWDRef {
+pub struct TermWindowCWDRef {
     pub window_session_id: String,
-    pub tab_id: String,
-    /// Empty string for tab-anchor entries (`Tab.cwd` rather than a pane).
-    pub pane_id: String,
-    pub kind: PaneKind,
+    pub session_id: String,
+    /// Empty string for session-anchor entries (`Session.cwd` rather than a window).
+    pub window_id: String,
+    pub kind: TermWindowKind,
     /// Absolute path. Trailing slash normalized off by the snapshot builder so
     /// prefix matching is straightforward.
     pub cwd: String,
@@ -31,8 +31,8 @@ pub struct PaneCWDRef {
 /// Flat list of every CWD reference across every window. Built once at the
 /// start of a rename attempt so the check runs against a consistent view.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PaneCWDSnapshot {
-    pub entries: Vec<PaneCWDRef>,
+pub struct TermWindowCWDSnapshot {
+    pub entries: Vec<TermWindowCWDRef>,
 }
 
 /// Return every snapshot entry whose `cwd` would be invalidated by renaming
@@ -43,7 +43,7 @@ pub struct PaneCWDSnapshot {
 /// form. `old_path == "/"` is excluded by the `can_rename` gate at the trigger
 /// layer; handled here too (every CWD would match) by returning an empty list —
 /// there's no useful rename to warn about.
-pub fn affected_by(old_path: &str, snapshot: &PaneCWDSnapshot) -> Vec<PaneCWDRef> {
+pub fn affected_by(old_path: &str, snapshot: &TermWindowCWDSnapshot) -> Vec<TermWindowCWDRef> {
     let normalized = normalize_path(old_path);
     if normalized == "/" {
         return Vec::new();
@@ -75,22 +75,22 @@ pub fn normalize_path(path: &str) -> String {
 mod tests {
     use super::*;
 
-    fn make_ref(cwd: &str, pane_id: &str, kind: PaneKind) -> PaneCWDRef {
-        PaneCWDRef {
+    fn make_ref(cwd: &str, window_id: &str, kind: TermWindowKind) -> TermWindowCWDRef {
+        TermWindowCWDRef {
             window_session_id: "win-1".into(),
-            tab_id: "tab-1".into(),
-            pane_id: pane_id.into(),
+            session_id: "session-1".into(),
+            window_id: window_id.into(),
             kind,
             cwd: cwd.into(),
         }
     }
 
-    fn make_snapshot(cwds: &[&str]) -> PaneCWDSnapshot {
-        PaneCWDSnapshot {
+    fn make_snapshot(cwds: &[&str]) -> TermWindowCWDSnapshot {
+        TermWindowCWDSnapshot {
             entries: cwds
                 .iter()
                 .enumerate()
-                .map(|(i, cwd)| make_ref(cwd, &format!("p{i}"), PaneKind::Terminal))
+                .map(|(i, cwd)| make_ref(cwd, &format!("p{i}"), TermWindowKind::Terminal))
                 .collect(),
         }
     }
@@ -147,22 +147,22 @@ mod tests {
     /// `FileBrowserCWDImpactCheckTests.test_multipleEntries_allMatchingReturned`
     #[test]
     fn multiple_entries_all_matching_returned() {
-        let snapshot = PaneCWDSnapshot {
+        let snapshot = TermWindowCWDSnapshot {
             entries: vec![
-                make_ref("/proj/foo", "p1", PaneKind::Terminal),
-                make_ref("/proj/foo/sub", "p2", PaneKind::Claude),
-                make_ref("/proj/foobar", "p3", PaneKind::Terminal),
-                make_ref("/elsewhere", "p4", PaneKind::Terminal),
+                make_ref("/proj/foo", "p1", TermWindowKind::Terminal),
+                make_ref("/proj/foo/sub", "p2", TermWindowKind::Claude),
+                make_ref("/proj/foobar", "p3", TermWindowKind::Terminal),
+                make_ref("/elsewhere", "p4", TermWindowKind::Terminal),
             ],
         };
         let affected = affected_by("/proj/foo", &snapshot);
         let ids: std::collections::HashSet<&str> =
-            affected.iter().map(|r| r.pane_id.as_str()).collect();
+            affected.iter().map(|r| r.window_id.as_str()).collect();
         assert_eq!(ids, ["p1", "p2"].into_iter().collect());
         // Kinds are preserved on the returned refs.
         assert_eq!(
-            affected.iter().find(|r| r.pane_id == "p2").map(|r| r.kind),
-            Some(PaneKind::Claude)
+            affected.iter().find(|r| r.window_id == "p2").map(|r| r.kind),
+            Some(TermWindowKind::Claude)
         );
     }
 

@@ -9,7 +9,7 @@
 //! 1. **Application Support state.** The interim build stored settings/sessions
 //!    under `~/Library/Application Support/Nice RS Dev/`. The renamed build uses
 //!    the per-variant folder (`Nice` / `Nice Dev`), so without help the interim
-//!    user's fonts/theme/shortcuts + restored tabs would be abandoned in the dead
+//!    user's fonts/theme/shortcuts + restored sessions would be abandoned in the dead
 //!    folder. [`migrate_support_folder`] moves the old folder's entries into the
 //!    new one on a genuine first launch of the renamed build.
 //! 2. **Claude artifacts.** The interim build installed `-rs`-suffixed Claude

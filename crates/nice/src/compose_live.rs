@@ -14,14 +14,14 @@
 //!
 //! So THIS scenario drives the pty with [`COMPOSE_TRIGGER_SEQ`] exactly as
 //! `dispatch_command_compose`'s `Trigger` route does (standing up a full
-//! `WindowState`/`SessionManager` here would re-prove what those tests pin),
+//! `WindowState`/`PtyManager` here would re-prove what those tests pin),
 //! and asserts what only a live ZLE can show: the sequence matches the keymap
 //! atomically, the spinner line paints while the fake claude thinks, the
 //! buffer is replaced without executing, and the user's own Enter runs it.
 //! Drives the pty directly — no CGEvents, so no Accessibility grant needed
 //! (the `niceties-drop` precedent).
 //!
-//! The busy-pane leg asserts the GATE SIGNALS on the live session (a foreground
+//! The busy-window leg asserts the GATE SIGNALS on the live session (a foreground
 //! child flips `has_foreground_child`; a plain prompt never has kitty
 //! super-forwarding) rather than writing the trigger into a busy pty — the
 //! whole point of the Nice-side gate is that those bytes are never sent then.
@@ -281,7 +281,7 @@ async fn run_compose_live(
     if kitty_busy {
         return fail("a plain busy shell unexpectedly reports kitty super-forwarding".into());
     }
-    // Interrupt the sleep so the pane returns to a prompt before teardown.
+    // Interrupt the sleep so the window returns to a prompt before teardown.
     let _ = handle.update(cx, |h, _| h.session().write_input(b"\x03"));
 
     CadenceReport {
@@ -289,7 +289,7 @@ async fn run_compose_live(
         stats: IntervalStats::default(),
         detail: format!(
             "trigger → ZLE widget → fake claude → spinner painted → buffer replaced with \
-             '{COMPOSED}' (not executed) → user Enter ran it; busy-pane gate signal verified \
+             '{COMPOSED}' (not executed) → user Enter ran it; busy-window gate signal verified \
              (fg_child flips, kitty_super stays off)"
         ),
     }

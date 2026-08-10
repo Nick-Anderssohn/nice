@@ -1,0 +1,22 @@
+{
+  "appearance": {
+    "scheme": "dark"
+  },
+  "shortcuts": {
+    "commandCompose": "cmd-enter",
+    "decreaseFontSize": "cmd--",
+    "increaseFontSize": "cmd-=",
+    "newTerminalPane": "cmd-shift-t",
+    "nextPane": "cmd-alt-right",
+    "nextSidebarTab": "cmd-alt-down",
+    "prevPane": "cmd-alt-left",
+    "prevSidebarTab": "cmd-alt-up",
+    "redoFileOperation": "cmd-shift-z",
+    "resetFontSizes": "cmd-0",
+    "somethingRemovedLongAgo": "cmd-9",
+    "toggleHiddenFiles": "cmd-shift-.",
+    "toggleSidebar": null,
+    "toggleSidebarMode": "cmd-shift-b",
+    "undoFileOperation": "cmd-z"
+  }
+}

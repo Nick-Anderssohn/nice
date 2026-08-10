@@ -84,7 +84,7 @@ fn keystroke_encoder_reaches_session(cx: &mut TestAppContext) {
 #[gpui::test]
 fn advance_clock_promotes_launch_overlay(cx: &mut TestAppContext) {
     let dir = session::temp_dir("overlay").expect("temp dir");
-    // A silent pane: no output, so `OutputStarted` never fires to clear the
+    // A silent window: no output, so `OutputStarted` never fires to clear the
     // overlay before the grace elapses.
     let spec = session::silent_command_spec(&dir, "sleep 30", 24, 80);
     let handle =
@@ -164,7 +164,7 @@ fn file_browser_row_drag_payload_reaches_terminal(cx: &mut TestAppContext) {
 /// suppresses the auto-focus. `on_mouse_down` therefore focuses **explicitly**.
 /// Without that, a terminal that had lost focus (e.g. the user clicked a file in
 /// the sidebar file browser, which parks focus in itself) could never regain it
-/// by clicking — only a tab switch (which focuses explicitly via the pane host)
+/// by clicking — only a session switch (which focuses explicitly via the window host)
 /// would. This pins the explicit focus. (Execution model: mocked
 /// `TestAppContext`, libtest.)
 #[gpui::test]

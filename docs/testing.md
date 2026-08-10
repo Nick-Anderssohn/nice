@@ -118,7 +118,7 @@ Work through these in order; the first one that applies decides the layer.
 4. **Does it need a mounted view + gpui's real focus/dispatch/entity
    machinery, but never touches a pixel or a real OS event?** → Layer 2,
    behavior context (`TestAppContext`). This is the default for new
-   chrome/pane-strip interaction tests (R9–R13): mount the view, drive
+   chrome/window-strip interaction tests (R9–R13): mount the view, drive
    simulated input, assert state (which handler fired, which entity
    mutated, what the encoder emitted) — not a screenshot.
 5. **Is it a pure function or value type with no window at all** (a
@@ -166,21 +166,21 @@ where two handlers could plausibly both claim the same press/drag/event —
 write the test as a pair, not a single assertion.**
 
 - The **positive** half asserts the intended outcome happened (e.g. "the
-  pill click selected the pane").
+  pill click selected the window").
 - The **negative** half asserts the specific thing that must not have
-  happened alongside it (e.g. "the window did not move").
+  happened alongside it (e.g. "the OS window did not move").
 
 Where the negative half lives depends on what it's actually checking, via
 the same decision rules above:
 
 - **In-process tests assert the classification outcome** — e.g. "the
   drag-arm handler never fired" / "the click was classified as a
-  pane-select, not a window-drag" — a state/dispatch assertion inside the
+  window-select, not an OS-window drag" — a state/dispatch assertion in the
   behavior context. This is almost always what an R9–R13 chrome test wants:
   it's cheap, parallel, and pins the *decision logic* the seam bug always
   turned out to be about.
-- **Only live scenarios assert real window-frame motion** — e.g. "the
-  window's actual on-screen frame is unchanged after the drag" is a claim
+- **Only live scenarios assert real OS-window frame motion** — e.g. "the
+  OS window's actual on-screen frame is unchanged after the drag" is a claim
   about the real windowserver, not the mocked/visual context's simulated
   platform, and belongs at layer 3 if it's ever needed as a true ground-truth
   check. Don't fake this at layer 2 by asserting on a value the mocked
@@ -188,7 +188,7 @@ the same decision rules above:
   frame assertions off-screen, that's a signal for a live scenario, not an
   in-process approximation.
 
-Every R9–R13 chrome/pane-strip test plan must follow this convention for its
+Every R9–R13 chrome/window-strip test plan must follow this convention for its
 seam-y interactions — reviewers should treat "asserts the action worked" with
 no adjacent "and the counterfactual didn't happen" as an incomplete test for
 anything drag/click-arbitration-shaped.
@@ -269,7 +269,7 @@ landed instead is a single live scenario, `ax-probe`
 
 This is a canary that AccessKit stays wired as gpui evolves across future
 pin bumps — **not** an a11y test suite, and not a general-purpose black-box
-matching mechanism for chrome/pane-strip tests to build on. Don't design a
+matching mechanism for chrome/window-strip tests to build on. Don't design a
 new live scenario around AX-identifier matching; it doesn't exist yet.
 
 **Threading note (load-bearing for anyone adding a second AX-based

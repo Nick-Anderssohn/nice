@@ -1,0 +1,85 @@
+{
+  "version": 3,
+  "windows": [
+    {
+      "activeTabId": "t-claude",
+      "frame": {
+        "height": 800.0,
+        "width": 1200.0,
+        "x": 120.0,
+        "y": 60.0
+      },
+      "id": "win-1",
+      "projects": [
+        {
+          "id": "terminals",
+          "name": "Terminals",
+          "path": "/Users/nick",
+          "tabs": [
+            {
+              "cwd": "/Users/nick",
+              "id": "terminals-main",
+              "nextTerminalIndex": 2,
+              "panes": [
+                {
+                  "id": "terminals-main-p0",
+                  "kind": "terminal",
+                  "title": "Terminal 1"
+                }
+              ],
+              "title": "Main"
+            }
+          ]
+        },
+        {
+          "id": "p-nice",
+          "name": "NICE",
+          "path": "/Users/nick/Projects/nice",
+          "tabs": [
+            {
+              "activePaneId": "t-root-claude",
+              "claudeSessionId": "8f1c0a2e-3b4d-4c5e-9a6b-7d8e9f0a1b2c",
+              "cwd": "/Users/nick/Projects/nice",
+              "id": "t-root",
+              "nextTerminalIndex": 3,
+              "panes": [
+                {
+                  "id": "t-root-claude",
+                  "kind": "claude",
+                  "title": "Claude"
+                },
+                {
+                  "cwd": "/Users/nick/Projects/nice/crates",
+                  "id": "t-root-t1",
+                  "kind": "terminal",
+                  "title": "logs",
+                  "titleManuallySet": true
+                }
+              ],
+              "title": "Adopt tmux terminology",
+              "titleManuallySet": true
+            },
+            {
+              "activePaneId": "t-claude-claude",
+              "claudeSessionId": "1a2b3c4d-5e6f-4708-8910-1112131415ab",
+              "cwd": "/Users/nick/Projects/nice",
+              "id": "t-claude",
+              "nextTerminalIndex": 2,
+              "panes": [
+                {
+                  "id": "t-claude-claude",
+                  "kind": "claude",
+                  "title": "Claude"
+                }
+              ],
+              "parentTabId": "t-root",
+              "title": "Child of the branch parent"
+            }
+          ]
+        }
+      ],
+      "sidebarCollapsed": false,
+      "sidebarMode": "tabs"
+    }
+  ]
+}

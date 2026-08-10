@@ -21,11 +21,11 @@
 //!     row over the full-width body, so `scenario_leading_column_width` reports
 //!     0). Restoring returns the column. (The window-drag region + traffic-light
 //!     geometry now live in the titlebar, not the sidebar strip; `chrome_live` and
-//!     `pane_strip_live` own those.)
+//!     `window_strip_live` own those.)
 //!   * **§4 dots** — with the model driven into all four dot states
 //!     (thinking / waiting-unacked / waiting-acked / idle), the dot colour per
 //!     token and the pulse-presence rule are asserted at the state level off the
-//!     view's own R8 predicates ([`SidebarShellView::tab_dot_inputs`]); pixel
+//!     view's own R8 predicates ([`SidebarShellView::session_dot_inputs`]); pixel
 //!     corroboration is best-effort and left to a human capture.
 //!
 //! The multi-select routing / rename-gate / Esc / band-arm *classification* is
@@ -40,7 +40,7 @@ use anyhow::Result;
 use gpui::{prelude::*, AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, Tab, TabModel, TabStatus};
+use nice_model::{TermWindow, TermWindowKind, Session, WorkspaceModel, SessionStatus};
 use nice_theme::chrome_geometry::{
     SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
@@ -76,7 +76,7 @@ process hosting this run (normally the terminal app). If it shows ON but this \
 persists, the grant is STALE — remove it with '-' and re-add it, then re-run. \
 Verify: swift -e 'import ApplicationServices; print(AXIsProcessTrusted())'";
 
-/// The four tab ids seeded into the fixture, one per dot state.
+/// The four session ids seeded into the fixture, one per dot state.
 const DOT_THINKING: &str = "dot-thinking";
 const DOT_WAITING_UNACK: &str = "dot-waiting-unack";
 const DOT_WAITING_ACK: &str = "dot-waiting-ack";
@@ -87,7 +87,7 @@ const DOT_IDLE: &str = "dot-idle";
 // ===========================================================================
 
 /// Open the `sidebar` scenario window — the real [`SidebarShellView`] over a
-/// seeded model (a Sessions project holding one Claude tab per dot state). Spawns
+/// seeded model (a Sessions project holding one Claude session per dot state). Spawns
 /// the driver (self-reported gate). No pty is needed: the shell hosts no terminal
 /// this cycle (its content area is a plain panel), so nothing spawns.
 pub fn open_sidebar_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
@@ -115,36 +115,36 @@ pub fn open_sidebar_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 }
 
 /// The fixture model: the pinned Terminals group (Main) plus a `sessions` project
-/// holding one Claude tab in each of the four dot states, so the live window
+/// holding one Claude session in each of the four dot states, so the live window
 /// renders all four dots and the §4 checks read them back.
-fn seed_model() -> TabModel {
-    let mut m = TabModel::new("/tmp");
+fn seed_model() -> WorkspaceModel {
+    let mut m = WorkspaceModel::new("/tmp");
     let pi = m.ensure_project("sessions", "Sessions", "/tmp/sessions");
-    let tabs = [
-        claude_tab(DOT_THINKING, "Thinking", TabStatus::Thinking, false),
-        claude_tab(DOT_WAITING_UNACK, "Waiting", TabStatus::Waiting, false),
-        claude_tab(DOT_WAITING_ACK, "Seen", TabStatus::Waiting, true),
-        claude_tab(DOT_IDLE, "Idle", TabStatus::Idle, false),
+    let sessions = [
+        claude_session(DOT_THINKING, "Thinking", SessionStatus::Thinking, false),
+        claude_session(DOT_WAITING_UNACK, "Waiting", SessionStatus::Waiting, false),
+        claude_session(DOT_WAITING_ACK, "Seen", SessionStatus::Waiting, true),
+        claude_session(DOT_IDLE, "Idle", SessionStatus::Idle, false),
     ];
-    for tab in tabs {
-        m.projects[pi].tabs.push(tab);
+    for session in sessions {
+        m.projects[pi].sessions.push(session);
     }
     m
 }
 
-/// A Claude tab whose sole Claude pane is driven into `status` (with `acked`
+/// A Claude session whose sole Claude window is driven into `status` (with `acked`
 /// applied on entry into `.waiting`) via the real R8 transition API, so
-/// `Tab::status()` / `Tab::waiting_acknowledged()` report the intended dot state.
-fn claude_tab(id: &str, title: &str, status: TabStatus, acked: bool) -> Tab {
-    let pane_id = format!("{id}-c");
-    let mut pane = Pane::new(pane_id.clone(), "Claude", PaneKind::Claude);
+/// `Session::status()` / `Session::waiting_acknowledged()` report the intended dot state.
+fn claude_session(id: &str, title: &str, status: SessionStatus, acked: bool) -> Session {
+    let term_window_id = format!("{id}-c");
+    let mut term_window = TermWindow::new(term_window_id.clone(), "Claude", TermWindowKind::Claude);
     // `apply_status_transition` sets `waiting_acknowledged = acked` on entry into
     // `.waiting`; for thinking/idle the flag is irrelevant.
-    pane.apply_status_transition(status, acked);
-    let mut tab = Tab::new(id, title, "/tmp/sessions");
-    tab.panes = vec![pane];
-    tab.active_pane_id = Some(pane_id);
-    tab
+    term_window.apply_status_transition(status, acked);
+    let mut session = Session::new(id, title, "/tmp/sessions");
+    session.windows = vec![term_window];
+    session.active_window_id = Some(term_window_id);
+    session
 }
 
 async fn settle(cx: &mut AsyncApp, ms: u64) {
@@ -417,17 +417,17 @@ fn dot_checks(cx: &mut AsyncApp, view: &Entity<SidebarShellView>, failures: &mut
             .ink3,
     );
 
-    // (tab id, expected status, expected base colour, expected pulse).
-    let cases: [(&str, TabStatus, Srgba, bool); 4] = [
-        (DOT_THINKING, TabStatus::Thinking, THINKING_DOT, true),
-        (DOT_WAITING_UNACK, TabStatus::Waiting, WAITING_DOT, true),
-        (DOT_WAITING_ACK, TabStatus::Waiting, WAITING_DOT, false),
-        (DOT_IDLE, TabStatus::Idle, idle, false),
+    // (session id, expected status, expected base colour, expected pulse).
+    let cases: [(&str, SessionStatus, Srgba, bool); 4] = [
+        (DOT_THINKING, SessionStatus::Thinking, THINKING_DOT, true),
+        (DOT_WAITING_UNACK, SessionStatus::Waiting, WAITING_DOT, true),
+        (DOT_WAITING_ACK, SessionStatus::Waiting, WAITING_DOT, false),
+        (DOT_IDLE, SessionStatus::Idle, idle, false),
     ];
 
     for (id, exp_status, exp_color, exp_pulse) in cases {
-        let Some((status, ack)) = view.update(cx, |v, cx| v.tab_dot_inputs(id, cx)) else {
-            failures.push(format!("dot: tab '{id}' missing from the model"));
+        let Some((status, ack)) = view.update(cx, |v, cx| v.session_dot_inputs(id, cx)) else {
+            failures.push(format!("dot: session '{id}' missing from the model"));
             continue;
         };
         if status != exp_status {

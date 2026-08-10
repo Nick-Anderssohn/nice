@@ -1,10 +1,10 @@
-//! `niceties-held` self-test scenario — the T10 held-pane UX (R7 Validation §5).
+//! `niceties-held` self-test scenario — the T10 held-window UX (R7 Validation §5).
 //!
-//! A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3
-//! classification holds it. The scenario asserts the whole held-pane contract end
+//! A window running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3
+//! classification holds it. The scenario asserts the whole held-window contract end
 //! to end over a real session:
 //!
-//! 1. **the pane is held** — `is_held()` latches after the non-zero exit;
+//! 1. **the window is held** — `is_held()` latches after the non-zero exit;
 //! 2. **output stays readable** — `FINAL` is still in the grid;
 //! 3. **the dim footer is in the buffer** — the ported `[Process exited (status 3)]`
 //!    line was fed into the held term;
@@ -49,7 +49,7 @@ const CELL_W: f32 = 8.0;
 const CELL_H: f32 = 16.0;
 
 /// macOS virtual keycode for `A` (`kVK_ANSI_A`) — the inert keystroke posted at a
-/// held pane. Plain (no modifiers), unicode "a".
+/// held window. Plain (no modifiers), unicode "a".
 const KC_A: u16 = 0;
 
 /// Accessibility-grant remediation (shared wording with the other CGEvent
@@ -58,7 +58,7 @@ const KC_A: u16 = 0;
 const ACCESSIBILITY_REMEDIATION: &str = "\
 Accessibility (TCC) grant missing: AXIsProcessTrusted() == false, so \
 CGEventPostToPid is SILENTLY DROPPED and no injected keystroke can reach the \
-held pane. Fix: System Settings → Privacy & Security → Accessibility → enable \
+held window. Fix: System Settings → Privacy & Security → Accessibility → enable \
 the process hosting this run. If it shows ON but this persists, the grant is \
 STALE — remove it with '-' and re-add it, then re-run.";
 
@@ -88,13 +88,13 @@ fn grid_text(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> Strin
     handle.update(cx, |h, _| h.session().grid_lines().join("\n"))
 }
 
-/// Open the `niceties-held` scenario window (the non-zero-exit pane) and spawn the
-/// held-pane assertions (self-reported gate).
+/// Open the `niceties-held` scenario window (the non-zero-exit window) and spawn the
+/// held-window assertions (self-reported gate).
 pub fn open_niceties_held_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let base = std::env::temp_dir().join(format!("nice-niceties-held-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
-    // A pane that prints then exits non-zero → the R3 classification holds it.
+    // A window that prints then exits non-zero → the R3 classification holds it.
     let spec = SpawnSpec::command("sh -c 'echo FINAL; exit 3'".to_string(), base_s.clone())
         .with_env(vec![("ZDOTDIR".to_string(), base_s)])
         .with_size(ROWS, COLS);
@@ -163,7 +163,7 @@ async fn run_niceties_held(
     }
     if !held {
         return CadenceReport::error(
-            "niceties-held: the pane never entered the held state after `exit 3` — the R3 \
+            "niceties-held: the window never entered the held state after `exit 3` — the R3 \
              Exited{held} event did not reach the view"
                 .to_string(),
         );
@@ -192,15 +192,15 @@ async fn run_niceties_held(
     let after = grid_text(cx, &handle);
     if after != before {
         failures.push(format!(
-            "typing at a held pane changed the grid (input should be inert)\n  before:\n{before}\n\
+            "typing at a held window changed the grid (input should be inert)\n  before:\n{before}\n\
              \n  after:\n{after}"
         ));
     }
     if !terminal.update(cx, |v, _| v.is_held()) {
-        failures.push("a non-dismiss keystroke un-held the pane (only ⏎ / dismiss should)".into());
+        failures.push("a non-dismiss keystroke un-held the window (only ⏎ / dismiss should)".into());
     }
 
-    // --- Dismiss → a fresh shell replaces the held pane -------------------
+    // --- Dismiss → a fresh shell replaces the held window -------------------
     terminal.update(cx, |v, cx| v.dismiss_held(cx));
     if terminal.update(cx, |v, _| v.is_held()) {
         failures.push("dismiss_held did not clear the held state".into());
@@ -234,7 +234,7 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail:
-                "held pane OK: `exit 3` held the pane (FINAL + dim `[… exited (status 3)]` footer \
+                "held window OK: `exit 3` held the window (FINAL + dim `[… exited (status 3)]` footer \
                  readable), a real keystroke was inert (grid unchanged, still held, no crash), and \
                  dismiss respawned a fresh shell (the only path that frees the held term)."
                     .to_string(),

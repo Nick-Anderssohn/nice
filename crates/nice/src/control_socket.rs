@@ -8,16 +8,16 @@
 //! see the plan's "wire protocol is FROZEN" decision):
 //!
 //!   * `claude`         — the shadowed `claude()` zsh function asking Nice to
-//!                        open a new tab or promote a pane in place.
+//!                        open a new session or promote a window in place.
 //!   * `session_update` — the SessionStart hook relaying session-id / cwd
 //!                        rotations (fire-and-forget, no reply).
 //!   * `handoff`        — the `/nice-handoff` skill's helper asking Nice to open
-//!                        a nested handoff tab.
+//!                        a nested handoff session.
 //!   * `dispatch`       — the `/nice-dispatch` skill's helper asking Nice to open
-//!                        a nested tab running `claude --worktree <name> …` on a
+//!                        a nested session running `claude --worktree <name> …` on a
 //!                        task file the dispatcher wrote.
 //!   * `claude_exited`  — the same `claude()` shadow reporting that the Claude it
-//!                        ran as a CHILD has returned, so the pane is a shell
+//!                        ran as a CHILD has returned, so the window is a shell
 //!                        prompt again. Only the `attach` reply verb produces
 //!                        such a child (Fix D). Fire-and-forget, no reply.
 //!
@@ -66,7 +66,7 @@
 //! filled the first three's bodies, `dispatch` added a fourth arm and Fix D a
 //! fifth (`claude_exited`), all without reshaping this socket. The `app::run`
 //! bootstrap
-//! (mint before the Main pane's spawn, start the listener, spawn the foreground
+//! (mint before the Main window's spawn, start the listener, spawn the foreground
 //! drain, stop in teardown) is wired by the R14 env-injection slice — this
 //! module only provides the mechanism, hence the module-wide `dead_code` allow
 //! (the established pattern for a later-slice production consumer).
@@ -125,41 +125,41 @@ const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// (`NiceControlSocket.swift:43-144`). Every normalization rule the parser
 /// applies is documented on [`parse_message`].
 pub(crate) enum SocketMessage {
-    /// `claude()` shadow asking whether to open a new sidebar tab (default) or
-    /// promote the sending pane in place. `tab_id` / `pane_id` are empty strings
-    /// for the Main Terminals tab. The handler replies exactly once via `reply`
+    /// `claude()` shadow asking whether to open a new sidebar session (default) or
+    /// promote the sending window in place. `session_id` / `term_window_id` are empty strings
+    /// for the Main Terminals session. The handler replies exactly once via `reply`
     /// with `newtab` / `inplace` / `inplace <session>` (+ optional settings
     /// pointer). `cwd` is required (may be empty); `args` defaults to `[]`.
     Claude {
         cwd: String,
         args: Vec<String>,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
         reply: Reply,
     },
     /// Claude Code SessionStart hook reporting the active session UUID for the
-    /// sending pane. Fire-and-forget: the client fd is closed BEFORE dispatch,
-    /// so this variant carries no [`Reply`]. `pane_id` + `session_id` are
+    /// sending window. Fire-and-forget: the client fd is closed BEFORE dispatch,
+    /// so this variant carries no [`Reply`]. `term_window_id` + `claude_session_id` are
     /// required non-empty; `source` / `cwd` are absent / empty / non-string
     /// normalized to `None` (older installed hooks predate these fields and must
     /// NOT be dropped).
     SessionUpdate {
-        pane_id: String,
-        session_id: String,
+        term_window_id: String,
+        claude_session_id: String,
         source: Option<String>,
         cwd: Option<String>,
     },
     /// The `claude()` shadow reporting that the Claude it ran as a CHILD has
-    /// returned, so the sending pane is a plain shell prompt again. Only the
+    /// returned, so the sending window is a plain shell prompt again. Only the
     /// `attach` reply verb produces such a child — every other verb `exec`s,
-    /// and a pane whose pty exits clears itself through `pane_held` — which is
-    /// why nothing but the promotion flag needs undoing here. Fire-and-forget:
+    /// and a window whose pty exits clears itself through `window_held` — which
+    /// is why nothing but the promotion flag needs undoing here. Fire-and-forget:
     /// the client fd is closed BEFORE dispatch, so this variant carries no
-    /// [`Reply`]. `pane_id` is required non-empty.
-    ClaudeExited { pane_id: String },
+    /// [`Reply`]. `term_window_id` is required non-empty.
+    ClaudeExited { term_window_id: String },
     /// `/nice-handoff` skill asking Nice to open a fresh Claude session nested
-    /// under the originating tab. `cwd` + `handoff_file` are required non-empty;
-    /// `instructions` / `model` / `effort` / `tab_id` / `pane_id` are normalized
+    /// under the originating session. `cwd` + `handoff_file` are required non-empty;
+    /// `instructions` / `model` / `effort` / `session_id` / `term_window_id` are normalized
     /// to `""` (an older installed helper omits `model` / `effort` entirely and
     /// must still dispatch). The handler replies once with `ok` / `error: …`.
     Handoff {
@@ -168,16 +168,16 @@ pub(crate) enum SocketMessage {
         instructions: String,
         model: String,
         effort: String,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
         reply: Reply,
     },
     /// `/nice-dispatch` skill asking Nice to open a fresh Claude session nested
-    /// under the originating tab, running `claude --worktree <name>` on a task
+    /// under the originating session, running `claude --worktree <name>` on a task
     /// file the dispatcher wrote. `cwd` (the MAIN checkout root, resolved by the
-    /// helper — the handler spawns from it, NOT from the originating tab's live
-    /// cwd), `worktree_name`, `task_file` and `pane_id` are required non-empty;
-    /// `instructions` / `model` / `effort` / `tab_id` normalize to `""`. Unlike
+    /// helper — the handler spawns from it, NOT from the originating session's live
+    /// cwd), `worktree_name`, `task_file` and `term_window_id` are required non-empty;
+    /// `instructions` / `model` / `effort` / `session_id` normalize to `""`. Unlike
     /// `handoff`, empty `model` / `effort` mean "omit the flag entirely" (the
     /// child runs on the user's configured default) — dispatch deliberately does
     /// NOT inherit the dispatcher's. The handler replies once with `ok` /
@@ -189,8 +189,8 @@ pub(crate) enum SocketMessage {
         instructions: String,
         model: String,
         effort: String,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
         reply: Reply,
     },
 }
@@ -246,17 +246,17 @@ pub(crate) enum RecordedSocketMessage {
     Claude {
         cwd: String,
         args: Vec<String>,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
     },
     SessionUpdate {
-        pane_id: String,
-        session_id: String,
+        term_window_id: String,
+        claude_session_id: String,
         source: Option<String>,
         cwd: Option<String>,
     },
     ClaudeExited {
-        pane_id: String,
+        term_window_id: String,
     },
     Handoff {
         cwd: String,
@@ -264,8 +264,8 @@ pub(crate) enum RecordedSocketMessage {
         instructions: String,
         model: String,
         effort: String,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
     },
     Dispatch {
         cwd: String,
@@ -274,8 +274,8 @@ pub(crate) enum RecordedSocketMessage {
         instructions: String,
         model: String,
         effort: String,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
     },
 }
 
@@ -600,7 +600,7 @@ fn read_framed_line(stream: &mut UnixStream) -> Option<Vec<u8>> {
 ///     `model` / `effort` / `tabId` / `paneId` normalize to `""` (an older
 ///     helper omitting `model`/`effort` must still dispatch, not drop).
 ///   * `dispatch`: `cwd` + `worktreeName` + `taskFile` + `paneId` required
-///     non-empty (unlike `handoff`, a dispatch without a sending pane cannot
+///     non-empty (unlike `handoff`, a dispatch without a sending window cannot
 ///     nest and is dropped); `instructions` / `model` / `effort` / `tabId`
 ///     normalize to `""`.
 fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
@@ -612,44 +612,44 @@ fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
         "claude" => {
             let cwd = obj.get("cwd").and_then(|v| v.as_str())?.to_string();
             let args = parse_string_array(obj.get("args"));
-            let tab_id = str_or_empty(obj, "tabId");
-            let pane_id = str_or_empty(obj, "paneId");
+            let session_id = str_or_empty(obj, "tabId");
+            let term_window_id = str_or_empty(obj, "paneId");
             Some(SocketMessage::Claude {
                 cwd,
                 args,
-                tab_id,
-                pane_id,
+                session_id,
+                term_window_id,
                 reply: Reply::new(stream),
             })
         }
         "session_update" => {
-            let pane_id = non_empty(obj, "paneId")?;
-            let session_id = non_empty(obj, "sessionId")?;
+            let term_window_id = non_empty(obj, "paneId")?;
+            let claude_session_id = non_empty(obj, "sessionId")?;
             let source = normalize_opt(obj, "source");
             let cwd = normalize_opt(obj, "cwd");
             // Fire-and-forget: close the fd BEFORE dispatch so the hook's `nc`
             // returns promptly even if the foreground is backed up.
             drop(stream);
             Some(SocketMessage::SessionUpdate {
-                pane_id,
-                session_id,
+                term_window_id,
+                claude_session_id,
                 source,
                 cwd,
             })
         }
         "claude_exited" => {
-            let pane_id = non_empty(obj, "paneId")?;
+            let term_window_id = non_empty(obj, "paneId")?;
             // Fire-and-forget, same as `session_update`: close the fd BEFORE
             // dispatch so the wrapper's `nc` returns to the user's prompt
             // immediately rather than waiting on the foreground.
             drop(stream);
-            Some(SocketMessage::ClaudeExited { pane_id })
+            Some(SocketMessage::ClaudeExited { term_window_id })
         }
         "handoff" => {
             let cwd = non_empty(obj, "cwd")?;
             let handoff_file = non_empty(obj, "handoffFile")?;
-            let tab_id = str_or_empty(obj, "tabId");
-            let pane_id = str_or_empty(obj, "paneId");
+            let session_id = str_or_empty(obj, "tabId");
+            let term_window_id = str_or_empty(obj, "paneId");
             let instructions = str_or_empty(obj, "instructions");
             let model = str_or_empty(obj, "model");
             let effort = str_or_empty(obj, "effort");
@@ -659,8 +659,8 @@ fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
                 instructions,
                 model,
                 effort,
-                tab_id,
-                pane_id,
+                session_id,
+                term_window_id,
                 reply: Reply::new(stream),
             })
         }
@@ -668,8 +668,8 @@ fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
             let cwd = non_empty(obj, "cwd")?;
             let worktree_name = non_empty(obj, "worktreeName")?;
             let task_file = non_empty(obj, "taskFile")?;
-            let pane_id = non_empty(obj, "paneId")?;
-            let tab_id = str_or_empty(obj, "tabId");
+            let term_window_id = non_empty(obj, "paneId")?;
+            let session_id = str_or_empty(obj, "tabId");
             let instructions = str_or_empty(obj, "instructions");
             let model = str_or_empty(obj, "model");
             let effort = str_or_empty(obj, "effort");
@@ -680,8 +680,8 @@ fn parse_message(line: &[u8], stream: UnixStream) -> Option<SocketMessage> {
                 instructions,
                 model,
                 effort,
-                tab_id,
-                pane_id,
+                session_id,
+                term_window_id,
                 reply: Reply::new(stream),
             })
         }
@@ -1072,11 +1072,11 @@ mod tests {
             let items = Arc::clone(&self.items);
             move |msg| match msg {
                 SocketMessage::SessionUpdate {
-                    pane_id,
-                    session_id,
+                    term_window_id,
+                    claude_session_id,
                     source,
                     cwd,
-                } => items.lock().unwrap().push((pane_id, session_id, source, cwd)),
+                } => items.lock().unwrap().push((term_window_id, claude_session_id, source, cwd)),
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
                 SocketMessage::Handoff { reply, .. } => reply.send("ok"),
                 SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn session_update_missing_pane_id_drops_silently() {
+    fn session_update_missing_window_id_drops_silently() {
         let captured = CapturedUpdates::default();
         let socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
@@ -1385,7 +1385,7 @@ mod tests {
 
     // ---- claude_exited parse ------------------------------------------------
 
-    /// Thread-safe collector for dispatched `claude_exited` pane ids.
+    /// Thread-safe collector for dispatched `claude_exited` window ids.
     #[derive(Clone, Default)]
     struct CapturedExits {
         items: Arc<Mutex<Vec<String>>>,
@@ -1394,7 +1394,7 @@ mod tests {
         fn handler(&self) -> impl Fn(SocketMessage) + Send + Sync + 'static {
             let items = Arc::clone(&self.items);
             move |msg| match msg {
-                SocketMessage::ClaudeExited { pane_id } => items.lock().unwrap().push(pane_id),
+                SocketMessage::ClaudeExited { term_window_id } => items.lock().unwrap().push(term_window_id),
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
                 SocketMessage::Handoff { reply, .. } => reply.send("ok"),
                 SocketMessage::Dispatch { reply, .. } => reply.send("ok"),
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_exited_dispatches_its_pane_id() {
+    fn claude_exited_dispatches_its_term_window_id() {
         let captured = CapturedExits::default();
         let socket = NiceControlSocket::with_intervals(
             Duration::from_secs(60),
@@ -1428,8 +1428,8 @@ mod tests {
     }
 
     #[test]
-    fn claude_exited_without_a_pane_id_drops_silently() {
-        // Nothing to clear without a pane — the same required-field rule
+    fn claude_exited_without_a_term_window_id_drops_silently() {
+        // Nothing to clear without a window — the same required-field rule
         // `session_update` applies.
         let captured = CapturedExits::default();
         let socket = NiceControlSocket::with_intervals(
@@ -1475,8 +1475,8 @@ mod tests {
         instructions: String,
         model: String,
         effort: String,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
     }
     impl CapturedHandoffs {
         fn handler(&self) -> impl Fn(SocketMessage) + Send + Sync + 'static {
@@ -1488,8 +1488,8 @@ mod tests {
                     instructions,
                     model,
                     effort,
-                    tab_id,
-                    pane_id,
+                    session_id,
+                    term_window_id,
                     reply,
                 } => {
                     reply.send("ok"); // drain the fd; the real decision is R26's
@@ -1499,8 +1499,8 @@ mod tests {
                         instructions,
                         model,
                         effort,
-                        tab_id,
-                        pane_id,
+                        session_id,
+                        term_window_id,
                     });
                 }
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
@@ -1541,8 +1541,8 @@ mod tests {
         assert_eq!(got.cwd, "/tmp/work");
         assert_eq!(got.handoff_file, "/tmp/work/.claude/handoff/h.md");
         assert_eq!(got.instructions, "Focus only on the UI layer");
-        assert_eq!(got.tab_id, "tab1");
-        assert_eq!(got.pane_id, "pane1");
+        assert_eq!(got.session_id, "tab1");
+        assert_eq!(got.term_window_id, "pane1");
         assert_eq!(got.model, "claude-opus-4-8");
         assert_eq!(got.effort, "xhigh");
     }
@@ -1639,7 +1639,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_absent_tab_id_normalizes_to_empty_string() {
+    fn handoff_absent_session_id_normalizes_to_empty_string() {
         let captured = CapturedHandoffs::default();
         let socket = socket_with(captured.handler());
         send_and_read(
@@ -1647,11 +1647,11 @@ mod tests {
             r#"{"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","paneId":"p1"}"#,
         );
         let got = captured.wait_one().expect("dispatch");
-        assert_eq!(got.tab_id, "", "absent tabId → \"\"");
+        assert_eq!(got.session_id, "", "absent tabId → \"\"");
     }
 
     #[test]
-    fn handoff_absent_pane_id_normalizes_to_empty_string() {
+    fn handoff_absent_window_id_normalizes_to_empty_string() {
         let captured = CapturedHandoffs::default();
         let socket = socket_with(captured.handler());
         send_and_read(
@@ -1659,7 +1659,7 @@ mod tests {
             r#"{"action":"handoff","cwd":"/tmp/work","handoffFile":"/tmp/work/.claude/handoff/h.md","tabId":"t1"}"#,
         );
         let got = captured.wait_one().expect("dispatch");
-        assert_eq!(got.pane_id, "", "absent paneId → \"\"");
+        assert_eq!(got.term_window_id, "", "absent paneId → \"\"");
     }
 
     #[test]
@@ -1728,8 +1728,8 @@ mod tests {
         instructions: String,
         model: String,
         effort: String,
-        tab_id: String,
-        pane_id: String,
+        session_id: String,
+        term_window_id: String,
     }
     impl CapturedDispatches {
         fn handler(&self) -> impl Fn(SocketMessage) + Send + Sync + 'static {
@@ -1742,8 +1742,8 @@ mod tests {
                     instructions,
                     model,
                     effort,
-                    tab_id,
-                    pane_id,
+                    session_id,
+                    term_window_id,
                     reply,
                 } => {
                     reply.send("ok"); // drain the fd; the real handler is window-side
@@ -1754,8 +1754,8 @@ mod tests {
                         instructions,
                         model,
                         effort,
-                        tab_id,
-                        pane_id,
+                        session_id,
+                        term_window_id,
                     });
                 }
                 SocketMessage::Claude { reply, .. } => reply.send("newtab"),
@@ -1799,8 +1799,8 @@ mod tests {
         assert_eq!(got.worktree_name, "fix-tabs");
         assert_eq!(got.task_file, "/repo/.claude/dispatch/fix-tabs-1.md");
         assert_eq!(got.instructions, "Only touch the parser");
-        assert_eq!(got.tab_id, "tab1");
-        assert_eq!(got.pane_id, "pane1");
+        assert_eq!(got.session_id, "tab1");
+        assert_eq!(got.term_window_id, "pane1");
         assert_eq!(got.model, "opus");
         assert_eq!(got.effort, "xhigh");
     }
@@ -1865,9 +1865,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_missing_pane_id_drops_silently() {
+    fn dispatch_missing_window_id_drops_silently() {
         // Unlike handoff (whose paneId is optional), a dispatch without a sending
-        // pane cannot resolve an originating tab to nest under.
+        // window cannot resolve an originating session to nest under.
         assert_dispatch_drops(
             r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","tabId":"t1"}"#,
             "missing paneId",
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_empty_pane_id_drops_silently() {
+    fn dispatch_empty_window_id_drops_silently() {
         assert_dispatch_drops(
             r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","tabId":"t1","paneId":""}"#,
             "empty paneId",
@@ -1893,7 +1893,7 @@ mod tests {
             r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","paneId":"p1"}"#,
         );
         let got = captured.wait_one().expect("dispatch");
-        assert_eq!(got.tab_id, "", "absent tabId → \"\"");
+        assert_eq!(got.session_id, "", "absent tabId → \"\"");
         assert_eq!(got.instructions, "", "absent instructions → \"\"");
         assert_eq!(got.model, "", "absent model → \"\"");
         assert_eq!(got.effort, "", "absent effort → \"\"");
@@ -1908,7 +1908,7 @@ mod tests {
             r#"{"action":"dispatch","cwd":"/repo","worktreeName":"w","taskFile":"/repo/t.md","tabId":"","paneId":"p1","instructions":"","model":"","effort":""}"#,
         );
         let got = captured.wait_one().expect("dispatch");
-        assert_eq!(got.tab_id, "");
+        assert_eq!(got.session_id, "");
         assert_eq!(got.instructions, "");
         assert_eq!(got.model, "");
         assert_eq!(got.effort, "");
@@ -1985,8 +1985,8 @@ mod tests {
 
         // Post two messages: the first fires the parked waker.
         tx.post(SocketMessage::SessionUpdate {
-            pane_id: "P1".into(),
-            session_id: "S1".into(),
+            term_window_id: "P1".into(),
+            claude_session_id: "S1".into(),
             source: None,
             cwd: None,
         });
@@ -1995,8 +1995,8 @@ mod tests {
             "post must fire the parked foreground waker"
         );
         tx.post(SocketMessage::SessionUpdate {
-            pane_id: "P2".into(),
-            session_id: "S2".into(),
+            term_window_id: "P2".into(),
+            claude_session_id: "S2".into(),
             source: None,
             cwd: None,
         });
@@ -2007,11 +2007,11 @@ mod tests {
 
         // Messages drain in FIFO order, then the channel is empty.
         match rx.try_recv() {
-            Ok(SocketMessage::SessionUpdate { pane_id, .. }) => assert_eq!(pane_id, "P1"),
+            Ok(SocketMessage::SessionUpdate { term_window_id, .. }) => assert_eq!(term_window_id, "P1"),
             _ => panic!("expected P1 first"),
         }
         match rx.try_recv() {
-            Ok(SocketMessage::SessionUpdate { pane_id, .. }) => assert_eq!(pane_id, "P2"),
+            Ok(SocketMessage::SessionUpdate { term_window_id, .. }) => assert_eq!(term_window_id, "P2"),
             _ => panic!("expected P2 second"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));

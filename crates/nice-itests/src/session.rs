@@ -12,7 +12,7 @@
 //!   scenario's pattern (raw mode: no line discipline / echo, so encoder bytes
 //!   land byte-exact).
 //! * [`silent_command_spec`] runs a command that produces no output (e.g.
-//!   `sleep`) — for timing tests that must keep a pane silent past a deadline.
+//!   `sleep`) — for timing tests that must keep a window silent past a deadline.
 //!
 //! Pure `std` + `nice_term_core::SpawnSpec` — no gpui. A caller passes the spec
 //! to `nice_term_view::TerminalSessionHandle::spawn`. The capture readers poll a
@@ -77,7 +77,7 @@ pub fn cat_fixture_spec(dir: &Path, fixture: &Path, rows: u16, cols: u16) -> Spa
 }
 
 /// A session running `command` with `ZDOTDIR` blanked (`dir`). Intended for a
-/// command that produces **no output** (e.g. `"sleep 30"`) so a pane stays silent
+/// command that produces **no output** (e.g. `"sleep 30"`) so a window stays silent
 /// past a timing deadline. `command` is exec-wrapped by the spawn contract
 /// (`zsh -ilc "exec <command>"`), so no extra `exec` is needed.
 pub fn silent_command_spec(dir: &Path, command: &str, rows: u16, cols: u16) -> SpawnSpec {

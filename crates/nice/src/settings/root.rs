@@ -18,7 +18,7 @@
 //!    not edit the rail, the selection state, or the dispatch match.
 //!
 //! The Appearance / Font / Claude / Advanced / About pane bodies are stubs in
-//! slice 1 ([`pane_placeholder`]); later slices of this cycle replace them.
+//! slice 1 (a flat placeholder body); later slices of this cycle replace them.
 
 use std::rc::Rc;
 
@@ -436,7 +436,7 @@ pub(crate) fn setting_subtitle(text: impl Into<SharedString>, cx: &App) -> impl 
 /// The hover tooltip for a setting that keeps non-obvious info after the
 /// description purge (mock feel-check: rows carry NO hint text). A themed
 /// wrapping label box built through gpui's `div::tooltip` seam (the toolbar's
-/// `TabTooltip` pattern).
+/// `SessionTooltip` pattern).
 pub(crate) struct SettingTooltip {
     pub(crate) text: SharedString,
 }

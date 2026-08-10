@@ -6,14 +6,14 @@
 //! `crate::app::run` uses) with a **real control socket** + **real ptys**. Two
 //! legs:
 //!
-//! * **(a) raw-socket dispatch → nested `[DISPATCH]` tab, opened in the
+//! * **(a) raw-socket dispatch → nested `[DISPATCH]` session, opened in the
 //!   BACKGROUND** — a raw-`UnixStream` `dispatch` message naming a seeded
-//!   originating Claude tab replies `ok`; a NEW tab appears nested one indent
-//!   under it (`parent_tab_id` → the originating id) with the LOCKED title
+//!   originating Claude session replies `ok`; a NEW session appears nested one indent
+//!   under it (`parent_session_id` → the originating id) with the LOCKED title
 //!   `[DISPATCH] <worktree name>` and `title_manually_set == true`; the
-//!   DISPATCHER tab is still `active_tab_id()` (a dispatch never steals focus)
-//!   while the unselected child's Claude pane is nonetheless
-//!   `is_claude_running`; the tab's `cwd` is the PAYLOAD cwd, not the
+//!   DISPATCHER session is still `active_session_id()` (a dispatch never steals focus)
+//!   while the unselected child's Claude window is nonetheless
+//!   `is_claude_running`; the session's `cwd` is the PAYLOAD cwd, not the
 //!   dispatcher's own; and the stub `claude`'s recorded argv carries
 //!   `--session-id <v4 uuid>` then `--add-dir <dirname(taskFile)>` IMMEDIATELY
 //!   followed by `--worktree <name>` (the variadic-`--add-dir` terminator),
@@ -22,8 +22,8 @@
 //!   installs the pair into the fixture's sandboxed dirs, and THAT installed
 //!   `nice-dispatch.sh` is then run as a real subprocess from a SUBDIRECTORY of
 //!   a `git init`-ed scratch repo with `NICE_SOCKET` / `NICE_TAB_ID` /
-//!   `NICE_PANE_ID` pointing at the live window + the seeded dispatcher tab. It
-//!   exits 0 saying the tab is opening, and the tab that appears is nested under
+//!   `NICE_PANE_ID` pointing at the live window + the seeded dispatcher session. It
+//!   exits 0 saying the session is opening, and the session that appears is nested under
 //!   the dispatcher, `[DISPATCH]`-titled, unselected — and its `cwd` is the REPO
 //!   ROOT rather than the subdir the helper ran in, which is the helper's
 //!   `git rev-parse --path-format=absolute --git-common-dir` main-root
@@ -67,20 +67,20 @@ use anyhow::{Context as _, Result};
 use gpui::{AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, Tab};
+use nice_model::{TermWindow, TermWindowKind, Session};
 
 use crate::app_shell::AppShellView;
-use crate::session_manager::ResolvedClaudePath;
+use crate::pty_manager::ResolvedClaudePath;
 use crate::skill_installer::DISPATCH_HELPER_FILENAME;
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 
 // -- timing ------------------------------------------------------------------
 
-/// Poll cap for a routed model mutation (tab creation) after a socket message —
+/// Poll cap for a routed model mutation (session creation) after a socket message —
 /// the drain-task hop, on the real clock.
 const ROUTE_POLLS: usize = 60;
-/// Poll cap for the stub `claude` to record its argv after its pane spawns.
+/// Poll cap for the stub `claude` to record its argv after its window spawns.
 const ARGV_POLLS: usize = 60;
 /// Poll cap for the real helper subprocess to exit (it posts, then waits on
 /// `nc -U -w 2` for the window's reply — which only arrives once the foreground
@@ -90,10 +90,10 @@ const HELPER_POLLS: usize = 100;
 /// subprocess run on OS threads / processes).
 const POLL_MS: u64 = 100;
 
-/// The seeded dispatcher tab's id / pane id — the `NICE_TAB_ID` / `NICE_PANE_ID`
-/// the helper leg exports, and the tab that must stay active throughout.
-const DISPATCHER_TAB: &str = "dispatcher-tab";
-const DISPATCHER_PANE: &str = "dispatcher-pane";
+/// The seeded dispatcher session's id / window id — the `NICE_TAB_ID` / `NICE_PANE_ID`
+/// the helper leg exports, and the session that must stay active throughout.
+const DISPATCHER_SESSION: &str = "dispatcher-tab";
+const DISPATCHER_WINDOW: &str = "dispatcher-pane";
 
 // -- fixture -----------------------------------------------------------------
 
@@ -160,7 +160,7 @@ impl Fixture {
 
         // The stub `claude`: record its full argv (one arg per line) to a
         // per-invocation file in the capture dir, then block reading stdin so the
-        // pane stays alive until teardown. NEVER the machine's real claude
+        // window stays alive until teardown. NEVER the machine's real claude
         // (hermeticity). The capture dir is baked in (not read from env) so the
         // stub is self-contained.
         let stub = bin.join("claude");
@@ -181,7 +181,7 @@ impl Fixture {
         // process-global (seeded in `open_dispatch_window`), and REMOVE any prior
         // scenario's `NICE_CLAUDE_OVERRIDE` so `is_override` stays false and the
         // Nice-injected flags emit (the argv legs depend on it).
-        // SAFETY: single-threaded scenario setup, before any Claude pane forks;
+        // SAFETY: single-threaded scenario setup, before any Claude window forks;
         // matches the existing `std::env::set_var`/`remove_var` seams.
         unsafe { std::env::remove_var("NICE_CLAUDE_OVERRIDE") };
 
@@ -237,13 +237,13 @@ pub fn open_dispatch_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let home = fixture.home_str();
     let whandle: WindowHandle<AppShellView> = cx.update(|app| {
         // The shipped builder reads the process-global `SharedFontSettings` (via
-        // the pane host); `install_shortcuts` seeds it (idempotent).
+        // the window host); `install_shortcuts` seeds it (idempotent).
         crate::keymap::install_shortcuts(app);
         // Seed the stub as the resolved claude binary (env override unset ⇒
         // `is_override` false ⇒ the full Nice argv reaches the stub).
         app.set_global(ResolvedClaudePath(Some(stub.clone())));
         // Sandbox HOME (no rc) for the whole driver; restored at teardown.
-        // SAFETY: single-threaded setup; the Main pane forks synchronously inside
+        // SAFETY: single-threaded setup; the Main window forks synchronously inside
         // `open_managed_window` under this HOME.
         unsafe { std::env::set_var("HOME", &home) };
         crate::app::open_managed_window(app)
@@ -293,14 +293,14 @@ async fn run_dispatch(
         );
     };
 
-    // The seeded dispatcher tab: present, non-Terminals, owning the pane the
+    // The seeded dispatcher session: present, non-Terminals, owning the window the
     // helper names. Its own cwd is the fixture `work` dir — deliberately NOT the
     // repo root, so leg (a)'s payload-cwd assertion can tell the two apart.
     let work = fixture.work_str();
-    seed_dispatcher_tab(cx, &state, &work);
+    seed_dispatcher_session(cx, &state, &work);
 
-    // === (a) raw-socket dispatch → nested, unselected [DISPATCH] tab ============
-    let before_a = all_tab_ids(cx, &state);
+    // === (a) raw-socket dispatch → nested, unselected [DISPATCH] session ============
+    let before_a = all_session_ids(cx, &state);
     let task_a = format!("{work}/briefs/dispatch-a.md");
     let reply_a = send_dispatch(
         cx,
@@ -308,8 +308,8 @@ async fn run_dispatch(
         &fixture.repo_str(),
         "fix-drag-crash",
         &task_a,
-        DISPATCHER_TAB,
-        DISPATCHER_PANE,
+        DISPATCHER_SESSION,
+        DISPATCHER_WINDOW,
         "keep it on the branch",
         "claude-opus-4-8",
         "xhigh",
@@ -318,7 +318,7 @@ async fn run_dispatch(
     if reply_a.as_deref().map(str::trim_end) != Some("ok") {
         failures.push(format!("(a) socket: expected reply 'ok', got {reply_a:?}"));
     }
-    assert_dispatch_tab(
+    assert_dispatch_session(
         cx,
         &state,
         &before_a,
@@ -330,7 +330,7 @@ async fn run_dispatch(
     .await;
     match poll_argv_for(cx, &fixture, &task_a).await {
         None => failures.push(
-            "(a) argv: the stub `claude` never recorded an argv naming the task file (the pane \
+            "(a) argv: the stub `claude` never recorded an argv naming the task file (the window \
              did not spawn, or is_override suppressed the flags)"
                 .into(),
         ),
@@ -398,7 +398,7 @@ async fn real_helper_leg(
     }
     let task_file = task_file.to_string_lossy().into_owned();
 
-    let before = all_tab_ids(cx, state);
+    let before = all_session_ids(cx, state);
     let output = run_helper(
         cx,
         &helper,
@@ -429,18 +429,18 @@ async fn real_helper_leg(
                     out.status.code()
                 ));
             }
-            if !stdout.contains("dispatch tab opening") {
+            if !stdout.contains("dispatch session opening") {
                 failures.push(format!(
-                    "(b) helper: the helper must report the tab is opening, got stdout {stdout:?} \
+                    "(b) helper: the helper must report the session is opening, got stdout {stdout:?} \
                      / stderr {stderr:?}"
                 ));
             }
         }
     }
 
-    // The tab the REAL payload produced: nested, locked-title, unselected — and
+    // The session the REAL payload produced: nested, locked-title, unselected — and
     // its cwd is the repo ROOT, not the subdir the helper ran in.
-    assert_dispatch_tab(
+    assert_dispatch_session(
         cx,
         state,
         &before,
@@ -475,15 +475,15 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
         CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
-            detail: "dispatch OK: a raw-socket `dispatch` naming a seeded dispatcher tab replied \
-                     `ok` and opened a nested, UNSELECTED [DISPATCH]-titled tab (locked title, \
+            detail: "dispatch OK: a raw-socket `dispatch` naming a seeded dispatcher session replied \
+                     `ok` and opened a nested, UNSELECTED [DISPATCH]-titled session (locked title, \
                      parented under the dispatcher, cwd = the PAYLOAD cwd, its unrendered Claude \
-                     pane running) whose stub argv carried --session-id <v4> then --add-dir \
+                     window running) whose stub argv carried --session-id <v4> then --add-dir \
                      <brief dir> --worktree <name> --model --effort with the prompt last; and the \
                      INSTALLED nice-dispatch.sh, run for real from a subdirectory of a git \
                      init-ed scratch repo, exited 0, posted the repo ROOT as cwd (its \
                      --git-common-dir main-root resolution, not $PWD) and produced a second \
-                     nested [DISPATCH] tab whose argv omitted --model/--effort with the prompt \
+                     nested [DISPATCH] session whose argv omitted --model/--effort with the prompt \
                      still directly after --worktree."
                 .to_string(),
         }
@@ -502,11 +502,11 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
 
 // -- assertions --------------------------------------------------------------
 
-/// Poll for the tab a dispatch produced and assert the shape both legs share:
+/// Poll for the session a dispatch produced and assert the shape both legs share:
 /// nested under the dispatcher with a LOCKED `[DISPATCH] …` title, spawned from
 /// `want_cwd` (the payload cwd), the dispatcher still active, and the unselected
-/// child's Claude pane running.
-async fn assert_dispatch_tab(
+/// child's Claude window running.
+async fn assert_dispatch_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     before: &[String],
@@ -515,63 +515,63 @@ async fn assert_dispatch_tab(
     want_cwd: &str,
     failures: &mut Vec<String>,
 ) {
-    let Some(new_tab) = poll_new_tab(cx, state, before).await else {
-        failures.push(format!("({leg}) tab: the dispatch produced no new tab in the model"));
+    let Some(new_session) = poll_new_session(cx, state, before).await else {
+        failures.push(format!("({leg}) session: the dispatch produced no new session in the model"));
         return;
     };
     let snap = state.update(cx, |s, _cx| {
-        s.model.tab_for(&new_tab).map(|t| {
+        s.workspace.session_for(&new_session).map(|t| {
             (
                 t.title.clone(),
                 t.title_manually_set,
-                t.parent_tab_id.clone(),
+                t.parent_session_id.clone(),
                 t.cwd.clone(),
-                t.panes
+                t.windows
                     .iter()
-                    .any(|p| p.kind == PaneKind::Claude && p.is_claude_running),
+                    .any(|p| p.kind == TermWindowKind::Claude && p.is_claude_running),
             )
         })
     });
     match snap {
-        None => failures.push(format!("({leg}) tab: the new tab vanished before assertion")),
+        None => failures.push(format!("({leg}) session: the new session vanished before assertion")),
         Some((title, locked, parent, cwd, claude_running)) => {
             if title != want_title {
-                failures.push(format!("({leg}) tab: title must be {want_title:?}, got {title:?}"));
+                failures.push(format!("({leg}) session: title must be {want_title:?}, got {title:?}"));
             }
             if !locked {
                 failures.push(format!(
-                    "({leg}) tab: the dispatch tab's title must be LOCKED \
+                    "({leg}) session: the dispatch session's title must be LOCKED \
                      (title_manually_set == true)"
                 ));
             }
-            if parent.as_deref() != Some(DISPATCHER_TAB) {
+            if parent.as_deref() != Some(DISPATCHER_SESSION) {
                 failures.push(format!(
-                    "({leg}) tab: the dispatch tab must nest under the dispatcher \
-                     (parent_tab_id == {DISPATCHER_TAB:?}), got {parent:?}"
+                    "({leg}) session: the dispatch session must nest under the dispatcher \
+                     (parent_session_id == {DISPATCHER_SESSION:?}), got {parent:?}"
                 ));
             }
             if cwd != want_cwd {
                 failures.push(format!(
-                    "({leg}) tab: the dispatch must spawn from the PAYLOAD cwd {want_cwd:?} \
+                    "({leg}) session: the dispatch must spawn from the PAYLOAD cwd {want_cwd:?} \
                      (never the dispatcher's own cwd), got {cwd:?}"
                 ));
             }
             if !claude_running {
                 failures.push(format!(
-                    "({leg}) tab: the unselected nested child must still have a RUNNING Claude \
-                     pane (its pty is owned by the session entity, not the view)"
+                    "({leg}) session: the unselected nested child must still have a RUNNING Claude \
+                     window (its pty is owned by the session entity, not the view)"
                 ));
             }
         }
     }
 
     // The dispatch opened in the BACKGROUND: selection never moved off the
-    // dispatcher tab.
-    let active = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
-    if active.as_deref() != Some(DISPATCHER_TAB) {
+    // dispatcher session.
+    let active = state.update(cx, |s, _cx| s.workspace.active_session_id().map(str::to_string));
+    if active.as_deref() != Some(DISPATCHER_SESSION) {
         failures.push(format!(
-            "({leg}) no-focus: a dispatch must NOT select its tab — the dispatcher \
-             {DISPATCHER_TAB:?} must still be active, got {active:?}"
+            "({leg}) no-focus: a dispatch must NOT select its session — the dispatcher \
+             {DISPATCHER_SESSION:?} must still be active, got {active:?}"
         ));
     }
 }
@@ -707,8 +707,8 @@ async fn run_helper(
         .current_dir(&fixture.repo_subdir)
         .env("HOME", &fixture.home)
         .env("NICE_SOCKET", socket_path)
-        .env("NICE_TAB_ID", DISPATCHER_TAB)
-        .env("NICE_PANE_ID", DISPATCHER_PANE)
+        .env("NICE_TAB_ID", DISPATCHER_SESSION)
+        .env("NICE_PANE_ID", DISPATCHER_WINDOW)
         // Dispatch must NOT inherit the dispatcher's effort (the locked decision
         // the helper has no `CLAUDE_EFFORT` fallback for) — seed one so a
         // regression that re-added the fallback would surface as an `--effort`
@@ -749,8 +749,8 @@ async fn send_dispatch(
     cwd: &str,
     worktree_name: &str,
     task_file: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     instructions: &str,
     model: &str,
     effort: &str,
@@ -759,8 +759,8 @@ async fn send_dispatch(
         cwd,
         worktree_name,
         task_file,
-        tab_id,
-        pane_id,
+        session_id,
+        term_window_id,
         instructions,
         model,
         effort,
@@ -812,8 +812,8 @@ fn dispatch_json(
     cwd: &str,
     worktree_name: &str,
     task_file: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     instructions: &str,
     model: &str,
     effort: &str,
@@ -823,8 +823,8 @@ fn dispatch_json(
         json_escape(cwd),
         json_escape(worktree_name),
         json_escape(task_file),
-        json_escape(tab_id),
-        json_escape(pane_id),
+        json_escape(session_id),
+        json_escape(term_window_id),
         json_escape(instructions),
         json_escape(model),
         json_escape(effort),
@@ -838,25 +838,25 @@ fn json_escape(s: &str) -> String {
 
 // -- model / argv readers ----------------------------------------------------
 
-fn all_tab_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
+fn all_session_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
     state.update(cx, |s, _cx| {
-        s.model
+        s.workspace
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect()
     })
 }
 
-/// Poll until a tab id appears that was not in `before`, returning it.
-async fn poll_new_tab(
+/// Poll until a session id appears that was not in `before`, returning it.
+async fn poll_new_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     before: &[String],
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let now = all_tab_ids(cx, state);
+        let now = all_session_ids(cx, state);
         if let Some(new) = now.iter().find(|t| !before.contains(t)) {
             return Some(new.clone());
         }
@@ -890,26 +890,26 @@ async fn poll_argv_for(
     None
 }
 
-/// Seed a model-only dispatcher Claude tab into a fresh non-Terminals project —
-/// present, non-Terminals, owning [`DISPATCHER_PANE`], so a dispatch resolves it
-/// and nests under it. The pane needs no live pty (resolution is model-only). Its
+/// Seed a model-only dispatcher Claude session into a fresh non-Terminals project —
+/// present, non-Terminals, owning [`DISPATCHER_WINDOW`], so a dispatch resolves it
+/// and nests under it. The window needs no live pty (resolution is model-only). Its
 /// `cwd` is deliberately NOT the scratch repo: a dispatch must spawn from the
-/// PAYLOAD cwd, and only a differing tab cwd can prove that.
-fn seed_dispatcher_tab(cx: &mut AsyncApp, state: &Entity<WindowState>, cwd: &str) {
+/// PAYLOAD cwd, and only a differing session cwd can prove that.
+fn seed_dispatcher_session(cx: &mut AsyncApp, state: &Entity<WindowState>, cwd: &str) {
     state.update(cx, |s, _cx| {
-        s.model.ensure_project("dispatcher-proj", "Dispatcher", cwd);
-        let mut claude = Pane::new(DISPATCHER_PANE, "Claude", PaneKind::Claude);
+        s.workspace.ensure_project("dispatcher-proj", "Dispatcher", cwd);
+        let mut claude = TermWindow::new(DISPATCHER_WINDOW, "Claude", TermWindowKind::Claude);
         claude.is_claude_running = true;
-        let mut tab = Tab::new(DISPATCHER_TAB, "dispatcher", cwd);
-        tab.panes = vec![
+        let mut session = Session::new(DISPATCHER_SESSION, "dispatcher", cwd);
+        session.windows = vec![
             claude,
-            Pane::new(format!("{DISPATCHER_TAB}-t1"), "Terminal 1", PaneKind::Terminal),
+            TermWindow::new(format!("{DISPATCHER_SESSION}-t1"), "Terminal 1", TermWindowKind::Terminal),
         ];
-        tab.active_pane_id = Some(DISPATCHER_PANE.to_string());
-        tab.next_terminal_index = 2;
-        if let Some(pi) = s.model.projects.iter().position(|p| p.id == "dispatcher-proj") {
-            s.model.projects[pi].tabs.push(tab);
+        session.active_window_id = Some(DISPATCHER_WINDOW.to_string());
+        session.next_terminal_index = 2;
+        if let Some(pi) = s.workspace.projects.iter().position(|p| p.id == "dispatcher-proj") {
+            s.workspace.projects[pi].sessions.push(session);
         }
-        s.model.select_tab(DISPATCHER_TAB);
+        s.workspace.select_session(DISPATCHER_SESSION);
     });
 }

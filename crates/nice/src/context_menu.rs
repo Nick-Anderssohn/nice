@@ -17,7 +17,7 @@
 //! [`ContextMenu::new`] (which grabs keyboard focus so Esc reaches it), renders
 //! it as a child while present, and subscribes to [`gpui::DismissEvent`] to drop
 //! it. Slice 3's `TabRow` / `ProjectGroup` wire the right-button trigger and the
-//! per-row item sets (e.g. "Close N Tabs", Rename); R11 reuses this component for
+//! per-row item sets (e.g. "Close N Sessions", Rename); R11 reuses this component for
 //! the toolbar pill menus. This module owns only the reusable popup + item model.
 
 // The component's constructor, `Render`, and the item builders have no in-crate
@@ -411,10 +411,10 @@ mod tests {
 
     #[test]
     fn entry_is_enabled_and_labeled() {
-        let item = ContextMenuItem::entry("Close Tab", |_, _| {});
+        let item = ContextMenuItem::entry("Close Session", |_, _| {});
         assert!(!item.is_separator());
         assert!(item.is_enabled());
-        assert_eq!(item.label(), Some("Close Tab"));
+        assert_eq!(item.label(), Some("Close Session"));
     }
 
     #[test]
@@ -449,8 +449,8 @@ mod tests {
 
     #[test]
     fn plain_entries_and_separators_are_not_selectable_and_carry_no_id() {
-        assert_eq!(ContextMenuItem::entry("Close Tab", |_, _| {}).selected(), None);
-        assert_eq!(ContextMenuItem::entry("Close Tab", |_, _| {}).entry_id(), None);
+        assert_eq!(ContextMenuItem::entry("Close Session", |_, _| {}).selected(), None);
+        assert_eq!(ContextMenuItem::entry("Close Session", |_, _| {}).entry_id(), None);
         assert_eq!(ContextMenuItem::disabled("Settings…").selected(), None);
         assert_eq!(ContextMenuItem::separator().selected(), None);
         assert_eq!(ContextMenuItem::separator().entry_id(), None);
@@ -468,10 +468,10 @@ mod tests {
 
     #[test]
     fn a_dynamic_close_n_label_round_trips() {
-        // Slice 3 builds the "Close N Tabs" label from the selection size; the
+        // Slice 3 builds the "Close N Sessions" label from the selection size; the
         // item model carries whatever label it is handed.
-        let item = ContextMenuItem::entry("Close 3 Tabs", |_, _| {});
-        assert_eq!(item.label(), Some("Close 3 Tabs"));
+        let item = ContextMenuItem::entry("Close 3 Sessions", |_, _| {});
+        assert_eq!(item.label(), Some("Close 3 Sessions"));
         assert!(item.is_enabled());
     }
 }

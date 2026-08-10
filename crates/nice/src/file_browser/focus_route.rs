@@ -21,7 +21,7 @@
 //!      closed-window banner).
 //!   3. **`drive_pending`** (dispatcher, has `&mut App`) drains the recorded
 //!      origins AFTER the undo/redo and drives each real window: `activate_window`
-//!      + sidebar → Files + `select_tab(origin.tab_id)` — Swift's
+//!      + sidebar → Files + `select_session(origin.session_id)` — Swift's
 //!      `FileOperationFocusRouter` behaviour, native shape (the documented
 //!      divergence from its 2-method protocol).
 //!
@@ -105,7 +105,7 @@ pub fn refresh_live(cx: &App) {
     };
     let live: HashSet<String> = WindowRegistry::all_states(cx)
         .iter()
-        .map(|s| s.read(cx).session_id().to_string())
+        .map(|s| s.read(cx).window_session_id().to_string())
         .collect();
     let mut st = router.0.borrow_mut();
     st.live = live;
@@ -114,7 +114,7 @@ pub fn refresh_live(cx: &App) {
 
 /// Drive every route the focus-follow closure resolved this pass: bring the
 /// originating window frontmost, flip its sidebar to Files, and select the origin
-/// tab. No-op when no router is installed / nothing resolved.
+/// session. No-op when no router is installed / nothing resolved.
 pub fn drive_pending(cx: &mut App) {
     let Some(router) = cx.try_global::<FocusRouterGlobal>().map(|g| g.0.clone()) else {
         return;
@@ -125,35 +125,35 @@ pub fn drive_pending(cx: &mut App) {
     }
 }
 
-/// Flip the origin window to Files + select its origin tab, then activate it. The
+/// Flip the origin window to Files + select its origin session, then activate it. The
 /// restored entry becomes visible through R19's watcher hub — no extra refresh.
 fn route_to_origin(cx: &mut App, origin: &FileOperationOrigin) {
-    let Some(state) = WindowRegistry::state_for_session_id(cx, &origin.window_session_id) else {
+    let Some(state) = WindowRegistry::state_for_window_session_id(cx, &origin.window_session_id) else {
         return;
     };
     state.update(cx, |s, cx| {
-        // Only two modes — flip to Files when not already there (`select_tab`
+        // Only two modes — flip to Files when not already there (`select_session`
         // handles a stale/absent id gracefully).
         if s.sidebar.mode() != SidebarMode::Files {
             s.sidebar.toggle_sidebar_mode();
         }
-        if let Some(tab_id) = &origin.tab_id {
-            s.model.select_tab(tab_id);
+        if let Some(session_id) = &origin.session_id {
+            s.workspace.select_session(session_id);
         }
         cx.notify();
     });
-    if let Some(handle) = window_handle_for_session(cx, &origin.window_session_id) {
+    if let Some(handle) = handle_for_window_session_id(cx, &origin.window_session_id) {
         let _ = handle.update(cx, |_root, window, _app| window.activate_window());
     }
 }
 
-/// The live window handle whose `WindowState` carries `session_id` (matched via
+/// The live window handle whose `WindowState` carries `window_session_id` (matched via
 /// the registry's id-keyed lookup over `cx.windows()`). `None` when the origin
 /// window is gone — the caller then leaves the change headless.
-fn window_handle_for_session(cx: &App, session_id: &str) -> Option<AnyWindowHandle> {
+fn handle_for_window_session_id(cx: &App, window_session_id: &str) -> Option<AnyWindowHandle> {
     cx.windows().into_iter().find(|w| {
         WindowRegistry::state_for_window(cx, w.window_id())
-            .is_some_and(|s| s.read(cx).session_id() == session_id)
+            .is_some_and(|s| s.read(cx).window_session_id() == window_session_id)
     })
 }
 
@@ -179,6 +179,6 @@ mod tests {
         let resolved = &router.0.borrow().resolved;
         assert_eq!(resolved.len(), 1, "only the live origin is recorded");
         assert_eq!(resolved[0].window_session_id, "win-A");
-        assert_eq!(resolved[0].tab_id.as_deref(), Some("tab-A"));
+        assert_eq!(resolved[0].session_id.as_deref(), Some("tab-A"));
     }
 }

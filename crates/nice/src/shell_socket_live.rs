@@ -4,16 +4,16 @@
 //! Where the ported unit suites pin the pure pieces (the frozen rc-stub text +
 //! real-zsh chain in [`crate::shell_inject`], the socket parse/normalization +
 //! self-healing in [`crate::control_socket`], the spec-wins env merge + the
-//! per-mode env matrix in [`crate::session_manager`]), this scenario drives the
+//! per-mode env matrix in [`crate::pty_manager`]), this scenario drives the
 //! **whole transport end to end** on a real pty: it spawns real login shells
 //! through the live spawn path with the window's manager env injection active
-//! (`NICE_SOCKET` + the synthetic `ZDOTDIR` rc chain + per-pane ids), then asserts
+//! (`NICE_SOCKET` + the synthetic `ZDOTDIR` rc chain + per-window ids), then asserts
 //! only **transport** properties — never a handler's decision, so it survives R15
 //! replacing the `claude` stub body unchanged.
 //!
 //! ## What it asserts (all fail-loud, grid-poll bounded — never sleep-and-hope)
 //!
-//! 1. **USER_RC_RAN chain-back** — a terminal pane's login shell, under the
+//! 1. **USER_RC_RAN chain-back** — a terminal window's login shell, under the
 //!    synthetic `ZDOTDIR`, restores the user's `ZDOTDIR` and sources the fixture
 //!    `~/.zshrc` (which echoes `USER_RC_RAN`): proof the whole `.zshenv` →
 //!    `.zshrc` chain fires and the `claude()` shadow / OSC 7 hook layer on top.
@@ -21,14 +21,14 @@
 //!    the stub `claude` directly (grid shows its argv echo) and sends NO socket
 //!    message.
 //! 3. **`claude` handshake** — a bare `claude` handshakes over `NICE_SOCKET`; the
-//!    window routing point records a `claude` message carrying the pane's exact
+//!    window routing point records a `claude` message carrying the window's exact
 //!    injected `tabId` / `paneId` and its `cwd`, and a raw-`UnixStream` probe
 //!    confirms exactly ONE newline-terminated reply line comes back (the `Reply`
 //!    one-line contract over the wire).
 //! 4. **raw `session_update`** — the headless app-level driver TRANCHE-2-NOTES §1
 //!    asks for: a raw `UnixStream` `session_update` line surfaces at the routing
 //!    point parsed + normalized (the fire-and-forget path).
-//! 5. **prefill** — a pane spawned with `NICE_PREFILL_COMMAND` in its spec env
+//! 5. **prefill** — a window spawned with `NICE_PREFILL_COMMAND` in its spec env
 //!    shows the pre-typed command at the prompt via the stub's `print -z` tail,
 //!    and (proof nothing ran) its side-effect never happens.
 //! 6. **self-heal** — deleting the socket file autonomously rebinds it at the same
@@ -106,7 +106,7 @@ impl Render for ShellSocketRoot {
 /// The sandboxed fixture: a fake `$HOME` + a marker `.zshrc`, a stub `claude` on a
 /// private `PATH` dir, a stub-written `ZDOTDIR`, and the prefill sentinel path.
 struct Fixture {
-    /// Canonicalized (symlinks resolved) so a pane's `$PWD` compares equal.
+    /// Canonicalized (symlinks resolved) so a window's `$PWD` compares equal.
     home: PathBuf,
     stub_claude: PathBuf,
     zdotdir: PathBuf,
@@ -173,7 +173,7 @@ impl Fixture {
 
 /// Open the `shell-socket` scenario window and spawn its headless driver
 /// (self-reported gate). The per-window [`WindowState`] is minted up front so the
-/// driver can arm its control socket + drive its [`SessionManager`](crate::session_manager::SessionManager)
+/// driver can arm its control socket + drive its [`PtyManager`](crate::pty_manager::PtyManager)
 /// directly against the fixture paths.
 pub fn open_shell_socket_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let fixture = Fixture::build()?;
@@ -212,7 +212,7 @@ async fn run_shell_socket(
 
     let mut failures: Vec<String> = Vec::new();
 
-    // Arm the control socket + set the window's shell-injection env BEFORE any pane
+    // Arm the control socket + set the window's shell-injection env BEFORE any window
     // forks (the env-before-fork invariant), pointing ZDOTDIR at the fixture stubs
     // and using a short health interval so the self-heal step is quick. This is the
     // exact production wiring (`crate::app::arm_window_control_socket`), so a socket
@@ -233,7 +233,7 @@ async fn run_shell_socket(
     });
 
     // === 1. chain-back: spawn a real login shell, poll for USER_RC_RAN ==========
-    let pane1_spec = SpawnSpec::shell(fixture.home_str())
+    let window1_spec = SpawnSpec::shell(fixture.home_str())
         .with_env(vec![
             // HOME is spec-provided so it wins over the forwarded process HOME —
             // the synthetic chain sources THIS fake home's rc, never the real one.
@@ -246,9 +246,9 @@ async fn run_shell_socket(
         ])
         .with_size(ROWS, COLS);
 
-    let Some((tab_id, pane_id, handle)) = spawn_terminal_pane(cx, &state, pane1_spec) else {
+    let Some((session_id, term_window_id, handle)) = spawn_terminal_window(cx, &state, window1_spec) else {
         return CadenceReport::error(
-            "shell-socket: could not create + spawn the handshake terminal pane",
+            "shell-socket: could not create + spawn the handshake terminal window",
         );
     };
     if !poll_grid_contains(cx, &handle, USER_RC_MARKER, READY_POLLS).await {
@@ -277,36 +277,36 @@ async fn run_shell_socket(
     write_line(cx, &handle, b"claude\n");
     let want_cwd = fixture.home.clone();
     let recorded_claude = poll_recorded(cx, &state, ROUTE_POLLS, |m| match m {
-        RecordedSocketMessage::Claude { tab_id: t, .. } => t == &tab_id,
+        RecordedSocketMessage::Claude { session_id: t, .. } => t == &session_id,
         _ => false,
     })
     .await;
     match recorded_claude {
         Some(RecordedSocketMessage::Claude {
             cwd,
-            tab_id: t,
-            pane_id: p,
+            session_id: t,
+            term_window_id: p,
             ..
         }) => {
-            if t != tab_id {
+            if t != session_id {
                 failures.push(format!(
-                    "handshake: recorded tabId {t:?} != the pane's injected NICE_TAB_ID {tab_id:?}"
+                    "handshake: recorded tabId {t:?} != the window's injected NICE_TAB_ID {session_id:?}"
                 ));
             }
-            if p != pane_id {
+            if p != term_window_id {
                 failures.push(format!(
-                    "handshake: recorded paneId {p:?} != the pane's injected NICE_PANE_ID {pane_id:?}"
+                    "handshake: recorded paneId {p:?} != the window's injected NICE_PANE_ID {term_window_id:?}"
                 ));
             }
             if !cwd_matches(&cwd, &want_cwd) {
                 failures.push(format!(
-                    "handshake: recorded cwd {cwd:?} != the pane's spawn cwd {want_cwd:?}"
+                    "handshake: recorded cwd {cwd:?} != the window's spawn cwd {want_cwd:?}"
                 ));
             }
         }
         _ => failures.push(
             "handshake: a bare `claude` did not reach the control socket (no recorded \
-             claude message with the pane's tabId)"
+             claude message with the window's tabId)"
                 .into(),
         ),
     }
@@ -335,22 +335,22 @@ async fn run_shell_socket(
         r#"{"action":"session_update","paneId":"RAW_PANE","sessionId":"RAW_SID","source":"resume","cwd":"/raw/cwd"}"#,
     );
     let recorded_update = poll_recorded(cx, &state, ROUTE_POLLS, |m| {
-        matches!(m, RecordedSocketMessage::SessionUpdate { pane_id, .. } if pane_id == "RAW_PANE")
+        matches!(m, RecordedSocketMessage::SessionUpdate { term_window_id, .. } if term_window_id == "RAW_PANE")
     })
     .await;
     match recorded_update {
         Some(RecordedSocketMessage::SessionUpdate {
-            session_id,
+            claude_session_id,
             source,
             cwd,
             ..
         }) => {
-            if session_id != "RAW_SID"
+            if claude_session_id != "RAW_SID"
                 || source.as_deref() != Some("resume")
                 || cwd.as_deref() != Some("/raw/cwd")
             {
                 failures.push(format!(
-                    "session_update: normalized fields wrong (sid={session_id:?} source={source:?} \
+                    "session_update: normalized fields wrong (sid={claude_session_id:?} source={source:?} \
                      cwd={cwd:?})"
                 ));
             }
@@ -369,7 +369,7 @@ async fn run_shell_socket(
             ("NICE_PREFILL_COMMAND".to_string(), prefill_cmd),
         ])
         .with_size(ROWS, COLS);
-    match spawn_terminal_pane(cx, &state, prefill_spec) {
+    match spawn_terminal_window(cx, &state, prefill_spec) {
         Some((_t, _p, prefill_handle)) => {
             // Wait for readiness (rc marker), then for the pre-typed line to render.
             let _ = poll_grid_contains(cx, &prefill_handle, USER_RC_MARKER, READY_POLLS).await;
@@ -387,7 +387,7 @@ async fn run_shell_socket(
                 );
             }
         }
-        None => failures.push("prefill: could not spawn the prefill pane".into()),
+        None => failures.push("prefill: could not spawn the prefill window".into()),
     }
 
     // === 6. self-heal: delete the socket file, poll until it rebinds ============
@@ -422,21 +422,21 @@ async fn run_shell_socket(
 // Live spawn / grid helpers
 // ---------------------------------------------------------------------------
 
-/// Create a terminal tab via the R10 sidebar seam, spawn its seeded pane through
+/// Create a terminal session via the R10 sidebar seam, spawn its seeded window through
 /// the manager's live spawn path (so the window env injection applies), and return
-/// `(tab_id, pane_id, handle)`.
-fn spawn_terminal_pane(
+/// `(session_id, term_window_id, handle)`.
+fn spawn_terminal_window(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     spec: SpawnSpec,
 ) -> Option<(String, String, Entity<TerminalSessionHandle>)> {
     let ids = state.update(cx, |s, cx| {
-        let tab_id = s.sidebar_actions.create_terminal_tab(&mut s.model)?;
-        let pane_id = s.model.tab_for(&tab_id)?.panes.first()?.id.clone();
-        s.session.spawn_pane(&tab_id, &pane_id, spec, cx).ok()?;
-        Some((tab_id, pane_id))
+        let session_id = s.sidebar_actions.create_terminal_session(&mut s.workspace)?;
+        let term_window_id = s.workspace.session_for(&session_id)?.windows.first()?.id.clone();
+        s.ptys.spawn_window(&session_id, &term_window_id, spec, cx).ok()?;
+        Some((session_id, term_window_id))
     })?;
-    let handle = state.update(cx, |s, _cx| s.session.pane_handle(&ids.0, &ids.1))?;
+    let handle = state.update(cx, |s, _cx| s.ptys.term_window_handle(&ids.0, &ids.1))?;
     Some((ids.0, ids.1, handle))
 }
 
@@ -450,7 +450,7 @@ fn grid_of(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> String 
     handle.update(cx, |h, _cx| h.session().grid_lines().join("\n"))
 }
 
-/// Poll the pane's grid for `needle`, settling between ticks. `true` on the first
+/// Poll the window's grid for `needle`, settling between ticks. `true` on the first
 /// tick it appears, `false` if the poll cap elapses (a real failure — the fixture
 /// never produced it — not a flaky timeout).
 async fn poll_grid_contains(
@@ -569,7 +569,7 @@ async fn settle(cx: &mut AsyncApp, ms: u64) {
         .await;
 }
 
-/// Compare a shell-reported `cwd` against the pane's spawn dir, tolerating symlink
+/// Compare a shell-reported `cwd` against the window's spawn dir, tolerating symlink
 /// differences (`/var` vs `/private/var`) by canonicalizing both sides.
 fn cwd_matches(reported: &str, want: &Path) -> bool {
     if Path::new(reported) == want {
@@ -608,7 +608,7 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             stats: IntervalStats::default(),
             detail: "shell-socket transport OK: the synthetic ZDOTDIR chain sourced the user's \
                      ~/.zshrc (USER_RC_RAN); `claude --help` passed through to the stub with no \
-                     socket message; a bare `claude` handshake recorded the pane's exact \
+                     socket message; a bare `claude` handshake recorded the window's exact \
                      tabId/paneId/cwd and one newline-terminated reply line came back; a raw \
                      session_update surfaced parsed + normalized; NICE_PREFILL_COMMAND pre-typed \
                      at the prompt without executing; the deleted socket self-healed at the same \

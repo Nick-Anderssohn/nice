@@ -7,10 +7,10 @@
 //! binary, which a dev/test crate cannot import (and vice versa) — exactly the
 //! constraint the R9 [`crate::chrome_band`] and R10 [`crate::sidebar_multiselect`]
 //! probes document. So this mirrors that wiring in local probes that drive the
-//! **real** `nice-model` types ([`TabModel`], [`SidebarModel`]) and gpui's **real**
+//! **real** `nice-model` types ([`WorkspaceModel`], [`SidebarModel`]) and gpui's **real**
 //! action/keymap dispatch: a [`RegistryProbe`] gpui global (the `WindowRegistry`
 //! mirror — MRU + `active_state`), a [`WindowStateProbe`] per window (the
-//! `WindowState` mirror — one `TabModel` + `SidebarModel` each), 14 gpui actions
+//! `WindowState` mirror — one `WorkspaceModel` + `SidebarModel` each), 14 gpui actions
 //! generated to mirror `nice_model::shortcuts`, and the app-level-vs-window-level
 //! handler split routed through the registry — the whole R12 dispatch shape, but
 //! over probes so a drift in the *ported* routing / isolation / peek semantics
@@ -25,15 +25,15 @@
 //! event cannot move a real `NSWindow`, and the one clock here is gpui's simulated
 //! one. The four concerns:
 //!
-//! * **Isolation** — two windows own independent `TabModel`s, so a mutation to
-//!   one's tree leaves the other **byte-identical** (a full tab/pane snapshot).
+//! * **Isolation** — two windows own independent `WorkspaceModel`s, so a mutation to
+//!   one's tree leaves the other **byte-identical** (a full session/window snapshot).
 //! * **Routing** — a window-scoped action dispatched while window B is key mutates
 //!   **B** (through the registry's `active_state`), never A; with B deregistered
 //!   (its close), dispatch falls back to the most-recently-keyed surviving window.
 //! * **All 14 fire** — every default combo dispatches to a live handler or, for the
 //!   three deferred actions (hidden-files R19, undo/redo R20), to a **declared
 //!   no-op marker** counter — consumed, not silently missing.
-//! * **Peek set/clear** — a sidebar-tab cycle on a *collapsed* sidebar sets the
+//! * **Peek set/clear** — a sidebar-session cycle on a *collapsed* sidebar sets the
 //!   peek; an *expanded* one does not (the differential); the peek clears once the
 //!   shortcut's modifiers all release, unless the pointer pins it.
 //!
@@ -48,7 +48,7 @@ use gpui::{
 };
 
 use nice_model::shortcuts::{default_bindings, default_combo, ShortcutAction};
-use nice_model::{Pane, PaneKind, SidebarMode, SidebarModel, Tab, TabModel};
+use nice_model::{TermWindow, TermWindowKind, SidebarMode, SidebarModel, Session, WorkspaceModel};
 
 // ---------------------------------------------------------------------------
 // The 14 gpui actions — one struct per `ShortcutAction` case, in a local
@@ -59,11 +59,11 @@ use nice_model::{Pane, PaneKind, SidebarMode, SidebarModel, Tab, TabModel};
 gpui::actions!(
     r12_itests,
     [
-        NextSidebarTab,
-        PrevSidebarTab,
-        NextPane,
-        PrevPane,
-        NewTerminalPane,
+        NextSidebarSession,
+        PrevSidebarSession,
+        NextWindow,
+        PrevWindow,
+        NewTerminalWindow,
         ToggleSidebar,
         ToggleSidebarMode,
         ToggleHiddenFiles,
@@ -78,7 +78,7 @@ gpui::actions!(
 
 // ---------------------------------------------------------------------------
 // WindowStateProbe — the per-window composition root mirror. Holds this window's
-// own `TabModel` + `SidebarModel` (isolation IS each window owning its own tree)
+// own `WorkspaceModel` + `SidebarModel` (isolation IS each window owning its own tree)
 // and the model-only ops the app keymap's window-scoped handlers drive. Ported
 // thin: the real model does the reasoning.
 // ---------------------------------------------------------------------------
@@ -87,12 +87,12 @@ gpui::actions!(
 /// the *key* window via [`RegistryProbe::active_state`], exactly like the app's
 /// `with_active_state`.
 struct WindowStateProbe {
-    /// This window's projects/tabs/panes tree (the isolation unit).
-    model: TabModel,
+    /// This window's projects/sessions/windows tree (the isolation unit).
+    workspace: WorkspaceModel,
     /// This window's sidebar collapse / mode / peek state.
     sidebar: SidebarModel,
-    /// Monotonic pane-id source (mirrors `ModelPaneStripActions`'s minted ids).
-    next_pane_seq: u64,
+    /// Monotonic window-id source (mirrors `ModelWindowStripActions`'s minted ids).
+    next_window_seq: u64,
     /// The `ToggleHiddenFiles` declared-no-op marker: incremented when ⌘⇧. reaches
     /// the (window-scoped, R19-deferred) handler, so "the action fired" is
     /// observable rather than silence.
@@ -106,11 +106,11 @@ struct WindowStateProbe {
 }
 
 impl WindowStateProbe {
-    fn new(model: TabModel, collapsed: bool) -> Self {
+    fn new(workspace: WorkspaceModel, collapsed: bool) -> Self {
         Self {
-            model,
-            sidebar: SidebarModel::new(collapsed, SidebarMode::Tabs),
-            next_pane_seq: 0,
+            workspace,
+            sidebar: SidebarModel::new(collapsed, SidebarMode::Sessions),
+            next_window_seq: 0,
             hidden_files_noop_fires: 0,
             compose_fires: 0,
         }
@@ -118,38 +118,38 @@ impl WindowStateProbe {
 
     // -- window-scoped handler bodies (mirror `keymap::register_window_scoped_actions`)
 
-    /// ⌘⌥↓ — cycle to the next sidebar tab, then float the peek if collapsed.
-    fn next_sidebar_tab(&mut self) {
-        self.model.select_next_sidebar_tab();
+    /// ⌘⌥↓ — cycle to the next sidebar session, then float the peek if collapsed.
+    fn next_sidebar_session(&mut self) {
+        self.workspace.select_next_sidebar_session();
         self.trigger_peek_if_collapsed();
     }
 
-    /// ⌘⌥↑ — cycle to the previous sidebar tab, then float the peek if collapsed.
-    fn prev_sidebar_tab(&mut self) {
-        self.model.select_prev_sidebar_tab();
+    /// ⌘⌥↑ — cycle to the previous sidebar session, then float the peek if collapsed.
+    fn prev_sidebar_session(&mut self) {
+        self.workspace.select_prev_sidebar_session();
         self.trigger_peek_if_collapsed();
     }
 
-    /// ⌘⌥→ — step the active tab's active pane forward (wrapping). Mirror of
-    /// `ModelPaneStripActions::select_next_pane` (`step_active_pane(+1)`).
-    fn next_pane(&mut self) {
-        step_active_pane(&mut self.model, 1);
+    /// ⌘⌥→ — step the active session's active window forward (wrapping). Mirror of
+    /// `ModelWindowStripActions::select_next_window` (`step_active_window(+1)`).
+    fn next_window(&mut self) {
+        step_active_window(&mut self.workspace, 1);
     }
 
-    /// ⌘⌥← — step the active tab's active pane backward (wrapping).
-    fn prev_pane(&mut self) {
-        step_active_pane(&mut self.model, -1);
+    /// ⌘⌥← — step the active session's active window backward (wrapping).
+    fn prev_window(&mut self) {
+        step_active_window(&mut self.workspace, -1);
     }
 
-    /// ⌘T — append an auto-named terminal pane to the active tab and focus it.
-    /// Mirror of `ModelPaneStripActions::add_terminal_pane` over `TabModel::add_pane`.
-    fn new_terminal_pane(&mut self) {
-        let Some(active) = self.model.active_tab_id().map(str::to_owned) else {
+    /// ⌘T — append an auto-named terminal window to the active session and focus it.
+    /// Mirror of `ModelWindowStripActions::add_terminal_window` over `WorkspaceModel::add_window`.
+    fn new_terminal_window(&mut self) {
+        let Some(active) = self.workspace.active_session_id().map(str::to_owned) else {
             return;
         };
-        self.next_pane_seq += 1;
-        let pane_id = format!("probe-pane-{}", self.next_pane_seq);
-        self.model.add_pane(&active, pane_id, None);
+        self.next_window_seq += 1;
+        let term_window_id = format!("probe-pane-{}", self.next_window_seq);
+        self.workspace.add_window(&active, term_window_id, None);
     }
 
     /// ⌘B — flip the sidebar collapsed flag.
@@ -157,7 +157,7 @@ impl WindowStateProbe {
         self.sidebar.toggle_sidebar();
     }
 
-    /// ⌘⇧B — flip the sidebar between tabs and files mode.
+    /// ⌘⇧B — flip the sidebar between sessions and files mode.
     fn toggle_sidebar_mode(&mut self) {
         self.sidebar.toggle_sidebar_mode();
     }
@@ -168,7 +168,7 @@ impl WindowStateProbe {
         self.hidden_files_noop_fires += 1;
     }
 
-    /// After a sidebar-tab cycle on a collapsed sidebar, float the peek overlay —
+    /// After a sidebar-session cycle on a collapsed sidebar, float the peek overlay —
     /// mirror of the app keymap's `trigger_peek_if_collapsed`.
     fn trigger_peek_if_collapsed(&mut self) {
         if self.sidebar.collapsed() {
@@ -177,30 +177,30 @@ impl WindowStateProbe {
     }
 }
 
-/// Wrapping step of the active tab's `active_pane_id` by `offset`, a <2-panes /
-/// no-active no-op — a verbatim mirror of `ModelPaneStripActions::step_active_pane`
-/// (`rem_euclid`), so the ported pane-step semantics are pinned here too.
-fn step_active_pane(model: &mut TabModel, offset: isize) {
-    let Some(tab_id) = model.active_tab_id().map(str::to_owned) else {
+/// Wrapping step of the active session's `active_window_id` by `offset`, a <2-windows /
+/// no-active no-op — a verbatim mirror of `ModelWindowStripActions::step_active_window`
+/// (`rem_euclid`), so the ported window-step semantics are pinned here too.
+fn step_active_window(model: &mut WorkspaceModel, offset: isize) {
+    let Some(session_id) = model.active_session_id().map(str::to_owned) else {
         return;
     };
-    let Some((pi, ti)) = model.project_tab_index(&tab_id) else {
+    let Some((pi, ti)) = model.project_session_index(&session_id) else {
         return;
     };
-    let tab = &model.projects[pi].tabs[ti];
-    let count = tab.panes.len();
+    let session = &model.projects[pi].sessions[ti];
+    let count = session.windows.len();
     if count < 2 {
         return;
     }
-    let Some(active) = tab.active_pane_id.clone() else {
+    let Some(active) = session.active_window_id.clone() else {
         return;
     };
-    let Some(cur) = tab.panes.iter().position(|p| p.id == active) else {
+    let Some(cur) = session.windows.iter().position(|p| p.id == active) else {
         return;
     };
     let next = (cur as isize + offset).rem_euclid(count as isize) as usize;
-    let next_id = tab.panes[next].id.clone();
-    model.projects[pi].tabs[ti].active_pane_id = Some(next_id);
+    let next_id = session.windows[next].id.clone();
+    model.projects[pi].sessions[ti].active_window_id = Some(next_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,11 +347,11 @@ fn register_app_level_actions(cx: &mut App) {
 /// Window-scoped handlers: mutate the key window's state through the registry
 /// (mirror of `keymap::register_window_scoped_actions`).
 fn register_window_scoped_actions(cx: &mut App) {
-    cx.on_action(|_: &NextSidebarTab, cx: &mut App| with_active(cx, |s| s.next_sidebar_tab()));
-    cx.on_action(|_: &PrevSidebarTab, cx: &mut App| with_active(cx, |s| s.prev_sidebar_tab()));
-    cx.on_action(|_: &NextPane, cx: &mut App| with_active(cx, |s| s.next_pane()));
-    cx.on_action(|_: &PrevPane, cx: &mut App| with_active(cx, |s| s.prev_pane()));
-    cx.on_action(|_: &NewTerminalPane, cx: &mut App| with_active(cx, |s| s.new_terminal_pane()));
+    cx.on_action(|_: &NextSidebarSession, cx: &mut App| with_active(cx, |s| s.next_sidebar_session()));
+    cx.on_action(|_: &PrevSidebarSession, cx: &mut App| with_active(cx, |s| s.prev_sidebar_session()));
+    cx.on_action(|_: &NextWindow, cx: &mut App| with_active(cx, |s| s.next_window()));
+    cx.on_action(|_: &PrevWindow, cx: &mut App| with_active(cx, |s| s.prev_window()));
+    cx.on_action(|_: &NewTerminalWindow, cx: &mut App| with_active(cx, |s| s.new_terminal_window()));
     cx.on_action(|_: &ToggleSidebar, cx: &mut App| with_active(cx, |s| s.toggle_sidebar()));
     cx.on_action(|_: &ToggleSidebarMode, cx: &mut App| with_active(cx, |s| s.toggle_sidebar_mode()));
     cx.on_action(|_: &ToggleHiddenFiles, cx: &mut App| {
@@ -388,11 +388,11 @@ fn table_bindings() -> Vec<KeyBinding> {
 /// is bound (mirror of `keymap::shortcut_binding`).
 fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
     match action {
-        ShortcutAction::NextSidebarTab => KeyBinding::new(chord, NextSidebarTab, None),
-        ShortcutAction::PrevSidebarTab => KeyBinding::new(chord, PrevSidebarTab, None),
-        ShortcutAction::NextPane => KeyBinding::new(chord, NextPane, None),
-        ShortcutAction::PrevPane => KeyBinding::new(chord, PrevPane, None),
-        ShortcutAction::NewTerminalPane => KeyBinding::new(chord, NewTerminalPane, None),
+        ShortcutAction::NextSidebarSession => KeyBinding::new(chord, NextSidebarSession, None),
+        ShortcutAction::PrevSidebarSession => KeyBinding::new(chord, PrevSidebarSession, None),
+        ShortcutAction::NextWindow => KeyBinding::new(chord, NextWindow, None),
+        ShortcutAction::PrevWindow => KeyBinding::new(chord, PrevWindow, None),
+        ShortcutAction::NewTerminalWindow => KeyBinding::new(chord, NewTerminalWindow, None),
         ShortcutAction::ToggleSidebar => KeyBinding::new(chord, ToggleSidebar, None),
         ShortcutAction::ToggleSidebarMode => KeyBinding::new(chord, ToggleSidebarMode, None),
         ShortcutAction::ToggleHiddenFiles => KeyBinding::new(chord, ToggleHiddenFiles, None),
@@ -410,7 +410,7 @@ fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
 // ---------------------------------------------------------------------------
 
 /// Window-level modifier-release handler: end the key window's peek once none of
-/// the sidebar-tab shortcuts' modifiers remain (mirror of
+/// the sidebar-session shortcuts' modifiers remain (mirror of
 /// `keymap::on_window_modifiers_changed`).
 fn on_window_modifiers_changed_probe(event: &ModifiersChangedEvent, cx: &mut App) {
     let Some(state) = RegistryProbe::active_state(cx, true) else {
@@ -426,11 +426,11 @@ fn on_window_modifiers_changed_probe(event: &ModifiersChangedEvent, cx: &mut App
     }
 }
 
-/// The union of the sidebar-tab-cycle combos' modifiers (⌘⌥ by default), read from
+/// The union of the sidebar-session-cycle combos' modifiers (⌘⌥ by default), read from
 /// the real table — mirror of `keymap::peek_relevant_modifiers`.
 fn peek_relevant_modifiers() -> Modifiers {
     let mut relevant = Modifiers::default();
-    for action in [ShortcutAction::NextSidebarTab, ShortcutAction::PrevSidebarTab] {
+    for action in [ShortcutAction::NextSidebarSession, ShortcutAction::PrevSidebarSession] {
         if let Some(combo) = default_combo(action) {
             let m = combo.modifiers;
             relevant.control |= m.control;
@@ -486,45 +486,45 @@ impl Render for WindowRootProbe {
 // Harness helpers
 // ---------------------------------------------------------------------------
 
-/// A model of four navigable terminal tabs (Main + `t1`..`t3`), Main active — so a
-/// sidebar-tab cycle genuinely moves the active tab.
-fn seed_multi_tab() -> TabModel {
-    let mut m = TabModel::new("/home/u");
+/// A model of four navigable terminal sessions (Main + `t1`..`t3`), Main active — so a
+/// sidebar-session cycle genuinely moves the active session.
+fn seed_multi_session() -> WorkspaceModel {
+    let mut m = WorkspaceModel::new("/home/u");
     for i in 1..=3 {
         let id = format!("t{i}");
-        let pane_id = format!("{id}-p");
-        let mut tab = Tab::new(id.clone(), format!("Tab {i}"), "/home/u");
-        tab.panes = vec![Pane::new(pane_id.clone(), "Terminal 1", PaneKind::Terminal)];
-        tab.active_pane_id = Some(pane_id);
-        m.projects[0].tabs.push(tab);
+        let term_window_id = format!("{id}-p");
+        let mut session = Session::new(id.clone(), format!("Tab {i}"), "/home/u");
+        session.windows = vec![TermWindow::new(term_window_id.clone(), "Terminal 1", TermWindowKind::Terminal)];
+        session.active_window_id = Some(term_window_id);
+        m.projects[0].sessions.push(session);
     }
-    m.select_tab(TabModel::MAIN_TERMINAL_TAB_ID);
+    m.select_session(WorkspaceModel::MAIN_TERMINAL_SESSION_ID);
     m
 }
 
-/// A model whose active tab (`multi`) has three panes (`a` active) — so a
-/// pane-step genuinely moves the active pane.
-fn seed_multi_pane() -> TabModel {
-    let mut m = seed_multi_tab();
-    let mut tab = Tab::new("multi", "Multi", "/home/u");
-    tab.panes = vec![
-        Pane::new("a", "A", PaneKind::Terminal),
-        Pane::new("b", "B", PaneKind::Terminal),
-        Pane::new("c", "C", PaneKind::Terminal),
+/// A model whose active session (`multi`) has three windows (`a` active) — so a
+/// window-step genuinely moves the active window.
+fn seed_multi_window() -> WorkspaceModel {
+    let mut m = seed_multi_session();
+    let mut session = Session::new("multi", "Multi", "/home/u");
+    session.windows = vec![
+        TermWindow::new("a", "A", TermWindowKind::Terminal),
+        TermWindow::new("b", "B", TermWindowKind::Terminal),
+        TermWindow::new("c", "C", TermWindowKind::Terminal),
     ];
-    tab.active_pane_id = Some("a".into());
-    m.projects[0].tabs.push(tab);
-    m.select_tab("multi");
+    session.active_window_id = Some("a".into());
+    m.projects[0].sessions.push(session);
+    m.select_session("multi");
     m
 }
 
 /// Mint a window-state entity over `model`, seeding the sidebar collapsed or not.
 fn new_state(
     cx: &mut TestAppContext,
-    model: TabModel,
+    workspace: WorkspaceModel,
     collapsed: bool,
 ) -> Entity<WindowStateProbe> {
-    cx.new(|_cx| WindowStateProbe::new(model, collapsed))
+    cx.new(|_cx| WindowStateProbe::new(workspace, collapsed))
 }
 
 /// Open a mocked window rooting a focusable probe over `state`, register it in the
@@ -560,21 +560,21 @@ fn activate(cx: &mut TestAppContext, window: WindowHandle<WindowRootProbe>) {
     cx.run_until_parked();
 }
 
-/// A full tab/pane snapshot of a window's model — the "byte-identical" proxy
-/// (`Tab` is `Clone + Eq`, so this captures ids, titles, panes, active pane, and
-/// per-pane status).
-fn model_snapshot(s: &WindowStateProbe) -> (Option<String>, Vec<Tab>) {
-    let active = s.model.active_tab_id().map(str::to_string);
-    let tabs = s
-        .model
-        .navigable_sidebar_tab_ids()
+/// A full session/window snapshot of a window's model — the "byte-identical" proxy
+/// (`Session` is `Clone + Eq`, so this captures ids, titles, windows, active window, and
+/// per-window status).
+fn model_snapshot(s: &WindowStateProbe) -> (Option<String>, Vec<Session>) {
+    let active = s.workspace.active_session_id().map(str::to_string);
+    let sessions = s
+        .workspace
+        .navigable_sidebar_session_ids()
         .iter()
-        .filter_map(|id| s.model.tab_for(id).cloned())
+        .filter_map(|id| s.workspace.session_for(id).cloned())
         .collect();
-    (active, tabs)
+    (active, sessions)
 }
 
-fn snapshot(cx: &mut TestAppContext, state: &Entity<WindowStateProbe>) -> (Option<String>, Vec<Tab>) {
+fn snapshot(cx: &mut TestAppContext, state: &Entity<WindowStateProbe>) -> (Option<String>, Vec<Session>) {
     cx.update(|app| model_snapshot(state.read(app)))
 }
 
@@ -582,8 +582,8 @@ fn collapsed(cx: &mut TestAppContext, state: &Entity<WindowStateProbe>) -> bool 
     cx.update(|app| state.read(app).sidebar.collapsed())
 }
 
-fn active_tab(cx: &mut TestAppContext, state: &Entity<WindowStateProbe>) -> Option<String> {
-    cx.update(|app| state.read(app).model.active_tab_id().map(str::to_string))
+fn active_session(cx: &mut TestAppContext, state: &Entity<WindowStateProbe>) -> Option<String> {
+    cx.update(|app| state.read(app).workspace.active_session_id().map(str::to_string))
 }
 
 fn app_probe<R>(cx: &mut TestAppContext, f: impl FnOnce(&AppLevelProbe) -> R) -> R {
@@ -594,27 +594,27 @@ fn app_probe<R>(cx: &mut TestAppContext, f: impl FnOnce(&AppLevelProbe) -> R) ->
 // isolation
 // ============================================================================
 
-/// Two windows own independent `TabModel`s: mutating A's tree through A's own seam
+/// Two windows own independent `WorkspaceModel`s: mutating A's tree through A's own seam
 /// leaves B **byte-identical**, and A genuinely diverges. The state-level isolation
 /// guarantee, exercised through two real gpui windows + entities.
 #[gpui::test]
 fn two_windows_own_isolated_models_mutating_a_leaves_b_byte_identical(cx: &mut TestAppContext) {
     install(cx);
-    let a = new_state(cx, seed_multi_tab(), false);
-    let b = new_state(cx, seed_multi_tab(), false);
+    let a = new_state(cx, seed_multi_session(), false);
+    let b = new_state(cx, seed_multi_session(), false);
     let _aw = open_probe_window(cx, a.clone());
     let _bw = open_probe_window(cx, b.clone());
 
     let before_b = snapshot(cx, &b);
 
-    // Mutate A's tree through its own seam (add a terminal pane to the active tab).
-    a.update(cx, |s, _cx| s.new_terminal_pane());
+    // Mutate A's tree through its own seam (add a terminal window to the active session).
+    a.update(cx, |s, _cx| s.new_terminal_window());
     cx.run_until_parked();
 
     assert_eq!(
         before_b,
         snapshot(cx, &b),
-        "B's tab/pane tree is byte-identical after A mutates its own"
+        "B's session/window tree is byte-identical after A mutates its own"
     );
     assert_ne!(
         snapshot(cx, &a),
@@ -633,8 +633,8 @@ fn two_windows_own_isolated_models_mutating_a_leaves_b_byte_identical(cx: &mut T
 #[gpui::test]
 fn window_scoped_action_routes_to_the_key_window_only(cx: &mut TestAppContext) {
     install(cx);
-    let a = new_state(cx, seed_multi_tab(), false);
-    let b = new_state(cx, seed_multi_tab(), false);
+    let a = new_state(cx, seed_multi_session(), false);
+    let b = new_state(cx, seed_multi_session(), false);
     let _aw = open_probe_window(cx, a.clone());
     let bw = open_probe_window(cx, b.clone());
 
@@ -651,8 +651,8 @@ fn window_scoped_action_routes_to_the_key_window_only(cx: &mut TestAppContext) {
 #[gpui::test]
 fn dispatch_falls_back_to_surviving_window_after_the_key_window_closes(cx: &mut TestAppContext) {
     install(cx);
-    let a = new_state(cx, seed_multi_tab(), false);
-    let b = new_state(cx, seed_multi_tab(), false);
+    let a = new_state(cx, seed_multi_session(), false);
+    let b = new_state(cx, seed_multi_session(), false);
     let aw = open_probe_window(cx, a.clone());
     let bw = open_probe_window(cx, b.clone());
 
@@ -694,7 +694,7 @@ fn all_default_combos_generate_a_binding(_cx: &mut TestAppContext) {
 #[gpui::test]
 fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
     install(cx);
-    let state = new_state(cx, seed_multi_pane(), false);
+    let state = new_state(cx, seed_multi_window(), false);
     let win = open_probe_window(cx, state.clone());
     activate(cx, win);
     let w = win.into();
@@ -702,38 +702,38 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
     let combo = |a| default_combo(a).unwrap().chord_str();
 
     // -- window-scoped live handlers ------------------------------------------
-    let before = active_tab(cx, &state);
-    cx.simulate_keystrokes(w, &combo(ShortcutAction::NextSidebarTab));
-    assert_ne!(active_tab(cx, &state), before, "⌘⌥↓ cycled the active sidebar tab");
-    cx.simulate_keystrokes(w, &combo(ShortcutAction::PrevSidebarTab));
-    assert_eq!(active_tab(cx, &state), before, "⌘⌥↑ cycled back");
+    let before = active_session(cx, &state);
+    cx.simulate_keystrokes(w, &combo(ShortcutAction::NextSidebarSession));
+    assert_ne!(active_session(cx, &state), before, "⌘⌥↓ cycled the active sidebar session");
+    cx.simulate_keystrokes(w, &combo(ShortcutAction::PrevSidebarSession));
+    assert_eq!(active_session(cx, &state), before, "⌘⌥↑ cycled back");
 
-    // Active tab is `multi` (a,b,c panes, a active) after the round trip returns to
-    // the seeded active tab — re-select it explicitly to pin pane-step observation.
-    state.update(cx, |s, _| s.model.select_tab("multi"));
-    let pane = |cx: &mut TestAppContext| {
+    // Active session is `multi` (a,b,c windows, a active) after the round trip returns to
+    // the seeded active session — re-select it explicitly to pin window-step observation.
+    state.update(cx, |s, _| s.workspace.select_session("multi"));
+    let term_window = |cx: &mut TestAppContext| {
         cx.update(|app| {
             state
                 .read(app)
-                .model
-                .tab_for("multi")
-                .and_then(|t| t.active_pane_id.clone())
+                .workspace
+                .session_for("multi")
+                .and_then(|t| t.active_window_id.clone())
         })
     };
-    cx.simulate_keystrokes(w, &combo(ShortcutAction::NextPane));
-    assert_eq!(pane(cx).as_deref(), Some("b"), "⌘⌥→ stepped to the next pane");
-    cx.simulate_keystrokes(w, &combo(ShortcutAction::PrevPane));
-    assert_eq!(pane(cx).as_deref(), Some("a"), "⌘⌥← stepped back");
+    cx.simulate_keystrokes(w, &combo(ShortcutAction::NextWindow));
+    assert_eq!(term_window(cx).as_deref(), Some("b"), "⌘⌥→ stepped to the next window");
+    cx.simulate_keystrokes(w, &combo(ShortcutAction::PrevWindow));
+    assert_eq!(term_window(cx).as_deref(), Some("a"), "⌘⌥← stepped back");
 
-    let pane_count = |cx: &mut TestAppContext| {
-        cx.update(|app| state.read(app).model.tab_for("multi").map(|t| t.panes.len()))
+    let window_count = |cx: &mut TestAppContext| {
+        cx.update(|app| state.read(app).workspace.session_for("multi").map(|t| t.windows.len()))
     };
-    let before_panes = pane_count(cx);
-    cx.simulate_keystrokes(w, &combo(ShortcutAction::NewTerminalPane));
+    let before_windows = window_count(cx);
+    cx.simulate_keystrokes(w, &combo(ShortcutAction::NewTerminalWindow));
     assert_eq!(
-        pane_count(cx),
-        before_panes.map(|n| n + 1),
-        "⌘T appended a terminal pane to the active tab"
+        window_count(cx),
+        before_windows.map(|n| n + 1),
+        "⌘T appended a terminal window to the active session"
     );
 
     assert!(!collapsed(cx, &state));
@@ -741,7 +741,7 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
     assert!(collapsed(cx, &state), "⌘B toggled the sidebar collapsed");
 
     let mode = |cx: &mut TestAppContext| cx.update(|app| state.read(app).sidebar.mode());
-    assert_eq!(mode(cx), SidebarMode::Tabs);
+    assert_eq!(mode(cx), SidebarMode::Sessions);
     cx.simulate_keystrokes(w, &combo(ShortcutAction::ToggleSidebarMode));
     assert_eq!(mode(cx), SidebarMode::Files, "⌘⇧B toggled the sidebar mode");
 
@@ -783,7 +783,7 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
 // peek set / clear
 // ============================================================================
 
-/// A sidebar-tab cycle on a **collapsed** sidebar floats the peek; the same cycle
+/// A sidebar-session cycle on a **collapsed** sidebar floats the peek; the same cycle
 /// on an **expanded** sidebar does not (the differential); and once the shortcut's
 /// modifiers all release, the window-level observer clears it — but a pinning
 /// pointer keeps it. Driven through real gpui dispatch + a real modifiers event.
@@ -792,20 +792,20 @@ fn peek_sets_on_collapsed_cycle_and_clears_on_modifier_release(cx: &mut TestAppC
     install(cx);
 
     // Expanded sidebar: a cycle must NOT peek.
-    let expanded = new_state(cx, seed_multi_tab(), false);
+    let expanded = new_state(cx, seed_multi_session(), false);
     let ew = open_probe_window(cx, expanded.clone());
     activate(cx, ew);
-    cx.dispatch_action(ew.into(), NextSidebarTab);
+    cx.dispatch_action(ew.into(), NextSidebarSession);
     assert!(
         !cx.update(|app| expanded.read(app).sidebar.peeking()),
         "an expanded-sidebar cycle does not peek"
     );
 
     // Collapsed sidebar: a cycle DOES peek.
-    let collapsed_state = new_state(cx, seed_multi_tab(), true);
+    let collapsed_state = new_state(cx, seed_multi_session(), true);
     let cw = open_probe_window(cx, collapsed_state.clone());
     activate(cx, cw);
-    cx.dispatch_action(cw.into(), NextSidebarTab);
+    cx.dispatch_action(cw.into(), NextSidebarSession);
     let peeking = |cx: &mut TestAppContext| cx.update(|app| collapsed_state.read(app).sidebar.peeking());
     assert!(peeking(cx), "a collapsed-sidebar cycle floats the peek");
 

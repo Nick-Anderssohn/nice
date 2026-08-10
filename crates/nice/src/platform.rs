@@ -1155,7 +1155,7 @@ type CfTypeRef = *const c_void;
 pub const FLAG_COMMAND: u64 = 0x0010_0000;
 
 /// The `CGEventFlags` ⌥ (Option / Alternate) mask — carried with ⌘ on the
-/// `multiwindow` scenario's ⌘⌥↓ sidebar-tab chord.
+/// `multiwindow` scenario's ⌘⌥↓ sidebar-session chord.
 pub const FLAG_OPTION: u64 = 0x0008_0000;
 
 /// The `CGEventFlags` ⇧ (Shift) mask — carried with ⌘ on the R19 `file-browser`
@@ -1688,7 +1688,7 @@ pub fn select_pinyin_input_source() -> Option<String> {
 /// Why not `background_executor().timer`: macOS App Nap indefinitely defers
 /// coalescable libdispatch timers on an idle/occluded app (the spike observed a
 /// 60 s deadline not firing within 8 minutes). The overlay-worthy case is a
-/// *silent* pane — no output, no events — which is exactly the idle condition
+/// *silent* window — no output, no events — which is exactly the idle condition
 /// that lets App Nap kick in, so the deadline cannot ride a coalescable timer.
 ///
 /// The mechanism (the harness watchdog pattern): a **dedicated OS thread** sleeps
@@ -2161,7 +2161,7 @@ fn ns_window_of(window: &Window) -> Option<*mut AnyObject> {
 /// EXACT action the red traffic-light close button's target invokes. It routes
 /// through the window delegate's `windowShouldClose:` (gpui's
 /// `on_window_should_close` gate) and only closes if it returns `true`, so with
-/// live panes it presents the W5 veto modal and the window stays open — WITHOUT
+/// live windows it presents the W5 veto modal and the window stays open — WITHOUT
 /// invoking the should-close closure directly (AppKit invokes it via the
 /// delegate). The `persistence-restore` scenario uses this to drive the veto: a
 /// synthetic CGEvent click on the native traffic-light button does not

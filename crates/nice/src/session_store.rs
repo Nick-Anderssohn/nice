@@ -1,14 +1,14 @@
 //! Session store (R18) — ports Swift `SessionStore` (`SessionStore.swift`).
 //!
-//! Persists the per-window tab tree to
+//! Persists the per-window session tree to
 //! `<app-support>/Nice RS Dev/sessions.json` so a relaunch restores
-//! windows/tabs/panes. Claude tabs resume via `claude --resume <uuid>`;
-//! terminal-only tabs restore with a fresh shell in their saved cwd.
+//! windows/sessions/windows. Claude sessions resume via `claude --resume <uuid>`;
+//! terminal-only sessions restore with a fresh shell in their saved cwd.
 //!
 //! ## Schema
 //!
 //! The window envelope (`PersistedState`/`PersistedWindow`/`PersistedFrame`)
-//! lives here; the model-shaped leaves (`PersistedPane`/`PersistedTab`/
+//! lives here; the model-shaped leaves (`PersistedTermWindow`/`PersistedSession`/
 //! `PersistedProject`) live gpui-free in `nice-model`. The schema is Swift's v3
 //! **minus `branch`** (M5), tolerant by SHAPE: no version gate on read, unknown
 //! fields ignored (NO `deny_unknown_fields`), nil-omitted optionals. A
@@ -108,12 +108,14 @@ pub struct PersistedFrame {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedWindow {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_tab_id: Option<String>,
+    /// Serialized as `activeTabId` — FROZEN v3 spelling (Phase R renamed the
+    /// field from `active_session_id`, never the JSON key).
+    #[serde(rename = "activeTabId", skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
     pub sidebar_collapsed: bool,
-    /// R19: which sidebar mode (`tabs` / `files`) the window last showed, restored
+    /// R19: which sidebar mode (`sessions` / `files`) the window last showed, restored
     /// per window (Swift's per-window `SceneStorage` mode). OPTIONAL so pre-R19
-    /// files decode (absent ⇒ Tabs, [`nice_model::SidebarMode`]'s restore default)
+    /// files decode (absent ⇒ Sessions, [`nice_model::SidebarMode`]'s restore default)
     /// and the shape-tolerant schema stays non-breaking — R19 adds this schema
     /// slot and is its sole writer/reader (the DO-NOT-SIMPLIFY seam split).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,10 +126,10 @@ pub struct PersistedWindow {
 }
 
 impl PersistedWindow {
-    /// Total saved tabs across all projects — "does this window have restorable
+    /// Total saved sessions across all projects — "does this window have restorable
     /// state" without caring which project owns what.
-    pub fn total_tab_count(&self) -> usize {
-        self.projects.iter().map(|p| p.tabs.len()).sum()
+    pub fn total_session_count(&self) -> usize {
+        self.projects.iter().map(|p| p.sessions.len()).sum()
     }
 }
 
@@ -352,7 +354,7 @@ impl SessionStore {
         self.mark_dirty_and_schedule(&mut inner);
     }
 
-    /// Drop every window with zero tabs except `keeping` (the caller's own slot
+    /// Drop every window with zero sessions except `keeping` (the caller's own slot
     /// so it can still save into it). No-op (no write) when nothing changes.
     pub fn prune_empty_windows(&self, keeping: &str) {
         self.prune_empty_windows_keeping(&[keeping.to_string()]);
@@ -368,7 +370,7 @@ impl SessionStore {
         let before = inner.cached.windows.len();
         let windows: Vec<PersistedWindow> = std::mem::take(&mut inner.cached.windows)
             .into_iter()
-            .filter(|w| keeping.iter().any(|k| k == &w.id) || w.total_tab_count() > 0)
+            .filter(|w| keeping.iter().any(|k| k == &w.id) || w.total_session_count() > 0)
             .collect();
         if windows.len() == before {
             inner.cached.windows = windows;

@@ -1,4 +1,4 @@
-//! Busy-pane close-confirmation copy — the Rust twin of Swift's
+//! Busy-window close-confirmation copy — the Rust twin of Swift's
 //! `CloseRequestCoordinator.describe(pane:)` (`CloseRequestCoordinator.swift:
 //! 281-286`) and `AppShellView.pendingCloseMessage` / `runningPrefix`
 //! (`AppShellView.swift:178-211`), plus the alert chrome itself
@@ -6,16 +6,16 @@
 //!
 //! This is a DISTINCT system from [`crate::lifecycle`]'s R18 quit/window-close
 //! copy (D0/D6): different strings, different buttons ("Force quit" vs
-//! "Quit"/"Close"), different counting (busy panes, not every alive pane) —
+//! "Quit"/"Close"), different counting (busy windows, not every alive window) —
 //! co-locating the two would blur two contracts. Unlike `lifecycle`'s
 //! `quit_dialog_copy` / `close_dialog_copy` (title + confirm label vary by
 //! caller), R20.5's title and both button labels are constant across every
 //! scope, so they are plain constants here rather than fields threaded
 //! through a per-scope builder.
 //!
-//! Only the pure, table-tested copy lives here: [`describe`] (per-pane text)
-//! and the four scope message builders. The busy CLASSIFICATION (which panes
-//! count as busy) reads both the model and `SessionManager` and lives on
+//! Only the pure, table-tested copy lives here: [`describe`] (per-window text)
+//! and the four scope message builders. The busy CLASSIFICATION (which windows
+//! count as busy) reads both the model and `PtyManager` and lives on
 //! `WindowState::request_close_*` (D6) — a later slice, not this module.
 
 // Consumed by `WindowState::request_close_*` (D1/D6, a later slice) when it
@@ -24,7 +24,7 @@
 // `#[test]`s in the meantime.
 #![allow(dead_code)]
 
-use nice_model::{Pane, PaneKind};
+use nice_model::{TermWindow, TermWindowKind};
 
 /// The alert title — constant across every busy-close scope (Swift's
 /// `AppShellView.swift:351`).
@@ -37,14 +37,14 @@ pub(crate) const CONFIRM_LABEL: &str = "Force quit";
 /// The cancel button's label. Swift's `AppShellView.swift:358`.
 pub(crate) const CANCEL_LABEL: &str = "Cancel";
 
-/// One busy pane's description for the alert body — Swift's
-/// `CloseRequestCoordinator.describe(pane:)` (`:281-286`). A Claude pane is
-/// prefixed `"Claude (…)"`; a terminal pane's title is used bare (its
+/// One busy window's description for the alert body — Swift's
+/// `CloseRequestCoordinator.describe(pane:)` (`:281-286`). A Claude window is
+/// prefixed `"Claude (…)"`; a terminal window's title is used bare (its
 /// `status` is meaningless — see D-BUSY §1).
-pub(crate) fn describe(pane: &Pane) -> String {
-    match pane.kind {
-        PaneKind::Claude => format!("Claude ({})", pane.title),
-        PaneKind::Terminal => pane.title.clone(),
+pub(crate) fn describe(term_window: &TermWindow) -> String {
+    match term_window.kind {
+        TermWindowKind::Claude => format!("Claude ({})", term_window.title),
+        TermWindowKind::Terminal => term_window.title.clone(),
     }
 }
 
@@ -62,17 +62,17 @@ fn running_prefix(busy: &[String]) -> String {
 }
 
 /// The `.pane` scope's alert body (Swift `AppShellView.swift:180-182`).
-pub(crate) fn pane_message(busy: &[String]) -> String {
+pub(crate) fn window_message(busy: &[String]) -> String {
     format!(
-        "{} Closing this pane will force it to quit.",
+        "{} Closing this window will force it to quit.",
         running_prefix(busy)
     )
 }
 
 /// The `.tab` scope's alert body (Swift `AppShellView.swift:183-185`).
-pub(crate) fn tab_message(busy: &[String]) -> String {
+pub(crate) fn session_message(busy: &[String]) -> String {
     format!(
-        "{} Closing this tab will force everything in it to quit.",
+        "{} Closing this session will force everything in it to quit.",
         running_prefix(busy)
     )
 }
@@ -80,35 +80,35 @@ pub(crate) fn tab_message(busy: &[String]) -> String {
 /// The `.project` scope's alert body (Swift `AppShellView.swift:186-188`).
 pub(crate) fn project_message(busy: &[String]) -> String {
     format!(
-        "{} Closing this project will force every tab in it to quit.",
+        "{} Closing this project will force every session in it to quit.",
         running_prefix(busy)
     )
 }
 
-/// One busy tab's per-line summary inside the `.tabs` list — Swift's
+/// One busy session's per-line summary inside the `.tabs` list — Swift's
 /// `BusyTabEntry.summary` (`CloseRequestCoordinator.swift:198-211`):
-/// `"<TabTitle> (<Pane1>, <Pane2>)"`, the tab's busy panes already
+/// `"<SessionTitle> (<Window1>, <Window2>)"`, the session's busy windows already
 /// `describe`d and comma+space joined inside the parens.
-pub(crate) fn busy_tab_summary(title: &str, busy_panes: &[String]) -> String {
-    format!("{title} ({})", busy_panes.join(", "))
+pub(crate) fn busy_session_summary(title: &str, busy_windows: &[String]) -> String {
+    format!("{title} ({})", busy_windows.join(", "))
 }
 
 /// The `.tabs` (multi-select) scope's alert body — a vertical list of
-/// per-tab summaries (Swift `AppShellView.swift:189-199`). `tab_summaries`
-/// are each a [`busy_tab_summary`] line, one per busy tab in the batch, in
+/// per-session summaries (Swift `AppShellView.swift:189-199`). `session_summaries`
+/// are each a [`busy_session_summary`] line, one per busy session in the batch, in
 /// batch order. `.tabs` always has `len() >= 2` in practice (single-id
 /// degrades to `.tab`, D5/§T.1), but the `n == 1` lead wording is kept
 /// defensively since Swift also branches on it.
-pub(crate) fn tabs_message(tab_summaries: &[String]) -> String {
-    let n = tab_summaries.len();
+pub(crate) fn sessions_message(session_summaries: &[String]) -> String {
+    let n = session_summaries.len();
     let lead = if n == 1 {
-        "1 tab is busy:".to_string()
+        "1 session is busy:".to_string()
     } else {
-        format!("{n} tabs are busy:")
+        format!("{n} sessions are busy:")
     };
     format!(
         "{lead}\n{}\nClosing them will force everything in them to quit.",
-        tab_summaries.join("\n")
+        session_summaries.join("\n")
     )
 }
 
@@ -116,58 +116,58 @@ pub(crate) fn tabs_message(tab_summaries: &[String]) -> String {
 mod tests {
     use super::*;
 
-    // MARK: - describe (per-pane description)
+    // MARK: - describe (per-window description)
 
     #[test]
-    fn describe_claude_pane_prefixes_claude() {
-        let pane = Pane::new("p1", "auth-refactor", PaneKind::Claude);
-        assert_eq!(describe(&pane), "Claude (auth-refactor)");
+    fn describe_claude_window_prefixes_claude() {
+        let term_window = TermWindow::new("p1", "auth-refactor", TermWindowKind::Claude);
+        assert_eq!(describe(&term_window), "Claude (auth-refactor)");
     }
 
     #[test]
-    fn describe_terminal_pane_is_bare_title() {
-        let pane = Pane::new("p2", "npm run dev", PaneKind::Terminal);
-        assert_eq!(describe(&pane), "npm run dev");
+    fn describe_terminal_window_is_bare_title() {
+        let term_window = TermWindow::new("p2", "npm run dev", TermWindowKind::Terminal);
+        assert_eq!(describe(&term_window), "npm run dev");
     }
 
     // MARK: - running_prefix / singular-scope tails (§2, VERBATIM)
 
     #[test]
-    fn pane_message_singular_item() {
+    fn window_message_singular_item() {
         let busy = vec!["Claude (auth-refactor)".to_string()];
         assert_eq!(
-            pane_message(&busy),
-            "Claude (auth-refactor) is still running. Closing this pane will force it to quit."
+            window_message(&busy),
+            "Claude (auth-refactor) is still running. Closing this window will force it to quit."
         );
     }
 
     #[test]
-    fn pane_message_multiple_items_lists_them() {
+    fn window_message_multiple_items_lists_them() {
         let busy = vec![
             "Claude (auth-refactor)".to_string(),
             "npm run dev".to_string(),
         ];
         assert_eq!(
-            pane_message(&busy),
+            window_message(&busy),
             "These are still running: Claude (auth-refactor), npm run dev. \
-             Closing this pane will force it to quit."
+             Closing this window will force it to quit."
         );
     }
 
     #[test]
-    fn tab_message_singular_and_plural_tail() {
+    fn session_message_singular_and_plural_tail() {
         let one = vec!["Claude (auth-refactor)".to_string()];
         assert_eq!(
-            tab_message(&one),
+            session_message(&one),
             "Claude (auth-refactor) is still running. \
-             Closing this tab will force everything in it to quit."
+             Closing this session will force everything in it to quit."
         );
 
         let two = vec!["Claude (a)".to_string(), "Claude (b)".to_string()];
         assert_eq!(
-            tab_message(&two),
+            session_message(&two),
             "These are still running: Claude (a), Claude (b). \
-             Closing this tab will force everything in it to quit."
+             Closing this session will force everything in it to quit."
         );
     }
 
@@ -177,27 +177,27 @@ mod tests {
         assert_eq!(
             project_message(&one),
             "npm run dev is still running. \
-             Closing this project will force every tab in it to quit."
+             Closing this project will force every session in it to quit."
         );
 
         let two = vec!["npm run dev".to_string(), "Claude (b)".to_string()];
         assert_eq!(
             project_message(&two),
             "These are still running: npm run dev, Claude (b). \
-             Closing this project will force every tab in it to quit."
+             Closing this project will force every session in it to quit."
         );
     }
 
     // MARK: - .tabs vertical list + BusyTabEntry-style summary (§2)
 
     #[test]
-    fn busy_tab_summary_joins_panes_in_parens() {
+    fn busy_session_summary_joins_windows_in_parens() {
         assert_eq!(
-            busy_tab_summary("my-project", &["Claude (auth-refactor)".to_string()]),
+            busy_session_summary("my-project", &["Claude (auth-refactor)".to_string()]),
             "my-project (Claude (auth-refactor))"
         );
         assert_eq!(
-            busy_tab_summary(
+            busy_session_summary(
                 "my-project",
                 &["Claude (a)".to_string(), "npm run dev".to_string()]
             ),
@@ -206,24 +206,24 @@ mod tests {
     }
 
     #[test]
-    fn tabs_message_n_eq_1_lead_is_singular() {
+    fn sessions_message_n_eq_1_lead_is_singular() {
         let summaries = vec!["my-project (Claude (a))".to_string()];
         assert_eq!(
-            tabs_message(&summaries),
-            "1 tab is busy:\nmy-project (Claude (a))\n\
+            sessions_message(&summaries),
+            "1 session is busy:\nmy-project (Claude (a))\n\
              Closing them will force everything in them to quit."
         );
     }
 
     #[test]
-    fn tabs_message_n_ge_2_lead_counts_and_lists_each_tab_on_its_own_line() {
+    fn sessions_message_n_ge_2_lead_counts_and_lists_each_session_on_its_own_line() {
         let summaries = vec![
             "my-project (Claude (a))".to_string(),
             "other-project (npm run dev)".to_string(),
         ];
         assert_eq!(
-            tabs_message(&summaries),
-            "2 tabs are busy:\nmy-project (Claude (a))\nother-project (npm run dev)\n\
+            sessions_message(&summaries),
+            "2 sessions are busy:\nmy-project (Claude (a))\nother-project (npm run dev)\n\
              Closing them will force everything in them to quit."
         );
     }

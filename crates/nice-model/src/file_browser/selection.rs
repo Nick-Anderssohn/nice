@@ -2,8 +2,8 @@
 //! per [`crate::file_browser::state::FileBrowserState`]. Ported from
 //! `Sources/Nice/State/FileBrowserSelection.swift`.
 //!
-//! Mirrors the landed sidebar idiom ([`crate::selection::SidebarTabSelection`])
-//! but keyed by **absolute path** and with **no active-tab invariant** and no
+//! Mirrors the landed sidebar idiom ([`crate::selection::SidebarSessionSelection`])
+//! but keyed by **absolute path** and with **no active-session invariant** and no
 //! toggle-out refusal — Finder semantics throughout:
 //!
 //! * `selected_paths` — current selection; the right-click menu acts on these

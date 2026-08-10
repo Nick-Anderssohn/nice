@@ -7,12 +7,12 @@
 //! the `capture` feature is compiled, corroborated with a pixel probe of the
 //! accent status dot:
 //!
-//! * **Slow, silent pane** (`sh -c 'sleep 3; echo up'`, a **short** grace): the
-//!   pane stays silent past the grace window, so the overlay shows
+//! * **Slow, silent window** (`sh -c 'sleep 3; echo up'`, a **short** grace): the
+//!   window stays silent past the grace window, so the overlay shows
 //!   ([`overlay_visible`] true + the accent dot on the window centre line); when
 //!   `up` finally prints, the first-output event clears it (overlay gone, no
 //!   accent dot).
-//! * **Instant-prompt pane** (a normal `zsh -il`, the default grace): the prompt
+//! * **Instant-prompt window** (a normal `zsh -il`, the default grace): the prompt
 //!   beats the grace window, so the overlay must **never** flash — the state-
 //!   machine counter [`overlay_ever_visible`] stays `false`.
 //!
@@ -50,17 +50,17 @@ const FONT_PX: f32 = 13.0;
 const CELL_W: f32 = 8.0;
 const CELL_H: f32 = 16.0;
 
-/// Short grace for the slow-pane case so the overlay shows promptly (the default
-/// 0.75 s is exercised by the fast-pane case, which must beat it).
+/// Short grace for the slow-window case so the overlay shows promptly (the default
+/// 0.75 s is exercised by the fast-window case, which must beat it).
 const SLOW_GRACE: Duration = Duration::from_millis(400);
 /// Per-channel tolerance for the accent-dot pixel probe. Loose: the only nearby
 /// accent is the dot itself (the terminal bg is near-black, far from Terracotta),
 /// so a loose bound cannot false-match while absorbing gamma/AA at the dot.
 const ACCENT_TOL: u8 = 24;
 
-/// A live overlay-test pane: its window + the session handle + the view (whose
+/// A live overlay-test window: its window + the session handle + the view (whose
 /// overlay state the assertions read).
-struct Pane {
+struct TermWindow {
     window: AnyWindowHandle,
     handle: Entity<TerminalSessionHandle>,
     terminal: Entity<TerminalView>,
@@ -133,9 +133,9 @@ fn center_band_accent(
     }
 }
 
-/// Build a live overlay-test pane: session + view (with the App-Nap-safe deadline
+/// Build a live overlay-test window: session + view (with the App-Nap-safe deadline
 /// injected, and an optional short grace override) + its RAF-animated window.
-fn build_pane(cx: &mut AsyncApp, spec: SpawnSpec, grace: Option<Duration>) -> Result<Pane> {
+fn build_window(cx: &mut AsyncApp, spec: SpawnSpec, grace: Option<Duration>) -> Result<TermWindow> {
     let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
     let theme = TerminalTheme::nice_default_dark();
     let accent = AccentPreset::Terracotta.color();
@@ -165,31 +165,31 @@ fn build_pane(cx: &mut AsyncApp, spec: SpawnSpec, grace: Option<Duration>) -> Re
     })?;
     let window: AnyWindowHandle = window.into();
     crate::app::install_present_kick(&handle, window, cx);
-    Ok(Pane {
+    Ok(TermWindow {
         window,
         handle,
         terminal,
     })
 }
 
-/// Open the `niceties-overlay` scenario window (the slow, silent case-A pane) and
+/// Open the `niceties-overlay` scenario window (the slow, silent case-A window) and
 /// spawn the overlay-timing assertions (self-reported gate). Case B (the instant-
-/// prompt pane) is opened + closed inside the task.
+/// prompt window) is opened + closed inside the task.
 pub fn open_niceties_overlay_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let base = std::env::temp_dir().join(format!("nice-niceties-overlay-{}", std::process::id()));
     std::fs::create_dir_all(&base)?;
     let base_s = base.to_string_lossy().to_string();
-    // A slow, SILENT pane: `exec sh -c 'sleep 3; echo up'` emits nothing until the
+    // A slow, SILENT window: `exec sh -c 'sleep 3; echo up'` emits nothing until the
     // sleep ends (empty ZDOTDIR → no zsh startup bytes before the exec), so the
     // grace window elapses in silence and the overlay shows.
     let spec = SpawnSpec::command("sh -c 'sleep 3; echo up'".to_string(), base_s.clone())
         .with_env(vec![("ZDOTDIR".to_string(), base_s)])
         .with_size(ROWS, COLS);
-    let pane = build_pane(cx, spec, Some(SLOW_GRACE))?;
-    let window = pane.window;
+    let term_window = build_window(cx, spec, Some(SLOW_GRACE))?;
+    let window = term_window.window;
 
     cx.spawn(async move |acx: &mut AsyncApp| {
-        let report = run_niceties_overlay(acx, pane).await;
+        let report = run_niceties_overlay(acx, term_window).await;
         eprintln!("[selftest] scenario 'niceties-overlay': {}", report.detail);
         nice_harness::selftest::report_gate(report);
     })
@@ -198,28 +198,28 @@ pub fn open_niceties_overlay_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle
     Ok(window)
 }
 
-async fn run_niceties_overlay(cx: &mut AsyncApp, pane: Pane) -> CadenceReport {
+async fn run_niceties_overlay(cx: &mut AsyncApp, term_window: TermWindow) -> CadenceReport {
     let _ = cx.update(|app| app.activate(true));
-    // Past the short grace: the silent pane should now be showing the overlay.
+    // Past the short grace: the silent window should now be showing the overlay.
     settle(cx, 900).await;
 
     let accent = AccentPreset::Terracotta.rgb8();
     let mut failures: Vec<String> = Vec::new();
 
     // --- Case A: overlay visible during the silent window --------------------
-    let (visible, ever) = pane
+    let (visible, ever) = term_window
         .terminal
         .update(cx, |v, _| (v.overlay_visible(), v.overlay_ever_visible()));
     if !visible {
         failures.push(
-            "case A: overlay is not visible after the grace window elapsed on a silent pane"
+            "case A: overlay is not visible after the grace window elapsed on a silent window"
                 .to_string(),
         );
     }
     if !ever {
         failures.push("case A: overlay_ever_visible is false while the overlay should be up".into());
     }
-    match center_band_accent(cx, pane.window, accent) {
+    match center_band_accent(cx, term_window.window, accent) {
         Some(true) => {
             eprintln!("[selftest] niceties-overlay case A: accent dot present at centre (visible)")
         }
@@ -235,20 +235,20 @@ async fn run_niceties_overlay(cx: &mut AsyncApp, pane: Pane) -> CadenceReport {
     let mut got_up = false;
     for _ in 0..40 {
         settle(cx, 150).await;
-        if grid_text(cx, &pane.handle).contains("up") {
+        if grid_text(cx, &term_window.handle).contains("up") {
             got_up = true;
             break;
         }
     }
     if !got_up {
-        failures.push("case A: the pane never printed `up` (sleep pane wedged?)".into());
+        failures.push("case A: the window never printed `up` (sleep window wedged?)".into());
     }
     // Let the OutputStarted event drain + clear the overlay before re-reading.
     settle(cx, 300).await;
-    if pane.terminal.update(cx, |v, _| v.overlay_visible()) {
+    if term_window.terminal.update(cx, |v, _| v.overlay_visible()) {
         failures.push("case A: overlay did not clear on first output".into());
     }
-    match center_band_accent(cx, pane.window, accent) {
+    match center_band_accent(cx, term_window.window, accent) {
         Some(true) => failures
             .push("case A: accent dot still painted at centre after the overlay cleared".into()),
         Some(false) => eprintln!(
@@ -257,7 +257,7 @@ async fn run_niceties_overlay(cx: &mut AsyncApp, pane: Pane) -> CadenceReport {
         None => {}
     }
 
-    // --- Case B: an instant-prompt pane never flashes the overlay ------------
+    // --- Case B: an instant-prompt window never flashes the overlay ------------
     let base_b =
         std::env::temp_dir().join(format!("nice-niceties-overlay-fast-{}", std::process::id()));
     if std::fs::create_dir_all(&base_b).is_ok() {
@@ -267,16 +267,16 @@ async fn run_niceties_overlay(cx: &mut AsyncApp, pane: Pane) -> CadenceReport {
         let spec_fast = SpawnSpec::shell(base_b_s.clone())
             .with_env(vec![("ZDOTDIR".to_string(), base_b_s)])
             .with_size(ROWS, COLS);
-        match build_pane(cx, spec_fast, None) {
-            Ok(pane_b) => {
+        match build_window(cx, spec_fast, None) {
+            Ok(window_b) => {
                 let _ = cx.update(|app| app.activate(true));
                 // Well past the default grace: if the overlay were going to flash,
                 // it would have by now.
                 settle(cx, 1200).await;
-                let grid_nonempty = grid_text(cx, &pane_b.handle)
+                let grid_nonempty = grid_text(cx, &window_b.handle)
                     .chars()
                     .any(|c| !c.is_whitespace());
-                let ever_b = pane_b.terminal.update(cx, |v, _| v.overlay_ever_visible());
+                let ever_b = window_b.terminal.update(cx, |v, _| v.overlay_ever_visible());
                 if !grid_nonempty {
                     failures.push(
                         "case B: zsh never printed a prompt — cannot conclude the overlay was \
@@ -286,20 +286,20 @@ async fn run_niceties_overlay(cx: &mut AsyncApp, pane: Pane) -> CadenceReport {
                 }
                 if ever_b {
                     failures.push(
-                        "case B: the overlay flashed for an instant-prompt pane \
+                        "case B: the overlay flashed for an instant-prompt window \
                          (overlay_ever_visible is true; first output should have beaten the grace)"
                             .into(),
                     );
                 }
                 // The harness only manages the primary (case-A) window — close ours.
-                let _ = pane_b
+                let _ = window_b
                     .window
                     .update(cx, |_v, window, _app| window.remove_window());
             }
-            Err(e) => failures.push(format!("case B: could not open the fast-pane window: {e}")),
+            Err(e) => failures.push(format!("case B: could not open the fast-window scenario window: {e}")),
         }
     } else {
-        failures.push("case B: could not create the fast-pane temp dir".into());
+        failures.push("case B: could not create the fast-window temp dir".into());
     }
 
     build_report(failures)
@@ -311,8 +311,8 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: format!(
-                "launch overlay OK: a silent pane shows the overlay past a {}ms grace and clears \
-                 it on first output; an instant-prompt pane never flashes it (state-machine \
+                "launch overlay OK: a silent window shows the overlay past a {}ms grace and clears \
+                 it on first output; an instant-prompt window never flashes it (state-machine \
                  counter). Pixel corroboration best-effort (capture-feature builds).",
                 SLOW_GRACE.as_millis()
             ),

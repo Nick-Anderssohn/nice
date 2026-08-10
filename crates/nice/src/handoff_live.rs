@@ -10,21 +10,21 @@
 //!   stable (idempotent), and `sync_with(false, …)` removes the skill subtree +
 //!   helper file while the shared helper dir survives. NEVER the real `~/.claude`
 //!   / `~/.nice`.
-//! * **(b) handoff socket → nested `[HANDOFF]` tab, opened in the BACKGROUND** —
-//!   a raw-`UnixStream` `handoff` message naming a seeded originating Claude tab
-//!   replies `ok`; a NEW tab appears nested one indent under it (`parent_tab_id`
+//! * **(b) handoff socket → nested `[HANDOFF]` session, opened in the BACKGROUND** —
+//!   a raw-`UnixStream` `handoff` message naming a seeded originating Claude session
+//!   replies `ok`; a NEW session appears nested one indent under it (`parent_session_id`
 //!   → the originating id) with the LOCKED title `[HANDOFF] <originating title>`
-//!   and `title_manually_set == true`; the ORIGINATING tab is still
-//!   `active_tab_id()` (D7 — a handoff never steals focus) while the nested
-//!   child's Claude pane is nonetheless `is_claude_running` (its pty is owned by
-//!   the session entity, not the view, so an unselected tab's Claude really
+//!   and `title_manually_set == true`; the ORIGINATING session is still
+//!   `active_session_id()` (D7 — a handoff never steals focus) while the nested
+//!   child's Claude window is nonetheless `is_claude_running` (its pty is owned by
+//!   the session entity, not the view, so an unselected session's Claude really
 //!   runs); the stub `claude`'s recorded argv carries `--session-id <v4 uuid>`
 //!   then `--model <m> --effort <e>` then the prompt `Read the handoff notes at
 //!   <handoffFile>. <instructions>` as the FINAL positional.
 //! * **(c) top-level fallback on a miss** — a `handoff` with an empty `tabId`
-//!   still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` tab
-//!   (`parent_tab_id == None`), proving a miss is a fallback, not a drop — and it
-//!   too leaves the originating tab active (D7 holds on the fallback path).
+//!   still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` session
+//!   (`parent_session_id == None`), proving a miss is a fallback, not a drop — and it
+//!   too leaves the originating session active (D7 holds on the fallback path).
 //! * **(d) empty model/effort omit their flags** — a `handoff` with `model:""` /
 //!   `effort:""` records argv carrying NEITHER `--model` NOR `--effort`, with the
 //!   prompt still the final positional.
@@ -55,20 +55,20 @@ use anyhow::{Context as _, Result};
 use gpui::{AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, Tab};
+use nice_model::{TermWindow, TermWindowKind, Session};
 
 use crate::app_shell::AppShellView;
-use crate::session_manager::ResolvedClaudePath;
+use crate::pty_manager::ResolvedClaudePath;
 use crate::skill_installer::{HELPER_FILENAME, SKILL_FILENAME};
 use crate::window_registry::WindowRegistry;
 use crate::window_state::WindowState;
 
 // -- timing ------------------------------------------------------------------
 
-/// Poll cap for a routed model mutation (tab creation) after a socket message —
+/// Poll cap for a routed model mutation (session creation) after a socket message —
 /// the drain-task hop, on the real clock.
 const ROUTE_POLLS: usize = 60;
-/// Poll cap for the stub `claude` to record its argv after its pane spawns.
+/// Poll cap for the stub `claude` to record its argv after its window spawns.
 const ARGV_POLLS: usize = 60;
 /// Interval between polls (real wall-clock; the pty children run on OS threads).
 const POLL_MS: u64 = 100;
@@ -114,7 +114,7 @@ impl Fixture {
 
         // The stub `claude`: record its full argv (one arg per line) to a
         // per-invocation file in the capture dir, then block reading stdin so the
-        // pane stays alive until teardown. NEVER the machine's real claude
+        // window stays alive until teardown. NEVER the machine's real claude
         // (hermeticity). The capture dir is baked in (not read from env) so the
         // stub is self-contained.
         let stub = bin.join("claude");
@@ -135,7 +135,7 @@ impl Fixture {
         // process-global (seeded in `open_handoff_window`), and REMOVE any prior
         // scenario's `NICE_CLAUDE_OVERRIDE` so `is_override` stays false and the
         // Nice-injected flags emit (the argv legs depend on it).
-        // SAFETY: single-threaded scenario setup, before any Claude pane forks;
+        // SAFETY: single-threaded scenario setup, before any Claude window forks;
         // matches the existing `std::env::set_var`/`remove_var` seams.
         unsafe { std::env::remove_var("NICE_CLAUDE_OVERRIDE") };
 
@@ -186,13 +186,13 @@ pub fn open_handoff_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let home = fixture.home_str();
     let whandle: WindowHandle<AppShellView> = cx.update(|app| {
         // The shipped builder reads the process-global `SharedFontSettings` (via
-        // the pane host); `install_shortcuts` seeds it (idempotent).
+        // the window host); `install_shortcuts` seeds it (idempotent).
         crate::keymap::install_shortcuts(app);
         // Seed the stub as the resolved claude binary (env override unset ⇒
         // `is_override` false ⇒ the full Nice argv reaches the stub).
         app.set_global(ResolvedClaudePath(Some(stub.clone())));
         // Sandbox HOME (no rc) for the whole driver; restored at teardown.
-        // SAFETY: single-threaded setup; the Main pane forks synchronously inside
+        // SAFETY: single-threaded setup; the Main window forks synchronously inside
         // `open_managed_window` under this HOME.
         unsafe { std::env::set_var("HOME", &home) };
         crate::app::open_managed_window(app)
@@ -246,11 +246,11 @@ async fn run_handoff(
     };
     let work = fixture.work_str();
 
-    // === (b) handoff socket → nested [HANDOFF] tab with locked title + argv ======
-    // Seed a model-only originating Claude tab (present, non-Terminals, owns its
-    // pane) so the handoff nests under it.
-    seed_originating_claude_tab(cx, &state, &work, "orig-tab", "orig-pane", "my-project");
-    let before_b = all_tab_ids(cx, &state);
+    // === (b) handoff socket → nested [HANDOFF] session with locked title + argv ======
+    // Seed a model-only originating Claude session (present, non-Terminals, owns its
+    // window) so the handoff nests under it.
+    seed_originating_claude_session(cx, &state, &work, "orig-tab", "orig-pane", "my-project");
+    let before_b = all_session_ids(cx, &state);
     let hf_b = format!("{work}/handoff-b.md");
     let reply_b = send_handoff(
         cx,
@@ -267,20 +267,20 @@ async fn run_handoff(
     if reply_b.as_deref().map(str::trim_end) != Some("ok") {
         failures.push(format!("(b) nested: expected reply 'ok', got {reply_b:?}"));
     }
-    match poll_new_tab(cx, &state, &before_b).await {
-        None => failures.push("(b) nested: the handoff produced no new tab in the model".into()),
-        Some(new_tab) => {
+    match poll_new_session(cx, &state, &before_b).await {
+        None => failures.push("(b) nested: the handoff produced no new session in the model".into()),
+        Some(new_session) => {
             let snap = state.update(cx, |s, _cx| {
-                s.model.tab_for(&new_tab).map(|t| {
+                s.workspace.session_for(&new_session).map(|t| {
                     (
                         t.title.clone(),
                         t.title_manually_set,
-                        t.parent_tab_id.clone(),
+                        t.parent_session_id.clone(),
                     )
                 })
             });
             match snap {
-                None => failures.push("(b) nested: the new tab vanished before assertion".into()),
+                None => failures.push("(b) nested: the new session vanished before assertion".into()),
                 Some((title, locked, parent)) => {
                     if title != "[HANDOFF] my-project" {
                         failures.push(format!(
@@ -289,41 +289,41 @@ async fn run_handoff(
                     }
                     if !locked {
                         failures.push(
-                            "(b) nested: the handoff tab's title must be LOCKED (title_manually_set == true)".into(),
+                            "(b) nested: the handoff session's title must be LOCKED (title_manually_set == true)".into(),
                         );
                     }
                     if parent.as_deref() != Some("orig-tab") {
                         failures.push(format!(
-                            "(b) nested: the handoff tab must nest under the originating tab \
-                             (parent_tab_id == 'orig-tab'), got {parent:?}"
+                            "(b) nested: the handoff session must nest under the originating session \
+                             (parent_session_id == 'orig-tab'), got {parent:?}"
                         ));
                     }
                 }
             }
 
             // (D7) The handoff opened in the BACKGROUND: selection never moved off
-            // the originating tab, yet the never-rendered child's Claude pane is
+            // the originating session, yet the never-rendered child's Claude window is
             // running (its pty belongs to the session entity, not the view).
             let (active, child_claude_running) = state.update(cx, |s, _cx| {
                 (
-                    s.model.active_tab_id().map(str::to_string),
-                    s.model.tab_for(&new_tab).map(|t| {
-                        t.panes
+                    s.workspace.active_session_id().map(str::to_string),
+                    s.workspace.session_for(&new_session).map(|t| {
+                        t.windows
                             .iter()
-                            .any(|p| p.kind == PaneKind::Claude && p.is_claude_running)
+                            .any(|p| p.kind == TermWindowKind::Claude && p.is_claude_running)
                     }),
                 )
             });
             if active.as_deref() != Some("orig-tab") {
                 failures.push(format!(
-                    "(b) no-focus: the handoff must NOT select its tab — the originating \
+                    "(b) no-focus: the handoff must NOT select its session — the originating \
                      'orig-tab' must still be active, got {active:?}"
                 ));
             }
             if child_claude_running != Some(true) {
                 failures.push(format!(
                     "(b) no-focus: the unselected nested child must still have a RUNNING \
-                     Claude pane (is_claude_running), got {child_claude_running:?}"
+                     Claude window (is_claude_running), got {child_claude_running:?}"
                 ));
             }
         }
@@ -331,7 +331,7 @@ async fn run_handoff(
     // The stub argv: `--session-id <v4> --model <m> --effort <e> <prompt-last>`.
     match poll_argv_for(cx, &fixture, &hf_b).await {
         None => failures.push(
-            "(b) argv: the stub `claude` never recorded an argv naming the handoff file (the pane \
+            "(b) argv: the stub `claude` never recorded an argv naming the handoff file (the window \
              did not spawn, or is_override suppressed the flags)"
                 .into(),
         ),
@@ -345,22 +345,22 @@ async fn run_handoff(
     }
 
     // === (c) top-level fallback on a miss: empty tabId ⇒ [HANDOFF] Session ========
-    let before_c = all_tab_ids(cx, &state);
+    let before_c = all_session_ids(cx, &state);
     let hf_c = format!("{work}/handoff-c.md");
     let reply_c = send_handoff(cx, &socket_path, &work, &hf_c, "", "", "", "", "").await;
     if reply_c.as_deref().map(str::trim_end) != Some("ok") {
         failures.push(format!("(c) fallback: expected reply 'ok' on a miss, got {reply_c:?}"));
     }
-    match poll_new_tab(cx, &state, &before_c).await {
-        None => failures.push("(c) fallback: the miss produced no top-level tab".into()),
-        Some(new_tab) => {
+    match poll_new_session(cx, &state, &before_c).await {
+        None => failures.push("(c) fallback: the miss produced no top-level session".into()),
+        Some(new_session) => {
             let snap = state.update(cx, |s, _cx| {
-                s.model
-                    .tab_for(&new_tab)
-                    .map(|t| (t.title.clone(), t.parent_tab_id.clone()))
+                s.workspace
+                    .session_for(&new_session)
+                    .map(|t| (t.title.clone(), t.parent_session_id.clone()))
             });
             match snap {
-                None => failures.push("(c) fallback: the new tab vanished before assertion".into()),
+                None => failures.push("(c) fallback: the new session vanished before assertion".into()),
                 Some((title, parent)) => {
                     if title != "[HANDOFF] Session" {
                         failures.push(format!(
@@ -369,17 +369,17 @@ async fn run_handoff(
                     }
                     if parent.is_some() {
                         failures.push(format!(
-                            "(c) fallback: a miss must open TOP-LEVEL (parent_tab_id == None), got {parent:?}"
+                            "(c) fallback: a miss must open TOP-LEVEL (parent_session_id == None), got {parent:?}"
                         ));
                     }
                 }
             }
-            // (D7) holds on the bucketing fallback too — a top-level handoff tab
+            // (D7) holds on the bucketing fallback too — a top-level handoff session
             // is just as unselected as a nested one.
-            let active = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
+            let active = state.update(cx, |s, _cx| s.workspace.active_session_id().map(str::to_string));
             if active.as_deref() != Some("orig-tab") {
                 failures.push(format!(
-                    "(c) no-focus: the top-level fallback must NOT select its tab — \
+                    "(c) no-focus: the top-level fallback must NOT select its session — \
                      'orig-tab' must still be active, got {active:?}"
                 ));
             }
@@ -483,12 +483,12 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             detail: "handoff OK: sync_with round-tripped the two -rs files against injected \
                      scratch dirs (helper 0o755, idempotent re-run, uninstall removed the skill \
                      subtree + helper file while the shared dir + R16 sibling survived); a socket \
-                     `handoff` naming a seeded Claude tab replied `ok` and opened a nested \
-                     [HANDOFF]-titled tab (locked, parented under the originating tab) IN THE \
-                     BACKGROUND (the originating tab stayed active while the unselected child's \
-                     Claude pane ran) whose stub argv carried --session-id <v4> --model --effort \
+                     `handoff` naming a seeded Claude session replied `ok` and opened a nested \
+                     [HANDOFF]-titled session (locked, parented under the originating session) IN THE \
+                     BACKGROUND (the originating session stayed active while the unselected child's \
+                     Claude window ran) whose stub argv carried --session-id <v4> --model --effort \
                      then the prompt last; a miss (empty tabId) still replied `ok` and opened a \
-                     top-level [HANDOFF] Session tab, also without stealing focus; and empty \
+                     top-level [HANDOFF] session, also without stealing focus; and empty \
                      model/effort omitted both flags with the prompt still last."
                 .to_string(),
         }
@@ -590,13 +590,13 @@ async fn send_handoff(
     socket_path: &str,
     cwd: &str,
     handoff_file: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     instructions: &str,
     model: &str,
     effort: &str,
 ) -> Option<String> {
-    let payload = handoff_json(cwd, handoff_file, tab_id, pane_id, instructions, model, effort);
+    let payload = handoff_json(cwd, handoff_file, session_id, term_window_id, instructions, model, effort);
     let rx = raw_request(socket_path.to_string(), payload);
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
@@ -643,8 +643,8 @@ fn raw_request(path: String, payload: String) -> Receiver<Option<Vec<u8>>> {
 fn handoff_json(
     cwd: &str,
     handoff_file: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     instructions: &str,
     model: &str,
     effort: &str,
@@ -653,8 +653,8 @@ fn handoff_json(
         "{{\"action\":\"handoff\",\"cwd\":\"{}\",\"handoffFile\":\"{}\",\"tabId\":\"{}\",\"paneId\":\"{}\",\"instructions\":\"{}\",\"model\":\"{}\",\"effort\":\"{}\"}}",
         json_escape(cwd),
         json_escape(handoff_file),
-        json_escape(tab_id),
-        json_escape(pane_id),
+        json_escape(session_id),
+        json_escape(term_window_id),
         json_escape(instructions),
         json_escape(model),
         json_escape(effort),
@@ -668,25 +668,25 @@ fn json_escape(s: &str) -> String {
 
 // -- model / argv readers ----------------------------------------------------
 
-fn all_tab_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
+fn all_session_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
     state.update(cx, |s, _cx| {
-        s.model
+        s.workspace
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect()
     })
 }
 
-/// Poll until a tab id appears that was not in `before`, returning it.
-async fn poll_new_tab(
+/// Poll until a session id appears that was not in `before`, returning it.
+async fn poll_new_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     before: &[String],
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let now = all_tab_ids(cx, state);
+        let now = all_session_ids(cx, state);
         if let Some(new) = now.iter().find(|t| !before.contains(t)) {
             return Some(new.clone());
         }
@@ -720,31 +720,31 @@ async fn poll_argv_for(
     None
 }
 
-/// Seed a model-only originating Claude tab into a fresh non-Terminals project —
-/// present, non-Terminals, owning `pane_id`, so the handoff resolves + nests. The
-/// pane needs no live pty (resolution is model-only).
-fn seed_originating_claude_tab(
+/// Seed a model-only originating Claude session into a fresh non-Terminals project —
+/// present, non-Terminals, owning `term_window_id`, so the handoff resolves + nests. The
+/// window needs no live pty (resolution is model-only).
+fn seed_originating_claude_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     cwd: &str,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     title: &str,
 ) {
     let _ = state.update(cx, |s, _cx| {
-        s.model.ensure_project("orig-proj", "Orig", cwd);
-        let mut claude = Pane::new(pane_id, "Claude", PaneKind::Claude);
+        s.workspace.ensure_project("orig-proj", "Orig", cwd);
+        let mut claude = TermWindow::new(term_window_id, "Claude", TermWindowKind::Claude);
         claude.is_claude_running = true;
-        let mut tab = Tab::new(tab_id, title, cwd);
-        tab.panes = vec![
+        let mut session = Session::new(session_id, title, cwd);
+        session.windows = vec![
             claude,
-            Pane::new(&format!("{tab_id}-t1"), "Terminal 1", PaneKind::Terminal),
+            TermWindow::new(&format!("{session_id}-t1"), "Terminal 1", TermWindowKind::Terminal),
         ];
-        tab.active_pane_id = Some(pane_id.to_string());
-        tab.next_terminal_index = 2;
-        if let Some(pi) = s.model.projects.iter().position(|p| p.id == "orig-proj") {
-            s.model.projects[pi].tabs.push(tab);
+        session.active_window_id = Some(term_window_id.to_string());
+        session.next_terminal_index = 2;
+        if let Some(pi) = s.workspace.projects.iter().position(|p| p.id == "orig-proj") {
+            s.workspace.projects[pi].sessions.push(session);
         }
-        s.model.select_tab(tab_id);
+        s.workspace.select_session(session_id);
     });
 }

@@ -3,9 +3,9 @@
 //!
 //! Drives the **shipped window** restore path with a **temp session store**
 //! (injected via `NICE_APPLICATION_SUPPORT_ROOT`) seeded with a hand-authored
-//! v3-shaped `sessions.json`: a Claude tab with a deliberately stale cwd + a
+//! v3-shaped `sessions.json`: a Claude session with a deliberately stale cwd + a
 //! planted fake `~/.claude/projects` bucket/transcript (the cwd-heal target), a
-//! terminal `Main` tab, a `parentTabId` pair, a saved frame, `sidebarCollapsed:
+//! terminal `Main` session, a `parentTabId` pair, a saved frame, `sidebarCollapsed:
 //! true`. One `Application::run`; the restore fan-out fns are called EXPLICITLY
 //! (the `shell-socket` precedent — no relaunch).
 //!
@@ -17,7 +17,7 @@
 //!   grid-poll shows the pre-typed `claude --resume <sid>` with NOTHING executed;
 //! * **(b)** a raw-socket mutation polls the store file for the debounced
 //!   coalesced write;
-//! * **(c)** the **W5 veto**: with live panes, the REAL close action
+//! * **(c)** the **W5 veto**: with live windows, the REAL close action
 //!   (`-[NSWindow performClose:]` — the exact action the red traffic-light button's
 //!   target invokes, routed through the window delegate's `windowShouldClose:`
 //!   gate, NOT the should-close closure directly; the traffic-light frame helper is
@@ -111,22 +111,22 @@ impl Fixture {
         }
 
         // The R14 ZDOTDIR stub chain (the `print -z` prefill tail) so a restored
-        // deferred-resume Claude pane pre-types NICE_PREFILL_COMMAND.
+        // deferred-resume Claude window pre-types NICE_PREFILL_COMMAND.
         crate::shell_inject::write_stubs(&zdotdir).context("write ZDOTDIR stubs")?;
 
-        // The stub `claude`: idle forever (a restored pane never RUNS it — the
+        // The stub `claude`: idle forever (a restored window never RUNS it — the
         // prefill is only pre-typed). NEVER the machine's real claude.
         let bin = base.join("bin");
         std::fs::create_dir_all(&bin)?;
         let stub = bin.join("claude");
         std::fs::write(&stub, "#!/bin/sh\nwhile IFS= read -r _l; do : ; done\n")?;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
-        // SAFETY: single-threaded scenario setup before any pane forks.
+        // SAFETY: single-threaded scenario setup before any window forks.
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
         // Plant the heal bucket: `<projects_root>/<bucket(recovered)>/sid.jsonl`
         // whose transcript head carries a top-level cwd == the recovered dir. The
-        // fixture Claude tab's persisted cwd points at a NON-existent stale path, so
+        // fixture Claude session's persisted cwd points at a NON-existent stale path, so
         // the heal must scan, find this bucket, and adopt `recovered`.
         let recovered_str = recovered.to_string_lossy().into_owned();
         let bucket = projects_root.join(encode_claude_bucket(&recovered_str));
@@ -136,8 +136,8 @@ impl Fixture {
             format!("{{\"type\":\"user\",\"cwd\":\"{recovered_str}\",\"sessionId\":\"{SID}\"}}\n"),
         )?;
 
-        // The hand-authored v3 store file (a parentTabId pair, a Claude tab with a
-        // stale cwd, a Main terminal tab, a frame, sidebarCollapsed true).
+        // The hand-authored v3 store file (a parentTabId pair, a Claude session with a
+        // stale cwd, a Main terminal session, a frame, sidebarCollapsed true).
         let store_dir = support_root.join(session_store::store_folder());
         std::fs::create_dir_all(&store_dir)?;
         let home_s = home.to_string_lossy();
@@ -231,7 +231,7 @@ pub fn open_persistence_restore_window(cx: &mut AsyncApp) -> Result<AnyWindowHan
             std::env::set_var("NICE_APPLICATION_SUPPORT_ROOT", &support);
             std::env::set_var("NICE_CLAUDE_PROJECTS_ROOT", &projects);
         }
-        // The restored deferred-resume Claude pane forks with the synthetic ZDOTDIR
+        // The restored deferred-resume Claude window forks with the synthetic ZDOTDIR
         // rc chain so its `print -z` tail pre-types NICE_PREFILL_COMMAND.
         crate::app::set_scenario_shell_inject_config(app, Some(zdotdir.clone()), None);
 
@@ -314,21 +314,21 @@ async fn run_persistence_restore(
 
     // === (a) restore round-trip ============================================
     // Model tree: the saved grouping is trusted (proj + Terminals), lineage intact.
-    let tab_ids = state.update(cx, |s, _| {
-        s.model
+    let session_ids = state.update(cx, |s, _| {
+        s.workspace
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect::<Vec<_>>()
     });
     for expect in ["terminals-main", "claude-tab", "child-tab"] {
-        if !tab_ids.iter().any(|t| t == expect) {
-            failures.push(format!("(a) restored tree is missing tab '{expect}'"));
+        if !session_ids.iter().any(|t| t == expect) {
+            failures.push(format!("(a) restored tree is missing session '{expect}'"));
         }
     }
-    // Lineage: child-tab's parent survived → link intact.
+    // Lineage: child-session's parent survived → link intact.
     let child_parent =
-        state.update(cx, |s, _| s.model.tab_for("child-tab").and_then(|t| t.parent_tab_id.clone()));
+        state.update(cx, |s, _| s.workspace.session_for("child-tab").and_then(|t| t.parent_session_id.clone()));
     if child_parent.as_deref() != Some("claude-tab") {
         failures.push(format!(
             "(a) lineage lost: child-tab parent = {child_parent:?}, expected Some(\"claude-tab\")"
@@ -354,20 +354,20 @@ async fn run_persistence_restore(
     }
     // cwd-heal corrected the stale Claude cwd to the recovered worktree path.
     let recovered = fixture.recovered.to_string_lossy().into_owned();
-    let healed_cwd = state.update(cx, |s, _| s.model.tab_for("claude-tab").map(|t| t.cwd.clone()));
+    let healed_cwd = state.update(cx, |s, _| s.workspace.session_for("claude-tab").map(|t| t.cwd.clone()));
     if healed_cwd.as_deref() != Some(recovered.as_str()) {
         failures.push(format!(
             "(a) cwd-heal did not adopt the recovered cwd: claude-tab.cwd = {healed_cwd:?}, \
              expected {recovered:?}"
         ));
     }
-    // The deferred-resume Claude pane lazy-spawns on activation and pre-types
+    // The deferred-resume Claude window lazy-spawns on activation and pre-types
     // `claude --resume <sid>` with NOTHING executed (the stub never runs).
     let mut spawned = None;
     for _ in 0..READY_POLLS {
         settle(cx, POLL_MS).await;
         if let Some(h) =
-            state.update(cx, |s, _| s.session.pane_handle("claude-tab", "claude-tab-claude"))
+            state.update(cx, |s, _| s.ptys.term_window_handle("claude-tab", "claude-tab-claude"))
         {
             spawned = Some(h);
             break;
@@ -378,34 +378,34 @@ async fn run_persistence_restore(
             let needle = format!("claude --resume {SID}");
             if !poll_grid_contains(cx, &h, &needle).await {
                 failures.push(format!(
-                    "(a) the restored Claude pane never pre-typed '{needle}' (deferred-resume \
+                    "(a) the restored Claude window never pre-typed '{needle}' (deferred-resume \
                      prefill / ZDOTDIR chain did not land)"
                 ));
             }
         }
         None => failures
-            .push("(a) the restored Claude active pane never lazy-spawned its deferred shell".into()),
+            .push("(a) the restored Claude active window never lazy-spawned its deferred shell".into()),
     }
 
     // === (b) socket mutation → debounced store write ========================
     if let Some(socket_path) = state.update(cx, |s, _| s.control_socket_path()) {
         let own = cx.update(|_| session_store::default_store_path());
-        let tabs_before = store_file_tab_count(&own);
+        let sessions_before = store_file_session_count(&own);
         let work = fixture.work.to_string_lossy().into_owned();
-        // A socket `claude` newtab with an empty tabId opens a new tab (a model
+        // A socket `claude` newtab with an empty tabId opens a new session (a model
         // mutation) — which fires the post-gate save trigger.
         let _ = send_claude_newtab(cx, &socket_path, &work).await;
         let mut wrote = false;
         for _ in 0..READY_POLLS {
             settle(cx, POLL_MS).await;
-            if store_file_tab_count(&own) > tabs_before {
+            if store_file_session_count(&own) > sessions_before {
                 wrote = true;
                 break;
             }
         }
         if !wrote {
             failures.push(
-                "(b) a socket mutation did not produce a debounced store write (tab count on disk \
+                "(b) a socket mutation did not produce a debounced store write (session count on disk \
                  never grew)"
                     .into(),
             );
@@ -576,7 +576,7 @@ async fn veto_leg(
 
     // The window stays OPEN (the veto) and the modal is presented.
     if cx.update(|app| WindowRegistry::state_for_window(app, win_id)).is_none() {
-        failures.push("(c) the close action closed the window with live panes (no veto)".into());
+        failures.push("(c) the close action closed the window with live term windows (no veto)".into());
         return Ok(());
     }
     if !state.update(cx, |s, _| s.pending_modal().is_some()) {
@@ -587,7 +587,7 @@ async fn veto_leg(
     // was `cx.notify()`-only; on an occluded window (stopped CVDisplayLink) notify
     // never presents, so the modal grabbed focus but painted nothing and the app
     // looked frozen — every quit/close funnels here because an idle shell keeps a
-    // pane alive. The frontmost self-test window can't reproduce the occluded
+    // window alive. The frontmost self-test window can't reproduce the occluded
     // pixels (its link runs, so notify presents), so we pin the MECHANISM directly:
     // the modal-kick counter must have advanced across the present. With the kick
     // absent (pre-fix) this delta is 0 and the assert fails.
@@ -742,7 +742,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
     let path = dir.join("sessions.json");
     let good = PersistedWindow {
         id: "keep-me".into(),
-        active_tab_id: None,
+        active_session_id: None,
         sidebar_collapsed: false,
         sidebar_mode: None,
         projects: sample_projects(),
@@ -750,7 +750,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
     };
     let ghost = PersistedWindow {
         id: "ghost".into(),
-        active_tab_id: None,
+        active_session_id: None,
         sidebar_collapsed: false,
         sidebar_mode: None,
         projects: vec![],
@@ -779,8 +779,8 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
     if seed.frame.as_ref() != Some(&FIXTURE_FRAME) {
         failures.push("(d) surviving seed frame does not match the saved record".into());
     }
-    if seed.projects.iter().flat_map(|p| p.tabs.iter()).count() == 0 {
-        failures.push("(d) surviving seed hydrated no tabs".into());
+    if seed.projects.iter().flat_map(|p| p.sessions.iter()).count() == 0 {
+        failures.push("(d) surviving seed hydrated no sessions".into());
     }
 }
 
@@ -789,15 +789,15 @@ fn sample_projects() -> Vec<nice_model::PersistedProject> {
         id: "proj".into(),
         name: "Proj".into(),
         path: "/work".into(),
-        tabs: vec![nice_model::PersistedTab {
+        sessions: vec![nice_model::PersistedSession {
             id: "t1".into(),
             title: "A".into(),
             cwd: "/work".into(),
             claude_session_id: None,
-            active_pane_id: None,
-            panes: vec![],
+            active_window_id: None,
+            windows: vec![],
             title_manually_set: None,
-            parent_tab_id: None,
+            parent_session_id: None,
             next_terminal_index: None,
         }],
     }]
@@ -809,7 +809,7 @@ fn quit_cascade_leg(failures: &mut Vec<String>) {
     use crate::lifecycle::{close_disposition, CloseDisposition};
     // Once quit has begun (AppQuitting), EVERY window close is inert — it PRESERVES
     // the snapshot, never removes it (the production wipe regression: a
-    // willClose firing during teardown must not wipe the window's saved tabs).
+    // willClose firing during teardown must not wipe the window's saved sessions).
     let confirmed_user_close = true;
     if close_disposition(true, confirmed_user_close) != CloseDisposition::Preserve {
         failures.push(
@@ -845,12 +845,12 @@ async fn poll_grid_contains(
     false
 }
 
-fn store_file_tab_count(path: &Path) -> usize {
+fn store_file_session_count(path: &Path) -> usize {
     session_store::read_state(path)
         .windows
         .iter()
         .flat_map(|w| w.projects.iter())
-        .map(|p| p.tabs.len())
+        .map(|p| p.sessions.len())
         .sum()
 }
 

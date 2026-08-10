@@ -2,7 +2,7 @@
 
 > **Never lose track of a Claude session again - even between restarts.**
 
-A native macOS terminal that organizes your Claude Code sessions for you. Run `claude` (or `claude -w worktree-name-here`) anywhere — Nice spawns it in a fresh pty and files it under the right project in the sidebar. No config, no setup, no "where did that window go" dance. Sessions persist through restarts — tabs are reopened with prepopulated `claude --resume id-here` commands.
+A native macOS terminal that organizes your Claude Code sessions for you. Run `claude` (or `claude -w worktree-name-here`) anywhere — Nice spawns it in a fresh pty and files it under the right project in the sidebar. No config, no setup, no "where did that window go" dance. Sessions persist through restarts — they are reopened with prepopulated `claude --resume id-here` commands.
 
 ```sh
 brew install --cask Nick-Anderssohn/nice/nice
@@ -16,7 +16,7 @@ brew install --cask Nick-Anderssohn/nice/nice
 
 You don't organize your Claude sessions. Nice does.
 
-Type `claude <args>` in any shell, from any project directory — a new tab opens in Nice, auto-grouped under the right project, running in its own long-lived pty with a plain `zsh` pane alongside.
+Type `claude <args>` in any shell, from any project directory — a new session opens in Nice, auto-grouped under the right project, running in its own long-lived pty with a plain `zsh` window alongside.
 
 ## The themes are lit 🔥
 
@@ -39,11 +39,11 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 
 | Shortcut | Action |
 |---|---|
-| `⌘⌥↓` / `⌘⌥↑` | Next / previous sidebar tab |
-| `⌘⌥→` / `⌘⌥←` | Next / previous pane within a tab |
-| `⌘T` | New terminal pane |
+| `⌘⌥↓` / `⌘⌥↑` | Next / previous sidebar session |
+| `⌘⌥→` / `⌘⌥←` | Next / previous window within a session |
+| `⌘T` | New terminal window |
 | `⌘B` | Toggle sidebar |
-| `⌘⇧B` | Toggle sidebar mode (tabs ↔ file browser) |
+| `⌘⇧B` | Toggle sidebar mode (sessions ↔ file browser) |
 | `⌘⇧.` | Toggle hidden files in the file browser |
 | `⌘+` / `⌘-` / `⌘0` | Zoom in, out, reset |
 | `⌘Z` / `⌘⇧Z` | Undo / redo file operation |
@@ -54,7 +54,7 @@ All rebindable in Settings (`⌘,`).
 ## Requirements
 
 - macOS 14 (Sonoma) or later
-- [Claude Code](https://github.com/anthropics/claude-code) on your `$PATH` — optional; tabs fall back to a plain `zsh` if it's missing
+- [Claude Code](https://github.com/anthropics/claude-code) on your `$PATH` — optional; sessions fall back to a plain `zsh` if it's missing
 
 ## Install
 
@@ -69,6 +69,6 @@ Signed, notarized, universal (Apple Silicon + Intel). `brew upgrade --cask nice`
 Nice is a native Rust app rendered on a single Metal stack:
 
 - [GPUI](https://www.gpui.rs) — the GPU-accelerated UI framework from [Zed](https://github.com/zed-industries/zed). The whole app (chrome, sidebar, and terminal) is drawn GPUI-native; Nice vendors a pinned Zed checkout with a small set of local patches.
-- [alacritty_terminal](https://github.com/alacritty/alacritty) — the VT engine (grid, scrollback, damage tracking, and VTE parsing) behind Nice's terminal panes.
+- [alacritty_terminal](https://github.com/alacritty/alacritty) — the VT engine (grid, scrollback, damage tracking, and VTE parsing) behind Nice's terminal windows.
 
 Terminal themes are compatible with [Ghostty](https://ghostty.org)'s theme file format.

@@ -11,10 +11,10 @@
 //!
 //! Today that is two pairs:
 //!   * **`nice-handoff`** + `~/.nice/nice-handoff.sh` → the `handoff` socket
-//!     action (hand the current work to a fresh session in a new tab).
+//!     action (hand the current work to a fresh session in a new Nice session).
 //!   * **`nice-dispatch`** + `~/.nice/nice-dispatch.sh` → the `dispatch` socket
 //!     action (farm a task brief out to a fresh session in its OWN `claude
-//!     --worktree` tab, opened in the background).
+//!     --worktree` session, opened in the background).
 //!
 //! Both ride the SINGLE `installHandoffSkill` CFPref toggle (there is no second
 //! toggle): flipping it on installs every pair, off removes every pair.
@@ -64,7 +64,7 @@ use crate::atomic_file::write_atomic;
 /// a Swift-installed copy is a no-op.
 pub const SKILL_MARKDOWN: &str = r#"---
 name: nice-handoff
-description: Hand off the current work to a fresh Claude session in a new Nice tab. Use when the context window is getting full, or when the user asks to hand off / continue work in a clean session. Writes a handoff file capturing the current state and opens a new nested tab that picks up where this one left off.
+description: Hand off the current work to a fresh Claude session in a new Nice session. Use when the context window is getting full, or when the user asks to hand off / continue work in a clean session. Writes a handoff file capturing the current state and opens a new nested session that picks up where this one left off.
 ---
 
 Follow these steps exactly to hand off to a fresh session:
@@ -99,7 +99,7 @@ Include all of:
   non-obvious decisions, or anything the new session must know to avoid
   repeating mistakes.
 
-## 2. Open the handoff tab
+## 2. Open the handoff session
 
 Run the helper, passing three arguments:
 
@@ -145,13 +145,13 @@ A forwarded string that still says "hand off…" makes the new session
 try to hand off AGAIN instead of doing the work. Beyond stripping that
 framing, do not editorialize or add instructions of your own.
 
-The third argument carries your model id so the new tab launches on the
+The third argument carries your model id so the new session launches on the
 same model. Your effort level is forwarded automatically by the helper
 (it reads `CLAUDE_EFFORT` from the environment), so you do not pass it.
 
 ## 3. Report back
 
-Tell the user that the handoff tab is opening (or relay any error the
+Tell the user that the handoff session is opening (or relay any error the
 helper printed to stderr). Keep it brief — one or two sentences."#;
 
 /// The bash helper written to `<helper_dir>/nice-handoff.sh` (via
@@ -163,7 +163,7 @@ helper printed to stderr). Keep it brief — one or two sentences."#;
 /// The `_nice_esc` tab-`sed` (`s/<TAB>/\t/g`) carries a LITERAL horizontal-tab
 /// byte between the slashes — load-bearing, preserved verbatim.
 pub const HELPER_SCRIPT: &str = r#"#!/usr/bin/env bash
-# nice-handoff.sh — opens a new Nice tab pre-loaded with a handoff file
+# nice-handoff.sh — opens a new Nice session pre-loaded with a handoff file
 # so a fresh Claude session can continue the current work. Posts a JSON
 # `handoff` message to Nice's control socket.
 # Installed automatically by Nice; safe to delete.
@@ -172,7 +172,7 @@ pub const HELPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 #       $2 = continuation instructions (optional)
 #       $3 = model id to launch the new session with (optional)
 # The effort level is NOT an argument: it is read from the CLAUDE_EFFORT
-# environment variable Claude Code exports into the pane, so the new
+# environment variable Claude Code exports into the window, so the new
 # session inherits the current effort tier automatically. CLAUDE_EFFORT
 # already holds the literal `claude --effort` token (low/medium/high/
 # xhigh/max) — Nice forwards it verbatim and does NOT translate it.
@@ -181,7 +181,7 @@ pub const HELPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 set -u
 
 if [ -z "${NICE_SOCKET:-}" ] || [ -z "${NICE_PANE_ID:-}" ]; then
-  printf 'nice: not running inside a Nice pane; cannot open a handoff tab\n' >&2
+  printf 'nice: not running inside a Nice window; cannot open a handoff session\n' >&2
   exit 1
 fi
 
@@ -194,7 +194,7 @@ fi
 INSTRUCTIONS="${2:-}"
 MODEL="${3:-}"
 # Effort tier is read from the environment, not passed as an argument:
-# Claude Code exports CLAUDE_EFFORT (e.g. "xhigh") into the pane. Empty
+# Claude Code exports CLAUDE_EFFORT (e.g. "xhigh") into the window. Empty
 # when the user is at the implicit default — Nice then omits --effort.
 EFFORT="${CLAUDE_EFFORT:-}"
 
@@ -232,7 +232,7 @@ PAYLOAD=$(printf '{"action":"handoff","cwd":"%s","handoffFile":"%s","tabId":"%s"
 REPLY=$(printf '%s\n' "$PAYLOAD" | /usr/bin/nc -U -w 2 "$NICE_SOCKET")
 
 if [ -z "$REPLY" ]; then
-  printf 'nice: no reply from control socket; handoff tab may not have opened\n' >&2
+  printf 'nice: no reply from control socket; handoff session may not have opened\n' >&2
   exit 1
 fi
 
@@ -242,7 +242,7 @@ case "$REPLY" in
     exit 1
     ;;
   *)
-    printf 'nice: handoff tab opening…\n'
+    printf 'nice: handoff session opening…\n'
     exit 0
     ;;
 esac"#;
@@ -261,7 +261,7 @@ esac"#;
 /// write-only-if-changed byte compare is exact).
 pub const DISPATCH_SKILL_MARKDOWN: &str = r#"---
 name: nice-dispatch
-description: Dispatch a task to a fresh Claude session working in its own git worktree, in a new background Nice tab. Use when the user asks to dispatch, farm out, or parallelise a task into its own worktree. Writes a task brief and opens a nested tab running `claude --worktree <name>` on it, without stealing focus from the current tab.
+description: Dispatch a task to a fresh Claude session working in its own git worktree, in a new background Nice session. Use when the user asks to dispatch, farm out, or parallelise a task into its own worktree. Writes a task brief and opens a nested session running `claude --worktree <name>` on it, without stealing focus from the current session.
 ---
 
 Follow these steps exactly to dispatch a task to a new worktree session.
@@ -312,7 +312,7 @@ questions. Include all of:
 End the brief by telling the session to commit its work on its worktree
 branch.
 
-## 3. Open the dispatch tab
+## 3. Open the dispatch session
 
 Run the helper with five arguments:
 
@@ -342,12 +342,12 @@ So the common case, with no instructions and no overrides, is:
 ```
 
 To dispatch several tasks, repeat steps 1-3 once per task: each gets its
-own worktree name, its own task file, and its own tab.
+own worktree name, its own task file, and its own session.
 
 ## 4. Report back
 
-Tell the user the dispatch tab is opening in the background and that the
-current tab keeps focus, naming the worktree (or relay any error the
+Tell the user the dispatch session is opening in the background and that the
+current session keeps focus, naming the worktree (or relay any error the
 helper printed to stderr). Keep it brief — one or two sentences."#;
 
 /// The bash helper written to `<helper_dir>/nice-dispatch.sh` (mode 0755) —
@@ -371,7 +371,7 @@ helper printed to stderr). Keep it brief — one or two sentences."#;
 /// byte between the slashes — load-bearing, preserved verbatim. NO trailing
 /// newline (parity with [`HELPER_SCRIPT`]).
 pub const DISPATCH_HELPER_SCRIPT: &str = r#"#!/usr/bin/env bash
-# nice-dispatch.sh — opens a new background Nice tab running
+# nice-dispatch.sh — opens a new background Nice session running
 # `claude --worktree <name>` on a task file the dispatching session wrote,
 # so the task is worked in its own worktree. Posts a JSON `dispatch`
 # message to Nice's control socket.
@@ -389,7 +389,7 @@ pub const DISPATCH_HELPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 set -u
 
 if [ -z "${NICE_SOCKET:-}" ] || [ -z "${NICE_PANE_ID:-}" ]; then
-  printf 'nice: not running inside a Nice pane; cannot open a dispatch tab\n' >&2
+  printf 'nice: not running inside a Nice window; cannot open a dispatch session\n' >&2
   exit 1
 fi
 
@@ -459,7 +459,7 @@ PAYLOAD=$(printf '{"action":"dispatch","cwd":"%s","worktreeName":"%s","taskFile"
 REPLY=$(printf '%s\n' "$PAYLOAD" | /usr/bin/nc -U -w 2 "$NICE_SOCKET")
 
 if [ -z "$REPLY" ]; then
-  printf 'nice: no reply from control socket; dispatch tab may not have opened\n' >&2
+  printf 'nice: no reply from control socket; dispatch session may not have opened\n' >&2
   exit 1
 fi
 
@@ -469,7 +469,7 @@ case "$REPLY" in
     exit 1
     ;;
   *)
-    printf 'nice: dispatch tab opening…\n'
+    printf 'nice: dispatch session opening…\n'
     exit 0
     ;;
 esac"#;

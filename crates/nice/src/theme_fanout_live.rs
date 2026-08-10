@@ -4,7 +4,7 @@
 //! exact path `crate::app::run` takes) with the live theme globals installed, then
 //! exercises the store `apply_*` mutators + the OS-sync reconcile and asserts the
 //! fan-out reaches BOTH halves — chrome (the active `Slots`) and a live terminal
-//! pane (the pushed `TerminalTheme` + a ground-truth pixel recolor) — plus the
+//! window (the pushed `TerminalTheme` + a ground-truth pixel recolor) — plus the
 //! R17-live Claude mirror.
 //!
 //! ## Legs (all fail-loud, state-poll bounded — never sleep-and-hope)
@@ -12,21 +12,21 @@
 //! * **(a/d) OS-sync scheme flip fans chrome + terminal.** With `sync_with_os` ON,
 //!   flipping the injected [`OsSchemeSource`](crate::theme_settings::OsSchemeSource)
 //!   stub and reconciling flips `scheme` (the adapter's job): the active chrome
-//!   `Slots` change, the Main pane's `TerminalView` swaps its render theme, and a
+//!   `Slots` change, the Main window's `TerminalView` swaps its render theme, and a
 //!   pixel sample on the live terminal recolors. With sync OFF, driving the stub is
 //!   a no-op (`reconcile_with_os` gates on `sync_with_os`).
 //! * **(d) manual contradiction turns sync off.** Re-enabling sync pins the scheme
 //!   to the stub OS; a manual `apply_scheme` to the OTHER scheme turns
 //!   `sync_with_os` off (the `userPicked` analog).
 //! * **(b) accent recolors the caret.** `apply_accent` pushes a new accent into the
-//!   pane; on the cursor-None Nice theme the accent IS the caret color, so the
+//!   window; on the cursor-None Nice theme the accent IS the caret color, so the
 //!   view's accent updates. **(b2)** over a CURSOR-BEARING theme (Solarized
-//!   Light) a PRESET still wins — the pane's theme arrives with `cursor` cleared
+//!   Light) a PRESET still wins — the window's theme arrives with `cursor` cleared
 //!   — while `AccentSelection::FromTheme` hands the caret back to the theme's own
 //!   cursor and derives the accent from the theme's curated hue.
 //! * **(c) terminal-theme-id: inactive is latent, the flip applies it.** Setting the
-//!   INACTIVE scheme's terminal-id does not recolor the pane (persisted, latent);
-//!   the next scheme flip makes that slot active and the pane picks it up. (The R21
+//!   INACTIVE scheme's terminal-id does not recolor the window (persisted, latent);
+//!   the next scheme flip makes that slot active and the window picks it up. (The R21
 //!   stub catalog resolves every id to the Nice default for a scheme, so a
 //!   same-scheme active-id change is a visual no-op by construction — the active
 //!   path is exercised through the scheme flip, which changes the active slot's
@@ -34,12 +34,12 @@
 //! * **(e) R17-live Claude mirror.** With the gate ON a theme change rewrites the
 //!   sandbox `nice.json` colors file (byte-diff via the landed only-if-changed
 //!   writer); `apply_sync_claude_theme` re-sources every window's `--settings`
-//!   provider so a subsequently-spawned pane would get / lose the flag.
+//!   provider so a subsequently-spawned window would get / lose the flag.
 //! * **(f) R22 Ghostty import end-to-end.** A fixture `.ghostty` written under the
 //!   sandbox support root is `import_theme`d through the Global catalog (parse →
 //!   persist verbatim as `<slug>.ghostty` → enter the imported list), resolves by
 //!   id, and — once `apply_terminal_theme_id` (R21) makes it live for the active
-//!   scheme — recolors the live terminal pane (render theme swap + a pixel sample),
+//!   scheme — recolors the live terminal window (render theme swap + a pixel sample),
 //!   proving parse → persist → catalog → resolve → fan-out on a real window.
 //!
 //! ## Hermeticity (tranche-5 rule)
@@ -47,7 +47,7 @@
 //! Fully sandboxed: an explicit temp theme-store path (never the real
 //! `ui_settings.json`), a fake `$HOME` (so the Claude colors + pointer files land
 //! under the sandbox, never `~/.claude` / `~/.nice`), a blanked `ZDOTDIR` rc chain
-//! for the Main pane's shell, a `NICE_CLAUDE_OVERRIDE` stub, and an INJECTED
+//! for the Main window's shell, a `NICE_CLAUDE_OVERRIDE` stub, and an INJECTED
 //! `OsSchemeSource` stub (no leg reads the real system appearance). It mints its OWN
 //! `SharedThemeState` + `OsSchemeSource` (`run_selftest` installs neither), and
 //! installs no `WindowRegistry` close observer (its `build_window_root` only
@@ -67,7 +67,7 @@ use nice_theme::palette::{ColorScheme, Slots};
 use nice_theme::AccentPreset;
 use nice_term_view::{TerminalColor, TerminalTheme};
 
-use crate::app_shell::{AppShellView, PaneHostView};
+use crate::app_shell::{AppShellView, WindowHostView};
 use crate::terminal_theme_catalog::TerminalThemeCatalog;
 use crate::theme_settings::{
     self, AccentSelection, OsSchemeSource, SharedThemeState, ThemeSettingsStore, ThemeState,
@@ -114,7 +114,7 @@ impl Fixture {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
         }
-        // SAFETY: single-threaded scenario setup before any pane forks.
+        // SAFETY: single-threaded scenario setup before any window forks.
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
         let theme_store_path = base.join("ui_settings.json");
@@ -156,7 +156,7 @@ fn u8_to_scheme(v: u8) -> ColorScheme {
 /// Open the shipped `theme-fanout` window and spawn its driver. Installs the live
 /// theme globals (store at a temp path, catalog stub, a freshly-minted
 /// `SharedThemeState`, an injected `OsSchemeSource` stub) BEFORE opening — so the
-/// Main pane seeds from the live theme — then opens exactly as `crate::app::run`
+/// Main window seeds from the live theme — then opens exactly as `crate::app::run`
 /// does (no `WindowRegistry` install). `$HOME` is sandboxed for the WHOLE driver
 /// (the R17-live Claude writes read it) and restored at teardown.
 pub fn open_theme_fanout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
@@ -217,7 +217,7 @@ pub fn open_theme_fanout_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
 
     cx.spawn(async move |acx: &mut AsyncApp| {
         let report = run_theme_fanout(acx, whandle, &fixture, os_cell).await;
-        // Reap the Main pane's shell, reset the scenario config, restore HOME/env.
+        // Reap the Main window's shell, reset the scenario config, restore HOME/env.
         let id = AnyWindowHandle::from(whandle).window_id();
         let _ = acx.update(|app| {
             if let Some(state) = WindowRegistry::state_for_window(app, id) {
@@ -262,27 +262,27 @@ fn store_sync_on(cx: &mut AsyncApp) -> bool {
     cx.update(|app| app.global::<ThemeSettingsStore>().appearance().sync_with_os)
 }
 
-/// The Main pane's live [`TerminalView`] render theme + accent — the terminal
-/// half of the fan-out (the pushed colors). `None` until the pane host has cached
+/// The Main window's live [`TerminalView`] render theme + accent — the terminal
+/// half of the fan-out (the pushed colors). `None` until the window host has cached
 /// the view.
 fn terminal_theme_accent(
     cx: &mut AsyncApp,
-    pane_host: &Entity<PaneHostView>,
-    pane_id: &str,
+    window_host: &Entity<WindowHostView>,
+    term_window_id: &str,
 ) -> Option<(TerminalTheme, nice_theme::color::Srgba)> {
-    let view = pane_host.update(cx, |h, _| h.scenario_terminal_for(pane_id))?;
+    let view = window_host.update(cx, |h, _| h.scenario_terminal_for(term_window_id))?;
     Some(view.update(cx, |v, _| (v.theme().clone(), v.accent())))
 }
 
-/// Poll until the Main pane's `TerminalView` is cached in the pane host (the
+/// Poll until the Main window's `TerminalView` is cached in the window host (the
 /// activate-on-render → deferred spawn path), so the terminal-half reads land.
 async fn await_terminal_view(
     cx: &mut AsyncApp,
-    pane_host: &Entity<PaneHostView>,
-    pane_id: &str,
+    window_host: &Entity<WindowHostView>,
+    term_window_id: &str,
 ) -> bool {
     for _ in 0..40 {
-        if terminal_theme_accent(cx, pane_host, pane_id).is_some() {
+        if terminal_theme_accent(cx, window_host, term_window_id).is_some() {
             return true;
         }
         settle(cx, 100).await;
@@ -329,21 +329,21 @@ async fn run_theme_fanout(
         Ok(v) => v,
         Err(e) => return CadenceReport::error(format!("theme-fanout: could not read the shell view: {e}")),
     };
-    let pane_host = shell.update(cx, |s, _| s.scenario_pane_host());
+    let window_host = shell.update(cx, |s, _| s.scenario_window_host());
     let id = any.window_id();
     let Some(state) = cx.update(|app| WindowRegistry::state_for_window(app, id)) else {
         return CadenceReport::error(
             "theme-fanout: the shipped builder did not register the window's WindowState".to_string(),
         );
     };
-    let Some((main_tab, main_pane)) = active_tab_and_pane(cx, &state) else {
-        return CadenceReport::error("theme-fanout: the shipped window has no active tab/pane".to_string());
+    let Some((main_session, main_window)) = active_session_and_window(cx, &state) else {
+        return CadenceReport::error("theme-fanout: the shipped window has no active session/window".to_string());
     };
-    let _ = main_tab;
+    let _ = main_session;
 
-    if !await_terminal_view(cx, &pane_host, &main_pane).await {
+    if !await_terminal_view(cx, &window_host, &main_window).await {
         return CadenceReport::error(
-            "theme-fanout: the Main pane's TerminalView never mounted (fan-out has no terminal to reach)"
+            "theme-fanout: the Main window's TerminalView never mounted (fan-out has no terminal to reach)"
                 .to_string(),
         );
     }
@@ -351,12 +351,12 @@ async fn run_theme_fanout(
 
     let mut failures: Vec<String> = Vec::new();
 
-    scheme_flip_leg(cx, any, &pane_host, &main_pane, &os_cell, &mut failures).await;
+    scheme_flip_leg(cx, any, &window_host, &main_window, &os_cell, &mut failures).await;
     manual_contradiction_leg(cx, &os_cell, &mut failures).await;
-    accent_leg(cx, &pane_host, &main_pane, &mut failures).await;
-    terminal_id_latency_leg(cx, any, &pane_host, &main_pane, &mut failures).await;
+    accent_leg(cx, &window_host, &main_window, &mut failures).await;
+    terminal_id_latency_leg(cx, any, &window_host, &main_window, &mut failures).await;
     claude_sync_leg(cx, &state, fixture, &mut failures).await;
-    imported_theme_leg(cx, any, &pane_host, &main_pane, fixture, &mut failures).await;
+    imported_theme_leg(cx, any, &window_host, &main_window, fixture, &mut failures).await;
     restyle_reentrancy_leg(cx, any, &mut failures).await;
 
     build_report(failures)
@@ -440,15 +440,15 @@ async fn restyle_reentrancy_leg(
 async fn scheme_flip_leg(
     cx: &mut AsyncApp,
     handle: AnyWindowHandle,
-    pane_host: &Entity<PaneHostView>,
-    pane_id: &str,
+    window_host: &Entity<WindowHostView>,
+    term_window_id: &str,
     os_cell: &Arc<AtomicU8>,
     failures: &mut Vec<String>,
 ) {
     // Baseline (Dark): chrome slots, terminal theme, pixels.
     let slots_before = active_slots(cx);
-    let Some((theme_before, _)) = terminal_theme_accent(cx, pane_host, pane_id) else {
-        failures.push("(a) baseline: Main pane TerminalView vanished".into());
+    let Some((theme_before, _)) = terminal_theme_accent(cx, window_host, term_window_id) else {
+        failures.push("(a) baseline: Main window TerminalView vanished".into());
         return;
     };
     let pixels_before = match sample_terminal(cx, handle) {
@@ -474,13 +474,13 @@ async fn scheme_flip_leg(
         failures.push("(a) chrome fan-out: the active Slots did not change on the scheme flip".into());
     }
     // Terminal half: the pushed render theme changed (nice_default_dark → light).
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((theme_after, _)) if theme_after != theme_before => {
             eprintln!("[selftest] theme-fanout (a): chrome Slots + terminal theme both recolored on the scheme flip");
         }
         Some(_) => failures
-            .push("(a) terminal fan-out: the Main pane's render theme did not change on the scheme flip".into()),
-        None => failures.push("(a) terminal fan-out: the Main pane TerminalView vanished".into()),
+            .push("(a) terminal fan-out: the Main window's render theme did not change on the scheme flip".into()),
+        None => failures.push("(a) terminal fan-out: the Main window TerminalView vanished".into()),
     }
     // Ground-truth pixel recolor on the live terminal cell.
     if let Some(before) = pixels_before {
@@ -542,28 +542,28 @@ async fn manual_contradiction_leg(
 
 async fn accent_leg(
     cx: &mut AsyncApp,
-    pane_host: &Entity<PaneHostView>,
-    pane_id: &str,
+    window_host: &Entity<WindowHostView>,
+    term_window_id: &str,
     failures: &mut Vec<String>,
 ) {
-    let Some((_, accent_before)) = terminal_theme_accent(cx, pane_host, pane_id) else {
-        failures.push("(b) baseline: Main pane TerminalView vanished".into());
+    let Some((_, accent_before)) = terminal_theme_accent(cx, window_host, term_window_id) else {
+        failures.push("(b) baseline: Main window TerminalView vanished".into());
         return;
     };
     // Pick an accent that differs from the current one (default is Terracotta).
     let target = AccentPreset::Fern;
     cx.update(|app| theme_settings::apply_accent(app, AccentSelection::Preset(target)));
     settle(cx, 200).await;
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((_, accent_after)) if accent_after != accent_before && accent_after == target.color() => {
-            eprintln!("[selftest] theme-fanout (b): apply_accent recolored the pane's accent (the cursor-None caret)");
+            eprintln!("[selftest] theme-fanout (b): apply_accent recolored the window's accent (the cursor-None caret)");
         }
-        Some(_) => failures.push("(b) accent fan-out: the pane's accent did not update on apply_accent".into()),
-        None => failures.push("(b) accent fan-out: the Main pane TerminalView vanished".into()),
+        Some(_) => failures.push("(b) accent fan-out: the window's accent did not update on apply_accent".into()),
+        None => failures.push("(b) accent fan-out: the Main window TerminalView vanished".into()),
     }
 
     // (b2) The caret rule over a CURSOR-BEARING theme — the origin bug + the
-    // "From theme" feature, asserted on the real fan-out into the live pane.
+    // "From theme" feature, asserted on the real fan-out into the live window.
     // The active scheme is Light here (leg (d) left it Light, sync off), so
     // Solarized Light is the cursor-bearing theme under test.
     const SOLARIZED_CURSOR: TerminalColor = TerminalColor::new(0x58, 0x6e, 0x75);
@@ -579,10 +579,10 @@ async fn accent_leg(
     });
     settle(cx, 200).await;
 
-    // A PRESET wins: the pane's theme arrives with `cursor` cleared, so the
+    // A PRESET wins: the window's theme arrives with `cursor` cleared, so the
     // renderer's `match theme.cursor` puts the preset on the caret instead of
     // Solarized's `#586e75`.
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((theme, accent)) if theme.cursor.is_none() && accent == target.color() => {
             eprintln!("[selftest] theme-fanout (b2): a preset accent cleared the cursor-bearing theme's caret override");
         }
@@ -590,7 +590,7 @@ async fn accent_leg(
             "(b2) preset accent did not win over the theme cursor: cursor {:?}, accent {accent:?}",
             theme.cursor
         )),
-        None => failures.push("(b2) the Main pane TerminalView vanished".into()),
+        None => failures.push("(b2) the Main window TerminalView vanished".into()),
     }
 
     // "From theme": the caret goes back to the theme author's cursor, and the
@@ -598,7 +598,7 @@ async fn accent_leg(
     cx.update(|app| theme_settings::apply_accent(app, AccentSelection::FromTheme));
     settle(cx, 200).await;
     let expected_accent = theme_settings::terminal_color_to_srgba(SOLARIZED_ACCENT);
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((theme, accent))
             if theme.cursor == Some(SOLARIZED_CURSOR) && accent == expected_accent =>
         {
@@ -609,7 +609,7 @@ async fn accent_leg(
              accent {accent:?} (want {expected_accent:?})",
             theme.cursor
         )),
-        None => failures.push("(b2) the Main pane TerminalView vanished".into()),
+        None => failures.push("(b2) the Main window TerminalView vanished".into()),
     }
 
     // Restore the preset accent + the slot's original theme so the later legs
@@ -626,26 +626,26 @@ async fn accent_leg(
 async fn terminal_id_latency_leg(
     cx: &mut AsyncApp,
     handle: AnyWindowHandle,
-    pane_host: &Entity<PaneHostView>,
-    pane_id: &str,
+    window_host: &Entity<WindowHostView>,
+    term_window_id: &str,
     failures: &mut Vec<String>,
 ) {
     // Active scheme is Light here (leg d left it Light, sync off). Setting the
-    // INACTIVE (Dark) slot's terminal id must NOT recolor the pane now.
-    let Some((theme_before, _)) = terminal_theme_accent(cx, pane_host, pane_id) else {
-        failures.push("(c) baseline: Main pane TerminalView vanished".into());
+    // INACTIVE (Dark) slot's terminal id must NOT recolor the window now.
+    let Some((theme_before, _)) = terminal_theme_accent(cx, window_host, term_window_id) else {
+        failures.push("(c) baseline: Main window TerminalView vanished".into());
         return;
     };
     let pixels_before = sample_terminal(cx, handle).ok();
     cx.update(|app| theme_settings::apply_terminal_theme_id(app, ColorScheme::Dark, "nice-default-dark"));
     settle(cx, 200).await;
 
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((theme_now, _)) if theme_now == theme_before => {
             eprintln!("[selftest] theme-fanout (c): an inactive-scheme terminal-id change is latent (no recolor)");
         }
-        Some(_) => failures.push("(c) latency: an INACTIVE-scheme terminal-id change recolored the pane (should be latent)".into()),
-        None => failures.push("(c) latency: the Main pane TerminalView vanished".into()),
+        Some(_) => failures.push("(c) latency: an INACTIVE-scheme terminal-id change recolored the window (should be latent)".into()),
+        None => failures.push("(c) latency: the Main window TerminalView vanished".into()),
     }
     if let (Some(before), Some(after)) = (pixels_before, sample_terminal(cx, handle).ok()) {
         let delta = max_channel_delta(&before, &after);
@@ -661,16 +661,16 @@ async fn terminal_id_latency_leg(
         failures.push(format!("(c) the inactive-slot id did not persist (dark id = {dark_id})"));
     }
 
-    // Flip to Dark: the now-active Dark slot applies, so the pane picks up the Dark
+    // Flip to Dark: the now-active Dark slot applies, so the window picks up the Dark
     // resolution (the active-slot path — R21's stub resolves it to nice_default_dark).
     cx.update(|app| theme_settings::apply_scheme(app, ColorScheme::Dark));
     settle(cx, 300).await;
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((theme_now, _)) if theme_now != theme_before => {
-            eprintln!("[selftest] theme-fanout (c): the scheme flip made the latent Dark slot active and the pane applied it");
+            eprintln!("[selftest] theme-fanout (c): the scheme flip made the latent Dark slot active and the window applied it");
         }
         Some(_) => failures.push("(c) the scheme flip did not apply the now-active Dark terminal slot".into()),
-        None => failures.push("(c) the Main pane TerminalView vanished after the flip".into()),
+        None => failures.push("(c) the Main window TerminalView vanished after the flip".into()),
     }
 }
 
@@ -682,7 +682,7 @@ async fn claude_sync_leg(
     fixture: &Fixture,
     failures: &mut Vec<String>,
 ) {
-    // Gate starts OFF: the window's provider is None (no --settings for new panes).
+    // Gate starts OFF: the window's provider is None (no --settings for new windows).
     let provider_off = cx.update(|app| state.read(app).claude_settings_path_provider());
     if provider_off.is_some() {
         failures.push("(e) precondition: the window carried a --settings provider while the gate was OFF".into());
@@ -719,7 +719,7 @@ async fn claude_sync_leg(
         }
     }
 
-    // Toggle OFF: re-source providers back to None (new panes get no flag).
+    // Toggle OFF: re-source providers back to None (new windows get no flag).
     cx.update(|app| theme_settings::apply_sync_claude_theme(app, false));
     settle(cx, 100).await;
     let provider_reoff = cx.update(|app| state.read(app).claude_settings_path_provider());
@@ -751,21 +751,21 @@ fn imported_theme_source() -> String {
 /// End-to-end R22 leg: write a fixture `.ghostty` under the sandbox support root,
 /// `import_theme` it through the Global catalog, confirm it persisted as
 /// `<slug>.ghostty` + entered the catalog + resolves, then `apply_terminal_theme_id`
-/// (R21) to its id for the active scheme and assert the live terminal pane recolors
+/// (R21) to its id for the active scheme and assert the live terminal window recolors
 /// to the imported background — proving parse → persist → catalog → resolve → R21
 /// fan-out on a real window.
 async fn imported_theme_leg(
     cx: &mut AsyncApp,
     handle: AnyWindowHandle,
-    pane_host: &Entity<PaneHostView>,
-    pane_id: &str,
+    window_host: &Entity<WindowHostView>,
+    term_window_id: &str,
     fixture: &Fixture,
     failures: &mut Vec<String>,
 ) {
     const NEON: TerminalColor = TerminalColor::new(0xff, 0x00, 0xff);
 
-    let Some((theme_before, _)) = terminal_theme_accent(cx, pane_host, pane_id) else {
-        failures.push("(f) baseline: Main pane TerminalView vanished".into());
+    let Some((theme_before, _)) = terminal_theme_accent(cx, window_host, term_window_id) else {
+        failures.push("(f) baseline: Main window TerminalView vanished".into());
         return;
     };
     let pixels_before = sample_terminal(cx, handle).ok();
@@ -811,17 +811,17 @@ async fn imported_theme_leg(
         failures.push("(f) the imported theme did not resolve to its background through the catalog".into());
     }
 
-    // Make it live for the active scheme (R21 mutator) — the pane recolors.
+    // Make it live for the active scheme (R21 mutator) — the window recolors.
     cx.update(|app| theme_settings::apply_terminal_theme_id(app, active, &entry.id));
     settle(cx, 300).await;
 
-    match terminal_theme_accent(cx, pane_host, pane_id) {
+    match terminal_theme_accent(cx, window_host, term_window_id) {
         Some((theme_now, _)) if theme_now != theme_before && theme_now.background == NEON => {
-            eprintln!("[selftest] theme-fanout (f): an imported Ghostty theme parsed → persisted → entered the catalog → resolved → recolored the live pane");
+            eprintln!("[selftest] theme-fanout (f): an imported Ghostty theme parsed → persisted → entered the catalog → resolved → recolored the live window");
         }
         Some(_) => failures
-            .push("(f) the imported theme did not recolor the Main pane's render theme".into()),
-        None => failures.push("(f) the Main pane TerminalView vanished after applying the import".into()),
+            .push("(f) the imported theme did not recolor the Main window's render theme".into()),
+        None => failures.push("(f) the Main window TerminalView vanished after applying the import".into()),
     }
     if let (Some(before), Some(after)) = (pixels_before, sample_terminal(cx, handle).ok()) {
         let delta = max_channel_delta(&before, &after);
@@ -837,11 +837,11 @@ async fn imported_theme_leg(
 
 // -- reads / report ----------------------------------------------------------
 
-fn active_tab_and_pane(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<(String, String)> {
+fn active_session_and_window(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Option<(String, String)> {
     state.update(cx, |s, _| {
-        let tab = s.model.active_tab_id()?.to_string();
-        let pane = s.model.tab_for(&tab).and_then(|t| t.active_pane_id.clone())?;
-        Some((tab, pane))
+        let session = s.workspace.active_session_id()?.to_string();
+        let term_window = s.workspace.session_for(&session).and_then(|t| t.active_window_id.clone())?;
+        Some((session, term_window))
     })
 }
 
@@ -853,12 +853,12 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             detail: "theme-fanout OK: (a/d) an OS Light switch (sync on) flipped the scheme — chrome Slots \
                      + terminal render theme + a live terminal pixel all recolored, and with sync off an OS \
                      switch was a no-op; (d) a manual contradicting pick turned sync off; (b) apply_accent \
-                     recolored the pane accent (the cursor-None caret); (c) an inactive-slot terminal-id \
+                     recolored the window accent (the cursor-None caret); (c) an inactive-slot terminal-id \
                      change was latent (no recolor, persisted) and the next scheme flip applied it; \
                      (e) the gate ON re-sourced the --settings provider + wrote the colors file, a gate-ON \
                      theme change rewrote it (byte-diff), and the gate OFF cleared the provider; \
                      (f) an imported Ghostty theme parsed → persisted as <slug>.ghostty under the temp \
-                     support root → entered the catalog → resolved → recolored the live terminal pane; \
+                     support root → entered the catalog → resolved → recolored the live terminal window; \
                      (g) a transparency commit from INSIDE a window update (the migration popup's confirm \
                      callback context) still reached the window via the deferred fanout (Blurred/30)"
                 .to_string(),

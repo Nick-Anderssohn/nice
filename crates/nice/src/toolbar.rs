@@ -1,17 +1,17 @@
-//! The window's slim titlebar + pane strip — originally ported from
+//! The window's slim titlebar + window strip — originally ported from
 //! `Sources/Nice/Views/WindowToolbarView.swift` (`WindowToolbarView`,
 //! `InlinePaneStrip`, `InlinePanePill`, `CloseXButton`, `OverflowMenuButton`,
 //! `NewTabBtn`). The 2026-07 restyle reshaped it (plan
 //! `docs/plans/restyle/01-titlebar-restyle.md`) into the fill-less 28pt titlebar: the
 //! leading sidebar-collapse toggle (an embedded stroke SVG, right of the native
-//! traffic lights), then the horizontally-scrolling row of tabs — plain
-//! text + a 1px accent underline on the active tab and a 1px grey underline on
-//! every inactive tab, no pills — with the overflow
+//! traffic lights), then the horizontally-scrolling row of sessions — plain
+//! text + a 1px accent underline on the active session and a 1px grey underline on
+//! every inactive session, no pills — with the overflow
 //! chevron (attention badge + edge fades) and the trailing `+` intact. When the
-//! strip holds exactly one pane, single-tab mode renders the sole pane's title as
-//! centered titlebar text (no tab chrome) instead. It is the
+//! strip holds exactly one window, single-session mode renders the sole window's title as
+//! centered titlebar text (no session chrome) instead. It is the
 //! full-width titlebar row in both shell states, carries the window drag region,
-//! and drives the R8 model through the injected [`PaneStripActions`] seam. The
+//! and drives the R8 model through the injected [`WindowStripActions`] seam. The
 //! brand block was removed.
 //!
 //! ## Real layout replaces the width estimator (binding decision)
@@ -21,17 +21,17 @@
 //! pills. GPUI reads **real** layout: the pill row is tracked by a
 //! [`gpui::ScrollHandle`], so
 //!
-//!   * the overflow chevron exists iff `>= 2` panes **and** the handle's
+//!   * the overflow chevron exists iff `>= 2` windows **and** the handle's
 //!     `max_offset().x > 0` ([`nice_model::should_show_overflow_chevron`]),
 //!     measured against a viewport whose width is fixed by two always-reserved
 //!     trailing slots (chevron + `+`) so showing the chevron can never
 //!     retroactively un-overflow the row (the reservation rule that survives the
 //!     dead estimator);
-//!   * the edge fades and the offscreen-pane set come from
+//!   * the edge fades and the offscreen-window set come from
 //!     [`nice_model::StripGeometry`] fed by each pill's real
 //!     `bounds_for_item(ix)`, translated into the viewport's `[0, visible_width]`
 //!     space ([`viewport_relative_rect`]);
-//!   * activating a pane auto-scrolls its pill to center via
+//!   * activating a window auto-scrolls its pill to center via
 //!     [`nice_model::center_offset_x`] + `set_offset` (`scroll_to_item` only
 //!     reveals).
 //!
@@ -42,13 +42,13 @@
 //! ## Shared per-window state + transient view state (the GPUI shape)
 //!
 //! Like [`crate::sidebar_shell::SidebarShellView`], the *document* state — the
-//! [`TabModel`] and the pane-strip select/close/add seam — lives in the shared
+//! [`WorkspaceModel`] and the window-strip select/close/add seam — lives in the shared
 //! per-window [`WindowState`] entity this view holds a handle to and renders
-//! from / mutates (R13.5's "one `TabModel` per window" invariant: no divergent
+//! from / mutates (R13.5's "one `WorkspaceModel` per window" invariant: no divergent
 //! model copy in any mounted view). What the view still owns is the transient
 //! per-view state (the scroll handle, hovered pill, inline-rename draft, the open
 //! context menu). A sibling holder of that same entity — the keymap's
-//! window-scoped pane actions (⌘T, pane-step) routed through the `WindowRegistry`
+//! window-scoped window actions (⌘T, window-step) routed through the `WindowRegistry`
 //! — mutating it re-renders this view through the `cx.observe` subscription set
 //! in [`new`](WindowToolbarView::new). The pills / buttons are built by helper
 //! methods rather than child entities so their handlers reach this state through
@@ -74,13 +74,13 @@ use gpui::{
 
 use nice_model::file_browser::TextFieldEditor;
 use nice_model::{
-    center_offset_x, resolve, should_show_overflow_chevron, Pane, PaneKind, Rect, StripGeometry,
-    Tab, TabStatus,
+    center_offset_x, resolve, should_show_overflow_chevron, TermWindow, TermWindowKind, Rect, StripGeometry,
+    Session, SessionStatus,
 };
 use nice_theme::chrome_geometry::{traffic_light_reserved_width, TOP_BAR_HEIGHT};
 use nice_theme::palette::Slots;
 
-use crate::app_shell::{PaneHostView, PANE_STRIP_ROOT_LABEL};
+use crate::app_shell::{WindowHostView, WINDOW_STRIP_ROOT_LABEL};
 use crate::context_menu::{ContextMenu, ContextMenuItem};
 use crate::inline_rename::{
     apply_rename_click, dispatch_rename_key, field_probe_cell, field_text, rename_field,
@@ -103,46 +103,46 @@ use crate::window_state::WindowState;
 /// vertical (the glyph's ink center measures level with the title text).
 pub(crate) const TOOLBAR_TRAILING_PAD: f32 = 10.0;
 
-/// Tab box: full-height (the bar), so the active-tab underline seats on the bar's
-/// bottom edge (`docs/design/restyle-mocks.html`, `.tabs { height: 100% }`; plan
+/// Session box: full-height (the bar), so the active-session underline seats on the bar's
+/// bottom edge (`docs/design/restyle-mocks.html`, `.sessions { height: 100% }`; plan
 /// `docs/plans/restyle/01-titlebar-restyle.md`). Equals [`TOP_BAR_HEIGHT`].
 const PILL_HEIGHT: f32 = TOP_BAR_HEIGHT;
-/// Tab max width before tail-ellipsis (mock `.tab { max-width: 200px }`; was 220).
+/// Session max width before tail-ellipsis (mock `.session { max-width: 200px }`; was 220).
 const PILL_MAX_WIDTH: f32 = 200.0;
-/// Tab horizontal padding (mock `.tab { padding: 0 12px }`).
+/// Session horizontal padding (mock `.session { padding: 0 12px }`).
 const TAB_PAD_X: f32 = 12.0;
-/// Tab inner spacing — dot ↔ title ↔ ✕ (mock `.tab { gap: 7px }`).
+/// Session inner spacing — dot ↔ title ↔ ✕ (mock `.session { gap: 7px }`).
 const PILL_GAP: f32 = 7.0;
-/// Tab title text size (mock `.tab { font-size: 12px }`).
+/// Session title text size (mock `.session { font-size: 12px }`).
 const PILL_TEXT_SIZE: f32 = 12.0;
-/// Leading terminal-glyph box for a Terminal pane's tab.
+/// Leading terminal-glyph box for a Terminal window's session.
 const PILL_ICON_SIZE: f32 = 12.0;
-/// Status-dot diameter inside a tab (the [`StatusDot`] component's 8pt default
+/// Status-dot diameter inside a session (the [`StatusDot`] component's 8pt default
 /// stays elsewhere — only its size parameter changes here, colours + pulse
 /// untouched).
 const TAB_STATUS_DOT_SIZE: f32 = 7.0;
-/// Tab underline: 1px tall, seated on the bar's bottom edge, inset 11px from the
-/// tab's outer edges, 0.5px corner radius (mock Style A `.tab::after` /
-/// `.tab.active::after` — round-2 thinned both underlines from 2px to 1px). The
-/// active tab wears it in the accent; every inactive tab wears it in a grey
+/// Session underline: 1px tall, seated on the bar's bottom edge, inset 11px from the
+/// session's outer edges, 0.5px corner radius (mock Style A `.session::after` /
+/// `.session.active::after` — round-2 thinned both underlines from 2px to 1px). The
+/// active session wears it in the accent; every inactive session wears it in a grey
 /// ([`nice_theme::tab_underline_idle`]) so it reads as clickable (round-2 plan 4
-/// "Inactive-tab underline": grammar underline = tab, color = state).
+/// "Inactive-session underline": grammar underline = session, color = state).
 const TAB_UNDERLINE_HEIGHT: f32 = 1.0;
 const TAB_UNDERLINE_INSET: f32 = 11.0;
 const TAB_UNDERLINE_RADIUS: f32 = 0.5;
 
-/// Single-tab mode: when the strip holds exactly one pane, its title + status
+/// Single-session mode: when the strip holds exactly one window, its title + status
 /// dot render as the window's centered titlebar text (macOS window-title
-/// convention) instead of a tab box. The centered text is an absolute overlay
+/// convention) instead of a session box. The centered text is an absolute overlay
 /// inset this far from BOTH window edges (symmetric, so it stays centered on the
 /// window's true center) — enough to clear the traffic-light cluster on the left
-/// and the trailing `+` on the right (mock `.tab-single { left: 90px; right:
-/// 90px }`; round-2 plan 4 "Single-tab mode"). The title clamps/ellipsizes
+/// and the trailing `+` on the right (mock `.session-single { left: 90px; right:
+/// 90px }`; round-2 plan 4 "Single-session mode"). The title clamps/ellipsizes
 /// within this box so it never collides with either.
 const SINGLE_TAB_EDGE_INSET: f32 = 90.0;
 
 /// The sidebar-collapse toggle box in the titlebar (mock `.tb-btn`: 24×22, 5px
-/// radius, 4px trailing margin before the tabs).
+/// radius, 4px trailing margin before the sessions).
 const COLLAPSE_BTN_W: f32 = 24.0;
 const COLLAPSE_BTN_H: f32 = 22.0;
 const COLLAPSE_BTN_RADIUS: f32 = 5.0;
@@ -154,7 +154,7 @@ const COLLAPSE_BTN_HOVER_INK_ALPHA: f32 = 0.08;
 const PILL_ROW_GAP: f32 = 2.0;
 
 /// The trailing update pill's AX element id (`UpdateAvailablePill.swift:58`).
-/// Distinct from the per-pane pills' ids and the status-dot's `pill.<id>` so an
+/// Distinct from the per-window pills' ids and the status-dot's `pill.<id>` so an
 /// AX walk / a scenario can find it unambiguously (R27, the reserved trailing
 /// slot).
 const UPDATE_PILL_ID: &str = "toolbar.updateAvailable";
@@ -171,12 +171,12 @@ const CLOSE_BTN_SIZE: f32 = 16.0;
 const CLOSE_BTN_RADIUS: f32 = 4.0;
 const CLOSE_GLYPH_SIZE: f32 = 9.0;
 
-/// The overflow chevron / new-tab button box (`WindowToolbarView.swift:1048,1137`).
+/// The overflow chevron / new-session button box (`WindowToolbarView.swift:1048,1137`).
 pub(crate) const SQUARE_BTN_SIZE: f32 = 22.0;
 const SQUARE_BTN_RADIUS: f32 = 5.0;
 const CHEVRON_GLYPH_SIZE: f32 = 10.0;
 const PLUS_GLYPH_SIZE: f32 = 11.0;
-/// The chevron / new-tab leading pad inside their slot (`.padding(.leading, 4)`,
+/// The chevron / new-session leading pad inside their slot (`.padding(.leading, 4)`,
 /// `WindowToolbarView.swift:238,245`).
 pub(crate) const SQUARE_BTN_LEADING_PAD: f32 = 4.0;
 /// Width of the chevron slot and the `+` slot — each **always** reserved in the
@@ -203,12 +203,12 @@ const BAND_DRAG_THRESHOLD_PX: f32 = 2.0;
 const PILL_HOVER_INK_ALPHA: f32 = 0.05;
 /// Close-"×" hover fill: 10% ink (`WindowToolbarView.swift:992`).
 const CLOSE_HOVER_INK_ALPHA: f32 = 0.10;
-/// Chevron / new-tab hover fill: 8% ink (`WindowToolbarView.swift:1054,1143`).
+/// Chevron / new-session hover fill: 8% ink (`WindowToolbarView.swift:1054,1143`).
 const SQUARE_BTN_HOVER_INK_ALPHA: f32 = 0.08;
 
 // ---- Icons (SF Symbols + Unicode fallbacks / stand-ins) ----------------------
 //
-// The tab/chevron/plus/close icons are real SF Symbols rendered through
+// The session/chevron/plus/close icons are real SF Symbols rendered through
 // `crate::sf_symbols` (M2 feel-check Item A); each ICON_* glyph remains as the
 // never-blank fallback. The overflow-menu rows keep their glyph stand-ins (the
 // pinned `ContextMenu` is plain-label). The leading sidebar-collapse toggle is
@@ -227,44 +227,46 @@ const SF_TERMINAL: &str = "terminal";
 const SF_CLOSE: &str = "xmark";
 /// Overflow chevron (`WindowToolbarView.swift:1045-1047`).
 const SF_CHEVRON_DOWN: &str = "chevron.down";
-/// New-tab button (`WindowToolbarView.swift:1134-1136`).
+/// New-session button (`WindowToolbarView.swift:1134-1136`).
 const SF_PLUS: &str = "plus";
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 
 /// The per-kind context-menu **rename** label (`WindowToolbarView.swift:751`).
-fn rename_menu_label(kind: PaneKind) -> &'static str {
+/// A pill is a terminal *window* in the tmux vocabulary; the kind qualifies it so
+/// neither label can be read as the macOS-standard window commands (⌘N/⌘W).
+fn rename_menu_label(kind: TermWindowKind) -> &'static str {
     match kind {
-        PaneKind::Terminal => "Rename Terminal",
-        PaneKind::Claude => "Rename Pane",
+        TermWindowKind::Terminal => "Rename Terminal Window",
+        TermWindowKind::Claude => "Rename Claude Window",
     }
 }
 
 /// The per-kind context-menu **close** label (`WindowToolbarView.swift:755`).
-fn close_menu_label(kind: PaneKind) -> &'static str {
+fn close_menu_label(kind: TermWindowKind) -> &'static str {
     match kind {
-        PaneKind::Terminal => "Close Terminal",
-        PaneKind::Claude => "Close Pane",
+        TermWindowKind::Terminal => "Close Terminal Window",
+        TermWindowKind::Claude => "Close Claude Window",
     }
 }
 
 /// One overflow-menu row's label: a kind/status glyph, the title, and a trailing
-/// checkmark on the active pane (`WindowToolbarView.swift:1079-1097`). The pinned
+/// checkmark on the active window (`WindowToolbarView.swift:1079-1097`). The pinned
 /// `ContextMenu` component is plain-label, so the leading `StatusDot` / terminal
 /// icon and the active checkmark are rendered as glyph stand-ins (same philosophy
 /// as the sidebar's Unicode icons) — the itest-pinned facts are "lists every
-/// pane" and "checkmark on the active row."
-fn overflow_row_label(pane: &Pane, active_pane_id: Option<&str>) -> String {
-    let icon = match pane.kind {
-        PaneKind::Claude => ICON_CLAUDE_DOT,
-        PaneKind::Terminal => ICON_TERMINAL,
+/// window" and "checkmark on the active row."
+fn overflow_row_label(term_window: &TermWindow, active_window_id: Option<&str>) -> String {
+    let icon = match term_window.kind {
+        TermWindowKind::Claude => ICON_CLAUDE_DOT,
+        TermWindowKind::Terminal => ICON_TERMINAL,
     };
-    let check = if active_pane_id == Some(pane.id.as_str()) {
+    let check = if active_window_id == Some(term_window.id.as_str()) {
         format!("  {ICON_CHECK}")
     } else {
         String::new()
     };
-    format!("{icon}  {}{check}", pane.title)
+    format!("{icon}  {}{check}", term_window.title)
 }
 
 /// Translate a scroll child's window-space bounds into the viewport-relative
@@ -299,12 +301,12 @@ fn ink_alpha(s: &Slots, a: f32) -> Rgba {
 
 // ---- View-model snapshot (decouples rendering from model borrows) -----------
 
-/// A per-render snapshot of one pane pill.
-struct PaneVm {
+/// A per-render snapshot of one window pill.
+struct WindowVm {
     id: String,
     title: String,
-    kind: PaneKind,
-    status: TabStatus,
+    kind: TermWindowKind,
+    status: SessionStatus,
     waiting_ack: bool,
     is_active: bool,
     is_hovered: bool,
@@ -313,24 +315,24 @@ struct PaneVm {
 
 // ---- Pill drag (R25 reorder) ------------------------------------------------
 
-/// The value a pill drag carries: just the dragged pane id and the tab it lives
+/// The value a pill drag carries: just the dragged window id and the session it lives
 /// in (D3). `'static`, no pasteboard/string encoding — this is a purely in-app
-/// `gpui` drag payload, the type gate `on_drop::<PaneDragPayload>` matches on.
-/// Carrying `tab_id` makes the drop's `move_pane` robust to any active-tab change
+/// `gpui` drag payload, the type gate `on_drop::<WindowDragPayload>` matches on.
+/// Carrying `session_id` makes the drop's `move_window` robust to any active-session change
 /// mid-drag. R25 is reorder-within-one-strip only: the CUT cross-window path's
 /// `PaneDragOrigin.sourceWindowSessionId` / `sourceIndex` are deliberately absent
 /// (scope fence).
 #[derive(Clone)]
-struct PaneDragPayload {
-    pane_id: SharedString,
-    tab_id: SharedString,
+struct WindowDragPayload {
+    term_window_id: SharedString,
+    session_id: SharedString,
 }
 
 /// The drag "ghost" that follows the cursor: a simplified pill chip (icon-less
 /// title at the pill's radius/height, reduced opacity), NOT a bitmap snapshot
 /// (D4). gpui lays the ghost out at `mouse - offset` each frame, so it
 /// compensates by re-adding `offset` (plus a small lead) as leading padding.
-struct PaneDragGhost {
+struct WindowDragGhost {
     title: SharedString,
     /// The pointer's position within the dragged pill, captured at drag-arm time.
     /// gpui lays the ghost out at `mouse - offset`, so we re-add it (plus a small
@@ -338,7 +340,7 @@ struct PaneDragGhost {
     offset: Point<Pixels>,
 }
 
-impl Render for PaneDragGhost {
+impl Render for WindowDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = active_slots(cx);
         // Outer wrapper carries the offset compensation as padding so the visible
@@ -370,16 +372,16 @@ impl Render for PaneDragGhost {
     }
 }
 
-// ---- Tab full-title tooltip -------------------------------------------------
+// ---- Session full-title tooltip -------------------------------------------------
 
-/// The hover tooltip showing a tab's full title (NEW work for the restyle — a
-/// tab tail-ellipsizes at [`PILL_MAX_WIDTH`], so the tooltip surfaces the rest).
+/// The hover tooltip showing a session's full title (NEW work for the restyle — a
+/// session tail-ellipsizes at [`PILL_MAX_WIDTH`], so the tooltip surfaces the rest).
 /// A small themed label box built through gpui's `div::tooltip` seam.
-struct TabTooltip {
+struct SessionTooltip {
     title: SharedString,
 }
 
-impl Render for TabTooltip {
+impl Render for SessionTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = active_slots(cx);
         div()
@@ -403,35 +405,35 @@ impl Render for TabTooltip {
 
 // ---- The view ---------------------------------------------------------------
 
-/// The per-window toolbar (the leading sidebar-collapse toggle + the pane
+/// The per-window toolbar (the leading sidebar-collapse toggle + the window
 /// strip). Construct with [`WindowToolbarView::new`] over the window's shared
-/// [`WindowState`] entity; it renders the shared `model`'s active-tab panes and
-/// mutates them through the `pane_strip_actions` seam.
+/// [`WindowState`] entity; it renders the shared `model`'s active-session windows and
+/// mutates them through the `window_strip_actions` seam.
 pub(crate) struct WindowToolbarView {
-    /// The shared per-window state (the single [`TabModel`] plus the pane-strip
-    /// select/close/add seam). This view renders the active tab's panes from it
+    /// The shared per-window state (the single [`WorkspaceModel`] plus the window-strip
+    /// select/close/add seam). This view renders the active session's windows from it
     /// and mutates it through the seam; it never keeps a private model copy
-    /// (R13.5's "one `TabModel` per window" invariant).
+    /// (R13.5's "one `WorkspaceModel` per window" invariant).
     state: Entity<WindowState>,
     /// Re-render this view whenever the shared state notifies — the seam through
-    /// which the keymap's window-scoped pane actions (⌘T, pane-step) become
+    /// which the keymap's window-scoped window actions (⌘T, window-step) become
     /// visible in the strip. Held so the subscription lives as long as the view.
     _state_sub: Subscription,
 
-    /// The pill (if any) the cursor is over, keyed by `Pane.id`. Lives in the
+    /// The pill (if any) the cursor is over, keyed by `TermWindow.id`. Lives in the
     /// container so only one close "×" is ever visible at a time
     /// (`WindowToolbarView.swift:169`).
-    hovered_pane_id: Option<String>,
+    hovered_window_id: Option<String>,
 
-    /// The `(tab_id, pane_id)` currently being inline-renamed, if any.
-    editing_pane: Option<(String, String)>,
+    /// The `(session_id, term_window_id)` currently being inline-renamed, if any.
+    editing_window: Option<(String, String)>,
     /// The in-flight rename editor (cursor + selection; `None` when not editing).
     rename_editor: Option<TextFieldEditor>,
     /// The rename field's painted geometry (text-run + field-box left edges and
     /// the shaped char-boundary table, window coords), written by the field's
     /// paint and read by its click-to-position handler.
     rename_probe: FieldProbeCell,
-    /// When the active pane last changed — the rename gate reference.
+    /// When the active window last changed — the rename gate reference.
     activated_at: Option<Instant>,
     /// Focus for the inline-rename field (grabbed on begin, released on commit).
     rename_focus: FocusHandle,
@@ -459,10 +461,10 @@ pub(crate) struct WindowToolbarView {
     /// The pill row's real-layout scroll state — the source of overflow / fades /
     /// centering (replaces the dead width estimator).
     scroll: ScrollHandle,
-    /// The active pane id as of the last render — a change resets the rename gate
+    /// The active window id as of the last render — a change resets the rename gate
     /// and arms an auto-center.
-    last_active_pane: Option<String>,
-    /// Set when the active pane changed and the strip still owes it a center-on
+    last_active_window: Option<String>,
+    /// Set when the active window changed and the strip still owes it a center-on
     /// scroll; cleared once the centering offset is applied (needs a completed
     /// layout so `bounds_for_item` is populated).
     center_pending: bool,
@@ -471,7 +473,7 @@ pub(crate) struct WindowToolbarView {
     band_press: Option<Point<Pixels>>,
 
     /// The pill-reorder drop slot the cursor currently resolves to, already gated
-    /// through [`TabModel::would_move_pane`] (a no-op slot resolves to `None`, D7).
+    /// through [`WorkspaceModel::would_move_window`] (a no-op slot resolves to `None`, D7).
     /// Recomputed in the scroll row's `on_drag_move` and cleared on drop / when the
     /// cursor leaves the strip (D8). The insertion line reads it, gated additionally
     /// on `cx.has_active_drag()` so a dropped-nowhere release drops the line the same
@@ -479,11 +481,11 @@ pub(crate) struct WindowToolbarView {
     drag_target: Option<(String, bool)>,
     /// Root focus handle (hosts the toolbar key context).
     focus_handle: FocusHandle,
-    /// The window's pane-content host, wired by `crate::app::build_window_root`
+    /// The window's window-content host, wired by `crate::app::build_window_root`
     /// (M2 Item D): the seam through which the strip returns key focus to the
     /// active terminal after a rename commit/cancel and on menu dismissal.
     /// `None` in the isolated `pane-strip` scenario (refocus is then a no-op).
-    pane_host: Option<Entity<PaneHostView>>,
+    window_host: Option<Entity<WindowHostView>>,
     /// Chrome-click focus bounce (M2 Item D): a click on empty toolbar chrome
     /// transfers key focus to `focus_handle` via gpui's tracked-focus mouse-down
     /// transfer; this `on_focus` subscription bounces it straight back to the
@@ -507,8 +509,8 @@ impl WindowToolbarView {
         Self {
             state,
             _state_sub: state_sub,
-            hovered_pane_id: None,
-            editing_pane: None,
+            hovered_window_id: None,
+            editing_window: None,
             rename_editor: None,
             rename_probe: field_probe_cell(),
             activated_at: Some(Instant::now()),
@@ -520,56 +522,56 @@ impl WindowToolbarView {
             update_popover_sub: None,
             update_pill_bounds: Rc::new(Cell::new(None)),
             scroll: ScrollHandle::new(),
-            last_active_pane: None,
+            last_active_window: None,
             center_pending: false,
             band_press: None,
             drag_target: None,
             focus_handle: cx.focus_handle(),
-            pane_host: None,
+            window_host: None,
             focus_bounce_sub: None,
             window_scale: 2.0,
         }
     }
 
-    /// Wire the window's pane host (called once by `build_window_root`) so the
+    /// Wire the window's window host (called once by `build_window_root`) so the
     /// strip can return key focus to the active terminal (M2 Item D).
-    pub(crate) fn set_pane_host(&mut self, host: Entity<PaneHostView>) {
-        self.pane_host = Some(host);
+    pub(crate) fn set_window_host(&mut self, host: Entity<WindowHostView>) {
+        self.window_host = Some(host);
     }
 
     // MARK: - Model access / snapshot
 
-    /// The active tab — the one whose panes the strip renders. The returned
+    /// The active session — the one whose windows the strip renders. The returned
     /// borrow is tied to `cx` (the shared model lives in the [`WindowState`]
     /// entity), so callers read it and drop the borrow before mutating.
-    fn active_tab<'a>(&self, cx: &'a App) -> Option<&'a Tab> {
+    fn active_session<'a>(&self, cx: &'a App) -> Option<&'a Session> {
         let ws = self.state.read(cx);
-        let id = ws.model.active_tab_id()?;
-        ws.model.tab_for(id)
+        let id = ws.workspace.active_session_id()?;
+        ws.workspace.session_for(id)
     }
 
-    /// The active tab's id (owned), if any.
-    fn active_tab_id(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).model.active_tab_id().map(|s| s.to_string())
+    /// The active session's id (owned), if any.
+    fn active_session_id(&self, cx: &App) -> Option<String> {
+        self.state.read(cx).workspace.active_session_id().map(|s| s.to_string())
     }
 
-    /// A per-render snapshot of the active tab's pills.
-    fn snapshot_panes(&self, cx: &App) -> Vec<PaneVm> {
-        let Some(tab) = self.active_tab(cx) else {
+    /// A per-render snapshot of the active session's pills.
+    fn snapshot_windows(&self, cx: &App) -> Vec<WindowVm> {
+        let Some(session) = self.active_session(cx) else {
             return Vec::new();
         };
-        let active = tab.active_pane_id.clone();
-        let editing = self.editing_pane.as_ref().map(|(_, p)| p.clone());
-        tab.panes
+        let active = session.active_window_id.clone();
+        let editing = self.editing_window.as_ref().map(|(_, p)| p.clone());
+        session.windows
             .iter()
-            .map(|p| PaneVm {
+            .map(|p| WindowVm {
                 id: p.id.clone(),
                 title: p.title.clone(),
                 kind: p.kind,
                 status: p.status,
                 waiting_ack: p.waiting_acknowledged,
                 is_active: active.as_deref() == Some(p.id.as_str()),
-                is_hovered: self.hovered_pane_id.as_deref() == Some(p.id.as_str()),
+                is_hovered: self.hovered_window_id.as_deref() == Some(p.id.as_str()),
                 is_editing: editing.as_deref() == Some(p.id.as_str()),
             })
             .collect()
@@ -577,7 +579,7 @@ impl WindowToolbarView {
 
     // MARK: - Overflow / fades / attention (real layout)
 
-    /// The pill row's real geometry: each pane's viewport-relative rect + the
+    /// The pill row's real geometry: each window's viewport-relative rect + the
     /// viewport width, fed to [`StripGeometry`] for the fades and offscreen set.
     fn strip_geometry(&self, cx: &App) -> StripGeometry {
         let viewport = self.scroll.bounds();
@@ -585,11 +587,11 @@ impl WindowToolbarView {
         let visible_width = f32::from(viewport.size.width);
         let offset_x = f32::from(self.scroll.offset().x);
         let mut frames = HashMap::new();
-        if let Some(tab) = self.active_tab(cx) {
-            for (ix, pane) in tab.panes.iter().enumerate() {
+        if let Some(session) = self.active_session(cx) {
+            for (ix, term_window) in session.windows.iter().enumerate() {
                 if let Some(b) = self.scroll.bounds_for_item(ix) {
                     frames.insert(
-                        pane.id.clone(),
+                        term_window.id.clone(),
                         viewport_relative_rect(
                             f32::from(b.origin.x),
                             f32::from(b.size.width),
@@ -603,30 +605,30 @@ impl WindowToolbarView {
         StripGeometry::new(frames, visible_width)
     }
 
-    /// Whether the overflow chevron should render — the `>= 2` panes + reserved
+    /// Whether the overflow chevron should render — the `>= 2` windows + reserved
     /// real-overflow rule.
     fn show_chevron(&self, cx: &App) -> bool {
-        let pane_count = self.active_tab(cx).map(|t| t.panes.len()).unwrap_or(0);
-        should_show_overflow_chevron(pane_count, f32::from(self.scroll.max_offset().x))
+        let window_count = self.active_session(cx).map(|t| t.windows.len()).unwrap_or(0);
+        should_show_overflow_chevron(window_count, f32::from(self.scroll.max_offset().x))
     }
 
-    /// Whether some fully-offscreen pane needs attention — reuses the R8
-    /// [`Tab::has_offscreen_attention`] fed this cycle's offscreen set (no second
+    /// Whether some fully-offscreen window needs attention — reuses the R8
+    /// [`Session::has_offscreen_attention`] fed this cycle's offscreen set (no second
     /// predicate).
     fn has_offscreen_attention(&self, cx: &App) -> bool {
-        let offscreen = self.strip_geometry(cx).offscreen_pane_ids();
-        self.active_tab(cx)
+        let offscreen = self.strip_geometry(cx).offscreen_window_ids();
+        self.active_session(cx)
             .map(|t| t.has_offscreen_attention(&offscreen))
             .unwrap_or(false)
     }
 
-    /// If the active pane changed since last frame, reset the rename gate and try
+    /// If the active window changed since last frame, reset the rename gate and try
     /// to center its pill; retry next frame while `bounds_for_item` is not yet
     /// populated (first layout).
-    fn sync_active_pane(&mut self, window: &mut Window, cx: &App) {
-        let active_now = self.active_tab(cx).and_then(|t| t.active_pane_id.clone());
-        if active_now != self.last_active_pane {
-            self.last_active_pane = active_now.clone();
+    fn sync_active_window(&mut self, window: &mut Window, cx: &App) {
+        let active_now = self.active_session(cx).and_then(|t| t.active_window_id.clone());
+        if active_now != self.last_active_window {
+            self.last_active_window = active_now.clone();
             self.activated_at = Some(Instant::now());
             self.center_pending = active_now.is_some();
         }
@@ -640,19 +642,19 @@ impl WindowToolbarView {
         }
     }
 
-    /// Apply the centering offset for the active pane. Returns `false` (a retry
+    /// Apply the centering offset for the active window. Returns `false` (a retry
     /// signal) when the pill hasn't been laid out yet.
     fn try_center_active(&mut self, cx: &App) -> bool {
-        // Resolve the active pane's row index (dropping the model borrow) before
+        // Resolve the active window's row index (dropping the model borrow) before
         // touching the scroll handle.
         let ix = {
-            let Some(tab) = self.active_tab(cx) else {
+            let Some(session) = self.active_session(cx) else {
                 return true; // nothing to center
             };
-            let Some(active_id) = tab.active_pane_id.as_deref() else {
+            let Some(active_id) = session.active_window_id.as_deref() else {
                 return true;
             };
-            match tab.panes.iter().position(|p| p.id == active_id) {
+            match session.windows.iter().position(|p| p.id == active_id) {
                 Some(ix) => ix,
                 None => return true,
             }
@@ -675,13 +677,13 @@ impl WindowToolbarView {
 
     // MARK: - Inline rename
 
-    fn begin_editing(&mut self, tab_id: &str, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_editing(&mut self, session_id: &str, term_window_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(title) = self
             .state
             .read(cx)
-            .model
-            .tab_for(tab_id)
-            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
+            .workspace
+            .session_for(session_id)
+            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
             .map(|p| p.title.clone())
         else {
             return;
@@ -690,11 +692,11 @@ impl WindowToolbarView {
         // drop the previous edit's boundary table and, crucially, any drag arm
         // it left behind (see `reset_field_probe`).
         reset_field_probe(&self.rename_probe);
-        // Select the whole title on entry (a pane title is not a filename, so the
+        // Select the whole title on entry (a window title is not a filename, so the
         // whole name — not base-minus-extension — is the replace target): the
         // first keystroke replaces it.
         self.rename_editor = Some(TextFieldEditor::with_selection(&title, title.chars().count()));
-        self.editing_pane = Some((tab_id.to_string(), pane_id.to_string()));
+        self.editing_window = Some((session_id.to_string(), term_window_id.to_string()));
         self.rename_focus.focus(window, cx);
         // Commit on focus loss (the DO-NOT-PORT click-away monitor replacement).
         // Replacing any prior subscription here drops it OUTSIDE its callback.
@@ -704,23 +706,23 @@ impl WindowToolbarView {
         cx.notify();
     }
 
-    /// Commit the draft through the R8 [`TabModel::rename_pane`] (empty input
+    /// Commit the draft through the R8 [`WorkspaceModel::rename_window`] (empty input
     /// resets to the per-kind auto-default + consumes a counter slot — asymmetry
     /// 3; the pill reimplements none of it). Idempotent: a stray focus-out after
     /// the edit already ended does nothing.
     fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((tab_id, pane_id)) = self.editing_pane.take() else {
+        let Some((session_id, term_window_id)) = self.editing_window.take() else {
             return;
         };
         let draft = self.rename_editor.take().map(|e| e.text()).unwrap_or_default();
         self.state
-            .update(cx, |ws, _| ws.model.rename_pane(&tab_id, &pane_id, &draft));
+            .update(cx, |ws, _| ws.workspace.rename_window(&session_id, &term_window_id, &draft));
         self.refocus_terminal_after_rename(window, cx);
         cx.notify();
     }
 
     fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_pane.take().is_none() {
+        if self.editing_window.take().is_none() {
             return;
         }
         self.rename_editor = None;
@@ -759,11 +761,11 @@ impl WindowToolbarView {
 
     /// Swift's `commitEdit`/`cancelEdit` call `sessions.focusActiveTerminal()`
     /// so the terminal regains first responder after a rename (dossier G10).
-    /// Here the window's [`PaneHostView`] owns the hosted terminal views, so
+    /// Here the window's [`WindowHostView`] owns the hosted terminal views, so
     /// focus routes back through its `focus_active_terminal` (M2 Item D). A
-    /// no-op in the isolated `pane-strip` scenario (no pane host wired).
+    /// no-op in the isolated `pane-strip` scenario (no window host wired).
     fn refocus_terminal_after_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(host) = self.pane_host.clone() {
+        if let Some(host) = self.window_host.clone() {
             host.update(cx, |host, cx| host.focus_active_terminal(window, cx));
         }
     }
@@ -772,7 +774,7 @@ impl WindowToolbarView {
         let ks = &event.keystroke;
         // Escape cancels the pill rename HERE — the shared editor leaves Escape
         // Ignored by design ("the owner's Esc binding cancels"), and unlike the
-        // sidebar (whose shell-level Esc action cancels its tab rename) the pill
+        // sidebar (whose shell-level Esc action cancels its session rename) the pill
         // has no shell action of its own, so its owner binding is this listener.
         // The sidebar shell's Esc action runs first (ancestor dispatch) and
         // propagates when it has nothing to do (M2 Item D: "Escape cancels").
@@ -815,23 +817,23 @@ impl WindowToolbarView {
 
     // MARK: - Pill interactions (select / rename gate)
 
-    /// Whether `pane_id` is the pane currently being inline-renamed.
-    fn is_editing_pane(&self, pane_id: &str) -> bool {
-        self.editing_pane.as_ref().map(|(_, p)| p.as_str()) == Some(pane_id)
+    /// Whether `term_window_id` is the window currently being inline-renamed.
+    fn is_editing_window(&self, term_window_id: &str) -> bool {
+        self.editing_window.as_ref().map(|(_, p)| p.as_str()) == Some(term_window_id)
     }
 
-    /// A plain (unmodified) press on a pill body: select the pane. Commits any
+    /// A plain (unmodified) press on a pill body: select the window. Commits any
     /// in-flight rename on another pill first.
-    fn select_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id(cx) else {
+    fn select_window(&mut self, term_window_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.active_session_id(cx) else {
             return;
         };
-        if self.editing_pane.is_some() {
+        if self.editing_window.is_some() {
             self.commit_rename(window, cx);
         }
         self.state.update(cx, |ws, _| {
-            ws.pane_strip_actions
-                .select_pane(&mut ws.model, &tab_id, pane_id)
+            ws.window_strip_actions
+                .select_window(&mut ws.workspace, &session_id, term_window_id)
         });
         cx.notify();
     }
@@ -839,51 +841,51 @@ impl WindowToolbarView {
     /// A press on the title of an already-active pill: enter rename past the gate,
     /// else it's a plain select on a non-active pill
     /// (`WindowToolbarView.swift:883-888`).
-    fn handle_title_tap(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id(cx) else {
+    fn handle_title_tap(&mut self, term_window_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.active_session_id(cx) else {
             return;
         };
         let is_active = self
-            .active_tab(cx)
-            .and_then(|t| t.active_pane_id.as_deref())
-            == Some(pane_id);
+            .active_session(cx)
+            .and_then(|t| t.active_window_id.as_deref())
+            == Some(term_window_id);
         if is_active {
             if rename_gate_open(self.activated_at) {
-                self.begin_editing(&tab_id, pane_id, window, cx);
+                self.begin_editing(&session_id, term_window_id, window, cx);
             }
             // else: same-click-as-select window — no-op.
         } else {
-            self.select_pane(pane_id, window, cx);
+            self.select_window(term_window_id, window, cx);
         }
     }
 
-    /// Close a pane, committing any in-flight edit first
+    /// Close a window, committing any in-flight edit first
     /// (`WindowToolbarView.swift:912-916`). R20.5: routes through the busy-close
-    /// gate ([`WindowState::request_close_pane`]) — a busy pane (a shell with a
-    /// foreground child) interposes the "Force quit" confirmation; an idle pane
+    /// gate ([`WindowState::request_close_term_window`]) — a busy window (a shell with a
+    /// foreground child) interposes the "Force quit" confirmation; an idle window
     /// still closes immediately (pty release + dissolve cascade + save + terminus),
     /// exactly as before. The gate owns the reconcile + notify + terminus in both
     /// paths.
-    fn close_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id(cx) else {
+    fn close_term_window(&mut self, term_window_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.active_session_id(cx) else {
             return;
         };
-        if self.editing_pane.is_some() {
+        if self.editing_window.is_some() {
             self.commit_rename(window, cx);
         }
         self.state.update(cx, |ws, wcx| {
-            ws.request_close_pane(&tab_id, pane_id, window, wcx);
+            ws.request_close_term_window(&session_id, term_window_id, window, wcx);
         });
     }
 
-    /// Add a terminal pane to the active tab through the seam
+    /// Add a terminal window to the active session through the seam
     /// (`WindowToolbarView.swift:242-244`).
-    fn add_terminal_pane(&mut self, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id(cx) else {
+    fn add_terminal_window(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.active_session_id(cx) else {
             return;
         };
         self.state
-            .update(cx, |ws, _| ws.pane_strip_actions.add_terminal_pane(&mut ws.model, &tab_id));
+            .update(cx, |ws, _| ws.window_strip_actions.add_terminal_window(&mut ws.workspace, &session_id));
         cx.notify();
     }
 
@@ -891,28 +893,28 @@ impl WindowToolbarView {
 
     fn open_pill_context_menu(
         &mut self,
-        pane_id: &str,
-        kind: PaneKind,
+        term_window_id: &str,
+        kind: TermWindowKind,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let weak = cx.weak_entity();
-        let pid = pane_id.to_string();
+        let pid = term_window_id.to_string();
 
         let rename = {
             let w = weak.clone();
             let pid = pid.clone();
             ContextMenuItem::entry(rename_menu_label(kind), move |window, app| {
                 let _ = w.update(app, |this, cx| {
-                    let Some(tab_id) = this.active_tab_id(cx) else {
+                    let Some(session_id) = this.active_session_id(cx) else {
                         return;
                     };
                     this.state.update(cx, |ws, _| {
-                        ws.pane_strip_actions
-                            .select_pane(&mut ws.model, &tab_id, &pid)
+                        ws.window_strip_actions
+                            .select_window(&mut ws.workspace, &session_id, &pid)
                     });
-                    this.begin_editing(&tab_id, &pid, window, cx);
+                    this.begin_editing(&session_id, &pid, window, cx);
                 });
             })
         };
@@ -921,7 +923,7 @@ impl WindowToolbarView {
             let pid = pid.clone();
             ContextMenuItem::entry(close_menu_label(kind), move |window, app| {
                 let _ = w.update(app, |this, cx| {
-                    this.close_pane(&pid, window, cx);
+                    this.close_term_window(&pid, window, cx);
                 });
             })
         };
@@ -929,16 +931,16 @@ impl WindowToolbarView {
     }
 
     fn open_overflow_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        // Snapshot the (pane id, row label) pairs while the model borrow is held,
+        // Snapshot the (window id, row label) pairs while the model borrow is held,
         // then build the menu items from owned data.
         let rows: Vec<(String, String)> = {
-            let Some(tab) = self.active_tab(cx) else {
+            let Some(session) = self.active_session(cx) else {
                 return;
             };
-            let active = tab.active_pane_id.clone();
-            tab.panes
+            let active = session.active_window_id.clone();
+            session.windows
                 .iter()
-                .map(|pane| (pane.id.clone(), overflow_row_label(pane, active.as_deref())))
+                .map(|term_window| (term_window.id.clone(), overflow_row_label(term_window, active.as_deref())))
                 .collect()
         };
         let weak = cx.weak_entity();
@@ -948,7 +950,7 @@ impl WindowToolbarView {
                 let w = weak.clone();
                 ContextMenuItem::entry(label, move |window, app| {
                     let _ = w.update(app, |this, cx| {
-                        this.select_pane(&pid, window, cx);
+                        this.select_window(&pid, window, cx);
                     });
                 })
             })
@@ -974,7 +976,7 @@ impl WindowToolbarView {
                 // terminal — unless the dismissed action began an inline rename
                 // (the Rename entry focuses the field before the menu dismisses),
                 // which must keep the field focused (M2 Item D).
-                if this.editing_pane.is_none() {
+                if this.editing_window.is_none() {
                     this.refocus_terminal_after_rename(window, cx);
                 }
                 cx.notify();
@@ -1079,20 +1081,20 @@ impl WindowToolbarView {
 
     /// The scroll row's `on_drag_move`: recompute the gated drop slot while a pill
     /// drag is in flight. Fires in the Capture phase for EVERY window mouse-move
-    /// while a `PaneDragPayload` is dragging — including over the terminal body
+    /// while a `WindowDragPayload` is dragging — including over the terminal body
     /// below the strip — so it FIRST guards strip containment (the port of Swift's
     /// `dropExited`, `WindowToolbarView.swift:529-536`): a cursor outside the row's
     /// hitbox clears `drag_target` and returns, else the row-only x-resolver would
     /// paint an insertion line while dragging straight down into the terminal (D8).
     /// When contained, the cursor's viewport-relative x is `position.x -
     /// bounds.origin.x` (the row IS the tracked viewport, so `bounds.origin.x ==
-    /// viewport_left`), fed with the model pane order + viewport-relative frames to
+    /// viewport_left`), fed with the model window order + viewport-relative frames to
     /// the pure [`resolve`], whose `would_move` gate closes over
-    /// [`TabModel::would_move_pane`]. The result (a no-op slot resolves to `None`)
+    /// [`WorkspaceModel::would_move_window`]. The result (a no-op slot resolves to `None`)
     /// is stored for the drop to read (D9).
     fn on_pill_drag_move(
         &mut self,
-        event: &DragMoveEvent<PaneDragPayload>,
+        event: &DragMoveEvent<WindowDragPayload>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1106,15 +1108,15 @@ impl WindowToolbarView {
             return;
         }
         let payload = event.drag(cx).clone();
-        let dragged = payload.pane_id.to_string();
-        let tab_id = payload.tab_id.to_string();
+        let dragged = payload.term_window_id.to_string();
+        let session_id = payload.session_id.to_string();
         let x_rel = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
-        let pane_order = self.pane_ids(cx);
-        let frames = self.strip_geometry(cx).pane_frames;
+        let window_order = self.term_window_ids(cx);
+        let frames = self.strip_geometry(cx).window_frames;
         let new_target = {
             let ws = self.state.read(cx);
-            resolve(&dragged, x_rel, &pane_order, &frames, |target, place_after| {
-                ws.model.would_move_pane(&dragged, &tab_id, target, place_after)
+            resolve(&dragged, x_rel, &window_order, &frames, |target, place_after| {
+                ws.workspace.would_move_window(&dragged, &session_id, target, place_after)
             })
         };
         if self.drag_target != new_target {
@@ -1125,21 +1127,21 @@ impl WindowToolbarView {
 
     /// The scroll row's `on_drop`: commit the reorder to the slot the last
     /// `on_drag_move` resolved (D9). Reads the stored `drag_target` (the mouse-up
-    /// carries no position), calls [`TabModel::move_pane`] synchronously — gpui
+    /// carries no position), calls [`WorkspaceModel::move_window`] synchronously — gpui
     /// clears `active_drag` itself after this listener, so no deferral is needed —
     /// then persists explicitly via [`WindowState::save_to_store`]. The
     /// once-per-window `on_tree_mutation` observer (BUGHUNT1-D) now also fires from
-    /// `move_pane`, so this explicit save is belt-and-suspenders (a duplicate
+    /// `move_window`, so this explicit save is belt-and-suspenders (a duplicate
     /// debounced upsert is harmless — kept per that plan's D2).
-    /// Selection/focus are untouched (`move_pane` never touches
-    /// `active_pane_id`). A drop resolving to `None` (a horizontal inter-pill gap,
+    /// Selection/focus are untouched (`move_window` never touches
+    /// `active_window_id`). A drop resolving to `None` (a horizontal inter-pill gap,
     /// or a no-op slot) just clears the field.
-    fn on_pill_drop(&mut self, payload: &PaneDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_pill_drop(&mut self, payload: &WindowDragPayload, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some((target, place_after)) = self.drag_target.take() {
-            let dragged = payload.pane_id.to_string();
-            let tab_id = payload.tab_id.to_string();
+            let dragged = payload.term_window_id.to_string();
+            let session_id = payload.session_id.to_string();
             self.state.update(cx, |ws, _| {
-                ws.model.move_pane(&dragged, &tab_id, &target, place_after);
+                ws.workspace.move_window(&dragged, &session_id, &target, place_after);
                 ws.save_to_store();
             });
         }
@@ -1149,18 +1151,18 @@ impl WindowToolbarView {
     /// The reorder insertion line: a 2pt vertical accent bar at the resolved target
     /// slot's edge, an absolute child of `scroll_wrap` (D10). `edge_x` is the target
     /// frame's leading edge (`place_after == false`) or trailing edge (`== true`),
-    /// read from the viewport-relative `pane_frames`. Painted only while
+    /// read from the viewport-relative `term_window_frames`. Painted only while
     /// `drag_target` is set AND gpui still has an active drag — the `has_active_drag`
     /// conjunct drops the line the instant a dropped-nowhere mouse-up clears
     /// `active_drag`, even if a stale `drag_target` somehow survived. Because
-    /// `drag_target` is already `would_move_pane`-gated, no line shows for a no-op
+    /// `drag_target` is already `would_move_window`-gated, no line shows for a no-op
     /// slot. Pure paint: no id, no listeners.
     fn insertion_line(&self, cx: &App) -> Option<gpui::AnyElement> {
         if !cx.has_active_drag() {
             return None;
         }
         let (target, place_after) = self.drag_target.as_ref()?;
-        let frames = self.strip_geometry(cx).pane_frames;
+        let frames = self.strip_geometry(cx).window_frames;
         let frame = frames.get(target)?;
         let edge_x = if *place_after {
             frame.max_x()
@@ -1184,26 +1186,26 @@ impl WindowToolbarView {
     /// the always-reserved chevron slot, then the always-visible `+`.
     fn render_strip(
         &self,
-        panes: &[PaneVm],
+        windows: &[WindowVm],
         s: &Slots,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Single-tab mode (round-2 plan 4): with EXACTLY one pane the strip draws
-        // no tab boxes — the title renders as the window's centered titlebar text
+        // Single-session mode (round-2 plan 4): with EXACTLY one window the strip draws
+        // no session boxes — the title renders as the window's centered titlebar text
         // (the overlay built in `render`), and the overflow chevron is hidden (it
         // cannot be needed; `show_chevron` already reports false below one overflow,
         // but the slot itself is dropped here so the tail is just the `+`). The
         // trailing `+` stays.
-        let single = panes.len() == 1;
+        let single = windows.len() == 1;
         let geometry = self.strip_geometry(cx);
         let show_chevron = self.show_chevron(cx);
         let has_attention = self.has_offscreen_attention(cx);
 
-        // The active tab id — captured once and threaded into each pill's drag
-        // payload (D3) so the drop's `move_pane` is robust to any active-tab change
+        // The active session id — captured once and threaded into each pill's drag
+        // payload (D3) so the drop's `move_window` is robust to any active-session change
         // mid-drag.
-        let tab_id = self.active_tab_id(cx).unwrap_or_default();
+        let session_id = self.active_session_id(cx).unwrap_or_default();
 
         // The tracked scroll viewport (fixed width — the two trailing slots are
         // always reserved) hosting the pill row. It is ALSO the drop target: the
@@ -1211,7 +1213,7 @@ impl WindowToolbarView {
         // `on_drag_move` here yields a valid viewport-relative `x_rel` (a
         // pill-attached mover would see the pill's own hitbox bounds instead —
         // D8). `on_drag_move` recomputes the gated `drag_target`; `on_drop` commits
-        // it. Both key on the `PaneDragPayload` type; no `can_drop` predicate.
+        // it. Both key on the `WindowDragPayload` type; no `can_drop` predicate.
         let mut row = div()
             .id("toolbar.paneStrip")
             .track_scroll(&self.scroll)
@@ -1223,19 +1225,19 @@ impl WindowToolbarView {
             .size_full()
             .on_drag_move(cx.listener(Self::on_pill_drag_move))
             .on_drop(cx.listener(Self::on_pill_drop));
-        // No pills in single-tab mode — the centered title overlay replaces them.
+        // No pills in single-session mode — the centered title overlay replaces them.
         if !single {
-            for vm in panes {
-                row = row.child(self.render_pill(vm, &tab_id, s, cx));
+            for vm in windows {
+                row = row.child(self.render_pill(vm, &session_id, s, cx));
             }
         }
 
         // The scroll wrapper carries the two edge fades as absolute overlays so
         // they sit at the viewport's own leading / trailing edges. It is also the
         // viewport-fixed host for the reorder insertion line (D10): `scroll_wrap`'s
-        // origin is the viewport left, and `pane_frames` are viewport-relative, so
+        // origin is the viewport left, and `term_window_frames` are viewport-relative, so
         // the line's x is directly the target frame edge.
-        // Restyle plan 3: the edge fade dissolves the fill-less scrolling tabs into
+        // Restyle plan 3: the edge fade dissolves the fill-less scrolling sessions into
         // the WINDOW-BODY surface (the terminal theme background at the active
         // window opacity), not the `chrome` slot — see `edge_fade`. Computed once
         // here (needs `cx`) and moved into the fade builders.
@@ -1265,12 +1267,12 @@ impl WindowToolbarView {
             .flex_row()
             .items_center()
             .child(scroll_wrap);
-        // Hide the overflow chevron slot entirely in single-tab mode (it cannot be
-        // needed with one pane) — the tail is then just the `+`.
+        // Hide the overflow chevron slot entirely in single-session mode (it cannot be
+        // needed with one window) — the tail is then just the `+`.
         if !single {
             tail = tail.child(self.render_chevron_slot(show_chevron, has_attention, s, cx));
         }
-        tail.child(self.render_new_tab_slot(s, cx))
+        tail.child(self.render_new_session_slot(s, cx))
     }
 
     /// A 16pt gradient from the window-body surface color (`fade`) to transparent,
@@ -1281,10 +1283,10 @@ impl WindowToolbarView {
     /// is the WINDOW-BODY surface — the terminal theme background at the active
     /// window opacity, computed by the caller — NOT the `chrome` slot
     /// (`background @ CHROME_OPACITY 0.70`). Plans 1–2 made the titlebar band
-    /// fill-less, so the fill-less tabs scroll directly over the (now possibly
+    /// fill-less, so the fill-less sessions scroll directly over the (now possibly
     /// translucent) window body; fading to `chrome @ 0.70` composited a FIXED
     /// 0.70-alpha, wrong-color band over the translucent surface (a double-applied,
-    /// differently-tinted stripe at the tab-strip edges). Fading to the same
+    /// differently-tinted stripe at the window-strip edges). Fading to the same
     /// surface color/alpha the body already paints keeps the edges consistent with
     /// the body at every per-scheme opacity.
     fn edge_fade(&self, trailing: bool, fade: Rgba) -> impl IntoElement {
@@ -1315,13 +1317,13 @@ impl WindowToolbarView {
         }
     }
 
-    /// The tab's leading indicator: a per-pane [`StatusDot`] (6pt) for a Claude
-    /// pane (only the size parameter changes here — colours + pulse untouched),
-    /// else the `terminal` SF symbol tinted `tab_ink`. Shared by the pill and the
-    /// single-tab centered title so both read the same per-kind glyph.
-    fn tab_leading(&self, vm: &PaneVm, tab_ink: Rgba, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The session's leading indicator: a per-window [`StatusDot`] (6pt) for a Claude
+    /// window (only the size parameter changes here — colours + pulse untouched),
+    /// else the `terminal` SF symbol tinted `session_ink`. Shared by the pill and the
+    /// single-session centered title so both read the same per-kind glyph.
+    fn session_leading(&self, vm: &WindowVm, session_ink: Rgba, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         match vm.kind {
-            PaneKind::Claude => StatusDot::new(
+            TermWindowKind::Claude => StatusDot::new(
                 SharedString::from(format!("pill.{}", vm.id)),
                 vm.status,
                 slot_srgba(s.ink3),
@@ -1329,7 +1331,7 @@ impl WindowToolbarView {
             .size(TAB_STATUS_DOT_SIZE)
             .suppress_waiting_pulse(vm.waiting_ack)
             .into_any_element(),
-            PaneKind::Terminal => div()
+            TermWindowKind::Terminal => div()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1340,7 +1342,7 @@ impl WindowToolbarView {
                     ICON_TERMINAL,
                     PILL_ICON_SIZE,
                     SymbolWeight::Regular,
-                    tab_ink,
+                    session_ink,
                     self.window_scale,
                     cx,
                 ))
@@ -1348,25 +1350,25 @@ impl WindowToolbarView {
         }
     }
 
-    /// The single-tab centered titlebar text (round-2 plan 4 "Single-tab mode"):
-    /// when the strip holds EXACTLY one pane, its title + leading status dot
+    /// The single-session centered titlebar text (round-2 plan 4 "Single-session mode"):
+    /// when the strip holds EXACTLY one window, its title + leading status dot
     /// render as the window's centered titlebar text (macOS window-title
-    /// convention) instead of a tab box. It is an absolute overlay spanning the
+    /// convention) instead of a session box. It is an absolute overlay spanning the
     /// FULL window width (inset [`SINGLE_TAB_EDGE_INSET`] from both edges so it
     /// clears the traffic-light cluster on the left and the tail `+` on the
     /// right), mono 12px in `ink`, a 6pt status dot leading the title — the sole
-    /// pane is always active, so both wear the active tint. Display-only: no
-    /// underline, no ✕, no hover fill (activation is meaningless with one pane;
+    /// window is always active, so both wear the active tint. Display-only: no
+    /// underline, no ✕, no hover fill (activation is meaningless with one window;
     /// close/rename stay available in the sidebar). It is a pure painted overlay
     /// — no mouse listeners and no `occlude()` — so the empty-band window drag /
     /// double-click-zoom pass straight through it (it stays in the titlebar drag
     /// region). The title clamps + ellipsizes within the inset box and wears the
-    /// same full-title hover tooltip a tab does (plan 1) when clamped.
-    fn render_single_tab_title(&self, vm: &PaneVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// same full-title hover tooltip a session does (plan 1) when clamped.
+    fn render_single_session_title(&self, vm: &WindowVm, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         let ink = slot_to_rgba(s.ink);
-        let leading = self.tab_leading(vm, ink, s, cx);
-        // Tab titles use the terminal font family (parity with the pill).
-        let tab_family = crate::theme_settings::chrome_font_family(cx);
+        let leading = self.session_leading(vm, ink, s, cx);
+        // Session titles use the terminal font family (parity with the pill).
+        let session_family = crate::theme_settings::chrome_font_family(cx);
         let full_title = SharedString::from(vm.title.clone());
         let tooltip_title = full_title.clone();
         div()
@@ -1380,14 +1382,14 @@ impl WindowToolbarView {
             .items_center()
             .justify_center()
             .gap(px(PILL_GAP))
-            .when_some(tab_family, |el, fam| el.font_family(fam))
+            .when_some(session_family, |el, fam| el.font_family(fam))
             .child(leading)
             .child(
                 // The title span shrinks + tail-ellipsizes (`min_w_0` + `truncate`)
                 // within the centered group so it never overruns the inset box; the
                 // `.id()` is only the tooltip's hover anchor — it carries no mouse
                 // listener and never occludes, so clicks/drag pass through to the
-                // band below (parity with the mock's `.tab-single .t`).
+                // band below (parity with the mock's `.session-single .t`).
                 div()
                     .id("toolbar.singleTabTitle")
                     .min_w_0()
@@ -1398,29 +1400,29 @@ impl WindowToolbarView {
                     .child(full_title)
                     .tooltip(move |_window, cx| {
                         let title = tooltip_title.clone();
-                        cx.new(|_| TabTooltip { title }).into()
+                        cx.new(|_| SessionTooltip { title }).into()
                     }),
             )
             .into_any_element()
     }
 
-    fn render_pill(&self, vm: &PaneVm, tab_id: &str, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_pill(&self, vm: &WindowVm, session_id: &str, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = crate::theme_settings::active_chrome_accent(cx);
         let is_active = vm.is_active;
         let ink = slot_to_rgba(s.ink);
         let ink2 = slot_to_rgba(s.ink2);
         let ink3 = slot_to_rgba(s.ink3);
-        // The tab's text tint: active → `ink`, inactive → `ink3` (mock Style A
+        // The session's text tint: active → `ink`, inactive → `ink3` (mock Style A
         // `.tab` / `.tab.active`). The leading glyph tracks the same tint.
-        let tab_ink = if is_active { ink } else { ink3 };
-        // Tab titles use the terminal font family (not the UI sans), read from the
+        let session_ink = if is_active { ink } else { ink3 };
+        // Session titles use the terminal font family (not the UI sans), read from the
         // shared font settings; `None` before the keymap wires it (isolated
         // scenarios) leaves the default font.
-        let tab_family = crate::theme_settings::chrome_font_family(cx);
+        let session_family = crate::theme_settings::chrome_font_family(cx);
 
-        // Leading icon: per-pane StatusDot for Claude (6pt in the strip), else the
-        // `terminal` symbol tinted like the title (shared with the single-tab title).
-        let leading = self.tab_leading(vm, tab_ink, s, cx);
+        // Leading icon: per-window StatusDot for Claude (6pt in the strip), else the
+        // `terminal` symbol tinted like the title (shared with the single-session title).
+        let leading = self.session_leading(vm, session_ink, s, cx);
 
         // Title: the shared inline-rename field while editing, else the label.
         let title: gpui::AnyElement = if vm.is_editing {
@@ -1479,12 +1481,12 @@ impl WindowToolbarView {
                 .whitespace_nowrap()
                 .truncate()
                 .text_size(px(PILL_TEXT_SIZE))
-                .text_color(tab_ink)
+                .text_color(session_ink)
                 .child(full_title)
                 // Full-title hover tooltip (the tail-ellipsized name in full).
                 .tooltip(move |_window, cx| {
                     let title = tooltip_title.clone();
-                    cx.new(|_| TabTooltip { title }).into()
+                    cx.new(|_| SessionTooltip { title }).into()
                 })
                 .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
                     this.handle_title_tap(&pid, window, cx);
@@ -1496,7 +1498,7 @@ impl WindowToolbarView {
         };
 
         // Trailing close "×" — its 16pt slot is always reserved (visibility
-        // toggled) so the tab width never jumps on hover.
+        // toggled) so the pill width never jumps on hover.
         let show_close = vm.is_hovered || is_active;
         let close = self.render_close_button(&vm.id, show_close, s, cx);
 
@@ -1505,22 +1507,22 @@ impl WindowToolbarView {
         let pid_menu = vm.id.clone();
         let kind = vm.kind;
 
-        // The stable per-pane element id the drag arms from (D11, exported
-        // contract `toolbar.pill.<pane_id>`). No `aria_label` — tests drive by
+        // The stable per-window element id the drag arms from (D11, exported
+        // contract `toolbar.pill.<term_window_id>`). No `aria_label` — tests drive by
         // geometry, not AX.
         let pill_id = SharedString::from(format!("toolbar.pill.{}", vm.id));
         // The drag payload (D3) + the ghost title (D4). Captured at drag start.
-        let drag_payload = PaneDragPayload {
-            pane_id: SharedString::from(vm.id.clone()),
-            tab_id: SharedString::from(tab_id.to_string()),
+        let drag_payload = WindowDragPayload {
+            term_window_id: SharedString::from(vm.id.clone()),
+            session_id: SharedString::from(session_id.to_string()),
         };
         let ghost_title = SharedString::from(vm.title.clone());
 
-        // The underline color: accent on the active tab, a scheme-scoped grey
-        // ([`nice_theme::tab_underline_idle`]) on every inactive tab so it reads
-        // as clickable (round-2 plan 4 "Inactive-tab underline"). Same geometry
+        // The underline color: accent on the active session, a scheme-scoped grey
+        // ([`nice_theme::tab_underline_idle`]) on every inactive session so it reads
+        // as clickable (round-2 plan 4 "Inactive-session underline"). Same geometry
         // for both (inset 11px, 1px tall, on the bar's bottom edge — mock Style A
-        // `.tab::after` / `.tab.active::after`).
+        // `.session::after` / `.session.active::after`).
         let underline = if is_active {
             srgba_to_rgba(accent)
         } else {
@@ -1529,10 +1531,10 @@ impl WindowToolbarView {
             ))
         };
 
-        // The tab is fill-less (no pill background, border, rounding, or shadow —
+        // The session is fill-less (no pill background, border, rounding, or shadow —
         // mock Style A): just the dot / title / ✕ row, full bar height, with a 1px
-        // underline seated on the bar's bottom edge (accent on the active tab,
-        // grey on inactive tabs).
+        // underline seated on the bar's bottom edge (accent on the active session,
+        // grey on inactive sessions).
         let pill = div()
             .id(pill_id)
             .relative()
@@ -1543,13 +1545,13 @@ impl WindowToolbarView {
             .px(px(TAB_PAD_X))
             .h(px(PILL_HEIGHT))
             .max_w(px(PILL_MAX_WIDTH))
-            .when_some(tab_family, |el, fam| el.font_family(fam))
+            .when_some(session_family, |el, fam| el.font_family(fam))
             .child(leading)
             .child(title)
             .child(close)
-            // Tab underline (inset 11px from the tab's outer edges, 1px tall, on
-            // the bar's bottom edge — mock `.tab::after` / `.tab.active::after`).
-            // Every tab wears one: accent when active, grey when inactive.
+            // Session underline (inset 11px from the session's outer edges, 1px tall, on
+            // the bar's bottom edge — mock `.session::after` / `.session.active::after`).
+            // Every session wears one: accent when active, grey when inactive.
             .child(
                 div()
                     .absolute()
@@ -1565,13 +1567,13 @@ impl WindowToolbarView {
             // constructor's `Point` offset (the grab point within the pill) when it
             // lays the ghost out (`window.rs` `mouse - cursor_offset`), so the ghost
             // captures that offset and re-adds it as padding to net to `pointer + 12`
-            // (see `PaneDragGhost`). Coexists with the mouse-down select below: gpui's
+            // (see `WindowDragGhost`). Coexists with the mouse-down select below: gpui's
             // drag-arming recorder is a separate window-level listener keyed on the
             // hitbox hover, not this element's handler (D6, proven by the F9 file
             // drag).
             .on_drag(drag_payload, move |_payload, offset, _window, app| {
                 let title = ghost_title.clone();
-                app.new(|_| PaneDragGhost { title, offset })
+                app.new(|_| WindowDragGhost { title, offset })
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -1580,17 +1582,17 @@ impl WindowToolbarView {
                     // on the editing pill's own icon/padding) must keep the edit
                     // alive, not commit + reselect — Swift's `if !isEditing`
                     // onTapGesture guard (`WindowToolbarView.swift:808`).
-                    if this.is_editing_pane(&pid_down) {
+                    if this.is_editing_window(&pid_down) {
                         cx.stop_propagation();
                         return;
                     }
                     // Mouse-down only commits ANOTHER pill's in-flight rename
                     // (prod's click-away mouse monitor fires at press time).
                     // Selection moved to `on_click` below so a press that arms
-                    // a drag no longer also selects the pane — prod's pill
+                    // a drag no longer also selects the window — prod's pill
                     // `.onTapGesture` is a click, not a press
                     // (`WindowToolbarView.swift:803-809`).
-                    if this.editing_pane.is_some() {
+                    if this.editing_window.is_some() {
                         this.commit_rename(window, cx);
                     }
                     // Still consumed: the empty-band window-drag press listener
@@ -1606,11 +1608,11 @@ impl WindowToolbarView {
                 // `.onTapGesture` (`WindowToolbarView.swift:803-809`). A drag
                 // that armed suppresses the click, so drag-to-reorder no longer
                 // double-fires a select.
-                if this.is_editing_pane(&pid_select) {
+                if this.is_editing_window(&pid_select) {
                     cx.stop_propagation();
                     return;
                 }
-                this.select_pane(&pid_select, window, cx);
+                this.select_window(&pid_select, window, cx);
                 cx.stop_propagation();
             }))
             .on_mouse_down(
@@ -1627,13 +1629,13 @@ impl WindowToolbarView {
     /// toggles paint + hit-testing so the pill width is hover-invariant.
     fn render_close_button(
         &self,
-        pane_id: &str,
+        term_window_id: &str,
         visible: bool,
         s: &Slots,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let hover = ink_alpha(s, CLOSE_HOVER_INK_ALPHA);
-        let pid = pane_id.to_string();
+        let pid = term_window_id.to_string();
         // 9pt semibold `xmark`, ink3 (`WindowToolbarView.swift:984-986`).
         let icon = sf_symbol_icon(
             SF_CLOSE,
@@ -1659,7 +1661,7 @@ impl WindowToolbarView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
-                        this.close_pane(&pid, window, cx);
+                        this.close_term_window(&pid, window, cx);
                         cx.stop_propagation();
                     }),
                 );
@@ -1744,14 +1746,14 @@ impl WindowToolbarView {
     /// asked for a vertical-centering fix. Direct pixel measurement of the shipped
     /// build (retina, scale 2) found the glyph already centered: the `+` ink
     /// mid-line lands within ~0.5pt of the 28pt bar's center and aligns with the
-    /// tab-title text. The SF `plus`/`chevron.down` bitmaps are themselves
+    /// session-title text. The SF `plus`/`chevron.down` bitmaps are themselves
     /// vertically symmetric (ink mid == box center), and this slot's
     /// `items_center` centers that box in the full-height bar — so NO optical
     /// nudge is applied (one would de-center it, and the plan forbids a magic
     /// offset absent a genuine metric need). Same construction for the chevron.
     /// The drift the feel-check actually saw was HORIZONTAL — see
     /// [`TOOLBAR_TRAILING_PAD`] (20 → the mock's 10).
-    fn render_new_tab_slot(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_session_slot(&self, s: &Slots, cx: &mut Context<Self>) -> impl IntoElement {
         let hover = ink_alpha(s, SQUARE_BTN_HOVER_INK_ALPHA);
         // 11pt semibold `plus`, ink2 (`WindowToolbarView.swift:1134-1136`).
         let icon = sf_symbol_icon(
@@ -1784,7 +1786,7 @@ impl WindowToolbarView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                            this.add_terminal_pane(cx);
+                            this.add_terminal_window(cx);
                             cx.stop_propagation();
                         }),
                     ),
@@ -1848,7 +1850,7 @@ impl WindowToolbarView {
                 .child(
                     div()
                         .text_size(px(PILL_TEXT_SIZE))
-                        // The chrome family — the tab pills render in it; without
+                        // The chrome family — the session pills render in it; without
                         // it this pill alone reads in the system font.
                         .when_some(crate::theme_settings::chrome_font_family(cx), |d, fam| {
                             d.font_family(fam)
@@ -1902,7 +1904,7 @@ impl WindowToolbarView {
                 // The popover grabbed key focus on open; hand it back to the
                 // active terminal (unless a rename is mid-flight — parity with the
                 // context-menu dismissal).
-                if this.editing_pane.is_none() {
+                if this.editing_window.is_none() {
                     this.refocus_terminal_after_rename(window, cx);
                 }
                 cx.notify();
@@ -1946,20 +1948,20 @@ impl Render for WindowToolbarView {
                 this.refocus_terminal_after_rename(window, cx);
             }));
         }
-        // Reset the rename gate + auto-center when the active pane changed.
-        self.sync_active_pane(window, cx);
+        // Reset the rename gate + auto-center when the active window changed.
+        self.sync_active_window(window, cx);
 
         let s = active_slots(cx);
-        let panes = self.snapshot_panes(cx);
+        let windows = self.snapshot_windows(cx);
 
-        // The single-pane centered title (round-2 plan 4). Built here because it is
+        // The single-window centered title (round-2 plan 4). Built here because it is
         // an absolute overlay spanning the FULL window width — not a child of the
         // padded content row (whose residual strip space is off-center). `None`
-        // unless the strip holds exactly one pane.
-        let single_tab_title =
-            (panes.len() == 1).then(|| self.render_single_tab_title(&panes[0], &s, cx));
+        // unless the strip holds exactly one window.
+        let single_session_title =
+            (windows.len() == 1).then(|| self.render_single_session_title(&windows[0], &s, cx));
 
-        // The padded content row: the collapse toggle, the pane strip, and the
+        // The padded content row: the collapse toggle, the window strip, and the
         // conditional trailing update pill. Its leading reserve clears the native
         // traffic-light cluster before the collapse toggle (the titlebar is now
         // full-width in both shell states, so its left edge sits under the lights).
@@ -1971,7 +1973,7 @@ impl Render for WindowToolbarView {
             .pl(px(traffic_light_reserved_width()))
             .pr(px(TOOLBAR_TRAILING_PAD))
             .child(self.render_collapse_toggle(&s, cx))
-            .child(self.render_strip(&panes, &s, window, cx))
+            .child(self.render_strip(&windows, &s, window, cx))
             // Trailing update-pill slot (R27, P7): the conditional update pill,
             // inserted after the strip. It renders ONLY when a newer release is
             // available — absent, it emits nothing, so the toolbar with no update is
@@ -1979,15 +1981,15 @@ impl Render for WindowToolbarView {
             .children(self.render_update_pill(&s, cx));
 
         div()
-            // Exported shipped-surface AX anchor (§6): the pane-strip (toolbar)
+            // Exported shipped-surface AX anchor (§6): the window-strip (toolbar)
             // root, found by an AX walk on role + label. `.id()` + a non-generic
             // `.role()` are what expose an element to the macOS AX tree; the
             // `aria_label` becomes its `AXTitle`.
-            .id(PANE_STRIP_ROOT_LABEL)
+            .id(WINDOW_STRIP_ROOT_LABEL)
             .role(gpui::Role::Group)
-            .aria_label(PANE_STRIP_ROOT_LABEL)
+            .aria_label(WINDOW_STRIP_ROOT_LABEL)
             // Unpadded (the padding lives on `content`) + `relative` so the
-            // single-tab title overlay + popups position against the full window
+            // single-session title overlay + popups position against the full window
             // width. No fill and no bottom rule — the fill-less restyle titlebar;
             // the window-body backing shows through (plan
             // `docs/plans/restyle/01-titlebar-restyle.md`).
@@ -1996,16 +1998,16 @@ impl Render for WindowToolbarView {
             .key_context("WindowToolbar")
             .w_full()
             .h(px(TOP_BAR_HEIGHT))
-            // Empty-band drag / double-click on the whole bar (the tabs + buttons
+            // Empty-band drag / double-click on the whole bar (the sessions + buttons
             // stop_propagation so only the empty titlebar reaches these — the R9
-            // differential pair; the single-tab title overlay passes clicks through).
+            // differential pair; the single-session title overlay passes clicks through).
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_band_mouse_down))
             .on_mouse_move(cx.listener(Self::on_band_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_band_mouse_up))
             .child(content)
-            // The single-pane centered title overlay (absolute, full window width,
+            // The single-window centered title overlay (absolute, full window width,
             // click pass-through) — painted above the pill-less strip, below the popups.
-            .children(single_tab_title)
+            .children(single_session_title)
             .children(self.context_menu.clone())
             // The update popover (D9), rendered as a deferred child while open.
             .children(self.update_popover.clone())
@@ -2019,20 +2021,20 @@ impl Render for WindowToolbarView {
 // methods route through the real select/close/add/rename paths so the scenario
 // exercises the shipped behaviour, not a shortcut.
 impl WindowToolbarView {
-    /// The active tab's pane ids, in order.
-    pub(crate) fn pane_ids(&self, cx: &App) -> Vec<String> {
-        self.active_tab(cx)
-            .map(|t| t.panes.iter().map(|p| p.id.clone()).collect())
+    /// The active session's window ids, in order.
+    pub(crate) fn term_window_ids(&self, cx: &App) -> Vec<String> {
+        self.active_session(cx)
+            .map(|t| t.windows.iter().map(|p| p.id.clone()).collect())
             .unwrap_or_default()
     }
 
-    /// The active pane id, if any.
-    pub(crate) fn active_pane_id(&self, cx: &App) -> Option<String> {
-        self.active_tab(cx)
-            .and_then(|t| t.active_pane_id.clone())
+    /// The active window id, if any.
+    pub(crate) fn active_window_id(&self, cx: &App) -> Option<String> {
+        self.active_session(cx)
+            .and_then(|t| t.active_window_id.clone())
     }
 
-    /// The current pill-reorder drop slot `(target_pane_id, place_after)` — the
+    /// The current pill-reorder drop slot `(target_window_id, place_after)` — the
     /// gated `drag_target` (D7), the deterministic slot the in-process reorder
     /// itests assert against and the live scenario can read.
     pub(crate) fn scenario_drag_target(&self) -> Option<(String, bool)> {
@@ -2044,18 +2046,18 @@ impl WindowToolbarView {
         self.show_chevron(cx)
     }
 
-    /// Whether the strip is in single-tab mode — exactly one pane, so the tab
+    /// Whether the strip is in single-session mode — exactly one window, so the session
     /// boxes are replaced by the centered titlebar title (round-2 plan 4). The
-    /// `pane-strip` scenario reads this after closing the strip down to one pane.
-    pub(crate) fn scenario_single_tab_active(&self, cx: &App) -> bool {
-        self.active_tab(cx).map(|t| t.panes.len() == 1).unwrap_or(false)
+    /// `pane-strip` scenario reads this after closing the strip down to one window.
+    pub(crate) fn scenario_single_session_active(&self, cx: &App) -> bool {
+        self.active_session(cx).map(|t| t.windows.len() == 1).unwrap_or(false)
     }
 
-    /// The single-tab centered title (the sole pane's title) when in single-tab
-    /// mode, else `None` — the scenario asserts it reads the surviving pane's name.
-    pub(crate) fn scenario_single_tab_title(&self, cx: &App) -> Option<String> {
-        let tab = self.active_tab(cx)?;
-        (tab.panes.len() == 1).then(|| tab.panes[0].title.clone())
+    /// The single-session centered title (the sole window's title) when in single-session
+    /// mode, else `None` — the scenario asserts it reads the surviving window's name.
+    pub(crate) fn scenario_single_session_title(&self, cx: &App) -> Option<String> {
+        let session = self.active_session(cx)?;
+        (session.windows.len() == 1).then(|| session.windows[0].title.clone())
     }
 
     /// Whether the overflow (or a pill) context menu is currently open — the live
@@ -2065,9 +2067,9 @@ impl WindowToolbarView {
         self.context_menu.is_some()
     }
 
-    /// The fully-offscreen pane ids (drives the fades / badge assertions).
-    pub(crate) fn scenario_offscreen_pane_ids(&self, cx: &App) -> std::collections::HashSet<String> {
-        self.strip_geometry(cx).offscreen_pane_ids()
+    /// The fully-offscreen window ids (drives the fades / badge assertions).
+    pub(crate) fn scenario_offscreen_window_ids(&self, cx: &App) -> std::collections::HashSet<String> {
+        self.strip_geometry(cx).offscreen_window_ids()
     }
 
     // --- R27 update pill / popover (the `update-check` scenario read/drive seam) ---
@@ -2128,7 +2130,7 @@ impl WindowToolbarView {
         cx.notify();
     }
 
-    /// Whether the attention badge should light (a fully-offscreen pane needs
+    /// Whether the attention badge should light (a fully-offscreen window needs
     /// attention).
     pub(crate) fn scenario_has_offscreen_attention(&self, cx: &App) -> bool {
         self.has_offscreen_attention(cx)
@@ -2141,22 +2143,22 @@ impl WindowToolbarView {
 
     /// The pill's window-space bounds, if laid out (drives the ×-slot width
     /// equality + centering assertions).
-    pub(crate) fn scenario_pill_bounds(&self, pane_id: &str, cx: &App) -> Option<Bounds<Pixels>> {
-        let tab = self.active_tab(cx)?;
-        let ix = tab.panes.iter().position(|p| p.id == pane_id)?;
+    pub(crate) fn scenario_pill_bounds(&self, term_window_id: &str, cx: &App) -> Option<Bounds<Pixels>> {
+        let session = self.active_session(cx)?;
+        let ix = session.windows.iter().position(|p| p.id == term_window_id)?;
         self.scroll.bounds_for_item(ix)
     }
 
-    /// The on-screen content-view centre of `pane_id`'s trailing "×" close square,
+    /// The on-screen content-view centre of `term_window_id`'s trailing "×" close square,
     /// as `(x, y_from_top)` — the R20.5 `close-confirmation` scenario's real-CGEvent
-    /// target. The `×` is the tab's last child: `TAB_PAD_X` in from the right edge,
+    /// target. The `×` is the session's last child: `TAB_PAD_X` in from the right edge,
     /// `CLOSE_BTN_SIZE` wide, so its centre sits `TAB_PAD_X + CLOSE_BTN_SIZE/2` left
-    /// of the tab's right edge. The offset-free pill bounds get the live scroll
+    /// of the session's right edge. The offset-free pill bounds get the live scroll
     /// offset applied (matching `scenario_pill_bounds`'s coordinate convention).
-    /// `None` when the pane is not laid out. NB the `×` is only hit-testable while
-    /// the pane is hovered/active — select it first.
-    pub(crate) fn scenario_close_button_center(&self, pane_id: &str, cx: &App) -> Option<(f32, f32)> {
-        let b = self.scenario_pill_bounds(pane_id, cx)?;
+    /// `None` when the window is not laid out. NB the `×` is only hit-testable while
+    /// the window is hovered/active — select it first.
+    pub(crate) fn scenario_close_button_center(&self, term_window_id: &str, cx: &App) -> Option<(f32, f32)> {
+        let b = self.scenario_pill_bounds(term_window_id, cx)?;
         let off = f32::from(self.scroll.offset().x);
         let right = f32::from(b.origin.x) + off + f32::from(b.size.width);
         let x = right - TAB_PAD_X - CLOSE_BTN_SIZE / 2.0;
@@ -2164,37 +2166,37 @@ impl WindowToolbarView {
         Some((x, y))
     }
 
-    /// Drive a pane selection through the real path.
-    pub(crate) fn drive_select_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_pane(pane_id, window, cx);
+    /// Drive a window selection through the real path.
+    pub(crate) fn drive_select_window(&mut self, term_window_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_window(term_window_id, window, cx);
     }
 
-    /// Drive a terminal-pane add through the real path.
-    pub(crate) fn drive_add_terminal_pane(&mut self, cx: &mut Context<Self>) {
-        self.add_terminal_pane(cx);
+    /// Drive a terminal-window add through the real path.
+    pub(crate) fn drive_add_terminal_window(&mut self, cx: &mut Context<Self>) {
+        self.add_terminal_window(cx);
     }
 
-    /// Drive a pane close through the real path.
-    pub(crate) fn drive_close_pane(&mut self, pane_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_pane(pane_id, window, cx);
+    /// Drive a window close through the real path.
+    pub(crate) fn drive_close_term_window(&mut self, term_window_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_term_window(term_window_id, window, cx);
     }
 
-    /// Begin an inline rename of the ACTIVE pane through the real path (the
+    /// Begin an inline rename of the ACTIVE window through the real path (the
     /// gate-passed title tap and the context-menu Rename entry both land in
     /// `begin_editing`) — the `app-shell` scenario's focus-routing driver.
     pub(crate) fn drive_begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_tab_id(cx) else {
+        let Some(session_id) = self.active_session_id(cx) else {
             return;
         };
-        let Some(pane_id) = self.active_pane_id(cx) else {
+        let Some(term_window_id) = self.active_window_id(cx) else {
             return;
         };
-        self.begin_editing(&tab_id, &pane_id, window, cx);
+        self.begin_editing(&session_id, &term_window_id, window, cx);
     }
 
-    /// Whether an inline pane rename is in flight.
+    /// Whether an inline window rename is in flight.
     pub(crate) fn scenario_rename_editing(&self) -> bool {
-        self.editing_pane.is_some()
+        self.editing_window.is_some()
     }
 
     /// The in-flight rename draft (the scenario's "keys land in the field" read).
@@ -2226,26 +2228,26 @@ impl WindowToolbarView {
         self.rename_focus.is_focused(window)
     }
 
-    /// Set a pane's `(status, viewed)` on the model (the scenario drives attention
+    /// Set a window's `(status, viewed)` on the model (the scenario drives attention
     /// via the model, never a second predicate).
-    pub(crate) fn drive_pane_status(
+    pub(crate) fn drive_window_status(
         &mut self,
-        pane_id: &str,
-        status: TabStatus,
+        term_window_id: &str,
+        status: SessionStatus,
         being_viewed: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab_id) = self.active_tab_id(cx) else {
+        let Some(session_id) = self.active_session_id(cx) else {
             return;
         };
         let changed = self.state.update(cx, |ws, _| {
-            if let Some((pi, ti)) = ws.model.project_tab_index(&tab_id) {
-                if let Some(pane) = ws.model.projects[pi].tabs[ti]
-                    .panes
+            if let Some((pi, ti)) = ws.workspace.project_session_index(&session_id) {
+                if let Some(term_window) = ws.workspace.projects[pi].sessions[ti]
+                    .windows
                     .iter_mut()
-                    .find(|p| p.id == pane_id)
+                    .find(|p| p.id == term_window_id)
                 {
-                    pane.apply_status_transition(status, being_viewed);
+                    term_window.apply_status_transition(status, being_viewed);
                     return true;
                 }
             }
@@ -2260,21 +2262,33 @@ impl WindowToolbarView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nice_model::Pane;
+    use nice_model::TermWindow;
 
     #[test]
     fn rename_and_close_labels_are_per_kind() {
         // WindowToolbarView.swift:751,755.
-        assert_eq!(rename_menu_label(PaneKind::Terminal), "Rename Terminal");
-        assert_eq!(rename_menu_label(PaneKind::Claude), "Rename Pane");
-        assert_eq!(close_menu_label(PaneKind::Terminal), "Close Terminal");
-        assert_eq!(close_menu_label(PaneKind::Claude), "Close Pane");
+        assert_eq!(
+            rename_menu_label(TermWindowKind::Terminal),
+            "Rename Terminal Window"
+        );
+        assert_eq!(
+            rename_menu_label(TermWindowKind::Claude),
+            "Rename Claude Window"
+        );
+        assert_eq!(
+            close_menu_label(TermWindowKind::Terminal),
+            "Close Terminal Window"
+        );
+        assert_eq!(
+            close_menu_label(TermWindowKind::Claude),
+            "Close Claude Window"
+        );
     }
 
     #[test]
-    fn overflow_row_label_marks_only_the_active_pane() {
-        let term = Pane::new("t", "Terminal 1", PaneKind::Terminal);
-        let claude = Pane::new("c", "Claude", PaneKind::Claude);
+    fn overflow_row_label_marks_only_the_active_window() {
+        let term = TermWindow::new("t", "Terminal 1", TermWindowKind::Terminal);
+        let claude = TermWindow::new("c", "Claude", TermWindowKind::Claude);
 
         // The active row carries the checkmark; the others do not.
         assert!(overflow_row_label(&term, Some("t")).ends_with(ICON_CHECK));
@@ -2313,22 +2327,22 @@ mod tests {
     }
 
     #[test]
-    fn tab_underline_is_the_round2_thin_1px_geometry() {
+    fn session_underline_is_the_round2_thin_1px_geometry() {
         // Round-2 restyle plan 4 thinned both the active (accent) and inactive
-        // (grey) tab underline from 2px to 1px, tracking the updated mock Style A
-        // `.tab::after` / `.tab.active::after` (supersedes plan 1's 2px). The
-        // inset from the tab's outer edges is unchanged at 11px.
+        // (grey) session underline from 2px to 1px, tracking the updated mock Style A
+        // `.session::after` / `.session.active::after` (supersedes plan 1's 2px). The
+        // inset from the session's outer edges is unchanged at 11px.
         assert_eq!(TAB_UNDERLINE_HEIGHT, 1.0);
         assert_eq!(TAB_UNDERLINE_RADIUS, 0.5);
         assert_eq!(TAB_UNDERLINE_INSET, 11.0);
     }
 
     #[test]
-    fn single_tab_edge_inset_matches_the_mock() {
-        // Round-2 plan 4 "Single-tab mode": the centered titlebar title is inset
+    fn single_session_edge_inset_matches_the_mock() {
+        // Round-2 plan 4 "Single-session mode": the centered titlebar title is inset
         // this far from BOTH window edges (symmetric, keeping it centered on the
         // window's true center) so it clears the traffic lights on the left and the
-        // tail `+` on the right — mock `.tab-single { left: 90px; right: 90px }`.
+        // tail `+` on the right — mock `.session-single { left: 90px; right: 90px }`.
         assert_eq!(SINGLE_TAB_EDGE_INSET, 90.0);
     }
 

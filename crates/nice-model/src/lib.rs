@@ -3,23 +3,23 @@
 //! Nice's per-window document model as pure Rust — no behavior tied to a
 //! window, no `gpui` dependency (crates/README.md "Layering rule"). Ported
 //! from `Sources/Nice/State/Models.swift`, the UI-free value tree that a
-//! sidebar row (`Tab`, a session) and its toolbar pills (`Pane`) render over.
+//! sidebar row (`Session`, a session) and its toolbar pills (`TermWindow`) render over.
 //!
 //! The crate splits into two layers, both ported verbatim from Swift:
 //!
 //! **Value types + status model** (`Models.swift`):
 //!
-//! * [`PaneKind`], [`TabStatus`] — the pane kind + per-pane Claude status.
-//! * [`Pane`] — a single toolbar pill: status transitions, the waiting-pulse
-//!   acknowledgment model, and [`Pane::needs_attention`].
-//! * [`Tab`] — a session: the derived aggregate [`Tab::status`] over its live
-//!   Claude panes, [`Tab::waiting_acknowledged`], and the
-//!   [`Tab::recover_next_terminal_index`] hydration helper.
-//! * [`Project`] — an ordered group of tabs.
+//! * [`TermWindowKind`], [`SessionStatus`] — the window kind + per-window Claude status.
+//! * [`TermWindow`] — a single toolbar pill: status transitions, the waiting-pulse
+//!   acknowledgment model, and [`TermWindow::needs_attention`].
+//! * [`Session`] — a session: the derived aggregate [`Session::status`] over its live
+//!   Claude windows, [`Session::waiting_acknowledged`], and the
+//!   [`Session::recover_next_terminal_index`] hydration helper.
+//! * [`Project`] — an ordered group of sessions.
 //!
 //! **The persistence leaves** (`SessionStore.swift`, model-shaped half):
 //!
-//! * [`PersistedPane`] / [`PersistedTab`] / [`PersistedProject`] — the v3
+//! * [`PersistedTermWindow`] / [`PersistedSession`] / [`PersistedProject`] — the v3
 //!   schema value types (camelCase JSON, Swift's shape **minus `branch`**) plus
 //!   `from_model` snapshot / `hydrate` with the exact restore defaults, and
 //!   [`snapshot_projects`] (the empty-project drop rule). The window envelope
@@ -28,9 +28,9 @@
 //!
 //! **The document** (`TabModel.swift`):
 //!
-//! * [`TabModel`] — the per-window projects/tabs/panes tree: seeding + the
-//!   pinned Terminals group, selection ([`TabModel::select_tab`], the single
-//!   `active_tab_id` writer), reorder, pane insert/extract/move, renames +
+//! * [`WorkspaceModel`] — the per-window projects/sessions/windows tree: seeding + the
+//!   pinned Terminals group, selection ([`WorkspaceModel::select_session`], the single
+//!   `active_session_id` writer), reorder, window insert/extract/move, renames +
 //!   title locks + auto-title, cwd bucketing/repair/resolution, depth-1
 //!   `/branch`+handoff lineage, single-entry removal + parent-pointer sweep,
 //!   the arg parsers, and the did-mutate signal.
@@ -42,29 +42,29 @@
 //! Several behaviors in this model look inconsistent and are each intentional
 //! and test-pinned. A reader "cleaning them up" is introducing a bug:
 //!
-//! 1. **"At most one *running* Claude per tab" is a creation-edge rule, not a
-//!    struct invariant.** The promotion guard keys on [`Pane::is_claude_running`]
-//!    ([`Tab::has_running_claude`]), so a running Claude and a deferred-resume
-//!    Claude (`is_claude_running == false`) legitimately coexist in one tab
-//!    transiently. [`Tab::status`] and the aggregations are written to tolerate
-//!    that — there is deliberately **no** type-level "one Claude pane" rule
+//! 1. **"At most one *running* Claude per session" is a creation-edge rule, not a
+//!    struct invariant.** The promotion guard keys on [`TermWindow::is_claude_running`]
+//!    ([`Session::has_running_claude`]), so a running Claude and a deferred-resume
+//!    Claude (`is_claude_running == false`) legitimately coexist in one session
+//!    transiently. [`Session::status`] and the aggregations are written to tolerate
+//!    that — there is deliberately **no** type-level "one Claude window" rule
 //!    here, because one would break promotion and deferred resume.
-//! 2. **The per-tab "Terminal N" counter ([`Tab::next_terminal_index`]) is
+//! 2. **The per-session "Terminal N" counter ([`Session::next_terminal_index`]) is
 //!    monotonic** — never decremented, never reused. Closing "Terminal 2" does
 //!    not free the name; the next add becomes "Terminal 4".
-//!    [`Tab::recover_next_terminal_index`] rebuilds it from pane titles.
-//! 3. **Empty-input rename is asymmetric.** [`TabModel::rename_tab`] with empty
-//!    input is a no-op; [`TabModel::rename_pane`] with empty input resets to
+//!    [`Session::recover_next_terminal_index`] rebuilds it from window titles.
+//! 3. **Empty-input rename is asymmetric.** [`WorkspaceModel::rename_session`] with empty
+//!    input is a no-op; [`WorkspaceModel::rename_window`] with empty input resets to
 //!    the per-kind default, clears the lock, and (for terminals) consumes a
 //!    counter slot.
-//! 4. **Two cwd writers, two policies.** OSC 7 writes `Pane.cwd` only;
-//!    [`TabModel::adopt_tab_cwd`] (the SessionStart-hook path) moves the tab and
-//!    pulls along only panes still tracking the old cwd — diverged panes stay,
-//!    per-pane, not all-or-nothing.
+//! 4. **Two cwd writers, two policies.** OSC 7 writes `TermWindow.cwd` only;
+//!    [`WorkspaceModel::adopt_session_cwd`] (the SessionStart-hook path) moves the session and
+//!    pulls along only windows still tracking the old cwd — diverged windows stay,
+//!    per-window, not all-or-nothing.
 //!
-//! And in the lineage: [`TabModel::insert_branch_parent`] re-parents an
+//! And in the lineage: [`WorkspaceModel::insert_branch_parent`] re-parents an
 //! originating root's former children on first-branch promotion, while
-//! [`TabModel::insert_handoff_child`] deliberately does **not** re-parent — the
+//! [`WorkspaceModel::insert_handoff_child`] deliberately does **not** re-parent — the
 //! anchor stays root.
 //!
 //! ## Sidebar UI state (R10 pure ports)
@@ -73,24 +73,24 @@
 //! case-for-case from the pure-Swift seams and unit-testable exactly like the
 //! tree above:
 //!
-//! * [`selection`] — [`SidebarTabSelection`], the Finder-style multi-select
-//!   model and the "selection ⊇ {active_tab_id}" invariant.
+//! * [`selection`] — [`SidebarSessionSelection`], the Finder-style multi-select
+//!   model and the "selection ⊇ {active_session_id}" invariant.
 //! * [`rename_gate`] — [`InlineRenameClickGate`], the injected-clock
 //!   click-to-rename time gate (R11 reuses it).
 //! * [`sidebar`] — [`SidebarModel`] (+ [`SidebarMode`]): collapsed/mode/peek
 //!   state and the toggle + peek render/clear methods (R12 triggers them).
 //!
-//! ## Pane strip geometry (R11 pure port)
+//! ## TermWindow strip geometry (R11 pure port)
 //!
-//! * [`strip_geometry`] — [`StripGeometry`], the toolbar pane strip's pure
+//! * [`strip_geometry`] — [`StripGeometry`], the toolbar window strip's pure
 //!   visibility math (edge fades + the offscreen id set), ported from
 //!   `Sources/Nice/Views/PaneStripGeometry.swift`, plus
-//!   [`should_show_overflow_chevron`], the reservation + `>=2`-panes overflow
+//!   [`should_show_overflow_chevron`], the reservation + `>=2`-windows overflow
 //!   rule ported *behaviorally* from `PaneStripOverflowEstimator.swift` (its
 //!   width-estimation machinery does not survive — GPUI's real layout
 //!   replaces it). The overflow chevron's attention badge is **not** a third
-//!   predicate here: it reuses [`Tab::has_offscreen_attention`] (R8) fed by
-//!   [`StripGeometry::offscreen_pane_ids`]. [`center_offset_x`] is the pure
+//!   predicate here: it reuses [`Session::has_offscreen_attention`] (R8) fed by
+//!   [`StripGeometry::offscreen_window_ids`]. [`center_offset_x`] is the pure
 //!   auto-center-on-activate offset math (the GPUI-real-layout replacement for
 //!   SwiftUI's `scrollTo(anchor: .center)`), kept here so the R11 view and the
 //!   in-process itests share one arithmetic.
@@ -102,7 +102,7 @@
 //! * [`file_browser`] — the gpui-free model family behind the sidebar's files
 //!   mode: [`file_browser::listing`] (dirs-first filter + sort + visible-order
 //!   flatten), [`file_browser::sort`] (the persisted sort-preference value
-//!   type), [`file_browser::state`]/[`file_browser::store`] (per-tab
+//!   type), [`file_browser::state`]/[`file_browser::store`] (per-session
 //!   in-memory root/expansion/hidden state + the per-window catalog),
 //!   [`file_browser::selection`] (the Finder-style multi-select model keyed by
 //!   path), [`file_browser::click_router`] (the hand-rolled 280 ms
@@ -130,30 +130,30 @@
 //!   prerelease/build-metadata handling, non-negative dotted integers only.
 
 pub mod file_browser;
-mod pane;
-mod pane_strip_drop;
 mod persisted;
 mod project;
 pub mod rename_gate;
 pub mod selection;
 mod semantic_version;
+mod session;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod strip_geometry;
-mod tab;
-mod tab_model;
+mod term_window;
+mod window_strip_drop;
+mod workspace_model;
 
-pub use pane::{Pane, PaneKind, TabStatus};
-pub use pane_strip_drop::{pane_target, resolve};
-pub use persisted::{snapshot_projects, PersistedPane, PersistedProject, PersistedTab};
+pub use persisted::{snapshot_projects, PersistedProject, PersistedSession, PersistedTermWindow};
 pub use project::Project;
 pub use rename_gate::InlineRenameClickGate;
-pub use selection::SidebarTabSelection;
+pub use selection::SidebarSessionSelection;
 pub use semantic_version::SemanticVersion;
+pub use session::Session;
 pub use shortcuts::{default_bindings, default_combo, KeyCombo, Modifiers, ShortcutAction};
 pub use sidebar::{SidebarMode, SidebarModel};
 pub use strip_geometry::{
     center_offset_x, should_show_overflow_chevron, Rect, StripGeometry, EDGE_TOLERANCE,
 };
-pub use tab::Tab;
-pub use tab_model::{FsProbe, TabModel};
+pub use term_window::{SessionStatus, TermWindow, TermWindowKind};
+pub use window_strip_drop::{resolve, window_target};
+pub use workspace_model::{FsProbe, WorkspaceModel};

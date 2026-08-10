@@ -9,46 +9,47 @@
 //! plan pins:
 //!
 //! * **(a) socket newtab + T5 status** — a raw-`UnixStream` `claude` message with
-//!   an empty `tabId` replies `newtab`; a fresh Claude tab appears with a minted
-//!   v4 session UUID, its Claude pane SPAWNED (the stub runs) and
+//!   an empty `tabId` replies `newtab`; a fresh Claude session appears with a minted
+//!   v4 session UUID, its Claude window SPAWNED (the stub runs) and
 //!   `is_claude_running == true` FROM CREATION; the stub's braille-prefixed then
-//!   ✳-prefixed OSC titles drive the tab's sidebar-dot status Thinking → Waiting
+//!   ✳-prefixed OSC titles drive the session's sidebar-dot status Thinking → Waiting
 //!   through the SHIPPED window's subscription.
-//! * **(b) ≤1-running-Claude refusal** — a second `claude` from that tab's real
-//!   pane ids replies `newtab` (Swift's `test_existingClaudeRunning_repliesNewtab`).
-//! * **(c) in-place promotion** — a plain terminal pane in a non-Terminals project
+//! * **(b) ≤1-running-Claude refusal** — a second `claude` from that session's real
+//!   window ids replies `newtab` (Swift's `test_existingClaudeRunning_repliesNewtab`).
+//! * **(c) in-place promotion** — a plain terminal window in a non-Terminals project
 //!   promoting on a `claude` message: reply begins `inplace <uuid>` (a valid v4
-//!   uuid as field 2, an optional R17 settings 3rd field TOLERATED) and the pane
+//!   uuid as field 2, an optional R17 settings 3rd field TOLERATED) and the window
 //!   flips (kind → Claude, `is_claude_running` false→true).
-//! * **(d) worktree split** — `claude -w foo` buckets the new tab under the
-//!   invocation cwd while its `Tab.cwd` carries `.claude/worktrees/foo`.
+//! * **(d) worktree split** — `claude -w foo` buckets the new session under the
+//!   invocation cwd while its `Session.cwd` carries `.claude/worktrees/foo`.
 //! * **(e) exit routes in the shipped window** — a real `exit` in a live terminal
-//!   pane removes it from the SHIPPED window (the subscription-lift proof).
+//!   window removes it from the SHIPPED window (the subscription-lift proof).
 //! * **(f) session_update rotation (R16)** — a raw-`UnixStream` `session_update`
 //!   with `source:"resume"` + a new id + a cwd move materializes a sibling parent
-//!   tab pinned to the OLD id, `is_claude_running == false`, at ROOT
-//!   (`parent_tab_id == None`) with the PRE-rotation cwd, while the originating tab
+//!   session pinned to the OLD id, `is_claude_running == false`, at ROOT
+//!   (`parent_session_id == None`) with the PRE-rotation cwd, while the originating session
 //!   is re-parented UNDER it (indented) and moves into the post-rotation worktree;
-//!   a `source:"clear"` update rotates the id in place with NO new tab; a
-//!   cwd-bearing update adopts onto `Tab.cwd`; and a `source:"fork"` update WITH a
-//!   `jobs/<first8>/state.json` entry (a daemon-hosted background `/fork`,
-//!   Claude Code ≥ 2.1.212) relayed from a pane NO tab owns materializes a nested,
-//!   deferred child under the tab its `forkParentSessionId` names — pinned to the
-//!   fork's id, titled by the job's `name`, carrying the fork's own worktree cwd —
-//!   while the addressed tab's session id and the active tab are untouched; and a
-//!   `source:"fork"` update WITHOUT a jobs entry (an in-pane `/branch` on Claude
-//!   Code ≥ 2.1.214, which stopped reporting `"resume"`) rotates the addressed tab
-//!   and materializes the pre-rotation conversation as a deferred parent, exactly
-//!   like the legacy `source:"resume"` leg; and a `source:"resume"` update naming
-//!   an id that HAS a jobs entry — the daemon waking a COLD background job on
-//!   `claude attach`, relayed with the stale pane id it inherited — touches
-//!   nothing at all: no rotation, no phantom parent (bug 3's second route).
+//!   a `source:"clear"` update rotates the id in place with NO new session; a
+//!   cwd-bearing update adopts onto `Session.cwd`; and a `source:"fork"` update
+//!   WITH a `jobs/<first8>/state.json` entry (a daemon-hosted background `/fork`,
+//!   Claude Code ≥ 2.1.212) relayed from a window NO session owns materializes a
+//!   nested, deferred child under the session its `forkParentSessionId` names —
+//!   pinned to the fork's id, titled by the job's `name`, carrying the fork's own
+//!   worktree cwd — while the addressed session's claude session id and the
+//!   active session are untouched; and a `source:"fork"` update WITHOUT a jobs
+//!   entry (an in-window `/branch` on Claude Code ≥ 2.1.214, which stopped
+//!   reporting `"resume"`) rotates the addressed session and materializes the
+//!   pre-rotation conversation as a deferred parent, exactly like the legacy
+//!   `source:"resume"` leg; and a `source:"resume"` update naming an id that HAS
+//!   a jobs entry — the daemon waking a COLD background job on `claude attach`,
+//!   relayed with the stale window id it inherited — touches nothing at all: no
+//!   rotation, no phantom parent (bug 3's second route).
 //!
 //! ## Hermeticity
 //!
 //! `NICE_CLAUDE_OVERRIDE` points `claude` at a stub script (emits the OSC titles,
 //! then idles) — the machine's real `claude` is NEVER spawned. `HOME` is a
-//! sandbox for the Main pane's login shell; every Claude pane spawns in a sandbox
+//! sandbox for the Main window's login shell; every Claude window spawns in a sandbox
 //! work dir carried by the socket message. Grid/model polls are bounded and
 //! fail-loud (never sleep-and-hope). `Gate::SelfReported`; registered BEFORE
 //! `multiwindow` (its `build_window_root` only `register`s — it installs no
@@ -66,7 +67,7 @@ use anyhow::{Context as _, Result};
 use gpui::{AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
-use nice_model::{Pane, PaneKind, Tab, TabStatus};
+use nice_model::{TermWindow, TermWindowKind, Session, SessionStatus};
 use nice_term_view::TerminalSessionHandle;
 
 use crate::app_shell::AppShellView;
@@ -75,7 +76,7 @@ use crate::window_state::WindowState;
 
 // -- timing ------------------------------------------------------------------
 
-/// Poll cap for a routed model mutation (tab creation, status transition, pane
+/// Poll cap for a routed model mutation (session creation, status transition, window
 /// removal) to land after its socket / pty event — the drain task + entity
 /// subscription hop, on the real clock.
 const ROUTE_POLLS: usize = 60;
@@ -147,7 +148,7 @@ impl Fixture {
         // Point the spawn path's `resolve_claude_binary` at the stub (process env —
         // re-read every spawn). Overwrite-always so a prior scenario's override is
         // replaced by this emitting stub.
-        // SAFETY: single-threaded scenario setup, before any Claude pane forks;
+        // SAFETY: single-threaded scenario setup, before any Claude window forks;
         // matches the existing `std::env::set_var` seams (spawn.rs, selftest).
         unsafe { std::env::set_var("NICE_CLAUDE_OVERRIDE", &stub) };
 
@@ -168,19 +169,19 @@ impl Fixture {
 
 /// Open the `claude-lifecycle` window through the SHIPPED builder and spawn its
 /// driver (self-reported gate). Sandboxes `HOME` around `open_managed_window` so
-/// the Main pane's login shell reads no real user rc, then restores it (every
-/// Claude pane spawns in a socket-supplied work dir, not `HOME`).
+/// the Main window's login shell reads no real user rc, then restores it (every
+/// Claude window spawns in a socket-supplied work dir, not `HOME`).
 pub fn open_claude_lifecycle_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     let fixture = Fixture::build()?;
     let home = fixture.home_str();
     let whandle: WindowHandle<AppShellView> = cx.update(|app| {
         // The shipped builder reads the process-global `SharedFontSettings` (via the
-        // pane host); `install_shortcuts` seeds it. Idempotent — an earlier suite
+        // window host); `install_shortcuts` seeds it. Idempotent — an earlier suite
         // scenario may already have installed it.
         crate::keymap::install_shortcuts(app);
         let prev = std::env::var("HOME").ok();
         // SAFETY: single-threaded setup; restored immediately after the (synchronous)
-        // Main-pane spawn inside `open_managed_window`.
+        // Main-window spawn inside `open_managed_window`.
         unsafe { std::env::set_var("HOME", &home) };
         let opened = crate::app::open_managed_window(app);
         match prev {
@@ -237,7 +238,7 @@ async fn run_claude_lifecycle(
     let work_d = fixture.work_d.to_string_lossy().into_owned();
 
     // === (a) socket newtab + minted uuid + spawned running Claude + T5 status ===
-    let tabs_before = all_tab_ids(cx, &state);
+    let sessions_before = all_session_ids(cx, &state);
     let reply_a = match send_claude(cx, &socket_path, &work_a, &[], "", "").await {
         Some(r) => r,
         None => {
@@ -249,68 +250,68 @@ async fn run_claude_lifecycle(
     if reply_a.trim_end() != "newtab" {
         failures.push(format!("(a) newtab: expected reply 'newtab', got {reply_a:?}"));
     }
-    // The new Claude tab: the one tab id that appeared (it is also now the active tab).
-    let claude_tab = match poll_new_tab(cx, &state, &tabs_before).await {
+    // The new Claude session: the one session id that appeared (it is also now the active session).
+    let claude_session = match poll_new_session(cx, &state, &sessions_before).await {
         Some(t) => t,
         None => {
             return CadenceReport::error(
-                "claude-lifecycle (a): the newtab reply produced no new tab in the model",
+                "claude-lifecycle (a): the newtab reply produced no new session in the model",
             )
         }
     };
-    let (claude_pane, companion_pane) = match tab_pane_ids(cx, &state, &claude_tab) {
+    let (claude_window, companion_window) = match session_window_ids(cx, &state, &claude_session) {
         Some(p) => p,
         None => {
             return CadenceReport::error(
-                "claude-lifecycle (a): the new Claude tab has no [Claude, Terminal 1] panes",
+                "claude-lifecycle (a): the new Claude session has no [Claude, Terminal 1] windows",
             )
         }
     };
-    // The Claude pane is running FROM CREATION + its pty SPAWNED (the stub runs).
-    if !pane_is_claude_running(cx, &state, &claude_tab, &claude_pane) {
-        failures.push("(a) the new Claude pane is not is_claude_running from creation".into());
+    // The Claude window is running FROM CREATION + its pty SPAWNED (the stub runs).
+    if !window_is_claude_running(cx, &state, &claude_session, &claude_window) {
+        failures.push("(a) the new Claude window is not is_claude_running from creation".into());
     }
-    if !poll_has_pane(cx, &state, &claude_tab, &claude_pane).await {
-        failures.push("(a) the new Claude pane never spawned its pty (the stub did not run)".into());
+    if !poll_has_window(cx, &state, &claude_session, &claude_window).await {
+        failures.push("(a) the new Claude window never spawned its pty (the stub did not run)".into());
     }
-    // A minted, valid v4 session UUID persists on the tab.
-    match tab_session_id(cx, &state, &claude_tab) {
+    // A minted, valid v4 session UUID persists on the session.
+    match session_claude_id(cx, &state, &claude_session) {
         Some(sid) if is_v4_uuid(&sid) => {}
-        Some(sid) => failures.push(format!("(a) tab session id {sid:?} is not a valid v4 UUID")),
-        None => failures.push("(a) the new Claude tab carries no minted session id".into()),
+        Some(sid) => failures.push(format!("(a) the session's Claude session id {sid:?} is not a valid v4 UUID")),
+        None => failures.push("(a) the new Claude session carries no minted session id".into()),
     }
-    // T5: the stub's braille OSC drives the tab's sidebar-dot status → Thinking,
+    // T5: the stub's braille OSC drives the session's sidebar-dot status → Thinking,
     // then (after a line of input) its ✳ OSC → Waiting — over the SHIPPED window's
     // subscription.
-    if !poll_tab_status(cx, &state, &claude_tab, TabStatus::Thinking).await {
+    if !poll_session_status(cx, &state, &claude_session, SessionStatus::Thinking).await {
         failures.push(
-            "(a) T5: the Claude pane's braille OSC title did not drive the tab status to Thinking \
+            "(a) T5: the Claude window's braille OSC title did not drive the session status to Thinking \
              (the shipped subscription did not route the title)"
                 .into(),
         );
     } else {
         // Unblock the stub's `read` so it emits the ✳ (waiting) title.
-        write_pane_line(cx, &state, &claude_tab, &claude_pane, b"go\n");
-        if !poll_tab_status(cx, &state, &claude_tab, TabStatus::Waiting).await {
+        write_window_line(cx, &state, &claude_session, &claude_window, b"go\n");
+        if !poll_session_status(cx, &state, &claude_session, SessionStatus::Waiting).await {
             failures.push(
-                "(a) T5: the Claude pane's ✳ OSC title did not drive the tab status to Waiting"
+                "(a) T5: the Claude window's ✳ OSC title did not drive the session status to Waiting"
                     .into(),
             );
         }
     }
 
-    // === (b) ≤1-running-Claude refusal: a second `claude` from that tab ⇒ newtab ==
-    let reply_b = send_claude(cx, &socket_path, &work_a, &[], &claude_tab, &companion_pane).await;
+    // === (b) ≤1-running-Claude refusal: a second `claude` from that session ⇒ newtab ==
+    let reply_b = send_claude(cx, &socket_path, &work_a, &[], &claude_session, &companion_window).await;
     match reply_b {
         Some(r) if r.trim_end() == "newtab" => {}
         Some(r) => failures.push(format!(
-            "(b) refusal: a second `claude` in a running-Claude tab must reply 'newtab', got {r:?}"
+            "(b) refusal: a second `claude` in a running-Claude session must reply 'newtab', got {r:?}"
         )),
         None => failures.push("(b) refusal: no reply to the second `claude` request".into()),
     }
 
-    // === (c) in-place promotion of a terminal pane in a non-Terminals project =====
-    seed_promotable_terminal_tab(cx, &state, &work_a);
+    // === (c) in-place promotion of a terminal window in a non-Terminals project =====
+    seed_promotable_terminal_session(cx, &state, &work_a);
     let reply_c = send_claude(cx, &socket_path, &work_a, &[], "promote-tab", "promote-pane").await;
     match reply_c {
         Some(r) => {
@@ -329,27 +330,27 @@ async fn run_claude_lifecycle(
         }
         None => failures.push("(c) promotion: no reply to the promoting `claude` request".into()),
     }
-    // The model flipped: the terminal pane is now a running Claude pane.
-    if !poll_pane_promoted(cx, &state, "promote-tab", "promote-pane").await {
+    // The model flipped: the terminal window is now a running Claude window.
+    if !poll_window_promoted(cx, &state, "promote-tab", "promote-pane").await {
         failures.push(
-            "(c) promotion: the terminal pane did not flip to a running Claude pane in the model"
+            "(c) promotion: the terminal window did not flip to a running Claude window in the model"
                 .into(),
         );
     }
 
-    // === (d) worktree split: `claude -w foo` ⇒ Tab.cwd + bucket anchor ============
-    let tabs_before_d = all_tab_ids(cx, &state);
+    // === (d) worktree split: `claude -w foo` ⇒ Session.cwd + bucket anchor ============
+    let sessions_before_d = all_session_ids(cx, &state);
     let reply_d = send_claude(cx, &socket_path, &work_d, &["-w".into(), "foo".into()], "", "").await;
     if reply_d.as_deref().map(str::trim_end) != Some("newtab") {
         failures.push(format!("(d) worktree: expected reply 'newtab', got {reply_d:?}"));
     }
-    match poll_new_tab(cx, &state, &tabs_before_d).await {
-        Some(wt_tab) => {
-            let (cwd, proj_path) = tab_cwd_and_project_path(cx, &state, &wt_tab);
+    match poll_new_session(cx, &state, &sessions_before_d).await {
+        Some(wt_session) => {
+            let (cwd, proj_path) = session_cwd_and_project_path(cx, &state, &wt_session);
             let want_suffix = "/.claude/worktrees/foo";
             if !cwd.as_deref().is_some_and(|c| c.ends_with(want_suffix)) {
                 failures.push(format!(
-                    "(d) worktree: Tab.cwd {cwd:?} must end with {want_suffix:?}"
+                    "(d) worktree: Session.cwd {cwd:?} must end with {want_suffix:?}"
                 ));
             }
             // The bucket project anchors at the invocation cwd (not the worktree).
@@ -360,81 +361,81 @@ async fn run_claude_lifecycle(
                 ));
             }
         }
-        None => failures.push("(d) worktree: the `claude -w foo` request produced no new tab".into()),
+        None => failures.push("(d) worktree: the `claude -w foo` request produced no new session".into()),
     }
 
-    // === (e) typed `exit` removes a live terminal pane from the SHIPPED window =====
-    // Add a deterministic read-then-exit pane to the Main tab (which keeps its Main
-    // login shell, so the tab survives the exit — no dissolve, no quit-terminus),
-    // spawn it, let the shipped `PaneHostView` sweep subscribe it, poll READY, then
+    // === (e) typed `exit` removes a live terminal window from the SHIPPED window =====
+    // Add a deterministic read-then-exit window to the Main session (which keeps its Main
+    // login shell, so the session survives the exit — no dissolve, no quit-terminus),
+    // spawn it, let the shipped `WindowHostView` sweep subscribe it, poll READY, then
     // write a line so it exits cleanly and assert the routed removal.
-    let main_tab = nice_model::TabModel::MAIN_TERMINAL_TAB_ID.to_string();
-    match spawn_exit_fixture_pane(cx, &state, &main_tab, &work_a) {
-        Some(exit_pane) => {
-            let handle = pane_handle(cx, &state, &main_tab, &exit_pane);
+    let main_session = nice_model::WorkspaceModel::MAIN_TERMINAL_SESSION_ID.to_string();
+    match spawn_exit_fixture_window(cx, &state, &main_session, &work_a) {
+        Some(exit_window) => {
+            let handle = term_window_handle(cx, &state, &main_session, &exit_window);
             let ready = match &handle {
                 Some(h) => poll_grid_contains(cx, h, READY_MARKER).await,
                 None => false,
             };
             if !ready {
-                failures.push("(e) exit: the read-then-exit fixture pane never became ready".into());
+                failures.push("(e) exit: the read-then-exit fixture window never became ready".into());
             } else {
-                write_pane_line(cx, &state, &main_tab, &exit_pane, b"go\n");
-                if !poll_pane_gone(cx, &state, &main_tab, &exit_pane).await {
+                write_window_line(cx, &state, &main_session, &exit_window, b"go\n");
+                if !poll_window_gone(cx, &state, &main_session, &exit_window).await {
                     failures.push(
-                        "(e) exit: the cleanly-exited pane was never removed from the shipped \
+                        "(e) exit: the cleanly-exited window was never removed from the shipped \
                          window (the subscription lift did not route Exited{held:false})"
                             .into(),
                     );
                 }
             }
         }
-        None => failures.push("(e) exit: could not add + spawn the read-then-exit fixture pane".into()),
+        None => failures.push("(e) exit: could not add + spawn the read-then-exit fixture window".into()),
     }
 
     // === (f) session_update rotation: /branch parent + /clear + cwd adopt =========
-    // Reuse the tab promoted in leg (c): "promote-tab" (in non-Terminals project
-    // "promote-proj"), whose claude pane "promote-pane" is now a running Claude with
+    // Reuse the session promoted in leg (c): "promote-session" (in non-Terminals project
+    // "promote-proj"), whose claude window "promote-window" is now a running Claude with
     // a minted session id. That minted id is the pre-rotation OLD id.
     //
     // Re-root the fork-job probe at the fixture's scratch jobs dir up front, before
     // the FIRST rotation: every source is screened against it now (a daemon relays
-    // a stale pane id for a background job's whole life, not just at its birth), so
+    // a stale window id for a background job's whole life, not just at its birth), so
     // leaving it pointed at the developer's real `~/.claude` would let their actual
     // background forks decide these assertions.
     state.update(cx, |s, _cx| s.set_fork_jobs_dir_for_scenario(fixture.jobs.clone()));
     let old_sid = state.update(cx, |s, _cx| {
-        s.model.tab_for("promote-tab").and_then(|t| t.claude_session_id.clone())
+        s.workspace.session_for("promote-tab").and_then(|t| t.claude_session_id.clone())
     });
     match old_sid {
-        None => failures.push("(f) rotation: the promoted tab carries no session id to rotate".into()),
+        None => failures.push("(f) rotation: the promoted session carries no session id to rotate".into()),
         Some(old_sid) => {
             // -- f1 /branch: source=resume + a NEW id + a cwd move. The pre-rotation
-            //    cwd is `work_a` (seed_promotable_terminal_tab set promote-tab.cwd).
+            //    cwd is `work_a` (seed_promotable_terminal_session set promote-session.cwd).
             let branch_wt = format!("{work_a}/.claude/worktrees/branch-wt");
             send_session_update(cx, &socket_path, "promote-pane", "branch-new-id", Some("resume"), Some(&branch_wt)).await;
             match poll_branch_parent(cx, &state, "promote-proj", &old_sid, "promote-tab").await {
                 None => failures.push(
-                    "(f) branch: no sibling parent tab pinned to the OLD id materialized in promote-proj".into(),
+                    "(f) branch: no sibling parent session pinned to the OLD id materialized in promote-proj".into(),
                 ),
                 Some(parent_id) => {
                     let snap = state.update(cx, |s, _cx| {
-                        let parent = s.model.tab_for(&parent_id).cloned();
-                        let orig = s.model.tab_for("promote-tab").cloned();
+                        let parent = s.workspace.session_for(&parent_id).cloned();
+                        let orig = s.workspace.session_for("promote-tab").cloned();
                         (parent, orig)
                     });
                     let (parent, orig) = snap;
                     let parent = parent.expect("parent id just polled must resolve");
                     let orig = orig.expect("originating promote-tab must still exist");
                     // Sibling parent: deferred (not running), pinned to OLD id, at ROOT.
-                    let parent_claude = parent.panes.iter().find(|p| p.kind == PaneKind::Claude);
-                    if parent_claude.map(|p| p.is_claude_running) != Some(false) {
-                        failures.push("(f) branch: sibling parent's claude pane must be is_claude_running == false (deferred)".into());
+                    let parent_claude = parent.windows.iter().find(|p| p.kind == TermWindowKind::Claude);
+                    if parent_claude.map(|w| w.is_claude_running) != Some(false) {
+                        failures.push("(f) branch: sibling parent's claude window must be is_claude_running == false (deferred)".into());
                     }
-                    if parent.parent_tab_id.is_some() {
+                    if parent.parent_session_id.is_some() {
                         failures.push(format!(
-                            "(f) branch: ROOT PROMOTION — the new parent must render at root (parent_tab_id == None), got {:?}",
-                            parent.parent_tab_id
+                            "(f) branch: ROOT PROMOTION — the new parent must render at root (parent_session_id == None), got {:?}",
+                            parent.parent_session_id
                         ));
                     }
                     // The sibling inherits the PRE-rotation cwd (its old-id transcript
@@ -445,24 +446,24 @@ async fn run_claude_lifecycle(
                             parent.cwd
                         ));
                     }
-                    // Originating tab: re-parented UNDER the new root (renders indented —
-                    // the landed row_indent contract keys off parent_tab_id.is_some()),
+                    // Originating session: re-parented UNDER the new root (renders indented —
+                    // the landed row_indent contract keys off parent_session_id.is_some()),
                     // moved into the post-rotation worktree, carrying the NEW id.
-                    if orig.parent_tab_id.as_deref() != Some(parent_id.as_str()) {
+                    if orig.parent_session_id.as_deref() != Some(parent_id.as_str()) {
                         failures.push(format!(
-                            "(f) branch: originating tab must be re-parented under the new root (indented), got parent_tab_id {:?}",
-                            orig.parent_tab_id
+                            "(f) branch: originating session must be re-parented under the new root (indented), got parent_session_id {:?}",
+                            orig.parent_session_id
                         ));
                     }
                     if orig.cwd != branch_wt {
                         failures.push(format!(
-                            "(f) branch: originating tab must move to the post-rotation worktree {branch_wt:?}, got {:?}",
+                            "(f) branch: originating session must move to the post-rotation worktree {branch_wt:?}, got {:?}",
                             orig.cwd
                         ));
                     }
                     if orig.claude_session_id.as_deref() != Some("branch-new-id") {
                         failures.push(format!(
-                            "(f) branch: originating tab must carry the NEW session id, got {:?}",
+                            "(f) branch: originating session must carry the NEW session id, got {:?}",
                             orig.claude_session_id
                         ));
                     }
@@ -470,7 +471,7 @@ async fn run_claude_lifecycle(
                     // -- f1-overlay (Bug 1): activating the deferred branch parent
                     //    must NOT flash the stray "Launching…" overlay. Its
                     //    ResumeDeferred shell already spawned + printed its prompt
-                    //    while the parent tab was INACTIVE, so the pane's one-shot
+                    //    while the parent session was INACTIVE, so the window's one-shot
                     //    OutputStarted fired to zero view subscribers; the FRESH
                     //    TerminalView mounted on first visit must read the latched
                     //    output_started and start its overlay cleared (never arming
@@ -478,15 +479,15 @@ async fn run_claude_lifecycle(
                     //    it never presses Enter, so the prefilled `claude --resume`
                     //    stays un-run (hermeticity: the stub claude is never spawned).
                     let parent_claude = parent
-                        .panes
+                        .windows
                         .iter()
-                        .find(|p| p.kind == PaneKind::Claude)
+                        .find(|p| p.kind == TermWindowKind::Claude)
                         .map(|p| p.id.clone());
                     match parent_claude {
                         None => failures
-                            .push("(f) branch-overlay: the sibling parent has no Claude pane".into()),
-                        Some(parent_pane) => {
-                            let printed = match pane_handle(cx, &state, &parent_id, &parent_pane) {
+                            .push("(f) branch-overlay: the sibling parent has no Claude window".into()),
+                        Some(parent_window) => {
+                            let printed = match term_window_handle(cx, &state, &parent_id, &parent_window) {
                                 Some(h) => poll_grid_nonempty(cx, &h).await,
                                 None => false,
                             };
@@ -497,25 +498,25 @@ async fn run_claude_lifecycle(
                                         .into(),
                                 );
                             } else {
-                                // Activate the parent tab: the shipped host builds a
-                                // fresh TerminalView for its already-output pane.
+                                // Activate the parent session: the shipped host builds a
+                                // fresh TerminalView for its already-output window.
                                 let _ = state.update(cx, |s, cx| {
-                                    s.model.select_tab(&parent_id);
+                                    s.workspace.select_session(&parent_id);
                                     cx.notify();
                                 });
                                 // Well past the 750 ms launch grace: a buggy overlay
                                 // would have armed on first paint and shown by now.
                                 settle(cx, 1200).await;
                                 let view = whandle
-                                    .update(cx, |shell, _w, _a| shell.scenario_pane_host())
+                                    .update(cx, |shell, _w, _a| shell.scenario_window_host())
                                     .ok()
                                     .and_then(|ph| {
-                                        ph.update(cx, |ph, _| ph.scenario_terminal_for(&parent_pane))
+                                        ph.update(cx, |ph, _| ph.scenario_terminal_for(&parent_window))
                                     });
                                 match view {
                                     None => failures.push(
                                         "(f) branch-overlay: activating the branch parent mounted no \
-                                         TerminalView for its pane".into(),
+                                         TerminalView for its window".into(),
                                     ),
                                     Some(view) => {
                                         let (visible, ever) = view.update(cx, |v, _| {
@@ -542,112 +543,112 @@ async fn run_claude_lifecycle(
                 }
             }
 
-            // -- f2 /clear: source=clear + a new id ⇒ id updates in place, NO new tab.
-            let count_before_clear = project_tab_count(cx, &state, "promote-proj");
+            // -- f2 /clear: source=clear + a new id ⇒ id updates in place, NO new session.
+            let count_before_clear = project_session_count(cx, &state, "promote-proj");
             send_session_update(cx, &socket_path, "promote-pane", "cleared-id", Some("clear"), None).await;
-            if !poll_tab_session_id(cx, &state, "promote-tab", "cleared-id").await {
-                failures.push("(f) clear: /clear must update the originating tab's session id in place".into());
+            if !poll_session_claude_id(cx, &state, "promote-tab", "cleared-id").await {
+                failures.push("(f) clear: /clear must update the originating session's session id in place".into());
             }
-            if project_tab_count(cx, &state, "promote-proj") != count_before_clear {
-                failures.push("(f) clear: /clear must NOT materialize a new tab".into());
+            if project_session_count(cx, &state, "promote-proj") != count_before_clear {
+                failures.push("(f) clear: /clear must NOT materialize a new session".into());
             }
 
-            // -- f3 cwd adopt: a same-id update carrying a fresh cwd ⇒ Tab.cwd adopts.
+            // -- f3 cwd adopt: a same-id update carrying a fresh cwd ⇒ Session.cwd adopts.
             let adopt_cwd = format!("{work_a}/.claude/worktrees/adopt-wt");
             send_session_update(cx, &socket_path, "promote-pane", "cleared-id", Some("clear"), Some(&adopt_cwd)).await;
-            if !poll_tab_cwd(cx, &state, "promote-tab", &adopt_cwd).await {
-                failures.push("(f) cwd adopt: a cwd-bearing update must adopt onto Tab.cwd".into());
+            if !poll_session_cwd(cx, &state, "promote-tab", &adopt_cwd).await {
+                failures.push("(f) cwd adopt: a cwd-bearing update must adopt onto Session.cwd".into());
             }
 
             // -- f4 background /fork: a `source:"fork"` update WITH a jobs entry ----
             //    Claude Code ≥ 2.1.212 runs `/fork` as a detached daemon session and
-            //    relays its SessionStart with whichever pane id first spawned the
+            //    relays its SessionStart with whichever window id first spawned the
             //    daemon. The `~/.claude/jobs/<first8>/` entry (here: the fixture's
             //    scratch jobs dir, read through the SHIPPED filesystem probe) is what
-            //    separates it from an in-pane `/branch`. The relayed pane is
-            //    deliberately one NO tab owns, so a pass proves the parent was found
+            //    separates it from an in-window `/branch`. The relayed window is
+            //    deliberately one NO session owns, so a pass proves the parent was found
             //    by session id alone.
             let fork_id = "b8c8244b-1111-2222-3333-444455556666";
             let fork_cwd = format!("{work_a}/.claude/worktrees/fork-wt");
-            let selected_before_fork = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
+            let selected_before_fork = state.update(cx, |s, _cx| s.workspace.active_session_id().map(str::to_string));
             match write_fork_job(&fixture.jobs, fork_id, "cleared-id", "⑂ forked work") {
                 Err(e) => failures.push(format!("(f) fork: could not write the jobs fixture: {e:#}")),
                 Ok(()) => {
-                    send_session_update(cx, &socket_path, "a-pane-no-tab-owns", fork_id, Some("fork"), Some(&fork_cwd)).await;
+                    send_session_update(cx, &socket_path, "a-window-no-session-owns", fork_id, Some("fork"), Some(&fork_cwd)).await;
                     match poll_branch_parent(cx, &state, "promote-proj", fork_id, "promote-tab").await {
                         None => failures.push(
-                            "(f) fork: a daemon-hosted /fork must materialize a tab pinned to the FORK's id".into(),
+                            "(f) fork: a daemon-hosted /fork must materialize a session pinned to the FORK's id".into(),
                         ),
-                        Some(fork_tab_id) => {
-                            let fork_tab = state.update(cx, |s, _cx| s.model.tab_for(&fork_tab_id).cloned());
-                            let fork_tab = fork_tab.expect("fork tab id just polled must resolve");
-                            // Nested one indent under the forked-from tab's lineage,
+                        Some(fork_session_row_id) => {
+                            let fork_session = state.update(cx, |s, _cx| s.workspace.session_for(&fork_session_row_id).cloned());
+                            let fork_session = fork_session.expect("fork session id just polled must resolve");
+                            // Nested one indent under the forked-from session's lineage,
                             // and placed immediately after it. The handoff shape's
                             // DEPTH-1 rule decides the pointer: an anchor that is
                             // already a depth-1 child (promote-tab is — f1's /branch
                             // re-parented it under the new root) hands the fork its
                             // own root instead of becoming a second level.
                             let (expected_parent, follows_anchor) = state.update(cx, |s, _cx| {
-                                let anchor = s.model.tab_for("promote-tab");
+                                let anchor = s.workspace.session_for("promote-tab");
                                 let expected = anchor
-                                    .and_then(|t| t.parent_tab_id.clone())
+                                    .and_then(|t| t.parent_session_id.clone())
                                     .unwrap_or_else(|| "promote-tab".to_string());
                                 let follows = s
-                                    .model
+                                    .workspace
                                     .projects
                                     .iter()
                                     .find(|p| p.id == "promote-proj")
                                     .and_then(|p| {
-                                        let i = p.tabs.iter().position(|t| t.id == "promote-tab")?;
-                                        Some(p.tabs.get(i + 1).map(|t| t.id.clone()))
+                                        let i = p.sessions.iter().position(|t| t.id == "promote-tab")?;
+                                        Some(p.sessions.get(i + 1).map(|t| t.id.clone()))
                                     })
                                     .flatten()
-                                    == Some(fork_tab_id.clone());
+                                    == Some(fork_session_row_id.clone());
                                 (expected, follows)
                             });
-                            if fork_tab.parent_tab_id.as_deref() != Some(expected_parent.as_str()) {
+                            if fork_session.parent_session_id.as_deref() != Some(expected_parent.as_str()) {
                                 failures.push(format!(
-                                    "(f) fork: the fork tab must nest at depth 1 under {expected_parent:?}, got parent_tab_id {:?}",
-                                    fork_tab.parent_tab_id
+                                    "(f) fork: the fork session must nest at depth 1 under {expected_parent:?}, got parent_session_id {:?}",
+                                    fork_session.parent_session_id
                                 ));
                             }
                             if !follows_anchor {
                                 failures.push(
-                                    "(f) fork: the fork tab must be inserted immediately after the forked-from tab".into(),
+                                    "(f) fork: the fork session must be inserted immediately after the forked-from session".into(),
                                 );
                             }
                             // The fork relocated into its own worktree (≥ 2.1.220).
-                            if fork_tab.cwd != fork_cwd {
+                            if fork_session.cwd != fork_cwd {
                                 failures.push(format!(
-                                    "(f) fork: the fork tab must carry the relayed cwd {fork_cwd:?}, got {:?}",
-                                    fork_tab.cwd
+                                    "(f) fork: the fork session must carry the relayed cwd {fork_cwd:?}, got {:?}",
+                                    fork_session.cwd
                                 ));
                             }
                             // Titled by the job's `name` (it carries the ⑂ marker).
-                            if fork_tab.title != "⑂ forked work" {
+                            if fork_session.title != "⑂ forked work" {
                                 failures.push(format!(
-                                    "(f) fork: the fork tab must take the job's name as its title, got {:?}",
-                                    fork_tab.title
+                                    "(f) fork: the fork session must take the job's name as its title, got {:?}",
+                                    fork_session.title
                                 ));
                             }
                             // Deferred: nothing runs until the user opens it.
-                            let fork_claude = fork_tab.panes.iter().find(|p| p.kind == PaneKind::Claude);
-                            if fork_claude.map(|p| p.is_claude_running) != Some(false) {
+                            let fork_claude = fork_session.windows.iter().find(|w| w.kind == TermWindowKind::Claude);
+                            if fork_claude.map(|w| w.is_claude_running) != Some(false) {
                                 failures.push(
-                                    "(f) fork: the fork tab's claude pane must be is_claude_running == false (deferred)".into(),
+                                    "(f) fork: the fork session's claude window must be is_claude_running == false (deferred)".into(),
                                 );
                             }
                             // BUG-3 REGRESSION PIN + the no-focus-steal contract: the
-                            // relayed pane's world is untouched and selection never moved.
-                            if tab_session_id(cx, &state, "promote-tab").as_deref() != Some("cleared-id") {
+                            // relayed window's world is untouched and selection never moved.
+                            if session_claude_id(cx, &state, "promote-tab").as_deref() != Some("cleared-id") {
                                 failures.push(
-                                    "(f) fork: a daemon-hosted fork must NOT rewrite the addressed tab's session id".into(),
+                                    "(f) fork: a daemon-hosted fork must NOT rewrite the addressed session's claude session id".into(),
                                 );
                             }
-                            let selected_after_fork = state.update(cx, |s, _cx| s.model.active_tab_id().map(str::to_string));
+                            let selected_after_fork = state.update(cx, |s, _cx| s.workspace.active_session_id().map(str::to_string));
                             if selected_after_fork != selected_before_fork {
                                 failures.push(format!(
-                                    "(f) fork: materializing a fork must not move the active tab ({selected_before_fork:?} → {selected_after_fork:?})"
+                                    "(f) fork: materializing a fork must not move the active session ({selected_before_fork:?} → {selected_after_fork:?})"
                                 ));
                             }
                         }
@@ -655,9 +656,9 @@ async fn run_claude_lifecycle(
                 }
             }
 
-            // -- f5 in-pane /branch on Claude ≥ 2.1.214: `source:"fork"` with NO ----
+            // -- f5 in-window /branch on Claude ≥ 2.1.214: `source:"fork"` with NO ----
             //    jobs entry. The OTHER half of the fork discriminator, and bug 2:
-            //    2.1.214 changed what an in-pane rotation reports, so this exact
+            //    2.1.214 changed what an in-window rotation reports, so this exact
             //    payload used to slip past the `source == "resume"` gate and drop
             //    the pre-branch conversation from the sidebar. Runs LAST because it
             //    rotates promote-tab off the "cleared-id" that f4's bug-3 pin (and
@@ -667,29 +668,29 @@ async fn run_claude_lifecycle(
             //    developer's real `~/.claude`.
             let inpane_id = "9e105a11-1111-2222-3333-444455556666";
             send_session_update(cx, &socket_path, "promote-pane", inpane_id, Some("fork"), None).await;
-            if !poll_tab_session_id(cx, &state, "promote-tab", inpane_id).await {
+            if !poll_session_claude_id(cx, &state, "promote-tab", inpane_id).await {
                 failures.push(
-                    "(f) in-pane fork: a jobs-less source=fork must rotate the addressed tab onto the new id".into(),
+                    "(f) in-window fork: a jobs-less source=fork must rotate the addressed session onto the new id".into(),
                 );
             }
             match poll_branch_parent(cx, &state, "promote-proj", "cleared-id", "promote-tab").await {
                 None => failures.push(
-                    "(f) in-pane fork: a jobs-less source=fork must materialize a parent pinned to the PRE-rotation id (bug 2)".into(),
+                    "(f) in-window fork: a jobs-less source=fork must materialize a parent pinned to the PRE-rotation id (bug 2)".into(),
                 ),
                 Some(parent_id) => {
-                    let parent = state.update(cx, |s, _cx| s.model.tab_for(&parent_id).cloned());
+                    let parent = state.update(cx, |s, _cx| s.workspace.session_for(&parent_id).cloned());
                     let parent = parent.expect("parent id just polled must resolve");
-                    let parent_claude = parent.panes.iter().find(|p| p.kind == PaneKind::Claude);
-                    if parent_claude.map(|p| p.is_claude_running) != Some(false) {
+                    let parent_claude = parent.windows.iter().find(|w| w.kind == TermWindowKind::Claude);
+                    if parent_claude.map(|w| w.is_claude_running) != Some(false) {
                         failures.push(
-                            "(f) in-pane fork: the branch parent's claude pane must be is_claude_running == false (deferred)".into(),
+                            "(f) in-window fork: the branch parent's claude window must be is_claude_running == false (deferred)".into(),
                         );
                     }
                     // The pre-rotation cwd, exactly as the legacy `source=resume`
                     // leg (f1) asserts — the ordering pin is source-independent.
                     if parent.cwd != adopt_cwd {
                         failures.push(format!(
-                            "(f) in-pane fork: the branch parent must inherit the pre-rotation cwd {adopt_cwd:?}, got {:?}",
+                            "(f) in-window fork: the branch parent must inherit the pre-rotation cwd {adopt_cwd:?}, got {:?}",
                             parent.cwd
                         ));
                     }
@@ -697,27 +698,27 @@ async fn run_claude_lifecycle(
             }
 
             // -- f6 cold-woken background job: `source:"resume"` naming an id that ---
-            //    HAS a jobs entry, relayed with a stale pane id a LIVE tab owns.
-            //    Opening a fork tab execs `claude attach`, and attaching to a COLD
+            //    HAS a jobs entry, relayed with a stale window id a LIVE session owns.
+            //    Opening a fork session execs `claude attach`, and attaching to a COLD
             //    job makes the daemon wake it — the woken worker fires SessionStart
             //    for its own session while carrying whichever NICE_PANE_ID the
             //    daemon inherited. Observed live: that relay rewrote the addressed
-            //    tab onto the woken job's id and invented a branch parent for the
+            //    session onto the woken job's id and invented a branch parent for the
             //    conversation it had just displaced (bug 3, through the route Fix D
             //    made routine). The source is `"resume"`, not `"fork"`, which is
             //    exactly why the screen cannot be gated on the source.
             if fixture.jobs.join(&fork_id[..8]).is_dir() {
-                let tabs_before_wake = project_tab_count(cx, &state, "promote-proj");
+                let sessions_before_wake = project_session_count(cx, &state, "promote-proj");
                 send_session_update(cx, &socket_path, "promote-pane", fork_id, Some("resume"), Some(&fork_cwd)).await;
                 settle(cx, 400).await;
-                if tab_session_id(cx, &state, "promote-tab").as_deref() != Some(inpane_id) {
+                if session_claude_id(cx, &state, "promote-tab").as_deref() != Some(inpane_id) {
                     failures.push(
-                        "(f) woken job: a daemon-relayed resume must NOT rewrite the addressed tab's session id".into(),
+                        "(f) woken job: a daemon-relayed resume must NOT rewrite the addressed session's claude session id".into(),
                     );
                 }
-                if project_tab_count(cx, &state, "promote-proj") != tabs_before_wake {
+                if project_session_count(cx, &state, "promote-proj") != sessions_before_wake {
                     failures.push(
-                        "(f) woken job: a daemon-relayed resume must materialize no tab (no phantom branch parent)".into(),
+                        "(f) woken job: a daemon-relayed resume must materialize no session (no phantom branch parent)".into(),
                     );
                 }
             }
@@ -737,20 +738,20 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: "claude lifecycle OK (shipped window): a socket `claude` newtab spawned a \
-                     running Claude tab with a minted v4 uuid whose stub OSC titles drove the \
-                     sidebar-dot status Thinking → Waiting; a second `claude` in that tab was \
-                     refused (newtab); a terminal pane promoted in place (inplace <uuid> + model \
-                     flip); `claude -w foo` split Tab.cwd into .claude/worktrees/foo anchored at \
-                     the invocation cwd; a typed `exit` removed a live terminal pane via the \
+                     running Claude session with a minted v4 uuid whose stub OSC titles drove the \
+                     sidebar-dot status Thinking → Waiting; a second `claude` in that session was \
+                     refused (newtab); a terminal window promoted in place (inplace <uuid> + model \
+                     flip); `claude -w foo` split Session.cwd into .claude/worktrees/foo anchored at \
+                     the invocation cwd; a typed `exit` removed a live terminal window via the \
                      shipped subscription lift; and a `session_update` /branch rotation \
                      (source=resume + new id + cwd move) materialized a deferred sibling parent \
                      pinned to the OLD id at root with the pre-rotation cwd while the originating \
-                     tab re-parented under it into the post-rotation worktree, a /clear rotated \
-                     the id in place with no new tab, a cwd-bearing update adopted Tab.cwd, and a \
-                     jobs-dir-backed source=fork update (relayed from a pane no tab owns) \
-                     materialized a nested deferred child pinned to the fork id under the tab its \
-                     forkParentSessionId named, without touching the addressed tab or the \
-                     selection, while a jobs-less source=fork update rotated the addressed tab and \
+                     session re-parented under it into the post-rotation worktree, a /clear rotated \
+                     the id in place with no new session, a cwd-bearing update adopted Session.cwd, and a \
+                     jobs-dir-backed source=fork update (relayed from a window no session owns) \
+                     materialized a nested deferred child pinned to the fork id under the session its \
+                     forkParentSessionId named, without touching the addressed session or the \
+                     selection, while a jobs-less source=fork update rotated the addressed session and \
                      materialized its pre-rotation conversation as a deferred parent."
                 .to_string(),
         }
@@ -778,10 +779,10 @@ async fn send_claude(
     socket_path: &str,
     cwd: &str,
     args: &[String],
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> Option<String> {
-    let payload = claude_json(cwd, args, tab_id, pane_id);
+    let payload = claude_json(cwd, args, session_id, term_window_id);
     let rx = raw_request(socket_path.to_string(), payload);
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
@@ -823,7 +824,7 @@ fn raw_request(path: String, payload: String) -> Receiver<Option<Vec<u8>>> {
 }
 
 /// Build the frozen `claude` NDJSON request line.
-fn claude_json(cwd: &str, args: &[String], tab_id: &str, pane_id: &str) -> String {
+fn claude_json(cwd: &str, args: &[String], session_id: &str, term_window_id: &str) -> String {
     let args_json = args
         .iter()
         .map(|a| format!("\"{}\"", json_escape(a)))
@@ -833,8 +834,8 @@ fn claude_json(cwd: &str, args: &[String], tab_id: &str, pane_id: &str) -> Strin
         "{{\"action\":\"claude\",\"cwd\":\"{}\",\"args\":[{}],\"tabId\":\"{}\",\"paneId\":\"{}\"}}",
         json_escape(cwd),
         args_json,
-        json_escape(tab_id),
-        json_escape(pane_id),
+        json_escape(session_id),
+        json_escape(term_window_id),
     )
 }
 
@@ -852,12 +853,12 @@ fn json_escape(s: &str) -> String {
 async fn send_session_update(
     cx: &mut AsyncApp,
     socket_path: &str,
-    pane_id: &str,
-    session_id: &str,
+    term_window_id: &str,
+    claude_session_id: &str,
     source: Option<&str>,
     cwd: Option<&str>,
 ) {
-    let payload = session_update_json(pane_id, session_id, source, cwd);
+    let payload = session_update_json(term_window_id, claude_session_id, source, cwd);
     let path = socket_path.to_string();
     let done = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(4);
@@ -884,7 +885,7 @@ async fn send_session_update(
 
 /// Write the `<jobs>/<first8(fork_id)>/state.json` the Claude daemon lays down
 /// before it spawns a background `/fork`'s child — the entry the SHIPPED probe
-/// reads to tell that fork apart from an in-pane `/branch`. Mirrors the real
+/// reads to tell that fork apart from an in-window `/branch`. Mirrors the real
 /// file's shape (`sessionId`, `forkParentSessionId`, `forkBoundaryAt`, `name`).
 fn write_fork_job(jobs: &std::path::Path, fork_id: &str, parent_id: &str, name: &str) -> Result<()> {
     let short = fork_id.get(..8).context("fork id shorter than its first 8")?;
@@ -905,11 +906,11 @@ fn write_fork_job(jobs: &std::path::Path, fork_id: &str, parent_id: &str, name: 
 
 /// Build a frozen `session_update` NDJSON request line (absent `source`/`cwd` are
 /// omitted, exactly as the hook script does when the field is empty).
-fn session_update_json(pane_id: &str, session_id: &str, source: Option<&str>, cwd: Option<&str>) -> String {
+fn session_update_json(term_window_id: &str, claude_session_id: &str, source: Option<&str>, cwd: Option<&str>) -> String {
     let mut fields = format!(
         "\"action\":\"session_update\",\"paneId\":\"{}\",\"sessionId\":\"{}\"",
-        json_escape(pane_id),
-        json_escape(session_id),
+        json_escape(term_window_id),
+        json_escape(claude_session_id),
     );
     if let Some(src) = source {
         fields.push_str(&format!(",\"source\":\"{}\"", json_escape(src)));
@@ -943,25 +944,25 @@ fn is_v4_uuid(s: &str) -> bool {
 
 // -- model / session readers -------------------------------------------------
 
-fn all_tab_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
+fn all_session_ids(cx: &mut AsyncApp, state: &Entity<WindowState>) -> Vec<String> {
     state.update(cx, |s, _cx| {
-        s.model
+        s.workspace
             .projects
             .iter()
-            .flat_map(|p| p.tabs.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
             .collect()
     })
 }
 
-/// Poll until exactly one tab id appears that was not in `before`, returning it.
-async fn poll_new_tab(
+/// Poll until exactly one session id appears that was not in `before`, returning it.
+async fn poll_new_session(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     before: &[String],
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let now = all_tab_ids(cx, state);
+        let now = all_session_ids(cx, state);
         if let Some(new) = now.iter().find(|t| !before.contains(t)) {
             return Some(new.clone());
         }
@@ -969,74 +970,74 @@ async fn poll_new_tab(
     None
 }
 
-/// The `(claude_pane_id, companion_pane_id)` of a `[Claude, Terminal 1]` tab.
-fn tab_pane_ids(
+/// The `(claude_window_id, companion_window_id)` of a `[Claude, Terminal 1]` session.
+fn session_window_ids(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
+    session_id: &str,
 ) -> Option<(String, String)> {
     state.update(cx, |s, _cx| {
-        let tab = s.model.tab_for(tab_id)?;
-        let claude = tab.panes.first()?.id.clone();
-        let companion = tab.panes.get(1)?.id.clone();
+        let session = s.workspace.session_for(session_id)?;
+        let claude = session.windows.first()?.id.clone();
+        let companion = session.windows.get(1)?.id.clone();
         Some((claude, companion))
     })
 }
 
-fn pane_is_claude_running(
+fn window_is_claude_running(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> bool {
     state.update(cx, |s, _cx| {
-        s.model
-            .tab_for(tab_id)
-            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
+        s.workspace
+            .session_for(session_id)
+            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
             .map(|p| p.is_claude_running)
             .unwrap_or(false)
     })
 }
 
-fn tab_session_id(cx: &mut AsyncApp, state: &Entity<WindowState>, tab_id: &str) -> Option<String> {
+fn session_claude_id(cx: &mut AsyncApp, state: &Entity<WindowState>, session_id: &str) -> Option<String> {
     state.update(cx, |s, _cx| {
-        s.model.tab_for(tab_id).and_then(|t| t.claude_session_id.clone())
+        s.workspace.session_for(session_id).and_then(|t| t.claude_session_id.clone())
     })
 }
 
-fn tab_cwd_and_project_path(
+fn session_cwd_and_project_path(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
+    session_id: &str,
 ) -> (Option<String>, Option<String>) {
     state.update(cx, |s, _cx| {
-        let cwd = s.model.tab_for(tab_id).map(|t| t.cwd.clone());
+        let cwd = s.workspace.session_for(session_id).map(|t| t.cwd.clone());
         let proj = s
-            .model
-            .project_tab_index(tab_id)
-            .map(|(pi, _)| s.model.projects[pi].path.clone());
+            .workspace
+            .project_session_index(session_id)
+            .map(|(pi, _)| s.workspace.projects[pi].path.clone());
         (cwd, proj)
     })
 }
 
-/// Poll until a tab in `project_id` (other than `exclude_tab`) is pinned to
-/// `session_id`, returning its id — the materialized branch parent, located by its
-/// pinned OLD session id (the originating tab excluded, since it briefly held the
+/// Poll until a session in `project_id` (other than `exclude_session`) is pinned to
+/// `claude_session_id`, returning its id — the materialized branch parent, located by its
+/// pinned OLD session id (the originating session excluded, since it briefly held the
 /// same id pre-rotation).
 async fn poll_branch_parent(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
     project_id: &str,
-    session_id: &str,
-    exclude_tab: &str,
+    claude_session_id: &str,
+    exclude_session: &str,
 ) -> Option<String> {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let found = state.update(cx, |s, _cx| {
-            s.model.projects.iter().find(|p| p.id == project_id).and_then(|p| {
-                p.tabs
+            s.workspace.projects.iter().find(|p| p.id == project_id).and_then(|p| {
+                p.sessions
                     .iter()
-                    .find(|t| t.id != exclude_tab && t.claude_session_id.as_deref() == Some(session_id))
+                    .find(|t| t.id != exclude_session && t.claude_session_id.as_deref() == Some(claude_session_id))
                     .map(|t| t.id.clone())
             })
         });
@@ -1047,42 +1048,42 @@ async fn poll_branch_parent(
     None
 }
 
-/// The number of tabs currently in `project_id` (0 if the project is gone).
-fn project_tab_count(cx: &mut AsyncApp, state: &Entity<WindowState>, project_id: &str) -> usize {
+/// The number of sessions currently in `project_id` (0 if the project is gone).
+fn project_session_count(cx: &mut AsyncApp, state: &Entity<WindowState>, project_id: &str) -> usize {
     state.update(cx, |s, _cx| {
-        s.model
+        s.workspace
             .projects
             .iter()
             .find(|p| p.id == project_id)
-            .map(|p| p.tabs.len())
+            .map(|p| p.sessions.len())
             .unwrap_or(0)
     })
 }
 
-async fn poll_tab_session_id(
+async fn poll_session_claude_id(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
+    session_id: &str,
     want: &str,
 ) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        if tab_session_id(cx, state, tab_id).as_deref() == Some(want) {
+        if session_claude_id(cx, state, session_id).as_deref() == Some(want) {
             return true;
         }
     }
     false
 }
 
-async fn poll_tab_cwd(
+async fn poll_session_cwd(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
+    session_id: &str,
     want: &str,
 ) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let got = state.update(cx, |s, _cx| s.model.tab_for(tab_id).map(|t| t.cwd.clone()));
+        let got = state.update(cx, |s, _cx| s.workspace.session_for(session_id).map(|t| t.cwd.clone()));
         if got.as_deref() == Some(want) {
             return true;
         }
@@ -1090,15 +1091,15 @@ async fn poll_tab_cwd(
     false
 }
 
-async fn poll_tab_status(
+async fn poll_session_status(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    want: TabStatus,
+    session_id: &str,
+    want: SessionStatus,
 ) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        let got = state.update(cx, |s, _cx| s.model.tab_for(tab_id).map(|t| t.status()));
+        let got = state.update(cx, |s, _cx| s.workspace.session_for(session_id).map(|t| t.status()));
         if got == Some(want) {
             return true;
         }
@@ -1106,34 +1107,34 @@ async fn poll_tab_status(
     false
 }
 
-async fn poll_has_pane(
+async fn poll_has_window(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
-        if state.update(cx, |s, _cx| s.session.has_pane(tab_id, pane_id)) {
+        if state.update(cx, |s, _cx| s.ptys.has_window(session_id, term_window_id)) {
             return true;
         }
     }
     false
 }
 
-async fn poll_pane_promoted(
+async fn poll_window_promoted(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let ok = state.update(cx, |s, _cx| {
-            s.model
-                .tab_for(tab_id)
-                .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
-                .map(|p| p.kind == PaneKind::Claude && p.is_claude_running)
+            s.workspace
+                .session_for(session_id)
+                .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
+                .map(|p| p.kind == TermWindowKind::Claude && p.is_claude_running)
                 .unwrap_or(false)
         });
         if ok {
@@ -1143,18 +1144,18 @@ async fn poll_pane_promoted(
     false
 }
 
-async fn poll_pane_gone(
+async fn poll_window_gone(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> bool {
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let gone = state.update(cx, |s, _cx| {
-            s.model
-                .tab_for(tab_id)
-                .map(|t| !t.panes.iter().any(|p| p.id == pane_id))
+            s.workspace
+                .session_for(session_id)
+                .map(|t| !t.windows.iter().any(|p| p.id == term_window_id))
                 .unwrap_or(true)
         });
         if gone {
@@ -1164,35 +1165,35 @@ async fn poll_pane_gone(
     false
 }
 
-/// Seed a plain terminal-only tab into a fresh non-Terminals project — the
-/// promotable target leg (c) needs (a terminal pane in a non-Terminals tab with no
-/// running Claude; the pane needs no live pty — promotion is model-only). Selects
+/// Seed a plain terminal-only session into a fresh non-Terminals project — the
+/// promotable target leg (c) needs (a terminal window in a non-Terminals session with no
+/// running Claude; the window needs no live pty — promotion is model-only). Selects
 /// it so the shipped shell renders it.
-fn seed_promotable_terminal_tab(cx: &mut AsyncApp, state: &Entity<WindowState>, cwd: &str) {
+fn seed_promotable_terminal_session(cx: &mut AsyncApp, state: &Entity<WindowState>, cwd: &str) {
     let _ = state.update(cx, |s, _cx| {
-        s.model.ensure_project("promote-proj", "Promote", cwd);
-        let mut tab = Tab::new("promote-tab", "term", cwd);
-        tab.panes = vec![Pane::new("promote-pane", "Terminal 1", PaneKind::Terminal)];
-        tab.active_pane_id = Some("promote-pane".to_string());
-        tab.next_terminal_index = 2;
-        if let Some(pi) = s.model.projects.iter().position(|p| p.id == "promote-proj") {
-            s.model.projects[pi].tabs.push(tab);
+        s.workspace.ensure_project("promote-proj", "Promote", cwd);
+        let mut session = Session::new("promote-tab", "term", cwd);
+        session.windows = vec![TermWindow::new("promote-pane", "Terminal 1", TermWindowKind::Terminal)];
+        session.active_window_id = Some("promote-pane".to_string());
+        session.next_terminal_index = 2;
+        if let Some(pi) = s.workspace.projects.iter().position(|p| p.id == "promote-proj") {
+            s.workspace.projects[pi].sessions.push(session);
         }
-        s.model.select_tab("promote-tab");
+        s.workspace.select_session("promote-tab");
     });
 }
 
-/// Add a `sh -c 'echo READY; read; exit 0'` pane to `tab_id` and spawn it through
-/// the manager; the shipped `PaneHostView` sweep subscribes it. Returns the new
-/// pane id.
-fn spawn_exit_fixture_pane(
+/// Add a `sh -c 'echo READY; read; exit 0'` window to `session_id` and spawn it through
+/// the manager; the shipped `WindowHostView` sweep subscribes it. Returns the new
+/// window id.
+fn spawn_exit_fixture_window(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
+    session_id: &str,
     cwd: &str,
 ) -> Option<String> {
     state.update(cx, |s, cx| {
-        let pane_id = s.session.add_pane(&mut s.model, tab_id, None)?;
+        let term_window_id = s.ptys.add_window(&mut s.workspace, session_id, None)?;
         let spec = nice_term_core::SpawnSpec::command(
             format!("sh -c 'echo {READY_MARKER}; IFS= read -r _l; exit 0'"),
             cwd.to_string(),
@@ -1200,20 +1201,20 @@ fn spawn_exit_fixture_pane(
         // Blank ZDOTDIR so no rc sourcing races the marker (spec-wins injection).
         .with_env(vec![("ZDOTDIR".to_string(), cwd.to_string())])
         .with_size(24, 80);
-        s.session.spawn_pane(tab_id, &pane_id, spec, cx).ok()?;
-        // Re-render so the host's sweep subscribes the fresh pane before it exits.
+        s.ptys.spawn_window(session_id, &term_window_id, spec, cx).ok()?;
+        // Re-render so the host's sweep subscribes the fresh window before it exits.
         cx.notify();
-        Some(pane_id)
+        Some(term_window_id)
     })
 }
 
-fn pane_handle(
+fn term_window_handle(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
 ) -> Option<Entity<TerminalSessionHandle>> {
-    state.update(cx, |s, _cx| s.session.pane_handle(tab_id, pane_id))
+    state.update(cx, |s, _cx| s.ptys.term_window_handle(session_id, term_window_id))
 }
 
 async fn poll_grid_contains(
@@ -1231,9 +1232,9 @@ async fn poll_grid_contains(
     false
 }
 
-/// Poll until the pane's grid holds any non-whitespace content — the deferred
-/// branch-parent shell's prompt. By the time it prints, that pane's one-shot
-/// `OutputStarted` has fired (and, since the pane has no view yet, drained to zero
+/// Poll until the window's grid holds any non-whitespace content — the deferred
+/// branch-parent shell's prompt. By the time it prints, that window's one-shot
+/// `OutputStarted` has fired (and, since the window has no view yet, drained to zero
 /// subscribers) — the exact precondition the /branch-overlay leg reproduces.
 async fn poll_grid_nonempty(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHandle>) -> bool {
     for _ in 0..READY_POLLS {
@@ -1246,14 +1247,14 @@ async fn poll_grid_nonempty(cx: &mut AsyncApp, handle: &Entity<TerminalSessionHa
     false
 }
 
-fn write_pane_line(
+fn write_window_line(
     cx: &mut AsyncApp,
     state: &Entity<WindowState>,
-    tab_id: &str,
-    pane_id: &str,
+    session_id: &str,
+    term_window_id: &str,
     bytes: &[u8],
 ) {
-    if let Some(handle) = pane_handle(cx, state, tab_id, pane_id) {
+    if let Some(handle) = term_window_handle(cx, state, session_id, term_window_id) {
         let bytes = bytes.to_vec();
         let _ = handle.update(cx, |h, _cx| {
             let _ = h.session().write_input(&bytes);

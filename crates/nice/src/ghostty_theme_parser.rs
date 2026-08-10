@@ -35,8 +35,8 @@ pub enum GhosttyParseError {
     PaletteIndexOutOfRange { index: i64, line: usize },
 }
 
-/// Trim ASCII horizontal whitespace (space + tab) from both ends — matching
-/// Swift's `CharacterSet.whitespaces` (space + tab, NOT newlines; lines are
+/// Trim ASCII horizontal whitespace (space + session) from both ends — matching
+/// Swift's `CharacterSet.whitespaces` (space + session, NOT newlines; lines are
 /// already newline-split before this runs).
 fn trim_ws(s: &str) -> &str {
     s.trim_matches(|c: char| c == ' ' || c == '\t')

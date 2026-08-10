@@ -1,9 +1,9 @@
 //! `file-browser` self-test scenario — the R19 shipped-surface gate (What to
 //! build #7). Opens through the SHIPPED builder (`open_managed_window` →
 //! `build_window_root` → `AppShellView`, the exact path `run` takes), roots the
-//! active tab's browser at a temp fixture tree, and drives the real composition:
+//! active session's browser at a temp fixture tree, and drives the real composition:
 //!
-//! (a) a real ⌘⇧B chord (the shipped `ToggleSidebarMode` keymap) swaps the tab
+//! (a) a real ⌘⇧B chord (the shipped `ToggleSidebarMode` keymap) swaps the session
 //!     list for the tree in the live window — the AX root
 //!     `nice-file-browser-root` surfaces as an `AXGroup` and a fixture row is
 //!     rendered (model-read corroboration);
@@ -290,15 +290,15 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
         );
     };
 
-    // Root the active tab's browser at the fixture tree (before entering files
+    // Root the active session's browser at the fixture tree (before entering files
     // mode, so the lazily-created state seeds its root there).
-    let Some(main_tab) = state.update(cx, |s, _| s.model.active_tab_id().map(str::to_string)) else {
-        return CadenceReport::error("file-browser: the shipped window has no active tab".to_string());
+    let Some(main_session) = state.update(cx, |s, _| s.workspace.active_session_id().map(str::to_string)) else {
+        return CadenceReport::error("file-browser: the shipped window has no active session".to_string());
     };
     let fixture_root = fixture.root.to_string_lossy().into_owned();
     state.update(cx, |s, cx| {
         let root = fixture_root.clone();
-        s.model.mutate_tab(&main_tab, |t| t.cwd = root);
+        s.workspace.mutate_session(&main_session, |t| t.cwd = root);
         cx.notify();
     });
 
@@ -311,7 +311,7 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
     // `tranche6-composition` discipline).
     let mut deferred: Vec<String> = Vec::new();
 
-    // (a) ⌘⇧B → files mode; the tree replaces the tab list.
+    // (a) ⌘⇧B → files mode; the tree replaces the session list.
     let Some(fb) = enter_files_mode(cx, whandle, &sidebar, pid, &mut failures).await else {
         return build_report(failures, deferred); // nothing else can run without the view
     };
@@ -358,7 +358,7 @@ async fn run_file_browser(cx: &mut AsyncApp, whandle: WindowHandle<AppShellView>
     // claim): two REAL windows, a CGEvent ⌘Z in window B undoing window A's op with
     // focus routed back. Runs here while window A's root is still the fixture tree
     // (before `reroot_check` re-roots it) and its sidebar is still in Files mode.
-    composition_leg(cx, whandle, &fb, &fixture, &state, &main_tab, pid, &mut failures).await;
+    composition_leg(cx, whandle, &fb, &fixture, &state, &main_session, pid, &mut failures).await;
 
     // (e′) plan-2: REAL press / release inside a 2-file selection (the press must
     // not collapse it; the release must), plus an attempted real end-to-end drag.
@@ -389,7 +389,7 @@ async fn enter_files_mode(
     settle(cx, 300).await;
     for _ in 0..20 {
         if let Some(fb) = sidebar.update(cx, |s, _| s.scenario_file_browser()) {
-            eprintln!("[selftest] file-browser: ⌘⇧B swapped the tab list for the tree");
+            eprintln!("[selftest] file-browser: ⌘⇧B swapped the session list for the tree");
             return Some(fb);
         }
         settle(cx, POLL_MS).await;
@@ -724,8 +724,8 @@ async fn mode_flip_check(
     tap(cx, pid, KC_B, platform::FLAG_COMMAND | platform::FLAG_SHIFT).await;
     settle(cx, 250).await;
     let mode = state.update(cx, |s, _| s.sidebar.mode());
-    if mode != SidebarMode::Tabs {
-        failures.push(format!("⌘⇧B: expected a flip back to Tabs mode, got {mode:?}"));
+    if mode != SidebarMode::Sessions {
+        failures.push(format!("⌘⇧B: expected a flip back to Sessions mode, got {mode:?}"));
         return;
     }
     tap(cx, pid, KC_B, platform::FLAG_COMMAND | platform::FLAG_SHIFT).await;
@@ -2058,7 +2058,7 @@ async fn answer_modal(
 /// enter files mode, click-select two rows, context-menu Copy → Paste (recorded
 /// on the fakes + applied on disk), a slow-second-click rename + commit, then open
 /// a SECOND real window via a ⌘N CGEvent and press ⌘Z THERE — the op undoes AND
-/// focus routes back to window A (active + sidebar Files + origin tab). The chords
+/// focus routes back to window A (active + sidebar Files + origin session). The chords
 /// that gpui matches by character (⌘N, ⌘Z) are REAL CGEvents to our own pid; the
 /// row-level interactions use the same real router seams the rest of this scenario
 /// drives (pixel-accurate row clicks aren't synthesizable via `CGEventPostToPid`).
@@ -2069,7 +2069,7 @@ async fn composition_leg(
     fb: &Entity<FileBrowserView>,
     fixture: &Fixture,
     state: &Entity<WindowState>,
-    main_tab: &str,
+    main_session: &str,
     pid: i32,
     failures: &mut Vec<String>,
 ) {
@@ -2209,21 +2209,21 @@ async fn composition_leg(
         );
     }
     let a_mode = state.update(cx, |s, _| s.sidebar.mode());
-    let a_tab = state.update(cx, |s, _| s.model.active_tab_id().map(str::to_string));
+    let a_session = state.update(cx, |s, _| s.workspace.active_session_id().map(str::to_string));
     if a_mode != SidebarMode::Files {
         failures.push(format!(
             "composition: focus route left window A in {a_mode:?}, expected Files mode"
         ));
     }
-    if a_tab.as_deref() != Some(main_tab) {
+    if a_session.as_deref() != Some(main_session) {
         failures.push(format!(
-            "composition: focus route did not select window A's origin tab (got {a_tab:?}, want {main_tab:?})"
+            "composition: focus route did not select window A's origin session (got {a_session:?}, want {main_session:?})"
         ));
     }
-    if undone && a_active && a_mode == SidebarMode::Files && a_tab.as_deref() == Some(main_tab) {
+    if undone && a_active && a_mode == SidebarMode::Files && a_session.as_deref() == Some(main_session) {
         eprintln!(
             "[selftest] file-browser §6: Copy→Paste + slow-second-click rename on window A, ⌘N opened window B, \
-             CGEvent ⌘Z in B undid A's op and routed focus back (A active + Files + origin tab)"
+             CGEvent ⌘Z in B undid A's op and routed focus back (A active + Files + origin session)"
         );
     }
 
@@ -2235,7 +2235,7 @@ async fn composition_leg(
 /// Close a scenario-opened window AND reap its state. `remove_window` closes the
 /// NSWindow (programmatic — no confirm gate; no close observer is installed here,
 /// so it never quits), but the `WindowRegistry`'s strong `WindowState` handle
-/// would otherwise keep the window's Main-pane pty alive; `route_close_disk_fate`
+/// would otherwise keep the window's Main-window pty alive; `route_close_disk_fate`
 /// deregisters it and tears its sessions down (reaping the pty). Store calls
 /// inside are no-ops — the scenario installs no session store.
 async fn close_and_reap(cx: &mut AsyncApp, handle: AnyWindowHandle) {

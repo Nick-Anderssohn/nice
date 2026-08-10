@@ -1,7 +1,7 @@
 //! `InlineRenameClickGate` — ported from
 //! `Sources/Nice/State/InlineRenameClickGate.swift`. The pure "click an active
 //! row's title to enter rename mode" gate shared by the sidebar `TabRow` and
-//! the toolbar pane pill (R11 reuses it).
+//! the toolbar window pill (R11 reuses it).
 //!
 //! The rule: the row must be active **and** at least `double_click_interval`
 //! must have elapsed since it became active — so the same click that selects a

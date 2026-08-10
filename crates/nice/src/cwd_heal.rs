@@ -3,21 +3,21 @@
 //! `healSpawnCwd` (`WindowSession.swift:412-589`).
 //!
 //! The bug shape: a bare `claude -w` (no name) auto-generates a worktree dir
-//! Nice can't predict at the args layer, so an older `tab.cwd` records the
+//! Nice can't predict at the args layer, so an older `session.cwd` records the
 //! pre-worktree project path while Claude bucketed the transcript under the
 //! real worktree. `claude --resume` from the wrong bucket fails with "No
 //! conversation found". On restore, before spawning a deferred-resume Claude
-//! tab, we check whether the expected transcript exists; if not, we locate it
+//! session, we check whether the expected transcript exists; if not, we locate it
 //! by session id across every projects bucket, recover the real cwd from the
 //! transcript head, and adopt it.
 //!
 //! Every entry point takes an injectable `projects_root` (default
 //! `~/.claude/projects`, resolved only in `app::run`) so tests plant a temp
 //! `<root>/<bucket>/<sid>.jsonl` tree and never touch the developer's real
-//! `~/.claude`. Claude tabs ONLY — terminal tabs never heal — and silent on
+//! `~/.claude`. Claude sessions ONLY — terminal sessions never heal — and silent on
 //! unrecoverable sessions.
 //!
-//! These are the pure helpers; the restore-loop wiring (adopt_tab_cwd +
+//! These are the pure helpers; the restore-loop wiring (adopt_session_cwd +
 //! schedule-save) lands with the fan-out in a later slice, hence the
 //! module-wide `dead_code` allow (the established later-slice-consumer pattern,
 //! per `control_socket`).
@@ -112,7 +112,7 @@ pub fn read_cwd_from_transcript(path: &Path) -> Option<String> {
 
 /// Locate a Claude session's actual on-disk bucket when the persisted
 /// `persisted_cwd` doesn't match what Claude bucketed under. Returns the
-/// recovered cwd (suitable for both `tab.cwd` persistence and as the
+/// recovered cwd (suitable for both `session.cwd` persistence and as the
 /// deferred-shell spawn dir), or `None` when no heal is necessary (transcript
 /// already at the expected path) or possible (session id absent from every
 /// bucket, transcript unreadable, recovered path no longer exists on disk).
@@ -120,20 +120,20 @@ pub fn read_cwd_from_transcript(path: &Path) -> Option<String> {
 /// `projects_root` is injectable so tests drive the scan against a temp root
 /// rather than `~/.claude/projects`.
 pub fn heal_spawn_cwd(
-    session_id: &str,
+    claude_session_id: &str,
     persisted_cwd: &str,
     projects_root: &Path,
 ) -> Option<String> {
     let expected_bucket = encode_claude_bucket(&expand_tilde(persisted_cwd));
     let expected_transcript = projects_root
         .join(&expected_bucket)
-        .join(format!("{session_id}{TRANSCRIPT_EXTENSION}"));
+        .join(format!("{claude_session_id}{TRANSCRIPT_EXTENSION}"));
     if expected_transcript.exists() {
         // The transcript is already where the persisted cwd implies — no heal.
         return None;
     }
 
-    // Enumerate every sibling bucket for `<session_id>.jsonl`. A missing /
+    // Enumerate every sibling bucket for `<claude_session_id>.jsonl`. A missing /
     // unreadable projects dir yields no entries (not an error) — we bail with
     // `None`, matching Swift's empty-contents guard.
     let entries = fs::read_dir(projects_root).ok()?;
@@ -141,7 +141,7 @@ pub fn heal_spawn_cwd(
     for entry in entries.flatten() {
         let candidate = entry
             .path()
-            .join(format!("{session_id}{TRANSCRIPT_EXTENSION}"));
+            .join(format!("{claude_session_id}{TRANSCRIPT_EXTENSION}"));
         if let Ok(meta) = fs::metadata(&candidate) {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             matches.push((candidate, mtime));
@@ -151,7 +151,7 @@ pub fn heal_spawn_cwd(
     let chosen = matches.into_iter().max_by_key(|(_, mtime)| *mtime)?.0;
 
     let recovered = read_cwd_from_transcript(&chosen)?;
-    // No point rewriting `tab.cwd` to a phantom path: if the worktree was
+    // No point rewriting `session.cwd` to a phantom path: if the worktree was
     // deleted, the resume is unrecoverable and `resolved_spawn_cwd`'s fallback
     // still drops the user into the project root.
     if !Path::new(&expand_tilde(&recovered)).exists() {
@@ -160,7 +160,7 @@ pub fn heal_spawn_cwd(
     Some(recovered)
 }
 
-/// Minimal tilde expansion for the heal path — mirrors `TabModel::expand_tilde`
+/// Minimal tilde expansion for the heal path — mirrors `WorkspaceModel::expand_tilde`
 /// but self-contained (this module is gpui/model-free). Reads `$HOME` only when
 /// the path actually starts with `~`; the heal tests use absolute paths, so no
 /// real-home read occurs.

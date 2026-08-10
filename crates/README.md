@@ -26,15 +26,16 @@ it doesn't re-derive the layer story itself.
 crates/
   nice           — the app binary (GPUI). Process name `nice`.
   nice-harness   — measurement + self-test library. No app logic lives here.
-  nice-model     — per-window document model as pure data: the projects/tabs/
-                   panes value tree + the Claude status model (R8). The
+  nice-model     — per-window document model as pure data: the projects/sessions/
+                   windows value tree + the Claude status model (R8). The
                    documented asymmetries are deliberate + test-pinned. No gpui
                    dependency.
   nice-theme     — design tokens as pure data (palettes, accents, typography,
                    chrome geometry). No gpui dependency.
   nice-term-core — headless terminal core: pty spawn semantics + the
-                   alacritty_terminal VT (grid/scrollback/damage) + the pane
-                   session state machine (deferred spawn, events, held panes).
+                   alacritty_terminal VT (grid/scrollback/damage) + the per-
+                   window pty session state machine (deferred spawn, events,
+                   held windows).
                    No gpui dependency.
   nice-term-input— pure input layer (R5): keyboard encoder (kitty CSI-u +
                    legacy VT fallback), VT mouse (X10/SGR/UTF-8),
@@ -49,7 +50,7 @@ crates/
   nice-itests    — dev/test-only in-process gpui integration-test harness
                    (T2): behavior fixtures on mocked TestAppContext + visual/
                    pixel fixtures on real-MacPlatform VisualTestAppContext. The
-                   shared bed the Stage-2 chrome/pane cycles write tests on. Not
+                   shared bed the Stage-2 chrome/window cycles write tests on. Not
                    depended on by the shipped `nice` binary (`publish = false`).
                    Depends on gpui. See `../docs/testing.md`.
 ```
@@ -66,12 +67,12 @@ The GPUI application. Structure (grows over later cycles):
   chrome band over a single terminal (the composition gap the launched app exposed).
   `open_managed_window` mints + seeds the window's `WindowState`, **arms the
   window's R14 control socket** (`arm_window_control_socket` — mint the socket path,
-  set the `SessionManager`'s shell-injection env, start the accept thread, spawn the
-  waker-woken foreground drain) BEFORE spawning the Main pane (the "env before fork"
-  invariant: the pane inherits `NICE_SOCKET` / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from
-  launch), spawns the Main tab's pane into its `SessionManager` up front with the
+  set the `PtyManager`'s shell-injection env, start the accept thread, spawn the
+  waker-woken foreground drain) BEFORE spawning the Main window (the "env before fork"
+  invariant: the window inherits `NICE_SOCKET` / `ZDOTDIR` / `NICE_USER_ZDOTDIR` from
+  launch), spawns the Main session's window into its `PtyManager` up front with the
   full shipped spec (the login shell `zsh -il` by default, or a one-off
-  `NICE_COMMAND`; later panes get a plain login shell via the R13 deferred-spawn
+  `NICE_COMMAND`; later windows get a plain login shell via the R13 deferred-spawn
   path), opens the window, and hands back the shell `WindowHandle` (`run` / the ⌘N
   handler discard it — the `app-shell` scenario keeps it). **`run`'s R14 bootstrap**
   (`install_shell_inject_bootstrap`, before the first `open_managed_window` — and
@@ -81,7 +82,7 @@ The GPUI application. Structure (grows over later cycles):
   `ShellInjectConfig` every window's `arm_window_control_socket` threads into its
   shell env) → **kick off the R15 claude-binary probe**. The reaper
   (`orphan_reaper::reap`, C12) SIGKILLs each `zsh` orphaned by a prior crash/SIGKILL
-  BEFORE any new pane forks — matched on ALL FOUR of `PPID==1` & `uid==getuid()` &
+  BEFORE any new window forks — matched on ALL FOUR of `PPID==1` & `uid==getuid()` &
   kernel `comm=="zsh"` & env carries `NICE_TAB_ID=` (never name-pattern matching;
   `proc_listpids` not `proc_listallpids`; env via `KERN_PROCARGS2`) so we don't
   inherit a starved pty table. The probe (`kickoff_claude_probe`, C11) resolves
@@ -111,46 +112,46 @@ The GPUI application. Structure (grows over later cycles):
   the band acts only on the remainder — is the reusable pattern the shell composes
   with.
 - `app_shell` — the R13.5 **per-window composition root**. `AppShellView` renders the
-  shell subtree (flat sidebar column + toolbar band + pane content — the 2026-07
+  shell subtree (flat sidebar column + toolbar band + window content — the 2026-07
   restyle flattened the sidebar card into the shared window-body surface), carries the window-level
   peek-clear modifier observer (moved off `WindowChromeView`), and observes the shared
   `WindowState`, the toolbar, and the sidebar — re-rendering the whole subtree on any
   notify, so a pill/row click (which notifies only its own view) still switches the
-  `PaneHostView` sibling's content. `PaneHostView` is the pane-content host (the
-  PROTECTED activation decision): it maps the active `(tab_id, pane_id)` →
-  `SessionManager::pane_handle` → a per-pane, lazily-created, cached `TerminalView`
+  `WindowHostView` sibling's content. `WindowHostView` is the window-content host (the
+  PROTECTED activation decision): it maps the active `(session_id, window_id)` →
+  `PtyManager::term_window_handle` → a per-window, lazily-created, cached `TerminalView`
   (shared theme/accent/font + the same platform probe injections `open_managed_window`
-  used), with activation flowing **only** through `SessionManager::activate_pane` (R13
+  used), with activation flowing **only** through `PtyManager::activate_term_window` (R13
   deferred-spawn + focus preserved verbatim, no view-side spawn), dropping a departed
-  pane's view and re-pointing the demand-present kick to the active pane on every
-  switch. **R15 subscription lift:** `PaneHostView`'s render also runs
-  `WindowState::subscribe_spawned_panes` — the single choke point every spawn flows
-  past (the Main pane forks before the first render; deferred terminals fork through
-  `activate_pane`; a Claude tab / socket newtab spawn re-renders the shell). It
-  subscribes each freshly-spawned pane's session entity to `route_terminal_event` so
+  window's view and re-pointing the demand-present kick to the active window on every
+  switch. **R15 subscription lift:** `WindowHostView`'s render also runs
+  `WindowState::subscribe_spawned_windows` — the single choke point every spawn flows
+  past (the Main window forks before the first render; deferred terminals fork through
+  `activate_term_window`; a Claude session / socket newtab spawn re-renders the shell). It
+  subscribes each freshly-spawned window's session entity to `route_terminal_event` so
   OSC titles / cwd / exits reach the model in the SHIPPED window (the tranche's known
   integration gap: this wiring previously lived ONLY in the `session-lifecycle`
   scenario, so shipped-window titles/exits dead-ended at the view adapter). It is
-  subscribe-once (a per-window `subscribed_panes` set), so sweeping every render is
+  subscribe-once (a per-window `subscribed_windows` set), so sweeping every render is
   safe. The `RoutedExit` neighbor-refocus spawn is composed by this same activation
-  path (the routed removal shifts the active pane, whose activation change re-runs
-  `activate_pane`); only the every-project-empty terminus — which needs a `&mut
+  path (the routed removal shifts the active window, whose activation change re-runs
+  `activate_term_window`); only the every-project-empty terminus — which needs a `&mut
   Window` a subscription callback lacks — is actuated through the `AnyWindowHandle`
   stashed on `WindowState` at `build_window_root`. The pure host logic
-  (`active_pane_target` / `model_pane_ids` / `stale_cache_ids`) is extracted +
+  (`active_window_target` / `model_window_ids` / `stale_cache_ids`) is extracted +
   in-crate `#[test]`-covered; the render-level placeholder → `TerminalView` swap (a
-  model-only Claude pane shows the placeholder until its spawn/promotion caches a
+  model-only Claude window shows the placeholder until its spawn/promotion caches a
   handle) is asserted in the `claude-lifecycle` scenario. The layout tree roots in `SidebarShellView` (it owns the collapse/peek/resize
-  geometry) with the toolbar band + pane host threaded into its content slots, mirroring
+  geometry) with the toolbar band + window host threaded into its content slots, mirroring
   Swift's `AppShellView` expanded/collapsed layout — no ChromeEventRouter /
   LivePaneRegistry seam ports. **The composition invariant (PROTECTED):**
-  `WindowState.model` is the ONLY `TabModel` a shipped window holds — `AppShellView` /
-  `SidebarShellView` / `WindowToolbarView` / `PaneHostView` all render from and mutate
+  `WindowState.model` is the ONLY `WorkspaceModel` a shipped window holds — `AppShellView` /
+  `SidebarShellView` / `WindowToolbarView` / `WindowHostView` all render from and mutate
   that one shared state, so no mounted view carries a divergent model copy and every
-  mutation flows through the `sidebar_actions` / `pane_strip_actions` / `session` seams.
+  mutation flows through the `sidebar_actions` / `window_strip_actions` / `session` seams.
   Exports the AX-anchor label constants `nice-sidebar-root` / `nice-pane-strip-root`
   (the §6 shipped-surface assertion hooks), placed as `.id()` + `.role(Group)` +
-  `.aria_label(..)` on the flat sidebar-column root (`sidebar_shell`) and the pane-strip root
+  `.aria_label(..)` on the flat sidebar-column root (`sidebar_shell`) and the window-strip root
   (`toolbar`).
 - `app_shell_live` — the R13.5 live app-shell composition self-test scenario
   (`app-shell`, see the table below). Opens through the SHIPPED builder
@@ -217,10 +218,10 @@ The GPUI application. Structure (grows over later cycles):
   the drop handler is driven with constructed `ExternalPaths` events, asserting
   byte-exact escaped-path typing.
 - `niceties_overlay` — the R7/T9 "Launching…" overlay self-test
-  (`niceties-overlay`): a slow silent pane shows the overlay past a short grace
-  window and clears it on first output, while an instant-prompt pane never
+  (`niceties-overlay`): a slow silent window shows the overlay past a short grace
+  window and clears it on first output, while an instant-prompt window never
   flashes it.
-- `niceties_held` — the R7/T10 held-pane self-test (`niceties-held`): a non-zero
+- `niceties_held` — the R7/T10 held-window self-test (`niceties-held`): a non-zero
   exit stays mounted with the dim in-buffer footer + the dismiss affordance,
   typing is inert, and dismiss respawns a fresh shell.
 - `niceties_link` — the ⌘+click / ⌘-hover terminal-link self-test
@@ -237,7 +238,7 @@ The GPUI application. Structure (grows over later cycles):
   serves only the R10/R11 components.
 - **Theme system (R21) — the live appearance state + fan-out.** Birth of the
   runtime theme system: a persisted appearance selection, OS-appearance sync, and a
-  fan-out that recolors every chrome view + every terminal pane across every window
+  fan-out that recolors every chrome view + every terminal window across every window
   with no view rebuild, plus the R17-live Claude mirror.
   - `theme_settings` — the app-crate theme store + the live state:
     - **The persisted `Appearance`** (pure value type): `scheme` (light|dark) ×
@@ -285,7 +286,7 @@ The GPUI application. Structure (grows over later cycles):
       (`WindowBackgroundAppearance` — Opaque|Transparent|Blurred)) as one process
       `Entity<ThemeState>` in a `Global` (mirrors `SharedFontSettings`); chrome
       reads it at render (`active_chrome_slots` / `active_chrome_accent`),
-      `build_window_root` seeds panes from it (`active_terminal_theme_and_accent`).
+      `build_window_root` seeds windows from it (`active_terminal_theme_and_accent`).
       Absent ⇒ the shipped Nice/Dark + Terracotta fallback (scenarios/tests render
       byte-identically). `from_stores` resolves the (theme, accent) PAIR through
       `resolve_theme_and_accent`, which owns the accent chain AND the caret rule:
@@ -318,10 +319,10 @@ The GPUI application. Structure (grows over later cycles):
       `commit_appearance`, so they fan out live.
     - **`apply_theme_fanout`** — repaint chrome (`refresh_windows`) + push the
       resolved terminal theme + accent AND the active surface-fill
-      `background_opacity` into every window's `PaneHostView` (the theme pushed
+      `background_opacity` into every window's `WindowHostView` (the theme pushed
       here is the POST-caret-rule one: under a preset its `cursor` is already
       `None`, which is what makes the caret wear the accent) (walking
-      `WindowRegistry::all_states` → each `WindowState::pane_host` → its cached
+      `WindowRegistry::all_states` → each `WindowState::window_host` → its cached
       `TerminalView`s) through the boundary-legal setters (the `SessionThemeCache`
       analog; the terminal recolor is an explicit push, never a cross-boundary
       observe), then `apply_window_transparency_fanout` — a `cx.defer`-ed push of the
@@ -526,33 +527,33 @@ The GPUI application. Structure (grows over later cycles):
   Its pure state ports gpui-free into `nice-model` (`selection` / `rename_gate` /
   `sidebar` — see that crate below); the views are GPUI-native here, and
   create/close/select actions bind to an injected seam that mutates the R8 model
-  only (R13 rewires it to real sessions). **S7 sidebar-tab drag-reorder is
+  only (R13 rewires it to real sessions). **S7 sidebar-session drag-reorder is
   excluded, not missing — it is not scheduled to any current cycle**
   (`SidebarDragState`, the drop delegates, the insertion line; R25 covers only
-  the pane strip's P4 pill reorder, not the sidebar); absent drag support is by
+  the window strip's P4 pill reorder, not the sidebar); absent drag support is by
   design, and a reviewer must not flag it.
   Modules:
-  - `status_dot` — the `StatusDot` component (per-`TabStatus` colour + the
+  - `status_dot` — the `StatusDot` component (per-`SessionStatus` colour + the
     ring/breathe pulse animations), which reads the R8 predicates
-    (`Tab::status` / `Tab::waiting_acknowledged`) and never recomputes them;
+    (`Session::status` / `Session::waiting_acknowledged`) and never recomputes them;
     reused by R11's toolbar pills.
   - `context_menu` — the in-house context-menu popup (`anchored()` + `deferred()`
     + right-button open + click-away/Esc dismiss; the pinned gpui has no
     context-menu widget). Reused by R11.
   - `sidebar_actions` — the `SidebarActions` create/close/select seam (dossier
     G3): the single nameable surface R13 rewires. `ModelSidebarActions` is the
-    R10 model-only impl (nothing spawns; no busy-pane confirmation — that is
-    W5/R18); removal always goes through the single `TabModel::remove_tab` entry
+    R10 model-only impl (nothing spawns; no busy-window confirmation — that is
+    W5/R18); removal always goes through the single `WorkspaceModel::remove_session` entry
     point so the parent-pointer sweep can't be skipped.
   - `sidebar_shell` — the `SidebarShellView` entity. **R13.5 (slice 1)** moved it off
-    its private `TabModel` copy: it now holds the shared `Entity<WindowState>` + a
+    its private `WorkspaceModel` copy: it now holds the shared `Entity<WindowState>` + a
     `cx.observe` subscription and reads/mutates the shared model, sidebar
-    (mode/collapse/peek), selection, and seam through it (the "one TabModel per window"
+    (mode/collapse/peek), selection, and seam through it (the "one WorkspaceModel per window"
     invariant); it keeps only its own view-local render state (resize width, disclosure
     set, inline-rename draft, open menu). Two constructors: `new(state, cx)` (the
     isolated `sidebar` scenario — placeholder content, layout byte-identical to before)
     and **`new_composed(state, main_toolbar, main_body, cx)`** (the shell — the toolbar
-    (now the full-width 28pt titlebar) + pane host injected as `AnyView`s. The 2026-07
+    (now the full-width 28pt titlebar) + window host injected as `AnyView`s. The 2026-07
     restyle restructured the expanded shell to `column(titlebar row, row(sidebar,
     content))`, so the toolbar rides a full-width `build_titlebar_row` at the top in
     BOTH shell states — replacing the old per-mode top-bar-accessory / main-column
@@ -560,7 +561,7 @@ The GPUI application. Structure (grows over later cycles):
     flattened the floating card into the shared terminal surface, leaving a single
     over-glass right-edge hairline / collapsed full-width body — the M2 design; the
     floating cap is gone / peek overlay / resize handle) + the column contents
-    (project groups, tab rows, footer, toggles), and carries the exported
+    (project groups, session rows, footer, toggles), and carries the exported
     `nice-sidebar-root` AX anchor on the sidebar-column root. The DO-NOT-PORT SwiftUI seams are
     replaced per the plan: the Esc `NSEvent` monitor → a `CollapseSidebarSelection` gpui
     key **binding** (dispatched before key listeners; collapses a >1 selection, else
@@ -568,14 +569,14 @@ The GPUI application. Structure (grows over later cycles):
     monitor → a `cx.on_blur` focus-out subscription.
   - `sidebar_live` — the R10 live sidebar self-test scenario (`sidebar`, see the
     table below).
-- **Toolbar (R11 pane strip).** The window toolbar's pane strip — the 2026-07
+- **Toolbar (R11 window strip).** The window toolbar's window strip — the 2026-07
   restyle dropped the brand block (logo + "Nice" + separator) entirely and turned
-  the pills into fill-less **text + accent-underline tabs** (leading status dot /
+  the pills into fill-less **text + accent-underline pills** (leading status dot /
   terminal glyph, truncating title, hover/active ✕ with an always-reserved 16pt
-  slot, active tab in `ink` with a 1px accent underline / inactive tabs in
+  slot, the active pill in `ink` with a 1px accent underline / inactive pills in
   `ink3` with a 1px grey (`tab_underline_idle`) underline so they read as
-  clickable, inline rename, per-kind context menus; single-tab mode renders the
-  sole pane's title as centered titlebar text with no tab chrome), the overflow
+  clickable, inline rename, per-kind context menus; single-window mode renders the
+  sole window's title as centered titlebar text with no pill chrome), the overflow
   chevron with its 6pt
   attention badge, the 16pt edge fades, the leading sidebar-collapse toggle, and
   the trailing `+`. The toolbar is now the fill-less full-width 28pt titlebar in
@@ -584,25 +585,25 @@ The GPUI application. Structure (grows over later cycles):
   width-estimation machinery does **not** survive: GPUI reads real layout, so a
   tracked `ScrollHandle` drives overflow / fades / offscreen / auto-center
   directly (the pure predicates live in `nice-model`'s `strip_geometry`; R8's
-  `Tab::has_offscreen_attention` is reused for the badge, never re-derived — one
+  `Session::has_offscreen_attention` is reused for the badge, never re-derived — one
   status model, dossier G2). The reservation rule that kills the
   show-chevron→shrink→hide feedback loop survives behaviorally: the chevron + `+`
   slots are unconditionally reserved, so the overflow decision never depends on
   the chevron's own visibility. **Intra-strip pill reorder (P4) LANDED in R25**
-  on GPUI's own drag API: pills carry a stable `.id()` (`toolbar.pill.<pane_id>`)
-  + `on_drag` (a `{ pane_id, tab_id }` `PaneDragPayload` + a lightweight
-  `PaneDragGhost` chip); the scroll row carries `on_drag_move` / `on_drop`; the
-  gated drop slot is resolved by the pure `nice-model::pane_strip_drop` resolver
+  on GPUI's own drag API: pills carry a stable `.id()` (`toolbar.pill.<term_window_id>`)
+  + `on_drag` (a `{ term_window_id, session_id }` `WindowDragPayload` + a lightweight
+  `WindowDragGhost` chip); the scroll row carries `on_drag_move` / `on_drop`; the
+  gated drop slot is resolved by the pure `nice-model::window_strip_drop` resolver
   (below); an insertion line paints at the target edge; and a committed reorder
-  calls `TabModel::move_pane` then persists with an **explicit `save_to_store()`**
+  calls `WorkspaceModel::move_window` then persists with an **explicit `save_to_store()`**
   (the `on_tree_mutation` observer is now wired once per window in
-  `build_window_root` via `wire_tree_mutation_save`, BUGHUNT1-D, and `move_pane`
+  `build_window_root` via `wire_tree_mutation_save`, BUGHUNT1-D, and `move_window`
   fires the did-mutate signal itself; the explicit save is retained as a harmless
   belt-and-suspenders — the observer's save is debounced, so the duplicate
   collapses). The existing select-on-press + `stop_propagation` is untouched
   — the drag arms alongside it. **P5 (cross-window move) + P6 (tear-off) are CUT**
   (scope fence): no `NSDraggingSource` / `LivePaneRegistry` / tear-off host, no
-  `extract_pane` / `insert_pane`, and no non-`.slot` resolver destinations.
+  `extract_window` / `insert_window`, and no non-`.slot` resolver destinations.
   **The trailing update pill (P7) LANDED in R27**: the reserved trailing slot now
   holds a conditional pill that renders ONLY when the release checker reports a
   newer version (see **Update checker (R27)** below) — absent an update it emits
@@ -619,24 +620,24 @@ The GPUI application. Structure (grows over later cycles):
     extracted from the R10 sidebar so the sidebar row and the toolbar pill mount
     the *same* field (R11's H2 pre-work); the rename *gate* stays R10's
     `InlineRenameClickGate`.
-  - `pane_strip_actions` — the `PaneStripActions` select/close/add-terminal seam
-    (the pane-level sibling of `SidebarActions`). `ModelPaneStripActions` is the
-    R11 model-only impl (select moves `active_pane_id`; close routes through the
-    single `TabModel::extract_pane`; add through the R8 `add_pane` "Terminal N"
+  - `window_strip_actions` — the `WindowStripActions` select/close/add-terminal seam
+    (the window-level sibling of `SidebarActions`). `ModelWindowStripActions` is the
+    R11 model-only impl (select moves `active_window_id`; close routes through the
+    single `WorkspaceModel::extract_window`; add through the R8 `add_window` "Terminal N"
     counter — nothing spawns until R13).
   - `toolbar` — the `WindowToolbarView` entity. **R13.5 (slice 1)** moved it off its
-    private `TabModel` copy the same way: it now holds the shared `Entity<WindowState>`
-    + a `cx.observe` subscription, renders the shared model's active-tab panes, and
-    routes select/close/add/rename through the shared `pane_strip_actions` seam; it
+    private `WorkspaceModel` copy the same way: it now holds the shared `Entity<WindowState>`
+    + a `cx.observe` subscription, renders the shared model's active-session windows, and
+    routes select/close/add/rename through the shared `window_strip_actions` seam; it
     keeps only its own view-local state (the `ScrollHandle`, hovered pill, rename draft,
     open menu). Constructor `new(state, cx)`. Renders the whole strip and carries the
     exported `nice-pane-strip-root` AX anchor on the strip root. Empty-submit pill
-    rename resets to the per-kind auto-default via the R8 `rename_pane` (the pill
+    rename resets to the per-kind auto-default via the R8 `rename_window` (the pill
     reimplements no title policy). **R25** adds the intra-strip drag: `render_pill`'s
-    `.id()` + `on_drag` (the `PaneDragPayload` + `PaneDragGhost`), the scroll row's
-    `on_drag_move` / `on_drop` (resolving the slot through `pane_strip_drop` +
-    committing `TabModel::move_pane` + `save_to_store`), the transient
-    `drag_target: Option<(target_pane_id, place_after)>` slot state, and the
+    `.id()` + `on_drag` (the `WindowDragPayload` + `WindowDragGhost`), the scroll row's
+    `on_drag_move` / `on_drop` (resolving the slot through `window_strip_drop` +
+    committing `WorkspaceModel::move_window` + `save_to_store`), the transient
+    `drag_target: Option<(target_window_id, place_after)>` slot state, and the
     insertion-line overlay on `scroll_wrap`. **R27** adds the trailing update pill:
     `render_update_pill` reads `release_check::update_available(cx)` and renders the
     conditional pill (AX id `toolbar.updateAvailable`, role Button, `stop_propagation`
@@ -664,7 +665,7 @@ The GPUI application. Structure (grows over later cycles):
     SHIPPED toolbar off the injected fetcher and a guarded global-HID click opens its
     popover; **(b)** a real guarded global-HID drag commits an R25 pill reorder on
     the shipped strip; **(c)** a socket `handoff` opens a nested `[HANDOFF]`-titled
-    tab on the shipped window (stub claude, never real) and ⌘, opens R23's shipped
+    session on the shipped window (stub claude, never real) and ⌘, opens R23's shipped
     settings window exposing the Claude section (the R26 `settings.claude.installHandoffSkill`
     toggle's home). The R25 drag + R27 click post through the new
     `platform::post_global_left_{down,drag,up}` / `post_global_left_click` seams
@@ -673,17 +674,17 @@ The GPUI application. Structure (grows over later cycles):
     stays `CGEventPostToPid`. R27 also owns the tranche's ONE full regression sweep
     (`cargo test --workspace` + `NICE_SELFTEST=all`, release, strictly serial,
     `multiwindow` last) — it lives here and in no other t6 plan.
-  - `pane_strip_live` — the R11 live pane-strip self-test scenario (`pane-strip`,
+  - `window_strip_live` — the R11 live window-strip self-test scenario (`pane-strip`,
     see the table below). Its in-process real-layout differentials (overflow
     onset, fades, badge, ✕-slot reservation, select/close/rename routing,
-    centering) live in `nice-itests`' `pane_strip` cases — a simulated event
+    centering) live in `nice-itests`' `window_strip` cases — a simulated event
     can't move a real frame, and real Taffy layout is deterministic in-process.
     **R25** adds the reorder leg: a `CGEventPostToPid` press-drag of one pill past
-    another's midpoint, hard-asserting `pane_ids()` flipped only on a
+    another's midpoint, hard-asserting `term_window_ids()` flipped only on a
     demonstrably-landed press (else DEFER — the honest-deferral discipline; the
     deterministic reorder is pinned in-process).
 - **Multi-window + shortcut dispatch (R12).** ⌘N opens a fully isolated window
-  (its own tabs / panes / sidebar), a process-wide registry routes focused-window
+  (its own sessions / windows / sidebar), a process-wide registry routes focused-window
   concerns, and the 13 default shortcuts dispatch through GPUI's action/keymap
   system with the terminal pass-through contract intact. The `WindowGroup` token
   dance, `NewWindowButton` UUID minting, the `WindowClaimLedger`, and the
@@ -691,74 +692,74 @@ The GPUI application. Structure (grows over later cycles):
   in GPUI the app calls `open_window` itself and hands each window its state as a
   **constructor argument**. Modules:
   - `window_state` — `WindowState`, the per-window composition root mirroring
-    Swift's `AppState`: the R8 `TabModel` document + the R10 `SidebarModel` /
-    `SidebarTabSelection` + the R10/R11 `SidebarActions` / `PaneStripActions`
-    seams + the R13 `SessionManager` (in the slot R12 reserved) + a unique
+    Swift's `AppState`: the R8 `WorkspaceModel` document + the R10 `SidebarModel` /
+    `SidebarSessionSelection` + the R10/R11 `SidebarActions` / `WindowStripActions`
+    seams + the R13 `PtyManager` (in the slot R12 reserved) + a unique
     per-window session id. `WindowState::new(cwd)` mints a fresh default window;
     **R13.5 (slice 1)** factored out **`WindowState::with_model(model)`** — it seeds a
-    window around a pre-built `TabModel` (re-syncing the selection from its active tab
-    so the "selection ⊇ {active tab}" invariant holds), the seam the isolated `sidebar`
+    window around a pre-built `WorkspaceModel` (re-syncing the selection from its active session
+    so the "selection ⊇ {active session}" invariant holds), the seam the isolated `sidebar`
     / `pane-strip` scenarios mount the shipped views over (and R18 restore will reuse);
     `new` delegates to it. Handed to `app::build_window_root` — the seam R18 threads
-    restored state through (cross-window pane adoption, the CUT P5 path, threads
-    nothing here — R25 landed pane-strip reorder only). `teardown` (a no-op in R12) is what
-    the registry calls on close; R13 makes it drop the window's `SessionManager`
+    restored state through (adopting a window into another OS window, the CUT P5 path, threads
+    nothing here — R25 landed window-strip reorder only). `teardown` (a no-op in R12) is what
+    the registry calls on close; R13 makes it drop the window's `PtyManager`
     sessions (SIGHUP→SIGKILL, no orphan zsh).
-  - `session_manager` — `SessionManager`, the per-window pty/session subsystem
-    (one per `WindowState`), the Rust twin of Swift's `SessionsModel` pane-lifecycle
+  - `pty_manager` — `PtyManager`, the per-window pty/session subsystem
+    (one per `WindowState`), the Rust twin of Swift's `SessionsModel` window-lifecycle
     half. It wires the R3–R7 terminal stack (`nice_term_view::TerminalSessionHandle`
-    entities) to the R8 `TabModel`: it owns the live pane sessions (tab-keyed
-    `pane_id → session`, mirroring Swift's `ptySessions`), spawns deferred panes on
+    entities) to the R8 `WorkspaceModel`: it owns the live window ptys (`session_id →
+    window_id → WindowPty`, mirroring Swift's `ptySessions`), spawns deferred windows on
     focus, and routes each session entity's OSC title/cwd + exit events back into
-    the model. **Pure model routing** (unit-tested, no gpui): `pane_cwd_changed`
-    (OSC 7 → `Pane.cwd` only, never `Tab.cwd`), `pane_title_changed` (terminal-branch
+    the model. **Pure model routing** (unit-tested, no gpui): `window_cwd_changed`
+    (OSC 7 → `TermWindow.cwd` only, never `Session.cwd`), `window_title_changed` (terminal-branch
     title policy — empty ignored, manual-rename lock respected, clip at 40; the
     **R15 T5 Claude branch** gated on `is_claude_running` splits the OSC title's
     status prefix via `parse_claude_title` — first scalar in `U+2800..=U+28FF` ⇒
     Thinking, exactly `U+2733` (✳) ⇒ Waiting — applies the status transition
-    (acked only on the viewed tab's active pane), and feeds the trailing label to
-    the tab auto-title, dropping the empty / `Claude Code` placeholder; the pane's
+    (acked only on the viewed session's active window), and feeds the trailing label to
+    the session auto-title, dropping the empty / `Claude Code` placeholder; the window's
     own pill is never written here),
-    `set_active_pane` (active + ack-when-viewed), `select_next`/`prev_pane` +
-    `step_active_pane` (wrap, <2-pane no-op), `add_pane` /
-    `add_terminal_to_active_tab` (terminal-kind only — the ≤1-Claude creation edge),
+    `set_active_window` (active + ack-when-viewed), `select_next`/`prev_window` +
+    `step_active_window` (wrap, <2-window no-op), `add_window` /
+    `add_terminal_to_active_session` (terminal-kind only — the ≤1-Claude creation edge),
     and `route_terminal_event` (map a decoded `TerminalEvent` to the routing call).
-    **Lifecycle** (the exact Swift ordering): `pane_exited` — (1) clear overlay,
+    **Lifecycle** (the exact Swift ordering): `window_exited` — (1) clear overlay,
     (2) model removal + neighbor refocus, (3) pty release, then (5) the synchronous
-    dissolve check, returning a `PaneExitResolution` so the live caller runs the
+    dissolve check, returning a `WindowExitResolution` so the live caller runs the
     two gpui-only side effects Swift runs inline (step-4 deferred-companion spawn on
-    a surviving tab, and the every-project-empty terminus); `pane_held` flips the
-    pane dead-but-mounted (`is_alive = false`, idle status, keep it in the strip).
-    **Dissolve cascade** (`finalize_dissolved_tab`) — `remove_tab` + parent-pointer
-    sweep → pty release → selection prune → active-tab fallback in
-    `navigable_sidebar_tab_ids` order → the every-project-empty terminus; three
-    entry points share it (pane-exit, `close_tab` = R10's action unconditional this
-    cycle, and the unused-until-R25 cross-window `dissolve_tab_if_empty`).
-    **Launch-overlay registry** (`register`/`promote`/`clear_pane_launch`, grace
+    a surviving session, and the every-project-empty terminus); `window_held` flips the
+    window dead-but-mounted (`is_alive = false`, idle status, keep it in the strip).
+    **Dissolve cascade** (`finalize_dissolved_session`) — `remove_session` + parent-pointer
+    sweep → pty release → selection prune → active-session fallback in
+    `navigable_sidebar_session_ids` order → the every-project-empty terminus; three
+    entry points share it (window-exit, `close_session` = R10's action unconditional this
+    cycle, and the unused-until-R25 cross-window `dissolve_session_if_empty`).
+    **Launch-overlay registry** (`register`/`promote`/`clear_window_launch`, grace
     default `DEFAULT_LAUNCH_OVERLAY_GRACE`, `≤ 0` promotes synchronously) mirrors
     Swift's `paneLaunchStates`; the grace deadline arms R7's App-Nap-safe
-    `LaunchDeadline`. **Termination** — `terminate_pane` (synthetic-held /
+    `LaunchDeadline`. **Termination** — `terminate_window` (synthetic-held /
     synthetic-armed / live fast paths, always drops), `terminate_all` (snapshots ids
     first — held synthesized exits re-enter removal mid-loop), `teardown`. Test
     seams: injectable `mint_id`, `launch_overlay_grace`, and synthetic held/armed
-    pane markers so close-flow tests build all three tri-state shapes (model-only /
+    window markers so close-flow tests build all three tri-state shapes (model-only /
     spawning / held) without a real child. The gpui composition primitives the
-    action seams call — `spawn_pane`, `ensure_active_pane_spawned` (deferred spawn),
-    `focus_active_pane`, `activate_pane` (the full `setActivePane`: model +
-    deferred-spawn + focus), `pane_handle` (the slice-3 subscription seam a
+    action seams call — `spawn_window`, `ensure_active_window_spawned` (deferred spawn),
+    `focus_active_window`, `activate_term_window` (the full `setActivePane`: model +
+    deferred-spawn + focus), `term_window_handle` (the slice-3 subscription seam a
     `cx.subscribe` reads to feed `route_terminal_event` from a live entity), and
     `apply_dissolve_terminus` (close-this-window-or-quit via the registry).
-    **R14 shell-injection env** (`set_window_shell_env` / `spawn_pane`): a window's
-    `SessionManager` carries a `WindowShellEnv` (socket path / `ZDOTDIR` /
-    `NICE_USER_ZDOTDIR`), set once at construction before the Main pane forks;
-    `spawn_pane` — the single choke point every pty spawn passes through — merges it
-    plus per-pane `NICE_TAB_ID` / `NICE_PANE_ID` into `spec.env` **spec-wins**
+    **R14 shell-injection env** (`set_window_shell_env` / `spawn_window`): a window's
+    `PtyManager` carries a `WindowShellEnv` (socket path / `ZDOTDIR` /
+    `NICE_USER_ZDOTDIR`), set once at construction before the Main window forks;
+    `spawn_window` — the single choke point every pty spawn passes through — merges it
+    plus per-window `NICE_TAB_ID` / `NICE_PANE_ID` into `spec.env` **spec-wins**
     (`merge_env_spec_wins`: a key already on the caller-built spec, e.g. a blanked
     `ZDOTDIR`, survives), so the ~10 landed ZDOTDIR-blanked scenarios are untouched.
-    `build_claude_extra_env` is the pure port of the Claude-pane env matrix
+    `build_claude_extra_env` is the pure port of the Claude-window env matrix
     (`TERM_PROGRAM` + ids + `NICE_SOCKET` always; `ZDOTDIR` + `NICE_USER_ZDOTDIR` +
     the frozen `NICE_PREFILL_COMMAND` only for `ResumeDeferred`) — was
-    production-unused before R15; R15's `spawn_claude_pane` now wires it, its
+    production-unused before R15; R15's `spawn_claude_window` now wires it, its
     `settings_path` arg threaded (the injectable theme-sync provider — **R17 fills it**
     from the process gate; changing no composer logic). Exported for later
     rows: teardown/restore for R18, and the dissolve cascade's declared-but-inert
@@ -771,64 +772,64 @@ The GPUI application. Structure (grows over later cycles):
     **R15 Claude lifecycle** makes `claude` real end to end. The socket `claude`
     handler (`WindowState::route_socket_message` → `resolve_claude_request`, the
     spawn-free decision half, threaded a `&mut Context` so the newtab decision can
-    spawn): reply `newtab` + build a fresh Claude tab unless the request names a real
-    pane in a known, non-Terminals tab with **no running Claude** (the ≤1-Claude
+    spawn): reply `newtab` + build a fresh Claude session unless the request names a real
+    window in a known, non-Terminals session with **no running Claude** (the ≤1-Claude
     guard), in which case promote **in place** — the only production false→true flip
     of `is_claude_running`, kind→Claude, title reset to `Claude`, `claude_session_id`
     set (parsed `--resume`/`--session-id` or a fresh v4 mint) — replying exactly once
     with the frozen ≤3-field grammar (the `--settings` field suppressed when the
-    client args already carry one). The ONE shared constructor `create_claude_tab`
+    client args already carry one). The ONE shared constructor `create_claude_session`
     (socket newtab bucket-by-cwd AND the sidebar project-`+` append-to-project) builds
-    `[Claude, Terminal 1]` with the Claude pane `is_claude_running = true` from
+    `[Claude, Terminal 1]` with the Claude window `is_claude_running = true` from
     creation (PROTECTED), pre-mints the v4 session UUID (`mint_session_uuid` over
-    `getentropy`, a separate mint from the ms+counter id minter), splits `Tab.cwd` to
+    `getentropy`, a separate mint from the ms+counter id minter), splits `Session.cwd` to
     `<cwd>/.claude/worktrees/<sanitized>` on `claude -w <name>` while the bucket
-    anchors at `cwd`, registers the session, and spawns the Claude pane immediately
-    (claude-kind panes never lazy-spawn); the companion terminal stays deferred.
-    `spawn_claude_pane` builds the mode-driven `SpawnSpec` (probe path + provider via
+    anchors at `cwd`, registers the session, and spawns the Claude window immediately
+    (claude-kind windows never lazy-spawn); the companion terminal stays deferred.
+    `spawn_claude_window` builds the mode-driven `SpawnSpec` (probe path + provider via
     `build_claude_exec_command`; the `.resumeDeferred` plain-shell + prefill variant;
     a plain-shell no-env fallback when the probe is unresolved), env wholly from
     `build_claude_extra_env`, and applies the launch-overlay policy (register the
-    user-facing command; suppress it for `.resumeDeferred`). `live_pane_keys`
+    user-facing command; suppress it for `.resumeDeferred`). `live_window_keys`
     enumerates the live sessions the shipped window's subscription sweep (see
     `app_shell`) walks.
     **R16 session rotation** fills R14's `session_update` stub on `window_state`
     (`WindowState::apply_session_update`, the pure model half + a router-fulfilled
     deferred spawn — the mirror of the `claude` handler's decision/spawn split).
-    The SessionStart hook relays a pane's rotated session id / cwd. The handler
+    The SessionStart hook relays a window's rotated session id / cwd. The handler
     FIRST screens the relayed id against `~/.claude/jobs/<first8>/` (`daemon_job_for`
     over the injectable `fork_job_probe`; a first-8 collision is rejected by matching
     `state.json`'s `sessionId`): an entry means the Claude **daemon** runs that
-    session, so the relayed pane id is merely whichever pane first spawned the daemon
-    and NO tab may be touched. That screen runs on **every** source, not just
-    `"fork"` — a cold `claude attach` wakes a background job whose SessionStart says
-    `"resume"`, and letting it through rewrote an unrelated tab's session id. On a
-    daemon-owned id, `source == "fork"` (the job's BIRTH — every later relay already
-    has its tab) instead hands off to `materialize_background_fork`: a nested,
-    UNSELECTED, deferred-resume child under the tab pinned to the job's
+    claude session, so the relayed window id is merely whichever window first spawned
+    the daemon and NO session may be touched. That screen runs on **every** source, not
+    just `"fork"` — a cold `claude attach` wakes a background job whose SessionStart says
+    `"resume"`, and letting it through rewrote an unrelated session's claude session id.
+    On a daemon-owned id, `source == "fork"` (the job's BIRTH — every later relay already
+    has its session) instead hands off to `materialize_background_fork`: a nested,
+    UNSELECTED, deferred-resume child under the session pinned to the job's
     `forkParentSessionId`, built on a spawned task because `state.json` can land
-    AFTER the hook fires and the forked-from tab may live in another window
-    (`WindowRegistry::state_for_claude_session`); an id some tab already pins, an
+    AFTER the hook fires and the forked-from session may live in another OS window
+    (`WindowRegistry::state_for_claude_session`); an id some session already pins, an
     unresolvable parent, or an aborted fork drops silently.
-    Everything else is an in-pane rotation: the handler resolves the owning tab by
-    pane (`TabModel::tab_id_owning`, the one R16 model addition — a stale/unknown
-    pane is a silent no-op), short-circuits a redundant id forward (the hook fires on
-    every SessionStart — this cheapness contract keeps identical ids from churning),
-    and, iff `source` is `resume` **or** `fork` with an ACTUAL id change (the
+    Everything else is an in-window rotation: the handler resolves the owning session by
+    window (`WorkspaceModel::session_id_owning`, the one R16 model addition — a
+    stale/unknown window is a silent no-op), short-circuits a redundant id forward (the
+    hook fires on every SessionStart — this cheapness contract keeps identical ids from
+    churning), and, iff `source` is `resume` **or** `fork` with an ACTUAL id change (the
     `/branch` + `--fork-session` signature; `fork` joined the gate because Claude
-    Code 2.1.214 made an in-pane `/branch` report `fork` while older CLIs still say
+    Code 2.1.214 made an in-window `/branch` report `fork` while older CLIs still say
     `resume` — `/clear` reports `clear`, a nil/unknown source is a plain id update),
-    materializes a sibling parent tab pinned to the OLD id **BEFORE** the cwd update
+    materializes a sibling parent session pinned to the OLD id **BEFORE** the cwd update
     so the sibling inherits the pre-rotation cwd (its old-id transcript lives in the
-    pre-rotation bucket). `materialize_branch_parent` composes landed pieces — mint the tab +
-    `-claude`/`-t1` pane ids (`mint_tab_id`), `TabModel::insert_branch_parent`
+    pre-rotation bucket). `materialize_branch_parent` composes landed pieces — mint the session +
+    `-claude`/`-t1` window ids (`mint_session_id`), `WorkspaceModel::insert_branch_parent`
     (returns the parent BY VALUE, root-promotion re-parenting owned by the model),
-    then `spawn_claude_pane(.resumeDeferred(old_id))` at `parent.cwd` (nothing
+    then `spawn_claude_window(.resumeDeferred(old_id))` at `parent.cwd` (nothing
     resumes / no tokens until the user opens the parent and hits Enter). Then the
-    originating tab's `Tab.cwd` adopts Claude's reported cwd (`adopt_tab_cwd`, per-pane
+    originating session's `Session.cwd` adopts Claude's reported cwd (`adopt_session_cwd`, per-window
     follow policy; None/empty filtered). Fire-and-forget throughout (R14 dropped the
     client fd before dispatch — no reply; a deferred-spawn failure degrades to a
-    model-only recovery tab). Persistence of rotated ids/lineage is R18.
+    model-only recovery session). Persistence of rotated ids/lineage is R18.
   - `window_registry` — `WindowRegistry`, the process-wide
     `WindowId → Entity<WindowState>` gpui global (the thin Rust port of Swift's
     `WindowRegistry`). `register` / `note_active` (MRU via
@@ -842,7 +843,7 @@ The GPUI application. Structure (grows over later cycles):
     several windows. Registration bakes in **no** close-confirm behavior (that is
     R18's `on_window_should_close`).
   - **Session persistence + restore (R18).** Quit and relaunch restores every
-    window / tab / pane (Milestone 4). The pieces:
+    OS window / session / terminal window (Milestone 4). The pieces:
     - `session_store` — `SessionStore`, the `sessions.json` writer (the Rust twin
       of Swift `SessionStore`). The store lives at
       **`<app-support>/<variant>/sessions.json`** (base dir injectable via
@@ -868,11 +869,11 @@ The GPUI application. Structure (grows over later cycles):
       cwd-heal pass (`heal_model_cwds`). `app::run`'s **restore fan-out**
       (`run_restore_fan_out`) loads the store once, runs the ghost pre-pass, opens
       one window per saved slot via `open_managed_window_with(seed, projects_root)`
-      (zero restorable ⇒ one fresh default window), then prunes leftover zero-tab
-      slots keeping every restored id. A restored window's active pane
+      (zero restorable ⇒ one fresh default window), then prunes leftover zero-session
+      slots keeping every restored id. A restored window's active window
       **lazy-spawns** on first activation (never eagerly — the documented
-      divergence that kills the 0×0-pty hazard); a restored **Claude** pane
-      lazy-spawns only in **deferred-resume** form (`ensure_active_pane_spawned`'s
+      divergence that kills the 0×0-pty hazard); a restored **Claude** window
+      lazy-spawns only in **deferred-resume** form (`ensure_active_window_spawned`'s
       new arm), so `claude --resume <sid>` is pre-typed but nothing runs until the
       user presses Enter. `WindowState::with_seed` does the restore composition
       (`from_parts` → `repair_project_structure` → `prune_dangling_parent_references`
@@ -902,19 +903,19 @@ The GPUI application. Structure (grows over later cycles):
       fullscreen — a deliberate fix of Swift's fullscreen-frame wart) into
       `WindowState.last_frame`. `window_options` gains an optional bounds/`display_id`
       override (delegating, not forked — the traffic-light chrome survives).
-    - `close_confirm` + the `WindowState::request_close_*` gates — the **busy-pane
+    - `close_confirm` + the `WindowState::request_close_*` gates — the **busy-window
       close confirmation** (R20.5, the `CloseRequestCoordinator` port). This is a
-      DISTINCT system from the W5 alive-pane quit/window-close confirmation below
-      (D0): the two counters never chain. **Three affordances gate on BUSY panes:**
-      the toolbar pill ✕ (`request_close_pane`), the sidebar tab-context "Close
-      Tab"/"Close N Tabs" (`request_close_tab` / `request_close_tabs`), and the
+      DISTINCT system from the W5 alive-window quit/window-close confirmation below
+      (D0): the two counters never chain. **Three affordances gate on BUSY windows:**
+      the toolbar pill ✕ (`request_close_term_window`), the sidebar session-context "Close
+      Session"/"Close N Sessions" (`request_close_session` / `request_close_sessions`), and the
       sidebar project-context "Close Project" (`request_close_project`) — the thin
       UI handlers route through these gates instead of calling `close_*_via_session`
-      directly. **Busy (D-BUSY):** an alive pane is busy iff it is a
-      thinking/waiting Claude (per-pane `Pane.status`) OR a terminal whose shell has
+      directly. **Busy (D-BUSY):** an alive window is busy iff it is a
+      thinking/waiting Claude (per-window `TermWindow.status`) OR a terminal whose shell has
       a foreground child (`tcgetpgrp(master_fd) != child_pid`, computed inside
       `nice-term-core::Session::has_foreground_child` and read via
-      `SessionManager::shell_has_foreground_child`, synthetic-seam-first for tests);
+      `PtyManager::shell_has_foreground_child`, synthetic-seam-first for tests);
       an idle Claude at rest and an idle shell at a prompt are ALIVE but NOT BUSY —
       they close with no dialog (exactly today's immediate hard-kill). Contrast W5,
       which counts `is_alive` and shows "Quit NICE?"/"Close this window?". **On
@@ -923,10 +924,10 @@ The GPUI application. Structure (grows over later cycles):
       `destructive_confirm = true` (red), in front of the UNCHANGED
       `close_*_via_session` kill routes (no new kill/dissolve/save logic — R18/R19's
       is reused verbatim); confirm re-resolves the target by id (never a stale
-      `Pane`) and runs the route + selection reconcile + dissolve terminus, cancel
+      `TermWindow`) and runs the route + selection reconcile + dissolve terminus, cancel
       is a no-op. `close_confirm.rs` owns the pure, table-tested copy (verbatim from
       `AppShellView.swift`); the busy classification + gates live on `WindowState`.
-      **`.tabs` multi-select is partial-eager:** idle tabs hard-kill immediately
+      **`.tabs` multi-select is partial-eager:** idle sessions hard-kill immediately
       (rows vanish before the dialog), only busy survivors are gated behind one
       modal, and cancel keeps the survivors alive while the idle members stay closed
       — NOT a total no-op. A second busy-close while a modal is up is dropped +
@@ -934,12 +935,12 @@ The GPUI application. Structure (grows over later cycles):
       scenario (the real pill-✕ handler over a real `tcgetpgrp` foreground child in
       a hermetic stub shell, the `.tabs` partial-cancel).
     - `lifecycle` + `confirmation_modal` — the W5 quit/window-close confirmation
-      (the alive-pane half; the busy-pane `CloseRequestCoordinator` alerts are
+      (the alive-window half; the busy-window `CloseRequestCoordinator` alerts are
       R20.5's `close_confirm` above). **Quit path:** `Quit`/`CloseWindow` actions + ⌘Q/⌘W +
       the app-menu items, plus the red-button `on_window_should_close` gate. Live
-      panes are counted with `nice_model::live_pane_counts` (both kinds; held panes
+      windows are counted with `nice_model::live_window_counts` (both kinds; held windows
       don't count; modelled-but-unspawned DO — the preserved Swift quirk). Zero live
-      panes ⇒ no dialog. `quit_cascade` is the ordered confirmed-quit path
+      windows ⇒ no dialog. `quit_cascade` is the ordered confirmed-quit path
       (`AppQuitting` global FIRST so every later close is inert → snapshot+upsert
       every window → synchronous flush → teardown ptys → `cx.quit()`); a per-window
       `user_initiated_close` flag (set only by a confirmed red-button/⌘W close)
@@ -964,12 +965,12 @@ The GPUI application. Structure (grows over later cycles):
     impure seams:
     - `file_browser/view` — `FileBrowserView`, the gpui view mounted by
       `SidebarShellView::build_body` in place of the landed files-mode placeholder
-      (peeking still shows the tab list — the preserved invariant). A
+      (peeking still shows the session list — the preserved invariant). A
       `uniform_list` disclosure tree over the pure `visible_order` projection
       (fixed-height rows: depth indent, disclosure chevron glyph-swap, SF-symbol
       icon via the static extension map, name), the project header (click resets
-      root to the tab cwd), the control strip (up-nav, sort-criterion menu,
-      direction toggle, hidden toggle), and the missing-folder / no-active-tab
+      root to the session cwd), the control strip (up-nav, sort-criterion menu,
+      direction toggle, hidden toggle), and the missing-folder / no-active-session
       empty states. Clicks route through the hand-rolled **280 ms**
       `FileBrowserClickRouter` (never gpui's native `click_count`: single =
       select/expand a folder, double folder = re-root, double file = open) —
@@ -1035,7 +1036,7 @@ The GPUI application. Structure (grows over later cycles):
         `FileOperationFocusRouter` — absent ⇒ the inverse still applies headlessly).
       - `focus_route` — the **production focus-follow closure** filling that seam:
         cross-window ⌘Z routes focus back to the originating window (activate +
-        sidebar → Files + select the origin tab), resolved via the `WindowRegistry`.
+        sidebar → Files + select the origin session), resolved via the `WindowRegistry`.
         Because the frozen `FocusFollow` closure runs cx-less inside
         `undo`/`redo`, the work splits across a shared cell — the dispatcher
         (`keymap::dispatch_file_history`) snapshots the live windows' session ids
@@ -1061,16 +1062,16 @@ The GPUI application. Structure (grows over later cycles):
         The `view` wires these to the inline-rename **input component** (slice 1's
         `TextFieldEditor` with caret/selection render + basename preselection),
         mounted through the SHARED `inline_rename` field — the same component the
-        toolbar pill and sidebar tab mount, so a change to that field fans out to
+        toolbar pill and sidebar session mount, so a change to that field fans out to
         all three call sites — plus the three triggers
         (context-menu one-shot, **Return** via a `FocusHandle` + `"FileBrowser"`
         key-context on the panel, and a 280 ms-deferred **slow-second-click** on
         files — folders keep expand/collapse, a documented divergence that preserves
         R19's contract), commit-on-blur with one-shot guards, the two async modals on
         R18's confirmation-modal behind the injected **confirmer** (absent ⇒ proceed),
-        and focus hand-back through the pane host on every exit path.
+        and focus hand-back through the window host on every exit path.
       - `cwd_snapshot` — the `WindowRegistry`-walking builder for the pure CWD-impact
-        rule (one tab-anchor entry + one per `is_alive` OSC-7 pane; the per-tab
+        rule (one session-anchor entry + one per `is_alive` OSC-7 window; the per-session
         projection is pure + table-tested).
       - **DnD (F9)** — the in-tree drag's payload IS `gpui::ExternalPaths` (the app's
         first `on_drag` consumer): rows drag their selection (else select-then-drag);
@@ -1120,12 +1121,12 @@ The GPUI application. Structure (grows over later cycles):
         gates. The in-process tests and the live `(e)` leg drive the
         begin-drag / handle-drop seam directly.
     - **Wiring (this cycle):** the per-window `FileBrowserStore` lives on
-      `WindowState` (`Tab.id → FileBrowserState`, in-memory only); a dissolved
-      tab's state is dropped via the `SessionManager` dissolved-id accumulator
+      `WindowState` (`Session.id → FileBrowserState`, in-memory only); a dissolved
+      session's state is dropped via the `PtyManager` dissolved-id accumulator
       drained after every close cascade (the single removal path). R19 adds the
       optional per-window `sidebarMode` schema slot and is its sole writer/reader
       (kept `Option`/`skip_serializing_if` so pre-R19 files decode); it persists
-      the mode through the session store (absent ⇒ Tabs).
+      the mode through the session store (absent ⇒ Sessions).
       `ToggleHiddenFiles` (⌘⇧.) and `ToggleSidebarMode` (⌘⇧B) are live in `keymap`.
     - `file_browser_live` — the `file-browser` self-test scenario (see the table
       below).
@@ -1136,10 +1137,10 @@ The GPUI application. Structure (grows over later cycles):
     **app-level** (`cx.on_action`) so they fire with no Nice window key, fanning
     out through the hoisted process-level `FontSettings` (one entity every
     `TerminalView` observes — the plan's font fan-out); the 8 window-scoped actions
-    (sidebar toggle/mode, sidebar-tab cycle, pane step, new pane, hidden-files)
+    (sidebar toggle/mode, sidebar-session cycle, window step, new window, hidden-files)
     route through `WindowRegistry::active_state`. **R19** filled the
     `ToggleHiddenFiles` (⌘⇧.) body (files mode active AND a browser state exists
-    for the active tab — the Swift double gate) and made `ToggleSidebarMode`
+    for the active session — the Swift double gate) and made `ToggleSidebarMode`
     (⌘⇧B) schedule the persistence upsert. **R20** filled the ⌘Z / ⌘⇧Z bodies:
     they dispatch through the ONE process-wide `FileOperationHistory` **BEFORE** any
     focused-window / terminal routing, so the chords are consumed **app-wide and
@@ -1243,15 +1244,15 @@ The GPUI application. Structure (grows over later cycles):
     **differentials** live in `nice-itests`' `multiwindow` cases (mirrors over the
     real `nice-model` types — a dev/test crate can't import the `nice` binary's
     `WindowState` / `WindowRegistry` / `keymap`, the same constraint the
-    `chrome_band` / `sidebar_multiselect` / `pane_strip` cases carry).
+    `chrome_band` / `sidebar_multiselect` / `window_strip` cases carry).
   - `session_lifecycle` — the R13 live session-manager scenario
-    (`session-lifecycle`, see the table below). Drives the real `SessionManager` on
+    (`session-lifecycle`, see the table below). Drives the real `PtyManager` on
     a real `WindowState` over real ptys, headless (no view — every assertion is
     model + session state, which `route_terminal_event` resolves in full). It holds
     the slice-3 action-seam wiring — the create-and-spawn / activate / project-`+`
     compositions the R10/R11 seams route through, and the live `cx.subscribe`
-    (reading `SessionManager::pane_handle`) that feeds `route_terminal_event` from
-    each pane's session entity. Registered **before** `multiwindow` (it installs no
+    (reading `PtyManager::term_window_handle`) that feeds `route_terminal_event` from
+    each window's session entity. Registered **before** `multiwindow` (it installs no
     `WindowRegistry`, so it doesn't disturb the quit-when-empty close observer that
     scenario relies on being last).
   - `shell_inject` — the R14 synthetic `ZDOTDIR` rc chain (port of Swift
@@ -1283,7 +1284,7 @@ The GPUI application. Structure (grows over later cycles):
     word-splits the command on whitespace (an Application Support path with spaces
     never execs). Both entry points take injectable script-dir + settings-path params
     (`install_with`); production `install()` resolves them from `$HOME`. Wired into
-    `app::run` ONLY (after R15's reaper slot, before the first pane spawns; failures
+    `app::run` ONLY (after R15's reaper slot, before the first window spawns; failures
     logged and swallowed) — never `run_selftest`, per tranche-3 hermeticity, so the
     regression suite never touches the real `~/.claude` / `~/.nice`.
   - `skill_installer` — the **R26 Nice Claude-skills installer** (port of Swift
@@ -1345,18 +1346,18 @@ The GPUI application. Structure (grows over later cycles):
     Both buttons set `handoffSkillPromptSeen` so it never reappears; "Install" installs,
     "Not Now" ensures removed. `run`-only — `run_selftest` fires no prompt and writes no
     CFPref (blocking hermeticity). **The socket handlers** — both open a nested claude
-    tab under the originating tab, in the background, never selected (D7: neither a
-    handoff nor a dispatch is a context switch, so the originating tab keeps selection
+    session under the originating session, in the background, never selected (D7: neither a
+    handoff nor a dispatch is a context switch, so the originating session keeps selection
     + key focus; the terminal-`claude` newtab path still selects, deliberately not
-    unified), through the ONE shared `session_manager::create_nested_claude_tab`
+    unified), through the ONE shared `pty_manager::create_nested_claude_session`
     constructor: a `handoff` message opens `[HANDOFF] <originating title>` from the
-    originating tab's LIVE cwd (the payload cwd only as the on-a-miss fallback —
-    `window_state`'s `handle_handoff` + `session_manager`'s
+    originating session's LIVE cwd (the payload cwd only as the on-a-miss fallback —
+    `window_state`'s `handle_handoff` + `pty_manager`'s
     `handoff_title` / `handoff_prompt` / `handoff_extra_args`), and a `dispatch`
     message opens `[DISPATCH] <worktree name>` — also spawned from the PAYLOAD cwd (the
-    main checkout the helper resolved, never the dispatcher tab's live cwd) with
+    main checkout the helper resolved, never the dispatcher session's live cwd) with
     `--add-dir <task-file dir> --worktree <name>` (`window_state`'s `handle_dispatch` +
-    `session_manager`'s `dispatch_title` / `dispatch_prompt` / `dispatch_extra_args`).
+    `pty_manager`'s `dispatch_title` / `dispatch_prompt` / `dispatch_extra_args`).
     The two features are exercised by the `handoff` and `dispatch` self-test scenarios
     in the table below.
   - `claude_theme_sync` — the R17 Nice → Claude theme mirror (port of Swift
@@ -1397,13 +1398,13 @@ The GPUI application. Structure (grows over later cycles):
     `claude_exited`, the first three **FROZEN** (installed helpers on user disks
     already speak them byte-for-byte) — with every normalization rule: `dispatch` requires
     `cwd`/`worktreeName`/`taskFile`/`paneId` non-empty (unlike `handoff`, a dispatch
-    with no sending pane cannot nest and is dropped) and normalizes
+    with no sending window cannot nest and is dropped) and normalizes
     `instructions`/`model`/`effort`/`tabId` to `""`; `claude_exited` — the `claude()`
-    shadow reporting that the Claude it ran as a CHILD has returned, so the pane is a
+    shadow reporting that the Claude it ran as a CHILD has returned, so the window is a
     shell prompt again — requires `paneId` non-empty and is fire-and-forget (the fd
     closes BEFORE dispatch, like `session_update`). Only the `attach <uuid>` reply runs
     Claude as a child; every other reply verb `exec`s, so the pty's death clears the
-    promotion flag through `pane_held` and no report is owed. Self-heals accept-error / forced-cancel /
+    promotion flag through `window_held` and no report is owed. Self-heals accept-error / forced-cancel /
     missing-file into one capped-backoff rebind path; idempotent `stop()` unlinks.
     The consume-on-use `Reply` (owns the client `UnixStream`, at-most-once by move).
     The waker-based `mpsc` → gpui foreground-drain bridge (`socket_channel` /
@@ -1411,11 +1412,11 @@ The GPUI application. Structure (grows over later cycles):
     `CFRunLoopWakeUp` on every enqueue (App-Nap-safe — the `nc -w 2` reply deadline),
     never a coalescable timer. The window routing point lives on `window_state`
     (its `claude` + `session_update` handlers are live as of R15 / R16; its `handoff`
-    handler went live in R26 — opening a nested `[HANDOFF]` tab; its `dispatch` handler
-    opens a nested `[DISPATCH]` tab spawning from the PAYLOAD cwd, see
-    `skill_installer` above; its `claude_exited` handler clears the sending pane's
-    `is_claude_running` + status ack so the tab promotes in place again instead of
-    opening a stray tab, a stale/unknown pane being a silent no-op);
+    handler went live in R26 — opening a nested `[HANDOFF]` session; its `dispatch` handler
+    opens a nested `[DISPATCH]` session spawning from the PAYLOAD cwd, see
+    `skill_installer` above; its `claude_exited` handler clears the sending window's
+    `is_claude_running` + status ack so the window promotes in place again instead of
+    opening a stray session, a stale/unknown window being a silent no-op);
     `app::arm_window_control_socket` mints + starts + drains
     + stores the socket (teardown stops it).
   - `tmp_sweep` — the R14 stale-`$TMPDIR` sweep (port of Swift
@@ -1431,20 +1432,20 @@ The GPUI application. Structure (grows over later cycles):
     spares deliberately daemonized non-Nice zshes). The OS surface (libproc /
     sysctl / `kill(2)`) is injected via the `ReaperEnv` struct-of-closures seam
     so the filter + kill-counting logic unit-tests on canned data. Runs once
-    from the `app::run` bootstrap, before any pane spawns.
+    from the `app::run` bootstrap, before any window spawns.
   - `shell_socket_live` — the R14 live shell-injection + control-socket transport
     scenario (`shell-socket`, see the table below). Headless (its own RAF root, no
     view assertions); registered **before** `multiwindow` (it installs no
     `WindowRegistry`). Reuses `app::arm_window_control_socket` — the exact production
     wiring — so a socket / env-injection regression surfaces here.
-  - `claude_lifecycle_live` — the R15/R16 live Claude tab lifecycle scenario
+  - `claude_lifecycle_live` — the R15/R16 live Claude session lifecycle scenario
     (`claude-lifecycle`, see the table below). Drives the whole `claude` flow
     over the shipped window (`open_managed_window` / `build_window_root`, the
     exact path `run` takes) with a real control socket + real ptys + the live
     `route_terminal_event` subscription lift. **R16** adds a sixth leg: a
     fire-and-forget `session_update` `/branch` rotation materializes a deferred
     sibling parent (pinned to the OLD id, at root, pre-rotation cwd) with the
-    originating tab re-parented + moved into the post-rotation worktree, then a
+    originating session re-parented + moved into the post-rotation worktree, then a
     `/clear` in-place rotation and a cwd adopt. Registered **before** `multiwindow`
     (its `build_window_root` only `register`s — no `WindowRegistry` close
     observer).
@@ -1454,25 +1455,25 @@ The GPUI application. Structure (grows over later cycles):
     real ptys that carry the R14 `claude()` shadow — with R17's theme sync ON, to close
     Milestone 3 on the shipped composition. Uses two scenario-only seams on `app`
     (`set_claude_theme_sync_gate`, `set_scenario_shell_inject_config`) to light up the
-    gate + give the Main pane the shadow through the SHIPPED builder, both reset at
+    gate + give the Main window the shadow through the SHIPPED builder, both reset at
     teardown. Registered **before** `multiwindow` (its `build_window_root` only
     `register`s — no `WindowRegistry` close observer).
-  - `close_confirm_live` — the R20.5 busy-pane close-confirmation scenario
+  - `close_confirm_live` — the R20.5 busy-window close-confirmation scenario
     (`close-confirmation`, see the table below). Drives the SHIPPED window with a
     real ZDOTDIR-blanked terminal shell over one `Application::run`: (a) an idle
     pill ✕ close hits no modal (immediate); (b) a shell given a real foreground
     child (`sleep`) is gated — the pill ✕ close vetoes, the modal's confirm button
     is a real AX node, Cancel keeps it open, a second ✕ + Confirm force-quits it
     (child reaped) — the ONLY real-`tcgetpgrp` leg; (c) a `.tabs` batch of one idle
-    + one busy tab (busy marked via the `synthetic_foreground_child` seam) drives
-    `request_close_tabs` and asserts the partial-cancel (idle eager-killed, busy
+    + one busy session (busy marked via the `synthetic_foreground_child` seam) drives
+    `request_close_sessions` and asserts the partial-cancel (idle eager-killed, busy
     survivor stays). The pill-✕ gesture asserts the ✕'s locatable on-screen frame
-    then drives the real `close_pane` handler — a synthetic CGEvent does not
+    then drives the real `close_term_window` handler — a synthetic CGEvent does not
     hit-test gpui content under the full-size-content window (the `persistence-
     restore` traffic-light limitation); the modal answers go through
     `ConfirmationModal::resolve`; `NICE_CLAUDE_OVERRIDE` stubs any Claude spawn.
     Registered **before** `multiwindow` (`open_managed_window` only `register`s the
-    `WindowRegistry`; the driver keeps the Main tab populated so no close empties
+    `WindowRegistry`; the driver keeps the Main session populated so no close empties
     the window).
 - **Update checker (R27, U1 + P7).** The release-check nudge — a **nudge, not an
   updater** (port of Swift's `ReleaseChecker`): poll GitHub Releases on a slow
@@ -1576,7 +1577,7 @@ The measurement + self-test library every later cycle reuses. Modules:
   `term-perf` uses `SelfReported` for its absolute frame-time + memory budget.
 - `workload` — the deterministic synthetic "Claude-streaming" stressor (seeded
   xorshift + a weighted SGR/reflow/long-line/unicode/plain content mix, ported
-  from the phase-0 spike) that `term-perf` floods a pane with.
+  from the phase-0 spike) that `term-perf` floods a window with.
 
 ### `crates/nice-model` (lib)
 
@@ -1586,26 +1587,26 @@ and **no `gpui` dependency** (it mirrors today's pure-Swift model code; see the
 
 **The value types + status model** (`Sources/Nice/State/Models.swift`):
 
-- `PaneKind` / `TabStatus` — the pane kind and per-pane Claude status.
-- `Pane` — a toolbar pill: `apply_status_transition` (the waiting-pulse
+- `TermWindowKind` / `SessionStatus` — the window kind and per-window Claude status.
+- `TermWindow` — a toolbar pill: `apply_status_transition` (the waiting-pulse
   acknowledgment truth table — a same-status re-report is a no-op that
   preserves acknowledgment), `mark_acknowledged_if_waiting`, `needs_attention`.
-- `Tab` — a session: the derived aggregate `status()` over its live Claude
-  panes (thinking > waiting > idle), `waiting_acknowledged()`,
+- `Session` — a sidebar row: the derived aggregate `status()` over its live Claude
+  windows (thinking > waiting > idle), `waiting_acknowledged()`,
   `has_running_claude()` (the promotion-refusal predicate), and the pure
   `recover_next_terminal_index` hydration helper (`^terminal\s+(\d+)$`,
   case-insensitive).
-- `Project` — an ordered group of tabs.
+- `Project` — an ordered group of sessions.
 
 **The document** (`Sources/Nice/State/TabModel.swift`):
 
-- `TabModel` — the per-window projects/tabs/panes tree: seeding + the pinned
-  Terminals group, `select_tab` (the single `active_tab_id` writer) +
-  `navigable_sidebar_tab_ids`, tab/pane reorder, pane insert/extract + the
-  shared neighbor-refocus rule, `add_pane`, renames + title locks +
-  `apply_auto_title`, cwd bucketing (`add_tab_to_projects`/`find_git_root`) +
-  `repair_project_structure`, the cwd resolution chain + `adopt_tab_cwd`,
-  depth-1 `/branch` + handoff lineage, single-entry `remove_tab` + the
+- `WorkspaceModel` — the per-window projects/sessions/windows tree: seeding + the pinned
+  Terminals group, `select_session` (the single `active_session_id` writer) +
+  `navigable_sidebar_session_ids`, session/window reorder, window insert/extract + the
+  shared neighbor-refocus rule, `add_window`, renames + title locks +
+  `apply_auto_title`, cwd bucketing (`add_session_to_projects`/`find_git_root`) +
+  `repair_project_structure`, the cwd resolution chain + `adopt_session_cwd`,
+  depth-1 `/branch` + handoff lineage, single-entry `remove_session` + the
   parent-pointer sweep, and the two arg parsers.
 - `FsProbe` — the injected filesystem seam (`exists` / `home`) that keeps the
   document a pure value-tree; production uses `std::fs`, tests inject a fake so
@@ -1615,12 +1616,12 @@ and **no `gpui` dependency** (it mirrors today's pure-Swift model code; see the
   window to the debounced session save (BUGHUNT1-D). The contract is structural:
   **every `&mut self` method that changes persisted state fires it.** Most
   change-guarded mutators still fire exactly once on a real change and not on a
-  no-op, but two fire without proving a change — `mutate_tab` (it cannot see
-  whether the caller's transform changed anything, so it fires whenever the tab
+  no-op, but two fire without proving a change — `mutate_session` (it cannot see
+  whether the caller's transform changed anything, so it fires whenever the session
   is found) and `repair_project_structure` (fires unconditionally at boot before
   the observer is wired) — and those spurious fires are tolerated because the
   save is debounced. The only mutation that deliberately does NOT fire is the
-  runtime-only `acknowledge_waiting_on_active_pane` (its sole write is the
+  runtime-only `acknowledge_waiting_on_active_window` (its sole write is the
   non-persisted `waiting_acknowledged` flag).
 
 **The asymmetries are deliberate.** This model contains behaviors that look
@@ -1628,18 +1629,18 @@ inconsistent and are each intentional + test-pinned (`Models.swift`,
 `TabModel.swift`, and the ~180 ported unit cases are the spec) — a reader
 "cleaning them up" is introducing a bug:
 
-1. "At most one *running* Claude per tab" is a creation-edge rule keyed on
-   `Pane::is_claude_running` (`Tab::has_running_claude`), **not** a struct-level
+1. "At most one *running* Claude per session" is a creation-edge rule keyed on
+   `TermWindow::is_claude_running` (`Session::has_running_claude`), **not** a struct-level
    uniqueness invariant, so a running Claude and a deferred-resume Claude
    coexist transiently and the aggregations tolerate it.
-2. The per-tab "Terminal N" counter (`Tab::next_terminal_index`) is monotonic —
+2. The per-session "Terminal N" counter (`Session::next_terminal_index`) is monotonic —
    never decremented, never reused.
-3. Empty-input rename is asymmetric: `TabModel::rename_tab` with empty input is
-   a no-op, while `TabModel::rename_pane` resets to the per-kind default, clears
+3. Empty-input rename is asymmetric: `WorkspaceModel::rename_session` with empty input is
+   a no-op, while `WorkspaceModel::rename_window` resets to the per-kind default, clears
    the lock, and (for terminals) consumes a counter slot.
-4. Two cwd writers, two policies: OSC 7 writes `Pane.cwd` only, while
-   `TabModel::adopt_tab_cwd` moves the tab and pulls along only panes still
-   tracking the old cwd (diverged panes stay — per-pane, not all-or-nothing).
+4. Two cwd writers, two policies: OSC 7 writes `TermWindow.cwd` only, while
+   `WorkspaceModel::adopt_session_cwd` moves the session and pulls along only windows still
+   tracking the old cwd (diverged windows stay — per-window, not all-or-nothing).
 
 And in the lineage, `insert_branch_parent` re-parents an originating root's
 former children on first-branch promotion, while `insert_handoff_child`
@@ -1647,7 +1648,7 @@ deliberately does **not** re-parent (the anchor stays root). `is_claude_running`
 is `#[serde(skip)]` (runtime only; restores always come back `false`), mirroring
 `Models.swift`'s `CodingKeys` exclusion.
 
-`Tab.branch` (vestigial, roadmap M5) is deliberately **not** ported here.
+`Session.branch` (vestigial, roadmap M5) is deliberately **not** ported here.
 
 **Sidebar UI state (R10 pure ports).** Three more gpui-free value-state modules
 the R10 sidebar builds over, ported case-for-case from the pure-Swift seams and
@@ -1655,8 +1656,8 @@ unit-tested exactly like the tree above (R11 reuses the rename gate; R12
 dispatches into the sidebar + selection; R13 prunes the selection in the
 dissolve cascade):
 
-- `selection` — `SidebarTabSelection`, the Finder-style multi-select model and
-  the "selection ⊇ {active_tab_id}" invariant (⌘-click on the only-and-active
+- `selection` — `SidebarSessionSelection`, the Finder-style multi-select model and
+  the "selection ⊇ {active_session_id}" invariant (⌘-click on the only-and-active
   row refused; ⇧ keeps the original anchor; the right-click snap policy; prune
   on removal).
 - `rename_gate` — `InlineRenameClickGate`, the injected-clock click-to-rename
@@ -1665,13 +1666,13 @@ dissolve cascade):
   the toggle + peek render/clear methods. `SidebarMode` carries serde derives
   for R18 persistence + Swift `Codable` parity; the `SceneStorage` bridge stays
   view-layer.
-- `strip_geometry` / `pane_strip_drop` — the pure pane-strip math the R11/R25
+- `strip_geometry` / `window_strip_drop` — the pure window-strip math the R11/R25
   toolbar reads. `strip_geometry` holds the viewport-relative `Rect` +
-  `pane_frames` and the overflow / fade / offscreen / auto-center predicates.
-  **R25** adds `pane_strip_drop` (`pane_target` + `resolve`) — the ported
+  `window_frames` and the overflow / fade / offscreen / auto-center predicates.
+  **R25** adds `window_strip_drop` (`window_target` + `resolve`) — the ported
   `PaneStripDropResolver` drop-slot math (before-first, after-last, bare-midpoint
   split with **no dead-band**, missing-frame skip, empty-order `None`) gated
-  through `TabModel::would_move_pane` so a no-op slot resolves to `None`. Only the
+  through `WorkspaceModel::would_move_window` so a no-op slot resolves to `None`. Only the
   single `.slot` destination is ported; the CUT cross-window destinations
   (`.otherWindowStrip` / `.newWindow` / …) are absent (scope fence).
 
@@ -1693,9 +1694,9 @@ state behind the sidebar's files mode, ported case-for-case from the pure-Swift
 comparator, `visible_order` flatten — lstat symlink semantics, the dual
 dot-prefix / BSD `UF_HIDDEN` hidden filter, Unicode-lowercase name fold),
 `sort` (the `FileBrowserSortCriterion` / `FileBrowserSortSettings` value type
-reused as the `ui_settings.json` schema surface), `state` / `store` (per-tab
+reused as the `ui_settings.json` schema surface), `state` / `store` (per-session
 `root_path` + expanded set + sticky cwd-aware `show_hidden` + owned selection;
-the per-window `tab_id → state` map with lazy `ensure_state`, `remove_state`,
+the per-window `session_id → state` map with lazy `ensure_state`, `remove_state`,
 and the ⌘⇧. `toggle_hidden_files_if_exists` gate), `selection` (path-keyed
 Finder multi-select + the pure right-click read / snap-on-action split),
 `click_router` (the hand-rolled **280 ms** double-click detector with the
@@ -1850,9 +1851,9 @@ narrow API. Modules, bottom-up:
   the `EventProxy`) and OSC 7 cwd (via the feeder's `osc7` tee) — and exposes the
   synchronous `bracketed_paste_active()` DECSET-2004 query the R5 paste / R7 drop
   paths consult.
-- `deferred` — `Session`: the value-owning pane session the renderer (R4) and
+- `deferred` — `Session`: the value-owning window session the renderer (R4) and
   the session manager (R13) consume, wrapping `TermSession` into the deferred
-  spawn state machine, the outward event stream, and held-pane classification
+  spawn state machine, the outward event stream, and held-window classification
   (below).
 
 #### Threading model
@@ -1873,13 +1874,13 @@ in the phase-0 spike (`spikes/phase0-poc`, RESULTS-spike8):
   pty output.
 
 The renderer never parses; it locks the shared `Term` only to copy the cells it
-paints. `Session` layers the pane lifecycle on top of that: an explicit deferred
+paints. `Session` layers the window lifecycle on top of that: an explicit deferred
 spawn state machine — `NotSpawned{spec} → Spawning → Live → Exited{status,
-held}` — so a not-yet-focused pane is a real, matchable state, never a nil pty a
+held}` — so a not-yet-focused window is a real, matchable state, never a nil pty a
 caller force-reads (the fix for BUG A in `docs/window-chrome-architecture.md`); a
 typed, `#[non_exhaustive]` outward event stream (`OutputStarted`, `Exited{status,
 held}`, and — landed in R6 — `TitleChanged`/`TitleReset` from OSC 0/2 via the
-`EventProxy` and `CwdChanged` from OSC 7 via the feeder's tee); and held-pane
+`EventProxy` and `CwdChanged` from OSC 7 via the feeder's tee); and held-window
 classification
 (`should_hold_on_exit`, ported from `TabPtySession.shouldHoldOnExit`): a
 non-zero or signalled exit the user didn't ask for is *held* — the `Term` and
@@ -1924,7 +1925,7 @@ ordinary element in gpui's own tree, so the `NSViewRepresentable` dance today's
   state is **computed** from `is_focused && window active`, never a stored flag).
 - `font` (R7/T11) — `FontSettings`, the shared **app-level** terminal-font state
   (family chain + point size) every view `cx.observe`s so a ⌘+/⌘−/⌘0 zoom fans out
-  to all panes; owns the SF Mono → JetBrains Mono NL → system-mono chain
+  to all windows; owns the SF Mono → JetBrains Mono NL → system-mono chain
   resolution through gpui's text system and the derived cell metrics. The type
   lives here (Rust's `nice → nice-term-view` graph forces it) but is constructed
   and owned once at the app root in `crates/nice` — no view creates its own.
@@ -1956,10 +1957,10 @@ R4 is now complete: the full color model, text attributes, selection,
 box-drawing / block elements, wide glyphs, the row-quantized bottom-anchored
 layout (T4), line-stepped scrollback scroll, and damage-driven present (the
 injected `setNeedsDisplay` kick) all live here, and `crates/nice`'s shipped
-window hosts a live zsh pane over this crate. The `term-perf` self-test gates
+window hosts a live zsh window over this crate. The `term-perf` self-test gates
 streaming frame time + memory under the synthetic workload. Out of R4's scope
 (later cycles): keyboard/IME/mouse input (R5), OSC title/cwd (now landed in R6),
-fonts/zoom + drag-drop + the launch overlay + held panes (now landed in R7 — the
+fonts/zoom + drag-drop + the launch overlay + held windows (now landed in R7 — the
 `font`/`drop`/`overlay` modules above), and sub-line smooth scroll (deferred).
 Terminal links landed later still (the `hyperlink` module above): ⌘+click opens
 the URL under the pointer with the OS default handler and ⌘-hover underlines it,
@@ -1984,7 +1985,7 @@ structs, deliberately kept out of `nice-term-view` (which links gpui) so the
 byte-exact encoder tests and the G1 IME-transition tests build without the gpui
 stack; the R5 event-edge (`nice-term-view/src/input.rs`) translates gpui events
 into these plain types at the boundary and hosts the platform `InputHandler`.
-`nice-model` (R8) is the fourth gpui-free model crate — the projects/tabs/panes
+`nice-model` (R8) is the fourth gpui-free model crate — the projects/sessions/windows
 value tree + the Claude status model carry no `gpui` dependency; the gpui
 adapter that wraps the document in an Entity lives downstream (R12/R13).
 `nice-term-view` (R4) **is** a UI crate —
@@ -2090,36 +2091,36 @@ the window, and moves to the next scenario.
 | `term-render` | Drives the `nice-term-view` renderer (R4) over a fixture-fed `nice_term_core` `Session` (a byte stream piped in via `cat`, with `ZDOTDIR` pointed at an empty dir so no user zsh rc pollutes the grid): a 16-color themed-ANSI swatch row, a 256-color indexed cube/ramp row, a 24-bit truecolor row, a parked block cursor, and two same-glyph cells (dark-on-light / light-on-dark), plus inverse-video, box-drawing / block, wide-glyph / emoji, underline / strikethrough, and a programmatic selection row. It captures and asserts those cell pixels within ±8/255, the cursor center matches the accent, and the **bg-luminance patch ENGAGES** (dark-on-light antialiased coverage exceeds light-on-dark — a check that fails on an unpatched vendor tree). Needs the `selftest` feature (pixel read-back) and a frontmost, focused window. |
 | `term-layout` | The T4 row-quantized, bottom-anchored layout gate: resizes the window shorter than the grid and asserts (via capture) the bottom prompt row stays pinned at the bottom gap while the top rows clip under the chrome. |
 | `term-scroll` | The scrollback scroll + park/snap gate: feeds >1 screen of numbered lines into an echo-off `cat`, then asserts (via the core's display offset + visible snapshot) parked-at-bottom, offset-3 after scroll-up, no auto-snap while scrolled, and snap-to-bottom resuming. |
-| `term-perf` | The streaming frame-time + memory budget gate (Validation §5). Floods a live ~120×40 pane (scrollback 10 000) with 15 s of the deterministic `nice_harness::workload` synthetic stream through a raw-mode `cat` while the RAF-animated `TerminalView` stamps frames; self-activates its window, reduces the frame stream to interval percentiles, samples memory, and gates on **absolute** frame times (p50 ≤ 17.5 ms, p95 ≤ 20 ms) plus the pane's own memory **growth** over its entry baseline (< 120 MiB) — a criterion the cadence-jitter gate can't express. (Growth, not absolute, because inside the `all` suite the process already carries ~140 MiB from the five prior scenarios' retained windows/atlas/readbacks; the absolute < 200 MiB "steady" budget is validated by the dedicated `NICE_SELFTEST=term-perf` run — a fresh process, ≈142 MiB.) Runs up to 3 times, gates on the best run, prints the percentiles + memory in the transcript. Uses `Gate::SelfReported` (it runs its own measurement and posts the verdict). |
+| `term-perf` | The streaming frame-time + memory budget gate (Validation §5). Floods a live ~120×40 window (scrollback 10 000) with 15 s of the deterministic `nice_harness::workload` synthetic stream through a raw-mode `cat` while the RAF-animated `TerminalView` stamps frames; self-activates its window, reduces the frame stream to interval percentiles, samples memory, and gates on **absolute** frame times (p50 ≤ 17.5 ms, p95 ≤ 20 ms) plus the window's own memory **growth** over its entry baseline (< 120 MiB) — a criterion the cadence-jitter gate can't express. (Growth, not absolute, because inside the `all` suite the process already carries ~140 MiB from the five prior scenarios' retained windows/atlas/readbacks; the absolute < 200 MiB "steady" budget is validated by the dedicated `NICE_SELFTEST=term-perf` run — a fresh process, ≈142 MiB.) Runs up to 3 times, gates on the best run, prints the percentiles + memory in the transcript. Uses `Gate::SelfReported` (it runs its own measurement and posts the verdict). |
 | `input-live` | The R5 live keyboard/paste/IME-anchor gate (Validation §2–§4). Spawns a capture-tee session (`sh -c 'stty raw -echo; exec tee <cap>'`), posts **real CGEvents** to nice's own pid (`crate::platform`, `CGEventPostToPid` — never the global HID tap), and asserts the bytes appended to the capture file match exactly: plain ASCII (rides the IME `insertText` path → pty), ⌘V paste with DECSET 2004 **off** (raw) then **on** (`ESC[200~…ESC[201~`), and arrow keys (`ESC[A/B/C/D`). Then the G1 **item-4 candidate anchor** is asserted programmatically — park the grid cursor mid-grid (CUP), drive a composition through the real `TermInputHandler`, and check `bounds_for_range` returns a rect at the grid-cursor cell (never `None`, the zed#46055 failure mode). Finally the **IME go/no-go probe** (TIS → Pinyin): if synthetic composition engages, items 1–3 + 5 are asserted mechanically; if not (plan-flagged UNPROVEN — and on this machine Pinyin is installed-but-not-enabled, so `TISSelectInputSource` refuses it), it records a **DEFERRED HUMAN PASS** (stderr checklist) rather than fail-looping. The user's keyboard input source is **always** restored (on `Drop`). Preflights `AXIsProcessTrusted()` and FAILs loudly (never silently skips) if the Accessibility grant is missing. `Gate::SelfReported` (byte-exact receipt, not cadence). |
 | `input-shell` | The R5 real-shell CGEvent sanity gate (Validation §5). A real `zsh -il` (user rc suppressed via an empty `ZDOTDIR`): polls the grid until the shell prints its prompt, then types `echo <marker>` + Enter entirely via CGEvents and asserts the marker appears ≥ 2× in the grid (the typed command echo **and** the command output), proving the whole path reaches a real login shell and its output round-trips. `Gate::SelfReported`. |
 | `niceties-zoom` | The R7/T11 live zoom + pty re-metric gate (Validation §2). Drives the shipped ⌘+/⌘−/⌘0 zoom keybindings with **real CGEvents** to nice's own pid over a real login shell and asserts the whole T11 chain: after ⌘+ ×3 the shared `FontSettings` reports a larger point size + cell box, the view re-fits the grid and pushes `(rows, cols)` to the pty (asserted both by the core `Term`'s grid dimensions matching an independent `fit_grid` **and** `stty size` in the child echoing them — proving SIGWINCH reached the shell), and ⌘0 restores the baseline exactly. Preflights the Accessibility grant and FAILs loudly if it is missing (a dropped CGEvent would make every zoom a no-op). `Gate::SelfReported` (state assertions, not cadence). |
 | `niceties-drop` | The R7/T7 file/image drag-drop gate (Validation §3). Drives the view's drop handler through its test seam (`handle_external_paths_drop`) with **constructed** `ExternalPaths` events over a real pty (a real OS drag is impractical headless, and gpui's macOS backend only accepts filename drags) and asserts the exact bytes typed into the child: one escaped, space-padded path (DECSET 2004 off); multiple paths space-joined in drop order; a path with spaces / shell metacharacters backslash-escaped; the **raw-image fallback** (a drop with no file URLs consults the injected image-drop provider — a stub path here); the `ESC[200~ … ESC[201~` frame with 2004 **on**; and never a trailing newline. Reuses the `input-live` capture-tee child; drives the handler directly, so it needs **no** Accessibility grant. `Gate::SelfReported` (byte-exact receipt). |
 | `niceties-link` | The ⌘+click / ⌘-hover terminal-link gate (the "⌘+click a printed URL does nothing" bug). Prints `http://localhost:5173/` into a capture-tee pty, then drives the shipped mouse/modifier listeners through **gpui's own dispatch** (`Window::dispatch_event` with constructed `MouseMove` / `MouseDown` / `MouseUp` / `ModifiersChanged` events, hit-tested against the rendered frame exactly as the platform's would be — the same seam `multiwindow` uses), aiming each event at a known cell via the view's published paint bounds. Asserts: the ⌘-hover sets on a ⌘+move over the URL, clears on ⌘ **release**, returns on ⌘ **press** with the pointer parked (no twitch), and clears on a move off the link; a ⌘+click on the URL hands the **recording** `UrlOpener` exactly that URL while creating no selection and writing **zero** bytes to the pty; the same holds with the app's SGR mouse reporting ON (⌘ bypasses the report, Ghostty parity — the bug's real setting); and a ⌘+click **off** the link opens nothing and sends the ordinary byte-exact SGR press/release pair. No CGEvents, so it needs **no** Accessibility grant, and no browser is launched (the real `NSWorkspace openURL:` is the one manual-adjacent black-box check). `Gate::SelfReported` (recorded opens + byte-exact receipt). |
-| `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent pane** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt pane** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
-| `niceties-held` | The R7/T10 held-pane gate (Validation §5). A pane running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the pane latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
-| `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/pane tests on. `Gate::SelfReported`. |
-| `chrome` | The R9 live window-chrome gate (Validation §1–§4). Opens the R9 chrome band (`WindowChromeView`) + repositioned native traffic lights + full-screen wiring over a silent live pane and drives it with **real mouse CGEvents** to nice's own pid, ground-truthed against AppKit reads. **§1** — via `platform::standard_window_button_frames`, asserts all three buttons exist, the close button's visual centre sits within the slim 28pt titlebar and its x-origin at the native macOS-26 default (9), and the three are equally pitched at the native pitch (read from the live frames) — the restyle stopped repositioning them; **re-asserted after a resize, a focus bounce, and a full-screen enter+exit** (the BUG-B stale-capture guard). **§2** — a CGEvent press-drag on the empty band vs the terminal content area, judged by real NSWindow frame reads (the content drag must leave the window put). **§3** — reads (never writes) `AppleActionOnDoubleClick`, posts a CGEvent double-click on the band, and checks the window state matches the predicted zoom / miniaturize / none, plus a double-click while full screen is a no-op (the band's `!is_fullscreen` gate). **§4** — dispatches `ToggleFullScreen` and asserts `is_fullscreen()` + the View-menu title flip, both ways. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Effects a synthetic CGEvent provably can't drive (a window drag via `performWindowDragWithEvent:` follows the *physical* cursor, which `CGEventPostToPid` doesn't move) are recorded as a **DEFERRED HUMAN PASS**, not fail-looped — the same honest-deferral pattern `input-live` uses for synthetic IME composition. `Gate::SelfReported`. |
-| `sidebar` | The R10 live sessions-sidebar gate (Validation §3–§4). Mounts the real `SidebarShellView` (no pty — the shell hosts no terminal this cycle) and drives it with **real mouse CGEvents** to nice's own pid, ground-truthed against AppKit reads. Asserts the expanded card reports the **240pt** default width; a CGEvent drag on the trailing resize handle **clamps at 160 and 480** and a CGEvent double-click **resets to 240**; **collapse** removes the leading column entirely (the 2026-07 restyle keeps the no-cap-card design: the full-width titlebar row over the full-width body, so `scenario_leading_column_width` reports 0) and **restore** returns the column. The window-drag region + traffic-light geometry moved into the titlebar in the restyle, so `chrome` / `pane-strip` own those; the sidebar top strip no longer drags the window. **§4 dots** — with the model driven into all four states (thinking / waiting-unacked / waiting-acked / idle), the dot colour per token and the pulse-presence rule are asserted at the state level off the view's own R8 predicates (`SidebarShellView::tab_dot_inputs`; pixel corroboration is best-effort under `capture`). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing; the resize clamps/reset hard-assert when the synthetic gesture drives the real behaviour, else **DEFER** (the 6pt resize handle a synthetic press may miss), the same honest-deferral pattern `chrome` uses. The in-process multi-select / rename-gate / Esc / band-arm **classification** differentials live in `nice-itests`' `sidebar_multiselect` cases (a simulated event can't move a real frame). `Gate::SelfReported`. |
-| `pane-strip` | The R11 live toolbar pane-strip gate (Validation §3). Mounts the real `WindowToolbarView` over a seeded Main tab and drives it with **real mouse CGEvents** to nice's own pid, ground-truthed against AppKit frame reads. Asserts the drag differential with pills present — a CGEvent press-drag starting on a pill **selects** the pill AND leaves the NSWindow frame **put** (hard-asserted only when the select confirms the synthetic press LANDED, else DEFERRED — a `CGEventPostToPid` mouse event need not land on a gpui hitbox), while the same drag on the empty toolbar band **moves** the window (DEFERRED — `performWindowDragWithEvent:` tracks the physical cursor `CGEventPostToPid` doesn't move) — plus the **R25 reorder leg** (a press-drag of the `p1` pill past `p0`'s midpoint reorders it before `p0`, `pane_ids()` → `[p1, p0]`, hard-asserted only on a demonstrably-landed press, else DEFERRED), the reserved-width overflow **showing the chevron** on a real window (hard, real layout), an **activate-from-elsewhere** that makes an offscreen pane active (hard) and auto-centers it into view (DEFERRED on repaint timing), and the **overflow menu opening** on a real chevron click (DEFERRED on a synthetic miss). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing — the same honest-deferral for synthetic mouse gestures `chrome` / `sidebar` use. The in-process overflow-onset / edge-fades / attention-badge / ✕-slot-reservation / select-close-rename / centering **real-layout** differentials live in `nice-itests`' `pane_strip` cases (a simulated event can't move a real frame; real Taffy layout is deterministic in-process). `Gate::SelfReported`. |
-| `session-lifecycle` | The R13 live session-manager gate (Validation §4). Drives the real per-window `SessionManager` on a real `WindowState` over **real ptys**, headless (no `TerminalView` — every assertion is model + session state, which `route_terminal_event` resolves in full; the two gpui-only side effects the pane-exit resolution carries, the deferred-companion spawn on refocus and the every-project-empty terminus, are composed by the live window root, and the scenario is built so the terminus stays `None` and no refocus lands on an unspawned companion). Asserts the six lifecycle behaviours Milestone 2 rests on: **immediate explicit-add spawn** — the `Terminals +` / ⌘T create-and-spawn path and the strip `+` (`add_terminal_to_active_tab`) path each fork their pty **synchronously** (Swift `addPane` semantics — an explicit add is never deferred); **Claude spawns now; companion on focus** — the project `+` seam builds the `[Claude, Terminal 1]` shape through the ONE shared constructor, which (R15, this cycle) spawns the Claude pane **immediately** (claude-kind panes never lazy-spawn; the pane execs the hermetic `NICE_CLAUDE_OVERRIDE` stub the scenario installs) while the companion terminal stays **deferred**, forking its pty on first focus via `ensure_active_pane_spawned` (the pre-R15 assertion that this leg spawned *neither* pane is deliberately rewritten here); **clean-exit neighbor refocus** — a shell `exit 0` (not held) removes the pane and re-points the active pane to the slot neighbor through the live `Exited{held:false}` subscription; **last-pane dissolve + Terminals-order fallback** — exiting the tab's last pane dissolves the tab and the active-tab selection falls back to the first navigable tab (the pinned Terminals group's Main tab); **held detour** — a `sh -c 'echo FINAL; exit 3'` pane exits non-zero, so the `Exited{held:true}` subscription flips it dead-but-mounted (`is_alive == false`, still in the strip) rather than removing it; and **orphan sweep** — `WindowState::teardown` drops every session (SIGHUP→SIGKILL), so no zsh survives (asserted externally by `ps`, the R3 teardown contract). The action-seam rewiring (create-and-spawn / activate / close+dissolve) and the live `cx.subscribe` that feeds `route_terminal_event` from each pane's session entity (via `SessionManager::pane_handle`) are the slice-3 wiring this exercises. Fixture shells poll the grid for a `READY` marker before the driver triggers their exit (never sleep-and-hope, per the ZDOTDIR-blanked-shell rule). Needs **no** Accessibility grant (it drives the manager directly, not via CGEvents). Registered before `multiwindow` (it installs no `WindowRegistry`). `Gate::SelfReported`. |
-| `app-shell` | The R13.5 app-shell composition gate (What-to-build #3). Opens through the **shipped builder** (`crate::app::open_managed_window` / `build_window_root` — the exact path `run` and every ⌘N take, not a hand-rolled root: a scenario mounting its own composition would re-create the blind spot R13.5 closes) and asserts the mounted shell over ONE shared `WindowState`. **The AX anchors are exposed** — an AX-tree walk (`ax_find_titled_role`, the `ax-probe` pattern) finds the sidebar-card root (`nice-sidebar-root`) and the pane-strip root (`nice-pane-strip-root`) each as an `AXGroup`; the poll forces a repaint per tick (a `WindowState` notify) because the shipped shell doesn't RAF, keeping AccessKit's lazily-activated tree current. **⌘T adds a visible pill AND switches pane content** — a real ⌘T CGEvent (`CGEventPostToPid`, own pid) routes through the shipped keymap to the key window: the toolbar gains one *laid-out* pill, the new pane becomes active, and the `PaneHostView` follows the switch and spawns+hosts its pty (proving the slice-2 `cx.notify()` wiring makes a window-scoped chord produce a visible result in the shipped shell). **The strip `+` spawns a real pty whose output renders** — the real toolbar `+` seam adds a terminal pane, the pane host spawns its login shell, and a marker echoed into that pty renders back in the pane's live grid. **Closing the extra pane refocuses a neighbor** — the real pill-× close removes the active extra pane from the model, the active pane refocuses to a surviving neighbor, and the pane host re-hosts it (the departed pane's view is dissolved from the composition). **⌘B collapses/expands the card** — a real ⌘B CGEvent (the R12 table binds *toggle-sidebar* to `cmd-b`; the plan's "⌘S" for this step predates that table) collapses the card and its intended leading-column width drops 240 → 0 (the M2 collapsed design reserves no leading column; `SidebarShellView::scenario_leading_column_width`, re-derived from the collapse flag — not a laid-out `Bounds` read), a second ⌘B restores it. **Teardown releases every session; the closed pane's pty is reaped** — `WindowState::teardown` clears the SessionManager's session map (asserted: every session released), and SIGHUP→SIGKILLs (via `PtyProcess::drop`, which joins the reaper — no zombie) any pane whose handle it held the *last* ref to: the closed pane, whose cached `TerminalView` the pane host already dropped, is reaped here (asserted: `kill(pid, 0)` → ESRCH). The still-*hosted* panes keep a `TerminalView` ref in the mounted `PaneHostView`, so their pty's final reap lands on window close (dropping the shell view tree) — confirmed by the external `ps` sweep, per the R3 teardown contract (reaping a view-hosted pane inside the still-open window is not possible; the assertion says so honestly). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make ⌘T / ⌘B no-ops). Registered **before** `multiwindow`: it does not install the `WindowRegistry` close observer (its `build_window_root` only `register`s, via `default_global`), so closing its window never trips the quit-when-empty terminus `multiwindow` — which DOES install it — relies on being last. `Gate::SelfReported`. |
-| `shell-socket` | The R14 shell-injection + control-socket **transport** gate (Validation §4). Spawns real `zsh -il` login shells through the live spawn path (`SessionManager::spawn_pane`) with the window's manager env injection active — the synthetic `ZDOTDIR` rc chain (written by the R14 stub writer directly against a temp dir) + per-pane `NICE_SOCKET` / `NICE_TAB_ID` / `NICE_PANE_ID` — over a fully sandboxed fixture (fake `$HOME` + marker `.zshrc`, a stub `claude` on `PATH` also exported as `NICE_CLAUDE_OVERRIDE`, a temp `ZDOTDIR`). Asserts **transport only** (never a handler's decision, so it survives R15 replacing the `claude` stub body): **chain-back** — the login shell restores the user `ZDOTDIR` and sources the fixture `~/.zshrc` (polls the grid for `USER_RC_RAN`); **`claude --help` bypass** — the shadow's non-interactive short-circuit runs the stub `claude` (grid shows its argv echo) and sends NO socket message; **`claude` handshake** — a bare `claude` handshakes over `NICE_SOCKET` and the window routing point records a `claude` message carrying the pane's exact injected `tabId`/`paneId` + its `cwd`, with a raw-`UnixStream` probe confirming exactly ONE newline-terminated reply line (the `Reply` one-line contract over the wire); **raw `session_update`** — a raw-`UnixStream` `session_update` line surfaces at the routing point parsed + normalized (the headless app-level driver TRANCHE-2-NOTES §1 asks for); **prefill** — a pane spawned with `NICE_PREFILL_COMMAND` in its spec env shows the pre-typed command via the stub's `print -z` tail and its side effect never runs (proof nothing executed); **self-heal** — deleting the socket file autonomously rebinds it at the same path (the health `stat()`, shortened here); **teardown** — `WindowState::teardown` unlinks the socket file. Grid-poll readiness with bounded fail-loud timeouts (never sleep-and-hope). Never launches the machine's real `claude`, never writes the real `~` / Application Support. Needs **no** Accessibility grant (raw sockets + pty writes, not CGEvents). Reuses `app::arm_window_control_socket` (the production wiring). Registered **before** `multiwindow` (it installs no `WindowRegistry`). `Gate::SelfReported`. |
-| `claude-lifecycle` | The R15/R16 Claude tab lifecycle gate. Drives the WHOLE `claude` flow over the **shipped window** (`open_managed_window` / `build_window_root`, the exact path `run` takes) with a **real control socket**, **real ptys**, and the live `route_terminal_event` subscription lift. `NICE_CLAUDE_OVERRIDE` points `claude` at a stub script (emits a braille-prefixed then a ✳-prefixed OSC title, idling between) — never the machine's real `claude`; `HOME` is sandboxed for the Main pane's login shell; every Claude pane spawns in a socket-supplied sandbox work dir. Six legs: **(a) socket newtab + T5 status** — a raw-`UnixStream` `claude` with an empty `tabId` replies `newtab`, a fresh Claude tab appears with a minted **valid v4** session UUID, its Claude pane SPAWNED (the stub runs) and `is_claude_running == true` FROM CREATION, and the stub's braille then (after a line of input) ✳ OSC titles drive the tab's sidebar-dot status **Thinking → Waiting** through the shipped subscription; **(b) ≤1-running-Claude refusal** — a second `claude` from that tab's real pane ids replies `newtab` (Swift's `test_existingClaudeRunning_repliesNewtab`); **(c) in-place promotion** — a terminal pane in a non-Terminals project promotes on a `claude`: reply begins `inplace <uuid>` (a valid v4 uuid field 2, an optional R17 settings 3rd field TOLERATED) and the pane flips kind→Claude + `is_claude_running` false→true; **(d) worktree split** — `claude -w foo` buckets the new tab under the invocation cwd while its `Tab.cwd` carries `.claude/worktrees/foo`; **(e) exit routes in the shipped window** — a real `exit` in a live terminal pane (added to the Main tab so the tab survives — no dissolve, no quit-terminus) is removed from the SHIPPED window via the subscription lift (the proof the lift reached shipped code); **(f) session_update rotation (R16)** — a fire-and-forget raw-`UnixStream` `session_update` with `source:"resume"` + a new id + a cwd move materializes a sibling parent tab pinned to the OLD id, `is_claude_running == false`, at ROOT (`parent_tab_id == None`) with the PRE-rotation cwd, while the originating tab re-parents UNDER it (indented — the landed `row_indent` contract) and moves into the post-rotation worktree with the NEW id; a `source:"clear"` update rotates the id in place with NO new tab; a cwd-bearing update adopts onto `Tab.cwd`; and a `source:"fork"` update carrying a `jobs/<first8>/state.json` entry (the daemon-hosted background `/fork` of Claude Code ≥ 2.1.212, read through the shipped filesystem probe re-rooted at a scratch fixture dir) relayed from a pane **no tab owns** materializes a nested, deferred child under the tab its `forkParentSessionId` names — pinned to the fork's id, titled by the job's `name`, carrying the fork's own worktree cwd — while the addressed tab's session id and the active tab stay untouched (the bug-3 regression pin); and a `source:"resume"` update naming an id that HAS a jobs entry — the daemon waking a COLD background job on `claude attach`, relayed with the stale pane id it inherited — mutates nothing at all, neither rotating the addressed tab nor materializing a phantom parent (bug 3's second route: the jobs screen runs on EVERY source, not just `"fork"`). Grid/model polls are bounded + fail-loud. Never launches the real `claude`, never writes the real `~` / Application Support. Needs **no** Accessibility grant (raw sockets + pty writes). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `claude-e2e` | The R17 Milestone-3 shipped-surface gate (Validation §4, the tranche-3 close-out owner). Drives the **shipped window** (`open_managed_window` / `build_window_root`) the way a **user** does — typing `claude\n` into real ptys carrying the R14 `claude()` shadow — with R17's **theme sync ON** (the process gate installed via the `set_claude_theme_sync_gate` seam so `open_managed_window`'s provider fill lights up through the SHIPPED path; the Main pane forks WITH the shadow via the `set_scenario_shell_inject_config` seam pointing `ZDOTDIR` at fixture stubs). Fully sandboxed: a fake `$HOME` + marker `.zshrc`, a stub `claude` on `PATH` **and** `NICE_CLAUDE_OVERRIDE` (echoes its argv, then braille/✳ OSC titles), a temp `ZDOTDIR`, and the theme/pointer files written against sandbox paths — never the real `claude` / `~/.claude` / `~/.nice`. Six legs (bounded fail-loud grid/model polls): **(a) typed newtab + theme sync ON** — `claude\n` in the real Main pane handshakes over the socket, the Terminals-group Main tab forces `newtab`, a fresh Claude tab appears with its stub SPAWNED (`is_claude_running` from creation) and a **valid v4** session UUID, and the window's `--settings` provider resolved to the sandbox pointer (the Main-tab newtab spawn runs under `NICE_CLAUDE_OVERRIDE`, so `build_claude_exec_command` suppresses the Nice flags — the wrapper-spliced argv is asserted in leg (c)); **(b) status pulse** — the new Claude pane's braille then (after a line of input) ✳ stub OSC titles drive the shipped sidebar-dot status **Thinking → Waiting**; **(c) typed in-place promotion through the real zsh wrapper** — a live terminal pane in a non-Terminals project, typing `claude\n`: the reply is `inplace <uuid> <ptr>` (theme sync ON) and the grid shows the stub `exec`'d with `--settings <ptr> --session-id <uuid>` argv (whitespace-insensitively, since the long argv hard-wraps) while the model flips kind→Claude + `is_claude_running` true; **(d) rotation on the shipped sidebar** — a raw-socket `session_update` `source:"resume"` + new id materializes the branch parent at ROOT (`parent_tab_id == None`) with the originating tab re-parented + indented beneath it (root promotion), then a `source:"clear"` rotates the id in place with NO new tab; **(e) theme + pointer files present** — the theme file at the `nice` slug carries `"_niceManaged": true` and the pointer file holds the exact `{"theme":"custom:nice"}` bytes; **(f) gate-OFF parity** — with the gate flipped OFF and the window provider re-filled, a fresh typed promotion is settings-less (the wrapper `exec`s the stub with `--session-id <uuid>` and NO `--settings` — byte-identical to the pre-theming protocol). Teardown reaps every session and resets the scenario `ShellInjectConfig`. Needs **no** Accessibility grant (pty writes + raw sockets, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `persistence-restore` | The R18 session persistence + restore gate (Validation §3). Drives the **shipped window** path with a **temp session store** (injected via `NICE_APPLICATION_SUPPORT_ROOT`) seeded with a hand-authored v3-shaped `sessions.json` (a Claude tab with a deliberately stale cwd + a planted fake `~/.claude/projects` bucket/transcript, a terminal tab with pane cwds, a `parentTabId` pair, a frame, `sidebarCollapsed: true`), a sandbox `HOME`/`ZDOTDIR`, and a stub `claude` (`NICE_CLAUDE_OVERRIDE` — the real `claude` is never spawned). One `Application::run`; the restore/fan-out fns are called **explicitly** (the shell-socket precedent, no relaunch). The legs: **(a)** restore round-trip on the shipped window (`open_managed_window_with` + `build_window_root`) — the model tree matches the fixture, lineage intact, sidebar collapsed (leading column width 0), the frame applied (read back via `window_screen_frame` within tolerance), the cwd-heal corrected the stale Claude cwd, and a bounded grid-poll shows the pre-typed `claude --resume <sid>` with NOTHING executed; **(b)** a raw-socket mutation + rename polls the store file for the debounced coalesced write; **(c)** the **W5 veto** — with live panes, the REAL close action (`-[NSWindow performClose:]`, the exact action the red traffic-light button's target invokes, routed through the delegate's `windowShouldClose:` gate — NOT the should-close closure directly; the traffic-light frame helper is asserted to locate the close button, but a synthetic CGEvent click does not hit-test to the native button under gpui's full-size-content window, verified on-device) leaves the window OPEN, the modal shows (AX role+label), Cancel is a total no-op (file byte-identical), Confirm closes + the slot disappears; **(d)** re-running the restore fan-out against the same store yields exactly the surviving slot's window (seed id/parts/frame match); **(e)** a unit-level quit cascade (two windows, both snapshots survive + a close after `AppQuitting` is inert — the wipe regression); **(f)** migration — a Swift-shaped fixture ⇒ lossless adopt, `branch` ignored, own file written, source bytes untouched. **Registers the `WindowRegistry` WITHOUT `install`** (quit-when-empty would kill the suite), registered **before** `multiwindow` (the sole installer, last). `Gate::SelfReported`. |
-| `file-browser` | The R19 file-explorer shipped-surface gate (Validation §3). Opens through the **shipped builder** (`open_managed_window` / `build_window_root`) with the active tab rooted at a temp fixture tree, and drives the sidebar's files mode: a real **⌘⇧B** CGEvent swaps the tab list for the tree (the AX root `nice-file-browser-root` surfaces as an `AXGroup` — poll forces a repaint per tick, the shipped shell doesn't RAF — and a fixture row is model-read-corroborated as rendered); **single-click expand/collapse** of a fixture dir; **double-click a folder re-roots** the tree (model `root_path`); **double-click a file** records **exactly one** `open` on the recording `WorkspaceOps` fake and **nothing is launched** (the fake's log is the only evidence); **right-click menus** — a file shows Open / Open With ▸ / Reveal in Finder / Copy Path, a folder OMITS Open + Open With (the pinned rule), and the **Open With ▸ second stage** lists the fake's apps **default-first** (`Zed (default)`, then alphabetized, then `Other…`); the **live kqueue watcher** surfaces a file created in an expanded dir as a new row within a bounded fail-loud poll (create → 120 ms debounce → wake → foreground drain → re-render — NO forced notify, so only a watcher-driven render can pass); the **sort-direction toggle** reorders rows; the **hidden toggle + a real ⌘⇧. chord** hide then re-show a dotfile (the shipped keymap's files-mode-AND-state-exists double gate); and **⌘⇧B still flips modes**. **R20 legs** (the scenario installs a fresh history over a temp-dir `FakeTrasher` + a recording fake pasteboard — never the production Trash, and never the general pasteboard for the FILE operations; the (d-clip) rename leg is the one exception — it drives the REAL general pasteboard and saves/restores it): **(a)** copy → paste twice into a folder lands `foo.txt` then `foo copy.txt`; **(b)** cut ghosts the rows, paste MOVES the tree, and an external-style pasteboard mutation degrades the cut to a copy (un-ghosts); **(c)** trash (FakeTrasher) → **⌘Z** (the shipped `UndoFileOperation`) restores into a still-collapsed dir → **⌘⇧Z** re-trashes; **(d)** menu-rename with a typed edit + Return commits (basename preselected — asserted via the field model), Esc reverts, and a `/` draft STAYS in edit mode; **(d-word)** with a rename open on a multi-word fixture name (`alpha beta_gamma.txt`), REAL `⌥←` / `⌥→` / `⌥⇧←` / `⌘←` / `⌘→` / `⌘⇧←` CGEvents walk a fixed caret/selection table and `⌥⌫` deletes the previous word (the live half of the Option/Cmd-chord fix — the unit tests pin the mapping, this pins the chords reaching the FOCUSED field; arrows/⌫ are functional keys, posted by keycode with no unicode override, and Esc leaves the file untouched); **(d-drag)** a press at one PAINTED char boundary and a move to another selects that range and typing replaces it — attempted first as a REAL guarded global-HID gesture (DOWN → held DRAG steps → UP behind the mandatory activate + raise + frontmost-at-point preflight; a press that lands but whose `mouseDragged:` never arrives DEFERS LOUDLY, the recorded synthetic-drag limitation) and hard-asserted either way through the production hit-test + `extend_to` over the geometry the field painted; **(d-clip)** with a rename open on `clipme.txt`, REAL `⌘A` / `⌘C` / `⌘V` CGEvents round-trip the field text through the REAL system clipboard (⌘A ⌘C copies the name out; ⌘V back over the still-selected field must leave the text IDENTICAL, so a dropped or doubled character shows up immediately; a bare `c` then types at the caret the paste left), and a driver-seeded MULTI-LINE clipboard pastes as ONE sanitized line — the live half of the ⌘C/⌘X/⌘V fix (the grant-free half, which carries the same wiring claim on any host, is `crates/nice-itests/tests/behavior_rename_clipboard.rs`); the leg saves and RESTORES whatever the clipboard held before it ran, and Esc leaves the file untouched; **(e)** an in-tree drag of a multi-selection onto a folder row MOVES both (the `can_drop` hover-highlight predicate asserted); **(e′)** with TWO fixture files selected (`multi1.txt` + `multi2.txt`), a REAL guarded global-HID left **press** on one of the selected rows must NOT collapse the selection (the bug collapsed at mouse-DOWN, so the armed drag payload was a single path) and a REAL **release in place** must then collapse it to that row alone — Finder's select-then-drag contract; the full real drag onto the `multidrag/` folder row (press → held moves → release) is ATTEMPTED and **DEFERS LOUDLY** when it does not arm (macOS establishes no implicit mouse grab for a synthetic press, so `mouseDragged:` never arrives and gpui's `on_drag`/`on_drop` never fire — the same recorded limitation as (d-drag)), while a drag that DOES arm and commits the wrong outcome hard-FAILs; the non-deferrable "the whole selection travels" gate stays on (e)'s `drive_drag_drop` seam plus the in-process `view.rs` tests; **(f)** deleting an undo target then ⌘Z shows the frozen drift banner and drops the op. **§6 final-composition leg (the Milestone-5 claim, Validation step 6):** in files mode, click-select two rows and context-menu **Copy → Paste** into a folder (recorded on the fake pasteboard + applied on disk); **slow-second-click rename** a row and commit; a **⌘N** CGEvent opens a SECOND real window B (the `multiwindow` precedent — this scenario now also installs the `NewWindow` command, its `build_window_root` still only `register`s so B never trips quit-when-empty); a **⌘Z** CGEvent posted to window B undoes window A's op AND the focus route brings window A frontmost (`active_window == A`) with its sidebar back in **Files** mode and the **origin tab** selected; window B is then programmatically closed. This is the only leg driving two real windows + the production focus-follow closure (installed here over the registry-registered windows). Hermetic: fixture under a temp dir, the recording fakes (`WorkspaceOps` + `FakeTrasher` + fake pasteboard) — no real app launch / Finder reveal / Launch-Services query / real Trash / general pasteboard for the FILE operations — (d-clip) deliberately uses the real general pasteboard, saved and restored (and left holding the leg's own copy when the clipboard had no text to begin with). Preflights `AXIsProcessTrusted()` and FAILs loudly on a missing grant. Under `NICE_CAPTURE` it also writes two MID-run frames of the OPEN rename field — `…-rename-caret.png` (the caret parked at the end of `beta_gamma`, from (d-word)) and `…-rename-selection.png` (the dragged selection highlight, from (d-drag)) — since the driver's own capture happens after teardown, when no field exists; both rows are on screen, and a requested capture that fails is a scenario failure. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `close-confirmation` | The R20.5 busy-pane close-confirmation gate (Validation §3). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with a real ZDOTDIR-blanked terminal shell over one `Application::run`; a stub `claude` on `NICE_CLAUDE_OVERRIDE` (never the real `claude`), a sandbox `HOME`/`ZDOTDIR`. The three legs: **(a) idle close is immediate** — with the shell idle at a prompt, closing the active pane's pill ✕ closes it with **no modal** (`pending_modal().is_none()`); **(b) busy shell is gated** — the shell is given a real foreground child (a `sleep`), polled to `has_foreground_child()` true (the ONLY leg exercising the true `tcgetpgrp != child_pid` syscall, against a hermetic stub child), then a pill-✕ close **vetoes** (window/tab stays, `pending_modal().is_some()`, the modal's `Force quit` button is a live AX node — `ax_find_titled_role` → `AXButton`); **Cancel** (`ConfirmationModal::resolve(.., false)`) closes nothing, then a second pill-✕ close + **Confirm** (`resolve(.., true)`) force-quits the busy pane (reaping the `sleep`); **(c) `.tabs` partial-cancel** (D5) — a batch of one idle + one busy tab (the busy tab marked through the `synthetic_foreground_child` seam) drives `request_close_tabs`, and on **Cancel** the idle member is already gone while the busy survivor REMAINS (NOT a total no-op). **The pill-✕ gesture** asserts the ✕ is a real, on-screen, locatable target and then drives the EXACT pill-✕ handler (`WindowToolbarView::close_pane` → the gate) rather than a synthetic CGEvent coordinate click: under the shipped **full-size-content** window a `CGEventPostToPid` mouse click does not hit-test to gpui content (re-verified on-device — a body-centre click did not select the pane; the same limitation `persistence-restore` hit for the traffic light, which drove `-[NSWindow performClose:]`). The modal is always answered via `ConfirmationModal::resolve`. Preflights `AXIsProcessTrusted()` (for the leg-(b) AX button probe) and FAILs loudly on a missing grant. Registered **before** `multiwindow`: `open_managed_window` only `register`s the `WindowRegistry` (no quit-when-empty close observer), and the driver keeps the Main tab populated so no close empties the window. `Gate::SelfReported`. |
-| `theme-fanout` | The R21 live theme-system gate (Validation §4). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with the live theme globals installed — a `ThemeSettingsStore` at a **temp** `ui_settings.json`, the `TerminalThemeCatalog` over a sandbox `terminal-themes/` dir (R22), a scenario-minted `SharedThemeState`, and an **injected `OsSchemeSource` stub** over a flippable cell (`run_selftest` mints none of these). Sandbox `HOME` (held for the whole driver so the R17-live Claude writes land under `<home>/.claude`), a blanked `ZDOTDIR` rc chain for the Main pane's shell, a `NICE_CLAUDE_OVERRIDE` stub — never the real `~/.claude` / `~/.nice` / system appearance. Legs (bounded fail-loud state polls): **(a/d) OS-sync scheme flip fans BOTH halves** — with `sync_with_os` ON, flipping the OS stub + `reconcile_with_os` flips `scheme`; the active chrome `Slots` change, the Main pane's `TerminalView` swaps its render theme, AND a **pixel sample on the live terminal recolors** (`nice_harness::capture::sample_window_pixels`, max channel delta > 8/255) — proving chrome + terminal across the window; with sync OFF, driving the stub is a no-op; **(d) manual contradiction** — re-enabling sync pins the scheme to the OS, then a manual `apply_scheme` to the other scheme turns `sync_with_os` off (`userPicked`); **(b) accent** — `apply_accent` pushes a new accent into the pane (the cursor-None caret color); **(c) terminal-id latency** — an INACTIVE-scheme `apply_terminal_theme_id` does NOT recolor the pane (persisted, latent) and the next scheme flip makes that slot active (leg (c) sets `nice-default-dark`, whose payload matches the scheme's Nice default, so the latency check stays a clean no-op; leg (f) exercises a distinct-theme active recolor now that R22's catalog resolves real themes); **(e) R17-live** — with the gate ON a theme change rewrites the sandbox `nice.json` colors file (byte-diff via the landed only-if-changed writer) and `apply_sync_claude_theme` re-sources every window's `--settings` provider (asserted through `claude_settings_path_provider`); **(f) R22 Ghostty import** — a fixture `.ghostty` written under the sandbox `terminal-themes/` dir is `import_theme`d through the Global catalog (parse → persist verbatim as `<slug>.ghostty` → enter the imported list → resolve by id), then `apply_terminal_theme_id` (R21) makes it live for the active scheme and the live terminal pane recolors to the imported background (render theme swap + pixel sample > 8/255) — parse → persist → catalog → resolve → fan-out end to end; **(g) restyle-popup reentrancy** — a `Blurred`/30 transparency `commit_appearance` driven FROM INSIDE a window update (reproducing the migration "Try the new look" confirm callback, which runs while its host window is mid-update) still reaches the window: the instrumented `transparency_fanout_applied` push generation advances to `Blurred`/30 via the DEFERRED `apply_window_transparency_fanout` instead of being dropped by gpui's reentrant-`update_window` guard (the pre-fix bug left the window opaque until relaunch). Needs **no** Accessibility grant (drives the store `apply_*` API + pixel readback, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `settings-window` | The R23 Settings-window gate (Validation §2–§3). Drives the ⌘, Settings window over a minimal host window in ONE `Application::run` (the open/apply fns driven explicitly, no relaunch), fully sandboxed: a `run_selftest` defaults+temp `SettingsPrefsStore` / theme store / catalog, a scenario-minted `SharedThemeState` + injected `OsSchemeSource` stub, and the `RecordingFilePicker` (no real `NSOpenPanel`). Legs: **(a) ⌘, singleton** — the first `OpenSettings` opens exactly one settings window (a fresh handle, `App::windows()`+1, the `SettingsWindow` Global `Some`), a second focuses the SAME window (no second window, handle unchanged), close clears the Global; **(b) live Appearance fan-out** — `apply_accent` flips the resolved `ThemeState` the chrome paints from (the composed real-window pixel assert is R24's, per the Validation split); **(c) Font slider fan-out + persist** — the Font pane's terminal-size handler changes the shared `FontSettings` px + re-metrics, a subsequent ⌘= (`zoom_by`) continues from the slider value on the SAME entity (no desync), and the `fonts` section on the temp `ui_settings.json` reflects the change; **(d) Import through the fake picker** — a scripted temp `.ghostty` imports through the `FilePickerOps` seam into `imported_entries()`/`themes(for:)`, a malformed fixture surfaces the exact mapped §ImportError string; **(e) rail** — `settings_rail_sections()` exposes the six slugs incl. the `shortcuts` row (the R24 pane); **(s1–s3) the R24 recorder** — over a dedicated host window rendering the shipped `shortcuts_pane` body (R23's live-window active-pane state is private, so this renders the identical pane): s1 enters recording on `newTerminalPane` and a REAL ⌘Y chord (`post_key_tap`, own pid) rebinds it, s2 captures ⌘B (ToggleSidebar's default) → the "Already used by <label>" conflict + Replace clears the loser and binds this action, s3 Reset restores the default and `is_at_default` flips; a `SavedInputSource` is held across the leg (IME restore) and `AXIsProcessTrusted()` is preflighted (a dropped chord fails loudly). **(§6) the tranche-5 final composition (Milestone 6)** — over the **REAL registered launch window** (`open_managed_window` / `build_window_root`, NOT a host; the §6 leg opens + reaps its own shipped window over a hermetic ZDOTDIR/HOME/`NICE_CLAUDE_OVERRIDE` fixture, its `build_window_root` only `register`s so it never trips quit-when-empty), by CGEvent to nice's own pid: **(6a)** a rebound chord dispatches — `set_binding(newTerminalPane → ⌘Y)` then a real ⌘Y adds a pane to the shipped window's `WindowState` and the old default ⌘T no longer does (`rebuild_keymap` dropped it); **(6b)** the PROTECTED non-rebindable set (⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@SidebarShell, ⌘,) survives the total clear — a `key_bindings()` presence audit (the `keymap` re-install probe, on the live board); **(6c)** a real ⌘, opens R23's settings window (the `OpenSettings` non-rebindable firing LIVE, `App::windows()`+1), then a live theme change (`apply_accent` + `apply_scheme`) repaints the shipped **chrome** AND a **terminal cell** (`sample_window_pixels`, max channel delta > 8/255 on both — the composed pixel assert the R23 `settings-window` leg (b) deferred to R24; the stub selftest catalog makes `apply_terminal_theme_id` a latent no-op, so the terminal recolor comes from the scheme flip, as `theme-fanout` proves); **(6d)** a busy pane (marked through the `synthetic_foreground_child` seam — the true `tcgetpgrp` is `close-confirmation`'s) close presents R20.5's `ConfirmationModal` (`pending_modal()` + the `CONFIRM_ACCEPT_ID` AXButton), cancelled. The launch window is reaped (`WindowState::teardown`) + the rebind reset at teardown so nothing leaks to `multiwindow`. This composed board is the Milestone-6 claim; no earlier cycle asserted it together. The settings window is UNREGISTERED (D7), and the scenario installs no `WindowRegistry` close observer. The s1–s3 + §6 legs need the Accessibility grant (real CGEvents); a–e do not. Registered **before** `multiwindow`. `Gate::SelfReported`. |
-| `handoff` | The R26 handoff gate (Validation §3). Drives the **shipped window** (`open_managed_window` / `build_window_root`) over a **real control socket** + **real ptys**, fully sandboxed: scratch `skills_root` / `helper_dir` under a temp root (auto-removed), a temp `HOME` / blanked `ZDOTDIR`, and a stub `claude` that records its full argv — seeded via the `ResolvedClaudePath` Global (`NICE_CLAUDE_OVERRIDE` UNSET, so `is_override` stays false and the Nice-injected flags emit for the argv legs to assert), never the machine's real `claude` / real `~/.claude` / `~/.nice`. Legs: **(a) installer round-trip (hermetic, injected dirs)** — `sync_with(true, skills_root, helper_dir)` lands both files (helper at 0o755), a re-run leaves mtimes stable (idempotent), and `sync_with(false, …)` removes the `nice-handoff/` skill subtree + the helper FILE while `helper_dir` SURVIVES (a planted R16 `nice-claude-hook.sh` sibling proven untouched — the `~/.nice/` ownership asymmetry); **(b) handoff socket → nested tab, opened in the BACKGROUND** — a raw `handoff` JSON line naming an originating claude tab's `tabId`/`paneId` plus a custom `instructions`/`model`/`effort` replies `ok`, a NEW tab appears nested one indent under the originating tab (`parent_tab_id` → the originating id) with the LOCKED title `[HANDOFF] <originating title>` + `title_manually_set == true`, the ORIGINATING tab is still `active_tab_id()` (D7 — a handoff never steals focus) while the unselected child's Claude pane is nonetheless `is_claude_running` (its pty is owned by the session entity, not the view, so a never-rendered tab's Claude really runs), and the stub's recorded argv carries `--session-id <v4 uuid>` then `--model <m> --effort <e>` then the prompt `Read the handoff notes at <handoffFile>. <instructions>` as the FINAL positional; **(c) top-level fallback on a miss** — a `handoff` with an empty `tabId` still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` tab (`parent_tab_id == None`), proving a miss is a fallback, not a drop, and it too leaves the originating tab active (D7 holds on the fallback path); **(d) empty model/effort omit their flags** — `model:""` / `effort:""` records argv carrying NEITHER `--model` NOR `--effort`, the prompt still last. The first-launch prompt is NOT exercised here (it does not fire under `run_selftest` by construction; its gate + copy are covered by the `should_offer_handoff_prompt` unit test + the verbatim plan copy). Needs **no** Accessibility grant (raw sockets + pty writes, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `dispatch` | The dispatch-to-a-worktree gate — the `/nice-dispatch` twin of `handoff`. Drives the **shipped window** (`open_managed_window` / `build_window_root`) over a **real control socket** + **real ptys**, sandboxed the same way (scratch `skills_root` / `helper_dir` + a `git init`-ed scratch repo under an auto-removed temp root, a temp `HOME`, and the argv-recording stub `claude` seeded via the `ResolvedClaudePath` Global with `NICE_CLAUDE_OVERRIDE` UNSET) — never the machine's real `claude` / `~/.claude` / `~/.nice`, and never a real repository. Legs: **(a) raw-socket dispatch → nested tab, opened in the BACKGROUND** — a raw `dispatch` JSON line naming the seeded dispatcher tab's `tabId`/`paneId` replies `ok`, a NEW tab appears nested one indent under it with the LOCKED title `[DISPATCH] <worktree name>` + `title_manually_set == true`, the DISPATCHER tab is still `active_tab_id()` (a dispatch never steals focus) while the unselected child's Claude pane is nonetheless `is_claude_running`, the tab's `cwd` is the **PAYLOAD** cwd (the dispatcher's own cwd is deliberately different — dispatch's one divergence from handoff), and the stub's recorded argv carries `--session-id <v4 uuid>` then `--add-dir <dirname(taskFile)>` **immediately** followed by `--worktree <name>` (the single-token option that terminates `--add-dir`'s variadic list before it can swallow the prompt) then `--model <m> --effort <e>` then the prompt as the FINAL positional; **(b) the REAL installed helper, end to end** — `sync_with(true, …)` lays the pair into the injected dirs and THAT installed `nice-dispatch.sh` is executed as a real subprocess from a SUBDIRECTORY of the scratch repo (polled for exit, never blocked on — it waits on the window's own socket reply), exits 0 reporting the tab is opening, and the tab it produces carries the repo ROOT as its cwd rather than the helper's `$PWD` (the `git rev-parse --path-format=absolute --git-common-dir` main-root resolution, proven for real) with an argv omitting BOTH `--model` and `--effort` (a `CLAUDE_EFFORT` is exported into the helper's environment precisely so a re-added inheritance fallback would fail this leg) and the prompt still directly after `--worktree`. What it deliberately does NOT prove: that the real Claude CLI parses that launch line, or that `claude --worktree` creates a worktree — the stub only records argv; that is the post-merge interactive feel-check. Needs **no** Accessibility grant (raw sockets, a subprocess, and pty writes — no CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `update-check` | The R27 update-checker gate (Validation §4). Mounts the real `WindowToolbarView` over a seeded tab and drives the WHOLE release-check nudge through the **injected** `RecordingReleaseFetcher` (installed process-wide by `run_selftest`) — never the real network / `github.com`, and never the launch timer (the worker is `run`-only + gated). **Success leg:** script the fetcher to a newer tag (`v9.9.9`), drive the foreground `check_now`, and assert `update_available` flips to `Some("v9.9.9")`; the trailing pill then renders — proven BOTH deterministically (the render gate) AND on the **real AX tree** (an `AXButton` titled `Update available`, polled while forcing a repaint per tick, the `ax-probe`/`app-shell` pattern). A **real guarded-HID click** on the pill (behind the mandatory preflight: activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point via `platform::frontmost_window_owns_point`) opens the popover — hard-asserted when the preflight passes, else **DEFERRED LOUDLY** (never a blind `CGEventPost` — the pid-only invariant's carve-out safety). The popover's contents (`brew update` then `brew upgrade --cask nice`, a Copy per row) and one Copy → clipboard write are asserted **in-process** (so a DEFERRED real click never weakens the content coverage — the `pane-strip` in-process-pins-content precedent). **Error leg:** reset the checker to a clean state, script a fetch ERROR, drive `check_now`, and assert `update_available` STAYS false and NO pill renders (the silent-error + layout-stability contract). No chord is typed (no `SavedInputSource` needed); the only synthetic input is the one guarded global-HID click, fenced by its preflight, and it preflights `AXIsProcessTrusted()`. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `tranche6-composition` | The R27 §6 **tranche-6 close-out** composition gate (Validation §6). Composes the whole tranche's board on the **REAL shipped launch window** (`open_managed_window` / `build_window_root` → `AppShellView`, the exact path `run` takes — never a scenario-only toolbar), sandboxed: a temp `HOME` (no rc) + a stub `claude` idling via the `ResolvedClaudePath` Global (`NICE_CLAUDE_OVERRIDE` UNSET), and the `run_selftest`-installed `RecordingReleaseFetcher` (never the real network / `github.com`). A `SavedInputSource` is held for the leg. Legs: **(a) R27 update pill** — script the fetcher to `v9.9.9`, drive the foreground `check_now` on the shipped window → the trailing pill appears on the SHIPPED toolbar (AX `AXButton` titled `Update available`), and a **real guarded global-HID click** (behind the mandatory activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point preflight) opens its popover showing `brew update` + `brew upgrade --cask nice` (hard when the preflight passes; else DEFERRED, with the popover contents still asserted in-process); **(b) R25 pill reorder** — with ≥2 panes, a **real guarded global-HID drag** of the trailing pill left past the leader's midpoint commits a reorder read back off the shipped strip (`pane_ids()` flips), hard-asserted only on a demonstrably-landed press (else DEFERRED — the `pane-strip` honest-deferral); **(c) R26 handoff** — a raw-`UnixStream` `handoff` naming a seeded originating Claude tab replies `ok` and opens a nested `[HANDOFF] my-project` tab on the shipped window (LOCKED title, parented under the originating tab, spawning the stub claude), and a real ⌘, (`CGEventPostToPid`) opens R23's shipped settings window whose rail exposes the **Claude section** (`AXButton` titled `Claude`) — the home of R26's `settings.claude.installHandoffSkill` toggle (whose click behaviour is pinned by R26's `claude_pane` unit test + the `handoff` installer scenario). The R25 drag + R27 click post via the new `platform::post_global_left_{down,drag,up}` / `post_global_left_click` seams (SELFTEST-ONLY carve-out — the ONLY global `CGEventPost` call sites, guarded by the preflight; a failed preflight DEFERS LOUDLY, never a blind post); ⌘, stays `CGEventPostToPid`. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
-| `multiwindow` | The R12 live multi-window + shortcut-dispatch gate (Validation §2–§5). Drives the shipped `WindowRegistry` / `WindowState` / `keymap` on **real `NSWindow`s** with **real CGEvents** to nice's own pid. Opens window A as a capture-tee managed window (the `input-live` pattern) registered in the process-wide registry, then asserts: **⌘N** opens a second, isolated, registry-tracked window (the registry count **and** `App::windows()` both step 1 → 2); **⌘T** posted while window B is key adds a pane to B's `WindowState` model only, leaving A's model signature unchanged (isolation + focused-window routing through `active_state`); **⌘=** grows the one process-level `FontSettings` every window observes (the font fan-out) and leaks **zero** bytes into A's capture-tee pty; the **pass-through differential** — a plain `x` reaches the pty as `x`, while **⌘⌥↓** cycles the sidebar and leaks **zero** capture bytes (a matched chord is consumed, an unmatched key falls through byte-identically); **live peek** — with A's sidebar collapsed, ⌘⌥↓ floats the peek and a modifiers-release clears it via the window-level `on_modifiers_changed` observer; and **close/deregister/fallback** — closing B deregisters it (registry + `NSWindow` count drop) and a window-scoped action then falls back to the surviving window A. Matching is **character-based** at the gpui pin (the documented divergence from Swift's physical-keycode match — see the `keymap` module notes). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make every chord a no-op). The per-pid flagsChanged the peek-clear needs is not synthesizable via `CGEventPostToPid`, so the modifier release is driven as a real `ModifiersChangedEvent` through GPUI's own dispatch (the same `on_modifiers_changed` path). The in-process isolation / routing / all-13-fire / peek **differentials** live in `nice-itests`' `multiwindow` cases. Registered **last** in `selftest_scenarios` (it installs the registry whose close observer quits when the registry empties). `Gate::SelfReported`. |
+| `niceties-overlay` | The R7/T9 "Launching…" overlay timing gate (Validation §4). Two cases over the real overlay state machine + the App-Nap-safe grace deadline, asserted via the view's exposed overlay state (feature-independent) and, when the `capture` feature is compiled, a pixel probe of the accent status dot: a **slow silent window** (`sh -c 'sleep 3; echo up'`, a short grace) stays silent past the grace window so the overlay shows, then the first-output `up` clears it; an **instant-prompt window** (a normal `zsh -il`, the default grace) beats the window so the overlay **never** flashes (`overlay_ever_visible` stays `false`). `Gate::SelfReported` (state transitions, not cadence). |
+| `niceties-held` | The R7/T10 held-window gate (Validation §5). A window running `sh -c 'echo FINAL; exit 3'` exits non-zero, so the R3 classification holds it; asserts the whole contract over a real session: the window latches held, `FINAL` stays in the grid, the dim `[Process exited (status 3)]` footer is fed into the held term, a **real CGEvent** keystroke is inert (grid unchanged, still held, no crash — the dead pty is never written and no AppKit beep), and dismiss respawns a fresh `zsh -il` in place (the grid no longer holds `FINAL` / the footer, a new prompt appears). Posts a real CGEvent for the inert-typing check, so it preflights the Accessibility grant and FAILs loudly if it is missing. `Gate::SelfReported`. |
+| `ax-probe` | The T2 AccessKit-wired canary (see "The AX decision record" in `../docs/testing.md`). Tags one stable root element (`AxProbeView`, id `ax-probe-root`, role `Group`, aria_label `nice-ax-probe-root`) and walks **this process's own** macOS AX tree via `crate::platform::ax_find_titled_role` (`AXUIElementCreateApplication` + a bounded `AXChildren`/`AXTitle`/`AXRole` traversal) to assert the node is exposed with role `AXGroup` — **role + label matching only, never identifier matching** (gpui never sets `author_id`, so `AXIdentifier` matching is unreachable without a vendor patch). Polls until AccessKit (lazily activated by the first AX query, run on the gpui main thread so it doesn't race gpui's per-frame `RefCell` borrow) surfaces the node. A canary that AccessKit stays wired as gpui evolves across pin bumps — **not** an a11y test suite, and not a general-purpose black-box matcher to build chrome/window tests on. `Gate::SelfReported`. |
+| `chrome` | The R9 live window-chrome gate (Validation §1–§4). Opens the R9 chrome band (`WindowChromeView`) + repositioned native traffic lights + full-screen wiring over a silent live window and drives it with **real mouse CGEvents** to nice's own pid, ground-truthed against AppKit reads. **§1** — via `platform::standard_window_button_frames`, asserts all three buttons exist, the close button's visual centre sits within the slim 28pt titlebar and its x-origin at the native macOS-26 default (9), and the three are equally pitched at the native pitch (read from the live frames) — the restyle stopped repositioning them; **re-asserted after a resize, a focus bounce, and a full-screen enter+exit** (the BUG-B stale-capture guard). **§2** — a CGEvent press-drag on the empty band vs the terminal content area, judged by real NSWindow frame reads (the content drag must leave the window put). **§3** — reads (never writes) `AppleActionOnDoubleClick`, posts a CGEvent double-click on the band, and checks the window state matches the predicted zoom / miniaturize / none, plus a double-click while full screen is a no-op (the band's `!is_fullscreen` gate). **§4** — dispatches `ToggleFullScreen` and asserts `is_fullscreen()` + the View-menu title flip, both ways. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Effects a synthetic CGEvent provably can't drive (a window drag via `performWindowDragWithEvent:` follows the *physical* cursor, which `CGEventPostToPid` doesn't move) are recorded as a **DEFERRED HUMAN PASS**, not fail-looped — the same honest-deferral pattern `input-live` uses for synthetic IME composition. `Gate::SelfReported`. |
+| `sidebar` | The R10 live sessions-sidebar gate (Validation §3–§4). Mounts the real `SidebarShellView` (no pty — the shell hosts no terminal this cycle) and drives it with **real mouse CGEvents** to nice's own pid, ground-truthed against AppKit reads. Asserts the expanded card reports the **240pt** default width; a CGEvent drag on the trailing resize handle **clamps at 160 and 480** and a CGEvent double-click **resets to 240**; **collapse** removes the leading column entirely (the 2026-07 restyle keeps the no-cap-card design: the full-width titlebar row over the full-width body, so `scenario_leading_column_width` reports 0) and **restore** returns the column. The window-drag region + traffic-light geometry moved into the titlebar in the restyle, so `chrome` / `pane-strip` own those; the sidebar top strip no longer drags the window. **§4 dots** — with the model driven into all four states (thinking / waiting-unacked / waiting-acked / idle), the dot colour per token and the pulse-presence rule are asserted at the state level off the view's own R8 predicates (`SidebarShellView::session_dot_inputs`; pixel corroboration is best-effort under `capture`). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing; the resize clamps/reset hard-assert when the synthetic gesture drives the real behaviour, else **DEFER** (the 6pt resize handle a synthetic press may miss), the same honest-deferral pattern `chrome` uses. The in-process multi-select / rename-gate / Esc / band-arm **classification** differentials live in `nice-itests`' `sidebar_multiselect` cases (a simulated event can't move a real frame). `Gate::SelfReported`. |
+| `pane-strip` | The R11 live toolbar window-strip gate (Validation §3). Mounts the real `WindowToolbarView` over a seeded Main session and drives it with **real mouse CGEvents** to nice's own pid, ground-truthed against AppKit frame reads. Asserts the drag differential with pills present — a CGEvent press-drag starting on a pill **selects** the pill AND leaves the NSWindow frame **put** (hard-asserted only when the select confirms the synthetic press LANDED, else DEFERRED — a `CGEventPostToPid` mouse event need not land on a gpui hitbox), while the same drag on the empty toolbar band **moves** the window (DEFERRED — `performWindowDragWithEvent:` tracks the physical cursor `CGEventPostToPid` doesn't move) — plus the **R25 reorder leg** (a press-drag of the `p1` pill past `p0`'s midpoint reorders it before `p0`, `term_window_ids()` → `[p1, p0]`, hard-asserted only on a demonstrably-landed press, else DEFERRED), the reserved-width overflow **showing the chevron** on a real window (hard, real layout), an **activate-from-elsewhere** that makes an offscreen window active (hard) and auto-centers it into view (DEFERRED on repaint timing), and the **overflow menu opening** on a real chevron click (DEFERRED on a synthetic miss). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing — the same honest-deferral for synthetic mouse gestures `chrome` / `sidebar` use. The in-process overflow-onset / edge-fades / attention-badge / ✕-slot-reservation / select-close-rename / centering **real-layout** differentials live in `nice-itests`' `window_strip` cases (a simulated event can't move a real frame; real Taffy layout is deterministic in-process). `Gate::SelfReported`. |
+| `session-lifecycle` | The R13 live session-manager gate (Validation §4). Drives the real per-window `PtyManager` on a real `WindowState` over **real ptys**, headless (no `TerminalView` — every assertion is model + session state, which `route_terminal_event` resolves in full; the two gpui-only side effects the window-exit resolution carries, the deferred-companion spawn on refocus and the every-project-empty terminus, are composed by the live window root, and the scenario is built so the terminus stays `None` and no refocus lands on an unspawned companion). Asserts the six lifecycle behaviours Milestone 2 rests on: **immediate explicit-add spawn** — the `Terminals +` / ⌘T create-and-spawn path and the strip `+` (`add_terminal_to_active_session`) path each fork their pty **synchronously** (Swift `addPane` semantics — an explicit add is never deferred); **Claude spawns now; companion on focus** — the project `+` seam builds the `[Claude, Terminal 1]` shape through the ONE shared constructor, which (R15, this cycle) spawns the Claude window **immediately** (claude-kind windows never lazy-spawn; the window execs the hermetic `NICE_CLAUDE_OVERRIDE` stub the scenario installs) while the companion terminal stays **deferred**, forking its pty on first focus via `ensure_active_window_spawned` (the pre-R15 assertion that this leg spawned *neither* window is deliberately rewritten here); **clean-exit neighbor refocus** — a shell `exit 0` (not held) removes the window and re-points the active window to the slot neighbor through the live `Exited{held:false}` subscription; **last-window dissolve + Terminals-order fallback** — exiting the session's last window dissolves the session and the active-session selection falls back to the first navigable session (the pinned Terminals group's Main session); **held detour** — a `sh -c 'echo FINAL; exit 3'` window exits non-zero, so the `Exited{held:true}` subscription flips it dead-but-mounted (`is_alive == false`, still in the strip) rather than removing it; and **orphan sweep** — `WindowState::teardown` drops every session (SIGHUP→SIGKILL), so no zsh survives (asserted externally by `ps`, the R3 teardown contract). The action-seam rewiring (create-and-spawn / activate / close+dissolve) and the live `cx.subscribe` that feeds `route_terminal_event` from each window's session entity (via `PtyManager::term_window_handle`) are the slice-3 wiring this exercises. Fixture shells poll the grid for a `READY` marker before the driver triggers their exit (never sleep-and-hope, per the ZDOTDIR-blanked-shell rule). Needs **no** Accessibility grant (it drives the manager directly, not via CGEvents). Registered before `multiwindow` (it installs no `WindowRegistry`). `Gate::SelfReported`. |
+| `app-shell` | The R13.5 app-shell composition gate (What-to-build #3). Opens through the **shipped builder** (`crate::app::open_managed_window` / `build_window_root` — the exact path `run` and every ⌘N take, not a hand-rolled root: a scenario mounting its own composition would re-create the blind spot R13.5 closes) and asserts the mounted shell over ONE shared `WindowState`. **The AX anchors are exposed** — an AX-tree walk (`ax_find_titled_role`, the `ax-probe` pattern) finds the sidebar-card root (`nice-sidebar-root`) and the window-strip root (`nice-pane-strip-root`) each as an `AXGroup`; the poll forces a repaint per tick (a `WindowState` notify) because the shipped shell doesn't RAF, keeping AccessKit's lazily-activated tree current. **⌘T adds a visible pill AND switches window content** — a real ⌘T CGEvent (`CGEventPostToPid`, own pid) routes through the shipped keymap to the key window: the toolbar gains one *laid-out* pill, the new window becomes active, and the `WindowHostView` follows the switch and spawns+hosts its pty (proving the slice-2 `cx.notify()` wiring makes a window-scoped chord produce a visible result in the shipped shell). **The strip `+` spawns a real pty whose output renders** — the real toolbar `+` seam adds a terminal window, the window host spawns its login shell, and a marker echoed into that pty renders back in the window's live grid. **Closing the extra window refocuses a neighbor** — the real pill-× close removes the active extra window from the model, the active window refocuses to a surviving neighbor, and the window host re-hosts it (the departed window's view is dissolved from the composition). **⌘B collapses/expands the card** — a real ⌘B CGEvent (the R12 table binds *toggle-sidebar* to `cmd-b`; the plan's "⌘S" for this step predates that table) collapses the card and its intended leading-column width drops 240 → 0 (the M2 collapsed design reserves no leading column; `SidebarShellView::scenario_leading_column_width`, re-derived from the collapse flag — not a laid-out `Bounds` read), a second ⌘B restores it. **Teardown releases every session; the closed window's pty is reaped** — `WindowState::teardown` clears the PtyManager's session map (asserted: every session released), and SIGHUP→SIGKILLs (via `PtyProcess::drop`, which joins the reaper — no zombie) any window whose handle it held the *last* ref to: the closed window, whose cached `TerminalView` the window host already dropped, is reaped here (asserted: `kill(pid, 0)` → ESRCH). The still-*hosted* windows keep a `TerminalView` ref in the mounted `WindowHostView`, so their pty's final reap lands on window close (dropping the shell view tree) — confirmed by the external `ps` sweep, per the R3 teardown contract (reaping a view-hosted window inside the still-open window is not possible; the assertion says so honestly). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make ⌘T / ⌘B no-ops). Registered **before** `multiwindow`: it does not install the `WindowRegistry` close observer (its `build_window_root` only `register`s, via `default_global`), so closing its window never trips the quit-when-empty terminus `multiwindow` — which DOES install it — relies on being last. `Gate::SelfReported`. |
+| `shell-socket` | The R14 shell-injection + control-socket **transport** gate (Validation §4). Spawns real `zsh -il` login shells through the live spawn path (`PtyManager::spawn_window`) with the window's manager env injection active — the synthetic `ZDOTDIR` rc chain (written by the R14 stub writer directly against a temp dir) + per-window `NICE_SOCKET` / `NICE_TAB_ID` / `NICE_PANE_ID` — over a fully sandboxed fixture (fake `$HOME` + marker `.zshrc`, a stub `claude` on `PATH` also exported as `NICE_CLAUDE_OVERRIDE`, a temp `ZDOTDIR`). Asserts **transport only** (never a handler's decision, so it survives R15 replacing the `claude` stub body): **chain-back** — the login shell restores the user `ZDOTDIR` and sources the fixture `~/.zshrc` (polls the grid for `USER_RC_RAN`); **`claude --help` bypass** — the shadow's non-interactive short-circuit runs the stub `claude` (grid shows its argv echo) and sends NO socket message; **`claude` handshake** — a bare `claude` handshakes over `NICE_SOCKET` and the window routing point records a `claude` message carrying the window's exact injected `tabId`/`paneId` + its `cwd`, with a raw-`UnixStream` probe confirming exactly ONE newline-terminated reply line (the `Reply` one-line contract over the wire); **raw `session_update`** — a raw-`UnixStream` `session_update` line surfaces at the routing point parsed + normalized (the headless app-level driver TRANCHE-2-NOTES §1 asks for); **prefill** — a window spawned with `NICE_PREFILL_COMMAND` in its spec env shows the pre-typed command via the stub's `print -z` tail and its side effect never runs (proof nothing executed); **self-heal** — deleting the socket file autonomously rebinds it at the same path (the health `stat()`, shortened here); **teardown** — `WindowState::teardown` unlinks the socket file. Grid-poll readiness with bounded fail-loud timeouts (never sleep-and-hope). Never launches the machine's real `claude`, never writes the real `~` / Application Support. Needs **no** Accessibility grant (raw sockets + pty writes, not CGEvents). Reuses `app::arm_window_control_socket` (the production wiring). Registered **before** `multiwindow` (it installs no `WindowRegistry`). `Gate::SelfReported`. |
+| `claude-lifecycle` | The R15/R16 Claude session lifecycle gate. Drives the WHOLE `claude` flow over the **shipped window** (`open_managed_window` / `build_window_root`, the exact path `run` takes) with a **real control socket**, **real ptys**, and the live `route_terminal_event` subscription lift. `NICE_CLAUDE_OVERRIDE` points `claude` at a stub script (emits a braille-prefixed then a ✳-prefixed OSC title, idling between) — never the machine's real `claude`; `HOME` is sandboxed for the Main window's login shell; every Claude window spawns in a socket-supplied sandbox work dir. Six legs: **(a) socket newtab + T5 status** — a raw-`UnixStream` `claude` with an empty `tabId` replies `newtab`, a fresh Claude session appears with a minted **valid v4** session UUID, its Claude window SPAWNED (the stub runs) and `is_claude_running == true` FROM CREATION, and the stub's braille then (after a line of input) ✳ OSC titles drive the session's sidebar-dot status **Thinking → Waiting** through the shipped subscription; **(b) ≤1-running-Claude refusal** — a second `claude` from that session's real window ids replies `newtab` (Swift's `test_existingClaudeRunning_repliesNewtab`); **(c) in-place promotion** — a terminal window in a non-Terminals project promotes on a `claude`: reply begins `inplace <uuid>` (a valid v4 uuid field 2, an optional R17 settings 3rd field TOLERATED) and the window flips kind→Claude + `is_claude_running` false→true; **(d) worktree split** — `claude -w foo` buckets the new session under the invocation cwd while its `Session.cwd` carries `.claude/worktrees/foo`; **(e) exit routes in the shipped window** — a real `exit` in a live terminal window (added to the Main session so the session survives — no dissolve, no quit-terminus) is removed from the SHIPPED window via the subscription lift (the proof the lift reached shipped code); **(f) session_update rotation (R16)** — a fire-and-forget raw-`UnixStream` `session_update` with `source:"resume"` + a new id + a cwd move materializes a sibling parent session pinned to the OLD id, `is_claude_running == false`, at ROOT (`parent_session_id == None`) with the PRE-rotation cwd, while the originating session re-parents UNDER it (indented — the landed `row_indent` contract) and moves into the post-rotation worktree with the NEW id; a `source:"clear"` update rotates the id in place with NO new session; a cwd-bearing update adopts onto `Session.cwd`; and a `source:"fork"` update carrying a `jobs/<first8>/state.json` entry (the daemon-hosted background `/fork` of Claude Code ≥ 2.1.212, read through the shipped filesystem probe re-rooted at a scratch fixture dir) relayed from a window **no session owns** materializes a nested, deferred child under the session its `forkParentSessionId` names — pinned to the fork's id, titled by the job's `name`, carrying the fork's own worktree cwd — while the addressed session's claude session id and the active session stay untouched (the bug-3 regression pin); and a `source:"resume"` update naming an id that HAS a jobs entry — the daemon waking a COLD background job on `claude attach`, relayed with the stale window id it inherited — mutates nothing at all, neither rotating the addressed session nor materializing a phantom parent (bug 3's second route: the jobs screen runs on EVERY source, not just `"fork"`). Grid/model polls are bounded + fail-loud. Never launches the real `claude`, never writes the real `~` / Application Support. Needs **no** Accessibility grant (raw sockets + pty writes). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `claude-e2e` | The R17 Milestone-3 shipped-surface gate (Validation §4, the tranche-3 close-out owner). Drives the **shipped window** (`open_managed_window` / `build_window_root`) the way a **user** does — typing `claude\n` into real ptys carrying the R14 `claude()` shadow — with R17's **theme sync ON** (the process gate installed via the `set_claude_theme_sync_gate` seam so `open_managed_window`'s provider fill lights up through the SHIPPED path; the Main window forks WITH the shadow via the `set_scenario_shell_inject_config` seam pointing `ZDOTDIR` at fixture stubs). Fully sandboxed: a fake `$HOME` + marker `.zshrc`, a stub `claude` on `PATH` **and** `NICE_CLAUDE_OVERRIDE` (echoes its argv, then braille/✳ OSC titles), a temp `ZDOTDIR`, and the theme/pointer files written against sandbox paths — never the real `claude` / `~/.claude` / `~/.nice`. Six legs (bounded fail-loud grid/model polls): **(a) typed newtab + theme sync ON** — `claude\n` in the real Main window handshakes over the socket, the Terminals-group Main session forces `newtab`, a fresh Claude session appears with its stub SPAWNED (`is_claude_running` from creation) and a **valid v4** session UUID, and the window's `--settings` provider resolved to the sandbox pointer (the Main-session newtab spawn runs under `NICE_CLAUDE_OVERRIDE`, so `build_claude_exec_command` suppresses the Nice flags — the wrapper-spliced argv is asserted in leg (c)); **(b) status pulse** — the new Claude window's braille then (after a line of input) ✳ stub OSC titles drive the shipped sidebar-dot status **Thinking → Waiting**; **(c) typed in-place promotion through the real zsh wrapper** — a live terminal window in a non-Terminals project, typing `claude\n`: the reply is `inplace <uuid> <ptr>` (theme sync ON) and the grid shows the stub `exec`'d with `--settings <ptr> --session-id <uuid>` argv (whitespace-insensitively, since the long argv hard-wraps) while the model flips kind→Claude + `is_claude_running` true; **(d) rotation on the shipped sidebar** — a raw-socket `session_update` `source:"resume"` + new id materializes the branch parent at ROOT (`parent_session_id == None`) with the originating session re-parented + indented beneath it (root promotion), then a `source:"clear"` rotates the id in place with NO new session; **(e) theme + pointer files present** — the theme file at the `nice` slug carries `"_niceManaged": true` and the pointer file holds the exact `{"theme":"custom:nice"}` bytes; **(f) gate-OFF parity** — with the gate flipped OFF and the window provider re-filled, a fresh typed promotion is settings-less (the wrapper `exec`s the stub with `--session-id <uuid>` and NO `--settings` — byte-identical to the pre-theming protocol). Teardown reaps every session and resets the scenario `ShellInjectConfig`. Needs **no** Accessibility grant (pty writes + raw sockets, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `persistence-restore` | The R18 session persistence + restore gate (Validation §3). Drives the **shipped window** path with a **temp session store** (injected via `NICE_APPLICATION_SUPPORT_ROOT`) seeded with a hand-authored v3-shaped `sessions.json` (a Claude session with a deliberately stale cwd + a planted fake `~/.claude/projects` bucket/transcript, a terminal session with window cwds, a `parentTabId` pair, a frame, `sidebarCollapsed: true`), a sandbox `HOME`/`ZDOTDIR`, and a stub `claude` (`NICE_CLAUDE_OVERRIDE` — the real `claude` is never spawned). One `Application::run`; the restore/fan-out fns are called **explicitly** (the shell-socket precedent, no relaunch). The legs: **(a)** restore round-trip on the shipped window (`open_managed_window_with` + `build_window_root`) — the model tree matches the fixture, lineage intact, sidebar collapsed (leading column width 0), the frame applied (read back via `window_screen_frame` within tolerance), the cwd-heal corrected the stale Claude cwd, and a bounded grid-poll shows the pre-typed `claude --resume <sid>` with NOTHING executed; **(b)** a raw-socket mutation + rename polls the store file for the debounced coalesced write; **(c)** the **W5 veto** — with live windows, the REAL close action (`-[NSWindow performClose:]`, the exact action the red traffic-light button's target invokes, routed through the delegate's `windowShouldClose:` gate — NOT the should-close closure directly; the traffic-light frame helper is asserted to locate the close button, but a synthetic CGEvent click does not hit-test to the native button under gpui's full-size-content window, verified on-device) leaves the window OPEN, the modal shows (AX role+label), Cancel is a total no-op (file byte-identical), Confirm closes + the slot disappears; **(d)** re-running the restore fan-out against the same store yields exactly the surviving slot's window (seed id/parts/frame match); **(e)** a unit-level quit cascade (two windows, both snapshots survive + a close after `AppQuitting` is inert — the wipe regression); **(f)** migration — a Swift-shaped fixture ⇒ lossless adopt, `branch` ignored, own file written, source bytes untouched. **Registers the `WindowRegistry` WITHOUT `install`** (quit-when-empty would kill the suite), registered **before** `multiwindow` (the sole installer, last). `Gate::SelfReported`. |
+| `file-browser` | The R19 file-explorer shipped-surface gate (Validation §3). Opens through the **shipped builder** (`open_managed_window` / `build_window_root`) with the active session rooted at a temp fixture tree, and drives the sidebar's files mode: a real **⌘⇧B** CGEvent swaps the session list for the tree (the AX root `nice-file-browser-root` surfaces as an `AXGroup` — poll forces a repaint per tick, the shipped shell doesn't RAF — and a fixture row is model-read-corroborated as rendered); **single-click expand/collapse** of a fixture dir; **double-click a folder re-roots** the tree (model `root_path`); **double-click a file** records **exactly one** `open` on the recording `WorkspaceOps` fake and **nothing is launched** (the fake's log is the only evidence); **right-click menus** — a file shows Open / Open With ▸ / Reveal in Finder / Copy Path, a folder OMITS Open + Open With (the pinned rule), and the **Open With ▸ second stage** lists the fake's apps **default-first** (`Zed (default)`, then alphabetized, then `Other…`); the **live kqueue watcher** surfaces a file created in an expanded dir as a new row within a bounded fail-loud poll (create → 120 ms debounce → wake → foreground drain → re-render — NO forced notify, so only a watcher-driven render can pass); the **sort-direction toggle** reorders rows; the **hidden toggle + a real ⌘⇧. chord** hide then re-show a dotfile (the shipped keymap's files-mode-AND-state-exists double gate); and **⌘⇧B still flips modes**. **R20 legs** (the scenario installs a fresh history over a temp-dir `FakeTrasher` + a recording fake pasteboard — never the production Trash, and never the general pasteboard for the FILE operations; the (d-clip) rename leg is the one exception — it drives the REAL general pasteboard and saves/restores it): **(a)** copy → paste twice into a folder lands `foo.txt` then `foo copy.txt`; **(b)** cut ghosts the rows, paste MOVES the tree, and an external-style pasteboard mutation degrades the cut to a copy (un-ghosts); **(c)** trash (FakeTrasher) → **⌘Z** (the shipped `UndoFileOperation`) restores into a still-collapsed dir → **⌘⇧Z** re-trashes; **(d)** menu-rename with a typed edit + Return commits (basename preselected — asserted via the field model), Esc reverts, and a `/` draft STAYS in edit mode; **(d-word)** with a rename open on a multi-word fixture name (`alpha beta_gamma.txt`), REAL `⌥←` / `⌥→` / `⌥⇧←` / `⌘←` / `⌘→` / `⌘⇧←` CGEvents walk a fixed caret/selection table and `⌥⌫` deletes the previous word (the live half of the Option/Cmd-chord fix — the unit tests pin the mapping, this pins the chords reaching the FOCUSED field; arrows/⌫ are functional keys, posted by keycode with no unicode override, and Esc leaves the file untouched); **(d-drag)** a press at one PAINTED char boundary and a move to another selects that range and typing replaces it — attempted first as a REAL guarded global-HID gesture (DOWN → held DRAG steps → UP behind the mandatory activate + raise + frontmost-at-point preflight; a press that lands but whose `mouseDragged:` never arrives DEFERS LOUDLY, the recorded synthetic-drag limitation) and hard-asserted either way through the production hit-test + `extend_to` over the geometry the field painted; **(d-clip)** with a rename open on `clipme.txt`, REAL `⌘A` / `⌘C` / `⌘V` CGEvents round-trip the field text through the REAL system clipboard (⌘A ⌘C copies the name out; ⌘V back over the still-selected field must leave the text IDENTICAL, so a dropped or doubled character shows up immediately; a bare `c` then types at the caret the paste left), and a driver-seeded MULTI-LINE clipboard pastes as ONE sanitized line — the live half of the ⌘C/⌘X/⌘V fix (the grant-free half, which carries the same wiring claim on any host, is `crates/nice-itests/tests/behavior_rename_clipboard.rs`); the leg saves and RESTORES whatever the clipboard held before it ran, and Esc leaves the file untouched; **(e)** an in-tree drag of a multi-selection onto a folder row MOVES both (the `can_drop` hover-highlight predicate asserted); **(e′)** with TWO fixture files selected (`multi1.txt` + `multi2.txt`), a REAL guarded global-HID left **press** on one of the selected rows must NOT collapse the selection (the bug collapsed at mouse-DOWN, so the armed drag payload was a single path) and a REAL **release in place** must then collapse it to that row alone — Finder's select-then-drag contract; the full real drag onto the `multidrag/` folder row (press → held moves → release) is ATTEMPTED and **DEFERS LOUDLY** when it does not arm (macOS establishes no implicit mouse grab for a synthetic press, so `mouseDragged:` never arrives and gpui's `on_drag`/`on_drop` never fire — the same recorded limitation as (d-drag)), while a drag that DOES arm and commits the wrong outcome hard-FAILs; the non-deferrable "the whole selection travels" gate stays on (e)'s `drive_drag_drop` seam plus the in-process `view.rs` tests; **(f)** deleting an undo target then ⌘Z shows the frozen drift banner and drops the op. **§6 final-composition leg (the Milestone-5 claim, Validation step 6):** in files mode, click-select two rows and context-menu **Copy → Paste** into a folder (recorded on the fake pasteboard + applied on disk); **slow-second-click rename** a row and commit; a **⌘N** CGEvent opens a SECOND real window B (the `multiwindow` precedent — this scenario now also installs the `NewWindow` command, its `build_window_root` still only `register`s so B never trips quit-when-empty); a **⌘Z** CGEvent posted to window B undoes window A's op AND the focus route brings window A frontmost (`active_window == A`) with its sidebar back in **Files** mode and the **origin session** selected; window B is then programmatically closed. This is the only leg driving two real windows + the production focus-follow closure (installed here over the registry-registered windows). Hermetic: fixture under a temp dir, the recording fakes (`WorkspaceOps` + `FakeTrasher` + fake pasteboard) — no real app launch / Finder reveal / Launch-Services query / real Trash / general pasteboard for the FILE operations — (d-clip) deliberately uses the real general pasteboard, saved and restored (and left holding the leg's own copy when the clipboard had no text to begin with). Preflights `AXIsProcessTrusted()` and FAILs loudly on a missing grant. Under `NICE_CAPTURE` it also writes two MID-run frames of the OPEN rename field — `…-rename-caret.png` (the caret parked at the end of `beta_gamma`, from (d-word)) and `…-rename-selection.png` (the dragged selection highlight, from (d-drag)) — since the driver's own capture happens after teardown, when no field exists; both rows are on screen, and a requested capture that fails is a scenario failure. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `close-confirmation` | The R20.5 busy-window close-confirmation gate (Validation §3). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with a real ZDOTDIR-blanked terminal shell over one `Application::run`; a stub `claude` on `NICE_CLAUDE_OVERRIDE` (never the real `claude`), a sandbox `HOME`/`ZDOTDIR`. The three legs: **(a) idle close is immediate** — with the shell idle at a prompt, closing the active window's pill ✕ closes it with **no modal** (`pending_modal().is_none()`); **(b) busy shell is gated** — the shell is given a real foreground child (a `sleep`), polled to `has_foreground_child()` true (the ONLY leg exercising the true `tcgetpgrp != child_pid` syscall, against a hermetic stub child), then a pill-✕ close **vetoes** (window/session stays, `pending_modal().is_some()`, the modal's `Force quit` button is a live AX node — `ax_find_titled_role` → `AXButton`); **Cancel** (`ConfirmationModal::resolve(.., false)`) closes nothing, then a second pill-✕ close + **Confirm** (`resolve(.., true)`) force-quits the busy window (reaping the `sleep`); **(c) `.tabs` partial-cancel** (D5) — a batch of one idle + one busy session (the busy session marked through the `synthetic_foreground_child` seam) drives `request_close_sessions`, and on **Cancel** the idle member is already gone while the busy survivor REMAINS (NOT a total no-op). **The pill-✕ gesture** asserts the ✕ is a real, on-screen, locatable target and then drives the EXACT pill-✕ handler (`WindowToolbarView::close_term_window` → the gate) rather than a synthetic CGEvent coordinate click: under the shipped **full-size-content** window a `CGEventPostToPid` mouse click does not hit-test to gpui content (re-verified on-device — a body-centre click did not select the window; the same limitation `persistence-restore` hit for the traffic light, which drove `-[NSWindow performClose:]`). The modal is always answered via `ConfirmationModal::resolve`. Preflights `AXIsProcessTrusted()` (for the leg-(b) AX button probe) and FAILs loudly on a missing grant. Registered **before** `multiwindow`: `open_managed_window` only `register`s the `WindowRegistry` (no quit-when-empty close observer), and the driver keeps the Main session populated so no close empties the window. `Gate::SelfReported`. |
+| `theme-fanout` | The R21 live theme-system gate (Validation §4). Drives the **shipped window** (`open_managed_window` / `build_window_root`) with the live theme globals installed — a `ThemeSettingsStore` at a **temp** `ui_settings.json`, the `TerminalThemeCatalog` over a sandbox `terminal-themes/` dir (R22), a scenario-minted `SharedThemeState`, and an **injected `OsSchemeSource` stub** over a flippable cell (`run_selftest` mints none of these). Sandbox `HOME` (held for the whole driver so the R17-live Claude writes land under `<home>/.claude`), a blanked `ZDOTDIR` rc chain for the Main window's shell, a `NICE_CLAUDE_OVERRIDE` stub — never the real `~/.claude` / `~/.nice` / system appearance. Legs (bounded fail-loud state polls): **(a/d) OS-sync scheme flip fans BOTH halves** — with `sync_with_os` ON, flipping the OS stub + `reconcile_with_os` flips `scheme`; the active chrome `Slots` change, the Main window's `TerminalView` swaps its render theme, AND a **pixel sample on the live terminal recolors** (`nice_harness::capture::sample_window_pixels`, max channel delta > 8/255) — proving chrome + terminal across the window; with sync OFF, driving the stub is a no-op; **(d) manual contradiction** — re-enabling sync pins the scheme to the OS, then a manual `apply_scheme` to the other scheme turns `sync_with_os` off (`userPicked`); **(b) accent** — `apply_accent` pushes a new accent into the window (the cursor-None caret color); **(c) terminal-id latency** — an INACTIVE-scheme `apply_terminal_theme_id` does NOT recolor the window (persisted, latent) and the next scheme flip makes that slot active (leg (c) sets `nice-default-dark`, whose payload matches the scheme's Nice default, so the latency check stays a clean no-op; leg (f) exercises a distinct-theme active recolor now that R22's catalog resolves real themes); **(e) R17-live** — with the gate ON a theme change rewrites the sandbox `nice.json` colors file (byte-diff via the landed only-if-changed writer) and `apply_sync_claude_theme` re-sources every window's `--settings` provider (asserted through `claude_settings_path_provider`); **(f) R22 Ghostty import** — a fixture `.ghostty` written under the sandbox `terminal-themes/` dir is `import_theme`d through the Global catalog (parse → persist verbatim as `<slug>.ghostty` → enter the imported list → resolve by id), then `apply_terminal_theme_id` (R21) makes it live for the active scheme and the live terminal window recolors to the imported background (render theme swap + pixel sample > 8/255) — parse → persist → catalog → resolve → fan-out end to end; **(g) restyle-popup reentrancy** — a `Blurred`/30 transparency `commit_appearance` driven FROM INSIDE a window update (reproducing the migration "Try the new look" confirm callback, which runs while its host window is mid-update) still reaches the window: the instrumented `transparency_fanout_applied` push generation advances to `Blurred`/30 via the DEFERRED `apply_window_transparency_fanout` instead of being dropped by gpui's reentrant-`update_window` guard (the pre-fix bug left the window opaque until relaunch). Needs **no** Accessibility grant (drives the store `apply_*` API + pixel readback, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `settings-window` | The R23 Settings-window gate (Validation §2–§3). Drives the ⌘, Settings window over a minimal host window in ONE `Application::run` (the open/apply fns driven explicitly, no relaunch), fully sandboxed: a `run_selftest` defaults+temp `SettingsPrefsStore` / theme store / catalog, a scenario-minted `SharedThemeState` + injected `OsSchemeSource` stub, and the `RecordingFilePicker` (no real `NSOpenPanel`). Legs: **(a) ⌘, singleton** — the first `OpenSettings` opens exactly one settings window (a fresh handle, `App::windows()`+1, the `SettingsWindow` Global `Some`), a second focuses the SAME window (no second window, handle unchanged), close clears the Global; **(b) live Appearance fan-out** — `apply_accent` flips the resolved `ThemeState` the chrome paints from (the composed real-window pixel assert is R24's, per the Validation split); **(c) Font slider fan-out + persist** — the Font pane's terminal-size handler changes the shared `FontSettings` px + re-metrics, a subsequent ⌘= (`zoom_by`) continues from the slider value on the SAME entity (no desync), and the `fonts` section on the temp `ui_settings.json` reflects the change; **(d) Import through the fake picker** — a scripted temp `.ghostty` imports through the `FilePickerOps` seam into `imported_entries()`/`themes(for:)`, a malformed fixture surfaces the exact mapped §ImportError string; **(e) rail** — `settings_rail_sections()` exposes the six slugs incl. the `shortcuts` row (the R24 pane); **(s1–s3) the R24 recorder** — over a dedicated host window rendering the shipped `shortcuts_pane` body (R23's live-window active-pane state is private, so this renders the identical pane): s1 enters recording on `newTerminalPane` and a REAL ⌘Y chord (`post_key_tap`, own pid) rebinds it, s2 captures ⌘B (ToggleSidebar's default) → the "Already used by <label>" conflict + Replace clears the loser and binds this action, s3 Reset restores the default and `is_at_default` flips; a `SavedInputSource` is held across the leg (IME restore) and `AXIsProcessTrusted()` is preflighted (a dropped chord fails loudly). **(§6) the tranche-5 final composition (Milestone 6)** — over the **REAL registered launch window** (`open_managed_window` / `build_window_root`, NOT a host; the §6 leg opens + reaps its own shipped window over a hermetic ZDOTDIR/HOME/`NICE_CLAUDE_OVERRIDE` fixture, its `build_window_root` only `register`s so it never trips quit-when-empty), by CGEvent to nice's own pid: **(6a)** a rebound chord dispatches — `set_binding(newTerminalPane → ⌘Y)` then a real ⌘Y adds a window to the shipped window's `WindowState` and the old default ⌘T no longer does (`rebuild_keymap` dropped it); **(6b)** the PROTECTED non-rebindable set (⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@SidebarShell, ⌘,) survives the total clear — a `key_bindings()` presence audit (the `keymap` re-install probe, on the live board); **(6c)** a real ⌘, opens R23's settings window (the `OpenSettings` non-rebindable firing LIVE, `App::windows()`+1), then a live theme change (`apply_accent` + `apply_scheme`) repaints the shipped **chrome** AND a **terminal cell** (`sample_window_pixels`, max channel delta > 8/255 on both — the composed pixel assert the R23 `settings-window` leg (b) deferred to R24; the stub selftest catalog makes `apply_terminal_theme_id` a latent no-op, so the terminal recolor comes from the scheme flip, as `theme-fanout` proves); **(6d)** a busy window (marked through the `synthetic_foreground_child` seam — the true `tcgetpgrp` is `close-confirmation`'s) close presents R20.5's `ConfirmationModal` (`pending_modal()` + the `CONFIRM_ACCEPT_ID` AXButton), cancelled. The launch window is reaped (`WindowState::teardown`) + the rebind reset at teardown so nothing leaks to `multiwindow`. This composed board is the Milestone-6 claim; no earlier cycle asserted it together. The settings window is UNREGISTERED (D7), and the scenario installs no `WindowRegistry` close observer. The s1–s3 + §6 legs need the Accessibility grant (real CGEvents); a–e do not. Registered **before** `multiwindow`. `Gate::SelfReported`. |
+| `handoff` | The R26 handoff gate (Validation §3). Drives the **shipped window** (`open_managed_window` / `build_window_root`) over a **real control socket** + **real ptys**, fully sandboxed: scratch `skills_root` / `helper_dir` under a temp root (auto-removed), a temp `HOME` / blanked `ZDOTDIR`, and a stub `claude` that records its full argv — seeded via the `ResolvedClaudePath` Global (`NICE_CLAUDE_OVERRIDE` UNSET, so `is_override` stays false and the Nice-injected flags emit for the argv legs to assert), never the machine's real `claude` / real `~/.claude` / `~/.nice`. Legs: **(a) installer round-trip (hermetic, injected dirs)** — `sync_with(true, skills_root, helper_dir)` lands both files (helper at 0o755), a re-run leaves mtimes stable (idempotent), and `sync_with(false, …)` removes the `nice-handoff/` skill subtree + the helper FILE while `helper_dir` SURVIVES (a planted R16 `nice-claude-hook.sh` sibling proven untouched — the `~/.nice/` ownership asymmetry); **(b) handoff socket → nested session, opened in the BACKGROUND** — a raw `handoff` JSON line naming an originating claude session's `tabId`/`paneId` plus a custom `instructions`/`model`/`effort` replies `ok`, a NEW session appears nested one indent under the originating session (`parent_session_id` → the originating id) with the LOCKED title `[HANDOFF] <originating title>` + `title_manually_set == true`, the ORIGINATING session is still `active_session_id()` (D7 — a handoff never steals focus) while the unselected child's Claude window is nonetheless `is_claude_running` (its pty is owned by the session entity, not the view, so a never-rendered session's Claude really runs), and the stub's recorded argv carries `--session-id <v4 uuid>` then `--model <m> --effort <e>` then the prompt `Read the handoff notes at <handoffFile>. <instructions>` as the FINAL positional; **(c) top-level fallback on a miss** — a `handoff` with an empty `tabId` still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` session (`parent_session_id == None`), proving a miss is a fallback, not a drop, and it too leaves the originating session active (D7 holds on the fallback path); **(d) empty model/effort omit their flags** — `model:""` / `effort:""` records argv carrying NEITHER `--model` NOR `--effort`, the prompt still last. The first-launch prompt is NOT exercised here (it does not fire under `run_selftest` by construction; its gate + copy are covered by the `should_offer_handoff_prompt` unit test + the verbatim plan copy). Needs **no** Accessibility grant (raw sockets + pty writes, not CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `dispatch` | The dispatch-to-a-worktree gate — the `/nice-dispatch` twin of `handoff`. Drives the **shipped window** (`open_managed_window` / `build_window_root`) over a **real control socket** + **real ptys**, sandboxed the same way (scratch `skills_root` / `helper_dir` + a `git init`-ed scratch repo under an auto-removed temp root, a temp `HOME`, and the argv-recording stub `claude` seeded via the `ResolvedClaudePath` Global with `NICE_CLAUDE_OVERRIDE` UNSET) — never the machine's real `claude` / `~/.claude` / `~/.nice`, and never a real repository. Legs: **(a) raw-socket dispatch → nested session, opened in the BACKGROUND** — a raw `dispatch` JSON line naming the seeded dispatcher session's `tabId`/`paneId` replies `ok`, a NEW session appears nested one indent under it with the LOCKED title `[DISPATCH] <worktree name>` + `title_manually_set == true`, the DISPATCHER session is still `active_session_id()` (a dispatch never steals focus) while the unselected child's Claude window is nonetheless `is_claude_running`, the session's `cwd` is the **PAYLOAD** cwd (the dispatcher's own cwd is deliberately different — dispatch's one divergence from handoff), and the stub's recorded argv carries `--session-id <v4 uuid>` then `--add-dir <dirname(taskFile)>` **immediately** followed by `--worktree <name>` (the single-token option that terminates `--add-dir`'s variadic list before it can swallow the prompt) then `--model <m> --effort <e>` then the prompt as the FINAL positional; **(b) the REAL installed helper, end to end** — `sync_with(true, …)` lays the pair into the injected dirs and THAT installed `nice-dispatch.sh` is executed as a real subprocess from a SUBDIRECTORY of the scratch repo (polled for exit, never blocked on — it waits on the window's own socket reply), exits 0 reporting the session is opening, and the session it produces carries the repo ROOT as its cwd rather than the helper's `$PWD` (the `git rev-parse --path-format=absolute --git-common-dir` main-root resolution, proven for real) with an argv omitting BOTH `--model` and `--effort` (a `CLAUDE_EFFORT` is exported into the helper's environment precisely so a re-added inheritance fallback would fail this leg) and the prompt still directly after `--worktree`. What it deliberately does NOT prove: that the real Claude CLI parses that launch line, or that `claude --worktree` creates a worktree — the stub only records argv; that is the post-merge interactive feel-check. Needs **no** Accessibility grant (raw sockets, a subprocess, and pty writes — no CGEvents). Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `update-check` | The R27 update-checker gate (Validation §4). Mounts the real `WindowToolbarView` over a seeded session and drives the WHOLE release-check nudge through the **injected** `RecordingReleaseFetcher` (installed process-wide by `run_selftest`) — never the real network / `github.com`, and never the launch timer (the worker is `run`-only + gated). **Success leg:** script the fetcher to a newer tag (`v9.9.9`), drive the foreground `check_now`, and assert `update_available` flips to `Some("v9.9.9")`; the trailing pill then renders — proven BOTH deterministically (the render gate) AND on the **real AX tree** (an `AXButton` titled `Update available`, polled while forcing a repaint per tick, the `ax-probe`/`app-shell` pattern). A **real guarded-HID click** on the pill (behind the mandatory preflight: activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point via `platform::frontmost_window_owns_point`) opens the popover — hard-asserted when the preflight passes, else **DEFERRED LOUDLY** (never a blind `CGEventPost` — the pid-only invariant's carve-out safety). The popover's contents (`brew update` then `brew upgrade --cask nice`, a Copy per row) and one Copy → clipboard write are asserted **in-process** (so a DEFERRED real click never weakens the content coverage — the `pane-strip` in-process-pins-content precedent). **Error leg:** reset the checker to a clean state, script a fetch ERROR, drive `check_now`, and assert `update_available` STAYS false and NO pill renders (the silent-error + layout-stability contract). No chord is typed (no `SavedInputSource` needed); the only synthetic input is the one guarded global-HID click, fenced by its preflight, and it preflights `AXIsProcessTrusted()`. Registered **before** `multiwindow` (it installs no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `tranche6-composition` | The R27 §6 **tranche-6 close-out** composition gate (Validation §6). Composes the whole tranche's board on the **REAL shipped launch window** (`open_managed_window` / `build_window_root` → `AppShellView`, the exact path `run` takes — never a scenario-only toolbar), sandboxed: a temp `HOME` (no rc) + a stub `claude` idling via the `ResolvedClaudePath` Global (`NICE_CLAUDE_OVERRIDE` UNSET), and the `run_selftest`-installed `RecordingReleaseFetcher` (never the real network / `github.com`). A `SavedInputSource` is held for the leg. Legs: **(a) R27 update pill** — script the fetcher to `v9.9.9`, drive the foreground `check_now` on the shipped window → the trailing pill appears on the SHIPPED toolbar (AX `AXButton` titled `Update available`), and a **real guarded global-HID click** (behind the mandatory activate + raise + `CGWindowListCopyWindowInfo` frontmost-at-point preflight) opens its popover showing `brew update` + `brew upgrade --cask nice` (hard when the preflight passes; else DEFERRED, with the popover contents still asserted in-process); **(b) R25 pill reorder** — with ≥2 windows, a **real guarded global-HID drag** of the trailing pill left past the leader's midpoint commits a reorder read back off the shipped strip (`term_window_ids()` flips), hard-asserted only on a demonstrably-landed press (else DEFERRED — the `pane-strip` honest-deferral); **(c) R26 handoff** — a raw-`UnixStream` `handoff` naming a seeded originating Claude session replies `ok` and opens a nested `[HANDOFF] my-project` session on the shipped window (LOCKED title, parented under the originating session, spawning the stub claude), and a real ⌘, (`CGEventPostToPid`) opens R23's shipped settings window whose rail exposes the **Claude section** (`AXButton` titled `Claude`) — the home of R26's `settings.claude.installHandoffSkill` toggle (whose click behaviour is pinned by R26's `claude_pane` unit test + the `handoff` installer scenario). The R25 drag + R27 click post via the new `platform::post_global_left_{down,drag,up}` / `post_global_left_click` seams (SELFTEST-ONLY carve-out — the ONLY global `CGEventPost` call sites, guarded by the preflight; a failed preflight DEFERS LOUDLY, never a blind post); ⌘, stays `CGEventPostToPid`. Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing. Registered **before** `multiwindow` (its `build_window_root` only `register`s — no `WindowRegistry` close observer). `Gate::SelfReported`. |
+| `multiwindow` | The R12 live multi-window + shortcut-dispatch gate (Validation §2–§5). Drives the shipped `WindowRegistry` / `WindowState` / `keymap` on **real `NSWindow`s** with **real CGEvents** to nice's own pid. Opens window A as a capture-tee managed window (the `input-live` pattern) registered in the process-wide registry, then asserts: **⌘N** opens a second, isolated, registry-tracked window (the registry count **and** `App::windows()` both step 1 → 2); **⌘T** posted while window B is key adds a window to B's `WindowState` model only, leaving A's model signature unchanged (isolation + focused-window routing through `active_state`); **⌘=** grows the one process-level `FontSettings` every window observes (the font fan-out) and leaks **zero** bytes into A's capture-tee pty; the **pass-through differential** — a plain `x` reaches the pty as `x`, while **⌘⌥↓** cycles the sidebar and leaks **zero** capture bytes (a matched chord is consumed, an unmatched key falls through byte-identically); **live peek** — with A's sidebar collapsed, ⌘⌥↓ floats the peek and a modifiers-release clears it via the window-level `on_modifiers_changed` observer; and **close/deregister/fallback** — closing B deregisters it (registry + `NSWindow` count drop) and a window-scoped action then falls back to the surviving window A. Matching is **character-based** at the gpui pin (the documented divergence from Swift's physical-keycode match — see the `keymap` module notes). Preflights `AXIsProcessTrusted()` and FAILs loudly if the grant is missing (a dropped CGEvent would make every chord a no-op). The per-pid flagsChanged the peek-clear needs is not synthesizable via `CGEventPostToPid`, so the modifier release is driven as a real `ModifiersChangedEvent` through GPUI's own dispatch (the same `on_modifiers_changed` path). The in-process isolation / routing / all-13-fire / peek **differentials** live in `nice-itests`' `multiwindow` cases. Registered **last** in `selftest_scenarios` (it installs the registry whose close observer quits when the registry empties). `Gate::SelfReported`. |
 
 **Tranche-3 close-out (Milestone 3).** `claude-e2e` is the standing Milestone-3
-regression: with it green, "typing `claude` anywhere opens/promotes tabs; statuses
+regression: with it green, "typing `claude` anywhere opens/promotes sessions; statuses
 pulse; `/clear`/`/branch` tracked — Claude parity minus restore" holds on the
 **shipped surface**, and Milestone 3 is ready for a feel-check. R17 is the tranche's
 final-composition owner (TRANCHE-2-NOTES §6): `NICE_SELFTEST=all` runs the ONE
@@ -2140,7 +2141,7 @@ rename with basename preselection + validators + the two async confirmation moda
 (F8), and in-tree drag & drop (F9). The `file-browser` scenario is the standing
 Milestone-5 regression (its R20 legs above); its **§6 shipped-surface composition
 leg** — two REAL windows, a CGEvent-driven ⌘Z in window B undoing window A's op with
-focus routed back (active + Files + origin tab), over the production focus-follow
+focus routed back (active + Files + origin session), over the production focus-follow
 closure (`file_browser::focus_route`) — asserts the claim on the shipped surface
 (TRANCHE-2-NOTES §6). The tranche's ONE full sweep (`cargo test --workspace` AND
 `NICE_SELFTEST=all`, release + selftest, strictly serial, `multiwindow` last)
@@ -2154,13 +2155,13 @@ in-app target cue is the destination-row highlight); a plain row click parks foc
 takes first responder) so **Return** can begin rename; slow-second-click rename is
 files-only (a folder's slow second click stays expand/collapse, preserving R19's
 contract — folders rename via the menu / Return); R19's two-stage Open With ▸ instead
-of a native hover submenu; and the busy-pane close-confirmation deferral is now
+of a native hover submenu; and the busy-window close-confirmation deferral is now
 roadmap row **R20.5**. Two **manual feel-check** items no automated test covers (the
 hermeticity rule forbids the real Trash / general pasteboard): a real Finder
 copy/paste round-trip and a real-Trash trash+undo.
 
 **Tranche-5 close-out (Milestone 6) — full preferences parity, minus the Editors
-pane.** R20.5→R21→R22→R23→**R24** land Milestone 6: the busy-pane close
+window.** R20.5→R21→R22→R23→**R24** land Milestone 6: the busy-window close
 confirmation (R20.5), the live theme system + per-scheme palettes/accent + Claude
 mirror (R21), the terminal-theme catalog + Ghostty import (R22), the Settings window
 + Appearance/Font/Claude/Advanced/About panes + persistence (R23), and rebindable
@@ -2169,7 +2170,7 @@ recorder field, and per-action Reset (R24). The `settings-window` scenario is th
 standing Milestone-6 regression; its **§6 final-composition leg** — over the REAL
 registered launch window: a rebound chord dispatches, the non-rebindable set
 survives the rebuild, ⌘, opens Settings + a live theme change repaints shipped
-chrome AND a terminal cell (pixel-level), and a busy pane close presents R20.5's
+chrome AND a terminal cell (pixel-level), and a busy window close presents R20.5's
 confirmation — asserts the composed board on the shipped surface (TRANCHE-2-NOTES
 §6). **R24 owns the tranche's ONE full regression sweep** (`cargo test --workspace`
 AND `NICE_SELFTEST=all`, release + `selftest`, strictly serial, `multiwindow`

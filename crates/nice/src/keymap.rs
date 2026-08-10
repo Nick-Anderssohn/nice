@@ -24,7 +24,7 @@
 //! **app-level** [`cx.on_action`](gpui::App::on_action) handlers that touch only
 //! the process-level [`FontSettings`] (or, for undo/redo, the future shared
 //! history) and never look a window up. The **window-scoped** actions (sidebar
-//! toggles, the tab-cycle, pane stepping, the new-pane path) route through
+//! toggles, the session-cycle, window stepping, the new-window path) route through
 //! [`WindowRegistry::active_state`] — the key window, else the most-recently
 //! keyed, else the first registered — exactly Swift's
 //! `registry.activeAppState(preferKey: true)`.
@@ -76,11 +76,11 @@ use crate::window_state::WindowState;
 gpui::actions!(
     nice,
     [
-        NextSidebarTab,
-        PrevSidebarTab,
-        NextPane,
-        PrevPane,
-        NewTerminalPane,
+        NextSidebarSession,
+        PrevSidebarSession,
+        NextWindow,
+        PrevWindow,
+        NewTerminalWindow,
         ToggleSidebar,
         ToggleSidebarMode,
         ToggleHiddenFiles,
@@ -132,7 +132,7 @@ pub(crate) fn try_shared_font_settings(cx: &App) -> Option<Entity<FontSettings>>
 ///
 /// 1. hoist [`FontSettings`] to one process-level entity (the font fan-out);
 /// 2. register every action's handler (app-level font/undo/redo; window-scoped
-///    sidebar/pane actions through [`WindowRegistry::active_state`]);
+///    sidebar/window actions through [`WindowRegistry::active_state`]);
 /// 3. bind all 14 default combos from the table, plus ⌃⌘F full screen, with
 ///    `use_key_equivalents` semantics.
 ///
@@ -329,32 +329,32 @@ fn register_app_level_actions(cx: &mut App) {
 /// resolved through [`WindowRegistry::active_state`] (key window → most-recently
 /// keyed → first). Matches Swift's window-scoped `dispatch(action, on: appState)`.
 fn register_window_scoped_actions(cx: &mut App) {
-    cx.on_action(|_: &NextSidebarTab, cx: &mut App| {
+    cx.on_action(|_: &NextSidebarSession, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
-            s.model.select_next_sidebar_tab();
-            // Re-sync the selection to the new active tab (Swift's active-tab
+            s.workspace.select_next_sidebar_session();
+            // Re-sync the selection to the new active session (Swift's active-session
             // observer) — else the prior-active row lingers as a dim highlight.
-            s.sync_selection_to_active_tab();
+            s.sync_selection_to_active_session();
             trigger_peek_if_collapsed(s);
         });
     });
-    cx.on_action(|_: &PrevSidebarTab, cx: &mut App| {
+    cx.on_action(|_: &PrevSidebarSession, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
-            s.model.select_prev_sidebar_tab();
-            s.sync_selection_to_active_tab();
+            s.workspace.select_prev_sidebar_session();
+            s.sync_selection_to_active_session();
             trigger_peek_if_collapsed(s);
         });
     });
-    cx.on_action(|_: &NextPane, cx: &mut App| {
-        with_active_state(cx, |s, _cx| s.pane_strip_actions.select_next_pane(&mut s.model));
+    cx.on_action(|_: &NextWindow, cx: &mut App| {
+        with_active_state(cx, |s, _cx| s.window_strip_actions.select_next_window(&mut s.workspace));
     });
-    cx.on_action(|_: &PrevPane, cx: &mut App| {
-        with_active_state(cx, |s, _cx| s.pane_strip_actions.select_prev_pane(&mut s.model));
+    cx.on_action(|_: &PrevWindow, cx: &mut App| {
+        with_active_state(cx, |s, _cx| s.window_strip_actions.select_prev_window(&mut s.workspace));
     });
-    cx.on_action(|_: &NewTerminalPane, cx: &mut App| {
+    cx.on_action(|_: &NewTerminalWindow, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
-            if let Some(active) = s.model.active_tab_id().map(str::to_owned) {
-                s.pane_strip_actions.add_terminal_pane(&mut s.model, &active);
+            if let Some(active) = s.workspace.active_session_id().map(str::to_owned) {
+                s.window_strip_actions.add_terminal_window(&mut s.workspace, &active);
             }
         });
     });
@@ -374,31 +374,31 @@ fn register_window_scoped_actions(cx: &mut App) {
     cx.on_action(|_: &CommandCompose, cx: &mut App| {
         // Command Compose (⌘↩): gate + route in WindowState (the pure
         // `compose_route` core carries the truth table). At an idle zsh prompt
-        // it writes the compose trigger to the active pane's pty; in a busy /
-        // kitty pane it replays the ⌘↩ bytes an unbound chord produced before
+        // it writes the compose trigger to the active window's pty; in a busy /
+        // kitty window it replays the ⌘↩ bytes an unbound chord produced before
         // this feature existed.
         with_active_state(cx, |s, cx| s.dispatch_command_compose(cx));
     });
     cx.on_action(|_: &ToggleHiddenFiles, cx: &mut App| {
         with_active_state(cx, |s, _cx| {
             // R19: the Swift double gate (`appState.toggleFileBrowserHiddenFiles()`)
-            // — flip dotfile visibility for the active tab ONLY when the sidebar is
-            // in files mode AND a browser state already exists for that tab
+            // — flip dotfile visibility for the active session ONLY when the sidebar is
+            // in files mode AND a browser state already exists for that session
             // (`toggle_hidden_files_if_exists` enforces the second gate, allocating
             // nothing when the user never opened the browser). Registered (not
             // silently missing) so ⌘⇧. is consumed rather than leaking to the pty.
             if s.sidebar.mode() != SidebarMode::Files {
                 return;
             }
-            if let Some(tab_id) = s.model.active_tab_id().map(str::to_owned) {
-                s.file_browser.toggle_hidden_files_if_exists(&tab_id);
+            if let Some(session_id) = s.workspace.active_session_id().map(str::to_owned) {
+                s.file_browser.toggle_hidden_files_if_exists(&session_id);
             }
         });
     });
 }
 
-/// After a sidebar-tab cycle on a collapsed sidebar, float the peek overlay so
-/// the user can see which tab they're cycling toward (dossier G6). Cleared on
+/// After a sidebar-session cycle on a collapsed sidebar, float the peek overlay so
+/// the user can see which session they're cycling toward (dossier G6). Cleared on
 /// modifier release by [`on_window_modifiers_changed`].
 fn trigger_peek_if_collapsed(state: &mut WindowState) {
     if state.sidebar.collapsed() {
@@ -414,10 +414,10 @@ fn trigger_peek_if_collapsed(state: &mut WindowState) {
 ///
 /// The trailing `cx.notify()` is what makes the window-scoped shortcuts produce
 /// **visible** results in the shipped shell (R13.5): the shell's
-/// `AppShellView` / `SidebarShellView` / `WindowToolbarView` / `PaneHostView`
+/// `AppShellView` / `SidebarShellView` / `WindowToolbarView` / `WindowHostView`
 /// each observe this `WindowState` entity, so `gpui::Entity::update` — which does
 /// not notify on its own — is followed by an explicit notify. Without it a ⌘T /
-/// ⌘S / pane-step would mutate state that nothing re-renders (the gap this cycle
+/// ⌘S / window-step would mutate state that nothing re-renders (the gap this cycle
 /// closes). Harmless where no view observes the state (e.g. the `multiwindow`
 /// scenario asserts the model directly).
 fn with_active_state(cx: &mut App, f: impl FnOnce(&mut WindowState, &mut Context<WindowState>)) {
@@ -504,11 +504,11 @@ fn shortcut_binding(
     mapper: &dyn PlatformKeyboardMapper,
 ) -> Result<KeyBinding, InvalidKeystrokeError> {
     let boxed: Box<dyn Action> = match action {
-        ShortcutAction::NextSidebarTab => Box::new(NextSidebarTab),
-        ShortcutAction::PrevSidebarTab => Box::new(PrevSidebarTab),
-        ShortcutAction::NextPane => Box::new(NextPane),
-        ShortcutAction::PrevPane => Box::new(PrevPane),
-        ShortcutAction::NewTerminalPane => Box::new(NewTerminalPane),
+        ShortcutAction::NextSidebarSession => Box::new(NextSidebarSession),
+        ShortcutAction::PrevSidebarSession => Box::new(PrevSidebarSession),
+        ShortcutAction::NextWindow => Box::new(NextWindow),
+        ShortcutAction::PrevWindow => Box::new(PrevWindow),
+        ShortcutAction::NewTerminalWindow => Box::new(NewTerminalWindow),
         ShortcutAction::ToggleSidebar => Box::new(ToggleSidebar),
         ShortcutAction::ToggleSidebarMode => Box::new(ToggleSidebarMode),
         ShortcutAction::ToggleHiddenFiles => Box::new(ToggleHiddenFiles),
@@ -540,7 +540,7 @@ fn load_binding<A: Action>(
 
 /// Window-level `on_modifiers_changed` handler (installed by the shipped
 /// window's root view): if the focused window is peeking, end the peek once none
-/// of the sidebar-tab shortcuts' modifiers are held anymore — Swift's
+/// of the sidebar-session shortcuts' modifiers are held anymore — Swift's
 /// `endPeekIfModifiersReleased`. Routes to the focused window's state through
 /// [`WindowRegistry::active_state`], matching the trigger side.
 pub(crate) fn on_window_modifiers_changed(event: &ModifiersChangedEvent, cx: &mut App) {
@@ -560,16 +560,16 @@ pub(crate) fn on_window_modifiers_changed(event: &ModifiersChangedEvent, cx: &mu
     }
 }
 
-/// The union of the two sidebar-tab-cycle shortcuts' modifier sets (⌘⌥ by
+/// The union of the two sidebar-session-cycle shortcuts' modifier sets (⌘⌥ by
 /// default) — the modifiers whose full release ends a peek. Reads the LIVE
 /// bindings (D4): rebinding a sidebar-nav chord to a different modifier set must
 /// re-point the peek at the NEW modifiers, else the overlay watches the wrong keys
 /// (the landed TODO). Falls back to the defaults when no store Global is installed
-/// (a scenario that never seeded it); an unbound sidebar-tab action contributes no
+/// (a scenario that never seeded it); an unbound sidebar-session action contributes no
 /// modifiers.
 fn peek_relevant_modifiers(cx: &App) -> Modifiers {
     let mut relevant = Modifiers::default();
-    for action in [ShortcutAction::NextSidebarTab, ShortcutAction::PrevSidebarTab] {
+    for action in [ShortcutAction::NextSidebarSession, ShortcutAction::PrevSidebarSession] {
         if let Some(m) = live_combo_modifiers(cx, action) {
             relevant.control |= m.control;
             relevant.alt |= m.alt;
@@ -622,7 +622,7 @@ mod tests {
         }
     }
 
-    /// ⌘⌥ — the default sidebar-tab-cycle modifier set the `should_end_peek` tests
+    /// ⌘⌥ — the default sidebar-session-cycle modifier set the `should_end_peek` tests
     /// exercise (equivalent to `peek_relevant_modifiers` with no store installed).
     fn command_alt() -> Modifiers {
         mods(false, true, false, true)
@@ -672,30 +672,30 @@ mod tests {
     }
 
     /// D4 / Validation §2a(e): `peek_relevant_modifiers` reads the LIVE map. With no
-    /// store it falls back to the ⌘⌥ defaults; after rebinding a sidebar-tab chord to
+    /// store it falls back to the ⌘⌥ defaults; after rebinding a sidebar-session chord to
     /// a ⌃⇧ combo the relevant set tracks the NEW modifiers (unioned with the other,
-    /// still-default sidebar-tab combo).
+    /// still-default sidebar-session combo).
     #[gpui::test]
     fn peek_relevant_modifiers_default_then_live(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            // No store yet ⇒ the defaults: both sidebar-tab combos are ⌘⌥.
+            // No store yet ⇒ the defaults: both sidebar-session combos are ⌘⌥.
             let r = peek_relevant_modifiers(cx);
             assert!(r.platform && r.alt, "⌘⌥ hold the peek by default");
             assert!(!r.control && !r.shift, "no other modifier holds the peek by default");
 
             cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("peek-live")));
-            // Rebind NextSidebarTab ⌘⌥↓ -> ⌃⇧↓ (persist + rebuild happen inside).
+            // Rebind NextSidebarSession ⌘⌥↓ -> ⌃⇧↓ (persist + rebuild happen inside).
             ShortcutBindings::set_binding(
                 cx,
-                ShortcutAction::NextSidebarTab,
+                ShortcutAction::NextSidebarSession,
                 OwnedCombo::from_token("ctrl-shift-down"),
             );
 
             let r = peek_relevant_modifiers(cx);
             assert!(r.control, "the rebound ⌃ now holds the peek");
             assert!(r.shift, "the rebound ⇧ now holds the peek");
-            // PrevSidebarTab is still ⌘⌥, so ⌘⌥ remain relevant too (the union).
-            assert!(r.platform && r.alt, "the other sidebar-tab combo keeps ⌘⌥ relevant");
+            // PrevSidebarSession is still ⌘⌥, so ⌘⌥ remain relevant too (the union).
+            assert!(r.platform && r.alt, "the other sidebar-session combo keeps ⌘⌥ relevant");
         });
     }
 
@@ -704,7 +704,7 @@ mod tests {
     /// `set_binding`), EVERY PROTECTED non-rebindable chord (⌃⌘F, ⌘N, ⌘Q, ⌘W,
     /// Esc@SidebarShell, ⌘,) is still present in the keymap — the total
     /// `clear_key_bindings()` must not have dropped them — AND the new live chord is
-    /// bound to `NewTerminalPane` while the old default `cmd-t` is not.
+    /// bound to `NewTerminalWindow` while the old default `cmd-t` is not.
     #[gpui::test]
     fn rebuild_keeps_non_rebindables_and_swaps_live_combo(cx: &mut gpui::TestAppContext) {
         use gpui::Keystroke;
@@ -713,10 +713,10 @@ mod tests {
             cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings(
                 "non-rebindable",
             )));
-            // Rebind NewTerminalPane ⌘T -> ⌘Y; set_binding persists then rebuilds.
+            // Rebind NewTerminalWindow ⌘T -> ⌘Y; set_binding persists then rebuilds.
             ShortcutBindings::set_binding(
                 cx,
-                ShortcutAction::NewTerminalPane,
+                ShortcutAction::NewTerminalWindow,
                 OwnedCombo::from_token("cmd-y"),
             );
 
@@ -742,8 +742,8 @@ mod tests {
             assert!(bound(&crate::settings::window::OpenSettings, "cmd-,"), "⌘, re-installed");
 
             // The rebound live combo is bound; the old default is gone.
-            assert!(bound(&NewTerminalPane, "cmd-y"), "the new ⌘Y drives NewTerminalPane");
-            assert!(!bound(&NewTerminalPane, "cmd-t"), "the old ⌘T no longer drives NewTerminalPane");
+            assert!(bound(&NewTerminalWindow, "cmd-y"), "the new ⌘Y drives NewTerminalWindow");
+            assert!(!bound(&NewTerminalWindow, "cmd-t"), "the old ⌘T no longer drives NewTerminalWindow");
         });
     }
 }

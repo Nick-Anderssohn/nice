@@ -8,7 +8,7 @@
 //! `~/.zshenv` to discover the user's intended `ZDOTDIR`), then — in `.zshrc` —
 //! restore `ZDOTDIR` to that intended value BEFORE sourcing the user's `.zshrc`
 //! and define a `claude()` function that intercepts *interactive* invocations
-//! and forwards them to Nice's control socket so a new tab opens instead of the
+//! and forwards them to Nice's control socket so a new session opens instead of the
 //! shell exec'ing claude in place.
 //!
 //! The "restore `ZDOTDIR` *before sourcing user's .zshrc*" dance is what stops
@@ -22,7 +22,7 @@
 //! anything the user defines.
 //!
 //! Documented limitations (kept as-is, NOT fixed — see the Swift header):
-//!   * `exec zsh` inside a Nice pane drops the injection (the new zsh runs with
+//!   * `exec zsh` inside a Nice window drops the injection (the new zsh runs with
 //!     the user's restored `ZDOTDIR`, not our temp value).
 //!   * `/etc/zshenv` setting `ZDOTDIR` bypasses the injection entirely (zsh
 //!     re-resolves `$ZDOTDIR/.zshenv` from the new value before reading our
@@ -32,7 +32,7 @@
 //! Application Support (`…/<CFBundleName>/zdotdir`) — NOT `$TMPDIR`. macOS's
 //! `com.apple.bsd.dirhelper` sweeps `$TMPDIR` files older than 3 days; when Nice
 //! ran longer than that, the sweep deleted the stubs out from under the live
-//! process and every new pane's zsh then sourced nothing. Application Support is
+//! process and every new window's zsh then sourced nothing. Application Support is
 //! never swept. Because the stub contents are static, one shared directory
 //! serves every window and every process of a variant; each variant stays
 //! isolated in its own per-variant Application Support folder via `CFBundleName`.
@@ -53,7 +53,7 @@
 //! shortcut: the trigger bytes and the `$NICE_COMPOSE_CONF` key names are
 //! app↔shell interchange, pinned the same way.
 //!
-//! The `$NICE_SOCKET` env var the `claude()` function reads, and the per-pane
+//! The `$NICE_SOCKET` env var the `claude()` function reads, and the per-window
 //! `NICE_TAB_ID` / `NICE_PANE_ID` / `NICE_USER_ZDOTDIR` / `NICE_PREFILL_COMMAND`
 //! values, are injected separately (R14 slice 3 / slice 4); these stubs only
 //! reference them. This module owns the stub text, the writer, and the
@@ -65,7 +65,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// The private pty trigger for Command Compose. Nice's `commandCompose` action
-/// handler writes exactly these bytes to the pane's pty (only when the shell
+/// handler writes exactly these bytes to the window's pty (only when the shell
 /// sits at an idle interactive prompt); the `ZSHRC_BODY` widget below binds
 /// exactly this sequence. CSI 5099~ (DECFNK style): no terminal emits
 /// tilde-coded numbers anywhere near 5099 from real keys (the real ones top out
@@ -149,8 +149,8 @@ unset NICE_RESOLVED_USER_ZDOTDIR
 
 # Now shadow `claude` so running it handshakes with Nice over
 # NICE_SOCKET. The socket either tells us to exit (Nice is opening
-# a new tab) or to exec claude in place (Nice is promoting this
-# pane to Claude). Defining the function AFTER user's .zshrc
+# a new session) or to exec claude in place (Nice is promoting this
+# window to Claude). Defining the function AFTER user's .zshrc
 # ensures we win over anything they may have defined themselves —
 # if a user wants to opt out, they can still `unfunction claude`
 # in a precmd hook.
@@ -164,12 +164,12 @@ _nice_json_escape() {
     printf '"%s"' "$s"
 }
 
-# Tell Nice the Claude we ran as a CHILD has returned, so this pane is a
+# Tell Nice the Claude we ran as a CHILD has returned, so this window is a
 # plain shell prompt again. Only the `attach` verb below runs one as a
-# child; every other verb execs, and a pane whose pty exits tells Nice by
-# exiting. Without this Nice's per-pane "a Claude is running here" flag
-# would stay set forever and every later `claude` in this tab would open a
-# NEW tab instead of promoting this pane. Fire-and-forget: Nice closes the
+# child; every other verb execs, and a window whose pty exits tells Nice by
+# exiting. Without this Nice's per-window "a Claude is running here" flag
+# would stay set forever and every later `claude` in this session would open
+# a NEW session instead of promoting this window. Fire-and-forget: Nice closes the
 # connection before handling it, so `nc` returns at once.
 _nice_claude_exited() {
     [[ -z "$NICE_SOCKET" ]] && return 0
@@ -222,12 +222,12 @@ claude() {
     # Send {cwd, args, tabId, paneId} and read a single-line reply.
     # NICE_TAB_ID / NICE_PANE_ID are empty in the Main Terminal —
     # Nice uses empty tabId as the signal for "always open a new
-    # sidebar tab."
-    local cwd_json tab_id_json pane_id_json
+    # sidebar session."
+    local cwd_json session_id_json window_id_json
     cwd_json=$(_nice_json_escape "$PWD")
-    tab_id_json=$(_nice_json_escape "${NICE_TAB_ID:-}")
-    pane_id_json=$(_nice_json_escape "${NICE_PANE_ID:-}")
-    local payload="{\"action\":\"claude\",\"cwd\":${cwd_json},\"args\":${args_json},\"tabId\":${tab_id_json},\"paneId\":${pane_id_json}}"
+    session_id_json=$(_nice_json_escape "${NICE_TAB_ID:-}")
+    window_id_json=$(_nice_json_escape "${NICE_PANE_ID:-}")
+    local payload="{\"action\":\"claude\",\"cwd\":${cwd_json},\"args\":${args_json},\"tabId\":${session_id_json},\"paneId\":${window_id_json}}"
 
     local response
     response=$(printf '%s\n' "$payload" | nc -U "$NICE_SOCKET" -w 2 2>/dev/null)
@@ -243,19 +243,19 @@ claude() {
     #   resume  <uuid> [<settings path>]   (exec-time normalization)
     # The last two carry Nice's decision about whether the named session is
     # still hosted by the Claude daemon — only Nice can tell, and only at this
-    # moment (a deferred pane's pre-typed command may have waited hours).
+    # moment (a deferred window's pre-typed command may have waited hours).
     local mode sid settings
     read -r mode sid settings <<< "$response"
     case "$mode" in
         newtab)
-            # Nice is opening a new sidebar tab; nothing to do here.
+            # Nice is opening a new sidebar session; nothing to do here.
             return 0
             ;;
         inplace)
-            # Nice promoted this pane to Claude. Build the exec line:
+            # Nice promoted this window to Claude. Build the exec line:
             #   --settings <path>  when Nice's theme sync is on (the
             #     3rd reply field), so this in-place Claude matches
-            #     the Nice theme like a from-scratch Nice Claude pane;
+            #     the Nice theme like a from-scratch Nice Claude window;
             #   --session-id <sid> when Nice minted an id so it can
             #     resume later. A sid of "-" (or empty) means the
             #     user's own args (e.g. --resume <uuid>) already
@@ -288,7 +288,7 @@ claude() {
             #
             # A child leaves this shell alive, which is exactly what the CLI
             # promises ("Ctrl+Z drops back to your shell") — so tell Nice the
-            # pane is a prompt again, or its promotion flag stays set forever.
+            # window is a prompt again, or its promotion flag stays set forever.
             local -a post=(--resume "$sid")
             [[ -n "$settings" ]] && post=(--settings "$settings" "${post[@]}")
             if command claude attach "${sid[1,8]}"; then
@@ -338,7 +338,7 @@ chpwd_functions+=(_nice_emit_cwd_osc7)
 _nice_emit_cwd_osc7
 
 # Nice: if the app asked us to pre-type a command at the next
-# prompt (set when a restored Claude tab boots), push it onto zsh's
+# prompt (set when a restored Claude session boots), push it onto zsh's
 # line-editor buffer. The user sees the command typed and ready;
 # nothing runs until they hit Enter.
 if [[ -n "$NICE_PREFILL_COMMAND" ]]; then
@@ -943,15 +943,15 @@ mod tests {
     }
 
     /// A returned attach leaves this shell alive (the CLI's ctrl-z detach drops
-    /// the user back to their prompt), so the wrapper must report the pane back
+    /// the user back to their prompt), so the wrapper must report the window back
     /// to Nice — otherwise its promotion flag stays set and every later `claude`
-    /// in the tab opens a new tab instead of promoting the pane.
+    /// in the session opens a new session instead of promoting the window.
     #[test]
     fn zshrc_reports_a_returned_attach_back_to_nice() {
         let body = zshrc();
         assert!(
             body.contains(r#""{\"action\":\"claude_exited\",\"paneId\":${pane_id_json}}""#),
-            "the notifier must send the claude_exited action with this pane's id"
+            "the notifier must send the claude_exited action with this window's id"
         );
         let arm = body
             .split_once("        attach)")
@@ -994,6 +994,29 @@ mod tests {
         );
     }
 
+    /// Phase R pin: the wrapper's payload interpolates shell locals that the
+    /// `local` line declares AND the two `_nice_json_escape` lines assign. A
+    /// rename that touches one spelling and not the others silently ships an
+    /// empty `tabId`/`paneId`, which reads as "always open a new session".
+    #[test]
+    fn zshrc_payload_locals_are_declared_and_assigned() {
+        let body = zshrc();
+        for var in ["cwd_json", "session_id_json", "window_id_json"] {
+            assert!(
+                body.contains(&format!("{var}=$(_nice_json_escape")),
+                "`{var}` is interpolated into the payload but never assigned"
+            );
+            assert!(
+                body.contains(&format!("${{{var}}}")),
+                "`{var}` is assigned but never interpolated into the payload"
+            );
+        }
+        assert!(
+            body.contains("local cwd_json session_id_json window_id_json"),
+            "the payload locals must all be declared `local`"
+        );
+    }
+
     #[test]
     fn zshrc_socket_unreachable_falls_back_to_command() {
         let body = zshrc();
@@ -1033,7 +1056,7 @@ mod tests {
     fn zshrc_prefill_command_uses_print_z() {
         assert!(
             zshrc().contains(r#"print -z "$NICE_PREFILL_COMMAND""#),
-            "restored Claude tabs rely on print -z to pre-type the resume command"
+            "restored Claude sessions rely on print -z to pre-type the resume command"
         );
     }
 
@@ -1196,7 +1219,7 @@ mod tests {
             )
             .env("HOST", "test.local")
             .env("NICE_USER_ZDOTDIR", "")
-            // Non-empty socket + pane ids: what a real Nice pane injects.
+            // Non-empty socket + window ids: what a real Nice window injects.
             .env("NICE_SOCKET", home.0.join("nice.sock"))
             .env("NICE_TAB_ID", "t1")
             .env("NICE_PANE_ID", "t1-claude")
@@ -1248,12 +1271,12 @@ mod tests {
             ok.transcript
         );
         // The attached Claude ran as a CHILD, so this shell outlived it: Nice
-        // must be told the pane is a prompt again, or its promotion flag stays
-        // set and every later `claude` here opens a new tab.
+        // must be told the window is a prompt again, or its promotion flag stays
+        // set and every later `claude` here opens a new session.
         assert_eq!(
             ok.payloads.last().map(String::as_str),
             Some(r#"{"action":"claude_exited","paneId":"t1-claude"}"#),
-            "a returned attach must report the pane back to Nice. payloads: {:?}",
+            "a returned attach must report the window back to Nice. payloads: {:?}",
             ok.payloads
         );
 
@@ -1276,7 +1299,7 @@ mod tests {
                 .payloads
                 .iter()
                 .any(|p| p.contains("claude_exited")),
-            "the fallback EXECS claude — the pty's own exit reports that pane. payloads: {:?}",
+            "the fallback EXECS claude — the pty's own exit reports that window. payloads: {:?}",
             fell_back.payloads
         );
     }

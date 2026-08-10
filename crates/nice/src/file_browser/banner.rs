@@ -155,7 +155,7 @@ impl Render for DriftBannerView {
         let ink2 = slot_to_rgba(s.ink2);
 
         // Bottom-centered floating card over the whole shell. `absolute` takes the
-        // layer out of flow so it never displaces the sidebar/pane content.
+        // layer out of flow so it never displaces the sidebar/window content.
         div()
             .id("drift-banner.layer")
             .absolute()

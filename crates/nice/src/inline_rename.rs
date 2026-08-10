@@ -1,6 +1,6 @@
 //! The shared inline-rename field — a small cursor-capable text editor that all
-//! three inline renames mount: the file-browser row, the sidebar tab title, and
-//! the toolbar pane pill.
+//! three inline renames mount: the file-browser row, the sidebar session title, and
+//! the toolbar window pill.
 //!
 //! ## One editor, three call sites
 //!
@@ -11,8 +11,8 @@
 //! (both composing with Shift), ⌥Delete deletes a word, ⌘A selects all,
 //! ⌘C/⌘X/⌘V copy / cut / paste through the system clipboard, a click
 //! repositions the caret, and a press-and-drag selects a range. The
-//! *commit* semantics differ per caller ([`nice_model::TabModel::rename_tab`] vs
-//! [`nice_model::TabModel::rename_pane`] vs the file-browser's validate+modal
+//! *commit* semantics differ per caller ([`nice_model::WorkspaceModel::rename_session`] vs
+//! [`nice_model::WorkspaceModel::rename_window`] vs the file-browser's validate+modal
 //! path), so the key handler and the click handler are injected — this module
 //! owns only the chrome, the caret/selection rendering, the pure key→editor
 //! dispatch ([`dispatch_rename_key`]), and the click-x→char-index hit-test
@@ -24,7 +24,7 @@
 //! [`App`]-shaped context, so the ⌘C/⌘X/⌘V rule stays exactly as unit-testable as
 //! the rest of the dispatch (the tests pass an in-memory fake; production passes
 //! the `App` the three call sites already hold). Pasted text is flattened to one
-//! line — a tab title / pane name / filename cannot hold a newline or a tab.
+//! line — a session title / window name / filename cannot hold a newline or a session.
 //!
 //! ## Escape is the owner's, not the field's
 //!
@@ -86,9 +86,9 @@ impl RenameClipboard for App {
     }
 }
 
-/// Flatten pasted clipboard text to the ONE line this field can hold (a tab
-/// title, a pane name, or a filename — none of which may contain a newline or a
-/// tab).
+/// Flatten pasted clipboard text to the ONE line this field can hold (a session
+/// title, a window name, or a filename — none of which may contain a newline or a
+/// session).
 ///
 /// Splits on control characters (`char::is_control`, which covers `\n`, `\r` and
 /// `\t`), drops the empty segments adjacent controls produce, and joins what is
@@ -398,7 +398,7 @@ pub(crate) fn char_boundary_x(probe: &FieldProbe, index: usize) -> Option<f32> {
 /// clicks were hit-tested against a FOURTH shaping done in the mouse handler
 /// with the WINDOW BASE style. Measured on the real element (the
 /// `visual_rename_caret` pixel gate, `WWWWiiiimmmm-1234567890.txt` at 14pt):
-/// with an ancestor font family set — the toolbar pill and sidebar tab
+/// with an ancestor font family set — the toolbar pill and sidebar session
 /// configuration — the painted caret sat 2.9px off the clicked x at boundary 9
 /// and 10.1px off at boundary 23 (avg advance 8.3px), i.e. the error grew with
 /// the prefix, exactly the reported drift. Shaping once at paint makes both
@@ -451,7 +451,7 @@ impl Element for RenameTextElement {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
         // The row is one line tall in the INHERITED line height — what the three
-        // text divs used to resolve to, so the sidebar tab's line-height wrapper
+        // text divs used to resolve to, so the sidebar session's line-height wrapper
         // (`sidebar_shell.rs`) still sizes the editing row exactly as before.
         style.size.height = window.line_height().into();
         (window.request_layout(style, [], cx), ())
@@ -586,9 +586,9 @@ impl Element for RenameTextElement {
 ///   below). It is a separate callback precisely so the click contract above
 ///   stays a single click policy: a drag never re-runs the 1/2/3-click mapping.
 ///
-/// The click handler `stop_propagation`s so the press never reaches the row / tab
+/// The click handler `stop_propagation`s so the press never reaches the row / session
 /// / pill mouse handler beneath it — the fix for "a click inside the field
-/// restarts the edit", and what keeps a drag-select from arming the row's / tab's
+/// restarts the edit", and what keeps a drag-select from arming the row's / session's
 /// / pill's own drag: a press those handlers never see arms nothing (the
 /// file-browser row's `on_drag` file-drag source is additionally suppressed
 /// outright while editing). The pointer shows the text I-beam over the whole
@@ -629,7 +629,7 @@ pub(crate) fn rename_field(
         .items_center()
         .flex_1()
         // The field pins its own size and colour; family / weight / line height
-        // still cascade from the call site (the pill and the sidebar tab set the
+        // still cascade from the call site (the pill and the sidebar session set the
         // terminal family on an ancestor), and the element below shapes with
         // whatever this resolves to.
         .text_size(px(text_size))
@@ -737,7 +737,7 @@ pub(crate) fn rename_field(
                 idx
             };
             on_click_index(idx, e.click_count, window, app);
-            // Swallow the press so the row / tab / pill handler beneath never sees
+            // Swallow the press so the row / session / pill handler beneath never sees
             // it — otherwise the click would re-trip the begin-rename gate.
             app.stop_propagation();
         })

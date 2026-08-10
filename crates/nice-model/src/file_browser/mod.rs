@@ -60,7 +60,7 @@ pub use click_router::{
     press_disposition, ClickAction, ClickModifier, FileBrowserClickRouter, PressDisposition,
     DOUBLE_CLICK_WINDOW,
 };
-pub use cwd_impact::{affected_by, PaneCWDRef, PaneCWDSnapshot};
+pub use cwd_impact::{affected_by, TermWindowCWDRef, TermWindowCWDSnapshot};
 pub use drop_resolver::{can_drop, operation as drop_operation, FileDragOperation};
 pub use header::file_browser_header_title;
 pub use menu::{FileBrowserContextMenuItem, FileBrowserContextMenuModel};
