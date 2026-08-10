@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nice × tmux — progress</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --muted:       #898781;
+    --hairline:    #e1e0d9;
+    --border:      rgba(11,11,11,0.10);
+    --accent:      #2a78d6;   /* meter fill / doing */
+    --track:       #e1e0d9;
+    --good:        #0ca30c;   /* done */
+    --good-text:   #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page:      #0d0d0d;
+      --surface:   #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --muted:     #898781;
+      --hairline:  #2c2c2a;
+      --border:    rgba(255,255,255,0.10);
+      --accent:    #3987e5;
+      --track:     #2c2c2a;
+      --good:      #0ca30c;
+      --good-text: #0ca30c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  header h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header .sub { color: var(--ink-2); margin: 0 0 6px; }
+  header .meta { color: var(--muted); font-size: 13px; margin: 0; }
+
+  /* Overall meter + stat tiles */
+  .overall {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin: 24px 0 36px;
+  }
+  .overall .meter { margin-top: 10px; }
+  .tiles { display: flex; gap: 28px; flex-wrap: wrap; margin-top: 14px; }
+  .tile .val { font-size: 22px; font-weight: 650; }
+  .tile .lbl { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Meter (shared) */
+  .meter { display: flex; align-items: center; gap: 10px; }
+  .meter .track {
+    flex: 1; height: 8px; border-radius: 4px;
+    background: var(--track); overflow: hidden;
+  }
+  .meter .fill {
+    height: 100%; width: 0; border-radius: 4px;
+    background: var(--accent);
+    transition: width .3s ease;
+  }
+  .meter .fill.full { background: var(--good); }
+  .meter .count {
+    font-size: 12px; color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    min-width: 52px; text-align: right;
+  }
+
+  /* Phase sections */
+  section.phase {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+  }
+  .phase-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .phase-head h2 { font-size: 16px; margin: 0; }
+  .effort {
+    font-size: 11px; font-weight: 600; color: var(--ink-2);
+    border: 1px solid var(--hairline); border-radius: 999px;
+    padding: 1px 8px; letter-spacing: 0.03em;
+  }
+  .phase-head .meter { flex: 1; min-width: 160px; margin-left: auto; }
+  .phase p.blurb { color: var(--ink-2); font-size: 13px; margin: 6px 0 10px; }
+
+  ul.tasks { list-style: none; margin: 0; padding: 0; }
+  ul.tasks li {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 6px 0; border-top: 1px solid var(--hairline);
+    font-size: 14px;
+  }
+  ul.tasks li:first-child { border-top: none; }
+  ul.tasks li .t { flex: 1; }
+  ul.tasks li .note { color: var(--muted); font-size: 12.5px; }
+
+  /* Status chips — label + dot, never color alone */
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border-radius: 999px; padding: 1px 9px;
+    border: 1px solid var(--hairline);
+    color: var(--muted); white-space: nowrap;
+  }
+  .chip::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%;
+    background: currentColor;
+  }
+  li[data-status="done"]     .chip { color: var(--good-text); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  li[data-status="doing"]    .chip { color: var(--accent);    border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  li[data-status="todo"]     .chip::before { background: transparent; border: 1.5px solid currentColor; }
+  li[data-status="deferred"] .chip { border-style: dashed; }
+  li[data-status="deferred"] .chip::before { background: transparent; border: 1.5px solid currentColor; }
+  li[data-status="done"] .t { color: var(--ink-2); }
+
+  /* Decisions + keybinds */
+  section.flat { margin: 36px 0 0; }
+  section.flat h2 { font-size: 16px; margin: 0 0 10px; }
+  .decisions li { margin: 6px 0; }
+  .decisions .d { color: var(--muted); font-size: 12.5px; }
+
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline); }
+  th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  kbd {
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--page); border: 1px solid var(--hairline);
+    border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px;
+    white-space: nowrap;
+  }
+
+  .howto { color: var(--muted); font-size: 12.5px; margin-top: 36px; border-top: 1px solid var(--hairline); padding-top: 12px; }
+  .howto code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Nice × tmux port</h1>
+  <p class="sub">Bringing tmux's session / window / pane model into Nice, natively.</p>
+  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-07</span></p>
+</header>
+
+<div class="overall">
+  <strong>Overall progress</strong>
+  <div class="meter" data-scope="all">
+    <div class="track"><div class="fill"></div></div>
+    <span class="count"></span>
+  </div>
+  <div class="tiles">
+    <div class="tile"><div class="val" id="tile-done">–</div><div class="lbl">Tasks done</div></div>
+    <div class="tile"><div class="val" id="tile-doing">–</div><div class="lbl">In progress</div></div>
+    <div class="tile"><div class="val" id="tile-phase">–</div><div class="lbl">Current phase</div></div>
+  </div>
+</div>
+
+<section class="phase" data-phase="Groundwork">
+  <div class="phase-head">
+    <h2>Groundwork</h2><span class="effort">done first</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <ul class="tasks">
+    <li data-status="done"><span class="chip">done</span><span class="t">Codebase exploration — UI/layout model + pty/keybind/session infrastructure mapped</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Concept mapping — sidebar row ≈ session, upper-bar pill ≈ tmux window, splits = the gap</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Keybind scheme decided — held <kbd>^⌘</kbd> + vim keys (see Decisions)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Roadmap written — <span class="note">docs/tmux-port-roadmap.md</span></span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="R">
+  <div class="phase-head">
+    <h2>Phase R — terminology rename</h2><span class="effort">first</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <p class="blurb">Codebase-wide rename to tmux terminology (see Terminology mapping below). Code-internal only — disk and wire formats keep their old names.</p>
+  <ul class="tasks">
+    <li data-status="done"><span class="chip">done</span><span class="t">Rename model types: <code>Tab</code> → <code>Session</code>, <code>Pane</code> → <code>TermWindow</code> (decided — avoids <code>gpui::Window</code> collision), <code>TabModel</code> → <code>WorkspaceModel</code></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Free the word "session" from pty-sense uses: <code>SessionManager</code> → <code>PtyManager</code> (or similar), <code>PaneSession</code>, related APIs</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Rename derived surfaces: <code>pane_strip_*</code>, <code>TabModel</code>, actions, tests, docs comments</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Compat shims: serde aliases so <code>sessions.json</code> keys, control-socket protocol, and <code>NICE_TAB_ID</code>/<code>NICE_PANE_ID</code> env vars stay byte-identical</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">UI copy pass: sidebar rows say "session", pills say "window" (⌘N menu item keeps macOS-standard wording)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Full build + test pass; verify restore from a pre-rename <code>sessions.json</code> + shortcuts compat</span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="0">
+  <div class="phase-head">
+    <h2>Phase 0 — quick wins</h2><span class="effort">S</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <p class="blurb">Small standalone improvements; no new architecture.</p>
+  <ul class="tasks">
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Remove/raise <code>SIDEBAR_MAX_WIDTH</code>; clamp against remaining terminal width instead</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Persist <code>sidebar_width</code> in <code>PersistedWindow</code> (currently resets every launch)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Keyboard scrollback: PageUp / PageDown / Home / End → scroll API (wheel-only today)</span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="1">
+  <div class="phase-head">
+    <h2>Phase 1 — <kbd>^⌘</kbd> keybind scheme</h2><span class="effort">M</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <p class="blurb">Held-modifier vim keys; no prefix state machine needed. All chords rebindable via the existing shortcuts store.</p>
+  <ul class="tasks">
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Add new rebindable actions to <code>ShortcutAction</code> + defaults (pane nav, pill nav, index jump, zoom stub…)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘h</kbd>/<kbd>^⌘l</kbd> prev/next pane (directional once splits land); <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> prev/next pill</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘1-9</kbd> pill by index; <kbd>^⌘o</kbd> last-active pane</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘u</kbd>/<kbd>^⌘d</kbd> half-page scrollback</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Hold-to-hint overlay — pane numbers/hints visible while <kbd>^⌘</kbd> is held (modifier-observer + present-kick)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Guard reserved combos in recorder/conflict check (<kbd>^⌘Q</kbd> <kbd>^⌘F</kbd> <kbd>^⌘Space</kbd> <kbd>^⌘D</kbd>)</span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="2">
+  <div class="phase-head">
+    <h2>Phase 2 — splits</h2><span class="effort">L</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <p class="blurb">The core investment: a split tree inside each upper-bar pill.</p>
+  <ul class="tasks">
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Model: layout tree per pill (leaves = pane ids, splits with ratios); <code>active_pane_id</code> = focused leaf</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t"><code>PaneHostView</code>: recursive render, N mounted <code>TerminalView</code>s, focused-pane affordance</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Divider drag-resize</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Multi-activation in <code>SessionManager</code>; validate independent refit/TIOCSWINSZ per mounted view</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Actions on the <kbd>^⌘</kbd> scheme: <kbd>^⌘v</kbd>/<kbd>^⌘s</kbd> split, directional focus <kbd>^⌘hjkl</kbd>, <kbd>^⌘z</kbd> zoom, swap, break-pane-to-pill</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Decide: <kbd>^⌘⇧hjkl</kbd> = resize or swap</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Spatial close-refocus (nearest neighbor, not index neighbor)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Persist layout in <code>PersistedTab</code> (schema bump, loader stays shape-tolerant)</span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="3">
+  <div class="phase-head">
+    <h2>Phase 3 — copy mode &amp; search</h2><span class="effort">M</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <p class="blurb">Keyboard-driven scrollback on top of alacritty primitives already linked.</p>
+  <ul class="tasks">
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Copy-mode state machine; vi motions over scrollback</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Keyboard selection via existing handle API + copy</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘/</kbd> search overlay (InlineRename pattern) + <code>RegexSearch</code> over scrollback</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Match highlighting in <code>element.rs</code>; n/N navigation</span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="4">
+  <div class="phase-head">
+    <h2>Phase 4 — detach, adopt, tear-off</h2><span class="effort">M–L</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <p class="blurb">In-app detach: sessions outlive their window (not the app). Full daemon deliberately deferred.</p>
+  <ul class="tasks">
+    <li data-status="todo"><span class="chip">todo</span><span class="t">App-global session registry (pty ownership out of per-window <code>SessionManager</code>)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Close-window-keeps-sessions option; "detached sessions" sidebar section</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Adopt-into-window</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Revive cross-window pane move / tear-off (<code>extract_pane</code>/<code>insert_pane</code> seams)</span></li>
+  </ul>
+</section>
+
+<section class="phase" data-phase="5">
+  <div class="phase-head">
+    <h2>Phase 5 — power features</h2><span class="effort">à la carte</span>
+    <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
+  </div>
+  <ul class="tasks">
+    <li data-status="todo"><span class="chip">todo</span><span class="t"><code>nice</code> CLI over the control socket: split, send-keys, new-session, select-pane</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Synchronize-panes (fan input to all panes in a pill)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Respawn-pane as an action (held-pane dismiss already exists)</span></li>
+    <li data-status="todo"><span class="chip">todo</span><span class="t">Popup terminal (floating overlay pane)</span></li>
+  </ul>
+</section>
+
+<section class="flat">
+  <h2>Terminology mapping</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>tmux term</th><th>Nice code today</th><th>After rename</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><strong>session</strong></td><td><code>Tab</code> — sidebar row (<code>tab.rs</code>)</td><td><code>Session</code></td><td>Named group of ptys, one active at a time</td></tr>
+      <tr><td><strong>window</strong></td><td><code>Pane</code> — upper-bar pill, one pty (<code>pane.rs</code>)</td><td><code>TermWindow</code></td><td>Decided 2026-08-08 — avoids the <code>gpui::Window</code> collision</td></tr>
+      <tr><td><strong>pane</strong></td><td>— (doesn't exist yet)</td><td><code>Pane</code></td><td>Split-tree leaf, introduced in Phase 2</td></tr>
+      <tr><td><strong>client</strong></td><td>OS window (<code>WindowState</code>)</td><td>keep</td><td></td></tr>
+      <tr><td><strong>server</strong></td><td>the app process</td><td>keep</td><td>No daemon; in-app detach is Phase 4</td></tr>
+      <tr><td>—</td><td><code>Project</code> — sidebar section</td><td>keep</td><td>No tmux analogue (session group)</td></tr>
+      <tr><td>—</td><td><code>SessionManager</code> etc. (pty-sense "session")</td><td><code>PtyManager</code> (or similar)</td><td>Frees the word "session" for the tmux sense</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="howto" style="margin-top:10px; border-top:none; padding-top:0;">
+    Disk/wire names are frozen regardless of the rename: <code>sessions.json</code> keys,
+    the control-socket protocol, and <code>NICE_TAB_ID</code>/<code>NICE_PANE_ID</code> keep their
+    current spellings via serde aliases.
+  </p>
+</section>
+
+<section class="flat">
+  <h2>Decisions (locked)</h2>
+  <ul class="decisions">
+    <li>Held <kbd>^⌘</kbd> + vim keys, <em>not</em> a tmux-style prefix — no pending state, free OS key-repeat, zero pty collisions <span class="d">2026-08-05</span></li>
+    <li><kbd>^⌘[</kbd> / <kbd>^⌘]</kbd> for prev/next pill (over <kbd>^⌘n</kbd>/<kbd>^⌘p</kbd>) <span class="d">2026-08-05</span></li>
+    <li>Hold-to-hint overlay is part of the scheme (live tmux <code>display-panes</code>) <span class="d">2026-08-05</span></li>
+    <li>Upper-bar pill = tmux window; split tree lives inside a pill; pill strip stays linear <span class="d">2026-08-05</span></li>
+    <li>Keystroke-sequence support deferred — only needed for a future tmux-compat prefix mode <span class="d">2026-08-05</span></li>
+    <li>Detach = in-app first (session registry), full daemon deferred <span class="d">2026-08-05</span></li>
+    <li>Code adopts tmux terminology before feature work (Phase R first): <code>Tab</code>→<code>Session</code>, <code>Pane</code>→<code>TermWindow</code>, split leaf = <code>Pane</code>; disk/wire names frozen <span class="d">2026-08-07</span></li>
+    <li><code>TermWindow</code> over qualified <code>model::Window</code> (no <code>gpui::Window</code> collision); Phase R includes the UI copy pass; plan at <code>docs/plans/phase-r-terminology-rename.md</code> <span class="d">2026-08-08</span></li>
+    <li>Never bind: <kbd>^⌘Q</kbd> (lock screen) <kbd>^⌘F</kbd> (fullscreen) <kbd>^⌘Space</kbd> (emoji) <kbd>^⌘D</kbd> (dictionary)</li>
+  </ul>
+</section>
+
+<section class="flat">
+  <h2>Keybind scheme</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Chord</th><th>Action</th><th>Phase</th></tr></thead>
+    <tbody>
+      <tr><td><kbd>^⌘h</kbd> <kbd>^⌘j</kbd> <kbd>^⌘k</kbd> <kbd>^⌘l</kbd></td><td>Directional pane focus (pre-splits: h/l = prev/next pane)</td><td>1 → 2</td></tr>
+      <tr><td><kbd>^⌘⇧h/j/k/l</kbd></td><td>Resize split toward edge — or swap (undecided)</td><td>2</td></tr>
+      <tr><td><kbd>^⌘[</kbd> / <kbd>^⌘]</kbd></td><td>Prev / next upper-bar pill</td><td>1</td></tr>
+      <tr><td><kbd>^⌘1</kbd>–<kbd>^⌘9</kbd></td><td>Pill by index</td><td>1</td></tr>
+      <tr><td><kbd>^⌘o</kbd></td><td>Last-active pane</td><td>1</td></tr>
+      <tr><td><kbd>^⌘z</kbd></td><td>Zoom pane</td><td>2</td></tr>
+      <tr><td><kbd>^⌘v</kbd> / <kbd>^⌘s</kbd></td><td>Vertical / horizontal split</td><td>2</td></tr>
+      <tr><td><kbd>^⌘u</kbd> / <kbd>^⌘d</kbd></td><td>Half-page scrollback up / down</td><td>1</td></tr>
+      <tr><td><kbd>^⌘/</kbd></td><td>Scrollback search</td><td>3</td></tr>
+      <tr><td><em>hold</em> <kbd>^⌘</kbd></td><td>Pane number / hint overlay while held</td><td>1</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<p class="howto">
+  To update: flip a task's <code>data-status</code> to <code>todo</code> / <code>doing</code> /
+  <code>done</code> / <code>deferred</code> and change the chip label to match; bump the
+  “Last updated” date. Meters and tiles recompute on load. Add tasks as new
+  <code>&lt;li&gt;</code> rows — nothing else to touch.
+</p>
+
+</main>
+<script>
+  const phases = document.querySelectorAll("section.phase");
+  let allDone = 0, allTotal = 0, allDoing = 0, currentPhase = null;
+  phases.forEach(ph => {
+    const items = ph.querySelectorAll("li[data-status]");
+    const done  = ph.querySelectorAll('li[data-status="done"]').length;
+    const doing = ph.querySelectorAll('li[data-status="doing"]').length;
+    const total = items.length;
+    allDone += done; allTotal += total; allDoing += doing;
+    const name = ph.dataset.phase;
+    if (currentPhase === null && done + doing > 0 && done < total) currentPhase = name;
+    const fill = ph.querySelector(".meter .fill");
+    fill.style.width = total ? (100 * done / total) + "%" : "0";
+    if (done === total && total > 0) fill.classList.add("full");
+    ph.querySelector(".meter .count").textContent = done + " / " + total;
+  });
+  // "Current phase" = first phase with unfinished work (started or not)
+  if (currentPhase === null) {
+    for (const ph of phases) {
+      const total = ph.querySelectorAll("li[data-status]").length;
+      const done = ph.querySelectorAll('li[data-status="done"]').length;
+      if (done < total) { currentPhase = ph.dataset.phase; break; }
+    }
+  }
+  const overall = document.querySelector('.meter[data-scope="all"]');
+  overall.querySelector(".fill").style.width = allTotal ? (100 * allDone / allTotal) + "%" : "0";
+  if (allDone === allTotal && allTotal > 0) overall.querySelector(".fill").classList.add("full");
+  overall.querySelector(".count").textContent = allDone + " / " + allTotal;
+  document.getElementById("tile-done").textContent = allDone + " / " + allTotal;
+  document.getElementById("tile-doing").textContent = allDoing;
+  document.getElementById("tile-phase").textContent = currentPhase ?? "all done";
+</script>
+</body>
+</html>

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nice — tmux terminology at a glance</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --hairline: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6;
+    --term-bg: #1a1a19; --term-ink: #c3c2b7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --hairline: #2c2c2a; --border: rgba(255,255,255,0.10);
+      --accent: #3987e5;
+      --term-bg: #111110; --term-ink: #c3c2b7;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1060px; margin: 0 auto; padding: 36px 24px 72px; }
+  h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 0 0 28px; }
+
+  .board { display: flex; gap: 28px; align-items: flex-start; flex-wrap: wrap; }
+
+  /* ---------- the mock window ---------- */
+  .stage { position: relative; flex: 0 0 auto; }
+  .mock {
+    position: relative; width: 620px; height: 400px;
+    background: var(--surface);
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+    overflow: hidden;
+    font-size: 12px;
+  }
+  /* titlebar */
+  .titlebar {
+    position: absolute; inset: 0 0 auto 0; height: 36px;
+    display: flex; align-items: center; gap: 6px; padding: 0 10px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .lights { display: flex; gap: 6px; margin-right: 6px; }
+  .lights i { width: 10px; height: 10px; border-radius: 50%; }
+  .lights i:nth-child(1){ background:#f45f57; } .lights i:nth-child(2){ background:#f5b32f; } .lights i:nth-child(3){ background:#37c648; }
+  .sbtoggle { width: 16px; height: 12px; border: 1.5px solid var(--muted); border-radius: 3px; position: relative; margin-right: 8px; }
+  .sbtoggle::before { content:""; position:absolute; top:0; bottom:0; left:4px; width:1.5px; background: var(--muted); }
+  .pill { padding: 3px 10px; border-radius: 6px; color: var(--ink-2); position: relative; }
+  .pill.active { color: var(--ink); font-weight: 600; }
+  .pill.active::after { content:""; position:absolute; left:8px; right:8px; bottom:-1px; height:2px; background: var(--accent); border-radius:1px; }
+  .pill.add { color: var(--muted); font-weight: 600; }
+  /* sidebar */
+  .sidebar {
+    position: absolute; top: 36px; bottom: 0; left: 0; width: 190px;
+    border-right: 1px solid var(--hairline); padding: 10px 0 8px;
+  }
+  .group { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: var(--muted);
+           padding: 8px 14px 4px; }
+  .row { display: flex; align-items: center; gap: 7px; padding: 5px 14px; color: var(--ink-2); }
+  .row.active { color: var(--ink); font-weight: 600; background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .row.child { padding-left: 30px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.think { background: var(--accent); }
+  .dot.wait { background: #eda100; }
+  /* terminal area */
+  .term {
+    position: absolute; top: 36px; left: 190px; right: 0; bottom: 0;
+    background: var(--term-bg); color: var(--term-ink);
+    font: 11px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 12px 14px;
+  }
+  .term .p { color: #3987e5; }
+  .term .ok { color: #0ca30c; }
+  /* ghost future split */
+  .ghost {
+    position: absolute; top: 36px; right: 0; bottom: 0; width: 170px;
+    border-left: 2px dashed color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+    display: flex; align-items: center; justify-content: center;
+    color: color-mix(in srgb, var(--accent) 80%, var(--term-ink));
+    font-size: 11px; text-align: center; padding: 10px;
+  }
+  /* numbered badges */
+  .badge {
+    position: absolute; z-index: 3;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent); color: #fff;
+    font-size: 12px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 0 3px var(--surface), 0 2px 6px rgba(0,0,0,0.25);
+  }
+
+  /* ---------- legend ---------- */
+  .legend { flex: 1 1 300px; min-width: 300px; }
+  .entry { display: flex; gap: 12px; padding: 10px 0; border-top: 1px solid var(--hairline); }
+  .entry:first-child { border-top: none; }
+  .entry .badge { position: static; flex: none; margin-top: 2px; box-shadow: none; }
+  .entry h3 { margin: 0; font-size: 15px; }
+  .entry h3 .code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .entry p { margin: 2px 0 0; font-size: 13px; color: var(--ink-2); }
+  .entry .was { color: var(--muted); font-size: 12px; }
+  .foot { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--hairline);
+          color: var(--muted); font-size: 12.5px; }
+  @media (max-width: 720px) { .stage { overflow-x: auto; max-width: 100%; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Nice speaks tmux now</h1>
+  <p class="sub">What each part of the app is called after the Phase R rename.</p>
+
+  <div class="board">
+    <div class="stage">
+      <div class="mock">
+        <div class="titlebar">
+          <div class="lights"><i></i><i></i><i></i></div>
+          <div class="sbtoggle"></div>
+          <span class="pill active">claude</span>
+          <span class="pill">zsh</span>
+          <span class="pill">build</span>
+          <span class="pill add">+</span>
+        </div>
+        <div class="sidebar">
+          <div class="group">TERMINALS</div>
+          <div class="row"><span class="dot"></span>main</div>
+          <div class="group">NICE</div>
+          <div class="row active"><span class="dot think"></span>tmux port</div>
+          <div class="row child"><span class="dot wait"></span>phase-r rename</div>
+          <div class="row"><span class="dot"></span>bug fixes</div>
+        </div>
+        <div class="term">
+          <div><span class="p">➜ nice</span> cargo test -p nice-model</div>
+          <div>running 118 tests …</div>
+          <div><span class="ok">test result: ok.</span> 118 passed</div>
+          <div><span class="p">➜ nice</span> ▍</div>
+        </div>
+        <div class="ghost">a <b>pane</b> will<br>split here<br>(Phase 2)</div>
+
+        <div class="badge" style="top: 4px;  left: 96px;">1</div>
+        <div class="badge" style="top: 26px; left: 150px;">2</div>
+        <div class="badge" style="top: 60px; left: 108px;">3</div>
+        <div class="badge" style="top: 96px; left: 4px;">4</div>
+        <div class="badge" style="top: 168px; left: 178px;">5</div>
+        <div class="badge" style="top: 240px; left: 300px;">6</div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div class="entry"><span class="badge">1</span><div>
+        <h3>Client <span class="code">WindowState</span></h3>
+        <p>The OS window. Many clients can exist; each shows one workspace of projects → sessions → windows.</p>
+      </div></div>
+      <div class="entry"><span class="badge">2</span><div>
+        <h3>Window <span class="code">TermWindow</span></h3>
+        <p>One pill = one pty (a shell or a Claude run). Only one is visible per session; the rest keep running in the background. <span class="was">was: “pane” / top-bar tab</span></p>
+        <p class="was">Menus say “Terminal Window” / “Claude Window” — ⌘N/⌘W still mean the OS window.</p>
+      </div></div>
+      <div class="entry"><span class="badge">3</span><div>
+        <h3>Window strip</h3>
+        <p>The row of window pills for the active session. <span class="was">was: pane strip</span></p>
+      </div></div>
+      <div class="entry"><span class="badge">4</span><div>
+        <h3>Project</h3>
+        <p>A sidebar group of sessions. Unchanged — tmux has no equivalent.</p>
+      </div></div>
+      <div class="entry"><span class="badge">5</span><div>
+        <h3>Session</h3>
+        <p>One sidebar row: a named group of windows with one active. Handoffs/dispatches nest as child sessions. <span class="was">was: tab</span></p>
+      </div></div>
+      <div class="entry"><span class="badge">6</span><div>
+        <h3>Pane <span class="code">(reserved — Phase 2)</span></h3>
+        <p>A split inside a window. Doesn't exist yet; the word is freed and waiting. Until then the terminal area shows the active window whole.</p>
+      </div></div>
+      <div class="foot">
+        And the <b>server</b> is just the app process — no daemon; sessions survive window closes starting Phase 4, and app restarts via <code>sessions.json</code> restore.
+        Keybinds: <b>^⌘[</b>/<b>^⌘]</b> switch windows, <b>^⌘h/l</b> switch panes (later), hold <b>^⌘</b> for hints.
+      </div>
+    </div>
+  </div>
+</main>
+</body>
+</html>
