@@ -81,7 +81,7 @@ sidebar request actually decomposes into:
   `hyperlink.rs:92-233`); full programmatic selection API on the handle
   (`session_handle.rs:517-618`); scrollback + scroll-position API, with
   keyboard scroll bindings since Phase 0 (Shift+PageUp/PageDown/Home/End)
-  and half-page jumps since Phase 1 (`^⌘u`/`^⌘d`).
+  and half-page jumps since Phase 1 (`^⌘↑`/`^⌘↓`).
   Missing is only UI: no copy-mode state machine, no search overlay.
 - **Overlay building blocks** for prefix-pending indicators, search fields,
   and pane-number popups: peek overlay + modifier observers
@@ -214,9 +214,16 @@ Everything else on the scheme is unchanged:
 | `^⌘o` | Last-active window (tmux `last-window`, a single bounce slot — not an MRU stack) | 1 |
 | `^⌘z` | Zoom pane | 2 |
 | `^⌘v` / `^⌘s` | Vertical / horizontal split | 2 |
-| `^⌘u` / `^⌘d` | Half-page scrollback up / down (no-op on the alternate screen) | 1 |
+| `^⌘↑` / `^⌘↓` | Half-page scrollback up / down (no-op on the alternate screen) — moved off `^⌘u`/`^⌘d` on 2026-08-11; both of those are now bound to nothing | 1 |
 | `^⌘/` | Scrollback search | 3 |
 | *hold* `^⌘` | Window-index badges on the pills — **D5**, ~200 ms debounce | 1 |
+
+**DECIDED (2026-08-11): half-page scroll moved to `^⌘↑`/`^⌘↓`** — real `^⌘D`
+keydowns are swallowed by the macOS dictionary hotkey before the app sees
+them (found in hand-testing; the gpui-level `keybind-scheme` scenario cannot
+detect OS-level interception, because it injects downstream of it). Both
+halves moved together to keep the pair symmetric; `^⌘u` and `^⌘d` are now
+bound to nothing, and `^⌘D` is a pure reserved-table entry again.
 
 All Phase 1 rows are rebindable in Settings ▸ Shortcuts; the frozen action
 ids never moved, only the default combos.

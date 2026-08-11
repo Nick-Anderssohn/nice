@@ -498,7 +498,7 @@ fn last_active_window(model: &mut nice_model::WorkspaceModel) {
     });
 }
 
-/// Half-page scrollback (⌃⌘U / ⌃⌘D) on the ACTIVE window of the active session.
+/// Half-page scrollback (⌃⌘↑ / ⌃⌘↓) on the ACTIVE window of the active session.
 ///
 /// No keymap action reaches a terminal view today (Phase 0's Shift+nav scrollback
 /// lives in the view's own key listener, not the keymap), so this rides the seam
@@ -1313,8 +1313,17 @@ mod tests {
             }
 
             assert!(bound(&LastActiveWindow, "cmd-ctrl-o"));
-            assert!(bound(&ScrollHalfPageUp, "cmd-ctrl-u"));
-            assert!(bound(&ScrollHalfPageDown, "cmd-ctrl-d"));
+            // Half-page scroll lives on the ARROWS. It shipped on ⌃⌘U/⌃⌘D, but
+            // macOS's dictionary hotkey swallows a real ⌃⌘D keydown before Nice
+            // ever sees it — invisible to the `dispatch_keystroke` scenario, which
+            // injects downstream of the OS intercept, so the board is pinned here.
+            assert!(bound(&ScrollHalfPageUp, "cmd-ctrl-up"));
+            assert!(bound(&ScrollHalfPageDown, "cmd-ctrl-down"));
+            assert!(unbound_entirely("cmd-ctrl-u"), "⌃⌘U is freed");
+            assert!(
+                unbound_entirely("cmd-ctrl-d"),
+                "⌃⌘D is freed — a pure reserved chord again"
+            );
 
             // D2: all nine digits are live off the one stored row.
             for index in 1u8..=9 {

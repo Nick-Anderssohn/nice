@@ -679,7 +679,7 @@ impl TerminalSessionHandle {
         }
     }
 
-    /// Scroll the viewport half a screen toward history (Phase 1: ⌃⌘U) — tmux
+    /// Scroll the viewport half a screen toward history (Phase 1: ⌃⌘↑) — tmux
     /// copy-mode `halfpage-up`. `alacritty_terminal::grid::Scroll` has no
     /// half-page variant at this pin, so the delta is computed from the live grid
     /// height by [`half_page_lines`]. Discards any sub-line wheel remainder like
@@ -689,7 +689,7 @@ impl TerminalSessionHandle {
         self.scroll_half_page(true);
     }
 
-    /// Scroll the viewport half a screen toward the bottom (Phase 1: ⌃⌘D); clamps
+    /// Scroll the viewport half a screen toward the bottom (Phase 1: ⌃⌘↓); clamps
     /// at offset 0. The [`scroll_half_page_up`](Self::scroll_half_page_up)
     /// counterpart.
     pub fn scroll_half_page_down(&mut self) {
@@ -833,7 +833,7 @@ fn take_scroll_steps(accum: &mut f32, delta: f32) -> i32 {
 }
 
 /// How many lines "half a page" is for a grid `screen_lines` tall — the magnitude
-/// the Phase 1 ⌃⌘U/⌃⌘D chords step the display by (`alacritty_terminal`'s `Scroll`
+/// the Phase 1 ⌃⌘↑/⌃⌘↓ chords step the display by (`alacritty_terminal`'s `Scroll`
 /// has no half-page variant at this pin, so the delta is computed here).
 ///
 /// Integer division truncates, and the result is floored at **1** so a
@@ -845,7 +845,7 @@ pub fn half_page_lines(screen_lines: usize) -> i32 {
 }
 
 /// The signed [`Scroll::Delta`] for one half-page step on a grid `screen_lines`
-/// tall: **positive** toward history (⌃⌘U), **negative** toward the bottom (⌃⌘D)
+/// tall: **positive** toward history (⌃⌘↑), **negative** toward the bottom (⌃⌘↓)
 /// — the same sign convention the wheel path
 /// ([`TerminalSessionHandle::scroll_lines`]) uses.
 pub fn half_page_delta(screen_lines: usize, toward_history: bool) -> i32 {
@@ -1899,7 +1899,7 @@ mod tests {
         assert_eq!(end, Point::new(Line(-3), Column(5)), "end rotated with its content");
     }
 
-    // ---- Half-page scrollback delta (Phase 1: ⌃⌘U / ⌃⌘D) --------------------
+    // ---- Half-page scrollback delta (Phase 1: ⌃⌘↑ / ⌃⌘↓) --------------------
 
     /// The magnitude is `screen_lines / 2`, truncating.
     #[test]
@@ -1920,8 +1920,8 @@ mod tests {
         assert_eq!(half_page_lines(0), 1, "a 0-row grid must not yield a 0-line step");
     }
 
-    /// Sign per direction: positive toward history (⌃⌘U), negative toward the
-    /// bottom (⌃⌘D) — the wheel path's `Scroll::Delta` convention.
+    /// Sign per direction: positive toward history (⌃⌘↑), negative toward the
+    /// bottom (⌃⌘↓) — the wheel path's `Scroll::Delta` convention.
     #[test]
     fn half_page_delta_signs_by_direction() {
         assert_eq!(half_page_delta(40, true), 20, "⌃⌘U pages toward history");

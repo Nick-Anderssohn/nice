@@ -105,11 +105,19 @@ pub enum ShortcutAction {
     /// Jump back to the window that was active before the current one (⌃⌘O) —
     /// tmux `last-window`. A single "previous" slot, not an MRU stack.
     LastActiveWindow,
-    /// Scroll the active window's viewport half a screen toward history (⌃⌘U) —
-    /// tmux copy-mode `halfpage-up`.
+    /// Scroll the active window's viewport half a screen toward history (⌃⌘↑) —
+    /// tmux copy-mode `halfpage-up`. Was ⌃⌘U until 2026-08-11, when the pair
+    /// moved to the arrows (see [`ScrollHalfPageDown`](Self::ScrollHalfPageDown));
+    /// ⌃⌘U is now bound to nothing.
     ScrollHalfPageUp,
     /// Scroll the active window's viewport half a screen toward the bottom
-    /// (⌃⌘D) — tmux copy-mode `halfpage-down`.
+    /// (⌃⌘↓) — tmux copy-mode `halfpage-down`.
+    ///
+    /// **Why the arrows.** This shipped on ⌃⌘D, which macOS's dictionary-lookup
+    /// hotkey swallows before the keydown ever reaches the app — the chord did
+    /// nothing in hand-testing while the self-test scenario passed, because
+    /// injected keystrokes enter downstream of the OS intercept. Both halves
+    /// moved together to keep the pair symmetric.
     ScrollHalfPageDown,
     /// Focus the Nth window of the active session (⌃⌘1…⌃⌘9) — tmux
     /// `select-window -t N`. **One** action covers all nine chords (D2): the
@@ -524,18 +532,23 @@ pub fn default_bindings() -> [(ShortcutAction, KeyCombo); 22] {
                 key: "o",
             },
         ),
+        // 2026-08-11: the half-page pair moved off ⌃⌘U/⌃⌘D onto the arrows.
+        // macOS's dictionary hotkey eats a real ⌃⌘D keydown before the app sees
+        // it, so the shipped chord did nothing in the hand. ⌃⌘U and ⌃⌘D are now
+        // bound to nothing (⌃⌘D stays RESERVED as the macOS chord it is; ⌃⌘U is
+        // simply free).
         (
             ScrollHalfPageUp,
             KeyCombo {
                 modifiers: Modifiers::CONTROL_COMMAND,
-                key: "u",
+                key: "up",
             },
         ),
         (
             ScrollHalfPageDown,
             KeyCombo {
                 modifiers: Modifiers::CONTROL_COMMAND,
-                key: "d",
+                key: "down",
             },
         ),
         // D2: the stored digit is always the normalized `1`; the combo MEANS
@@ -799,10 +812,12 @@ pub const RESERVED_TOGGLE_FULL_SCREEN: ReservedCombo = ReservedCombo {
 /// is deliberately NOT here: plain Escape cancels the capture before any reserved
 /// lookup runs, so it is uncapturable anyway and the entry would be dead data.
 ///
-/// ⌃⌘D carries the Phase 1 default for "Scroll half page down" AND is a macOS
-/// dictionary chord. Both come from the plan (Slice 1's defaults; Slice 2's group
-/// b). The guard only governs the RECORDER, so the shipped default binding is
-/// unaffected — it just cannot be re-recorded by hand.
+/// No entry doubles as a shipped default: ⌃⌘D was both the "Scroll half page
+/// down" default and the macOS dictionary chord until 2026-08-11, when the
+/// half-page pair moved to ⌃⌘↑/⌃⌘↓ (macOS eats a real ⌃⌘D keydown before the app
+/// sees it, so the binding never worked in the hand). It is a pure group-b entry
+/// again, and the `no_default_combo_is_reserved` test pins that the table and the
+/// defaults stay disjoint.
 pub const RESERVED_COMBOS: [ReservedCombo; 20] = [
     // (a) Nice's own fixed accelerators.
     RESERVED_QUIT,
@@ -1019,8 +1034,10 @@ mod tests {
         assert_eq!(combo(ShortcutAction::FocusPaneUp), "cmd-ctrl-shift-k");
         assert_eq!(combo(ShortcutAction::FocusPaneRight), "cmd-ctrl-shift-l");
         assert_eq!(combo(ShortcutAction::LastActiveWindow), "cmd-ctrl-o");
-        assert_eq!(combo(ShortcutAction::ScrollHalfPageUp), "cmd-ctrl-u");
-        assert_eq!(combo(ShortcutAction::ScrollHalfPageDown), "cmd-ctrl-d");
+        // The half-page pair lives on the ARROWS (⌃⌘U/⌃⌘D are bound to nothing —
+        // macOS's dictionary hotkey swallows a real ⌃⌘D before Nice sees it).
+        assert_eq!(combo(ShortcutAction::ScrollHalfPageUp), "cmd-ctrl-up");
+        assert_eq!(combo(ShortcutAction::ScrollHalfPageDown), "cmd-ctrl-down");
         // D2: the template row stores the normalized digit.
         assert_eq!(combo(ShortcutAction::WindowByIndex), "cmd-ctrl-1");
     }
@@ -1443,18 +1460,23 @@ mod tests {
         );
     }
 
-    /// The Phase 1 defaults do not collide with the reserved table — except the
-    /// one collision the plan itself specifies (⌃⌘D is both "Scroll half page
-    /// down" and the macOS dictionary chord). Pinned so a future defaults edit
-    /// that adds a SECOND such overlap is noticed.
+    /// NO default collides with the reserved table. The one exception the plan
+    /// used to specify — ⌃⌘D as both "Scroll half page down" and the macOS
+    /// dictionary chord — is gone since 2026-08-11: shipping a default a system
+    /// hotkey swallows meant shipping a chord that did nothing in the hand, so the
+    /// half-page pair moved to ⌃⌘↑/⌃⌘↓. A default that lands on a reserved chord
+    /// is now simply a bug.
     #[test]
-    fn only_scroll_half_page_down_overlaps_the_reserved_table() {
-        let overlapping: Vec<ShortcutAction> = default_bindings()
+    fn no_default_combo_is_reserved() {
+        let overlapping: Vec<(ShortcutAction, String)> = default_bindings()
             .into_iter()
             .filter(|(_, c)| reserved_combo(&OwnedCombo::from(*c)).is_some())
-            .map(|(a, _)| a)
+            .map(|(a, c)| (a, c.chord_str()))
             .collect();
-        assert_eq!(overlapping, vec![ShortcutAction::ScrollHalfPageDown]);
+        assert!(
+            overlapping.is_empty(),
+            "these defaults sit on reserved chords: {overlapping:?}"
+        );
     }
 
     /// The digit-key helpers the recorder and the keymap expansion share.

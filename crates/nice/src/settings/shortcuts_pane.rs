@@ -1070,17 +1070,27 @@ mod tests {
         );
     }
 
-    /// The guard runs BEFORE the conflict check: ⌃⌘D is both a reserved macOS
-    /// chord and (per the plan's Slice 1 defaults) the live "Scroll half page down"
-    /// binding, and it reports Reserved — not a Conflict the user could Replace.
+    /// The guard runs BEFORE the conflict check. No SHIPPED default sits on a
+    /// reserved chord any more — ⌃⌘D stopped being "Scroll half page down" on
+    /// 2026-08-11, because macOS's dictionary hotkey swallows the real keydown —
+    /// so the precedence is driven off a hand-built board: park an action on the
+    /// reserved ⌃⌘D, then record that chord from a DIFFERENT action. It must
+    /// report Reserved, not a Conflict the user could Replace; otherwise anyone
+    /// whose stored map already held the chord could walk around the guard.
     #[test]
     fn reserved_wins_over_an_intra_table_conflict() {
+        let mut bindings = default_bindings_vec();
+        for (a, c) in bindings.iter_mut() {
+            if *a == ShortcutAction::ScrollHalfPageDown {
+                *c = Some(combo("cmd-ctrl-d"));
+            }
+        }
         let out = decide_capture(
             ShortcutAction::ToggleSidebar,
             Modifiers::CONTROL_COMMAND,
             "d",
             false,
-            &default_bindings_vec(),
+            &bindings,
         );
         assert_eq!(
             out,

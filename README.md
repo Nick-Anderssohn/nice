@@ -48,7 +48,7 @@ jumps to it.
 | `⌃⌘J` / `⌃⌘K` | Next / previous sidebar session (`j` goes down the list) |
 | `⌃⌘1`–`⌃⌘9` | Jump to a window by its position |
 | `⌃⌘O` | Back to the last window you were in |
-| `⌃⌘U` / `⌃⌘D` | Half-page through terminal scrollback |
+| `⌃⌘↑` / `⌃⌘↓` | Half-page through terminal scrollback |
 | `⌘T` | New terminal window |
 | `⌘B` | Toggle sidebar |
 | `⌘⇧B` | Toggle sidebar mode (sessions ↔ file browser) |
@@ -62,7 +62,7 @@ jumps to it.
 All rebindable in Settings (`⌘,`), except the `⇧`-scrollback keys — those are
 terminal-level and fall through to fullscreen apps like vim. `⌃⌘1`–`⌃⌘9` is a
 single row there: record any digit and the modifiers you chose apply to all
-nine. `⌃⌘U`/`⌃⌘D` deliberately do nothing on the alternate screen, so vim and
+nine. `⌃⌘↑`/`⌃⌘↓` deliberately do nothing on the alternate screen, so vim and
 less keep their own half-page keys.
 
 ## Requirements

@@ -962,11 +962,17 @@ struct KeybindFixture {
 /// Every chord is asserted twice: once on its EFFECT (the pill or sidebar
 /// session the model made active, the viewport offset) and once on the pty (`0`
 /// bytes captured), with a plain `u` as the differential that proves the capture
-/// file would have shown a leak. The chords the 2026-08-11 hjkl-ladder revision
-/// FREED (`⌃⌘]` / `⌃⌘[`) get the mirror assertion — no effect and no bytes — so
-/// "unbound" is proven to mean inert rather than "falls through and types".
+/// file would have shown a leak. The chords the 2026-08-11 revisions FREED
+/// (`⌃⌘]` / `⌃⌘[` from the hjkl ladder, `⌃⌘U` / `⌃⌘D` from the half-page move)
+/// get the mirror assertion — no effect and no bytes — so "unbound" is proven to
+/// mean inert rather than "falls through and types".
+///
 /// Keystrokes ride `Window::dispatch_keystroke`, so no Accessibility grant is
-/// needed.
+/// needed — at the cost of one BLIND SPOT worth naming: injection happens
+/// downstream of the OS hotkey layer, so a chord macOS itself intercepts (⌃⌘D →
+/// dictionary lookup) passes here while doing nothing on a real keyboard. That
+/// is how the shipped `⌃⌘D` half-page default survived this gate and died in
+/// hand-testing. Chord CHOICE cannot be validated here; only dispatch can.
 pub fn open_keybind_scheme_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     use crate::window_registry::WindowRegistry;
     use crate::window_state::WindowState;
@@ -1286,12 +1292,20 @@ async fn run_keybind_scheme(
     nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-o", 3).await;
     nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-o", 2).await;
 
-    // --- §4 the FREED chords do nothing (the 2026-08-11 ladder revision) ---
+    // --- §4 the FREED chords do nothing (the 2026-08-11 revisions) ---------
     // ⌃⌘] / ⌃⌘[ were the shipped prev/next-pill defaults; the ladder moved that
-    // pair onto ⌃⌘H/⌃⌘L and left these bound to nothing. Unbound must mean
-    // INERT, not "falls through and types" — assert both halves.
+    // pair onto ⌃⌘H/⌃⌘L. ⌃⌘U / ⌃⌘D were the half-page pair, which moved to the
+    // arrows after macOS's dictionary hotkey turned out to swallow a real ⌃⌘D
+    // before Nice saw it. All four are bound to nothing now — and unbound must
+    // mean INERT, not "falls through and types", so assert both halves.
+    //
+    // NOTE the blind spot this leg does NOT cover: `dispatch_keystroke` injects
+    // downstream of the OS hotkey layer, so a chord macOS intercepts still looks
+    // live here. That is exactly how the ⌃⌘D defect reached a hand-test.
     freed_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]").await;
     freed_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-[").await;
+    freed_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-u").await;
+    freed_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-d").await;
 
     // --- §5 ⌃⌘J / ⌃⌘K step the SIDEBAR sessions ----------------------------
     // The ladder's bare-⌃⌘ vertical axis: j = down the sidebar list = next.
@@ -1307,7 +1321,7 @@ async fn run_keybind_scheme(
     // pins that the digit expansion is not just the `2` binding.
     nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-1", 1).await;
 
-    // --- §5 ⌃⌘U / ⌃⌘D half-page scrollback ---------------------------------
+    // --- §6 ⌃⌘↑ / ⌃⌘↓ half-page scrollback ---------------------------------
     let seed: String = (1..=KEYBIND_SEED_LINES)
         .map(|i| format!("seed-{i}\r\n"))
         .collect();
@@ -1336,36 +1350,36 @@ async fn run_keybind_scheme(
     // The exact step is `screen_lines / 2` on the LAID-OUT grid (the mounted
     // view refits the pty to the real window), which the driver cannot read
     // directly — so assert the invariants that pin the same math: the first step
-    // moves, the second doubles it (equal steps), and two ⌃⌘D undo them exactly.
+    // moves, the second doubles it (equal steps), and two ⌃⌘↓ undo them exactly.
     let mut half_leaks: Vec<(&str, Vec<u8>)> = Vec::new();
-    let up1 = chord_leak(cx, window, &cap_path, "ctrl-cmd-u").await;
-    half_leaks.push(("ctrl-cmd-u", up1));
+    let up1 = chord_leak(cx, window, &cap_path, "ctrl-cmd-up").await;
+    half_leaks.push(("ctrl-cmd-up", up1));
     let off1 = offset(cx);
     if off1 == 0 {
-        failures.push("ctrl-cmd-u: display offset stayed 0 (no half-page scroll)".into());
+        failures.push("ctrl-cmd-up: display offset stayed 0 (no half-page scroll)".into());
     }
-    let up2 = chord_leak(cx, window, &cap_path, "ctrl-cmd-u").await;
-    half_leaks.push(("ctrl-cmd-u", up2));
+    let up2 = chord_leak(cx, window, &cap_path, "ctrl-cmd-up").await;
+    half_leaks.push(("ctrl-cmd-up", up2));
     let off2 = offset(cx);
     if off2 != off1 * 2 {
         failures.push(format!(
-            "ctrl-cmd-u: second half-page landed at {off2}, expected {} (two equal steps)",
+            "ctrl-cmd-up: second half-page landed at {off2}, expected {} (two equal steps)",
             off1 * 2
         ));
     }
-    let down1 = chord_leak(cx, window, &cap_path, "ctrl-cmd-d").await;
-    half_leaks.push(("ctrl-cmd-d", down1));
+    let down1 = chord_leak(cx, window, &cap_path, "ctrl-cmd-down").await;
+    half_leaks.push(("ctrl-cmd-down", down1));
     if offset(cx) != off1 {
         failures.push(format!(
-            "ctrl-cmd-d: landed at {}, expected {off1} (same magnitude, opposite sign)",
+            "ctrl-cmd-down: landed at {}, expected {off1} (same magnitude, opposite sign)",
             offset(cx)
         ));
     }
-    let down2 = chord_leak(cx, window, &cap_path, "ctrl-cmd-d").await;
-    half_leaks.push(("ctrl-cmd-d", down2));
+    let down2 = chord_leak(cx, window, &cap_path, "ctrl-cmd-down").await;
+    half_leaks.push(("ctrl-cmd-down", down2));
     if offset(cx) != 0 {
         failures.push(format!(
-            "ctrl-cmd-d: viewport is at {} instead of parked at the bottom",
+            "ctrl-cmd-down: viewport is at {} instead of parked at the bottom",
             offset(cx)
         ));
     }
@@ -1375,7 +1389,7 @@ async fn run_keybind_scheme(
         }
     }
 
-    // --- §6 the differential: a plain `u` still reaches the pty -------------
+    // --- §7 the differential: a plain `u` still reaches the pty -------------
     // Without this the zero-byte assertions above could pass vacuously (an
     // unwired keymap leaks nothing either).
     let start = cap_len(&cap_path);
@@ -1383,7 +1397,7 @@ async fn run_keybind_scheme(
     settle(cx, 250).await;
     expect_bytes(&mut failures, "plain-u", b"u", &cap_since(&cap_path, start));
 
-    // --- §7 alt screen: the half-page chords do nothing at all --------------
+    // --- §8 alt screen: the half-page chords do nothing at all --------------
     // They are keymap bindings, so they never encoded to the pty and there is
     // nothing to fall through TO (contrast Shift+PageUp, which does encode).
     if let Err(e) = write_child(cx, &handle, b"\x1b[?1049h") {
@@ -1401,15 +1415,15 @@ async fn run_keybind_scheme(
     if !alt {
         failures.push("alt-screen: grid never cleared after ESC[?1049h".into());
     } else {
-        let leaked = chord_leak(cx, window, &cap_path, "ctrl-cmd-u").await;
+        let leaked = chord_leak(cx, window, &cap_path, "ctrl-cmd-up").await;
         if !leaked.is_empty() {
             failures.push(format!(
-                "alt-screen ctrl-cmd-u: leaked \"{}\" to the pty",
+                "alt-screen ctrl-cmd-up: leaked \"{}\" to the pty",
                 esc(&leaked)
             ));
         }
         if offset(cx) != 0 {
-            failures.push("alt-screen: ctrl-cmd-u moved the viewport".into());
+            failures.push("alt-screen: ctrl-cmd-up moved the viewport".into());
         }
         let _ = write_child(cx, &handle, b"\x1b[?1049l");
     }
@@ -1419,8 +1433,8 @@ async fn run_keybind_scheme(
             passed: true,
             stats: IntervalStats::default(),
             detail: "held-⌃⌘ scheme OK end to end: ⌃⌘L/⌃⌘H cycled the pills (wrapping), ⌃⌘1/⌃⌘2 \
-                     jumped by index, ⌃⌘O bounced between the last two, the freed ⌃⌘]/⌃⌘[ did \
-                     nothing at all, ⌃⌘J/⌃⌘K stepped the sidebar sessions, ⌃⌘U/⌃⌘D half-paged \
+                     jumped by index, ⌃⌘O bounced between the last two, the freed ⌃⌘]/⌃⌘[/⌃⌘U/⌃⌘D \
+                     did nothing at all, ⌃⌘J/⌃⌘K stepped the sidebar sessions, ⌃⌘↑/⌃⌘↓ half-paged \
                      in equal steps and no-opped on the alt screen — every chord silent to the \
                      pty while a plain `u` still encoded"
                 .to_string(),

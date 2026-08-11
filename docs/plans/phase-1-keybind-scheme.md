@@ -11,7 +11,10 @@ actions, bound but inert until Phase 2), `^⌥⌘` = split resize and `^⌥⌘�
 `⌘⌥` arrows end up bound to nothing. `^⌘Space` for swap was rejected: it is the
 macOS emoji picker, and Space is not a modifier. Everything else below still
 holds — the frozen action ids, D2, D4, D5, and the guard/handler architecture.
-The historical body is left as written.
+Half-page scroll moved the same day too, off `^⌘u`/`^⌘d` onto `^⌘↑`/`^⌘↓`,
+because macOS's dictionary hotkey swallows a real `^⌘D` keydown before the app
+sees it — which also retires this plan's "ships as a default AND is reserved"
+quirk. The historical body is left as written.
 
 Roadmap: `docs/tmux-port-roadmap.md` § "Phase 1 — held-modifier keybind
 scheme (M) — SHIPPED". Locked decisions (2026-08-05): held `^⌘` + vim keys,
