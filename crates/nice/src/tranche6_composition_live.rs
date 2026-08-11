@@ -888,7 +888,7 @@ async fn poll_new_session(
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let now = all_session_ids(cx, state);
-        if let Some(new) = now.iter().find(|t| !before.contains(t)) {
+        if let Some(new) = now.iter().find(|s| !before.contains(s)) {
             return Some(new.clone());
         }
     }

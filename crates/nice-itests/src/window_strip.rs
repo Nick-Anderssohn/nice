@@ -185,7 +185,7 @@ impl WindowStripProbe {
     }
 
     fn term_window_ids(&self) -> Vec<String> {
-        self.session().windows.iter().map(|p| p.id.clone()).collect()
+        self.session().windows.iter().map(|w| w.id.clone()).collect()
     }
 
     fn active_window_id(&self) -> Option<String> {
@@ -237,7 +237,7 @@ impl WindowStripProbe {
     }
 
     fn pill_bounds(&self, term_window_id: &str) -> Option<Bounds<Pixels>> {
-        let ix = self.session().windows.iter().position(|p| p.id == term_window_id)?;
+        let ix = self.session().windows.iter().position(|w| w.id == term_window_id)?;
         self.scroll.bounds_for_item(ix)
     }
 
@@ -249,7 +249,7 @@ impl WindowStripProbe {
     fn select_window(&mut self, term_window_id: &str) {
         if let Some((pi, ti)) = self.workspace.project_session_index(&self.session_id) {
             let session = &mut self.workspace.projects[pi].sessions[ti];
-            if session.windows.iter().any(|p| p.id == term_window_id)
+            if session.windows.iter().any(|w| w.id == term_window_id)
                 && session.active_window_id.as_deref() != Some(term_window_id)
             {
                 session.active_window_id = Some(term_window_id.to_string());
@@ -279,7 +279,7 @@ impl WindowStripProbe {
         let Some(active) = self.active_window_id() else {
             return;
         };
-        let Some(ix) = self.session().windows.iter().position(|p| p.id == active) else {
+        let Some(ix) = self.session().windows.iter().position(|w| w.id == active) else {
             return;
         };
         let Some(item) = self.scroll.bounds_for_item(ix) else {
@@ -304,8 +304,8 @@ impl WindowStripProbe {
             .session()
             .windows
             .iter()
-            .find(|p| p.id == term_window_id)
-            .map(|p| p.title.clone());
+            .find(|w| w.id == term_window_id)
+            .map(|w| w.title.clone());
         if let Some(title) = title {
             self.editing_window = Some(term_window_id.to_string());
             self.draft = title;
@@ -1144,7 +1144,7 @@ impl WindowStripProbe {
         self.workspace.projects[pi].sessions[ti]
             .windows
             .iter_mut()
-            .find(|p| p.id == term_window_id)
+            .find(|w| w.id == term_window_id)
             .expect("window exists")
     }
 }

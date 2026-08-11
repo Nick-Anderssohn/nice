@@ -313,7 +313,7 @@ async fn run_claude_e2e(
     // The real Main window (Terminals-group Main session), spawned with the shadow.
     let main_session = WorkspaceModel::MAIN_TERMINAL_SESSION_ID.to_string();
     let Some(main_window) = state.update(cx, |s, _cx| {
-        s.workspace.session_for(&main_session).and_then(|t| t.windows.first()).map(|p| p.id.clone())
+        s.workspace.session_for(&main_session).and_then(|t| t.windows.first()).map(|w| w.id.clone())
     }) else {
         return CadenceReport::error("claude-e2e: the shipped window has no Main terminal window");
     };
@@ -732,7 +732,7 @@ async fn poll_new_session(
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let now = all_session_ids(cx, state);
-        if let Some(new) = now.iter().find(|t| !before.contains(t)) {
+        if let Some(new) = now.iter().find(|s| !before.contains(s)) {
             return Some(new.clone());
         }
     }
@@ -752,8 +752,8 @@ fn window_is_claude_running(cx: &mut AsyncApp, state: &Entity<WindowState>, sess
     state.update(cx, |s, _cx| {
         s.workspace
             .session_for(session_id)
-            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-            .map(|p| p.is_claude_running)
+            .and_then(|t| t.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.is_claude_running)
             .unwrap_or(false)
     })
 }
@@ -829,8 +829,8 @@ async fn poll_window_promoted(cx: &mut AsyncApp, state: &Entity<WindowState>, se
         let ok = state.update(cx, |s, _cx| {
             s.workspace
                 .session_for(session_id)
-                .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-                .map(|p| p.kind == TermWindowKind::Claude && p.is_claude_running)
+                .and_then(|t| t.windows.iter().find(|w| w.id == term_window_id))
+                .map(|w| w.kind == TermWindowKind::Claude && w.is_claude_running)
                 .unwrap_or(false)
         });
         if ok {

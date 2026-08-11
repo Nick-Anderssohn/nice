@@ -399,7 +399,7 @@ impl PtyManager {
     ) -> bool {
         let mut changed = false;
         model.mutate_session(session_id, |session| {
-            if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                 if term_window.cwd.as_deref() != Some(cwd) {
                     term_window.cwd = Some(cwd.to_string());
                     changed = true;
@@ -439,7 +439,7 @@ impl PtyManager {
         let Some(session) = model.session_for(session_id) else {
             return false;
         };
-        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
+        let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return false;
         };
         let kind = term_window.kind;
@@ -461,7 +461,7 @@ impl PtyManager {
                 let clipped = clip_title(trimmed, WINDOW_TITLE_MAX);
                 let mut changed = false;
                 model.mutate_session(session_id, |session| {
-                    if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                    if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                         if term_window.title != clipped {
                             term_window.title = clipped;
                             changed = true;
@@ -493,7 +493,7 @@ impl PtyManager {
                     let viewing = model.active_session_id() == Some(session_id);
                     model.mutate_session(session_id, |session| {
                         let is_active_window = session.active_window_id.as_deref() == Some(term_window_id);
-                        if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                        if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                             term_window.apply_status_transition(new_status, viewing && is_active_window);
                         }
                     });
@@ -597,10 +597,10 @@ impl PtyManager {
     pub(crate) fn set_active_window(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
         let viewing = model.active_session_id() == Some(session_id);
         model.mutate_session(session_id, |session| {
-            if session.windows.iter().any(|p| p.id == term_window_id) {
+            if session.windows.iter().any(|w| w.id == term_window_id) {
                 session.active_window_id = Some(term_window_id.to_string());
                 if viewing {
-                    if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+                    if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                         term_window.mark_acknowledged_if_waiting();
                     }
                 }
@@ -639,7 +639,7 @@ impl PtyManager {
         let Some(active) = session.active_window_id.clone() else {
             return;
         };
-        let Some(cur) = session.windows.iter().position(|p| p.id == active) else {
+        let Some(cur) = session.windows.iter().position(|w| w.id == active) else {
             return;
         };
         // `((i + off) % n + n) % n`, expressed with rem_euclid.
@@ -767,7 +767,7 @@ impl PtyManager {
         self.clear_window_launch(term_window_id);
         // (2) model removal + neighbor refocus.
         model.mutate_session(session_id, |session| {
-            if let Some(idx) = session.windows.iter().position(|p| p.id == term_window_id) {
+            if let Some(idx) = session.windows.iter().position(|w| w.id == term_window_id) {
                 session.windows.remove(idx);
                 if session.active_window_id.as_deref() == Some(term_window_id) {
                     session.active_window_id = WorkspaceModel::neighbor_active_window_id(idx, &session.windows);
@@ -811,7 +811,7 @@ impl PtyManager {
     pub(crate) fn window_held(&mut self, model: &mut WorkspaceModel, session_id: &str, term_window_id: &str) {
         self.clear_window_launch(term_window_id);
         model.mutate_session(session_id, |session| {
-            if let Some(term_window) = session.windows.iter_mut().find(|p| p.id == term_window_id) {
+            if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                 term_window.is_alive = false;
                 // A held-dead window is not thinking or waiting regardless of its
                 // last OSC title; idle it and clear the ack so a future fresh
@@ -980,13 +980,13 @@ impl PtyManager {
             // Drop unspawned rows up front (before terminating spawned ones).
             let drop: HashSet<String> = unspawned.into_iter().collect();
             model.mutate_session(session_id, |session| {
-                session.windows.retain(|p| !drop.contains(&p.id));
+                session.windows.retain(|w| !drop.contains(&w.id));
                 let active_dropped = session
                     .active_window_id
                     .as_deref()
                     .is_some_and(|a| drop.contains(a));
                 if active_dropped {
-                    session.active_window_id = session.windows.first().map(|p| p.id.clone());
+                    session.active_window_id = session.windows.first().map(|w| w.id.clone());
                 }
             });
         }
@@ -1705,7 +1705,7 @@ impl PtyManager {
         let Some(term_window_id) = session.active_window_id.clone() else {
             return;
         };
-        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
+        let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return;
         };
         if !self.session_has_pty(session_id) || self.has_window(session_id, &term_window_id) {

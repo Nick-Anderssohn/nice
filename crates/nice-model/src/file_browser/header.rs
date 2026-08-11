@@ -13,11 +13,11 @@ use crate::WorkspaceModel;
 /// The title to show at the top of the file browser for `session_id`. See the
 /// module docs for the rule.
 pub fn file_browser_header_title(model: &WorkspaceModel, session_id: &str) -> String {
-    let session_title = model.session_for(session_id).map(|t| t.title.clone());
+    let session_title = model.session_for(session_id).map(|s| s.title.clone());
     let owning_project = model
         .projects
         .iter()
-        .find(|p| p.sessions.iter().any(|t| t.id == session_id));
+        .find(|p| p.sessions.iter().any(|s| s.id == session_id));
 
     let Some(project) = owning_project else {
         return session_title.unwrap_or_else(|| "Files".to_string());

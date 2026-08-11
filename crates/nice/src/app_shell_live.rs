@@ -349,7 +349,7 @@ async fn cmd_t_checks(
     let pills_after = toolbar_window_ids(cx, toolbar);
     let active_after = toolbar_active(cx, toolbar);
 
-    let Some(new_pill) = pills_after.iter().find(|p| !pills_before.contains(p)).cloned() else {
+    let Some(new_pill) = pills_after.iter().find(|w| !pills_before.contains(w)).cloned() else {
         failures.push(format!(
             "⌘T: pill count {}→{} — no new window pill (did the chord route to the shipped key window?)",
             pills_before.len(),
@@ -403,7 +403,7 @@ async fn strip_add_checks(
     settle(cx, 400).await;
 
     let pills_after = toolbar_window_ids(cx, toolbar);
-    let Some(new_pill) = pills_after.iter().find(|p| !pills_before.contains(p)).cloned() else {
+    let Some(new_pill) = pills_after.iter().find(|w| !pills_before.contains(w)).cloned() else {
         failures.push("strip-+: no new window pill after the toolbar + add".to_string());
         return;
     };
@@ -618,7 +618,7 @@ async fn rename_focus_checks(
     let committed = state.update(cx, |s, _| {
         s.workspace.session_for(&session).and_then(|t| {
             let pid = t.active_window_id.as_deref()?;
-            t.windows.iter().find(|p| p.id == pid).map(|p| p.title.clone())
+            t.windows.iter().find(|w| w.id == pid).map(|w| w.title.clone())
         })
     });
     if committed.as_deref() != Some(draft_after.as_str()) {
@@ -643,7 +643,7 @@ async fn rename_focus_checks(
     let title_before = state.update(cx, |s, _| {
         s.workspace.session_for(&session).and_then(|t| {
             let pid = t.active_window_id.as_deref()?;
-            t.windows.iter().find(|p| p.id == pid).map(|p| p.title.clone())
+            t.windows.iter().find(|w| w.id == pid).map(|w| w.title.clone())
         })
     });
     let _ = whandle.update(cx, |_r, window, app| {
@@ -659,7 +659,7 @@ async fn rename_focus_checks(
     let title_now = state.update(cx, |s, _| {
         s.workspace.session_for(&session).and_then(|t| {
             let pid = t.active_window_id.as_deref()?;
-            t.windows.iter().find(|p| p.id == pid).map(|p| p.title.clone())
+            t.windows.iter().find(|w| w.id == pid).map(|w| w.title.clone())
         })
     });
     if title_now != title_before {

@@ -1636,8 +1636,8 @@ pub(crate) fn open_managed_window_with(
         let session = ws.workspace.active_session_id().map(str::to_owned);
         let term_window = session
             .as_deref()
-            .and_then(|t| ws.workspace.session_for(t))
-            .and_then(|t| t.active_window_id.clone());
+            .and_then(|s| ws.workspace.session_for(s))
+            .and_then(|s| s.active_window_id.clone());
         session.zip(term_window)
     };
 
@@ -3842,6 +3842,18 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            name: "scrollback-keys",
+            open: crate::input_live::open_scrollback_keys_window,
+            gate: Gate::SelfReported {
+                // Seed render poll + five dispatched chords with settles + the
+                // alt-screen round trip; generous headroom. Needs NO
+                // Accessibility grant (in-process `dispatch_keystroke`, not
+                // CGEvents).
+                budget: Duration::from_secs(30),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "compose-live",
             open: crate::compose_live::open_compose_live_window,
             gate: Gate::SelfReported {
@@ -4617,7 +4629,7 @@ mod tests {
             .iter()
             .flat_map(|w| w.projects.clone())
             .flat_map(|p| p.sessions)
-            .find(|t| t.id == session_id)
+            .find(|s| s.id == session_id)
     }
 
     /// Acceptance #1 (BUGS.md #8 site 1 — `sidebar_shell.rs` `commit_rename`): a
@@ -4641,7 +4653,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(
-            persisted_session(&store, &session_id).map(|t| t.title),
+            persisted_session(&store, &session_id).map(|s| s.title),
             Some("Renamed Tab".to_string()),
             "the session rename persisted through the wired observer, not a per-site save"
         );
@@ -4668,8 +4680,8 @@ mod tests {
                 let term_window_id = ws
                     .workspace
                     .session_for(&session_id)
-                    .and_then(|t| t.windows.first())
-                    .map(|p| p.id.clone())
+                    .and_then(|s| s.windows.first())
+                    .map(|w| w.id.clone())
                     .unwrap();
                 (session_id, term_window_id)
             };
@@ -4685,7 +4697,7 @@ mod tests {
         cx.run_until_parked();
         {
             let session = persisted_session(&store, &session_id).expect("session persisted");
-            let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+            let term_window = session.windows.iter().find(|w| w.id == term_window_id).expect("window persisted");
             assert_eq!(term_window.title, "Deploy", "the custom window label persisted");
             assert_eq!(term_window.title_manually_set, Some(true), "the rename lock persisted");
             assert_eq!(
@@ -4702,7 +4714,7 @@ mod tests {
         cx.run_until_parked();
         {
             let session = persisted_session(&store, &session_id).expect("session persisted");
-            let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+            let term_window = session.windows.iter().find(|w| w.id == term_window_id).expect("window persisted");
             assert_eq!(term_window.title, "Terminal 2", "empty submit reset to the auto-default");
             assert_eq!(
                 session.next_terminal_index,
@@ -4731,8 +4743,8 @@ mod tests {
                 let term_window_id = ws
                     .workspace
                     .session_for(&session_id)
-                    .and_then(|t| t.windows.first())
-                    .map(|p| p.id.clone())
+                    .and_then(|s| s.windows.first())
+                    .map(|w| w.id.clone())
                     .unwrap();
                 (session_id, term_window_id)
             };
@@ -4749,7 +4761,7 @@ mod tests {
         cx.run_until_parked();
 
         let session = persisted_session(&store, &session_id).expect("session persisted");
-        let term_window = session.windows.iter().find(|p| p.id == term_window_id).expect("window persisted");
+        let term_window = session.windows.iter().find(|w| w.id == term_window_id).expect("window persisted");
         assert_eq!(
             term_window.cwd.as_deref(),
             Some("/tmp/newcwd"),
@@ -4829,7 +4841,7 @@ mod tests {
 
         let session = persisted_session(&store, &session_id).expect("session persisted");
         assert!(
-            session.windows.iter().any(|p| p.id == "new-pane-id"),
+            session.windows.iter().any(|w| w.id == "new-pane-id"),
             "the newly-created window persisted through the observer"
         );
         assert_eq!(
@@ -4869,7 +4881,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(
-            persisted_session(&store, &session_id).map(|t| t.title),
+            persisted_session(&store, &session_id).map(|s| s.title),
             Some("Lease Safe".to_string()),
             "the deferred drain saved outside the lease — no double-lease abort"
         );

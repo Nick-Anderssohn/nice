@@ -41,9 +41,7 @@ use gpui::{prelude::*, AnyWindowHandle, AsyncApp, Entity, WindowHandle};
 
 use nice_harness::frame::{CadenceReport, IntervalStats};
 use nice_model::{TermWindow, TermWindowKind, Session, WorkspaceModel, SessionStatus};
-use nice_theme::chrome_geometry::{
-    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-};
+use nice_theme::chrome_geometry::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH};
 use nice_theme::color::Srgba;
 use nice_theme::palette::{slots, ColorScheme, Palette};
 use nice_theme::status::{THINKING_DOT, WAITING_DOT};
@@ -62,9 +60,14 @@ const GEOMETRY_TOL: f32 = 0.5;
 /// Tolerance (pt) for a width-clamp / reset assertion (`clamp` is exact; this
 /// only absorbs the CGEvent content↔global round-trip).
 const WIDTH_TOL: f32 = 1.0;
-/// A resize drag distance (pt) large enough to force the clamp from any start in
-/// [160, 480] (min−max span is 320, so ±400 always overshoots the bound).
+/// The extra drag distance (pt) past a clamp bound that guarantees the drag
+/// overshoots it. The low drag uses a fixed span (the start is at most the
+/// default 240, so 400 always overshoots the 160 floor); the HIGH bound is
+/// viewport-derived since Phase 0, so its drag distance is computed per run
+/// as `(expected_max - start) + RESIZE_OVERSHOOT_MARGIN`.
 const RESIZE_OVERSHOOT: f64 = 400.0;
+/// See [`RESIZE_OVERSHOOT`]: margin added past the computed high bound.
+const RESIZE_OVERSHOOT_MARGIN: f64 = 100.0;
 
 /// Accessibility-grant remediation, shared verbatim with the other CGEvent
 /// scenarios.
@@ -194,7 +197,7 @@ async fn run_sidebar(cx: &mut AsyncApp, whandle: WindowHandle<SidebarShellView>)
 
     // §3 — collapse removes the leading column, then restore returns it.
     collapse_checks(cx, &view, &mut failures).await;
-    restore_check(cx, &view, &mut failures).await;
+    restore_check(cx, whandle, &view, &mut failures).await;
 
     // §4 — dot colour + pulse per state (state-level, off the view's predicates).
     dot_checks(cx, &view, &mut failures);
@@ -209,7 +212,9 @@ async fn run_sidebar(cx: &mut AsyncApp, whandle: WindowHandle<SidebarShellView>)
 // `WindowHandle::update` returns a `Result` (the window can close), hence the
 // `.ok()` on those.
 fn read_width(cx: &mut AsyncApp, view: &Entity<SidebarShellView>) -> f32 {
-    view.update(cx, |v, _| v.sidebar_width())
+    // The EFFECTIVE (rendered) width — the ground truth the pixels follow, so
+    // the assertions can never diverge from what is painted (Phase 0).
+    view.update(cx, |v, _| v.effective_sidebar_width())
 }
 
 fn read_collapsed(cx: &mut AsyncApp, view: &Entity<SidebarShellView>) -> bool {
@@ -275,16 +280,39 @@ async fn resize_checks(
         ));
     }
 
-    // Drag far right → clamp high (480).
+    // Drag far right → clamp high at the viewport-derived max (Phase 0:
+    // viewport - TERMINAL_MIN_WIDTH, replacing the old fixed 480). The bound
+    // is no longer fixed, so the drag distance is computed per run: enough to
+    // reach the bound from the current width, plus a margin to overshoot it.
     let w_before_high = read_width(cx, view);
-    cg_resize_drag(cx, whandle, pid, w_before_high, RESIZE_OVERSHOOT).await;
+    let expected_max = whandle
+        .update(cx, |_v, w, _a| {
+            crate::sidebar_shell::max_sidebar_width(f32::from(w.viewport_size().width))
+        })
+        .unwrap_or(SIDEBAR_MIN_WIDTH);
+    let overshoot_high = (expected_max - w_before_high) as f64 + RESIZE_OVERSHOOT_MARGIN;
+    cg_resize_drag(cx, whandle, pid, w_before_high, overshoot_high).await;
     let w_high = read_width(cx, view);
-    if (w_high - SIDEBAR_MAX_WIDTH).abs() <= WIDTH_TOL {
-        eprintln!("[selftest] sidebar resize: dragged far right → clamped at {SIDEBAR_MAX_WIDTH} (high bound)");
+    if (w_high - expected_max).abs() <= WIDTH_TOL {
+        eprintln!("[selftest] sidebar resize: dragged far right → clamped at {expected_max} (viewport-derived high bound)");
     } else {
         failures.push(format!(
-            "resize high clamp: drag far right settled at {w_high:.1}, expected {SIDEBAR_MAX_WIDTH}"
+            "resize high clamp: drag far right settled at {w_high:.1}, expected {expected_max}"
         ));
+    }
+
+    // The drag-end must have COMMITTED the settled width into the shared
+    // state's sidebar model (the value persistence reads) — the disk half of
+    // the loop is covered by the persistence-restore scenario.
+    let committed = view.update(cx, |v, cx| v.scenario_committed_sidebar_width(cx));
+    match committed {
+        Some(cw) if (cw - w_high).abs() <= WIDTH_TOL => {
+            eprintln!("[selftest] sidebar resize: drag-end committed width {cw:.1} to the sidebar model");
+        }
+        other => failures.push(format!(
+            "resize commit: after the drag the sidebar model holds {other:?}, expected \
+             Some({w_high:.1}) — drag-end did not commit the width persistence reads"
+        )),
     }
 
     // Double-click the handle → reset to 240.
@@ -385,6 +413,7 @@ async fn collapse_checks(
 
 async fn restore_check(
     cx: &mut AsyncApp,
+    whandle: WindowHandle<SidebarShellView>,
     view: &Entity<SidebarShellView>,
     failures: &mut Vec<String>,
 ) {
@@ -395,10 +424,17 @@ async fn restore_check(
         return;
     }
     let w = read_width(cx, view);
-    if w < SIDEBAR_MIN_WIDTH - WIDTH_TOL || w > SIDEBAR_MAX_WIDTH + WIDTH_TOL {
+    // Phase 0: the high bound is viewport-derived, recomputed here from the
+    // live viewport so the sanity range stays two-sided.
+    let max = whandle
+        .update(cx, |_v, win, _a| {
+            crate::sidebar_shell::max_sidebar_width(f32::from(win.viewport_size().width))
+        })
+        .unwrap_or(SIDEBAR_MIN_WIDTH);
+    if w < SIDEBAR_MIN_WIDTH - WIDTH_TOL || w > max + WIDTH_TOL {
         failures.push(format!(
             "restore: expanded column width {w:.1} is outside the resizable range \
-             [{SIDEBAR_MIN_WIDTH}, {SIDEBAR_MAX_WIDTH}]"
+             [{SIDEBAR_MIN_WIDTH}, {max}]"
         ));
     } else {
         eprintln!("[selftest] sidebar restore: returned the expanded column at width {w:.1}pt");

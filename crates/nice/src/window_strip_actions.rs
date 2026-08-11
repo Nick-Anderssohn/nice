@@ -98,7 +98,7 @@ impl ModelWindowStripActions {
         let Some(active) = session.active_window_id.clone() else {
             return;
         };
-        let Some(cur) = session.windows.iter().position(|p| p.id == active) else {
+        let Some(cur) = session.windows.iter().position(|w| w.id == active) else {
             return;
         };
         let next = (cur as isize + offset).rem_euclid(count as isize) as usize;
@@ -115,7 +115,7 @@ impl WindowStripActions for ModelWindowStripActions {
         let session = &mut model.projects[pi].sessions[ti];
         // Guard against selecting a window that isn't on the session — never leave a
         // dangling active_window_id.
-        if session.windows.iter().any(|p| p.id == term_window_id) {
+        if session.windows.iter().any(|w| w.id == term_window_id) {
             session.active_window_id = Some(term_window_id.to_string());
         }
     }
@@ -196,7 +196,7 @@ mod tests {
             .unwrap();
 
         let session = model.session_for(main_session_id()).unwrap();
-        let mut ids: Vec<&str> = session.windows.iter().map(|p| p.id.as_str()).collect();
+        let mut ids: Vec<&str> = session.windows.iter().map(|w| w.id.as_str()).collect();
         ids.sort();
         let before = ids.len();
         ids.dedup();
@@ -268,7 +268,7 @@ mod tests {
 
         let session = model.session_for("t2").unwrap();
         assert_eq!(session.windows.len(), 2);
-        assert!(session.windows.iter().all(|p| p.id != "b"), "b is gone");
+        assert!(session.windows.iter().all(|w| w.id != "b"), "b is gone");
         assert_eq!(
             session.active_window_id.as_deref(),
             Some("c"),
@@ -295,7 +295,7 @@ mod tests {
     fn active_window(model: &WorkspaceModel) -> Option<String> {
         model
             .session_for("t3")
-            .and_then(|t| t.active_window_id.clone())
+            .and_then(|s| s.active_window_id.clone())
     }
 
     #[test]

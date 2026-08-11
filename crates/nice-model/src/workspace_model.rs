@@ -173,7 +173,7 @@ impl WorkspaceModel {
         let mut terminal = 0;
         for project in &self.projects {
             for session in &project.sessions {
-                for window in session.windows.iter().filter(|p| p.is_alive) {
+                for window in session.windows.iter().filter(|w| w.is_alive) {
                     match window.kind {
                         TermWindowKind::Claude => claude += 1,
                         TermWindowKind::Terminal => terminal += 1,
@@ -209,14 +209,14 @@ impl WorkspaceModel {
         self.projects
             .iter()
             .flat_map(|p| p.sessions.iter())
-            .find(|t| t.id == id)
+            .find(|s| s.id == id)
     }
 
     /// Project + session index for the session with id `id`, for in-place mutation
     /// (`TabModel.swift:132-139`).
     pub fn project_session_index(&self, id: &str) -> Option<(usize, usize)> {
         for (pi, project) in self.projects.iter().enumerate() {
-            if let Some(ti) = project.sessions.iter().position(|t| t.id == id) {
+            if let Some(ti) = project.sessions.iter().position(|s| s.id == id) {
                 return Some((pi, ti));
             }
         }
@@ -270,7 +270,7 @@ impl WorkspaceModel {
     pub fn navigable_sidebar_session_ids(&self) -> Vec<String> {
         self.projects
             .iter()
-            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|s| s.id.clone()))
             .collect()
     }
 
@@ -285,8 +285,8 @@ impl WorkspaceModel {
         self.projects
             .iter()
             .flat_map(|p| p.sessions.iter())
-            .find(|t| t.windows.iter().any(|window| window.id == window_id))
-            .map(|t| t.id.clone())
+            .find(|s| s.windows.iter().any(|window| window.id == window_id))
+            .map(|s| s.id.clone())
     }
 
     /// The id of the session pinned to Claude session `claude_session_id`, in
@@ -366,8 +366,8 @@ impl WorkspaceModel {
         // fired via `set_active_session_id`.
         self.mutate_session_silent(session_id, |session| {
             if let Some(window_id) = session.active_window_id.clone() {
-                if let Some(p) = session.windows.iter_mut().find(|p| p.id == window_id) {
-                    p.mark_acknowledged_if_waiting();
+                if let Some(w) = session.windows.iter_mut().find(|w| w.id == window_id) {
+                    w.mark_acknowledged_if_waiting();
                 }
             }
         });
@@ -464,8 +464,8 @@ impl WorkspaceModel {
         if let Some((pi, ti)) = self.project_session_index(session_id) {
             let session = &mut self.projects[pi].sessions[ti];
             if let (Some(src), Some(dst)) = (
-                session.windows.iter().position(|p| p.id == window_id),
-                session.windows.iter().position(|p| p.id == target_window_id),
+                session.windows.iter().position(|w| w.id == window_id),
+                session.windows.iter().position(|w| w.id == target_window_id),
             ) {
                 let mut insert_index = if place_after { dst + 1 } else { dst };
                 if src < insert_index {
@@ -498,8 +498,8 @@ impl WorkspaceModel {
             return false;
         };
         let (Some(src), Some(dst)) = (
-            session.windows.iter().position(|p| p.id == window_id),
-            session.windows.iter().position(|p| p.id == target_window_id),
+            session.windows.iter().position(|w| w.id == window_id),
+            session.windows.iter().position(|w| w.id == target_window_id),
         ) else {
             return false;
         };
@@ -520,7 +520,7 @@ impl WorkspaceModel {
         let mut removed = None;
         if let Some((pi, ti)) = self.project_session_index(session_id) {
             let session = &mut self.projects[pi].sessions[ti];
-            if let Some(idx) = session.windows.iter().position(|p| p.id == window_id) {
+            if let Some(idx) = session.windows.iter().position(|w| w.id == window_id) {
                 let was_active = session.active_window_id.as_deref() == Some(window_id);
                 let r = session.windows.remove(idx);
                 if was_active {
@@ -549,7 +549,7 @@ impl WorkspaceModel {
         let mut inserted = false;
         if let Some((pi, ti)) = self.project_session_index(session_id) {
             let session = &mut self.projects[pi].sessions[ti];
-            if !session.windows.iter().any(|p| p.id == window.id) {
+            if !session.windows.iter().any(|w| w.id == window.id) {
                 let insert_index = match target_window_id
                     .and_then(|t| session.windows.iter().position(|p| p.id == t))
                 {
@@ -623,7 +623,7 @@ impl WorkspaceModel {
         let mut changed = false;
         if let Some((pi, ti)) = self.project_session_index(session_id) {
             let session = &mut self.projects[pi].sessions[ti];
-            if let Some(idx) = session.windows.iter().position(|p| p.id == window_id) {
+            if let Some(idx) = session.windows.iter().position(|w| w.id == window_id) {
                 if trimmed.is_empty() {
                     // Empty submit: release the lock and recompute the
                     // auto-default. A terminal reset consumes the next slot from
@@ -726,7 +726,7 @@ impl WorkspaceModel {
                 self.fire_mutation();
             }
             if self.active_session_id.is_none() {
-                if let Some(first_id) = self.projects[0].sessions.first().map(|t| t.id.clone()) {
+                if let Some(first_id) = self.projects[0].sessions.first().map(|s| s.id.clone()) {
                     // `set_active_session_id` fires the did-mutate signal itself.
                     self.set_active_session_id(Some(first_id));
                 }
@@ -990,7 +990,7 @@ impl WorkspaceModel {
         if let Some(project) = self
             .projects
             .iter()
-            .find(|p| p.sessions.iter().any(|t| t.id == session.id))
+            .find(|p| p.sessions.iter().any(|s| s.id == session.id))
         {
             return self.expand_tilde(&project.path);
         }
@@ -1018,7 +1018,7 @@ impl WorkspaceModel {
             return cwd.to_string();
         }
         if let Some(active_id) = &session.active_window_id {
-            if let Some(active_window) = session.windows.iter().find(|p| &p.id == active_id) {
+            if let Some(active_window) = session.windows.iter().find(|w| &w.id == active_id) {
                 return self.resolved_spawn_cwd_for_window(session, active_window);
             }
         }
@@ -1081,7 +1081,7 @@ impl WorkspaceModel {
             // cross-project pointer would mean prior corruption; don't compound
             // it by inheriting the bad pointer.
             debug_assert!(
-                self.projects[pi].sessions.iter().any(|t| &t.id == root),
+                self.projects[pi].sessions.iter().any(|s| &s.id == root),
                 "originating session's parent_session_id must live in the same project"
             );
         }
@@ -1201,7 +1201,7 @@ impl WorkspaceModel {
         let valid: HashSet<String> = self
             .projects
             .iter()
-            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|s| s.id.clone()))
             .collect();
         let mut changed = false;
         for pi in 0..self.projects.len() {
@@ -1260,7 +1260,7 @@ impl WorkspaceModel {
                 // kept it lives on another session). When a window on this session kept
                 // the id, the pointer already resolves unambiguously to it.
                 if let Some(active) = session.active_window_id.clone() {
-                    if !session.windows.iter().any(|p| p.id == active) {
+                    if !session.windows.iter().any(|w| w.id == active) {
                         if let Some((_, new_id)) =
                             renames.iter().find(|(old, _)| *old == active)
                         {
@@ -1395,8 +1395,8 @@ fn plan_session_move(
     if session_id == target_session_id {
         return None;
     }
-    let src = sessions.iter().position(|t| t.id == session_id)?;
-    let dst = sessions.iter().position(|t| t.id == target_session_id)?;
+    let src = sessions.iter().position(|s| s.id == session_id)?;
+    let dst = sessions.iter().position(|s| s.id == target_session_id)?;
 
     let order = match sessions[src].parent_session_id.clone() {
         None => plan_root_block_move(sessions, src, dst, place_after)?,
@@ -1414,7 +1414,7 @@ fn child_indices(sessions: &[Session], root_idx: usize) -> Vec<usize> {
     let root_id = sessions[root_idx].id.as_str();
     sessions.iter()
         .enumerate()
-        .filter(|(_, t)| t.parent_session_id.as_deref() == Some(root_id))
+        .filter(|(_, s)| s.parent_session_id.as_deref() == Some(root_id))
         .map(|(i, _)| i)
         .collect()
 }
@@ -1435,7 +1435,7 @@ fn plan_root_block_move(
     // impossible after `prune_dangling_parent_references`) rejects the drop.
     let target_root = match sessions[dst].parent_session_id.as_deref() {
         None => dst,
-        Some(pid) => sessions.iter().position(|t| t.id == pid)?,
+        Some(pid) => sessions.iter().position(|s| s.id == pid)?,
     };
     if target_root == src {
         // The slot lands inside the dragged session's own subtree.

@@ -86,8 +86,8 @@ use nice_model::file_browser::TextFieldEditor;
 use nice_model::{InlineRenameClickGate, SidebarMode, WorkspaceModel, SessionStatus};
 use nice_theme::chrome_geometry::{
     CARD_CORNER_RADIUS, CARD_SHADOW_OPACITY, CARD_SHADOW_RADIUS, CARD_SHADOW_Y_OFFSET,
-    INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SIDEBAR_PEEK_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, TOP_BAR_HEIGHT,
+    INNER_CORNER_RADIUS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_PEEK_WIDTH,
+    SIDEBAR_RESIZE_HANDLE_WIDTH, TERMINAL_MIN_WIDTH, TOP_BAR_HEIGHT,
 };
 use nice_theme::color::Srgba;
 use nice_theme::glass::{glass_fill, glass_line};
@@ -183,14 +183,25 @@ const SIDEBAR_ROW_DOT_SIZE: f32 = 7.0;
 
 // ---- Pure helpers (unit-tested; no gpui) ------------------------------------
 
-/// Clamp a candidate sidebar width to the resizable range (`AppShellView.swift:882`).
-fn clamp_sidebar_width(width: f32) -> f32 {
-    width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+/// The dynamic upper clamp on the docked sidebar (Phase 0): leave at least
+/// [`TERMINAL_MIN_WIDTH`] pt of window for terminal content, but never fall
+/// below [`SIDEBAR_MIN_WIDTH`] — a degenerate tiny window pins the resizable
+/// range to `MIN..=MIN` rather than inverting it. `pub(crate)` for the
+/// `sidebar` live scenario's clamp expectations.
+pub(crate) fn max_sidebar_width(viewport_width: f32) -> f32 {
+    (viewport_width - TERMINAL_MIN_WIDTH).max(SIDEBAR_MIN_WIDTH)
+}
+
+/// Clamp a candidate sidebar width to the resizable range: the Swift fixed
+/// 160..=480 (`AppShellView.swift:882`) with the upper bound now derived from
+/// the viewport (Phase 0, `docs/plans/phase-0-quick-wins.md`).
+fn clamp_sidebar_width(width: f32, viewport_width: f32) -> f32 {
+    width.clamp(SIDEBAR_MIN_WIDTH, max_sidebar_width(viewport_width))
 }
 
 /// The new sidebar width for a resize drag: baseline + horizontal delta, clamped.
-fn resize_width(baseline: f32, delta_x: f32) -> f32 {
-    clamp_sidebar_width(baseline + delta_x)
+fn resize_width(baseline: f32, delta_x: f32, viewport_width: f32) -> f32 {
+    clamp_sidebar_width(baseline + delta_x, viewport_width)
 }
 
 /// Row leading inset for a session, given whether it is a depth-1 lineage child.
@@ -529,12 +540,26 @@ pub(crate) struct SidebarShellView {
     /// the shell's fill body below the toolbar. `None` in the isolated scenario.
     main_body: Option<AnyView>,
 
-    /// The user-resizable docked sidebar width (in-memory; resets on relaunch).
+    /// The user-resizable docked sidebar width — the live value a drag mutates
+    /// per mouse-move. Seeded from the shared state's persisted width on
+    /// construction; committed back (and persisted) on drag-end (Phase 0).
     sidebar_width: f32,
-    /// The width at the start of a resize drag (baseline for the clamp).
+    /// The width the current frame actually renders: `sidebar_width` re-clamped
+    /// against the viewport at the top of every render, so shrinking the OS
+    /// window squeezes the sidebar WITHOUT rewriting the chosen width —
+    /// re-widening the window restores it (Phase 0).
+    effective_sidebar_width: f32,
+    /// The width at the start of a resize drag (baseline for the clamp) — the
+    /// EFFECTIVE width, so a drag on a viewport-shrunk sidebar tracks the
+    /// handle the user actually grabbed, not the stored pre-shrink width.
     drag_start_width: Option<f32>,
     /// Window-x of the resize drag's initial press (delta reference).
     resize_origin_x: Option<f32>,
+    /// Whether the current resize press produced at least one drag move. A
+    /// zero-movement click on the handle must NOT commit a width — that would
+    /// convert a never-customized window (persisted `sidebarWidth` absent)
+    /// into one pinned at the current default.
+    resize_moved: bool,
 
     /// True while the cursor pins an open peek overlay (the view's own hover
     /// pin, OR'd with `SidebarModel::peeking` which R12 drives).
@@ -648,14 +673,23 @@ impl SidebarShellView {
             .unwrap_or(crate::settings::sidebar_font::DEFAULT_SIDEBAR_FONT_PX);
         let sidebar_font_sub =
             sidebar_font.map(|e| cx.observe(&e, |_this, _e, cx| cx.notify()));
+        // Phase 0: seed the live width from the persisted per-window width
+        // (restore ran before this view exists); absent ⇒ the default.
+        let initial_width = state
+            .read(cx)
+            .sidebar
+            .width()
+            .unwrap_or(SIDEBAR_DEFAULT_WIDTH);
         Self {
             state,
             _state_sub: state_sub,
             main_toolbar: None,
             main_body: None,
-            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            sidebar_width: initial_width,
+            effective_sidebar_width: initial_width,
             drag_start_width: None,
             resize_origin_x: None,
+            resize_moved: false,
             peek_mouse_pinned: false,
             collapsed_projects: HashSet::new(),
             hovered_project: None,
@@ -738,21 +772,21 @@ impl SidebarShellView {
                 let sessions = if is_open {
                     p.sessions
                         .iter()
-                        .map(|t| SessionVm {
-                            id: t.id.clone(),
-                            title: t.title.clone(),
-                            indented: t.parent_session_id.is_some(),
+                        .map(|s| SessionVm {
+                            id: s.id.clone(),
+                            title: s.title.clone(),
+                            indented: s.parent_session_id.is_some(),
                             child_count: p
                                 .sessions
                                 .iter()
-                                .filter(|c| c.parent_session_id.as_deref() == Some(t.id.as_str()))
+                                .filter(|c| c.parent_session_id.as_deref() == Some(s.id.as_str()))
                                 .count(),
-                            has_claude: t.has_claude(),
-                            status: t.status(),
-                            waiting_ack: t.waiting_acknowledged(),
-                            is_active: active.as_deref() == Some(t.id.as_str()),
-                            is_selected: ws.selection.contains(&t.id),
-                            is_editing: self.editing_session_id.as_deref() == Some(t.id.as_str()),
+                            has_claude: s.has_claude(),
+                            status: s.status(),
+                            waiting_ack: s.waiting_acknowledged(),
+                            is_active: active.as_deref() == Some(s.id.as_str()),
+                            is_selected: ws.selection.contains(&s.id),
+                            is_editing: self.editing_session_id.as_deref() == Some(s.id.as_str()),
                         })
                         .collect()
                 } else {
@@ -866,7 +900,7 @@ impl SidebarShellView {
             .read(cx)
             .workspace
             .session_for(session_id)
-            .map(|t| t.title.clone())
+            .map(|s| s.title.clone())
         else {
             return;
         };
@@ -1119,7 +1153,7 @@ impl SidebarShellView {
                 .map(|p| {
                     p.sessions
                         .iter()
-                        .map(|t| (t.id.clone(), t.parent_session_id.clone()))
+                        .map(|s| (s.id.clone(), s.parent_session_id.clone()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1333,13 +1367,21 @@ impl SidebarShellView {
         cx: &mut Context<Self>,
     ) {
         if event.click_count >= 2 {
-            // Double-click resets to the default width.
+            // Double-click resets to the default width — and clears the
+            // persisted per-window width back to "never customized".
             self.sidebar_width = SIDEBAR_DEFAULT_WIDTH;
             self.drag_start_width = None;
             self.resize_origin_x = None;
+            self.resize_moved = false;
+            self.commit_sidebar_width(None, cx);
         } else {
             self.resize_origin_x = Some(f32::from(event.position.x));
-            self.drag_start_width = Some(self.sidebar_width);
+            // Baseline off the EFFECTIVE width: that is where the handle is
+            // painted (and grabbed). Baselining off the stored width would
+            // give the handle a dead zone whenever the viewport re-clamp has
+            // squeezed the rendered column below the stored value.
+            self.drag_start_width = Some(self.effective_sidebar_width);
+            self.resize_moved = false;
         }
         cx.stop_propagation();
         cx.notify();
@@ -1348,7 +1390,7 @@ impl SidebarShellView {
     fn on_root_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (Some(origin), Some(base)) = (self.resize_origin_x, self.drag_start_width) else {
@@ -1356,20 +1398,44 @@ impl SidebarShellView {
         };
         if event.pressed_button == Some(MouseButton::Left) {
             let delta = f32::from(event.position.x) - origin;
-            self.sidebar_width = resize_width(base, delta);
+            self.resize_moved = true;
+            self.sidebar_width = resize_width(base, delta, f32::from(window.viewport_size().width));
             cx.notify();
         } else {
-            self.resize_origin_x = None;
-            self.drag_start_width = None;
+            // Missed the mouse-up (released outside the window): end the drag
+            // and commit the width it settled at, same as `on_root_mouse_up`.
+            self.end_resize_drag(cx);
         }
     }
 
     fn on_root_mouse_up(&mut self, _e: &MouseUpEvent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.resize_origin_x.is_some() {
-            self.resize_origin_x = None;
-            self.drag_start_width = None;
+            self.end_resize_drag(cx);
             cx.notify();
         }
+    }
+
+    /// End an in-flight resize drag, committing the settled width iff the
+    /// press actually dragged — a zero-movement click commits nothing, so it
+    /// cannot flip a never-customized window to a pinned width.
+    fn end_resize_drag(&mut self, cx: &mut Context<Self>) {
+        self.resize_origin_x = None;
+        self.drag_start_width = None;
+        if self.resize_moved {
+            self.resize_moved = false;
+            self.commit_sidebar_width(Some(self.sidebar_width), cx);
+        }
+    }
+
+    /// Commit a settled sidebar width into the shared [`WindowState`]'s sidebar
+    /// model and persist it (debounced upsert). Called on drag-end and
+    /// double-click reset only — NOT per mouse-move, so a drag in progress
+    /// never notify-storms the state's other observers.
+    fn commit_sidebar_width(&mut self, width: Option<f32>, cx: &mut Context<Self>) {
+        self.state.update(cx, |ws, _cx| {
+            ws.sidebar.set_width(width);
+            ws.save_to_store();
+        });
     }
 
     // MARK: - Rendering
@@ -1469,7 +1535,7 @@ impl SidebarShellView {
             .flex_none()
             .flex()
             .flex_col()
-            .w(px(self.sidebar_width))
+            .w(px(self.effective_sidebar_width))
             .h_full()
             // No fill: the flattened column shows the shared window-body backing
             // (the terminal-theme background app_shell paints), so the sidebar and
@@ -2219,8 +2285,18 @@ impl SidebarShellView {
 // on expand), not a bypass.
 impl SidebarShellView {
     /// The current docked sidebar width (the resize target the scenario clamps).
-    pub(crate) fn sidebar_width(&self) -> f32 {
-        self.sidebar_width
+    /// The width the current frame actually renders (the viewport-re-clamped
+    /// value) — the scenarios' ground-truth read, so it can never disagree
+    /// with the painted pixels.
+    pub(crate) fn effective_sidebar_width(&self) -> f32 {
+        self.effective_sidebar_width
+    }
+
+    /// The COMMITTED width in the shared state's sidebar model — what
+    /// `persisted_snapshot` will write. The `sidebar` scenario asserts a
+    /// drag-end actually committed (`None` ⇒ never customized).
+    pub(crate) fn scenario_committed_sidebar_width(&self, cx: &App) -> Option<f32> {
+        self.state.read(cx).sidebar.width()
     }
 
     /// Whether the sidebar is collapsed (drives the band-vs-column assertion).
@@ -2244,7 +2320,7 @@ impl SidebarShellView {
             .read(cx)
             .workspace
             .session_for(session_id)
-            .map(|t| (t.status(), t.waiting_acknowledged()))
+            .map(|s| (s.status(), s.waiting_acknowledged()))
     }
 
     /// The user's accent (thinking-dot colour) — resolved once at construction.
@@ -2253,12 +2329,13 @@ impl SidebarShellView {
     }
 
     /// The width the shell sizes its leading column to right now — the docked card
-    /// width (`sidebar_width`) when expanded, and **0 when collapsed**: the M2
+    /// width (`effective_sidebar_width`, the viewport-re-clamped render value)
+    /// when expanded, and **0 when collapsed**: the M2
     /// collapsed design reserves no leading column at all (the floating cap is
     /// gone; the top row is one full-width band — see
     /// [`build_collapsed_shell`](Self::build_collapsed_shell)). This is the
     /// *intended* column width, re-derived from the collapse flag (and the
-    /// `sidebar_width` field), NOT a read of the rendered element's laid-out
+    /// effective-width field), NOT a read of the rendered element's laid-out
     /// `Bounds`. The `app-shell` scenario samples it across a ⌘B toggle to
     /// confirm 240 → 0 → 240; because that scenario never resizes, the change
     /// follows from the collapse flag rather than an independent layout
@@ -2267,7 +2344,7 @@ impl SidebarShellView {
         if self.is_collapsed(cx) {
             0.0
         } else {
-            self.sidebar_width
+            self.effective_sidebar_width
         }
     }
 
@@ -2335,6 +2412,11 @@ impl Render for SidebarShellView {
         // Re-sample the backing scale so the SF Symbol cache renders (and hits)
         // at this window's device resolution.
         self.window_scale = window.scale_factor();
+        // Phase 0: re-clamp the rendered width against the live viewport so a
+        // window shrink can't leave the sidebar swallowing the terminal. The
+        // stored `sidebar_width` is deliberately untouched — see the field docs.
+        self.effective_sidebar_width =
+            clamp_sidebar_width(self.sidebar_width, f32::from(window.viewport_size().width));
         // Drop the previous frame's row extents — the paint that follows this
         // render re-records every VISIBLE row, so closed sessions and collapsed
         // groups can't leave stale frames for the drop resolver to hit.
@@ -2416,19 +2498,44 @@ mod tests {
     use nice_theme::AccentPreset;
 
     #[test]
-    fn clamp_sidebar_width_bounds_at_160_and_480() {
-        assert_eq!(clamp_sidebar_width(100.0), SIDEBAR_MIN_WIDTH);
-        assert_eq!(clamp_sidebar_width(600.0), SIDEBAR_MAX_WIDTH);
-        assert_eq!(clamp_sidebar_width(300.0), 300.0);
+    fn clamp_sidebar_width_bounds_at_min_and_viewport_derived_max() {
+        // 1000pt viewport ⇒ max = 1000 - TERMINAL_MIN_WIDTH = 700.
+        assert_eq!(clamp_sidebar_width(100.0, 1000.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(800.0, 1000.0), 700.0);
+        assert_eq!(clamp_sidebar_width(300.0, 1000.0), 300.0);
         assert_eq!(SIDEBAR_MIN_WIDTH, 160.0);
-        assert_eq!(SIDEBAR_MAX_WIDTH, 480.0);
+        assert_eq!(TERMINAL_MIN_WIDTH, 300.0);
+    }
+
+    #[test]
+    fn max_sidebar_width_scales_with_viewport() {
+        assert_eq!(max_sidebar_width(1200.0), 900.0);
+        assert_eq!(max_sidebar_width(800.0), 500.0);
+    }
+
+    #[test]
+    fn tiny_viewport_pins_the_range_to_min_without_inverting() {
+        // viewport - TERMINAL_MIN_WIDTH would fall below SIDEBAR_MIN_WIDTH (or
+        // negative): the range pins to MIN..=MIN instead of inverting (an
+        // inverted clamp would panic).
+        assert_eq!(max_sidebar_width(400.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(max_sidebar_width(0.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(240.0, 400.0), SIDEBAR_MIN_WIDTH);
     }
 
     #[test]
     fn resize_width_applies_delta_then_clamps() {
-        assert_eq!(resize_width(240.0, 60.0), 300.0);
-        assert_eq!(resize_width(240.0, -200.0), SIDEBAR_MIN_WIDTH, "clamps low");
-        assert_eq!(resize_width(240.0, 400.0), SIDEBAR_MAX_WIDTH, "clamps high");
+        assert_eq!(resize_width(240.0, 60.0, 1000.0), 300.0);
+        assert_eq!(
+            resize_width(240.0, -200.0, 1000.0),
+            SIDEBAR_MIN_WIDTH,
+            "clamps low"
+        );
+        assert_eq!(
+            resize_width(240.0, 600.0, 1000.0),
+            700.0,
+            "clamps high at viewport - TERMINAL_MIN_WIDTH"
+        );
     }
 
     #[test]

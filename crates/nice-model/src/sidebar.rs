@@ -39,6 +39,10 @@ pub struct SidebarModel {
     /// pin so a hovered peek stays open after the keys lift
     /// (`SidebarModel.swift:34-37`).
     peeking: bool,
+    /// The user-chosen docked width (pt), `None` while never customized — the
+    /// view layer resolves `None` to its default width. Persisted per window
+    /// (Phase 0's `sidebarWidth` slot); a double-click reset returns it to `None`.
+    width: Option<f32>,
 }
 
 impl SidebarModel {
@@ -49,6 +53,7 @@ impl SidebarModel {
             collapsed: initial_collapsed,
             mode: initial_mode,
             peeking: false,
+            width: None,
         }
     }
 
@@ -57,6 +62,22 @@ impl SidebarModel {
     /// Whether the sidebar is collapsed.
     pub fn collapsed(&self) -> bool {
         self.collapsed
+    }
+
+    /// The user-chosen docked width (pt) — `None` while never customized (the
+    /// view layer resolves that to its default).
+    pub fn width(&self) -> Option<f32> {
+        self.width
+    }
+
+    /// Set (or, with `None`, reset) the user-chosen docked width. Driven by the
+    /// view layer's resize drag-end / double-click reset, and by restore seeding
+    /// the persisted per-window value. Ownership note: within a session the
+    /// sidebar view is the SOLE writer (restore writes only before the view
+    /// exists), and the view keeps its own live copy for the in-flight drag —
+    /// this slot is the committed value persistence reads, not the per-frame one.
+    pub fn set_width(&mut self, width: Option<f32>) {
+        self.width = width;
     }
 
     /// Which content the sidebar is showing.
@@ -169,6 +190,18 @@ mod tests {
         assert!(!s.peeking());
         s.end_sidebar_peek();
         assert!(!s.peeking());
+    }
+
+    // MARK: - width (Phase 0)
+
+    #[test]
+    fn width_starts_none_and_round_trips_through_set() {
+        let mut s = SidebarModel::new(false, SidebarMode::Sessions);
+        assert_eq!(s.width(), None, "never customized until set");
+        s.set_width(Some(320.0));
+        assert_eq!(s.width(), Some(320.0));
+        s.set_width(None); // the double-click reset path
+        assert_eq!(s.width(), None, "reset returns to never-customized");
     }
 
     // MARK: - peek render/clear seam

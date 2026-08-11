@@ -195,7 +195,7 @@ fn step_active_window(model: &mut WorkspaceModel, offset: isize) {
     let Some(active) = session.active_window_id.clone() else {
         return;
     };
-    let Some(cur) = session.windows.iter().position(|p| p.id == active) else {
+    let Some(cur) = session.windows.iter().position(|w| w.id == active) else {
         return;
     };
     let next = (cur as isize + offset).rem_euclid(count as isize) as usize;
@@ -717,7 +717,7 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
                 .read(app)
                 .workspace
                 .session_for("multi")
-                .and_then(|t| t.active_window_id.clone())
+                .and_then(|s| s.active_window_id.clone())
         })
     };
     cx.simulate_keystrokes(w, &combo(ShortcutAction::NextWindow));
@@ -726,7 +726,7 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
     assert_eq!(term_window(cx).as_deref(), Some("a"), "⌘⌥← stepped back");
 
     let window_count = |cx: &mut TestAppContext| {
-        cx.update(|app| state.read(app).workspace.session_for("multi").map(|t| t.windows.len()))
+        cx.update(|app| state.read(app).workspace.session_for("multi").map(|s| s.windows.len()))
     };
     let before_windows = window_count(cx);
     cx.simulate_keystrokes(w, &combo(ShortcutAction::NewTerminalWindow));

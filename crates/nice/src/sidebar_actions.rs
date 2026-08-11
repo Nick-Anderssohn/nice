@@ -151,7 +151,7 @@ impl SidebarActions for ModelSidebarActions {
         let Some(pi) = model.projects.iter().position(|p| p.id == project_id) else {
             return;
         };
-        let ids: Vec<String> = model.projects[pi].sessions.iter().map(|t| t.id.clone()).collect();
+        let ids: Vec<String> = model.projects[pi].sessions.iter().map(|s| s.id.clone()).collect();
         for id in &ids {
             Self::remove_by_id(model, id);
         }
@@ -193,7 +193,7 @@ mod tests {
 
         let terminals = &model.projects[0];
         assert_eq!(terminals.id, WorkspaceModel::TERMINALS_PROJECT_ID);
-        let created = terminals.sessions.iter().find(|t| t.id == id).unwrap();
+        let created = terminals.sessions.iter().find(|s| s.id == id).unwrap();
         assert_eq!(created.windows.len(), 1);
         assert_eq!(created.windows[0].kind, TermWindowKind::Terminal);
         assert_eq!(created.windows[0].title, "Terminal 1");

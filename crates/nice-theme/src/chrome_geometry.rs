@@ -21,15 +21,20 @@ pub const TOP_BAR_HEIGHT: f32 = 28.0;
 
 // ---- Sidebar ----------------------------------------------------------------
 
-/// Docked-sidebar default width (pt). Per-window and in-memory: resets to this
-/// on every launch by design. `AppShellView.swift:129`.
+/// Docked-sidebar default width (pt). Per-window; a persisted per-window width
+/// (Phase 0's `sidebarWidth` slot) overrides it on restore. `AppShellView.swift:129`.
 pub const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
 
 /// Lower clamp on the user-resizable docked sidebar (pt). `AppShellView.swift:882`.
 pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 
-/// Upper clamp on the user-resizable docked sidebar (pt). `AppShellView.swift:882`.
-pub const SIDEBAR_MAX_WIDTH: f32 = 480.0;
+/// Minimum width (pt) of window the sidebar must leave for terminal content:
+/// the upper clamp on a sidebar resize is `viewport_width - TERMINAL_MIN_WIDTH`
+/// (floored at [`SIDEBAR_MIN_WIDTH`]). Phase 0 (tmux-port roadmap) replaced the
+/// fixed 480pt `SIDEBAR_MAX_WIDTH` with this dynamic clamp — a deliberate
+/// divergence from `AppShellView.swift:882`. 300pt keeps a ~40-column terminal
+/// at the default font.
+pub const TERMINAL_MIN_WIDTH: f32 = 300.0;
 
 /// Fixed width (pt) of the peek/overlay sidebar, which is never resizable.
 /// `AppShellView.swift:824,898`.
@@ -143,7 +148,10 @@ mod tests {
     fn sidebar_constants_match_swift() {
         assert_eq!(SIDEBAR_DEFAULT_WIDTH, 240.0); // AppShellView.swift:129
         assert_eq!(SIDEBAR_MIN_WIDTH, 160.0); // AppShellView.swift:882
-        assert_eq!(SIDEBAR_MAX_WIDTH, 480.0); // AppShellView.swift:882
+        // The fixed SIDEBAR_MAX_WIDTH (480, AppShellView.swift:882) is retired:
+        // Phase 0 clamps dynamically against the viewport, leaving at least
+        // TERMINAL_MIN_WIDTH of terminal (docs/plans/phase-0-quick-wins.md).
+        assert_eq!(TERMINAL_MIN_WIDTH, 300.0);
         assert_eq!(SIDEBAR_PEEK_WIDTH, 240.0); // AppShellView.swift:824,898
         assert_eq!(SIDEBAR_RESIZE_HANDLE_WIDTH, 6.0); // AppShellView.swift:855
     }

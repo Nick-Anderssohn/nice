@@ -528,7 +528,7 @@ async fn assert_dispatch_session(
                 t.cwd.clone(),
                 t.windows
                     .iter()
-                    .any(|p| p.kind == TermWindowKind::Claude && p.is_claude_running),
+                    .any(|w| w.kind == TermWindowKind::Claude && w.is_claude_running),
             )
         })
     });
@@ -857,7 +857,7 @@ async fn poll_new_session(
     for _ in 0..ROUTE_POLLS {
         settle(cx, POLL_MS).await;
         let now = all_session_ids(cx, state);
-        if let Some(new) = now.iter().find(|t| !before.contains(t)) {
+        if let Some(new) = now.iter().find(|s| !before.contains(s)) {
             return Some(new.clone());
         }
     }

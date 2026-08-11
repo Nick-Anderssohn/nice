@@ -118,14 +118,14 @@ fn session_ids_in(model: &WorkspaceModel, project_id: &str) -> Vec<String> {
     project_by_id(model, project_id)
         .sessions
         .iter()
-        .map(|t| t.id.clone())
+        .map(|s| s.id.clone())
         .collect()
 }
 
 fn window_ids(model: &WorkspaceModel, session_id: &str) -> Vec<String> {
     model
         .session_for(session_id)
-        .map(|t| t.windows.iter().map(|p| p.id.clone()).collect())
+        .map(|s| s.windows.iter().map(|w| w.id.clone()).collect())
         .unwrap_or_default()
 }
 
@@ -251,8 +251,8 @@ fn adopt_session_cwd_same_cwd_returns_false_windows_untouched() {
     let mut model = model_empty("/tmp/main");
     let (_c, term) = seed_claude_session(&mut model, "p", "t-same", "s", "/tmp/same", true);
     model.mutate_session("t-same", |session| {
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == term) {
-            p.cwd = Some("/tmp/same".into());
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == term) {
+            w.cwd = Some("/tmp/same".into());
         }
     });
     let pre = model.session_for("t-same").unwrap().clone();
@@ -279,8 +279,8 @@ fn adopt_session_cwd_window_policy_matching_follows() {
     let mut model = model_empty("/tmp/main");
     let (_c, term) = seed_claude_session(&mut model, "p", "t-match", "s", "/tmp/old", true);
     model.mutate_session("t-match", |session| {
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == term) {
-            p.cwd = Some("/tmp/old".into());
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == term) {
+            w.cwd = Some("/tmp/old".into());
         }
     });
     assert!(model.adopt_session_cwd("t-match", "/tmp/new"));
@@ -289,7 +289,7 @@ fn adopt_session_cwd_window_policy_matching_follows() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == term)
+        .find(|w| w.id == term)
         .unwrap()
         .cwd
         .clone();
@@ -310,7 +310,7 @@ fn adopt_session_cwd_window_policy_nil_follows() {
             .unwrap()
             .windows
             .iter()
-            .find(|p| p.id == claude_window)
+            .find(|w| w.id == claude_window)
             .unwrap()
             .cwd
             .is_none(),
@@ -322,7 +322,7 @@ fn adopt_session_cwd_window_policy_nil_follows() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == claude_window)
+        .find(|w| w.id == claude_window)
         .unwrap()
         .cwd
         .clone();
@@ -338,8 +338,8 @@ fn adopt_session_cwd_window_policy_diverged_stays() {
     let mut model = model_empty("/tmp/main");
     let (_c, term) = seed_claude_session(&mut model, "p", "t-div", "s", "/tmp/old", true);
     model.mutate_session("t-div", |session| {
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == term) {
-            p.cwd = Some("/tmp/somewhere-else".into());
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == term) {
+            w.cwd = Some("/tmp/somewhere-else".into());
         }
     });
     assert!(model.adopt_session_cwd("t-div", "/tmp/new"));
@@ -348,7 +348,7 @@ fn adopt_session_cwd_window_policy_diverged_stays() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == term)
+        .find(|w| w.id == term)
         .unwrap()
         .cwd
         .clone();
@@ -367,8 +367,8 @@ fn adopt_session_cwd_mixed_windows_applies_policy_per_window() {
     model.mutate_session("t-mixed", |session| {
         // Claude window stays nil (nil follows). Terminal window at /tmp/old
         // (matching-old follows).
-        if let Some(p) = session.windows.iter_mut().find(|p| p.id == term) {
-            p.cwd = Some("/tmp/old".into());
+        if let Some(w) = session.windows.iter_mut().find(|w| w.id == term) {
+            w.cwd = Some("/tmp/old".into());
         }
         let mut diverged = terminal(&extra, "Terminal 2");
         diverged.cwd = Some("/tmp/diverged".into());
@@ -379,7 +379,7 @@ fn adopt_session_cwd_mixed_windows_applies_policy_per_window() {
     let cwd_of = |id: &str| {
         windows
             .iter()
-            .find(|p| p.id == id)
+            .find(|w| w.id == id)
             .unwrap()
             .cwd
             .clone()
@@ -422,7 +422,7 @@ fn ie_model() -> WorkspaceModel {
 fn extract_window_removes_and_returns_window() {
     let mut model = ie_model();
     let removed = model.extract_window("ie-session-p1", "ie-session");
-    assert_eq!(removed.map(|p| p.id), Some("ie-session-p1".to_string()));
+    assert_eq!(removed.map(|w| w.id), Some("ie-session-p1".to_string()));
     assert_eq!(window_ids(&model, "ie-session"), ["ie-session-p0", "ie-session-p2"]);
 }
 
@@ -439,7 +439,7 @@ fn extract_window_non_active_leaves_active_unchanged() {
 #[test]
 fn extract_window_active_refocuses_slot_neighbor() {
     let mut model = ie_model();
-    model.mutate_session("ie-session", |t| t.active_window_id = Some("ie-session-p1".into()));
+    model.mutate_session("ie-session", |s| s.active_window_id = Some("ie-session-p1".into()));
     model.extract_window("ie-session-p1", "ie-session");
     assert_eq!(
         model.session_for("ie-session").unwrap().active_window_id.as_deref(),
@@ -451,7 +451,7 @@ fn extract_window_active_refocuses_slot_neighbor() {
 #[test]
 fn extract_window_active_last_refocuses_previous() {
     let mut model = ie_model();
-    model.mutate_session("ie-session", |t| t.active_window_id = Some("ie-session-p2".into()));
+    model.mutate_session("ie-session", |s| s.active_window_id = Some("ie-session-p2".into()));
     model.extract_window("ie-session-p2", "ie-session");
     assert_eq!(
         model.session_for("ie-session").unwrap().active_window_id.as_deref(),
@@ -464,7 +464,7 @@ fn extract_window_last_remaining_clears_active() {
     let mut model = ie_model();
     model.extract_window("ie-session-p1", "ie-session");
     model.extract_window("ie-session-p2", "ie-session");
-    model.mutate_session("ie-session", |t| t.active_window_id = Some("ie-session-p0".into()));
+    model.mutate_session("ie-session", |s| s.active_window_id = Some("ie-session-p0".into()));
     model.extract_window("ie-session-p0", "ie-session");
     assert!(window_ids(&model, "ie-session").is_empty());
     assert!(model.session_for("ie-session").unwrap().active_window_id.is_none());
@@ -1244,7 +1244,7 @@ fn select_session_acknowledges_waiting_on_target_active_window() {
         let claude = session
             .windows
             .iter_mut()
-            .find(|p| p.id == claude_window_id)
+            .find(|w| w.id == claude_window_id)
             .unwrap();
         claude.apply_status_transition(crate::SessionStatus::Waiting, false);
     });
@@ -1468,7 +1468,7 @@ fn add_session_to_projects_under_main_cwd_creates_new_project_group() {
     assert_eq!(new.name, "ZEPHYR");
     assert_eq!(new.path, cwd);
     assert_eq!(new.sessions.len(), 1);
-    assert!(new.sessions[0].windows.iter().any(|p| p.kind == TermWindowKind::Claude));
+    assert!(new.sessions[0].windows.iter().any(|w| w.kind == TermWindowKind::Claude));
 }
 
 #[test]
@@ -1493,7 +1493,7 @@ fn add_session_to_projects_picks_existing_project_when_cwd_matches() {
     assert_eq!(model.projects.len(), 2, "reuse p1, not create a third project");
     let p1 = project_by_id(&model, "p1");
     assert_eq!(p1.sessions.len(), 2);
-    assert!(p1.sessions.last().unwrap().windows.iter().any(|p| p.kind == TermWindowKind::Claude));
+    assert!(p1.sessions.last().unwrap().windows.iter().any(|w| w.kind == TermWindowKind::Claude));
     assert_eq!(model.projects[0].sessions.len(), 1);
 }
 
@@ -1701,14 +1701,14 @@ fn repair_promotion_then_move_compose() {
     let promoted = project_by_id(&model, "p-sub-original");
     assert_eq!(promoted.path, outer, "pass 1 promotes outer/sub to outer");
     assert_eq!(promoted.name, "OUTER");
-    assert_eq!(promoted.sessions.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["sub-seed"]);
+    assert_eq!(promoted.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["sub-seed"]);
 
     let nested_p = model
         .projects
         .iter()
         .find(|p| p.path == nested)
         .expect("pass 2 must create a project for the nested-cwd session");
-    assert_eq!(nested_p.sessions.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["deep-nested"]);
+    assert_eq!(nested_p.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["deep-nested"]);
 }
 
 #[test]
@@ -1754,7 +1754,7 @@ fn repair_merges_duplicate_projects_at_same_git_root() {
     assert_eq!(non_terminals_projects(&model).len(), 1, "duplicate at same path merged");
     let canonical = project_by_id(&model, "first");
     assert_eq!(
-        canonical.sessions.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        canonical.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         ["first-session", "second-session"],
         "canonical's own sessions first, then the merged dupe's"
     );
@@ -1785,8 +1785,8 @@ fn repair_leaves_terminals_project_alone() {
     assert_eq!(after.path, before.path);
     assert_eq!(after.name, before.name);
     assert_eq!(
-        after.sessions.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
-        before.sessions.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+        after.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        before.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
     );
 }
 
@@ -1828,7 +1828,7 @@ fn repair_is_idempotent() {
                     p.id.clone(),
                     p.name.clone(),
                     p.path.clone(),
-                    p.sessions.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                    p.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>()
@@ -1974,11 +1974,11 @@ fn add_window_is_monotonic_after_closing_a_window() {
     assert_eq!(session.windows[1].title, "Terminal 2");
     assert_eq!(session.windows[2].title, "Terminal 3");
 
-    model.mutate_session(session_id, |t| t.windows.retain(|p| p.id != "px2"));
+    model.mutate_session(session_id, |s| s.windows.retain(|w| w.id != "px2"));
 
     let px4 = model.add_window(session_id, "px4", None).unwrap();
     let session_after = model.session_for(session_id).unwrap();
-    let new_window = session_after.windows.iter().find(|p| p.id == px4).unwrap();
+    let new_window = session_after.windows.iter().find(|w| w.id == px4).unwrap();
     assert_eq!(new_window.title, "Terminal 4", "closing T2 must not reuse the number");
     assert_eq!(session_after.next_terminal_index, 5, "closing a window must not decrement the counter");
 }
@@ -2085,15 +2085,15 @@ fn rename_window_does_not_touch_other_windows() {
     let mut model = model_empty("/tmp/main");
     let session_id = WorkspaceModel::MAIN_TERMINAL_SESSION_ID;
     let window1 = main_window_id(&model);
-    model.mutate_session(session_id, |t| {
-        t.windows.push(terminal("stable-p2", "Terminal 2"));
+    model.mutate_session(session_id, |s| {
+        s.windows.push(terminal("stable-p2", "Terminal 2"));
     });
     let before = model
         .session_for(session_id)
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == "stable-p2")
+        .find(|w| w.id == "stable-p2")
         .unwrap()
         .title
         .clone();
@@ -2103,7 +2103,7 @@ fn rename_window_does_not_touch_other_windows() {
         .unwrap()
         .windows
         .iter()
-        .find(|p| p.id == "stable-p2")
+        .find(|w| w.id == "stable-p2")
         .unwrap()
         .title
         .clone();
@@ -2129,7 +2129,7 @@ fn rename_window_does_not_touch_other_windows() {
 fn branch_seed(session: &str, title: &str) -> WorkspaceModel {
     let mut model = WorkspaceModel::with_fs("/tmp", fake_fs("/home", &[]));
     seed_claude_session(&mut model, "p", "t1", session, "/tmp/p", true);
-    model.mutate_session("t1", |t| t.title = title.to_string());
+    model.mutate_session("t1", |s| s.title = title.to_string());
     model
 }
 
@@ -2140,7 +2140,7 @@ fn insert_branch_parent_creates_parent_shape() {
         .insert_branch_parent("t1", "parent-1", "parent-1-claude", "parent-1-t1", "OLD")
         .expect("insert_branch_parent must return the inserted parent");
     // Caller (R16) updates the originating session to the post-rotation id.
-    model.mutate_session("t1", |t| t.claude_session_id = Some("NEW".into()));
+    model.mutate_session("t1", |s| s.claude_session_id = Some("NEW".into()));
 
     let project = project_by_id(&model, "p");
     assert_eq!(project.sessions.len(), 2, "exactly one sibling parent added");
@@ -2158,10 +2158,10 @@ fn insert_branch_parent_creates_parent_shape() {
     assert_eq!(parent_session.cwd, child.cwd, "parent inherits the cwd");
 
     assert_eq!(parent_session.windows.len(), 2);
-    assert!(parent_session.windows.iter().any(|p| p.kind == TermWindowKind::Claude));
-    assert!(parent_session.windows.iter().any(|p| p.kind == TermWindowKind::Terminal));
+    assert!(parent_session.windows.iter().any(|w| w.kind == TermWindowKind::Claude));
+    assert!(parent_session.windows.iter().any(|w| w.kind == TermWindowKind::Terminal));
     // Deferred-resume: the parent's Claude window is created NOT running.
-    let parent_claude = parent_session.windows.iter().find(|p| p.kind == TermWindowKind::Claude).unwrap();
+    let parent_claude = parent_session.windows.iter().find(|w| w.kind == TermWindowKind::Claude).unwrap();
     assert!(!parent_claude.is_claude_running, "branch parent's Claude window is deferred (not running)");
     assert_eq!(parent, *parent_session, "returned parent equals the inserted tree node");
 }
@@ -2170,7 +2170,7 @@ fn insert_branch_parent_creates_parent_shape() {
 fn first_branch_promotes_parent_to_root_and_originating_becomes_child() {
     let mut model = branch_seed("S0", "New session");
     model.insert_branch_parent("t1", "P1", "P1-c", "P1-t", "S0");
-    model.mutate_session("t1", |t| t.claude_session_id = Some("S1".into()));
+    model.mutate_session("t1", |s| s.claude_session_id = Some("S1".into()));
 
     let project = project_by_id(&model, "p");
     assert_eq!(project.sessions.len(), 2);
@@ -2186,9 +2186,9 @@ fn first_branch_promotes_parent_to_root_and_originating_becomes_child() {
 fn second_branch_adds_sibling_child_under_same_root() {
     let mut model = branch_seed("S0", "New session");
     model.insert_branch_parent("t1", "P1", "P1-c", "P1-t", "S0");
-    model.mutate_session("t1", |t| t.claude_session_id = Some("S1".into()));
+    model.mutate_session("t1", |s| s.claude_session_id = Some("S1".into()));
     model.insert_branch_parent("t1", "P2", "P2-c", "P2-t", "S1");
-    model.mutate_session("t1", |t| t.claude_session_id = Some("S2".into()));
+    model.mutate_session("t1", |s| s.claude_session_id = Some("S2".into()));
 
     let after = project_by_id(&model, "p");
     assert_eq!(after.sessions.len(), 3);
@@ -2213,7 +2213,7 @@ fn third_branch_keeps_adding_siblings_under_same_root() {
         let old = model.session_for("t1").unwrap().claude_session_id.clone().unwrap();
         let pid = format!("parent-{}", i);
         model.insert_branch_parent("t1", &pid, &format!("{}-c", pid), &format!("{}-t", pid), &old);
-        model.mutate_session("t1", |t| t.claude_session_id = Some(new_session.to_string()));
+        model.mutate_session("t1", |s| s.claude_session_id = Some(new_session.to_string()));
         assert_eq!(project_by_id(&model, "p").sessions.len(), i + 2);
     }
 
@@ -2234,22 +2234,22 @@ fn branch_on_root_preserves_depth1_by_reparenting_former_children() {
     let mut model = branch_seed("S0", "New session");
     // First branch: P1(S0) root, t1(S1) child of P1.
     model.insert_branch_parent("t1", "P1", "P1-c", "P1-t", "S0");
-    model.mutate_session("t1", |t| t.claude_session_id = Some("S1".into()));
+    model.mutate_session("t1", |s| s.claude_session_id = Some("S1".into()));
     // Second branch on t1: P2(S1) sibling under P1.
     model.insert_branch_parent("t1", "P2", "P2-c", "P2-t", "S1");
-    model.mutate_session("t1", |t| t.claude_session_id = Some("S2".into()));
+    model.mutate_session("t1", |s| s.claude_session_id = Some("S2".into()));
 
     // Now /branch on the OLD ROOT (P1). old session on P1 is S0.
     model.insert_branch_parent("P1", "P3", "P3-c", "P3-t", "S0");
-    model.mutate_session("P1", |t| t.claude_session_id = Some("S0-PRIME".into()));
+    model.mutate_session("P1", |s| s.claude_session_id = Some("S0-PRIME".into()));
 
     let after = project_by_id(&model, "p");
-    let roots: Vec<&Session> = after.sessions.iter().filter(|t| t.parent_session_id.is_none()).collect();
+    let roots: Vec<&Session> = after.sessions.iter().filter(|s| s.parent_session_id.is_none()).collect();
     assert_eq!(roots.len(), 1, "exactly one root remains after /branch on the old root");
     let new_root = roots[0];
     assert_eq!(new_root.id, "P3");
     assert_ne!(new_root.id, "P1", "old root must no longer be at depth 0");
-    for session in after.sessions.iter().filter(|t| t.id != new_root.id) {
+    for session in after.sessions.iter().filter(|s| s.id != new_root.id) {
         assert_eq!(session.parent_session_id.as_deref(), Some("P3"), "every former child re-parented to the new root");
     }
     assert_eq!(model.session_for("t1").unwrap().claude_session_id.as_deref(), Some("S2"));
@@ -2308,8 +2308,8 @@ fn prune_dangling_parent_references_clears_orphans() {
     // A session pointing at an existing parent (kept) and one at a ghost (cleared).
     seed_claude_session(&mut model, "p", "child-valid", "s-cv", "/tmp/p", true);
     seed_claude_session(&mut model, "p", "child-orphan", "s-co", "/tmp/p", true);
-    model.mutate_session("child-valid", |t| t.parent_session_id = Some("root".into()));
-    model.mutate_session("child-orphan", |t| t.parent_session_id = Some("does-not-exist".into()));
+    model.mutate_session("child-valid", |s| s.parent_session_id = Some("root".into()));
+    model.mutate_session("child-orphan", |s| s.parent_session_id = Some("does-not-exist".into()));
 
     model.prune_dangling_parent_references();
 
@@ -2394,7 +2394,7 @@ fn dedupe_window_ids_suffix_skips_an_id_already_in_the_tree() {
         .unwrap()
         .windows
         .iter()
-        .map(|p| p.id.as_str())
+        .map(|w| w.id.as_str())
         .collect();
     assert_eq!(ids, vec!["window-1-dup2", "window-1", "window-1-dup3"]);
 }
@@ -2465,7 +2465,7 @@ fn handoff_originating_session_is_child_child_inherits_grandparent_returns_true(
     seed_claude_session(&mut model, "p", "root", "s-root", "/tmp/p", true);
     // "originating" already points at root.
     seed_claude_session(&mut model, "p", "originating", "session-orig", "/tmp/p", true);
-    model.mutate_session("originating", |t| t.parent_session_id = Some("root".into()));
+    model.mutate_session("originating", |s| s.parent_session_id = Some("root".into()));
 
     let inserted = model.insert_handoff_child(make_handoff_session("child1", "/tmp/p"), "originating");
     assert!(inserted);
@@ -2860,7 +2860,7 @@ fn fire_mutation_matrix_every_persisting_mutator_fires() {
     );
     assert!(
         fires_for(matrix_fixture(), |m| {
-            m.mutate_session("t1", |t| t.cwd = "/tmp/elsewhere".into());
+            m.mutate_session("t1", |s| s.cwd = "/tmp/elsewhere".into());
         }) >= 1,
         "mutate_session (session found) must fire"
     );

@@ -501,7 +501,7 @@ async fn run_session_lifecycle(
                     let window_alive = s
                         .workspace
                         .session_for(&qb_session)
-                        .map(|t| t.windows.iter().any(|p| p.id == qb_window))
+                        .map(|t| t.windows.iter().any(|w| w.id == qb_window))
                         .unwrap_or(false);
                     (s.workspace.session_for(&qb_session).is_some(), window_alive)
                 });
@@ -652,7 +652,7 @@ async fn poll_window_gone(
         let gone = state.update(cx, |s, _cx| {
             s.workspace
                 .session_for(session_id)
-                .map(|t| !t.windows.iter().any(|p| p.id == term_window_id))
+                .map(|t| !t.windows.iter().any(|w| w.id == term_window_id))
                 // Session itself gone also counts as the window being gone.
                 .unwrap_or(true)
         });
@@ -687,8 +687,8 @@ async fn poll_window_held(
         let held = state.update(cx, |s, _cx| {
             s.workspace
                 .session_for(session_id)
-                .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-                .map(|p| !p.is_alive)
+                .and_then(|t| t.windows.iter().find(|w| w.id == term_window_id))
+                .map(|w| !w.is_alive)
                 .unwrap_or(false)
         });
         if held {

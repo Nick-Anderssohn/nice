@@ -561,18 +561,18 @@ impl WindowToolbarView {
             return Vec::new();
         };
         let active = session.active_window_id.clone();
-        let editing = self.editing_window.as_ref().map(|(_, p)| p.clone());
+        let editing = self.editing_window.as_ref().map(|(_, w)| w.clone());
         session.windows
             .iter()
-            .map(|p| WindowVm {
-                id: p.id.clone(),
-                title: p.title.clone(),
-                kind: p.kind,
-                status: p.status,
-                waiting_ack: p.waiting_acknowledged,
-                is_active: active.as_deref() == Some(p.id.as_str()),
-                is_hovered: self.hovered_window_id.as_deref() == Some(p.id.as_str()),
-                is_editing: editing.as_deref() == Some(p.id.as_str()),
+            .map(|w| WindowVm {
+                id: w.id.clone(),
+                title: w.title.clone(),
+                kind: w.kind,
+                status: w.status,
+                waiting_ack: w.waiting_acknowledged,
+                is_active: active.as_deref() == Some(w.id.as_str()),
+                is_hovered: self.hovered_window_id.as_deref() == Some(w.id.as_str()),
+                is_editing: editing.as_deref() == Some(w.id.as_str()),
             })
             .collect()
     }
@@ -608,7 +608,7 @@ impl WindowToolbarView {
     /// Whether the overflow chevron should render — the `>= 2` windows + reserved
     /// real-overflow rule.
     fn show_chevron(&self, cx: &App) -> bool {
-        let window_count = self.active_session(cx).map(|t| t.windows.len()).unwrap_or(0);
+        let window_count = self.active_session(cx).map(|s| s.windows.len()).unwrap_or(0);
         should_show_overflow_chevron(window_count, f32::from(self.scroll.max_offset().x))
     }
 
@@ -618,7 +618,7 @@ impl WindowToolbarView {
     fn has_offscreen_attention(&self, cx: &App) -> bool {
         let offscreen = self.strip_geometry(cx).offscreen_window_ids();
         self.active_session(cx)
-            .map(|t| t.has_offscreen_attention(&offscreen))
+            .map(|s| s.has_offscreen_attention(&offscreen))
             .unwrap_or(false)
     }
 
@@ -626,7 +626,7 @@ impl WindowToolbarView {
     /// to center its pill; retry next frame while `bounds_for_item` is not yet
     /// populated (first layout).
     fn sync_active_window(&mut self, window: &mut Window, cx: &App) {
-        let active_now = self.active_session(cx).and_then(|t| t.active_window_id.clone());
+        let active_now = self.active_session(cx).and_then(|s| s.active_window_id.clone());
         if active_now != self.last_active_window {
             self.last_active_window = active_now.clone();
             self.activated_at = Some(Instant::now());
@@ -654,7 +654,7 @@ impl WindowToolbarView {
             let Some(active_id) = session.active_window_id.as_deref() else {
                 return true;
             };
-            match session.windows.iter().position(|p| p.id == active_id) {
+            match session.windows.iter().position(|w| w.id == active_id) {
                 Some(ix) => ix,
                 None => return true,
             }
@@ -683,8 +683,8 @@ impl WindowToolbarView {
             .read(cx)
             .workspace
             .session_for(session_id)
-            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-            .map(|p| p.title.clone())
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .map(|w| w.title.clone())
         else {
             return;
         };
@@ -819,7 +819,7 @@ impl WindowToolbarView {
 
     /// Whether `term_window_id` is the window currently being inline-renamed.
     fn is_editing_window(&self, term_window_id: &str) -> bool {
-        self.editing_window.as_ref().map(|(_, p)| p.as_str()) == Some(term_window_id)
+        self.editing_window.as_ref().map(|(_, w)| w.as_str()) == Some(term_window_id)
     }
 
     /// A plain (unmodified) press on a pill body: select the window. Commits any
@@ -847,7 +847,7 @@ impl WindowToolbarView {
         };
         let is_active = self
             .active_session(cx)
-            .and_then(|t| t.active_window_id.as_deref())
+            .and_then(|s| s.active_window_id.as_deref())
             == Some(term_window_id);
         if is_active {
             if rename_gate_open(self.activated_at) {
@@ -2024,14 +2024,14 @@ impl WindowToolbarView {
     /// The active session's window ids, in order.
     pub(crate) fn term_window_ids(&self, cx: &App) -> Vec<String> {
         self.active_session(cx)
-            .map(|t| t.windows.iter().map(|p| p.id.clone()).collect())
+            .map(|s| s.windows.iter().map(|w| w.id.clone()).collect())
             .unwrap_or_default()
     }
 
     /// The active window id, if any.
     pub(crate) fn active_window_id(&self, cx: &App) -> Option<String> {
         self.active_session(cx)
-            .and_then(|t| t.active_window_id.clone())
+            .and_then(|s| s.active_window_id.clone())
     }
 
     /// The current pill-reorder drop slot `(target_window_id, place_after)` — the
@@ -2050,7 +2050,7 @@ impl WindowToolbarView {
     /// boxes are replaced by the centered titlebar title (round-2 plan 4). The
     /// `pane-strip` scenario reads this after closing the strip down to one window.
     pub(crate) fn scenario_single_session_active(&self, cx: &App) -> bool {
-        self.active_session(cx).map(|t| t.windows.len() == 1).unwrap_or(false)
+        self.active_session(cx).map(|s| s.windows.len() == 1).unwrap_or(false)
     }
 
     /// The single-session centered title (the sole window's title) when in single-session
@@ -2145,7 +2145,7 @@ impl WindowToolbarView {
     /// equality + centering assertions).
     pub(crate) fn scenario_pill_bounds(&self, term_window_id: &str, cx: &App) -> Option<Bounds<Pixels>> {
         let session = self.active_session(cx)?;
-        let ix = session.windows.iter().position(|p| p.id == term_window_id)?;
+        let ix = session.windows.iter().position(|w| w.id == term_window_id)?;
         self.scroll.bounds_for_item(ix)
     }
 
@@ -2245,7 +2245,7 @@ impl WindowToolbarView {
                 if let Some(term_window) = ws.workspace.projects[pi].sessions[ti]
                     .windows
                     .iter_mut()
-                    .find(|p| p.id == term_window_id)
+                    .find(|w| w.id == term_window_id)
                 {
                     term_window.apply_status_transition(status, being_viewed);
                     return true;

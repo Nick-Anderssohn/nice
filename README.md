@@ -47,9 +47,12 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 | `⌘⇧.` | Toggle hidden files in the file browser |
 | `⌘+` / `⌘-` / `⌘0` | Zoom in, out, reset |
 | `⌘Z` / `⌘⇧Z` | Undo / redo file operation |
+| `⇧PgUp` / `⇧PgDn` | Page through terminal scrollback |
+| `⇧Home` / `⇧End` | Jump to the top / bottom of scrollback |
 | `⌘`+click | Open a URL in the terminal (hold `⌘` to underline it) |
 
-All rebindable in Settings (`⌘,`).
+All rebindable in Settings (`⌘,`), except the scrollback keys — those are
+terminal-level and fall through to fullscreen apps like vim.
 
 ## Requirements
 

@@ -151,6 +151,7 @@ impl Fixture {
       "id": "{WIN_ID}",
       "activeTabId": "claude-tab",
       "sidebarCollapsed": true,
+      "sidebarWidth": 320.0,
       "frame": {{ "x": {fx}, "y": {fy}, "width": {fw}, "height": {fh} }},
       "projects": [
         {{
@@ -322,7 +323,7 @@ async fn run_persistence_restore(
             .collect::<Vec<_>>()
     });
     for expect in ["terminals-main", "claude-tab", "child-tab"] {
-        if !session_ids.iter().any(|t| t == expect) {
+        if !session_ids.iter().any(|s| s == expect) {
             failures.push(format!("(a) restored tree is missing session '{expect}'"));
         }
     }
@@ -337,6 +338,14 @@ async fn run_persistence_restore(
     // Sidebar collapsed (restored FROM THE STORE), leading column width 0.
     if !state.update(cx, |s, _| s.sidebar.collapsed()) {
         failures.push("(a) restored sidebar is not collapsed (sidebarCollapsed: true)".into());
+    }
+    // Phase 0: the persisted sidebar width restores into the sidebar model
+    // (disk → seed → SidebarModel; the view seeds from the model when built).
+    let restored_width = state.update(cx, |s, _| s.sidebar.width());
+    if restored_width != Some(320.0) {
+        failures.push(format!(
+            "(a) restored sidebar width = {restored_width:?}, expected Some(320.0) (sidebarWidth: 320)"
+        ));
     }
     // Frame applied: the read-back Cocoa frame matches the fixture within tolerance
     // (width/height preserved; origin may shift a little for the menu bar / Dock).
@@ -745,6 +754,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
         active_session_id: None,
         sidebar_collapsed: false,
         sidebar_mode: None,
+        sidebar_width: None,
         projects: sample_projects(),
         frame: Some(FIXTURE_FRAME),
     };
@@ -753,6 +763,7 @@ fn fan_out_selection_leg(cx: &mut AsyncApp, fixture: &Fixture, failures: &mut Ve
         active_session_id: None,
         sidebar_collapsed: false,
         sidebar_mode: None,
+        sidebar_width: None,
         projects: vec![],
         frame: None,
     };

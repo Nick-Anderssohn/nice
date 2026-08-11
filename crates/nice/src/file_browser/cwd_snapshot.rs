@@ -38,7 +38,7 @@ pub fn entries_for_session(window_session_id: &str, session: &Session) -> Vec<Te
         kind: TermWindowKind::Terminal,
         cwd: normalize_path(&session.cwd),
     });
-    for term_window in session.windows.iter().filter(|p| p.is_alive) {
+    for term_window in session.windows.iter().filter(|w| w.is_alive) {
         if let Some(cwd) = term_window.cwd.as_deref().filter(|c| !c.is_empty()) {
             out.push(TermWindowCWDRef {
                 window_session_id: window_session_id.to_string(),

@@ -48,13 +48,12 @@ shell root as a split-tree member. That buys nothing tmux-shaped: tmux has no
 sidebar; its session/window navigation UI is the status line. What the
 sidebar request actually decomposes into:
 
-1. **Remove the width cap** — trivial. `SIDEBAR_MAX_WIDTH = 480.0` at
-   `crates/nice-theme/src/chrome_geometry.rs:32`, enforced by
-   `clamp_sidebar_width` (`sidebar_shell.rs:187-189`), bounds pinned by test
-   at `sidebar_shell.rs:2417-2422`. Raise/remove the cap (keep a sane min on
-   the *terminal* side instead), and persist `sidebar_width` (currently
-   view-local, in-memory only — `sidebar_shell.rs:533`) alongside
-   `sidebar_collapsed`/`sidebar_mode` in `PersistedWindow`.
+1. **Remove the width cap** — DONE in Phase 0: the fixed `SIDEBAR_MAX_WIDTH`
+   (480) is retired for a viewport-derived clamp (`viewport −
+   TERMINAL_MIN_WIDTH`, 300pt, in `chrome_geometry.rs`; `clamp_sidebar_width`
+   in `sidebar_shell.rs`), and the committed width lives in `SidebarModel`,
+   persisted as the optional `sidebarWidth` slot in `PersistedWindow`
+   alongside `sidebar_collapsed`/`sidebar_mode`.
 2. **Real side-by-side terminals** — that's Phase 2 (splits), in the terminal
    area where it belongs.
 
@@ -79,9 +78,9 @@ sidebar request actually decomposes into:
 - **Search/selection primitives.** Vanilla alacritty_terminal 0.26:
   `RegexSearch`/`RegexIter` already linked (used for hyperlinks,
   `hyperlink.rs:92-233`); full programmatic selection API on the handle
-  (`session_handle.rs:517-618`); scrollback + scroll-position API. Missing is
-  only UI: no keyboard scroll bindings, no copy-mode state machine, no search
-  overlay.
+  (`session_handle.rs:517-618`); scrollback + scroll-position API, with
+  keyboard scroll bindings since Phase 0 (Shift+PageUp/PageDown/Home/End).
+  Missing is only UI: no copy-mode state machine, no search overlay.
 - **Overlay building blocks** for prefix-pending indicators, search fields,
   and pane-number popups: peek overlay + modifier observers
   (`keymap.rs:546-606`), `InlineRename`, `ConfirmationModal`, `ContextMenu`,
@@ -166,10 +165,17 @@ calling it done.
 Full implementation plan: `docs/plans/phase-r-terminology-rename.md`.
 
 ### Phase 0 — quick wins (S)
-- Raise/remove `SIDEBAR_MAX_WIDTH`; clamp against remaining terminal width
-  instead; persist `sidebar_width` in `PersistedWindow`.
-- Keyboard scrollback: PageUp/PageDown/Home/End (+ Shift variants) →
-  `scroll_lines`/`scroll_to_bottom`. Today scrolling is wheel-only.
+- Sidebar width: retire the fixed `SIDEBAR_MAX_WIDTH` for a viewport-derived
+  clamp (`viewport − TERMINAL_MIN_WIDTH`, **decided: 300pt**); persist the
+  width per window (`sidebarWidth` slot in `PersistedWindow`, absent = never
+  customized; double-click reset clears it).
+- Keyboard scrollback (**decided 2026-08-10: Shift variants ONLY** — plain
+  PageUp/PageDown/Home/End keep encoding to the pty for less/vim, and on the
+  alternate screen even Shift variants fall through to the TUI): Shift+PageUp/
+  PageDown page (`scroll_page_up`/`scroll_page_down`), Shift+Home/End jump
+  (`scroll_to_top`/`scroll_to_bottom`). Scrolling was wheel-only before.
+
+Full implementation plan: `docs/plans/phase-0-quick-wins.md`.
 
 ### Phase 1 — held-modifier keybind scheme (M)
 

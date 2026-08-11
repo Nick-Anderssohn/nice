@@ -707,6 +707,213 @@ pub fn open_input_shell_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     Ok(window)
 }
 
+// -- scenario: scrollback-keys (Phase 0 keyboard scrollback, end to end) ------
+
+/// Seeded output lines — three screens' worth, so page jumps have room to move.
+const SCROLLBACK_SEED_LINES: usize = ROWS as usize * 3;
+
+/// The `scrollback-keys` scenario: the Phase 0 keyboard-scrollback gate, end to
+/// end. A real [`TerminalView`] over a real pty (the same capture-tee child as
+/// `input-live`, so pty-bound bytes are observable), driven with REAL
+/// keystrokes through the window's key-dispatch tree
+/// (`Window::dispatch_keystroke` — the exact path an OS key event takes after
+/// the platform hop), so it needs **no Accessibility grant**. Asserts the whole
+/// shipped policy: Shift+PageUp scrolls the viewport a page and encodes
+/// NOTHING to the pty; Shift+Home jumps to the top and Shift+End back to the
+/// bottom; plain PageUp encodes `ESC[5~` (less/vim keep working); and on the
+/// alternate screen Shift+PageUp encodes `ESC[5;2~` while the viewport stays
+/// parked (the TUI owns the keys).
+pub fn open_scrollback_keys_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
+    let base = prepare_dir("scrollback-keys")?;
+    let cap_path = base.join("capture.bin");
+    let base_s = base.to_string_lossy().to_string();
+    let cap_s = cap_path.to_string_lossy().to_string();
+
+    // Capture-tee child (the `input-live` pattern): raw mode, then `tee` copies
+    // pty-bound bytes into the capture file AND echoes them back out, so writes
+    // via `write_child` render as terminal OUTPUT (the scrollback seed) and
+    // encoded keystrokes are observable in the capture.
+    let inner = format!("stty raw -echo; exec tee {cap_s}");
+    let spec = SpawnSpec::command(format!("sh -c '{inner}'"), base_s.clone())
+        .with_env(vec![("ZDOTDIR".to_string(), base_s)])
+        .with_size(ROWS, COLS);
+
+    let handle = TerminalSessionHandle::spawn(cx, spec, DEFAULT_SCROLLBACK_LINES)?;
+    let terminal = make_view(handle.clone(), cx);
+
+    let whandle = cx.open_window(crate::app::window_options(), {
+        let terminal = terminal.clone();
+        move |_window, cx| cx.new(|_cx| InputTermView { terminal })
+    })?;
+    let window: AnyWindowHandle = whandle.into();
+    crate::app::install_present_kick(&handle, window, cx);
+
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let report = run_scrollback_keys(acx, whandle, handle, terminal, cap_path).await;
+        eprintln!("[selftest] scenario 'scrollback-keys': {}", report.detail);
+        nice_harness::selftest::report_gate(report);
+    })
+    .detach();
+
+    Ok(window)
+}
+
+/// Dispatch one keystroke (e.g. `"shift-pageup"`) through the window's real
+/// key-dispatch tree. Returns whether anything consumed it.
+fn dispatch_key(
+    cx: &mut AsyncApp,
+    whandle: gpui::WindowHandle<InputTermView>,
+    keystroke: &str,
+) -> bool {
+    let ks = gpui::Keystroke::parse(keystroke).expect("valid keystroke literal");
+    whandle
+        .update(cx, |_root, window, cx| window.dispatch_keystroke(ks, cx))
+        .unwrap_or(false)
+}
+
+async fn run_scrollback_keys(
+    cx: &mut AsyncApp,
+    whandle: gpui::WindowHandle<InputTermView>,
+    handle: Entity<TerminalSessionHandle>,
+    terminal: Entity<TerminalView>,
+    cap_path: PathBuf,
+) -> CadenceReport {
+    let _ = cx.update(|app| app.activate(true));
+    settle(cx, 500).await;
+
+    // Focus the terminal view: `dispatch_keystroke` walks the focus path, so
+    // the view's key listener only runs while its focus handle is focused.
+    let _ = whandle.update(cx, |_root, window, cx| {
+        let fh = terminal.read(cx).focus_handle_ref().clone();
+        window.focus(&fh, cx);
+    });
+    settle(cx, 200).await;
+
+    let mut failures: Vec<String> = Vec::new();
+    let offset = |cx: &mut AsyncApp| handle.update(cx, |h, _| h.display_offset());
+
+    // Seed three screens of numbered output through the tee echo, then poll the
+    // grid for the last marker (never sleep-and-hope).
+    let seed: String = (1..=SCROLLBACK_SEED_LINES)
+        .map(|i| format!("seed-{i}\r\n"))
+        .collect();
+    if let Err(e) = write_child(cx, &handle, seed.as_bytes()) {
+        return CadenceReport::error(format!("scrollback-keys: seeding failed: {e}"));
+    }
+    let last_marker = format!("seed-{SCROLLBACK_SEED_LINES}");
+    let mut seeded = false;
+    for _ in 0..60 {
+        settle(cx, 100).await;
+        let text = handle.update(cx, |h, _| h.session().grid_lines().join("\n"));
+        if text.contains(&last_marker) {
+            seeded = true;
+            break;
+        }
+    }
+    if !seeded {
+        return CadenceReport::error(format!(
+            "scrollback-keys: the seed never rendered ({last_marker} absent from the grid)"
+        ));
+    }
+    if offset(cx) != 0 {
+        failures.push("seed: viewport not parked at the bottom after output".into());
+    }
+
+    // §1 Shift+PageUp scrolls one page into history and encodes NOTHING.
+    let cap_start = cap_len(&cap_path);
+    dispatch_key(cx, whandle, "shift-pageup");
+    settle(cx, 150).await;
+    let page_off = offset(cx);
+    if page_off == 0 {
+        failures.push("shift-pageup: display offset stayed 0 (no scroll)".into());
+    } else {
+        eprintln!("[selftest] scrollback-keys: shift-pageup scrolled to offset {page_off}");
+    }
+
+    // §2 Shift+Home jumps to the top (strictly above the single page).
+    dispatch_key(cx, whandle, "shift-home");
+    settle(cx, 150).await;
+    let top_off = offset(cx);
+    if top_off <= page_off {
+        failures.push(format!(
+            "shift-home: offset {top_off} did not jump above the page offset {page_off}"
+        ));
+    }
+
+    // §3 Shift+End parks back at the bottom.
+    dispatch_key(cx, whandle, "shift-end");
+    settle(cx, 150).await;
+    if offset(cx) != 0 {
+        failures.push(format!("shift-end: offset {} != 0 (not at bottom)", offset(cx)));
+    }
+
+    // The three scrolling chords must have written NOTHING to the pty.
+    settle(cx, 150).await;
+    let scroll_bytes = cap_since(&cap_path, cap_start);
+    if !scroll_bytes.is_empty() {
+        failures.push(format!(
+            "scroll chords leaked to the pty: {:?}",
+            String::from_utf8_lossy(&scroll_bytes)
+        ));
+    }
+
+    // §4 plain PageUp still encodes to the pty (less/vim keep their key).
+    let cap_start = cap_len(&cap_path);
+    dispatch_key(cx, whandle, "pageup");
+    settle(cx, 200).await;
+    expect_bytes(&mut failures, "plain-pageup", b"\x1b[5~", &cap_since(&cap_path, cap_start));
+
+    // §5 alternate screen: the TUI owns the keys — Shift+PageUp encodes the
+    // shifted legacy sequence and the viewport stays parked. The echoed DECSET
+    // 1049 switches the parser to the alt screen (grid clears of seed text).
+    if let Err(e) = write_child(cx, &handle, b"\x1b[?1049h") {
+        failures.push(format!("alt-screen: could not enter: {e}"));
+    }
+    let mut alt = false;
+    for _ in 0..40 {
+        settle(cx, 50).await;
+        let text = handle.update(cx, |h, _| h.session().grid_lines().join(""));
+        if !text.contains("seed-") {
+            alt = true;
+            break;
+        }
+    }
+    if !alt {
+        failures.push("alt-screen: grid never cleared after ESC[?1049h".into());
+    } else {
+        let cap_start = cap_len(&cap_path);
+        dispatch_key(cx, whandle, "shift-pageup");
+        settle(cx, 200).await;
+        expect_bytes(
+            &mut failures,
+            "alt-screen shift-pageup",
+            b"\x1b[5;2~",
+            &cap_since(&cap_path, cap_start),
+        );
+        if offset(cx) != 0 {
+            failures.push("alt-screen: shift-pageup moved the viewport".into());
+        }
+        let _ = write_child(cx, &handle, b"\x1b[?1049l");
+    }
+
+    if failures.is_empty() {
+        CadenceReport {
+            passed: true,
+            stats: IntervalStats::default(),
+            detail: "keyboard scrollback OK end to end: shift-pageup paged (silent to the pty), \
+                     shift-home/end jumped top/bottom, plain pageup encoded ESC[5~, alt-screen \
+                     shift-pageup encoded ESC[5;2~ with the viewport parked"
+                .to_string(),
+        }
+    } else {
+        CadenceReport {
+            passed: false,
+            stats: IntervalStats::default(),
+            detail: format!("scrollback-keys FAILED:\n  - {}", failures.join("\n  - ")),
+        }
+    }
+}
+
 async fn run_input_shell(cx: &mut AsyncApp, handle: Entity<TerminalSessionHandle>) -> CadenceReport {
     let _ = cx.update(|app| app.activate(true));
     settle(cx, 400).await;

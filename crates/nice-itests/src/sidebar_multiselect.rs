@@ -197,7 +197,7 @@ impl SidebarProbe {
                 if self.collapsed_projects.contains(&p.id) {
                     Vec::new()
                 } else {
-                    p.sessions.iter().map(|t| t.id.clone()).collect()
+                    p.sessions.iter().map(|s| s.id.clone()).collect()
                 }
             })
             .collect()

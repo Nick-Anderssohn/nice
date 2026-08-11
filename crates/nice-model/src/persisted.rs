@@ -165,11 +165,11 @@ impl PersistedSession {
         let windows: Vec<TermWindow> = self.windows.iter().map(PersistedTermWindow::hydrate).collect();
         let default_active = windows
             .iter()
-            .find(|p| p.kind == TermWindowKind::Claude)
+            .find(|w| w.kind == TermWindowKind::Claude)
             .or_else(|| windows.first())
-            .map(|p| p.id.clone());
+            .map(|w| w.id.clone());
         let next_terminal_index = self.next_terminal_index.unwrap_or_else(|| {
-            let titles: Vec<&str> = self.windows.iter().map(|p| p.title.as_str()).collect();
+            let titles: Vec<&str> = self.windows.iter().map(|w| w.title.as_str()).collect();
             Session::recover_next_terminal_index(&titles)
         });
 
@@ -329,7 +329,7 @@ mod tests {
         let json = serde_json::to_string(&windows).unwrap();
         let restored: Vec<PersistedTermWindow> = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            restored.iter().map(|p| p.cwd.clone()).collect::<Vec<_>>(),
+            restored.iter().map(|w| w.cwd.clone()).collect::<Vec<_>>(),
             vec![Some("/usr".into()), Some("/var/log".into())]
         );
     }

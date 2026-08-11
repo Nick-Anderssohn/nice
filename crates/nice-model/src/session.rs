@@ -84,7 +84,7 @@ impl Session {
     fn live_claude_windows(&self) -> impl Iterator<Item = &TermWindow> {
         self.windows
             .iter()
-            .filter(|p| p.kind == TermWindowKind::Claude && p.is_alive)
+            .filter(|w| w.kind == TermWindowKind::Claude && w.is_alive)
     }
 
     /// True if any alive window on this session is a Claude window (`Models.swift:215`).
@@ -99,13 +99,13 @@ impl Session {
     /// only the running one trips this. Keys on [`TermWindow::is_claude_running`],
     /// exactly like the Swift promotion guard (`SessionsModel.swift:855-859`).
     pub fn has_running_claude(&self) -> bool {
-        self.live_claude_windows().any(|p| p.is_claude_running)
+        self.live_claude_windows().any(|w| w.is_claude_running)
     }
 
     /// The window currently focused, if any (`Models.swift:220-223`).
     pub fn active_window(&self) -> Option<&TermWindow> {
         let id = self.active_window_id.as_ref()?;
-        self.windows.iter().find(|p| &p.id == id)
+        self.windows.iter().find(|w| &w.id == id)
     }
 
     /// Whether any window in `offscreen_ids` currently needs attention — used by
@@ -117,7 +117,7 @@ impl Session {
         }
         self.windows
             .iter()
-            .any(|p| offscreen_ids.contains(&p.id) && p.needs_attention())
+            .any(|w| offscreen_ids.contains(&w.id) && w.needs_attention())
     }
 
     /// Aggregate status shown in the sidebar dot. Derived from live Claude
@@ -125,10 +125,10 @@ impl Session {
     /// the toolbar pill. Written defensively for transient multi-window states
     /// during creation/teardown (`Models.swift:242-247`).
     pub fn status(&self) -> SessionStatus {
-        if self.live_claude_windows().any(|p| p.status == SessionStatus::Thinking) {
+        if self.live_claude_windows().any(|w| w.status == SessionStatus::Thinking) {
             return SessionStatus::Thinking;
         }
-        if self.live_claude_windows().any(|p| p.status == SessionStatus::Waiting) {
+        if self.live_claude_windows().any(|w| w.status == SessionStatus::Waiting) {
             return SessionStatus::Waiting;
         }
         SessionStatus::Idle
@@ -142,7 +142,7 @@ impl Session {
         let mut any_waiting = false;
         for window in self
             .live_claude_windows()
-            .filter(|p| p.status == SessionStatus::Waiting)
+            .filter(|w| w.status == SessionStatus::Waiting)
         {
             any_waiting = true;
             if !window.waiting_acknowledged {
@@ -332,7 +332,7 @@ mod tests {
 
         // Claude "emits" thinking while the terminal is active.
         {
-            let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+            let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
             c.apply_status_transition(SessionStatus::Thinking, false);
         }
         assert_eq!(
@@ -343,7 +343,7 @@ mod tests {
 
         // Claude transitions to waiting — the moment the sidebar used to freeze.
         {
-            let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+            let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
             c.apply_status_transition(SessionStatus::Waiting, false);
         }
         assert_eq!(
@@ -366,7 +366,7 @@ mod tests {
         // Claude window is active AND the session is being viewed → waiting lands
         // already acknowledged.
         {
-            let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+            let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
             c.apply_status_transition(SessionStatus::Waiting, true);
         }
         assert_eq!(session.status(), SessionStatus::Waiting);
@@ -395,10 +395,10 @@ mod tests {
             session.active_window_id = Some(active.to_string());
             let being_viewed = active == "claude";
             {
-                let c = session.windows.iter_mut().find(|p| p.id == "claude").unwrap();
+                let c = session.windows.iter_mut().find(|w| w.id == "claude").unwrap();
                 c.apply_status_transition(new_status, being_viewed);
             }
-            let claude_status = session.windows.iter().find(|p| p.id == "claude").unwrap().status;
+            let claude_status = session.windows.iter().find(|w| w.id == "claude").unwrap().status;
             assert_eq!(session.status(), expected, "session.status (sidebar source) drifted");
             assert_eq!(
                 session.status(),

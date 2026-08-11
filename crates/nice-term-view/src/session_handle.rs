@@ -645,6 +645,38 @@ impl TerminalSessionHandle {
         }
     }
 
+    /// Jump to the top (oldest scrollback line), discarding any sub-line
+    /// remainder (Phase 0: Shift+Home). Caller should `cx.notify()` to repaint.
+    /// No-op if not yet spawned.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().scroll_display(Scroll::Top);
+        }
+    }
+
+    /// Page the viewport one screen toward history (Phase 0: Shift+PageUp) —
+    /// the core derives the page size from the current grid height and clamps
+    /// at the history end. Discards any sub-line wheel remainder. Caller should
+    /// `cx.notify()` to repaint. No-op if not yet spawned.
+    pub fn scroll_page_up(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().scroll_display(Scroll::PageUp);
+        }
+    }
+
+    /// Page the viewport one screen toward the bottom (Phase 0:
+    /// Shift+PageDown); clamps at offset 0. Discards any sub-line wheel
+    /// remainder. Caller should `cx.notify()` to repaint. No-op if not yet
+    /// spawned.
+    pub fn scroll_page_down(&mut self) {
+        self.scroll_accum = 0.0;
+        if let Some(term_arc) = self.session.term() {
+            term_arc.lock().scroll_display(Scroll::PageDown);
+        }
+    }
+
     /// The current scrollback display offset in lines (0 == parked at the bottom).
     /// Locks the `Term` briefly to read it; 0 if not yet spawned.
     pub fn display_offset(&self) -> usize {

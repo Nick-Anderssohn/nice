@@ -59,7 +59,9 @@
 //! see [`element`]'s module doc), **line-stepped
 //! scrollback scroll** (wheel/trackpad → [`TerminalSessionHandle::scroll_lines`],
 //! clamped, core-driven auto-snap-to-bottom, float remainder kept as the deferred
-//! smooth-scroll seam), and **damage-driven present**: the session handle's drain
+//! smooth-scroll seam; keyboard since Phase 0 — Shift+PageUp/PageDown/Home/End →
+//! the page/jump methods, intercepted before the pty encoder, alt-screen
+//! excepted), and **damage-driven present**: the session handle's drain
 //! wakes `cx.notify()` + an injected [`PresentKick`] (`setNeedsDisplay`,
 //! constructed in `crates/nice/src/platform` — the sole objc2 crossing).
 //!

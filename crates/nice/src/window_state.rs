@@ -588,6 +588,7 @@ impl WindowState {
             active_session_id,
             sidebar_collapsed,
             sidebar_mode,
+            sidebar_width,
             ..
         } = seed;
 
@@ -618,6 +619,8 @@ impl WindowState {
         // R19: restore the saved sidebar mode (absent ⇒ Sessions — the pre-R19 / never-
         // toggled default).
         state.sidebar = SidebarModel::new(sidebar_collapsed, sidebar_mode.unwrap_or(SidebarMode::Sessions));
+        // Phase 0: restore the saved per-window sidebar width (absent ⇒ default).
+        state.sidebar.set_width(sidebar_width.map(|w| w as f32));
         // Re-seed the selection from the (possibly repair-shifted) active session.
         state.selection.sync_active_session_id(state.workspace.active_session_id());
         state
@@ -1096,8 +1099,8 @@ impl WindowState {
         let is_terminals = self.workspace.is_terminals_project_session(session_id);
         let (window_in_session, has_running) = match self.workspace.session_for(session_id) {
             Some(session) => (
-                session.windows.iter().any(|p| p.id == term_window_id),
-                session.windows.iter().any(|p| p.is_claude_running),
+                session.windows.iter().any(|w| w.id == term_window_id),
+                session.windows.iter().any(|w| w.is_claude_running),
             ),
             None => (false, false),
         };
@@ -1444,7 +1447,7 @@ impl WindowState {
         let old_id = self
             .workspace
             .session_for(&session_id)
-            .and_then(|t| t.claude_session_id.clone());
+            .and_then(|s| s.claude_session_id.clone());
         let id_changed = self.update_claude_session_id(&session_id, claude_session_id);
         // /branch classification: a `resume` / `fork` source with an ACTUAL id
         // change is the signature of `/branch` and `--fork-session`. Real
@@ -1727,12 +1730,12 @@ impl WindowState {
         };
         // Owned copies so the immutable model borrow ends before the mutable insert.
         let Some((parent_title, parent_cwd, title_auto, title_manual)) =
-            self.workspace.session_for(&parent_session_id).map(|t| {
+            self.workspace.session_for(&parent_session_id).map(|s| {
                 (
-                    t.title.clone(),
-                    t.cwd.clone(),
-                    t.title_auto_generated,
-                    t.title_manually_set,
+                    s.title.clone(),
+                    s.cwd.clone(),
+                    s.title_auto_generated,
+                    s.title_manually_set,
                 )
             })
         else {
@@ -1830,16 +1833,16 @@ impl WindowState {
             {
                 self.workspace
                     .session_for(&session_id)
-                    .filter(|t| t.windows.iter().any(|p| p.id == term_window_id))
+                    .filter(|s| s.windows.iter().any(|w| w.id == term_window_id))
             } else {
                 None
             };
             (
-                originating.map(|t| t.id.clone()),
-                originating.map(|t| t.title.clone()),
+                originating.map(|s| s.id.clone()),
+                originating.map(|s| s.title.clone()),
                 // Prefer the resolved session's live cwd (it may have moved into a
                 // worktree); else the payload cwd.
-                originating.map(|t| t.cwd.clone()).unwrap_or(cwd),
+                originating.map(|s| s.cwd.clone()).unwrap_or(cwd),
             )
         };
 
@@ -1934,11 +1937,11 @@ impl WindowState {
                 if !session_id.is_empty() && !self.workspace.is_terminals_project_session(&session_id) {
                     self.workspace
                         .session_for(&session_id)
-                        .filter(|t| t.windows.iter().any(|p| p.id == term_window_id))
+                        .filter(|s| s.windows.iter().any(|w| w.id == term_window_id))
                 } else {
                     None
                 };
-            originating.map(|t| t.id.clone())
+            originating.map(|s| s.id.clone())
         };
         // On a miss, "" makes `insert_handoff_child` reject the anchor and the session
         // opens top-level.
@@ -2058,6 +2061,9 @@ impl WindowState {
             // R19: persist the live sidebar mode so a restored window reopens in
             // the mode it was last in (absent on decode ⇒ Sessions).
             sidebar_mode: Some(self.sidebar.mode()),
+            // Phase 0: the user-resized sidebar width; None (⇒ key absent) while
+            // never customized.
+            sidebar_width: self.sidebar.width().map(f64::from),
             projects: nice_model::snapshot_projects(&self.workspace.projects),
             frame: self.last_frame.clone(),
         }
@@ -2250,7 +2256,7 @@ impl WindowState {
         let session_ids: Vec<String> = self.workspace.projects[pi]
             .sessions
             .iter()
-            .map(|t| t.id.clone())
+            .map(|s| s.id.clone())
             .collect();
 
         let terminus = if session_ids.is_empty() {
@@ -2373,7 +2379,7 @@ impl WindowState {
         let Some(term_window_id) = session.active_window_id.clone() else {
             return;
         };
-        let Some(term_window) = session.windows.iter().find(|p| p.id == term_window_id) else {
+        let Some(term_window) = session.windows.iter().find(|w| w.id == term_window_id) else {
             return;
         };
         let (kind, alive) = (term_window.kind, term_window.is_alive);
@@ -2425,7 +2431,7 @@ impl WindowState {
         };
         session.windows
             .iter()
-            .filter(|p| self.window_is_busy(session_id, p, cx))
+            .filter(|w| self.window_is_busy(session_id, w, cx))
             .map(crate::close_confirm::describe)
             .collect()
     }
@@ -2462,8 +2468,8 @@ impl WindowState {
         let busy_desc = self
             .workspace
             .session_for(session_id)
-            .and_then(|t| t.windows.iter().find(|p| p.id == term_window_id))
-            .filter(|p| self.window_is_busy(session_id, p, cx))
+            .and_then(|s| s.windows.iter().find(|w| w.id == term_window_id))
+            .filter(|w| self.window_is_busy(session_id, w, cx))
             .map(crate::close_confirm::describe);
         match busy_desc {
             Some(desc) => {
@@ -2584,10 +2590,10 @@ impl WindowState {
                 .find(|p| p.id == project_id)
                 .into_iter()
                 .flat_map(|project| {
-                    project.sessions.iter().flat_map(|t| {
-                        t.windows
+                    project.sessions.iter().flat_map(|s| {
+                        s.windows
                             .iter()
-                            .filter(|p| self.window_is_busy(&t.id, p, cx))
+                            .filter(|w| self.window_is_busy(&s.id, w, cx))
                             .map(crate::close_confirm::describe)
                     })
                 })
@@ -2668,7 +2674,7 @@ impl WindowState {
         } = split_sessions_close_batch(ids, |id| {
             self.workspace
                 .session_for(id)
-                .map(|t| (t.title.clone(), self.busy_descriptions_in_session(id, cx)))
+                .map(|s| (s.title.clone(), self.busy_descriptions_in_session(id, cx)))
         });
         // §T.4 — eagerly close the idle sessions NOW (rows vanish immediately). Any
         // terminus is at most `WindowEmptied`, which can only fire when NO busy
@@ -3079,6 +3085,7 @@ mod tests {
             active_session_id: active.map(str::to_string),
             sidebar_collapsed: collapsed,
             sidebar_mode: None,
+            sidebar_width: None,
             frame: None,
         }
     }
@@ -3115,7 +3122,7 @@ mod tests {
         let ws = WindowState::with_seed(seed);
 
         let session = ws.workspace.session_for(WorkspaceModel::MAIN_TERMINAL_SESSION_ID).unwrap();
-        let mut ids: Vec<&str> = session.windows.iter().map(|p| p.id.as_str()).collect();
+        let mut ids: Vec<&str> = session.windows.iter().map(|w| w.id.as_str()).collect();
         ids.sort();
         let before = ids.len();
         ids.dedup();
@@ -3140,7 +3147,7 @@ mod tests {
         // the dangling parent link so the session renders at root instead of orphaned.
         let mut seed = restore_seed("w", Some("t-a"), false);
         let pi = seed.projects.iter().position(|p| p.id == "proj").unwrap();
-        let ti = seed.projects[pi].sessions.iter().position(|t| t.id == "t-a").unwrap();
+        let ti = seed.projects[pi].sessions.iter().position(|s| s.id == "t-a").unwrap();
         seed.projects[pi].sessions[ti].parent_session_id = Some("never-existed".into());
 
         let ws = WindowState::with_seed(seed);
@@ -3170,6 +3177,39 @@ mod tests {
             Some(SidebarMode::Files),
             "toggling to files mode is captured in the snapshot"
         );
+    }
+
+    #[test]
+    fn persisted_snapshot_carries_sidebar_width_absent_until_customized() {
+        // Phase 0: a never-resized window snapshots NO width (the key stays
+        // absent on disk); a set width round-trips through the snapshot.
+        let ws = window_with_project();
+        assert_eq!(
+            ws.persisted_snapshot().sidebar_width,
+            None,
+            "a fresh window persists no sidebar width"
+        );
+        let mut ws = window_with_project();
+        ws.sidebar.set_width(Some(320.0));
+        assert_eq!(
+            ws.persisted_snapshot().sidebar_width,
+            Some(320.0),
+            "a user-resized width is captured in the snapshot"
+        );
+    }
+
+    #[test]
+    fn with_seed_restores_sidebar_width_absent_stays_default() {
+        // Phase 0: a saved width restores into the sidebar model; an absent
+        // field (pre-Phase-0 save / never resized) leaves it None ⇒ the view
+        // resolves its default.
+        let mut seed = restore_seed("w-wide", Some("t-a"), false);
+        seed.sidebar_width = Some(355.0);
+        let ws = WindowState::with_seed(seed);
+        assert_eq!(ws.sidebar.width(), Some(355.0), "the saved width restores");
+
+        let ws = WindowState::with_seed(restore_seed("w-defw", Some("t-a"), false));
+        assert_eq!(ws.sidebar.width(), None, "absent ⇒ never customized");
     }
 
     #[test]
@@ -3219,7 +3259,7 @@ mod tests {
             .projects
             .iter()
             .flat_map(|p| p.sessions.iter())
-            .filter(|t| t.id == WorkspaceModel::MAIN_TERMINAL_SESSION_ID)
+            .filter(|s| s.id == WorkspaceModel::MAIN_TERMINAL_SESSION_ID)
             .count();
         assert_eq!(mains, 1, "restore rebuilds the saved tree, never re-seeds Main");
     }
@@ -3263,7 +3303,7 @@ mod tests {
         model
             .projects
             .iter()
-            .flat_map(|p| p.sessions.iter().map(|t| t.id.clone()))
+            .flat_map(|p| p.sessions.iter().map(|s| s.id.clone()))
             .collect()
     }
 
@@ -3651,7 +3691,7 @@ mod tests {
             .unwrap()
             .windows
             .iter()
-            .find(|p| p.id == term)
+            .find(|w| w.id == term)
             .unwrap();
         assert_eq!(term_window.kind, TermWindowKind::Terminal, "terminal window must NOT promote");
         assert!(!term_window.is_claude_running);
@@ -3671,7 +3711,7 @@ mod tests {
         );
 
         let session = state.workspace.session_for("t1").unwrap();
-        let term_window = session.windows.iter().find(|p| p.id == claude).unwrap();
+        let term_window = session.windows.iter().find(|w| w.id == claude).unwrap();
         assert!(term_window.is_claude_running, "deferred-resume promotion flips running");
         assert_eq!(term_window.kind, TermWindowKind::Claude);
         assert_eq!(term_window.title, "Claude", "pill reset to Claude until the OSC arrives");
@@ -3702,7 +3742,7 @@ mod tests {
             Some(minted),
             "wrapper + model must agree on the persisted session id"
         );
-        let term_window = session.windows.iter().find(|p| p.id == term).unwrap();
+        let term_window = session.windows.iter().find(|w| w.id == term).unwrap();
         assert_eq!(term_window.kind, TermWindowKind::Claude, "terminal window promotes to claude");
         assert!(term_window.is_claude_running);
         assert_eq!(term_window.title, "Claude");
@@ -4322,7 +4362,7 @@ mod tests {
         state
             .workspace
             .session_for(session_id)
-            .and_then(|t| t.claude_session_id.clone())
+            .and_then(|s| s.claude_session_id.clone())
     }
 
     // === AppStateClaudeSessionUpdateTests =====================================
@@ -4414,7 +4454,7 @@ mod tests {
         let (model, selection) = (&mut state.workspace, &mut state.selection);
         state.ptys.window_exited(model, selection, "t1", "t1-claude");
         assert!(
-            state.workspace.session_for("t1").is_some_and(|t| !t.windows.iter().any(|p| p.id == "t1-claude")),
+            state.workspace.session_for("t1").is_some_and(|s| !s.windows.iter().any(|w| w.id == "t1-claude")),
             "precondition: claude window is gone after window_exited"
         );
         // A late update for the now-defunct window arrives.
@@ -4436,7 +4476,7 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "S1", "/Users/nick/Projects/notes");
         let out = state.apply_session_update("t1-claude", "S1", Some("clear"), Some("/Users/nick/Projects/notes"));
-        assert_eq!(state.workspace.session_for("t1").map(|t| t.cwd.as_str()), Some("/Users/nick/Projects/notes"));
+        assert_eq!(state.workspace.session_for("t1").map(|s| s.cwd.as_str()), Some("/Users/nick/Projects/notes"));
         assert!(!out.did_mutate, "matching cwd + matching id must not fire the save signal");
     }
 
@@ -4450,7 +4490,7 @@ mod tests {
         let out = state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
         let session = state.workspace.session_for("t1").unwrap();
         assert_eq!(session.cwd, worktree, "session.cwd moves to the worktree");
-        let claude = session.windows.iter().find(|p| p.kind == TermWindowKind::Claude).unwrap();
+        let claude = session.windows.iter().find(|w| w.kind == TermWindowKind::Claude).unwrap();
         assert_eq!(claude.cwd.as_deref(), Some(worktree), "nil-cwd claude window follows the session");
         assert!(out.did_mutate, "cwd change must fire the save signal");
     }
@@ -4462,13 +4502,13 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "S1", "/Users/nick/Projects/notes");
         state.workspace.mutate_session("t1", |session| {
-            for term_window in session.windows.iter_mut().filter(|p| p.kind == TermWindowKind::Terminal) {
+            for term_window in session.windows.iter_mut().filter(|w| w.kind == TermWindowKind::Terminal) {
                 term_window.cwd = Some("/Users/nick/Projects/notes".into());
             }
         });
         let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
         state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
-        let term = state.workspace.session_for("t1").unwrap().windows.iter().find(|p| p.kind == TermWindowKind::Terminal).unwrap().cwd.clone();
+        let term = state.workspace.session_for("t1").unwrap().windows.iter().find(|w| w.kind == TermWindowKind::Terminal).unwrap().cwd.clone();
         assert_eq!(term.as_deref(), Some(worktree), "companion matching the old cwd follows into the worktree");
     }
 
@@ -4480,13 +4520,13 @@ mod tests {
         seed_rotation_session(&mut state.workspace, "p", "t1", "S1", "/Users/nick/Projects/notes");
         let user_cd = "/Users/nick/Projects/notes/some/subdir";
         state.workspace.mutate_session("t1", |session| {
-            for term_window in session.windows.iter_mut().filter(|p| p.kind == TermWindowKind::Terminal) {
+            for term_window in session.windows.iter_mut().filter(|w| w.kind == TermWindowKind::Terminal) {
                 term_window.cwd = Some(user_cd.into());
             }
         });
         let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
         state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
-        let term = state.workspace.session_for("t1").unwrap().windows.iter().find(|p| p.kind == TermWindowKind::Terminal).unwrap().cwd.clone();
+        let term = state.workspace.session_for("t1").unwrap().windows.iter().find(|w| w.kind == TermWindowKind::Terminal).unwrap().cwd.clone();
         assert_eq!(term.as_deref(), Some(user_cd), "diverged OSC-7-tracked companion stays put");
     }
 
@@ -4497,12 +4537,12 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "S1", "/Users/nick/Projects/notes");
         assert!(
-            state.workspace.session_for("t1").unwrap().windows.iter().find(|p| p.kind == TermWindowKind::Terminal).unwrap().cwd.is_none(),
+            state.workspace.session_for("t1").unwrap().windows.iter().find(|w| w.kind == TermWindowKind::Terminal).unwrap().cwd.is_none(),
             "precondition: terminal window cwd starts nil"
         );
         let worktree = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
         state.apply_session_update("t1-claude", "S1", Some("startup"), Some(worktree));
-        let term = state.workspace.session_for("t1").unwrap().windows.iter().find(|p| p.kind == TermWindowKind::Terminal).unwrap().cwd.clone();
+        let term = state.workspace.session_for("t1").unwrap().windows.iter().find(|w| w.kind == TermWindowKind::Terminal).unwrap().cwd.clone();
         assert_eq!(term.as_deref(), Some(worktree), "nil window cwd inherits the new session.cwd");
     }
 
@@ -4513,7 +4553,7 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "S1", "/Users/nick/Projects/notes");
         state.apply_session_update("t1-claude", "S1", Some("clear"), None);
-        assert_eq!(state.workspace.session_for("t1").map(|t| t.cwd.as_str()), Some("/Users/nick/Projects/notes"));
+        assert_eq!(state.workspace.session_for("t1").map(|s| s.cwd.as_str()), Some("/Users/nick/Projects/notes"));
     }
 
     #[test]
@@ -4523,7 +4563,7 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "S1", "/Users/nick/Projects/notes");
         state.apply_session_update("t1-claude", "S1", Some("clear"), Some(""));
-        assert_eq!(state.workspace.session_for("t1").map(|t| t.cwd.as_str()), Some("/Users/nick/Projects/notes"));
+        assert_eq!(state.workspace.session_for("t1").map(|s| s.cwd.as_str()), Some("/Users/nick/Projects/notes"));
     }
 
     #[test]
@@ -4551,7 +4591,7 @@ mod tests {
         let original_cwd = "/Users/nick/Projects/notes";
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "OLD-ID", original_cwd);
-        assert_eq!(state.workspace.session_for("t1").map(|t| t.cwd.as_str()), Some(original_cwd));
+        assert_eq!(state.workspace.session_for("t1").map(|s| s.cwd.as_str()), Some(original_cwd));
 
         let new_cwd = "/Users/nick/Projects/notes/.claude/worktrees/auto-name";
         state.apply_session_update("t1-claude", "NEW-ID", Some("resume"), Some(new_cwd));
@@ -4563,7 +4603,7 @@ mod tests {
 
         // The sibling parent — pinned to OLD-ID — holds the PRE-rotation cwd.
         let sessions = project_sessions(&state, "p");
-        let sibling = sessions.iter().find(|t| t.claude_session_id.as_deref() == Some("OLD-ID"));
+        let sibling = sessions.iter().find(|s| s.claude_session_id.as_deref() == Some("OLD-ID"));
         let sibling = sibling.expect("branch rotation must materialize a sibling parent");
         assert_eq!(
             sibling.cwd, original_cwd,
@@ -4577,7 +4617,7 @@ mod tests {
     fn branch_resume_with_id_change_creates_parent_session() {
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "OLD", "/tmp/p");
-        state.workspace.mutate_session("t1", |t| t.title = "wire up the foo".into());
+        state.workspace.mutate_session("t1", |s| s.title = "wire up the foo".into());
 
         state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
 
@@ -4593,8 +4633,8 @@ mod tests {
         assert_eq!(parent.title, "wire up the foo", "parent inherits the title");
         assert_eq!(parent.cwd, child.cwd, "parent inherits the cwd");
         assert_eq!(parent.windows.len(), 2);
-        assert!(parent.windows.iter().any(|p| p.kind == TermWindowKind::Claude), "parent has a claude window");
-        assert!(parent.windows.iter().any(|p| p.kind == TermWindowKind::Terminal), "parent has a companion terminal");
+        assert!(parent.windows.iter().any(|w| w.kind == TermWindowKind::Claude), "parent has a claude window");
+        assert!(parent.windows.iter().any(|w| w.kind == TermWindowKind::Terminal), "parent has a companion terminal");
     }
 
     #[test]
@@ -4694,7 +4734,7 @@ mod tests {
         assert_eq!(project_sessions(&state, "p")[1].parent_session_id.as_deref(), Some(parent.id.as_str()), "precondition: child points at parent");
 
         // Dissolve the parent by exiting all its windows (model-level cascade).
-        for term_window_id in parent.windows.iter().map(|p| p.id.clone()) {
+        for term_window_id in parent.windows.iter().map(|w| w.id.clone()) {
             let (model, selection) = (&mut state.workspace, &mut state.selection);
             state.ptys.window_exited(model, selection, &parent.id, &term_window_id);
         }
@@ -4717,7 +4757,7 @@ mod tests {
         assert!(parent.parent_session_id.is_none(), "precondition: parent at root");
         assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()), "precondition: child under parent");
 
-        for term_window_id in child.windows.iter().map(|p| p.id.clone()) {
+        for term_window_id in child.windows.iter().map(|w| w.id.clone()) {
             let (model, selection) = (&mut state.workspace, &mut state.selection);
             state.ptys.window_exited(model, selection, &child.id, &term_window_id);
         }
@@ -4762,20 +4802,20 @@ mod tests {
         state.apply_session_update("t1-claude", "S2", Some("resume"), None);
 
         // /branch on the OLD ROOT. Its claude window id and current session (S0).
-        let old_root_claude = old_root.windows.iter().find(|p| p.kind == TermWindowKind::Claude).unwrap().id.clone();
+        let old_root_claude = old_root.windows.iter().find(|w| w.kind == TermWindowKind::Claude).unwrap().id.clone();
         state.apply_session_update(&old_root_claude, "S0-PRIME", Some("resume"), None);
 
         let sessions = project_sessions(&state, "p");
-        let roots: Vec<&Session> = sessions.iter().filter(|t| t.parent_session_id.is_none()).collect();
+        let roots: Vec<&Session> = sessions.iter().filter(|s| s.parent_session_id.is_none()).collect();
         assert_eq!(roots.len(), 1, "exactly one root remains in the lineage");
         let new_root = roots[0];
         assert_ne!(new_root.id, old_root.id, "old root is no longer at depth 0");
-        for session in sessions.iter().filter(|t| t.id != new_root.id) {
+        for session in sessions.iter().filter(|s| s.id != new_root.id) {
             assert_eq!(session.parent_session_id.as_deref(), Some(new_root.id.as_str()), "every non-root session is re-parented to the new root");
         }
-        assert_eq!(sessions.iter().find(|t| t.id == "t1").unwrap().claude_session_id.as_deref(), Some("S2"), "t1 untouched by the /branch on the root");
+        assert_eq!(sessions.iter().find(|s| s.id == "t1").unwrap().claude_session_id.as_deref(), Some("S2"), "t1 untouched by the /branch on the root");
         assert_eq!(new_root.claude_session_id.as_deref(), Some("S0"), "new root pins the id current on old root right before its /branch");
-        assert_eq!(sessions.iter().find(|t| t.id == old_root.id).unwrap().claude_session_id.as_deref(), Some("S0-PRIME"), "old root now holds its post-rotation id");
+        assert_eq!(sessions.iter().find(|s| s.id == old_root.id).unwrap().claude_session_id.as_deref(), Some("S0-PRIME"), "old root now holds its post-rotation id");
     }
 
     #[test]
@@ -4813,7 +4853,7 @@ mod tests {
         let main = WorkspaceModel::MAIN_TERMINAL_SESSION_ID;
         let main_window = state.workspace.session_for(main).unwrap().windows[0].id.clone();
         // Give the Main session a session id so the id-change guard would otherwise fire.
-        state.workspace.mutate_session(main, |t| t.claude_session_id = Some("OLD".into()));
+        state.workspace.mutate_session(main, |s| s.claude_session_id = Some("OLD".into()));
 
         state.apply_session_update(&main_window, "FRESH", Some("resume"), None);
         assert_eq!(project_sessions(&state, terminals).len(), before, "Terminals session count must not change on a spurious branch signal");
@@ -4827,11 +4867,11 @@ mod tests {
         // Claude branch until the socket in-place promotion opens it.
         let mut state = WindowState::new("/home/u");
         seed_rotation_session(&mut state.workspace, "p", "t1", "OLD", "/tmp/p");
-        state.workspace.mutate_session("t1", |t| t.title = "wire up the foo".into());
+        state.workspace.mutate_session("t1", |s| s.title = "wire up the foo".into());
         state.apply_session_update("t1-claude", "NEW", Some("resume"), None);
 
         let parent = project_sessions(&state, "p")[0].clone();
-        let parent_claude = parent.windows.iter().find(|p| p.kind == TermWindowKind::Claude).unwrap().clone();
+        let parent_claude = parent.windows.iter().find(|w| w.kind == TermWindowKind::Claude).unwrap().clone();
         assert!(!parent_claude.is_claude_running, "sanity: branch parent's claude window is deferred");
 
         let model = &mut state.workspace;
@@ -4884,7 +4924,7 @@ mod tests {
         let mut state = WindowState::new("/home/u");
         state.set_fork_job_probe_for_test(|_| None);
         seed_rotation_session(&mut state.workspace, "p", "t1", "OLD", "/tmp/p");
-        state.workspace.mutate_session("t1", |t| t.title = "wire up the foo".into());
+        state.workspace.mutate_session("t1", |s| s.title = "wire up the foo".into());
 
         let out = state.apply_session_update("t1-claude", "NEW", Some("fork"), None);
         assert!(out.did_mutate);
@@ -4928,7 +4968,7 @@ mod tests {
             "a daemon-hosted fork must NEVER rewrite the relayed window's session id"
         );
         assert_eq!(
-            state.workspace.session_for("t1").map(|t| t.cwd.clone()).as_deref(),
+            state.workspace.session_for("t1").map(|s| s.cwd.clone()).as_deref(),
             Some("/tmp/p"),
             "nor adopt the fork's cwd onto that session"
         );
@@ -5027,7 +5067,7 @@ mod tests {
             "the addressed session keeps its own conversation"
         );
         assert_eq!(
-            state.workspace.session_for("t1").map(|t| t.cwd.clone()).as_deref(),
+            state.workspace.session_for("t1").map(|s| s.cwd.clone()).as_deref(),
             Some("/tmp/p"),
             "nor adopts the job's cwd"
         );
@@ -5148,7 +5188,7 @@ mod tests {
             ws.set_fork_job_probe_for_test(probe);
             seed_rotation_session(&mut ws.workspace, "p", "t-parent", "PARENT-SID", cwd);
             ws.workspace
-                .mutate_session("t-parent", |t| t.title = "wire up the foo".into());
+                .mutate_session("t-parent", |s| s.title = "wire up the foo".into());
             ws.workspace.select_session("t-parent");
             ws.selection.sync_active_session_id(ws.workspace.active_session_id());
         });
@@ -5186,7 +5226,7 @@ mod tests {
             .find(|p| p.id == "p")?
             .sessions
             .iter()
-            .find(|t| t.id != "t-parent")
+            .find(|s| s.id != "t-parent")
             .cloned()
     }
 
@@ -5235,7 +5275,7 @@ mod tests {
             let claude = child
                 .windows
                 .iter()
-                .find(|p| p.kind == TermWindowKind::Claude)
+                .find(|w| w.kind == TermWindowKind::Claude)
                 .expect("the fork session has a Claude window");
             assert!(
                 !claude.is_claude_running,
@@ -5344,7 +5384,7 @@ mod tests {
                 "the forked-from session plus ONE fork session"
             );
             assert_eq!(
-                fork_child(ws).and_then(|t| t.claude_session_id).as_deref(),
+                fork_child(ws).and_then(|s| s.claude_session_id).as_deref(),
                 Some(fork_id.as_str())
             );
         });
