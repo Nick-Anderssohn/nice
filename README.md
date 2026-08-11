@@ -38,14 +38,14 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 ## Keyboard-first
 
 Window navigation is a tmux-style held-modifier scheme: hold `⌃⌘` and use vim
-keys. Hold it for a moment without pressing anything and each window pill shows
-the digit that jumps to it.
+keys — `h`/`l` step the window pills, `j`/`k` step the sidebar sessions. Hold it
+for a moment without pressing anything and each window pill shows the digit that
+jumps to it.
 
 | Shortcut | Action |
 |---|---|
-| `⌘⌥↓` / `⌘⌥↑` | Next / previous sidebar session |
-| `⌃⌘]` / `⌃⌘[` | Next / previous window within a session |
-| `⌃⌘L` / `⌃⌘H` | Same, on the vim keys (directional once splits land) |
+| `⌃⌘L` / `⌃⌘H` | Next / previous window within a session |
+| `⌃⌘J` / `⌃⌘K` | Next / previous sidebar session (`j` goes down the list) |
 | `⌃⌘1`–`⌃⌘9` | Jump to a window by its position |
 | `⌃⌘O` | Back to the last window you were in |
 | `⌃⌘U` / `⌃⌘D` | Half-page through terminal scrollback |

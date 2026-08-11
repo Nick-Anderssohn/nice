@@ -190,13 +190,26 @@ it, so it leaks zero bytes). OS key-repeat gives free continuous
 navigation (hold `^⌘` + hold `j`), which tmux only approximates with
 `repeat-time`.
 
-Shipped bindings (all rebindable in Settings ▸ Shortcuts):
+**REVISED (2026-08-11) — the hjkl ladder: the modifier SET selects the
+verb, the `hjkl` key selects the direction.** Sessions join the bare `^⌘`
+layer, so both container axes (pills across, sessions down) live on one
+held pair; pane-level verbs climb a rung per modifier. `^⌘Space` for swap
+was rejected — it is the macOS emoji picker, and Space is not a modifier —
+so swap took the Hyper cluster (`^⌥⌘⇧`). The revision frees `^⌘[`/`^⌘]`
+(the shipped D1 spelling) and `⌘⌥↑`/`⌘⌥↓` (the pre-Phase-1 session
+chords): nothing binds them.
+
+| Rung | `h` | `j` | `k` | `l` | Verb | Phase |
+|---|---|---|---|---|---|---|
+| `^⌘` | prev pill | next session | prev session | next pill | navigate containers | 1 |
+| `^⌘⇧` | focus pane left | down | up | right | move pane focus (`FocusPane*`, bound but inert) | 2 |
+| `^⌥⌘` | resize left | down | up | right | resize split (reserved, unbound) | 2 |
+| `^⌥⌘⇧` | swap left | down | up | right | directional pane swap (reserved, unbound) | 2 |
+
+Everything else on the scheme is unchanged:
 
 | Chord | Action | Phase |
 |---|---|---|
-| `^⌘h/j/k/l` | Directional pane focus — **D3**: named for the Phase 2 spatial meaning; pre-splits `h`/`l` alias prev/next pill, `j`/`k` are registered but inert | 1 |
-| `^⌘⇧h/j/k/l` | Resize split toward that edge (or swap — finalize in Phase 2) | 2 |
-| `^⌘[` / `^⌘]` | Prev / next upper-bar pill — **D1**: these are now the `PrevWindow`/`NextWindow` DEFAULTS (was `⌘⌥←`/`⌘⌥→`, which are freed); the frozen action ids are unchanged | 1 |
 | `^⌘1-9` | Window by index — **D2**: ONE rebindable row (`windowByIndex`, "Window 1-9") whose recorded modifier set applies to all nine digits; nine separate rows were rejected | 1 |
 | `^⌘o` | Last-active window (tmux `last-window`, a single bounce slot — not an MRU stack) | 1 |
 | `^⌘z` | Zoom pane | 2 |
@@ -205,12 +218,17 @@ Shipped bindings (all rebindable in Settings ▸ Shortcuts):
 | `^⌘/` | Scrollback search | 3 |
 | *hold* `^⌘` | Window-index badges on the pills — **D5**, ~200 ms debounce | 1 |
 
+All Phase 1 rows are rebindable in Settings ▸ Shortcuts; the frozen action
+ids never moved, only the default combos.
+
 Reserved — never bind: `^⌘Q` (macOS lock screen, system-intercepted),
 `^⌘F` (fullscreen, in Nice's protected set), `^⌘Space` (emoji picker),
 `^⌘D` (macOS dictionary lookup). **D4**: the four Phase 2/3 chords
 (`^⌘z`, `^⌘v`, `^⌘s`, `^⌘/`) join them in the guard rather than shipping
-as no-op actions, so nothing can squat on them before those phases land.
-All twelve live in one `RESERVED_COMBOS` table in `nice-model`; the
+as no-op actions, so nothing can squat on them before those phases land —
+and the revision puts the ladder's two Phase 2 rungs (`^⌥⌘hjkl` resize,
+`^⌥⌘⇧hjkl` swap, eight chords) in the same group for the same reason.
+All twenty live in one `RESERVED_COMBOS` table in `nice-model`; the
 recorder refuses them with a per-entry reason, and `keymap` installs the
 five fixed accelerators FROM those same entries so guard and install
 cannot drift.
@@ -224,6 +242,9 @@ cannot drift.
   debounce `Task` on `WindowState` (`nice-model` is gpui-free). The watched
   modifier pair is read from the LIVE next-pill binding, so rebinding the
   scheme keeps a working overlay.
+- **Holding `^⌘` also floats the collapsed-sidebar peek** — a side effect of
+  the revision, and intended: the peek watches the LIVE sidebar-session
+  chords, which are now `^⌘j`/`^⌘k`. One held pair, both affordances.
 - The rebindable set grew from 14 to 22 actions. Store migration is
   DELIBERATELY absent: a user who ever rebound anything has the full map on
   disk, so for them the D1 flip does not land and the new ids load unbound
@@ -239,9 +260,11 @@ gate: the `keybind-scheme` self-test scenario.
   ratios); `active_pane_id` = focused leaf.
 - `PaneHostView`: recursive render, N mounted views, dividers with
   drag-resize, focused-pane affordance.
-- Actions (all on the Phase-1 `^⌘` scheme): split h/v, directional
-  focus move, resize, zoom toggle, swap, break-pane-to-new-pill,
-  even-layout presets; finalize whether `^⌘⇧h/j/k/l` means resize or swap.
+- Actions (all on the Phase-1 `^⌘` ladder): split h/v, zoom toggle,
+  break-pane-to-new-pill, even-layout presets — plus the three `hjkl`
+  rungs the ladder already assigns: fill in the inert `^⌘⇧hjkl` focus
+  handlers, and claim the reserved `^⌥⌘hjkl` (resize) / `^⌥⌘⇧hjkl` (swap)
+  chords as real bindings.
 - Spatial close-refocus; multi-activation in `SessionManager`.
 - Persist `layout` in `PersistedTab` (version bump; loader stays
   shape-tolerant).

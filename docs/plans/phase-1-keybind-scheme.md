@@ -1,5 +1,18 @@
 # Phase 1 — held-`^⌘` keybind scheme
 
+## Superseded (2026-08-11): hjkl ladder revision
+
+D1's and D3's **chord assignments** were revised right after ship. The modifier
+SET now selects the verb and `hjkl` selects the direction: bare `^⌘` navigates
+containers (`h`/`l` = prev/next pill — the only pill pair — and `j`/`k` =
+next/prev sidebar session), `^⌘⇧` = directional pane focus (the `FocusPane*`
+actions, bound but inert until Phase 2), `^⌥⌘` = split resize and `^⌥⌘⇧` (Hyper)
+= directional pane swap, both reserved rather than bound. `^⌘[`/`^⌘]` and the
+`⌘⌥` arrows end up bound to nothing. `^⌘Space` for swap was rejected: it is the
+macOS emoji picker, and Space is not a modifier. Everything else below still
+holds — the frozen action ids, D2, D4, D5, and the guard/handler architecture.
+The historical body is left as written.
+
 Roadmap: `docs/tmux-port-roadmap.md` § "Phase 1 — held-modifier keybind
 scheme (M) — SHIPPED". Locked decisions (2026-08-05): held `^⌘` + vim keys,
 no prefix state machine; `^⌘[`/`^⌘]` for prev/next pill; hold-to-hint overlay
