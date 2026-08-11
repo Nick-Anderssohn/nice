@@ -206,9 +206,9 @@
   </div>
   <p class="blurb">Small standalone improvements; no new architecture.</p>
   <ul class="tasks">
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Remove/raise <code>SIDEBAR_MAX_WIDTH</code>; clamp against remaining terminal width instead</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Persist <code>sidebar_width</code> in <code>PersistedWindow</code> (currently resets every launch)</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Keyboard scrollback: PageUp / PageDown / Home / End → scroll API (wheel-only today)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t"><code>SIDEBAR_MAX_WIDTH</code> retired; clamp is dynamic: viewport − <code>TERMINAL_MIN_WIDTH</code> (300pt)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Persist <code>sidebar_width</code> in <code>PersistedWindow</code> (optional <code>sidebarWidth</code> key, new-key-only; frozen v3 spellings untouched)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Keyboard scrollback: <kbd>⇧PageUp</kbd> / <kbd>⇧PageDown</kbd> / <kbd>⇧Home</kbd> / <kbd>⇧End</kbd> → scroll API (plain keys still encode to the pty)</span></li>
   </ul>
 </section>
 
@@ -322,6 +322,8 @@
     <li>Code adopts tmux terminology before feature work (Phase R first): <code>Tab</code>→<code>Session</code>, <code>Pane</code>→<code>TermWindow</code>, split leaf = <code>Pane</code>; disk/wire names frozen <span class="d">2026-08-07</span></li>
     <li><code>TermWindow</code> over qualified <code>model::Window</code> (no <code>gpui::Window</code> collision); Phase R includes the UI copy pass; plan at <code>docs/plans/phase-r-terminology-rename.md</code> <span class="d">2026-08-08</span></li>
     <li>Never bind: <kbd>^⌘Q</kbd> (lock screen) <kbd>^⌘F</kbd> (fullscreen) <kbd>^⌘Space</kbd> (emoji) <kbd>^⌘D</kbd> (dictionary)</li>
+    <li>Scrollback keys are Shift-variants only (<kbd>⇧PageUp</kbd>/<kbd>⇧PageDown</kbd>/<kbd>⇧Home</kbd>/<kbd>⇧End</kbd>); plain keys keep encoding to the pty; alt screen falls through to the TUI <span class="d">2026-08-10</span></li>
+    <li><code>TERMINAL_MIN_WIDTH</code> = 300pt; sidebar max = viewport − 300pt (fixed 480pt cap retired) <span class="d">2026-08-10</span></li>
   </ul>
 </section>
 
