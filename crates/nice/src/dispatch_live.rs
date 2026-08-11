@@ -6,11 +6,11 @@
 //! `crate::app::run` uses) with a **real control socket** + **real ptys**. Two
 //! legs:
 //!
-//! * **(a) raw-socket dispatch → nested `[DISPATCH]` session, opened in the
+//! * **(a) raw-socket dispatch → nested `[D]` session, opened in the
 //!   BACKGROUND** — a raw-`UnixStream` `dispatch` message naming a seeded
 //!   originating Claude session replies `ok`; a NEW session appears nested one indent
 //!   under it (`parent_session_id` → the originating id) with the LOCKED title
-//!   `[DISPATCH] <worktree name>` and `title_manually_set == true`; the
+//!   `[D] <worktree name>` and `title_manually_set == true`; the
 //!   DISPATCHER session is still `active_session_id()` (a dispatch never steals focus)
 //!   while the unselected child's Claude window is nonetheless
 //!   `is_claude_running`; the session's `cwd` is the PAYLOAD cwd, not the
@@ -24,7 +24,7 @@
 //!   a `git init`-ed scratch repo with `NICE_SOCKET` / `NICE_TAB_ID` /
 //!   `NICE_PANE_ID` pointing at the live window + the seeded dispatcher session. It
 //!   exits 0 saying the session is opening, and the session that appears is nested under
-//!   the dispatcher, `[DISPATCH]`-titled, unselected — and its `cwd` is the REPO
+//!   the dispatcher, `[D]`-titled, unselected — and its `cwd` is the REPO
 //!   ROOT rather than the subdir the helper ran in, which is the helper's
 //!   `git rev-parse --path-format=absolute --git-common-dir` main-root
 //!   resolution proven for real. With model/effort left empty (the default
@@ -299,7 +299,7 @@ async fn run_dispatch(
     let work = fixture.work_str();
     seed_dispatcher_session(cx, &state, &work);
 
-    // === (a) raw-socket dispatch → nested, unselected [DISPATCH] session ============
+    // === (a) raw-socket dispatch → nested, unselected [D] session ============
     let before_a = all_session_ids(cx, &state);
     let task_a = format!("{work}/briefs/dispatch-a.md");
     let reply_a = send_dispatch(
@@ -323,7 +323,7 @@ async fn run_dispatch(
         &state,
         &before_a,
         "a",
-        "[DISPATCH] fix-drag-crash",
+        "[D] fix-drag-crash",
         &fixture.repo_str(),
         &mut failures,
     )
@@ -445,7 +445,7 @@ async fn real_helper_leg(
         state,
         &before,
         "b",
-        "[DISPATCH] sidebar-perf",
+        "[D] sidebar-perf",
         &fixture.repo_str(),
         failures,
     )
@@ -476,14 +476,14 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
             detail: "dispatch OK: a raw-socket `dispatch` naming a seeded dispatcher session replied \
-                     `ok` and opened a nested, UNSELECTED [DISPATCH]-titled session (locked title, \
+                     `ok` and opened a nested, UNSELECTED [D]-titled session (locked title, \
                      parented under the dispatcher, cwd = the PAYLOAD cwd, its unrendered Claude \
                      window running) whose stub argv carried --session-id <v4> then --add-dir \
                      <brief dir> --worktree <name> --model --effort with the prompt last; and the \
                      INSTALLED nice-dispatch.sh, run for real from a subdirectory of a git \
                      init-ed scratch repo, exited 0, posted the repo ROOT as cwd (its \
                      --git-common-dir main-root resolution, not $PWD) and produced a second \
-                     nested [DISPATCH] session whose argv omitted --model/--effort with the prompt \
+                     nested [D] session whose argv omitted --model/--effort with the prompt \
                      still directly after --worktree."
                 .to_string(),
         }
@@ -503,7 +503,7 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
 // -- assertions --------------------------------------------------------------
 
 /// Poll for the session a dispatch produced and assert the shape both legs share:
-/// nested under the dispatcher with a LOCKED `[DISPATCH] …` title, spawned from
+/// nested under the dispatcher with a LOCKED `[D] …` title, spawned from
 /// `want_cwd` (the payload cwd), the dispatcher still active, and the unselected
 /// child's Claude window running.
 async fn assert_dispatch_session(

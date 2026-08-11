@@ -3286,7 +3286,7 @@ mod tests {
 
     // R26 replaced the R14 `handoff` stub (which replied
     // `error: handoff is not supported yet`) with a real handler that opens a
-    // nested `[HANDOFF]` Claude session and replies `ok`. The new body takes a gpui
+    // nested `[H]` Claude session and replies `ok`. The new body takes a gpui
     // `Context` (it spawns a Claude window, like the `claude` arm), so it can no
     // longer be driven from a plain `#[test]` in this binary crate (which never
     // links gpui test-support) — its behavior (nested + top-level-fallback open,
@@ -3433,7 +3433,7 @@ mod tests {
 
     /// The handler-level facts of `dispatch` that no pure helper can carry:
     /// nesting under the RESOLVED originating session, the top-level fallback on a
-    /// stale `tabId`, the locked `[DISPATCH] …` title, the background (unselected)
+    /// stale `tabId`, the locked `[D] …` title, the background (unselected)
     /// open, and — the one real split from `handoff` — that the new session's cwd is
     /// the PAYLOAD cwd (the main checkout root) even though the dispatcher session
     /// itself sits in a worktree.
@@ -3506,10 +3506,10 @@ mod tests {
                 "the dispatch spawns from the PAYLOAD cwd (main checkout), never \
                  the dispatcher session's worktree cwd"
             );
-            assert_eq!(session.title, "[DISPATCH] fix-tabs");
+            assert_eq!(session.title, "[D] fix-tabs");
             assert!(
                 session.title_manually_set,
-                "the [DISPATCH] label is locked against Claude's OSC auto-title"
+                "the [D] label is locked against Claude's OSC auto-title"
             );
             assert_eq!(
                 ws.workspace.active_session_id(),
@@ -3548,7 +3548,7 @@ mod tests {
                 session.parent_session_id.is_none(),
                 "an unresolvable tabId opens the dispatch session top-level"
             );
-            assert_eq!(session.title, "[DISPATCH] other-task");
+            assert_eq!(session.title, "[D] other-task");
             assert_eq!(
                 ws.workspace.active_session_id(),
                 Some("t-orig"),

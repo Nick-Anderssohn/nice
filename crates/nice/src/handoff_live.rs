@@ -10,10 +10,10 @@
 //!   stable (idempotent), and `sync_with(false, …)` removes the skill subtree +
 //!   helper file while the shared helper dir survives. NEVER the real `~/.claude`
 //!   / `~/.nice`.
-//! * **(b) handoff socket → nested `[HANDOFF]` session, opened in the BACKGROUND** —
+//! * **(b) handoff socket → nested `[H]` session, opened in the BACKGROUND** —
 //!   a raw-`UnixStream` `handoff` message naming a seeded originating Claude session
 //!   replies `ok`; a NEW session appears nested one indent under it (`parent_session_id`
-//!   → the originating id) with the LOCKED title `[HANDOFF] <originating title>`
+//!   → the originating id) with the LOCKED title `[H] <originating title>`
 //!   and `title_manually_set == true`; the ORIGINATING session is still
 //!   `active_session_id()` (D7 — a handoff never steals focus) while the nested
 //!   child's Claude window is nonetheless `is_claude_running` (its pty is owned by
@@ -22,7 +22,7 @@
 //!   then `--model <m> --effort <e>` then the prompt `Read the handoff notes at
 //!   <handoffFile>. <instructions>` as the FINAL positional.
 //! * **(c) top-level fallback on a miss** — a `handoff` with an empty `tabId`
-//!   still replies `ok` and opens a TOP-LEVEL `[HANDOFF] Session` session
+//!   still replies `ok` and opens a TOP-LEVEL `[H] Session` session
 //!   (`parent_session_id == None`), proving a miss is a fallback, not a drop — and it
 //!   too leaves the originating session active (D7 holds on the fallback path).
 //! * **(d) empty model/effort omit their flags** — a `handoff` with `model:""` /
@@ -246,7 +246,7 @@ async fn run_handoff(
     };
     let work = fixture.work_str();
 
-    // === (b) handoff socket → nested [HANDOFF] session with locked title + argv ======
+    // === (b) handoff socket → nested [H] session with locked title + argv ======
     // Seed a model-only originating Claude session (present, non-Terminals, owns its
     // window) so the handoff nests under it.
     seed_originating_claude_session(cx, &state, &work, "orig-tab", "orig-pane", "my-project");
@@ -282,9 +282,9 @@ async fn run_handoff(
             match snap {
                 None => failures.push("(b) nested: the new session vanished before assertion".into()),
                 Some((title, locked, parent)) => {
-                    if title != "[HANDOFF] my-project" {
+                    if title != "[H] my-project" {
                         failures.push(format!(
-                            "(b) nested: title must be '[HANDOFF] my-project', got {title:?}"
+                            "(b) nested: title must be '[H] my-project', got {title:?}"
                         ));
                     }
                     if !locked {
@@ -344,7 +344,7 @@ async fn run_handoff(
         ),
     }
 
-    // === (c) top-level fallback on a miss: empty tabId ⇒ [HANDOFF] Session ========
+    // === (c) top-level fallback on a miss: empty tabId ⇒ [H] Session ========
     let before_c = all_session_ids(cx, &state);
     let hf_c = format!("{work}/handoff-c.md");
     let reply_c = send_handoff(cx, &socket_path, &work, &hf_c, "", "", "", "", "").await;
@@ -362,9 +362,9 @@ async fn run_handoff(
             match snap {
                 None => failures.push("(c) fallback: the new session vanished before assertion".into()),
                 Some((title, parent)) => {
-                    if title != "[HANDOFF] Session" {
+                    if title != "[H] Session" {
                         failures.push(format!(
-                            "(c) fallback: a miss must title '[HANDOFF] Session', got {title:?}"
+                            "(c) fallback: a miss must title '[H] Session', got {title:?}"
                         ));
                     }
                     if parent.is_some() {
@@ -484,11 +484,11 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
                      scratch dirs (helper 0o755, idempotent re-run, uninstall removed the skill \
                      subtree + helper file while the shared dir + R16 sibling survived); a socket \
                      `handoff` naming a seeded Claude session replied `ok` and opened a nested \
-                     [HANDOFF]-titled session (locked, parented under the originating session) IN THE \
+                     [H]-titled session (locked, parented under the originating session) IN THE \
                      BACKGROUND (the originating session stayed active while the unselected child's \
                      Claude window ran) whose stub argv carried --session-id <v4> --model --effort \
                      then the prompt last; a miss (empty tabId) still replied `ok` and opened a \
-                     top-level [HANDOFF] session, also without stealing focus; and empty \
+                     top-level [H] session, also without stealing focus; and empty \
                      model/effort omitted both flags with the prompt still last."
                 .to_string(),
         }

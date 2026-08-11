@@ -4173,10 +4173,10 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // build_window_root) over a real control socket + real ptys: the installer
         // round-trips the two -rs files against INJECTED scratch dirs (never the
         // real ~/.claude / ~/.nice); a socket `handoff` naming a seeded originating
-        // Claude session opens a nested [HANDOFF]-titled session (locked, parented under the
+        // Claude session opens a nested [H]-titled session (locked, parented under the
         // originating session) whose stub argv carries --session-id/--model/--effort +
         // the prompt last; a miss (empty tabId) still replies `ok` and opens a
-        // top-level [HANDOFF] session; and empty model/effort omit both flags.
+        // top-level [H] session; and empty model/effort omit both flags.
         // The stub `claude` is seeded via the ResolvedClaudePath Global with
         // NICE_CLAUDE_OVERRIDE UNSET (so is_override stays false and the flags emit);
         // no real claude spawns. Sandbox HOME (no rc) for the driver's lifetime.
@@ -4197,7 +4197,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // The dispatch gate — the `/nice-dispatch` twin of `handoff`, likewise on
         // the SHIPPED window over a real control socket + real ptys with a stub
         // `claude` (never the real one) and a sandboxed HOME. Two legs: a raw
-        // `dispatch` message opens a nested, UNSELECTED `[DISPATCH] <worktree>` session
+        // `dispatch` message opens a nested, UNSELECTED `[D] <worktree>` session
         // (locked title, parented under the seeded dispatcher, spawned from the
         // PAYLOAD cwd — never the dispatcher's own) whose argv carries
         // `--add-dir <brief dir>` immediately followed by `--worktree <name>` then
@@ -4248,7 +4248,7 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
         // update pill appears on the SHIPPED toolbar off the injected fetcher and a
         // guarded global-HID click opens its popover; (b) a real guarded global-HID
         // drag commits an R25 pill reorder on the shipped strip; (c) a socket
-        // `handoff` opens a nested [HANDOFF]-titled session on the shipped window (stub
+        // `handoff` opens a nested [H]-titled session on the shipped window (stub
         // claude, never real) and ⌘, opens R23's shipped settings window exposing
         // the Claude section (the R26 handoff toggle's home). The R25 drag + R27
         // click post via the NEW guarded global-HID seams (activate + raise +

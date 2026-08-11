@@ -2433,7 +2433,7 @@ fn dedupe_window_ids_is_a_noop_on_unique_ids() {
 
 fn make_handoff_session(id: &str, cwd: &str) -> Session {
     let claude_window_id = format!("{}-claude", id);
-    let mut session = Session::new(id, "[HANDOFF] Some task", cwd);
+    let mut session = Session::new(id, "[H] Some task", cwd);
     session.windows = vec![
         claude(&claude_window_id),
         terminal(&format!("{}-t1", id), "Terminal 1"),

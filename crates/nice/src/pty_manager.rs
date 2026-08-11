@@ -1504,7 +1504,7 @@ impl PtyManager {
     ///   activation, as before.
     /// * **(D4) the title is fixed AND locked** — set to `title` up front with
     ///   `title_manually_set = true`, so Claude's OSC auto-title cannot overwrite
-    ///   the `[HANDOFF] …` / `[DISPATCH] …` label once the fresh session names
+    ///   the `[H] …` / `[D] …` label once the fresh session names
     ///   itself (unlike an ordinary claude session, which keeps auto-title).
     /// * **(D3) placement nests one indent under the originating session** — via
     ///   [`WorkspaceModel::insert_handoff_child`] (depth-1 lineage, the invariant
@@ -1548,7 +1548,7 @@ impl PtyManager {
         ];
         session.active_window_id = Some(claude_window_id.clone());
         session.claude_session_id = Some(claude_session_id.clone());
-        // (D4) Lock the "[HANDOFF] …" / "[DISPATCH] …" title against Claude's OSC
+        // (D4) Lock the "[H] …" / "[D] …" title against Claude's OSC
         // auto-title.
         session.title_manually_set = true;
         session.next_terminal_index = 2;
@@ -2334,17 +2334,17 @@ fn claude_launch_display_command(mode: &ClaudeSessionMode, extra_args: &[String]
 
 /// The prefix on every handoff-session title — Swift `handoffTitlePrefix`
 /// (`SessionsModel.swift:1161`). A single existing occurrence is stripped before
-/// re-prefixing so a handoff-fired-from-a-handoff reads `[HANDOFF] Foo`, not
-/// `[HANDOFF] [HANDOFF] Foo`.
-const HANDOFF_TITLE_PREFIX: &str = "[HANDOFF] ";
+/// re-prefixing so a handoff-fired-from-a-handoff reads `[H] Foo`, not
+/// `[H] [H] Foo`.
+const HANDOFF_TITLE_PREFIX: &str = "[H] ";
 
-/// Build the locked `[HANDOFF] …` title for a handoff session from the originating
+/// Build the locked `[H] …` title for a handoff session from the originating
 /// session's current title — pure port of Swift `handoffTitle`
 /// (`SessionsModel.swift:1173-1181`), unit-tested directly like
-/// [`build_claude_exec_command`]. Strips a single leading `[HANDOFF] ` (no
+/// [`build_claude_exec_command`]. Strips a single leading `[H] ` (no
 /// stacking), trims whitespace/newlines, and falls back to `Session` when the
 /// result is empty (a `None` / blank / whitespace-only originating title — which
-/// would otherwise yield a ragged `[HANDOFF]    `).
+/// would otherwise yield a ragged `[H]    `).
 pub(crate) fn handoff_title(originating_title: Option<&str>) -> String {
     let raw = originating_title.unwrap_or("");
     // `strip_prefix` mirrors Swift's `hasPrefix` + `dropFirst(prefix.count)`.
@@ -2398,13 +2398,13 @@ pub(crate) fn handoff_extra_args(model: &str, effort: &str, prompt: &str) -> Vec
 /// The prefix on every dispatch-session title. Unlike [`HANDOFF_TITLE_PREFIX`] there
 /// is no stripping rule: a dispatch title is built from the WORKTREE NAME, not
 /// from another session's title, so it can never stack.
-const DISPATCH_TITLE_PREFIX: &str = "[DISPATCH] ";
+const DISPATCH_TITLE_PREFIX: &str = "[D] ";
 
-/// Build the locked `[DISPATCH] <worktree-name>` title for a dispatch session. The
+/// Build the locked `[D] <worktree-name>` title for a dispatch session. The
 /// locked title keeps the sidebar's session→worktree mapping stable against Claude's
 /// OSC auto-title. Trims and falls back to `Session` on a blank name exactly as
 /// [`handoff_title`] does, so a whitespace-only name can't render a ragged
-/// `[DISPATCH]    ` (the socket parser only rejects a truly empty
+/// `[D]    ` (the socket parser only rejects a truly empty
 /// `worktreeName`).
 pub(crate) fn dispatch_title(worktree_name: &str) -> String {
     let trimmed = worktree_name.trim();

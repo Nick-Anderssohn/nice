@@ -31,7 +31,7 @@
 //!     in-process by `nice-itests`.
 //!   * **(c) R26 — handoff nested session + settings toggle.** A raw-`UnixStream`
 //!     `handoff` naming a seeded originating Claude session replies `ok` and opens a
-//!     nested `[HANDOFF] <title>` session on the shipped window (parented under the
+//!     nested `[H] <title>` session on the shipped window (parented under the
 //!     originating session), with the stub `claude` (never the machine's real one); and
 //!     ⌘, opens R23's shipped settings window whose rail exposes the Claude section
 //!     (an `AXButton`) — the home of R26's `settings.claude.installHandoffSkill`
@@ -175,7 +175,7 @@ impl Fixture {
         }
         // The stub `claude`: idle reading stdin so its window stays alive until
         // teardown. NEVER the machine's real claude (hermeticity). It records no
-        // argv — this leg asserts the [HANDOFF] session + `ok` reply, not the flags
+        // argv — this leg asserts the [H] session + `ok` reply, not the flags
         // (the `handoff` scenario pins the argv).
         let stub = bin.join("claude");
         std::fs::write(&stub, "#!/bin/sh\nwhile IFS= read -r _l; do : ; done\n")
@@ -611,9 +611,9 @@ async fn leg_c_handoff(
             match snap {
                 None => failures.push("(c) handoff: the new session vanished before assertion".to_string()),
                 Some((title, locked, parent)) => {
-                    if title != "[HANDOFF] my-project" {
+                    if title != "[H] my-project" {
                         failures.push(format!(
-                            "(c) handoff: the nested session title must be '[HANDOFF] my-project', got {title:?}"
+                            "(c) handoff: the nested session title must be '[H] my-project', got {title:?}"
                         ));
                     }
                     if !locked {
@@ -625,7 +625,7 @@ async fn leg_c_handoff(
                              (parent_session_id == 'comp-orig-tab'), got {parent:?}"
                         ));
                     } else {
-                        eprintln!("[selftest] tranche6-composition (c): a socket `handoff` opened a nested [HANDOFF]-titled session on the shipped window (reply ok, parented under the originating session)");
+                        eprintln!("[selftest] tranche6-composition (c): a socket `handoff` opened a nested [H]-titled session on the shipped window (reply ok, parented under the originating session)");
                     }
                 }
             }
@@ -1048,7 +1048,7 @@ fn build_report(failures: Vec<String>, deferred: Vec<String>) -> CadenceReport {
                  (hard-asserted when the drag armed, else DEFERRED — a synthetic press does not \
                  arm gpui's drag-and-drop; the deterministic reorder is pinned by nice-itests); \
                  (c) a socket `handoff` opened a nested \
-                 [HANDOFF]-titled session (reply ok) and ⌘, opened the shipped settings window exposing \
+                 [H]-titled session (reply ok) and ⌘, opened the shipped settings window exposing \
                  the Claude section (AXButton) — the R26 handoff toggle's home; {} item(s) DEFERRED \
                  to a human pass",
                 deferred.len()

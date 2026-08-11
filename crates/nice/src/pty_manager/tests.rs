@@ -2440,34 +2440,34 @@ fn claude_display_command_resume_hides_uuid() {
     );
 }
 
-// handoff_title — the locked "[HANDOFF] …" label (R26). Strip a single existing
+// handoff_title — the locked "[H] …" label (R26). Strip a single existing
 // prefix (no stacking), trim, blank → "Session".
 
 #[test]
 fn handoff_title_prefixes_a_plain_title() {
-    assert_eq!(handoff_title(Some("Foo")), "[HANDOFF] Foo");
+    assert_eq!(handoff_title(Some("Foo")), "[H] Foo");
 }
 
 #[test]
 fn handoff_title_does_not_stack_an_existing_prefix() {
-    // A handoff fired FROM a handoff session reads "[HANDOFF] Foo", not doubled.
-    assert_eq!(handoff_title(Some("[HANDOFF] Foo")), "[HANDOFF] Foo");
+    // A handoff fired FROM a handoff session reads "[H] Foo", not doubled.
+    assert_eq!(handoff_title(Some("[H] Foo")), "[H] Foo");
 }
 
 #[test]
 fn handoff_title_none_falls_back_to_session() {
-    assert_eq!(handoff_title(None), "[HANDOFF] Session");
+    assert_eq!(handoff_title(None), "[H] Session");
 }
 
 #[test]
 fn handoff_title_whitespace_only_falls_back_to_session() {
-    // A whitespace-only title would otherwise yield a ragged "[HANDOFF]    ".
-    assert_eq!(handoff_title(Some("   ")), "[HANDOFF] Session");
+    // A whitespace-only title would otherwise yield a ragged "[H]    ".
+    assert_eq!(handoff_title(Some("   ")), "[H] Session");
 }
 
 #[test]
 fn handoff_title_trims_surrounding_whitespace() {
-    assert_eq!(handoff_title(Some("  Bar  ")), "[HANDOFF] Bar");
+    assert_eq!(handoff_title(Some("  Bar  ")), "[H] Bar");
 }
 
 // handoff_prompt — always points at the notes file; blank instructions get the
@@ -2530,23 +2530,23 @@ fn handoff_extra_args_model_and_effort_then_prompt_last() {
     );
 }
 
-// dispatch_title — the locked "[DISPATCH] <worktree-name>" label.
+// dispatch_title — the locked "[D] <worktree-name>" label.
 
 #[test]
 fn dispatch_title_prefixes_the_worktree_name() {
-    assert_eq!(dispatch_title("fix-tabs"), "[DISPATCH] fix-tabs");
+    assert_eq!(dispatch_title("fix-tabs"), "[D] fix-tabs");
 }
 
 #[test]
 fn dispatch_title_trims_surrounding_whitespace() {
-    assert_eq!(dispatch_title("  fix-tabs  "), "[DISPATCH] fix-tabs");
+    assert_eq!(dispatch_title("  fix-tabs  "), "[D] fix-tabs");
 }
 
 #[test]
 fn dispatch_title_blank_name_falls_back_to_session() {
     // The socket parser rejects an EMPTY worktreeName, but " " gets through and
-    // would otherwise render a ragged "[DISPATCH]  ".
-    assert_eq!(dispatch_title("   "), "[DISPATCH] Session");
+    // would otherwise render a ragged "[D]  ".
+    assert_eq!(dispatch_title("   "), "[D] Session");
 }
 
 // dispatch_prompt — always points at the task file and tells the child to START
