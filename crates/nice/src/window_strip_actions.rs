@@ -48,14 +48,14 @@ pub(crate) trait WindowStripActions {
 
     /// Move focus to the next window within the active session, **wrapping**. A no-op
     /// when the active session has fewer than two windows (or has no active window). The
-    /// R12 ⌘⌥→ shortcut drives this; model-only — it moves the active session's
+    /// The ⌃⌘L shortcut drives this; model-only — it moves the active session's
     /// `active_window_id`. R13 re-implements it behind this same name so real focus
     /// activation + the deferred-spawn acknowledgment ride along without touching
     /// callers. Ported from `SessionsModel.stepActivePane(by: +1)`.
     fn select_next_window(&mut self, model: &mut WorkspaceModel);
 
     /// Move focus to the previous window within the active session, **wrapping**. The
-    /// ⌘⌥← counterpart of [`select_next_window`](Self::select_next_window); same
+    /// ⌃⌘H counterpart of [`select_next_window`](Self::select_next_window); same
     /// <2-windows no-op and same R13 rewiring contract. Ported from
     /// `SessionsModel.stepActivePane(by: -1)`.
     fn select_prev_window(&mut self, model: &mut WorkspaceModel);

@@ -429,21 +429,17 @@ fn register_window_scoped_actions(cx: &mut App) {
     });
     // -- Phase 1 (tmux port): the held-⌃⌘ scheme ------------------------------
     //
-    // D3: the four `FocusPane*` actions are named for their PHASE 2 spatial
-    // meaning (tmux `select-pane -L/-D/-U/-R` over the future split tree).
-    // Pre-splits the only spatial axis is the pill strip, so left/right alias
-    // prev/next window; Phase 2 swaps these handler bodies without touching a
-    // single binding or migrating anything.
-    cx.on_action(|_: &FocusPaneLeft, cx: &mut App| {
-        with_active_state(cx, |s, _cx| s.window_strip_actions.select_prev_window(&mut s.workspace));
-    });
-    cx.on_action(|_: &FocusPaneRight, cx: &mut App| {
-        with_active_state(cx, |s, _cx| s.window_strip_actions.select_next_window(&mut s.workspace));
-    });
-    // D3: registered but INERT until Phase 2 lands splits — there is nothing
-    // stacked vertically to move between yet. Registered rather than omitted so
-    // the chord is consumed by the keymap instead of leaking into the pty, and so
-    // Phase 2 only has to fill these bodies in.
+    // D3, as revised by the 2026-08-11 hjkl ladder: the four `FocusPane*`
+    // actions are the ladder's ⌃⌘⇧ rung — directional PANE focus (tmux
+    // `select-pane -L/-D/-U/-R` over the future split tree). All four are
+    // registered but INERT until Phase 2 lands splits: there are no panes to
+    // move between, and the bare-⌃⌘ rung (`h`/`l` → prev/next pill, `j`/`k` →
+    // prev/next sidebar session) owns container navigation, so `h`/`l` no longer
+    // alias the pill strip. Registered rather than omitted so the chords are
+    // consumed by the keymap instead of leaking into the pty, and so Phase 2 only
+    // has to fill these bodies in — no binding moves, nothing migrates.
+    cx.on_action(|_: &FocusPaneLeft, _cx: &mut App| {});
+    cx.on_action(|_: &FocusPaneRight, _cx: &mut App| {});
     cx.on_action(|_: &FocusPaneUp, _cx: &mut App| {});
     cx.on_action(|_: &FocusPaneDown, _cx: &mut App| {});
     cx.on_action(|_: &LastActiveWindow, cx: &mut App| {
@@ -790,7 +786,7 @@ fn end_peek_if_modifiers_released(current: Modifiers, state: &Entity<WindowState
 }
 
 /// D5: how long the scheme's modifier pair must be held, with no chord committed,
-/// before the hint overlay appears. Long enough that a fast `⌃⌘]` never flashes
+/// before the hint overlay appears. Long enough that a fast `⌃⌘L` never flashes
 /// the badges, short enough to feel like a held-key affordance rather than a
 /// delayed popup — tmux `display-panes` territory.
 pub(crate) const HINT_OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -812,21 +808,25 @@ fn update_hint_overlay(current: Modifiers, state: &Entity<WindowState>, cx: &mut
 
 /// The modifier set the hint overlay watches, read from the LIVE bindings (the
 /// [`peek_relevant_modifiers`] pattern) so a user who rebinds the scheme keeps a
-/// working overlay: the next-pill chord's modifiers — [`ShortcutAction::FocusPaneRight`]
-/// (`⌃⌘L` by default), falling back to [`ShortcutAction::NextWindow`] (`⌃⌘]`) when
-/// that one is unbound.
+/// working overlay: the next-pill chord's modifiers — [`ShortcutAction::NextWindow`]
+/// (`⌃⌘L` by default), falling back to [`ShortcutAction::WindowByIndex`] (`⌃⌘1`…`⌃⌘9`)
+/// when that one is unbound.
+///
+/// The fallback is the badge row itself, which is exactly what the overlay
+/// PAINTS — the 2026-08-11 hjkl-ladder revision moved `FocusPaneRight` up to the
+/// `⌃⌘⇧` rung, where it is an inert Phase-2 action, so it can no longer speak for
+/// this hold.
 ///
 /// `None` — never show the overlay — when both are unbound. A combo bound to a
 /// BARE key (no modifiers) is rejected by [`hint_hold_matches`], which owns that
 /// rule.
 ///
 /// The badges the overlay draws are [`ShortcutAction::WindowByIndex`]'s digits,
-/// which share this modifier set in the defaults. A user who rebinds ONLY
-/// `WindowByIndex` to a different set still gets the badges on the nav-chord hold;
-/// re-deriving them per action is a Phase 2 problem, when panes (not just pills)
-/// get numbers.
+/// which share this modifier set in the defaults. A user who rebinds ONLY the
+/// next-pill chord still gets the badges on that hold; re-deriving them per action
+/// is a Phase 2 problem, when panes (not just pills) get numbers.
 fn hint_relevant_modifiers(cx: &App) -> Option<nice_model::shortcuts::Modifiers> {
-    [ShortcutAction::FocusPaneRight, ShortcutAction::NextWindow]
+    [ShortcutAction::NextWindow, ShortcutAction::WindowByIndex]
         .into_iter()
         .find_map(|action| live_combo_modifiers(cx, action))
 }
@@ -852,8 +852,10 @@ fn hint_hold_matches(current: Modifiers, hint: Option<nice_model::shortcuts::Mod
         && current.platform == hint.command
 }
 
-/// The union of the two sidebar-session-cycle shortcuts' modifier sets (⌘⌥ by
-/// default) — the modifiers whose full release ends a peek. Reads the LIVE
+/// The union of the two sidebar-session-cycle shortcuts' modifier sets (⌃⌘ since
+/// the hjkl-ladder revision put `⌃⌘J`/`⌃⌘K` on the sessions — so holding the
+/// scheme's pair now floats the collapsed-sidebar peek AND, after the debounce,
+/// the pill hint badges) — the modifiers whose full release ends a peek. Reads the LIVE
 /// bindings (D4): rebinding a sidebar-nav chord to a different modifier set must
 /// re-point the peek at the NEW modifiers, else the overlay watches the wrong keys
 /// (the landed TODO). Falls back to the defaults when no store Global is installed
@@ -914,10 +916,11 @@ mod tests {
         }
     }
 
-    /// ⌘⌥ — the default sidebar-session-cycle modifier set the `should_end_peek` tests
-    /// exercise (equivalent to `peek_relevant_modifiers` with no store installed).
-    fn command_alt() -> Modifiers {
-        mods(false, true, false, true)
+    /// ⌃⌘ — the default sidebar-session-cycle modifier set the `should_end_peek`
+    /// tests exercise (equivalent to `peek_relevant_modifiers` with no store
+    /// installed, since the hjkl ladder put `⌃⌘J`/`⌃⌘K` on the sessions).
+    fn peek_pair() -> Modifiers {
+        mods(true, false, false, true)
     }
 
     /// A unique `ui_settings.json` temp path for a store the gpui tests install.
@@ -937,57 +940,57 @@ mod tests {
 
     #[test]
     fn peek_stays_while_any_relevant_modifier_is_held() {
-        let relevant = command_alt(); // ⌘⌥
+        let relevant = peek_pair(); // ⌃⌘
         // Both held → stays.
-        assert!(!should_end_peek(mods(false, true, false, true), relevant, false));
-        // Only ⌘ still held (⌥ released) → stays (Swift keeps it until BOTH lift).
+        assert!(!should_end_peek(mods(true, false, false, true), relevant, false));
+        // Only ⌘ still held (⌃ released) → stays (Swift keeps it until BOTH lift).
         assert!(!should_end_peek(mods(false, false, false, true), relevant, false));
-        // Only ⌥ still held → stays.
-        assert!(!should_end_peek(mods(false, true, false, false), relevant, false));
+        // Only ⌃ still held → stays.
+        assert!(!should_end_peek(mods(true, false, false, false), relevant, false));
     }
 
     #[test]
     fn peek_ends_when_all_relevant_modifiers_release() {
-        let relevant = command_alt();
+        let relevant = peek_pair();
         // Nothing held → end.
         assert!(should_end_peek(mods(false, false, false, false), relevant, false));
-        // An unrelated modifier (⇧ / ⌃) held but neither ⌘ nor ⌥ → still end.
-        assert!(should_end_peek(mods(true, false, true, false), relevant, false));
+        // An unrelated modifier (⌥ / ⇧) held but neither ⌃ nor ⌘ → still end.
+        assert!(should_end_peek(mods(false, true, true, false), relevant, false));
     }
 
     #[test]
     fn mouse_pin_keeps_the_peek_even_with_no_modifiers() {
         // The pointer pinning the overlay wins over modifier release (dossier
         // G6 / R10's hover pin) — never ends while pinned.
-        let relevant = command_alt();
+        let relevant = peek_pair();
         assert!(!should_end_peek(mods(false, false, false, false), relevant, true));
     }
 
     /// D4 / Validation §2a(e): `peek_relevant_modifiers` reads the LIVE map. With no
-    /// store it falls back to the ⌘⌥ defaults; after rebinding a sidebar-session chord to
-    /// a ⌃⇧ combo the relevant set tracks the NEW modifiers (unioned with the other,
-    /// still-default sidebar-session combo).
+    /// store it falls back to the ⌃⌘ defaults (the hjkl ladder's session rung); after
+    /// rebinding a sidebar-session chord to an ⌥⇧ combo the relevant set tracks the NEW
+    /// modifiers (unioned with the other, still-default sidebar-session combo).
     #[gpui::test]
     fn peek_relevant_modifiers_default_then_live(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            // No store yet ⇒ the defaults: both sidebar-session combos are ⌘⌥.
+            // No store yet ⇒ the defaults: both sidebar-session combos are ⌃⌘.
             let r = peek_relevant_modifiers(cx);
-            assert!(r.platform && r.alt, "⌘⌥ hold the peek by default");
-            assert!(!r.control && !r.shift, "no other modifier holds the peek by default");
+            assert!(r.platform && r.control, "⌃⌘ hold the peek by default");
+            assert!(!r.alt && !r.shift, "no other modifier holds the peek by default");
 
             cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("peek-live")));
-            // Rebind NextSidebarSession ⌘⌥↓ -> ⌃⇧↓ (persist + rebuild happen inside).
+            // Rebind NextSidebarSession ⌃⌘J -> ⌥⇧↓ (persist + rebuild happen inside).
             ShortcutBindings::set_binding(
                 cx,
                 ShortcutAction::NextSidebarSession,
-                OwnedCombo::from_token("ctrl-shift-down"),
+                OwnedCombo::from_token("alt-shift-down"),
             );
 
             let r = peek_relevant_modifiers(cx);
-            assert!(r.control, "the rebound ⌃ now holds the peek");
+            assert!(r.alt, "the rebound ⌥ now holds the peek");
             assert!(r.shift, "the rebound ⇧ now holds the peek");
-            // PrevSidebarSession is still ⌘⌥, so ⌘⌥ remain relevant too (the union).
-            assert!(r.platform && r.alt, "the other sidebar-session combo keeps ⌘⌥ relevant");
+            // PrevSidebarSession is still ⌃⌘, so ⌃⌘ remain relevant too (the union).
+            assert!(r.platform && r.control, "the other sidebar-session combo keeps ⌃⌘ relevant");
         });
     }
 
@@ -1054,10 +1057,10 @@ mod tests {
             );
 
             cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings("hint-live")));
-            // Rebind FocusPaneRight (the primary source) ⌃⌘L -> ⌥⇧L.
+            // Rebind NextWindow (the primary source) ⌃⌘L -> ⌥⇧L.
             ShortcutBindings::set_binding(
                 cx,
-                ShortcutAction::FocusPaneRight,
+                ShortcutAction::NextWindow,
                 OwnedCombo::from_token("alt-shift-l"),
             );
 
@@ -1072,23 +1075,24 @@ mod tests {
         });
     }
 
-    /// `FocusPaneRight` unbound ⇒ the fallback source (`NextWindow`) supplies the
-    /// pair, so the overlay survives clearing one of the two nav chords.
+    /// `NextWindow` unbound ⇒ the fallback source (`WindowByIndex`, the row whose
+    /// digits the overlay actually paints) supplies the pair, so the overlay
+    /// survives clearing the next-pill chord.
     #[gpui::test]
-    fn hint_modifiers_fall_back_to_next_window(cx: &mut gpui::TestAppContext) {
+    fn hint_modifiers_fall_back_to_window_by_index(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             cx.set_global(ShortcutBindings::with_defaults(unique_temp_ui_settings(
                 "hint-fallback",
             )));
-            ShortcutBindings::set_binding(cx, ShortcutAction::FocusPaneRight, None);
+            ShortcutBindings::set_binding(cx, ShortcutAction::NextWindow, None);
             assert_eq!(
                 hint_relevant_modifiers(cx),
                 Some(control_command()),
-                "⌃⌘] still defines the hold"
+                "⌃⌘1-9 still defines the hold"
             );
 
-            // Both nav chords cleared ⇒ no overlay at all.
-            ShortcutBindings::set_binding(cx, ShortcutAction::NextWindow, None);
+            // Both sources cleared ⇒ no overlay at all.
+            ShortcutBindings::set_binding(cx, ShortcutAction::WindowByIndex, None);
             assert_eq!(hint_relevant_modifiers(cx), None);
         });
     }
@@ -1239,8 +1243,9 @@ mod tests {
         });
     }
 
-    /// The default board reaches the live keymap: every Phase 1 chord is bound to
-    /// its action, and the D1 flip means ⌘⌥←/→ no longer drive the pill strip.
+    /// The default board reaches the live keymap: every chord of the hjkl ladder
+    /// is bound to its action on the right rung, and the chords the 2026-08-11
+    /// revision freed (⌃⌘[ / ⌃⌘] and the ⌘⌥ arrows) drive nothing at all.
     #[gpui::test]
     fn phase_one_default_chords_are_live_in_the_keymap(cx: &mut gpui::TestAppContext) {
         use gpui::Keystroke;
@@ -1257,18 +1262,56 @@ mod tests {
                     .bindings_for_action(action)
                     .any(|b| matches!(b.match_keystrokes(std::slice::from_ref(&ks)), Some(false)))
             };
+            // Nothing AT ALL is bound to `chord` — the freed-chord assertion, which
+            // a per-action `!bound` could never make.
+            let unbound_entirely = |chord: &str| -> bool {
+                let ks = Keystroke::parse(chord).expect("test chord parses");
+                keymap
+                    .all_bindings_for_input(std::slice::from_ref(&ks))
+                    .is_empty()
+            };
 
-            // D1: the pill chords moved.
-            assert!(bound(&NextWindow, "cmd-ctrl-]"), "⌃⌘] steps to the next window");
-            assert!(bound(&PrevWindow, "cmd-ctrl-["), "⌃⌘[ steps to the previous window");
-            assert!(!bound(&NextWindow, "cmd-alt-right"), "⌘⌥→ is freed");
-            assert!(!bound(&PrevWindow, "cmd-alt-left"), "⌘⌥← is freed");
+            // The ladder's bare-⌃⌘ rung: h/l pills, j/k sidebar sessions.
+            assert!(bound(&NextWindow, "cmd-ctrl-l"), "⌃⌘L steps to the next window");
+            assert!(bound(&PrevWindow, "cmd-ctrl-h"), "⌃⌘H steps to the previous window");
+            assert!(
+                bound(&NextSidebarSession, "cmd-ctrl-j"),
+                "⌃⌘J steps down the sidebar sessions"
+            );
+            assert!(
+                bound(&PrevSidebarSession, "cmd-ctrl-k"),
+                "⌃⌘K steps up the sidebar sessions"
+            );
 
-            // D3 + the rest of the scheme.
-            assert!(bound(&FocusPaneLeft, "cmd-ctrl-h"));
-            assert!(bound(&FocusPaneDown, "cmd-ctrl-j"));
-            assert!(bound(&FocusPaneUp, "cmd-ctrl-k"));
-            assert!(bound(&FocusPaneRight, "cmd-ctrl-l"));
+            // The chords the revision freed drive NOTHING (not merely "not this
+            // action"): the old pill pair and the old sidebar-session arrows.
+            assert!(unbound_entirely("cmd-ctrl-]"), "⌃⌘] is freed");
+            assert!(unbound_entirely("cmd-ctrl-["), "⌃⌘[ is freed");
+            assert!(unbound_entirely("cmd-alt-down"), "⌘⌥↓ is freed");
+            assert!(unbound_entirely("cmd-alt-up"), "⌘⌥↑ is freed");
+            assert!(unbound_entirely("cmd-alt-right"), "⌘⌥→ is freed");
+            assert!(unbound_entirely("cmd-alt-left"), "⌘⌥← is freed");
+
+            // The ⌃⌘⇧ rung: directional pane focus (bound, inert until Phase 2).
+            assert!(bound(&FocusPaneLeft, "cmd-ctrl-shift-h"));
+            assert!(bound(&FocusPaneDown, "cmd-ctrl-shift-j"));
+            assert!(bound(&FocusPaneUp, "cmd-ctrl-shift-k"));
+            assert!(bound(&FocusPaneRight, "cmd-ctrl-shift-l"));
+
+            // The two rungs above it are RESERVED, never bound (Phase 2 claims them).
+            for chord in [
+                "cmd-ctrl-alt-h",
+                "cmd-ctrl-alt-j",
+                "cmd-ctrl-alt-k",
+                "cmd-ctrl-alt-l",
+                "cmd-ctrl-alt-shift-h",
+                "cmd-ctrl-alt-shift-j",
+                "cmd-ctrl-alt-shift-k",
+                "cmd-ctrl-alt-shift-l",
+            ] {
+                assert!(unbound_entirely(chord), "{chord} is reserved, not bound");
+            }
+
             assert!(bound(&LastActiveWindow, "cmd-ctrl-o"));
             assert!(bound(&ScrollHalfPageUp, "cmd-ctrl-u"));
             assert!(bound(&ScrollHalfPageDown, "cmd-ctrl-d"));

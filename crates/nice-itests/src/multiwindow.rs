@@ -130,25 +130,25 @@ impl WindowStateProbe {
 
     // -- window-scoped handler bodies (mirror `keymap::register_window_scoped_actions`)
 
-    /// ⌘⌥↓ — cycle to the next sidebar session, then float the peek if collapsed.
+    /// ⌃⌘J — cycle to the next sidebar session, then float the peek if collapsed.
     fn next_sidebar_session(&mut self) {
         self.workspace.select_next_sidebar_session();
         self.trigger_peek_if_collapsed();
     }
 
-    /// ⌘⌥↑ — cycle to the previous sidebar session, then float the peek if collapsed.
+    /// ⌃⌘K — cycle to the previous sidebar session, then float the peek if collapsed.
     fn prev_sidebar_session(&mut self) {
         self.workspace.select_prev_sidebar_session();
         self.trigger_peek_if_collapsed();
     }
 
-    /// ⌘⌥→ — step the active session's active window forward (wrapping). Mirror of
+    /// ⌃⌘L — step the active session's active window forward (wrapping). Mirror of
     /// `ModelWindowStripActions::select_next_window` (`step_active_window(+1)`).
     fn next_window(&mut self) {
         step_active_window(&mut self.workspace, 1);
     }
 
-    /// ⌘⌥← — step the active session's active window backward (wrapping).
+    /// ⌃⌘H — step the active session's active window backward (wrapping).
     fn prev_window(&mut self) {
         step_active_window(&mut self.workspace, -1);
     }
@@ -461,7 +461,7 @@ fn on_window_modifiers_changed_probe(event: &ModifiersChangedEvent, cx: &mut App
     }
 }
 
-/// The union of the sidebar-session-cycle combos' modifiers (⌘⌥ by default), read from
+/// The union of the sidebar-session-cycle combos' modifiers (⌃⌘ by default), read from
 /// the real table — mirror of `keymap::peek_relevant_modifiers`.
 fn peek_relevant_modifiers() -> Modifiers {
     let mut relevant = Modifiers::default();
@@ -742,7 +742,7 @@ fn every_default_combo_dispatches_to_its_handler(cx: &mut TestAppContext) {
     // -- window-scoped live handlers ------------------------------------------
     let before = active_session(cx, &state);
     cx.simulate_keystrokes(w, &combo(ShortcutAction::NextSidebarSession));
-    assert_ne!(active_session(cx, &state), before, "⌘⌥↓ cycled the active sidebar session");
+    assert_ne!(active_session(cx, &state), before, "⌃⌘J cycled the active sidebar session");
     cx.simulate_keystrokes(w, &combo(ShortcutAction::PrevSidebarSession));
     assert_eq!(active_session(cx, &state), before, "⌘⌥↑ cycled back");
 
@@ -847,7 +847,7 @@ fn peek_sets_on_collapsed_cycle_and_clears_on_modifier_release(cx: &mut TestAppC
     let peeking = |cx: &mut TestAppContext| cx.update(|app| collapsed_state.read(app).sidebar.peeking());
     assert!(peeking(cx), "a collapsed-sidebar cycle floats the peek");
 
-    // A modifiers change that still holds ⌘ keeps the peek (⌘⌥ → ⌘).
+    // A modifiers change that still holds ⌘ keeps the peek (⌃⌘ → ⌘).
     on_modifiers(cx, cw, Modifiers { platform: true, ..Default::default() });
     assert!(peeking(cx), "the peek stays while a relevant modifier (⌘) is still held");
 

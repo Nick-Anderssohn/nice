@@ -1055,7 +1055,7 @@ mod tests {
         let path = temp_ui_settings("shortcuts-e2e");
         let blob = prod_shortcuts_blob(&[
             ("newTerminalPane", 16, NS_COMMAND),             // ⌘Y (custom rebind)
-            ("nextSidebarTab", 125, NS_COMMAND | NS_OPTION), // ⌘⌥↓ (== default)
+            ("nextSidebarTab", 125, NS_COMMAND | NS_OPTION), // ⌘⌥↓ (a prod value, no longer a Rust default)
             ("undoFileOperation", 200, NS_COMMAND),          // unmappable → keep ⌘Z
             ("someFutureAction", 17, NS_COMMAND),            // no Rust counterpart
         ]);
@@ -1079,7 +1079,9 @@ mod tests {
             store.binding(ShortcutAction::NewTerminalWindow),
             OwnedCombo::from_token("cmd-y")
         );
-        // A prod entry equal to the default lands as the default.
+        // A prod entry lands as its own stored VALUE, not as the Rust default
+        // (which the hjkl-ladder revision moved to ⌃⌘J) — the import is a
+        // faithful copy of what prod had.
         assert_eq!(
             store.binding(ShortcutAction::NextSidebarSession),
             OwnedCombo::from_token("cmd-alt-down")

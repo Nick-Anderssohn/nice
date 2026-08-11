@@ -1154,9 +1154,12 @@ type CfTypeRef = *const c_void;
 /// The `CGEventFlags` ⌘ (Command) mask — carried on a synthesized ⌘V / ⌘=.
 pub const FLAG_COMMAND: u64 = 0x0010_0000;
 
-/// The `CGEventFlags` ⌥ (Option / Alternate) mask — carried with ⌘ on the
-/// `multiwindow` scenario's ⌘⌥↓ sidebar-session chord.
+/// The `CGEventFlags` ⌥ (Option / Alternate) mask.
 pub const FLAG_OPTION: u64 = 0x0008_0000;
+
+/// The `CGEventFlags` ⌃ (Control) mask — carried with ⌘ on the `multiwindow`
+/// scenario's ⌃⌘J sidebar-session chord (the hjkl ladder's session rung).
+pub const FLAG_CONTROL: u64 = 0x0004_0000;
 
 /// The `CGEventFlags` ⇧ (Shift) mask — carried with ⌘ on the R19 `file-browser`
 /// scenario's ⌘⇧B (toggle sidebar mode) and ⌘⇧. (toggle hidden files) chords.

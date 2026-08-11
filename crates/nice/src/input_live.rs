@@ -939,6 +939,10 @@ struct KeybindFixture {
     session_id: String,
     /// The three pills' ids, in `Session.windows` (= pill) order.
     windows: Vec<String>,
+    /// The three sidebar sessions' ids, in navigable (= sidebar row) order.
+    /// `sessions[0]` is [`session_id`](KeybindFixture::session_id) — the only one
+    /// with a live pty.
+    sessions: Vec<String>,
 }
 
 /// The `keybind-scheme` scenario: Phase 1's held-`⌃⌘` scheme, end to end, over
@@ -955,11 +959,14 @@ struct KeybindFixture {
 /// THROUGH that state's `PtyManager` so `term_window_handle` resolves for the
 /// half-page handler.
 ///
-/// Every chord is asserted twice: once on its EFFECT (the pill the model made
-/// active, the viewport offset) and once on the pty (`0` bytes captured), with a
-/// plain `u` as the differential that proves the capture file would have shown a
-/// leak. Keystrokes ride `Window::dispatch_keystroke`, so no Accessibility grant
-/// is needed.
+/// Every chord is asserted twice: once on its EFFECT (the pill or sidebar
+/// session the model made active, the viewport offset) and once on the pty (`0`
+/// bytes captured), with a plain `u` as the differential that proves the capture
+/// file would have shown a leak. The chords the 2026-08-11 hjkl-ladder revision
+/// FREED (`⌃⌘]` / `⌃⌘[`) get the mirror assertion — no effect and no bytes — so
+/// "unbound" is proven to mean inert rather than "falls through and types".
+/// Keystrokes ride `Window::dispatch_keystroke`, so no Accessibility grant is
+/// needed.
 pub fn open_keybind_scheme_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
     use crate::window_registry::WindowRegistry;
     use crate::window_state::WindowState;
@@ -1017,6 +1024,27 @@ pub fn open_keybind_scheme_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> 
             ));
         }
 
+        // Two EXTRA sidebar sessions through the same model seam the sidebar's
+        // `+` uses (`create_terminal_session` — model-only, no pty), so the
+        // ⌃⌘J/⌃⌘K session legs have somewhere to go. THREE navigable sessions,
+        // not two: with only two, next and prev are the same step and the leg
+        // could not tell the directions apart.
+        let sessions = state.update(app, |s, _cx| {
+            s.sidebar_actions.create_terminal_session(&mut s.workspace);
+            s.sidebar_actions.create_terminal_session(&mut s.workspace);
+            // `create_terminal_session` SELECTS what it creates — park back on
+            // the seeded session so every leg starts where the fixture says.
+            s.sidebar_actions
+                .select_session(&mut s.workspace, &session_id);
+            s.sync_selection_to_active_session();
+            s.workspace.navigable_sidebar_session_ids()
+        });
+        if sessions.len() != 3 || sessions.first().map(String::as_str) != Some(session_id.as_str()) {
+            return Err(anyhow!(
+                "keybind-scheme: expected the seeded session first of three, got {sessions:?}"
+            ));
+        }
+
         // Only the FIRST pill gets a live pty — the half-page chords resolve the
         // ACTIVE window's handle, so parking the strip back on pill 1 before the
         // scroll legs is part of the scenario (and the nav legs prove the
@@ -1039,6 +1067,7 @@ pub fn open_keybind_scheme_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> 
             handle,
             session_id,
             windows,
+            sessions,
         })
     })?;
 
@@ -1094,6 +1123,17 @@ async fn chord_leak(
     cap_since(cap_path, start)
 }
 
+/// The active SIDEBAR SESSION id, read straight off the model the keymap
+/// handlers mutate.
+fn active_session_id(
+    cx: &mut AsyncApp,
+    state: &Entity<crate::window_state::WindowState>,
+) -> Option<String> {
+    state.update(cx, |s, _cx| {
+        s.workspace.active_session_id().map(str::to_owned)
+    })
+}
+
 /// The active window id of `session_id`, read straight off the model the
 /// keymap handlers mutate.
 fn active_window_id(
@@ -1138,6 +1178,66 @@ async fn nav_chord(
     }
 }
 
+/// Dispatch a sidebar-session chord, then assert BOTH halves: the sidebar moved
+/// to session `want_slot` (1-based, navigable order) and the chord wrote nothing
+/// to the pty.
+#[allow(clippy::too_many_arguments)]
+async fn session_chord(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    fixture: &KeybindFixture,
+    cap_path: &Path,
+    failures: &mut Vec<String>,
+    keystroke: &str,
+    want_slot: usize,
+) {
+    let leaked = chord_leak(cx, window, cap_path, keystroke).await;
+    if !leaked.is_empty() {
+        failures.push(format!("{keystroke}: leaked \"{}\" to the pty", esc(&leaked)));
+    }
+    let want = fixture.sessions[want_slot - 1].clone();
+    let got = active_session_id(cx, &fixture.state);
+    if got.as_deref() != Some(want.as_str()) {
+        let slot = got
+            .as_ref()
+            .and_then(|id| fixture.sessions.iter().position(|s| s == id))
+            .map(|i| (i + 1).to_string())
+            .unwrap_or_else(|| "none".to_string());
+        failures.push(format!(
+            "{keystroke}: active session is slot {slot} ({got:?}), expected slot {want_slot} ({want})"
+        ));
+    }
+}
+
+/// Dispatch a chord the scheme deliberately leaves UNBOUND and assert it did
+/// nothing at all: the active pill is unchanged and not one byte reached the pty.
+/// gpui matches no binding, so the keystroke falls through to the terminal's own
+/// key handler — which must not encode a ⌘ chord either (`should_encode`'s
+/// `control && !platform` gate), so the pty stays silent from both directions.
+async fn freed_chord(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    fixture: &KeybindFixture,
+    cap_path: &Path,
+    failures: &mut Vec<String>,
+    keystroke: &str,
+) {
+    let before = active_window_id(cx, &fixture.state, &fixture.session_id);
+    let leaked = chord_leak(cx, window, cap_path, keystroke).await;
+    if !leaked.is_empty() {
+        failures.push(format!(
+            "{keystroke} is freed but leaked \"{}\" to the pty",
+            esc(&leaked)
+        ));
+    }
+    let after = active_window_id(cx, &fixture.state, &fixture.session_id);
+    if after != before {
+        failures.push(format!(
+            "{keystroke} is freed but moved the active pill {before:?} -> {after:?}"
+        ));
+    }
+}
+
 async fn run_keybind_scheme(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
@@ -1169,12 +1269,13 @@ async fn run_keybind_scheme(
         );
     }
 
-    // --- §1 ⌃⌘] / ⌃⌘[ cycle the pill strip, wrapping (D1) -------------------
-    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]", 2).await;
-    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]", 3).await;
+    // --- §1 ⌃⌘L / ⌃⌘H cycle the pill strip, wrapping -----------------------
+    // The hjkl ladder's bare-⌃⌘ horizontal axis, and the ONLY pill pair.
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-l", 2).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-l", 3).await;
     // Wraps 3 → 1 rather than stopping at the end.
-    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]", 1).await;
-    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-[", 3).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-l", 1).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-h", 3).await;
 
     // --- §2 ⌃⌘2 jumps straight to a slot (D2 — one row, nine chords) -------
     nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-2", 2).await;
@@ -1185,9 +1286,22 @@ async fn run_keybind_scheme(
     nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-o", 3).await;
     nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-o", 2).await;
 
-    // --- §4 ⌃⌘H / ⌃⌘L alias prev/next pill pre-splits (D3) ----------------
-    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-h", 1).await;
-    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-l", 2).await;
+    // --- §4 the FREED chords do nothing (the 2026-08-11 ladder revision) ---
+    // ⌃⌘] / ⌃⌘[ were the shipped prev/next-pill defaults; the ladder moved that
+    // pair onto ⌃⌘H/⌃⌘L and left these bound to nothing. Unbound must mean
+    // INERT, not "falls through and types" — assert both halves.
+    freed_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]").await;
+    freed_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-[").await;
+
+    // --- §5 ⌃⌘J / ⌃⌘K step the SIDEBAR sessions ----------------------------
+    // The ladder's bare-⌃⌘ vertical axis: j = down the sidebar list = next.
+    // Three seeded sessions, so the two directions are distinguishable.
+    session_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-j", 2).await;
+    session_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-j", 3).await;
+    session_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-k", 2).await;
+    // Back to the seeded session — the only one with a live pty, so the scroll
+    // legs below resolve a handle at all.
+    session_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-k", 1).await;
 
     // Park back on pill 1 — the only one with a live pty — via ⌃⌘1, which also
     // pins that the digit expansion is not just the `2` binding.
@@ -1304,10 +1418,11 @@ async fn run_keybind_scheme(
         CadenceReport {
             passed: true,
             stats: IntervalStats::default(),
-            detail: "held-⌃⌘ scheme OK end to end: ⌃⌘]/⌃⌘[ cycled the pills (wrapping), ⌃⌘1/⌃⌘2 \
-                     jumped by index, ⌃⌘O bounced between the last two, ⌃⌘H/⌃⌘L aliased \
-                     prev/next, ⌃⌘U/⌃⌘D half-paged in equal steps and no-opped on the alt \
-                     screen — every chord silent to the pty while a plain `u` still encoded"
+            detail: "held-⌃⌘ scheme OK end to end: ⌃⌘L/⌃⌘H cycled the pills (wrapping), ⌃⌘1/⌃⌘2 \
+                     jumped by index, ⌃⌘O bounced between the last two, the freed ⌃⌘]/⌃⌘[ did \
+                     nothing at all, ⌃⌘J/⌃⌘K stepped the sidebar sessions, ⌃⌘U/⌃⌘D half-paged \
+                     in equal steps and no-opped on the alt screen — every chord silent to the \
+                     pty while a plain `u` still encoded"
                 .to_string(),
         }
     } else {

@@ -21,9 +21,9 @@
 //! 3. **Font fan-out (§2)** — ⌘= grows the one process-level `FontSettings` every
 //!    window observes, and leaks **zero** bytes into the focused capture-tee pty.
 //! 4. **Pass-through differential (§2)** — a plain `x` arrives at the pty as `x`;
-//!    ⌘⌥↓ changes the sidebar (the active session cycles) and leaks **zero** capture
+//!    ⌃⌘J changes the sidebar (the active session cycles) and leaks **zero** capture
 //!    bytes.
-//! 5. **Live peek (§5)** — with A's sidebar collapsed, ⌘⌥↓ floats the peek; a
+//! 5. **Live peek (§5)** — with A's sidebar collapsed, ⌃⌘J floats the peek; a
 //!    modifiers-release clears it (the window-level `on_modifiers_changed` observer).
 //! 6. **Last-window shell exit closes only its window (§3.5, regression)** — with
 //!    A + B live, a fresh window C's Main window exits cleanly; C dissolves and
@@ -74,7 +74,7 @@ const COLS: u16 = 80;
 const KC_N: u16 = 45; // ⌘N — New Window
 const KC_T: u16 = 17; // ⌘T — new terminal window
 const KC_B: u16 = 11; // ⌘B — toggle sidebar
-const KC_DOWN: u16 = 125; // ⌘⌥↓ — next sidebar session
+const KC_J: u16 = 38; // ⌃⌘J — next sidebar session (the hjkl ladder's session rung)
 const KC_EQUAL: u16 = 24; // ⌘= — increase font
 const KC_ZERO: u16 = 29; // ⌘0 — reset font
 const KC_X: u16 = 7; // plain x — the pass-through control char
@@ -169,7 +169,7 @@ pub fn open_multiwindow_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
             });
 
             // Window A's per-window state, seeded with two extra terminal sessions so a
-            // ⌘⌥↓ sidebar-session cycle genuinely moves the active session (a fresh window
+            // ⌃⌘J sidebar-session cycle genuinely moves the active session (a fresh window
             // has a single navigable session, which cannot cycle).
             let state = cx.new(|_cx| WindowState::new(cwd));
             state.update(cx, |s, _cx| {
@@ -666,7 +666,7 @@ async fn run_multiwindow(
         settle(cx, 200).await;
     }
 
-    // === §2 — pass-through differential: plain x, then ⌘⌥↓ ===================
+    // === §2 — pass-through differential: plain x, then ⌃⌘J ===================
     {
         // A plain key falls through the keymap to the pty byte-identically.
         let start = cap_len(&cap_path);
@@ -680,30 +680,30 @@ async fn run_multiwindow(
             ));
         }
 
-        // A matched chord (⌘⌥↓) changes the sidebar (active session cycles) and leaks
+        // A matched chord (⌃⌘J) changes the sidebar (active session cycles) and leaks
         // zero bytes.
         let session_before = active_session_id(cx, &a_state);
         let start = cap_len(&cap_path);
-        tap(cx, pid, KC_DOWN, platform::FLAG_COMMAND | platform::FLAG_OPTION, None).await;
+        tap(cx, pid, KC_J, platform::FLAG_COMMAND | platform::FLAG_CONTROL, None).await;
         settle(cx, 200).await;
         let session_after = active_session_id(cx, &a_state);
         let leaked = cap_since(&cap_path, start);
         if session_after == session_before {
             failures.push(format!(
-                "⌘⌥↓ did not cycle the active sidebar session (still {session_before:?}) — the chord did \
+                "⌃⌘J did not cycle the active sidebar session (still {session_before:?}) — the chord did \
                  not route to A"
             ));
         }
         if !leaked.is_empty() {
             failures.push(format!(
-                "⌘⌥↓ leaked {} byte(s) into the pty ('{}') — a matched chord must consume",
+                "⌃⌘J leaked {} byte(s) into the pty ('{}') — a matched chord must consume",
                 leaked.len(),
                 esc(&leaked)
             ));
         }
     }
 
-    // === §5 — live peek: collapse, ⌘⌥↓ floats it, release clears it ==========
+    // === §5 — live peek: collapse, ⌃⌘J floats it, release clears it ==========
     {
         // Collapse A's sidebar via ⌘B (assert it took, so the peek trigger's
         // collapsed precondition holds).
@@ -714,11 +714,11 @@ async fn run_multiwindow(
         if !sidebar_collapsed(cx, &a_state) {
             failures.push("⌘B did not collapse A's sidebar (peek precondition)".to_string());
         } else {
-            // ⌘⌥↓ on the collapsed sidebar floats the peek.
-            tap(cx, pid, KC_DOWN, platform::FLAG_COMMAND | platform::FLAG_OPTION, None).await;
+            // ⌃⌘J on the collapsed sidebar floats the peek.
+            tap(cx, pid, KC_J, platform::FLAG_COMMAND | platform::FLAG_CONTROL, None).await;
             settle(cx, 200).await;
             if !sidebar_peeking(cx, &a_state) {
-                failures.push("⌘⌥↓ on the collapsed sidebar did not float the peek".to_string());
+                failures.push("⌃⌘J on the collapsed sidebar did not float the peek".to_string());
             }
             // Releasing the modifiers clears it (the window-level observer). A real
             // per-pid flagsChanged is not synthesizable via CGEventPostToPid, so the
@@ -910,7 +910,7 @@ fn build_report(failures: Vec<String>) -> CadenceReport {
             stats: IntervalStats::default(),
             detail: "multi-window OK: ⌘N opened + registered a second window, ⌘T routed to the \
                      key window (A unchanged), ⌘= fanned out the font with zero pty leak, plain x \
-                     passed through byte-identically, ⌘⌥↓ cycled the sidebar with zero leak, the \
+                     passed through byte-identically, ⌃⌘J cycled the sidebar with zero leak, the \
                      collapsed peek set + cleared, and closing B deregistered + fell back to A"
                 .to_string(),
         }

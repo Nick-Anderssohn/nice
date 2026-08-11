@@ -713,7 +713,7 @@ impl WindowState {
     /// becomes exactly that pair; its counterpart is
     /// [`cancel_key_hint`](Self::cancel_key_hint).
     ///
-    /// The delay is what keeps a fast `⌃⌘]` from flashing the badges: a chord that
+    /// The delay is what keeps a fast `⌃⌘L` from flashing the badges: a chord that
     /// commits within it releases the modifiers, which cancels before the timer
     /// fires.
     ///
@@ -2996,7 +2996,7 @@ mod tests {
 
     #[gpui::test]
     fn cancelling_inside_the_debounce_never_shows_the_hint(cx: &mut gpui::TestAppContext) {
-        // The fast-chord case: ⌃⌘] commits and the modifiers lift well before the
+        // The fast-chord case: ⌃⌘L commits and the modifiers lift well before the
         // timer fires, so the pending task must produce nothing at all.
         let state = cx.new(|_cx| WindowState::new("/home/u"));
         state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
