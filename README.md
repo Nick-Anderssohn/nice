@@ -37,10 +37,18 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 
 ## Keyboard-first
 
+Window navigation is a tmux-style held-modifier scheme: hold `⌃⌘` and use vim
+keys. Hold it for a moment without pressing anything and each window pill shows
+the digit that jumps to it.
+
 | Shortcut | Action |
 |---|---|
 | `⌘⌥↓` / `⌘⌥↑` | Next / previous sidebar session |
-| `⌘⌥→` / `⌘⌥←` | Next / previous window within a session |
+| `⌃⌘]` / `⌃⌘[` | Next / previous window within a session |
+| `⌃⌘L` / `⌃⌘H` | Same, on the vim keys (directional once splits land) |
+| `⌃⌘1`–`⌃⌘9` | Jump to a window by its position |
+| `⌃⌘O` | Back to the last window you were in |
+| `⌃⌘U` / `⌃⌘D` | Half-page through terminal scrollback |
 | `⌘T` | New terminal window |
 | `⌘B` | Toggle sidebar |
 | `⌘⇧B` | Toggle sidebar mode (sessions ↔ file browser) |
@@ -51,8 +59,11 @@ Already have a [Ghostty](https://ghostty.org) theme you love? Nice reads Ghostty
 | `⇧Home` / `⇧End` | Jump to the top / bottom of scrollback |
 | `⌘`+click | Open a URL in the terminal (hold `⌘` to underline it) |
 
-All rebindable in Settings (`⌘,`), except the scrollback keys — those are
-terminal-level and fall through to fullscreen apps like vim.
+All rebindable in Settings (`⌘,`), except the `⇧`-scrollback keys — those are
+terminal-level and fall through to fullscreen apps like vim. `⌃⌘1`–`⌃⌘9` is a
+single row there: record any digit and the modifiers you chose apply to all
+nine. `⌃⌘U`/`⌃⌘D` deliberately do nothing on the alternate screen, so vim and
+less keep their own half-page keys.
 
 ## Requirements
 

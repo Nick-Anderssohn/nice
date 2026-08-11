@@ -66,7 +66,7 @@ enum ComposeRoute {
 
 use gpui::{AnyWindowHandle, AppContext, Entity};
 use nice_model::file_browser::FileBrowserStore;
-use nice_model::{Session, TermWindow, TermWindowKind, SidebarMode, SidebarModel, SidebarSessionSelection, WorkspaceModel, SessionStatus};
+use nice_model::{Session, TermWindow, TermWindowKind, KeyHintModel, SidebarMode, SidebarModel, SidebarSessionSelection, WorkspaceModel, SessionStatus};
 use nice_term_view::TerminalEvent;
 
 use crate::confirmation_modal::ConfirmationModal;
@@ -371,6 +371,23 @@ pub(crate) struct WindowState {
     pub(crate) workspace: WorkspaceModel,
     /// R10 sidebar collapse / mode / peek state.
     pub(crate) sidebar: SidebarModel,
+    /// Phase 1 (D5): whether the hold-to-hint overlay is showing (the window-index
+    /// badges on the toolbar pills). Set/cleared by the keymap's modifier observer
+    /// ([`crate::keymap::on_window_modifiers_changed`]) through
+    /// [`arm_key_hint`](Self::arm_key_hint) / [`cancel_key_hint`](Self::cancel_key_hint);
+    /// read by [`crate::toolbar::WindowToolbarView`]'s render. Never persisted.
+    pub(crate) key_hint: KeyHintModel,
+    /// Phase 1 (D5): the pending ~200 ms hold debounce, held (not detached) so
+    /// dropping it — on a cancel, or when the window entity drops — cancels the
+    /// timer instead of leaking a task that would flash the overlay after the keys
+    /// lifted. Lives here rather than in `nice-model` because that crate is
+    /// gpui-free.
+    hint_task: Option<gpui::Task<()>>,
+    /// Phase 1 (D5): bumped on every arm and every cancel, and captured by the
+    /// pending task. A timer that already fired its `timer(..).await` cannot be
+    /// stopped by dropping its `Task`, so the generation is what makes a cancel
+    /// that lands in that window still win: the task compares and returns.
+    hint_generation: u64,
     /// R10 Finder-style multi-selection (invariant: contains the active session).
     pub(crate) selection: SidebarSessionSelection,
     /// R10 sidebar create/close/select seam (model-only; R13 rewires).
@@ -540,6 +557,9 @@ impl WindowState {
         Self {
             workspace,
             sidebar: SidebarModel::new(false, SidebarMode::Sessions),
+            key_hint: KeyHintModel::new(),
+            hint_task: None,
+            hint_generation: 0,
             selection,
             sidebar_actions: Box::new(ModelSidebarActions::new()),
             window_strip_actions: Box::new(ModelWindowStripActions::new()),
@@ -685,6 +705,89 @@ impl WindowState {
             self.sidebar.end_sidebar_peek();
         }
         cx.notify();
+    }
+
+    /// Phase 1 (D5): start the hold debounce — show the hint overlay if the
+    /// scheme's modifier pair is STILL held `delay` from now. Driven by
+    /// [`crate::keymap::on_window_modifiers_changed`] the moment the held set
+    /// becomes exactly that pair; its counterpart is
+    /// [`cancel_key_hint`](Self::cancel_key_hint).
+    ///
+    /// The delay is what keeps a fast `⌃⌘]` from flashing the badges: a chord that
+    /// commits within it releases the modifiers, which cancels before the timer
+    /// fires.
+    ///
+    /// Idempotent per hold — a second arm while one is pending (or while the
+    /// overlay already shows) is ignored, so the repeated modifier events one
+    /// physical hold can produce never restart the countdown.
+    ///
+    /// The timer is the gpui executor's (`background_executor().timer`), NEVER
+    /// `smol::Timer` — an untracked timer is invisible to `run_until_parked`, so
+    /// the tests below could never observe it fire.
+    pub(crate) fn arm_key_hint(
+        &mut self,
+        delay: std::time::Duration,
+        cx: &mut gpui::Context<WindowState>,
+    ) {
+        if self.key_hint.visible() || self.hint_task.is_some() {
+            return;
+        }
+        self.hint_generation = self.hint_generation.wrapping_add(1);
+        let generation = self.hint_generation;
+        self.hint_task = Some(cx.spawn(
+            async move |this: gpui::WeakEntity<WindowState>, acx: &mut gpui::AsyncApp| {
+                acx.background_executor().timer(delay).await;
+                // The window this fires on, iff the hold survived — `None` means
+                // some cancel won, or the flag was already set, so there is
+                // nothing to paint.
+                let kick = this
+                    .update(acx, |ws, cx| {
+                        // A cancel (or a re-arm) since this task was spawned wins:
+                        // the modifiers changed inside the debounce window.
+                        if ws.hint_generation != generation {
+                            return None;
+                        }
+                        if !ws.key_hint.set_visible(true) {
+                            return None;
+                        }
+                        cx.notify();
+                        ws.window_handle
+                    })
+                    .ok()
+                    .flatten();
+                // `cx.notify()` alone never PRESENTS while the window's
+                // CVDisplayLink is stopped (`crate::platform` fact 1), and unlike
+                // every other shortcut path this one paints on a TIMER, with no
+                // user event behind it — so fire the same demand-present kick the
+                // modal path uses. A no-op on a visible window (the kick is
+                // occlusion-gated inside `platform::present_kick`) and on any
+                // `WindowState` the shipped builder never mounted (`window_handle`
+                // is `None` in unit tests / headless scenarios).
+                if let Some(handle) = kick {
+                    let _ = handle.update(acx, |_root, window, _app| {
+                        let view_ptr = crate::platform::ns_view_of(window);
+                        // SAFETY: `view_ptr` is this window's live NSView (or null,
+                        // which `present_kick` treats as a no-op).
+                        unsafe { crate::platform::present_kick(view_ptr) };
+                    });
+                }
+            },
+        ));
+    }
+
+    /// Phase 1 (D5): hide the hint overlay and drop any pending debounce — the
+    /// instant-clear half, driven by any modifier change that leaves the scheme's
+    /// pair (including the release that ends the hold).
+    ///
+    /// Both halves matter: dropping the [`Task`](gpui::Task) cancels a timer that
+    /// has not fired, and the generation bump neutralizes one that already fired
+    /// and is waiting its turn on the foreground queue.
+    pub(crate) fn cancel_key_hint(&mut self, cx: &mut gpui::Context<WindowState>) {
+        self.hint_task = None;
+        self.hint_generation = self.hint_generation.wrapping_add(1);
+        if self.key_hint.set_visible(false) {
+            cx.notify();
+        }
     }
 
     /// R15 subscription lift — the shipped-window twin of the
@@ -2861,6 +2964,91 @@ mod tests {
         state.update(cx, |ws, _| {
             assert!(!ws.sidebar.collapsed(), "second toggle expands");
             assert!(!ws.sidebar.peeking(), "expanding clears the peek");
+        });
+    }
+
+    // MARK: - Hold-to-hint overlay debounce (Phase 1, D5)
+
+    /// The debounce delay the hint tests arm with — the keymap's shipped value is
+    /// [`crate::keymap::HINT_OVERLAY_DELAY`]; the exact number is irrelevant here,
+    /// only the before/after behavior around it.
+    const TEST_HINT_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+    #[gpui::test]
+    fn key_hint_shows_only_after_the_full_hold(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+        state.update(cx, |ws, _| assert!(!ws.key_hint.visible(), "starts hidden"));
+
+        state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
+        // Half-way through the hold: still nothing (a fast chord never flashes it).
+        cx.executor().advance_clock(TEST_HINT_DELAY / 2);
+        cx.run_until_parked();
+        state.update(cx, |ws, _| {
+            assert!(!ws.key_hint.visible(), "nothing shows inside the debounce window")
+        });
+
+        cx.executor().advance_clock(TEST_HINT_DELAY);
+        cx.run_until_parked();
+        state.update(cx, |ws, _| {
+            assert!(ws.key_hint.visible(), "the surviving hold shows the overlay")
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_inside_the_debounce_never_shows_the_hint(cx: &mut gpui::TestAppContext) {
+        // The fast-chord case: ⌃⌘] commits and the modifiers lift well before the
+        // timer fires, so the pending task must produce nothing at all.
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+        state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
+        cx.executor().advance_clock(TEST_HINT_DELAY / 4);
+        state.update(cx, |ws, cx| ws.cancel_key_hint(cx));
+
+        cx.executor().advance_clock(TEST_HINT_DELAY * 4);
+        cx.run_until_parked();
+        state.update(cx, |ws, _| {
+            assert!(!ws.key_hint.visible(), "a cancelled hold never paints badges")
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_hides_a_shown_hint_and_re_arming_shows_it_again(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+        state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
+        cx.executor().advance_clock(TEST_HINT_DELAY * 2);
+        cx.run_until_parked();
+        state.update(cx, |ws, _| assert!(ws.key_hint.visible()));
+
+        // Release: instant hide, no delay.
+        state.update(cx, |ws, cx| ws.cancel_key_hint(cx));
+        state.update(cx, |ws, _| {
+            assert!(!ws.key_hint.visible(), "release hides immediately")
+        });
+
+        // Holding again re-arms from scratch.
+        state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
+        cx.executor().advance_clock(TEST_HINT_DELAY * 2);
+        cx.run_until_parked();
+        state.update(cx, |ws, _| {
+            assert!(ws.key_hint.visible(), "a second hold shows the overlay again")
+        });
+    }
+
+    #[gpui::test]
+    fn re_arming_mid_hold_does_not_restart_the_countdown(cx: &mut gpui::TestAppContext) {
+        // One physical hold can produce several modifier events with the same held
+        // set; each would arm again. If that restarted the timer, holding ⌃⌘ while
+        // the OS repeats events could postpone the overlay forever.
+        let state = cx.new(|_cx| WindowState::new("/home/u"));
+        state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
+        cx.executor().advance_clock(TEST_HINT_DELAY * 3 / 4);
+        cx.run_until_parked();
+        state.update(cx, |ws, cx| ws.arm_key_hint(TEST_HINT_DELAY, cx));
+
+        // Past the FIRST arm's deadline, short of a restarted one.
+        cx.executor().advance_clock(TEST_HINT_DELAY / 2);
+        cx.run_until_parked();
+        state.update(cx, |ws, _| {
+            assert!(ws.key_hint.visible(), "the original countdown still owns the hold")
         });
     }
 

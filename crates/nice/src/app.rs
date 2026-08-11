@@ -1155,7 +1155,7 @@ pub fn run() {
         cx.set_global(crate::settings::prefs_store::SettingsPrefsStore::load(
             crate::file_browser::sort_settings_store::default_ui_settings_path(),
         ));
-        // R12: the app-wide shortcut keymap — the 14 rebindable actions + ⌃⌘F
+        // R12: the app-wide shortcut keymap — the rebindable actions + ⌃⌘F
         // generated from `nice_model::shortcuts`, their handlers, and the hoisted
         // process-level `FontSettings` every window shares. Must run before the
         // first window opens: `open_managed_window` reads the shared font entity.
@@ -1170,7 +1170,7 @@ pub fn run() {
         ));
         // R24 (G7): re-apply the just-loaded map over the default keymap that
         // `install_shortcuts` bound — `rebuild_keymap` clears every binding and
-        // re-emits the 14 LIVE combos plus the PROTECTED non-rebindable set, so a
+        // re-emits the LIVE combos plus the PROTECTED non-rebindable set, so a
         // persisted rebind (or explicit unbind) is live from boot. Harmless when the
         // section is absent (the store is at defaults, so the board is unchanged).
         crate::keymap::rebuild_keymap(cx);
@@ -3854,6 +3854,20 @@ pub fn selftest_scenarios() -> Vec<Scenario> {
             activate: true,
         },
         Scenario {
+            name: "keybind-scheme",
+            open: crate::input_live::open_keybind_scheme_window,
+            gate: Gate::SelfReported {
+                // Ten nav chords + the seed render poll + four half-page chords +
+                // the alt-screen round trip, each with its settle. Needs NO
+                // Accessibility grant (in-process `dispatch_keystroke`, not
+                // CGEvents). Registered BEFORE `multiwindow`: it only `register`s
+                // its window (no `WindowRegistry::install`), so closing it never
+                // trips the quit-when-empty terminus.
+                budget: Duration::from_secs(45),
+            },
+            activate: true,
+        },
+        Scenario {
             name: "compose-live",
             open: crate::compose_live::open_compose_live_window,
             gate: Gate::SelfReported {
@@ -4335,7 +4349,7 @@ pub fn run_selftest(selector: String) {
         // R24 (G6): the rebindable-shortcut store with DEFAULTS + a throwaway temp
         // path — never the real `ui_settings.json` (the launch-time read +
         // default-path resolution stay in `run`). A scenario that rebinds a shortcut
-        // writes only this temp file; a fresh scenario reads all 14 defaults.
+        // writes only this temp file; a fresh scenario reads all the defaults.
         let shortcuts_path = std::env::temp_dir().join(format!(
             "nice-selftest-shortcuts-{}.json",
             std::process::id()

@@ -154,7 +154,7 @@
 <header>
   <h1>Nice × tmux port</h1>
   <p class="sub">Bringing tmux's session / window / pane model into Nice, natively.</p>
-  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-07</span></p>
+  <p class="meta">Plan: <code>docs/tmux-port-roadmap.md</code> · Last updated: <span id="updated">2026-08-11</span></p>
 </header>
 
 <div class="overall">
@@ -217,14 +217,15 @@
     <h2>Phase 1 — <kbd>^⌘</kbd> keybind scheme</h2><span class="effort">M</span>
     <div class="meter"><div class="track"><div class="fill"></div></div><span class="count"></span></div>
   </div>
-  <p class="blurb">Held-modifier vim keys; no prefix state machine needed. All chords rebindable via the existing shortcuts store.</p>
+  <p class="blurb">Held-modifier vim keys; no prefix state machine needed. All chords rebindable via the existing shortcuts store. The rebindable set grew 14 → 22 actions; no store migration by design (defaults users get the new board).</p>
   <ul class="tasks">
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Add new rebindable actions to <code>ShortcutAction</code> + defaults (pane nav, pill nav, index jump, zoom stub…)</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘h</kbd>/<kbd>^⌘l</kbd> prev/next pane (directional once splits land); <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> prev/next pill</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘1-9</kbd> pill by index; <kbd>^⌘o</kbd> last-active pane</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t"><kbd>^⌘u</kbd>/<kbd>^⌘d</kbd> half-page scrollback</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Hold-to-hint overlay — pane numbers/hints visible while <kbd>^⌘</kbd> is held (modifier-observer + present-kick)</span></li>
-    <li data-status="todo"><span class="chip">todo</span><span class="t">Guard reserved combos in recorder/conflict check (<kbd>^⌘Q</kbd> <kbd>^⌘F</kbd> <kbd>^⌘Space</kbd> <kbd>^⌘D</kbd>)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Eight new rebindable actions on <code>ShortcutAction</code> + defaults (<code>FocusPane*</code>, <code>LastActiveWindow</code>, <code>ScrollHalfPage*</code>, <code>WindowByIndex</code>)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t"><kbd>^⌘h</kbd>/<kbd>^⌘l</kbd> prev/next window (directional once splits land, <kbd>^⌘j</kbd>/<kbd>^⌘k</kbd> registered-but-inert); <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> prev/next pill — <span class="note">D1: the new defaults, <kbd>⌘⌥←</kbd>/<kbd>⌘⌥→</kbd> freed</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t"><kbd>^⌘1-9</kbd> window by index — <span class="note">D2: ONE settings row, any digit rebinds all nine</span>; <kbd>^⌘o</kbd> last-active window</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t"><kbd>^⌘u</kbd>/<kbd>^⌘d</kbd> half-page scrollback (no-op on the alternate screen)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Hold-to-hint overlay — index badges on the pills after ~200 ms of held <kbd>^⌘</kbd> <span class="note">D5: modifier-observer only, binds no keys</span></span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Guard reserved combos in the recorder (<kbd>^⌘Q</kbd> <kbd>^⌘F</kbd> <kbd>^⌘Space</kbd> <kbd>^⌘D</kbd> + the fixed accelerators + <span class="note">D4: <kbd>^⌘z</kbd> <kbd>^⌘v</kbd> <kbd>^⌘s</kbd> <kbd>^⌘/</kbd></span>)</span></li>
+    <li data-status="done"><span class="chip">done</span><span class="t">Live gate: the <code>keybind-scheme</code> self-test scenario (every chord asserted on its effect AND on zero pty bytes)</span></li>
   </ul>
 </section>
 
@@ -322,6 +323,12 @@
     <li>Code adopts tmux terminology before feature work (Phase R first): <code>Tab</code>→<code>Session</code>, <code>Pane</code>→<code>TermWindow</code>, split leaf = <code>Pane</code>; disk/wire names frozen <span class="d">2026-08-07</span></li>
     <li><code>TermWindow</code> over qualified <code>model::Window</code> (no <code>gpui::Window</code> collision); Phase R includes the UI copy pass; plan at <code>docs/plans/phase-r-terminology-rename.md</code> <span class="d">2026-08-08</span></li>
     <li>Never bind: <kbd>^⌘Q</kbd> (lock screen) <kbd>^⌘F</kbd> (fullscreen) <kbd>^⌘Space</kbd> (emoji) <kbd>^⌘D</kbd> (dictionary)</li>
+    <li><strong>D1</strong> — <kbd>^⌘[</kbd>/<kbd>^⌘]</kbd> become the <code>PrevWindow</code>/<code>NextWindow</code> <em>defaults</em> (frozen ids unchanged); <kbd>⌘⌥←</kbd>/<kbd>⌘⌥→</kbd> are freed, no dual-chord installs <span class="d">2026-08-11</span></li>
+    <li><strong>D2</strong> — <kbd>^⌘1-9</kbd> is ONE rebindable row (<code>windowByIndex</code>): the recorded modifier set applies to every digit; nine separate rows rejected <span class="d">2026-08-11</span></li>
+    <li><strong>D3</strong> — the <kbd>^⌘hjkl</kbd> actions are named for their Phase 2 spatial meaning (<code>FocusPaneLeft/Down/Up/Right</code>); pre-splits <kbd>h</kbd>/<kbd>l</kbd> alias prev/next pill and <kbd>j</kbd>/<kbd>k</kbd> are registered but inert, so Phase 2 swaps handlers only <span class="d">2026-08-11</span></li>
+    <li><strong>D4</strong> — the future-phase chords (<kbd>^⌘z</kbd> <kbd>^⌘v</kbd> <kbd>^⌘s</kbd> <kbd>^⌘/</kbd>) go in the reserved-combo guard rather than shipping as no-op actions <span class="d">2026-08-11</span></li>
+    <li><strong>D5</strong> — the hint overlay appears after ~200 ms of held <kbd>^⌘</kbd> and hides instantly on release or any change to the held set <span class="d">2026-08-11</span></li>
+    <li>No shortcut-store migration for the D1 flip: a user who ever rebound anything keeps their stored combos and loads the new action ids unbound (frozen load rule 5) — accepted, not a bug <span class="d">2026-08-11</span></li>
     <li>Scrollback keys are Shift-variants only (<kbd>⇧PageUp</kbd>/<kbd>⇧PageDown</kbd>/<kbd>⇧Home</kbd>/<kbd>⇧End</kbd>); plain keys keep encoding to the pty; alt screen falls through to the TUI <span class="d">2026-08-10</span></li>
     <li><code>TERMINAL_MIN_WIDTH</code> = 300pt; sidebar max = viewport − 300pt (fixed 480pt cap retired) <span class="d">2026-08-10</span></li>
   </ul>
@@ -333,16 +340,16 @@
   <table>
     <thead><tr><th>Chord</th><th>Action</th><th>Phase</th></tr></thead>
     <tbody>
-      <tr><td><kbd>^⌘h</kbd> <kbd>^⌘j</kbd> <kbd>^⌘k</kbd> <kbd>^⌘l</kbd></td><td>Directional pane focus (pre-splits: h/l = prev/next pane)</td><td>1 → 2</td></tr>
+      <tr><td><kbd>^⌘h</kbd> <kbd>^⌘j</kbd> <kbd>^⌘k</kbd> <kbd>^⌘l</kbd></td><td>Directional pane focus (pre-splits: h/l = prev/next pill; j/k inert)</td><td>1 ✓ → 2</td></tr>
       <tr><td><kbd>^⌘⇧h/j/k/l</kbd></td><td>Resize split toward edge — or swap (undecided)</td><td>2</td></tr>
-      <tr><td><kbd>^⌘[</kbd> / <kbd>^⌘]</kbd></td><td>Prev / next upper-bar pill</td><td>1</td></tr>
-      <tr><td><kbd>^⌘1</kbd>–<kbd>^⌘9</kbd></td><td>Pill by index</td><td>1</td></tr>
-      <tr><td><kbd>^⌘o</kbd></td><td>Last-active pane</td><td>1</td></tr>
+      <tr><td><kbd>^⌘[</kbd> / <kbd>^⌘]</kbd></td><td>Prev / next upper-bar pill</td><td>1 ✓</td></tr>
+      <tr><td><kbd>^⌘1</kbd>–<kbd>^⌘9</kbd></td><td>Pill by index (one rebindable row)</td><td>1 ✓</td></tr>
+      <tr><td><kbd>^⌘o</kbd></td><td>Last-active window</td><td>1 ✓</td></tr>
       <tr><td><kbd>^⌘z</kbd></td><td>Zoom pane</td><td>2</td></tr>
       <tr><td><kbd>^⌘v</kbd> / <kbd>^⌘s</kbd></td><td>Vertical / horizontal split</td><td>2</td></tr>
-      <tr><td><kbd>^⌘u</kbd> / <kbd>^⌘d</kbd></td><td>Half-page scrollback up / down</td><td>1</td></tr>
+      <tr><td><kbd>^⌘u</kbd> / <kbd>^⌘d</kbd></td><td>Half-page scrollback up / down (inert on the alt screen)</td><td>1 ✓</td></tr>
       <tr><td><kbd>^⌘/</kbd></td><td>Scrollback search</td><td>3</td></tr>
-      <tr><td><em>hold</em> <kbd>^⌘</kbd></td><td>Pane number / hint overlay while held</td><td>1</td></tr>
+      <tr><td><em>hold</em> <kbd>^⌘</kbd></td><td>Window-index badges on the pills while held (~200 ms)</td><td>1 ✓</td></tr>
     </tbody>
   </table>
   </div>

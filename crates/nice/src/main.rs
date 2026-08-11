@@ -83,7 +83,7 @@
 //!     register/deregister on open/close, MRU via `observe_window_activation`,
 //!     the four-consumer lookup contract (`active_state`, id / session-id
 //!     lookup), and the close→teardown hook.
-//!   * [`keymap`] — the R12 shortcut dispatch: the 14 rebindable actions +
+//!   * [`keymap`] — the R12 shortcut dispatch: the rebindable actions +
 //!     ⌃⌘F generated from `nice_model::shortcuts`, the app-level (font/undo) vs
 //!     window-level (sidebar/window, through the registry's `active_state`)
 //!     handler split, the process-level `FontSettings` fan-out, and the peek

@@ -73,6 +73,18 @@ gpui::actions!(
         UndoFileOperation,
         RedoFileOperation,
         CommandCompose,
+        // tmux Phase 1 (held-⌃⌘ scheme). `WindowByIndex` is a unit probe action
+        // here: the app expands that ONE table row into nine data-carrying
+        // `SelectWindowIndex` bindings, which `keymap.rs`'s own tests pin. This
+        // mirror only has to prove every table chord parses into a binding.
+        FocusPaneLeft,
+        FocusPaneDown,
+        FocusPaneUp,
+        FocusPaneRight,
+        LastActiveWindow,
+        ScrollHalfPageUp,
+        ScrollHalfPageDown,
+        WindowByIndex,
     ]
 );
 
@@ -360,6 +372,19 @@ fn register_window_scoped_actions(cx: &mut App) {
     cx.on_action(|_: &CommandCompose, cx: &mut App| {
         with_active(cx, |s| s.compose_fires += 1)
     });
+    // Phase 1: left/right alias prev/next pill pre-splits (the app's D3 shape);
+    // up/down are registered-but-inert until splits land. The last-active,
+    // half-page-scroll and window-by-index handlers need a pty/handle the probe
+    // does not stand up, so they register as no-ops — their behavior is pinned by
+    // `window_strip_actions` / `keymap` unit tests in `crates/nice`.
+    cx.on_action(|_: &FocusPaneLeft, cx: &mut App| with_active(cx, |s| s.prev_window()));
+    cx.on_action(|_: &FocusPaneRight, cx: &mut App| with_active(cx, |s| s.next_window()));
+    cx.on_action(|_: &FocusPaneUp, _cx: &mut App| {});
+    cx.on_action(|_: &FocusPaneDown, _cx: &mut App| {});
+    cx.on_action(|_: &LastActiveWindow, _cx: &mut App| {});
+    cx.on_action(|_: &ScrollHalfPageUp, _cx: &mut App| {});
+    cx.on_action(|_: &ScrollHalfPageDown, _cx: &mut App| {});
+    cx.on_action(|_: &WindowByIndex, _cx: &mut App| {});
 }
 
 /// Route a window-scoped action to the key window's state (mirror of
@@ -370,7 +395,8 @@ fn with_active(cx: &mut App, f: impl FnOnce(&mut WindowStateProbe)) {
     }
 }
 
-/// Build the 14 default bindings from the real `nice_model::shortcuts` table — the
+/// Build one binding per default table row from the real `nice_model::shortcuts`
+/// table — the
 /// mirror of `keymap::table_bindings`. Uses `KeyBinding::new` (no context = active
 /// everywhere, like the app's process-wide monitor); the app additionally applies
 /// `use_key_equivalents` layout semantics, the documented divergence the live
@@ -402,6 +428,15 @@ fn shortcut_binding(action: ShortcutAction, chord: &str) -> KeyBinding {
         ShortcutAction::UndoFileOperation => KeyBinding::new(chord, UndoFileOperation, None),
         ShortcutAction::RedoFileOperation => KeyBinding::new(chord, RedoFileOperation, None),
         ShortcutAction::CommandCompose => KeyBinding::new(chord, CommandCompose, None),
+        ShortcutAction::FocusPaneLeft => KeyBinding::new(chord, FocusPaneLeft, None),
+        ShortcutAction::FocusPaneDown => KeyBinding::new(chord, FocusPaneDown, None),
+        ShortcutAction::FocusPaneUp => KeyBinding::new(chord, FocusPaneUp, None),
+        ShortcutAction::FocusPaneRight => KeyBinding::new(chord, FocusPaneRight, None),
+        ShortcutAction::LastActiveWindow => KeyBinding::new(chord, LastActiveWindow, None),
+        ShortcutAction::ScrollHalfPageUp => KeyBinding::new(chord, ScrollHalfPageUp, None),
+        ShortcutAction::ScrollHalfPageDown => KeyBinding::new(chord, ScrollHalfPageDown, None),
+        // One binding here, not the app's nine-way expansion — see the actions! note.
+        ShortcutAction::WindowByIndex => KeyBinding::new(chord, WindowByIndex, None),
     }
 }
 
@@ -674,7 +709,7 @@ fn dispatch_falls_back_to_surviving_window_after_the_key_window_closes(cx: &mut 
 }
 
 // ============================================================================
-// all 14 actions fire
+// every action fires
 // ============================================================================
 
 /// The action set and `ShortcutAction::ALL` stay in lockstep, and every default
@@ -683,8 +718,11 @@ fn dispatch_falls_back_to_surviving_window_after_the_key_window_closes(cx: &mut 
 #[gpui::test]
 fn all_default_combos_generate_a_binding(_cx: &mut TestAppContext) {
     let bindings = table_bindings();
-    assert_eq!(bindings.len(), 14, "every default combo produced a binding");
-    assert_eq!(ShortcutAction::ALL.len(), 14, "14 rebindable actions");
+    assert_eq!(
+        bindings.len(),
+        ShortcutAction::ALL.len(),
+        "every default combo produced a binding"
+    );
 }
 
 /// Every one of the 14 default combos, dispatched as a real keystroke through the

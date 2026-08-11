@@ -598,7 +598,9 @@ impl PtyManager {
         let viewing = model.active_session_id() == Some(session_id);
         model.mutate_session(session_id, |session| {
             if session.windows.iter().any(|w| w.id == term_window_id) {
-                session.active_window_id = Some(term_window_id.to_string());
+                // A user switch — routed through the choke point that records the
+                // tmux `last-window` bounce target (Phase 1's ⌃⌘O).
+                session.switch_active_window(term_window_id);
                 if viewing {
                     if let Some(term_window) = session.windows.iter_mut().find(|w| w.id == term_window_id) {
                         term_window.mark_acknowledged_if_waiting();

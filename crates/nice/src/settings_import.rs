@@ -960,11 +960,26 @@ mod tests {
     /// The prod-action-id → Rust action map is an explicit, verified pairing: every
     /// listed prod id resolves to its action AND agrees with the store's shared JSON
     /// key (`ShortcutAction::id`); an unknown id has no counterpart. Coverage is
-    /// "every action EXCEPT the Rust-only `commandCompose`" — prod Swift never had
-    /// that rawValue, so pairing it would be false (its import outcome is the
-    /// store's seeding exception instead).
+    /// "every action EXCEPT the Rust-only ones" — prod Swift never had those
+    /// rawValues, so pairing them would be false (`commandCompose`'s import outcome
+    /// is the store's seeding exception instead; the tmux Phase 1 actions simply
+    /// have nothing on the prod side to import).
     #[test]
     fn prod_action_map_pairs_every_action_by_verified_id() {
+        // Actions with no Swift-prod `rawValue` counterpart: `CommandCompose` (the
+        // first Rust-only action) plus the eight tmux Phase 1 additions.
+        const RUST_ONLY: [ShortcutAction; 9] = [
+            ShortcutAction::CommandCompose,
+            ShortcutAction::FocusPaneLeft,
+            ShortcutAction::FocusPaneDown,
+            ShortcutAction::FocusPaneUp,
+            ShortcutAction::FocusPaneRight,
+            ShortcutAction::LastActiveWindow,
+            ShortcutAction::ScrollHalfPageUp,
+            ShortcutAction::ScrollHalfPageDown,
+            ShortcutAction::WindowByIndex,
+        ];
+
         for (prod_id, action) in PROD_ACTION_MAP {
             assert_eq!(rust_action_for_prod_id(prod_id), Some(action));
             assert_eq!(action.id(), prod_id, "shared JSON key agrees for {action:?}");
@@ -973,8 +988,8 @@ mod tests {
             let paired = PROD_ACTION_MAP.iter().any(|(_, a)| *a == action);
             assert_eq!(
                 paired,
-                action != ShortcutAction::CommandCompose,
-                "{action:?}: every action is prod-paired except the Rust-only commandCompose"
+                !RUST_ONLY.contains(&action),
+                "{action:?}: every action is prod-paired except the Rust-only ones"
             );
         }
         assert_eq!(rust_action_for_prod_id("notAnAction"), None);
@@ -1086,7 +1101,7 @@ mod tests {
     }
 
     /// An absent prod `keyboardShortcuts` blob writes NO `shortcuts` section, so the
-    /// store loads all 14 defaults (load rule 1) — a fresh prod user is not
+    /// store loads all defaults (load rule 1) — a fresh prod user is not
     /// clobbered into all-unbound.
     #[test]
     fn absent_prod_shortcuts_leaves_store_defaults() {

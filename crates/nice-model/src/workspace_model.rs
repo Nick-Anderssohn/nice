@@ -526,6 +526,14 @@ impl WorkspaceModel {
                 if was_active {
                     session.active_window_id = Self::neighbor_active_window_id(idx, &session.windows);
                 }
+                // tmux `last-window` must never bounce to a window that no longer
+                // exists — drop the previous slot when it pointed at this one. The
+                // structural re-point above deliberately does NOT go through
+                // `Session::switch_active_window`: closing a window is not a user
+                // switch, so it must not overwrite the bounce target.
+                if session.prev_active_window_id.as_deref() == Some(window_id) {
+                    session.prev_active_window_id = None;
+                }
                 removed = Some(r);
             }
         }

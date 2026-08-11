@@ -489,6 +489,67 @@ fn extract_window_real_removal_fires_on_tree_mutation_once() {
 }
 
 #[test]
+fn extract_window_clears_a_prev_active_pointer_at_the_removed_window() {
+    // tmux `last-window` must not offer a closed window as the bounce target.
+    let mut model = ie_model();
+    model.mutate_session("ie-session", |s| {
+        s.switch_active_window("ie-session-p1");
+    });
+    assert_eq!(
+        model.session_for("ie-session").unwrap().prev_active_window_id.as_deref(),
+        Some("ie-session-p0")
+    );
+
+    model.extract_window("ie-session-p0", "ie-session");
+
+    let session = model.session_for("ie-session").unwrap();
+    assert_eq!(session.prev_active_window_id, None, "the stale bounce target is cleared");
+    assert_eq!(session.last_active_window_id(), None);
+    assert_eq!(
+        session.active_window_id.as_deref(),
+        Some("ie-session-p1"),
+        "closing an inactive window must not move the active window"
+    );
+}
+
+#[test]
+fn extract_window_keeps_an_unrelated_prev_active_pointer() {
+    let mut model = ie_model();
+    model.mutate_session("ie-session", |s| {
+        s.switch_active_window("ie-session-p1");
+    });
+
+    // Close p2 — neither the active nor the previously-active window.
+    model.extract_window("ie-session-p2", "ie-session");
+
+    assert_eq!(
+        model.session_for("ie-session").unwrap().last_active_window_id(),
+        Some("ie-session-p0"),
+        "an unrelated close must leave the bounce target intact"
+    );
+}
+
+#[test]
+fn extract_window_of_the_active_window_does_not_overwrite_the_bounce_target() {
+    // The structural re-point to a neighbor is NOT a user switch — it must not
+    // run through `switch_active_window` and clobber the previous slot.
+    let mut model = ie_model();
+    model.mutate_session("ie-session", |s| {
+        s.switch_active_window("ie-session-p1");
+    });
+
+    model.extract_window("ie-session-p1", "ie-session");
+
+    let session = model.session_for("ie-session").unwrap();
+    assert_eq!(session.active_window_id.as_deref(), Some("ie-session-p2"));
+    assert_eq!(
+        session.last_active_window_id(),
+        Some("ie-session-p0"),
+        "the neighbor re-point must not become the new bounce target"
+    );
+}
+
+#[test]
 fn insert_window_before_target() {
     let mut model = ie_model();
     model.insert_window(terminal("fx", "Foreign"), "ie-session", Some("ie-session-p1"), false);

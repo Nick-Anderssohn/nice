@@ -5,7 +5,7 @@
 //!
 //! ## Layout
 //! One [`setting_row`](crate::settings::root::setting_row) per rebindable
-//! [`ShortcutAction`] (all 14, `ShortcutAction::ALL` order). Each row's control is a
+//! [`ShortcutAction`] (all 22, `ShortcutAction::ALL` order). Each row's control is a
 //! **recorder field**:
 //! * **Resting** — the bound combo rendered as key-pills (⌘⌥ symbols + the key), or
 //!   `"Not bound"` when the action is unbound; clicking it enters capture mode. A
@@ -13,8 +13,10 @@
 //!   `KeyRecorderField.swift:62-65, 277-279`).
 //! * **Capture** — a focus-scoped div (`key_context "ShortcutRecorder"`) whose
 //!   `on_key_down` reads the chord. Plain Escape cancels; a conflicting combo shows
-//!   an `"Already used by <label>"` row with **Replace** / **Cancel**; a free combo
-//!   commits and tears down (§Recorder).
+//!   an `"Already used by <label>"` row with **Replace** / **Cancel**; a PROTECTED
+//!   combo (⌘Q, ⌃⌘Space, a future-phase chord — `RESERVED_COMBOS`) shows its reason
+//!   with **Cancel** and can never commit; a free combo commits and tears down
+//!   (§Recorder).
 //!
 //! ## Capture mechanism (D3, adapted to the gpui pin)
 //! D3 specifies "a focus-scoped `on_key_down` that stops propagation so the chord
@@ -53,7 +55,10 @@ use gpui::{
     SharedString, Subscription, Window,
 };
 
-use nice_model::shortcuts::{conflicting_action, Modifiers, OwnedCombo, ShortcutAction};
+use nice_model::shortcuts::{
+    conflicting_action, is_window_index_key, reserved_combo, Modifiers, OwnedCombo, ShortcutAction,
+    WINDOW_INDEX_STORED_KEY,
+};
 
 use crate::settings::root::{setting_row, setting_row_info};
 use crate::shortcuts_store::ShortcutBindings;
@@ -81,12 +86,41 @@ pub(crate) enum CaptureOutcome {
         combo: OwnedCombo,
         other: ShortcutAction,
     },
+    /// A PROTECTED combo (`nice_model::shortcuts::RESERVED_COMBOS`) — Nice's own
+    /// fixed accelerators, macOS-claimed chords, and the chords held for later
+    /// tmux-port phases. Stay recording and show `reason`; there is no Replace,
+    /// because nothing in the rebindable table owns the chord to give up.
+    Reserved {
+        combo: OwnedCombo,
+        reason: &'static str,
+    },
 }
 
 /// Decide what a captured keystroke means (pure, §Recorder). `bindings` is the live
 /// `(action, Option<combo>)` map (for the intra-table conflict check). Auto-repeat
-/// is ignored; plain Escape cancels; Escape WITH modifiers is a legit combo; a combo
-/// held by another rebindable action conflicts; else it commits.
+/// is ignored; plain Escape cancels; Escape WITH modifiers is a legit combo; a bare
+/// (modifier-less) key is ignored; a combo held by another rebindable action
+/// conflicts; else it commits.
+///
+/// **The modifier requirement.** Every binding installs process-wide with no context
+/// predicate, so committing a bare key would swallow it in every terminal. The
+/// recorder therefore never commits a modifier-less keystroke — it stays in capture
+/// mode instead.
+///
+/// **The reserved guard (Slice 2).** A chord in
+/// [`RESERVED_COMBOS`](nice_model::shortcuts::RESERVED_COMBOS) is refused with its
+/// reason BEFORE the conflict check runs — those chords are owned outside the
+/// rebindable table (Nice's fixed accelerators, macOS, a future phase), so
+/// `conflicting_action` would report them as free and the recorder would happily
+/// shadow ⌘Q. The lookup uses the chord the user PHYSICALLY pressed, before the
+/// `WindowByIndex` digit normalization below, so the reason always names the chord
+/// they actually hit.
+///
+/// **The `WindowByIndex` special case (D2).** That row is ONE binding standing for
+/// nine chords, so recording it only accepts a digit 1-9 — any other key stays in
+/// capture mode (`Ignore`) rather than committing a meaningless chord — and the
+/// committed combo normalizes the digit to
+/// [`WINDOW_INDEX_STORED_KEY`], so recording `⌃⌘7` rebinds all nine.
 pub(crate) fn decide_capture(
     recording: ShortcutAction,
     modifiers: Modifiers,
@@ -99,12 +133,42 @@ pub(crate) fn decide_capture(
         return CaptureOutcome::Ignore;
     }
     // Plain Escape (no modifiers) cancels; Escape + modifiers is a real combo.
+    // Checked BEFORE the digit gate so Esc always cancels the Window 1-9 row too.
     if key == "escape" && modifiers == Modifiers::default() {
         return CaptureOutcome::Cancel;
     }
-    let combo = OwnedCombo {
+    // A modifier-LESS keystroke never commits. Bindings install process-wide with no
+    // context predicate, so a bare key would be swallowed app-wide before the pty
+    // ever saw it — typing that letter into a terminal would fire the action instead.
+    // On the `WindowByIndex` row it is nine-fold: a bare `1` expands into bindings on
+    // every digit 1…9. Stay in capture mode so the next keystroke (or Esc) resolves,
+    // matching the non-digit gate below. The overlay side rejects the same shape in
+    // `keymap::hint_hold_matches`.
+    if modifiers == Modifiers::default() {
+        return CaptureOutcome::Ignore;
+    }
+    // The PROTECTED set, before any other judgement about the chord: a reserved
+    // combo is refused whichever row is recording and whatever the table says.
+    let pressed = OwnedCombo {
         modifiers,
         key: key.to_string(),
+    };
+    if let Some(reserved) = reserved_combo(&pressed) {
+        return CaptureOutcome::Reserved {
+            combo: pressed,
+            reason: reserved.reason,
+        };
+    }
+    let combo = if recording == ShortcutAction::WindowByIndex {
+        if !is_window_index_key(key) {
+            return CaptureOutcome::Ignore;
+        }
+        OwnedCombo {
+            modifiers,
+            key: WINDOW_INDEX_STORED_KEY.to_string(),
+        }
+    } else {
+        pressed
     };
     let view = bindings.iter().map(|(a, c)| (*a, c.as_ref()));
     match conflicting_action(view, &combo, recording) {
@@ -135,6 +199,10 @@ struct RecorderState {
     pending: Option<OwnedCombo>,
     /// The action `pending` collides with (the Replace target).
     conflict: Option<ShortcutAction>,
+    /// The reason the last captured chord was refused as PROTECTED, or `None`.
+    /// Mutually exclusive with `pending`/`conflict` — a reserved chord has no
+    /// Replace path, so the row is a message plus Cancel.
+    reserved: Option<&'static str>,
     /// Live focus-out subscription: leaving the recorder (rail switch, window close,
     /// click-away) tears the capture down and restores the keymap.
     blur_sub: Option<Subscription>,
@@ -158,6 +226,12 @@ pub(crate) fn conflict_action(cx: &App) -> Option<ShortcutAction> {
     cx.try_global::<RecorderState>().and_then(|r| r.conflict)
 }
 
+/// Why the last captured chord was refused as PROTECTED, or `None` when the
+/// capture hit no reserved combo.
+pub(crate) fn reserved_reason(cx: &App) -> Option<&'static str> {
+    cx.try_global::<RecorderState>().and_then(|r| r.reserved)
+}
+
 fn recorder_focus(cx: &App) -> Option<FocusHandle> {
     cx.try_global::<RecorderState>().map(|r| r.focus.clone())
 }
@@ -176,6 +250,7 @@ pub(crate) fn enter_record(window: &mut Window, cx: &mut App, action: ShortcutAc
             recording: None,
             pending: None,
             conflict: None,
+            reserved: None,
             blur_sub: None,
         });
     }
@@ -198,6 +273,7 @@ pub(crate) fn enter_record(window: &mut Window, cx: &mut App, action: ShortcutAc
     state.recording = Some(action);
     state.pending = None;
     state.conflict = None;
+    state.reserved = None;
     state.blur_sub = Some(sub);
     cx.refresh_windows();
 }
@@ -224,6 +300,18 @@ fn apply_key_down(cx: &mut App, event: &KeyDownEvent) {
                 let state = cx.global_mut::<RecorderState>();
                 state.pending = Some(combo);
                 state.conflict = Some(other);
+                state.reserved = None;
+            }
+            cx.refresh_windows();
+        }
+        // PROTECTED chord: nothing is written and nothing can be replaced — stay
+        // in capture mode showing the reason, so the next chord (or Esc) resolves.
+        CaptureOutcome::Reserved { combo: _, reason } => {
+            if cx.try_global::<RecorderState>().is_some() {
+                let state = cx.global_mut::<RecorderState>();
+                state.pending = None;
+                state.conflict = None;
+                state.reserved = Some(reason);
             }
             cx.refresh_windows();
         }
@@ -269,8 +357,9 @@ fn teardown(cx: &mut App) {
         state.recording = None;
         state.pending = None;
         state.conflict = None;
+        state.reserved = None;
     }
-    // Restore the full keymap (the 14 live combos + the non-rebindable set), picking
+    // Restore the full keymap (the live combos + the non-rebindable set), picking
     // up any binding just committed. The SOLE rebind owner (D2).
     crate::keymap::rebuild_keymap(cx);
     cx.refresh_windows();
@@ -354,6 +443,7 @@ pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     let recording = recording_action(cx);
     let pending = pending_combo(cx);
     let conflict = conflict_action(cx);
+    let reserved = reserved_reason(cx);
 
     let mut col = div()
         .flex()
@@ -371,7 +461,7 @@ pub(crate) fn shortcuts_pane(_window: &mut Window, cx: &mut App) -> AnyElement {
     for action in ShortcutAction::ALL {
         let control: AnyElement = if recording == Some(action) {
             let focus = recorder_focus(cx).expect("recording implies the RecorderState is installed");
-            capture_control(focus, pending.clone(), conflict, colors)
+            capture_control(action, focus, pending.clone(), conflict, reserved, colors)
         } else {
             let combo = cx.try_global::<ShortcutBindings>().and_then(|s| s.binding(action));
             let at_default = cx
@@ -416,7 +506,7 @@ fn resting_control(
         .cursor_pointer();
     match &combo {
         Some(combo) => {
-            for label in combo_pill_labels(combo) {
+            for label in combo_pill_labels(action, combo) {
                 field = field.child(key_pill(label, colors));
             }
         }
@@ -447,12 +537,14 @@ fn resting_control(
 }
 
 /// The capture control: a focus-scoped `on_key_down` div showing the recording
-/// prompt (+ pending pills once a combo is held), and the conflict row when the
-/// captured combo collides.
+/// prompt (+ pending pills once a combo is held), the conflict row when the
+/// captured combo collides, and the reserved row when it is PROTECTED.
 fn capture_control(
+    action: ShortcutAction,
     focus: FocusHandle,
     pending: Option<OwnedCombo>,
     conflict: Option<ShortcutAction>,
+    reserved: Option<&'static str>,
     colors: RowColors,
 ) -> AnyElement {
     // The recording capsule (§Recorder recording capsule).
@@ -470,7 +562,7 @@ fn capture_control(
         .bg(colors.fill);
     match &pending {
         Some(combo) => {
-            for label in combo_pill_labels(combo) {
+            for label in combo_pill_labels(action, combo) {
                 capsule = capsule.child(key_pill(label, colors));
             }
             capsule = capsule.child(
@@ -493,6 +585,9 @@ fn capture_control(
     let mut inner = div().flex().flex_col().gap(px(6.0)).child(capsule);
     if let Some(other) = conflict {
         inner = inner.child(conflict_row(other, colors));
+    }
+    if let Some(reason) = reserved {
+        inner = inner.child(reserved_row(reason, colors));
     }
 
     div()
@@ -551,6 +646,46 @@ fn conflict_row(other: ShortcutAction, colors: RowColors) -> impl IntoElement {
         .child(div().flex().flex_row().gap(px(6.0)).child(replace).child(cancel))
 }
 
+/// The reserved row (Slice 2): the refusal reason plus Cancel. No Replace — the
+/// chord belongs to Nice's fixed accelerators, to macOS, or to a future phase, so
+/// there is nothing in the rebindable table that could hand it over.
+fn reserved_row(reason: &'static str, colors: RowColors) -> impl IntoElement {
+    let cancel = div()
+        .id("settings.shortcuts.reserved.cancel")
+        .role(gpui::Role::Button)
+        .aria_label("Cancel")
+        .px(px(10.0))
+        .py(px(3.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(colors.line)
+        .text_size(px(12.0))
+        .text_color(colors.ink)
+        .cursor_pointer()
+        .child("Cancel")
+        .on_mouse_down(MouseButton::Left, move |_e, _window, cx: &mut App| {
+            cancel_capture(cx);
+        });
+    div()
+        .id("settings.shortcuts.reserved")
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(colors.warn)
+                .child(SharedString::from(reason)),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(colors.ink2)
+                .child("Press a different combo, or cancel."),
+        )
+        .child(div().flex().flex_row().gap(px(6.0)).child(cancel))
+}
+
 /// A per-action Reset button (a11y `settings.shortcuts.<id>.reset`) — shown only
 /// when the action is off its default.
 fn reset_button(action: ShortcutAction, colors: RowColors) -> impl IntoElement {
@@ -593,9 +728,14 @@ fn key_pill(label: String, colors: RowColors) -> impl IntoElement {
         .child(SharedString::from(label))
 }
 
+/// How the [`ShortcutAction::WindowByIndex`] row spells its key: the whole digit
+/// range it claims, not the normalized digit it stores (D2).
+const WINDOW_INDEX_RANGE_LABEL: &str = "1…9";
+
 /// The pill labels for a combo — the modifier symbols (⌘⌃⌥⇧, canonical order) then
-/// the key glyph.
-fn combo_pill_labels(combo: &OwnedCombo) -> Vec<String> {
+/// the key glyph. `action` is needed because the `WindowByIndex` row renders the
+/// digit RANGE it stands for rather than the single digit it stores (D2).
+fn combo_pill_labels(action: ShortcutAction, combo: &OwnedCombo) -> Vec<String> {
     let mut v = Vec::new();
     if combo.modifiers.command {
         v.push("⌘".to_string());
@@ -609,7 +749,12 @@ fn combo_pill_labels(combo: &OwnedCombo) -> Vec<String> {
     if combo.modifiers.shift {
         v.push("⇧".to_string());
     }
-    v.push(key_display(&combo.key));
+    v.push(match action {
+        ShortcutAction::WindowByIndex if is_window_index_key(&combo.key) => {
+            WINDOW_INDEX_RANGE_LABEL.to_string()
+        }
+        _ => key_display(&combo.key),
+    });
     v
 }
 
@@ -680,6 +825,351 @@ mod tests {
             &default_bindings_vec(),
         );
         assert_eq!(out, CaptureOutcome::Commit(combo("cmd-shift-escape")));
+    }
+
+    /// A bare (modifier-less) key never commits — bindings are process-wide and
+    /// context-free, so a plain `Y` binding would eat every `y` typed into a
+    /// terminal. The capture stays open instead.
+    #[test]
+    fn bare_key_never_commits() {
+        for key in ["y", "1", "0", "left", "f5", "-", "space"] {
+            let out = decide_capture(
+                ShortcutAction::NewTerminalWindow,
+                Modifiers::default(),
+                key,
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(
+                out,
+                CaptureOutcome::Ignore,
+                "bare {key:?} must not commit — the capture stays open"
+            );
+        }
+    }
+
+    /// The Window 1-9 row is the worst case: a bare digit would expand into nine
+    /// context-free bindings on `1`…`9`, swallowing every digit typed anywhere.
+    /// It must not commit.
+    #[test]
+    fn bare_digit_does_not_commit_the_window_index_row() {
+        for key in ["1", "5", "9"] {
+            let out = decide_capture(
+                ShortcutAction::WindowByIndex,
+                Modifiers::default(),
+                key,
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(
+                out,
+                CaptureOutcome::Ignore,
+                "a bare {key:?} must not claim all nine window-index chords"
+            );
+        }
+    }
+
+    /// One modifier is enough — the guard rejects only the EMPTY set, it does not
+    /// demand ⌘ or a particular pair.
+    #[test]
+    fn a_single_modifier_still_commits() {
+        for (modifiers, token) in [
+            (Modifiers::COMMAND, "cmd-y"),
+            (
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                "shift-y",
+            ),
+        ] {
+            let out = decide_capture(
+                ShortcutAction::NewTerminalWindow,
+                modifiers,
+                "y",
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(out, CaptureOutcome::Commit(combo(token)));
+        }
+    }
+
+    // ---- The `WindowByIndex` template row (D2) ------------------------------
+
+    /// Recording the Window 1-9 row only commits on a digit 1-9; any other key
+    /// stays in capture mode rather than committing a chord the row can't mean.
+    #[test]
+    fn window_by_index_capture_rejects_non_digit_keys() {
+        for key in ["y", "escape", "0", "f5", "left", "-"] {
+            let out = decide_capture(
+                ShortcutAction::WindowByIndex,
+                Modifiers::COMMAND_ALT,
+                key,
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(
+                out,
+                CaptureOutcome::Ignore,
+                "{key:?} is not a window index — the capture must stay open"
+            );
+        }
+    }
+
+    /// Plain Escape still cancels the Window 1-9 capture (the cancel check runs
+    /// BEFORE the digit gate — otherwise Esc would look like a rejected key and
+    /// strand the recorder).
+    #[test]
+    fn window_by_index_capture_still_cancels_on_plain_escape() {
+        let out = decide_capture(
+            ShortcutAction::WindowByIndex,
+            Modifiers::default(),
+            "escape",
+            false,
+            &default_bindings_vec(),
+        );
+        assert_eq!(out, CaptureOutcome::Cancel);
+    }
+
+    /// Any digit commits, and the STORED digit normalizes to `1` — so recording
+    /// ⌥7 rebinds all nine chords to ⌥1…⌥9.
+    #[test]
+    fn window_by_index_capture_normalizes_the_stored_digit() {
+        for key in ["1", "4", "9"] {
+            let out = decide_capture(
+                ShortcutAction::WindowByIndex,
+                Modifiers::COMMAND_ALT,
+                key,
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(
+                out,
+                CaptureOutcome::Commit(combo("cmd-alt-1")),
+                "recording ⌘⌥{key} must store the normalized ⌘⌥1"
+            );
+        }
+    }
+
+    /// Auto-repeat still wins over the digit gate — a held ⌃⌘3 must not spam
+    /// commits.
+    #[test]
+    fn window_by_index_capture_ignores_auto_repeat() {
+        let out = decide_capture(
+            ShortcutAction::WindowByIndex,
+            Modifiers::CONTROL_COMMAND,
+            "3",
+            true,
+            &default_bindings_vec(),
+        );
+        assert_eq!(out, CaptureOutcome::Ignore);
+    }
+
+    /// The digit expansion reaches the recorder both ways: recording ⌃⌘3 on ANOTHER
+    /// action reports the Window 1-9 row as the holder, and recording the row onto a
+    /// modifier set that already holds a digit reports that action.
+    #[test]
+    fn window_by_index_conflicts_surface_in_the_recorder() {
+        let out = decide_capture(
+            ShortcutAction::ToggleSidebar,
+            Modifiers::CONTROL_COMMAND,
+            "3",
+            false,
+            &default_bindings_vec(),
+        );
+        assert_eq!(
+            out,
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-ctrl-3"),
+                other: ShortcutAction::WindowByIndex,
+            }
+        );
+
+        // The other direction: put ToggleSidebar on ⌘⌥4, then record the row on ⌘⌥1.
+        let mut bindings = default_bindings_vec();
+        for (a, c) in bindings.iter_mut() {
+            if *a == ShortcutAction::ToggleSidebar {
+                *c = Some(combo("cmd-alt-4"));
+            }
+        }
+        let out = decide_capture(
+            ShortcutAction::WindowByIndex,
+            Modifiers::COMMAND_ALT,
+            "1",
+            false,
+            &bindings,
+        );
+        assert_eq!(
+            out,
+            CaptureOutcome::Conflict {
+                combo: combo("cmd-alt-1"),
+                other: ShortcutAction::ToggleSidebar,
+            }
+        );
+    }
+
+    // ---- The reserved-combo guard (Slice 2) ---------------------------------
+
+    /// Every chord in every group of `RESERVED_COMBOS` is refused, carrying that
+    /// entry's reason and the chord the user pressed. Driven off the table itself,
+    /// so a new entry is covered the moment it lands.
+    #[test]
+    fn every_reserved_chord_is_refused_with_its_reason() {
+        for entry in nice_model::shortcuts::RESERVED_COMBOS {
+            let out = decide_capture(
+                ShortcutAction::ToggleSidebar,
+                entry.combo.modifiers,
+                entry.combo.key,
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(
+                out,
+                CaptureOutcome::Reserved {
+                    combo: combo(&entry.combo.chord_str()),
+                    reason: entry.reason,
+                },
+                "{} must be refused as reserved",
+                entry.combo.chord_str()
+            );
+        }
+    }
+
+    /// One chord per group, spelled out — the guard is not just "whatever the
+    /// table happens to say" (⌘Q fixed accelerator, ⌃⌘Space macOS, ⌃⌘Z future).
+    #[test]
+    fn reserved_groups_are_each_covered() {
+        let refuse = |token: &str, modifiers, key| {
+            let out = decide_capture(
+                ShortcutAction::NewTerminalWindow,
+                modifiers,
+                key,
+                false,
+                &default_bindings_vec(),
+            );
+            match out {
+                CaptureOutcome::Reserved { combo: c, reason } => {
+                    assert_eq!(c, combo(token));
+                    assert!(!reason.is_empty(), "{token} needs a reason");
+                    reason
+                }
+                other => panic!("{token} must be Reserved, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            refuse("cmd-q", Modifiers::COMMAND, "q"),
+            "Reserved: Nice's Quit shortcut"
+        );
+        assert_eq!(
+            refuse("cmd-ctrl-space", Modifiers::CONTROL_COMMAND, "space"),
+            "Reserved: the macOS emoji picker"
+        );
+        assert_eq!(
+            refuse("cmd-ctrl-z", Modifiers::CONTROL_COMMAND, "z"),
+            "Reserved for a future Nice feature"
+        );
+    }
+
+    /// The guard runs BEFORE the conflict check: ⌃⌘D is both a reserved macOS
+    /// chord and (per the plan's Slice 1 defaults) the live "Scroll half page down"
+    /// binding, and it reports Reserved — not a Conflict the user could Replace.
+    #[test]
+    fn reserved_wins_over_an_intra_table_conflict() {
+        let out = decide_capture(
+            ShortcutAction::ToggleSidebar,
+            Modifiers::CONTROL_COMMAND,
+            "d",
+            false,
+            &default_bindings_vec(),
+        );
+        assert_eq!(
+            out,
+            CaptureOutcome::Reserved {
+                combo: combo("cmd-ctrl-d"),
+                reason: "Reserved: the macOS dictionary lookup",
+            }
+        );
+    }
+
+    /// Near-misses still commit — the claim is the full (modifiers, key) pair, so
+    /// a reserved key under other modifiers, or a reserved modifier set under
+    /// another key, is an ordinary free combo.
+    #[test]
+    fn chords_adjacent_to_reserved_ones_still_commit() {
+        for (modifiers, key, token) in [
+            (Modifiers::COMMAND_ALT, "q", "cmd-alt-q"),
+            (Modifiers::COMMAND_SHIFT, "n", "cmd-shift-n"),
+            (Modifiers::CONTROL_COMMAND, "y", "cmd-ctrl-y"),
+            (Modifiers::COMMAND, "f", "cmd-f"),
+        ] {
+            let out = decide_capture(
+                ShortcutAction::NewTerminalWindow,
+                modifiers,
+                key,
+                false,
+                &default_bindings_vec(),
+            );
+            assert_eq!(out, CaptureOutcome::Commit(combo(token)));
+        }
+    }
+
+    /// Auto-repeat and plain Escape still win over the guard: a held ⌘Q must not
+    /// spam refusals, and Esc must always be able to leave the capture.
+    #[test]
+    fn auto_repeat_and_escape_outrank_the_reserved_guard() {
+        assert_eq!(
+            decide_capture(
+                ShortcutAction::ToggleSidebar,
+                Modifiers::COMMAND,
+                "q",
+                true,
+                &default_bindings_vec()
+            ),
+            CaptureOutcome::Ignore
+        );
+        assert_eq!(
+            decide_capture(
+                ShortcutAction::ToggleSidebar,
+                Modifiers::default(),
+                "escape",
+                false,
+                &default_bindings_vec()
+            ),
+            CaptureOutcome::Cancel
+        );
+    }
+
+    /// The guard applies to the Window 1-9 row too, and it reads the chord the
+    /// user PHYSICALLY pressed — recording ⌃⌘F there reports the full-screen
+    /// reason rather than silently ignoring a non-digit key. Digits are never
+    /// reserved, so the row's own capture path is untouched.
+    #[test]
+    fn window_by_index_capture_reports_reserved_chords() {
+        let out = decide_capture(
+            ShortcutAction::WindowByIndex,
+            Modifiers::CONTROL_COMMAND,
+            "f",
+            false,
+            &default_bindings_vec(),
+        );
+        assert_eq!(
+            out,
+            CaptureOutcome::Reserved {
+                combo: combo("cmd-ctrl-f"),
+                reason: "Reserved: Nice's Full Screen shortcut",
+            }
+        );
+        // A digit still commits the normalized combo.
+        assert_eq!(
+            decide_capture(
+                ShortcutAction::WindowByIndex,
+                Modifiers::CONTROL_COMMAND,
+                "5",
+                false,
+                &default_bindings_vec()
+            ),
+            CaptureOutcome::Commit(combo("cmd-ctrl-1"))
+        );
     }
 
     /// A free combo commits to the recording action.
@@ -786,12 +1276,33 @@ mod tests {
     /// arrows and letters render as glyphs.
     #[test]
     fn combo_pill_labels_render_glyphs() {
+        let a = ShortcutAction::NextSidebarSession;
         assert_eq!(
-            combo_pill_labels(&combo("cmd-alt-down")),
+            combo_pill_labels(a, &combo("cmd-alt-down")),
             vec!["⌘", "⌥", "↓"]
         );
-        assert_eq!(combo_pill_labels(&combo("cmd-shift-b")), vec!["⌘", "⇧", "B"]);
-        assert_eq!(combo_pill_labels(&combo("cmd--")), vec!["⌘", "-"]);
+        assert_eq!(combo_pill_labels(a, &combo("cmd-shift-b")), vec!["⌘", "⇧", "B"]);
+        assert_eq!(combo_pill_labels(a, &combo("cmd--")), vec!["⌘", "-"]);
+    }
+
+    /// D2: the `WindowByIndex` row renders the digit RANGE it claims, not the single
+    /// normalized digit it stores — so the settings row reads `⌘⌃1…9`.
+    #[test]
+    fn window_by_index_row_renders_the_digit_range() {
+        assert_eq!(
+            combo_pill_labels(ShortcutAction::WindowByIndex, &combo("cmd-ctrl-1")),
+            vec!["⌘", "⌃", "1…9"]
+        );
+        // A user who rebinds it to ⌥7 still sees the range under the new modifier.
+        assert_eq!(
+            combo_pill_labels(ShortcutAction::WindowByIndex, &combo("alt-7")),
+            vec!["⌥", "1…9"]
+        );
+        // Any OTHER action bound to a digit renders that digit literally.
+        assert_eq!(
+            combo_pill_labels(ShortcutAction::ResetFontSizes, &combo("cmd-0")),
+            vec!["⌘", "0"]
+        );
     }
 
     // ===================================================================
@@ -899,6 +1410,64 @@ mod tests {
                     .binding(ShortcutAction::NewTerminalWindow),
                 OwnedCombo::from_token("cmd-y"),
                 "Esc-cancel left the binding untouched"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Reserved arm of `apply_key_down`: a PROTECTED chord keeps the recorder
+    /// recording, surfaces the reason, writes nothing to the store — and the next,
+    /// free chord clears the reason and commits normally.
+    #[gpui::test]
+    fn apply_key_down_reserved_then_recovers(cx: &mut gpui::TestAppContext) {
+        let path = unique_temp_ui_settings("apply-key-down-reserved");
+        let dir = path.parent().unwrap().to_path_buf();
+        let window = cx.add_window(|_window, _cx| gpui::Empty);
+        cx.update(|app| {
+            app.set_global(ShortcutBindings::with_defaults(path));
+        });
+
+        window
+            .update(cx, |_v, window, cx| {
+                enter_record(window, cx, ShortcutAction::NewTerminalWindow);
+                apply_key_down(cx, &key_down("cmd-q"));
+            })
+            .unwrap();
+        cx.update(|app| {
+            assert_eq!(
+                recording_action(app),
+                Some(ShortcutAction::NewTerminalWindow),
+                "a reserved chord keeps the recorder recording"
+            );
+            assert_eq!(
+                reserved_reason(app),
+                Some("Reserved: Nice's Quit shortcut"),
+                "the recorder surfaces the refusal reason"
+            );
+            assert_eq!(pending_combo(app), None, "a reserved chord is never pending");
+            assert_eq!(conflict_action(app), None, "there is nothing to Replace");
+            assert_eq!(
+                app.global::<ShortcutBindings>()
+                    .binding(ShortcutAction::NewTerminalWindow),
+                OwnedCombo::from_token("cmd-t"),
+                "the reserved chord wrote nothing to the store"
+            );
+        });
+
+        // The same capture recovers: a free combo clears the reason and commits.
+        window
+            .update(cx, |_v, _window, cx| {
+                apply_key_down(cx, &key_down("cmd-y"))
+            })
+            .unwrap();
+        cx.update(|app| {
+            assert_eq!(recording_action(app), None, "the free combo tore the capture down");
+            assert_eq!(reserved_reason(app), None, "the refusal reason cleared");
+            assert_eq!(
+                app.global::<ShortcutBindings>()
+                    .binding(ShortcutAction::NewTerminalWindow),
+                OwnedCombo::from_token("cmd-y")
             );
         });
 

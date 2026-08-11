@@ -70,7 +70,8 @@ sidebar request actually decomposes into:
   (`shortcuts.rs`, `shortcuts_store.rs`, `shortcuts_pane.rs`) — the natural
   home for prefix-table config. Limitation: `OwnedCombo::from_token` cannot
   represent a two-keystroke sequence yet (`shortcuts.rs:363-449`), and the
-  recorder captures exactly one keystroke.
+  recorder captures exactly one keystroke. Since Phase 1 the recorder also
+  refuses the reserved combos (`RESERVED_COMBOS`) with a per-entry reason.
 - **A scriptable IPC seam.** Per-window AF_UNIX control socket with NDJSON
   protocol (`control_socket.rs`), `NICE_SOCKET`/`NICE_TAB_ID`/`NICE_PANE_ID`
   injected into every pty env — the foundation for tmux-style
@@ -79,7 +80,8 @@ sidebar request actually decomposes into:
   `RegexSearch`/`RegexIter` already linked (used for hyperlinks,
   `hyperlink.rs:92-233`); full programmatic selection API on the handle
   (`session_handle.rs:517-618`); scrollback + scroll-position API, with
-  keyboard scroll bindings since Phase 0 (Shift+PageUp/PageDown/Home/End).
+  keyboard scroll bindings since Phase 0 (Shift+PageUp/PageDown/Home/End)
+  and half-page jumps since Phase 1 (`^⌘u`/`^⌘d`).
   Missing is only UI: no copy-mode state machine, no search overlay.
 - **Overlay building blocks** for prefix-pending indicators, search fields,
   and pane-number popups: peek overlay + modifier observers
@@ -177,44 +179,60 @@ Full implementation plan: `docs/plans/phase-r-terminology-rename.md`.
 
 Full implementation plan: `docs/plans/phase-0-quick-wins.md`.
 
-### Phase 1 — held-modifier keybind scheme (M)
+### Phase 1 — held-modifier keybind scheme (M) — SHIPPED
 
 **DECIDED (2026-08-05): no tmux-style prefix sequences. The scheme is
 vim keys held under `^⌘` (control+command).** Held-modifier chords are
 single keystrokes to gpui — no pending-prefix state machine, no timeout,
-no send-literal escape hatch needed (nothing is stolen from the pty:
-`should_encode`'s ctrl branch is `ctrl && !cmd`, so any ⌘-bearing chord
-is never terminal-owned). OS key-repeat gives free continuous navigation
-(hold `^⌘` + hold `j`), which tmux only approximates with `repeat-time`.
+no send-literal escape hatch needed (nothing is stolen from the pty: a
+bound chord fires its action before the terminal's key listener ever sees
+it, so it leaks zero bytes). OS key-repeat gives free continuous
+navigation (hold `^⌘` + hold `j`), which tmux only approximates with
+`repeat-time`.
 
-Locked-in bindings:
+Shipped bindings (all rebindable in Settings ▸ Shortcuts):
 
-| Chord | Action |
-|---|---|
-| `^⌘h/j/k/l` | Directional pane focus (pre-splits: `h`/`l` = prev/next pane) |
-| `^⌘⇧h/j/k/l` | Resize split toward that edge (or swap — finalize in Phase 2) |
-| `^⌘[` / `^⌘]` | Prev / next upper-bar pill **(decided over `^⌘n`/`^⌘p`)** |
-| `^⌘1-9` | Pill by index |
-| `^⌘o` | Last-active pane |
-| `^⌘z` | Zoom pane |
-| `^⌘v` / `^⌘s` | Vertical / horizontal split |
-| `^⌘u` / `^⌘d` | Half-page scrollback up / down |
-| `^⌘/` | Scrollback search |
+| Chord | Action | Phase |
+|---|---|---|
+| `^⌘h/j/k/l` | Directional pane focus — **D3**: named for the Phase 2 spatial meaning; pre-splits `h`/`l` alias prev/next pill, `j`/`k` are registered but inert | 1 |
+| `^⌘⇧h/j/k/l` | Resize split toward that edge (or swap — finalize in Phase 2) | 2 |
+| `^⌘[` / `^⌘]` | Prev / next upper-bar pill — **D1**: these are now the `PrevWindow`/`NextWindow` DEFAULTS (was `⌘⌥←`/`⌘⌥→`, which are freed); the frozen action ids are unchanged | 1 |
+| `^⌘1-9` | Window by index — **D2**: ONE rebindable row (`windowByIndex`, "Window 1-9") whose recorded modifier set applies to all nine digits; nine separate rows were rejected | 1 |
+| `^⌘o` | Last-active window (tmux `last-window`, a single bounce slot — not an MRU stack) | 1 |
+| `^⌘z` | Zoom pane | 2 |
+| `^⌘v` / `^⌘s` | Vertical / horizontal split | 2 |
+| `^⌘u` / `^⌘d` | Half-page scrollback up / down (no-op on the alternate screen) | 1 |
+| `^⌘/` | Scrollback search | 3 |
+| *hold* `^⌘` | Window-index badges on the pills — **D5**, ~200 ms debounce | 1 |
 
 Reserved — never bind: `^⌘Q` (macOS lock screen, system-intercepted),
 `^⌘F` (fullscreen, in Nice's protected set), `^⌘Space` (emoji picker),
-`^⌘D` (macOS dictionary lookup).
+`^⌘D` (macOS dictionary lookup). **D4**: the four Phase 2/3 chords
+(`^⌘z`, `^⌘v`, `^⌘s`, `^⌘/`) join them in the guard rather than shipping
+as no-op actions, so nothing can squat on them before those phases land.
+All twelve live in one `RESERVED_COMBOS` table in `nice-model`; the
+recorder refuses them with a per-entry reason, and `keymap` installs the
+five fixed accelerators FROM those same entries so guard and install
+cannot drift.
 
-- **Hold-to-hint overlay (decided, part of the scheme):** while `^⌘` is
-  held, show pane numbers/hints as an overlay — tmux `display-panes`, but
-  live for the duration of the hold. Build on the existing modifier-state
-  observer used by sidebar peek (`keymap::on_window_modifiers_changed`,
-  `keymap.rs:546-606`) + the present-kick pattern.
-- Grow the rebindable action set accordingly; all chords rebindable via
-  the existing shortcuts store/recorder (single-keystroke capture already
-  suffices — no sequence support needed).
+- **Hold-to-hint overlay (D5, shipped):** holding `^⌘` for ~200 ms with no
+  chord committed paints the jump digit on each of the first nine pills;
+  release (or any change to the held set) clears it instantly, so a fast
+  `^⌘]` never flashes it. Driven purely by
+  `keymap::on_window_modifiers_changed` — it binds no keys and can never
+  swallow a chord — over a never-persisted `KeyHintModel` flag, with the
+  debounce `Task` on `WindowState` (`nice-model` is gpui-free). The watched
+  modifier pair is read from the LIVE next-pill binding, so rebinding the
+  scheme keeps a working overlay.
+- The rebindable set grew from 14 to 22 actions. Store migration is
+  DELIBERATELY absent: a user who ever rebound anything has the full map on
+  disk, so for them the D1 flip does not land and the new ids load unbound
+  (frozen load rule 5). Accepted — defaults users get the new board.
 - Keystroke-sequence support in `OwnedCombo` is DEFERRED — only needed if
   a tmux-compat prefix mode is ever added.
+
+Full implementation plan: `docs/plans/phase-1-keybind-scheme.md`. Live
+gate: the `keybind-scheme` self-test scenario.
 
 ### Phase 2 — splits (L, the core investment)
 - Model: layout tree per upper-bar pill (leaves = pane ids, splits with

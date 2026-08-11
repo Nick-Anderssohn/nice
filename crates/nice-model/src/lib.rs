@@ -79,6 +79,11 @@
 //!   click-to-rename time gate (R11 reuses it).
 //! * [`sidebar`] — [`SidebarModel`] (+ [`SidebarMode`]): collapsed/mode/peek
 //!   state and the toggle + peek render/clear methods (R12 triggers them).
+//! * [`key_hint`] — [`KeyHintModel`], the tmux-port Phase 1 hold-to-hint
+//!   overlay flag (D5). Same shape as the peek flag: transient, never
+//!   persisted, set/cleared by the keymap's modifier observer and rendered by
+//!   the toolbar. The debounce timer behind it is gpui-side and stays in
+//!   `crates/nice`.
 //!
 //! ## TermWindow strip geometry (R11 pure port)
 //!
@@ -130,6 +135,7 @@
 //!   prerelease/build-metadata handling, non-negative dotted integers only.
 
 pub mod file_browser;
+pub mod key_hint;
 mod persisted;
 mod project;
 pub mod rename_gate;
@@ -145,6 +151,7 @@ mod workspace_model;
 
 pub use persisted::{snapshot_projects, PersistedProject, PersistedSession, PersistedTermWindow};
 pub use project::Project;
+pub use key_hint::KeyHintModel;
 pub use rename_gate::InlineRenameClickGate;
 pub use selection::SidebarSessionSelection;
 pub use semantic_version::SemanticVersion;

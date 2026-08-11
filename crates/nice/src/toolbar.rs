@@ -73,6 +73,7 @@ use gpui::{
 };
 
 use nice_model::file_browser::TextFieldEditor;
+use nice_model::shortcuts::WINDOW_INDEX_KEYS;
 use nice_model::{
     center_offset_x, resolve, should_show_overflow_chevron, TermWindow, TermWindowKind, Rect, StripGeometry,
     Session, SessionStatus,
@@ -130,6 +131,14 @@ const TAB_STATUS_DOT_SIZE: f32 = 7.0;
 const TAB_UNDERLINE_HEIGHT: f32 = 1.0;
 const TAB_UNDERLINE_INSET: f32 = 11.0;
 const TAB_UNDERLINE_RADIUS: f32 = 0.5;
+
+/// The hold-to-hint index badge (Phase 1, D5): a 14pt accent square carrying the
+/// pill's ⌃⌘-digit, painted over the leading glyph while the scheme's modifiers
+/// are held — the pill's icon slot momentarily becomes its number, so the badge
+/// costs no layout and never covers the title. 3pt radius, 9pt semibold digit.
+const HINT_BADGE_SIZE: f32 = 14.0;
+const HINT_BADGE_RADIUS: f32 = 3.0;
+const HINT_BADGE_TEXT_SIZE: f32 = 9.0;
 
 /// Single-session mode: when the strip holds exactly one window, its title + status
 /// dot render as the window's centered titlebar text (macOS window-title
@@ -277,6 +286,19 @@ fn overflow_row_label(term_window: &TermWindow, active_window_id: Option<&str>) 
 /// `item_left + offset_x - viewport_left`.
 fn viewport_relative_rect(item_left: f32, item_width: f32, offset_x: f32, viewport_left: f32) -> Rect {
     Rect::new(item_left + offset_x - viewport_left, item_width)
+}
+
+/// The hint badge a pill in strip position `slot` (0-based) wears while the
+/// hold-to-hint overlay shows (Phase 1, D5) — the 1-based digit that jumps to it.
+///
+/// `None` past the ninth pill: `ShortcutAction::WindowByIndex` claims exactly nine
+/// digits ([`WINDOW_INDEX_KEYS`]), so a badge on a tenth pill would promise a chord
+/// that does not exist.
+fn hint_badge_index(slot: usize, hint_visible: bool) -> Option<usize> {
+    if !hint_visible || slot >= WINDOW_INDEX_KEYS.len() {
+        return None;
+    }
+    Some(slot + 1)
 }
 
 /// Has a press→current displacement crossed the [`BAND_DRAG_THRESHOLD_PX`]
@@ -1225,10 +1247,21 @@ impl WindowToolbarView {
             .size_full()
             .on_drag_move(cx.listener(Self::on_pill_drag_move))
             .on_drop(cx.listener(Self::on_pill_drop));
+        // Phase 1 (D5): while the scheme's modifiers are held, each pill wears the
+        // digit that jumps to it (tmux `display-panes`). The flag is set on a timer
+        // by `WindowState::arm_key_hint`; this view re-renders off that state
+        // notification like every other shared-state change.
+        let hint_visible = self.state.read(cx).key_hint.visible();
         // No pills in single-session mode — the centered title overlay replaces them.
         if !single {
-            for vm in windows {
-                row = row.child(self.render_pill(vm, &session_id, s, cx));
+            for (slot, vm) in windows.iter().enumerate() {
+                row = row.child(self.render_pill(
+                    vm,
+                    hint_badge_index(slot, hint_visible),
+                    &session_id,
+                    s,
+                    cx,
+                ));
             }
         }
 
@@ -1406,7 +1439,14 @@ impl WindowToolbarView {
             .into_any_element()
     }
 
-    fn render_pill(&self, vm: &WindowVm, session_id: &str, s: &Slots, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_pill(
+        &self,
+        vm: &WindowVm,
+        hint_index: Option<usize>,
+        session_id: &str,
+        s: &Slots,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let accent = crate::theme_settings::active_chrome_accent(cx);
         let is_active = vm.is_active;
         let ink = slot_to_rgba(s.ink);
@@ -1562,6 +1602,9 @@ impl WindowToolbarView {
                     .rounded(px(TAB_UNDERLINE_RADIUS))
                     .bg(underline),
             )
+            // Phase 1 (D5): the ⌃⌘-digit badge, present only while the hold-to-hint
+            // overlay shows.
+            .children(hint_index.map(|i| Self::render_hint_badge(i, s, srgba_to_rgba(accent))))
             // The pill carries `.id()` + `on_drag` ONLY — `on_drag_move` / `on_drop`
             // live on the scroll row (the tracked viewport, D8). gpui subtracts the
             // constructor's `Point` offset (the grab point within the pill) when it
@@ -1623,6 +1666,38 @@ impl WindowToolbarView {
                 }),
             );
         pill.into_any_element()
+    }
+
+    /// The hold-to-hint index badge (Phase 1, D5): `index` — the digit that jumps
+    /// to this pill — in an accent square seated over the pill's leading glyph
+    /// (`build_peek_overlay`'s absolute-child-in-a-`.relative()`-parent pattern,
+    /// `sidebar_shell.rs`). Absolute, so showing it reflows nothing and the pill
+    /// never jumps width mid-hold; and — like [`edge_fade`](Self::edge_fade) — it
+    /// carries no id and no listeners, so it registers no hitbox and a click during
+    /// a hold still lands on the pill underneath.
+    ///
+    /// Only pills 1-9 get one ([`hint_badge_index`]), and only while the scheme's
+    /// modifiers are held.
+    fn render_hint_badge(index: usize, s: &Slots, accent: Rgba) -> impl IntoElement {
+        div()
+            .absolute()
+            // Centered over the leading glyph box: the pill's content starts one
+            // `TAB_PAD_X` in, and the badge is `HINT_BADGE_SIZE - PILL_ICON_SIZE`
+            // wider than the glyph it covers.
+            .left(px(TAB_PAD_X - (HINT_BADGE_SIZE - PILL_ICON_SIZE) / 2.0))
+            .top(px((PILL_HEIGHT - HINT_BADGE_SIZE) / 2.0))
+            .w(px(HINT_BADGE_SIZE))
+            .h(px(HINT_BADGE_SIZE))
+            .rounded(px(HINT_BADGE_RADIUS))
+            .bg(accent)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(HINT_BADGE_TEXT_SIZE))
+            .font_weight(FontWeight::SEMIBOLD)
+            // Reads against the accent fill, whatever the accent is.
+            .text_color(slot_to_rgba(s.background))
+            .child(SharedString::from(index.to_string()))
     }
 
     /// The trailing "×" close square. Its slot is always laid out; `visible`
@@ -2298,6 +2373,25 @@ mod tests {
         assert!(overflow_row_label(&term, None).contains("Terminal 1"));
         assert!(overflow_row_label(&term, None).starts_with(ICON_TERMINAL));
         assert!(overflow_row_label(&claude, None).starts_with(ICON_CLAUDE_DOT));
+    }
+
+    #[test]
+    fn hint_badges_are_off_until_the_overlay_shows() {
+        // No hold, no badges — the strip is unchanged the rest of the time.
+        assert_eq!(hint_badge_index(0, false), None);
+        assert_eq!(hint_badge_index(4, false), None);
+    }
+
+    #[test]
+    fn hint_badges_number_the_first_nine_pills_from_one() {
+        // The badge is the digit of the chord that jumps to that pill, so slot 0
+        // wears "1" (⌃⌘1), not "0".
+        assert_eq!(hint_badge_index(0, true), Some(1));
+        assert_eq!(hint_badge_index(8, true), Some(9));
+        // Past nine there is no chord to promise (`WindowByIndex` claims 1-9).
+        assert_eq!(hint_badge_index(9, true), None);
+        assert_eq!(hint_badge_index(40, true), None);
+        assert_eq!(WINDOW_INDEX_KEYS.len(), 9, "the badge range tracks the digits");
     }
 
     #[test]

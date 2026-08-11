@@ -37,6 +37,13 @@
 //! driver types a marker `echo` command entirely via CGEvents and asserts the
 //! grid shows both the echoed command and its output, proving the whole path
 //! reaches a real login shell and its output round-trips back to the grid.
+//!
+//! ## `scrollback-keys` / `keybind-scheme` — grant-free keystroke scenarios
+//!
+//! Both drive `Window::dispatch_keystroke` instead of CGEvents (the exact path
+//! an OS key event takes AFTER the platform hop), so neither needs an
+//! Accessibility grant: `scrollback-keys` is Phase 0's keyboard-scrollback gate,
+//! `keybind-scheme` is Phase 1's held-`⌃⌘` scheme gate.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -749,7 +756,7 @@ pub fn open_scrollback_keys_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle>
     crate::app::install_present_kick(&handle, window, cx);
 
     cx.spawn(async move |acx: &mut AsyncApp| {
-        let report = run_scrollback_keys(acx, whandle, handle, terminal, cap_path).await;
+        let report = run_scrollback_keys(acx, window, handle, terminal, cap_path).await;
         eprintln!("[selftest] scenario 'scrollback-keys': {}", report.detail);
         nice_harness::selftest::report_gate(report);
     })
@@ -760,20 +767,24 @@ pub fn open_scrollback_keys_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle>
 
 /// Dispatch one keystroke (e.g. `"shift-pageup"`) through the window's real
 /// key-dispatch tree. Returns whether anything consumed it.
-fn dispatch_key(
-    cx: &mut AsyncApp,
-    whandle: gpui::WindowHandle<InputTermView>,
-    keystroke: &str,
-) -> bool {
+///
+/// Routed through `AnyWindowHandle::update`, which hands the root out as an
+/// untyped `AnyView` and leases NOTHING — deliberately not `WindowHandle<V>::
+/// update`, which leases the root entity for the whole call. `dispatch_key_event`
+/// re-`draw`s the window first whenever the invalidator is dirty (terminal damage
+/// from a seed write, a focus change, a handler's `notify`), and that draw
+/// re-enters the root view: under the typed handle that is a double-lease abort,
+/// which is exactly how this scenario family aborts intermittently.
+fn dispatch_key(cx: &mut AsyncApp, window: AnyWindowHandle, keystroke: &str) -> bool {
     let ks = gpui::Keystroke::parse(keystroke).expect("valid keystroke literal");
-    whandle
+    window
         .update(cx, |_root, window, cx| window.dispatch_keystroke(ks, cx))
         .unwrap_or(false)
 }
 
 async fn run_scrollback_keys(
     cx: &mut AsyncApp,
-    whandle: gpui::WindowHandle<InputTermView>,
+    window: AnyWindowHandle,
     handle: Entity<TerminalSessionHandle>,
     terminal: Entity<TerminalView>,
     cap_path: PathBuf,
@@ -783,7 +794,7 @@ async fn run_scrollback_keys(
 
     // Focus the terminal view: `dispatch_keystroke` walks the focus path, so
     // the view's key listener only runs while its focus handle is focused.
-    let _ = whandle.update(cx, |_root, window, cx| {
+    let _ = window.update(cx, |_root, window, cx| {
         let fh = terminal.read(cx).focus_handle_ref().clone();
         window.focus(&fh, cx);
     });
@@ -821,7 +832,7 @@ async fn run_scrollback_keys(
 
     // §1 Shift+PageUp scrolls one page into history and encodes NOTHING.
     let cap_start = cap_len(&cap_path);
-    dispatch_key(cx, whandle, "shift-pageup");
+    dispatch_key(cx, window, "shift-pageup");
     settle(cx, 150).await;
     let page_off = offset(cx);
     if page_off == 0 {
@@ -831,7 +842,7 @@ async fn run_scrollback_keys(
     }
 
     // §2 Shift+Home jumps to the top (strictly above the single page).
-    dispatch_key(cx, whandle, "shift-home");
+    dispatch_key(cx, window, "shift-home");
     settle(cx, 150).await;
     let top_off = offset(cx);
     if top_off <= page_off {
@@ -841,7 +852,7 @@ async fn run_scrollback_keys(
     }
 
     // §3 Shift+End parks back at the bottom.
-    dispatch_key(cx, whandle, "shift-end");
+    dispatch_key(cx, window, "shift-end");
     settle(cx, 150).await;
     if offset(cx) != 0 {
         failures.push(format!("shift-end: offset {} != 0 (not at bottom)", offset(cx)));
@@ -859,7 +870,7 @@ async fn run_scrollback_keys(
 
     // §4 plain PageUp still encodes to the pty (less/vim keep their key).
     let cap_start = cap_len(&cap_path);
-    dispatch_key(cx, whandle, "pageup");
+    dispatch_key(cx, window, "pageup");
     settle(cx, 200).await;
     expect_bytes(&mut failures, "plain-pageup", b"\x1b[5~", &cap_since(&cap_path, cap_start));
 
@@ -882,7 +893,7 @@ async fn run_scrollback_keys(
         failures.push("alt-screen: grid never cleared after ESC[?1049h".into());
     } else {
         let cap_start = cap_len(&cap_path);
-        dispatch_key(cx, whandle, "shift-pageup");
+        dispatch_key(cx, window, "shift-pageup");
         settle(cx, 200).await;
         expect_bytes(
             &mut failures,
@@ -910,6 +921,400 @@ async fn run_scrollback_keys(
             passed: false,
             stats: IntervalStats::default(),
             detail: format!("scrollback-keys FAILED:\n  - {}", failures.join("\n  - ")),
+        }
+    }
+}
+
+// -- scenario: keybind-scheme (Phase 1 held-⌃⌘ scheme, end to end) -----------
+
+/// Seeded output lines for the half-page legs — five screens' worth at the
+/// spawn size, so the mounted view's refit (the real window is taller than
+/// [`ROWS`]) still leaves plenty of history under the viewport.
+const KEYBIND_SEED_LINES: usize = ROWS as usize * 5;
+
+/// Everything [`run_keybind_scheme`] needs from the setup phase.
+struct KeybindFixture {
+    state: Entity<crate::window_state::WindowState>,
+    handle: Entity<TerminalSessionHandle>,
+    session_id: String,
+    /// The three pills' ids, in `Session.windows` (= pill) order.
+    windows: Vec<String>,
+}
+
+/// The `keybind-scheme` scenario: Phase 1's held-`⌃⌘` scheme, end to end, over
+/// the SHIPPED dispatch path.
+///
+/// The `scrollback-keys` pattern alone would not gate anything here: that
+/// scenario opens a bare view with no keymap, no `WindowState` and no registry,
+/// so every `⌃⌘` chord would silently no-op and a "zero pty bytes" assertion
+/// would pass vacuously. So this one stands the real wiring up —
+/// `keymap::install_shortcuts` + a defaults `ShortcutBindings` at a temp path +
+/// `keymap::rebuild_keymap`, a `WindowState` registered in the `WindowRegistry`
+/// (via `register`, NOT `install`: the close observer's quit-when-empty would
+/// end the suite when this window closes), and the capture-tee child spawned
+/// THROUGH that state's `PtyManager` so `term_window_handle` resolves for the
+/// half-page handler.
+///
+/// Every chord is asserted twice: once on its EFFECT (the pill the model made
+/// active, the viewport offset) and once on the pty (`0` bytes captured), with a
+/// plain `u` as the differential that proves the capture file would have shown a
+/// leak. Keystrokes ride `Window::dispatch_keystroke`, so no Accessibility grant
+/// is needed.
+pub fn open_keybind_scheme_window(cx: &mut AsyncApp) -> Result<AnyWindowHandle> {
+    use crate::window_registry::WindowRegistry;
+    use crate::window_state::WindowState;
+
+    let base = prepare_dir("keybind-scheme")?;
+    let cap_path = base.join("capture.bin");
+    let base_s = base.to_string_lossy().to_string();
+    let cap_s = cap_path.to_string_lossy().to_string();
+    let store_path = base.join("ui_settings.json");
+
+    // Capture-tee child (the `input-live` pattern): pty-bound bytes land in the
+    // capture file verbatim AND echo back, so `write_child` renders as terminal
+    // OUTPUT (the scrollback seed) while encoded keystrokes stay observable.
+    let inner = format!("stty raw -echo; exec tee {cap_s}");
+    let spec = SpawnSpec::command(format!("sh -c '{inner}'"), base_s.clone())
+        .with_env(vec![("ZDOTDIR".to_string(), base_s.clone())])
+        .with_size(ROWS, COLS);
+
+    let fixture = cx.update(|app| -> Result<KeybindFixture> {
+        // The shipped keymap wiring (idempotent across scenarios), then the
+        // rebindable store seeded with DEFAULTS at a temp path — the
+        // `run_selftest` seam, so an earlier scenario's rebind can never leak
+        // into this one's board — and a rebuild so the live keymap IS that map.
+        crate::keymap::install_shortcuts(app);
+        app.set_global(crate::shortcuts_store::ShortcutBindings::with_defaults(
+            store_path,
+        ));
+        crate::keymap::rebuild_keymap(app);
+
+        let state = app.new(|_cx| WindowState::new(base_s.clone()));
+        // A fresh window seeds one "Terminal 1" pill; two more make the strip
+        // long enough for wrap-around stepping AND a `⌃⌘2` that is neither the
+        // first nor the last slot.
+        let (session_id, windows) = state.update(app, |s, _cx| {
+            let session_id = s
+                .workspace
+                .active_session_id()
+                .map(str::to_owned)
+                .unwrap_or_default();
+            s.window_strip_actions
+                .add_terminal_window(&mut s.workspace, &session_id);
+            s.window_strip_actions
+                .add_terminal_window(&mut s.workspace, &session_id);
+            let windows: Vec<String> = s
+                .workspace
+                .session_for(&session_id)
+                .map(|sess| sess.windows.iter().map(|w| w.id.clone()).collect())
+                .unwrap_or_default();
+            (session_id, windows)
+        });
+        if windows.len() != 3 {
+            return Err(anyhow!(
+                "keybind-scheme: expected a 3-window session, seeded {}",
+                windows.len()
+            ));
+        }
+
+        // Only the FIRST pill gets a live pty — the half-page chords resolve the
+        // ACTIVE window's handle, so parking the strip back on pill 1 before the
+        // scroll legs is part of the scenario (and the nav legs prove the
+        // parking chord works).
+        state.update(app, |s, cx| {
+            s.ptys.spawn_window(&session_id, &windows[0], spec, cx)
+        })?;
+        state.update(app, |s, _cx| {
+            s.window_strip_actions
+                .select_window(&mut s.workspace, &session_id, &windows[0])
+        });
+        let handle = state
+            .read(app)
+            .ptys
+            .term_window_handle(&session_id, &windows[0])
+            .ok_or_else(|| anyhow!("keybind-scheme: the seeded window has no pty handle"))?;
+
+        Ok(KeybindFixture {
+            state,
+            handle,
+            session_id,
+            windows,
+        })
+    })?;
+
+    let terminal = make_view(fixture.handle.clone(), cx);
+
+    let whandle = cx.open_window(crate::app::window_options(), {
+        let terminal = terminal.clone();
+        let state = fixture.state.clone();
+        move |window, cx| {
+            // `register` (not `install`): `install` also wires the close observer
+            // whose quit-when-empty would kill the suite when this window closes.
+            // `register` goes through `default_global`, so the registry exists
+            // either way — the `app-shell` / `file-browser` precedent.
+            let id = window.window_handle().window_id();
+            WindowRegistry::register(cx, id, state.clone());
+            state
+                .update(cx, |_s, cx| {
+                    cx.observe_window_activation(window, |_s, window, cx| {
+                        if window.is_window_active() {
+                            WindowRegistry::note_active(cx, window.window_handle().window_id());
+                        }
+                    })
+                    .detach();
+                });
+            cx.new(|_cx| InputTermView { terminal })
+        }
+    })?;
+    let window: AnyWindowHandle = whandle.into();
+    crate::app::install_present_kick(&fixture.handle, window, cx);
+
+    cx.spawn(async move |acx: &mut AsyncApp| {
+        let report = run_keybind_scheme(acx, window, terminal, fixture, cap_path).await;
+        eprintln!("[selftest] scenario 'keybind-scheme': {}", report.detail);
+        nice_harness::selftest::report_gate(report);
+    })
+    .detach();
+
+    Ok(window)
+}
+
+/// Dispatch one chord and return the bytes it leaked to the pty (expected: none
+/// — a bound chord fires its action and stops propagation before the terminal's
+/// key listener or input handler ever sees it).
+async fn chord_leak(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    cap_path: &Path,
+    keystroke: &str,
+) -> Vec<u8> {
+    let start = cap_len(cap_path);
+    dispatch_key(cx, window, keystroke);
+    settle(cx, 140).await;
+    cap_since(cap_path, start)
+}
+
+/// The active window id of `session_id`, read straight off the model the
+/// keymap handlers mutate.
+fn active_window_id(
+    cx: &mut AsyncApp,
+    state: &Entity<crate::window_state::WindowState>,
+    session_id: &str,
+) -> Option<String> {
+    state.update(cx, |s, _cx| {
+        s.workspace
+            .session_for(session_id)
+            .and_then(|sess| sess.active_window_id.clone())
+    })
+}
+
+/// Dispatch a pill-navigation chord, then assert BOTH halves: the strip moved to
+/// slot `want_slot` (1-based, pill order) and the chord wrote nothing to the pty.
+#[allow(clippy::too_many_arguments)]
+async fn nav_chord(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    fixture: &KeybindFixture,
+    cap_path: &Path,
+    failures: &mut Vec<String>,
+    keystroke: &str,
+    want_slot: usize,
+) {
+    let leaked = chord_leak(cx, window, cap_path, keystroke).await;
+    if !leaked.is_empty() {
+        failures.push(format!("{keystroke}: leaked \"{}\" to the pty", esc(&leaked)));
+    }
+    let want = fixture.windows[want_slot - 1].clone();
+    let got = active_window_id(cx, &fixture.state, &fixture.session_id);
+    if got.as_deref() != Some(want.as_str()) {
+        let slot = got
+            .as_ref()
+            .and_then(|id| fixture.windows.iter().position(|w| w == id))
+            .map(|i| (i + 1).to_string())
+            .unwrap_or_else(|| "none".to_string());
+        failures.push(format!(
+            "{keystroke}: active pill is slot {slot} ({got:?}), expected slot {want_slot} ({want})"
+        ));
+    }
+}
+
+async fn run_keybind_scheme(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    terminal: Entity<TerminalView>,
+    fixture: KeybindFixture,
+    cap_path: PathBuf,
+) -> CadenceReport {
+    let _ = cx.update(|app| app.activate(true));
+    settle(cx, 500).await;
+
+    // Focus the terminal view — `dispatch_keystroke` walks the focus path, and
+    // the plain-`u` differential needs the view's own input path live.
+    let _ = window.update(cx, |_root, window, cx| {
+        let fh = terminal.read(cx).focus_handle_ref().clone();
+        window.focus(&fh, cx);
+    });
+    settle(cx, 200).await;
+
+    let mut failures: Vec<String> = Vec::new();
+    let handle = fixture.handle.clone();
+    let offset = |cx: &mut AsyncApp| handle.update(cx, |h, _| h.display_offset());
+
+    // Precondition: the strip is parked on pill 1 (the one with the live pty).
+    if active_window_id(cx, &fixture.state, &fixture.session_id).as_deref()
+        != Some(fixture.windows[0].as_str())
+    {
+        return CadenceReport::error(
+            "keybind-scheme: the seeded strip did not start on pill 1".to_string(),
+        );
+    }
+
+    // --- §1 ⌃⌘] / ⌃⌘[ cycle the pill strip, wrapping (D1) -------------------
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]", 2).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]", 3).await;
+    // Wraps 3 → 1 rather than stopping at the end.
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-]", 1).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-[", 3).await;
+
+    // --- §2 ⌃⌘2 jumps straight to a slot (D2 — one row, nine chords) -------
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-2", 2).await;
+
+    // --- §3 ⌃⌘O bounces between the last two (tmux `last-window`) ----------
+    // The jump above left pill 3 as the bounce target; the bounce then makes
+    // pill 2 the target, so a second ⌃⌘O comes straight back.
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-o", 3).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-o", 2).await;
+
+    // --- §4 ⌃⌘H / ⌃⌘L alias prev/next pill pre-splits (D3) ----------------
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-h", 1).await;
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-l", 2).await;
+
+    // Park back on pill 1 — the only one with a live pty — via ⌃⌘1, which also
+    // pins that the digit expansion is not just the `2` binding.
+    nav_chord(cx, window, &fixture, &cap_path, &mut failures, "ctrl-cmd-1", 1).await;
+
+    // --- §5 ⌃⌘U / ⌃⌘D half-page scrollback ---------------------------------
+    let seed: String = (1..=KEYBIND_SEED_LINES)
+        .map(|i| format!("seed-{i}\r\n"))
+        .collect();
+    if let Err(e) = write_child(cx, &handle, seed.as_bytes()) {
+        return CadenceReport::error(format!("keybind-scheme: seeding failed: {e}"));
+    }
+    let last_marker = format!("seed-{KEYBIND_SEED_LINES}");
+    let mut seeded = false;
+    for _ in 0..60 {
+        settle(cx, 100).await;
+        let text = handle.update(cx, |h, _| h.session().grid_lines().join("\n"));
+        if text.contains(&last_marker) {
+            seeded = true;
+            break;
+        }
+    }
+    if !seeded {
+        return CadenceReport::error(format!(
+            "keybind-scheme: the seed never rendered ({last_marker} absent from the grid)"
+        ));
+    }
+    if offset(cx) != 0 {
+        failures.push("seed: viewport not parked at the bottom after output".into());
+    }
+
+    // The exact step is `screen_lines / 2` on the LAID-OUT grid (the mounted
+    // view refits the pty to the real window), which the driver cannot read
+    // directly — so assert the invariants that pin the same math: the first step
+    // moves, the second doubles it (equal steps), and two ⌃⌘D undo them exactly.
+    let mut half_leaks: Vec<(&str, Vec<u8>)> = Vec::new();
+    let up1 = chord_leak(cx, window, &cap_path, "ctrl-cmd-u").await;
+    half_leaks.push(("ctrl-cmd-u", up1));
+    let off1 = offset(cx);
+    if off1 == 0 {
+        failures.push("ctrl-cmd-u: display offset stayed 0 (no half-page scroll)".into());
+    }
+    let up2 = chord_leak(cx, window, &cap_path, "ctrl-cmd-u").await;
+    half_leaks.push(("ctrl-cmd-u", up2));
+    let off2 = offset(cx);
+    if off2 != off1 * 2 {
+        failures.push(format!(
+            "ctrl-cmd-u: second half-page landed at {off2}, expected {} (two equal steps)",
+            off1 * 2
+        ));
+    }
+    let down1 = chord_leak(cx, window, &cap_path, "ctrl-cmd-d").await;
+    half_leaks.push(("ctrl-cmd-d", down1));
+    if offset(cx) != off1 {
+        failures.push(format!(
+            "ctrl-cmd-d: landed at {}, expected {off1} (same magnitude, opposite sign)",
+            offset(cx)
+        ));
+    }
+    let down2 = chord_leak(cx, window, &cap_path, "ctrl-cmd-d").await;
+    half_leaks.push(("ctrl-cmd-d", down2));
+    if offset(cx) != 0 {
+        failures.push(format!(
+            "ctrl-cmd-d: viewport is at {} instead of parked at the bottom",
+            offset(cx)
+        ));
+    }
+    for (chord, leaked) in half_leaks {
+        if !leaked.is_empty() {
+            failures.push(format!("{chord}: leaked \"{}\" to the pty", esc(&leaked)));
+        }
+    }
+
+    // --- §6 the differential: a plain `u` still reaches the pty -------------
+    // Without this the zero-byte assertions above could pass vacuously (an
+    // unwired keymap leaks nothing either).
+    let start = cap_len(&cap_path);
+    dispatch_key(cx, window, "u");
+    settle(cx, 250).await;
+    expect_bytes(&mut failures, "plain-u", b"u", &cap_since(&cap_path, start));
+
+    // --- §7 alt screen: the half-page chords do nothing at all --------------
+    // They are keymap bindings, so they never encoded to the pty and there is
+    // nothing to fall through TO (contrast Shift+PageUp, which does encode).
+    if let Err(e) = write_child(cx, &handle, b"\x1b[?1049h") {
+        failures.push(format!("alt-screen: could not enter: {e}"));
+    }
+    let mut alt = false;
+    for _ in 0..40 {
+        settle(cx, 50).await;
+        let text = handle.update(cx, |h, _| h.session().grid_lines().join(""));
+        if !text.contains("seed-") {
+            alt = true;
+            break;
+        }
+    }
+    if !alt {
+        failures.push("alt-screen: grid never cleared after ESC[?1049h".into());
+    } else {
+        let leaked = chord_leak(cx, window, &cap_path, "ctrl-cmd-u").await;
+        if !leaked.is_empty() {
+            failures.push(format!(
+                "alt-screen ctrl-cmd-u: leaked \"{}\" to the pty",
+                esc(&leaked)
+            ));
+        }
+        if offset(cx) != 0 {
+            failures.push("alt-screen: ctrl-cmd-u moved the viewport".into());
+        }
+        let _ = write_child(cx, &handle, b"\x1b[?1049l");
+    }
+
+    if failures.is_empty() {
+        CadenceReport {
+            passed: true,
+            stats: IntervalStats::default(),
+            detail: "held-⌃⌘ scheme OK end to end: ⌃⌘]/⌃⌘[ cycled the pills (wrapping), ⌃⌘1/⌃⌘2 \
+                     jumped by index, ⌃⌘O bounced between the last two, ⌃⌘H/⌃⌘L aliased \
+                     prev/next, ⌃⌘U/⌃⌘D half-paged in equal steps and no-opped on the alt \
+                     screen — every chord silent to the pty while a plain `u` still encoded"
+                .to_string(),
+        }
+    } else {
+        CadenceReport {
+            passed: false,
+            stats: IntervalStats::default(),
+            detail: format!("keybind-scheme FAILED:\n  - {}", failures.join("\n  - ")),
         }
     }
 }

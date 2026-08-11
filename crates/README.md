@@ -474,12 +474,26 @@ The GPUI application. Structure (grows over later cycles):
     (production `NSOpenPanel` from `app::run`; a `RecordingFilePicker` from
     `run_selftest`; no real panel in any test/scenario).
   - `shortcuts_pane` (R24) — the recorder-field pane filling the seam above. One
-    `setting_row` per rebindable `ShortcutAction` (all 13); each row's control is a
+    `setting_row` per rebindable `ShortcutAction` (every case of `ALL`); each row's
+    control is a
     recorder field: at rest the bound combo as key-pills (or "Not bound") + a
     per-action **Reset** shown only when `!is_at_default` (Swift parity); in capture
     mode a focus-scoped `on_key_down` that reads the chord — plain Escape cancels, a
+    **reserved** combo shows its reason and refuses (Phase 1, below), a
     conflicting combo shows an `"Already used by <label>"` row with **Replace** /
-    **Cancel**, a free combo commits. Transient capture state (which action is
+    **Cancel**, a free combo commits.
+
+    **Phase 1 additions.** `decide_capture` gained `CaptureOutcome::Reserved
+    { combo, reason }`, checked BEFORE the intra-table conflict and against the
+    chord PHYSICALLY pressed (ahead of the Window 1-9 digit normalization); the
+    recorder stays in capture mode and renders the reason plus **Cancel**, with no
+    Replace. The `windowByIndex` row is the one row with a key gate — a capture
+    commits only on a digit `1`-`9`, and the stored digit normalizes to `1`, so
+    the row renders as `⌃⌘1…9` and any digit rebinds all nine chords. A
+    modifier-LESS keystroke never commits on any row (the capture stays open):
+    bindings install process-wide with no context predicate, so a bare key would be
+    swallowed before it reached a pty — nine-fold on the Window 1-9 row, which would
+    claim every digit. Transient capture state (which action is
     recording, a pending combo + its conflict, the recorder `FocusHandle`) rides the
     `RecorderState` gpui `Global` (the stateless-pane-over-a-Global shape R23's
     `ImportFeedback` uses), installed lazily on first record — no path, no disk.
@@ -647,6 +661,11 @@ The GPUI application. Structure (grows over later cycles):
     `UpdatePopover` via `cx.defer_in` (D9 — gpui takes the window out of `cx.windows`
     mid-dispatch), and the view holds the `Option<Entity<UpdatePopover>>` + its
     `DismissEvent` subscription (the `context_menu` field pattern).
+    **Phase 1** adds the hold-to-hint badge (D5): while `WindowState.key_hint` is
+    showing, each of the first nine pills paints its jump digit as an absolute
+    child of the pill's existing `.relative()` box (the `build_peek_overlay`
+    pattern), seated over the leading glyph with no id and no listeners — so it
+    adds no hitbox and no reflow.
   - `update_popover` — the `UpdatePopover` `ManagedView` (R27, D9): the small
     anchored card under the pill (`deferred(anchored(...))`, click-away + Esc
     dismiss) rendering the header (`Update available: <version>`), the two brew
@@ -687,7 +706,7 @@ The GPUI application. Structure (grows over later cycles):
     deterministic reorder is pinned in-process).
 - **Multi-window + shortcut dispatch (R12).** ⌘N opens a fully isolated window
   (its own sessions / windows / sidebar), a process-wide registry routes focused-window
-  concerns, and the 13 default shortcuts dispatch through GPUI's action/keymap
+  concerns, and the default shortcuts dispatch through GPUI's action/keymap
   system with the terminal pass-through contract intact. The `WindowGroup` token
   dance, `NewWindowButton` UUID minting, the `WindowClaimLedger`, and the
   process-wide `KeyboardShortcutMonitor` `NSEvent` machinery are all DO-NOT-PORT:
@@ -697,7 +716,12 @@ The GPUI application. Structure (grows over later cycles):
     Swift's `AppState`: the R8 `WorkspaceModel` document + the R10 `SidebarModel` /
     `SidebarSessionSelection` + the R10/R11 `SidebarActions` / `WindowStripActions`
     seams + the R13 `PtyManager` (in the slot R12 reserved) + a unique
-    per-window session id. `WindowState::new(cwd)` mints a fresh default window;
+    per-window session id, plus **Phase 1**'s hint-overlay debounce: the
+    `KeyHintModel` flag with `arm_key_hint` / `cancel_key_hint`, whose pending
+    gpui executor timer `Task` (never `smol::Timer`) and generation counter live
+    HERE because `nice-model` is gpui-free — cancel both drops the task and bumps
+    the counter, so either half of the arm/cancel race wins.
+    `WindowState::new(cwd)` mints a fresh default window;
     **R13.5 (slice 1)** factored out **`WindowState::with_model(model)`** — it seeds a
     window around a pre-built `WorkspaceModel` (re-syncing the selection from its active session
     so the "selection ⊇ {active session}" invariant holds), the seam the isolated `sidebar`
@@ -1133,7 +1157,8 @@ The GPUI application. Structure (grows over later cycles):
       `ToggleHiddenFiles` (⌘⇧.) and `ToggleSidebarMode` (⌘⇧B) are live in `keymap`.
     - `file_browser_live` — the `file-browser` self-test scenario (see the table
       below).
-  - `keymap` — the shortcut dispatch: 13 gpui `actions!` + key bindings generated
+  - `keymap` — the shortcut dispatch: one gpui `actions!` struct per
+    `ShortcutAction` + key bindings generated
     from the gpui-free `nice_model::shortcuts` table (`ShortcutAction` +
     `default_bindings`), the Rust replacement for the `NSEvent` monitor. The
     dispatch-order split: font zoom (⌘=/⌘−/⌘0) + the deferred undo/redo register
@@ -1167,7 +1192,7 @@ The GPUI application. Structure (grows over later cycles):
     the SOLE caller of `clear_key_bindings()` + `bind_keys(..)` on any binding change
     (boot-load, rebind, per-action reset). gpui has no per-binding remove, so the
     only live-rebind primitive is a **total** clear + full re-bind. `rebuild_keymap`
-    re-emits, on every rebuild, the 13 LIVE combos from `ShortcutBindings` (an unbound
+    re-emits, on every rebuild, the LIVE combos from `ShortcutBindings` (an unbound
     action omitted; a persisted/user token that fails to parse is logged + skipped,
     never a panic — unlike the statically-valid defaults) PLUS the **PROTECTED
     non-rebindable re-install set** — ⌃⌘F, ⌘N, ⌘Q, ⌘W, Esc@`SidebarShell`, ⌘, — each
@@ -1177,9 +1202,32 @@ The GPUI application. Structure (grows over later cycles):
     action handlers (those stay one-shot in `install_shortcuts`;
     double-registration double-fires). `peek_relevant_modifiers` reads the LIVE map
     (D4) so a rebound sidebar-nav chord re-points the peek at its new modifiers.
+
+    **Phase 1 (tmux port) — the held-`⌃⌘` scheme.** Eight new actions ride the
+    same table-driven wiring; three of them need something the recipe did not
+    have. (a) `WindowByIndex` is ONE settings row standing for nine chords, so
+    `shortcut_binding` returns a `Vec<KeyBinding>` and expands that row over
+    `WINDOW_INDEX_KEYS` into nine data-carrying `SelectWindowIndex { index }`
+    bindings — the expansion lives in the one function BOTH keymap paths
+    (`table_bindings` and `rebuild_keymap`) go through, so the default board and
+    the live board can never disagree. (b) `ScrollHalfPageUp`/`Down` is the first
+    keymap action that reaches a terminal view: it resolves the active window's
+    handle through `PtyManager::term_window_handle`, no-ops on the alternate
+    screen (`is_alt_screen`), and follows `perform_scrollback`'s notify
+    discipline. (c) `FocusPaneUp`/`Down` are registered with EMPTY handlers (D3)
+    so the chord is consumed by the keymap instead of leaking to the pty, and
+    Phase 2 only has to fill the bodies in. `non_rebindable_bindings` now spells
+    its five fixed accelerators FROM `RESERVED_COMBOS`, so the install and the
+    recorder's guard read one table. `on_window_modifiers_changed` grew a second
+    overlay beside the peek clear: `update_hint_overlay` arms/cancels the D5
+    hold-to-hint debounce on an EXACT match against the live next-pill chord's
+    modifiers (`hint_relevant_modifiers` → `FocusPaneRight`, else `NextWindow`;
+    both unbound ⇒ never shown). It binds no keys, so it can never swallow a
+    chord.
   - `shortcuts_store` (R24, G6) — `ShortcutBindings`, the mutable/persisted binding
-    map: a gpui `Global` of `HashMap<ShortcutAction, Option<OwnedCombo>>` (always all
-    13 keys; `None` = explicitly unbound), seeded from `default_bindings()`. Reads
+    map: a gpui `Global` of `HashMap<ShortcutAction, Option<OwnedCombo>>` (always
+    every `ShortcutAction::ALL` key; `None` = explicitly unbound), seeded from
+    `default_bindings()`. Reads
     `binding` / `is_at_default` / `bindings`; free-standing mutators
     `set_binding` / `reset` take `&mut App`, persist only-if-changed, THEN call
     `keymap::rebuild_keymap` (the `theme_settings` mutator pattern — the borrow ends
@@ -1189,10 +1237,10 @@ The GPUI application. Structure (grows over later cycles):
     (`"cmd-alt-down"`, `"cmd--"`, `"cmd-shift-."`) or JSON `null` for unbound, written
     THROUGH the shared `write_ui_settings_merged` read-merge-write writer so every
     co-owner section (`appearance` / `fonts` / `file_browser_sort` / any unknown key)
-    rides along untouched. Frozen load rules (Swift parity): absent section ⇒ all 13
+    rides along untouched. Frozen load rules (Swift parity): absent section ⇒ all
     defaults; malformed ⇒ defaults (fail-soft); unknown action key dropped; present +
     `null` ⇒ unbound; **absent from a present section ⇒ unbound** (preserves explicit
-    clears across launches). The write rule persists the FULL 13-entry map with
+    clears across launches). The write rule persists the FULL map with
     explicit `null` (a self-describing, diffable file; load-equivalent to Swift's
     omit-unbound form). **Token-vs-keyCode divergence (D1):** the schema is
     token-based where Swift's `keyboardShortcuts` blob is keyCode-based, and the two
@@ -1651,6 +1699,15 @@ deliberately does **not** re-parent (the anchor stays root). `is_claude_running`
 is `#[serde(skip)]` (runtime only; restores always come back `false`), mirroring
 `Models.swift`'s `CodingKeys` exclusion.
 
+`Session::prev_active_window_id` (Phase 1) is the same shape: `#[serde(skip)]`,
+so no `sessions.json` key appears. It is tmux `last-window` — a single bounce
+slot, NOT an MRU stack — written only by `switch_active_window`, the choke point
+every USER window switch routes through (the strip's select/step/by-index, the
+`⌃⌘O` handler itself, `PtyManager::set_active_window`). Structural and seeding
+writes (`add_window`, lineage insert, rename repair, restore) deliberately do
+NOT go through it, and `extract_window` clears it when the window it points at
+closes, so `last_active_window_id()` can never resolve to a dead window.
+
 `Session.branch` (vestigial, roadmap M5) is deliberately **not** ported here.
 
 **Sidebar UI state (R10 pure ports).** Three more gpui-free value-state modules
@@ -1665,6 +1722,10 @@ dissolve cascade):
   on removal).
 - `rename_gate` — `InlineRenameClickGate`, the injected-clock click-to-rename
   time gate (edit iff `now − activated_at ≥ interval`, `>=` boundary).
+- `key_hint` — `KeyHintModel` (Phase 1, D5): the one-flag, NEVER-persisted
+  hold-to-hint UI state, mirroring `SidebarModel`'s peek flag. The debounce
+  `Task` + generation counter cannot live here (`nice-model` is gpui-free) — they
+  sit on `WindowState`.
 - `sidebar` — `SidebarModel` (+ `SidebarMode`): collapsed/mode/peek/width state
   and the toggle + peek render/clear methods. The width slot (Phase 0) is the
   committed user-resized docked width persistence reads (`None` = never
@@ -1682,7 +1743,8 @@ dissolve cascade):
   (`.otherWindowStrip` / `.newWindow` / …) are absent (scope fence).
 
 **Keyboard-shortcut data (R12 pure port).** `shortcuts` — `ShortcutAction` (the
-closed 13-action user-rebindable set) + `default_bindings` (the default-combo
+closed user-rebindable set: 13 ported cases, plus `commandCompose`, plus Phase
+1's eight held-`⌃⌘` cases = 22) + `default_bindings` (the default-combo
 table as data), ported from `KeyboardShortcuts.swift`. Gpui-free: R12's `keymap`
 slice in `crates/nice` generates the `actions!` / `bind_keys` wiring from this
 table via `KeyCombo::chord_str` (the canonical gpui keystroke string), and R24's
@@ -1692,6 +1754,19 @@ divergence from Swift's layout-independent `keyCode` match; there is no
 keycode-binding API at the gpui pin). Window-management accelerators that are not
 rebindable (New Window ⌘N, Toggle Full Screen ⌃⌘F) are deliberately absent from
 this table — they live as fixed actions in `crates/nice`.
+
+Phase 1 added two data structures beside the table. `RESERVED_COMBOS` is the
+12-entry reserved set the recorder refuses, each with a `ReservedKind` and a
+user-facing reason: the five fixed accelerators (⌘Q ⌘N ⌘W ⌘, ⌃⌘F — which
+`crates/nice` also INSTALLS from these entries, so guard and install cannot
+drift), the three macOS-owned chords (⌃⌘Q lock screen, ⌃⌘Space emoji, ⌃⌘D
+dictionary), and the four D4 future-phase chords (⌃⌘z ⌃⌘v ⌃⌘s ⌃⌘/); `reserved_
+combo()` looks a full masked (modifiers, key) pair up. `WINDOW_INDEX_KEYS` is
+the nine digits `WindowByIndex` stands for — `conflicting_action` treats that
+action as claiming its modifiers paired with EVERY one of them, in both
+directions. One known overlap is deliberate and pinned by tests: ⌃⌘D ships as
+`ScrollHalfPageDown`'s default AND sits in the reserved table, so it works out
+of the box but can never be re-recorded by hand.
 
 **File-browser model family (R19 pure port).** `file_browser` — the gpui-free
 state behind the sidebar's files mode, ported case-for-case from the pure-Swift
@@ -2100,6 +2175,7 @@ the window, and moves to the next scenario.
 | `input-live` | The R5 live keyboard/paste/IME-anchor gate (Validation §2–§4). Spawns a capture-tee session (`sh -c 'stty raw -echo; exec tee <cap>'`), posts **real CGEvents** to nice's own pid (`crate::platform`, `CGEventPostToPid` — never the global HID tap), and asserts the bytes appended to the capture file match exactly: plain ASCII (rides the IME `insertText` path → pty), ⌘V paste with DECSET 2004 **off** (raw) then **on** (`ESC[200~…ESC[201~`), and arrow keys (`ESC[A/B/C/D`). Then the G1 **item-4 candidate anchor** is asserted programmatically — park the grid cursor mid-grid (CUP), drive a composition through the real `TermInputHandler`, and check `bounds_for_range` returns a rect at the grid-cursor cell (never `None`, the zed#46055 failure mode). Finally the **IME go/no-go probe** (TIS → Pinyin): if synthetic composition engages, items 1–3 + 5 are asserted mechanically; if not (plan-flagged UNPROVEN — and on this machine Pinyin is installed-but-not-enabled, so `TISSelectInputSource` refuses it), it records a **DEFERRED HUMAN PASS** (stderr checklist) rather than fail-looping. The user's keyboard input source is **always** restored (on `Drop`). Preflights `AXIsProcessTrusted()` and FAILs loudly (never silently skips) if the Accessibility grant is missing. `Gate::SelfReported` (byte-exact receipt, not cadence). |
 | `input-shell` | The R5 real-shell CGEvent sanity gate (Validation §5). A real `zsh -il` (user rc suppressed via an empty `ZDOTDIR`): polls the grid until the shell prints its prompt, then types `echo <marker>` + Enter entirely via CGEvents and asserts the marker appears ≥ 2× in the grid (the typed command echo **and** the command output), proving the whole path reaches a real login shell and its output round-trips. `Gate::SelfReported`. |
 | `scrollback-keys` | The Phase 0 keyboard-scrollback end-to-end gate. A real `TerminalView` over the `input-live` capture-tee child (pty-bound bytes observable in the capture file), driven with real keystrokes through the window's key-dispatch tree via `Window::dispatch_keystroke` — the exact path an OS key event takes after the platform hop — so it needs **no Accessibility grant**. Seeds three screens of output, then asserts the shipped policy in full: Shift+PageUp pages the viewport into history and writes NOTHING to the pty, Shift+Home/End jump top/bottom, plain PageUp encodes `ESC[5~` (less/vim keep their key), and on the alternate screen (DECSET 1049 round-tripped through the tee) Shift+PageUp encodes `ESC[5;2~` while the viewport stays parked. `Gate::SelfReported`. |
+| `keybind-scheme` | The Phase 1 held-`⌃⌘` keybind-scheme end-to-end gate, over the SHIPPED dispatch path. The `scrollback-keys` shape alone would gate nothing here — a bare view has no keymap, no `WindowState` and no registry, so every `⌃⌘` chord would silently no-op and a "zero pty bytes" assertion would pass vacuously — so this scenario stands the real wiring up: `keymap::install_shortcuts` + a DEFAULTS `ShortcutBindings` at a temp path + `rebuild_keymap` (so an earlier scenario's rebind can never leak in), a `WindowState` seeded to three pills and put in the `WindowRegistry` via `register` (NOT `install` — the close observer's quit-when-empty would end the suite), and the `input-live` capture-tee child spawned THROUGH that state's `PtyManager` so `term_window_handle` resolves for the half-page handler. Every chord is asserted **twice** — on its EFFECT (the pill the model made active, the viewport offset) and on the pty (`0` bytes captured) — with a plain `u` reaching the pty as the differential that proves the capture file would have shown a leak: `⌃⌘]`/`⌃⌘[` cycle the strip with wrap-around, `⌃⌘1`/`⌃⌘2` jump by index off the ONE stored row, `⌃⌘O` bounces between the last two, `⌃⌘H`/`⌃⌘L` alias prev/next pre-splits, `⌃⌘U`/`⌃⌘D` half-page in two equal steps that undo each other, and on the alternate screen `⌃⌘U` moves nothing and encodes nothing. Keystrokes ride `Window::dispatch_keystroke`, so it needs **no Accessibility grant**. Registered **before** `multiwindow`. `Gate::SelfReported`. |
 | `niceties-zoom` | The R7/T11 live zoom + pty re-metric gate (Validation §2). Drives the shipped ⌘+/⌘−/⌘0 zoom keybindings with **real CGEvents** to nice's own pid over a real login shell and asserts the whole T11 chain: after ⌘+ ×3 the shared `FontSettings` reports a larger point size + cell box, the view re-fits the grid and pushes `(rows, cols)` to the pty (asserted both by the core `Term`'s grid dimensions matching an independent `fit_grid` **and** `stty size` in the child echoing them — proving SIGWINCH reached the shell), and ⌘0 restores the baseline exactly. Preflights the Accessibility grant and FAILs loudly if it is missing (a dropped CGEvent would make every zoom a no-op). `Gate::SelfReported` (state assertions, not cadence). |
 | `niceties-drop` | The R7/T7 file/image drag-drop gate (Validation §3). Drives the view's drop handler through its test seam (`handle_external_paths_drop`) with **constructed** `ExternalPaths` events over a real pty (a real OS drag is impractical headless, and gpui's macOS backend only accepts filename drags) and asserts the exact bytes typed into the child: one escaped, space-padded path (DECSET 2004 off); multiple paths space-joined in drop order; a path with spaces / shell metacharacters backslash-escaped; the **raw-image fallback** (a drop with no file URLs consults the injected image-drop provider — a stub path here); the `ESC[200~ … ESC[201~` frame with 2004 **on**; and never a trailing newline. Reuses the `input-live` capture-tee child; drives the handler directly, so it needs **no** Accessibility grant. `Gate::SelfReported` (byte-exact receipt). |
 | `niceties-link` | The ⌘+click / ⌘-hover terminal-link gate (the "⌘+click a printed URL does nothing" bug). Prints `http://localhost:5173/` into a capture-tee pty, then drives the shipped mouse/modifier listeners through **gpui's own dispatch** (`Window::dispatch_event` with constructed `MouseMove` / `MouseDown` / `MouseUp` / `ModifiersChanged` events, hit-tested against the rendered frame exactly as the platform's would be — the same seam `multiwindow` uses), aiming each event at a known cell via the view's published paint bounds. Asserts: the ⌘-hover sets on a ⌘+move over the URL, clears on ⌘ **release**, returns on ⌘ **press** with the pointer parked (no twitch), and clears on a move off the link; a ⌘+click on the URL hands the **recording** `UrlOpener` exactly that URL while creating no selection and writing **zero** bytes to the pty; the same holds with the app's SGR mouse reporting ON (⌘ bypasses the report, Ghostty parity — the bug's real setting); and a ⌘+click **off** the link opens nothing and sends the ordinary byte-exact SGR press/release pair. No CGEvents, so it needs **no** Accessibility grant, and no browser is launched (the real `NSWorkspace openURL:` is the one manual-adjacent black-box check). `Gate::SelfReported` (recorded opens + byte-exact receipt). |
@@ -2183,14 +2259,18 @@ AND `NICE_SELFTEST=all`, release + `selftest`, strictly serial, `multiwindow`
 last); no earlier tranche-5 cycle runs the full suite. **Deliberate divergences**
 (reviewers must not "fix" them): shortcut matching is **gpui token / produced
 character**, not Swift's physical keyCodes, and there is **no migration of Swift's
-`keyboardShortcuts` UserDefaults blob** — every user starts fresh at the 13 defaults
+`keyboardShortcuts` UserDefaults blob** — every user starts fresh at the defaults
 (R24 D1; distinct bundle ids, a keyCode→token table is speculative YAGNI); conflict
-detection is **intra-table only** — a collision with a fixed accelerator or a system
-shortcut is undetected (Swift's own blind spot); dispatch is a **whole-keymap
-rebuild** (`clear_key_bindings()` + re-`bind_keys` of the live 13 PLUS the PROTECTED
+detection was **intra-table only** through R24 — a collision with a fixed
+accelerator or a system shortcut went undetected (Swift's own blind spot) — until
+Phase 1 added the `RESERVED_COMBOS` guard (below), which now refuses the fixed
+accelerators, the macOS-owned chords, and the reserved future-phase chords;
+dispatch is a **whole-keymap
+rebuild** (`clear_key_bindings()` + re-`bind_keys` of the live combos PLUS the
+PROTECTED
 non-rebindable set) rather than an `NSEvent` monitor (on the DO-NOT-PORT list — gpui
 has no per-binding remove at the pin, R24 D2); the persisted write form is the FULL
-13-entry map with explicit JSON `null` for unbound (load-equivalent to Swift's
+map with explicit JSON `null` for unbound (load-equivalent to Swift's
 omit-unbound, R24 schema); a live unregistered Settings window now **BLOCKS
 quit-when-empty** (the app stays open while Settings is open — closing the last main
 window no longer quits it, BUGS.md #13 / D4, revising R23 D7); R23 ships an **inert

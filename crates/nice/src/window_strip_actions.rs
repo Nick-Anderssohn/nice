@@ -59,6 +59,13 @@ pub(crate) trait WindowStripActions {
     /// <2-windows no-op and same R13 rewiring contract. Ported from
     /// `SessionsModel.stepActivePane(by: -1)`.
     fn select_prev_window(&mut self, model: &mut WorkspaceModel);
+
+    /// Focus the `index`-th window of the active session, **1-based** — tmux
+    /// `select-window -t N`, driven by Phase 1's ⌃⌘1…⌃⌘9 chords. Index order is
+    /// the pill order (`Session.windows`). Out of range (including `0`) is a
+    /// no-op, so ⌃⌘9 on a three-window session does nothing rather than clamping
+    /// to the last pill.
+    fn select_window_by_index(&mut self, model: &mut WorkspaceModel, index: u8);
 }
 
 /// The R11 model-only [`WindowStripActions`] implementation. Window ids come from
@@ -103,7 +110,9 @@ impl ModelWindowStripActions {
         };
         let next = (cur as isize + offset).rem_euclid(count as isize) as usize;
         let next_id = session.windows[next].id.clone();
-        model.projects[pi].sessions[ti].active_window_id = Some(next_id);
+        // A user switch — routed through the choke point so tmux `last-window`
+        // (⌃⌘O) can bounce back to the window we just left.
+        model.projects[pi].sessions[ti].switch_active_window(&next_id);
     }
 }
 
@@ -114,9 +123,10 @@ impl WindowStripActions for ModelWindowStripActions {
         };
         let session = &mut model.projects[pi].sessions[ti];
         // Guard against selecting a window that isn't on the session — never leave a
-        // dangling active_window_id.
+        // dangling active_window_id. A real user switch, so it goes through the
+        // choke point that records the tmux `last-window` bounce target.
         if session.windows.iter().any(|w| w.id == term_window_id) {
-            session.active_window_id = Some(term_window_id.to_string());
+            session.switch_active_window(term_window_id);
         }
     }
 
@@ -135,6 +145,26 @@ impl WindowStripActions for ModelWindowStripActions {
 
     fn select_prev_window(&mut self, model: &mut WorkspaceModel) {
         Self::step_active_window(model, -1);
+    }
+
+    fn select_window_by_index(&mut self, model: &mut WorkspaceModel, index: u8) {
+        let Some(session_id) = model.active_session_id().map(str::to_owned) else {
+            return;
+        };
+        let Some((pi, ti)) = model.project_session_index(&session_id) else {
+            return;
+        };
+        // 1-based, so index 0 has no slot; `checked_sub` makes that a no-op
+        // rather than an underflow.
+        let Some(slot) = (index as usize).checked_sub(1) else {
+            return;
+        };
+        let session = &mut model.projects[pi].sessions[ti];
+        let Some(target) = session.windows.get(slot).map(|w| w.id.clone()) else {
+            // Out of range — do nothing (never clamp to the last pill).
+            return;
+        };
+        session.switch_active_window(&target);
     }
 }
 
@@ -339,6 +369,80 @@ mod tests {
             model.session_for(main_session_id()).unwrap().active_window_id,
             before,
             "a single-window session has nowhere to step — active_window_id is untouched"
+        );
+    }
+
+    // MARK: - select_window_by_index (Phase 1: ⌃⌘1…⌃⌘9)
+
+    #[test]
+    fn select_window_by_index_focuses_the_nth_pill() {
+        let mut model = seeded_three_window();
+        let mut actions = ModelWindowStripActions::new();
+
+        actions.select_window_by_index(&mut model, 2);
+        assert_eq!(active_window(&model).as_deref(), Some("b"), "index is 1-based");
+        actions.select_window_by_index(&mut model, 3);
+        assert_eq!(active_window(&model).as_deref(), Some("c"));
+        actions.select_window_by_index(&mut model, 1);
+        assert_eq!(active_window(&model).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn select_window_by_index_out_of_range_is_a_noop() {
+        let mut model = seeded_three_window();
+        let mut actions = ModelWindowStripActions::new();
+        let before = active_window(&model);
+
+        // Past the end — never clamps to the last pill.
+        actions.select_window_by_index(&mut model, 4);
+        assert_eq!(active_window(&model), before, "⌃⌘4 on three windows does nothing");
+        actions.select_window_by_index(&mut model, 9);
+        assert_eq!(active_window(&model), before);
+        // Index 0 has no slot (the chords are 1-9) and must not underflow.
+        actions.select_window_by_index(&mut model, 0);
+        assert_eq!(active_window(&model), before, "index 0 is a no-op, not a panic");
+    }
+
+    // MARK: - tmux `last-window` bookkeeping (prev_active_window_id)
+
+    #[test]
+    fn selection_paths_record_the_last_active_window() {
+        let mut model = seeded_three_window();
+        let mut actions = ModelWindowStripActions::new();
+
+        // Explicit pill select.
+        actions.select_window(&mut model, "t3", "b");
+        assert_eq!(
+            model.session_for("t3").unwrap().last_active_window_id(),
+            Some("a"),
+            "a pill click records the window it left"
+        );
+
+        // Prev/next stepping.
+        actions.select_next_window(&mut model);
+        assert_eq!(active_window(&model).as_deref(), Some("c"));
+        assert_eq!(model.session_for("t3").unwrap().last_active_window_id(), Some("b"));
+
+        // Index jump.
+        actions.select_window_by_index(&mut model, 1);
+        assert_eq!(active_window(&model).as_deref(), Some("a"));
+        assert_eq!(model.session_for("t3").unwrap().last_active_window_id(), Some("c"));
+    }
+
+    #[test]
+    fn adding_a_terminal_window_is_not_a_user_switch() {
+        // Structural writes must not become the bounce target — `add_window`
+        // focuses the new window without going through `switch_active_window`.
+        let mut model = seeded_three_window();
+        let mut actions = ModelWindowStripActions::new();
+        actions.select_window(&mut model, "t3", "b");
+
+        actions.add_terminal_window(&mut model, "t3").unwrap();
+
+        assert_eq!(
+            model.session_for("t3").unwrap().last_active_window_id(),
+            Some("a"),
+            "the add must not overwrite the bounce target"
         );
     }
 
