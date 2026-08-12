@@ -2218,6 +2218,28 @@ fn parse_title_braille_range_boundaries_set_thinking() {
     assert_eq!(parse_claude_title("\u{28FF}x").0, Some(SessionStatus::Thinking));
 }
 
+/// Claude Code 2.1.228 swapped the title busy spinner from braille to the
+/// half-shaded circles ◐◑ ("Updated terminal title busy-spinner glyphs to
+/// reduce tab-bar jitter"); the whole ◐◓◑◒ quad (U+25D0..=U+25D3) ⇒ Thinking.
+#[test]
+fn parse_title_half_shaded_circle_spinner_sets_thinking() {
+    // The observed 2.1.228 title shape: "◐ <label>".
+    let (status, label) = parse_claude_title("\u{25D0} count-to-three");
+    assert_eq!(status, Some(SessionStatus::Thinking));
+    assert_eq!(label, " count-to-three");
+    // Every phase of the quad, inclusive at both ends.
+    for c in ['\u{25D0}', '\u{25D1}', '\u{25D2}', '\u{25D3}'] {
+        assert_eq!(
+            parse_claude_title(&format!("{c}x")).0,
+            Some(SessionStatus::Thinking),
+            "{c:?} must map to Thinking"
+        );
+    }
+    // Neighbours just outside the quad stay plain labels.
+    assert_eq!(parse_claude_title("\u{25CF}x").0, None); // ● black circle
+    assert_eq!(parse_claude_title("\u{25D4}x").0, None); // ◔ quadrant circle
+}
+
 /// The sparkle ✳ (U+2733) ⇒ Waiting.
 #[test]
 fn parse_title_sparkle_sets_waiting() {

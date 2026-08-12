@@ -73,7 +73,7 @@
 //!   the `cx.subscribe` that feeds [`route_terminal_event`] from a live entity,
 //!   the live arming of the launch-overlay `LaunchDeadline`, and the
 //!   `session-lifecycle` live scenario — **slice 3**.
-//! * Claude status parsing (braille/✳ → thinking/waiting), session auto-title from
+//! * Claude status parsing (braille or ◐◑ / ✳ → thinking/waiting), session auto-title from
 //!   the OSC label, socket, promotion, persistence — **R15/R18** (breadcrumbs
 //!   below).
 //!
@@ -471,8 +471,9 @@ impl PtyManager {
                 changed
             }
             TermWindowKind::Claude => {
-                // R15 T5: the Claude branch — split the braille-spinner (U+2800..
-                // U+28FF → thinking) / sparkle (U+2733 → waiting) status prefix via
+                // R15 T5: the Claude branch — split the busy-spinner (braille
+                // U+2800..U+28FF, or ◐◑ U+25D0..U+25D3 from Claude 2.1.228, →
+                // thinking) / sparkle (U+2733 → waiting) status prefix via
                 // [`parse_claude_title`], apply the status transition, and feed the
                 // trailing label into the session auto-title (dropping the "Claude Code"
                 // placeholder). Gated on `is_claude_running`: a deferred-resume
@@ -2183,9 +2184,13 @@ fn compose_id_reply(verb: &str, session_id: &str, settings_path: Option<&str>) -
 }
 
 /// Split a Claude OSC title into its status prefix and the trailing label,
-/// per the T5 grammar. Pure port of the status-prefix extraction in Swift
-/// `paneTitleChanged`'s Claude branch (`SessionsModel.swift:439-453`): the
-/// first Unicode scalar in `U+2800..=U+28FF` (braille spinner) ⇒
+/// per the T5 grammar. Ported from the status-prefix extraction in Swift
+/// `paneTitleChanged`'s Claude branch (`SessionsModel.swift:439-453`), extended
+/// for Claude Code 2.1.228's busy-glyph change: a first Unicode scalar in
+/// `U+2800..=U+28FF` (braille spinner, Claude ≤ 2.1.227) OR
+/// `U+25D0..=U+25D3` (◐◑◒◓ half-shaded circles, the busy spinner from 2.1.228's
+/// "reduce tab-bar jitter" glyph update — the title alternates ◐/◑; the
+/// four-phase quad is accepted whole in case the cycle widens) ⇒
 /// [`Thinking`](SessionStatus::Thinking); exactly `U+2733` (✳ sparkle) ⇒
 /// [`Waiting`](SessionStatus::Waiting); anything else ⇒ no status change and the
 /// whole string is the label.
@@ -2199,7 +2204,7 @@ pub(crate) fn parse_claude_title(title: &str) -> (Option<SessionStatus>, &str) {
         return (None, title);
     };
     let cp = first as u32;
-    if (0x2800..=0x28FF).contains(&cp) {
+    if (0x2800..=0x28FF).contains(&cp) || (0x25D0..=0x25D3).contains(&cp) {
         (Some(SessionStatus::Thinking), &title[first.len_utf8()..])
     } else if cp == 0x2733 {
         (Some(SessionStatus::Waiting), &title[first.len_utf8()..])
