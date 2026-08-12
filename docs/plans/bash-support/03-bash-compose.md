@@ -454,6 +454,33 @@ Fix-round policy per repo rules: run the targeted tests above, not the full suit
 7. All new tests green; compose e2e + smoke scenario skip cleanly (with notice) on
    machines without a modern bash; zsh compose suite untouched and green.
 
+## Validation
+
+All headless, run from the worktree. See "Test plan" for the layer-by-layer coverage.
+
+1. `cargo build --workspace` — green.
+2. `/bin/bash -n crates/nice/src/shell/scripts/bash/nice.bashrc` — exit 0 **after** the compose
+   section is appended. This is the "3.2 parses the whole file" gate (acceptance 4); it must pass
+   before anything else here matters.
+3. `cargo test -p nice shell::bash` — structural pins (bind spelling == `COMPOSE_TRIGGER_BINDKEY`,
+   all three keymaps inside the `BASH_VERSINFO` ≥ 4.3 guard, "single bash command line"
+   instruction with no `zsh`, stdin-borne request, no `accept-line`), the version-probe
+   parser/stub/truth tests, and the stock-3.2 function e2e (`_nice_compose_translate`,
+   `_nice_compose_strip`, `_nice_compose_conf_get`). Unconditional — a skip here is a failure.
+4. `cargo test -p nice compose_route` — the `PaneShell { kind: Bash, compose: None }` row never
+   yields `Trigger` (the F6 regression pin).
+5. `cargo test -p nice compose_ -- --nocapture` for the interactive real-pty e2e (work item 5).
+   It resolves a bash ≥ 4.3 through `find_compose_bash()` (`NICE_TEST_BASH` →
+   `/opt/homebrew/bin/bash` → `/usr/local/bin/bash` → PATH). **A printed skip notice is an
+   acceptable pass** when no such bash exists — but the stock-3.2 legs (steps 2–4, plus the
+   guard-closed "sources cleanly, no `bind` warnings" leg) must still pass. To force the modern
+   path where a bash 5 exists: `NICE_TEST_BASH=/opt/homebrew/bin/bash cargo test -p nice compose_`.
+6. `cargo test --workspace` — green.
+
+Deferred to the user's feel-check on the merged branch: acceptance 1–3's live behavior and the
+`compose-live-bash` GUI scenario (work item 7) — it drives a real window and self-skips without a
+modern bash, so it is not part of the headless gate.
+
 ## Open questions
 
 1. **Design-doc deviation (factual correction): version gate is ≥ 4.3, not ≥ 4.0.**

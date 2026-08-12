@@ -531,6 +531,28 @@ Step 2:
 - `advanced.shell` in `ui_settings.json` overrides `$SHELL`; `NICE_SHELL` overrides both.
 - `pane_shell` snapshots are runtime-only (nothing new in `sessions.json`).
 
+## Validation
+
+All headless, run from the worktree. See "Test plan" for what each suite covers.
+
+1. `cargo build --workspace` — must stay green through the series (W1.2 and W1.5 are the two
+   likely break points; keep those commits small).
+2. `cargo test -p nice shell::` — the moved zsh suite plus the new profile/resolve/fallback
+   tests. Green **with `stub_bodies_and_argv_sha256_frozen` passing** is the byte-freeze proof.
+3. `shasum -a 256 crates/nice/src/shell/scripts/zsh/*.zsh` — the four hashes must match W1.0's
+   hex literals (catches an `include_str!` aimed at the wrong file); and
+   `tail -c 1 crates/nice/src/shell/scripts/zsh/zshrc.zsh | xxd` must NOT show `0a`.
+4. `git log -p <base>..HEAD -- crates/nice/src/shell` — reviewer check: no changed assertion
+   text in the moved tests, only `use`-path/move noise.
+5. `cargo test -p nice-term-core` (incl. `exec_args.rs`) and
+   `cargo test -p nice compose_route` — pass with expected-value edits only where the
+   "Existing tests that CHANGE" table says so.
+6. `cargo test --workspace` — green at step-1 exit and again at step-2 exit.
+
+Deferred to the user's feel-check on the merged branch: both scratch-env `Nice Dev` launches in
+Acceptance criteria (zsh parity; `NICE_SHELL=/bin/bash` fallback panes). No install, app launch,
+or GUI automation is part of this plan's runnable validation.
+
 ## Open questions (for the design owner — do not silently deviate)
 
 1. **`comm_name(&self) -> &'static str` can't be satisfied by `FallbackProfile`** (its comm is

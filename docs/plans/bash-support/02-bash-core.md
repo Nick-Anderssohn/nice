@@ -543,6 +543,30 @@ env (and a scratch `$HOME/.bash_profile` exporting a marker + PATH):
 - `cargo test --workspace` green; no compose bytes can reach a bash pane (`PaneShell.compose
   == None` for every pane this plan spawns).
 
+## Validation
+
+All headless, run from the worktree. See "Test plan" for what each suite covers.
+
+1. `cargo build --workspace` — green.
+2. `/bin/bash -n crates/nice/src/shell/scripts/bash/nice.bashrc` — exit 0. This is the real
+   bash 3.2 syntax gate; it must pass standalone before any pty test is worth running.
+3. `cargo test -p nice shell::bash` — the `spawn_argv`/`probe_argv`/`write_rc_files` unit table,
+   the structural positive+negative sets (no `print -z`, no `NICE_PREFILL_COMMAND`, no compose
+   bytes), and the real-`/bin/bash` e2e legs (`-i -c` rcfile-sourcing pin, login-emulation order,
+   `claude()` shadow reply modes, OSC 7 encoding + dedup). Unconditional — `/bin/bash` 3.2 ships
+   on every macOS, so a skip here is a failure, not an environment gap.
+4. `cargo test -p nice shell::resolve` and `cargo test -p nice comm_accepted` — bash arm returns
+   `BashProfile` at the resolved path; `all_known_comm_names()` is `["zsh", "bash"]` and the union
+   accepts a `bash` comm while the active profile is zsh.
+5. `cargo test -p nice pty_manager` — `AppTyped` records `pending_prefill` with no
+   `NICE_PREFILL_COMMAND`, the `CwdChanged` slot is taken exactly once, no trailing newline, and
+   the existing zsh env-matrix assertions are unchanged.
+6. `cargo test --workspace` — green.
+
+Deferred to the user's feel-check on the merged branch: the whole "Verification (real app)"
+section (scratch-env `Nice Dev` with `NICE_SHELL=/bin/bash`, handshake, prefill-typed resume line,
+⌘↩ silence, reaper). Nothing there is runnable headlessly.
+
 ## Open questions
 
 - **Version probe placement.** §3/§6.3 say `BashProfile` carries its probed major version from

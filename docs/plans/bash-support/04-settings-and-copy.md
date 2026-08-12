@@ -335,6 +335,29 @@ Scratch-env `Nice Dev` per CLAUDE.md (seeded HOME, keychain symlink, own setting
 7. With bash selected on a stock Mac, Settings ▸ Claude ▸ Command Compose model ⓘ leads with the
    "isn't available in bash" sentence.
 
+## Validation
+
+All headless, run from the worktree. See "Test plan" for what each suite covers.
+
+1. `cargo build --workspace` — green (W3 changes `advanced_pane`'s signature and its `root.rs`
+   wrapper; that is the one compile risk).
+2. `cargo test -p nice shell::choices` — filtering, dedupe, zsh-before-bash ordering, labels,
+   Automatic as row 0, the unknown-persisted-path passthrough row, `id_suffix` sanitization.
+3. `cargo test -p nice settings::advanced_pane` — `shell_dropdown_items` ids/labels with exactly
+   one `selected`, and `persist_shell_setting` round-tripping Automatic → `/bin/bash` → Automatic
+   through a temp-path store (plus the absent-store no-op).
+4. `cargo test -p nice prefs_store` — `advanced.shell` round-trip, key omitted for `None`,
+   co-owner sections survive a shell write.
+5. `cargo test -p nice shell_row_info compose_model_info` and `cargo test -p nice-model shortcuts`
+   — copy pins, including the literal `"4.3"` and no `"zsh"` in any `ShortcutAction`
+   `label()`/`info()`.
+6. `grep -rn zsh README.md crates/nice-model/src/shortcuts.rs` — expect no user-facing hit
+   (`settings/scenario.rs`'s zsh-stub-writer call is dev-facing and deliberately excluded).
+7. `cargo test --workspace` — green; no new live-scenario runtime added.
+
+Deferred to the user's feel-check on the merged branch: the entire "Verification (real app)"
+section (picker rendering, ⓘ tooltips, new-window-vs-open-window shell, relaunch persistence).
+
 ## Acceptance criteria
 
 - Settings ▸ Advanced has a **Shell** dropdown: Automatic + every profile-backed shell binary
